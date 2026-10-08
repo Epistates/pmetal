@@ -1,53 +1,27 @@
 //! KL Divergence loss for knowledge distillation.
 //!
-//! GPU-first implementation using Metal kernels for optimal performance on Apple Silicon.
-//! Falls back to MLX operations when Metal is unavailable.
-//!
 //! KL(P || Q) = sum(P * log(P / Q))
 //!
 //! In distillation:
-//! - Forward KL: KL(teacher || student) - mode-covering
-//! - Reverse KL: KL(student || teacher) - mode-seeking
+//! - Forward KL: KL(teacher || student) - mode-covering (Hinton et al., 2015)
+//! - Reverse KL: KL(student || teacher) - mode-seeking (Gu et al., 2023)
 //!
-//! # Zero-Copy Optimization
-//!
-//! On Apple Silicon, MLX and Metal share unified memory. This implementation uses
-//! zero-copy bridging to pass MLX array data directly to Metal kernels without
-//! copying, providing significant performance improvements for large tensors.
+//! Both are taken between the temperature-softened distributions
+//! `softmax(logits / T)`, computed in log space. The `T²` factor of Hinton et
+//! al. §2 is applied once, by [`Distiller::compute_loss`](crate::Distiller::compute_loss),
+//! not here, so the value is the divergence itself.
 
-#![allow(unsafe_code)]
-
-use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
-use crate::Result;
-use pmetal_bridge::compat::{Array, ops};
-
-#[cfg(feature = "metal")]
-use std::sync::Arc;
-
-#[cfg(feature = "metal")]
-use pmetal_metal::{
-    bridge::metal_buffer_from_ptr,
-    context::MetalContext,
-    kernels::{DistillLossType as MetalDistillLossType, FusedDistill, FusedDistillConfig},
+use super::{
+    DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, reduce_per_token, tempered_log_probs,
 };
+use crate::Result;
+use pmetal_bridge::compat::Array;
 
 /// KL Divergence loss for knowledge distillation.
 ///
 /// Computes either forward KL (teacher || student) or reverse KL (student || teacher).
 /// Forward KL encourages the student to cover all modes of the teacher distribution.
 /// Reverse KL encourages the student to match the dominant modes.
-///
-/// # GPU Acceleration
-///
-/// When the `metal` feature is enabled (default), this implementation uses
-/// custom Metal kernels with online softmax for O(1) memory per token instead
-/// of materializing full probability tensors.
-///
-/// # Zero-Copy Optimization
-///
-/// This implementation uses zero-copy bridging to pass MLX array data directly
-/// to Metal kernels without copying. This is possible because MLX and Metal share
-/// unified memory on Apple Silicon.
 pub struct KlDivergenceLoss {
     /// Whether to use reverse KL (student || teacher).
     reverse: bool,
@@ -57,10 +31,6 @@ pub struct KlDivergenceLoss {
     /// Only used when teacher and student have different vocabulary sizes
     /// (cross-architecture distillation).  Defaults to [`SPARSE_TOPK_DEFAULT`].
     sparse_top_k: i32,
-
-    /// Cached Metal context for GPU acceleration.
-    #[cfg(feature = "metal")]
-    ctx: Option<Arc<MetalContext>>,
 }
 
 impl KlDivergenceLoss {
@@ -69,8 +39,6 @@ impl KlDivergenceLoss {
         Self {
             reverse: false,
             sparse_top_k: SPARSE_TOPK_DEFAULT,
-            #[cfg(feature = "metal")]
-            ctx: MetalContext::global().ok(),
         }
     }
 
@@ -79,8 +47,6 @@ impl KlDivergenceLoss {
         Self {
             reverse: true,
             sparse_top_k: SPARSE_TOPK_DEFAULT,
-            #[cfg(feature = "metal")]
-            ctx: MetalContext::global().ok(),
         }
     }
 
@@ -100,115 +66,6 @@ impl KlDivergenceLoss {
         self.sparse_top_k = k.max(1);
         self
     }
-
-    /// Check if GPU acceleration is available.
-    #[cfg(feature = "metal")]
-    pub fn is_gpu_available(&self) -> bool {
-        self.ctx.is_some()
-    }
-
-    #[cfg(not(feature = "metal"))]
-    pub fn is_gpu_available(&self) -> bool {
-        false
-    }
-
-    /// GPU-accelerated forward pass using Metal kernels with zero-copy bridging.
-    ///
-    /// Uses zero-copy bridging to pass MLX array data directly to Metal kernels
-    /// without copying. This is possible because MLX and Metal share unified
-    /// memory on Apple Silicon.
-    ///
-    /// When `weights` is `Some`, the per-token losses produced by the fused
-    /// kernel are combined on the CPU as `sum(loss * w) / max(sum(w), eps)`.
-    /// Weights are expected to have a total element count equal to the number
-    /// of tokens (typically shape `[batch, seq]`).
-    #[cfg(feature = "metal")]
-    fn compute_gpu(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-        weights: Option<&Array>,
-    ) -> Result<Array> {
-        let ctx = self
-            .ctx
-            .as_ref()
-            .ok_or_else(|| crate::DistillError::Metal("Metal context not available".to_string()))?;
-
-        let shape = teacher_logits.shape();
-        if shape.len() < 2 {
-            return Err(crate::DistillError::Other(
-                "Logits must have at least 2 dimensions".to_string(),
-            ));
-        }
-
-        // Get dimensions - handle both [batch, seq, vocab] and [tokens, vocab]
-        let vocab_size = shape[shape.len() - 1] as usize;
-        let num_tokens: usize = shape[..shape.len() - 1]
-            .iter()
-            .map(|&d| d as usize)
-            .product();
-        let total_elements = num_tokens * vocab_size;
-
-        // Flatten to [num_tokens, vocab] for Metal kernel
-        let teacher_flat = teacher_logits
-            .as_type::<f32>()
-            .reshape(&[-1, vocab_size as i32]);
-        let student_flat = student_logits
-            .as_type::<f32>()
-            .reshape(&[-1, vocab_size as i32]);
-
-        // Evaluate the arrays to ensure data is computed and available
-        teacher_flat.eval();
-        student_flat.eval();
-
-        // SAFETY: data_ptr() returns unified memory owned by the evaluated MLX arrays.
-        // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
-        // takes a mutable void pointer (Metal API constraint), but the buffer is
-        // created as a read-only view — we never write through this pointer.
-        // The cast is safe because:
-        //   1. The data is valid unified memory owned by the evaluated MLX arrays.
-        //   2. We only read from the Metal buffer (kernel input).
-        //   3. teacher_flat/student_flat remain alive for the duration of this fn.
-        let teacher_ptr = teacher_flat.data_ptr() as *mut f32;
-        let student_ptr = student_flat.data_ptr() as *mut f32;
-
-        if teacher_ptr.is_null() || student_ptr.is_null() {
-            return Err(crate::DistillError::Metal(
-                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
-                    .to_string(),
-            ));
-        }
-
-        let teacher_view = unsafe {
-            metal_buffer_from_ptr(ctx, teacher_ptr, total_elements)
-                .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
-        };
-        let student_view = unsafe {
-            metal_buffer_from_ptr(ctx, student_ptr, total_elements)
-                .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
-        };
-
-        // Configure kernel with automatic SIMD selection for large vocabularies
-        let config = FusedDistillConfig::new(num_tokens, vocab_size).with_temperature(temperature);
-
-        let kernel = FusedDistill::new(ctx.clone(), config)
-            .map_err(|e| crate::DistillError::Metal(format!("Kernel error: {}", e)))?;
-
-        // Select loss type
-        let loss_type = if self.reverse {
-            MetalDistillLossType::ReverseKlDivergence
-        } else {
-            MetalDistillLossType::KlDivergence
-        };
-
-        // Execute kernel with zero-copy buffer views
-        let output = kernel
-            .forward(&teacher_view, &student_view, loss_type)
-            .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
-
-        super::reduce_per_token_with_weights(&output.losses, weights, num_tokens)
-    }
 }
 
 impl Default for KlDivergenceLoss {
@@ -225,50 +82,28 @@ impl DistillLoss for KlDivergenceLoss {
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        // Align vocab sizes.  When they differ we take the sparse top-k path
-        // which always uses MLX (Metal kernels require equal vocab sizes).
-        let (teacher_logits, student_logits, vocab_mismatched) =
+        // Align vocab sizes (sparse top-k over the teacher when they differ).
+        let (teacher_logits, student_logits, _) =
             align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
-        let teacher_logits = &teacher_logits;
-        let student_logits = &student_logits;
 
-        // GPU-first: fused Metal kernel supports both unweighted and per-token
-        // weighted reductions. Cross-vocab sparse-top-k alignment is the only
-        // case that requires the MLX path (the kernel assumes equal vocab).
-        if !vocab_mismatched {
-            #[cfg(feature = "metal")]
-            {
-                if self.ctx.is_some() {
-                    return self.compute_gpu(teacher_logits, student_logits, temperature, weights);
-                }
-            }
-        }
-
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp);
-        let student_scaled = student_logits.divide(&temp);
-
-        let teacher_log_probs = teacher_scaled.log_softmax(-1);
-        let student_log_probs = student_scaled.log_softmax(-1);
-        let teacher_probs = teacher_log_probs.exp();
-        let student_probs = student_log_probs.exp();
+        let teacher_log_probs = tempered_log_probs(&teacher_logits, temperature);
+        let student_log_probs = tempered_log_probs(&student_logits, temperature);
 
         let kl_per_token = if self.reverse {
             let log_ratio = student_log_probs.subtract(&teacher_log_probs);
-            student_probs.multiply(&log_ratio).sum_axes(&[-1], false)
+            student_log_probs
+                .exp()
+                .multiply(&log_ratio)
+                .sum_axes(&[-1], false)
         } else {
             let log_ratio = teacher_log_probs.subtract(&student_log_probs);
-            teacher_probs.multiply(&log_ratio).sum_axes(&[-1], false)
+            teacher_log_probs
+                .exp()
+                .multiply(&log_ratio)
+                .sum_axes(&[-1], false)
         };
 
-        if let Some(w) = weights {
-            let weighted = kl_per_token.multiply(w);
-            let total_weight = w.sum_all();
-            let safe_weight = ops::maximum(&total_weight, &Array::from_f32(1e-8));
-            Ok(weighted.sum_all().divide(&safe_weight))
-        } else {
-            Ok(kl_per_token.mean_all())
-        }
+        reduce_per_token(&kl_per_token, weights)
     }
 
     fn name(&self) -> &'static str {
@@ -370,74 +205,10 @@ mod tests {
         assert!(rev_val > 0.0);
     }
 
-    #[cfg(feature = "metal")]
-    #[test]
-    #[serial]
-    fn test_gpu_acceleration_available() {
-        let loss = KlDivergenceLoss::new();
-        // On Apple Silicon, GPU should be available
-        println!("GPU available: {}", loss.is_gpu_available());
-    }
-
-    /// Verify that gradients flow through the KL divergence loss and are
-    /// finite + non-zero.  This guards against accidentally detaching the
-    /// computation graph (e.g. via `.item()` or `.eval()` mid-graph).
-    #[test]
-    #[serial]
-    fn test_kl_divergence_gradient_flow() {
-        use pmetal_bridge::compat::nn::value_and_grad_explicit;
-
-        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let teacher_clone = teacher.clone();
-
-        let loss_fn = |inputs: &[Array]| -> Array {
-            let student = &inputs[0];
-            let temp = Array::from_f32(2.0);
-            let teacher_scaled = teacher_clone.divide(&temp);
-            let student_scaled = student.divide(&temp);
-
-            let teacher_log_probs = teacher_scaled.log_softmax(-1);
-            let student_log_probs = student_scaled.log_softmax(-1);
-            let teacher_probs = teacher_log_probs.exp();
-
-            let log_ratio = teacher_log_probs.subtract(&student_log_probs);
-            let kl = teacher_probs.multiply(&log_ratio);
-            let kl_sum = kl.sum_axes(&[-1], false);
-            kl_sum.mean_all()
-        };
-
-        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (loss_val_arr, grads) = value_and_grad_explicit(loss_fn, &[student], &[]).unwrap();
-
-        loss_val_arr.eval();
-        grads[0].eval();
-
-        let loss_val: f32 = loss_val_arr.item();
-        assert!(
-            loss_val.is_finite(),
-            "loss must be finite, got {}",
-            loss_val
-        );
-        assert!(loss_val > 0.0, "KL loss must be positive, got {}", loss_val);
-
-        let grad_data: Vec<f32> = grads[0].clone().to_f32_vec(4).unwrap();
-        let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
-        assert!(
-            grad_norm.is_finite(),
-            "gradient must be finite, got norm={}",
-            grad_norm
-        );
-        assert!(
-            grad_norm > 1e-10,
-            "gradient must be non-zero, got norm={}",
-            grad_norm
-        );
-    }
-
     #[test]
     #[serial]
     fn test_larger_batch() {
-        // Test with larger tensors to exercise GPU path
+        // Realistic vocab width: the row normalizer runs over 1024 entries
         let batch_size = 4;
         let seq_len = 8;
         let vocab_size = 1024;
@@ -608,12 +379,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Weighted Metal-path tests
+    // Weighted reduction tests
     // -----------------------------------------------------------------
 
     /// Weighted reduction with uniform weights must match the unweighted mean
-    /// within floating-point tolerance. Exercises the fused Metal path end to
-    /// end (compute_weighted → compute_gpu → reduce_per_token_with_weights).
+    /// within floating-point tolerance.
     #[test]
     #[serial]
     fn weighted_uniform_matches_unweighted_mean() {

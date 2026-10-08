@@ -1,30 +1,31 @@
 # pmetal-distill
 
-Knowledge distillation with GPU-accelerated loss computation.
+Knowledge distillation losses for training on Apple Silicon.
 
 ## Overview
 
-This crate provides knowledge distillation utilities for training smaller student models to mimic larger teacher models. It includes Metal-optimized loss functions for efficient training on Apple Silicon.
+This crate provides knowledge distillation utilities for training smaller student models to mimic larger teacher models. Every loss is an MLX expression, so it runs on the GPU and the student is trained by differentiating it.
 
 ## Loss Functions
 
-| Loss | Description | Memory |
-|------|-------------|--------|
-| **KL Divergence** | Standard KL distance | O(vocab) |
-| **Jensen-Shannon** | Symmetric divergence | O(vocab) |
-| **Soft Cross-Entropy** | Temperature-scaled CE | O(1) |
-| **TVD** | Total Variation Distance | O(vocab) |
-| **Hinge Ranking** | Margin-based ranking loss | O(vocab) |
-| **Logistic Ranking** | Logistic ranking loss | O(vocab) |
-| **Hidden State MSE** | Layer alignment | O(hidden) |
-| **Hidden State Cosine** | Direction alignment | O(hidden) |
-| **Hidden State L1** | L1 layer alignment | O(hidden) |
+| Loss | Description |
+|------|-------------|
+| **KL Divergence** | Forward or reverse KL at temperature `T` |
+| **Jensen-Shannon** | Symmetric divergence |
+| **Soft Cross-Entropy** | Temperature-scaled CE |
+| **TVD** | Total Variation Distance |
+| **Hinge Ranking** | Margin-based ranking loss |
+| **Logistic Ranking** | Logistic ranking loss |
+| **Hidden State MSE** | Layer alignment |
+| **Hidden State Cosine** | Direction alignment |
+| **Hidden State L1** | L1 layer alignment |
+
+`Distiller::compute_loss` multiplies the soft loss by `T²`, as in Hinton et
+al. (2015), so its gradient keeps the same scale as the temperature changes.
 
 ## Features
 
 - **TAID**: Temporally Adaptive Interpolated Distillation (ICLR 2025 SOTA) — `TaidDistiller` with configurable schedules
-- **Online Softmax**: O(1) memory per token via streaming computation
-- **Fused Operations**: Temperature scaling + softmax + loss in one kernel
 - **Cross-Vocabulary Distillation**: Sparse top-k alignment for teacher/student vocab mismatch (e.g. Qwen3 to Qwen3.5)
 - **Progressive Distillation**: Temperature annealing schedules
 - **Offline Distillation**: Compressed logit caching for large teachers (`LogitCache`, `LogitCompressor`)
@@ -49,14 +50,6 @@ fn build() -> Result<Distiller> {
 
 For end-to-end model training, use the `pmetal distill` CLI or
 `pmetal_trainer::DistillationTrainer`.
-
-## Metal Optimizations
-
-The distillation losses are optimized for Apple Silicon:
-
-- **Online Softmax**: Streaming max/sum computation avoids materializing full probability tensors
-- **Fused Temperature**: Temperature division happens once in the kernel
-- **SIMD Parallelization**: Efficient handling of large vocabularies
 
 ## Modules
 

@@ -1,8 +1,5 @@
 //! Loss functions for knowledge distillation.
 //!
-//! GPU-first implementations using Metal kernels for optimal Apple Silicon performance.
-//! Falls back to MLX operations when Metal is unavailable.
-//!
 //! This module provides various loss functions used in knowledge distillation:
 //! - KL Divergence (forward and reverse)
 //! - Jensen-Shannon Divergence
@@ -10,13 +7,13 @@
 //! - MSE on logits
 //! - Hidden state alignment losses
 //!
-//! # GPU Acceleration
+//! # Differentiability
 //!
-//! When the `metal` feature is enabled (default), all loss implementations
-//! automatically use custom Metal kernels with these optimizations:
-//! - Online softmax: O(1) memory per token instead of materializing full probability tensors
-//! - Fused operations: temperature scaling + softmax + loss in single kernel pass
-//! - SIMD parallelization: Optimized for large vocabularies (>1024 tokens)
+//! Every loss here is built from MLX operations, so the value it returns is a
+//! node in the autodiff graph: the student is trained by differentiating it.
+//! A loss must never evaluate its inputs and hand back a scalar rebuilt from
+//! host memory (or from a Metal buffer), because that scalar is a constant to
+//! autodiff and the student would receive no gradient from it.
 //!
 //! # Example
 //!
@@ -24,8 +21,6 @@
 //! use pmetal_distill::losses::{KlDivergenceLoss, DistillLoss};
 //!
 //! let loss = KlDivergenceLoss::new();
-//!
-//! // GPU acceleration is automatic - no API changes needed
 //! let result = loss.compute(&teacher_logits, &student_logits, 2.0)?;
 //! ```
 
@@ -106,9 +101,8 @@ pub trait DistillLoss: Send + Sync {
     /// Tokens where `mask == 0` are excluded from the mean so that padding
     /// positions and special tokens do not dilute the gradient signal.
     ///
-    /// The default implementation calls `compute_weighted` with `weights = None`,
-    /// multiplies per-token losses by the mask, then normalises by the number of
-    /// unmasked tokens (floored at 1 to avoid NaN on all-zero masks).
+    /// The mask is the per-token weight of [`compute_weighted`](Self::compute_weighted),
+    /// so the result is the mean over the unmasked tokens only.
     ///
     /// # Arguments
     /// * `teacher_logits` - Teacher logits `[batch, seq, vocab]`
@@ -122,30 +116,47 @@ pub trait DistillLoss: Send + Sync {
         temperature: f32,
         mask: &Array,
     ) -> Result<Array> {
-        let loss = self.compute_weighted(teacher_logits, student_logits, temperature, None)?;
-        let masked = loss.multiply(mask);
-        let sum = masked.sum_all();
-        let count = mask.sum_all();
-        let safe_count = ops::maximum(&count, &Array::from_f32(1.0));
-        Ok(sum.divide(&safe_count))
+        self.compute_weighted(teacher_logits, student_logits, temperature, Some(mask))
     }
 
     /// Get the name of this loss function.
     fn name(&self) -> &'static str;
 }
 
-/// Check if GPU acceleration is available for distillation losses.
+/// Temperature-softened log-probabilities, `log_softmax(logits / T)`, in f32.
 ///
-/// Returns true if Metal is available and the device supports GPU-accelerated
-/// distillation loss computation.
-#[cfg(feature = "metal")]
-pub fn is_gpu_available() -> bool {
-    pmetal_metal::context::MetalContext::global().is_ok()
+/// Logits are upcast before scaling so a bf16 student is normalized at full
+/// precision; `log_softmax` subtracts the row's log-sum-exp rather than taking
+/// the log of a softmax, so no probability underflows to `log(0)`.
+pub(crate) fn tempered_log_probs(logits: &Array, temperature: f32) -> Array {
+    logits
+        .as_dtype(Dtype::Float32.as_i32())
+        .divide(&Array::from_f32(temperature))
+        .log_softmax(-1)
 }
 
-#[cfg(not(feature = "metal"))]
-pub fn is_gpu_available() -> bool {
-    false
+/// Reduce per-token losses to a scalar, in the autodiff graph.
+///
+/// Without `weights` this is the mean. With them it is
+/// `sum(loss * w) / max(sum(w), 1e-8)`, where `weights` holds one entry per
+/// token (typically `[batch, seq]`), so a 0/1 mask averages over the kept
+/// tokens only.
+pub(crate) fn reduce_per_token(per_token: &Array, weights: Option<&Array>) -> Result<Array> {
+    let Some(w) = weights else {
+        return Ok(per_token.mean_all());
+    };
+    if w.size() != per_token.size() {
+        return Err(crate::DistillError::Other(format!(
+            "weight tensor has {} elements but expected {} (one per token)",
+            w.size(),
+            per_token.size()
+        )));
+    }
+    let w = w
+        .reshape(per_token.shape())
+        .as_dtype(Dtype::Float32.as_i32());
+    let safe_weight = ops::maximum(&w.sum_all(), &Array::from_f32(1e-8));
+    Ok(per_token.multiply(&w).sum_all().divide(&safe_weight))
 }
 
 /// Combined distillation loss with hard and soft targets.
@@ -255,8 +266,7 @@ pub fn align_vocab(teacher_logits: &Array, student_logits: &Array) -> Result<(Ar
 ///    they contribute negligible softmax probability.
 ///
 /// The returned pair has matching last dimensions so any loss function can be
-/// applied without modification.  The Metal GPU path must be bypassed for
-/// mismatched vocab because the fused kernels require equal vocab sizes.
+/// applied without modification.
 ///
 /// # Parameters
 ///
@@ -368,57 +378,6 @@ fn gather_at_indices(values: &Array, indices: &Array) -> Result<Array> {
     Ok(gathered)
 }
 
-/// Combine per-token losses produced by a fused Metal kernel with an optional
-/// per-token weight tensor and return a scalar reduction.
-///
-/// When `weights` is `None`, returns the unweighted mean.
-/// When `weights` is `Some`, returns `sum(loss * w) / max(sum(w), 1e-8)`; the
-/// weight tensor must have `num_tokens` total elements (typically shape
-/// `[batch, seq]`).
-///
-/// This is the shared path used by `KlDivergenceLoss`, `JensenShannonLoss`,
-/// `SoftCrossEntropyLoss` etc. to consume the per-token output of
-/// `FusedDistill::forward`. Weighted reduction runs on the CPU (≤ a few KB of
-/// f32 data per step), which is negligible next to the O(N·V) kernel work that
-/// already stayed on the GPU.
-#[cfg(feature = "metal")]
-pub(crate) fn reduce_per_token_with_weights(
-    per_token_losses: &pmetal_metal::buffer::MetalBuffer<f32>,
-    weights: Option<&Array>,
-    num_tokens: usize,
-) -> Result<Array> {
-    let losses = per_token_losses.as_slice();
-    if losses.is_empty() {
-        return Ok(Array::from_f32(0.0));
-    }
-
-    let Some(w) = weights else {
-        let sum: f32 = losses.iter().sum();
-        return Ok(Array::from_f32(sum / losses.len() as f32));
-    };
-
-    let w_size: usize = w.shape().iter().map(|&d| d as usize).product();
-    if w_size != num_tokens {
-        return Err(crate::DistillError::Other(format!(
-            "weight tensor has {} elements but expected {} (one per token)",
-            w_size, num_tokens
-        )));
-    }
-
-    let w_flat = w.reshape(&[num_tokens as i32]);
-    w_flat.eval();
-    let w_slice = w_flat.as_slice::<f32>();
-
-    let mut weighted_sum = 0.0_f32;
-    let mut total_weight = 0.0_f32;
-    for (loss, weight) in losses.iter().zip(w_slice.iter()) {
-        weighted_sum += loss * weight;
-        total_weight += weight;
-    }
-    let safe_weight = total_weight.abs().max(1e-8);
-    Ok(Array::from_f32(weighted_sum / safe_weight))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,14 +429,6 @@ mod tests {
         assert_eq!(result_data.len(), 2);
         assert!((result_data[0] - 0.2).abs() < 1e-5); // row 0, col 1
         assert!((result_data[1] - 0.6).abs() < 1e-5); // row 1, col 2
-    }
-
-    #[test]
-    #[serial]
-    fn test_gpu_availability_check() {
-        // Should return true on Apple Silicon with Metal feature
-        let available = is_gpu_available();
-        println!("GPU acceleration available: {}", available);
     }
 
     // -----------------------------------------------------------------

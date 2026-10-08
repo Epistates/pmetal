@@ -9,14 +9,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[features]
-default = ["metal"]
-metal = ["pmetal-metal"]
-
 [dependencies]
 pmetal-core = { workspace = true }
 pmetal-mlx = { workspace = true }
-pmetal-metal = { workspace = true, optional = true }
 pmetal-bridge = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }

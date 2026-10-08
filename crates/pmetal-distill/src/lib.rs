@@ -25,16 +25,10 @@
 //! let loss = distiller.compute_loss(&teacher_logits, &student_logits, step, total_steps, None)?;
 //! ```
 //!
-//! # GPU Acceleration
+//! # Differentiability
 //!
-//! When the `metal` feature is enabled (default), all loss implementations
-//! automatically use custom Metal kernels with these optimizations:
-//!
-//! - **Online softmax**: O(1) memory per token instead of O(vocab) probability tensors
-//! - **Fused operations**: Temperature scaling + softmax + loss in single kernel pass
-//! - **SIMD parallelization**: Optimized for large vocabularies (>1024 tokens)
-//!
-//! No API changes are needed - GPU acceleration is transparent to the user.
+//! Every loss is an MLX expression, so it runs on the GPU through MLX and the
+//! student is trained by differentiating it directly.
 //!
 //! # Example
 //!
@@ -72,7 +66,7 @@ pub use error::{DistillError, Result};
 pub use losses::{
     AttentionTransferLoss, DistillLoss, GkdLoss, GreedySampler, HiddenStateLoss, HingeRankingLoss,
     JensenShannonLoss, JsdSkewedLoss, KlDivergenceLoss, LogisticRankingLoss, MiniLlmLoss, MseLoss,
-    OnPolicySampler, SoftCrossEntropyLoss, TvdLoss, UniversalLogitLoss, is_gpu_available,
+    OnPolicySampler, SoftCrossEntropyLoss, TvdLoss, UniversalLogitLoss,
 };
 pub use offline::{LogitCache, LogitCompressor};
 pub use reasoning::RationaleLoss;

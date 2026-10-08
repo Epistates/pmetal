@@ -1,4 +1,4 @@
-//! Benchmarks for GPU-first distillation losses.
+//! Benchmarks for the distillation losses.
 //!
 //! Run with: cargo bench -p pmetal-distill
 
@@ -50,7 +50,7 @@ fn bench_kl_divergence(c: &mut Criterion) {
         group.throughput(Throughput::Elements(throughput));
 
         group.bench_with_input(
-            BenchmarkId::new("gpu_first", name),
+            BenchmarkId::new("loss", name),
             &(&teacher, &student),
             |b, (t, s)| {
                 b.iter(|| {
@@ -110,7 +110,7 @@ fn bench_jensen_shannon(c: &mut Criterion) {
         group.throughput(Throughput::Elements(throughput));
 
         group.bench_with_input(
-            BenchmarkId::new("gpu_first", name),
+            BenchmarkId::new("loss", name),
             &(&teacher, &student),
             |b, (t, s)| {
                 b.iter(|| {
@@ -143,7 +143,7 @@ fn bench_soft_cross_entropy(c: &mut Criterion) {
         group.throughput(Throughput::Elements(throughput));
 
         group.bench_with_input(
-            BenchmarkId::new("gpu_first", name),
+            BenchmarkId::new("loss", name),
             &(&teacher, &student),
             |b, (t, s)| {
                 b.iter(|| {
@@ -175,7 +175,7 @@ fn bench_hidden_mse(c: &mut Criterion) {
         group.throughput(Throughput::Elements(throughput));
 
         group.bench_with_input(
-            BenchmarkId::new("gpu_first", name),
+            BenchmarkId::new("loss", name),
             &(&teacher, &student),
             |b, (t, s)| {
                 b.iter(|| {
@@ -207,7 +207,7 @@ fn bench_hidden_cosine(c: &mut Criterion) {
         group.throughput(Throughput::Elements(throughput));
 
         group.bench_with_input(
-            BenchmarkId::new("gpu_first", name),
+            BenchmarkId::new("loss", name),
             &(&teacher, &student),
             |b, (t, s)| {
                 b.iter(|| {

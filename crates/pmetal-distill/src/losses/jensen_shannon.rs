@@ -1,72 +1,45 @@
 //! Jensen-Shannon Divergence loss for knowledge distillation.
 //!
-//! GPU-first implementation using Metal kernels for optimal performance on Apple Silicon.
-//! Falls back to MLX operations when Metal is unavailable.
-//!
 //! JS(P || Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M)
 //! where M = 0.5 * (P + Q)
 //!
-//! Jensen-Shannon is symmetric and bounded [0, log(2)], making it
-//! more stable than KL divergence for distillation.
-//!
-//! # Zero-Copy Optimization
-//!
-//! On Apple Silicon, MLX and Metal share unified memory. This implementation uses
-//! zero-copy bridging to pass MLX array data directly to Metal kernels without
-//! copying, providing significant performance improvements for large tensors.
+//! This is the β = 0.5 member of the generalized JSD of Agarwal et al. (2024,
+//! "On-Policy Distillation of Language Models"); [`JsdSkewedLoss`](super::JsdSkewedLoss)
+//! covers other β. It is symmetric and bounded in [0, log 2], making it more
+//! stable than KL divergence for distillation.
 
-#![allow(unsafe_code)]
-
-use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
+use super::{
+    DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, reduce_per_token, tempered_log_probs,
+};
 use crate::Result;
 use pmetal_bridge::compat::{Array, ops};
 
-/// Numerically stable log(exp(a) + exp(b)) = max(a,b) + log(1 + exp(-|a-b|)).
+/// Numerically stable `log(exp(a) + exp(b))` = `m + log(exp(a - m) + exp(b - m))`
+/// with `m = max(a, b)`.
+///
+/// `m` appears both outside and inside the log, so its own derivative cancels
+/// and the gradient splits evenly between `a` and `b` where they tie, as the
+/// derivative of `log(exp(a) + exp(b))` does. The shortcut
+/// `m + log(1 + exp(-|a - b|))` has the same value but not that property: the
+/// gradient of `maximum` sends a tie entirely to one argument and `|x|`
+/// contributes nothing there, so wherever teacher and student gave a token the
+/// same log-probability the student's gradient through the mixture came out
+/// wrong (tenfold on a permuted-row fixture).
 fn log_sum_exp(a: &Array, b: &Array) -> Array {
-    let max_ab = ops::maximum(a, b);
-    let diff = a.subtract(b).abs_val();
-    let log1p_term = diff.negative().exp().add(&Array::from_f32(1.0)).log();
-    max_ab.add(&log1p_term)
+    let m = ops::maximum(a, b);
+    m.add(&a.subtract(&m).exp().add(&b.subtract(&m).exp()).log())
 }
-
-#[cfg(feature = "metal")]
-use std::sync::Arc;
-
-#[cfg(feature = "metal")]
-use pmetal_metal::{
-    bridge::metal_buffer_from_ptr,
-    context::MetalContext,
-    kernels::{DistillLossType as MetalDistillLossType, FusedDistill, FusedDistillConfig},
-};
 
 /// Jensen-Shannon Divergence loss for knowledge distillation.
 ///
 /// A symmetric, bounded alternative to KL divergence.
 /// JS(P || Q) = JS(Q || P), unlike KL divergence.
-///
-/// # GPU Acceleration
-///
-/// When the `metal` feature is enabled (default), this implementation uses
-/// custom Metal kernels with online softmax for optimal memory efficiency.
-///
-/// # Zero-Copy Optimization
-///
-/// This implementation uses zero-copy bridging to pass MLX array data directly
-/// to Metal kernels without copying. This is possible because MLX and Metal share
-/// unified memory on Apple Silicon.
 pub struct JensenShannonLoss {
     /// Number of top-k teacher tokens to retain when vocab sizes differ.
     ///
     /// Only used when teacher and student have different vocabulary sizes
     /// (cross-architecture distillation).  Defaults to [`SPARSE_TOPK_DEFAULT`].
     sparse_top_k: i32,
-
-    /// Cached Metal context for GPU acceleration.
-    #[cfg(feature = "metal")]
-    ctx: Option<Arc<MetalContext>>,
-
-    #[cfg(not(feature = "metal"))]
-    _phantom: (),
 }
 
 impl JensenShannonLoss {
@@ -74,10 +47,6 @@ impl JensenShannonLoss {
     pub fn new() -> Self {
         Self {
             sparse_top_k: SPARSE_TOPK_DEFAULT,
-            #[cfg(feature = "metal")]
-            ctx: MetalContext::global().ok(),
-            #[cfg(not(feature = "metal"))]
-            _phantom: (),
         }
     }
 
@@ -90,106 +59,6 @@ impl JensenShannonLoss {
     pub fn with_sparse_top_k(mut self, k: i32) -> Self {
         self.sparse_top_k = k.max(1);
         self
-    }
-
-    /// Check if GPU acceleration is available.
-    #[cfg(feature = "metal")]
-    pub fn is_gpu_available(&self) -> bool {
-        self.ctx.is_some()
-    }
-
-    #[cfg(not(feature = "metal"))]
-    pub fn is_gpu_available(&self) -> bool {
-        false
-    }
-
-    /// GPU-accelerated forward pass using Metal kernels with zero-copy bridging.
-    ///
-    /// Uses zero-copy bridging to pass MLX array data directly to Metal kernels
-    /// without copying. This is possible because MLX and Metal share unified
-    /// memory on Apple Silicon.
-    #[cfg(feature = "metal")]
-    fn compute_gpu(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-        weights: Option<&Array>,
-    ) -> Result<Array> {
-        let ctx = self
-            .ctx
-            .as_ref()
-            .ok_or_else(|| crate::DistillError::Metal("Metal context not available".to_string()))?;
-
-        let shape = teacher_logits.shape();
-        if shape.len() < 2 {
-            return Err(crate::DistillError::Other(
-                "Logits must have at least 2 dimensions".to_string(),
-            ));
-        }
-
-        // Get dimensions - handle both [batch, seq, vocab] and [tokens, vocab]
-        let vocab_size = shape[shape.len() - 1] as usize;
-        let num_tokens: usize = shape[..shape.len() - 1]
-            .iter()
-            .map(|&d| d as usize)
-            .product();
-        let total_elements = num_tokens * vocab_size;
-
-        // Flatten to [num_tokens, vocab] for Metal kernel
-        let teacher_flat = teacher_logits
-            .as_type::<f32>()
-            .reshape(&[-1, vocab_size as i32]);
-        let student_flat = student_logits
-            .as_type::<f32>()
-            .reshape(&[-1, vocab_size as i32]);
-
-        // Evaluate the arrays to ensure data is computed and available
-        teacher_flat.eval();
-        student_flat.eval();
-
-        // SAFETY: data_ptr() returns *mut f32 pointing to unified memory shared by MLX and Metal.
-        // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
-        // takes a mutable void pointer (Metal API constraint), but the buffer is
-        // created as a read-only view — we never write through this pointer.
-        // The cast is safe because:
-        //   1. The data is valid unified memory owned by the evaluated MLX arrays.
-        //   2. We only read from the Metal buffer (kernel input).
-        //   3. teacher_flat/student_flat remain alive for the duration of this fn.
-        let teacher_ptr = teacher_flat.data_ptr() as *mut f32;
-        let student_ptr = student_flat.data_ptr() as *mut f32;
-
-        if teacher_ptr.is_null() || student_ptr.is_null() {
-            return Err(crate::DistillError::Metal(
-                "data_ptr returned null — array may not be f32 or not evaluated".to_string(),
-            ));
-        }
-
-        let teacher_view = unsafe {
-            metal_buffer_from_ptr(ctx, teacher_ptr, total_elements)
-                .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
-        };
-        let student_view = unsafe {
-            metal_buffer_from_ptr(ctx, student_ptr, total_elements)
-                .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
-        };
-
-        // Configure kernel with automatic SIMD selection for large vocabularies
-        let config = FusedDistillConfig::new(num_tokens, vocab_size).with_temperature(temperature);
-
-        let kernel = FusedDistill::new(ctx.clone(), config)
-            .map_err(|e| crate::DistillError::Metal(format!("Kernel error: {}", e)))?;
-
-        // Execute kernel with zero-copy buffer views
-        let output = kernel
-            .forward(
-                &teacher_view,
-                &student_view,
-                MetalDistillLossType::JensenShannon,
-            )
-            .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
-
-        super::reduce_per_token_with_weights(&output.losses, weights, num_tokens)
     }
 }
 
@@ -207,31 +76,13 @@ impl DistillLoss for JensenShannonLoss {
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        // Align vocab sizes.  When they differ we take the sparse top-k path
-        // which always uses MLX (Metal kernels require equal vocab sizes).
-        let (teacher_logits, student_logits, vocab_mismatched) =
+        // Align vocab sizes (sparse top-k over the teacher when they differ).
+        let (teacher_logits, student_logits, _) =
             align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
-        let teacher_logits = &teacher_logits;
-        let student_logits = &student_logits;
 
-        // GPU-first: fused kernel supports both unweighted and per-token
-        // weighted reductions; only the sparse-vocab path has to stay on MLX.
-        if !vocab_mismatched {
-            #[cfg(feature = "metal")]
-            {
-                if self.ctx.is_some() {
-                    return self.compute_gpu(teacher_logits, student_logits, temperature, weights);
-                }
-            }
-        }
-
-        // MLX fallback / weighted / sparse-vocab implementation (log-domain for stability)
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp);
-        let student_scaled = student_logits.divide(&temp);
-
-        let teacher_log_probs = teacher_scaled.log_softmax(-1);
-        let student_log_probs = student_scaled.log_softmax(-1);
+        // Log-domain throughout for stability.
+        let teacher_log_probs = tempered_log_probs(&teacher_logits, temperature);
+        let student_log_probs = tempered_log_probs(&student_logits, temperature);
         let teacher_probs = teacher_log_probs.exp();
 
         // log(M) via log-sum-exp for stability (avoids 0*-inf = NaN for disjoint distributions)
@@ -248,14 +99,7 @@ impl DistillLoss for JensenShannonLoss {
             .multiply(&half)
             .sum_axes(&[-1], false);
 
-        if let Some(w) = weights {
-            let weighted = js_per_token.multiply(w);
-            let total_weight = w.sum_all();
-            let safe_weight = ops::maximum(&total_weight, &Array::from_f32(1e-8));
-            Ok(weighted.sum_all().divide(&safe_weight))
-        } else {
-            Ok(js_per_token.mean_all())
-        }
+        reduce_per_token(&js_per_token, weights)
     }
 
     fn name(&self) -> &'static str {
@@ -350,78 +194,10 @@ mod tests {
         );
     }
 
-    /// Verify gradients flow through Jensen-Shannon loss (finite + non-zero).
-    #[test]
-    #[serial]
-    fn test_jensen_shannon_gradient_flow() {
-        use pmetal_bridge::compat::nn::value_and_grad_explicit;
-
-        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-
-        let loss_fn = |inputs: &[Array]| -> Array {
-            let student = &inputs[0];
-            let temp = Array::from_f32(2.0);
-            let teacher_scaled = teacher.divide(&temp);
-            let student_scaled = student.divide(&temp);
-
-            let teacher_log_probs = teacher_scaled.log_softmax(-1);
-            let student_log_probs = student_scaled.log_softmax(-1);
-            let teacher_probs = teacher_log_probs.exp();
-
-            // log(M) = log(0.5*(P+Q)) via log-sum-exp
-            let log2 = Array::from_f32(2.0_f32.ln());
-            let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs).subtract(&log2);
-
-            let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture));
-            let student_probs = student_log_probs.exp();
-            let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture));
-
-            let half = Array::from_f32(0.5);
-            let js = kl_teacher_m.add(&kl_student_m).multiply(&half);
-            let js_sum = js.sum_axes(&[-1], false);
-            js_sum.mean_all()
-        };
-
-        let student = Array::from_f32_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
-        let (loss_val_arr, grads) = value_and_grad_explicit(loss_fn, &[student], &[]).unwrap();
-
-        loss_val_arr.eval();
-        grads[0].eval();
-
-        let loss_val: f32 = loss_val_arr.item();
-        assert!(
-            loss_val.is_finite(),
-            "JS loss must be finite, got {}",
-            loss_val
-        );
-        assert!(loss_val > 0.0, "JS loss must be positive, got {}", loss_val);
-
-        let grad_data: Vec<f32> = grads[0].clone().to_f32_vec(4).unwrap();
-        let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
-        assert!(
-            grad_norm.is_finite(),
-            "gradient must be finite, got norm={}",
-            grad_norm
-        );
-        assert!(
-            grad_norm > 1e-10,
-            "gradient must be non-zero, got norm={}",
-            grad_norm
-        );
-    }
-
-    #[cfg(feature = "metal")]
-    #[test]
-    #[serial]
-    fn test_gpu_acceleration_available() {
-        let loss = JensenShannonLoss::new();
-        println!("GPU available: {}", loss.is_gpu_available());
-    }
-
     #[test]
     #[serial]
     fn test_larger_batch() {
-        // Test with larger tensors to exercise GPU path
+        // Realistic vocab width: the row normalizer runs over 1024 entries
         let batch_size = 4;
         let seq_len = 8;
         let vocab_size = 1024;

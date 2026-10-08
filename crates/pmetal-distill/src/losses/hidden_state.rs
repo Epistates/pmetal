@@ -1,53 +1,21 @@
 //! Hidden state alignment losses for knowledge distillation.
 //!
-//! GPU-first implementation using Metal kernels for optimal performance on Apple Silicon.
-//! Falls back to MLX operations when Metal is unavailable.
-//!
 //! These losses enable distilling knowledge from intermediate layers,
 //! not just the final logits. This can improve student model quality
 //! by ensuring internal representations align with the teacher.
-//!
-//! # Zero-Copy Optimization
-//!
-//! On Apple Silicon, MLX and Metal share unified memory. This implementation uses
-//! zero-copy bridging to pass MLX array data directly to Metal kernels without
-//! copying, providing significant performance improvements for large tensors.
-
-#![allow(unsafe_code)]
 
 use crate::{HiddenStateLossType, Result};
 use pmetal_bridge::compat::Array;
-
-#[cfg(feature = "metal")]
-use std::sync::Arc;
-
-#[cfg(feature = "metal")]
-use pmetal_metal::{
-    bridge::metal_buffer_from_ptr,
-    context::MetalContext,
-    kernels::{
-        FusedHiddenAlign, HiddenAlignConfig, HiddenAlignLossType as MetalHiddenAlignLossType,
-    },
-};
 
 /// Hidden state alignment loss.
 ///
 /// Aligns hidden states between teacher and student layers.
 /// Supports MSE, cosine similarity, and L1 losses.
-///
-/// # GPU Acceleration
-///
-/// When the `metal` feature is enabled (default), this implementation uses
-/// custom Metal kernels for MSE and cosine similarity losses.
 pub struct HiddenStateLoss {
     /// Type of loss to use.
     loss_type: HiddenStateLossType,
     /// Optional projection matrix for dimension mismatch.
     projection: Option<Array>,
-
-    /// Cached Metal context for GPU acceleration.
-    #[cfg(feature = "metal")]
-    ctx: Option<Arc<MetalContext>>,
 }
 
 impl HiddenStateLoss {
@@ -56,8 +24,6 @@ impl HiddenStateLoss {
         Self {
             loss_type,
             projection: None,
-            #[cfg(feature = "metal")]
-            ctx: MetalContext::global().ok(),
         }
     }
 
@@ -83,17 +49,6 @@ impl HiddenStateLoss {
     pub fn with_projection(mut self, projection: Array) -> Self {
         self.projection = Some(projection);
         self
-    }
-
-    /// Check if GPU acceleration is available.
-    #[cfg(feature = "metal")]
-    pub fn is_gpu_available(&self) -> bool {
-        self.ctx.is_some()
-    }
-
-    #[cfg(not(feature = "metal"))]
-    pub fn is_gpu_available(&self) -> bool {
-        false
     }
 
     /// Compute alignment loss between teacher and student hidden states.
@@ -123,7 +78,7 @@ impl HiddenStateLoss {
             student_hidden.matmul(proj)
         } else {
             // Without a projection the shapes must already align on the
-            // hidden axis; otherwise the loss kernel would fail with a
+            // hidden axis; otherwise the loss would fail with a
             // shape-broadcast error.
             let t_last = teacher_hidden.dim(-1);
             let s_last = student_hidden.dim(-1);
@@ -137,33 +92,6 @@ impl HiddenStateLoss {
             student_hidden.clone()
         };
 
-        // GPU-first: try Metal for supported loss types
-        #[cfg(feature = "metal")]
-        {
-            if self.ctx.is_some() {
-                match self.loss_type {
-                    HiddenStateLossType::Mse => {
-                        return self.compute_gpu(
-                            teacher_hidden,
-                            &student_aligned,
-                            MetalHiddenAlignLossType::Mse,
-                        );
-                    }
-                    HiddenStateLossType::Cosine => {
-                        return self.compute_gpu(
-                            teacher_hidden,
-                            &student_aligned,
-                            MetalHiddenAlignLossType::Cosine,
-                        );
-                    }
-                    HiddenStateLossType::L1 => {
-                        // L1 not implemented in Metal, fall through to MLX
-                    }
-                }
-            }
-        }
-
-        // MLX fallback
         match self.loss_type {
             HiddenStateLossType::Mse => self.mse_loss_mlx(teacher_hidden, &student_aligned),
             HiddenStateLossType::Cosine => self.cosine_loss_mlx(teacher_hidden, &student_aligned),
@@ -171,114 +99,14 @@ impl HiddenStateLoss {
         }
     }
 
-    /// GPU-accelerated forward pass using Metal kernels with zero-copy bridging.
-    ///
-    /// Uses zero-copy bridging to pass MLX array data directly to Metal kernels
-    /// without copying. This is possible because MLX and Metal share unified
-    /// memory on Apple Silicon.
-    #[cfg(feature = "metal")]
-    fn compute_gpu(
-        &self,
-        teacher_hidden: &Array,
-        student_hidden: &Array,
-        loss_type: MetalHiddenAlignLossType,
-    ) -> Result<Array> {
-        let ctx = self
-            .ctx
-            .as_ref()
-            .ok_or_else(|| crate::DistillError::Metal("Metal context not available".to_string()))?;
-
-        let t_shape = teacher_hidden.shape();
-        let s_shape = student_hidden.shape();
-
-        if t_shape.len() < 2 || s_shape.len() < 2 {
-            return Err(crate::DistillError::Other(
-                "Hidden states must have at least 2 dimensions".to_string(),
-            ));
-        }
-
-        // Get dimensions
-        let teacher_dim = t_shape[t_shape.len() - 1] as usize;
-        let student_dim = s_shape[s_shape.len() - 1] as usize;
-        let num_tokens: usize = t_shape[..t_shape.len() - 1]
-            .iter()
-            .map(|&d| d as usize)
-            .product();
-        let teacher_elements = num_tokens * teacher_dim;
-        let student_elements = num_tokens * student_dim;
-
-        // Flatten to [num_tokens, hidden] for Metal kernel
-        let teacher_flat = teacher_hidden
-            .as_type::<f32>()
-            .reshape(&[-1, teacher_dim as i32]);
-        let student_flat = student_hidden
-            .as_type::<f32>()
-            .reshape(&[-1, student_dim as i32]);
-
-        // Evaluate the arrays to ensure data is computed and available
-        teacher_flat.eval();
-        student_flat.eval();
-
-        // Get raw data pointers via mlx_sys which returns a legitimate *mut f32
-        // backed by the array's unified-memory allocation.
-        // SAFETY:
-        // 1. Arrays have been eval()'d above — data is present in unified memory
-        // 2. Arrays remain in scope for the duration of the Metal buffer views
-        // 3. Apple Silicon unified memory is directly accessible by the GPU
-        // 4. teacher_elements/student_elements correctly bound each allocation
-        // SAFETY: mlx_array_data_float32 returns *const f32 in mlx-rs 0.25.7+.
-        // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
-        // takes a mutable void pointer (Metal API constraint), but the buffer is
-        // created as a read-only view — we never write through this pointer.
-        // The cast is safe because:
-        //   1. The data is valid unified memory owned by the evaluated MLX arrays.
-        //   2. We only read from the Metal buffer (kernel input).
-        //   3. teacher_flat/student_flat remain alive for the duration of this fn.
-        let teacher_ptr = teacher_flat.data_ptr() as *mut f32;
-        let student_ptr = student_flat.data_ptr() as *mut f32;
-
-        if teacher_ptr.is_null() || student_ptr.is_null() {
-            return Err(crate::DistillError::Metal(
-                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
-                    .to_string(),
-            ));
-        }
-
-        let teacher_view = unsafe {
-            metal_buffer_from_ptr(ctx, teacher_ptr, teacher_elements)
-                .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
-        };
-        let student_view = unsafe {
-            metal_buffer_from_ptr(ctx, student_ptr, student_elements)
-                .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
-        };
-
-        // Configure kernel
-        let config = HiddenAlignConfig::new(num_tokens, teacher_dim, student_dim);
-
-        let kernel = FusedHiddenAlign::new(ctx.clone(), config)
-            .map_err(|e| crate::DistillError::Metal(format!("Kernel error: {}", e)))?;
-
-        // Execute kernel with zero-copy buffer views
-        let losses = kernel
-            .forward(&teacher_view, &student_view, loss_type)
-            .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
-
-        // Compute mean loss
-        let loss_data = losses.as_slice();
-        let mean_loss: f32 = loss_data.iter().sum::<f32>() / loss_data.len() as f32;
-
-        Ok(Array::from_f32(mean_loss))
-    }
-
-    /// MSE loss on hidden states (MLX fallback).
+    /// MSE loss on hidden states.
     fn mse_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
         let diff = student.subtract(teacher);
         let squared = diff.multiply(&diff);
         Ok(squared.mean_all())
     }
 
-    /// Cosine similarity loss (1 - cosine_similarity) (MLX fallback).
+    /// Cosine similarity loss (1 - cosine_similarity).
     fn cosine_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
         // Cosine similarity along last dimension
         // cos(t, s) = (t · s) / (||t|| * ||s||)
@@ -302,7 +130,7 @@ impl HiddenStateLoss {
         Ok(loss.mean_all())
     }
 
-    /// L1 loss on hidden states (MLX only - no Metal kernel).
+    /// L1 loss on hidden states.
     fn l1_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
         let diff = student.subtract(teacher);
         let abs_diff = diff.abs_val();
@@ -463,7 +291,9 @@ impl LayerDistillation {
 // SAFETY: `HiddenStateLoss` is constructed once and its `projection` Array (if any)
 // is thereafter immutable. MLX arrays on Apple Silicon use an internal reference-count
 // that is thread-safe; we never mutate the array from multiple threads simultaneously.
+#[allow(unsafe_code)]
 unsafe impl Send for HiddenStateLoss {}
+#[allow(unsafe_code)]
 unsafe impl Sync for HiddenStateLoss {}
 
 impl super::DistillLoss for HiddenStateLoss {
@@ -595,14 +425,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "metal")]
-    #[test]
-    #[serial]
-    fn test_gpu_acceleration_available() {
-        let loss = HiddenStateLoss::mse();
-        println!("GPU available: {}", loss.is_gpu_available());
-    }
-
     /// Mismatched hidden dimensions without a projection must surface a
     /// descriptive `InvalidConfig` error before the matmul kernel runs.
     #[test]
@@ -663,7 +485,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_larger_batch() {
-        // Test with larger tensors to exercise GPU path
+        // Realistic hidden width
         let batch_size = 4;
         let seq_len = 8;
         let hidden_dim = 256;
