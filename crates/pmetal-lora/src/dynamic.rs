@@ -255,6 +255,10 @@ impl TrainableModel for DynamicLoraModel {
         TrainableModel::supports_packed_positions(&self.inner)
     }
 
+    fn has_recurrent_layers(&self) -> bool {
+        TrainableModel::has_recurrent_layers(&self.inner)
+    }
+
     fn forward_with_images(
         &mut self,
         input_ids: &Array,

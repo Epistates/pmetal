@@ -76,6 +76,15 @@ pub trait TrainableModel: ModuleParameters {
         false
     }
 
+    /// Whether any layer carries recurrent state along the sequence (Mamba,
+    /// gated delta net). Such a layer runs straight through the boundary
+    /// between two packed sequences: the attention mask can't stop it, so the
+    /// second sequence would start from the first one's state. Training loops
+    /// must not pack these models.
+    fn has_recurrent_layers(&self) -> bool {
+        false
+    }
+
     /// Perform forward pass for Vision-Language Models with image inputs.
     ///
     /// This is used for VLM training (e.g., Llama 3.2 Vision) where the model

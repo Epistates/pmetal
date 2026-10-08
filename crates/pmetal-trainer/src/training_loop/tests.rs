@@ -156,6 +156,103 @@ fn test_take_log_interval_metrics_uses_actual_logged_steps() {
     assert_eq!(training_loop.last_log_step, Some(10));
 }
 
+/// A tiny Qwen 3.5 hybrid: three gated-delta-net layers and one attention layer.
+fn small_hybrid_model() -> AdaptedModel {
+    use pmetal_models::architectures::qwen3_next::Qwen3NextConfig;
+    let config = Qwen3NextConfig {
+        hidden_size: 32,
+        intermediate_size: 64,
+        num_hidden_layers: 4,
+        num_attention_heads: 2,
+        num_key_value_heads: Some(1),
+        head_dim: Some(16),
+        vocab_size: 100,
+        linear_num_value_heads: 2,
+        linear_num_key_heads: 1,
+        linear_key_head_dim: 32,
+        linear_value_head_dim: 16,
+        linear_conv_kernel_dim: 4,
+        full_attention_interval: 4,
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        decoder_sparse_step: 1,
+        moe_intermediate_size: 16,
+        shared_expert_intermediate_size: 32,
+        mlp_only_layers: vec![],
+        norm_topk_prob: false,
+        tie_word_embeddings: true,
+        ..Default::default()
+    };
+    let json = serde_json::json!({ "model_type": "qwen3_next", "text_config": config });
+    let base = DynamicModel::from_config(&json.to_string()).expect("qwen3_next builds");
+    AdaptedModel::attach(base, small_lora_config()).expect("attach adapters")
+}
+
+/// Packing puts several sequences in one row. A gated-delta-net layer would
+/// carry the first one's state into the second, so `run_packed` must train a
+/// model with recurrent layers on unpacked batches: one step per sequence
+/// here, where the attention-only control packs them into fewer steps.
+#[test]
+fn test_run_packed_does_not_pack_models_with_recurrent_layers() {
+    let config = || TrainingLoopConfig {
+        training: TrainingConfig {
+            learning_rate: 1e-4,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            num_epochs: 1,
+            max_steps: None,
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len: 64,
+            shuffle: false,
+            pad_token_id: 0,
+            ..Default::default()
+        },
+        pack_max_seq_len: Some(64),
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        use_jit_compilation: false,
+        use_cut_cross_entropy: false,
+        ..Default::default()
+    };
+    let dataset = || {
+        let samples: Vec<Sample> = (0..6)
+            .map(|i| Sample::new((0..8).map(|j| ((i * 7 + j) % 90 + 1) as u32).collect()))
+            .collect();
+        TrainingDataset::from_samples(samples)
+    };
+
+    let hybrid = small_hybrid_model();
+    assert!(hybrid.has_recurrent_layers());
+    let mut training_loop = TrainingLoop::new(config());
+    training_loop
+        .run_packed(hybrid, dataset(), None, None)
+        .unwrap();
+    pmetal_bridge::check_last_error().unwrap();
+    assert_eq!(
+        training_loop.current_step(),
+        6,
+        "a model with recurrent layers must train on one unpacked sequence per step"
+    );
+
+    let dense = small_model();
+    assert!(!dense.has_recurrent_layers());
+    let mut training_loop = TrainingLoop::new(config());
+    training_loop
+        .run_packed(dense, dataset(), None, None)
+        .unwrap();
+    assert!(
+        training_loop.current_step() < 6,
+        "the attention-only control should pack, took {} steps",
+        training_loop.current_step()
+    );
+}
+
 #[test]
 fn test_run_packed_falls_back_to_standard_when_no_sequences_are_combined() {
     let config = TrainingLoopConfig {

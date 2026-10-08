@@ -335,6 +335,13 @@ impl crate::TrainableModel for AdaptedModel {
         self.model.supports_packed_positions()
     }
 
+    /// An architecture with recurrent layers is one whose decoding needs a
+    /// recurrent cache beside the KV cache, which is what the dispatcher's
+    /// `create_mamba_cache` answers for every such model.
+    fn has_recurrent_layers(&self) -> bool {
+        self.model.create_mamba_cache().is_some()
+    }
+
     /// `pixel_values` here means vision features already projected to the text
     /// hidden size, which is what the VLM adapter path computes once and
     /// reuses. Running the tower from raw pixels needs the processor's tile

@@ -608,6 +608,12 @@ impl TrainableModel for DynamicQloraModel {
     fn supports_packed_positions(&self) -> bool {
         dispatch_qlora!(self, supports_packed_positions)
     }
+
+    /// Gated delta net (Qwen 3.5) and Mamba-2 (NemotronH) layers carry state
+    /// along the sequence.
+    fn has_recurrent_layers(&self) -> bool {
+        matches!(self, Self::Qwen3Next(_) | Self::NemotronH(_))
+    }
 }
 
 // ---------------------------------------------------------------------------
