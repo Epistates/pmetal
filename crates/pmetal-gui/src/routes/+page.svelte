@@ -288,7 +288,7 @@
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
           </svg>
           <p class="font-medium text-surface-900 dark:text-surface-100">Start Training</p>
-          <p class="text-xs text-surface-500 dark:text-surface-400 mt-1">LoRA, QLoRA, DPO</p>
+          <p class="text-xs text-surface-500 dark:text-surface-400 mt-1">LoRA, QLoRA</p>
         </a>
 
         <a href="/grpo" class="p-4 rounded-lg bg-surface-50 dark:bg-surface-700/50 hover:bg-surface-100 dark:hover:bg-surface-700 transition-colors text-center">

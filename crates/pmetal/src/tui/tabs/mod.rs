@@ -14,6 +14,7 @@ mod jobs;
 mod merge;
 mod models;
 mod ollama;
+mod preference;
 mod pretrain;
 mod quantize;
 mod rlkd;
@@ -35,6 +36,7 @@ pub use jobs::JobsTab;
 pub use merge::MergeTab;
 pub use models::{ModelSource, ModelsTab, write_training_info};
 pub use ollama::OllamaTab;
+pub use preference::PreferenceTab;
 pub use pretrain::PretrainTab;
 pub use quantize::QuantizeTab;
 pub use rlkd::RlkdTab;
@@ -62,6 +64,7 @@ pub enum Tab {
     Distillation,
     Rlkd,
     Grpo,
+    Preference,
     Inference,
     Dflash,
     Serve,
@@ -78,7 +81,7 @@ impl Tab {
     ///
     /// Ordering rationale:
     /// - System/data tabs first: Device, Models, Datasets, Tokenize
-    /// - Training family: Training, EmbedTrain, Pretrain, Distillation, Rlkd, Grpo
+    /// - Training family: Training, EmbedTrain, Pretrain, Distillation, Rlkd, Grpo, Preference
     /// - Dashboard (metrics monitor) after training group
     /// - Inference/serving: Inference, DFlash, Serve
     /// - Post-processing: Quantize, Merge, Bench, Eval
@@ -95,6 +98,7 @@ impl Tab {
         Tab::Distillation,
         Tab::Rlkd,
         Tab::Grpo,
+        Tab::Preference,
         Tab::Dashboard,
         Tab::Inference,
         Tab::Dflash,
@@ -121,6 +125,7 @@ impl Tab {
             Tab::Distillation => "^",
             Tab::Rlkd => "r",
             Tab::Grpo => "!",
+            Tab::Preference => "<",
             Tab::Inference => "$",
             Tab::Dflash => "d",
             Tab::Serve => "*",
@@ -162,6 +167,7 @@ impl std::fmt::Display for Tab {
             Tab::Distillation => write!(f, "Distill"),
             Tab::Rlkd => write!(f, "RLKD"),
             Tab::Grpo => write!(f, "GRPO"),
+            Tab::Preference => write!(f, "Preference"),
             Tab::Inference => write!(f, "Inference"),
             Tab::Dflash => write!(f, "DFlash"),
             Tab::Serve => write!(f, "Serve"),

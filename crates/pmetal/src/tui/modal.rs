@@ -1152,7 +1152,7 @@ fn tab_help(tab: Tab) -> &'static [(&'static str, &'static str)] {
             ("S", "Start the job"),
             ("x", "Cancel the running job"),
         ],
-        Tab::EmbedTrain | Tab::Rlkd | Tab::Tokenize => &[
+        Tab::EmbedTrain | Tab::Rlkd | Tab::Preference | Tab::Tokenize => &[
             ("j / k", "Navigate fields"),
             ("Enter", "Edit / cycle / pick"),
             ("S", "Start the job"),

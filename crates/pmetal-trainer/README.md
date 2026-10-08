@@ -12,12 +12,12 @@ This crate provides the training infrastructure for PMetal, including various tr
 |--------|-------------|----------|
 | **SFT** | Supervised Fine-Tuning | General instruction tuning |
 | **LoRA** | Low-Rank Adaptation | Parameter-efficient fine-tuning |
-| **DPO** | Direct Preference Optimization | Preference-based alignment |
+| **DPO / Robust DPO / IPO / hinge** | Preference optimization against a reference | Pairwise preference data |
 | **GRPO** | Group Relative Policy Optimization | Efficient PPO alternative |
 | **DAPO** | Decoupled Clip and Dynamic Sampling PO | GRPO mode (`GrpoConfig::for_dapo`) |
-| **ORPO** | Odds Ratio Preference Optimization | Reference-free alignment |
-| **SimPO** | Simple Preference Optimization | Simplified preference learning |
-| **KTO** | Kahneman-Tversky Optimization | Unpaired preference data |
+| **ORPO** | Odds Ratio Preference Optimization | Reference-free, SFT and alignment in one stage |
+| **SimPO** | Simple Preference Optimization | Reference-free, length-normalized |
+| **KTO** | Kahneman-Tversky Optimization | Unpaired good/bad feedback |
 | **Distillation** | Knowledge distillation | Teacher→student transfer |
 | **ANE** | Apple Neural Engine training | Power-efficient on-device training |
 | **RLKD** | RL with Knowledge Distillation | GRPO + teacher distillation |
@@ -117,12 +117,9 @@ fn train_with_checkpoints(
 |--------|-------------|
 | `training_loop` | Main training orchestration |
 | `sft` | Supervised fine-tuning trainer |
-| `dpo` | Direct Preference Optimization |
+| `preference` | DPO, Robust DPO, IPO, hinge, SimPO, ORPO (`PreferenceTrainer`) and KTO (`KtoTrainer`) |
 | `grpo` | Group Relative Policy Optimization |
 | `ane_training` | ANE training loop (feature-gated: `ane`) |
-| `orpo` | Odds Ratio Preference Optimization |
-| `simpo` | Simple Preference Optimization |
-| `kto` | Kahneman-Tversky Optimization |
 | `distillation` | Knowledge distillation orchestration |
 | `rlkd` | Reinforcement Learning with Knowledge Distillation |
 | `embedding_trainer` | Sentence-transformer fine-tuning |
@@ -132,7 +129,6 @@ fn train_with_checkpoints(
 | `mlx_metal_optimizer` | Metal-accelerated AdamW updates |
 | `adaptive_lr` | EMA-based adaptive learning rate control |
 | `checkpoint` | Checkpoint save/load |
-| `checkpointing` | Gradient checkpointing |
 | `scheduler` | Learning rate schedulers |
 | `callbacks` | Training callbacks (`MetricsJsonCallback`, `StepMetrics`) |
 | `param_groups` | Per-layer learning rates |

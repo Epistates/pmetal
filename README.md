@@ -22,13 +22,13 @@ cd crates/pmetal-gui
 bun install && bun tauri dev
 ```
 
-19 pages: Dashboard, Training, GRPO, Distillation, Pretrain, Inference, DFlash, Models, Datasets, Merging, Quantize, Embed Train, RLKD, Ollama, Serve, Bench, Eval, Jobs, and Settings. Download models from HuggingFace, configure LoRA training with live loss metrics, chat with models, merge weights, and quantize — all from the GUI. Training, inference, distillation and GRPO run in-process with real-time progress updates; the remaining pages drive the `pmetal` CLI as a subprocess, which the app bundles.
+20 pages: Dashboard, Training, GRPO, Distillation, Pretrain, Inference, DFlash, Models, Datasets, Merging, Quantize, Embed Train, RLKD, Preference, Ollama, Serve, Bench, Eval, Jobs, and Settings. Download models from HuggingFace, configure LoRA training with live loss metrics, chat with models, merge weights, and quantize — all from the GUI. Training, inference, distillation and GRPO run in-process with real-time progress updates; the remaining pages drive the `pmetal` CLI as a subprocess, which the app bundles.
 
 ### Terminal TUI
 
 <img src="public/pmetal_tui.png" alt="pmetal screenshot showing TUI" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
 
-A full-featured terminal control center with 20 tabs.
+A full-featured terminal control center with 21 tabs.
 
 ```bash
 pmetal tui
@@ -45,6 +45,7 @@ pmetal tui
 | **Pretrain** | Full-parameter pretraining from scratch |
 | **Distillation** | Configure knowledge distillation (online, offline, progressive) |
 | **RLKD** | Reinforcement learning with knowledge distillation |
+| **Preference** | DPO, Robust DPO, IPO, hinge, SimPO, ORPO and KTO with LoRA |
 | **GRPO** | Configure GRPO/DAPO reasoning training with reward functions and sampling params |
 | **Dashboard** | Live loss curves (braille), LR schedule, throughput sparklines, timing breakdown gauges |
 | **Inference** | Interactive chat interface with markdown rendering and generation settings sidebar |
@@ -142,6 +143,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `distill` | Knowledge distillation (online, offline, progressive) |
 | `grpo` | GRPO/DAPO reasoning training (VLM, speculative, async rewards) |
 | `rlkd` | Reinforcement Learning with Knowledge Distillation |
+| `preference` | DPO, Robust DPO, IPO, hinge, SimPO, ORPO or KTO with LoRA (alias `dpo`) |
 | `embed-train` | Sentence-transformer fine-tuning (InfoNCE, Triplet, CoSENT) |
 | `search` | Search HuggingFace Hub with memory fit estimation |
 | `download` | Download a model from HuggingFace Hub |
@@ -151,7 +153,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `fuse` | Fuse LoRA adapter weights into base model |
 | `eval` | Evaluate model perplexity on a dataset |
 | `serve` | OpenAI- and Anthropic-compatible inference server |
-| `tui` | Full TUI control center (20 tabs) |
+| `tui` | Full TUI control center (21 tabs) |
 | `dashboard` | Real-time training metrics visualization |
 | `dataset` | Dataset utilities: `analyze`, `download`, `convert` |
 | `ollama` | Ollama integration: `modelfile`, `create`, `templates` |
@@ -167,7 +169,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `tokenize` | Tokenize a text corpus into binary shards for pretraining |
 | `pack-experts` | Pack expert weights for SSD-offloaded MoE inference |
 | `dflash` | Block-diffusion speculative decoding |
-| `mcp` | Start MCP server over stdio (52 tools for Claude Desktop / Claude Code) |
+| `mcp` | Start MCP server over stdio (53 tools for Claude Desktop / Claude Code) |
 | `cluster` | Multi-Mac cluster: discover peers, train across machines, run all-reduce / pipeline benchmarks |
 
 ### Multi-Mac Cluster (Thunderbolt-aware)
@@ -248,8 +250,8 @@ let output = generate(
 println!("{}", tokenizer.decode(&output.token_ids[input_ids.len()..])?);
 ```
 
-Preference optimization (`DpoTrainer`, `SimpoTrainer`, `OrpoTrainer`, `KtoTrainer`) and TAID
-distillation are library-only for now — there is no CLI subcommand for them yet.
+Preference optimization runs from `pmetal preference` (`PreferenceTrainer`, `KtoTrainer` in Rust).
+TAID distillation is library-only for now: there is no CLI subcommand for it yet.
 
 For step-by-step control, use the crates directly: `pmetal_trainer::TrainingLoop`,
 `pmetal_models::DynamicModel`, `pmetal_lora::DynamicLoraModel`, `pmetal_distill::Distiller`. Every
@@ -370,7 +372,7 @@ pmetal/
 ├── pmetal-distributed  # Distributed training (mDNS, Ring All-Reduce)
 ├── pmetal-vocoder      # BigVGAN neural vocoder
 ├── pmetal-serve        # OpenAI- and Anthropic-compatible inference server
-├── pmetal-mcp          # MCP server (52 tools for Claude Desktop)
+├── pmetal-mcp          # MCP server (53 tools for Claude Desktop)
 ├── pmetal-py           # Python bindings (maturin/PyO3)
 ├── pmetal              # Umbrella crate: CLI binary + TUI control center
 └── pmetal-gui          # Desktop GUI (Tauri + Svelte + TailwindCSS)
@@ -471,10 +473,10 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | LoRA | `train` | Yes | Yes | `orchestrator::run_training()` |
 | QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `orchestrator::run_training()` |
 | DoRA | — | — | — | `LoraConfig { use_dora: true }` |
-| DPO (Direct Preference) | — | — | — | `DpoTrainer` |
-| SimPO (Simple Preference) | — | — | — | `SimpoTrainer` |
-| ORPO (Odds-Ratio Preference) | — | — | — | `OrpoTrainer` |
-| KTO (Kahneman-Tversky) | — | — | — | `KtoTrainer` |
+| DPO / Robust DPO, IPO, hinge | `preference --loss dpo\|ipo\|hinge` | Yes | Yes | `PreferenceTrainer` |
+| SimPO (Simple Preference) | `preference --loss simpo` | Yes | Yes | `PreferenceTrainer` |
+| ORPO (Odds-Ratio Preference) | `preference --loss orpo` | Yes | Yes | `PreferenceTrainer` |
+| KTO (Kahneman-Tversky) | `preference --loss kto` | Yes | Yes | `KtoTrainer` |
 | GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
 | DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `GrpoTrainer` DAPO mode |
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |
@@ -695,7 +697,7 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | No | `pmetal-serve` | OpenAI- and Anthropic-compatible inference server |
-| `mcp` | No | `pmetal-mcp` | MCP server (52 tools for Claude Desktop) |
+| `mcp` | No | `pmetal-mcp` | MCP server (53 tools for Claude Desktop) |
 | `full` | No | — | All sub-crate features (not `cli`, `serve` or `mcp`) |
 
 `serve` and `mcp` stay out of the default set so library consumers don't inherit axum and rmcp. The **prebuilt binary and the Homebrew formula both build with `--features serve,mcp`**, so `pmetal serve` and `pmetal mcp` are there if you installed either way. Building yourself, add the flag: `cargo install pmetal --features serve,mcp`.

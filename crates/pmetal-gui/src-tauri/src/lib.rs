@@ -138,6 +138,7 @@ pub fn run() {
             start_dflash,
             start_embed_train,
             start_rlkd,
+            start_preference,
             start_ollama,
         ])
         .on_window_event(|window, event| {

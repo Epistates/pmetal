@@ -437,6 +437,7 @@ fn default_output_dir_for_command(command: &str) -> &'static str {
         "distill" => "./output/distilled",
         "grpo" => "./output/grpo",
         "rlkd" => "./output/rlkd",
+        "preference" => "./output/preference",
         "embed-train" => "./output-embed",
         "pretrain" => "./pretrain-output",
         _ => "./output",

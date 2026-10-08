@@ -12,10 +12,10 @@ PMetal supports 12+ training methods across CLI, GUI, TUI, and the Rust/Python S
 | LoRA | `train` | Yes | Yes | `orchestrator::run_training()` |
 | QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `orchestrator::run_training()` |
 | DoRA | — | — | — | `LoraConfig { use_dora: true }` |
-| DPO (Direct Preference) | — | — | — | `DpoTrainer` |
-| SimPO | — | — | — | `SimpoTrainer` |
-| ORPO | — | — | — | `OrpoTrainer` |
-| KTO | — | — | — | `KtoTrainer` |
+| DPO / Robust DPO, IPO, hinge | `preference --loss dpo\|ipo\|hinge` | Yes | Yes | `PreferenceTrainer` |
+| SimPO | `preference --loss simpo` | Yes | Yes | `PreferenceTrainer` |
+| ORPO | `preference --loss orpo` | Yes | Yes | `PreferenceTrainer` |
+| KTO | `preference --loss kto` | Yes | Yes | `KtoTrainer` |
 | GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
 | DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `GrpoTrainer` DAPO mode |
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |

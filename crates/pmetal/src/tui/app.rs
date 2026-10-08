@@ -23,8 +23,8 @@ use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::{
     BenchTab, DashboardTab, DatasetsTab, DeviceTab, DflashTab, DistillationTab, EmbedTrainTab,
     EvalTab, GrpoTab, InferenceFocus, InferenceTab, JobsTab, MergeTab, ModelSource, ModelsTab,
-    OllamaTab, PretrainTab, QuantizeTab, RlkdTab, ServeTab, Tab, TokenizeTab, TrainingStatus,
-    TrainingTab, write_training_info,
+    OllamaTab, PreferenceTab, PretrainTab, QuantizeTab, RlkdTab, ServeTab, Tab, TokenizeTab,
+    TrainingStatus, TrainingTab, write_training_info,
 };
 use crate::tui::theme::THEME;
 use crate::tui::widgets::{Footer, FormAction, Header};
@@ -48,6 +48,7 @@ pub struct App {
     pub training: TrainingTab,
     pub embed_train: EmbedTrainTab,
     pub rlkd: RlkdTab,
+    pub preference: PreferenceTab,
     pub tokenize: TokenizeTab,
     pub ollama: OllamaTab,
     pub inference: InferenceTab,
@@ -115,6 +116,9 @@ pub struct App {
     /// Currently active rlkd job ID (if any).
     active_rlkd_job: Option<String>,
 
+    /// Currently active preference job ID (if any).
+    active_preference_job: Option<String>,
+
     /// Currently active tokenize job ID (if any).
     active_tokenize_job: Option<String>,
 
@@ -178,6 +182,9 @@ enum PendingModalTarget {
     RlkdTeacherModel,
     RlkdDataset,
     RlkdStart,
+    PreferenceModel,
+    PreferenceDataset,
+    PreferenceStart,
     TokenizeModel,
     TokenizeStart,
     OllamaStart,
@@ -204,6 +211,7 @@ impl App {
             training: TrainingTab::new(),
             embed_train: EmbedTrainTab::new(),
             rlkd: RlkdTab::new(),
+            preference: PreferenceTab::new(),
             tokenize: TokenizeTab::new(),
             ollama: OllamaTab::new(),
             inference: InferenceTab::new(),
@@ -234,6 +242,7 @@ impl App {
             active_pretrain_job: None,
             active_embed_train_job: None,
             active_rlkd_job: None,
+            active_preference_job: None,
             active_tokenize_job: None,
             active_ollama_job: None,
             hf_search_cancel: None,
@@ -578,6 +587,7 @@ impl App {
             Tab::Training => self.handle_training_key(key),
             Tab::EmbedTrain => self.handle_embed_train_key(key),
             Tab::Rlkd => self.handle_rlkd_key(key),
+            Tab::Preference => self.handle_preference_key(key),
             Tab::Tokenize => self.handle_tokenize_key(key),
             Tab::Ollama => self.handle_ollama_key(key),
             Tab::Pretrain => self.handle_pretrain_key(key),
@@ -1276,6 +1286,61 @@ impl App {
         }
     }
 
+    // --- Preference tab key handler ---
+    fn handle_preference_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::KeyCode;
+        if self.preference.is_editing() {
+            match key.code {
+                KeyCode::Enter => self.preference.confirm_edit(),
+                KeyCode::Esc => self.preference.cancel_edit(),
+                _ => self.preference.handle_edit_key(key),
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.preference.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.preference.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.preference.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {
+                            self.pending_modal_context = Some(PendingModalTarget::PreferenceModel);
+                            let entries = self.model_picker_entries();
+                            self.modal_stack.push(Modal::model_picker(entries));
+                        }
+                        FormAction::OpenDatasetPicker { .. } => {
+                            self.pending_modal_context =
+                                Some(PendingModalTarget::PreferenceDataset);
+                            let entries = self.dataset_picker_entries();
+                            self.modal_stack.push(Modal::dataset_picker(entries));
+                        }
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                if self.preference.is_running() {
+                    self.modal_stack.push(Modal::error(
+                        "Already Running",
+                        "A preference job is already in progress. Cancel it first (x).",
+                    ));
+                } else {
+                    self.start_preference_prompt();
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(ref job_id) = self.active_preference_job.clone() {
+                    if let Some(runner) = &mut self.runner {
+                        runner.cancel(job_id);
+                    }
+                    self.preference.mark_failed("cancelled by user");
+                }
+            }
+            _ => {}
+        }
+    }
+
     // --- DFlash tab key handler ---
     fn handle_dflash_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::KeyCode;
@@ -1458,6 +1523,7 @@ impl App {
                     Tab::Training => self.training.prev_param(),
                     Tab::EmbedTrain => self.embed_train.prev_param(),
                     Tab::Rlkd => self.rlkd.prev_param(),
+                    Tab::Preference => self.preference.prev_param(),
                     Tab::Tokenize => self.tokenize.prev_param(),
                     Tab::Pretrain => self.pretrain.prev_param(),
                     Tab::Jobs => self.jobs.prev_row(),
@@ -1479,6 +1545,7 @@ impl App {
                 Tab::Training => self.training.next_param(),
                 Tab::EmbedTrain => self.embed_train.next_param(),
                 Tab::Rlkd => self.rlkd.next_param(),
+                Tab::Preference => self.preference.next_param(),
                 Tab::Tokenize => self.tokenize.next_param(),
                 Tab::Pretrain => self.pretrain.next_param(),
                 Tab::Jobs => self.jobs.next_row(),
@@ -1629,6 +1696,10 @@ impl App {
                 // RLKD output lives in the RLKD tab.
                 if self.active_rlkd_job.as_deref() == Some(&job_id) {
                     self.rlkd.append_log(&line);
+                }
+                // Preference output lives in the Preference tab.
+                if self.active_preference_job.as_deref() == Some(&job_id) {
+                    self.preference.append_log(&line);
                 }
                 // Tokenize output lives in the Tokenize tab.
                 if self.active_tokenize_job.as_deref() == Some(&job_id) {
@@ -1834,6 +1905,14 @@ impl App {
                         self.rlkd.mark_failed(&message);
                     }
                 }
+                if self.active_preference_job.as_deref() == Some(&job_id) {
+                    self.active_preference_job = None;
+                    if success {
+                        self.preference.mark_completed();
+                    } else {
+                        self.preference.mark_failed(&message);
+                    }
+                }
                 if self.active_tokenize_job.as_deref() == Some(&job_id) {
                     self.active_tokenize_job = None;
                     if success {
@@ -2006,6 +2085,9 @@ impl App {
                     Some(PendingModalTarget::RlkdStart) => {
                         self.start_rlkd();
                     }
+                    Some(PendingModalTarget::PreferenceStart) => {
+                        self.start_preference();
+                    }
                     Some(PendingModalTarget::TokenizeStart) => {
                         self.start_tokenize();
                     }
@@ -2117,6 +2199,9 @@ impl App {
                 Some(PendingModalTarget::RlkdTeacherModel) => {
                     self.rlkd.set_teacher_model(&id);
                 }
+                Some(PendingModalTarget::PreferenceModel) => {
+                    self.preference.set_model(&id);
+                }
                 Some(PendingModalTarget::TokenizeModel) => {
                     self.tokenize.set_tokenizer(&id);
                 }
@@ -2167,6 +2252,9 @@ impl App {
                 }
                 Some(PendingModalTarget::RlkdDataset) => {
                     self.rlkd.set_dataset(&path);
+                }
+                Some(PendingModalTarget::PreferenceDataset) => {
+                    self.preference.set_dataset(&path);
                 }
                 _ => {}
             },
@@ -2263,6 +2351,7 @@ impl App {
             self.active_pretrain_job.is_some(),
             self.active_embed_train_job.is_some(),
             self.active_rlkd_job.is_some(),
+            self.active_preference_job.is_some(),
             self.active_tokenize_job.is_some(),
             self.active_ollama_job.is_some(),
         ]
@@ -2729,6 +2818,32 @@ impl App {
         }
     }
 
+    fn start_preference_prompt(&mut self) {
+        if let Err(msg) = self.preference.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        let summary = self.preference.config_summary();
+        self.pending_modal_context = Some(PendingModalTarget::PreferenceStart);
+        self.modal_stack
+            .push(Modal::confirm("Start preference optimization?", summary));
+    }
+
+    fn start_preference(&mut self) {
+        let args = self.preference.build_cli_args();
+        let spec = CommandSpec {
+            job_type: JobType::Preference,
+            args,
+            metrics_file: None,
+            output_dir: None,
+        };
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_preference_job = Some(job_id);
+            self.preference.mark_running();
+        }
+    }
+
     fn start_tokenize_prompt(&mut self) {
         if let Err(msg) = self.tokenize.validate_config() {
             self.modal_stack.push(Modal::error("Invalid Config", msg));
@@ -3100,6 +3215,7 @@ impl App {
                 | Tab::Grpo
                 | Tab::EmbedTrain
                 | Tab::Rlkd
+                | Tab::Preference
         );
         let (dash_samples, dash_throughput) = if needs_metrics {
             (
@@ -3135,6 +3251,7 @@ impl App {
                 );
             }
             Tab::Rlkd => self.rlkd.render(content_area, buf),
+            Tab::Preference => self.preference.render(content_area, buf),
             Tab::Inference => (&mut self.inference).render(content_area, buf),
             Tab::Jobs => (&mut self.jobs).render(content_area, buf),
             Tab::Distillation => {

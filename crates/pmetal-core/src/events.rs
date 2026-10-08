@@ -38,6 +38,8 @@ pub enum JobKind {
     Grpo,
     /// Reinforcement Learning with Knowledge Distillation.
     Rlkd,
+    /// Offline preference optimization (DPO, IPO, hinge, SimPO, ORPO, KTO).
+    Preference,
     /// Embedding model training.
     EmbedTrain,
     /// Full-parameter pretraining.

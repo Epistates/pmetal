@@ -16,6 +16,7 @@ pub mod grpo;
 pub mod infer;
 pub mod merge;
 pub mod pack_experts;
+pub mod preference;
 pub mod pretrain;
 pub mod quantize;
 pub mod rlkd;

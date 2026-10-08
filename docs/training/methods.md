@@ -26,28 +26,53 @@ pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --dora
 
 ## Preference Optimization
 
+`pmetal preference` (alias `pmetal dpo`) trains a LoRA adapter on preference data with one of six
+objectives, chosen with `--loss`. See [`pmetal preference`](../cli/preference.md) for the data
+formats and every flag.
+
+```bash
+pmetal preference --model Qwen/Qwen3-0.6B --dataset pairs.jsonl --loss dpo
+```
+
+The objectives that compare against a reference model (DPO, IPO, hinge, KTO) take it from the model
+before training: a fresh LoRA adapter starts at zero, so each example is scored once up front and no
+second copy of the model is held.
+
 ### DPO (Direct Preference Optimization)
-Trains on preference pairs (chosen/rejected) without a reward model. Library-only for now: there is
-no `pmetal` subcommand for it.
+Trains on preference pairs (chosen/rejected) without a reward model, pushing up the chosen
+completion's log-probability ratio against the reference relative to the rejected one's
+(arXiv:2305.18290). `--label-smoothing ε` turns it into Robust DPO (arXiv:2403.00409), an unbiased
+loss for labels flipped a fraction ε of the time.
+
+### IPO and hinge
+IPO (arXiv:2310.12036) regresses the length-averaged margin to `1/(2β)` instead of pushing it
+without bound. The hinge loss (SLiC, arXiv:2305.10425) stops pushing once the margin clears `1/β`.
+
+### SimPO (Simple Preference Optimization)
+Reference-free: the length-averaged log-probability is the reward, with a target margin set by
+`--simpo-gamma-ratio` (γ/β) (arXiv:2405.14734).
+
+### ORPO (Odds-Ratio Preference Optimization)
+Combines SFT and preference optimization in a single stage: the chosen response's NLL plus an
+odds-ratio penalty on the rejected one, with no reference model (arXiv:2403.07691).
+
+### KTO (Kahneman-Tversky Optimization)
+Preference optimization using prospect theory: works with binary feedback (good/bad) instead of
+pairwise comparisons, measuring each completion against a KL reference point estimated from
+mismatched completions in the batch (arXiv:2402.01306).
+
+From Rust, `PreferenceTrainer` and `KtoTrainer` run the same loops:
 
 ```rust
 use pmetal_core::TrainingConfig;
-use pmetal_trainer::{DpoConfig, DpoTrainer};
+use pmetal_trainer::{PreferenceLoss, PreferenceTrainer};
 
-let trainer = DpoTrainer::new(
-    DpoConfig { beta: 0.1, ..Default::default() },
+let mut trainer = PreferenceTrainer::new(
+    PreferenceLoss::Dpo { beta: 0.1, label_smoothing: 0.0 },
     TrainingConfig::default(),
 )?;
+// trainer.train(&mut model, &pairs, &mut optimizer, |opt, lr| { /* set lr */ })?;
 ```
-
-### SimPO (Simple Preference Optimization)
-Simplified DPO without a reference model.
-
-### ORPO (Odds-Ratio Preference Optimization)
-Combines SFT and preference optimization in a single stage.
-
-### KTO (Kahneman-Tversky Optimization)
-Preference optimization using prospect theory — works with binary feedback (good/bad) instead of pairwise comparisons.
 
 ## Reasoning Training
 

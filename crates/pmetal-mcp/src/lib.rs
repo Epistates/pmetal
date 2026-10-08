@@ -11,7 +11,8 @@ use jobs::JobManager;
 use pmetal_core::JobFields as _;
 use pmetal_core::jobs::{
     DecideSpec, DflashSpec, DistillSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
-    PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainSpec,
+    PackExpertsSpec, PreferenceSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec,
+    TrainSpec,
 };
 
 /// MCP server exposing all PMetal functionality.
@@ -83,6 +84,7 @@ const BACKGROUND_CLI_ALLOWLIST: &[&str] = &[
     "infer",
     "merge",
     "pack-experts",
+    "preference",
     "pretrain",
     "quantize",
     "rlkd",
@@ -978,6 +980,69 @@ impl PmetalMcpServer {
         let mut mgr = self.jobs.write().await;
         let id = mgr.spawn("rlkd", argv).await?;
         job_started_response(&id, "rlkd")
+    }
+
+    /// Start preference optimization with LoRA: DPO (or Robust DPO with
+    /// label smoothing), IPO, hinge, SimPO or ORPO on prompt/chosen/rejected
+    /// pairs, or KTO on prompt/completion/label rows. Returns a job ID.
+    #[tool]
+    async fn preference(
+        &self,
+        #[description("Model ID or path")] model: String,
+        #[description("Dataset: JSONL/JSON/Parquet path or Hugging Face dataset ID")]
+        dataset: String,
+        #[description("Objective: dpo, ipo, hinge, simpo, orpo or kto (default: dpo)")]
+        loss: Option<String>,
+        #[description("Output directory (default: ./output/preference)")] output: Option<String>,
+        #[description("Beta (default: 2.5 for simpo, 0.1 otherwise)")] beta: Option<f64>,
+        #[description("SimPO target margin over beta (default: 0.5)")] simpo_gamma_ratio: Option<
+            f64,
+        >,
+        #[description("DPO label smoothing; above 0 trains Robust DPO (default: 0)")]
+        label_smoothing: Option<f64>,
+        #[description("KTO desirable weight (default: 1.0)")] desirable_weight: Option<f64>,
+        #[description("KTO undesirable weight (default: 1.0)")] undesirable_weight: Option<f64>,
+        #[description("Learning rate (default: 1e-5)")] learning_rate: Option<f64>,
+        #[description("Micro-batch size (default: 2)")] batch_size: Option<u64>,
+        #[description("Gradient accumulation steps (default: 8)")]
+        gradient_accumulation_steps: Option<u64>,
+        #[description("Number of epochs (default: 1)")] epochs: Option<u64>,
+        #[description("Stop after this many optimizer steps")] max_steps: Option<u64>,
+        #[description("LoRA rank (default: 16)")] lora_r: Option<u64>,
+        #[description("LoRA alpha (default: 32)")] lora_alpha: Option<f64>,
+        #[description("Max prompt tokens (default: 512)")] max_prompt_length: Option<u64>,
+        #[description("Max prompt + completion tokens (default: 1024)")] max_length: Option<u64>,
+        #[description("Random seed (default: 42)")] seed: Option<u64>,
+    ) -> McpResult<String> {
+        let d = PreferenceSpec::default();
+        let mut spec = PreferenceSpec {
+            model,
+            dataset,
+            output_dir: output.unwrap_or(d.output_dir.clone()),
+            loss: loss.unwrap_or(d.loss.clone()),
+            beta: beta.map(|b| b as f32),
+            simpo_gamma_ratio: simpo_gamma_ratio.map_or(d.simpo_gamma_ratio, |v| v as f32),
+            label_smoothing: label_smoothing.map_or(d.label_smoothing, |v| v as f32),
+            desirable_weight: desirable_weight.map_or(d.desirable_weight, |v| v as f32),
+            undesirable_weight: undesirable_weight.map_or(d.undesirable_weight, |v| v as f32),
+            learning_rate: learning_rate.unwrap_or(d.learning_rate),
+            batch_size: batch_size.map_or(d.batch_size, |v| v as usize),
+            gradient_accumulation_steps: gradient_accumulation_steps
+                .map_or(d.gradient_accumulation_steps, |v| v as usize),
+            epochs: epochs.map_or(d.epochs, |v| v as usize),
+            max_steps: max_steps.map(|v| v as usize),
+            lora_r: lora_r.map_or(d.lora_r, |v| v as usize),
+            lora_alpha: lora_alpha.map_or(d.lora_alpha, |v| v as f32),
+            max_prompt_length: max_prompt_length.map_or(d.max_prompt_length, |v| v as usize),
+            max_length: max_length.map_or(d.max_length, |v| v as usize),
+            seed: seed.unwrap_or(d.seed),
+            ..d
+        };
+        spec.normalize().map_err(into_mcp_error)?;
+        let argv = spec.to_argv();
+        let mut mgr = self.jobs.write().await;
+        let id = mgr.spawn("preference", argv).await?;
+        job_started_response(&id, "preference")
     }
 
     /// Train an embedding model for semantic search or similarity tasks.

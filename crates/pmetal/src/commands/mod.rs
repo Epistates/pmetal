@@ -20,6 +20,8 @@ pub(crate) mod info;
 #[cfg(feature = "merge")]
 pub(crate) mod merge;
 pub(crate) mod ollama;
+#[cfg(feature = "trainer")]
+pub(crate) mod preference;
 pub(crate) mod quantize;
 #[cfg(feature = "trainer")]
 pub(crate) mod rlkd;

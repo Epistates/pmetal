@@ -174,7 +174,7 @@ impl Widget for Footer {
                     Span::styled(" cancel  ", THEME.footer_desc),
                 ]);
             }
-            Tab::EmbedTrain | Tab::Rlkd | Tab::Tokenize | Tab::Dflash => {
+            Tab::EmbedTrain | Tab::Rlkd | Tab::Preference | Tab::Tokenize | Tab::Dflash => {
                 spans.extend([
                     Span::styled("jk", THEME.footer_key),
                     Span::styled(" navigate  ", THEME.footer_desc),

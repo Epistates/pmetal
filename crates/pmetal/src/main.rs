@@ -560,6 +560,12 @@ enum Commands {
     #[cfg(feature = "trainer")]
     Rlkd(crate::cli::rlkd::RlkdArgs),
 
+    /// Preference optimization with LoRA: DPO, IPO, hinge, SimPO and ORPO on
+    /// prompt/chosen/rejected pairs, or KTO on completions labelled good or bad.
+    #[cfg(feature = "trainer")]
+    #[command(visible_alias = "dpo")]
+    Preference(crate::cli::preference::PreferenceArgs),
+
     /// Start MCP server for Claude Desktop integration
     #[cfg(feature = "mcp")]
     Mcp,
@@ -2497,6 +2503,21 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
+        #[cfg(feature = "trainer")]
+        Commands::Preference(args) => {
+            let mut spec = pmetal_core::jobs::PreferenceSpec::from(args);
+            spec.normalize().map_err(|errs| {
+                anyhow::anyhow!(
+                    "{}",
+                    errs.iter()
+                        .map(|e| e.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            })?;
+            commands::preference::run_preference(spec, true, Vec::new()).await?;
+        }
+
         Commands::Dataset { action } => {
             commands::dataset::run_dataset_command(action).await?;
         }
@@ -2992,6 +3013,44 @@ mod argv_roundtrip {
             "GrpoSpec argv failed to parse: {}",
             result.unwrap_err()
         );
+    }
+
+    /// Every field survives spec → argv → clap → spec, defaults included,
+    /// so the spec's `default_*` attributes and the CLI's defaults agree.
+    #[test]
+    fn preference_spec_round_trip() {
+        use pmetal_core::jobs::PreferenceSpec;
+        let defaults = PreferenceSpec {
+            model: "model".into(),
+            dataset: "data.jsonl".into(),
+            ..Default::default()
+        };
+        let custom = PreferenceSpec {
+            loss: "kto".into(),
+            beta: Some(0.3),
+            max_steps: Some(12),
+            undesirable_weight: 1.5,
+            log_metrics: Some("m.jsonl".into()),
+            ..defaults.clone()
+        };
+        for spec in [defaults, custom] {
+            let parsed = match try_parse("preference", spec.to_argv()) {
+                Ok(Commands::Preference(args)) => PreferenceSpec::from(args),
+                Ok(_) => panic!("parsed as another command"),
+                Err(e) => panic!("PreferenceSpec argv failed to parse: {e}"),
+            };
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                serde_json::to_value(&spec).unwrap()
+            );
+        }
+        assert!(matches!(
+            try_parse(
+                "dpo",
+                vec!["-m".into(), "x".into(), "-d".into(), "y".into()]
+            ),
+            Ok(Commands::Preference(_))
+        ));
     }
 
     #[test]

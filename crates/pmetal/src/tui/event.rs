@@ -110,6 +110,8 @@ pub enum JobType {
     Pretrain,
     /// Sentence embedding training job (`pmetal embed-train`).
     EmbedTrain,
+    /// Preference optimization job (`pmetal preference`).
+    Preference,
     /// RL with Knowledge Distillation job (`pmetal rlkd`).
     Rlkd,
     /// Corpus tokenization job (`pmetal tokenize`).
@@ -136,6 +138,7 @@ impl std::fmt::Display for JobType {
             JobType::Pretrain => write!(f, "Pretrain"),
             JobType::EmbedTrain => write!(f, "EmbedTrain"),
             JobType::Rlkd => write!(f, "RLKD"),
+            JobType::Preference => write!(f, "Preference"),
             JobType::Tokenize => write!(f, "Tokenize"),
             JobType::Ollama => write!(f, "Ollama"),
         }

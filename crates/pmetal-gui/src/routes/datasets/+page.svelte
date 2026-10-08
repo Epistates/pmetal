@@ -282,7 +282,7 @@
           <div class="grid grid-cols-2 md:grid-cols-3 gap-4 text-sm">
             {#each [
               { format: 'Alpaca', desc: 'instruction / input / output fields', method: 'SFT, LoRA' },
-              { format: 'ShareGPT', desc: 'conversations array with role/value', method: 'SFT, LoRA, DPO' },
+              { format: 'ShareGPT', desc: 'conversations array with role/value', method: 'SFT, LoRA' },
               { format: 'HuggingFace', desc: 'Auto-detect from dataset card', method: 'All methods' },
               { format: 'JSONL', desc: 'One JSON object per line with text field', method: 'SFT, LoRA' },
               { format: 'Preference', desc: 'prompt / chosen / rejected fields', method: 'DPO, SimPO, ORPO, KTO' },

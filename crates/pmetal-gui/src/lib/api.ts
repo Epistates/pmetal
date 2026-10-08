@@ -1153,6 +1153,46 @@ export async function startRlkd(
 }
 
 // =============================================================================
+// Preference optimization API
+// =============================================================================
+
+/** Mirrors `PreferenceSpec` (pmetal-core); omitted fields take its defaults. */
+export interface PreferenceSpec {
+  model: string;
+  dataset: string;
+  output_dir?: string;
+  loss?: 'dpo' | 'ipo' | 'hinge' | 'simpo' | 'orpo' | 'kto';
+  beta?: number | null;
+  simpo_gamma_ratio?: number;
+  label_smoothing?: number;
+  desirable_weight?: number;
+  undesirable_weight?: number;
+  learning_rate?: number;
+  batch_size?: number;
+  gradient_accumulation_steps?: number;
+  epochs?: number;
+  max_steps?: number | null;
+  warmup_ratio?: number;
+  max_grad_norm?: number;
+  weight_decay?: number;
+  lora_r?: number;
+  lora_alpha?: number;
+  max_prompt_length?: number;
+  max_length?: number;
+  seed?: number;
+  log_metrics?: string | null;
+}
+
+export async function startPreference(
+  spec: PreferenceSpec,
+  onEvent?: (e: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onEvent) channel.onmessage = onEvent;
+  return await invoke('start_preference', { spec, onEvent: channel });
+}
+
+// =============================================================================
 // DFlash API
 // =============================================================================
 

@@ -4452,9 +4452,33 @@ pub async fn start_ollama(
     Ok(run_id)
 }
 
+// ---------------------------------------------------------------------------
+// Preference optimization — DPO, IPO, hinge, SimPO, ORPO, KTO with LoRA
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn start_preference(
+    mut spec: pmetal::core::jobs::PreferenceSpec,
+    on_event: tauri::ipc::Channel<serde_json::Value>,
+) -> Result<String> {
+    spec.normalize().map_err(|errs| {
+        AppError(
+            errs.iter()
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    })?;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let mut args: Vec<String> = vec!["preference".into()];
+    args.extend(spec.to_argv());
+    spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
+    Ok(run_id)
+}
+
 /// Spawn a `pmetal <subcommand>` child for a one-shot job that doesn't need
 /// state tracking — just streams stdout/stderr lines through the IPC channel.
-/// Used by DFlash, EmbedTrain, RLKD, and Modelfile export which have no corresponding
+/// Used by DFlash, EmbedTrain, RLKD, Preference, and Modelfile export which have no corresponding
 /// run-list state in AppState (they're additive routes with no legacy state).
 async fn spawn_oneshot_subprocess(
     run_id: String,

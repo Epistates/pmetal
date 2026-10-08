@@ -1,8 +1,8 @@
 # pmetal tui
 
-Launch the full-featured terminal control center with 20 tabs.
+Launch the full-featured terminal control center with 21 tabs.
 
-Launch the terminal UI — a full control center with 20 tabs for monitoring, configuration, and interaction.
+Launch the terminal UI — a full control center with 21 tabs for monitoring, configuration, and interaction.
 
 ## Usage
 
@@ -25,6 +25,7 @@ Listed in tab order, which is also the `Alt+N` order.
 | **Pretrain** | Full-parameter pretraining from scratch |
 | **Distillation** | Configure knowledge distillation (online, offline, progressive) |
 | **RLKD** | Reinforcement learning with knowledge distillation |
+| **Preference** | DPO, Robust DPO, IPO, hinge, SimPO, ORPO and KTO with LoRA |
 | **GRPO** | Configure GRPO/DAPO reasoning training with reward functions and sampling params |
 | **Dashboard** | Live loss curves (braille), LR schedule, throughput sparklines, timing breakdown gauges |
 | **Inference** | Interactive chat interface with markdown rendering and generation settings sidebar |

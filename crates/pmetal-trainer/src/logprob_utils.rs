@@ -89,7 +89,7 @@ pub fn selective_log_softmax_with_temperature(
 }
 
 /// Shift-then-selective-log-softmax primitive shared by DPO / KTO / ORPO /
-/// OnlineDPO / GRPO.
+/// GRPO.
 ///
 /// Every preference/RL trainer open-coded this same 2-step pattern:
 /// 1. Shift: `pred_logits = logits[:, :-1, :]`, `target_labels = labels[:, 1:]`
@@ -115,7 +115,7 @@ pub fn shifted_selective_log_softmax(
 }
 
 /// Next-token-shifted sum of selective log-probs — the shared canonical shape
-/// for DPO / KTO / ORPO / OnlineDPO.
+/// for the preference trainers.
 ///
 /// Sum over the sequence axis after [`shifted_selective_log_softmax`]. Masked
 /// positions (label == -100) contribute 0.

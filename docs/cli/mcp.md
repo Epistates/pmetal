@@ -46,11 +46,11 @@ claude mcp add pmetal -- pmetal mcp
 
 ## Tools
 
-52 tools, grouped by what they do.
+53 tools, grouped by what they do.
 
 | Group | Tools |
 |-------|-------|
-| **Training** | `train`, `pretrain`, `grpo`, `rlkd`, `distill`, `embed_train`, `dflash` |
+| **Training** | `train`, `pretrain`, `grpo`, `rlkd`, `preference`, `distill`, `embed_train`, `dflash` |
 | **Inference** | `generate`, `chat`, `decide`, `start_serve` |
 | **Jobs** | `list_jobs`, `job_status`, `job_logs`, `stop_job`, `job_graceful_stop`, `job_save_checkpoint`, `start_cli_job` |
 | **Adaptive LR** | `job_set_lr`, `job_reduce_lr`, `job_reset_lr` |

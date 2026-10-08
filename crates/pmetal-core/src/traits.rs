@@ -224,6 +224,8 @@ pub mod defaults {
     pub const GRPO_OUTPUT_DIR: &str = "./output/grpo";
     /// Default output directory for `pmetal rlkd`.
     pub const RLKD_OUTPUT_DIR: &str = "./output/rlkd";
+    /// Default output directory for `pmetal preference`.
+    pub const PREFERENCE_OUTPUT_DIR: &str = "./output/preference";
     /// Default output directory for `pmetal embed-train`.
     pub const EMBED_OUTPUT_DIR: &str = "./output-embed";
     /// Default output directory for `pmetal pretrain`.

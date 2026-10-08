@@ -3,12 +3,10 @@
 //! This crate provides:
 //! - Supervised Fine-Tuning (SFT)
 //! - LoRA fine-tuning
-//! - Direct Preference Optimization (DPO)
+//! - Offline preference optimization ([`preference`]): DPO, IPO, hinge,
+//!   SimPO and ORPO on preference pairs, and KTO on labelled completions
 //! - Group Relative Policy Optimization (GRPO), with DAPO's clip-higher,
 //!   dynamic sampling and overlong penalty as a mode of the same trainer
-//! - ORPO (Odds Ratio Preference Optimization)
-//! - SimPO (Simple Preference Optimization)
-//! - KTO (Kahneman-Tversky Optimization)
 //! - Learning rate schedulers
 //! - Training callbacks
 //! - Parameter grouping for per-layer learning rates
@@ -51,7 +49,6 @@
 #![allow(ambiguous_glob_reexports)]
 
 pub mod orchestrator;
-pub mod preference_data;
 
 pub mod adamw_groups;
 pub mod adaptive_lr;
@@ -62,26 +59,18 @@ pub mod contrastive_loss;
 pub mod dflash_training;
 pub mod diffusion_gemma_train;
 pub mod distillation;
-pub mod dpo;
 pub mod embedding_trainer;
 pub mod grpo;
-#[cfg(feature = "experimental-trainers")]
-pub mod kto;
 pub mod logprob_utils;
 pub mod mlx_metal_optimizer;
 pub mod mtp_training;
-#[cfg(feature = "experimental-trainers")]
-pub mod orpo;
-pub mod paired_preference;
 pub mod param_groups;
-mod preference_batch;
+pub mod preference;
 pub mod pretrain;
 pub mod reward_model;
 pub mod rlkd;
 pub mod scheduler;
 pub mod sft;
-#[cfg(feature = "experimental-trainers")]
-pub mod simpo;
 pub mod tensorboard;
 pub mod training_loop;
 
@@ -111,27 +100,24 @@ pub use diffusion_gemma_train::{
     uniform_categorical_noise,
 };
 pub use distillation::*;
-pub use dpo::*;
 pub use embedding_trainer::{
     EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
     EmbeddingTrainerError,
 };
 pub use grpo::*;
-#[cfg(feature = "experimental-trainers")]
-pub use kto::*;
 pub use mlx_metal_optimizer::{
     MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig, MlxMetalOptimizerError,
     MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
 };
 pub use mtp_training::*;
-#[cfg(feature = "experimental-trainers")]
-pub use orpo::*;
 pub use param_groups::*;
+pub use preference::{
+    KtoConfig, KtoSample, KtoTrainer, PreferenceError, PreferenceLoss, PreferencePair,
+    PreferenceResult, PreferenceStepMetrics, PreferenceTrainer,
+};
 pub use rlkd::{RlkdConfig, RlkdStepStats, RlkdTrainer};
 pub use scheduler::*;
 pub use sft::*;
-#[cfg(feature = "experimental-trainers")]
-pub use simpo::*;
 pub use training_loop::*;
 
 // Orchestrator re-exports
