@@ -1255,6 +1255,14 @@ pub(crate) fn validate_shard_path(
             // Return original symlink path to preserve .safetensors extension
             return Ok(shard_path);
         }
+        // Third check: huggingface_hub's cache-wide shared blob store, where a
+        // repo's `blobs/<etag>` is itself a symlink to `<cache>/blobs/<xx>/<hash>`
+        // so Xet files are stored once across repos. Still inside the cache.
+        if let Some(shared_blobs) = repo_root.parent().map(|cache| cache.join("blobs")) {
+            if canonical_shard.starts_with(&shared_blobs) {
+                return Ok(shard_path);
+            }
+        }
     }
     Err(LoadError::Io(std::io::Error::new(
         std::io::ErrorKind::PermissionDenied,
@@ -2206,6 +2214,38 @@ mod tests {
             .zip(vb.iter())
             .map(|(p, q)| (p - q).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    /// huggingface_hub's shared blob store puts the bytes at
+    /// `<cache>/blobs/<xx>/<hash>`, outside the repo directory, behind two
+    /// symlinks. Such a shard is inside the cache and must load; one pointing
+    /// anywhere else still must not.
+    #[test]
+    fn shard_paths_follow_the_shared_blob_store_but_no_further() {
+        use std::os::unix::fs::symlink;
+        let cache = tempdir().unwrap();
+        let root = cache.path();
+        let snapshot = root.join("models--org--name/snapshots/abc");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::create_dir_all(root.join("models--org--name/blobs")).unwrap();
+        std::fs::create_dir_all(root.join("blobs/9f")).unwrap();
+        std::fs::write(root.join("blobs/9f/9fce"), b"shard").unwrap();
+        symlink(
+            "../../blobs/9f/9fce",
+            root.join("models--org--name/blobs/etag"),
+        )
+        .unwrap();
+        symlink("../../blobs/etag", snapshot.join("model-1.safetensors")).unwrap();
+        assert!(validate_shard_path(&snapshot, "model-1.safetensors").is_ok());
+
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("elsewhere"), b"shard").unwrap();
+        symlink(
+            outside.path().join("elsewhere"),
+            snapshot.join("model-2.safetensors"),
+        )
+        .unwrap();
+        assert!(validate_shard_path(&snapshot, "model-2.safetensors").is_err());
     }
 
     /// ⚠️ A ModelOpt checkpoint used to load with its sidecars skipped as
