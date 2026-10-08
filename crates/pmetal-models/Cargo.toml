@@ -35,6 +35,7 @@ objc2-metal = { workspace = true }
 [dev-dependencies]
 serial_test = { workspace = true }
 image = { workspace = true }
+base64 = { workspace = true }
 tempfile = { workspace = true }
 # Pull in pmetal-mlx's `test-utils` feature so integration tests can reach
 # the shared parity helpers (`test_utils::*`). The feature is empty in

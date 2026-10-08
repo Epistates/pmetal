@@ -9,7 +9,9 @@ pub struct DecideArgs {
     #[arg(short, long = "model")]
     pub model: String,
 
-    /// `/v1/systemone` request body: a JSON file, or `-` for stdin
+    /// `/v1/systemone` request body: a JSON file, or `-` for stdin. Its
+    /// `images` may be file paths, base64 or data URIs; its `videos` lists of
+    /// frames, or `{"frames": [...], "fps": N}`
     #[arg(short, long = "request")]
     pub request: String,
 

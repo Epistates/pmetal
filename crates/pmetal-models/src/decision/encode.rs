@@ -375,11 +375,29 @@ pub fn tokenize_with(
 /// every question.
 ///
 /// `tokenize` must tokenize without adding special tokens; the prompt spells
-/// its own.
+/// its own. A record with `images` or `videos` needs the processor's tokens
+/// for them: see [`encode_record_with_media`].
 pub fn encode_record<F>(
+    tokenize: F,
+    record: &Value,
+    options: EncodeOptions,
+) -> Result<EncodedRecord, DecisionError>
+where
+    F: FnMut(&str) -> Result<Vec<u32>, DecisionError>,
+{
+    encode_record_with_media(tokenize, record, options, None)
+}
+
+/// [`encode_record`] for a record whose media the processor has expanded:
+/// `media_ids` are the tokens of the placeholder text
+/// ([`super::media::placeholder_text`]) with each placeholder expanded,
+/// inserted right after the prompt's `STATE:` line, where the reference puts
+/// them. They count against `max_length` like the rest of the fixed prompt.
+pub fn encode_record_with_media<F>(
     mut tokenize: F,
     record: &Value,
     options: EncodeOptions,
+    media_ids: Option<&[u32]>,
 ) -> Result<EncodedRecord, DecisionError>
 where
     F: FnMut(&str) -> Result<Vec<u32>, DecisionError>,
@@ -387,13 +405,10 @@ where
     let record = record
         .as_object()
         .ok_or_else(|| DecisionError::Request("record must be a JSON object".into()))?;
-    for key in ["images", "videos"] {
-        if record.get(key).is_some_and(is_truthy) {
-            return Err(DecisionError::Unsupported(format!(
-                "{key} are not supported yet: pmetal has no Qwen3.5 vision encoder, so this \
-                 server answers text-only records"
-            )));
-        }
+    if super::media::has_media(record) && media_ids.is_none() {
+        return Err(DecisionError::Unsupported(
+            "records with images or videos require a processor".into(),
+        ));
     }
     let questions = record
         .get("questions")
@@ -461,9 +476,12 @@ where
         });
     }
 
-    let prefix_ids = tokenize(&format!(
+    let mut prefix_ids = tokenize(&format!(
         "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n"
     ))?;
+    if let Some(media_ids) = media_ids {
+        prefix_ids.extend_from_slice(media_ids);
+    }
     let suffix_ids = tokenize(
         "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",
     )?;
@@ -649,5 +667,32 @@ mod tests {
         ));
         let empty = json!({"state": "x", "images": [], "questions": {"q": {"type": "noul"}}});
         assert!(encode_record(char_tokens, &empty, EncodeOptions::default()).is_ok());
+    }
+
+    /// The processor's tokens go right after `STATE:\n`, before the state,
+    /// and every span moves past them.
+    #[test]
+    fn media_tokens_follow_the_state_line() {
+        // A state character the fixed prompt does not contain.
+        let record =
+            json!({"state": "µ", "images": ["a.png"], "questions": {"q": {"type": "noul"}}});
+        let text = json!({"state": "µ", "questions": {"q": {"type": "noul"}}});
+        let plain = encode_record(char_tokens, &text, EncodeOptions::default()).unwrap();
+        let media = [9_000_001, 9_000_002, 9_000_003];
+        let with =
+            encode_record_with_media(char_tokens, &record, EncodeOptions::default(), Some(&media))
+                .unwrap();
+        let prefix = plain
+            .input_ids
+            .iter()
+            .position(|&id| id == 'µ' as u32)
+            .unwrap();
+        assert_eq!(&with.input_ids[prefix..prefix + 3], &media);
+        assert_eq!(&with.input_ids[..prefix], &plain.input_ids[..prefix]);
+        assert_eq!(&with.input_ids[prefix + 3..], &plain.input_ids[prefix..]);
+        assert_eq!(
+            with.questions[0].question_span.0,
+            plain.questions[0].question_span.0 + 3
+        );
     }
 }

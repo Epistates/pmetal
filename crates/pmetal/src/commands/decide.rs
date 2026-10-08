@@ -3,7 +3,7 @@
 use std::io::Read;
 use std::time::Instant;
 
-use pmetal_models::decision::DecisionModel;
+use pmetal_models::decision::{DecisionModel, MediaSources};
 
 /// Load the decision model `model_id`, answer the request body in
 /// `request_path` (`-` reads stdin), and print the response body.
@@ -35,6 +35,8 @@ pub(crate) async fn run_decide(
     }
     let started = Instant::now();
     let mut model = DecisionModel::load(&model_path)?;
+    // The request is the user's own file, so its images may be local paths.
+    model.set_media_sources(MediaSources::AllowPaths);
     tracing::info!(
         "Loaded decision model {} in {:.1}s",
         model_path.display(),

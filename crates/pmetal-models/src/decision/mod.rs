@@ -13,12 +13,15 @@
 //! A release directory is a Qwen3.5 checkpoint plus `joint_head_config.json`
 //! and `joint_head.safetensors`; [`is_decision_model`] checks for both.
 //!
-//! Text only for now: the Qwen3.5 vision encoder is not ported, so a request
-//! with `images` or `videos` is refused rather than answered without them.
+//! A record may carry `images` and `videos` (see [`media`] for their JSON
+//! form). They are preprocessed by the checkpoint's own processor, encoded by
+//! its vision tower (loaded on the first record that needs it) and placed
+//! after the prompt's `STATE:` line, as the reference does.
 
 mod backbone;
 pub mod encode;
 pub mod head;
+pub mod media;
 pub mod systemone;
 
 use std::path::{Path, PathBuf};
@@ -28,9 +31,12 @@ use pmetal_bridge::compat::{Array, Dtype, Exception};
 use backbone::Backbone;
 pub use encode::{
     DEFAULT_MAX_LENGTH, EncodeOptions, EncodedQuestion, EncodedRecord, QuestionType, encode_record,
-    python_json, render,
+    encode_record_with_media, python_json, render,
 };
 pub use head::{JointHeadConfig, JointSchemaHead};
+pub use media::MediaSources;
+
+use crate::architectures::qwen3_5_vision::{EncodedMedia, Qwen3_5Vision};
 
 /// The head's shape, next to the backbone's `config.json`.
 pub const HEAD_CONFIG_FILE: &str = "joint_head_config.json";
@@ -72,6 +78,10 @@ pub struct DecisionModel {
     output_embedding: Array,
     tokenizer: pmetal_data::Tokenizer,
     path: PathBuf,
+    /// The vision tower and processors, loaded by the first record with media.
+    vision: Option<Qwen3_5Vision>,
+    /// Which image strings records may use.
+    media_sources: MediaSources,
 }
 
 impl std::fmt::Debug for DecisionModel {
@@ -135,7 +145,15 @@ impl DecisionModel {
             output_embedding,
             tokenizer,
             path: dir.to_path_buf(),
+            vision: None,
+            media_sources: MediaSources::default(),
         })
+    }
+
+    /// Which image strings records may use: base64 only (the default, for a
+    /// server) or also local file paths (for the CLI).
+    pub fn set_media_sources(&mut self, sources: MediaSources) {
+        self.media_sources = sources;
     }
 
     /// The release directory this model was loaded from.
@@ -162,12 +180,89 @@ impl DecisionModel {
         encode_record(encode::tokenize_with(&self.tokenizer), record, options)
     }
 
+    /// Encode a record that may carry `images` and `videos`: the media are
+    /// decoded, preprocessed, expanded into the prompt and run through the
+    /// vision tower. `None` media for a text-only record.
+    pub fn encode_with_media(
+        &mut self,
+        record: &serde_json::Value,
+        options: EncodeOptions,
+    ) -> Result<(EncodedRecord, Option<EncodedMedia>), DecisionError> {
+        let fields = record
+            .as_object()
+            .ok_or_else(|| DecisionError::Request("record must be a JSON object".into()))?;
+        if !media::has_media(fields) {
+            return Ok((self.encode(record, options)?, None));
+        }
+        let input = media::decode_record_media(fields, self.media_sources)?;
+        let vision = self.vision()?;
+        let images = input
+            .images
+            .iter()
+            .map(|image| vision.processor.preprocess_image(image))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DecisionError::Request(e.to_string()))?;
+        let videos = input
+            .videos
+            .iter()
+            .map(|video| vision.processor.preprocess_video(video))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| DecisionError::Request(e.to_string()))?;
+        let text = vision.expand_placeholders(
+            &media::placeholder_text(images.len(), videos.len()),
+            &images,
+            &videos,
+        )?;
+        let media_ids = encode::tokenize_with(&self.tokenizer)(&text)?;
+        let encoded = encode_record_with_media(
+            encode::tokenize_with(&self.tokenizer),
+            record,
+            options,
+            Some(&media_ids),
+        )?;
+        let vision = self.vision.as_ref().expect("loaded above");
+        let media = vision.encode(&encoded.input_ids, &images, &videos)?;
+        Ok((encoded, Some(media)))
+    }
+
+    /// The vision tower and processors, loaded on first use.
+    fn vision(&mut self) -> Result<&Qwen3_5Vision, DecisionError> {
+        if self.vision.is_none() {
+            let vision = Qwen3_5Vision::load(&self.path).map_err(|e| {
+                DecisionError::Unsupported(format!("this model cannot read images or videos: {e}"))
+            })?;
+            self.vision = Some(vision);
+        }
+        Ok(self.vision.as_ref().expect("just loaded"))
+    }
+
     /// One logit per option of every question, in record order.
     pub fn logits(&mut self, record: &EncodedRecord) -> Result<Vec<Vec<f32>>, DecisionError> {
+        self.logits_with_media(record, None)
+    }
+
+    /// [`logits`](Self::logits) for a record encoded by
+    /// [`encode_with_media`](Self::encode_with_media).
+    pub fn logits_with_media(
+        &mut self,
+        record: &EncodedRecord,
+        media: Option<&EncodedMedia>,
+    ) -> Result<Vec<Vec<f32>>, DecisionError> {
         let ids: Vec<i32> = record.input_ids.iter().map(|&id| id as i32).collect();
         let ids = Array::from_i32_slice_shaped(&ids, &[1, ids.len() as i32]);
         let started = std::time::Instant::now();
-        let hidden = self.backbone.forward_hidden(&ids)?;
+        let hidden = match media {
+            None => self.backbone.forward_hidden(&ids)?,
+            Some(media) => {
+                let multimodal = &self
+                    .vision
+                    .as_ref()
+                    .expect("media were encoded by the loaded vision tower")
+                    .config;
+                self.backbone
+                    .forward_hidden_media(&record.input_ids, media, multimodal)?
+            }
+        };
         hidden
             .try_eval()
             .map_err(|e| DecisionError::Model(Exception::custom(e.to_string())))?;
@@ -204,14 +299,14 @@ impl DecisionModel {
         max_length: usize,
     ) -> Result<serde_json::Value, DecisionError> {
         systemone::validate_request(request)?;
-        let encoded = self.encode(
+        let (encoded, media) = self.encode_with_media(
             request,
             EncodeOptions {
                 max_length,
                 max_state_tokens: None,
             },
         )?;
-        let logits = self.logits(&encoded)?;
+        let logits = self.logits_with_media(&encoded, media.as_ref())?;
         systemone::response(request, &encoded, &logits)
     }
 }

@@ -5380,6 +5380,7 @@ dependencies = [
 name = "pmetal-models"
 version = "0.6.0"
 dependencies = [
+ "base64 0.23.1",
  "image",
  "json5",
  "objc2",

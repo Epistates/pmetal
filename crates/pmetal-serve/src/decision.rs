@@ -132,7 +132,8 @@ pub fn build_decision_router(engine: DecisionEngine, max_concurrent: usize) -> R
         .route("/v1/models", axum::routing::get(list_models))
         .route("/v1/systemone", axum::routing::post(systemone))
         .layer(TraceLayer::new_for_http())
-        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
+        // Images and video frames arrive base64-encoded in the body.
+        .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .with_state(state)
 }
 

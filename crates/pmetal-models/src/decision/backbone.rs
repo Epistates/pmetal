@@ -9,14 +9,18 @@
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
-use pmetal_bridge::qwen3_native::{self, LayerWeight, NativeCache, NativeWeights};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module};
+use pmetal_bridge::qwen3_native::{self, LayerWeight, NativeCache, NativeWeights, Qwen3Config};
 
 use super::DecisionError;
+use crate::architectures::qwen3_5_vision::{EncodedMedia, Qwen3_5MultimodalConfig};
 use crate::dispatcher::{DynamicModel, ModelArchitecture};
 
 pub(crate) enum Backbone {
-    Native(Box<NativeWeights>),
+    Native {
+        weights: Box<NativeWeights>,
+        config: Box<Qwen3Config>,
+    },
     Dynamic(Box<DynamicModel>),
 }
 
@@ -26,7 +30,10 @@ impl Backbone {
         if runs_natively(dir) {
             let config = qwen3_native::load_config(dir).map_err(load_error)?;
             let weights = qwen3_native::load_model(dir, &config).map_err(load_error)?;
-            return Ok(Self::Native(Box::new(weights)));
+            return Ok(Self::Native {
+                weights: Box::new(weights),
+                config: Box::new(config),
+            });
         }
         let model = DynamicModel::load(dir).map_err(|e| load_error(e.to_string()))?;
         Ok(Self::Dynamic(Box::new(model)))
@@ -35,7 +42,7 @@ impl Backbone {
     /// The LM-head matrix, `[vocab, hidden]`, if it is dense.
     pub(crate) fn output_embedding(&self) -> Option<Array> {
         match self {
-            Self::Native(weights) => {
+            Self::Native { weights, .. } => {
                 if weights.tie_word_embeddings {
                     weights
                         .embed_scales
@@ -56,7 +63,7 @@ impl Backbone {
     /// Final normalized hidden states for one prompt, `[1, len, hidden]`.
     pub(crate) fn forward_hidden(&mut self, input_ids: &Array) -> Result<Array, Exception> {
         match self {
-            Self::Native(weights) => {
+            Self::Native { weights, .. } => {
                 // A fresh cache per prompt: nothing is carried between records.
                 let mut cache = NativeCache::new_empty(weights);
                 // The logits are never evaluated, so the LM-head matmul over
@@ -66,6 +73,46 @@ impl Backbone {
                 Ok(hidden)
             }
             Self::Dynamic(model) => model.forward_hidden(input_ids, None),
+        }
+    }
+
+    /// Final normalized hidden states for a prompt carrying images or videos:
+    /// the media tokens' embeddings replaced by vision features, at the
+    /// prompt's 3-D positions. `input_ids` is the expanded prompt.
+    pub(crate) fn forward_hidden_media(
+        &mut self,
+        input_ids: &[u32],
+        media: &EncodedMedia,
+        multimodal: &Qwen3_5MultimodalConfig,
+    ) -> Result<Array, Exception> {
+        let ids: Vec<i32> = input_ids.iter().map(|&id| id as i32).collect();
+        let ids = Array::from_i32_slice_shaped(&ids, &[1, ids.len() as i32]);
+        let positions = media.positions.array();
+        match self {
+            Self::Native { weights, config } => {
+                let text = qwen3_native::embed_tokens(weights, &ids);
+                let embeddings = media.merge(&text, input_ids, multimodal)?;
+                let tables = config.mrope_tables(&positions);
+                let mut cache = NativeCache::new_empty(weights);
+                let (hidden, _logits) = qwen3_native::forward_embeddings_hidden(
+                    weights,
+                    &embeddings,
+                    &tables,
+                    media.positions.next_position,
+                    &mut cache,
+                );
+                Ok(hidden)
+            }
+            Self::Dynamic(model) => {
+                let qwen = model.as_qwen3_next_mut().ok_or_else(|| {
+                    Exception::custom("images and videos need a Qwen3.5-family backbone")
+                })?;
+                let text = Module::forward(&mut qwen.model.embed_tokens, &ids)?;
+                let embeddings = media.merge(&text, input_ids, multimodal)?;
+                let (hidden, _logits) =
+                    qwen.forward_embeddings(&embeddings, &positions, None, None)?;
+                Ok(hidden)
+            }
         }
     }
 }

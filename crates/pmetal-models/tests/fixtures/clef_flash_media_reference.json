@@ -1,0 +1,223 @@
+{
+ "oracle": "joint_schema_model.load_release_model + systemone (release reference code)",
+ "release": "fde727a287004204b7518dcc983fe64379776712",
+ "dtype": "float32",
+ "torch_version": "2.14.1",
+ "transformers_version": "5.19.0",
+ "results": [
+  {
+   "request": {
+    "model": "clef-flash",
+    "id": "image-shapes",
+    "state": "A user uploaded the attached picture.",
+    "images": [
+     "iVBORw0KGgoAAAANSUhEUgAAAcAAAAFACAIAAACk9zv8AAAGKElEQVR42u3dwVHrShBA0bZKeWhBHIThKAnDcXihSIYtGwpsjDTdfc7+/8KjmlvdtuFdxhgBwOMWRwAgoAACCiCgAAIKgIACCCiAgAIIKICAAiCgAAIKIKAAAgogoAAIKICAAggogIACIKAAAgogoAACCiCgAAgogIACCCiAgAIIKAACCiCgAAIKIKAACCiAgAIIKICAAggoAAIKIKAAAgogoAACCoCAAggogIACCCgAAgogoAACCiCgAAIKgIACCCiAgAIIKICAAiCgAAIKIKAAAgqAgAIIKICAAggogIACIKAAAgogoAACCiSyfbw7BAEFEFDg2PHTECqgAAIKHP7upyFUQAEEFEBAgSzfXrLFCyiAgAIkcRljOIUXum/bo//J2747N07/7aP9enM+j1odwZGt/P3/R1XBBCqaLyCmHPPL74ZQE2iRaH73A4gpCKhu/vWnUlKwwuumBZ+J/nidLd4E2iWdX39sGQUTqHSaRjn5bycbQk2g7dJpGgUBlU4ZBSu8dFrqSftvH9niTaDd02kahfDHRNTTa+fgf3rTH7gzgcqHURRMoOrpNCB8iCQW4cMlZt/fw0dJJlD1dD4goOrglMAKLwrWefLs77b4dhOoejo3EFAVcHqcP36GL4Q2Caj77wxBQN18JwkC6s47T5Lv77b44gF1250qCKh77myZd2A0hFYLqBvuhEFA3W3nDALqVmsoFfd3W3ydgLrPzhwEFEg2JBpCcwfUKOTkQUDdYQ0FAXV7NZQe+7st3nugAM0CavDxLEBA3VgNJf1mbYu3wgNUD6hhx3NhwpHQEJogoG6phoKAAgioAQfPqP3+bos3gQIUDajRxhDK/GOgIdQEClAooIYaQygIKFB8g7bFL8YZPDUwgYLx0xDaNaAGGUMoCCiAgBph8ATt77Z4EyiAgAIIqO3PFk+VfbntFm8CBRBQMH762boF1N5niwcBBRBQwI5sixdQgLIB9ZZZeBuUQsNdtyHUBAogoAACCuTdi1tt8Ys3y/BkwQQKxk8/s4ACCCiAgAJ2YVu8gAIIKEDTgPqmS/gmE6W34A5bvAkUQEDB+OlVCCiAgAIIKGDztcULKICAgvHTKxJQAAEFEFDAtut1CSiAgILx06sTUAABBRBQwIbrNQooQIOAvu270y/M80VAAbutVyqgAAIKhjKvV0ABBBRAQAH7rFedI6C+6RK+wwQCChg/G752AQUQUIBWAfVmWXgD1A7rBAQUwAQKGL6cg4AC1A6ot8zCG6AgoID9vdVpCChA5oDa++zvIKCA/b3RmQgoQPKA2v7s70YtJyOgACZQIwyeHZhAwZbqfOoH1CBj/AQBBYyf9U9pMc7geYEJFKB9QA01xk+bqbMSUAATqNEGz8j46cRMoAD1A2rAMX6CgLql6mkbpea5WeEBigbUsOOJgIC6seppD6Xa6VnhAUoH1ODjKRignKGAur3qCSZQd1g9QUAdAdjfnWSLgBqFnDkIqPvstA1NpD/Pxa3GOUOv90DdbScMAuqGO1v7JllPdXHPcarQ9GtMbrvzNCg5WwF1550kmEDdfGcIAur+qyf2dyfc5Vc5VcC5wZHWki24b5tHK51gAtUFp2S7ZNJzXtRBPYHnXMYYtV+hdV46jZ/F7NebCVQvnAaED5F8siSdED5EUhCvHfu7MzeBGkWlE8KHSOHDJek0ChETfpS0Ru+ttmRGpRMEVEalE6zwlnrptL9TcYtfPYPs06h0ggnUQKqbxk+SDaEm0J8LNVVJdRPCh0hJd+RTYiqaYIW344um/Z1SW7wJ9MWNe6KqWglWeNQQwh8TAezvnoiAAggoGD+Z7bkIKICAAggo2BNJ8XQEFEBAwfjpGQkoQPhdeAArPAACCiCgAAIKIKAAAgqAgAIIKICAAggogIACIKAAAgogoAACCoCAAggogIACCCiAgAIgoAACCiCgAAIKIKAACCiAgAIIKICAAiCgAAIKIKAAAgogoAAIKICAAggogIACCCgAAgogoAACCiCgAAgogIACCCiAgAIIKAACCiCgAAIKIKAAAgqAgAIIKICAAggoAAIKIKAAAgogoAACCoCAAggogIACCCiAgAIgoAD/5hNd0AGI2c6K8wAAAABJRU5ErkJggg=="
+    ],
+    "questions": {
+     "circle_color": {
+      "type": "choice",
+      "instructions": "What color is the circle in the picture?",
+      "criteria": {
+       "red": "The circle is red.",
+       "blue": "The circle is blue.",
+       "green": "The circle is green."
+      }
+     },
+     "has_triangle": {
+      "type": "noul",
+      "instructions": "Does the picture contain a triangle?"
+     },
+     "shape_count": {
+      "type": "score",
+      "instructions": "How many distinct shapes are drawn?",
+      "criteria": [
+       "none",
+       "one",
+       "two",
+       "three or more"
+      ]
+     }
+    }
+   },
+   "input_tokens": 487,
+   "probabilities": {
+    "circle_color": {
+     "blue": 0.007433897349983454,
+     "green": 0.0095189418643713,
+     "red": 0.9830471873283386
+    },
+    "has_triangle": {
+     "true": 0.9629123210906982,
+     "false": 0.037087637931108475
+    },
+    "shape_count": {
+     "0": 0.015165548771619797,
+     "1": 0.017468776553869247,
+     "2": 0.9474985003471375,
+     "3": 0.019867122173309326
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "circle_color": {
+      "type": "choice",
+      "choice": "red",
+      "confidence": 0.983,
+      "probabilities": {
+       "red": 0.983,
+       "blue": 0.0074,
+       "green": 0.0095
+      }
+     },
+     "has_triangle": {
+      "type": "noul",
+      "noul": 0.9629
+     },
+     "shape_count": {
+      "type": "score",
+      "score": 1.9721,
+      "confidence": 0.9475,
+      "legend": {
+       "0": "none",
+       "1": "one",
+       "2": "two",
+       "3": "three or more"
+      },
+      "probabilities": {
+       "0": 0.0152,
+       "1": 0.0175,
+       "2": 0.9475,
+       "3": 0.0199
+      }
+     }
+    },
+    "usage": {
+     "input_tokens": 487,
+     "output_tokens": 0
+    }
+   }
+  },
+  {
+   "request": {
+    "model": "clef-flash",
+    "id": "two-images",
+    "state": {
+     "task": "compare the two pictures"
+    },
+    "images": [
+     "iVBORw0KGgoAAAANSUhEUgAAAcAAAAFACAIAAACk9zv8AAAGKElEQVR42u3dwVHrShBA0bZKeWhBHIThKAnDcXihSIYtGwpsjDTdfc7+/8KjmlvdtuFdxhgBwOMWRwAgoAACCiCgAAIKgIACCCiAgAIIKICAAiCgAAIKIKAAAgogoAAIKICAAggogIACIKAAAgogoAACCiCgAAgogIACCCiAgAIIKAACCiCgAAIKIKAACCiAgAIIKICAAggoAAIKIKAAAgogoAACCoCAAggogIACCCgAAgogoAACCiCgAAIKgIACCCiAgAIIKICAAiCgAAIKIKAAAgqAgAIIKICAAggogIACIKAAAgogoAACCiSyfbw7BAEFEFDg2PHTECqgAAIKHP7upyFUQAEEFEBAgSzfXrLFCyiAgAIkcRljOIUXum/bo//J2747N07/7aP9enM+j1odwZGt/P3/R1XBBCqaLyCmHPPL74ZQE2iRaH73A4gpCKhu/vWnUlKwwuumBZ+J/nidLd4E2iWdX39sGQUTqHSaRjn5bycbQk2g7dJpGgUBlU4ZBSu8dFrqSftvH9niTaDd02kahfDHRNTTa+fgf3rTH7gzgcqHURRMoOrpNCB8iCQW4cMlZt/fw0dJJlD1dD4goOrglMAKLwrWefLs77b4dhOoejo3EFAVcHqcP36GL4Q2Caj77wxBQN18JwkC6s47T5Lv77b44gF1250qCKh77myZd2A0hFYLqBvuhEFA3W3nDALqVmsoFfd3W3ydgLrPzhwEFEg2JBpCcwfUKOTkQUDdYQ0FAXV7NZQe+7st3nugAM0CavDxLEBA3VgNJf1mbYu3wgNUD6hhx3NhwpHQEJogoG6phoKAAgioAQfPqP3+bos3gQIUDajRxhDK/GOgIdQEClAooIYaQygIKFB8g7bFL8YZPDUwgYLx0xDaNaAGGUMoCCiAgBph8ATt77Z4EyiAgAIIqO3PFk+VfbntFm8CBRBQMH762boF1N5niwcBBRBQwI5sixdQgLIB9ZZZeBuUQsNdtyHUBAogoAACCuTdi1tt8Ys3y/BkwQQKxk8/s4ACCCiAgAJ2YVu8gAIIKEDTgPqmS/gmE6W34A5bvAkUQEDB+OlVCCiAgAIIKGDztcULKICAgvHTKxJQAAEFEFDAtut1CSiAgILx06sTUAABBRBQwIbrNQooQIOAvu270y/M80VAAbutVyqgAAIKhjKvV0ABBBRAQAH7rFedI6C+6RK+wwQCChg/G752AQUQUIBWAfVmWXgD1A7rBAQUwAQKGL6cg4AC1A6ot8zCG6AgoID9vdVpCChA5oDa++zvIKCA/b3RmQgoQPKA2v7s70YtJyOgACZQIwyeHZhAwZbqfOoH1CBj/AQBBYyf9U9pMc7geYEJFKB9QA01xk+bqbMSUAATqNEGz8j46cRMoAD1A2rAMX6CgLql6mkbpea5WeEBigbUsOOJgIC6seppD6Xa6VnhAUoH1ODjKRignKGAur3qCSZQd1g9QUAdAdjfnWSLgBqFnDkIqPvstA1NpD/Pxa3GOUOv90DdbScMAuqGO1v7JllPdXHPcarQ9GtMbrvzNCg5WwF1550kmEDdfGcIAur+qyf2dyfc5Vc5VcC5wZHWki24b5tHK51gAtUFp2S7ZNJzXtRBPYHnXMYYtV+hdV46jZ/F7NebCVQvnAaED5F8siSdED5EUhCvHfu7MzeBGkWlE8KHSOHDJek0ChETfpS0Ru+ttmRGpRMEVEalE6zwlnrptL9TcYtfPYPs06h0ggnUQKqbxk+SDaEm0J8LNVVJdRPCh0hJd+RTYiqaYIW344um/Z1SW7wJ9MWNe6KqWglWeNQQwh8TAezvnoiAAggoGD+Z7bkIKICAAggo2BNJ8XQEFEBAwfjpGQkoQPhdeAArPAACCiCgAAIKIKAAAgqAgAIIKICAAggogIACIKAAAgogoAACCoCAAggogIACCCiAgAIgoAACCiCgAAIKIKAACCiAgAIIKICAAiCgAAIKIKAAAgogoAAIKICAAggogIACCCgAAgogoAACCiCgAAgogIACCCiAgAIIKAACCiCgAAIKIKAAAgqAgAIIKICAAggoAAIKIKAAAgogoAACCoCAAggogIACCCiAgAIgoAD/5hNd0AGI2c6K8wAAAABJRU5ErkJggg==",
+     "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAIAAADTED8xAAACGUlEQVR42u3VsRGAIBREQXHohIhKrNlKjCjjcoogcMTdDjjmzS9JDvir0wQIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAkAAIAAQAAgABAACAAGAAEAAIAAQAOyifv0B/Rp+8V3P3VwAEAAIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAgABgABAACAAEAAIAAQAAgABIAAQAAgABAACAAGAAEAAIAAQAAgABAACAAGAAEAAIAAQAAgABAACAAGAAEAAIAAQAAgABAACAAGAAEAAIAAQAAgABAACAAGAAEAAIAAQAAgABAACAAGAAEAAIAAQAAgAAZgAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACADWlCRWwAUAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAAYAAQAAgABAACAAEAAIAASAAEyAAEAAIAAQAAgABgABAACAAEAAIALYwAYzYCr/chKy4AAAAAElFTkSuQmCC"
+    ],
+    "questions": {
+     "second_has_square": {
+      "type": "noul",
+      "instructions": "Does the second picture show a square?"
+     },
+     "same_picture": {
+      "type": "noul",
+      "instructions": "Are the two pictures identical?"
+     }
+    }
+   },
+   "input_tokens": 445,
+   "probabilities": {
+    "second_has_square": {
+     "true": 0.9667242169380188,
+     "false": 0.033275820314884186
+    },
+    "same_picture": {
+     "true": 0.0049750604666769505,
+     "false": 0.9950249791145325
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "second_has_square": {
+      "type": "noul",
+      "noul": 0.9667
+     },
+     "same_picture": {
+      "type": "noul",
+      "noul": 0.005
+     }
+    },
+    "usage": {
+     "input_tokens": 445,
+     "output_tokens": 0
+    }
+   }
+  },
+  {
+   "request": {
+    "model": "clef-flash",
+    "id": "video-motion",
+    "state": "Watch the clip.",
+    "videos": [
+     {
+      "frames": [
+       "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"
+      ],
+      "fps": 3.0
+     }
+    ],
+    "questions": {
+     "direction": {
+      "type": "choice",
+      "instructions": "Which way does the red circle move?",
+      "criteria": {
+       "left_to_right": "It moves from left to right.",
+       "right_to_left": "It moves from right to left.",
+       "stationary": "It does not move."
+      }
+     },
+     "is_moving": {
+      "type": "noul",
+      "instructions": "Is the circle moving?"
+     }
+    }
+   },
+   "input_tokens": 314,
+   "probabilities": {
+    "direction": {
+     "left_to_right": 0.8683003783226013,
+     "right_to_left": 0.08974847197532654,
+     "stationary": 0.04195111617445946
+    },
+    "is_moving": {
+     "true": 0.7396895885467529,
+     "false": 0.26031041145324707
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "direction": {
+      "type": "choice",
+      "choice": "left_to_right",
+      "confidence": 0.8683,
+      "probabilities": {
+       "left_to_right": 0.8683,
+       "right_to_left": 0.0897,
+       "stationary": 0.042
+      }
+     },
+     "is_moving": {
+      "type": "noul",
+      "noul": 0.7397
+     }
+    },
+    "usage": {
+     "input_tokens": 314,
+     "output_tokens": 0
+    }
+   }
+  }
+ ]
+}
