@@ -306,6 +306,37 @@ enum Commands {
         revision: Option<String>,
     },
 
+    /// Publish a model directory to HuggingFace (creates the repo if needed)
+    ///
+    /// Authenticates with `HF_TOKEN`, or the token stored by `hf auth login`.
+    Upload {
+        /// Local directory to publish (a fused model, an adapter, a quantized export)
+        path: String,
+
+        /// Target repository, as owner/name
+        repo: String,
+
+        /// Create the repository as private (no effect if it already exists)
+        #[arg(long)]
+        private: bool,
+
+        /// Branch to commit to (default: the repository's default branch)
+        #[arg(long)]
+        revision: Option<String>,
+
+        /// Commit message
+        #[arg(short, long)]
+        message: Option<String>,
+
+        /// Open a pull request instead of committing to the branch
+        #[arg(long)]
+        create_pr: bool,
+
+        /// Glob of files to leave out, relative to PATH (repeatable), e.g. "checkpoints/**"
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude: Vec<String>,
+    },
+
     /// Search HuggingFace Hub for models and show device fit
     Search {
         /// Search query (e.g. "qwen3 0.6B", "llama 8b")
@@ -608,6 +639,7 @@ impl Commands {
             #[cfg(feature = "trainer")]
             Commands::Init { .. } => false,
             Commands::Download { .. }
+            | Commands::Upload { .. }
             | Commands::Search { .. }
             | Commands::Dataset { .. }
             | Commands::Tokenize(_) => false,
@@ -1920,6 +1952,30 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             tracing::info!(model = %model, "Downloading model");
             let path = pmetal_hub::download_model(&model, revision.as_deref(), None).await?;
             println!("Model downloaded to: {}", path.display());
+        }
+
+        Commands::Upload {
+            path,
+            repo,
+            private,
+            revision,
+            message,
+            create_pr,
+            exclude,
+        } => {
+            tracing::info!(path = %path, repo = %repo, "Uploading model");
+            let options = pmetal_hub::UploadOptions {
+                private,
+                revision,
+                commit_message: message,
+                create_pr,
+                ignore: exclude,
+            };
+            let report = pmetal_hub::upload_model(&path, &repo, None, &options).await?;
+            println!("Uploaded {path} to {}", report.repo_url);
+            if let Some(commit) = report.commit_url {
+                println!("Commit: {commit}");
+            }
         }
 
         Commands::PackExperts(args) => {

@@ -145,6 +145,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `embed-train` | Sentence-transformer fine-tuning (InfoNCE, Triplet, CoSENT) |
 | `search` | Search HuggingFace Hub with memory fit estimation |
 | `download` | Download a model from HuggingFace Hub |
+| `upload` | Publish a model directory to HuggingFace Hub |
 | `merge` | Merge two models (12 strategies) |
 | `quantize` | GGUF quantization (24 methods) |
 | `fuse` | Fuse LoRA adapter weights into base model |
