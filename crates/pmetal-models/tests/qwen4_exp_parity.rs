@@ -109,14 +109,14 @@ fn assert_argmax(logits: &Array, reference: &Array) {
 
 /// The cached run: a 9-token prefill, a 4-token chunk, then one token a step.
 fn cached_logits(model: &mut DynamicModel, input_ids: &Array) -> Array {
-    let seq = input_ids.dim(1);
+    let (batch, seq) = (input_ids.dim(0), input_ids.dim(1));
     let mut kv = model.create_cache(64);
     let mut mamba = model.create_mamba_cache();
     let mut segments = vec![(0, 9), (9, 13)];
     segments.extend((13..seq).map(|t| (t, t + 1)));
     let mut outputs = Vec::new();
     for (start, stop) in segments {
-        let chunk = input_ids.slice(&[0, start], &[1, stop]);
+        let chunk = input_ids.slice(&[0, start], &[batch, stop]);
         let logits = model
             .forward_with_hybrid_cache(&chunk, None, Some(&mut kv), mamba.as_mut())
             .expect("cached forward");
@@ -345,4 +345,39 @@ fn qwen4_exp_nvfp4_experts_run_packed() {
     ];
     assert_all_pass("NVFP4 packed experts", &reports);
     assert_eq!(argmax_last_axis(&runs[1].0), argmax_last_axis(&runs[0].0));
+}
+
+/// Two prompts in one batch, through the caches, give each prompt's own
+/// logits: the n-gram context, PLE conv and indexer states are kept per row.
+#[test]
+#[serial]
+fn qwen4_exp_batch_rows_are_independent() {
+    let reference = load_shard(&fixture_path("qwen4_exp_synth_reference.safetensors"));
+    let first = ref_tensor(&reference, "input_ids").clone();
+    let ids: Vec<i32> = to_f32_vec_eval(&first).iter().map(|&t| t as i32).collect();
+    let reversed: Vec<i32> = ids.iter().rev().copied().collect();
+    let second = Array::from_i32_slice_shaped(&reversed, &[1, ids.len() as i32]);
+    let both =
+        Array::from_i32_slice_shaped(&[ids.clone(), reversed].concat(), &[2, ids.len() as i32]);
+
+    let dir = checkpoint_dir();
+    let mut model = DynamicModel::load(dir.path()).expect("loads");
+    let alone = [
+        cached_logits(&mut model, &first),
+        cached_logits(&mut model, &second),
+    ];
+    let batched = cached_logits(&mut model, &both);
+    for (row, logits) in alone.iter().enumerate() {
+        let slice = batched.slice(
+            &[row as i32, 0, 0],
+            &[row as i32 + 1, batched.dim(1), batched.dim(2)],
+        );
+        let report = ParityReport::compute(
+            &format!("batch_row_{row}"),
+            &slice,
+            logits,
+            Tolerance::new(1e-5, 1e-5),
+        );
+        assert_all_pass("batched cached decode", &[report]);
+    }
 }

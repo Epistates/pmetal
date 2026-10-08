@@ -1697,12 +1697,22 @@ impl Qwen4ExpModel {
 /// `input_ids` as one row of token ids per batch entry, on the CPU (the
 /// n-gram hash runs there).
 fn token_rows(input_ids: &Array) -> Vec<Vec<i64>> {
-    let ids = input_ids.as_dtype(Dtype::Int32.as_i32());
-    ids.eval();
-    let (batch, seq) = match ids.ndim() {
-        1 => (1, ids.dim(0) as usize),
-        _ => (ids.dim(0) as usize, ids.dim(1) as usize),
+    let ids = if input_ids.ndim() == 1 {
+        input_ids.reshape(&[1, -1])
+    } else {
+        input_ids.clone()
     };
+    let (batch, seq) = (ids.dim(0) as usize, ids.dim(1) as usize);
+    // `as_slice` reads memory order, and a chunk sliced out of a longer batch
+    // is a strided view, so every row past the first came back as the first's
+    // continuation (or, for one column, as an unrelated token). An elementwise
+    // op writes a strided input out row-major, and the reshape copies whatever
+    // layout is left that a flat view cannot express.
+    let ids = ids
+        .as_dtype(Dtype::Int32.as_i32())
+        .add(&Array::from_i32(0))
+        .reshape(&[-1]);
+    ids.eval();
     let flat = ids.as_slice::<i32>();
     (0..batch)
         .map(|b| {
