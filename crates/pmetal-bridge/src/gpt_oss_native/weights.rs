@@ -34,7 +34,8 @@ pub(super) struct LayerWeights {
     pub(super) attn_n_kv_heads: i32,
     pub(super) attn_head_dim: i32,
     pub(super) attn_scale: f32,
-    pub(super) attn_rope_base: f32,
+    /// The rotary embedding (YaRN on every release).
+    pub(super) attn_rotary: crate::rope::RotaryEmbedding,
     pub(super) attn_is_sliding: bool,
     pub(super) attn_sliding_window: i32,
 
@@ -219,7 +220,7 @@ pub fn load_model(
     let n_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
     let attn_scale = 1.0_f32 / (head_dim as f32).sqrt();
-    let rope_base = config.rope_theta;
+    let rotary = config.rotary()?;
     let n_experts = config.num_local_experts;
     let top_k = config.experts_per_tok();
     let use_bias = config.attention_bias;
@@ -307,7 +308,7 @@ pub fn load_model(
             attn_n_kv_heads: n_kv_heads,
             attn_head_dim: head_dim,
             attn_scale,
-            attn_rope_base: rope_base,
+            attn_rotary: rotary.clone(),
             attn_is_sliding: is_sliding,
             attn_sliding_window: config.sliding_window,
 

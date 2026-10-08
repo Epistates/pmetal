@@ -72,23 +72,11 @@ pub(super) fn mla_forward(
         .reshape(&[b, s, 1, rope_dim])
         .transpose_axes(&[0, 2, 1, 3]); // [B, 1, S, rope_dim]
 
-    // Apply RoPE to q_pe [B, H, S, rope_dim] and k_pe [B, 1, S, rope_dim].
-    // DeepSeek V3 uses traditional=true RoPE (the default in initialize_rope with
-    // traditional=True in the Python code).
-    let q_pe = q_pe.rope(
-        rope_dim,
-        /*traditional=*/ true,
-        lw.rope_base,
-        lw.rope_scale,
-        rope_offset,
-    );
-    let k_pe = k_pe_raw_4d.rope(
-        rope_dim,
-        /*traditional=*/ true,
-        lw.rope_base,
-        lw.rope_scale,
-        rope_offset,
-    );
+    // Apply RoPE to q_pe [B, H, S, rope_dim] and k_pe [B, 1, S, rope_dim]:
+    // interleaved pairs, with YaRN's frequencies and attention factor when
+    // `rope_scaling` sets them (DeepSeek-V3/R1 ship factor 40).
+    let q_pe = lw.rotary.apply(&q_pe, rope_offset);
+    let k_pe = lw.rotary.apply(&k_pe_raw_4d, rope_offset);
 
     // Expand kv_latent: [B, S, lora] → [B, 1, S, lora] (Python: expand_dims(axis=1))
     let kv_latent_4d = kv_latent_tok.expand_dims(1); // [B, 1, S, lora_rank]

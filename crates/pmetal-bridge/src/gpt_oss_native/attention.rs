@@ -26,8 +26,16 @@ pub(super) fn attn_forward(
     // call `compiled_gptoss_attn_layer_fixed` which fuses Q/K/V proj +
     // bias adds + RoPE + cache write + SDPA + o_proj + bias into one
     // mx.compile graph. Sliding-window layers, turboquant cache, and
-    // zero-overhead-quantized cache stay on the per-op paths below.
-    if s == 1 && !lw.attn_is_sliding && cache.turboquant.is_none() && cache.quant_config.is_none() {
+    // zero-overhead-quantized cache stay on the per-op paths below, and so
+    // does a scaled RoPE (YaRN, which every release ships): the compiled
+    // graph rotates by a scalar base it has no equivalent for.
+    let scalar_rope = lw.attn_rotary.scalar().filter(|&(_, scale)| scale == 1.0);
+    if s == 1
+        && !lw.attn_is_sliding
+        && cache.turboquant.is_none()
+        && cache.quant_config.is_none()
+        && let Some((rope_base, _)) = scalar_rope
+    {
         if let (Some(qb), Some(kb), Some(vb), Some(ob)) = (
             lw.attn_q_b.as_ref(),
             lw.attn_k_b.as_ref(),
@@ -66,7 +74,7 @@ pub(super) fn attn_forward(
                     n_kv_heads,
                     head_dim,
                     scale,
-                    lw.attn_rope_base,
+                    rope_base,
                 );
             cache.keys = Some(new_cache_keys);
             cache.values = Some(new_cache_vals);
@@ -102,9 +110,10 @@ pub(super) fn attn_forward(
         .reshape(&[b, s, n_kv_heads, head_dim])
         .transpose_axes(&[0, 2, 1, 3]);
 
-    // Full RoPE (head_dim = 64, no partial rotation)
-    let q = q.rope(head_dim, false, lw.attn_rope_base, 1.0, rope_offset);
-    let k = k.rope(head_dim, false, lw.attn_rope_base, 1.0, rope_offset);
+    // Full RoPE (head_dim = 64, no partial rotation): YaRN's frequencies and
+    // attention factor, split-half.
+    let q = lw.attn_rotary.apply(&q, rope_offset);
+    let k = lw.attn_rotary.apply(&k, rope_offset);
 
     // KV cache update
     let prev = cache.offset;

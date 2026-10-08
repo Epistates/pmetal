@@ -94,13 +94,13 @@ pub enum AttentionLayerType {
     FullAttention,
 }
 
-/// RoPE scaling configuration (YaRN).
-#[derive(Debug, Clone, Deserialize)]
-pub struct RopeScalingConfig {
-    pub rope_type: String,
-    pub factor: f32,
-    #[serde(default)]
-    pub original_max_position_embeddings: i32,
+/// The rope dict transformers' `GptOssConfig` fills in when a config carries
+/// none: YaRN, factor 32 over 4096, `truncate: false`, as every release ships.
+pub fn default_rope_scaling() -> serde_json::Value {
+    serde_json::json!({
+        "rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0,
+        "truncate": false, "original_max_position_embeddings": 4096
+    })
 }
 
 /// Minimal, serde-deserializable GPT-OSS config.
@@ -129,8 +129,11 @@ pub struct GptOssConfig {
     pub rms_norm_eps: f32,
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    /// YaRN on every release; read by [`crate::rope`].
     #[serde(default)]
-    pub rope_scaling: Option<RopeScalingConfig>,
+    pub rope_scaling: Option<serde_json::Value>,
+    #[serde(default)]
+    pub max_position_embeddings: Option<i32>,
     #[serde(default = "default_true")]
     pub attention_bias: bool,
     #[serde(default)]
@@ -157,6 +160,27 @@ pub struct GptOssConfig {
 }
 
 impl GptOssConfig {
+    /// The rotary embedding: YaRN with gpt-oss's `truncate: false` and its
+    /// attention factor on q and k (transformers' [`default_rope_scaling`]
+    /// when the config has no rope dict); an unknown `rope_type` is an error
+    /// naming it.
+    pub fn rotary(&self) -> Result<crate::rope::RotaryEmbedding, String> {
+        let default = default_rope_scaling();
+        crate::rope::RotaryEmbedding::from_config(
+            self.head_dim,
+            crate::rope::RopeConfig {
+                rope_scaling: Some(self.rope_scaling.as_ref().unwrap_or(&default)),
+                rope_theta: Some(self.rope_theta as f64),
+                max_position_embeddings: self.max_position_embeddings.map(f64::from),
+                ..crate::rope::RopeConfig::default()
+            },
+            self.rope_theta as f64,
+            1.0,
+            false,
+        )
+        .map_err(|e| format!("gpt_oss config: {e}"))
+    }
+
     /// Effective experts per token.
     pub fn experts_per_tok(&self) -> i32 {
         self.num_experts_per_tok.unwrap_or(self.experts_per_token)
@@ -209,4 +233,39 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<GptOssConfig, String> 
         text
     };
     serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GptOssConfig;
+    use crate::rope::{RopeConfig, Rotary};
+
+    /// The native engine rotated every gpt-oss with plain RoPE at
+    /// `rope_theta`. It now runs the release's YaRN (`truncate: false`) and
+    /// the attention factor, read the way every other engine reads it; a
+    /// config with no rope dict gets transformers' gpt-oss default, and an
+    /// unknown type is refused by name.
+    #[test]
+    fn native_gpt_oss_rotates_with_the_released_yarn() {
+        let released = serde_json::json!({
+            "head_dim": 64, "rope_theta": 150000.0, "max_position_embeddings": 131072,
+            "rope_scaling": {"beta_fast": 32.0, "beta_slow": 1.0, "factor": 32.0,
+                "original_max_position_embeddings": 4096, "rope_type": "yarn", "truncate": false}
+        });
+        let want = Rotary::from_config(64, RopeConfig::from_json(&released), 1e4, 1.0).unwrap();
+        let config: GptOssConfig = serde_json::from_value(released.clone()).unwrap();
+        let rotary = config.rotary().unwrap();
+        assert_eq!(rotary.rotary(), &want);
+        assert!(
+            rotary.scalar().is_none(),
+            "the compiled scalar-base path must step aside"
+        );
+
+        let mut bare = config.clone();
+        bare.rope_scaling = None;
+        assert_eq!(bare.rotary().unwrap().rotary(), &want);
+
+        bare.rope_scaling = Some(serde_json::json!({"rope_type": "xpos"}));
+        assert!(bare.rotary().unwrap_err().contains("xpos"));
+    }
 }

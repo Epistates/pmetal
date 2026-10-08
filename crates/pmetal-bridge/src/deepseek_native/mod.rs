@@ -132,6 +132,9 @@ pub struct DeepSeekConfig {
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
 
+    #[serde(default)]
+    pub max_position_embeddings: Option<i32>,
+
     #[serde(default = "default_false")]
     pub attention_bias: bool,
 
@@ -145,24 +148,30 @@ impl DeepSeekConfig {
         self.qk_nope_head_dim + self.qk_rope_head_dim
     }
 
-    /// Attention scale — applied to Q before computing scores.
-    /// Includes mscale correction for YaRN rope scaling when configured.
-    pub fn attention_scale(&self) -> f32 {
-        let base = (self.q_head_dim() as f32).powf(-0.5);
-        if let Some(ref rs) = self.rope_scaling {
-            let mscale_all_dim = rs
-                .get("mscale_all_dim")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            if mscale_all_dim > 0.0 {
-                let factor = rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
-                if factor > 1.0 {
-                    let s = 0.1 * mscale_all_dim * factor.ln() + 1.0;
-                    return base * (s * s) as f32;
-                }
-            }
-        }
-        base
+    /// The interleaved rotary embedding of the `qk_rope_head_dim` channels,
+    /// YaRN as `rope_scaling` gives it (frequencies and attention factor); an
+    /// unknown `rope_type` is an error naming it.
+    pub fn rotary(&self) -> Result<crate::rope::RotaryEmbedding, String> {
+        crate::rope::RotaryEmbedding::from_config(
+            self.qk_rope_head_dim,
+            crate::rope::RopeConfig {
+                rope_scaling: self.rope_scaling.as_ref(),
+                rope_theta: Some(self.rope_theta),
+                max_position_embeddings: self.max_position_embeddings.map(f64::from),
+                ..crate::rope::RopeConfig::default()
+            },
+            self.rope_theta,
+            1.0,
+            true,
+        )
+        .map_err(|e| format!("deepseek config: {e}"))
+    }
+
+    /// Softmax scale — applied to Q before computing scores: `q_head_dim^-½`
+    /// times YaRN's `get_mscale(factor, mscale_all_dim)²` when configured
+    /// (see [`crate::rope::RopeScaling::mla_softmax_mscale`]).
+    pub fn attention_scale(&self, rotary: &crate::rope::RotaryEmbedding) -> f32 {
+        (self.q_head_dim() as f32).powf(-0.5) * rotary.rotary().scaling.mla_softmax_mscale() as f32
     }
 
     /// Returns true when layer `layer_id` uses MoE instead of dense MLP.
@@ -173,13 +182,6 @@ impl DeepSeekConfig {
         let li = layer_id as i32;
         li >= self.first_k_dense_replace && li % self.moe_layer_freq == 0
     }
-
-    /// RoPE base as f32.
-    pub fn rope_base_f32(&self) -> f32 {
-        // Apply YaRN mscale to rope_theta when configured.
-        // The Python initialize_rope() handles this; we replicate the effect.
-        self.rope_theta as f32
-    }
 }
 
 /// Parse `config.json` from a model directory.
@@ -188,4 +190,49 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<DeepSeekConfig, String
     let cfg: DeepSeekConfig =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
     Ok(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeepSeekConfig;
+
+    /// DeepSeek-V3's released attention config: YaRN factor 40 over 4096
+    /// with `mscale = mscale_all_dim = 1`. The native engine used to rotate
+    /// with plain RoPE and apply only the softmax mscale²; it now rotates
+    /// with transformers' YaRN frequencies (the shared fixture's
+    /// `yarn_deepseek_v3` case) and keeps the softmax term.
+    #[test]
+    fn deepseek_v3_native_rotates_with_yarn() {
+        let config: DeepSeekConfig = serde_json::from_value(serde_json::json!({
+            "intermediate_size": 64, "num_experts_per_tok": 2, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "kv_lora_rank": 16, "qk_rope_head_dim": 64,
+            "v_head_dim": 32, "qk_nope_head_dim": 128, "rope_theta": 10000,
+            "max_position_embeddings": 163840,
+            "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 40, "mscale": 1.0,
+                "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096, "type": "yarn"}
+        }))
+        .unwrap();
+        let rotary = config.rotary().unwrap();
+        assert!(rotary.traditional());
+        assert_eq!(rotary.attention_factor(), 1.0);
+        let mscale = 0.1 * 40f32.ln() + 1.0;
+        let want_scale = 192f32.powf(-0.5) * mscale * mscale;
+        assert!((config.attention_scale(&rotary) - want_scale).abs() < 1e-6);
+
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/rope_scaling_reference.json"
+        ))
+        .unwrap();
+        let case = reference["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "yarn_deepseek_v3")
+            .unwrap();
+        let got = rotary.inverse_frequencies(0);
+        for (g, w) in got.iter().zip(case["inv_freq"].as_array().unwrap()) {
+            let w = w.as_f64().unwrap();
+            assert!(((*g as f64) - w).abs() <= 2e-6 * w, "{g} vs {w}");
+        }
+    }
 }

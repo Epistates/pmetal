@@ -9,7 +9,6 @@
 
 // ModuleParameters derive via impl_module_params!
 use crate::checkpointing::checkpointed_layer;
-use crate::common::yarn::{YarnRope, build_yarn_rope, yarn_get_mscale};
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_bridge::compat::indexing::IndexOp;
@@ -18,10 +17,11 @@ use pmetal_bridge::compat::{
     Param, VisitLinears, indexing, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, rope, rope_with_inv_freq},
+    rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
@@ -115,6 +115,25 @@ impl DeepSeekConfig {
     pub fn q_head_dim(&self) -> i32 {
         self.qk_nope_head_dim + self.qk_rope_head_dim
     }
+
+    /// The rotary embedding of the `qk_rope_head_dim` channels, YaRN as
+    /// `rope_scaling` gives it (frequencies and attention factor); an unknown
+    /// `rope_type` is an error naming it. MLA pairs them interleaved
+    /// (`traditional`); the V3.2 indexer may not.
+    pub fn rotary(&self, traditional: bool) -> Result<RotaryEmbedding> {
+        crate::common::rotary_embedding(
+            "deepseek",
+            self.qk_rope_head_dim,
+            RopeConfig {
+                rope_scaling: self.rope_scaling.as_ref(),
+                rope_theta: Some(self.rope_theta as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                ..RopeConfig::default()
+            },
+            1.0,
+            traditional,
+        )
+    }
     pub fn is_moe_layer(&self, layer_id: i32) -> bool {
         if layer_id < self.first_k_dense_replace {
             return false;
@@ -199,44 +218,6 @@ fn default_true() -> bool {
     true
 }
 
-// DeepSeek YARN RoPE: the per-dim frequency + embedding-mscale math is the
-// shared reference `YarnRoPE` formula, extracted to `common::yarn` and reused by
-// GPT-OSS. DeepSeek applies it with interleaved RoPE and folds `mscale²` into
-// the softmax scale (see `DeepSeekAttention::new`).
-
-/// Parse a DeepSeek `rope_scaling` JSON block into YARN params, with reference
-/// defaults. Returns `None` if no block is configured.
-fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<YarnScaling> {
-    let rs = rope_scaling.as_ref()?;
-    let get = |k: &str, default: f32| {
-        rs.get(k)
-            .and_then(|v| v.as_f64())
-            .map(|v| v as f32)
-            .unwrap_or(default)
-    };
-    Some(YarnScaling {
-        factor: get("factor", 1.0),
-        original_max_pos: rs
-            .get("original_max_position_embeddings")
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32)
-            .unwrap_or(4096),
-        beta_fast: get("beta_fast", 32.0),
-        beta_slow: get("beta_slow", 1.0),
-        mscale: get("mscale", 1.0),
-        mscale_all_dim: get("mscale_all_dim", 0.0),
-    })
-}
-
-struct YarnScaling {
-    factor: f32,
-    original_max_pos: i32,
-    beta_fast: f32,
-    beta_slow: f32,
-    mscale: f32,
-    mscale_all_dim: f32,
-}
-
 #[derive(Debug)]
 pub struct DeepSeekAttention {
     pub config: DeepSeekConfig,
@@ -251,40 +232,26 @@ pub struct DeepSeekAttention {
     pub kv_a_layernorm: nn::RmsNorm,
     pub kv_b_proj: nn::Linear,
     pub o_proj: nn::Linear,
-    /// Precomputed YARN rotary state; `None` when no `rope_scaling` is configured
-    /// (plain traditional RoPE).
-    yarn_rope: Option<YarnRope>,
+    /// The interleaved rotary embedding of `q_pe` / `k_pe`, YaRN included.
+    rotary: RotaryEmbedding,
 }
 impl_module_params!(DeepSeekAttention; q_a_proj, q_a_layernorm, q_b_proj, q_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj);
 
-/// The softmax scale and YARN tables an MLA layer runs with.
+/// The softmax scale and rotary embedding an MLA layer runs with.
 ///
-/// These are one decision, not two: YARN folds `mscale²` into the softmax scale
-/// (reference `DeepseekV2Attention`) at the same moment it builds the per-dimension
-/// inverse frequencies. Returning them together is what stops a caller taking
-/// the tables and forgetting the scale, or taking neither.
+/// These are one decision, not two: a scaled RoPE folds
+/// `get_mscale(factor, mscale_all_dim)²` into the softmax scale (transformers'
+/// `deepseek_v3` `yarn_apply_mscale`) on top of the YaRN frequencies and
+/// attention factor the rotation carries. Returning them together is what
+/// stops a caller taking the rotation and forgetting the scale.
 ///
 /// Public because `pmetal-lora` builds the same attention and needs the same
 /// answer.
-pub fn mla_scale_and_yarn(config: &DeepSeekConfig) -> (f32, Option<YarnRope>) {
-    let mut scale = (config.q_head_dim() as f32).powf(-0.5);
-    let yarn_rope = parse_yarn_scaling(&config.rope_scaling).map(|y| {
-        if y.mscale_all_dim != 0.0 {
-            let s = yarn_get_mscale(y.factor, y.mscale_all_dim);
-            scale *= s * s;
-        }
-        build_yarn_rope(
-            config.qk_rope_head_dim,
-            config.rope_theta,
-            y.factor,
-            y.original_max_pos,
-            y.beta_fast,
-            y.beta_slow,
-            y.mscale,
-            y.mscale_all_dim,
-        )
-    });
-    (scale, yarn_rope)
+pub fn mla_scale_and_rotary(config: &DeepSeekConfig) -> Result<(f32, RotaryEmbedding)> {
+    let rotary = config.rotary(true)?;
+    let scale = (config.q_head_dim() as f32).powf(-0.5)
+        * rotary.rotary().scaling.mla_softmax_mscale() as f32;
+    Ok((scale, rotary))
 }
 
 impl DeepSeekAttention {
@@ -292,7 +259,7 @@ impl DeepSeekAttention {
         let hidden_size = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let q_head_dim = config.q_head_dim();
-        let (scale, yarn_rope) = mla_scale_and_yarn(config);
+        let (scale, rotary) = mla_scale_and_rotary(config)?;
         let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) =
             if let Some(q_lora_rank) = config.q_lora_rank {
                 let q_a = nn::LinearBuilder::new(hidden_size, q_lora_rank)
@@ -338,7 +305,7 @@ impl DeepSeekAttention {
             kv_a_layernorm,
             kv_b_proj,
             o_proj,
-            yarn_rope,
+            rotary,
         })
     }
     fn project_qkv_uncached(
@@ -378,41 +345,10 @@ impl DeepSeekAttention {
         let kv_split = ops::split_sections(&kv, &[self.config.qk_nope_head_dim as i32], -1);
         let k_nope = &kv_split[0];
         let values = &kv_split[1];
-        // DeepSeek MLA uses traditional (interleaved) RoPE. With rope_scaling
-        // configured, apply YARN per-dim frequencies + embedding mscale; without
-        // it, plain RoPE at rope_theta.
-        let rope_dim = self.config.qk_rope_head_dim;
-        let (q_pe, k_pe) = if let Some(yarn) = &self.yarn_rope {
-            let (q_in, k_in) = if yarn.mscale != 1.0 {
-                let m = Array::from_f32(yarn.mscale);
-                (q_pe.multiply(&m), k_pe.multiply(&m))
-            } else {
-                (q_pe.clone(), k_pe.clone())
-            };
-            (
-                rope_with_inv_freq(&q_in, rope_positions, &yarn.inv_freq, rope_dim, true)?,
-                rope_with_inv_freq(&k_in, rope_positions, &yarn.inv_freq, rope_dim, true)?,
-            )
-        } else {
-            (
-                rope(
-                    q_pe,
-                    rope_positions,
-                    rope_dim,
-                    true,
-                    self.config.rope_theta,
-                    1.0,
-                )?,
-                rope(
-                    k_pe,
-                    rope_positions,
-                    rope_dim,
-                    true,
-                    self.config.rope_theta,
-                    1.0,
-                )?,
-            )
-        };
+        // DeepSeek MLA rotates `q_pe` / `k_pe` interleaved (traditional),
+        // with YaRN's frequencies and attention factor when configured.
+        let q_pe = rope_embedding(q_pe, rope_positions, &self.rotary);
+        let k_pe = rope_embedding(k_pe, rope_positions, &self.rotary);
         let k_pe_repeated = pmetal_bridge::compat::ops::broadcast_to(
             &k_pe,
             &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim],
@@ -516,9 +452,10 @@ pub struct LightningIndexer {
     pub k_proj: nn::Linear,
     pub head_dim: i32,
     pub scale: f32,
-    pub rope_dim: i32,
-    pub rope_theta: f32,
-    pub non_interleaved: bool,
+    /// The model's rotary embedding (YaRN included, as transformers'
+    /// `deepseek_v32` indexer takes the model's `cos`/`sin`), in the
+    /// indexer's own pair layout.
+    pub rotary: RotaryEmbedding,
 }
 impl_module_params!(LightningIndexer; q_proj, k_proj);
 
@@ -538,9 +475,7 @@ impl LightningIndexer {
             k_proj,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
-            rope_dim: config.qk_rope_head_dim,
-            rope_theta: config.rope_theta,
-            non_interleaved: config.indexer_non_interleaved_rope,
+            rotary: config.rotary(!config.indexer_non_interleaved_rope)?,
         })
     }
     pub fn compute_scores(
@@ -561,22 +496,8 @@ impl LightningIndexer {
             .forward(x)
             .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
-        let q = rope(
-            &q,
-            rope_positions,
-            self.rope_dim,
-            !self.non_interleaved,
-            self.rope_theta,
-            1.0,
-        )?;
-        let k = rope(
-            &k,
-            rope_positions,
-            self.rope_dim,
-            !self.non_interleaved,
-            self.rope_theta,
-            1.0,
-        )?;
+        let q = rope_embedding(&q, rope_positions, &self.rotary);
+        let k = rope_embedding(&k, rope_positions, &self.rotary);
         let scores = q
             .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
             .multiply(&Array::from_f32(self.scale));

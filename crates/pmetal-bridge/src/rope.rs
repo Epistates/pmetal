@@ -151,6 +151,22 @@ impl RopeScaling {
         matches!(self, Self::Dynamic { .. } | Self::LongRope(_))
     }
 
+    /// The factor DeepSeek's MLA multiplies its softmax scale by:
+    /// `get_mscale(factor, mscale_all_dim)²` under YaRN with a non-zero
+    /// `mscale_all_dim`, 1 otherwise (transformers' `deepseek_v3`
+    /// `yarn_apply_mscale`). It is on top of the attention factor the
+    /// rotation itself carries.
+    pub fn mla_softmax_mscale(&self) -> f64 {
+        match self {
+            Self::Yarn(Yarn {
+                factor,
+                mscale_all_dim: Some(all),
+                ..
+            }) if *all != 0.0 => yarn_get_mscale(*factor, *all).powi(2),
+            _ => 1.0,
+        }
+    }
+
     /// Resolve a rope dict (`rope_scaling` or `rope_parameters`; `None` for
     /// plain RoPE).
     ///

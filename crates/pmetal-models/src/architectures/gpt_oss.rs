@@ -25,11 +25,11 @@ use pmetal_bridge::compat::{Array, Exception, ModuleParameters, Param, indexing,
 use pmetal_bridge::impl_module_params;
 
 use crate::checkpointing::checkpointed_layer;
-use crate::common::yarn::{YarnRope, build_yarn_rope};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig,
-    rope::{RopePositions, rope, rope_with_inv_freq},
+    rope::{RopePositions, rope_embedding},
     sink_sdpa,
 };
 use pmetal_mlx::kv_cache::KVCache;
@@ -149,9 +149,10 @@ pub struct RopeScalingConfig {
     /// Beta slow for YaRN.
     #[serde(default = "default_beta_slow")]
     pub beta_slow: f32,
-    /// Whether to truncate position embeddings.
-    #[serde(default)]
-    pub truncate: bool,
+    /// Whether YaRN's correction range is rounded to whole frequencies.
+    /// gpt-oss ships `false`; absent means transformers' default, `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncate: Option<bool>,
 }
 
 // Default functions
@@ -256,26 +257,29 @@ impl GptOssConfig {
         self.rope_scaling.as_ref().map(|s| s.factor).unwrap_or(1.0)
     }
 
-    /// Build the YARN rotary state (per-dim inverse frequencies + embedding
-    /// mscale) when `rope_scaling.rope_type == "yarn"`, mirroring the reference
-    /// `initialize_rope` → `YarnRoPE`. GPT-OSS's config omits `mscale`/
-    /// `mscale_all_dim`, so the reference defaults (1.0 / 0.0) apply — which still
-    /// yields a non-trivial `mscale` for factor > 1.
-    fn yarn_rope(&self) -> Option<YarnRope> {
-        let rs = self.rope_scaling.as_ref()?;
-        if rs.rope_type != "yarn" {
-            return None;
-        }
-        Some(build_yarn_rope(
+    /// The rotary embedding `rope_scaling` describes: YaRN with gpt-oss's
+    /// `truncate: false` and the attention factor `0.1 ln(factor) + 1` on q
+    /// and k. A config with no rope dict at all gets the one transformers'
+    /// `GptOssConfig` fills in (YaRN, factor 32 over 4096, `truncate: false`);
+    /// an unknown `rope_type` is an error naming it.
+    pub fn rotary(&self) -> Result<RotaryEmbedding, Exception> {
+        let rope_scaling = match &self.rope_scaling {
+            Some(rs) => serde_json::to_value(rs)
+                .map_err(|e| Exception::custom(format!("gpt_oss rope_scaling: {e}")))?,
+            None => pmetal_bridge::gpt_oss_native::default_rope_scaling(),
+        };
+        crate::common::rotary_embedding(
+            &self.model_type,
             self.head_dim,
-            self.rope_theta,
-            rs.factor,
-            rs.original_max_position_embeddings,
-            rs.beta_fast,
-            rs.beta_slow,
+            RopeConfig {
+                rope_scaling: Some(&rope_scaling),
+                rope_theta: Some(self.rope_theta as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                ..RopeConfig::default()
+            },
             1.0,
-            0.0,
-        ))
+            false,
+        )
     }
 
     /// Get the effective max position embeddings considering RoPE scaling.
@@ -309,7 +313,7 @@ impl GptOssConfig {
                 original_max_position_embeddings: 4096,
                 beta_fast: 32.0,
                 beta_slow: 1.0,
-                truncate: false,
+                truncate: Some(false),
             }),
             attention_bias: true,
             attention_dropout: 0.0,
@@ -354,8 +358,6 @@ pub struct GptOssAttention {
     head_dim: i32,
     /// Attention scale.
     scale: f32,
-    /// RoPE theta.
-    rope_theta: f32,
     /// Sliding window size (for sliding attention layers).
     sliding_window: i32,
     /// Attention type for this layer.
@@ -372,9 +374,8 @@ pub struct GptOssAttention {
     /// denominator as a valueless virtual key (GPT-OSS); loaded from the
     /// checkpoint's `self_attn.sinks`, zero-initialised otherwise.
     pub sinks: Param<Array>,
-    /// Precomputed YARN rotary state (per-dim inverse frequencies + embedding
-    /// mscale); `None` when `rope_scaling` is absent or not `"yarn"`.
-    yarn_rope: Option<YarnRope>,
+    /// The rotary embedding (YaRN on every released gpt-oss).
+    rotary: RotaryEmbedding,
 }
 impl_module_params!(GptOssAttention; q_proj, k_proj, v_proj, o_proj, sinks);
 
@@ -387,7 +388,7 @@ impl GptOssAttention {
         let hidden_size = config.hidden_size;
         let scale = (head_dim as f32).powf(-0.5);
         let attention_type = config.attention_type_at(layer_idx);
-        let yarn_rope = config.yarn_rope();
+        let rotary = config.rotary()?;
 
         // GPT-OSS uses attention bias
         let use_bias = config.attention_bias;
@@ -406,7 +407,6 @@ impl GptOssAttention {
             .build()?;
 
         Ok(Self {
-            rope_theta: config.rope_theta,
             sliding_window: config.sliding_window,
             attention_type,
             n_heads,
@@ -418,7 +418,7 @@ impl GptOssAttention {
             v_proj,
             o_proj,
             sinks: Param::new(Array::zeros_f32(&[n_heads])),
-            yarn_rope,
+            rotary,
         })
     }
 
@@ -449,22 +449,16 @@ impl GptOssAttention {
         let k = k.transpose_axes(&[0, 2, 1, 3]);
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE — YARN per-dim frequencies + embedding mscale when
-        // configured (real GPT-OSS uses yarn factor=32), else plain base RoPE.
+        // RoPE: YaRN's frequencies and attention factor (real gpt-oss is
+        // factor 32, `truncate: false`), split-half.
         let rope_positions = RopePositions::resolve(
             positions,
             cache
                 .as_ref()
                 .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
-        let (q, k) = apply_gpt_oss_rope(
-            &q,
-            &k,
-            self.head_dim,
-            self.rope_theta,
-            &self.yarn_rope,
-            rope_positions,
-        )?;
+        let q = rope_embedding(&q, rope_positions, &self.rotary);
+        let k = rope_embedding(&k, rope_positions, &self.rotary);
 
         // Configure attention based on layer type
         let mask_type = match self.attention_type {
@@ -600,37 +594,6 @@ fn router_topk_softmax(gate_logits: &Array, top_k: i32) -> (Array, Array) {
     let top_logits = gate_logits.take_along_axis(&top_indices, -1);
     let weights = ops::softmax_axis(&top_logits, -1);
     (top_indices, weights)
-}
-
-/// Apply GPT-OSS RoPE to q/k. When `yarn` is `Some`, uses YARN per-dimension
-/// inverse frequencies and scales q/k by the embedding `mscale` first (reference
-/// `YarnRoPE`); otherwise plain base RoPE. Split-half (`traditional=false`) in
-/// both cases. Shared by the base and LoRA attention paths.
-fn apply_gpt_oss_rope(
-    q: &Array,
-    k: &Array,
-    head_dim: i32,
-    rope_theta: f32,
-    yarn: &Option<YarnRope>,
-    rope_positions: RopePositions<'_>,
-) -> Result<(Array, Array), Exception> {
-    if let Some(yarn) = yarn {
-        let (qi, ki) = if yarn.mscale != 1.0 {
-            let m = Array::from_f32(yarn.mscale);
-            (q.multiply(&m), k.multiply(&m))
-        } else {
-            (q.clone(), k.clone())
-        };
-        Ok((
-            rope_with_inv_freq(&qi, rope_positions, &yarn.inv_freq, head_dim, false)?,
-            rope_with_inv_freq(&ki, rope_positions, &yarn.inv_freq, head_dim, false)?,
-        ))
-    } else {
-        Ok((
-            rope(q, rope_positions, head_dim, false, rope_theta, 1.0)?,
-            rope(k, rope_positions, head_dim, false, rope_theta, 1.0)?,
-        ))
-    }
 }
 
 /// GPT-OSS expert MLP with bias and SwiGLU clamping.
@@ -1435,6 +1398,35 @@ mod tests {
         assert_eq!(config.attention_type_at(1), AttentionType::FullAttention);
         assert_eq!(config.attention_type_at(2), AttentionType::SlidingAttention);
         assert_eq!(config.attention_type_at(3), AttentionType::FullAttention);
+    }
+
+    /// gpt-oss ships `truncate: false`, which the YaRN helper this replaced
+    /// ignored (it always rounded the correction range): 9 of the 32
+    /// frequencies move, by up to 43%. The typed config has to carry it to the shared parser,
+    /// and a config with no rope dict gets transformers' gpt-oss default.
+    #[test]
+    fn gpt_oss_yarn_keeps_truncate_false() {
+        use pmetal_bridge::rope::{RopeConfig, RopeScaling, Rotary};
+
+        let released = serde_json::json!({
+            "head_dim": 64, "rope_theta": 150000, "max_position_embeddings": 131072,
+            "rope_scaling": {"beta_fast": 32.0, "beta_slow": 1.0, "factor": 32.0,
+                "original_max_position_embeddings": 4096, "rope_type": "yarn", "truncate": false}
+        });
+        let want = Rotary::from_config(64, RopeConfig::from_json(&released), 1e4, 1.0).unwrap();
+        let RopeScaling::Yarn(yarn) = &want.scaling else {
+            panic!("yarn")
+        };
+        assert!(!yarn.truncate);
+
+        let preset = GptOssConfig::gpt_oss_20b().rotary().unwrap();
+        assert_eq!(preset.rotary(), &want);
+        let bare = GptOssConfig {
+            rope_scaling: None,
+            ..GptOssConfig::gpt_oss_20b()
+        };
+        assert_eq!(bare.rotary().unwrap().rotary(), &want);
+        assert!((preset.attention_factor() as f64 - (0.1 * 32f64.ln() + 1.0)).abs() < 1e-6);
     }
 
     #[test]

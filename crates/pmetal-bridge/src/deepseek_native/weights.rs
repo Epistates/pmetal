@@ -78,8 +78,8 @@ pub(super) struct LayerWeights {
     pub(super) v_head_dim: i32,
     pub(super) kv_lora_rank: i32,
     pub(super) scale: f32,
-    pub(super) rope_base: f32,
-    pub(super) rope_scale: f32,
+    /// Interleaved RoPE of `q_pe` / `k_pe`, YaRN included.
+    pub(super) rotary: crate::rope::RotaryEmbedding,
 
     // ── MLP / MoE ─────────────────────────────────────────────────────────
     pub(super) is_moe: bool,
@@ -297,9 +297,8 @@ pub fn load_model(
 
     let model_dtype = embed_w.dtype_raw();
 
-    let scale = config.attention_scale();
-    let rope_base = config.rope_base_f32();
-    let rope_scale = 1.0_f32;
+    let rotary = config.rotary()?;
+    let scale = config.attention_scale(&rotary);
 
     let mut layers = Vec::with_capacity(n_layers);
 
@@ -419,8 +418,7 @@ pub fn load_model(
             v_head_dim: config.v_head_dim,
             kv_lora_rank: config.kv_lora_rank,
             scale,
-            rope_base,
-            rope_scale,
+            rotary: rotary.clone(),
             is_moe,
             mlp_gate_w,
             mlp_up_w,
