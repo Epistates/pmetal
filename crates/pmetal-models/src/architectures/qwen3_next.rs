@@ -31,7 +31,7 @@ use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
 use pmetal_bridge::native_weight::LayerWeight;
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
-use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
+use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
 use pmetal_mlx::{
     gather_mm,
     kernels::{
@@ -3605,8 +3605,12 @@ pub struct Qwen3NextForCausalLM {
     pub config: Qwen3NextConfig,
     /// InlineArray weights for zero-overhead decode. Built lazily on first decode call.
     pub inline_weights: Option<super::qwen3_next_inline::InlineModelWeights>,
-    /// Persistent InlineArray cache — lives across decode steps, zero conversion overhead.
-    pub inline_cache: Option<super::qwen3_next_inline::InlineCache>,
+    /// InlineArray decode state, one per sequence being decoded, keyed by the
+    /// caller's `MambaCache`. It lives across decode steps (no conversion per
+    /// step) and takes over from the caller's caches, which the inline path
+    /// doesn't update. Keeping a single one made every sequence after the
+    /// first decode against the first one's state.
+    pub inline_caches: Vec<(SequenceKey, super::qwen3_next_inline::InlineCache)>,
 }
 impl_module_params!(Qwen3NextForCausalLM; model, lm_head);
 
@@ -3635,7 +3639,7 @@ impl Qwen3NextForCausalLM {
             lm_head,
             config,
             inline_weights: None,
-            inline_cache: None,
+            inline_caches: Vec::new(),
         })
     }
 
@@ -3689,19 +3693,34 @@ impl Qwen3NextForCausalLM {
                     }
                 }
             }
-            if let Some(ref weights) = self.inline_weights {
-                // Bootstrap InlineCache on first decode (from mlx-rs caches, called once)
-                if self.inline_cache.is_none() {
-                    eprintln!("[INLINE] Bootstrapping InlineCache from mlx-rs caches...");
-                    if let (Some(kv), Some(mb)) = (kv_cache.as_ref(), mamba_cache.as_ref()) {
-                        self.inline_cache =
-                            Some(super::qwen3_next_inline::InlineCache::from_caches(
+            if let (Some(weights), Some(kv), Some(mb)) = (
+                self.inline_weights.as_ref(),
+                kv_cache.as_ref(),
+                mamba_cache.as_ref(),
+            ) {
+                // This sequence's inline state, bootstrapped from its caches
+                // on its first decode step. Sequences that have finished
+                // (their cache dropped or reset) give theirs up.
+                self.inline_caches.retain(|(key, _)| key.is_live());
+                let slot = match self
+                    .inline_caches
+                    .iter()
+                    .position(|(key, _)| key.belongs_to(mb))
+                {
+                    Some(slot) => slot,
+                    None => {
+                        tracing::debug!("[INLINE] Bootstrapping InlineCache from mlx-rs caches");
+                        self.inline_caches.push((
+                            mb.sequence_key(),
+                            super::qwen3_next_inline::InlineCache::from_caches(
                                 kv,
                                 mb,
                                 &weights.layers,
-                            ));
+                            ),
+                        ));
+                        self.inline_caches.len() - 1
                     }
-                }
+                };
 
                 // Pure InlineArray decode. From here on the InlineCache owns
                 // the decode state; `kv_cache` / `mamba_cache` are not updated.
@@ -3709,7 +3728,7 @@ impl Qwen3NextForCausalLM {
                 let logits = super::qwen3_next_inline::inline_decode_step_pure(
                     weights,
                     &token,
-                    self.inline_cache.as_mut().unwrap(),
+                    &mut self.inline_caches[slot].1,
                 );
                 return Ok(super::qwen3_next_inline::ia_to_array(&logits));
             }

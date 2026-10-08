@@ -1,5 +1,7 @@
 //! Mamba SSM state cache for hybrid architectures.
 
+use std::sync::{Arc, Weak};
+
 use pmetal_bridge::compat::{Array, Exception, ops};
 
 use crate::array_ext::ArrayDtypeExt;
@@ -13,11 +15,48 @@ use crate::kernels::gated_delta_state_advance;
 ///
 /// Without this cache, each generated token is processed without context from
 /// previous tokens through Mamba layers, producing incoherent output.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MambaCache {
     /// Per-layer cache entries.
     /// Each entry is (conv_state, ssm_state) where both may be None initially.
     layers: Vec<MambaCacheEntry>,
+    /// The sequence this state belongs to; see [`SequenceKey`].
+    sequence: Arc<()>,
+}
+
+/// A clone holds the same state but is a different sequence from then on, so
+/// it gets its own [`SequenceKey`].
+impl Clone for MambaCache {
+    fn clone(&self) -> Self {
+        Self {
+            layers: self.layers.clone(),
+            sequence: Arc::new(()),
+        }
+    }
+}
+
+/// Names the sequence a [`MambaCache`] holds state for, without keeping it
+/// alive.
+///
+/// A model that keeps decode state of its own beside the caller's caches has
+/// to keep one per sequence, or a second sequence decodes against the first
+/// one's state. It keys that state with the cache's `SequenceKey`, finds it
+/// again with [`belongs_to`](Self::belongs_to), and drops it once
+/// [`is_live`](Self::is_live) says the cache is gone or was
+/// [reset](MambaCache::reset).
+#[derive(Debug, Clone)]
+pub struct SequenceKey(Weak<()>);
+
+impl SequenceKey {
+    /// Whether this is the sequence `cache` currently holds.
+    pub fn belongs_to(&self, cache: &MambaCache) -> bool {
+        std::ptr::eq(self.0.as_ptr(), Arc::as_ptr(&cache.sequence))
+    }
+
+    /// Whether the cache this names still exists and hasn't been reset.
+    pub fn is_live(&self) -> bool {
+        self.0.strong_count() > 0
+    }
 }
 
 /// Cache entry for a single Mamba layer.
@@ -75,7 +114,15 @@ impl MambaCache {
         let layers = (0..num_layers)
             .map(|_| MambaCacheEntry::default())
             .collect();
-        Self { layers }
+        Self {
+            layers,
+            sequence: Arc::new(()),
+        }
+    }
+
+    /// The key naming the sequence this cache holds; see [`SequenceKey`].
+    pub fn sequence_key(&self) -> SequenceKey {
+        SequenceKey(Arc::downgrade(&self.sequence))
     }
 
     /// Number of layers tracked by this cache.
@@ -93,12 +140,14 @@ impl MambaCache {
         self.layers.get(layer_idx)
     }
 
-    /// Reset all cache entries to None.
+    /// Reset all cache entries to None. What follows is a new sequence, with
+    /// a new [`SequenceKey`].
     pub fn reset(&mut self) {
         for entry in &mut self.layers {
             entry.conv_state = None;
             entry.ssm_state = None;
         }
+        self.sequence = Arc::new(());
     }
 
     /// Check if the cache is empty (no state stored).

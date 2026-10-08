@@ -1545,6 +1545,31 @@ fn gdn_random_inputs(
     (k, v, g, beta)
 }
 
+/// Each cache, clone and reset is its own sequence, and a key outlives
+/// neither the cache it names nor a reset.
+#[test]
+fn test_mamba_sequence_key_names_one_sequence() {
+    let mut a = MambaCache::new(2);
+    let b = MambaCache::new(2);
+    let key = a.sequence_key();
+    assert!(key.belongs_to(&a) && key.is_live());
+    assert!(!key.belongs_to(&b));
+
+    let clone = a.clone();
+    assert!(!key.belongs_to(&clone), "a clone is a new sequence");
+
+    a.reset();
+    assert!(!key.belongs_to(&a), "a reset starts a new sequence");
+    assert!(!key.is_live());
+
+    let key = a.sequence_key();
+    drop(a);
+    assert!(!key.is_live());
+    // The dead key's allocation is still held, so no new cache can reuse it.
+    let c = MambaCache::new(2);
+    assert!(!key.belongs_to(&c));
+}
+
 #[test]
 fn test_mamba_snapshot_and_restore_roundtrip() {
     let mut cache = MambaCache::new(2);
