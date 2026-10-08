@@ -827,10 +827,10 @@ impl KVCache {
         self.config.num_layers * bytes_per_layer
     }
 
-    /// Fetch cached keys/values for a layer (for compiled decode).
+    /// Fetch cached keys/values for a layer, for a decode path that keeps
+    /// its own copy of the cache.
     ///
     /// Returns the current cached keys/values up to the current offset.
-    /// The compiled closure will concatenate new K/V and return the full result.
     pub fn fetch_for_compiled_decode(&self, layer_idx: usize) -> Result<(Array, Array), Exception> {
         let cache = &self.layer_caches[layer_idx];
         if let (Some(k), Some(v)) = (&cache.keys, &cache.values) {
@@ -855,54 +855,6 @@ impl KVCache {
                 "KV cache for layer {layer_idx} not initialized — run prefill first"
             )))
         }
-    }
-
-    /// Update cache from compiled decode outputs.
-    ///
-    /// The compiled closure returns full_keys/full_values (old + new concatenated).
-    /// We just replace the cache contents with these.
-    pub fn update_from_compiled_decode(
-        &mut self,
-        layer_idx: usize,
-        full_keys: &Array,
-        full_values: &Array,
-    ) -> Result<(), Exception> {
-        let cache = &mut self.layer_caches[layer_idx];
-        let new_seq_len = full_keys.dim(2) as usize;
-
-        // Ensure buffer is large enough
-        let needs_growth = cache.keys.is_none() || {
-            let allocated = cache.keys.as_ref().unwrap().dim(2) as usize;
-            new_seq_len > allocated
-        };
-        if needs_growth {
-            // Just store the full arrays directly
-            cache.keys = Some(full_keys.clone());
-            cache.values = Some(full_values.clone());
-        } else {
-            // In-place update into pre-allocated buffer
-            let k_buf = cache.keys.take().unwrap();
-            let v_buf = cache.values.take().unwrap();
-            let kb = k_buf.dim(0) as usize;
-            let kh = k_buf.dim(1) as usize;
-            let kd = k_buf.dim(3) as usize;
-            let vd = v_buf.dim(3) as usize;
-            cache.keys = Some(k_buf.slice_set(
-                full_keys,
-                &[0, 0, 0, 0],
-                &[kb as i32, kh as i32, new_seq_len as i32, kd as i32],
-            ));
-            cache.values = Some(v_buf.slice_set(
-                full_values,
-                &[0, 0, 0, 0],
-                &[kb as i32, kh as i32, new_seq_len as i32, vd as i32],
-            ));
-        }
-        cache.offset = new_seq_len;
-        if layer_idx == 0 {
-            self.total_tokens = new_seq_len;
-        }
-        Ok(())
     }
 }
 
