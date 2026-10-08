@@ -26,6 +26,7 @@ pub mod pixtral;
 pub mod qwen2;
 pub mod qwen2_vl;
 pub mod qwen3;
+pub mod qwen3_5_vision;
 pub mod qwen3_moe;
 pub mod qwen3_next;
 pub mod qwen3_next_inline;
