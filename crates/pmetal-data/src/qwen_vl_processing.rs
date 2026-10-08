@@ -27,7 +27,9 @@
 //! [`expand_placeholders`] turns each `<|image_pad|>` / `<|video_pad|>` in a
 //! prompt into the run of tokens the vision tower's output fills.
 
-use std::path::Path;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 /// The decoded-image type every function here takes, re-exported so callers
@@ -448,25 +450,76 @@ impl QwenVlProcessor {
 
     /// Preprocess one video.
     pub fn preprocess_video(&self, video: &VideoFrames) -> Result<ProcessedMedia> {
-        let config = &self.video;
         let first = video
             .frames
             .first()
             .ok_or_else(|| invalid("video has no frames"))?;
-        let (height, width) = (first.height() as usize, first.width() as usize);
-        if video
-            .frames
-            .iter()
-            .any(|f| (f.height() as usize, f.width() as usize) != (height, width))
-        {
+        let size = first.dimensions();
+        if video.frames.iter().any(|f| f.dimensions() != size) {
             return Err(invalid("every frame of a video must be the same size"));
         }
-        if let Some(fps) = video.fps
+        self.preprocess_sampled_video(video.frames.len(), video.fps, size, |i| {
+            Ok(Cow::Borrowed(&video.frames[i]))
+        })
+    }
+
+    /// Preprocess one video given as image files, one per frame in order,
+    /// at `fps` frames per second (`None` for the reference's 24). Only the
+    /// frames the sampling keeps are decoded; the others' sizes are read from
+    /// their headers.
+    pub fn preprocess_video_files(
+        &self,
+        frames: &[PathBuf],
+        fps: Option<f64>,
+    ) -> Result<ProcessedMedia> {
+        let dimensions = |path: &PathBuf| {
+            image::image_dimensions(path).map_err(|e| invalid(format!("{}: {e}", path.display())))
+        };
+        let first = frames
+            .first()
+            .ok_or_else(|| invalid("video has no frames"))?;
+        let size = dimensions(first)?;
+        for path in &frames[1..] {
+            let other = dimensions(path)?;
+            if other != size {
+                return Err(invalid(format!(
+                    "every frame of a video must be the same size: {} is {}x{}, {} is {}x{}",
+                    first.display(),
+                    size.0,
+                    size.1,
+                    path.display(),
+                    other.0,
+                    other.1
+                )));
+            }
+        }
+        self.preprocess_sampled_video(frames.len(), fps, size, |i| {
+            let path = &frames[i];
+            let bytes =
+                std::fs::read(path).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+            decode_image(&bytes)
+                .map(Cow::Owned)
+                .map_err(|e| invalid(format!("{}: {e}", path.display())))
+        })
+    }
+
+    /// Sample a video of `total` frames, each `size` (width, height), and
+    /// preprocess the frames kept; `frame(i)` hands over frame `i`.
+    fn preprocess_sampled_video<'a>(
+        &self,
+        total: usize,
+        fps: Option<f64>,
+        size: (u32, u32),
+        mut frame: impl FnMut(usize) -> Result<Cow<'a, RgbImage>>,
+    ) -> Result<ProcessedMedia> {
+        let config = &self.video;
+        if let Some(fps) = fps
             && !(fps.is_finite() && fps > 0.0)
         {
             return Err(invalid(format!("video fps must be positive, got {fps}")));
         }
-        let indices = self.sample_frame_indices(video.frames.len(), video.fps);
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let indices = self.sample_frame_indices(total, fps);
         let (h, w) = if config.do_resize {
             smart_resize_video(
                 indices.len(),
@@ -482,15 +535,17 @@ impl QwenVlProcessor {
         let planes: Vec<Vec<f32>> = indices
             .iter()
             .map(|&i| {
-                let frame = &video.frames[i];
-                let resized = if config.do_resize {
-                    resize(frame, h, w, config.resample)
+                let frame = frame(i)?;
+                if frame.dimensions() != size {
+                    return Err(invalid("every frame of a video must be the same size"));
+                }
+                Ok(if config.do_resize {
+                    normalize(&resize(&frame, h, w, config.resample), config)
                 } else {
-                    frame.clone()
-                };
-                normalize(&resized, config)
+                    normalize(&frame, config)
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
         // Pad to whole temporal groups with the last frame.
         let mut frames: Vec<&Vec<f32>> = planes.iter().collect();
         while frames.len() % config.temporal_patch_size != 0 {
@@ -503,7 +558,7 @@ impl QwenVlProcessor {
             grid_thw: [grid_t, grid_h, grid_w],
             timestamps: timestamps(
                 &indices,
-                video.fps.unwrap_or(DEFAULT_VIDEO_FPS),
+                fps.unwrap_or(DEFAULT_VIDEO_FPS),
                 config.temporal_patch_size,
             ),
             frame_indices: indices,
@@ -636,6 +691,18 @@ fn patchify(
 // Prompt placeholders
 // ---------------------------------------------------------------------------
 
+/// One `<|vision_start|><|image_pad|><|vision_end|>` per image, then one
+/// with `<|video_pad|>` per video: what the chat template renders for media
+/// items, and what [`expand_placeholders`] expands.
+pub fn media_placeholders(images: usize, videos: usize) -> String {
+    let wrap = |pad: &str| format!("{VISION_START}{pad}{VISION_END}");
+    format!(
+        "{}{}",
+        wrap(IMAGE_PAD).repeat(images),
+        wrap(VIDEO_PAD).repeat(videos)
+    )
+}
+
 /// What `<|image_pad|>` becomes for this image.
 pub fn image_replacement(media: &ProcessedMedia, merge_size: usize) -> String {
     IMAGE_PAD.repeat(media.num_tokens(merge_size))
@@ -760,6 +827,85 @@ fn decode_base64(data: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+// ---------------------------------------------------------------------------
+// Video sources
+// ---------------------------------------------------------------------------
+
+/// The frames of a video given as a directory of images: its image files
+/// (by extension; hidden files skipped), in natural file-name order, so
+/// `frame2.png` comes before `frame10.png`. Video files are not decoded.
+pub fn video_frame_paths(dir: &Path) -> Result<Vec<PathBuf>> {
+    if dir.is_file() {
+        return Err(invalid(format!(
+            "{}: video files are not decoded; extract the frames into a directory and pass \
+             that, with their frame rate",
+            dir.display()
+        )));
+    }
+    let entries = std::fs::read_dir(dir).map_err(|e| invalid(format!("{}: {e}", dir.display())))?;
+    let mut frames = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| invalid(format!("{}: {e}", dir.display())))?
+            .path();
+        let hidden = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| name.starts_with('.'));
+        if !hidden && path.is_file() && image::ImageFormat::from_path(&path).is_ok() {
+            frames.push(path);
+        }
+    }
+    if frames.is_empty() {
+        return Err(invalid(format!(
+            "{} has no image files to use as video frames",
+            dir.display()
+        )));
+    }
+    frames.sort_by(|a, b| {
+        natural_cmp(
+            &a.file_name().unwrap_or_default().to_string_lossy(),
+            &b.file_name().unwrap_or_default().to_string_lossy(),
+        )
+    });
+    Ok(frames)
+}
+
+/// Compare names with each run of digits read as a number.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let digits = |s: &str| s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a.chars().next(), b.chars().next()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let (run_a, run_b) = (digits(a), digits(b));
+                let (num_a, num_b) = (
+                    a[..run_a].trim_start_matches('0'),
+                    b[..run_b].trim_start_matches('0'),
+                );
+                let order = num_a
+                    .len()
+                    .cmp(&num_b.len())
+                    .then_with(|| num_a.cmp(num_b))
+                    .then_with(|| run_a.cmp(&run_b));
+                if order != Ordering::Equal {
+                    return order;
+                }
+                (a, b) = (&a[run_a..], &b[run_b..]);
+            }
+            (Some(x), Some(y)) => {
+                if x != y {
+                    return x.cmp(&y);
+                }
+                (a, b) = (&a[x.len_utf8()..], &b[y.len_utf8()..]);
+            }
+        }
+    }
+}
+
 fn truncate_for_error(source: &str) -> String {
     const LIMIT: usize = 64;
     match source.char_indices().nth(LIMIT) {
@@ -777,6 +923,30 @@ mod tests {
             shortest_edge: min,
             longest_edge: max,
         }
+    }
+
+    #[test]
+    fn frame_names_sort_naturally() {
+        let mut names = vec![
+            "frame10.png",
+            "frame2.png",
+            "frame1.png",
+            "frame002.png",
+            "a.png",
+            "frame.png",
+        ];
+        names.sort_by(|a, b| natural_cmp(a, b));
+        assert_eq!(
+            names,
+            [
+                "a.png",
+                "frame.png",
+                "frame1.png",
+                "frame2.png",
+                "frame002.png",
+                "frame10.png"
+            ]
+        );
     }
 
     #[test]

@@ -33,6 +33,15 @@ pmetal infer \
   --model Qwen/Qwen3-0.6B \
   --tools tools.json --chat
 
+# Images and videos (Qwen3.5-family vision models)
+pmetal infer --model Qwen/Qwen3.5-0.8B --image photo.jpg \
+  --prompt "What is in this picture?" --chat
+
+# A video is a directory of its frames; extract them first, for example
+# `ffmpeg -i clip.mp4 -vf fps=4 frames/%04d.png`, and give their rate
+pmetal infer --model Qwen/Qwen3.5-0.8B --video frames/ --video-fps 4 \
+  --prompt "Describe what happens in this video." --chat
+
 # Inference on the Apple Neural Engine
 pmetal infer --model Qwen/Qwen3-4B --backend ane --ane-max-seq-len 2048 --chat
 
@@ -82,6 +91,9 @@ pmetal infer \
 | `--model` | *required* | HuggingFace model ID or local path |
 | `--prompt` | — | Input prompt (omit for stdin) |
 | `--lora` | — | Path to LoRA adapter weights |
+| `--image` | — | Image file to show a Qwen3.5-family vision model, before the prompt (repeatable) |
+| `--video` | — | Directory of a video's frames to show a Qwen3.5-family vision model, after the images (repeatable). The frames are its image files in natural file-name order (`frame2.png` before `frame10.png`); video files are not decoded |
+| `--video-fps` | `24` | Frame rate of the `--video` frames. They are sampled to the checkpoint's rate (2 per second in the released configs) and time-stamped in the prompt |
 | `--draft-model` | — | Gemma 4 MTP assistant model for exact speculative decoding |
 | `--mtp` | off | Enable bundled Qwen3Next/Qwen3.6 MTP exact speculative decoding |
 | `--mtp-model` | bundled `mtp.*` in `--model` | Optional external Qwen MTP checkpoint directory |

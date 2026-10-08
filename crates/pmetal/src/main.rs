@@ -1827,6 +1827,8 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 lora,
                 prompt,
                 image,
+                video,
+                video_fps,
                 max_tokens,
                 temperature,
                 top_k,
@@ -1938,6 +1940,8 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 detect_repetition,
                 experts_dir.as_deref(),
                 &image,
+                &video,
+                video_fps,
             )
             .await?;
         }
@@ -3048,6 +3052,34 @@ mod argv_roundtrip {
             "InferSpec argv failed to parse: {}",
             result.unwrap_err()
         );
+    }
+
+    #[test]
+    fn infer_video_flags_parse() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "--model".to_string(),
+                "m".into(),
+                "--prompt".into(),
+                "p".into(),
+            ];
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            try_parse("infer", argv)
+        };
+        match parse(&["--video", "a", "--video", "b", "--video-fps", "2.5"]) {
+            Ok(Commands::Infer(args)) => {
+                assert_eq!(args.video, ["a", "b"]);
+                assert_eq!(args.video_fps, Some(2.5));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&["--video-fps", "2"]).is_err(), "fps without a video");
+        for fps in ["0", "-1", "inf", "NaN", "two"] {
+            assert!(
+                parse(&["--video", "a", "--video-fps", fps]).is_err(),
+                "{fps}"
+            );
+        }
     }
 
     /// `--backend` is the one way to pick a generation path: the spec, the

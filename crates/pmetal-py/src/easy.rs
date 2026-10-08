@@ -664,6 +664,7 @@ fn run_infer(py: Python<'_>, opts: InferOptions) -> PyResult<InferRunResult> {
                 no_thinking: opts.no_thinking,
                 tools: None,
                 images: Vec::new(),
+                videos: Vec::new(),
                 temperature: Some(opts.temperature),
                 top_k: opts.top_k,
                 top_p: opts.top_p,

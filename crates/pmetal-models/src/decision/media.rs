@@ -60,19 +60,10 @@ pub fn has_media(record: &Map<String, Value>) -> bool {
 /// The prompt text the reference gives the processor for this many images and
 /// videos: each one's placeholder, then a newline.
 pub fn placeholder_text(images: usize, videos: usize) -> String {
-    let image = format!(
-        "{}{}{}",
-        qwen_vl_processing::VISION_START,
-        qwen_vl_processing::IMAGE_PAD,
-        qwen_vl_processing::VISION_END
-    );
-    let video = format!(
-        "{}{}{}",
-        qwen_vl_processing::VISION_START,
-        qwen_vl_processing::VIDEO_PAD,
-        qwen_vl_processing::VISION_END
-    );
-    format!("{}{}\n", image.repeat(images), video.repeat(videos))
+    format!(
+        "{}\n",
+        qwen_vl_processing::media_placeholders(images, videos)
+    )
 }
 
 /// Decode a record's `images` and `videos`.

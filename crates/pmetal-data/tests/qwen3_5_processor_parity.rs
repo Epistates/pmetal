@@ -32,7 +32,7 @@ use pmetal_bridge::compat::Array;
 use pmetal_data::pillow_resample::{ResampleFilter, resize_rgb8_torchvision};
 use pmetal_data::qwen_vl_processing::{
     PixelBudget, ProcessedMedia, QwenVlProcessor, QwenVlProcessorConfig, VideoFrames,
-    expand_placeholders, smart_resize, smart_resize_video,
+    expand_placeholders, smart_resize, smart_resize_video, video_frame_paths,
 };
 use pmetal_mlx::test_utils::to_f32_vec_eval;
 use serde_json::Value;
@@ -248,6 +248,65 @@ fn videos_match_the_reference_processor() {
         let (want, _) = fx.floats(&format!("video_{name}_pixel_values"));
         assert_pixels_equal(name, &got, &want);
     }
+}
+
+/// The same videos as a directory of PNG frames, `frame1.png` to
+/// `frameN.png` unpadded, beside a hidden file and a non-image: read in
+/// natural order and decoded only where sampled, they still match exactly.
+#[test]
+fn videos_from_frame_directories_match_the_reference_processor() {
+    let fx = fixture();
+    let processor = released_processor();
+    for case in fx.meta["video_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let fps = case["fps"].as_f64();
+        let frames = fx.frames(&format!("video_{name}_frames"));
+        let dir = tempfile::tempdir().unwrap();
+        for (i, frame) in frames.iter().enumerate() {
+            frame
+                .save(dir.path().join(format!("frame{}.png", i + 1)))
+                .unwrap();
+        }
+        std::fs::write(dir.path().join("._frame1.png"), b"not an image").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"not a frame").unwrap();
+
+        let paths = video_frame_paths(dir.path()).unwrap();
+        assert_eq!(paths.len(), frames.len(), "{name}: frame count");
+        let got = processor.preprocess_video_files(&paths, fps).unwrap();
+        let want = processor
+            .preprocess_video(&VideoFrames { frames, fps })
+            .unwrap();
+        assert_eq!(
+            got.frame_indices, want.frame_indices,
+            "{name}: sampled frames"
+        );
+        assert_eq!(got.grid_thw, want.grid_thw, "{name}: grid");
+        assert_eq!(got.timestamps, want.timestamps, "{name}: timestamps");
+        let (reference, _) = fx.floats(&format!("video_{name}_pixel_values"));
+        assert_pixels_equal(name, &got, &reference);
+    }
+}
+
+#[test]
+fn frame_directories_refuse_what_they_cannot_use() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(video_frame_paths(dir.path()).is_err(), "no frames");
+    let clip = dir.path().join("clip.mp4");
+    std::fs::write(&clip, b"").unwrap();
+    assert!(video_frame_paths(&clip).is_err(), "a video file");
+    assert!(video_frame_paths(dir.path()).is_err(), "no image files");
+
+    for (name, size) in [("a.png", 4), ("b.png", 6)] {
+        RgbImage::new(size, size)
+            .save(dir.path().join(name))
+            .unwrap();
+    }
+    let paths = video_frame_paths(dir.path()).unwrap();
+    let error = released_processor()
+        .preprocess_video_files(&paths, None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("same size"), "{error}");
 }
 
 #[test]

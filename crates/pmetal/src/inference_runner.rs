@@ -40,6 +40,17 @@ use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
 #[cfg(feature = "lora")]
 use pmetal_models::generate_qwen3_next_mtp_streaming_rebuild;
 
+/// A video given as a directory of its frames.
+#[derive(Clone, Debug)]
+pub struct VideoInput {
+    /// The directory's image files are the frames, in natural file-name
+    /// order ([`pmetal_data::qwen_vl_processing::video_frame_paths`]).
+    pub frames_dir: PathBuf,
+    /// The frames' rate, used to sample them and time-stamp them in the
+    /// prompt; `None` assumes 24 as the reference does.
+    pub fps: Option<f64>,
+}
+
 /// Configuration for preparing an inference run.
 ///
 /// All sampling fields are `Option` — `None` means "use model's
@@ -84,6 +95,9 @@ pub struct InferenceRunnerConfig {
     /// placeholder ahead of the prompt text, where the chat template would
     /// put an image item that precedes the text.
     pub images: Vec<PathBuf>,
+    /// Videos to show a Qwen3.5-family vision model, in order, after the
+    /// images and before the prompt text.
+    pub videos: Vec<VideoInput>,
 
     // ── Sampling ─────────────────────────────────────────────────────────
     pub temperature: Option<f32>,
@@ -153,6 +167,7 @@ impl Default for InferenceRunnerConfig {
             no_thinking: false,
             tools: None,
             images: Vec::new(),
+            videos: Vec::new(),
             temperature: None,
             top_k: None,
             top_p: None,
@@ -234,7 +249,9 @@ pub struct InferenceGenState {
     /// Enable n-gram repetition loop detection (opt-in).
     detect_repetition: bool,
     /// Preprocessed images the prompt's image tokens stand for.
-    media: Vec<ProcessedMedia>,
+    images: Vec<ProcessedMedia>,
+    /// Preprocessed videos the prompt's video tokens stand for.
+    videos: Vec<ProcessedMedia>,
 }
 
 impl InferenceGenState {
@@ -261,17 +278,17 @@ impl InferenceRunner {
     /// 11. Create Mamba cache (for hybrid models)
     pub fn prepare(mut config: InferenceRunnerConfig) -> Result<Self, Exception> {
         let images = std::mem::take(&mut config.images);
-        if !images.is_empty() {
-            // One `<|vision_start|><|image_pad|><|vision_end|>` per image, ahead
-            // of the text: what the chat template renders for image items
-            // before a text item, and the processor's input otherwise.
-            let placeholder = format!(
-                "{}{}{}",
-                pmetal_data::qwen_vl_processing::VISION_START,
-                pmetal_data::qwen_vl_processing::IMAGE_PAD,
-                pmetal_data::qwen_vl_processing::VISION_END
+        let videos = std::mem::take(&mut config.videos);
+        let has_media = !images.is_empty() || !videos.is_empty();
+        if has_media {
+            // The images' and then the videos' placeholders ahead of the
+            // text: what the chat template renders for media items before a
+            // text item, and the processor's input otherwise.
+            config.prompt = format!(
+                "{}{}",
+                pmetal_data::qwen_vl_processing::media_placeholders(images.len(), videos.len()),
+                config.prompt
             );
-            config.prompt = format!("{}{}", placeholder.repeat(images.len()), config.prompt);
         }
         let model_path = &config.model_path;
         if config.qwen_mtp && config.mtp_assistant_path.is_some() {
@@ -321,7 +338,7 @@ impl InferenceRunner {
             None
         };
         let native_bridge_candidate = native_bridge_info.is_some();
-        let multimodal = if images.is_empty() {
+        let multimodal = if !has_media {
             None
         } else {
             if mtp_requested
@@ -329,11 +346,30 @@ impl InferenceRunner {
                     .is_some_and(|info| info.arch == crate::native_inference::NativeArch::Qwen3_5)
             {
                 return Err(Exception::custom(
-                    "images need a Qwen3.5-family vision model on the native engine (no LoRA, \
-                     FP8, expert offload or MTP)",
+                    "images and videos need a Qwen3.5-family vision model on the native engine \
+                     (no LoRA, FP8, expert offload or MTP)",
                 ));
             }
             Some(Qwen3_5MultimodalConfig::from_model_dir(model_path)?)
+        };
+        // The media are preprocessed before the prompt is tokenized: a
+        // video's placeholder expands to text as well as tokens (each frame's
+        // timestamp), so placeholders are expanded in the prompt text.
+        let (image_media, video_media) = match &multimodal {
+            None => (Vec::new(), Vec::new()),
+            Some(multimodal) => preprocess_media(model_path, multimodal, &images, &videos)?,
+        };
+        let expand_media = |text: String| -> Result<String, Exception> {
+            match &multimodal {
+                None => Ok(text),
+                Some(multimodal) => pmetal_data::qwen_vl_processing::expand_placeholders(
+                    &text,
+                    &image_media,
+                    &video_media,
+                    multimodal.vision.spatial_merge_size,
+                )
+                .map_err(|e| Exception::custom(e.to_string())),
+            }
         };
 
         // 4. Prime the Metal runtime before MLX model construction. The stable
@@ -375,9 +411,11 @@ impl InferenceRunner {
                 &config.prompt,
             );
 
-            let formatted = detected
-                .apply_inference(&messages, no_thinking, config.tools.as_deref())
-                .text;
+            let formatted = expand_media(
+                detected
+                    .apply_inference(&messages, no_thinking, config.tools.as_deref())
+                    .text,
+            )?;
 
             let ids = tokenizer
                 .encode_with_special_tokens(&formatted)
@@ -399,35 +437,9 @@ impl InferenceRunner {
                 config.prompt.clone()
             };
             let ids = tokenizer
-                .encode(&prompt_text)
+                .encode(&expand_media(prompt_text)?)
                 .map_err(|e| Exception::custom(e.to_string()))?;
             (ids, None)
-        };
-
-        let (input_ids, media) = match &multimodal {
-            None => (input_ids, Vec::new()),
-            Some(multimodal) => {
-                let processor = QwenVlProcessor::from_model_dir(model_path)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let media = images
-                    .iter()
-                    .map(|path| {
-                        let image = pmetal_data::qwen_vl_processing::load_image_source(
-                            &path.to_string_lossy(),
-                        )
-                        .and_then(|image| processor.preprocess_image(&image))
-                        .map_err(|e| Exception::custom(format!("{}: {e}", path.display())))?;
-                        tracing::info!(
-                            image = %path.display(),
-                            grid = ?image.grid_thw,
-                            tokens = image.num_tokens(multimodal.vision.spatial_merge_size),
-                            "Image preprocessed"
-                        );
-                        Ok(image)
-                    })
-                    .collect::<Result<Vec<_>, Exception>>()?;
-                (multimodal.expand_image_tokens(&input_ids, &media)?, media)
-            }
         };
 
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
@@ -758,7 +770,8 @@ impl InferenceRunner {
                 model_path: config.model_path.clone(),
                 last_decode_metrics: None,
                 detect_repetition: config.detect_repetition,
-                media,
+                images: image_media,
+                videos: video_media,
             },
             chat_template_type: template_type,
             is_chat: use_chat,
@@ -954,7 +967,7 @@ impl InferenceGenState {
             };
             let on_native_token =
                 |token| forward_native_token(&stop_tokens, &mut on_token_guarded, token);
-            let output = if self.media.is_empty() {
+            let output = if self.images.is_empty() && self.videos.is_empty() {
                 crate::native_inference::run_native_inference_ext(
                     &self.model_path,
                     &self.input_ids,
@@ -968,8 +981,8 @@ impl InferenceGenState {
                 crate::native_inference::run_native_multimodal_inference_ext(
                     &self.model_path,
                     &self.input_ids,
-                    &self.media,
-                    &[],
+                    &self.images,
+                    &self.videos,
                     self.gen_config.max_new_tokens,
                     sampling_params,
                     self.native_turboquant,
@@ -1265,6 +1278,53 @@ fn build_benchmark_prompt(prompt_tokens: usize, vocab_size: usize, seed: u64) ->
         out.push(sample as u32);
     }
     out
+}
+
+/// Preprocess a prompt's images and videos with the checkpoint's processor.
+fn preprocess_media(
+    model_path: &Path,
+    multimodal: &Qwen3_5MultimodalConfig,
+    images: &[PathBuf],
+    videos: &[VideoInput],
+) -> Result<(Vec<ProcessedMedia>, Vec<ProcessedMedia>), Exception> {
+    let processor = QwenVlProcessor::from_model_dir(model_path)
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    let merge = multimodal.vision.spatial_merge_size;
+    let images = images
+        .iter()
+        .map(|path| {
+            let image = pmetal_data::qwen_vl_processing::load_image_source(&path.to_string_lossy())
+                .and_then(|image| processor.preprocess_image(&image))
+                .map_err(|e| Exception::custom(format!("{}: {e}", path.display())))?;
+            tracing::info!(
+                image = %path.display(),
+                grid = ?image.grid_thw,
+                tokens = image.num_tokens(merge),
+                "Image preprocessed"
+            );
+            Ok(image)
+        })
+        .collect::<Result<Vec<_>, Exception>>()?;
+    let videos = videos
+        .iter()
+        .map(|video| {
+            let frames = pmetal_data::qwen_vl_processing::video_frame_paths(&video.frames_dir)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let processed = processor
+                .preprocess_video_files(&frames, video.fps)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            tracing::info!(
+                video = %video.frames_dir.display(),
+                frames = frames.len(),
+                sampled = processed.frame_indices.len(),
+                grid = ?processed.grid_thw,
+                tokens = processed.num_tokens(merge),
+                "Video preprocessed"
+            );
+            Ok(processed)
+        })
+        .collect::<Result<Vec<_>, Exception>>()?;
+    Ok((images, videos))
 }
 
 fn load_standard_model_for_inference(

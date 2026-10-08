@@ -310,6 +310,8 @@ pub(crate) async fn run_inference(
     detect_repetition: bool,
     experts_dir: Option<&str>,
     images: &[String],
+    videos: &[String],
+    video_fps: Option<f64>,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
     if ane {
@@ -344,9 +346,16 @@ pub(crate) async fn run_inference(
         }
     };
 
-    if !images.is_empty() {
-        // Images go through the native engine's multimodal prefill; every
-        // other generation path would ignore them.
+    if !images.is_empty() || !videos.is_empty() {
+        // Images and videos go through the native engine's multimodal
+        // prefill; every other generation path would ignore them.
+        let media = if videos.is_empty() {
+            "--image"
+        } else if images.is_empty() {
+            "--video"
+        } else {
+            "--image / --video"
+        };
         let other = [
             (benchmark, "--benchmark"),
             (profile_layers, "--profile-layers"),
@@ -361,7 +370,7 @@ pub(crate) async fn run_inference(
             (ane, "--ane / --backend ane"),
         ];
         if let Some((_, flag)) = other.iter().find(|(set, _)| *set) {
-            anyhow::bail!("--image cannot be combined with {flag}");
+            anyhow::bail!("{media} cannot be combined with {flag}");
         }
     }
 
@@ -441,6 +450,13 @@ pub(crate) async fn run_inference(
         no_thinking,
         tools: tools.map(|t| t.to_vec()),
         images: images.iter().map(std::path::PathBuf::from).collect(),
+        videos: videos
+            .iter()
+            .map(|dir| pmetal::inference_runner::VideoInput {
+                frames_dir: dir.into(),
+                fps: video_fps,
+            })
+            .collect(),
         temperature,
         top_k,
         top_p,

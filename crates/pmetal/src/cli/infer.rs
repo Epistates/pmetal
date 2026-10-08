@@ -2,6 +2,14 @@
 
 use clap::Args;
 
+/// A frame rate: a finite number above zero.
+fn parse_fps(value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(fps) if fps.is_finite() && fps > 0.0 => Ok(fps),
+        _ => Err(format!("{value} is not a frame rate above 0")),
+    }
+}
+
 /// Thin clap argument struct for `pmetal infer`.
 #[derive(Args, Debug)]
 pub struct InferArgs {
@@ -21,6 +29,18 @@ pub struct InferArgs {
     /// order). Qwen3.5-family vision models (Qwen3.5 / 3.6 / 3.8).
     #[arg(long = "image")]
     pub image: Vec<String>,
+
+    /// Directory of a video's frames to show the model, after the images
+    /// (repeatable, in order). Its image files are the frames, in natural
+    /// file-name order; video files are not decoded, so extract the frames
+    /// first. Qwen3.5-family vision models.
+    #[arg(long = "video", value_name = "FRAMES_DIR")]
+    pub video: Vec<String>,
+
+    /// Frame rate of the --video frames, used to sample them and to
+    /// time-stamp them in the prompt [default: 24]
+    #[arg(long = "video-fps", value_name = "FPS", requires = "video", value_parser = parse_fps)]
+    pub video_fps: Option<f64>,
 
     /// Maximum tokens to generate
     #[arg(long = "max-tokens", default_value = "256")]
