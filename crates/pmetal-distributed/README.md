@@ -44,7 +44,7 @@ This crate provides peer-to-peer distributed training infrastructure designed fo
 - **Topology Awareness**: Graph-based cluster representation with node capability and connection profiling
 - **Master Election**: Seniority-based distributed leader election with PeerId tiebreaking
 - **Health Monitoring**: Heartbeat-based peer tracking with exponential moving average latency
-- **Gradient Compression**: TopK, random sparsification, FP16/BF16/INT8 quantization, and PowerSGD with error feedback
+- **Gradient Compression**: TopK, random sparsification, and FP16/BF16/INT8 quantization, with error feedback
 - **Network Isolation**: SHA3-256 PSK namespacing to prevent cross-cluster communication
 - **Metrics**: Counters, gauges, and histograms for all-reduce duration, bytes processed, and failures
 
@@ -118,7 +118,6 @@ fn compress(gradients: &[f32]) -> CompressedGradient {
 | **FP16** | Half-precision quantization | 2x |
 | **BF16** | Brain float quantization | 2x |
 | **INT8** | 8-bit quantization | 4x |
-| **PowerSGD** | Low-rank approximation | Rank-dependent |
 
 ## Collective Operations
 

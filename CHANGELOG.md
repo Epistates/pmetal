@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The static ANE trainer and the code only it used** (`pmetal_metal::ane::{trainer, budget, pipeline, profiler}`, the static kernel generators in `ane::kernel`, and the dynamic `ffn_w2`, `wo_bwd`, `qkv_bwd`, `rmsnorm`, `softmax` and attention-only kernels). `DynamicAneTrainer` replaced the static trainer and runs those layers through its projection kernel; nothing called them. `PMetalError::AneCompileBudgetExhausted`, which nothing raised, is gone too
 - **`infer --backend dflash` and `DraftBackend`.** The backend only ever refused to run and pointed at `pmetal dflash`, which is still the way to run DFlash on the GPU (`infer --ane --draft-model` drafts for the ANE engine). It's gone from `InferenceBackend`, `InferSpec`'s backend options and the MCP `infer` tool. `DFlashConfig.draft_backend` had one working value; its other, `DraftBackend::Ane`, returned "not yet implemented"
 - **`pmetal_mlx::offloading`** (`ActivationOffloader`, `GradientOffloader`, `FrozenParameterManager`, `OffloadedEmbedding` and their configs). The module described itself as not yet integrated, and nothing in pmetal used it
+- **`pmetal_trainer::SftTrainer`**, a legacy trainer whose `train`, `evaluate`, `save_checkpoint` and `load_checkpoint` only returned "not implemented", along with its `TrainingState` (a second type of that name beside `pmetal_core::TrainingState`) and `lm_loss`. `TrainingLoop` is the trainer
+- **`CompressionStrategy::PowerSGD`** in pmetal-distributed. It logged a warning and sent the gradients uncompressed, while the crate README listed it as a working strategy
 
 ### Fixed
 

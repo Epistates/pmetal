@@ -9,7 +9,6 @@
 //! References:
 //! - Deep Gradient Compression (Lin et al., 2018)
 //! - 1-Bit SGD (Seide et al., 2014)
-//! - PowerSGD (Vogels et al., 2019)
 
 use half::{bf16, f16};
 use serde::{Deserialize, Serialize};
@@ -28,8 +27,6 @@ pub enum CompressionStrategy {
     Random { probability: f32 },
     /// Quantize to lower precision.
     Quantize(QuantizationType),
-    /// PowerSGD low-rank approximation.
-    PowerSGD { rank: usize },
 }
 
 /// Quantization type.
@@ -143,15 +140,6 @@ impl GradientCompressor {
                 self.compress_random(&working_grads, *probability)
             }
             CompressionStrategy::Quantize(qtype) => (self.quantize(&working_grads, *qtype), None),
-            CompressionStrategy::PowerSGD { rank } => {
-                // PowerSGD is not yet implemented — fall back to uncompressed
-                // with a warning so the caller can see it in logs.
-                tracing::warn!(
-                    rank,
-                    "PowerSGD compression not yet implemented; sending uncompressed gradients"
-                );
-                (CompressedData::Full(working_grads.clone()), None)
-            }
         };
 
         // Store residual for error feedback
