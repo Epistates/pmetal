@@ -27,11 +27,11 @@ pub enum QuantizationMethod {
     /// No quantization (standard LoRA)
     #[default]
     None,
-    /// NF4 (Normal Float 4-bit) - recommended, optimal for normally distributed weights
+    /// NF4 (4-bit NormalFloat), the QLoRA paper's data type - recommended
     Nf4,
-    /// FP4 (Float Point 4-bit)
+    /// NVFP4: E2M1 values with an E4M3 scale per 16 and an FP32 scale per tensor
     Fp4,
-    /// INT8 (8-bit integer)
+    /// 8-bit affine integers
     Int8,
 }
 

@@ -4,12 +4,12 @@ LoRA and QLoRA training implementations with Metal acceleration.
 
 ## Overview
 
-This crate provides efficient Low-Rank Adaptation (LoRA) and Quantized LoRA (QLoRA) training for LLMs on Apple Silicon. It includes architecture-specific optimizations and a dynamic model system for seamless multi-architecture support.
+This crate provides Low-Rank Adaptation (LoRA) and Quantized LoRA (QLoRA) training for LLMs on Apple Silicon. Adapters attach to the projections of the same model the inference path loads, so every architecture it loads can be fine-tuned.
 
 ## Features
 
 - **Standard LoRA**: Low-rank adaptation with configurable rank and alpha
-- **QLoRA**: 4-bit quantized base weights with full-precision adapters
+- **QLoRA**: base weights packed to NF4, NVFP4 or 8-bit integers, adapters in full precision
 - **Dynamic Architecture**: Auto-detect and load any supported model
 - **Fused Training**: Metal-accelerated forward/backward passes (~2x speedup)
 - **Gradient Checkpointing**: Memory-efficient training for large models
@@ -47,6 +47,32 @@ fn train(model_dir: &str, batches: &[Array]) -> Result<(), Box<dyn std::error::E
 }
 ```
 
+### QLoRA
+
+Pack the base before the adapters go on. NF4 is the QLoRA paper's data type; `fp4` (NVFP4)
+and `int8` run MLX's fused quantized matmul.
+
+```rust,no_run
+use pmetal_core::LoraConfig;
+use pmetal_lora::{DynamicLoraModel, QLoraConfig, QLoraScheme, TrainableModel};
+
+fn qlora(model_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let qlora = QLoraConfig {
+        scheme: QLoraScheme::Nf4,
+        group_size: 64,
+        double_quant: true,
+    };
+    let (model, packed) =
+        DynamicLoraModel::from_pretrained_quantized(model_dir, LoraConfig::default(), &qlora)?;
+    println!(
+        "{} projections packed, {} -> {} bytes",
+        packed.packed, packed.dense_bytes, packed.packed_bytes
+    );
+    model.save_lora_weights("output/lora_weights.safetensors")?;
+    Ok(())
+}
+```
+
 ### Loading Trained Adapters
 
 ```rust,no_run
@@ -71,8 +97,8 @@ fn infer(model_dir: &str, input_ids: &Array) -> Result<Array, Box<dyn std::error
 adapters attached to its projections. Every architecture `DynamicModel` loads can be LoRA-trained
 this way, so a fine-tune trains exactly the forward pass `pmetal infer` and `pmetal serve` run.
 
-QLoRA (`DynamicQloraModel`) has dedicated modules for Llama, Mistral, Granite, Qwen 2 / 3,
-Qwen 3.5 (Next), Qwen3 MoE, Gemma, Gemma 4, GPT-OSS, Llama 4, DeepSeek, NemotronH, Phi and Cohere.
+QLoRA is the same model with its projections packed first (`quantize_base`), so it covers the same
+architectures. The LM head, MoE routers and routed experts stay as loaded.
 
 ## Configuration
 
@@ -89,11 +115,8 @@ Qwen 3.5 (Next), Qwen3 MoE, Gemma, Gemma 4, GPT-OSS, Llama 4, DeepSeek, Nemotron
 |--------|-------------|
 | `adapted` | `AdaptedModel`: LoRA adapters attached to a `DynamicModel` |
 | `dynamic` | `DynamicLoraModel`, the trainer-facing shell over `AdaptedModel` |
-| `dynamic_qlora` | `DynamicQloraModel` with per-architecture QLoRA dispatch |
-| `lora` / `dora` / `qlora` | `LoraLinear`, `DoraLinear`, `QLoraLinear` |
-| `*_qlora`, `*_lora` | Per-architecture QLoRA models and the LoRA stacks they build on |
-| `autograd` | Hand-written LoRA and fused-MLP backward passes |
-| `lora_helpers` | Shared parameter collection and adapter save/load |
+| `qlora` | `quantize_base` and the QLoRA schemes |
+| `lora` | `LoraError` and adapter-file IO |
 | `trainable` | `TrainableModel` trait definition |
 
 ## License

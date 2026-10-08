@@ -16,11 +16,8 @@ use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
     TrainingDataset, resolve_dataset_source,
 };
-use pmetal_lora::{DynamicLoraModel, DynamicQloraModel, QLoraConfig, TrainableModel};
-use pmetal_mlx::quantization::QuantScheme;
+use pmetal_lora::{DynamicLoraModel, QLoraConfig, QLoraScheme, TrainableModel};
 use pmetal_models::WeightFormat;
-// LlamaConfig import removed — config.json is now parsed as generic serde_json::Value
-// to support all architectures (QLoRA uses DynamicQloraModel for arch-specific parsing).
 
 use crate::{
     AdaptiveLrConfig, CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig,
@@ -454,11 +451,6 @@ pub async fn run_training(
         }
     }
 
-    let use_qlora = config
-        .qlora
-        .as_ref()
-        .is_some_and(|q| !matches!(q.scheme, QuantizationScheme::None));
-
     // -----------------------------------------------------------------------
     // Phase 2: Resolve model (async — may download from HF)
     // -----------------------------------------------------------------------
@@ -813,39 +805,21 @@ pub async fn run_training(
     // Catch panics from MLX/Metal so all frontends (CLI, TUI, GUI) get a
     // proper error instead of a silent process crash.
     let training_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        if use_qlora {
-            run_qlora_path(
-                &config,
-                &full_config,
-                &model_path,
-                training_loop_config,
-                train_dataset,
-                eval_dataset,
-                &checkpoint_manager,
-                &mut metrics_callback,
-                &mut extra_callbacks,
-                &output_dir,
-                phase_cb,
-                has_metrics_cb,
-                take_distributed_sync(&mut distributed_sync),
-            )
-        } else {
-            run_lora_path(
-                &config,
-                &full_config,
-                &model_path,
-                training_loop_config,
-                train_dataset,
-                eval_dataset,
-                &checkpoint_manager,
-                &mut metrics_callback,
-                &mut extra_callbacks,
-                &output_dir,
-                phase_cb,
-                has_metrics_cb,
-                take_distributed_sync(&mut distributed_sync),
-            )
-        }
+        run_lora_path(
+            &config,
+            &full_config,
+            &model_path,
+            training_loop_config,
+            train_dataset,
+            eval_dataset,
+            &checkpoint_manager,
+            &mut metrics_callback,
+            &mut extra_callbacks,
+            &output_dir,
+            phase_cb,
+            has_metrics_cb,
+            take_distributed_sync(&mut distributed_sync),
+        )
     }));
 
     // Drop the training result's captured state (model, optimizer, etc.)
@@ -936,190 +910,24 @@ pub async fn run_training(
 }
 
 // ---------------------------------------------------------------------------
-// QLoRA training path
+// LoRA training path, with the base packed for QLoRA when asked
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn run_qlora_path(
-    config: &TrainingJobConfig,
-    full_config: &FullTrainingConfig,
-    model_path: &Path,
-    mut training_loop_config: TrainingLoopConfig,
-    train_dataset: TrainingDataset,
-    eval_dataset: Option<TrainingDataset>,
-    checkpoint_manager: &CheckpointManager,
-    metrics_callback: &mut Option<Box<dyn TrainingCallback>>,
-    extra_callbacks: &mut Option<Vec<Box<dyn TrainingCallback>>>,
-    output_dir: &str,
-    phase_cb: Option<&dyn PhaseCallback>,
-    has_metrics_cb: bool,
-    distributed_sync: DistributedSyncOption,
-) -> anyhow::Result<(f64, usize, usize)> {
-    let qlora_cfg = config
-        .qlora
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("QLoRA path requires qlora config"))?;
-    let quant_scheme = match qlora_cfg.scheme {
-        QuantizationScheme::Nf4 => QuantScheme::NF4,
-        QuantizationScheme::Fp4 => QuantScheme::FP4,
-        QuantizationScheme::Int8 => QuantScheme::Int8,
-        QuantizationScheme::None => unreachable!(),
+/// The base-packing config `--quantization` asks for, if any.
+fn qlora_config(config: &TrainingJobConfig) -> Option<QLoraConfig> {
+    let qlora = config.qlora.as_ref()?;
+    let scheme = match qlora.scheme {
+        QuantizationScheme::None => return None,
+        QuantizationScheme::Nf4 => QLoraScheme::Nf4,
+        QuantizationScheme::Fp4 => QLoraScheme::Fp4,
+        QuantizationScheme::Int8 => QLoraScheme::Int8,
     };
-
-    let qlora_config = QLoraConfig {
-        lora: config.lora.clone(),
-        quant_scheme,
-        block_size: qlora_cfg.block_size,
-        double_quant: qlora_cfg.double_quant,
-        compute_in_half: true,
-    };
-
-    tracing::info!(
-        "Initializing QLoRA model with {:?} quantization...",
-        qlora_cfg.scheme
-    );
-
-    // Detect architecture and construct the correct QLoRA model.
-    // Errors early with a clear message for unsupported architectures.
-    let mut model = DynamicQloraModel::from_model_dir(model_path, qlora_config)?;
-
-    tracing::info!(
-        "Loading and quantizing {} base model weights from {:?}...",
-        model.arch_name(),
-        model_path
-    );
-    model.load_and_quantize_from_dir(model_path)?;
-
-    let savings = model.memory_savings();
-    let (quant_bytes, lora_bytes, total_bytes) = model.memory_usage();
-    tracing::info!(
-        "Memory usage: {:.2} MB (quantized: {:.2} MB, LoRA: {:.2} MB) - {:.1}% of full precision",
-        total_bytes as f64 / 1_000_000.0,
-        quant_bytes as f64 / 1_000_000.0,
-        lora_bytes as f64 / 1_000_000.0,
-        savings * 100.0
-    );
-    tracing::info!(
-        "Trainable parameters: {}",
-        format_param_count(model.num_trainable_params())
-    );
-    pmetal_mlx::memory::log_memory_stats();
-
-    if config.dispatch.gradient_checkpointing {
-        if model.supports_gradient_checkpointing() {
-            model.enable_gradient_checkpointing(config.dispatch.gradient_checkpointing_layers);
-            tracing::info!(
-                "Gradient checkpointing enabled ({} layers per block)",
-                config.dispatch.gradient_checkpointing_layers
-            );
-        } else {
-            tracing::warn!(
-                "Gradient checkpointing requested but not supported by this QLoRA model ({}).",
-                model.arch_name()
-            );
-        }
-        // The model has already handled the capability check above. Do not let
-        // the TrainingLoop re-apply or re-log this setting.
-        training_loop_config.gradient_checkpointing = false;
-    }
-
-    let mut training_loop = TrainingLoop::new(training_loop_config);
-    #[cfg(feature = "distributed")]
-    if let Some(sync) = distributed_sync {
-        training_loop.set_distributed(sync);
-    }
-
-    if let Some(cb) = metrics_callback.take() {
-        training_loop.add_callback(cb);
-    }
-    if let Some(callbacks) = extra_callbacks.take() {
-        for callback in callbacks {
-            training_loop.add_callback(callback);
-        }
-    }
-
-    {
-        let mut adaptive_config = AdaptiveLrConfig::for_lora();
-        if config.dispatch.no_adaptive_lr {
-            adaptive_config.enabled = false;
-        }
-        let control_file = PathBuf::from(output_dir).join(".lr_control.json");
-        training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
-        training_loop.set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
-    }
-
-    if config.resume {
-        if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
-            tracing::info!("Resuming from checkpoint at step {}", metadata.step);
-            model.set_lora_parameters(&lora_params);
-            training_loop.set_step(metadata.step);
-            training_loop.set_epoch(metadata.epoch);
-            // Restore persisted best-loss snapshot so rollback works after resume.
-            if let Some(snapshot) =
-                crate::checkpoint::load_best_snapshot(checkpoint_manager.checkpoint_dir())
-            {
-                training_loop.best_lora_snapshot = Some(snapshot);
-                // Notify adaptive LR controller that a snapshot is available for rollback.
-                if let Some(ref mut ctrl) = training_loop.adaptive_lr {
-                    ctrl.set_has_snapshot(metadata.running_loss, metadata.step);
-                }
-                tracing::info!("Restored best snapshot from disk for rollback-on-resume");
-            }
-        } else {
-            tracing::info!("No checkpoint found, starting fresh");
-        }
-    }
-
-    tracing::info!("Starting QLoRA training...");
-    pmetal_mlx::memory::log_memory_stats();
-    emit_phase(phase_cb, TrainingPhase::Training);
-
-    for cb in &mut training_loop.callbacks {
-        cb.on_train_start();
-    }
-
-    if config.dispatch.fused {
-        tracing::warn!("Fused training is not yet supported for QLoRA, using standard training");
-    }
-
-    tracing::info!("Entering training_loop.run() for QLoRA...");
-    training_loop.run(
-        &mut model,
-        train_dataset,
-        eval_dataset,
-        Some(checkpoint_manager),
-    )?;
-
-    let final_path = PathBuf::from(output_dir).join("lora_weights.safetensors");
-    model.save_lora_weights(&final_path)?;
-    tracing::info!("Saved LoRA weights to {:?}", final_path);
-    save_adapter_config(
-        &final_path,
-        config.lora.r,
-        config.lora.alpha,
-        &config.lora.target_modules,
-        config.lora.use_rslora,
-    )?;
-
-    // Recover the metrics callback (always inserted first) for finalization.
-    // Only recover if we actually created one — don't grab a user callback by mistake.
-    if has_metrics_cb && metrics_callback.is_none() {
-        let mut cbs = training_loop.take_callbacks();
-        if !cbs.is_empty() {
-            *metrics_callback = Some(cbs.remove(0));
-        }
-    }
-
-    Ok((
-        training_loop.current_loss(),
-        training_loop.current_step(),
-        training_loop.total_tokens(),
-    ))
+    Some(QLoraConfig {
+        scheme,
+        group_size: qlora.block_size as i32,
+        double_quant: qlora.double_quant,
+    })
 }
-
-// ---------------------------------------------------------------------------
-// Standard LoRA training path
-// ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn run_lora_path(
@@ -1139,12 +947,48 @@ fn run_lora_path(
 ) -> anyhow::Result<(f64, usize, usize)> {
     tracing::info!("Initializing LoRA model with auto-detected architecture...");
 
-    let mut model = match WeightFormat::detect(model_path) {
-        Some(WeightFormat::Gguf) => {
+    let qlora = qlora_config(config);
+    let mut model = match (WeightFormat::detect(model_path), qlora) {
+        (Some(WeightFormat::Gguf), Some(_)) => anyhow::bail!(
+            "--quantization packs a safetensors checkpoint for QLoRA; a GGUF file is \
+             already quantized in its own format. Train LoRA on it without --quantization, \
+             or point at the safetensors checkpoint."
+        ),
+        (Some(WeightFormat::Gguf), None) => {
             tracing::info!("Detected GGUF format, loading with dequantization...");
             DynamicLoraModel::from_gguf(model_path, config.lora.clone())?
         }
-        _ => DynamicLoraModel::from_pretrained(model_path, config.lora.clone())?,
+        (_, Some(qlora)) => {
+            if qlora.scheme == QLoraScheme::Fp4 && qlora.group_size != 64 {
+                tracing::warn!(
+                    "--quant-block-size {} is ignored for fp4: NVFP4's block is 16",
+                    qlora.group_size
+                );
+            }
+            let (model, packed) = DynamicLoraModel::from_pretrained_quantized(
+                model_path,
+                config.lora.clone(),
+                &qlora,
+            )?;
+            let mb = |bytes: usize| bytes as f64 / 1_000_000.0;
+            tracing::info!(
+                "QLoRA: {} projections packed as {}{}, {:.1} MB -> {:.1} MB",
+                packed.packed,
+                qlora.scheme,
+                if qlora.double_quant {
+                    " with double quantization"
+                } else {
+                    ""
+                },
+                mb(packed.dense_bytes),
+                mb(packed.packed_bytes),
+            );
+            for (path, reason) in &packed.kept {
+                tracing::debug!("QLoRA kept {path} as loaded: {reason}");
+            }
+            model
+        }
+        (_, None) => DynamicLoraModel::from_pretrained(model_path, config.lora.clone())?,
     };
     tracing::info!(
         "Loaded {} model with LoRA adapters",

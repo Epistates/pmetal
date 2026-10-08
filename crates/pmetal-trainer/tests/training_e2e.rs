@@ -383,111 +383,25 @@ fn test_learning_rate_schedules() {
     }
 }
 
-#[test]
-fn test_qlora_training_step() {
-    use pmetal_lora::{LlamaQloraForCausalLM, QLoraConfig};
-    use pmetal_mlx::quantization::QuantScheme;
-
-    // Create QLoRA config
-    let qlora_config = QLoraConfig {
-        lora: LoraConfig {
-            r: 4,
-            alpha: 8.0,
-            use_rslora: false,
-            ..Default::default()
-        },
-        quant_scheme: QuantScheme::NF4,
-        block_size: 64,
-        double_quant: true,
-        compute_in_half: false,
-    };
-
-    // Create QLoRA model
-    let mut model = LlamaQloraForCausalLM::with_qlora_config(small_llama_config(), qlora_config)
-        .expect("Failed to create QLoRA model");
-
-    // Verify memory savings
-    let savings = model.memory_savings();
-    assert!(
-        savings < 0.35,
-        "QLoRA should provide significant memory savings, got {}",
-        savings
-    );
-
-    // Create training loop config
-    let config = TrainingLoopConfig {
-        training: TrainingConfig {
-            learning_rate: 1e-4,
-            batch_size: 2,
-            gradient_accumulation_steps: 1,
-            ..Default::default()
-        },
-        dataloader: DataLoaderConfig {
-            batch_size: 2,
-            max_seq_len: 16,
-            shuffle: false,
-            pad_token_id: 0,
-            ..Default::default()
-        },
-        use_metal_flash_attention: false,
-        log_every: 1,
-        checkpoint_every: 0,
-        eval_every: 0,
-        use_jit_compilation: false,
+/// [`small_model`] with its base packed for QLoRA before the adapters go on,
+/// which is what `pmetal train --quantization` builds.
+fn small_qlora_model(scheme: pmetal_lora::QLoraScheme) -> (AdaptedModel, pmetal_lora::PackedBase) {
+    let mut base =
+        DynamicModel::from_config(&serde_json::to_string(&small_llama_config()).unwrap())
+            .expect("llama builds");
+    let config = pmetal_lora::QLoraConfig {
+        scheme,
         ..Default::default()
     };
-
-    let mut training_loop = TrainingLoop::new(config);
-    let dataset = create_dummy_dataset(4, 16);
-    let mut dataloader = pmetal_data::DataLoader::new(
-        dataset,
-        DataLoaderConfig {
-            batch_size: 2,
-            max_seq_len: 16,
-            shuffle: false,
-            pad_token_id: 0,
-            ..Default::default()
-        },
-        None,
-    );
-
-    let mut optimizer = Sgd::new(1e-4);
-    let batch = dataloader.next_batch().expect("Should have a batch");
-
-    // Perform training step with QLoRA model
-    let stats = training_loop
-        .train_step(&mut model, &batch, &mut optimizer)
-        .expect("QLoRA training step should succeed");
-
-    assert!(stats.loss > 0.0, "QLoRA loss should be positive");
-    assert_eq!(stats.step, 1, "Step should be 1");
-    assert!(stats.tokens > 0, "Tokens processed should be positive");
+    let packed = pmetal_lora::quantize_base(&mut base, &config).expect("pack base");
+    let model = AdaptedModel::attach(base, small_lora_config()).expect("attach adapters");
+    (model, packed)
 }
 
-#[test]
-fn test_qlora_multiple_steps() {
-    use pmetal_lora::{LlamaQloraForCausalLM, QLoraConfig};
-    use pmetal_mlx::quantization::QuantScheme;
-
-    let qlora_config = QLoraConfig {
-        lora: LoraConfig {
-            r: 4,
-            alpha: 8.0,
-            use_rslora: false,
-            ..Default::default()
-        },
-        quant_scheme: QuantScheme::NF4,
-        block_size: 64,
-        double_quant: true,
-        compute_in_half: false,
-    };
-
-    let mut model = LlamaQloraForCausalLM::with_qlora_config(small_llama_config(), qlora_config)
-        .expect("Failed to create QLoRA model");
-
-    let config = TrainingLoopConfig {
+fn qlora_loop(learning_rate: f64) -> TrainingLoop {
+    TrainingLoop::new(TrainingLoopConfig {
         training: TrainingConfig {
-            learning_rate: 1e-3,
+            learning_rate,
             batch_size: 2,
             gradient_accumulation_steps: 1,
             max_grad_norm: 1.0,
@@ -506,12 +420,26 @@ fn test_qlora_multiple_steps() {
         eval_every: 0,
         use_jit_compilation: false,
         ..Default::default()
-    };
+    })
+}
 
-    let mut training_loop = TrainingLoop::new(config);
-    let dataset = create_dummy_dataset(8, 16);
+#[test]
+fn test_qlora_training_step() {
+    let (mut model, packed) = small_qlora_model(pmetal_lora::QLoraScheme::Nf4);
+
+    // Every projection but the (absent, tied) LM head packs, to under a
+    // third of its f32 size.
+    assert_eq!(packed.packed, 2 * 7, "two layers of seven projections");
+    assert!(
+        packed.packed_bytes * 3 < packed.dense_bytes,
+        "{} packed bytes for {} dense",
+        packed.packed_bytes,
+        packed.dense_bytes
+    );
+
+    let mut training_loop = qlora_loop(1e-4);
     let mut dataloader = pmetal_data::DataLoader::new(
-        dataset,
+        create_dummy_dataset(4, 16),
         DataLoaderConfig {
             batch_size: 2,
             max_seq_len: 16,
@@ -521,34 +449,56 @@ fn test_qlora_multiple_steps() {
         },
         None,
     );
+    let mut optimizer = Sgd::new(1e-4);
+    let batch = dataloader.next_batch().expect("Should have a batch");
 
-    let mut optimizer = Sgd::new(1e-3);
-    let mut losses = Vec::new();
+    let stats = training_loop
+        .train_step(&mut model, &batch, &mut optimizer)
+        .expect("QLoRA training step should succeed");
+    pmetal_bridge::check_last_error().expect("no bridge error");
 
-    // Train for 4 steps
-    for _ in 0..4 {
-        if let Some(batch) = dataloader.next_batch() {
+    assert!(stats.loss > 0.0, "QLoRA loss should be positive");
+    assert_eq!(stats.step, 1, "Step should be 1");
+    assert!(stats.tokens > 0, "Tokens processed should be positive");
+}
+
+/// Each scheme fits one batch: the adapters train through the packed base.
+#[test]
+fn test_qlora_loss_decreases_for_every_scheme() {
+    for scheme in [
+        pmetal_lora::QLoraScheme::Nf4,
+        pmetal_lora::QLoraScheme::Fp4,
+        pmetal_lora::QLoraScheme::Int8,
+    ] {
+        let (mut model, _) = small_qlora_model(scheme);
+        let mut training_loop = qlora_loop(1e-2);
+        let mut dataloader = pmetal_data::DataLoader::new(
+            create_dummy_dataset(2, 16),
+            DataLoaderConfig {
+                batch_size: 2,
+                max_seq_len: 16,
+                shuffle: false,
+                pad_token_id: 0,
+                ..Default::default()
+            },
+            None,
+        );
+        let batch = dataloader.next_batch().expect("a batch");
+        let mut optimizer = pmetal_bridge::compat::optimizers::AdamW::new(1e-2, 0.0);
+
+        let mut losses = Vec::new();
+        for _ in 0..10 {
             let stats = training_loop
                 .train_step(&mut model, &batch, &mut optimizer)
-                .unwrap();
+                .expect("step");
             losses.push(stats.loss);
-            assert!(
-                stats.grad_norm.is_some(),
-                "Gradient norm should be computed"
-            );
         }
-    }
-
-    assert_eq!(
-        training_loop.current_step(),
-        4,
-        "Should have completed 4 steps"
-    );
-    assert_eq!(losses.len(), 4, "Should have 4 loss values");
-
-    // All losses should be positive
-    for loss in &losses {
-        assert!(*loss > 0.0, "Loss should be positive");
+        pmetal_bridge::check_last_error().expect("no bridge error");
+        assert!(losses.iter().all(|l| l.is_finite()), "{scheme}: {losses:?}");
+        assert!(
+            losses[9] < losses[0] - 0.1,
+            "{scheme}: loss did not fall: {losses:?}"
+        );
     }
 }
 

@@ -55,7 +55,9 @@ pmetal train --config training.yaml
 | `--max-seq-len` | `0` | Max sequence length (0 = auto-detect) |
 | `--epochs` | `1` | Number of training epochs |
 | `--max-grad-norm` | `1.0` | Gradient clipping |
-| `--quantization` | none | QLoRA method: `nf4`, `fp4`, `int8` |
+| `--quantization` | none | QLoRA base format: `nf4`, `fp4` (NVFP4), `int8` |
+| `--quant-block-size` | `64` | Weights per scale for `nf4` and `int8` (32, 64 or 128) |
+| `--double-quant` | `false` | Pack `nf4`'s absmax values to 8 bits as well |
 | `--gradient-accumulation-steps` | `4` | Gradient accumulation steps |
 | `--embedding-lr` | None | Separate LR for embeddings |
 | `--no-metal-fused-optimizer` | `false` | Disable Metal fused optimizer |

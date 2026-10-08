@@ -13,10 +13,22 @@ Low-Rank Adaptation — trains small adapter matrices instead of full weights. P
 - **alpha** (`--lora-alpha`): Scaling factor (default: 2× rank)
 
 ### QLoRA
-4-bit quantized LoRA. Loads base model in NF4/FP4/INT8, trains adapters in full precision.
+LoRA over a packed base: the projections are stored in NF4, NVFP4 or 8-bit integers and unpacked
+inside the forward pass, and the adapters train in full precision. It is the same model LoRA trains,
+with the same architectures; the LM head, MoE routers and routed experts stay as loaded.
 ```bash
-pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --quantization nf4
+pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --quantization nf4 --double-quant
 ```
+
+| `--quantization` | Storage | Bits/weight | Qwen3-0.6B loss (bf16: 2.604) |
+|---|---|---|---|
+| `nf4` | NF4 codes, absmax per `--quant-block-size` (64) | 4.25, 4.13 with `--double-quant` | 2.648 |
+| `fp4` | NVFP4: E2M1, E4M3 scale per 16, FP32 scale per tensor | 4.5 | 2.660 |
+| `int8` | 8-bit affine per `--quant-block-size` | 8.5 | 2.601 |
+
+NF4 is the QLoRA paper's data type (Dettmers et al., 2023): its levels sit at a normal distribution's
+quantiles, which is how pretrained weights are distributed. `fp4` and `int8` run MLX's fused quantized
+matmul; NF4 unpacks to the compute dtype first, since MLX has no NF4 kernel.
 
 ### DoRA
 Weight-Decomposed LoRA — decomposes weight updates into magnitude and direction for better training stability.

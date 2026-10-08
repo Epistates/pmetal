@@ -87,11 +87,11 @@ pub struct TrainArgs {
     #[arg(long = "quantization", value_enum, default_value = "none")]
     pub quantization: crate::QuantizationMethod,
 
-    /// Block size for quantization (default: 64)
+    /// Weights per scale for nf4 and int8 (32, 64 or 128; fp4's block is 16)
     #[arg(long = "quant-block-size", default_value = "64")]
     pub quant_block_size: usize,
 
-    /// Enable double quantization for absmax values
+    /// Pack nf4's absmax values to 8 bits as well (QLoRA double quantization)
     #[arg(long = "double-quant")]
     pub double_quant: bool,
 
