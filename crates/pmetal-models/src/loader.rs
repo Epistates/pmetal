@@ -1594,12 +1594,17 @@ pub fn load_qwen3_next_weights_with_options(
             unmatched.push(key.clone());
         }
     }
+    // The vision tower and the MTP predictor were filtered out by name before
+    // sanitizing; a tensor left over now is a weight the model would run
+    // without, so it is an error rather than a warning.
     if !unmatched.is_empty() {
-        tracing::warn!(
-            "Qwen3Next weight loading skipped {} unmatched weights (first 10): {:?}",
+        unmatched.sort();
+        return Err(LoadError::SafeTensors(format!(
+            "Qwen3Next weight loading found {} checkpoint tensor(s) no parameter consumes \
+             (first 10): {:?}",
             unmatched.len(),
             &unmatched[..unmatched.len().min(10)]
-        );
+        )));
     }
 
     let missing: Vec<String> = expected_keys

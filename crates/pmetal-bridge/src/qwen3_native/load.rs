@@ -204,8 +204,9 @@ pub fn load_model(
         }
     }
 
-    // 3b. Drop mtp.* keys.
-    raw.retain(|k, _| !k.contains("mtp."));
+    // 3b. Drop what the text model never reads: the bundled MTP predictor
+    // (`--mtp` loads it separately) and the vision tower.
+    raw.retain(|k, _| !k.contains("mtp.") && !family::is_unused_by_text_model(k));
 
     // 3c. Drop lm_head.weight when embeddings are tied.
     if config.tie_word_embeddings {
@@ -461,8 +462,19 @@ pub fn load_model(
     }
 
     // ── Step 4: Build per-layer weight structs ──────────────────────────────
+    //
+    // Every tensor read is recorded, so that after the build any checkpoint
+    // tensor nobody read is an error rather than a silently ignored weight.
+    let consumed = std::cell::RefCell::new(std::collections::HashSet::<String>::new());
+    let take = |key: &str| -> Option<InlineArray> {
+        let value = raw.get(key).cloned();
+        if value.is_some() {
+            consumed.borrow_mut().insert(key.to_owned());
+        }
+        value
+    };
     let get = |key: &str| -> Result<InlineArray, String> {
-        raw.get(key).cloned().ok_or_else(|| {
+        take(key).ok_or_else(|| {
             let parts: Vec<&str> = key.rsplitn(2, '.').collect();
             let suffix = parts[0];
             let close: Vec<&String> = raw.keys().filter(|k| k.ends_with(suffix)).take(5).collect();
@@ -485,13 +497,15 @@ pub fn load_model(
         let b_key = format!("{base_key}.biases");
         let mxfp8_s_key = format!("{base_key}.mxfp8_scales");
         let nvfp4_s_key = format!("{base_key}.nvfp4_scales");
-        let tensor_scale = raw.get(&format!("{base_key}.tensor_scale")).cloned();
+        let tensor_scale = || take(&format!("{base_key}.tensor_scale"));
 
-        if let (Some(w), Some(scales)) = (raw.get(&w_key), raw.get(&mxfp8_s_key)) {
+        if raw.contains_key(&w_key)
+            && let Some(scales) = take(&mxfp8_s_key)
+        {
             return Ok(LayerWeight::Quantized {
-                tensor_scale,
-                weight: w.clone(),
-                scales: scales.clone(),
+                tensor_scale: tensor_scale(),
+                weight: get(&w_key)?,
+                scales,
                 biases: None,
                 params: QuantParams {
                     group_size: MXFP8_GROUP_SIZE,
@@ -500,25 +514,31 @@ pub fn load_model(
                 },
             });
         }
-        if let (Some(w), Some(scales)) = (raw.get(&w_key), raw.get(&nvfp4_s_key)) {
+        if raw.contains_key(&w_key)
+            && let Some(scales) = take(&nvfp4_s_key)
+        {
             return Ok(LayerWeight::Quantized {
-                tensor_scale,
-                weight: w.clone(),
-                scales: scales.clone(),
+                tensor_scale: tensor_scale(),
+                weight: get(&w_key)?,
+                scales,
                 biases: None,
                 params: QuantParams::defaults_for(QuantizedMode::Nvfp4),
             });
         }
 
-        match (raw.get(&w_key), raw.get(&s_key), raw.get(&b_key)) {
-            (Some(w), Some(s), Some(b)) => {
+        match (
+            raw.contains_key(&w_key),
+            raw.contains_key(&s_key),
+            raw.contains_key(&b_key),
+        ) {
+            (true, true, true) => {
                 let params = quant_params_for(config, base_key, default_params);
                 validate_quantization_runtime_support(params.bits)?;
                 Ok(LayerWeight::Quantized {
                     tensor_scale: None,
-                    weight: w.clone(),
-                    scales: s.clone(),
-                    biases: Some(b.clone()),
+                    weight: get(&w_key)?,
+                    scales: get(&s_key)?,
+                    biases: Some(get(&b_key)?),
                     // Scales plus biases is affine, whatever the block says.
                     params: QuantParams {
                         mode: QuantizedMode::Affine,
@@ -606,30 +626,27 @@ pub fn load_model(
             // Stacked expert weights were placed under "switch_mlp.{proj}.weight" during
             // Step 3e above.  For quantized models the stacking loop also placed
             // "switch_mlp.{proj}.scales" and ".biases" — check for those here.
-            let moe_gate = {
-                let base = format!("{p}.mlp.switch_mlp.gate_proj");
+            let stacked = |proj: &str| -> Result<LayerWeight, String> {
+                let base = format!("{p}.mlp.switch_mlp.{proj}");
                 let params = stacked_quant_params
                     .get(&format!("{base}.weight"))
                     .copied()
                     .unwrap_or_else(|| quant_params_for(config, &base, default_params));
-                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)?
+                for part in [
+                    "weight",
+                    "scales",
+                    "biases",
+                    "mxfp8_scales",
+                    "nvfp4_scales",
+                    "tensor_scale",
+                ] {
+                    take(&format!("{base}.{part}"));
+                }
+                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)
             };
-            let moe_up = {
-                let base = format!("{p}.mlp.switch_mlp.up_proj");
-                let params = stacked_quant_params
-                    .get(&format!("{base}.weight"))
-                    .copied()
-                    .unwrap_or_else(|| quant_params_for(config, &base, default_params));
-                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)?
-            };
-            let moe_down = {
-                let base = format!("{p}.mlp.switch_mlp.down_proj");
-                let params = stacked_quant_params
-                    .get(&format!("{base}.weight"))
-                    .copied()
-                    .unwrap_or_else(|| quant_params_for(config, &base, default_params));
-                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)?
-            };
+            let moe_gate = stacked("gate_proj")?;
+            let moe_up = stacked("up_proj")?;
+            let moe_down = stacked("down_proj")?;
 
             // Shared expert weights — may be quantized.
             let sh_gate = get_layer_weight(&format!("{p}.mlp.shared_expert.gate_proj"))?;
@@ -806,6 +823,24 @@ pub fn load_model(
         }
 
         layers.push(lw);
+    }
+
+    // A Qwen3.5-family checkpoint tensor that nothing above read is a weight
+    // the model would run without. The vision tower and the MTP predictor
+    // were dropped by name in step 3b; anything else left over is refused.
+    if !config.is_qwen3_dense() {
+        let consumed = consumed.borrow();
+        let mut unread: Vec<&String> = raw.keys().filter(|k| !consumed.contains(*k)).collect();
+        if !unread.is_empty() {
+            unread.sort();
+            return Err(format!(
+                "{} checkpoint tensor(s) were not consumed by the Qwen3.5 loader \
+                 (first {}): {:?}",
+                unread.len(),
+                unread.len().min(10),
+                &unread[..unread.len().min(10)]
+            ));
+        }
     }
 
     // ── Step 5: copy_fresh — force all weights into fresh Metal buffers ─────

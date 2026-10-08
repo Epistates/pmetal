@@ -335,12 +335,23 @@ fn load_qwen3_next_mtp_weights(
     let mut params = model.flatten_params_mut();
     let expected_keys: HashSet<String> = params.keys().map(|key| key.to_string()).collect();
     let mut loaded = HashSet::new();
+    let mut unmatched = Vec::new();
 
     for (key, value) in weights {
         if let Some(param) = params.get_mut(&**key) {
             **param = value.clone();
             loaded.insert(key.clone());
+        } else {
+            unmatched.push(key.clone());
         }
+    }
+    if !unmatched.is_empty() {
+        unmatched.sort();
+        return Err(Exception::custom(format!(
+            "Qwen MTP weight loading found {} predictor tensor(s) no parameter consumes: {:?}",
+            unmatched.len(),
+            &unmatched[..unmatched.len().min(10)]
+        )));
     }
 
     let missing: Vec<String> = expected_keys
