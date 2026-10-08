@@ -291,7 +291,10 @@ impl Qwen4ExpConfig {
                 problems.push(format!("unsupported layer type {t:?}"));
             }
         }
-        if self.hidden_act != "silu" {
+        if !matches!(
+            self.hidden_act.to_ascii_lowercase().as_str(),
+            "silu" | "swish"
+        ) {
             problems.push(format!(
                 "hidden_act {:?}: the GDN conv, experts and shared expert are SiLU here",
                 self.hidden_act
@@ -386,19 +389,11 @@ impl Qwen4ExpConfig {
             .is_some_and(|t| t == "linear_attention")
     }
 
-    /// The GDN output gate's activation (`output_gate_type`, else `hidden_act`).
+    /// The GDN output gate's activation (`output_gate_type`, else
+    /// `hidden_act`), resolved as for the rest of the Qwen3.5 family.
     pub fn gate_activation(&self) -> Result<GateActivation, Exception> {
-        match self
-            .output_gate_type
-            .as_deref()
-            .unwrap_or(self.hidden_act.as_str())
-        {
-            "sigmoid" => Ok(GateActivation::Sigmoid),
-            "silu" => Ok(GateActivation::Silu),
-            other => Err(Exception::custom(format!(
-                "unsupported output gate activation {other:?}"
-            ))),
-        }
+        GateActivation::resolve(self.output_gate_type.as_deref(), Some(&self.hidden_act))
+            .map_err(Exception::custom)
     }
 
     /// RoPE as the reference resolves it: `rope_scaling` replaces
@@ -2643,6 +2638,35 @@ mod tests {
         assert_eq!(rows, expected);
         // A chunk continuing from cached context hashes as the whole would.
         assert_eq!(hash.rows_for(&[1, 7], &[8]), row(8, 7, 1));
+    }
+
+    /// `"swish"` is SiLU, as Qwen3.6 and 3.8 spell it, for the gate and for
+    /// `hidden_act` alike.
+    #[test]
+    fn gate_accepts_the_family_spellings() {
+        let base: serde_json::Value = serde_json::from_str(&released_text_config()).unwrap();
+        let gate = |patch: serde_json::Value| {
+            let mut config = base.clone();
+            for (k, v) in patch.as_object().unwrap() {
+                config[k] = v.clone();
+            }
+            Qwen4ExpConfig::from_json(&config.to_string())
+                .expect("config parses")
+                .gate_activation()
+                .unwrap()
+        };
+        assert_eq!(
+            gate(serde_json::json!({"output_gate_type": "swish"})),
+            GateActivation::Silu
+        );
+        assert_eq!(
+            gate(serde_json::json!({"output_gate_type": null, "hidden_act": "swish"})),
+            GateActivation::Silu
+        );
+        assert_eq!(
+            gate(serde_json::json!({"output_gate_type": null, "hidden_act": "silu"})),
+            GateActivation::Silu
+        );
     }
 
     #[test]
