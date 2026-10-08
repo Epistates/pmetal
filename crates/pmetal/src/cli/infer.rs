@@ -37,8 +37,10 @@ pub struct InferArgs {
     #[arg(long = "video", value_name = "FRAMES_DIR")]
     pub video: Vec<String>,
 
-    /// Frame rate of the --video frames, used to sample them and to
-    /// time-stamp them in the prompt [default: 24]
+    /// Frame rate the --video frames were extracted at, used to sample them
+    /// to the model's rate (2 per second) and to time-stamp them in the
+    /// prompt. Give it: without it 24 is assumed, as the reference does
+    /// [default: 24]
     #[arg(long = "video-fps", value_name = "FPS", requires = "video", value_parser = parse_fps)]
     pub video_fps: Option<f64>,
 

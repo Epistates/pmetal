@@ -1310,6 +1310,20 @@ fn preprocess_media(
         .map(|video| {
             let frames = pmetal_data::qwen_vl_processing::video_frame_paths(&video.frames_dir)
                 .map_err(|e| Exception::custom(e.to_string()))?;
+            if video.fps.is_none() {
+                // The reference warns here too: frames sampled at a lower
+                // rate than the assumed 24 lose most of themselves to the
+                // processor's own sampling (a short clip drops to 4 frames)
+                // and get timestamps that are off by the same factor.
+                tracing::warn!(
+                    video = %video.frames_dir.display(),
+                    "No frame rate given for the video; assuming {} frames per second, as the \
+                     reference does. Give the rate the frames were extracted at (this model \
+                     samples {} per second)",
+                    pmetal_data::qwen_vl_processing::DEFAULT_VIDEO_FPS,
+                    processor.video.fps
+                );
+            }
             let processed = processor
                 .preprocess_video_files(&frames, video.fps)
                 .map_err(|e| Exception::custom(e.to_string()))?;
