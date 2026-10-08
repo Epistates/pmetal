@@ -4,6 +4,7 @@
 use crate::InlineArray;
 
 use super::cache::GdnCache;
+use super::family::{GdnGateActivation, gdn_qk_rms_norm_eps};
 use super::weights::{LayerWeight, LayerWeights};
 
 // ============================================================================
@@ -213,6 +214,8 @@ pub(super) fn gdn_forward(
                 ck,
                 kd,
                 lw.gdn_norm_eps,
+                gdn_qk_rms_norm_eps(dk),
+                lw.gdn_gate == GdnGateActivation::Sigmoid,
             );
 
             cache.conv_state = Some(new_conv);
@@ -258,9 +261,11 @@ pub(super) fn gdn_forward(
     let k = conv_parts.pop().unwrap().reshape(&[b, s, nk, dk]);
     let q = conv_parts.pop().unwrap().reshape(&[b, s, nk, dk]);
 
-    // Q/K normalization
-    let q = q.rms_norm(lw.gdn_q_nw.as_ref(), 1e-6);
-    let k = k.rms_norm(lw.gdn_k_nw.as_ref(), 1e-6);
+    // Q/K normalization: transformers' L2 norm (and the 1/sqrt(Dk) query
+    // scale) as one rms_norm; see `gdn_qk_rms_norm_eps` for the epsilon.
+    let qk_eps = gdn_qk_rms_norm_eps(dk);
+    let q = q.rms_norm(lw.gdn_q_nw.as_ref(), qk_eps);
+    let k = k.rms_norm(lw.gdn_k_nw.as_ref(), qk_eps);
 
     // Decay gate: fused compute_g
     let g = InlineArray::fused_compute_g(
@@ -280,9 +285,12 @@ pub(super) fn gdn_forward(
     cache.conv_state = Some(new_conv);
     cache.ssm_state = Some(new_state);
 
-    // Output: rms_norm → precise_swiglu → reshape → out_proj
+    // Output: rms_norm → gate (in f32) → reshape → out_proj
     let out_n = out.rms_norm(lw.gdn_norm_w.as_ref(), lw.gdn_norm_eps);
-    let gated = InlineArray::fused_precise_swiglu(&out_n, &z);
+    let gated = match lw.gdn_gate {
+        GdnGateActivation::Silu => InlineArray::fused_precise_swiglu(&out_n, &z),
+        GdnGateActivation::Sigmoid => InlineArray::precise_sigmoid_gate(&out_n, &z),
+    };
     let flat = gated.reshape(&[b, s, -1]);
     lw.gdn_out_w.as_ref().unwrap().matmul_from(&flat)
 }

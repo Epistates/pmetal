@@ -591,9 +591,10 @@ impl Qwen3NextLoraGDN {
             &[self.head_k_dim],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &ones_weight, 1e-6)
+        let qk_eps = pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps(self.head_k_dim);
+        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &ones_weight, qk_eps)
             .multiply(&Array::from_f32(inv_scale * inv_scale));
-        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &ones_weight, 1e-6)
+        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &ones_weight, qk_eps)
             .multiply(&Array::from_f32(inv_scale));
 
         // Get SSM state from cache

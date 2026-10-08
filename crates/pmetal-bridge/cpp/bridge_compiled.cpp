@@ -116,7 +116,28 @@ void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
     });
 }
 
+void mlx_inline_fused_precise_sigmoid_gate(mlx_inline_array* dst,
+    const mlx_inline_array* x, const mlx_inline_array* gate) {
+    BRIDGE_TRY_DST("fused_precise_sigmoid_gate", dst, {
+        static auto* compiled = make_compiled(
+            [](const std::vector<array>& inputs) -> std::vector<array> {
+                auto& x = inputs[0];
+                auto& g = inputs[1];
+                auto g32 = sigmoid(astype(g, float32));
+                auto x32 = astype(x, float32);
+                return {astype(multiply(g32, x32), x.dtype())};
+            });
+        auto result = (*compiled)({as_arr(x), as_arr(gate)});
+        new (dst->buf) array(result[0]);
+    });
+}
+
 // shapeless=false version — fixed shapes, works with ALL primitives.
+//
+// ⚠️ The traced graph bakes in the head geometry, the epsilons and the gate
+// activation, so it is cached per combination of them. One process-wide trace
+// served whichever Qwen3.5-family model ran first, and a second model with
+// different dimensions replayed it.
 void mlx_inline_compiled_gdn_layer_fixed(
     mlx_inline_array* dst_out,
     mlx_inline_array* dst_conv_state,
@@ -129,16 +150,33 @@ void mlx_inline_compiled_gdn_layer_fixed(
     const mlx_inline_array* a_log, const mlx_inline_array* dt_bias,
     const mlx_inline_array* norm_w, const mlx_inline_array* out_w,
     const mlx_inline_array* conv_state_in, const mlx_inline_array* ssm_state_in,
-    int nv, int nk, int dk, int dv, int cd, int ck, int kd, float norm_eps
+    int nv, int nk, int dk, int dv, int cd, int ck, int kd, float norm_eps,
+    float qk_eps, bool sigmoid_gate
 ) {
+    struct Entry {
+        int nv, nk, dk, dv, cd, ck, kd;
+        float norm_eps, qk_eps;
+        bool sigmoid_gate;
+        CompiledFn* compiled;
+    };
     // Heap-leaked to avoid cross-DSO static destructor ordering crash.
-    static CompiledFn* compiled = nullptr;
+    static auto* entries = new std::vector<Entry>();
     try {
+        CompiledFn* compiled = nullptr;
+        for (auto& e : *entries) {
+            if (e.nv == nv && e.nk == nk && e.dk == dk && e.dv == dv && e.cd == cd
+                && e.ck == ck && e.kd == kd && e.norm_eps == norm_eps
+                && e.qk_eps == qk_eps && e.sigmoid_gate == sigmoid_gate) {
+                compiled = e.compiled;
+                break;
+            }
+        }
         if (!compiled) {
             int NV=nv, NK=nk, DK=dk, DV=dv, CD=cd, CK=ck, KD=kd;
-            float EPS=norm_eps;
+            float EPS=norm_eps, QK_EPS=qk_eps;
+            bool SIGMOID_GATE=sigmoid_gate;
             compiled = make_compiled_fixed(
-                [NV, NK, DK, DV, CD, CK, KD, EPS](const std::vector<array>& ins) -> std::vector<array> {
+                [NV, NK, DK, DV, CD, CK, KD, EPS, QK_EPS, SIGMOID_GATE](const std::vector<array>& ins) -> std::vector<array> {
                     auto& normed = ins[0];
                     auto& qkv_w = ins[1]; auto& z_w = ins[2];
                     auto& b_w = ins[3]; auto& a_w = ins[4]; auto& conv_w = ins[5];
@@ -160,8 +198,8 @@ void mlx_inline_compiled_gdn_layer_fixed(
 
                     // Single split → 3 siblings sharing one Split primitive (matches Python).
                     auto conv_parts = split(conv_act, Shape{KD, KD * 2}, -1);
-                    auto q = fast::rms_norm(reshape(conv_parts[0], {B, S, NK, DK}), q_nw, EPS);
-                    auto k = fast::rms_norm(reshape(conv_parts[1], {B, S, NK, DK}), k_nw, EPS);
+                    auto q = fast::rms_norm(reshape(conv_parts[0], {B, S, NK, DK}), q_nw, QK_EPS);
+                    auto k = fast::rms_norm(reshape(conv_parts[1], {B, S, NK, DK}), k_nw, QK_EPS);
                     auto v = reshape(conv_parts[2], {B, S, NV, DV});
 
                     auto g = exp(negative(multiply(exp(astype(a_log_arr, float32)),
@@ -179,12 +217,15 @@ void mlx_inline_compiled_gdn_layer_fixed(
                         std::nullopt, false, {});
 
                     auto out_n = fast::rms_norm(kout[0], norm_w_arr, EPS);
-                    auto g32 = multiply(astype(z, float32), sigmoid(astype(z, float32)));
+                    auto z32 = astype(z, float32);
+                    auto g32 = SIGMOID_GATE ? sigmoid(z32) : multiply(z32, sigmoid(z32));
                     auto output = matmul(
                         reshape(astype(multiply(g32, astype(out_n, float32)), q.dtype()),
                                 {B, S, NV * DV}), out_w);
                     return {output, new_conv, kout[1]};
                 });
+            entries->push_back(Entry{nv, nk, dk, dv, cd, ck, kd, norm_eps, qk_eps,
+                                     sigmoid_gate, compiled});
         }
 
         auto result = (*compiled)({

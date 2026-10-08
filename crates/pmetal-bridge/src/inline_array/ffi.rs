@@ -237,6 +237,8 @@ unsafe extern "C" {
         ck: i32,
         kd: i32,
         norm_eps: f32,
+        qk_eps: f32,
+        sigmoid_gate: bool,
     );
 
     pub(super) fn mlx_inline_compiled_attn_layer_fixed(
@@ -1333,6 +1335,12 @@ unsafe extern "C" {
         dt_bias: *const RawBuf,
     );
     pub(super) fn mlx_inline_fused_precise_swiglu(
+        dst: *mut RawBuf,
+        x: *const RawBuf,
+        gate: *const RawBuf,
+    );
+
+    pub(super) fn mlx_inline_fused_precise_sigmoid_gate(
         dst: *mut RawBuf,
         x: *const RawBuf,
         gate: *const RawBuf,

@@ -17,6 +17,7 @@ use pmetal_bridge::compat::{
     VisitLinears, fast, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
+use pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -1105,7 +1106,9 @@ impl Qwen3NextGatedDeltaNet {
                 let inv = (head_k_dim as f32).sqrt().recip();
                 Array::ones_f32(&[head_k_dim]).multiply(&Array::from_f32(inv))
             },
-            qk_norm_eps: 1e-6,
+            // transformers' `l2norm(eps=1e-6)` exactly; see
+            // `gdn_qk_rms_norm_eps` for why it is not `1e-6` itself.
+            qk_norm_eps: gdn_qk_rms_norm_eps(head_k_dim),
             inline_weights: None,
             compiled_decode: None,
         })

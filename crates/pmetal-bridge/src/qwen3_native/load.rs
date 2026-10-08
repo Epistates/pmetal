@@ -568,6 +568,11 @@ pub fn load_model(
     let rope_base = config.rope_theta as f32;
     let rope_scale = 1.0_f32;
     let attn_gated = !config.is_qwen3_dense();
+    let gdn_gate = if config.is_qwen3_dense() {
+        family::GdnGateActivation::Silu
+    } else {
+        config.gdn_gate()?
+    };
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
 
@@ -722,6 +727,7 @@ pub fn load_model(
             gdn_kd: 0,
             gdn_cd: 0,
             gdn_ck: 0,
+            gdn_gate,
         };
 
         if is_linear {

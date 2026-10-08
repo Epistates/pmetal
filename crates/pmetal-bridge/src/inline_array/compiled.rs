@@ -18,6 +18,10 @@ impl InlineArray {
     /// Fixed-shape compiled GDN layer (shapeless=false).
     /// Works with ALL primitives. Traces on first T=1 call, replays tape on subsequent.
     /// Eliminates graph traversal overhead for ~10ms savings per step.
+    ///
+    /// `norm_eps` is the output norm's epsilon, `qk_eps` the query/key
+    /// `rms_norm` one (see `qwen3_native::family::gdn_qk_rms_norm_eps`), and
+    /// `sigmoid_gate` picks `sigmoid(z)` over `silu(z)` for the output gate.
     #[allow(clippy::too_many_arguments)]
     pub fn compiled_gdn_layer_fixed(
         normed: &Self,
@@ -42,6 +46,8 @@ impl InlineArray {
         ck: i32,
         kd: i32,
         norm_eps: f32,
+        qk_eps: f32,
+        sigmoid_gate: bool,
     ) -> (Self, Self, Self) {
         let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
         let mut conv = std::mem::MaybeUninit::<RawBuf>::uninit();
@@ -73,6 +79,8 @@ impl InlineArray {
                 ck,
                 kd,
                 norm_eps,
+                qk_eps,
+                sigmoid_gate,
             );
             (
                 Self {
@@ -632,6 +640,20 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_fused_precise_swiglu(dst.as_mut_ptr(), &x.raw, &gate.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    /// Fused precise sigmoid gate: `(sigmoid(gate.f32()) * x.f32()).as(x.dtype)`,
+    /// the `output_gate_type: "sigmoid"` counterpart of
+    /// [`fused_precise_swiglu`](Self::fused_precise_swiglu).
+    #[inline]
+    pub fn precise_sigmoid_gate(x: &Self, gate: &Self) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_fused_precise_sigmoid_gate(dst.as_mut_ptr(), &x.raw, &gate.raw);
             Self {
                 raw: dst.assume_init(),
             }

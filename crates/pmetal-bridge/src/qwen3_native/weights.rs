@@ -81,6 +81,8 @@ pub(crate) struct LayerWeights {
     pub(crate) gdn_kd: i32,
     pub(crate) gdn_cd: i32,
     pub(crate) gdn_ck: i32,
+    /// Activation on the GDN output gate (`output_gate_type`).
+    pub(crate) gdn_gate: super::family::GdnGateActivation,
 }
 
 // ============================================================================

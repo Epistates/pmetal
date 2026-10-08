@@ -1355,6 +1355,9 @@ fn inline_gdn_forward_pure(
             ck,
             kd,
             lw.gdn_norm_eps,
+            pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps(dk),
+            // `from_model` admits only SiLU-gated checkpoints onto this path.
+            false,
         );
 
         cache.conv_state = Some(new_conv);
@@ -1394,8 +1397,9 @@ fn inline_gdn_forward_pure(
         .reshape(&[b, s, nv, dv]);
 
     // Q/K normalization
-    let q = q.rms_norm(lw.gdn_q_nw.as_ref(), 1e-6);
-    let k = k.rms_norm(lw.gdn_k_nw.as_ref(), 1e-6);
+    let qk_eps = pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps(lw.gdn_dk);
+    let q = q.rms_norm(lw.gdn_q_nw.as_ref(), qk_eps);
+    let k = k.rms_norm(lw.gdn_k_nw.as_ref(), qk_eps);
 
     // Gating
     let g = InlineArray::fused_compute_g(
@@ -1590,8 +1594,9 @@ fn inline_gdn_forward(
         .reshape(&[b, s, nv, dv]);
 
     // Q/K normalization
-    let q = q.rms_norm(lw.gdn_q_nw.as_ref(), 1e-6);
-    let k = k.rms_norm(lw.gdn_k_nw.as_ref(), 1e-6);
+    let qk_eps = pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps(lw.gdn_dk);
+    let q = q.rms_norm(lw.gdn_q_nw.as_ref(), qk_eps);
+    let k = k.rms_norm(lw.gdn_k_nw.as_ref(), qk_eps);
 
     // GDN recurrence — compute g/beta with FUSED ops (1 dispatch each),
     // then dispatch Metal kernel with pre-computed g/beta.

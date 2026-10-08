@@ -38,6 +38,10 @@ void mlx_inline_fused_compute_g(mlx_inline_array* dst,
 void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* gate);
 
+// fused_precise_sigmoid_gate: (sigmoid(gate.f32()) * x.f32()).as(x.dtype)
+void mlx_inline_fused_precise_sigmoid_gate(mlx_inline_array* dst,
+    const mlx_inline_array* x, const mlx_inline_array* gate);
+
 // ── Layer-level fixed-shape compiled graphs (shapeless=false) ────────────
 // First call traces; subsequent calls replay the tape with zero graph overhead.
 void mlx_inline_compiled_gdn_layer_fixed(
@@ -52,7 +56,8 @@ void mlx_inline_compiled_gdn_layer_fixed(
     const mlx_inline_array* a_log, const mlx_inline_array* dt_bias,
     const mlx_inline_array* norm_w, const mlx_inline_array* out_w,
     const mlx_inline_array* conv_state_in, const mlx_inline_array* ssm_state_in,
-    int nv, int nk, int dk, int dv, int cd, int ck, int kd, float norm_eps);
+    int nv, int nk, int dk, int dv, int cd, int ck, int kd, float norm_eps,
+    float qk_eps, bool sigmoid_gate);
 
 // Fixed-shape compiled attention decode layer (shapeless=false).
 // Traces per cache-shape bucket on first T=1 call, then replays.

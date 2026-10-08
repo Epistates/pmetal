@@ -196,7 +196,7 @@ static array run_gdn_layer(
             &w_qkv, &w_z, &w_b, &w_a, &w_conv,
             &w_qn, &w_kn, &w_al, &w_dt, &w_nm, &w_out,
             &w_cs, &w_ss,
-            nv, nk, dk, dv, cd, ck, kd, norm_eps);
+            nv, nk, dk, dv, cd, ck, kd, norm_eps, norm_eps / dk, false);
 
         // Destroy temp wrappers
         as_arr(&w_normed).~array(); as_arr(&w_qkv).~array();
@@ -233,8 +233,10 @@ static array run_gdn_layer(
     // Single split → 3 siblings sharing one Split primitive (matches Python's mx.split).
     // This replaces 3 Slice nodes with 1 Split node, saving 2 nodes per GDN prefill layer.
     auto conv_parts = split(conv_act, Shape{kd, kd * 2}, -1);
-    auto q = fast::rms_norm(reshape(conv_parts[0], {B,S,nk,dk}), q_nw, norm_eps);
-    auto k = fast::rms_norm(reshape(conv_parts[1], {B,S,nk,dk}), k_nw, norm_eps);
+    // L2 norm as rms_norm: eps / dk keeps transformers' epsilon (see
+    // `qwen3_native::family::gdn_qk_rms_norm_eps`).
+    auto q = fast::rms_norm(reshape(conv_parts[0], {B,S,nk,dk}), q_nw, norm_eps / dk);
+    auto k = fast::rms_norm(reshape(conv_parts[1], {B,S,nk,dk}), k_nw, norm_eps / dk);
     auto v =                reshape(conv_parts[2], {B,S,nv,dv});
 
     // compute_g: exp(-exp(a_log.f32) * softplus(a_val + dt_bias))
