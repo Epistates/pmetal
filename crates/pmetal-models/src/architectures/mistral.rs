@@ -169,10 +169,8 @@ pub struct MistralAttention {
     pub v_proj: nn::Linear,
     /// Output projection.
     pub o_proj: nn::Linear,
-    /// RoPE layer.
-    pub rope: nn::Rope,
 }
-impl_module_params!(MistralAttention; q_proj, k_proj, v_proj, o_proj, rope);
+impl_module_params!(MistralAttention; q_proj, k_proj, v_proj, o_proj);
 
 impl MistralAttention {
     /// Create a new attention layer.
@@ -196,12 +194,6 @@ impl MistralAttention {
             .bias(false)
             .build()?;
 
-        // Initialize RoPE
-        let rope = nn::RopeBuilder::new(head_dim)
-            .base(rope_theta)
-            .traditional(false)
-            .build()?;
-
         Ok(Self {
             n_heads,
             n_kv_heads,
@@ -213,7 +205,6 @@ impl MistralAttention {
             k_proj,
             v_proj,
             o_proj,
-            rope,
         })
     }
 

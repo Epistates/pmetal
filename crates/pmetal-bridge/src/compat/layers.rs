@@ -1116,101 +1116,6 @@ impl Conv1dBuilder {
     }
 }
 
-// ── Rope (RotaryPositionalEncoding) ───────────────────────────────────────
-
-/// Rotary positional encoding (RoPE).
-///
-/// Stateless — no trainable parameters.  The forward pass is dispatched
-/// via `InlineArray::rope()`.
-#[derive(Debug, Clone)]
-pub struct Rope {
-    pub dimensions: i32,
-    pub traditional: bool,
-    pub base: f32,
-    pub scale: f32,
-}
-
-impl Rope {
-    pub const DEFAULT_TRADITIONAL: bool = false;
-    pub const DEFAULT_BASE: f32 = 10_000.0;
-    pub const DEFAULT_SCALE: f32 = 1.0;
-
-    pub fn new(dims: i32, traditional: bool, base: f32, scale: f32) -> Self {
-        Self {
-            dimensions: dims,
-            traditional,
-            base,
-            scale,
-        }
-    }
-
-    pub fn forward(&self, x: &Array, offset: i32) -> Array {
-        x.rope(
-            self.dimensions,
-            self.traditional,
-            self.base,
-            self.scale,
-            offset,
-        )
-    }
-}
-
-// RoPE holds frequency tables, never a projection.
-impl super::VisitLinears for Rope {
-    fn visit_linears_mut(&mut self, _prefix: &str, _f: &mut dyn FnMut(&str, &mut Linear)) {}
-}
-
-impl ModuleParameters for Rope {
-    fn num_parameters(&self) -> usize {
-        0
-    }
-    fn parameters(&self) -> ModuleParamRef<'_> {
-        HashMap::new()
-    }
-    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        HashMap::new()
-    }
-}
-
-/// Builder for [`Rope`].
-pub struct RopeBuilder {
-    dims: i32,
-    traditional: bool,
-    base: f32,
-    scale: f32,
-}
-
-impl RopeBuilder {
-    pub fn new(dims: i32) -> Self {
-        Self {
-            dims,
-            traditional: Rope::DEFAULT_TRADITIONAL,
-            base: Rope::DEFAULT_BASE,
-            scale: Rope::DEFAULT_SCALE,
-        }
-    }
-    pub fn traditional(mut self, t: bool) -> Self {
-        self.traditional = t;
-        self
-    }
-    pub fn base(mut self, b: f32) -> Self {
-        self.base = b;
-        self
-    }
-    pub fn scale(mut self, s: f32) -> Self {
-        self.scale = s;
-        self
-    }
-    pub fn build(self) -> Result<Rope, Exception> {
-        Ok(Rope::new(
-            self.dims,
-            self.traditional,
-            self.base,
-            self.scale,
-        ))
-    }
-}
-
 // ── Vec<T> where T: ModuleParameters ─────────────────────────────────────
 
 impl<T: ModuleParameters> ModuleParameters for Vec<T> {
@@ -1334,17 +1239,6 @@ impl super::Module<&Array> for Conv1d {
     type Error = super::Exception;
     fn forward(&mut self, x: &Array) -> Result<Array, super::Exception> {
         Ok(Conv1d::forward(self, x))
-    }
-    fn training_mode(&mut self, _mode: bool) {}
-}
-
-// Rope uses a tuple input (x, offset) since offset is needed.
-// We also provide a Module<&Array> impl that uses offset=0 for non-cached paths.
-impl super::Module<&Array> for Rope {
-    type Output = Array;
-    type Error = super::Exception;
-    fn forward(&mut self, x: &Array) -> Result<Array, super::Exception> {
-        Ok(Rope::forward(self, x, 0))
     }
     fn training_mode(&mut self, _mode: bool) {}
 }

@@ -18,7 +18,7 @@
 use crate::decoder_layer::{
     AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
 };
-use pmetal_bridge::compat::nn::{Embedding, Linear, RmsNorm, RopeBuilder};
+use pmetal_bridge::compat::nn::{Embedding, Linear, RmsNorm};
 use pmetal_bridge::compat::{
     Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random,
 };
@@ -421,8 +421,6 @@ pub struct PhiAttention {
     pub k_proj: Linear,
     pub v_proj: Linear,
     pub o_proj: Linear,
-    /// Standard RoPE module (used when `long_rope` is None).
-    pub rope: pmetal_bridge::compat::nn::Rope,
     pub n_heads: i32,
     pub n_kv_heads: i32,
     pub head_dim: i32,
@@ -459,12 +457,6 @@ impl PhiAttention {
                 .bias(false)
                 .build()?;
 
-        let rope = RopeBuilder::new(rope_dim)
-            .traditional(false)
-            .base(rope_theta)
-            .scale(1.0)
-            .build()?;
-
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         // Compute LongRoPE tables if rope_scaling is provided (Phi-3 128K / Phi-3.5 / Phi-4)
@@ -491,7 +483,6 @@ impl PhiAttention {
             k_proj,
             v_proj,
             o_proj,
-            rope,
             n_heads: config.num_attention_heads,
             n_kv_heads: config.num_key_value_heads,
             head_dim,

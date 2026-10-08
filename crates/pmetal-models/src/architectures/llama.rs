@@ -181,10 +181,8 @@ pub struct LlamaAttention {
     pub v_proj: nn::Linear,
     /// Output projection.
     pub o_proj: nn::Linear,
-    /// RoPE layer (used for non-cached forward).
-    pub rope: nn::Rope,
 }
-impl_module_params!(LlamaAttention; q_proj, k_proj, v_proj, o_proj, rope);
+impl_module_params!(LlamaAttention; q_proj, k_proj, v_proj, o_proj);
 
 impl LlamaAttention {
     /// Create a new attention layer.
@@ -217,13 +215,6 @@ impl LlamaAttention {
             .bias(false)
             .build()?;
 
-        // Initialize RoPE with scaled parameters
-        let rope = nn::RopeBuilder::new(head_dim)
-            .base(effective_base)
-            .scale(rope_scale)
-            .traditional(false)
-            .build()?;
-
         Ok(Self {
             n_heads,
             n_kv_heads,
@@ -238,7 +229,6 @@ impl LlamaAttention {
             k_proj,
             v_proj,
             o_proj,
-            rope,
         })
     }
 

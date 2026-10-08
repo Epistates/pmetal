@@ -264,10 +264,8 @@ pub struct Qwen2Attention {
     pub v_proj: nn::Linear,
     /// Output projection.
     pub o_proj: nn::Linear,
-    /// RoPE layer.
-    pub rope: nn::Rope,
 }
-impl_module_params!(Qwen2Attention; q_proj, k_proj, v_proj, o_proj, rope);
+impl_module_params!(Qwen2Attention; q_proj, k_proj, v_proj, o_proj);
 
 impl Qwen2Attention {
     /// Create a new attention layer.
@@ -300,13 +298,6 @@ impl Qwen2Attention {
             .bias(false) // Output projection has no bias
             .build()?;
 
-        // Initialize RoPE with scaled parameters
-        let rope = nn::RopeBuilder::new(head_dim)
-            .base(effective_base)
-            .scale(rope_scale)
-            .traditional(false)
-            .build()?;
-
         Ok(Self {
             n_heads,
             n_kv_heads,
@@ -321,7 +312,6 @@ impl Qwen2Attention {
             k_proj,
             v_proj,
             o_proj,
-            rope,
         })
     }
 

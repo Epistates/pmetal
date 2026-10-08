@@ -374,8 +374,6 @@ pub struct GemmaAttention {
     pub v_proj: nn::Linear,
     /// Output projection.
     pub o_proj: nn::Linear,
-    /// RoPE layer.
-    pub rope: nn::Rope,
     /// Per-head query norm, Gemma 3 onward (`self_attn.q_norm.weight`).
     ///
     /// Gemma 3 normalizes queries and keys over the head dimension between the
@@ -385,7 +383,7 @@ pub struct GemmaAttention {
     /// Per-head key norm, Gemma 3 onward (`self_attn.k_norm.weight`).
     pub k_norm: Option<GemmaRmsNorm>,
 }
-impl_module_params!(GemmaAttention; q_proj, k_proj, v_proj, o_proj, rope, q_norm, k_norm);
+impl_module_params!(GemmaAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
 impl GemmaAttention {
     /// Create a new attention layer.
@@ -432,12 +430,6 @@ impl GemmaAttention {
             .bias(false)
             .build()?;
 
-        let rope = nn::RopeBuilder::new(head_dim)
-            .base(effective_base)
-            .scale(rope_scale)
-            .traditional(false)
-            .build()?;
-
         // Gemma 3's QK-norm normalizes over the head dimension, so these are
         // sized `head_dim`, not `hidden_size`.
         let (q_norm, k_norm) = if config.is_gemma3 {
@@ -465,7 +457,6 @@ impl GemmaAttention {
             k_proj,
             v_proj,
             o_proj,
-            rope,
             q_norm,
             k_norm,
         })
