@@ -1091,6 +1091,7 @@ impl DFlashTarget for DynamicModel {
             Self::Cohere(_) => Err(dflash_architecture_unsupported("Cohere")),
             Self::Granite(_) => Err(dflash_architecture_unsupported("Granite")),
             Self::NemotronH(_) => Err(dflash_architecture_unsupported("NemotronH")),
+            Self::Qwen4Exp(_) => Err(dflash_architecture_unsupported("Qwen4Exp")),
             // Mllama's decoder interleaves cross-attention layers whose KV
             // comes from images, so a text-only draft model cannot mirror it.
             Self::Mllama(_) => Err(dflash_architecture_unsupported("Mllama")),
@@ -1170,6 +1171,7 @@ impl DFlashTarget for DynamicModel {
             Self::Cohere(_) => Err(dflash_architecture_unsupported("Cohere")),
             Self::Granite(_) => Err(dflash_architecture_unsupported("Granite")),
             Self::NemotronH(_) => Err(dflash_architecture_unsupported("NemotronH")),
+            Self::Qwen4Exp(_) => Err(dflash_architecture_unsupported("Qwen4Exp")),
             Self::Mllama(_) => Err(dflash_architecture_unsupported("Mllama")),
             Self::Flux(_) | Self::Bert(_) | Self::DiffusionGemma(_) => Err(Exception::custom(
                 "DFlashTarget: Flux / BERT / DiffusionGemma are not causal LMs",

@@ -153,6 +153,9 @@ pub enum ModelArchitecture {
     DiffusionGemma,
     /// Mllama (Llama 3.2 Vision) — tiled vision tower + cross-attending text decoder.
     Mllama,
+    /// Qwen4-Exp (Qwen3.8-Flash-Next): hybrid GDN / indexed attention with
+    /// hyper-connections and PLE n-gram embeddings. Text tower.
+    Qwen4Exp,
 }
 
 impl std::fmt::Display for ModelArchitecture {
@@ -178,6 +181,7 @@ impl std::fmt::Display for ModelArchitecture {
             Self::Bert => write!(f, "BERT"),
             Self::DiffusionGemma => write!(f, "DiffusionGemma"),
             Self::Mllama => write!(f, "Llama 3.2 Vision (Mllama)"),
+            Self::Qwen4Exp => write!(f, "Qwen4-Exp (Qwen3.8-Flash-Next)"),
         }
     }
 }
@@ -210,6 +214,7 @@ impl ModelArchitecture {
             Self::Bert => "Bert",
             Self::DiffusionGemma => "DiffusionGemma",
             Self::Mllama => "Mllama",
+            Self::Qwen4Exp => "Qwen4Exp",
         }
     }
 
@@ -234,6 +239,7 @@ impl ModelArchitecture {
             "qwen3_next" | "qwen3_5" | "qwen3.5" | "qwen3_5_text" | "qwen3_5_moe"
             | "qwen3_5_moe_text" | "qwen3_6" | "qwen3.6" | "qwen3_6_text" | "qwen3_6_moe"
             | "qwen3_6_moe_text" => Some(Self::Qwen3Next),
+            "qwen4_exp" | "qwen4_exp_text" => Some(Self::Qwen4Exp),
             "qwen3" => Some(Self::Qwen3),
             "qwen2" | "qwen2_5" => Some(Self::Qwen2),
             "gemma" | "gemma2" | "gemma3" => Some(Self::Gemma),
@@ -295,6 +301,11 @@ impl ModelArchitecture {
             }
             if lower.contains("llama") {
                 return Some(Self::Llama);
+            }
+            // Before the generic "qwen" fallback below, which would take it
+            // for Qwen 2.
+            if lower.contains("qwen4exp") || lower.contains("qwen4_exp") {
+                return Some(Self::Qwen4Exp);
             }
             if lower.contains("qwen3moe") || lower.contains("qwen3_moe") {
                 return Some(Self::Qwen3MoE);
@@ -429,6 +440,7 @@ impl ModelArchitecture {
                 serde_json::to_value(&parsed).map_err(|e| Exception::custom(e.to_string()))
             }
             Self::Mllama => round_trip!(MllamaConfig, config_content),
+            Self::Qwen4Exp => round_trip!(Qwen4ExpConfig, &nested),
             Self::Flux => Err(Exception::custom(
                 "Flux is a diffusion pipeline, not a causal LM; its config is parsed by FluxPipeline.",
             )),
@@ -491,6 +503,7 @@ macro_rules! dispatch_uniform {
             Self::Bert(m) => m.$method($($arg),*),
             Self::DiffusionGemma(m) => m.$method($($arg),*),
             Self::Mllama(m) => m.$method($($arg),*),
+            Self::Qwen4Exp(m) => m.$method($($arg),*),
         }
     };
 }
@@ -519,6 +532,7 @@ macro_rules! dispatch_architecture {
             Self::Bert(_) => ModelArchitecture::Bert,
             Self::DiffusionGemma(_) => ModelArchitecture::DiffusionGemma,
             Self::Mllama(_) => ModelArchitecture::Mllama,
+            Self::Qwen4Exp(_) => ModelArchitecture::Qwen4Exp,
         }
     };
 }
@@ -651,6 +665,7 @@ pub enum DynamicModel {
     Bert(BertForEmbedding),
     DiffusionGemma(DiffusionGemmaForBlockDiffusion),
     Mllama(MllamaForConditionalGeneration),
+    Qwen4Exp(Qwen4ExpForCausalLM),
 }
 
 impl std::fmt::Debug for DynamicModel {
@@ -676,6 +691,7 @@ impl std::fmt::Debug for DynamicModel {
             Self::Bert(_) => write!(f, "DynamicModel::Bert"),
             Self::DiffusionGemma(_) => write!(f, "DynamicModel::DiffusionGemma"),
             Self::Mllama(_) => write!(f, "DynamicModel::Mllama"),
+            Self::Qwen4Exp(_) => write!(f, "DynamicModel::Qwen4Exp"),
         }
     }
 }
@@ -810,6 +826,10 @@ impl DynamicModel {
                     config_content,
                     Mllama
                 )
+            }
+            ModelArchitecture::Qwen4Exp => {
+                let config = Qwen4ExpConfig::from_json(&unwrap_text_config(config_content)?)?;
+                Ok(Self::Qwen4Exp(Qwen4ExpForCausalLM::new(config)?))
             }
             ModelArchitecture::Flux => Err(Exception::custom(
                 "Flux models are diffusion pipelines, not causal language models. Build them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::from_config.",
@@ -1021,6 +1041,33 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3Next(model))
+            }
+            ModelArchitecture::Qwen4Exp => {
+                let config = Qwen4ExpConfig::from_json(&unwrap_text_config(&config_content)?)?;
+                let skip_routed_experts = options.prefer_expert_offload;
+                let mut model = Qwen4ExpForCausalLM::new_for_loading(
+                    config,
+                    if skip_routed_experts {
+                        Qwen3NextRoutedExpertMode::Placeholder
+                    } else {
+                        Qwen3NextRoutedExpertMode::Resident
+                    },
+                )?;
+                let load_options = Qwen4ExpLoadOptions {
+                    skip_routed_experts,
+                    ngram_rows_on_disk: model.config.ngram_table_bytes()
+                        > Qwen4ExpLoadOptions::RESIDENT_NGRAM_LIMIT_BYTES,
+                };
+                let report = load_qwen4_exp_weights(&mut model, model_dir, load_options)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                tracing::info!(
+                    ngram_rows_on_disk = load_options.ngram_rows_on_disk,
+                    "Qwen4-Exp weight load: {} loaded, {} skipped by design (vision tower, MTP)",
+                    report.loaded,
+                    report.skipped.len()
+                );
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Qwen4Exp(model))
             }
             ModelArchitecture::Flux => Err(Exception::custom(
                 "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
@@ -1244,6 +1291,7 @@ impl DynamicModel {
             Self::Granite(m) => m.forward(input_ids, mask, None),
             Self::NemotronH(m) => m.forward(input_ids, None),
             Self::Qwen3Next(m) => m.forward(input_ids, mask),
+            Self::Qwen4Exp(m) => m.forward(input_ids, mask),
             Self::GptOss(m) => m.forward(input_ids, mask, None),
             Self::Gemma4(m) => m.forward(input_ids, mask),
             // Text-only: this signature carries no images, so the
@@ -1436,6 +1484,8 @@ impl DynamicModel {
             // Qwen3Next linear-attn + Mamba hybrid — cacheless forward
             // wraps the standard dispatch with None/None caches.
             Self::Qwen3Next(m) => m.model.forward(input_ids, mask),
+            // The final hyper-connection mix, which is what the LM head reads.
+            Self::Qwen4Exp(m) => m.model.forward(input_ids, mask),
             Self::Mistral(m) => m.model.forward(input_ids, mask),
             Self::Gemma(m) => m.model.forward(input_ids, mask),
             // Gemma4 / Phi / Phi4 inner models expose only forward_with_cache;
@@ -1488,7 +1538,7 @@ impl DynamicModel {
             Self::Mllama(m) => m.forward_with_cache(input_ids, mask, cache),
             // Hybrid recurrent+attention models require both a KV cache and a
             // Mamba/GDN state cache. Use `forward_with_hybrid_cache` instead.
-            Self::NemotronH(_) | Self::Qwen3Next(_) => Err(Exception::custom(
+            Self::NemotronH(_) | Self::Qwen3Next(_) | Self::Qwen4Exp(_) => Err(Exception::custom(
                 "Hybrid architecture requires both KV and Mamba caches. \
                  Use DynamicModel::forward_with_hybrid_cache with both \
                  create_cache() and create_mamba_cache().",
@@ -1603,6 +1653,7 @@ impl DynamicModel {
             Self::Qwen3(m) => Some(&mut m.model.embed_tokens),
             Self::Qwen3MoE(m) => Some(&mut m.model.embed_tokens),
             Self::Qwen3Next(m) => Some(&mut m.model.embed_tokens),
+            Self::Qwen4Exp(m) => Some(&mut m.model.embed_tokens),
             Self::Gemma(m) => Some(&mut m.model.embed_tokens),
             Self::Gemma4(m) => Some(&mut m.model.embed_tokens),
             Self::Mistral(m) => Some(&mut m.model.embed_tokens),
@@ -1684,6 +1735,8 @@ impl DynamicModel {
             Self::Cohere(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Granite(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Qwen3Next(m) => crate::fp8_utils::quantize_model_linears(m),
+            // The n-gram tables are embeddings, which the generic pass leaves alone.
+            Self::Qwen4Exp(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::GptOss(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Gemma4(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Bert(m) => crate::fp8_utils::quantize_model_linears(m),
@@ -1745,6 +1798,7 @@ impl DynamicModel {
                 m.config().num_kv_heads() as usize,
                 m.config().head_dim() as usize,
             )),
+            Self::Qwen4Exp(m) => m.create_cache(max_seq_len),
             Self::GptOss(m) => KVCache::new(KVCacheConfig::new(
                 m.config().num_hidden_layers as usize,
                 max_seq_len,
@@ -1805,6 +1859,8 @@ impl DynamicModel {
         match self {
             Self::NemotronH(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
             Self::Qwen3Next(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
+            // GDN state plus the indexer and PLE states; see `Qwen4ExpCacheLayout`.
+            Self::Qwen4Exp(m) => Some(m.create_mamba_cache()),
             _ => None,
         }
     }
@@ -1819,6 +1875,7 @@ impl DynamicModel {
         match self {
             Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             Self::Qwen3Next(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
+            Self::Qwen4Exp(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache(input_ids, mask, kv_cache),
         }
     }
@@ -1994,6 +2051,7 @@ impl DynamicModel {
             Self::Bert(m) => m.config().vocab_size as i32,
             Self::DiffusionGemma(m) => m.vocab_size,
             Self::Mllama(m) => m.config.text_config.llama.vocab_size,
+            Self::Qwen4Exp(m) => m.config.vocab_size,
         }
     }
 
@@ -2019,6 +2077,7 @@ impl DynamicModel {
             Self::Bert(m) => m.config().hidden_size as i32,
             Self::DiffusionGemma(m) => m.encoder.config.hidden_size,
             Self::Mllama(m) => m.config.text_config.llama.hidden_size,
+            Self::Qwen4Exp(m) => m.config.hidden_size,
         }
     }
 
@@ -2044,6 +2103,7 @@ impl DynamicModel {
             Self::Bert(m) => eval_module_parameters_batched(m),
             Self::DiffusionGemma(m) => eval_module_parameters_batched(m),
             Self::Mllama(m) => eval_module_parameters_batched(m),
+            Self::Qwen4Exp(m) => eval_module_parameters_batched(m),
         }
     }
 
@@ -2406,6 +2466,23 @@ mod tests {
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Qwen3Next)
+        );
+    }
+
+    /// Qwen3.8-Flash-Next ships `qwen4_exp`. Its class name contains "qwen",
+    /// which the generic fallback reads as Qwen 2.
+    #[test]
+    fn qwen4_exp_detects_from_model_type_and_architecture_string() {
+        for mt in ["qwen4_exp", "qwen4_exp_text"] {
+            assert_eq!(
+                ModelArchitecture::from_model_type(mt),
+                Some(ModelArchitecture::Qwen4Exp)
+            );
+        }
+        let architectures = vec!["Qwen4ExpForConditionalGeneration".to_string()];
+        assert_eq!(
+            ModelArchitecture::from_architectures(&architectures),
+            Some(ModelArchitecture::Qwen4Exp)
         );
     }
 
