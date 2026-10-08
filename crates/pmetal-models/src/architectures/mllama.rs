@@ -790,6 +790,15 @@ impl MllamaVisionModel {
         // Patch embedding. MLX convolves NHWC and yields [N, h/p, w/p, hidden],
         // whose row-major flattening already matches the reference's
         // `flatten(2).transpose(1, 2)` on NCHW.
+        // In the tower's dtype, as the reference casts them (`pixel_values.
+        // to(self.dtype)`): f32 pixels would run a bf16 checkpoint's whole
+        // tower, and the text model after its first cross layer, in f32.
+        let weight_dtype = self.patch_embedding.weight.dtype();
+        let pixel_values = if pixel_values.dtype() == weight_dtype {
+            pixel_values.clone()
+        } else {
+            pixel_values.as_dtype(weight_dtype.as_i32())
+        };
         let flat_tiles = pixel_values
             .reshape(&[rows * tiles, channels, height, width])
             .transpose_axes(&[0, 2, 3, 1]);
@@ -1087,7 +1096,14 @@ impl MllamaTextDecoderLayer {
             // Text rows that attend to no image at all are zeroed here rather
             // than masked in the softmax — see `prepare_cross_attention_mask`.
             if let Some(rows) = cross.and_then(|c| c.full_text_row_mask.as_ref()) {
-                ff = ff.multiply(rows);
+                // The 0/1 rows in the activations' dtype, as the reference
+                // casts them: an f32 mask would promote a bf16 model's
+                // residual stream to f32 from the first cross layer on.
+                ff = if rows.dtype() == ff.dtype() {
+                    ff.multiply(rows)
+                } else {
+                    ff.multiply(&rows.as_dtype(ff.dtype().as_i32()))
+                };
             }
             ff = apply_gate(&self.cross_attn_mlp_gate, &ff);
         }
