@@ -160,7 +160,7 @@ pub(crate) async fn run_preference(
 
     let weights = output_dir.join("lora_weights.safetensors");
     model.save_lora_weights(&weights)?;
-    pmetal_trainer::orchestrator::save_adapter_config_with_base(
+    pmetal_trainer::orchestrator::save_adapter_config(
         &weights,
         lora_config.r,
         lora_config.alpha,

@@ -1101,6 +1101,7 @@ fn run_lora_path(
             config.lora.alpha,
             &config.lora.target_modules,
             config.lora.use_rslora,
+            Some(&full_config.model.model_id),
         )?;
     } else if (config.dispatch.fused || config.dispatch.jit_compilation)
         && full_config.training.gradient_accumulation_steps == 1
@@ -1121,6 +1122,7 @@ fn run_lora_path(
             config.lora.alpha,
             &config.lora.target_modules,
             config.lora.use_rslora,
+            Some(&full_config.model.model_id),
         )?;
     } else if config.dispatch.metal_fused_optimizer {
         tracing::info!("Using Metal fused optimizer for training");
@@ -1140,6 +1142,7 @@ fn run_lora_path(
             config.lora.alpha,
             &config.lora.target_modules,
             config.lora.use_rslora,
+            Some(&full_config.model.model_id),
         )?;
     } else {
         if (config.dispatch.fused || config.dispatch.jit_compilation)
@@ -1165,6 +1168,7 @@ fn run_lora_path(
             config.lora.alpha,
             &config.lora.target_modules,
             config.lora.use_rslora,
+            Some(&full_config.model.model_id),
         )?;
     }
 
@@ -1773,25 +1777,9 @@ pub async fn resolve_dataset_path(dataset_id: &str) -> anyhow::Result<PathBuf> {
 // Helper: save adapter config
 // ---------------------------------------------------------------------------
 
+/// Write `adapter_config.json` beside the LoRA weights at `lora_weights_path`,
+/// naming the base model it was trained on when known.
 pub fn save_adapter_config(
-    lora_weights_path: &Path,
-    r: usize,
-    alpha: f32,
-    target_modules: &[String],
-    use_rslora: bool,
-) -> anyhow::Result<()> {
-    save_adapter_config_with_base(
-        lora_weights_path,
-        r,
-        alpha,
-        target_modules,
-        use_rslora,
-        None,
-    )
-}
-
-/// Save adapter_config.json with optional base_model metadata.
-pub fn save_adapter_config_with_base(
     lora_weights_path: &Path,
     r: usize,
     alpha: f32,
@@ -1937,6 +1925,28 @@ impl Default for FullTrainingConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_adapter_config_names_its_base_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let weights = dir.path().join("lora_weights.safetensors");
+        let targets = vec!["q_proj".to_string(), "v_proj".to_string()];
+        save_adapter_config(&weights, 8, 16.0, &targets, true, Some("Qwen/Qwen3-0.6B")).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("adapter_config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "r": 8,
+                "alpha": 16.0,
+                "target_modules": ["q_proj", "v_proj"],
+                "use_rslora": true,
+                "base_model": "Qwen/Qwen3-0.6B",
+            })
+        );
+    }
 
     #[test]
     fn config_file_merge_preserves_yaml_training_defaults() {

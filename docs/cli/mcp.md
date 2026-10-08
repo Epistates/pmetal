@@ -54,7 +54,7 @@ claude mcp add pmetal -- pmetal mcp
 | **Inference** | `generate`, `chat`, `decide`, `start_serve` |
 | **Jobs** | `list_jobs`, `job_status`, `job_logs`, `stop_job`, `job_graceful_stop`, `job_save_checkpoint`, `start_cli_job` |
 | **Adaptive LR** | `job_set_lr`, `job_reduce_lr`, `job_reset_lr` |
-| **Models** | `search_models`, `download_model`, `list_local_models`, `model_info`, `model_fit`, `estimate_model_memory` |
+| **Models** | `search_models`, `download_model`, `list_local_models`, `model_info`, `model_fit` |
 | **Datasets** | `dataset_analyze`, `dataset_convert`, `dataset_download`, `dataset_filter`, `dataset_merge`, `dataset_prepare`, `dataset_preview`, `dataset_sample`, `dataset_split`, `dataset_template`, `dataset_validate`, `tokenize` |
 | **Model ops** | `merge_models`, `quantize`, `fuse_lora`, `pack_experts`, `ollama_create`, `ollama_modelfile` |
 | **Evaluation** | `eval_perplexity`, `benchmark`, `bench_train`, `bench_gen`, `bench_corpus` |

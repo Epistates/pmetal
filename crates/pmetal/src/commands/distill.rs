@@ -552,7 +552,7 @@ pub(crate) async fn run_distillation_cli(
     std::fs::create_dir_all(&validated_distill_output)?;
     use pmetal_lora::TrainableModel;
     student_model.save_lora_weights(&lora_output)?;
-    crate::save_adapter_config(
+    pmetal_trainer::orchestrator::save_adapter_config(
         &lora_output,
         student_lora_config.r,
         student_lora_config.alpha,

@@ -452,7 +452,7 @@ pub(crate) async fn run_grpo_cli(
     std::fs::create_dir_all(&output_dir_path)?;
     let final_path = output_dir_path.join("lora_weights.safetensors");
     model.save_lora_weights(&final_path)?;
-    crate::save_adapter_config(
+    pmetal_trainer::orchestrator::save_adapter_config(
         &final_path,
         lora_config.r,
         lora_config.alpha,

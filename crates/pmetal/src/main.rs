@@ -2857,34 +2857,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Save adapter config alongside LoRA weights.
-#[cfg(feature = "trainer")]
-fn save_adapter_config(
-    lora_weights_path: &std::path::Path,
-    r: usize,
-    alpha: f32,
-    target_modules: &[String],
-    use_rslora: bool,
-    base_model: Option<&str>,
-) -> anyhow::Result<()> {
-    let mut adapter_config = serde_json::json!({
-        "r": r,
-        "alpha": alpha,
-        "target_modules": target_modules,
-        "use_rslora": use_rslora,
-    });
-    if let Some(bm) = base_model {
-        adapter_config["base_model"] = serde_json::Value::String(bm.to_string());
-    }
-    let config_path = lora_weights_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("adapter_config.json");
-    std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-    tracing::info!("Saved adapter config to {:?}", config_path);
-    Ok(())
-}
-
 fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
     use std::path::{Component, PathBuf};
 

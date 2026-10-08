@@ -86,7 +86,7 @@ pub use fused_swiglu::{
 };
 pub use fused_training::{
     AdamWConfig, BatchCompletionToken, BatchedCommandBuffer, FusedAdamW, FusedCrossEntropyTraining,
-    FusedGradientClipping, FusedTrainingCoordinator, ParamInfo,
+    FusedGradientClipping, ParamInfo,
 };
 pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};
 pub use mpp_flash_attention::{
