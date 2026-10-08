@@ -95,7 +95,11 @@ pub fn schedule_zero_bubble(
     }
 
     // Steady state: F, B, then fill bubble with W from earlier micro-batches.
-    while next_fwd < num_micro_batches || next_bwd < num_micro_batches {
+    // It lasts while forwards remain; the cooldown below takes the
+    // backwards left after the last one. (Running it until every backward
+    // was out spun forever: with no forward left, the gate on B never
+    // opened again for the last `num_stages - stage - 1` micro-batches.)
+    while next_fwd < num_micro_batches {
         // Forward for new micro-batch.
         if next_fwd < num_micro_batches {
             if !is_first {
