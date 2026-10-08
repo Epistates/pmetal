@@ -42,8 +42,7 @@ pub use forward::{
     forward_step_tree_verify, forward_step_with_capture, rollback_cache,
 };
 pub use generate::{
-    QwenDecodeBackend, benchmark_trial, benchmark_trial_canonical, canonical_decode_backend,
-    generate, generate_canonical, generate_from_primed_sample, generate_from_primed_sample_silent,
+    benchmark_trial, generate, generate_from_primed_sample, generate_from_primed_sample_silent,
     generate_preserve_peak, prefill_first_token, prime_generation_preserve_peak,
     prime_generation_preserve_peak_silent,
 };
@@ -524,10 +523,7 @@ fn json_quantization_is_sidecar(value: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        QwenDecodeBackend, canonical_decode_backend, parse_config_text,
-        validate_quantization_runtime_support_for,
-    };
+    use super::{parse_config_text, validate_quantization_runtime_support_for};
     use crate::native_moe::switch_glu_input as moe_switch_glu_input;
     use crate::{compat::Dtype, inline_array::InlineArray};
 
@@ -805,33 +801,6 @@ mod tests {
         let x_flat = InlineArray::ones(&[3, 4], dt);
         let switch_in = moe_switch_glu_input(&x_flat);
         assert_eq!(switch_in.shape(), &[3, 1, 1, 4]);
-    }
-
-    #[test]
-    fn canonical_decode_backend_prefers_rust_bridge_for_qwen35_moe() {
-        let config = parse_config_text(
-            r#"{
-                "model_type": "qwen3_5_moe",
-                "text_config": {
-                    "model_type": "qwen3_5_moe_text",
-                    "hidden_size": 2048,
-                    "num_hidden_layers": 40,
-                    "num_attention_heads": 16,
-                    "num_key_value_heads": 2,
-                    "head_dim": 256,
-                    "num_experts": 256,
-                    "num_experts_per_tok": 8,
-                    "moe_intermediate_size": 512,
-                    "shared_expert_intermediate_size": 512
-                }
-            }"#,
-        )
-        .expect("moe config parses");
-
-        assert_eq!(
-            canonical_decode_backend(&config, None),
-            QwenDecodeBackend::RustBridge
-        );
     }
 
     #[test]

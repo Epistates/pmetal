@@ -111,15 +111,12 @@ fn main() {
     }
 
     let t0 = std::time::Instant::now();
-    eprintln!("Using canonical bridge decode path");
-    let (tokens, metrics) = pmetal_bridge::qwen3_native::generate_canonical(
+    let (tokens, metrics) = pmetal_bridge::qwen3_native::generate(
         &weights,
         &mut cache,
-        &config,
         first_tok_id,
         max_tokens,
         pmetal_bridge::decode::SamplingParams::new(temperature),
-        tq_bits.map(|bits| pmetal_bridge::turboquant::TurboQuantConfig::uniform(bits, bits)),
         |_tok| true,
     );
     let elapsed = t0.elapsed().as_secs_f64();

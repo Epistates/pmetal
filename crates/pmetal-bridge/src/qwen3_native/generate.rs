@@ -3,7 +3,6 @@
 use crate::InlineArray;
 use crate::inline_array as bridge;
 
-use super::Qwen3Config;
 use super::cache::NativeCache;
 use super::forward::forward_step;
 use super::weights::NativeWeights;
@@ -255,50 +254,6 @@ pub fn generate(
     generate_from_primed_sample_impl(
         weights, cache, current_y, max_tokens, params, true, on_token,
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QwenDecodeBackend {
-    RustBridge,
-}
-
-pub fn canonical_decode_backend(
-    _config: &Qwen3Config,
-    _turboquant: Option<crate::turboquant::TurboQuantConfig>,
-) -> QwenDecodeBackend {
-    QwenDecodeBackend::RustBridge
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn generate_canonical(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
-    config: &Qwen3Config,
-    first_token: u32,
-    max_tokens: usize,
-    params: crate::decode::SamplingParams,
-    turboquant: Option<crate::turboquant::TurboQuantConfig>,
-    on_token: impl FnMut(u32) -> bool,
-) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    match canonical_decode_backend(config, turboquant) {
-        QwenDecodeBackend::RustBridge => {
-            generate(weights, cache, first_token, max_tokens, params, on_token)
-        }
-    }
-}
-
-pub fn benchmark_trial_canonical(
-    weights: &NativeWeights,
-    config: &Qwen3Config,
-    prompt_ids: &[u32],
-    generation_tokens: usize,
-    turboquant: Option<crate::turboquant::TurboQuantConfig>,
-) -> crate::decode::BenchmarkTrial {
-    match canonical_decode_backend(config, turboquant) {
-        QwenDecodeBackend::RustBridge => {
-            benchmark_trial(weights, prompt_ids, generation_tokens, turboquant)
-        }
-    }
 }
 
 pub fn generate_preserve_peak(

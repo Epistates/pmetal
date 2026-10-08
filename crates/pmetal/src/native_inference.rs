@@ -1317,10 +1317,8 @@ fn run_qwen3(
         },
         |weights, _| build_qwen3_cache_with_quant(weights, turboquant, quant_config),
         prefill_first_token,
-        |weights, config, cache, first_tok, remaining, params, on_token| {
-            qwen3_native::generate_canonical(
-                weights, cache, config, first_tok, remaining, params, turboquant, on_token,
-            )
+        |weights, _config, cache, first_tok, remaining, params, on_token| {
+            qwen3_native::generate(weights, cache, first_tok, remaining, params, on_token)
         },
     )
 }
@@ -1425,9 +1423,8 @@ pub fn benchmark_native(
                 let config = qwen3_native::load_config(model_path)?;
                 let weights = qwen3_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    qwen3_native::benchmark_trial_canonical(
+                    qwen3_native::benchmark_trial(
                         &weights,
-                        &config,
                         prompt_ids,
                         generation_tokens,
                         turboquant,
