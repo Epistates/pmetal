@@ -1863,7 +1863,7 @@ impl PmetalMcpServer {
         #[description("Port to listen on (default: 8080)")] port: Option<u64>,
         #[description("Host to bind to (default: 0.0.0.0)")] host: Option<String>,
         #[description(
-            "Context length per sequence (default: the model's context window, capped by device memory and at 32768)"
+            "Context length per sequence (default: the model's context window, capped by device memory)"
         )]
         max_seq_len: Option<u64>,
         #[description("Packed expert weights dir for SSD-offloaded MoE")] experts_dir: Option<

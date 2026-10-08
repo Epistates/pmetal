@@ -20,7 +20,7 @@ pub struct ServeArgs {
     /// Context length the server holds per sequence (prompt plus output).
     /// Default: the model's context window (max_position_embeddings, or the
     /// YaRN-stretched length), capped by what the device's memory holds for
-    /// the weights plus that much KV cache and at 32768, and never under 4096.
+    /// the weights plus that much KV cache, and never under 4096.
     #[arg(long = "max-seq-len")]
     pub max_seq_len: Option<usize>,
 

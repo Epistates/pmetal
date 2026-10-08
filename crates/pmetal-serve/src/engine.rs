@@ -1866,7 +1866,7 @@ impl InferenceEngine {
         use pmetal_bridge::compat::ops::async_eval;
         use pmetal_models::generation::{
             StreamContext, WiredLimitGuard, clear_generation_caches, create_generation_stream,
-            run_cached_prefill_chunks, token_logprobs,
+            run_cached_prefill_chunks_at, token_logprobs,
         };
 
         let _wired_guard = WiredLimitGuard::new();
@@ -1922,19 +1922,26 @@ impl InferenceEngine {
 
         // === Prefill (chunked, on possibly shortened suffix) ===
         //
-        // `run_cached_prefill_chunks` calls `forward` once per chunk; each
+        // `run_cached_prefill_chunks_at` calls `forward` once per chunk; each
         // call wraps the forward in a fresh `StreamContext` so chunked
-        // prefill also runs on the generation stream. The final chunk's
+        // prefill also runs on the generation stream. Chunks shrink as the
+        // cache deepens (counting a restored prefix), so none runs past the
+        // GPU watchdog near the end of a long context. The final chunk's
         // logits are returned lazily so we can fold them into the async
         // decode pipeline without a host sync.
         //
         // A prompt with media prefills in one forward from its merged
         // embeddings, as `pmetal infer --image` does.
         let prefill_logits = match media {
-            None => run_cached_prefill_chunks(prefill_slice, prefill_step_size, |chunk| {
-                let _ctx = StreamContext::new(&stream);
-                model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
-            }),
+            None => run_cached_prefill_chunks_at(
+                prefill_slice,
+                prefix_hit_len,
+                prefill_step_size,
+                |chunk| {
+                    let _ctx = StreamContext::new(&stream);
+                    model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
+                },
+            ),
             Some(media) => {
                 let _ctx = StreamContext::new(&stream);
                 Self::prefill_media(model, media, cache, mamba_cache.as_mut())

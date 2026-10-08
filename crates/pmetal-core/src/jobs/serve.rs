@@ -45,7 +45,7 @@ pub struct ServeSpec {
         argv = "--max-seq-len",
         min = 256,
         max = 4_194_304,
-        help = "Default: the model's context window, capped by device memory and at 32768"
+        help = "Default: the model's context window, capped by device memory"
     )]
     #[serde(default)]
     pub max_seq_len: Option<usize>,

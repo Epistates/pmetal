@@ -208,6 +208,33 @@ pub fn clear_generation_caches() {
     pmetal_mlx::memory::clear_cache();
 }
 
+/// Most attention one prefill chunk computes: its length times the depth it
+/// attends over (the tokens already cached plus its own). A chunk's attention
+/// runs as one Metal dispatch whose time grows with that product, and macOS
+/// kills a command buffer that runs past a few seconds
+/// (`kIOGPUCommandBufferCallbackErrorTimeout`), so a fixed chunk that is safe
+/// near the start of a long prompt is not safe near its end. 1.6e8 is the
+/// budget measured to hold a 245k-token prompt under the watchdog on an
+/// M5 Pro; a 2048-token chunk stays whole to a depth of about 76k tokens.
+pub const PREFILL_ATTENTION_BUDGET: usize = 160_000_000;
+
+/// Shortest chunk a deep prefill shrinks to.
+pub const MIN_PREFILL_CHUNK: usize = 128;
+
+/// Length of the prefill chunk that starts `depth` tokens into the cache:
+/// `step_size`, or, once `step_size * (depth + step_size)` passes
+/// [`PREFILL_ATTENTION_BUDGET`], the largest power of two inside the budget,
+/// never under [`MIN_PREFILL_CHUNK`] (nor over `step_size`).
+pub fn prefill_chunk_len(step_size: usize, depth: usize) -> usize {
+    let step_size = step_size.max(1);
+    let fits = PREFILL_ATTENTION_BUDGET / (depth + step_size);
+    let pow2 = match fits {
+        0 => 0,
+        n => 1usize << (usize::BITS - 1 - n.leading_zeros()),
+    };
+    step_size.min(pow2.max(MIN_PREFILL_CHUNK))
+}
+
 /// Run cached prompt prefill, optionally chunking long prompts to bound peak memory.
 ///
 /// Used by the async-pipelined generators (and by `pmetal-serve`) to keep
@@ -215,31 +242,41 @@ pub fn clear_generation_caches() {
 /// MLX allocation cache is cleared between chunks so peak memory matches a
 /// single-chunk forward. The final chunk's logits are returned lazily (no
 /// `eval`) so the caller can fold them into the async decode pipeline.
+///
+/// Chunks shrink as the prompt gets deeper ([`prefill_chunk_len`]) so no
+/// chunk's attention runs long enough for the GPU watchdog to kill it.
 pub fn run_cached_prefill_chunks<F>(
     input_ids: &[u32],
+    prefill_step_size: usize,
+    forward: F,
+) -> Result<Array, Exception>
+where
+    F: FnMut(&Array) -> Result<Array, Exception>,
+{
+    run_cached_prefill_chunks_at(input_ids, 0, prefill_step_size, forward)
+}
+
+/// [`run_cached_prefill_chunks`] into a cache that already holds `depth`
+/// tokens (a restored prefix), which the chunk sizing counts.
+/// `prefill_step_size == 0` prefills in one forward, unbounded.
+pub fn run_cached_prefill_chunks_at<F>(
+    input_ids: &[u32],
+    depth: usize,
     prefill_step_size: usize,
     mut forward: F,
 ) -> Result<Array, Exception>
 where
     F: FnMut(&Array) -> Result<Array, Exception>,
 {
-    if input_ids.is_empty() {
-        return forward(&token_input_array(input_ids));
-    }
-
-    let step_size = if prefill_step_size == 0 {
-        input_ids.len()
-    } else {
-        prefill_step_size.max(1)
-    };
-
-    if input_ids.len() <= step_size {
+    if input_ids.is_empty() || prefill_step_size == 0 {
         return forward(&token_input_array(input_ids));
     }
 
     let mut last_logits = None;
-    for start in (0..input_ids.len()).step_by(step_size) {
-        let end = (start + step_size).min(input_ids.len());
+    let mut start = 0;
+    while start < input_ids.len() {
+        let len = prefill_chunk_len(prefill_step_size, depth + start);
+        let end = (start + len).min(input_ids.len());
         let chunk_input = token_input_array(&input_ids[start..end]);
         let logits = forward(&chunk_input)?;
         if end < input_ids.len() {
@@ -248,6 +285,7 @@ where
         } else {
             last_logits = Some(logits);
         }
+        start = end;
     }
 
     last_logits.ok_or_else(|| Exception::custom("chunked prefill produced no output"))
@@ -2912,6 +2950,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(seen_chunks, vec![4]);
+    }
+
+    #[test]
+    fn prefill_chunks_shrink_with_depth_to_stay_inside_the_attention_budget() {
+        // Whole chunks until the budget binds, at about 76k tokens deep.
+        assert_eq!(prefill_chunk_len(2048, 0), 2048);
+        assert_eq!(prefill_chunk_len(2048, 70_000), 2048);
+        assert_eq!(prefill_chunk_len(2048, 100_000), 1024);
+        // Near the end of a 262,144-token window.
+        assert_eq!(prefill_chunk_len(2048, 255_000), 512);
+        // A million-token YaRN window bottoms out at the floor.
+        assert_eq!(prefill_chunk_len(2048, 1_048_576), MIN_PREFILL_CHUNK);
+        // A step under the floor is never stretched.
+        assert_eq!(prefill_chunk_len(64, 10_000_000), 64);
+        for depth in [0, 50_000, 80_000, 150_000, 262_144, 600_000] {
+            let len = prefill_chunk_len(2048, depth);
+            assert!(len.is_power_of_two());
+            assert!(
+                len == MIN_PREFILL_CHUNK || len * (depth + 2048) <= PREFILL_ATTENTION_BUDGET,
+                "{len} tokens at depth {depth}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_prefill_counts_the_restored_prefix_and_covers_every_token() {
+        let input_ids: Vec<u32> = (0..3000).collect();
+        let mut seen = Vec::new();
+        let _ = run_cached_prefill_chunks_at(&input_ids, 255_000, 2048, |chunk| {
+            seen.push(chunk.dim(1) as usize);
+            Ok(Array::zeros_f32(&[1, chunk.dim(1), 8]))
+        })
+        .unwrap();
+        assert!(seen[..seen.len() - 1].iter().all(|&len| len == 512));
+        assert_eq!(seen.iter().sum::<usize>(), 3000);
     }
 
     #[test]

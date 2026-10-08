@@ -1907,20 +1907,14 @@ pub struct DefaultContextLength {
 /// Shortest default context: what every model this server runs takes.
 pub const MIN_DEFAULT_CONTEXT: usize = 4096;
 
-/// Longest default context. 32,768 tokens holds the output budget Qwen's
-/// cards recommend for most queries, or a prompt with a couple of
-/// full-budget images; a model's whole window (262,144 tokens for Qwen3.5)
-/// timed the GPU out on the server's first request, so anything past this
-/// is asked for with `--max-seq-len`.
-pub const MAX_DEFAULT_CONTEXT: usize = 32_768;
-
 /// The default per-sequence context of `pmetal serve`: the model's context
 /// window ([`context_window`](pmetal_data::inference_config::context_window),
 /// YaRN included), capped so the weights plus `sequences` full-length fp16 KV
 /// caches stay within 70% of the device's recommended working set (the line
-/// above which the server already switches the cache to 8 bits) and at
-/// [`MAX_DEFAULT_CONTEXT`], rounded down to a multiple of 1024 and never
-/// under [`MIN_DEFAULT_CONTEXT`].
+/// above which the server already switches the cache to 8 bits), rounded
+/// down to a multiple of 1024 and never under [`MIN_DEFAULT_CONTEXT`]. A
+/// request's cache grows with its sequence, so a long window costs memory
+/// only when a request fills it.
 ///
 /// The KV estimate counts every layer that keeps one (full and sliding
 /// attention alike, so a sliding window is overestimated); recurrent layers
@@ -1946,7 +1940,7 @@ pub fn default_serve_context_len(model_path: &Path, sequences: usize) -> Default
         (None, Some(m)) => m,
         (None, None) => MIN_DEFAULT_CONTEXT,
     };
-    let tokens = (tokens.min(MAX_DEFAULT_CONTEXT) / 1024 * 1024).max(MIN_DEFAULT_CONTEXT);
+    let tokens = (tokens / 1024 * 1024).max(MIN_DEFAULT_CONTEXT);
     DefaultContextLength {
         tokens,
         context_window,

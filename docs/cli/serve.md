@@ -130,8 +130,11 @@ curl http://localhost:8080/v1/chat/completions \
 Without `--max-seq-len`, each sequence gets the model's context window
 (`max_position_embeddings`, or the YaRN-stretched length), capped so the
 weights plus a full-length fp16 KV cache per sequence (per continuous-batching
-slot) fit in 70% of the device's working set, and at 32,768 tokens; never
-under 4096. Pass `--max-seq-len` for longer contexts.
+slot) fit in 70% of the device's working set; never under 4096. A request's
+cache grows with its sequence, so a long window costs memory only when a
+request fills it. A long prompt prefills in chunks that shrink as the context
+deepens, so no chunk's attention runs long enough for the GPU watchdog to
+stop it. Pass `--max-seq-len` for a shorter (or longer) context.
 
 ### Output length
 
