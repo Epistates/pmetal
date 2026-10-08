@@ -293,6 +293,9 @@ enum Commands {
     /// Run inference with a model
     Infer(crate::cli::infer::InferArgs),
 
+    /// Answer typed questions about a state with a decision model (Clef)
+    Decide(crate::cli::decide::DecideArgs),
+
     /// Download a model from HuggingFace
     Download {
         /// Model ID
@@ -1776,6 +1779,16 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
+        Commands::Decide(args) => {
+            let crate::cli::decide::DecideArgs {
+                model,
+                request,
+                max_length,
+                compact,
+            } = args;
+            commands::decide::run_decide(&model, &request, max_length, compact).await?;
+        }
+
         Commands::Infer(args) => {
             let crate::cli::infer::InferArgs {
                 model,
@@ -2862,9 +2875,9 @@ mod argv_roundtrip {
     #[cfg(feature = "serve")]
     use pmetal_core::jobs::ServeSpec;
     use pmetal_core::jobs::{
-        BenchSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec,
-        InferSpec, MergeSpec, PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec, TokenizeSpec,
-        TrainSpec,
+        BenchSpec, DecideSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec,
+        GrpoSpec, InferSpec, MergeSpec, PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec,
+        TokenizeSpec, TrainSpec,
     };
 
     /// Parse an argv slice built from a spec's `to_argv()` output.  Returns
@@ -3121,6 +3134,22 @@ mod argv_roundtrip {
         assert!(
             result.is_ok(),
             "PackExpertsSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn decide_spec_round_trip() {
+        let spec = DecideSpec {
+            model: "Cloudflare/clef-flash".into(),
+            request: "request.json".into(),
+            compact: true,
+            ..Default::default()
+        };
+        let result = try_parse("decide", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "DecideSpec argv failed to parse: {}",
             result.unwrap_err()
         );
     }

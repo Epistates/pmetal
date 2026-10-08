@@ -6,6 +6,7 @@
 pub mod bench;
 #[cfg(feature = "distributed")]
 pub mod cluster;
+pub mod decide;
 pub mod dflash;
 pub mod distill;
 pub mod embed_train;

@@ -10,7 +10,7 @@ use turbomcp::prelude::*;
 use jobs::JobManager;
 use pmetal_core::JobFields as _;
 use pmetal_core::jobs::{
-    DflashSpec, DistillSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
+    DecideSpec, DflashSpec, DistillSpec, EmbedTrainSpec, FuseSpec, GrpoSpec, InferSpec, MergeSpec,
     PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec, ServeSpec, TokenizeSpec, TrainSpec,
 };
 
@@ -490,6 +490,45 @@ impl PmetalMcpServer {
         };
         let argv = spec.to_argv();
         util::run_pmetal_blocking_argv("infer", &argv).await
+    }
+
+    /// Answer typed questions about a state with a decision model (Clef,
+    /// Clef-flash). Takes a `/v1/systemone` request body and returns the
+    /// response body: one probability per allowed option of every question.
+    /// Blocks until answered; loads the model per call, so use start_serve for
+    /// many requests.
+    #[tool]
+    async fn decide(
+        &self,
+        #[description("Decision model ID or path, e.g. Cloudflare/clef-flash")] model: String,
+        #[description(
+            "Request body as JSON: {\"model\", \"state\", \"questions\": {id: {\"type\": \
+             \"noul\"|\"choice\"|\"score\", \"instructions\", \"criteria\"}}}"
+        )]
+        request: String,
+        #[description("Longest prompt in tokens (default: 16384)")] max_length: Option<u64>,
+    ) -> McpResult<String> {
+        serde_json::from_str::<serde_json::Value>(&request)
+            .map_err(|e| McpError::invalid_params(format!("request is not JSON: {e}")))?;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let request_path =
+            std::env::temp_dir().join(format!("pmetal-decide-{}-{nanos}.json", std::process::id()));
+        std::fs::write(&request_path, &request)
+            .map_err(|e| McpError::internal(format!("cannot stage the request: {e}")))?;
+        let mut spec = DecideSpec {
+            model,
+            request: request_path.to_string_lossy().into_owned(),
+            max_length: max_length.map_or(DecideSpec::default().max_length, |n| n as usize),
+            compact: true,
+        };
+        let result = match spec.normalize() {
+            Ok(()) => util::run_pmetal_blocking_argv("decide", &spec.to_argv()).await,
+            Err(errors) => Err(into_mcp_error(errors)),
+        };
+        let _ = std::fs::remove_file(&request_path);
+        result
     }
 
     // ── Training (background jobs) ────────────────────────────────────────

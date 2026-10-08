@@ -3,6 +3,7 @@ pub(crate) mod bench;
 #[cfg(feature = "distributed")]
 pub(crate) mod cluster;
 pub(crate) mod dataset;
+pub(crate) mod decide;
 pub(crate) mod dflash;
 #[cfg(feature = "trainer")]
 pub(crate) mod distill;

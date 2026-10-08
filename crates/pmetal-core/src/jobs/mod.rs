@@ -17,6 +17,7 @@
 //! `From<*Spec> for *OrchConfig`.
 
 pub mod bench;
+pub mod decide;
 pub mod dflash;
 pub mod distill;
 pub mod embed_train;
@@ -34,6 +35,7 @@ pub mod tokenize;
 pub mod train;
 
 pub use bench::BenchSpec;
+pub use decide::DecideSpec;
 pub use dflash::DflashSpec;
 pub use distill::DistillSpec;
 pub use embed_train::EmbedTrainSpec;

@@ -46,6 +46,8 @@ pub enum JobKind {
     Serve,
     /// One-shot inference / generation.
     Infer,
+    /// Typed decisions from a decision model (`/v1/systemone`).
+    Decide,
     /// Benchmarking sweep.
     Bench,
     /// Evaluation / perplexity / accuracy.

@@ -138,6 +138,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `train-diffusion` | LoRA/QLoRA fine-tune a DiffusionGemma block-diffusion model |
 | `pretrain` | Pretrain a model from scratch (full-parameter, no LoRA) |
 | `infer` | Interactive inference with chat, tool use, and thinking mode |
+| `decide` | Typed decisions (choice, score, true/false) from a Clef decision model in one forward pass |
 | `distill` | Knowledge distillation (online, offline, progressive) |
 | `grpo` | GRPO/DAPO reasoning training (VLM, speculative, async rewards) |
 | `rlkd` | Reinforcement Learning with Knowledge Distillation |
@@ -165,7 +166,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `tokenize` | Tokenize a text corpus into binary shards for pretraining |
 | `pack-experts` | Pack expert weights for SSD-offloaded MoE inference |
 | `dflash` | Block-diffusion speculative decoding |
-| `mcp` | Start MCP server over stdio (51 tools for Claude Desktop / Claude Code) |
+| `mcp` | Start MCP server over stdio (52 tools for Claude Desktop / Claude Code) |
 | `cluster` | Multi-Mac cluster: discover peers, train across machines, run all-reduce / pipeline benchmarks |
 
 ### Multi-Mac Cluster (Thunderbolt-aware)
@@ -368,7 +369,7 @@ pmetal/
 ├── pmetal-distributed  # Distributed training (mDNS, Ring All-Reduce)
 ├── pmetal-vocoder      # BigVGAN neural vocoder
 ├── pmetal-serve        # OpenAI- and Anthropic-compatible inference server
-├── pmetal-mcp          # MCP server (51 tools for Claude Desktop)
+├── pmetal-mcp          # MCP server (52 tools for Claude Desktop)
 ├── pmetal-py           # Python bindings (maturin/PyO3)
 ├── pmetal              # Umbrella crate: CLI binary + TUI control center
 └── pmetal-gui          # Desktop GUI (Tauri + Svelte + TailwindCSS)
@@ -706,7 +707,7 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | No | `pmetal-serve` | OpenAI- and Anthropic-compatible inference server |
-| `mcp` | No | `pmetal-mcp` | MCP server (51 tools for Claude Desktop) |
+| `mcp` | No | `pmetal-mcp` | MCP server (52 tools for Claude Desktop) |
 | `full` | No | — | All sub-crate features (not `cli`, `serve` or `mcp`) |
 
 `serve` and `mcp` stay out of the default set so library consumers don't inherit axum and rmcp. The **prebuilt binary and the Homebrew formula both build with `--features serve,mcp`**, so `pmetal serve` and `pmetal mcp` are there if you installed either way. Building yourself, add the flag: `cargo install pmetal --features serve,mcp`.
