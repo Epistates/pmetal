@@ -285,6 +285,9 @@ void mlx_inline_compiled_attn_layer_fixed(
         int head_dim;
         int rope_dims;
         int gated;
+        // The trace bakes these in too, so two models that share a geometry
+        // but not a RoPE base or norm epsilon must not share an entry.
+        float scale, rope_base, rope_scale, q_norm_eps, k_norm_eps;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -301,7 +304,12 @@ void mlx_inline_compiled_attn_layer_fixed(
                 && entry.n_kv == n_kv
                 && entry.head_dim == head_dim
                 && entry.rope_dims == rope_dims
-                && entry.gated == static_cast<int>(gated)) {
+                && entry.gated == static_cast<int>(gated)
+                && entry.scale == scale
+                && entry.rope_base == rope_base
+                && entry.rope_scale == rope_scale
+                && entry.q_norm_eps == q_norm_eps
+                && entry.k_norm_eps == k_norm_eps) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -328,6 +336,11 @@ void mlx_inline_compiled_attn_layer_fixed(
                 head_dim,
                 rope_dims,
                 static_cast<int>(gated),
+                scale,
+                rope_base,
+                rope_scale,
+                q_norm_eps,
+                k_norm_eps,
                 *make_compiled_fixed(
                     [NH, NKV, HD, RD, L, GATED, SCALE, RBASE, RSCALE, QEPS, KEPS]
                     (const std::vector<array>& ins) -> std::vector<array> {
