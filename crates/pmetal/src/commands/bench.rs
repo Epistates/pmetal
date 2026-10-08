@@ -330,7 +330,7 @@ fn workload_preset_config(preset: WorkloadBenchmarkPreset) -> WorkloadPresetConf
         },
         WorkloadBenchmarkPreset::HybridQwen3Next => WorkloadPresetConfig {
             preset,
-            model_id: "unsloth/Qwen3.5-0.8B",
+            model_id: "Qwen/Qwen3.5-0.8B",
             dataset_id: "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
             prompt_samples: 4,
             max_prompt_tokens: 0,
@@ -344,7 +344,7 @@ fn workload_preset_config(preset: WorkloadBenchmarkPreset) -> WorkloadPresetConf
         },
         WorkloadBenchmarkPreset::HybridQwen35Steady => WorkloadPresetConfig {
             preset,
-            model_id: "unsloth/Qwen3.5-0.8B",
+            model_id: "Qwen/Qwen3.5-0.8B",
             dataset_id: "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
             prompt_samples: 2,
             max_prompt_tokens: 0,
@@ -358,7 +358,7 @@ fn workload_preset_config(preset: WorkloadBenchmarkPreset) -> WorkloadPresetConf
         },
         WorkloadBenchmarkPreset::MoeNemotronH => WorkloadPresetConfig {
             preset,
-            model_id: "unsloth/NVIDIA-Nemotron-3-Nano-4B",
+            model_id: "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16",
             dataset_id: "TeichAI/gemini-3-pro-preview-high-reasoning-250x",
             prompt_samples: 2,
             max_prompt_tokens: 512,
@@ -4561,7 +4561,7 @@ mod tests {
                 memory_bandwidth_source: "measured_gpu_copy".to_string(),
             },
             stage: "input-proj".to_string(),
-            model_id: "unsloth/Qwen3.5-0.8B".to_string(),
+            model_id: "Qwen/Qwen3.5-0.8B".to_string(),
             resolved_model_path: "/tmp/model".to_string(),
             layer_idx: 0,
             batch_size: 1,
@@ -5009,7 +5009,7 @@ mod tests {
     fn hybrid_qwen3next_preset_uses_conservative_training_shape() {
         let preset = workload_preset_config(WorkloadBenchmarkPreset::HybridQwen3Next);
 
-        assert_eq!(preset.model_id, "unsloth/Qwen3.5-0.8B");
+        assert_eq!(preset.model_id, "Qwen/Qwen3.5-0.8B");
         assert!(matches!(
             preset.inference_context,
             WorkloadInferenceContext::TextPrefix
@@ -5024,7 +5024,7 @@ mod tests {
     fn hybrid_qwen35_steady_preset_prefers_longer_decode_measurement() {
         let preset = workload_preset_config(WorkloadBenchmarkPreset::HybridQwen35Steady);
 
-        assert_eq!(preset.model_id, "unsloth/Qwen3.5-0.8B");
+        assert_eq!(preset.model_id, "Qwen/Qwen3.5-0.8B");
         assert!(matches!(
             preset.inference_context,
             WorkloadInferenceContext::TextPrefix
@@ -5040,7 +5040,7 @@ mod tests {
     fn moe_nemotronh_preset_is_inference_only() {
         let preset = workload_preset_config(WorkloadBenchmarkPreset::MoeNemotronH);
 
-        assert_eq!(preset.model_id, "unsloth/NVIDIA-Nemotron-3-Nano-4B");
+        assert_eq!(preset.model_id, "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16");
         assert!(matches!(
             preset.inference_context,
             WorkloadInferenceContext::TextPrefix

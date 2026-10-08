@@ -68,7 +68,7 @@ pmetal infer \
 
 # Profile Qwen 3.5 hybrid prefill + cached decode layers and write JSON
 pmetal infer \
-  --model unsloth/Qwen3.5-0.8B \
+  --model Qwen/Qwen3.5-0.8B \
   --prompt "write a fizzbuzz program in python" \
   --chat --no-thinking --temperature 0 \
   --profile-layers \

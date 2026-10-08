@@ -64,8 +64,8 @@ The training side is automatic too by default. If you omit `--max-seq-len`, `ben
 
 If you want a one-command regression lane instead of spelling out every knob, `--preset` now provides:
 - `dense-qwen3`: the cached dense Qwen3-0.6B path
-- `hybrid-qwen3next`: the cached non-dense Qwen3.5/Qwen3Next path using `unsloth/Qwen3.5-0.8B`, with `text-prefix` inference and training intentionally skipped so it stays a fast inference regression lane
-- `hybrid-qwen35-steady`: the same cached `unsloth/Qwen3.5-0.8B` hybrid path, but with `2` prompt samples, `64` decode steps, `2` warmup passes per sample, and `3` timed inference repeats so decode throughput is less noisy when you are tuning inference
+- `hybrid-qwen3next`: the cached non-dense Qwen3.5/Qwen3Next path using `Qwen/Qwen3.5-0.8B`, with `text-prefix` inference and training intentionally skipped so it stays a fast inference regression lane
+- `hybrid-qwen35-steady`: the same cached `Qwen/Qwen3.5-0.8B` hybrid path, but with `2` prompt samples, `64` decode steps, `2` warmup passes per sample, and `3` timed inference repeats so decode throughput is less noisy when you are tuning inference
 - `moe-nemotronh`: the cached Nemotron-H sparse/hybrid inference path with a `512`-token `text-prefix` window and training skipped
 
 When `--preset` is set, it overrides the model/dataset/shape knobs below.
@@ -118,7 +118,7 @@ This is the right tool when you want to evaluate alternative BLAS kernels on the
 
 ```bash
 pmetal bench-gdn \
-  --model ~/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
+  --model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/<rev> \
   --json \
   --output bench_gdn_qwen35_0_8b.json
 ```
@@ -126,7 +126,7 @@ pmetal bench-gdn \
 ```bash
 pmetal bench-gdn \
   --stage out-proj \
-  --model ~/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
+  --model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/<rev> \
   --json \
   --output bench_gdn_qwen35_0_8b_out_proj.json
 ```
@@ -135,7 +135,7 @@ pmetal bench-gdn \
 pmetal bench-gdn \
   --stage prefill \
   --seq-len 1024 \
-  --model ~/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
+  --model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/<rev> \
   --json \
   --output bench_gdn_qwen35_0_8b_prefill.json
 ```

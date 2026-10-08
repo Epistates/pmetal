@@ -452,7 +452,7 @@ enum Commands {
     #[cfg(feature = "trainer")]
     BenchGdn {
         /// Qwen3.5/Qwen3Next model ID or local path
-        #[arg(long, default_value = "unsloth/Qwen3.5-0.8B")]
+        #[arg(long, default_value = "Qwen/Qwen3.5-0.8B")]
         model: String,
 
         /// Projection stage to benchmark

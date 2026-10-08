@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .position(|a| a == "--model")
         .and_then(|i| args.get(i + 1))
         .map(String::as_str)
-        .unwrap_or("unsloth/Qwen3.5-0.8B");
+        .unwrap_or("Qwen/Qwen3.5-0.8B");
     let seq_len: i32 = args
         .iter()
         .position(|a| a == "--seq-len")
