@@ -478,7 +478,9 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | ORPO (Odds-Ratio Preference) | `preference --loss orpo` | Yes | Yes | `PreferenceTrainer` |
 | KTO (Kahneman-Tversky) | `preference --loss kto` | Yes | Yes | `KtoTrainer` |
 | GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
-| DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `GrpoTrainer` DAPO mode |
+| DAPO | `grpo --dapo` | Yes | Yes | `GrpoConfig::for_dapo` |
+| Dr. GRPO | `grpo --loss-type dr_grpo` | Yes | Yes | `GrpoConfig::for_dr_grpo` |
+| GSPO | `grpo --loss-type gspo --num-iterations 2` | Yes | Yes | `GrpoConfig::for_gspo` |
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |
 | TAID (Temporally Adaptive) | — | — | — | `TaidDistiller` |
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |

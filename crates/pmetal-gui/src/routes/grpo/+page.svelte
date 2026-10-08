@@ -1,7 +1,7 @@
 <script lang="ts">
   import { modelsStore, grpoStore } from '$lib/stores.svelte';
-  import type { GrpoSpec, GrpoRun, OptimizerName } from '$lib/api';
-  import { OPTIMIZERS, OPTIMIZER_HINT } from '$lib/api';
+  import type { GrpoSpec, GrpoRun, OptimizerName, GrpoLossType } from '$lib/api';
+  import { GRPO_LOSS_TYPES, OPTIMIZERS, OPTIMIZER_HINT } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   // Form state
@@ -13,6 +13,9 @@
   let batchSize = $state(1);
   let groupSize = $state(8);
   let beta = $state(0.04);
+  let lossType = $state<GrpoLossType>('dapo');
+  let numIterations = $state(1);
+  let dapo = $state(false);
   let loraRank = $state(16);
   let loraAlpha = $state(32);
   let maxSeqLen = $state(2048);
@@ -49,6 +52,9 @@
         optimizer,
         num_generations: groupSize,
         beta,
+        loss_type: lossType,
+        num_iterations: numIterations,
+        dapo,
         lora_r: loraRank,
         lora_alpha: loraAlpha,
         max_seq_len: maxSeqLen,
@@ -178,6 +184,20 @@
                 <p class="text-xs text-surface-500 mt-1">KL penalty weight</p>
               </div>
               <div>
+                <label class="label" for="grpo-loss-type">Loss Type</label>
+                <select id="grpo-loss-type" class="input" bind:value={lossType}>
+                  {#each GRPO_LOSS_TYPES as t}
+                    <option value={t}>{t}</option>
+                  {/each}
+                </select>
+                <p class="text-xs text-surface-500 mt-1">gspo needs 2+ updates per batch</p>
+              </div>
+              <div>
+                <label class="label" for="grpo-iterations">Updates per Batch</label>
+                <input id="grpo-iterations" type="number" class="input" min="1" max="64" bind:value={numIterations} />
+                <p class="text-xs text-surface-500 mt-1">Above 1, clipping engages</p>
+              </div>
+              <div>
                 <label class="label" for="grpo-lora-rank">LoRA Rank</label>
                 <input id="grpo-lora-rank" type="number" class="input" min="4" max="256" step="4" bind:value={loraRank} />
               </div>
@@ -220,6 +240,19 @@
                   <span class="text-sm font-semibold text-accent-800 dark:text-accent-200">Reasoning Rewards</span>
                   <p class="text-xs text-accent-700 dark:text-accent-300 mt-0.5">
                     Apply format + correctness rewards for math/reasoning tasks. Rewards thinking tokens wrapped in &lt;think&gt; tags and verifiable final answers.
+                  </p>
+                </div>
+              </label>
+            </div>
+
+            <!-- DAPO recipe -->
+            <div class="p-4 rounded-lg bg-surface-50 dark:bg-surface-900/20 border border-surface-200 dark:border-surface-700">
+              <label class="flex items-start gap-3 cursor-pointer">
+                <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={dapo} />
+                <div>
+                  <span class="text-sm font-semibold text-surface-800 dark:text-surface-200">DAPO Recipe</span>
+                  <p class="text-xs text-surface-600 dark:text-surface-300 mt-0.5">
+                    Token-level loss, no KL term, clip-higher (0.2, 0.28), dynamic sampling, an overlong penalty and at least 16 completions per prompt.
                   </p>
                 </div>
               </label>

@@ -15,6 +15,8 @@ This crate provides the training infrastructure for PMetal, including various tr
 | **DPO / Robust DPO / IPO / hinge** | Preference optimization against a reference | Pairwise preference data |
 | **GRPO** | Group Relative Policy Optimization | Efficient PPO alternative |
 | **DAPO** | Decoupled Clip and Dynamic Sampling PO | GRPO mode (`GrpoConfig::for_dapo`) |
+| **Dr. GRPO** | GRPO without length or difficulty bias | GRPO mode (`GrpoConfig::for_dr_grpo`) |
+| **GSPO** | Group Sequence Policy Optimization | GRPO mode (`GrpoConfig::for_gspo`), sequence-level ratio |
 | **ORPO** | Odds Ratio Preference Optimization | Reference-free, SFT and alignment in one stage |
 | **SimPO** | Simple Preference Optimization | Reference-free, length-normalized |
 | **KTO** | Kahneman-Tversky Optimization | Unpaired good/bad feedback |

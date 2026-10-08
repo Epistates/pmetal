@@ -66,9 +66,23 @@ pub struct GrpoArgs {
     #[arg(long = "resume")]
     pub resume: bool,
 
-    /// Enable DAPO (Distribution-Aware Policy Optimization)
+    /// The DAPO recipe (Decoupled Clip and Dynamic sAmpling Policy
+    /// Optimization): token-level loss, no KL term, clip-higher (0.2, 0.28),
+    /// dynamic sampling, an overlong penalty and at least 16 completions.
     #[arg(long = "dapo")]
     pub dapo: bool,
+
+    /// How token losses combine: dapo (token-level, the default), grpo (each
+    /// completion averaged over its length), dr_grpo (a constant normalizer
+    /// and no std scaling of advantages) or gspo (a sequence-level policy
+    /// ratio with clip range 3e-4/4e-4; needs --num-iterations above 1).
+    #[arg(long = "loss-type", default_value = "dapo")]
+    pub loss_type: String,
+
+    /// Optimizer updates per generation batch. Above 1 the policy ratio
+    /// moves off 1 and clipping engages.
+    #[arg(long = "num-iterations", default_value = "1")]
+    pub num_iterations: usize,
 
     /// Use reasoning-aware rewards (e.g., length, formatting)
     #[arg(long = "reasoning-rewards")]

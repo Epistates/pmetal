@@ -782,7 +782,7 @@ async fn run_grpo_direct(
     let output = required_arg(&spec.args, "--output")?;
     let callbacks = direct_training_callbacks(job_id, tx, cancel);
 
-    let grpo_type = optional_arg(&spec.args, "--grpo-type").unwrap_or_else(|| "bnpo".to_string());
+    let loss_type = optional_arg(&spec.args, "--loss-type").unwrap_or_else(|| "dapo".to_string());
 
     crate::commands::grpo::run_grpo_cli(
         &model,
@@ -800,7 +800,9 @@ async fn run_grpo_direct(
         parse_arg(&spec.args, "--seed", 42u64)?,
         parse_arg(&spec.args, "--checkpoint-every", 50usize)?,
         has_flag(&spec.args, "--resume"),
-        grpo_type == "dapo" || has_flag(&spec.args, "--dapo"),
+        has_flag(&spec.args, "--dapo"),
+        &loss_type,
+        parse_arg(&spec.args, "--num-iterations", 1usize)?,
         has_flag(&spec.args, "--reasoning-rewards"),
         !has_flag(&spec.args, "--no-flash-attention"),
         has_flag(&spec.args, "--vlm"),

@@ -183,6 +183,10 @@ export interface GrpoRun {
   error_message: string | null;
 }
 
+/** GRPO loss types: dapo (token-level, default), grpo, dr_grpo, gspo. */
+export const GRPO_LOSS_TYPES = ['dapo', 'grpo', 'dr_grpo', 'gspo'] as const;
+export type GrpoLossType = (typeof GRPO_LOSS_TYPES)[number];
+
 export interface GrpoSpec {
   model: string;
   dataset: string;
@@ -198,6 +202,8 @@ export interface GrpoSpec {
   max_completion_length?: number;
   seed?: number;
   dapo?: boolean;
+  loss_type?: GrpoLossType;
+  num_iterations?: number;
   reasoning_rewards?: boolean;
   no_flash_attention?: boolean;
   vlm?: boolean;

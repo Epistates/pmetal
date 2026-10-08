@@ -142,11 +142,36 @@ pub struct GrpoSpec {
         label = "DAPO",
         group = "GRPO",
         argv = "--dapo",
+        help = "The DAPO recipe: token-level loss, no KL, clip-higher (0.2, 0.28), dynamic sampling, overlong penalty, 16+ completions",
         flag,
         default_bool = false
     )]
     #[serde(default)]
     pub dapo: bool,
+
+    #[job(
+        label = "Loss Type",
+        group = "GRPO",
+        argv = "--loss-type",
+        kind = "enum",
+        enum_options = ["dapo", "grpo", "dr_grpo", "gspo"],
+        help = "dapo: token-level; grpo: per-sequence mean; dr_grpo: constant normalizer, no std scaling; gspo: sequence-level ratio (needs num_iterations > 1)",
+        default = "dapo"
+    )]
+    #[serde(default = "default_loss_type")]
+    pub loss_type: String,
+
+    #[job(
+        label = "Updates per Batch",
+        group = "GRPO",
+        argv = "--num-iterations",
+        help = "Optimizer updates per generation batch (μ); above 1 the policy ratio moves off 1 and clipping engages",
+        min = 1,
+        max = 64,
+        default_int = 1
+    )]
+    #[serde(default = "default_num_iterations")]
+    pub num_iterations: usize,
 
     #[job(
         label = "Reasoning Rewards",
@@ -314,6 +339,8 @@ impl Default for GrpoSpec {
             max_completion_length: default_max_completion(),
             seed: default_seed(),
             dapo: false,
+            loss_type: default_loss_type(),
+            num_iterations: default_num_iterations(),
             reasoning_rewards: false,
             no_flash_attention: false,
             vlm: false,
@@ -345,6 +372,12 @@ impl GrpoSpec {
 
 fn default_output() -> String {
     crate::defaults::GRPO_OUTPUT_DIR.to_string()
+}
+fn default_loss_type() -> String {
+    "dapo".to_string()
+}
+fn default_num_iterations() -> usize {
+    1
 }
 fn default_num_generations() -> usize {
     8

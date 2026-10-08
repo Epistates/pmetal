@@ -3491,6 +3491,13 @@ async fn run_grpo_in_process(
 
     let mut grpo_config =
         pmetal::trainer::GrpoConfig::new(spec.num_generations).with_beta(spec.beta);
+    if spec.dapo {
+        grpo_config = grpo_config.for_dapo();
+    }
+    grpo_config = grpo_config
+        .with_loss_preset(&spec.loss_type)
+        .map_err(AppError)?;
+    grpo_config.num_iterations = spec.num_iterations.max(1);
     grpo_config.max_prompt_length = max_seq_len;
     grpo_config.max_completion_length = spec.max_completion_length;
     grpo_config.kv_cache_bits = spec.grpo_kv_bits;

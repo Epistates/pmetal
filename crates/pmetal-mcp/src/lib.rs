@@ -900,7 +900,18 @@ impl PmetalMcpServer {
         #[description("Max completion length per generation (default: 512)")]
         max_completion_length: Option<u64>,
         #[description("Random seed (default: 42)")] seed: Option<u64>,
-        #[description("Enable DAPO (Distribution-Aware Policy Optimization)")] dapo: Option<bool>,
+        #[description(
+            "DAPO recipe: token-level loss, no KL, clip-higher (0.2, 0.28), dynamic sampling, overlong penalty, 16+ completions"
+        )]
+        dapo: Option<bool>,
+        #[description(
+            "Loss: dapo (token-level, default), grpo (per-completion mean), dr_grpo (constant normalizer, no std scaling), gspo (sequence-level ratio; needs num_iterations > 1)"
+        )]
+        loss_type: Option<String>,
+        #[description(
+            "Optimizer updates per generation batch (default: 1); above 1 the policy ratio moves and clipping engages"
+        )]
+        num_iterations: Option<u64>,
         #[description("Disable Metal FlashAttention")] no_flash_attention: Option<bool>,
         #[description("Enable VLM mode for image inputs")] vlm: Option<bool>,
         #[description("Max image size pixels (default: 336)")] max_image_size: Option<u64>,
@@ -937,6 +948,9 @@ impl PmetalMcpServer {
             max_completion_length: max_completion_length.unwrap_or(512) as usize,
             seed: seed.unwrap_or(42),
             dapo: dapo.unwrap_or(false),
+            loss_type: loss_type.unwrap_or_else(|| GrpoSpec::default().loss_type),
+            num_iterations: num_iterations
+                .map_or(GrpoSpec::default().num_iterations, |n| n as usize),
             reasoning_rewards: reasoning_rewards.unwrap_or(false),
             no_flash_attention: no_flash_attention.unwrap_or(false),
             vlm: vlm.unwrap_or(false),

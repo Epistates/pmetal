@@ -16,6 +16,7 @@ use pmetal_bridge::compat::{
     module::{Module, ModuleParameters},
     nn, ops,
     optimizers::Optimizer,
+    transforms,
 };
 use pmetal_core::TrainingConfig;
 use pmetal_lora::TrainableModel;
@@ -34,6 +35,11 @@ pub struct GrpoIterationStats {
     pub kl: f32,
     /// Policy gradient loss.
     pub policy_loss: f32,
+    /// Share of completion tokens whose objective clipping changed, averaged
+    /// over the batch's updates. Always 0 with one update per batch.
+    pub clip_fraction: f32,
+    /// Optimizer updates taken on this generation batch.
+    pub iterations: usize,
     /// Mean reward for this batch.
     pub reward: f32,
     /// Mean advantage for this batch.
@@ -71,18 +77,62 @@ pub enum GrpoError {
 /// Result type for GRPO operations.
 pub type GrpoResult<T> = std::result::Result<T, GrpoError>;
 
-/// GRPO loss type variants.
+/// How the per-token clipped surrogate losses are aggregated into one loss.
+///
+/// The names and normalizers are those of TRL's `GRPOTrainer` `loss_type`,
+/// which follows each method's paper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrpoLossType {
-    /// Standard GRPO / BNPO (Base Normalized Policy Optimization).
+    /// The original GRPO aggregation (DeepSeekMath, arXiv 2402.03300): each
+    /// sequence's tokens averaged over its own length, then the sequences
+    /// averaged. It weights a long completion's tokens less than a short
+    /// one's, which biases toward short correct and long wrong answers.
+    Grpo,
+    /// Token-level aggregation (DAPO, arXiv 2503.14476): every token in the
+    /// generation batch weighs the same, the sum over the number of
+    /// completion tokens. TRL's default. Within one generation batch it is
+    /// also TRL's `bnpo`.
     #[default]
-    Bnpo,
-    /// DR-GRPO (Detailed Reward GRPO).
-    DrGrpo,
-    /// DAPO (Distribution-Aware Policy Optimization).
     Dapo,
-    /// Simple REINFORCE-style loss without KL.
-    Reinforce,
+    /// Dr. GRPO's aggregation (*Understanding R1-Zero-Like Training*, arXiv
+    /// 2503.20783): the sum over tokens divided by a constant, the number of
+    /// sequences times `max_completion_length`, so no completion's length
+    /// changes how much its tokens count. The paper also drops the
+    /// advantages' division by the group's standard deviation;
+    /// [`GrpoConfig::with_loss_preset`]`("dr_grpo")` does both.
+    DrGrpo,
+}
+
+/// The level the policy ratio `π_θ / π_θ_old` is taken at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportanceSampling {
+    /// One ratio per token, as in PPO and GRPO.
+    #[default]
+    Token,
+    /// One ratio per sequence, the length-normalized sequence likelihood ratio
+    /// `s_i = exp(mean_t (log π_θ − log π_θ_old))` that GSPO (*Group Sequence
+    /// Policy Optimization*, arXiv 2507.18071) clips. It differs from the
+    /// token level only once the policy has moved off the one that generated
+    /// the batch, i.e. with `num_iterations > 1`.
+    Sequence,
+}
+
+/// The parts of one GRPO loss evaluation.
+#[derive(Debug, Clone)]
+pub struct GrpoLoss {
+    /// Policy loss plus `beta` times the KL to the reference, minus the
+    /// entropy bonus: what the optimizer minimizes.
+    pub total: Array,
+    /// The clipped surrogate term alone.
+    pub policy: Array,
+    /// Mean per-token KL to the reference model (0 without one).
+    pub kl: Array,
+    /// The importance ratio: `[B, T]` per token, `[B, 1]` per sequence.
+    pub ratio: Array,
+    /// Share of completion tokens whose objective clipping changed: ratio
+    /// below `1 − ε_low` with a negative advantage or above `1 + ε_high` with
+    /// a positive one.
+    pub clip_fraction: Array,
 }
 
 /// GRPO configuration.
@@ -106,11 +156,20 @@ pub struct GrpoConfig {
     pub whiten_advantages: bool,
     /// Entropy bonus coefficient.
     pub entropy_coef: f64,
-    /// Loss function type.
+    /// How token losses are aggregated.
     pub loss_type: GrpoLossType,
+    /// Whether the policy ratio is per token or per sequence (GSPO).
+    pub importance_sampling: ImportanceSampling,
+    /// Optimizer updates per generation batch (μ in the GRPO paper, TRL's
+    /// `num_iterations`). The policy ratio is taken against the log-probs of
+    /// the policy that generated the batch, so with μ = 1 it is exactly 1 and
+    /// clipping never engages; from the second update on it measures how far
+    /// the policy has moved, and the clip bounds that.
+    pub num_iterations: usize,
     /// Lower clipping epsilon for PPO-clip (default 0.2).
     pub epsilon_low: f64,
-    /// Upper clipping epsilon for PPO-clip (default 0.2).
+    /// Upper clipping epsilon for PPO-clip (default 0.2; DAPO's clip-higher
+    /// uses 0.28).
     pub epsilon_high: f64,
     /// Enable VLM (Vision-Language Model) mode for processing image inputs.
     ///
@@ -205,14 +264,16 @@ pub struct GrpoConfig {
     pub kv_cache_bits: Option<u8>,
     /// Optional rollout RNG seed for reproducible generation.
     pub seed: Option<u64>,
-    /// Enable DAPO dynamic sampling when `loss_type` is DAPO.
+    /// DAPO dynamic sampling: drop groups whose completions are all right or
+    /// all wrong, since their advantages are all zero.
     pub dapo_dynamic_sampling: bool,
     /// Accuracy threshold margin for DAPO dynamic sampling.
     pub dapo_dynamic_sampling_min_accuracy: f64,
     /// Reward threshold above which a completion is counted as correct.
     pub dapo_accuracy_reward_threshold: f64,
-    /// Reward penalty applied to completions that stop because they hit max length.
-    pub dapo_overlong_penalty: f64,
+    /// Reward added to completions that stop because they hit the length
+    /// limit (DAPO's overlong penalty); `None` leaves their rewards alone.
+    pub dapo_overlong_penalty: Option<f64>,
     /// Minimum completions required after DAPO filtering.
     pub dapo_min_group_size: usize,
 }
@@ -229,7 +290,9 @@ impl Default for GrpoConfig {
             top_k: 40,
             whiten_advantages: true,
             entropy_coef: 0.0,
-            loss_type: GrpoLossType::Bnpo,
+            loss_type: GrpoLossType::Dapo,
+            importance_sampling: ImportanceSampling::Token,
+            num_iterations: 1,
             epsilon_low: 0.2,
             epsilon_high: 0.2,
             vlm_mode: false,
@@ -246,7 +309,7 @@ impl Default for GrpoConfig {
             dapo_dynamic_sampling: false,
             dapo_dynamic_sampling_min_accuracy: 0.01,
             dapo_accuracy_reward_threshold: 0.0,
-            dapo_overlong_penalty: -1.0,
+            dapo_overlong_penalty: None,
             dapo_min_group_size: 2,
         }
     }
@@ -265,18 +328,62 @@ impl GrpoConfig {
         self
     }
 
+    /// The DAPO recipe (arXiv 2503.14476): token-level loss, no KL term,
+    /// clip-higher (ε_low 0.2, ε_high 0.28), dynamic sampling, an overlong
+    /// penalty and groups of at least 16.
     pub fn for_dapo(mut self) -> Self {
         self.loss_type = GrpoLossType::Dapo;
-        self.beta = 0.0; // DAPO usually doesn't use standard KL
-        self.epsilon_low = 0.0;
+        self.beta = 0.0;
+        self.epsilon_low = 0.2;
         self.epsilon_high = 0.28;
         self.num_generations = self.num_generations.max(16);
         self.dapo_dynamic_sampling = true;
-        self.dapo_overlong_penalty = -1.0;
+        self.dapo_overlong_penalty = Some(-1.0);
         self.dapo_min_group_size = 2;
         self
     }
+
+    /// Dr. GRPO (arXiv 2503.20783): the constant-normalized loss and
+    /// advantages that are not divided by the group's standard deviation.
+    pub fn for_dr_grpo(mut self) -> Self {
+        self.loss_type = GrpoLossType::DrGrpo;
+        self.whiten_advantages = false;
+        self
+    }
+
+    /// GSPO (arXiv 2507.18071): the sequence-level ratio, sequences averaged
+    /// as in GRPO, and the paper's clip range (ε_low 3e-4, ε_high 4e-4, its
+    /// section 5.1). Its ratio only differs from 1 once the policy moves, so
+    /// it needs `num_iterations > 1` to do anything.
+    pub fn for_gspo(mut self) -> Self {
+        self.importance_sampling = ImportanceSampling::Sequence;
+        self.loss_type = GrpoLossType::Grpo;
+        self.epsilon_low = 3e-4;
+        self.epsilon_high = 4e-4;
+        self
+    }
+
+    /// Apply the method a CLI `--loss-type` names: `dapo` (the default),
+    /// `grpo`, `dr_grpo` or `gspo`.
+    pub fn with_loss_preset(mut self, name: &str) -> Result<Self, String> {
+        match name.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "dapo" => self.loss_type = GrpoLossType::Dapo,
+            "grpo" => self.loss_type = GrpoLossType::Grpo,
+            "dr_grpo" => self = self.for_dr_grpo(),
+            "gspo" => self = self.for_gspo(),
+            other => {
+                return Err(format!(
+                    "unknown GRPO loss type '{other}'; valid: {}",
+                    GRPO_LOSS_PRESETS.join(", ")
+                ));
+            }
+        }
+        Ok(self)
+    }
 }
+
+/// The names [`GrpoConfig::with_loss_preset`] accepts.
+pub const GRPO_LOSS_PRESETS: [&str; 4] = ["dapo", "grpo", "dr_grpo", "gspo"];
 
 /// Completion group for a single prompt.
 #[derive(Debug, Clone)]
@@ -392,6 +499,8 @@ pub struct GrpoTrainer {
     checkpoint_manager: Option<crate::CheckpointManager>,
     best_checkpoint_loss: f64,
     last_loss: Option<f64>,
+    /// Optimizer steps the LR schedule spans, set by [`Self::plan_schedule`].
+    schedule_total_steps: Option<usize>,
 }
 
 impl GrpoTrainer {
@@ -407,6 +516,7 @@ impl GrpoTrainer {
             checkpoint_manager: None,
             best_checkpoint_loss: f64::MAX,
             last_loss: None,
+            schedule_total_steps: None,
         })
     }
 
@@ -439,7 +549,57 @@ impl GrpoTrainer {
         if let Some(lr) = self.adaptive_lr_override {
             return lr;
         }
-        self.training_config.learning_rate as f32
+        self.scheduled_lr()
+    }
+
+    /// The training config's schedule at the current optimizer step, over
+    /// [`Self::plan_schedule`]'s total.
+    fn scheduled_lr(&self) -> f32 {
+        let total = self
+            .schedule_total_steps
+            .or(self.training_config.max_steps)
+            .unwrap_or(0);
+        pmetal_core::LearningRateScheduler::for_training(&self.training_config, total)
+            .get_lr(self.step) as f32
+    }
+
+    /// Size the schedule for `generation_batches` batches an epoch, each
+    /// taking `num_iterations` optimizer steps (or `max_steps`), and return
+    /// the total.
+    pub fn plan_schedule(&mut self, generation_batches: usize) -> usize {
+        let iterations = self.config.num_iterations.max(1);
+        let total = pmetal_core::total_training_steps(
+            &self.training_config,
+            generation_batches * iterations,
+            1,
+            true,
+        );
+        let warmup = pmetal_core::warmup_steps_for(&self.training_config, total);
+        info!(
+            "LR schedule: {:?} over {total} optimizer steps ({} epoch(s) of {generation_batches} \
+             generation batches, {iterations} update(s) each{}), {warmup} warmup steps, peak lr {:.2e}",
+            self.training_config.lr_scheduler,
+            self.training_config.num_epochs.max(1),
+            if self.training_config.max_steps.is_some() {
+                ", capped by max_steps"
+            } else {
+                ""
+            },
+            self.training_config.learning_rate,
+        );
+        self.schedule_total_steps = Some(total);
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(total);
+            ctrl.set_warmup_steps(warmup);
+        }
+        total
+    }
+
+    /// Whether `max_steps` optimizer steps have been taken.
+    fn reached_max_steps(&self) -> bool {
+        self.training_config
+            .max_steps
+            .is_some_and(|max| self.step >= max)
     }
 
     /// Take a snapshot of the model's LoRA weights as the current best.
@@ -513,7 +673,7 @@ impl GrpoTrainer {
     ///
     /// Returns an `AdaptiveAction` indicating how the training loop should proceed.
     fn apply_adaptive_lr_action(&mut self, loss: f64) -> crate::training_loop::AdaptiveAction {
-        let scheduled = self.training_config.learning_rate;
+        let scheduled = self.scheduled_lr() as f64;
         let step = self.step;
         if let Some(ref mut ctrl) = self.adaptive_lr {
             let (adjusted, event) = ctrl.step(step, loss, scheduled);
@@ -621,15 +781,13 @@ impl GrpoTrainer {
     }
 
     fn prepare_group_for_loss(&self, group: &mut CompletionGroup) -> bool {
-        if self.config.loss_type != GrpoLossType::Dapo {
-            return true;
-        }
-
-        for (reward, stopped_by_length) in
-            group.rewards.iter_mut().zip(group.stopped_by_length.iter())
-        {
-            if *stopped_by_length {
-                *reward += self.config.dapo_overlong_penalty;
+        if let Some(penalty) = self.config.dapo_overlong_penalty {
+            for (reward, stopped_by_length) in
+                group.rewards.iter_mut().zip(group.stopped_by_length.iter())
+            {
+                if *stopped_by_length {
+                    *reward += penalty;
+                }
             }
         }
 
@@ -663,13 +821,16 @@ impl GrpoTrainer {
         true
     }
 
-    /// Compute GRPO loss components at the per-token level.
+    /// The GRPO loss for one batch of completions.
     ///
-    /// All variants use PPO-clip as the policy gradient objective (matching TRL):
-    /// `L_policy = -min(ratio * A, clip(ratio, 1-eps, 1+eps) * A)`
-    ///
-    /// The ratio is computed against `old_per_token_logps` (generation-time policy),
-    /// NOT the reference model. KL regularization uses the reference model separately.
+    /// The policy term is PPO's clipped surrogate,
+    /// `−min(w·A, clip(w, 1−ε_low, 1+ε_high)·A)`, with the importance ratio
+    /// `w` taken against `old_per_token_logps`, the log-probs of the policy
+    /// that generated the batch: per token, or per sequence as the
+    /// length-normalized `exp(mean_t log ratio)` (GSPO). It is aggregated as
+    /// [`GrpoLossType`] says, and the `beta`-weighted KL to the reference
+    /// (`exp(ref − π) − (ref − π) − 1` per token) is aggregated the same way,
+    /// as in TRL's `GRPOTrainer`.
     ///
     /// # Arguments
     /// * `per_token_logps` - Current policy per-token log-probs `[B, T]`
@@ -686,83 +847,94 @@ impl GrpoTrainer {
         advantages: &Array,
         completion_mask: &Array,
         entropy: Option<&Array>,
-    ) -> GrpoResult<(Array, Array, Array)> {
+    ) -> GrpoResult<GrpoLoss> {
         let eps_low = self.config.epsilon_low as f32;
         let eps_high = self.config.epsilon_high as f32;
+        let one = Array::from_f32(1.0);
+        let mask = completion_mask;
+        let n_seqs = advantages.dim(0);
 
-        // --- PPO-clip policy loss (all variants) ---
-        // Importance ratio against OLD policy (generation-time), not reference
         let log_ratio = per_token_logps.subtract(old_per_token_logps);
-        let ratio = log_ratio.exp();
-
-        // Expand advantages for token-level broadcasting: [B] -> [B, 1]
-        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1]);
-
-        // Clipped surrogate objective
-        let clip_lo = Array::from_f32(1.0 - eps_low);
-        let clip_hi = Array::from_f32(1.0 + eps_high);
-        let clipped_ratio = ops::clip(&ratio, Some(&clip_lo), Some(&clip_hi));
-        let surr1 = ratio.multiply(&adv_expanded);
-        let surr2 = clipped_ratio.multiply(&adv_expanded);
-        let token_policy_loss = ops::minimum(&surr1, &surr2).negative();
-
-        // --- Per-variant reduction ---
-        let masked_policy_loss = token_policy_loss.multiply(completion_mask);
-        let total_tokens = completion_mask.sum(None);
-        let safe_token_count = ops::maximum(&total_tokens, &Array::from_f32(1.0));
-
-        let policy_loss = match self.config.loss_type {
-            GrpoLossType::Bnpo => {
-                // BNPO: mean over valid tokens
-                masked_policy_loss.sum(None).divide(&safe_token_count)
-            }
-            GrpoLossType::DrGrpo => {
-                // DR-GRPO: per-sequence mean, then batch mean
-                // Sum tokens per sequence, divide by per-sequence token count
-                let per_seq_sum = masked_policy_loss.sum_axis(-1, false);
-                let per_seq_count = completion_mask.sum_axis(-1, false);
-                let safe_per_seq = ops::maximum(&per_seq_count, &Array::from_f32(1.0));
-                per_seq_sum.divide(&safe_per_seq).mean(None)
-            }
-            GrpoLossType::Dapo => {
-                // DAPO: token-level mean (same as BNPO but conceptually distinct)
-                masked_policy_loss.sum(None).divide(&safe_token_count)
-            }
-            GrpoLossType::Reinforce => {
-                // REINFORCE: simple batch mean
-                masked_policy_loss.sum(None).divide(&safe_token_count)
+        let log_weights = match self.config.importance_sampling {
+            ImportanceSampling::Token => log_ratio,
+            ImportanceSampling::Sequence => {
+                let lengths = ops::maximum(&mask.sum_axis(-1, true), &one);
+                log_ratio.multiply(mask).sum_axis(-1, true).divide(&lengths)
             }
         };
+        let ratio = log_weights.exp();
 
-        // --- KL divergence (against reference model, not old policy) ---
-        // KL(pi || ref) ≈ exp(ref - pi) - (ref - pi) - 1  (Schulman approximation)
-        // Correct direction: ratio = ref/pi, KL = ratio - 1 - log(ratio)
-        let kl_mean = if let Some(ref_logps) = ref_per_token_logps {
-            let kl_log_ratio = ref_logps.subtract(per_token_logps);
-            let kl_ratio = kl_log_ratio.exp();
-            let per_token_kl = kl_ratio
-                .subtract(&Array::from_f32(1.0))
-                .subtract(&kl_log_ratio);
-            let masked_kl = per_token_kl.multiply(completion_mask);
-            masked_kl.sum(None).divide(&safe_token_count)
-        } else {
-            Array::from_f32(0.0)
+        // [B] -> [B, 1], broadcasting over tokens.
+        let adv = advantages.reshape(&[n_seqs, 1]);
+        let lo = Array::from_f32(1.0 - eps_low);
+        let hi = Array::from_f32(1.0 + eps_high);
+        let clipped = ops::clip(&ratio, Some(&lo), Some(&hi));
+        let per_token_policy =
+            ops::minimum(&ratio.multiply(&adv), &clipped.multiply(&adv)).negative();
+
+        let token_count = ops::maximum(&mask.sum(None), &one);
+        let reduce = |per_token: &Array| -> Array {
+            let masked = per_token.multiply(mask);
+            match self.config.loss_type {
+                GrpoLossType::Grpo => {
+                    let lengths = ops::maximum(&mask.sum_axis(-1, false), &one);
+                    masked.sum_axis(-1, false).divide(&lengths).mean(None)
+                }
+                GrpoLossType::Dapo => masked.sum(None).divide(&token_count),
+                GrpoLossType::DrGrpo => {
+                    let budget =
+                        (n_seqs as usize * self.config.max_completion_length.max(1)) as f32;
+                    masked.sum(None).divide(&Array::from_f32(budget))
+                }
+            }
+        };
+        let policy = reduce(&per_token_policy);
+
+        let (kl, mut total) = match ref_per_token_logps {
+            Some(ref_logps) => {
+                let d = ref_logps.subtract(per_token_logps);
+                let per_token_kl = d.exp().subtract(&one).subtract(&d);
+                let kl = per_token_kl.multiply(mask).sum(None).divide(&token_count);
+                let total = if self.config.beta != 0.0 {
+                    policy.add(
+                        &reduce(&per_token_kl).multiply(&Array::from_f32(self.config.beta as f32)),
+                    )
+                } else {
+                    policy.clone()
+                };
+                (kl, total)
+            }
+            None => (Array::from_f32(0.0), policy.clone()),
         };
 
-        let kl_loss = kl_mean.multiply(&Array::from_f32(self.config.beta as f32));
-        let mut total_loss = policy_loss.add(&kl_loss);
-
-        // Entropy bonus: subtract entropy_coef * entropy to encourage exploration
         if let (Some(ent), coef) = (entropy, self.config.entropy_coef) {
             if coef > 0.0 {
-                let masked_ent = ent.multiply(completion_mask);
-                let mean_ent = masked_ent.sum(None).divide(&safe_token_count);
-                let entropy_bonus = mean_ent.multiply(&Array::from_f32(coef as f32));
-                total_loss = total_loss.subtract(&entropy_bonus);
+                let mean_ent = ent.multiply(mask).sum(None).divide(&token_count);
+                total = total.subtract(&mean_ent.multiply(&Array::from_f32(coef as f32)));
             }
         }
 
-        Ok((total_loss, kl_mean, policy_loss))
+        // Where clipping changed the objective (no gradient flows through it).
+        let w = ratio.stop_gradient();
+        let f32_dtype = pmetal_bridge::dtype::F32;
+        let zero = Array::from_f32(0.0);
+        let low = w
+            .less(&lo)
+            .as_dtype(f32_dtype)
+            .multiply(&adv.less(&zero).as_dtype(f32_dtype));
+        let high = w
+            .greater(&hi)
+            .as_dtype(f32_dtype)
+            .multiply(&adv.greater(&zero).as_dtype(f32_dtype));
+        let clip_fraction = low.add(&high).multiply(mask).sum(None).divide(&token_count);
+
+        Ok(GrpoLoss {
+            total,
+            policy,
+            kl,
+            ratio,
+            clip_fraction,
+        })
     }
 
     /// Prepare a training batch from completion groups.
@@ -798,14 +970,16 @@ impl GrpoTrainer {
         Ok((all_prompts, all_completions, advantages, all_masks, None))
     }
 
-    /// Run a single training step on a batch of completion groups.
+    /// Train on one generation batch of completion groups.
     ///
-    /// Implements the correct GRPO training loop matching TRL:
+    /// As in TRL's `GRPOTrainer`:
     /// 1. Build padded input_ids / labels / completion_mask tensors
-    /// 2. Compute `old_per_token_logps` from the CURRENT policy (generation-time snapshot)
+    /// 2. Compute `old_per_token_logps` from the policy that generated the
+    ///    batch (nothing has updated it since generation)
     /// 3. Optionally compute `ref_per_token_logps` from the reference model
-    /// 4. Run `value_and_grad` with `compute_grpo_loss` (PPO-clip on old, KL on ref)
-    /// 5. Update optimizer
+    /// 4. `num_iterations` times: set the scheduled learning rate through
+    ///    `set_lr`, take `value_and_grad` of [`Self::compute_grpo_loss`],
+    ///    clip the gradient to `max_grad_norm` and update
     ///
     /// When `vlm_mode` is enabled and the groups contain `pixel_values`, the policy
     /// forward passes use `forward_with_images` to condition on visual inputs.
@@ -815,6 +989,7 @@ impl GrpoTrainer {
         mut ref_model: Option<&mut R>,
         groups: &[CompletionGroup],
         optimizer: &mut O,
+        set_lr: &mut impl FnMut(&mut O, f32),
     ) -> GrpoResult<GrpoIterationStats>
     where
         M: TrainableModel,
@@ -929,79 +1104,83 @@ impl GrpoTrainer {
             None
         };
 
-        // 3. Loss function for value_and_grad — only the policy model is differentiated.
-        //    `pixel_values` is captured by reference from the outer scope; it is already
-        //    materialized (eval'd) so it is safe inside the gradient closure.
+        // 3. `num_iterations` updates on this batch. The ratio is taken against
+        //    the generation-time log-probs above, so the first update is on
+        //    policy (ratio 1) and the later ones are clipped as the policy moves.
+        //    `pixel_values` is already materialized, so the closure can capture it.
         let pixel_values_ref = pixel_values.as_ref();
-        let loss_fn = |model: &mut M,
-                       (input_ids, labels, adv_array, old_logps, mask): (
-            &Array,
-            &Array,
-            &Array,
-            &Array,
-            &Array,
-        )|
-         -> std::result::Result<Array, Exception> {
-            let logits = model
-                .forward_with_images(input_ids, None, pixel_values_ref)
-                .map_err(|e| Exception::custom(e.to_string()))?;
+        let iterations = self.config.num_iterations.max(1);
+        let max_grad_norm = self.training_config.max_grad_norm as f32;
+        let mut losses = Vec::with_capacity(iterations);
+        let mut policy_losses = Vec::with_capacity(iterations);
+        let mut kls = Vec::with_capacity(iterations);
+        let mut clip_fractions = Vec::with_capacity(iterations);
 
-            let (per_token_logps, _) = self
-                .compute_per_token_logps(&logits, labels, temperature)
-                .map_err(|e| Exception::custom(e.to_string()))?;
+        for _ in 0..iterations {
+            let stash: std::cell::RefCell<Option<GrpoLoss>> = std::cell::RefCell::new(None);
+            let loss_fn = |model: &mut M,
+                           (input_ids, labels, adv_array, old_logps, mask): (
+                &Array,
+                &Array,
+                &Array,
+                &Array,
+                &Array,
+            )|
+             -> std::result::Result<Array, Exception> {
+                let logits = model
+                    .forward_with_images(input_ids, None, pixel_values_ref)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let (per_token_logps, _) = self
+                    .compute_per_token_logps(&logits, labels, temperature)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let parts = self
+                    .compute_grpo_loss(
+                        &per_token_logps,
+                        old_logps,
+                        ref_per_token_logps.as_ref(),
+                        adv_array,
+                        mask,
+                        None,
+                    )
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let total = parts.total.clone();
+                *stash.borrow_mut() = Some(parts);
+                Ok(total)
+            };
 
-            let (total_loss, _kl, _policy_loss) = self
-                .compute_grpo_loss(
-                    &per_token_logps,
-                    old_logps,
-                    ref_per_token_logps.as_ref(),
-                    adv_array,
-                    mask,
-                    None,
-                )
-                .map_err(|e| Exception::custom(e.to_string()))?;
+            set_lr(optimizer, self.get_learning_rate());
+            let (loss, mut grads) = {
+                let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+                loss_and_grad_fn(
+                    policy_model,
+                    (
+                        &input_ids,
+                        &labels,
+                        &adv_array,
+                        &old_per_token_logps,
+                        &completion_mask,
+                    ),
+                )?
+            };
+            if max_grad_norm > 0.0 {
+                pmetal_bridge::training::clip_grad_norm_map(&mut grads, max_grad_norm);
+            }
+            optimizer.update(policy_model, grads)?;
+            let parts = stash
+                .into_inner()
+                .expect("value_and_grad calls the loss closure once");
+            transforms::eval([&loss, &parts.policy, &parts.kl, &parts.clip_fraction])?;
+            let params = policy_model.lora_parameters();
+            transforms::eval(params.values())?;
+            pmetal_bridge::check_last_error().map_err(|e| Exception::custom(e.to_string()))?;
+            losses.push(loss.item_f32());
+            policy_losses.push(parts.policy.item_f32());
+            kls.push(parts.kl.item_f32());
+            clip_fractions.push(parts.clip_fraction.item_f32());
+            self.step += 1;
+        }
 
-            Ok(total_loss)
-        };
-
-        let (total_loss_arr, grads) = {
-            let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-            loss_and_grad_fn(
-                policy_model,
-                (
-                    &input_ids,
-                    &labels,
-                    &adv_array,
-                    &old_per_token_logps,
-                    &completion_mask,
-                ),
-            )?
-        };
-
-        // 4. Update optimizer
-        optimizer.update(policy_model, grads)?;
-
-        // Extract loss from the forward pass (already computed, no redundant re-forward)
-        let mut total_loss_arr = total_loss_arr;
-        let total_loss = total_loss_arr.item_f32();
-
-        // Compute KL/policy_loss stats from the values already available in the loss
-        // (We use the pre-update values since post-update requires an extra forward pass.
-        // The loss value itself is the authoritative training signal.)
-        let kl_stat = if let Some(ref_logps) = ref_per_token_logps.as_ref() {
-            // Approximate: compute from old policy vs ref (cheap, no extra forward)
-            let kl_log_ratio = ref_logps.subtract(&old_per_token_logps);
-            let kl_ratio = kl_log_ratio.exp();
-            let per_token_kl = kl_ratio
-                .subtract(&Array::from_f32(1.0))
-                .subtract(&kl_log_ratio);
-            let masked_kl = per_token_kl.multiply(&completion_mask);
-            let safe_count = ops::maximum(&completion_mask.sum(None), &Array::from_f32(1.0));
-            masked_kl.sum(None).divide(&safe_count).item_f32()
-        } else {
-            0.0
-        };
-
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
         let mean_reward = if raw_rewards.is_empty() {
             0.0
         } else {
@@ -1013,13 +1192,13 @@ impl GrpoTrainer {
             advantages.iter().sum::<f64>() / advantages.len() as f64
         };
 
-        self.step += 1;
-
         Ok(GrpoIterationStats {
             step: self.step,
-            loss: total_loss,
-            kl: kl_stat,
-            policy_loss: total_loss, // Policy loss is the dominant component
+            loss: mean(&losses),
+            kl: mean(&kls),
+            policy_loss: mean(&policy_losses),
+            clip_fraction: mean(&clip_fractions),
+            iterations,
             reward: mean_reward as f32,
             advantage: mean_adv as f32,
             completions_per_second: n_completions as f32 / start_time.elapsed().as_secs_f32(),
@@ -1170,16 +1349,13 @@ impl GrpoTrainer {
         info!("Starting GRPO training loop...");
         let n_epochs = self.training_config.num_epochs;
         let n_samples = dataset.samples().len();
-        let total_steps = n_samples * n_epochs;
-        if let Some(ref mut ctrl) = self.adaptive_lr {
-            ctrl.set_total_steps(total_steps);
-        }
+        let total_steps = self.plan_schedule(n_samples);
 
         for cb in &mut self.callbacks {
             cb.on_train_start();
         }
 
-        for epoch in 0..n_epochs {
+        'epochs: for epoch in 0..n_epochs {
             info!("Epoch {}/{}", epoch + 1, n_epochs);
 
             for (i, sample) in dataset.samples().iter().enumerate() {
@@ -1258,11 +1434,13 @@ impl GrpoTrainer {
                 }
 
                 // Apply adaptive LR override to optimizer before step
-                let current_lr = self.get_learning_rate();
-                set_optimizer_lr(optimizer, current_lr);
-
-                let stats =
-                    self.train_step(policy_model, ref_model.as_deref_mut(), &[group], optimizer)?;
+                let stats = self.train_step(
+                    policy_model,
+                    ref_model.as_deref_mut(),
+                    &[group],
+                    optimizer,
+                    &mut set_optimizer_lr,
+                )?;
 
                 // Feed loss to adaptive LR controller and handle the resulting action
                 let action = self.apply_adaptive_lr_action(stats.loss as f64);
@@ -1305,11 +1483,13 @@ impl GrpoTrainer {
                 if i % 10 == 0 {
                     let adjusted_lr = self.get_learning_rate();
                     info!(
-                        "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, lr={:.2e}, completion_len={:.1}",
+                        "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, clip_fraction={:.3} over {} update(s), lr={:.2e}, completion_len={:.1}",
                         stats.step,
                         stats.loss,
                         stats.kl,
                         stats.reward,
+                        stats.clip_fraction,
+                        stats.iterations,
                         adjusted_lr,
                         gen_output.num_generated.iter().sum::<usize>() as f32
                             / gen_output.num_generated.len() as f32
@@ -1337,6 +1517,11 @@ impl GrpoTrainer {
                     if self.callbacks.iter().any(|cb| cb.should_stop()) {
                         return Err(GrpoError::Cancelled);
                     }
+                }
+
+                if self.reached_max_steps() {
+                    info!("Reached max_steps={} optimizer steps, stopping", self.step);
+                    break 'epochs;
                 }
             }
         }
@@ -1400,10 +1585,7 @@ impl GrpoTrainer {
 
         let n_epochs = self.training_config.num_epochs;
         let n_samples = dataset.samples().len();
-        let total_steps = n_samples * n_epochs;
-        if let Some(ref mut ctrl) = self.adaptive_lr {
-            ctrl.set_total_steps(total_steps);
-        }
+        let total_steps = self.plan_schedule(n_samples);
 
         for cb in &mut self.callbacks {
             cb.on_train_start();
@@ -1424,7 +1606,7 @@ impl GrpoTrainer {
 
         let mut deferred: Option<DeferredStep> = None;
 
-        for epoch in 0..n_epochs {
+        'epochs: for epoch in 0..n_epochs {
             info!("Epoch {}/{}", epoch + 1, n_epochs);
 
             for (i, sample) in dataset.samples().iter().enumerate() {
@@ -1514,14 +1696,12 @@ impl GrpoTrainer {
                         continue;
                     }
 
-                    let current_lr = self.get_learning_rate();
-                    set_optimizer_lr(optimizer, current_lr);
-
                     let stats = self.train_step(
                         policy_model,
                         ref_model.as_deref_mut(),
                         &[group],
                         optimizer,
+                        &mut set_optimizer_lr,
                     )?;
 
                     // Adaptive LR + rollback (mirrors the synchronous run() path).
@@ -1568,11 +1748,13 @@ impl GrpoTrainer {
                     if i % 10 == 0 {
                         let adjusted_lr = self.get_learning_rate();
                         info!(
-                            "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, lr={:.2e}, completion_len={:.1}",
+                            "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, clip_fraction={:.3} over {} update(s), lr={:.2e}, completion_len={:.1}",
                             stats.step,
                             stats.loss,
                             stats.kl,
                             stats.reward,
+                            stats.clip_fraction,
+                            stats.iterations,
                             adjusted_lr,
                             gen_output.num_generated.iter().sum::<usize>() as f32
                                 / gen_output.num_generated.len() as f32
@@ -1604,6 +1786,13 @@ impl GrpoTrainer {
                             return Err(GrpoError::Cancelled);
                         }
                     }
+
+                    if self.reached_max_steps() {
+                        info!("Reached max_steps={} optimizer steps, stopping", self.step);
+                        let _ = session.flush();
+                        deferred = None;
+                        break 'epochs;
+                    }
                 }
                 // On the very first iteration (i == 0), prev_deferred is None and we
                 // skip training — the first GPU step happens at i == 1 using step 0's
@@ -1629,11 +1818,14 @@ impl GrpoTrainer {
                     return Ok(());
                 }
 
-                let current_lr = self.get_learning_rate();
-                set_optimizer_lr(optimizer, current_lr);
-
                 let flush_step_start = std::time::Instant::now();
-                let stats = self.train_step(policy_model, ref_model, &[group], optimizer)?;
+                let stats = self.train_step(
+                    policy_model,
+                    ref_model,
+                    &[group],
+                    optimizer,
+                    &mut set_optimizer_lr,
+                )?;
 
                 // Apply the same adaptive LR / rollback / callback logic as the
                 // main loop so the final step participates in divergence detection
@@ -2037,6 +2229,7 @@ mod tests {
             checkpoint_manager: None,
             best_checkpoint_loss: f64::MAX,
             last_loss: None,
+            schedule_total_steps: None,
         }
     }
 
@@ -2154,267 +2347,332 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // 4. compute_grpo_loss — ratio = 1 (per_token_logps == old_per_token_logps)
+    // 4. compute_grpo_loss
     // ---------------------------------------------------------------------------
 
-    /// When the current and old log-probs are identical the importance ratio is
-    /// exactly 1, so the PPO-clip surrogate is:
-    ///   L = -min(1 * A, clip(1, 1-ε, 1+ε) * A) = -A
-    /// The final loss (averaged over tokens) should equal -mean(advantages).
+    fn arr(v: &[f32], shape: &[i32]) -> Array {
+        Array::from_slice(v, shape)
+    }
+
+    fn scalar(a: &Array) -> f32 {
+        a.eval();
+        pmetal_bridge::check_last_error().expect("bridge op failed");
+        a.item_f32()
+    }
+
+    fn values(a: &Array) -> Vec<f32> {
+        a.eval();
+        pmetal_bridge::check_last_error().expect("bridge op failed");
+        a.as_slice::<f32>().to_vec()
+    }
+
+    /// With the current and old log-probs equal the ratio is 1 everywhere,
+    /// nothing is clipped, and the loss is −A averaged as the loss type says.
     #[test]
     #[serial]
-    fn test_compute_grpo_loss_ratio_one() {
+    fn on_policy_the_ratio_is_one_and_nothing_clips() {
         let trainer = make_trainer(GrpoConfig {
-            beta: 0.0, // no KL penalty
+            beta: 0.0,
             ..GrpoConfig::default()
         });
-
-        // [2 sequences, 4 tokens]
-        let logps_data: Vec<f32> = vec![
-            -0.5, -0.5, -0.5, -0.5, // seq 0
-            -1.0, -1.0, -1.0, -1.0, // seq 1
-        ];
-        let per_token_logps = Array::from_slice(&logps_data, &[2, 4]);
-        let old_per_token_logps = Array::from_slice(&logps_data, &[2, 4]);
-
-        // advantages: [2] — one per sequence
-        let advantages_data = [1.0f32, -1.0];
-        let advantages = Array::from_slice(&advantages_data, &[2]);
-
-        // completion_mask: all valid tokens
-        let mask_data = [1.0f32; 8];
-        let completion_mask = Array::from_slice(&mask_data, &[2, 4]);
-
-        let (total_loss, kl_mean, policy_loss) = trainer
+        let logps = arr(&[-0.5, -0.5, -0.5, -0.5, -1.0, -1.0, -1.0, -1.0], &[2, 4]);
+        let parts = trainer
             .compute_grpo_loss(
-                &per_token_logps,
-                &old_per_token_logps,
+                &logps,
+                &logps,
                 None,
-                &advantages,
-                &completion_mask,
+                &arr(&[1.0, -1.0], &[2]),
+                &arr(&[1.0; 8], &[2, 4]),
                 None,
             )
             .unwrap();
-
-        total_loss.eval().unwrap();
-        kl_mean.eval().unwrap();
-        policy_loss.eval().unwrap();
-
-        let loss_val: f32 = total_loss.item();
-        let kl_val: f32 = kl_mean.item();
-
-        assert!(
-            loss_val.is_finite(),
-            "total loss must be finite, got {loss_val}"
-        );
-
-        // KL is 0 when beta=0 and no ref model
-        assert!(
-            kl_val.abs() < 1e-6,
-            "KL should be ~0 with no ref model; got {kl_val}"
-        );
-
-        // When ratio=1 and clipping is inactive, L = -mean(A).
-        // mean(A) for the whole batch over equal token counts =
-        //   (-A[0] * 4 tokens + -A[1] * 4 tokens) / 8  = -(1.0 - 1.0)/2 = 0.0
-        // The per-token loss is -A (broadcast), so the mean should be ~0
-        // (advantages cancel: one positive, one negative with equal weight).
-        assert!(
-            loss_val.abs() < 1e-5,
-            "loss should be ~0 when advantages cancel; got {loss_val}"
-        );
+        assert!(scalar(&parts.total).abs() < 1e-6);
+        assert_eq!(scalar(&parts.kl), 0.0);
+        assert_eq!(scalar(&parts.clip_fraction), 0.0);
+        assert!(values(&parts.ratio).iter().all(|&r| r == 1.0));
     }
 
-    // ---------------------------------------------------------------------------
-    // 5. compute_grpo_loss — PPO clipping
-    // ---------------------------------------------------------------------------
-
-    /// Drive the ratio far outside [0.8, 1.2] by using very different log-probs.
-    /// The loss should still be finite (clipping prevents exploding gradients).
+    /// A ratio of e⁵ on a positive advantage is clipped to 1 + ε.
     #[test]
     #[serial]
-    fn test_compute_grpo_loss_clipping() {
+    fn a_large_token_ratio_is_clipped_at_one_plus_epsilon() {
         let trainer = make_trainer(GrpoConfig {
             beta: 0.0,
             epsilon_low: 0.2,
             epsilon_high: 0.2,
             ..GrpoConfig::default()
         });
-
-        // Current policy: very different from old (log ratio ~ +5)
-        let per_token_logps = Array::from_slice(
-            &[-0.1f32, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1],
-            &[2, 4],
-        );
-        // Old policy: much lower log-probs → log_ratio = (-0.1) - (-5.1) = 5.0
-        let old_per_token_logps = Array::from_slice(
-            &[-5.1f32, -5.1, -5.1, -5.1, -5.1, -5.1, -5.1, -5.1],
-            &[2, 4],
-        );
-
-        let advantages = Array::from_slice(&[1.0f32, 1.0], &[2]);
-        let completion_mask = Array::from_slice(&[1.0f32; 8], &[2, 4]);
-
-        let (total_loss, _kl, _policy_loss) = trainer
+        let parts = trainer
             .compute_grpo_loss(
-                &per_token_logps,
-                &old_per_token_logps,
+                &arr(&[-0.1; 8], &[2, 4]),
+                &arr(&[-5.1; 8], &[2, 4]),
                 None,
-                &advantages,
-                &completion_mask,
+                &arr(&[1.0, 1.0], &[2]),
+                &arr(&[1.0; 8], &[2, 4]),
                 None,
             )
             .unwrap();
-
-        total_loss.eval().unwrap();
-
-        let loss_val: f32 = total_loss.item();
-
-        assert!(!loss_val.is_nan(), "loss must not be NaN; got {loss_val}");
-        assert!(loss_val.is_finite(), "loss must be finite; got {loss_val}");
-
-        // With positive advantages and clipping at 1.2, the clipped surrogate yields:
-        //   surr2 = clip(ratio, 0.8, 1.2) * A = 1.2 * 1.0 = 1.2  (ratio >> 1.2)
-        //   surr1 = ratio * A >> 1.2
-        //   min(surr1, surr2) = 1.2
-        //   token_policy_loss = -min(...) = -1.2
-        // Averaged across all tokens and both sequences → loss = -1.2.
-        // This is correct: gradient descent on a negative loss ascends reward.
-        let expected = -1.2f32;
-        assert!(
-            (loss_val - expected).abs() < 1e-4,
-            "clipped loss should be ~{expected}, got {loss_val}"
-        );
+        assert!((scalar(&parts.total) + 1.2).abs() < 1e-4);
+        assert_eq!(scalar(&parts.clip_fraction), 1.0);
     }
 
-    // ---------------------------------------------------------------------------
-    // 6. KL penalty is non-negative
-    // ---------------------------------------------------------------------------
-
-    /// KL(pi || ref) estimated via the Schulman approximation:
-    ///   kl ≈ exp(ref - pi) - 1 - (ref - pi)
-    /// This is always >= 0. Verify that:
-    ///   a) kl_mean >= 0 when policy ≠ reference
-    ///   b) kl_mean ≈ 0 when policy == reference
+    /// KL(π‖ref) ≈ exp(ref − π) − (ref − π) − 1 ≥ 0, and 0 when they agree.
     #[test]
     #[serial]
-    fn test_kl_penalty_non_negative() {
+    fn the_kl_estimate_is_non_negative_and_zero_at_the_reference() {
         let trainer = make_trainer(GrpoConfig {
             beta: 0.1,
             ..GrpoConfig::default()
         });
-
-        let per_token_logps = Array::from_slice(
-            &[-0.5f32, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5],
-            &[2, 4],
-        );
-        // Reference is much more certain (higher log-probs)
-        let ref_per_token_logps = Array::from_slice(
-            &[-0.1f32, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1],
-            &[2, 4],
-        );
-
-        let advantages = Array::from_slice(&[0.0f32, 0.0], &[2]);
-        let completion_mask = Array::from_slice(&[1.0f32; 8], &[2, 4]);
-
-        // Case A: different ref → KL should be > 0
-        let (_total, kl_mean_a, _policy) = trainer
-            .compute_grpo_loss(
-                &per_token_logps,
-                &per_token_logps, // old == current (ratio=1)
-                Some(&ref_per_token_logps),
-                &advantages,
-                &completion_mask,
-                None,
-            )
+        let policy = arr(&[-0.5; 8], &[2, 4]);
+        let reference = arr(&[-0.1; 8], &[2, 4]);
+        let adv = arr(&[0.0, 0.0], &[2]);
+        let mask = arr(&[1.0; 8], &[2, 4]);
+        let parts = trainer
+            .compute_grpo_loss(&policy, &policy, Some(&reference), &adv, &mask, None)
             .unwrap();
-
-        kl_mean_a.eval().unwrap();
-        let kl_val_a: f32 = kl_mean_a.item();
-        assert!(kl_val_a >= 0.0, "KL must be >= 0; got {kl_val_a}");
-        assert!(kl_val_a.is_finite(), "KL must be finite; got {kl_val_a}");
-        // Expectation: ref is closer to 0 than policy, so KL > 0 is expected.
-        // The Schulman approx: exp(ref-pi) - 1 - (ref-pi) = exp(0.4) - 1 - 0.4 ≈ 0.092
-        assert!(
-            kl_val_a > 0.01,
-            "KL should be noticeably positive; got {kl_val_a}"
-        );
-
-        // Case B: ref == policy → KL should be ~0
-        let (_total, kl_mean_b, _policy) = trainer
-            .compute_grpo_loss(
-                &per_token_logps,
-                &per_token_logps,
-                Some(&per_token_logps), // ref == policy
-                &advantages,
-                &completion_mask,
-                None,
-            )
+        let want = 0.4f32.exp() - 0.4 - 1.0;
+        assert!((scalar(&parts.kl) - want).abs() < 1e-6);
+        // With zero advantages the loss is β·KL.
+        assert!((scalar(&parts.total) - 0.1 * want).abs() < 1e-6);
+        let parts = trainer
+            .compute_grpo_loss(&policy, &policy, Some(&policy), &adv, &mask, None)
             .unwrap();
-
-        kl_mean_b.eval().unwrap();
-        let kl_val_b: f32 = kl_mean_b.item();
-        assert!(
-            kl_val_b.abs() < 1e-5,
-            "KL should be ~0 when ref==policy; got {kl_val_b}"
-        );
+        assert!(scalar(&parts.kl).abs() < 1e-6);
     }
 
-    // ---------------------------------------------------------------------------
-    // 7. All four loss types produce finite scalars
-    // ---------------------------------------------------------------------------
-
+    /// Two completions of 2 and 4 tokens with advantages +1 and −1, on
+    /// policy, so each token's loss is −A: −1 −1 for the first, +1 four times
+    /// for the second.
     #[test]
     #[serial]
-    fn test_grpo_loss_reduction_variants() {
-        let loss_types = [
-            GrpoLossType::Bnpo,
-            GrpoLossType::DrGrpo,
-            GrpoLossType::Dapo,
-            GrpoLossType::Reinforce,
+    fn each_loss_type_aggregates_as_its_paper_does() {
+        let logps = arr(&[-0.5; 8], &[2, 4]);
+        let adv = arr(&[1.0, -1.0], &[2]);
+        let mask = arr(&[1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], &[2, 4]);
+        let cases = [
+            // GRPO: each sequence over its own length, (−1 + 1) / 2.
+            (GrpoLossType::Grpo, 0.0),
+            // DAPO: every token alike, (−2 + 4) / 6.
+            (GrpoLossType::Dapo, 2.0 / 6.0),
+            // Dr. GRPO: over 2 sequences × max_completion_length 4.
+            (GrpoLossType::DrGrpo, 2.0 / 8.0),
         ];
-
-        let per_token_logps = Array::from_slice(
-            &[-0.5f32, -0.6, -0.7, -0.8, -0.4, -0.5, -0.6, -0.7],
-            &[2, 4],
-        );
-        let old_per_token_logps = Array::from_slice(
-            &[-0.5f32, -0.6, -0.7, -0.8, -0.4, -0.5, -0.6, -0.7],
-            &[2, 4],
-        );
-        let advantages = Array::from_slice(&[0.5f32, -0.5], &[2]);
-        let completion_mask = Array::from_slice(&[1.0f32; 8], &[2, 4]);
-
-        for loss_type in loss_types {
+        for (loss_type, want) in cases {
             let trainer = make_trainer(GrpoConfig {
                 beta: 0.0,
                 loss_type,
+                max_completion_length: 4,
                 ..GrpoConfig::default()
             });
-
-            let (total_loss, _kl, _policy_loss) = trainer
-                .compute_grpo_loss(
-                    &per_token_logps,
-                    &old_per_token_logps,
-                    None,
-                    &advantages,
-                    &completion_mask,
-                    None,
-                )
+            let parts = trainer
+                .compute_grpo_loss(&logps, &logps, None, &adv, &mask, None)
                 .unwrap();
-
-            total_loss.eval().unwrap();
-            let loss_val: f32 = total_loss.item();
-
+            let got = scalar(&parts.total);
             assert!(
-                !loss_val.is_nan(),
-                "loss_type={loss_type:?}: loss must not be NaN, got {loss_val}"
-            );
-            assert!(
-                loss_val.is_finite(),
-                "loss_type={loss_type:?}: loss must be finite, got {loss_val}"
+                (got - want).abs() < 1e-6,
+                "{loss_type:?}: got {got}, want {want}"
             );
         }
+    }
+
+    /// GSPO's ratio is the length-normalized sequence likelihood ratio,
+    /// exp((log π(o|q) − log π_old(o|q)) / |o|), over completion tokens only.
+    #[test]
+    #[serial]
+    fn the_gspo_ratio_is_the_length_normalized_sequence_ratio() {
+        let trainer = make_trainer(GrpoConfig {
+            beta: 0.0,
+            ..GrpoConfig::default().for_gspo()
+        });
+        let old = [-1.0f32, -2.0, -0.5, -0.5, -1.5, -1.0, -2.0, -0.7];
+        // Per-token log ratios: [0.1, 0.3, 5, 5] (the 5s are masked out) and
+        // [0.5, −0.1, 0.2, 0.0].
+        let deltas = [0.1f32, 0.3, 5.0, 5.0, 0.5, -0.1, 0.2, 0.0];
+        let current: Vec<f32> = old.iter().zip(deltas).map(|(o, d)| o + d).collect();
+        let mask = [1.0f32, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let parts = trainer
+            .compute_grpo_loss(
+                &arr(&current, &[2, 4]),
+                &arr(&old, &[2, 4]),
+                None,
+                &arr(&[1.0, -1.0], &[2]),
+                &arr(&mask, &[2, 4]),
+                None,
+            )
+            .unwrap();
+
+        // By hand, from the sequences' log-likelihoods.
+        let seq_ratio = |cur: &[f32], old: &[f32], mask: &[f32]| {
+            let n: f32 = mask.iter().sum();
+            let lp: f32 = cur.iter().zip(mask).map(|(x, m)| x * m).sum();
+            let lp_old: f32 = old.iter().zip(mask).map(|(x, m)| x * m).sum();
+            ((lp - lp_old) / n).exp()
+        };
+        let s0 = seq_ratio(&current[..4], &old[..4], &mask[..4]);
+        let s1 = seq_ratio(&current[4..], &old[4..], &mask[4..]);
+        assert!((s0 - 0.2f32.exp()).abs() < 1e-6 && (s1 - 0.15f32.exp()).abs() < 1e-6);
+        assert_eq!(parts.ratio.shape(), &[2, 1]);
+        let ratio = values(&parts.ratio);
+        assert!(
+            (ratio[0] - s0).abs() < 1e-5 && (ratio[1] - s1).abs() < 1e-5,
+            "{ratio:?}"
+        );
+
+        // Clip range [1 − 3e-4, 1 + 4e-4]. s₀ > 1 + ε with A > 0 is clipped to
+        // 1.0004; s₁ > 1 + ε with A < 0 keeps its (worse) unclipped value.
+        // Sequences average as in GRPO: (−1.0004 + s₁) / 2.
+        let want = (-(1.0 + 4e-4) + s1) / 2.0;
+        assert!((scalar(&parts.total) - want).abs() < 1e-5);
+        // The clipped sequence's 2 tokens of the 6.
+        assert!((scalar(&parts.clip_fraction) - 2.0 / 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn loss_presets_set_what_their_papers_describe() {
+        let base = GrpoConfig::default();
+        assert_eq!(base.loss_type, GrpoLossType::Dapo);
+        let dr = base.clone().with_loss_preset("dr_grpo").unwrap();
+        assert_eq!(dr.loss_type, GrpoLossType::DrGrpo);
+        assert!(!dr.whiten_advantages);
+        let gspo = base.clone().with_loss_preset("gspo").unwrap();
+        assert_eq!(gspo.importance_sampling, ImportanceSampling::Sequence);
+        assert_eq!(gspo.loss_type, GrpoLossType::Grpo);
+        assert_eq!((gspo.epsilon_low, gspo.epsilon_high), (3e-4, 4e-4));
+        let grpo = base.clone().with_loss_preset("GRPO").unwrap();
+        assert_eq!(grpo.loss_type, GrpoLossType::Grpo);
+        assert!(base.clone().with_loss_preset("bnpo").is_err());
+        let dapo = base.for_dapo();
+        assert_eq!((dapo.epsilon_low, dapo.epsilon_high), (0.2, 0.28));
+        assert_eq!(dapo.dapo_overlong_penalty, Some(-1.0));
+        assert_eq!(GrpoConfig::default().dapo_overlong_penalty, None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // 7. num_iterations on a model
+    // ---------------------------------------------------------------------------
+
+    fn small_policy() -> pmetal_lora::AdaptedModel {
+        use pmetal_models::architectures::llama::LlamaConfig;
+        let config = LlamaConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: Some(2),
+            max_position_embeddings: 128,
+            ..Default::default()
+        };
+        let base =
+            pmetal_models::DynamicModel::from_config(&serde_json::to_string(&config).unwrap())
+                .unwrap();
+        let lora = pmetal_core::LoraConfig {
+            r: 4,
+            alpha: 8.0,
+            dropout: 0.0,
+            target_modules: vec!["q_proj".into(), "v_proj".into()],
+            ..Default::default()
+        };
+        pmetal_lora::AdaptedModel::attach(base, lora).unwrap()
+    }
+
+    fn one_group() -> CompletionGroup {
+        let mut group = CompletionGroup::new(vec![1, 2, 3], 4);
+        group.add_completion(vec![4, 5, 6], 1.0, false);
+        group.add_completion(vec![7, 8], 0.0, false);
+        group.add_completion(vec![9, 10, 11, 12], 1.0, false);
+        group.add_completion(vec![13, 14, 15], 0.0, false);
+        group
+    }
+
+    type Weights = std::collections::HashMap<std::rc::Rc<str>, Array>;
+
+    /// Train one generation batch with `config` from LoRA weights `init`.
+    fn train_batch(
+        model: &mut pmetal_lora::AdaptedModel,
+        init: &Weights,
+        config: GrpoConfig,
+    ) -> (GrpoIterationStats, Weights) {
+        model.set_lora_parameters(init);
+        let mut trainer = make_trainer(GrpoConfig {
+            beta: 0.0,
+            ..config
+        });
+        trainer.training_config.learning_rate = 0.05;
+        trainer.training_config.warmup_steps = 0;
+        trainer.training_config.lr_scheduler = pmetal_core::LrSchedulerType::Constant;
+        trainer.training_config.weight_decay = 0.0;
+        let mut optimizer = crate::TrainOptimizer::from_config(&trainer.training_config);
+        let stats = trainer
+            .train_step(
+                model,
+                None::<&mut pmetal_models::DynamicModel>,
+                &[one_group()],
+                &mut optimizer,
+                &mut |opt: &mut crate::TrainOptimizer, lr| opt.set_lr(lr),
+            )
+            .unwrap();
+        assert_eq!(trainer.step, stats.iterations);
+        (stats, model.lora_parameters())
+    }
+
+    fn max_abs_diff(a: &Weights, b: &Weights) -> f32 {
+        a.iter()
+            .map(|(k, x)| scalar(&x.subtract(&b[k]).abs().max(None)))
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    #[serial]
+    fn later_iterations_on_a_batch_are_clipped_and_clipping_changes_the_update() {
+        let mut model = small_policy();
+        let init = model.lora_parameters();
+        let tight = GrpoConfig {
+            epsilon_low: 0.01,
+            epsilon_high: 0.01,
+            ..GrpoConfig::default()
+        };
+
+        // One update per batch is on policy: the ratio is 1, nothing clips.
+        let (stats, _) = train_batch(&mut model, &init, tight.clone());
+        assert_eq!(stats.iterations, 1);
+        assert_eq!(stats.clip_fraction, 0.0);
+
+        // A second update on the same batch sees the moved policy.
+        let two = GrpoConfig {
+            num_iterations: 2,
+            ..tight
+        };
+        let (stats, clipped) = train_batch(&mut model, &init, two.clone());
+        assert_eq!(stats.iterations, 2);
+        assert!(stats.loss.is_finite());
+        assert!(
+            stats.clip_fraction > 0.0,
+            "no token clipped on the second update"
+        );
+
+        // The same two updates with a clip range nothing reaches.
+        let unclipped_config = GrpoConfig {
+            epsilon_low: 1e3,
+            epsilon_high: 1e3,
+            ..two
+        };
+        let (stats, unclipped) = train_batch(&mut model, &init, unclipped_config);
+        assert_eq!(stats.clip_fraction, 0.0);
+        let diff = max_abs_diff(&clipped, &unclipped);
+        assert!(
+            diff > 1e-6,
+            "clipping did not change the update (diff {diff})"
+        );
+
+        // GSPO clips whole sequences once the policy moves.
+        let gspo = GrpoConfig {
+            num_iterations: 2,
+            ..GrpoConfig::default().for_gspo()
+        };
+        let (stats, _) = train_batch(&mut model, &init, gspo);
+        assert!(stats.clip_fraction > 0.0, "GSPO never clipped");
     }
 
     // ---------------------------------------------------------------------------

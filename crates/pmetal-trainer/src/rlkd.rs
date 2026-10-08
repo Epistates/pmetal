@@ -522,7 +522,7 @@ impl RlkdTrainer {
             // the KL toward ref is handled separately via grpo_trainer.train_step
             // when a reference model is provided — RLKD uses the teacher as the
             // knowledge signal instead of a separate reference model).
-            let (grpo_loss, _kl, _policy_loss) = self
+            let grpo_loss = self
                 .grpo_trainer
                 .compute_grpo_loss(
                     &per_token_logps,
@@ -532,7 +532,8 @@ impl RlkdTrainer {
                     comp_mask,
                     None,
                 )
-                .map_err(|e| Exception::custom(e.to_string()))?;
+                .map_err(|e| Exception::custom(e.to_string()))?
+                .total;
 
             // Distillation loss: KL(teacher || student) with temperature scaling
             let distill_loss = Self::compute_distill_loss(

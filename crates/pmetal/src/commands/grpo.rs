@@ -22,6 +22,8 @@ pub(crate) async fn run_grpo_cli(
     checkpoint_every: usize,
     resume: bool,
     dapo: bool,
+    loss_type: &str,
+    num_iterations: usize,
     reasoning_rewards: bool,
     use_metal_flash_attention: bool,
     vlm_mode: bool,
@@ -68,6 +70,8 @@ pub(crate) async fn run_grpo_cli(
         println!("Beta:          {}", beta);
         println!("LR:            {:.2e}", learning_rate);
         println!("DAPO:          {}", dapo);
+        println!("Loss type:     {}", loss_type);
+        println!("Updates/batch: {}", num_iterations);
         println!("Reasoning Rew: {}", reasoning_rewards);
         if vlm_mode {
             println!("VLM Mode:      enabled (max_image_size={})", max_image_size);
@@ -182,6 +186,18 @@ pub(crate) async fn run_grpo_cli(
 
     if dapo {
         grpo_config = grpo_config.for_dapo();
+    }
+    grpo_config = grpo_config
+        .with_loss_preset(loss_type)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    grpo_config.num_iterations = num_iterations.max(1);
+    if grpo_config.importance_sampling == pmetal_trainer::ImportanceSampling::Sequence
+        && grpo_config.num_iterations == 1
+    {
+        tracing::warn!(
+            "GSPO's sequence-level ratio is 1 on the first update of a batch, so with \
+             --num-iterations 1 it trains exactly like GRPO; pass --num-iterations 2 or more"
+        );
     }
 
     // 6. Setup Reward Functions

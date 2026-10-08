@@ -100,8 +100,13 @@ pmetal grpo --model Qwen/Qwen3-0.6B --dataset reasoning.jsonl --reasoning-reward
 - **Speculative decoding** (`--speculative`): Draft/verify rollout generation for 2-4× throughput
 - **Async reward pipelining** (`--async-rewards`): Background reward scoring concurrent with GPU training
 
-### DAPO (Decoupled Alignment with Policy Optimization)
-Decouples the alignment and policy optimization steps for more stable reasoning training.
+`--num-iterations N` takes N optimizer updates on each batch of completions. The policy ratio is taken against the log-probs of the policy that generated them, so it is 1 on the first update and clipping (and GSPO) only act from the second.
+
+### DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization)
+`pmetal grpo --dapo`: token-level loss, no KL term, clip-higher (ε 0.2 below, 0.28 above), dynamic sampling of groups that are neither all right nor all wrong, and a penalty for completions cut off at the length limit (arXiv 2503.14476).
+
+### Dr. GRPO and GSPO
+`--loss-type dr_grpo` divides the summed token losses by a constant (completions × `--max-completion-length`) and stops dividing advantages by the group's standard deviation (arXiv 2503.20783). `--loss-type gspo` clips one ratio per completion, the length-normalized sequence likelihood ratio, in [1 − 3e-4, 1 + 4e-4] (arXiv 2507.18071); use it with `--num-iterations 2` or more.
 
 ### RLKD (Reinforcement Learning with Knowledge Distillation)
 Combines GRPO policy gradient optimization with distillation from a frozen teacher model. Loss: `L = (1-alpha) * L_grpo + alpha * L_distill`.

@@ -2,7 +2,7 @@
 
 GRPO and DAPO reasoning training with reward functions and sampling.
 
-Train models for reasoning tasks using Group Relative Policy Optimization (GRPO) or Decoupled Alignment with Policy Optimization (DAPO).
+Train models for reasoning tasks with Group Relative Policy Optimization (GRPO) and its variants: DAPO, Dr. GRPO and GSPO.
 
 ## Usage
 
@@ -27,6 +27,12 @@ pmetal grpo \
   --model Qwen/Qwen3-0.6B \
   --dataset reasoning.jsonl \
   --dapo
+
+# GSPO: a sequence-level ratio, clipped over several updates per batch
+pmetal grpo \
+  --model Qwen/Qwen3-0.6B \
+  --dataset reasoning.jsonl \
+  --loss-type gspo --num-iterations 2 --beta 0
 
 # With speculative decoding (2-4× faster rollouts)
 pmetal grpo \
@@ -62,7 +68,9 @@ GRPO expects a reasoning dataset:
 |-----------|---------|-------------|
 | `--model` | *required* | Model ID or local path |
 | `--dataset` | *required* | Reasoning dataset (JSONL) |
-| `--dapo` | `false` | Use DAPO variant |
+| `--dapo` | `false` | DAPO recipe: token-level loss, no KL, clip-higher (0.2, 0.28), dynamic sampling, overlong penalty, at least 16 completions |
+| `--loss-type` | `dapo` | `dapo` (token-level), `grpo` (each completion averaged over its length), `dr_grpo` (constant normalizer, no std scaling), `gspo` (sequence-level ratio, clip 3e-4/4e-4) |
+| `--num-iterations` | `1` | Optimizer updates per generation batch (μ). The ratio against the generating policy is 1 on the first, so clipping and GSPO only act from the second |
 | `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW |
 | `--reasoning-rewards` | `false` | Enable reasoning-aware rewards |
 | `--speculative` | `false` | Speculative decoding for faster rollouts |
@@ -77,8 +85,10 @@ GRPO expects a reasoning dataset:
 
 | Method | Description |
 |--------|-------------|
-| GRPO | Group Relative Policy Optimization — samples multiple completions and optimizes relative to group reward |
-| DAPO | Decoupled GRPO — separates alignment and policy optimization for more stable training |
+| GRPO | Group Relative Policy Optimization (arXiv 2402.03300): samples a group of completions per prompt and pushes toward the ones that score above the group mean, with a clipped per-token ratio |
+| DAPO | Decoupled Clip and Dynamic sAmpling Policy Optimization (arXiv 2503.14476): token-level loss, clip-higher, dynamic sampling and an overlong penalty (`--dapo`) |
+| Dr. GRPO | *Understanding R1-Zero-Like Training* (arXiv 2503.20783): normalizes by a constant and drops the std scaling of advantages, removing GRPO's length and difficulty biases (`--loss-type dr_grpo`) |
+| GSPO | Group Sequence Policy Optimization (arXiv 2507.18071): clips one length-normalized likelihood ratio per completion instead of one per token (`--loss-type gspo --num-iterations 2`) |
 
 ## See Also
 
