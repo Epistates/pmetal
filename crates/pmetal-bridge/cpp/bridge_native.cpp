@@ -225,7 +225,8 @@ static array run_gdn_layer(
     auto a_val = matmul(normed, a_w);
 
     auto conv_in  = concatenate({C_arr(cache_conv), qkv}, 1);
-    auto new_conv = slice(conv_in, {0, 1, 0}, {B, ck, cd});
+    // The last ck - 1 inputs ({1, ck} is that only for S == 1).
+    auto new_conv = slice(conv_in, {0, S, 0}, {B, S + ck - 1, cd});
     auto conv_out = mlx::core::conv1d(conv_in, conv_w, 1, 0, 1, cd);
     // fused silu: x * sigmoid(x)
     auto conv_act = multiply(conv_out, sigmoid(conv_out));

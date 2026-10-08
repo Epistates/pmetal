@@ -250,7 +250,10 @@ pub(super) fn gdn_forward(
         .unwrap_or_else(|| InlineArray::zeros(&[b, ck - 1, cd], dtype));
     let conv_in = conv_state.concatenate_2(&qkv, 1);
 
-    let new_conv = conv_in.slice(&[0, 1, 0], &[b, ck, cd]);
+    // ⚠️ The state is the last `ck - 1` inputs. `[1, ck)` is that only when
+    // s == 1; after an s-token prefill it kept the oldest ones, so the first
+    // decode steps convolved over the wrong tokens.
+    let new_conv = conv_in.slice(&[0, s, 0], &[b, s + ck - 1, cd]);
     let conv_out = conv_in
         .conv1d(lw.gdn_conv_w.as_ref().unwrap(), 1, 0, 1, cd)
         .fused_silu();
