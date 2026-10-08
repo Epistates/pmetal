@@ -33,11 +33,11 @@ pmetal infer \
   --model Qwen/Qwen3-0.6B \
   --tools tools.json --chat
 
-# ANE-optimized inference
-pmetal infer --model Qwen/Qwen3-0.6B --ane-max-seq-len 2048
+# Inference on the Apple Neural Engine
+pmetal infer --model Qwen/Qwen3-4B --backend ane --ane-max-seq-len 2048 --chat
 
 # JIT-compiled sampling
-pmetal infer --model Qwen/Qwen3-0.6B --compiled --chat
+pmetal infer --model Qwen/Qwen3-0.6B --backend compiled --chat
 
 # Gemma 4 MTP assistant (exact speculative decode)
 pmetal infer \
@@ -96,10 +96,10 @@ pmetal infer \
 | `--presence-penalty` | `0.0` | Presence penalty |
 | `--chat` | `false` | Apply chat template |
 | `--fp8` | `false` | FP8 weights (~2× mem reduction) |
-| `--compiled` | `false` | JIT-compiled sampling |
+| `--backend` | `auto` | Generation path: `auto`, `standard`, `compiled` (JIT-compiled sampling), `metal-sampler` (fused Metal sampling kernel), `ane` (Apple Neural Engine) or `minimal` (debug loop) |
 | `--profile-layers` | `false` | Run an opt-in per-layer forward profile for supported hybrid models |
 | `--profile-output` | — | Write the layer profile report as pretty JSON |
-| `--ane-max-seq-len` | `1024` | Max ANE kernel sequence length |
+| `--ane-max-seq-len` | `4096` | Largest context (prompt plus output) the ANE compiles a model for |
 | `--tools` | — | Tool definitions file (OpenAI format) |
 | `--system` | — | System message |
 
@@ -107,7 +107,7 @@ pmetal infer \
 
 `--profile-layers` is currently implemented for standard `Qwen 3.5 / qwen3_next` inference. It runs one real prefill pass and one real cached decode pass using the shared inference runner, forcing MLX evaluation at each measured section so the report reflects actual wall time instead of only op scheduling overhead.
 
-`--mtp` is its own verifier/drafter generation backend. It supports bundled Qwen `mtp.*` weights or an external `--mtp-model` checkpoint, FP8 target/MTP weights, packed expert offload, LoRA-merged Qwen3Next targets, and checkpoints with more than one MTP predictor layer. Backend selectors such as ANE, compiled, minimal, and metal-sampler are ignored while MTP is active because exact speculative verification owns the decode loop. LoRA and `--experts-dir` are not combined; fuse the adapter first if you need packed expert offload.
+`--mtp` is its own verifier/drafter generation backend. It supports bundled Qwen `mtp.*` weights or an external `--mtp-model` checkpoint, FP8 target/MTP weights, packed expert offload, LoRA-merged Qwen3Next targets, and checkpoints with more than one MTP predictor layer. `--backend` is ignored while MTP is active because exact speculative verification owns the decode loop. LoRA and `--experts-dir` are not combined; fuse the adapter first if you need packed expert offload.
 
 When Gemma 4 or Qwen MTP is active, the CLI prints a `Speculative:` summary with draft
 acceptance rate, accepted/attempted draft tokens, average accepted draft tokens per verify

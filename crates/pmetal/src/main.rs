@@ -1845,9 +1845,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 mtp,
                 mtp_model,
                 mtp_draft_tokens,
-                metal_sampler,
-                compiled,
-                minimal,
                 hide_thinking,
                 tools,
                 fp8,
@@ -1913,9 +1910,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 mtp,
                 mtp_model.as_deref(),
                 mtp_draft_tokens,
-                metal_sampler,
-                compiled,
-                minimal,
                 hide_thinking,
                 fp8,
                 tool_defs.as_deref(),
@@ -3054,6 +3048,58 @@ mod argv_roundtrip {
             "InferSpec argv failed to parse: {}",
             result.unwrap_err()
         );
+    }
+
+    /// `--backend` is the one way to pick a generation path: the spec, the
+    /// help text and the parser offer the same variants, and the per-path
+    /// flags it replaced are gone.
+    #[test]
+    fn infer_backend_is_the_only_path_selector() {
+        use clap::CommandFactory;
+        use pmetal_data::inference_config::InferenceBackend;
+
+        let names: Vec<&str> = InferenceBackend::ALL.iter().map(|b| b.as_str()).collect();
+        let spec_options = InferSpec::field_descriptors()
+            .iter()
+            .find(|d| d.name == "backend")
+            .map(|d| match d.kind {
+                pmetal_core::FieldKind::Enum { options } => options.to_vec(),
+                other => panic!("backend is not an enum field: {other:?}"),
+            })
+            .expect("InferSpec has a backend field");
+        assert_eq!(spec_options, names);
+
+        let cli = Cli::command();
+        let backend = cli
+            .find_subcommand("infer")
+            .and_then(|infer| infer.get_arguments().find(|a| a.get_id() == "backend"))
+            .expect("infer has --backend");
+        let help = backend.get_help().expect("--backend has help").to_string();
+        let listed = help
+            .split_once(':')
+            .map(|(_, list)| list.trim().trim_end_matches('.'))
+            .expect("--backend help lists the variants");
+        assert_eq!(listed.split(" | ").collect::<Vec<_>>(), names);
+
+        for name in &names {
+            let spec = InferSpec {
+                model: "model".into(),
+                prompt: "Hello".into(),
+                backend: (*name).to_string(),
+                ..Default::default()
+            };
+            assert!(try_parse("infer", spec.to_argv()).is_ok(), "{name}");
+        }
+        for legacy in ["--compiled", "--metal-sampler", "--minimal"] {
+            let argv = vec![
+                "--model".to_string(),
+                "m".into(),
+                "--prompt".into(),
+                "p".into(),
+                legacy.into(),
+            ];
+            assert!(try_parse("infer", argv).is_err(), "{legacy} still parses");
+        }
     }
 
     // Commands::Serve is only compiled when `--features serve` is active.

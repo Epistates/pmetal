@@ -170,36 +170,6 @@ pub struct InferSpec {
     #[serde(default)]
     pub draft_model: Option<String>,
 
-    #[job(
-        label = "Compiled Sampling",
-        group = "Compute",
-        argv = "--compiled",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub compiled: bool,
-
-    #[job(
-        label = "Metal Sampler",
-        group = "Compute",
-        argv = "--metal-sampler",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub metal_sampler: bool,
-
-    #[job(
-        label = "Minimal Path",
-        group = "Compute",
-        argv = "--minimal",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub minimal: bool,
-
     #[job(label = "Tools JSON", group = "Input", argv = "--tools", kind = "path")]
     #[serde(default)]
     pub tools: Option<String>,
@@ -382,9 +352,6 @@ impl Default for InferSpec {
             mode: default_mode(),
             backend: default_backend(),
             draft_model: None,
-            compiled: false,
-            metal_sampler: false,
-            minimal: false,
             tools: None,
             fp8: false,
             experts_dir: None,

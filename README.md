@@ -665,8 +665,8 @@ Multiple distillation methods and loss functions:
 | `--mtp-model` | bundled `mtp.*` | Optional external Qwen MTP checkpoint from `train-mtp` |
 | `--mtp-draft-tokens` | 3 | Qwen MTP draft tokens per verification step |
 | `--fp8` | false | Use FP8 weights (~2x mem reduction) |
-| `--compiled` | false | Use JIT-compiled sampling |
-| `--ane-max-seq-len` | 1024 | Max ANE kernel sequence length |
+| `--backend` | auto | Generation path: `auto`, `standard`, `compiled`, `metal-sampler`, `ane` or `minimal` |
+| `--ane-max-seq-len` | 4096 | Largest ANE context (prompt plus output) |
 | `--tools` | — | Tool/function definitions file (OpenAI format) |
 | `--system` | — | System message |
 

@@ -224,13 +224,13 @@ pub enum InferenceBackend {
     Auto,
     /// Default streaming MLX path (the current no-flag behavior).
     Standard,
-    /// JIT-compiled sampling (mlx.compile) — matches `--compiled`.
+    /// JIT-compiled sampling (mlx.compile).
     Compiled,
-    /// Fused Metal sampling kernel — matches `--metal-sampler`.
+    /// Fused Metal sampling kernel.
     MetalSampler,
-    /// Apple Neural Engine — matches `--ane` (requires `ane` feature).
+    /// Apple Neural Engine, same as `--ane` (requires the `ane` feature).
     Ane,
-    /// Minimal async generation (debug path) — matches `--minimal`.
+    /// Minimal async generation (debug path).
     Minimal,
 }
 

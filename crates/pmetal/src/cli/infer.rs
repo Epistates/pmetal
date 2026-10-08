@@ -74,7 +74,7 @@ pub struct InferArgs {
     #[arg(long = "mode", default_value = "auto")]
     pub mode: pmetal_data::inference_config::SamplingMode,
 
-    /// Execution backend: auto | standard | compiled | metal-sampler | ane | minimal | dflash.
+    /// Execution backend: auto | standard | compiled | metal-sampler | ane | minimal.
     #[arg(long = "backend", default_value = "auto")]
     pub backend: pmetal_data::inference_config::InferenceBackend,
 
@@ -95,20 +95,6 @@ pub struct InferArgs {
     /// Number of Qwen MTP draft tokens to verify per speculative step.
     #[arg(long = "mtp-draft-tokens", default_value = "3")]
     pub mtp_draft_tokens: usize,
-
-    /// Use fused Metal sampling kernel for better battery performance.
-    /// Legacy alias — prefer `--backend metal-sampler`.
-    #[arg(long = "metal-sampler")]
-    pub metal_sampler: bool,
-
-    /// Use JIT-compiled sampling for better performance.
-    /// Legacy alias — prefer `--backend compiled`.
-    #[arg(long = "compiled")]
-    pub compiled: bool,
-
-    /// Use minimal async generation (for performance debugging)
-    #[arg(long = "minimal")]
-    pub minimal: bool,
 
     /// Hide thinking trace from output
     #[arg(long = "hide-thinking")]

@@ -288,9 +288,6 @@ pub(crate) async fn run_inference(
     mtp: bool,
     mtp_model: Option<&str>,
     mtp_draft_tokens: usize,
-    metal_sampler: bool,
-    compiled: bool,
-    minimal: bool,
     hide_thinking: bool,
     fp8: bool,
     tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
@@ -323,16 +320,12 @@ pub(crate) async fn run_inference(
         GenerationOutput, generate_cached_compiled, generate_cached_metal, generate_minimal_async,
     };
 
-    // ── Resolve --backend into the legacy boolean path selectors ──────────
+    // ── Resolve --backend into the generation path ────────────────────────
     //
-    // Legacy flags (`--metal-sampler`, `--compiled`, `--minimal`, `--ane`) still
-    // work as before when `--backend` is left at `auto`. Any other variant
-    // takes precedence and clears the legacy flags, reasserting only the one
-    // that matches. `auto` defers to the runner's existing behavior — today
-    // that's "streaming path when no legacy flag is set"; Phase 2 will add a
-    // device-aware heuristic here.
+    // `auto` streams on the GPU, or runs on the ANE when `--ane` is set; any
+    // other variant pins its path and overrides `--ane`.
     let (metal_sampler, compiled, minimal, ane) = match backend {
-        InferenceBackend::Auto => (metal_sampler, compiled, minimal, ane),
+        InferenceBackend::Auto => (false, false, false, ane),
         InferenceBackend::Standard => (false, false, false, false),
         InferenceBackend::Compiled => (false, true, false, false),
         InferenceBackend::MetalSampler => (true, false, false, false),
@@ -362,9 +355,9 @@ pub(crate) async fn run_inference(
             (lora_path.is_some(), "--lora"),
             (fp8, "--fp8"),
             (experts_dir.is_some(), "--experts-dir"),
-            (metal_sampler, "--metal-sampler / --backend metal-sampler"),
-            (compiled, "--compiled / --backend compiled"),
-            (minimal, "--minimal / --backend minimal"),
+            (metal_sampler, "--backend metal-sampler"),
+            (compiled, "--backend compiled"),
+            (minimal, "--backend minimal"),
             (ane, "--ane / --backend ane"),
         ];
         if let Some((_, flag)) = other.iter().find(|(set, _)| *set) {

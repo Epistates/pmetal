@@ -48,13 +48,12 @@ Tools remaining to migrate (mechanical, identical pattern):
 
 The `generate` tool (which maps to `pmetal infer`) exposes approximately 21 flags.
 The `InferSpec` in `pmetal_core::jobs::infer` models **32** fields. The following
-10 are absent from the MCP `generate` tool today:
+9 are absent from the MCP `generate` tool today:
 
 | Missing flag | `InferSpec` field | CLI flag |
 |---|---|---|
-| Backend selector | `backend: String` | `--backend auto\|standard\|compiled\|metal-sampler\|ane\|minimal\|dflash` |
+| Backend selector | `backend: String` | `--backend auto\|standard\|compiled\|metal-sampler\|ane\|minimal` |
 | Draft model | `draft_model: Option<String>` | `--draft-model <path>` |
-| Compiled sampling | `compiled: bool` | `--compiled` |
 | Benchmark mode | `benchmark: bool` | `--benchmark` |
 | Profile layers | `profile_layers: bool` | `--profile-layers` |
 | KV K-bits (per-key quant) | `kv_k_bits: Option<u8>` | `--kv-k-bits <bits>` |
@@ -74,7 +73,6 @@ async fn generate(&self, model: String, prompt: String,
     /* existing params... */
     backend: Option<String>,
     draft_model: Option<String>,
-    compiled: Option<bool>,
     benchmark: Option<bool>,
     profile_layers: Option<bool>,
     kv_k_bits: Option<u64>,
@@ -89,7 +87,6 @@ async fn generate(&self, model: String, prompt: String,
         max_tokens: max_tokens.unwrap_or(256) as usize,
         backend: backend.unwrap_or_else(|| "auto".to_string()),
         draft_model,
-        compiled: compiled.unwrap_or(false),
         benchmark: benchmark.unwrap_or(false),
         profile_layers: profile_layers.unwrap_or(false),
         kv_k_bits: kv_k_bits.map(|b| b as u8),
