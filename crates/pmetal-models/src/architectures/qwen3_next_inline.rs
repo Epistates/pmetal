@@ -90,6 +90,43 @@ pub struct InlineLayerWeights {
     gdn_ck: i32,
 }
 
+impl InlineLayerWeights {
+    /// Every array this layer holds; the ones its kind does not use are absent.
+    fn arrays_mut(&mut self) -> impl Iterator<Item = &mut InlineArray> {
+        [
+            &mut self.input_ln_w,
+            &mut self.post_ln_w,
+            &mut self.mlp_gate_w,
+            &mut self.mlp_up_w,
+            &mut self.mlp_down_w,
+        ]
+        .into_iter()
+        .chain(
+            [
+                &mut self.attn_q_w,
+                &mut self.attn_k_w,
+                &mut self.attn_v_w,
+                &mut self.attn_o_w,
+                &mut self.attn_q_norm_w,
+                &mut self.attn_k_norm_w,
+                &mut self.gdn_qkv_w,
+                &mut self.gdn_z_w,
+                &mut self.gdn_b_w,
+                &mut self.gdn_a_w,
+                &mut self.gdn_conv_w,
+                &mut self.gdn_q_nw,
+                &mut self.gdn_k_nw,
+                &mut self.gdn_a_log,
+                &mut self.gdn_dt_bias,
+                &mut self.gdn_norm_w,
+                &mut self.gdn_out_w,
+            ]
+            .into_iter()
+            .flatten(),
+        )
+    }
+}
+
 // ============================================================================
 // Cached model weights
 // ============================================================================
@@ -350,88 +387,22 @@ impl InlineModelWeights {
 
         let model_dtype = embed_w.dtype_raw();
 
-        // CRITICAL: Detach ALL weight arrays from their graph chains.
-        // Weight arrays come from ia_from_array(weight).t() which creates:
-        //   Transpose(Copy(Concatenate(individual_weights...)))
-        // Even though all nodes are evaluated, the graph chain keeps
-        // hundreds of ArrayDesc objects alive with references.
-        // Detaching severs these chains, potentially reducing eval overhead.
-        // Eval ALL weights (forces lazy transposes to materialize) then detach
-        // to sever graph chains. Without this, each weight carries:
-        //   Transpose → Copy → Concatenate → individual weights
-        // These chains add ~200+ graph nodes that the eval engine traverses.
-        // Force-copy ALL weights into fresh Metal buffers (data.use_count=1).
-        // Model weights share data with mlx-rs (use_count=2), which prevents
-        // optimal Metal buffer scheduling during eval. Copying breaks the sharing.
-        let zero = InlineArray::from_f32(0.0).as_dtype(model_dtype);
-        let copy_fresh = |w: &InlineArray| -> InlineArray {
-            let mut fresh = w.add(&zero);
-            fresh.eval();
-            fresh.detach();
-            fresh
+        // Every entry above shares its buffer with the model's own weight; the
+        // projections are transposed views of it, not copies. Evaluating them
+        // here settles the views (and dequantizes any FP8 weight once, the
+        // only case that needs a new buffer), and detaching drops the
+        // graph nodes that produced them, so each decode step's graph starts
+        // at plain arrays.
+        let settle = |w: &mut InlineArray| {
+            w.eval();
+            w.detach();
         };
-        embed_w = copy_fresh(&embed_w);
-        final_norm_w = copy_fresh(&final_norm_w);
-        lm_head_w = lm_head_w.map(|w| copy_fresh(&w));
+        settle(&mut embed_w);
+        settle(&mut final_norm_w);
+        lm_head_w.iter_mut().for_each(settle);
         for lw in &mut layers {
-            lw.input_ln_w = copy_fresh(&lw.input_ln_w);
-            lw.post_ln_w = copy_fresh(&lw.post_ln_w);
-            lw.mlp_gate_w = copy_fresh(&lw.mlp_gate_w);
-            lw.mlp_up_w = copy_fresh(&lw.mlp_up_w);
-            lw.mlp_down_w = copy_fresh(&lw.mlp_down_w);
-            if let Some(ref w) = lw.attn_q_w {
-                lw.attn_q_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.attn_k_w {
-                lw.attn_k_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.attn_v_w {
-                lw.attn_v_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.attn_o_w {
-                lw.attn_o_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.attn_q_norm_w {
-                lw.attn_q_norm_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.attn_k_norm_w {
-                lw.attn_k_norm_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_qkv_w {
-                lw.gdn_qkv_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_z_w {
-                lw.gdn_z_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_b_w {
-                lw.gdn_b_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_a_w {
-                lw.gdn_a_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_conv_w {
-                lw.gdn_conv_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_q_nw {
-                lw.gdn_q_nw = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_k_nw {
-                lw.gdn_k_nw = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_a_log {
-                lw.gdn_a_log = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_dt_bias {
-                lw.gdn_dt_bias = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_norm_w {
-                lw.gdn_norm_w = Some(copy_fresh(w));
-            }
-            if let Some(ref w) = lw.gdn_out_w {
-                lw.gdn_out_w = Some(copy_fresh(w));
-            }
+            lw.arrays_mut().for_each(settle);
         }
-        eprintln!("[INLINE-GEN] Force-copied all weights into fresh Metal buffers");
 
         Ok(Self {
             embed_w,
