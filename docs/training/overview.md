@@ -22,7 +22,7 @@ PMetal supports 12+ training methods across CLI, GUI, TUI, and the Rust/Python S
 | TAID | — | — | — | `TaidDistiller` |
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |
 
-Library-only methods: GSPO, PPO, Online DPO, Diffusion Training.
+Library-only methods: Diffusion Training.
 
 ## Training Infrastructure
 

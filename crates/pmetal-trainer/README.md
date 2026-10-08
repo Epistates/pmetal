@@ -14,13 +14,10 @@ This crate provides the training infrastructure for PMetal, including various tr
 | **LoRA** | Low-Rank Adaptation | Parameter-efficient fine-tuning |
 | **DPO** | Direct Preference Optimization | Preference-based alignment |
 | **GRPO** | Group Relative Policy Optimization | Efficient PPO alternative |
-| **GSPO** | Group Sequence Policy Optimization | Fixes GRPO length bias |
-| **DAPO** | Decoupled Clip and Dynamic Sampling PO | ByteDance's 4 GRPO improvements |
-| **PPO** | Proximal Policy Optimization | RLHF with reward model |
+| **DAPO** | Decoupled Clip and Dynamic Sampling PO | GRPO mode (`GrpoConfig::for_dapo`) |
 | **ORPO** | Odds Ratio Preference Optimization | Reference-free alignment |
 | **SimPO** | Simple Preference Optimization | Simplified preference learning |
 | **KTO** | Kahneman-Tversky Optimization | Unpaired preference data |
-| **Online DPO** | Online Direct Preference Optimization | DPO with online sampling |
 | **Distillation** | Knowledge distillation | Teacher→student transfer |
 | **ANE** | Apple Neural Engine training | Power-efficient on-device training |
 | **RLKD** | RL with Knowledge Distillation | GRPO + teacher distillation |
@@ -125,14 +122,10 @@ fn train_with_checkpoints(
 | `sft` | Supervised fine-tuning trainer |
 | `dpo` | Direct Preference Optimization |
 | `grpo` | Group Relative Policy Optimization |
-| `gspo` | Group Sequence Policy Optimization |
-| `dapo` | Decoupled Clip and Dynamic Sampling PO |
 | `ane_training` | ANE training loop (feature-gated: `ane`) |
-| `ppo` | Proximal Policy Optimization |
 | `orpo` | Odds Ratio Preference Optimization |
 | `simpo` | Simple Preference Optimization |
 | `kto` | Kahneman-Tversky Optimization |
-| `online_dpo` | Online DPO with sampling |
 | `distillation` | Knowledge distillation orchestration |
 | `rlkd` | Reinforcement Learning with Knowledge Distillation |
 | `embedding_trainer` | Sentence-transformer fine-tuning |

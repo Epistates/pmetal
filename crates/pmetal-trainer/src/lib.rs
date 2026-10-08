@@ -4,25 +4,15 @@
 //! - Supervised Fine-Tuning (SFT)
 //! - LoRA fine-tuning
 //! - Direct Preference Optimization (DPO)
-//! - Group Relative Policy Optimization (GRPO)
-//! - DAPO (Decoupled Clip and Dynamic Sampling Policy Optimization)
-//! - GSPO (Group Sequence Policy Optimization)
-//! - PPO (Proximal Policy Optimization)
+//! - Group Relative Policy Optimization (GRPO), with DAPO's clip-higher,
+//!   dynamic sampling and overlong penalty as a mode of the same trainer
 //! - ORPO (Odds Ratio Preference Optimization)
 //! - SimPO (Simple Preference Optimization)
 //! - KTO (Kahneman-Tversky Optimization)
-//! - Online DPO with reward models
 //! - LLaDA-style Diffusion Training
 //! - Learning rate schedulers
 //! - Training callbacks
 //! - Parameter grouping for per-layer learning rates
-//!
-//! # Q4 2025 SOTA Algorithms
-//!
-//! - **DAPO**: ByteDance's algorithm with Clip-Higher, Dynamic Sampling,
-//!   Token-Level Policy Gradient, and Overlong Reward Penalty
-//! - **GSPO**: Group Sequence Policy Optimization with equal token weighting
-//!   to fix GRPO length bias
 //!
 //! # Separate Embedding Learning Rates
 //!
@@ -72,7 +62,6 @@ pub mod ane_reward;
 pub mod callbacks;
 pub mod checkpoint;
 pub mod contrastive_loss;
-pub mod dapo;
 pub mod dflash_training;
 #[cfg(feature = "experimental-trainers")]
 pub mod diffusion;
@@ -81,23 +70,17 @@ pub mod distillation;
 pub mod dpo;
 pub mod embedding_trainer;
 pub mod grpo;
-pub mod gspo;
 #[cfg(feature = "experimental-trainers")]
 pub mod kto;
 pub mod logprob_utils;
 pub mod mlx_metal_optimizer;
 pub mod mtp_training;
 #[cfg(feature = "experimental-trainers")]
-pub mod online_dpo;
-#[cfg(feature = "experimental-trainers")]
 pub mod orpo;
 pub mod paired_preference;
 pub mod param_groups;
-#[cfg(feature = "experimental-trainers")]
-pub mod ppo;
 mod preference_batch;
 pub mod pretrain;
-pub mod reasoning_template;
 pub mod reward_model;
 pub mod rlkd;
 #[cfg(feature = "experimental-trainers")]
@@ -131,7 +114,6 @@ pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, 
 pub use ane_reward::{AsyncRewardModel, PendingRewards, PipelinedGrpoSession};
 pub use callbacks::*;
 pub use checkpoint::*;
-pub use dapo::*;
 #[cfg(feature = "experimental-trainers")]
 pub use diffusion::*;
 pub use diffusion_gemma_train::{
@@ -141,13 +123,6 @@ pub use diffusion_gemma_train::{
 };
 pub use distillation::*;
 pub use dpo::*;
-pub use gspo::*;
-pub use mlx_metal_optimizer::{
-    MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig, MlxMetalOptimizerError,
-    MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
-};
-pub use mtp_training::*;
-// Re-export online_dpo selectively to avoid ambiguous RewardFunction with grpo
 pub use embedding_trainer::{
     EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,
     EmbeddingTrainerError,
@@ -155,16 +130,14 @@ pub use embedding_trainer::{
 pub use grpo::*;
 #[cfg(feature = "experimental-trainers")]
 pub use kto::*;
-#[cfg(feature = "experimental-trainers")]
-pub use online_dpo::{
-    LengthRewardFunction, OnlineDpoConfig, OnlineDpoIterationStats, OnlineDpoTrainer,
-    OnlinePreferencePair, RewardFunction as OnlineRewardFunction,
+pub use mlx_metal_optimizer::{
+    MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig, MlxMetalOptimizerError,
+    MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
 };
+pub use mtp_training::*;
 #[cfg(feature = "experimental-trainers")]
 pub use orpo::*;
 pub use param_groups::*;
-#[cfg(feature = "experimental-trainers")]
-pub use ppo::*;
 pub use rlkd::{RlkdConfig, RlkdStepStats, RlkdTrainer};
 #[cfg(feature = "experimental-trainers")]
 pub use schedule_free::{

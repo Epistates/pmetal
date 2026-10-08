@@ -486,8 +486,6 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | Gemma/Qwen MTP Predictor Training | `train-mtp` | — | — | `pmetal_trainer::mtp_training` |
 | DFlash Draft Training | `train-draft` | — | — | `pmetal_trainer::mtp_training` |
 
-Additional methods available via the library only: GSPO (`GspoTrainer`), PPO (`PpoTrainer`), Online DPO (`OnlineDpoTrainer`).
-
 ## Key Features
 
 ### Metal GPU Optimizations
