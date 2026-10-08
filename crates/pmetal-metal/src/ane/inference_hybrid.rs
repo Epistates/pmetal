@@ -27,7 +27,7 @@
 use std::path::Path;
 
 use crate::accelerate;
-use crate::ane::inference::sample;
+use crate::ane::lm::sample;
 use crate::error::{MetalError, Result};
 
 // ============================================================================

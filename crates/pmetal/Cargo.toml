@@ -144,11 +144,6 @@ path = "examples/inference.rs"
 required-features = ["hub", "data", "models"]
 
 [[example]]
-name = "inference_ane"
-path = "examples/inference_ane.rs"
-required-features = ["hub", "data", "models", "ane"]
-
-[[example]]
 name = "finetune_manual"
 path = "examples/finetune_manual.rs"
 required-features = ["data", "lora", "trainer"]

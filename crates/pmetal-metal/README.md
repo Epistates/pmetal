@@ -39,8 +39,9 @@ pmetal-metal/
 │       ├── kernel.rs         # Static kernel generators + TransformerKernelConfig
 │       ├── dynamic_kernel.rs # Dynamic weight kernel generators (9 kernels)
 │       ├── dynamic_trainer.rs# Compile-once training loop
-│       ├── inference.rs      # ANE inference engine (prefill + CPU decode)
-│       ├── inference_hybrid.rs # Hybrid ANE+CPU inference for large models
+│       ├── extend.rs         # Multi-layer prefill/decode/verify kernels over an IOSurface KV cache
+│       ├── lm.rs             # ANE text generation from a Hugging Face checkpoint
+│       ├── inference_hybrid.rs # CPU decode engine for Qwen3.5 hybrid models
 │       └── budget.rs         # ANE compile budget tracking
 ```
 
@@ -48,7 +49,7 @@ pmetal-metal/
 
 The ANE module provides a complete training and inference pipeline using Apple's private `AppleNeuralEngine.framework` APIs. The dynamic weight pipeline compiles 9 MIL kernels once at startup and packs weights alongside activations in the IOSurface spatial dimension — eliminating all recompilation during training.
 
-**Inference** uses a hybrid ANE prefill + CPU decode architecture with KV cache. RMSNorm is computed on CPU in f32 to avoid fp16 overflow (ANE uses saturation arithmetic that silently clips values instead of producing NaN/inf). Per-head QK-norm stays on ANE.
+**Inference** (`ane::lm::AneLm`) runs the model's layers as a few multi-layer extend programs over a KV cache held in IOSurfaces, with int8 weights by default. The same programs handle prefill, decode and speculative verification, and they compile once: Apple's ANE service caches them for later runs.
 
 | # | Kernel | Purpose |
 |---|--------|---------|

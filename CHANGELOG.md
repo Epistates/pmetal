@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Local builds take far less disk.** The root, GUI and fuzz workspaces share one `target/`. MLX is compiled once per configuration and reused by every `pmetal-bridge` variant, where each variant used to compile its own (~800 MB and several minutes apiece). Dev builds keep line tables rather than full debug info (`CARGO_PROFILE_DEV_DEBUG=true` restores it). A full `just preflight` from clean leaves 19 GB
 - **Dependency policy is enforced by `cargo-deny`** (`deny.toml`, `just deny`, in `just preflight` and a new CI job) for both the workspace and the GUI. Licenses are permissive-only; the six MPL-2.0 crates in the tree (`option-ext`, `colored`, and in the GUI `cssparser`, `cssparser-macros`, `dtoa-short`, `selectors`) are named exceptions, so a new copyleft crate fails the check. `just audit` now runs the same advisory check with `deny.toml`'s reviewed ignores
 
+### Removed
+
+- **The old ANE inference engine** (`pmetal_metal::ane::inference`, `AneInferenceEngine`) and the `inference_ane` example that drove it. `AneLm` replaced it behind `infer --ane` and `serve --ane`, and nothing else called it. Its sampler moved to `pmetal_metal::ane::lm::sample`
+
 ### Fixed
 
 - **Qwen 3.5 / 3.6 MoE layers counted their input twice** wherever the `pmetal-models` MoE block ran them: `--experts-dir`, LoRA training and `PMETAL_DISABLE_NATIVE_BRIDGE`. The block returned its expert mixture plus its own input, and the decoder layer then added the residual on top. The default inference path has its own MoE and was not affected

@@ -455,9 +455,73 @@ impl AneLm {
     }
 }
 
-/// Sample a token: greedy at `temperature` 0.
-fn sample(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
-    crate::ane::inference::sample(logits, temperature, top_k)
+/// Sample a token from a logits vector.
+///
+/// - `temperature == 0.0`: greedy (argmax)
+/// - `temperature > 0.0`: scale → softmax → optional top-k → categorical
+pub fn sample(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
+    use rand::RngExt;
+
+    if temperature < 1e-6 {
+        return argmax(logits);
+    }
+
+    let v = logits.len();
+
+    // Apply temperature
+    let mut scaled: Vec<f32> = logits.iter().map(|&l| l / temperature).collect();
+
+    // Softmax
+    let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    for x in &mut scaled {
+        *x = (*x - max_val).exp();
+    }
+    let sum: f32 = scaled.iter().sum();
+    for x in &mut scaled {
+        *x /= sum;
+    }
+
+    // Top-k filter
+    if top_k > 0 && top_k < v {
+        let mut sorted: Vec<f32> = scaled.clone();
+        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold = sorted[top_k - 1];
+        for x in &mut scaled {
+            if *x < threshold {
+                *x = 0.0;
+            }
+        }
+        let sum: f32 = scaled.iter().sum();
+        if sum > 0.0 {
+            for x in &mut scaled {
+                *x /= sum;
+            }
+        }
+    }
+
+    // Categorical sampling
+    let r: f32 = rand::rng().random();
+    let mut cumulative = 0.0;
+    for (i, &p) in scaled.iter().enumerate() {
+        cumulative += p;
+        if r < cumulative {
+            return i as u32;
+        }
+    }
+
+    // Fallback (floating-point rounding)
+    (v - 1) as u32
+}
+
+/// Index of the largest value; the first one on a tie.
+fn argmax(values: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, v) in values.iter().enumerate() {
+        if *v > values[best] {
+            best = i;
+        }
+    }
+    best as u32
 }
 
 /// The logits from one [`AneLm::step`].
@@ -495,13 +559,39 @@ impl Logits<'_> {
 
     /// Position `t`'s most likely token.
     pub fn argmax(&self, t: usize) -> u32 {
-        let row = self.row(t);
-        let mut best = 0;
-        for (i, v) in row.iter().enumerate() {
-            if *v > row[best] {
-                best = i;
-            }
+        argmax(&self.row(t))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn greedy_picks_the_first_max() {
+        assert_eq!(sample(&[0.1, 0.5, 0.3, 0.9, 0.2], 0.0, 0), 3);
+        assert_eq!(sample(&[-1.0, -2.0, 5.0, -3.0, 4.0, 0.0], 0.0, 0), 2);
+        assert_eq!(argmax(&[0.0; 100]), 0);
+    }
+
+    #[test]
+    fn high_temperature_reaches_every_token() {
+        // At temperature 100 the logits are [0.1, 0, 0, 0, 0]: nearly uniform.
+        let logits = [10.0, 0.0, 0.0, 0.0, 0.0];
+        let mut counts = [0u32; 5];
+        for _ in 0..1000 {
+            counts[sample(&logits, 100.0, 0) as usize] += 1;
         }
-        best as u32
+        for (i, &c) in counts.iter().enumerate() {
+            assert!(c > 0, "token {i} never sampled at high temperature");
+        }
+    }
+
+    #[test]
+    fn top_k_never_leaves_the_top_k() {
+        let logits = [10.0, 5.0, 0.0, 0.0, 0.0];
+        for _ in 0..500 {
+            assert!(sample(&logits, 1.0, 2) <= 1);
+        }
     }
 }
