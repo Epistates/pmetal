@@ -43,7 +43,6 @@ pub mod quantize;
 pub mod reader;
 pub mod tokenizer;
 mod types;
-pub mod vec_dot;
 mod writer;
 
 pub use reader::{

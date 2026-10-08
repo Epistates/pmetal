@@ -100,7 +100,6 @@ fn write(path: &str, embeddings: Vec<f32>) -> Result<(), Box<dyn std::error::Err
 | `imatrix` | Importance matrix support |
 | `k_quants` | K-quant implementations |
 | `iq_quants` | IQ-quant implementations |
-| `vec_dot` | Vectorized dot product kernels |
 
 ## License
 
