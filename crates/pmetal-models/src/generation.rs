@@ -2598,12 +2598,118 @@ pub fn is_ane_inference_compatible(
     pmetal_metal::ane::lm::check_supported(config_json)
 }
 
-/// Check if a model config is compatible with the CPU hybrid engine.
+/// Check if a model config is compatible with the CPU hybrid engine: a
+/// dense Qwen3.5-family text config whose every value the engine runs.
 #[cfg(feature = "ane")]
 pub fn is_hybrid_cpu_compatible(
     config_json: &serde_json::Value,
 ) -> std::result::Result<(), String> {
-    pmetal_metal::ane::inference_hybrid::is_hybrid_cpu_compatible(config_json)
+    pmetal_metal::ane::inference_hybrid::is_hybrid_cpu_compatible(config_json)?;
+    hybrid_cpu_inference_config(config_json, 1)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The CPU hybrid engine's configuration for a Qwen3.5-family
+/// `config.json`, flat or nested under `text_config`.
+///
+/// The config is read through
+/// [`normalize_text_config`](pmetal_bridge::qwen3_native::family::normalize_text_config),
+/// as both GPU engines read it: transformers' defaults for absent keys, the
+/// outer `tie_word_embeddings`, `layer_types`, `rope_parameters` and the
+/// output gate resolved the same way, and anything it cannot run refused by
+/// name. Generation parameters are left at greedy defaults for the caller to
+/// set.
+#[cfg(feature = "ane")]
+pub fn hybrid_cpu_inference_config(
+    config_json: &serde_json::Value,
+    max_seq_len: usize,
+) -> std::result::Result<
+    pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
+    pmetal_metal::error::MetalError,
+> {
+    use pmetal_bridge::qwen3_native::family::{
+        GdnGateActivation, gdn_qk_rms_norm_eps, normalize_text_config,
+    };
+    use pmetal_metal::ane::inference_hybrid::{GdnOutputGate, Qwen3NextInferenceConfig};
+    use pmetal_metal::error::MetalError;
+
+    let text = normalize_text_config(config_json).map_err(MetalError::InvalidConfig)?;
+    let usize_of = |key: &str| -> std::result::Result<usize, MetalError> {
+        text.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(|v| v as usize)
+            .ok_or_else(|| {
+                MetalError::InvalidConfig(format!(
+                    "config key `{key}` must be a non-negative integer"
+                ))
+            })
+    };
+    let f32_of = |key: &str| -> std::result::Result<f32, MetalError> {
+        text.get(key)
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v as f32)
+            .ok_or_else(|| {
+                MetalError::InvalidConfig(format!("config key `{key}` must be a number"))
+            })
+    };
+
+    let num_experts = text
+        .get("num_experts")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if num_experts > 0 {
+        return Err(MetalError::InvalidConfig(format!(
+            "the CPU hybrid engine has no MoE layers (num_experts = {num_experts})"
+        )));
+    }
+
+    let gdn_output_gate = match GdnGateActivation::resolve(text["output_gate_type"].as_str(), None)
+        .map_err(MetalError::InvalidConfig)?
+    {
+        GdnGateActivation::Silu => GdnOutputGate::Silu,
+        GdnGateActivation::Sigmoid => GdnOutputGate::Sigmoid,
+    };
+    let head_k_dim = usize_of("linear_key_head_dim")?;
+    let layer_types = text["layer_types"].as_array().map(|types| {
+        types
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect()
+    });
+
+    Ok(Qwen3NextInferenceConfig {
+        dim: usize_of("hidden_size")?,
+        hidden_dim: usize_of("intermediate_size")?,
+        n_heads: usize_of("num_attention_heads")?,
+        n_kv_heads: usize_of("num_key_value_heads")?,
+        head_dim: usize_of("head_dim")?,
+        n_layers: usize_of("num_hidden_layers")?,
+        vocab_size: usize_of("vocab_size")?,
+        max_seq_len,
+        rms_norm_eps: f32_of("rms_norm_eps")?,
+        rope_theta: f32_of("rope_theta")?,
+        partial_rotary_factor: f32_of("partial_rotary_factor")?,
+        num_v_heads: usize_of("linear_num_value_heads")?,
+        num_k_heads: usize_of("linear_num_key_heads")?,
+        head_k_dim,
+        head_v_dim: usize_of("linear_value_head_dim")?,
+        conv_kernel_size: usize_of("linear_conv_kernel_dim")?,
+        gdn_output_gate,
+        gdn_qk_norm_eps: gdn_qk_rms_norm_eps(head_k_dim as i32),
+        // `layer_types` is always present after normalization and governs;
+        // the interval is only its fallback inside the engine.
+        full_attention_interval: text
+            .get("full_attention_interval")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(4, |v| v as usize),
+        layer_types,
+        tie_word_embeddings: text["tie_word_embeddings"].as_bool().unwrap_or(false),
+        temperature: 0.0,
+        top_k: 0,
+        max_tokens: 0,
+        eos_token_id: None,
+    })
 }
 
 #[cfg(feature = "ane")]
@@ -2615,110 +2721,16 @@ fn build_hybrid_cpu_inference_config(
     pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
     pmetal_metal::error::MetalError,
 > {
-    use pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig;
-
     let config_json = load_model_config_json(model_path)?;
-
-    let get_usize = |key: &str| -> std::result::Result<usize, pmetal_metal::error::MetalError> {
-        config_json
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .ok_or_else(|| {
-                pmetal_metal::error::MetalError::InvalidConfig(format!(
-                    "config.json missing '{key}'"
-                ))
-            })
-    };
-    let get_usize_or = |key: &str, default: usize| -> usize {
-        config_json
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(default)
-    };
-    let get_float_or = |key: &str, default: f64| -> f32 {
-        config_json
-            .get(key)
-            .and_then(|v| v.as_f64())
-            .unwrap_or(default) as f32
-    };
-
-    let dim = get_usize("hidden_size")?;
-    let hidden_dim = get_usize("intermediate_size")?;
-    let n_heads = get_usize("num_attention_heads")?;
-    let n_layers = get_usize("num_hidden_layers")?;
-    let vocab_size = get_usize("vocab_size")?;
-    let n_kv_heads = get_usize_or("num_key_value_heads", n_heads);
-    let head_dim = get_usize_or("head_dim", dim / n_heads);
-
-    let rope_theta = get_float_or("rope_theta", 10_000_000.0);
-    let rms_norm_eps = get_float_or("rms_norm_eps", 1e-6);
-    let partial_rotary_factor = get_float_or("partial_rotary_factor", 0.25);
-
-    let num_v_heads = get_usize_or("linear_num_value_heads", 8);
-    let num_k_heads = get_usize_or("linear_num_key_heads", 4);
-    let head_k_dim = get_usize_or("linear_key_head_dim", 128);
-    let head_v_dim = get_usize_or("linear_value_head_dim", 128);
-    let conv_kernel_size = get_usize_or("linear_conv_kernel_dim", 4);
-    let full_attention_interval = get_usize_or("full_attention_interval", 4);
-    let tie_word_embeddings = config_json
-        .get("tie_word_embeddings")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let layer_types: Option<Vec<String>> = config_json
-        .get("layer_types")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        });
-
-    // Check rope_parameters for nested overrides
-    let (rope_theta, partial_rotary_factor) =
-        if let Some(rope_params) = config_json.get("rope_parameters") {
-            let theta = rope_params
-                .get("rope_theta")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .unwrap_or(rope_theta);
-            let prf = rope_params
-                .get("partial_rotary_factor")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32)
-                .unwrap_or(partial_rotary_factor);
-            (theta, prf)
-        } else {
-            (rope_theta, partial_rotary_factor)
-        };
-
-    Ok(Qwen3NextInferenceConfig {
-        dim,
-        hidden_dim,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        n_layers,
-        vocab_size,
-        max_seq_len: input_ids.len() + gen_config.max_new_tokens + 64,
-        rms_norm_eps,
-        rope_theta,
-        partial_rotary_factor,
-        num_v_heads,
-        num_k_heads,
-        head_k_dim,
-        head_v_dim,
-        conv_kernel_size,
-        full_attention_interval,
-        layer_types,
-        tie_word_embeddings,
-        temperature: gen_config.temperature,
-        top_k: gen_config.top_k,
-        max_tokens: gen_config.max_new_tokens,
-        eos_token_id: gen_config.stop_tokens.first().copied(),
-    })
+    let mut config = hybrid_cpu_inference_config(
+        &config_json,
+        input_ids.len() + gen_config.max_new_tokens + 64,
+    )?;
+    config.temperature = gen_config.temperature;
+    config.top_k = gen_config.top_k;
+    config.max_tokens = gen_config.max_new_tokens;
+    config.eos_token_id = gen_config.stop_tokens.first().copied();
+    Ok(config)
 }
 
 /// Generate tokens using the CPU GEMV hybrid engine for Qwen3.5 models.

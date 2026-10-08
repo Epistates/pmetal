@@ -29,6 +29,10 @@
 //! prefills part of the prompt and then feeds the rest one token at a time,
 //! each step compared to the reference's row for that position. The sequence
 //! is 70 tokens, past the reference's 64-token chunk boundary.
+//!
+//! The CPU hybrid engine (`pmetal_metal::ane::inference_hybrid`, which
+//! `infer --ane` runs on a flat dense text config) is checked the same way:
+//! it has only a single-token step, so its whole sequence is a cached decode.
 
 mod common;
 
@@ -302,6 +306,44 @@ fn native_prefill_and_decode(profile: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// CPU hybrid engine (`infer --ane` on a flat Qwen3.5 text config)
+// ---------------------------------------------------------------------------
+
+/// The CPU engine feeds every token through its single-token step, so its
+/// logits for the whole sequence are a cached decode from the first token.
+#[cfg(feature = "ane")]
+fn hybrid_cpu_decode(profile: &str) {
+    use pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine;
+
+    let fx = checkpoint(profile);
+    let config_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.path().join("config.json")).unwrap())
+            .unwrap();
+    let t = fx.seq_len();
+    let config = pmetal_models::hybrid_cpu_inference_config(&config_json, t as usize)
+        .expect("CPU hybrid config parses");
+    let mut engine = Qwen3NextInferenceEngine::new(config).expect("engine builds");
+    engine
+        .load_weights_safetensors(fx.path())
+        .expect("CPU hybrid weights load");
+
+    let ids = fx.input_ids().as_type::<i32>();
+    ids.eval();
+    let ids: Vec<u32> = ids.as_slice::<i32>().iter().map(|&id| id as u32).collect();
+    let rows = engine.prompt_logits(&ids).expect("CPU hybrid decodes");
+    let vocab = rows[0].len() as i32;
+    let flat: Vec<f32> = rows.into_iter().flatten().collect();
+    let logits = Array::from_slice(&flat, &[1, t, vocab]);
+
+    let want = fx.tensor("logits");
+    let reports = vec![ParityReport::compute_with_per_position(
+        "logits", &logits, &want, DECODE_TOL,
+    )];
+    assert_all_pass(&format!("{profile}: CPU hybrid decode"), &reports);
+    assert_same_argmax(profile, &logits, &want);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -351,4 +393,18 @@ fn sigmoid_mtp_head_matches_reference() {
 #[serial]
 fn sigmoid_native_matches_transformers() {
     native_prefill_and_decode("sigmoid");
+}
+
+#[cfg(feature = "ane")]
+#[test]
+#[serial]
+fn swish_cpu_hybrid_matches_transformers() {
+    hybrid_cpu_decode("swish");
+}
+
+#[cfg(feature = "ane")]
+#[test]
+#[serial]
+fn sigmoid_cpu_hybrid_matches_transformers() {
+    hybrid_cpu_decode("sigmoid");
 }

@@ -71,6 +71,14 @@ pub struct Qwen3NextInferenceConfig {
     pub head_v_dim: usize,
     /// Conv1d kernel size for GDN.
     pub conv_kernel_size: usize,
+    /// Activation on the GDN output gate, `rms_norm(y) * act(z)`.
+    pub gdn_output_gate: GdnOutputGate,
+    /// Epsilon of the per-head RMS norm on GDN queries and keys.
+    ///
+    /// The norm stands in for transformers' L2 norm, whose epsilon is added
+    /// to the sum of squares; an RMS norm adds its epsilon to the mean, so
+    /// this is the L2 epsilon divided by `head_k_dim`.
+    pub gdn_qk_norm_eps: f32,
 
     // --- Hybrid layer control ---
     /// Every Nth layer is a full attention layer (default 4).
@@ -89,6 +97,26 @@ pub struct Qwen3NextInferenceConfig {
     pub max_tokens: usize,
     /// EOS token ID for early stopping.
     pub eos_token_id: Option<u32>,
+}
+
+/// Activation on the gated-delta-net output gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GdnOutputGate {
+    /// `z * sigmoid(z)`.
+    #[default]
+    Silu,
+    /// `sigmoid(z)`.
+    Sigmoid,
+}
+
+impl GdnOutputGate {
+    #[inline]
+    fn apply(self, z: f32) -> f32 {
+        match self {
+            Self::Silu => z / (1.0 + (-z).exp()),
+            Self::Sigmoid => sigmoid(z),
+        }
+    }
 }
 
 impl Qwen3NextInferenceConfig {
@@ -380,6 +408,12 @@ impl Qwen3NextInferenceEngine {
                 config.n_heads, config.n_kv_heads
             )));
         }
+        if config.num_k_heads == 0 || config.num_v_heads % config.num_k_heads != 0 {
+            return Err(MetalError::InvalidConfig(format!(
+                "num_v_heads ({}) must be a multiple of num_k_heads ({})",
+                config.num_v_heads, config.num_k_heads
+            )));
+        }
 
         let scratch = ScratchBuffers::new(&config);
 
@@ -458,6 +492,24 @@ impl Qwen3NextInferenceEngine {
     /// Generate tokens using CPU-only decode (sequential prefill + cached decode).
     pub fn generate_cached(&mut self, input_ids: &[u32]) -> Result<Vec<u32>> {
         self.generate_cached_streaming(input_ids, |_| true)
+    }
+
+    /// Logits after each token of `input_ids`, fed one at a time from a fresh
+    /// state: `[input_ids.len()][vocab_size]`, row `t` predicting token
+    /// `t + 1`. The same steps generation runs, without sampling.
+    pub fn prompt_logits(&mut self, input_ids: &[u32]) -> Result<Vec<Vec<f32>>> {
+        if input_ids.len() > self.config.max_seq_len {
+            return Err(MetalError::InvalidConfig(format!(
+                "Input length {} exceeds max_seq_len {}",
+                input_ids.len(),
+                self.config.max_seq_len
+            )));
+        }
+        let mut state = HybridStatePool::new(&self.config);
+        input_ids
+            .iter()
+            .map(|&tok| self.decode_step(tok, &mut state))
+            .collect()
     }
 
     /// Generate tokens with streaming callback.
@@ -744,7 +796,11 @@ impl Qwen3NextInferenceEngine {
                     continue;
                 }
                 if name == "lm_head.weight" {
-                    self.lm_head_weights = Some(data);
+                    // A tied head is the embedding table, whatever else the
+                    // checkpoint carries.
+                    if !self.config.tie_word_embeddings {
+                        self.lm_head_weights = Some(data);
+                    }
                     continue;
                 }
 
@@ -787,6 +843,11 @@ impl Qwen3NextInferenceEngine {
         if self.rms_final.is_empty() {
             return Err(MetalError::InvalidConfig(
                 "model.norm.weight not found".into(),
+            ));
+        }
+        if !self.config.tie_word_embeddings && self.lm_head_weights.is_none() {
+            return Err(MetalError::InvalidConfig(
+                "lm_head.weight not found and tie_word_embeddings is false".into(),
             ));
         }
 
@@ -864,10 +925,12 @@ fn decode_gdn_layer(
     // 5. Split conv output → Q[key_dim], K[key_dim], V[value_dim]
     // (conv_out layout: [0..key_dim]=Q, [key_dim..2*key_dim]=K, [2*key_dim..conv_dim]=V)
 
-    // 6. Q/K RMSNorm with identity weights + scaling
+    // 6. Q/K L2 norm (an RMS norm with `gdn_qk_norm_eps`) + scaling: unit
+    // keys, queries scaled by 1/sqrt(head_k_dim).
     let inv_scale = (head_k_dim as f32).powf(-0.5);
     let q_scale = inv_scale * inv_scale;
     let k_scale = inv_scale;
+    let qk_eps = config.gdn_qk_norm_eps;
 
     // Q norm + scale: per k-head (compute RMS first, then write back)
     for h in 0..num_k_heads {
@@ -876,7 +939,7 @@ fn decode_gdn_layer(
         for i in 0..head_k_dim {
             ss += s.conv_out[off + i] * s.conv_out[off + i];
         }
-        ss = 1.0 / (ss / head_k_dim as f32 + 1e-6).sqrt();
+        ss = 1.0 / (ss / head_k_dim as f32 + qk_eps).sqrt();
         for i in 0..head_k_dim {
             s.conv_out[off + i] *= ss * q_scale;
         }
@@ -890,14 +953,17 @@ fn decode_gdn_layer(
         for i in 0..head_k_dim {
             ss += s.conv_out[off + i] * s.conv_out[off + i];
         }
-        ss = 1.0 / (ss / head_k_dim as f32 + 1e-6).sqrt();
+        ss = 1.0 / (ss / head_k_dim as f32 + qk_eps).sqrt();
         for i in 0..head_k_dim {
             s.conv_out[off + i] *= ss * k_scale;
         }
     }
 
-    // 7-8. Compute gating + GDN recurrence per value head
+    // 7-8. Compute gating + GDN recurrence per value head. Each key head
+    // serves `num_v_heads / num_k_heads` consecutive value heads, as
+    // transformers' `repeat_interleave` lays them out.
     let state_stride = head_v_dim * head_k_dim;
+    let v_per_k = num_v_heads / num_k_heads;
 
     for h in 0..num_v_heads {
         let a_biased = s.a_proj[h] + lw.dt_bias[h];
@@ -906,9 +972,10 @@ fn decode_gdn_layer(
         let g = (-decay_rate * sp).exp();
         let beta = sigmoid(s.b_proj[h]);
 
+        let kh = h / v_per_k;
         let state_h = &mut ls.ssm_state[h * state_stride..(h + 1) * state_stride];
-        let q_h = &s.conv_out[h * head_k_dim..(h + 1) * head_k_dim];
-        let k_h = &s.conv_out[key_dim + h * head_k_dim..key_dim + (h + 1) * head_k_dim];
+        let q_h = &s.conv_out[kh * head_k_dim..(kh + 1) * head_k_dim];
+        let k_h = &s.conv_out[key_dim + kh * head_k_dim..key_dim + (kh + 1) * head_k_dim];
         let v_h = &s.conv_out[2 * key_dim + h * head_v_dim..2 * key_dim + (h + 1) * head_v_dim];
 
         // Decay
@@ -966,7 +1033,8 @@ fn decode_gdn_layer(
         s.gdn_y[h * head_v_dim..(h + 1) * head_v_dim].copy_from_slice(&s.y_head[..head_v_dim]);
     }
 
-    // 9. Gated RMSNorm: rmsnorm(y, norm_weight) * silu(z) per head
+    // 9. Gated RMSNorm: rmsnorm(y, norm_weight) * gate(z) per head
+    let gate = config.gdn_output_gate;
     for h in 0..num_v_heads {
         let off = h * head_v_dim;
         let mut ss = 0.0f32;
@@ -977,9 +1045,7 @@ fn decode_gdn_layer(
 
         for i in 0..head_v_dim {
             let normed = lw.norm_weight[i] * s.gdn_y[off + i] * ss;
-            let z_val = s.z_proj[off + i];
-            let silu_z = z_val / (1.0 + (-z_val).exp());
-            s.gdn_normed[off + i] = normed * silu_z;
+            s.gdn_normed[off + i] = normed * gate.apply(s.z_proj[off + i]);
         }
     }
 
@@ -1373,6 +1439,8 @@ mod tests {
             head_k_dim: 8,
             head_v_dim: 8,
             conv_kernel_size: 4,
+            gdn_output_gate: GdnOutputGate::Silu,
+            gdn_qk_norm_eps: 1e-6 / 8.0,
             full_attention_interval: 4,
             layer_types: None,
             tie_word_embeddings: true,
