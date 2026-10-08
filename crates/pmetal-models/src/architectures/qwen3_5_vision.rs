@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, Param, nn, ops};
-use pmetal_data::qwen_vl_processing::ProcessedMedia;
+use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
 use serde::Deserialize;
 
 use super::utils::{Activation, resolve_activation};
@@ -247,6 +247,44 @@ impl Qwen3_5MultimodalConfig {
         })
     }
 
+    /// Expand each `<|image_pad|>` id of a tokenized prompt into its image's
+    /// token run. Equivalent to expanding the placeholder in the text, since
+    /// the pad is a special token; videos carry timestamp text and must be
+    /// expanded before tokenizing.
+    pub fn expand_image_tokens(
+        &self,
+        input_ids: &[u32],
+        images: &[ProcessedMedia],
+    ) -> Result<Vec<u32>, Exception> {
+        let merge = self.vision.spatial_merge_size;
+        if input_ids.contains(&self.video_token_id) {
+            return Err(Exception::custom(
+                "video placeholders must be expanded in the prompt text, before tokenizing",
+            ));
+        }
+        let pads = input_ids
+            .iter()
+            .filter(|&&id| id == self.image_token_id)
+            .count();
+        if pads != images.len() {
+            return Err(Exception::custom(format!(
+                "the prompt has {pads} image placeholders for {} images",
+                images.len()
+            )));
+        }
+        let mut images = images.iter();
+        let mut out = Vec::with_capacity(input_ids.len());
+        for &id in input_ids {
+            if id == self.image_token_id {
+                let tokens = images.next().expect("counted above").num_tokens(merge);
+                out.extend(std::iter::repeat_n(id, tokens));
+            } else {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// [`from_config_value`](Self::from_config_value) on a checkpoint
     /// directory's `config.json`.
     pub fn from_model_dir(dir: &Path) -> Result<Self, Exception> {
@@ -375,6 +413,40 @@ impl Qwen3_5VisionModel {
     /// The dtype the tower computes in: its weights'.
     pub fn dtype(&self) -> Dtype {
         self.patch_embed.weight.as_ref().dtype()
+    }
+
+    /// Cast every weight to `dtype`, which the tower then computes in.
+    pub fn set_dtype(&mut self, dtype: Dtype) {
+        let cast = |linear: &mut nn::Linear| {
+            linear.weight = Param::new(linear.weight.as_ref().as_dtype(dtype.as_i32()));
+            if let Some(bias) = linear.bias.as_ref() {
+                linear.bias = Param::new(Some(bias.as_dtype(dtype.as_i32())));
+            }
+        };
+        let cast_norm = |norm: &mut nn::LayerNorm| {
+            for slot in [&mut norm.weight, &mut norm.bias] {
+                if let Some(value) = slot.as_ref() {
+                    *slot = Param::new(Some(value.as_dtype(dtype.as_i32())));
+                }
+            }
+        };
+        cast(&mut self.patch_embed);
+        self.pos_embed = Param::new(self.pos_embed.as_ref().as_dtype(dtype.as_i32()));
+        for block in &mut self.blocks {
+            cast_norm(&mut block.norm1);
+            cast_norm(&mut block.norm2);
+            for linear in [
+                &mut block.qkv,
+                &mut block.proj,
+                &mut block.fc1,
+                &mut block.fc2,
+            ] {
+                cast(linear);
+            }
+        }
+        cast_norm(&mut self.merger.norm);
+        cast(&mut self.merger.fc1);
+        cast(&mut self.merger.fc2);
     }
 
     /// Load the tower of a checkpoint directory: `config.json`'s
@@ -775,6 +847,148 @@ pub fn load_visual_tensors(dir: &Path) -> Result<HashMap<String, Array>, Excepti
         )));
     }
     Ok(tensors)
+}
+
+// ---------------------------------------------------------------------------
+// The bundle the surfaces use
+// ---------------------------------------------------------------------------
+
+/// Everything a Qwen3.5-family checkpoint needs to read images and videos:
+/// its processors, its vision tower and its media token ids.
+#[derive(Debug)]
+pub struct Qwen3_5Vision {
+    /// The checkpoint's image and video processors.
+    pub processor: QwenVlProcessor,
+    /// The vision tower.
+    pub tower: Qwen3_5VisionModel,
+    /// Media token ids and the tower's config.
+    pub config: Qwen3_5MultimodalConfig,
+}
+
+/// A prompt's media, encoded: vision features and 3-D positions, ready for
+/// either text engine.
+#[derive(Debug, Clone)]
+pub struct EncodedMedia {
+    /// `[image tokens, hidden]`, one row per `<|image_pad|>` in the prompt.
+    pub image_features: Option<Array>,
+    /// `[video tokens, hidden]`, one row per `<|video_pad|>` in the prompt.
+    pub video_features: Option<Array>,
+    /// The prompt's positions.
+    pub positions: MropePositions,
+}
+
+impl EncodedMedia {
+    /// The prompt's input embeddings: `text_embeddings` (`[1, T, hidden]`, the
+    /// token embeddings of `input_ids`) with the media tokens' rows replaced.
+    pub fn merge(
+        &self,
+        text_embeddings: &Array,
+        input_ids: &[u32],
+        config: &Qwen3_5MultimodalConfig,
+    ) -> Result<Array, Exception> {
+        merge_media_features(
+            text_embeddings,
+            input_ids,
+            self.image_features.as_ref(),
+            self.video_features.as_ref(),
+            config.image_token_id,
+            config.video_token_id,
+        )
+    }
+}
+
+impl Qwen3_5Vision {
+    /// Load a checkpoint's processors and vision tower.
+    pub fn load(dir: &Path) -> Result<Self, Exception> {
+        let config = Qwen3_5MultimodalConfig::from_model_dir(dir)?;
+        let processor =
+            QwenVlProcessor::from_model_dir(dir).map_err(|e| Exception::custom(e.to_string()))?;
+        if processor.image.patch_size != config.vision.patch_size
+            || processor.image.merge_size != config.vision.spatial_merge_size
+            || processor.image.temporal_patch_size != config.vision.temporal_patch_size
+        {
+            return Err(Exception::custom(format!(
+                "the image processor (patch {}, merge {}, temporal {}) does not match the vision \
+                 tower (patch {}, merge {}, temporal {})",
+                processor.image.patch_size,
+                processor.image.merge_size,
+                processor.image.temporal_patch_size,
+                config.vision.patch_size,
+                config.vision.spatial_merge_size,
+                config.vision.temporal_patch_size
+            )));
+        }
+        let mut tower = Qwen3_5VisionModel::new(config.vision.clone())?;
+        tower.load_weights(load_visual_tensors(dir)?)?;
+        Ok(Self {
+            processor,
+            tower,
+            config,
+        })
+    }
+
+    /// Replace each `<|image_pad|>` / `<|video_pad|>` in prompt `text` with
+    /// its media's token run (timestamps included for videos).
+    pub fn expand_placeholders(
+        &self,
+        text: &str,
+        images: &[ProcessedMedia],
+        videos: &[ProcessedMedia],
+    ) -> Result<String, Exception> {
+        pmetal_data::qwen_vl_processing::expand_placeholders(
+            text,
+            images,
+            videos,
+            self.config.vision.spatial_merge_size,
+        )
+        .map_err(|e| Exception::custom(e.to_string()))
+    }
+
+    /// Run the tower over a prompt's media and lay out its positions.
+    /// `input_ids` is the expanded prompt. The features are evaluated, so the
+    /// tower can be dropped before the text model loads.
+    pub fn encode(
+        &self,
+        input_ids: &[u32],
+        images: &[ProcessedMedia],
+        videos: &[ProcessedMedia],
+    ) -> Result<EncodedMedia, Exception> {
+        let grids = |media: &[ProcessedMedia]| media.iter().map(|m| m.grid_thw).collect::<Vec<_>>();
+        let positions = rope_index(
+            input_ids,
+            &grids(images),
+            &grids(videos),
+            self.config.vision.spatial_merge_size,
+            self.config.image_token_id,
+            self.config.video_token_id,
+        )?;
+        let image_features = self.tower.encode(images)?;
+        let video_features = self.tower.encode(videos)?;
+        for features in image_features.iter().chain(&video_features) {
+            features
+                .try_eval()
+                .map_err(|e| Exception::custom(format!("vision tower: {e}")))?;
+        }
+        pmetal_bridge::check_last_error()
+            .map_err(|e| Exception::custom(format!("vision tower: {e}")))?;
+        let encoded = EncodedMedia {
+            image_features,
+            video_features,
+            positions,
+        };
+        // The counts are checked here, where the error can be reported,
+        // rather than inside an engine's prefill.
+        let count = |id: u32| input_ids.iter().filter(|&&t| t == id).count();
+        let rows = |f: &Option<Array>| f.as_ref().map_or(0, |f| f.dim(0) as usize);
+        if count(self.config.image_token_id) != rows(&encoded.image_features)
+            || count(self.config.video_token_id) != rows(&encoded.video_features)
+        {
+            return Err(Exception::custom(
+                "the prompt's media tokens do not match the media's features",
+            ));
+        }
+        Ok(encoded)
+    }
 }
 
 // ---------------------------------------------------------------------------

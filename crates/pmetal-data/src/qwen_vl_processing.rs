@@ -30,7 +30,9 @@
 use std::path::Path;
 
 use base64::Engine as _;
-use image::RgbImage;
+/// The decoded-image type every function here takes, re-exported so callers
+/// need not depend on `image` themselves.
+pub use image::RgbImage;
 use pmetal_bridge::compat::Array;
 use serde::Deserialize;
 
