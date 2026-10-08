@@ -6130,6 +6130,7 @@ version = "0.6.0"
 dependencies = [
  "ahash",
  "arrow",
+ "base64 0.23.1",
  "image",
  "memmap2",
  "minijinja",
