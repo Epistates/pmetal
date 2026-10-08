@@ -1,0 +1,115 @@
+{
+  "config": {
+    "feedforward": 64,
+    "heads": 4,
+    "hidden_size": 48,
+    "layers": 2,
+    "routing_layers": 2,
+    "width": 32
+  },
+  "length": 40,
+  "logits": [
+    [
+      -4.8148956298828125,
+      -8.357475280761719,
+      -10.744815826416016
+    ],
+    [
+      -4.27861213684082,
+      0.8579821586608887
+    ],
+    [
+      -13.726822853088379,
+      -4.577425956726074,
+      20.666656494140625,
+      -7.018501281738281
+    ]
+  ],
+  "oracle": "joint_schema_model.JointSchemaHead (release reference code)",
+  "questions": [
+    {
+      "option_ids": [
+        "draft",
+        "overdue",
+        "paid"
+      ],
+      "option_spans": [
+        [
+          10,
+          13
+        ],
+        [
+          13,
+          14
+        ],
+        [
+          15,
+          19
+        ]
+      ],
+      "question_id": "status",
+      "question_span": [
+        5,
+        9
+      ],
+      "question_type": 1
+    },
+    {
+      "option_ids": [
+        "true",
+        "false"
+      ],
+      "option_spans": [
+        [
+          22,
+          25
+        ],
+        [
+          25,
+          28
+        ]
+      ],
+      "question_id": "large",
+      "question_span": [
+        20,
+        21
+      ],
+      "question_type": 0
+    },
+    {
+      "option_ids": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "option_spans": [
+        [
+          31,
+          32
+        ],
+        [
+          32,
+          35
+        ],
+        [
+          35,
+          37
+        ],
+        [
+          37,
+          39
+        ]
+      ],
+      "question_id": "urgency",
+      "question_span": [
+        29,
+        31
+      ],
+      "question_type": 2
+    }
+  ],
+  "rng_seed": 20261007,
+  "torch_version": "2.14.1",
+  "vocab": 97
+}

@@ -59,6 +59,14 @@ impl From<pmetal_bridge::compat::Exception> for LoadError {
 
 const PARAM_EVAL_BATCH_SIZE: usize = 128;
 
+/// Read one safetensors file into a name → array map, as stored (no
+/// dequantization or renaming).
+pub fn load_safetensors_file(
+    path: impl AsRef<std::path::Path>,
+) -> Result<HashMap<String, Array>, LoadError> {
+    load_shard(path.as_ref())
+}
+
 /// Load a safetensors shard file into a `HashMap<String, Array>`.
 ///
 /// This wraps `pmetal_bridge::inline_array::load_safetensors_shard` which

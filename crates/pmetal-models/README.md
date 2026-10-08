@@ -106,6 +106,7 @@ fn detect(model_dir: &str) -> Result<ModelArchitecture, Exception> {
 | Module | Description |
 |--------|-------------|
 | `architectures/` | Model implementations (Llama, Qwen, etc.) |
+| `decision` | Decision models (Clef): record encoding, the joint schema head, `/v1/systemone` |
 | `dispatcher` | Dynamic model loading and dispatch |
 | `generation` | Token generation with sampling |
 | `loader` | HuggingFace model loading |

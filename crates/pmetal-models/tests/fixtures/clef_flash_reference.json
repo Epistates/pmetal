@@ -1,0 +1,432 @@
+{
+ "oracle": "joint_schema_model.load_release_model + systemone (release reference code)",
+ "release": "flash",
+ "dtype": "float32",
+ "torch_version": "2.14.1",
+ "results": [
+  {
+   "request": {
+    "model": "clef-flash",
+    "state": {
+     "invoice": {
+      "vendor": "Acme",
+      "total": 1250.0,
+      "currency": "USD",
+      "status": "overdue"
+     }
+    },
+    "questions": {
+     "status": {
+      "type": "choice",
+      "instructions": "What is the invoice status?",
+      "criteria": {
+       "paid": "Invoice is paid.",
+       "overdue": "Invoice is past due.",
+       "draft": "Not sent."
+      }
+     },
+     "large": {
+      "type": "noul",
+      "instructions": "Is the total above 1000 USD?"
+     }
+    }
+   },
+   "input_tokens": 260,
+   "probabilities": {
+    "status": {
+     "draft": 0.009696342051029205,
+     "overdue": 0.9728924036026001,
+     "paid": 0.017411280423402786
+    },
+    "large": {
+     "true": 0.9729102253913879,
+     "false": 0.027089804410934448
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "status": {
+      "type": "choice",
+      "choice": "overdue",
+      "confidence": 0.9729,
+      "probabilities": {
+       "paid": 0.0174,
+       "overdue": 0.9729,
+       "draft": 0.0097
+      }
+     },
+     "large": {
+      "type": "noul",
+      "noul": 0.9729
+     }
+    },
+    "usage": {
+     "input_tokens": 260,
+     "output_tokens": 0
+    }
+   }
+  },
+  {
+   "request": {
+    "model": "clef-flash",
+    "state": "Our checkout started returning errors and orders are blocked.",
+    "questions": {
+     "department": {
+      "type": "choice",
+      "instructions": "Which team should handle the message?",
+      "criteria": {
+       "billing": "Payments or invoices",
+       "technical": "Bugs or outages"
+      }
+     },
+     "urgency": {
+      "type": "score",
+      "criteria": [
+       "Can wait",
+       "This week",
+       "Today"
+      ]
+     },
+     "outage": {
+      "type": "noul",
+      "instructions": "Is a service down?"
+     }
+    }
+   },
+   "input_tokens": 300,
+   "probabilities": {
+    "department": {
+     "billing": 0.039227236062288284,
+     "technical": 0.9607727527618408
+    },
+    "urgency": {
+     "0": 0.0712900161743164,
+     "1": 0.07053900510072708,
+     "2": 0.8581710457801819
+    },
+    "outage": {
+     "true": 0.8362614512443542,
+     "false": 0.16373853385448456
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "department": {
+      "type": "choice",
+      "choice": "technical",
+      "confidence": 0.9608,
+      "probabilities": {
+       "billing": 0.0392,
+       "technical": 0.9608
+      }
+     },
+     "urgency": {
+      "type": "score",
+      "score": 1.7869,
+      "confidence": 0.8582,
+      "legend": {
+       "0": "Can wait",
+       "1": "This week",
+       "2": "Today"
+      },
+      "probabilities": {
+       "0": 0.0713,
+       "1": 0.0705,
+       "2": 0.8582
+      }
+     },
+     "outage": {
+      "type": "noul",
+      "noul": 0.8363
+     }
+    },
+    "usage": {
+     "input_tokens": 300,
+     "output_tokens": 0
+    }
+   }
+  },
+  {
+   "request": {
+    "model": "clef-flash",
+    "state": {
+     "message": "Bonjour, j'ai été débité deux fois pour ma commande n° 4471. Pouvez-vous me rembourser ?",
+     "channel": "email",
+     "customer": {
+      "tier": "gold",
+      "since": 2019
+     }
+    },
+    "questions": {
+     "language": {
+      "type": "choice",
+      "instructions": "Which language is the message in?",
+      "criteria": {
+       "en": "English",
+       "fr": "French",
+       "de": "German",
+       "ja": "Japanese"
+      }
+     },
+     "intent": {
+      "type": "choice",
+      "criteria": {
+       "refund": "Asks for money back",
+       "shipping": "Asks where an order is",
+       "account": "Login or profile problem",
+       "other": null
+      }
+     },
+     "angry": {
+      "type": "noul",
+      "instructions": "Is the customer angry?",
+      "criteria": {
+       "true": "Hostile or furious tone.",
+       "false": "Calm or polite tone."
+      }
+     },
+     "priority": {
+      "type": "score",
+      "instructions": "How quickly should support respond?",
+      "criteria": [
+       "Within a week",
+       "Within a day",
+       "Within an hour",
+       "Immediately"
+      ]
+     }
+    }
+   },
+   "input_tokens": 480,
+   "probabilities": {
+    "language": {
+     "de": 0.006093563977628946,
+     "en": 0.010701796971261501,
+     "fr": 0.9769672155380249,
+     "ja": 0.006237346213310957
+    },
+    "intent": {
+     "account": 0.004341631196439266,
+     "other": 0.024438800290226936,
+     "refund": 0.9638022184371948,
+     "shipping": 0.00741736963391304
+    },
+    "angry": {
+     "true": 0.02554684318602085,
+     "false": 0.9744531512260437
+    },
+    "priority": {
+     "0": 0.015911415219306946,
+     "1": 0.30533817410469055,
+     "2": 0.27898526191711426,
+     "3": 0.39976516366004944
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "language": {
+      "type": "choice",
+      "choice": "fr",
+      "confidence": 0.977,
+      "probabilities": {
+       "en": 0.0107,
+       "fr": 0.977,
+       "de": 0.0061,
+       "ja": 0.0062
+      }
+     },
+     "intent": {
+      "type": "choice",
+      "choice": "refund",
+      "confidence": 0.9638,
+      "probabilities": {
+       "refund": 0.9638,
+       "shipping": 0.0074,
+       "account": 0.0043,
+       "other": 0.0244
+      }
+     },
+     "angry": {
+      "type": "noul",
+      "noul": 0.0255
+     },
+     "priority": {
+      "type": "score",
+      "score": 2.0626,
+      "confidence": 0.3998,
+      "legend": {
+       "0": "Within a week",
+       "1": "Within a day",
+       "2": "Within an hour",
+       "3": "Immediately"
+      },
+      "probabilities": {
+       "0": 0.0159,
+       "1": 0.3053,
+       "2": 0.279,
+       "3": 0.3998
+      }
+     }
+    },
+    "usage": {
+     "input_tokens": 480,
+     "output_tokens": 0
+    }
+   }
+  },
+  {
+   "request": {
+    "model": "clef-flash",
+    "state": {
+     "premise": "A man is playing a guitar on stage in front of a crowd.",
+     "hypothesis": "A musician is performing."
+    },
+    "questions": {
+     "label": {
+      "type": "choice",
+      "instructions": "Does the premise entail the hypothesis?",
+      "criteria": {
+       "entailment": "The hypothesis must be true given the premise.",
+       "neutral": "The hypothesis may or may not be true.",
+       "contradiction": "The hypothesis must be false given the premise."
+      }
+     },
+     "mentions_crowd": {
+      "type": "noul",
+      "instructions": "Does the premise mention an audience?"
+     }
+    }
+   },
+   "input_tokens": 280,
+   "probabilities": {
+    "label": {
+     "contradiction": 0.040670815855264664,
+     "entailment": 0.8731461763381958,
+     "neutral": 0.08618304878473282
+    },
+    "mentions_crowd": {
+     "true": 0.966315507888794,
+     "false": 0.03368450701236725
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "label": {
+      "type": "choice",
+      "choice": "entailment",
+      "confidence": 0.8731,
+      "probabilities": {
+       "entailment": 0.8731,
+       "neutral": 0.0862,
+       "contradiction": 0.0407
+      }
+     },
+     "mentions_crowd": {
+      "type": "noul",
+      "noul": 0.9663
+     }
+    },
+    "usage": {
+     "input_tokens": 280,
+     "output_tokens": 0
+    }
+   }
+  },
+  {
+   "request": {
+    "model": "clef-flash",
+    "state": {
+     "question": "Which planet is known as the Red Planet?",
+     "choices": [
+      "Venus",
+      "Mars",
+      "Jupiter",
+      "Saturn"
+     ]
+    },
+    "questions": {
+     "answer": {
+      "type": "choice",
+      "instructions": "Pick the correct answer.",
+      "criteria": {
+       "A": "Venus",
+       "B": "Mars",
+       "C": "Jupiter",
+       "D": "Saturn"
+      }
+     },
+     "confidence_needed": {
+      "type": "score",
+      "instructions": "How hard is this question?",
+      "criteria": [
+       "Trivial",
+       "Easy",
+       "Medium",
+       "Hard",
+       "Expert"
+      ]
+     }
+    }
+   },
+   "input_tokens": 301,
+   "probabilities": {
+    "answer": {
+     "A": 0.017125286161899567,
+     "B": 0.9474841952323914,
+     "C": 0.018507076427340508,
+     "D": 0.016883475705981255
+    },
+    "confidence_needed": {
+     "0": 0.4084247648715973,
+     "1": 0.5315548777580261,
+     "2": 0.026336463168263435,
+     "3": 0.016712279990315437,
+     "4": 0.016971640288829803
+    }
+   },
+   "response": {
+    "model": "clef-flash",
+    "answers": {
+     "answer": {
+      "type": "choice",
+      "choice": "B",
+      "confidence": 0.9475,
+      "probabilities": {
+       "A": 0.0171,
+       "B": 0.9475,
+       "C": 0.0185,
+       "D": 0.0169
+      }
+     },
+     "confidence_needed": {
+      "type": "score",
+      "score": 0.7023,
+      "confidence": 0.5316,
+      "legend": {
+       "0": "Trivial",
+       "1": "Easy",
+       "2": "Medium",
+       "3": "Hard",
+       "4": "Expert"
+      },
+      "probabilities": {
+       "0": 0.4084,
+       "1": 0.5316,
+       "2": 0.0263,
+       "3": 0.0167,
+       "4": 0.017
+      }
+     }
+    },
+    "usage": {
+     "input_tokens": 301,
+     "output_tokens": 0
+    }
+   }
+  }
+ ]
+}
