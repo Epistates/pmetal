@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Output streams token by token in `infer`, and the timing line separates loading from generation
   - Qwen3 only for now; `infer --ane` says why it's using the GPU for anything else
 - **`Linear` can hold its weight packed for MLX's quantized matmul** (`Linear::quantize`, `LinearQuant`), as `mlx.nn.QuantizedLinear` does, with the packed weight's `scales` and `biases` beside it in the parameter tree. A packed layer doesn't train, but a LoRA adapter on it does and computes what it would on the unpacked weight, which is QLoRA; merging the adapter unpacks the layer
+- **Qwen3.8-Flash-Next (`model_type: qwen4_exp`) runs**, text only: the hybrid of Gated DeltaNet and full attention behind a sparse-attention indexer, with four hyper-connection streams, a 512-expert MoE and 51B parameters of hashed n-gram embeddings. `infer`, `serve` and `--experts-dir` drive it like any hybrid model. The vision tower and the MTP head are not loaded yet
+  - It matches transformers to 2.1e-6 on a small fp32 model with every feature on, over the whole prompt and through the caches one token at a time
+  - The n-gram table is read row by row from the checkpoint rather than loaded (a token reads 16 rows of it), and the NVFP4 release's experts stay packed, 68 GB rather than 241 GB unpacked. That puts the NVFP4 release at about 78 GB resident, which fits a 128 GB Mac
+  - The bf16, FP8 and NVFP4 releases' layouts are checked against the loader from their safetensors headers: every tensor is loaded or skipped by name
 
 ### Changed
 
@@ -32,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Qwen 3.5 / 3.6 MoE layers counted their input twice** wherever the `pmetal-models` MoE block ran them: `--experts-dir`, LoRA training and `PMETAL_DISABLE_NATIVE_BRIDGE`. The block returned its expert mixture plus its own input, and the decoder layer then added the residual on top. The default inference path has its own MoE and was not affected
 - **`pmetal dflash` accepted none of its draft model's guesses** on Qwen3-4B, so it ran slower than decoding without a drafter. Each draft saw only the few tokens the previous step had accepted as context, where the draft model reads the target's hidden states for the whole context, kept in its own KV cache. It now keeps them: tokens per verify step on a chat prompt went from 1.0 to 8.5, 192 tokens from 12.1 s to 2.2 s, with the same output. Tree verification (`--tree-budget`) had the same fault and the same fix
 - **`serve --ane` loaded the model again for many requests.** The loaded ANE model was kept per thread, and the server runs each request on whichever thread its pool hands out, so two requests at once, or any request after ten idle seconds, compiled or loaded the whole model again (seconds per request) and held another copy. The models now live on one thread of their own that every request runs on, one at a time
 - **`--seed` didn't make training reproducible** (#33). It seeded the data pipeline but not MLX's random key on `train`, `distill`, `rlkd` and `embed-train`, so LoRA initialisation and step-1 gradients differed between runs with the same seed. `train` is seeded where the shared training entry point starts, which covers the CLI, TUI, GUI, MCP and Python
