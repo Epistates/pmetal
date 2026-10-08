@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **`--ane-max-seq-len` is the largest context the ANE engine compiles for**, prompt plus output, and defaults to 4096 (was 1024). Each request gets the smallest power of two from 512 that fits it, so short requests stay fast; a longer one recompiles the model once at the larger size. A prompt that doesn't fit is refused with the flag named
+- **A Qwen3 `config.json` without `tie_word_embeddings` means an untied head on the native engine**, as it does in transformers and on the `DynamicModel` path. The native engine assumed tied, so such a checkpoint ran with the embedding table as its head and its own `lm_head.weight` dropped. Every Qwen3 release sets the key, so they load as before
 
 - **Every dependency is at its latest release**, with all lockfiles regenerated from scratch. Majors: `hf-hub` 1.0, `safetensors` 0.8, `base64` 0.23, `pyo3` 0.29, `dirs` 7
   - `hf-hub` 1.0 is a rewrite. Downloads now use Hugging Face's Xet transfer protocol and retry 429 and 5xx responses on their own. The Xet client's per-request INFO logging is held to warnings in the CLI

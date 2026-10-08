@@ -151,7 +151,9 @@ pub struct Qwen3Config {
     #[serde(default)]
     rope_parameters: Option<RopeParameters>,
 
-    #[serde(default = "default_true")]
+    /// transformers' `Qwen3Config` defaults this to `false`. The Qwen3.5
+    /// family always carries it, from [`family::normalize_text_config`].
+    #[serde(default)]
     pub tie_word_embeddings: bool,
 
     #[serde(default = "default_full_attn_interval")]
@@ -561,6 +563,29 @@ mod tests {
         assert_eq!(config.decoder_sparse_step, 1);
         assert!(config.norm_topk_prob);
         assert_eq!(config.rope_theta, 10_000_000.0);
+    }
+
+    /// transformers' `Qwen3Config.tie_word_embeddings` defaults to `false`; a
+    /// config that omits it has its own `lm_head.weight`.
+    #[test]
+    fn qwen3_dense_head_is_untied_unless_the_config_says_so() {
+        let parse = |tie: &str| {
+            parse_config_text(&format!(
+                r#"{{
+                    "model_type": "qwen3",
+                    "hidden_size": 1024,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 4,
+                    "head_dim": 128{tie}
+                }}"#
+            ))
+            .expect("qwen3 config parses")
+            .tie_word_embeddings
+        };
+        assert!(!parse(""));
+        assert!(parse(r#", "tie_word_embeddings": true"#));
+        assert!(!parse(r#", "tie_word_embeddings": false"#));
     }
 
     #[test]
