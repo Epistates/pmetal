@@ -54,6 +54,30 @@ impl LearningRateScheduler {
         }
     }
 
+    /// The schedule a training config describes over `total_steps` optimizer
+    /// steps: its scheduler type, warmup (`warmup_ratio` of the total when
+    /// set, else `warmup_steps`), `min_lr`, restarts, WSD stable share and
+    /// polynomial power.
+    pub fn for_training(config: &crate::TrainingConfig, total_steps: usize) -> Self {
+        let mut scheduler = Self::new(
+            config.learning_rate,
+            total_steps,
+            warmup_steps_for(config, total_steps),
+            config.lr_scheduler,
+        )
+        .with_min_lr(config.min_lr.unwrap_or(0.0));
+        if let Some(restarts) = config.cosine_num_restarts {
+            scheduler = scheduler.with_num_restarts(restarts);
+        }
+        if let Some(ratio) = config.wsd_stable_ratio {
+            scheduler = scheduler.with_stable_ratio(ratio);
+        }
+        if let Some(power) = config.polynomial_power {
+            scheduler = scheduler.with_polynomial_power(power);
+        }
+        scheduler
+    }
+
     /// Set minimum learning rate.
     pub fn with_min_lr(mut self, min_lr: f64) -> Self {
         self.min_lr = min_lr;
@@ -175,6 +199,40 @@ impl LearningRateScheduler {
     }
 }
 
+/// Warmup steps for a run of `total_steps` optimizer steps: `warmup_ratio`
+/// of the total, rounded up, when the config sets one, else `warmup_steps`.
+pub fn warmup_steps_for(config: &crate::TrainingConfig, total_steps: usize) -> usize {
+    match config.warmup_ratio {
+        Some(ratio) => (total_steps as f64 * ratio).ceil() as usize,
+        None => config.warmup_steps,
+    }
+}
+
+/// Optimizer steps in a run, counted the way the reference trainers count
+/// them: `max_steps` when set, else every epoch's micro-batches divided
+/// into optimizer steps of `micro_batches_per_step`. `flush_each_epoch`
+/// says whether a partial accumulation at the end of an epoch still takes
+/// a step (as in the preference loop) or carries into the next epoch (as
+/// in the SFT loop).
+pub fn total_training_steps(
+    config: &crate::TrainingConfig,
+    micro_batches_per_epoch: usize,
+    micro_batches_per_step: usize,
+    flush_each_epoch: bool,
+) -> usize {
+    if let Some(max) = config.max_steps {
+        return max.max(1);
+    }
+    let per_step = micro_batches_per_step.max(1);
+    let epochs = config.num_epochs.max(1);
+    let total = if flush_each_epoch {
+        micro_batches_per_epoch.div_ceil(per_step) * epochs
+    } else {
+        micro_batches_per_epoch * epochs / per_step
+    };
+    total.max(1)
+}
+
 /// Builder for `LearningRateScheduler`.
 #[derive(Debug, Clone)]
 pub struct SchedulerBuilder {
@@ -269,7 +327,7 @@ impl SchedulerBuilder {
     /// Build the scheduler.
     pub fn build(self) -> Result<LearningRateScheduler> {
         let warmup_steps = if let Some(ratio) = self.warmup_ratio {
-            (self.total_steps as f64 * ratio) as usize
+            (self.total_steps as f64 * ratio).ceil() as usize
         } else {
             self.warmup_steps
         };
@@ -333,6 +391,55 @@ mod tests {
 
         // Should approach min at end
         assert!(scheduler.get_lr(999) < scheduler.get_lr(500));
+    }
+
+    #[test]
+    fn total_steps_count_optimizer_steps_like_the_reference_trainers() {
+        let config = crate::TrainingConfig {
+            num_epochs: 3,
+            max_steps: None,
+            ..Default::default()
+        };
+        // 10 micro-batches an epoch, 4 per step. Flushing each epoch takes
+        // ceil(10/4) = 3 steps an epoch; carrying the remainder takes 30/4.
+        assert_eq!(total_training_steps(&config, 10, 4, true), 9);
+        assert_eq!(total_training_steps(&config, 10, 4, false), 7);
+        assert_eq!(total_training_steps(&config, 10, 1, false), 30);
+        assert_eq!(total_training_steps(&config, 0, 4, false), 1);
+        let capped = crate::TrainingConfig {
+            max_steps: Some(5),
+            ..config
+        };
+        assert_eq!(total_training_steps(&capped, 10, 4, true), 5);
+    }
+
+    #[test]
+    fn for_training_applies_every_schedule_setting() {
+        let config = crate::TrainingConfig {
+            learning_rate: 1e-3,
+            warmup_steps: 50,
+            warmup_ratio: Some(0.1),
+            min_lr: Some(1e-4),
+            lr_scheduler: LrSchedulerType::Cosine,
+            ..Default::default()
+        };
+        // Warmup is ceil(0.1 * 95) = 10 of the 95 steps, not the 50 steps.
+        assert_eq!(warmup_steps_for(&config, 95), 10);
+        let s = LearningRateScheduler::for_training(&config, 95);
+        assert!((s.get_lr(5) - (1e-4 + (1e-3 - 1e-4) * 0.5)).abs() < 1e-12);
+        assert!((s.get_lr(10) - 1e-3).abs() < 1e-12);
+        // Cosine ends at the floor, not at zero.
+        assert!((s.get_lr(95) - 1e-4).abs() < 1e-12);
+        let wsd = crate::TrainingConfig {
+            lr_scheduler: LrSchedulerType::Wsd,
+            wsd_stable_ratio: Some(0.0),
+            warmup_ratio: None,
+            warmup_steps: 0,
+            min_lr: None,
+            ..config
+        };
+        let s = LearningRateScheduler::for_training(&wsd, 100);
+        assert!(s.get_lr(50) < 0.6e-3, "no stable phase: decays from step 0");
     }
 
     #[test]

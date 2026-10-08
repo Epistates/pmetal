@@ -952,3 +952,76 @@ fn the_sft_loop_trains_with_the_optimizer_the_config_names() {
         }
     }
 }
+
+/// An epoch-based run: 2 epochs of 10 one-sample batches, 2 per step.
+fn epoch_based_config() -> TrainingLoopConfig {
+    let mut config = TrainingLoopConfig {
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        ..Default::default()
+    };
+    config.training.learning_rate = 1e-3;
+    config.training.warmup_ratio = Some(0.1);
+    config.training.lr_scheduler = LrSchedulerType::Cosine;
+    config.training.gradient_accumulation_steps = 2;
+    config.training.num_epochs = 2;
+    config.training.max_steps = None;
+    config.dataloader.batch_size = 1;
+    config.dataloader.shuffle = false;
+    config
+}
+
+#[test]
+fn an_epoch_based_schedule_spans_the_run_in_optimizer_steps() {
+    let mut training_loop = TrainingLoop::new(epoch_based_config());
+    let micro = training_loop.micro_batches_per_epoch(&create_dummy_dataset(10, 8));
+    assert_eq!(micro, 10);
+    // 20 micro-batches over the run, 2 per step: 10 optimizer steps, of
+    // which ceil(0.1 * 10) = 1 warms up.
+    assert_eq!(training_loop.plan_schedule(micro, 2), 20);
+    assert_eq!(training_loop.schedule_total_steps, Some(10));
+    let lr_at = |tl: &mut TrainingLoop, micro_step: usize| {
+        tl.step = micro_step;
+        tl.get_learning_rate()
+    };
+    // Micro-batches 0 and 1 make up step 0: warmup's first rate, zero.
+    assert_eq!(lr_at(&mut training_loop, 0), 0.0);
+    assert_eq!(lr_at(&mut training_loop, 1), 0.0);
+    assert!((lr_at(&mut training_loop, 2) - 1e-3).abs() < 1e-9);
+    // The last step is the cosine's last: 1e-3 * (1 + cos(pi * 8/9)) / 2.
+    let want = 1e-3 * 0.5 * (1.0 + (std::f64::consts::PI * 8.0 / 9.0).cos());
+    assert!((lr_at(&mut training_loop, 19) as f64 - want).abs() < 1e-9);
+    assert!(want < 3.1e-5);
+}
+
+#[test]
+fn an_epoch_based_run_decays_to_the_end_and_max_steps_counts_optimizer_steps() {
+    let capture = MetricsCapture::default();
+    let mut training_loop = TrainingLoop::new(epoch_based_config());
+    training_loop.add_callback(Box::new(capture.clone()));
+    let mut model = small_model();
+    training_loop
+        .run(&mut model, create_dummy_dataset(10, 8), None, None)
+        .unwrap();
+    let steps = capture.snapshot();
+    assert_eq!(training_loop.current_step(), 20);
+    assert_eq!(steps.last().unwrap().total_steps, 20);
+    // The rate the last logged step reports is the end of the cosine.
+    let last_lr = steps.last().unwrap().lr;
+    assert!(
+        last_lr < 2e-5,
+        "the schedule never decayed: last lr {last_lr}"
+    );
+
+    let mut config = epoch_based_config();
+    config.training.max_steps = Some(3);
+    let mut training_loop = TrainingLoop::new(config);
+    training_loop
+        .run(&mut model, create_dummy_dataset(10, 8), None, None)
+        .unwrap();
+    // 3 optimizer steps of 2 micro-batches each.
+    assert_eq!(training_loop.optimizer_steps_taken(), 3);
+    assert_eq!(training_loop.current_step(), 6);
+}

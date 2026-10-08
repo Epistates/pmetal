@@ -309,6 +309,11 @@ pub struct TrainingLoop {
     /// When present, gradients are all-reduced across nodes after each accumulation cycle.
     #[cfg(feature = "distributed")]
     pub(crate) distributed: Option<crate::distributed_bridge::DistributedGradientSync>,
+    /// Optimizer steps the LR schedule spans, set by [`Self::plan_schedule`]
+    /// when a run starts.
+    pub(crate) schedule_total_steps: Option<usize>,
+    /// Micro-batches (calls that advance `step`) per optimizer step.
+    pub(crate) micro_steps_per_update: usize,
 }
 
 impl TrainingLoop {
@@ -351,6 +356,8 @@ impl TrainingLoop {
             snapshot_persist_dir: None,
             #[cfg(feature = "distributed")]
             distributed: None,
+            schedule_total_steps: None,
+            micro_steps_per_update: 1,
         }
     }
 
@@ -546,20 +553,72 @@ impl TrainingLoop {
     }
 
     /// Get the base scheduled LR (ignoring adaptive adjustments).
+    ///
+    /// The schedule runs over optimizer steps, not micro-batches: with
+    /// gradient accumulation the rate holds across the micro-batches of one
+    /// step. Before [`Self::plan_schedule`] has run, the schedule spans
+    /// `max_steps` if set, and otherwise holds the peak rate after warmup.
     pub(crate) fn get_scheduled_lr(&self) -> f32 {
-        use pmetal_core::LearningRateScheduler;
-
         let cfg = &self.config.training;
-        let total_steps = cfg.max_steps.unwrap_or(10000);
+        let total_steps = self.schedule_total_steps.or(cfg.max_steps).unwrap_or(0);
+        pmetal_core::LearningRateScheduler::for_training(cfg, total_steps)
+            .get_lr(self.optimizer_steps_taken()) as f32
+    }
 
-        let scheduler = LearningRateScheduler::new(
-            cfg.learning_rate,
-            total_steps,
-            cfg.warmup_steps,
+    /// Optimizer steps taken so far.
+    pub fn optimizer_steps_taken(&self) -> usize {
+        self.step / self.micro_steps_per_update.max(1)
+    }
+
+    /// Whether `max_steps` optimizer steps have been taken.
+    pub(crate) fn reached_max_steps(&self) -> bool {
+        self.config
+            .training
+            .max_steps
+            .is_some_and(|max| self.optimizer_steps_taken() >= max)
+    }
+
+    /// Micro-batches the dataloader yields from `dataset` in one epoch.
+    pub(crate) fn micro_batches_per_epoch(&self, dataset: &TrainingDataset) -> usize {
+        DataLoader::new(dataset.clone(), self.config.dataloader.clone(), None).num_batches()
+    }
+
+    /// Size the learning-rate schedule for a run of `micro_batches_per_epoch`
+    /// micro-batches an epoch, `micro_steps_per_update` of them per optimizer
+    /// step, as the reference trainers do: `max_steps` when set, else every
+    /// epoch's micro-batches over the accumulation. Returns the run's length
+    /// in micro-batches, the unit `step` and the callbacks count in.
+    pub(crate) fn plan_schedule(
+        &mut self,
+        micro_batches_per_epoch: usize,
+        micro_steps_per_update: usize,
+    ) -> usize {
+        let per_update = micro_steps_per_update.max(1);
+        let cfg = &self.config.training;
+        // A partial accumulation carries into the next epoch.
+        let total =
+            pmetal_core::total_training_steps(cfg, micro_batches_per_epoch, per_update, false);
+        let warmup = pmetal_core::warmup_steps_for(cfg, total);
+        tracing::info!(
+            "LR schedule: {:?} over {total} optimizer steps ({} epoch(s) of {micro_batches_per_epoch} \
+             micro-batches, {per_update} per step{}), {warmup} warmup steps, peak lr {:.2e}",
             cfg.lr_scheduler,
+            cfg.num_epochs.max(1),
+            if cfg.max_steps.is_some() {
+                ", capped by max_steps"
+            } else {
+                ""
+            },
+            cfg.learning_rate,
         );
-
-        scheduler.get_lr(self.step) as f32
+        self.schedule_total_steps = Some(total);
+        self.micro_steps_per_update = per_update;
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            // The controller is fed once per micro-batch.
+            ctrl.set_total_steps(total * per_update);
+            ctrl.set_warmup_steps(warmup * per_update);
+        }
+        total * per_update
     }
 
     /// Feed loss to the adaptive LR controller and update the override.

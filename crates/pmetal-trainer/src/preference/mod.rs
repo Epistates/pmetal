@@ -383,24 +383,17 @@ where
     let batch = config.batch_size.max(1);
     let accum = config.gradient_accumulation_steps.max(1);
     let epochs = config.num_epochs.max(1);
-    let steps_per_epoch = n.div_ceil(batch).div_ceil(accum);
-    let total_steps = config.max_steps.unwrap_or(steps_per_epoch * epochs).max(1);
-    let warmup = config
-        .warmup_ratio
-        .map(|r| (r * total_steps as f64).round() as usize)
-        .unwrap_or(config.warmup_steps);
-    let scheduler = LearningRateScheduler::new(
-        config.learning_rate,
-        total_steps,
-        warmup,
-        config.lr_scheduler,
-    )
-    .with_min_lr(config.min_lr.unwrap_or(0.0));
+    // Each epoch ends on a step, partial accumulation or not.
+    let total_steps = pmetal_core::total_training_steps(config, n.div_ceil(batch), accum, true);
+    let warmup = pmetal_core::warmup_steps_for(config, total_steps);
+    let scheduler = LearningRateScheduler::for_training(config, total_steps);
     let log_every = config.logging_steps.max(1);
 
     tracing::info!(
         "{objective}: {n} examples, {epochs} epoch(s), {total_steps} steps \
-         (batch {batch} x {accum} accumulation), {} trainable parameters",
+         (batch {batch} x {accum} accumulation), {warmup} warmup steps, {:?} schedule, \
+         {} trainable parameters",
+        config.lr_scheduler,
         model.num_trainable_params()
     );
 

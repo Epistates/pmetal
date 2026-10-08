@@ -87,14 +87,9 @@ impl TrainingLoop {
 
         let mut best_eval_loss = f64::MAX;
 
-        // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = train_dataset
-            .len()
-            .div_ceil(self.config.training.batch_size);
-        let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
-        if let Some(ref mut ctrl) = self.adaptive_lr {
-            ctrl.set_total_steps(computed_total_steps);
-        }
+        let micro_batches = self.micro_batches_per_epoch(&train_dataset);
+        let accum = self.config.training.gradient_accumulation_steps;
+        let computed_total_steps = self.plan_schedule(micro_batches, accum);
 
         // Distributed training: barrier at start of metal fused training
         #[cfg(feature = "distributed")]
@@ -229,12 +224,10 @@ impl TrainingLoop {
                 // Scheduled regular checkpointing (rank-0 only in distributed mode).
                 self.maybe_save_regular_checkpoint(model, checkpoint_manager)?;
 
-                // Check max steps
-                if let Some(max) = max_steps {
-                    if self.step >= max {
-                        tracing::info!("Reached max_steps={}, stopping", max);
-                        return Ok(());
-                    }
+                // max_steps counts optimizer steps.
+                if self.reached_max_steps() {
+                    tracing::info!("Reached max_steps={max_steps:?} optimizer steps, stopping");
+                    return Ok(());
                 }
             }
 

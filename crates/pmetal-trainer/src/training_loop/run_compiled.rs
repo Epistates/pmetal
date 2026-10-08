@@ -72,14 +72,9 @@ impl TrainingLoop {
         // This allows the step function to mutate both in a single function
         let mut state = (model, optimizer);
 
-        // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = train_dataset
-            .len()
-            .div_ceil(self.config.training.batch_size);
-        let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
-        if let Some(ref mut ctrl) = self.adaptive_lr {
-            ctrl.set_total_steps(computed_total_steps);
-        }
+        // One optimizer step per batch (this path requires no accumulation).
+        let micro_batches = self.micro_batches_per_epoch(&train_dataset);
+        let computed_total_steps = self.plan_schedule(micro_batches, 1);
 
         // =========================================================================
         // PHASE 1: WARMUP - Initialize optimizer states with one step
@@ -108,6 +103,9 @@ impl TrainingLoop {
             "Warmup: Running uncompiled step to initialize optimizer states (state_count={})",
             state_count_before
         );
+
+        // The warmup step is the run's first step, on the schedule's first rate.
+        state.1.set_learning_rate(self.get_learning_rate());
 
         // Run ONE uncompiled training step
         let mut warmup_loss = if self.config.use_cut_cross_entropy {

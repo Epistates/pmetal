@@ -36,7 +36,9 @@ pub use events::{
     ServeRequestMetrics, TrainingCallbackToSink, parse_event, write_event,
 };
 pub use fields::{DefaultValue, FieldDescriptor, FieldError, FieldKind, JobFields};
-pub use scheduler::{LearningRateScheduler, SchedulerBuilder};
+pub use scheduler::{
+    LearningRateScheduler, SchedulerBuilder, total_training_steps, warmup_steps_for,
+};
 pub use secrets::SecretString;
 pub use traits::*;
 pub use types::*;

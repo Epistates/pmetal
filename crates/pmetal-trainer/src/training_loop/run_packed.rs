@@ -117,19 +117,9 @@ impl TrainingLoop {
 
         self.apply_gradient_checkpointing(&mut model, "Packed");
 
-        // Compute actual total steps: max_steps takes priority, otherwise epochs * batches_per_epoch
-        let computed_total_steps = max_steps.unwrap_or(num_epochs * stats.num_batches);
-        if let Some(ref mut ctrl) = self.adaptive_lr {
-            ctrl.set_total_steps(computed_total_steps);
-            // Extend grace period to cover the full LR warmup so the adaptive
-            // controller doesn't intervene while the LR is still ramping.
-            let warmup_steps = if let Some(ratio) = self.config.training.warmup_ratio {
-                (computed_total_steps as f64 * ratio) as usize
-            } else {
-                self.config.training.warmup_steps
-            };
-            ctrl.set_warmup_steps(warmup_steps);
-        }
+        // Each packed batch is one optimizer step: this path does not
+        // accumulate gradients.
+        let computed_total_steps = self.plan_schedule(stats.num_batches, 1);
 
         // Create state tuple for training
         let mut state = (model, optimizer);
@@ -158,6 +148,9 @@ impl TrainingLoop {
             "Warmup: Running step to initialize optimizer states (state_count={})",
             state_count_before
         );
+
+        // The warmup step is the run's first step, on the schedule's first rate.
+        state.1.set_learning_rate(self.get_learning_rate());
 
         // Execute warmup step - this initializes optimizer momentum/velocity buffers
         let max_grad_norm = self.config.training.max_grad_norm as f32;

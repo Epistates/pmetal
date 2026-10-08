@@ -52,12 +52,21 @@ impl DistillationTrainer {
     }
 
     fn total_steps_for_dataset(&self, train_dataset: &TrainingDataset) -> usize {
-        let dl = DataLoader::new(
-            train_dataset.clone(),
-            self.loop_state.config.dataloader.clone(),
-            None,
-        );
-        dl.num_batches() * self.loop_state.config.training.num_epochs
+        self.loop_state.micro_batches_per_epoch(train_dataset)
+            * self.loop_state.config.training.num_epochs
+    }
+
+    /// Size the learning-rate schedule (one optimizer step per batch) and put
+    /// the optimizer on its first rate. Returns the run's length in steps.
+    fn plan_schedule(
+        &mut self,
+        train_dataset: &TrainingDataset,
+        optimizer: &mut crate::ParamGroupOptimizer,
+    ) -> usize {
+        let micro_batches = self.loop_state.micro_batches_per_epoch(train_dataset);
+        self.loop_state.plan_schedule(micro_batches, 1);
+        optimizer.set_learning_rate(self.loop_state.get_learning_rate());
+        self.total_steps_for_dataset(train_dataset)
     }
 
     fn distillation_weights(batch: &TrainingBatch) -> Array {
@@ -335,11 +344,7 @@ impl DistillationTrainer {
         // Track the best eval (or train) loss seen so far for "is_best" tagging.
         let mut best_loss = f64::MAX;
 
-        // Estimate total steps for progress reporting
-        let total_steps = self.total_steps_for_dataset(&train_dataset);
-        if let Some(ref mut ctrl) = self.loop_state.adaptive_lr {
-            ctrl.set_total_steps(total_steps);
-        }
+        let total_steps = self.plan_schedule(&train_dataset, &mut optimizer);
 
         // Notify callbacks
         for cb in &mut self.loop_state.callbacks {
@@ -484,7 +489,7 @@ impl DistillationTrainer {
         let num_epochs = self.loop_state.config.training.num_epochs;
         let checkpoint_every = self.loop_state.config.checkpoint_every;
         let mut best_loss = f64::MAX;
-        let total_steps = self.total_steps_for_dataset(&train_dataset);
+        let total_steps = self.plan_schedule(&train_dataset, &mut optimizer);
 
         if cache.metadata().num_sequences < train_dataset.len() {
             return Err(SftError::Mlx(Exception::custom(format!(
@@ -492,10 +497,6 @@ impl DistillationTrainer {
                 train_dataset.len(),
                 cache.metadata().num_sequences
             ))));
-        }
-
-        if let Some(ref mut ctrl) = self.loop_state.adaptive_lr {
-            ctrl.set_total_steps(total_steps);
         }
 
         for cb in &mut self.loop_state.callbacks {
