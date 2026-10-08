@@ -81,19 +81,6 @@ pub enum DistributedError {
     #[error("No route to peer {0}")]
     NoRoute(PeerId),
 
-    // === Election Errors ===
-    #[error("Election timeout after {0:?}")]
-    ElectionTimeout(std::time::Duration),
-
-    #[error("Split brain detected: multiple masters ({0:?})")]
-    SplitBrain(Vec<PeerId>),
-
-    #[error("No master elected")]
-    NoMaster,
-
-    #[error("Master unreachable: {0}")]
-    MasterUnreachable(PeerId),
-
     // === Protocol Errors ===
     #[error("Protocol error: {0}")]
     Protocol(String),
@@ -124,13 +111,6 @@ pub enum DistributedError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] bitcode::Error),
 
-    // === Health Check Errors ===
-    #[error("Health check failed for peer {peer}: {reason}")]
-    HealthCheckFailed { peer: PeerId, reason: String },
-
-    #[error("Heartbeat timeout for peer {0} after {1:?}")]
-    HeartbeatTimeout(PeerId, std::time::Duration),
-
     // === Shutdown Errors ===
     #[error("Shutdown in progress")]
     ShuttingDown,
@@ -144,11 +124,7 @@ impl DistributedError {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            Self::ConnectionTimeout(_, _)
-                | Self::PeerTimeout { .. }
-                | Self::HeartbeatTimeout(_, _)
-                | Self::ElectionTimeout(_)
-                | Self::TopologyChanged
+            Self::ConnectionTimeout(_, _) | Self::PeerTimeout { .. } | Self::TopologyChanged
         )
     }
 
@@ -160,8 +136,6 @@ impl DistributedError {
                 | Self::PeerUnreachable(_)
                 | Self::PeerTimeout { .. }
                 | Self::PeerIncoherentData { .. }
-                | Self::HealthCheckFailed { .. }
-                | Self::HeartbeatTimeout(_, _)
         )
     }
 
@@ -169,8 +143,7 @@ impl DistributedError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::SplitBrain(_)
-                | Self::ShuttingDown
+            Self::ShuttingDown
                 | Self::Cancelled
                 | Self::VersionMismatch { .. }
                 | Self::NamespaceMismatch { .. }
@@ -183,12 +156,8 @@ impl DistributedError {
             Self::PeerLost(p)
             | Self::UnknownPeer(p)
             | Self::PeerUnreachable(p)
-            | Self::NoRoute(p)
-            | Self::MasterUnreachable(p)
-            | Self::HeartbeatTimeout(p, _) => Some(p),
-            Self::PeerTimeout { peer, .. }
-            | Self::PeerIncoherentData { peer, .. }
-            | Self::HealthCheckFailed { peer, .. } => Some(peer),
+            | Self::NoRoute(p) => Some(p),
+            Self::PeerTimeout { peer, .. } | Self::PeerIncoherentData { peer, .. } => Some(peer),
             _ => None,
         }
     }

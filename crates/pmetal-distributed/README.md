@@ -22,17 +22,17 @@ This crate provides peer-to-peer distributed training infrastructure designed fo
 │  (Zero-config mDNS)      │         │  (Manual peer list)      │
 └────────────┬─────────────┘         └──────────────────────────┘
              │
-     ┌───────┼───────┬───────────┐
-     ▼       ▼       ▼           ▼
- Identity  Discovery  Topology  Election
- (Ed25519) (libp2p)  (petgraph) (Seniority)
-     │       │        │           │
-     └───────┼────────┴───────────┘
+     ┌───────┼───────┐
+     ▼       ▼       ▼
+ Identity  Discovery  Topology
+ (Ed25519) (libp2p)  (petgraph)
+     │       │        │
+     └───────┼────────┘
              ▼
-     ┌───────────────┐  ┌───────────────┐  ┌───────────────┐
-     │  Transport    │  │  Compression  │  │  Health       │
-     │  (TCP Ring)   │  │  (TopK/Quant) │  │  (Heartbeat)  │
-     └───────────────┘  └───────────────┘  └───────────────┘
+     ┌───────────────┐  ┌───────────────┐
+     │  Transport    │  │  Compression  │
+     │  (TCP Ring)   │  │  (TopK/Quant) │
+     └───────────────┘  └───────────────┘
 ```
 
 ## Features
@@ -42,8 +42,6 @@ This crate provides peer-to-peer distributed training infrastructure designed fo
 - **Local UltraFusion Planner**: Per-die stage planning plus same-process in-memory transport scaffolding for Ultra Macs
 - **Persistent Identity**: Ed25519 keypairs stored at `~/.pmetal/node_keypair`
 - **Topology Awareness**: Graph-based cluster representation with node capability and connection profiling
-- **Master Election**: Seniority-based distributed leader election with PeerId tiebreaking
-- **Health Monitoring**: Heartbeat-based peer tracking with exponential moving average latency
 - **Gradient Compression**: TopK, random sparsification, and FP16/BF16/INT8 quantization, with error feedback
 - **Network Isolation**: SHA3-256 PSK namespacing to prevent cross-cluster communication
 - **Metrics**: Counters, gauges, and histograms for all-reduce duration, bytes processed, and failures
@@ -119,14 +117,6 @@ fn compress(gradients: &[f32]) -> CompressedGradient {
 | **BF16** | Brain float quantization | 2x |
 | **INT8** | 8-bit quantization | 4x |
 
-## Collective Operations
-
-| Strategy | Latency | Bandwidth | Best For |
-|----------|---------|-----------|----------|
-| **Ring** | O(n) | O(1)/node | Large gradients, balanced clusters |
-| **Tree** | O(log n) | O(log n)/node | Small messages, low latency |
-| **Centralized** | O(n) | O(n)/root | Very small clusters (2-3 nodes) |
-
 ## Configuration
 
 | Parameter | Default | Description |
@@ -146,12 +136,9 @@ fn compress(gradients: &[f32]) -> CompressedGradient {
 | `ring` | Ring-based all-reduce for manual configuration |
 | `discovery` | libp2p peer discovery service |
 | `transport` | TCP transport with connection pooling |
-| `collective` | Pluggable collective operation strategies |
 | `compression` | Gradient compression with error feedback |
 | `topology` | Cluster graph with node and connection profiles |
 | `identity` | Persistent Ed25519 keypair management |
-| `election` | Distributed master election |
-| `health` | Heartbeat-based peer monitoring |
 | `namespace` | PSK network isolation |
 | `metrics` | Observability counters and gauges |
 

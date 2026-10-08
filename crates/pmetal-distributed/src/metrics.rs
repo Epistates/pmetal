@@ -3,7 +3,7 @@
 //! Provides comprehensive metrics tracking for:
 //! - Collective operations (all-reduce, reduce, broadcast)
 //! - Network performance (latency, bandwidth, throughput)
-//! - Peer health and connectivity
+//! - Peer connectivity
 //! - Compression efficiency
 //!
 //! Metrics can be exposed via callbacks or collected for monitoring systems.
@@ -236,12 +236,6 @@ pub struct NetworkMetrics {
 pub struct PeerMetrics {
     /// Number of connected peers.
     pub connected_peers: Gauge,
-    /// Number of healthy peers.
-    pub healthy_peers: Gauge,
-    /// Number of degraded peers.
-    pub degraded_peers: Gauge,
-    /// Number of unhealthy peers.
-    pub unhealthy_peers: Gauge,
     /// Total peer connections ever.
     pub total_connections: Counter,
     /// Total peer disconnections.
@@ -270,21 +264,6 @@ impl CompressionMetrics {
     }
 }
 
-/// Election metrics.
-#[derive(Debug, Default)]
-pub struct ElectionMetrics {
-    /// Number of elections started.
-    pub elections_started: Counter,
-    /// Number of elections completed successfully.
-    pub elections_completed: Counter,
-    /// Number of election timeouts.
-    pub election_timeouts: Counter,
-    /// Time as master (seconds).
-    pub time_as_master_secs: Counter,
-    /// Time as follower (seconds).
-    pub time_as_follower_secs: Counter,
-}
-
 /// All distributed metrics.
 #[derive(Debug, Default)]
 pub struct DistributedMetrics {
@@ -302,8 +281,6 @@ pub struct DistributedMetrics {
     pub peer: PeerMetrics,
     /// Compression metrics.
     pub compression: CompressionMetrics,
-    /// Election metrics.
-    pub election: ElectionMetrics,
     /// Start time for uptime calculation.
     start_time: RwLock<Option<Instant>>,
 }
@@ -335,7 +312,6 @@ impl DistributedMetrics {
             bytes_sent: self.network.bytes_sent.get(),
             bytes_received: self.network.bytes_received.get(),
             connected_peers: self.peer.connected_peers.get(),
-            healthy_peers: self.peer.healthy_peers.get(),
             compression_ratio: self.compression.compression_ratio(),
         }
     }
@@ -368,8 +344,6 @@ pub struct MetricsSnapshot {
     pub bytes_received: u64,
     /// Number of connected peers.
     pub connected_peers: u64,
-    /// Number of healthy peers.
-    pub healthy_peers: u64,
     /// Overall compression ratio.
     pub compression_ratio: f64,
 }

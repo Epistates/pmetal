@@ -10,8 +10,6 @@
 //! - **Ring All-Reduce**: Bandwidth-optimal gradient synchronization
 //! - **Persistent Identity**: Ed25519 keypairs stored at `~/.pmetal/node_keypair`
 //! - **Topology Awareness**: Graph-based cluster management with petgraph
-//! - **Master Election**: Distributed leader election for coordination
-//! - **Health Monitoring**: Heartbeat-based peer health tracking
 //! - **Gradient Compression**: TopK, quantization, and error feedback
 //! - **Network Isolation**: PSK-based namespace isolation
 //! - **Observability**: Comprehensive metrics and tracing
@@ -74,13 +72,6 @@
 //! │          └────────────────┼─────────────────┘                    │
 //! │                           ▼                                      │
 //! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
-//! │  │  Election    │  │   Health     │  │  Collective  │           │
-//! │  │  (Master)    │  │  (Heartbeat) │  │  (Strategies)│           │
-//! │  └──────────────┘  └──────────────┘  └──────────────┘           │
-//! │          │                │                 │                    │
-//! │          └────────────────┼─────────────────┘                    │
-//! │                           ▼                                      │
-//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
 //! │  │ Compression  │  │   Metrics    │  │  Namespace   │           │
 //! │  │  (TopK/Quant)│  │ (Observ.)    │  │  (PSK)       │           │
 //! │  └──────────────┘  └──────────────┘  └──────────────┘           │
@@ -101,7 +92,6 @@ pub enum ReduceOp {
 
 // Core modules
 pub mod auto;
-pub mod cloud_bridge;
 pub mod cluster_runtime;
 pub mod config;
 pub mod discovery;
@@ -113,10 +103,7 @@ pub mod topology;
 pub mod transport;
 
 // Advanced modules
-pub mod collective;
 pub mod compression;
-pub mod election;
-pub mod health;
 pub mod metrics;
 pub mod namespace;
 
@@ -131,7 +118,6 @@ pub mod activation_transport;
 pub mod layer_assignment;
 pub mod pipeline;
 pub mod pipeline_harness;
-pub mod solver;
 pub mod ultrafusion;
 
 // ─── Feature-gated modules ──────────────────────────────────────────────────
@@ -164,16 +150,13 @@ pub mod pipeline_training;
 pub use activation_codec::ActivationCodec;
 pub use activation_transport::{ActivationMessage, DtypeTag};
 pub use auto::{AutoDiscoveryBackend, AutoDiscoveryConfig};
-pub use collective::{AllReduceStrategy, BroadcastStrategy, CollectiveConfig, ReduceStrategy};
 pub use compression::{CompressionStrategy, GradientCompressor, QuantizationType};
 pub use config::DistributedConfig;
-pub use election::{ElectionConfig, ElectionEvent, ElectionManager, ElectionState};
 pub use error::{DistributedError, DistributedResult};
 pub use fabric::{
     InterfaceInfo, InterfaceKind, LinkScore, LocalFabric, is_link_local_ipv4, nominal_score,
     probe_local_fabric, score_link,
 };
-pub use health::{HealthConfig, HealthEvent, HealthMonitor, HealthStatus, HealthSummary};
 pub use identity::NodeIdentity;
 pub use layer_assignment::{assign_layers_bandwidth_aware, assign_layers_proportional};
 pub use metrics::{DistributedMetrics, MetricsSnapshot, SharedMetrics};
@@ -324,12 +307,9 @@ pub mod prelude {
     pub use crate::DistributedContext;
     pub use crate::ReduceOp;
     pub use crate::auto::{AutoDiscoveryBackend, AutoDiscoveryConfig};
-    pub use crate::collective::{AllReduceStrategy, CollectiveConfig};
     pub use crate::compression::{CompressionStrategy, GradientCompressor};
     pub use crate::config::DistributedConfig;
-    pub use crate::election::{ElectionConfig, ElectionManager};
     pub use crate::error::{DistributedError, DistributedResult};
-    pub use crate::health::{HealthConfig, HealthMonitor, HealthStatus};
     pub use crate::identity::NodeIdentity;
     pub use crate::metrics::{DistributedMetrics, SharedMetrics};
     pub use crate::namespace::NetworkNamespace;
