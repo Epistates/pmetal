@@ -482,7 +482,7 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |
 | RLKD (RL + Distillation) | `rlkd` | Yes | Yes | `RlkdTrainer` |
 | Embedding Training | `embed-train` | Yes | Yes | `EmbeddingTrainer` |
-| Block-Diffusion (DiffusionGemma) | `train-diffusion` | — | — | `DiffusionTrainingLoop` |
+| Block-Diffusion (DiffusionGemma) | `train-diffusion` | — | — | `DiffusionGemmaTrainer` |
 | Gemma/Qwen MTP Predictor Training | `train-mtp` | — | — | `pmetal_trainer::mtp_training` |
 | DFlash Draft Training | `train-draft` | — | — | `pmetal_trainer::mtp_training` |
 

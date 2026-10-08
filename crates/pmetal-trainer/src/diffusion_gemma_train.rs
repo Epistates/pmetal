@@ -7,7 +7,7 @@
 //! `forward` returns logits, never a loss), so the objective here is derived
 //! from the architecture, mirroring how the generation sampler was.
 //!
-//! Two differences from the LLaDA masked-diffusion path in [`crate::diffusion`]:
+//! Two differences from LLaDA-style masked diffusion:
 //!
 //! 1. **Corruption kernel is uniform-categorical, not masking.** A corrupted
 //!    canvas position is replaced by a *uniformly random vocabulary token*

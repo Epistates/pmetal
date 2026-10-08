@@ -22,7 +22,6 @@ This crate provides the training infrastructure for PMetal, including various tr
 | **ANE** | Apple Neural Engine training | Power-efficient on-device training |
 | **RLKD** | RL with Knowledge Distillation | GRPO + teacher distillation |
 | **Embedding** | Sentence-transformer training | InfoNCE, Triplet, CoSENT contrastive |
-| **Diffusion** | LLaDA-style diffusion training | Experimental |
 
 ## Usage
 
@@ -130,7 +129,6 @@ fn train_with_checkpoints(
 | `rlkd` | Reinforcement Learning with Knowledge Distillation |
 | `embedding_trainer` | Sentence-transformer fine-tuning |
 | `contrastive_loss` | InfoNCE, Triplet, CoSENT loss functions |
-| `diffusion` | Diffusion-based training |
 | `orchestrator` | Unified training pipeline (shared across CLI/GUI/TUI/easy) |
 | `adamw_groups` | AdamW with parameter groups |
 | `adam8bit` | 8-bit Adam optimizer |

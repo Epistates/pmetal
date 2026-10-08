@@ -9,7 +9,6 @@
 //! - ORPO (Odds Ratio Preference Optimization)
 //! - SimPO (Simple Preference Optimization)
 //! - KTO (Kahneman-Tversky Optimization)
-//! - LLaDA-style Diffusion Training
 //! - Learning rate schedulers
 //! - Training callbacks
 //! - Parameter grouping for per-layer learning rates
@@ -63,8 +62,6 @@ pub mod callbacks;
 pub mod checkpoint;
 pub mod contrastive_loss;
 pub mod dflash_training;
-#[cfg(feature = "experimental-trainers")]
-pub mod diffusion;
 pub mod diffusion_gemma_train;
 pub mod distillation;
 pub mod dpo;
@@ -114,8 +111,6 @@ pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, 
 pub use ane_reward::{AsyncRewardModel, PendingRewards, PipelinedGrpoSession};
 pub use callbacks::*;
 pub use checkpoint::*;
-#[cfg(feature = "experimental-trainers")]
-pub use diffusion::*;
 pub use diffusion_gemma_train::{
     DiffusionGemmaStepStats, DiffusionGemmaTrainConfig, DiffusionGemmaTrainer,
     diffusion_denoising_loss, encoder_ar_loss, load_lora_adapters, save_lora_adapters,
