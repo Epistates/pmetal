@@ -2,11 +2,14 @@
 //!
 //! A model compiled for the ANE takes seconds to load and holds its weights
 //! on the ANE, so there is one per checkpoint, kept between requests. They
-//! live on a single long-lived thread and every request runs there, one at a
-//! time: callers on any thread (a server's blocking pool, the CLI's main
-//! thread) find the model already loaded, and the models and their GPU
+//! live on a single long-lived [`ModelThread`] and every request runs there,
+//! one at a time: callers on any thread (a server's blocking pool, the CLI's
+//! main thread) find the model already loaded, and the models and their GPU
 //! drafters never cross threads. Tokens come back to the caller as they're
 //! generated, and the caller's answer (go on or stop) goes back.
+//!
+//! Unlike most model threads, this one drops its models when a request
+//! panics (see [`generate`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +22,7 @@ use pmetal_metal::ane::lm::{
 use pmetal_metal::error::{MetalError, Result};
 
 use crate::dflash_drafter::DFlashDrafter;
+use crate::model_thread::ModelThread;
 
 /// How the DFlash drafter's weights are packed. At 8 bits its guesses are as
 /// good as at bf16 (Qwen3-4B: 7.1, 4.7 and 3.1 tokens per pass on three chat
@@ -40,8 +44,6 @@ struct AneEngine {
 
 /// The ANE thread's models, by checkpoint.
 type Engines = HashMap<PathBuf, AneEngine>;
-
-type Job = Box<dyn FnOnce(&mut Engines) + Send>;
 
 /// One generation on the ANE.
 pub(crate) struct AneRequest {
@@ -68,12 +70,25 @@ pub(crate) fn generate(
 ) -> Result<(Vec<u32>, GenerationStats)> {
     let (events, from_worker) = mpsc::channel::<Event>();
     let (answers, from_caller) = mpsc::channel::<bool>();
-    submit(Box::new(move |engines| {
-        let result = run(engines, &request, |token| {
-            events.send(Event::Token(token)).is_ok() && from_caller.recv().unwrap_or(false)
-        });
-        let _ = events.send(Event::Done(result));
-    }))?;
+    ane_thread()?
+        .submit(move |engines| {
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(engines, &request, |token| {
+                    events.send(Event::Token(token)).is_ok() && from_caller.recv().unwrap_or(false)
+                })
+            }));
+            let result = ran.unwrap_or_else(|_| {
+                // A panic can leave a model half built, or its KV cache
+                // half written, and both outlive the request. Reloading
+                // costs seconds; generating from a damaged model would cost
+                // wrong output on every later request. So start over.
+                tracing::error!("an ANE request panicked; dropping the loaded models");
+                engines.clear();
+                Err(MetalError::Internal("the ANE request panicked".into()))
+            });
+            let _ = events.send(Event::Done(result));
+        })
+        .map_err(|e| MetalError::Internal(e.to_string()))?;
     for event in from_worker {
         match event {
             Event::Token(token) => {
@@ -89,33 +104,18 @@ pub(crate) fn generate(
     ))
 }
 
-/// Queue `job` on the ANE thread, starting the thread on first use.
-fn submit(job: Job) -> Result<()> {
-    static JOBS: OnceLock<std::result::Result<mpsc::Sender<Job>, String>> = OnceLock::new();
-    let jobs = JOBS.get_or_init(|| {
-        let (jobs, queue) = mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("pmetal-ane".into())
-            .spawn(move || {
-                let mut engines = Engines::new();
-                for job in queue {
-                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        job(&mut engines)
-                    }));
-                    if ran.is_err() {
-                        // A model may be half built; start over.
-                        tracing::error!("an ANE request panicked; dropping the loaded models");
-                        engines.clear();
-                    }
-                }
+/// The ANE thread, started on first use. It lives as long as the process.
+fn ane_thread() -> Result<&'static ModelThread<Engines>> {
+    static THREAD: OnceLock<std::result::Result<ModelThread<Engines>, String>> = OnceLock::new();
+    THREAD
+        .get_or_init(|| {
+            ModelThread::spawn("pmetal-ane", || {
+                Ok::<_, std::convert::Infallible>(Engines::new())
             })
-            .map(|_| jobs)
             .map_err(|e| e.to_string())
-    });
-    jobs.as_ref()
-        .map_err(|e| MetalError::Internal(format!("can't start the ANE thread: {e}")))?
-        .send(job)
-        .map_err(|_| MetalError::Internal("the ANE thread has exited".into()))
+        })
+        .as_ref()
+        .map_err(|e| MetalError::Internal(format!("can't start the ANE thread: {e}")))
 }
 
 /// Generate for `request` with its model, loading or rebuilding the model
