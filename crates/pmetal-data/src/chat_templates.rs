@@ -769,6 +769,9 @@ impl ChatTemplate {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> FormattedChat {
+        if let Some(formatted) = self.render_reasoning_conversation(messages, tools) {
+            return formatted;
+        }
         match self.template_type {
             ChatTemplateType::ChatMl | ChatTemplateType::Qwen => {
                 self.format_chatml(messages, tools)
@@ -790,6 +793,53 @@ impl ChatTemplate {
             ChatTemplateType::Cohere => self.format_cohere(messages),
             ChatTemplateType::Custom => self.format_chatml(messages, tools),
         }
+    }
+
+    /// A conversation ending in an assistant turn, rendered by a reasoning
+    /// model's own template, with the response starting where generation
+    /// would.
+    ///
+    /// Qwen 3's template writes the final assistant turn as
+    /// `<think>\n{reasoning}\n</think>\n\n{answer}`, with an empty block when
+    /// there is no reasoning, and serving prompts with that empty block in
+    /// non-thinking mode. The hand-written ChatML formatter knows nothing of
+    /// it, so a fine-tune taught the model to answer straight after
+    /// `<|im_start|>assistant\n`, where it puts all its mass on `<think>`:
+    /// Qwen3-0.6B's first-token loss on such data was 21 nats.
+    ///
+    /// The prompt is the conversation before the last turn with the
+    /// generation prompt the template appends, non-thinking first (the
+    /// empty block stays out of the loss, as serving supplies it) and then
+    /// thinking (reasoning in the answer is trained). `None` when the
+    /// template has no reasoning block, the last turn isn't the assistant's,
+    /// or neither prompt is a prefix of the full rendering; the hand-written
+    /// formatter takes those.
+    fn render_reasoning_conversation(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Option<FormattedChat> {
+        let src = self.jinja_source.as_deref()?;
+        if !src.contains("</think>") {
+            return None;
+        }
+        let (last, prompt) = messages.split_last()?;
+        if last.role != "assistant" {
+            return None;
+        }
+        let text = self
+            .render_jinja(src, messages, false, tools, &ChatTemplateKwargs::new())
+            .ok()?;
+        [false, true].into_iter().find_map(|thinking| {
+            let kwargs =
+                ChatTemplateKwargs::new().with(ChatTemplateKwargs::ENABLE_THINKING, thinking);
+            let prefix = self.render_jinja(src, prompt, true, tools, &kwargs).ok()?;
+            text.starts_with(&prefix).then(|| FormattedChat {
+                response_start: prefix.len(),
+                text: text.clone(),
+                template_type: self.template_type,
+            })
+        })
     }
 
     /// Format an inference prompt with any template-specific generation prefill.
@@ -848,7 +898,7 @@ impl ChatTemplate {
         let Some(src) = self.jinja_source.as_deref() else {
             return Ok(self.apply_builtin_inference(messages, tools, no_thinking));
         };
-        match self.render_jinja(src, messages, tools, kwargs) {
+        match self.render_jinja(src, messages, true, tools, kwargs) {
             Ok(text) => Ok(FormattedChat {
                 text,
                 response_start: 0, // training masks set this separately
@@ -1011,7 +1061,7 @@ impl ChatTemplate {
             .jinja_source
             .as_deref()
             .ok_or("the model ships no chat template")?;
-        self.render_jinja(src, messages, tools, kwargs)
+        self.render_jinja(src, messages, true, tools, kwargs)
     }
 
     /// Render the upstream Jinja template.
@@ -1019,6 +1069,7 @@ impl ChatTemplate {
         &self,
         src: &str,
         messages: &[Message],
+        add_generation_prompt: bool,
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
     ) -> Result<String, String> {
@@ -1078,7 +1129,7 @@ impl ChatTemplate {
         });
 
         let options = crate::jinja_chat::JinjaRenderOptions {
-            add_generation_prompt: true,
+            add_generation_prompt,
             enable_thinking: None,
             tools: tools_json,
             bos_token: self.bos_token.clone(),
@@ -2546,6 +2597,66 @@ mod tests {
                 .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         );
         assert_eq!(formatted.response_start, formatted.text.len());
+    }
+
+    /// Qwen 3's template, reduced to the parts a single exchange reaches:
+    /// the last assistant turn carries a `<think>` block, empty without
+    /// reasoning, and the generation prompt is the empty block in
+    /// non-thinking mode.
+    const QWEN3_REASONING_TEMPLATE: &str = r#"{%- for message in messages %}
+    {%- set content = message.content %}
+    {%- if message.role == "assistant" %}
+        {%- set reasoning_content = '' %}
+        {%- if message.reasoning_content is string %}
+            {%- set reasoning_content = message.reasoning_content %}
+        {%- elif '</think>' in content %}
+            {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+            {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+        {%- endif %}
+        {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content.strip('\n') + '\n</think>\n\n' + content.lstrip('\n') }}
+        {{- '<|im_end|>\n' }}
+    {%- else %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif %}"#;
+
+    /// A training conversation renders the way the template writes it, so
+    /// the answer follows the empty `<think>` block serving prompts with
+    /// rather than the bare assistant header.
+    #[test]
+    fn a_reasoning_template_trains_the_answer_after_its_think_block() {
+        let mut template = ChatTemplate::qwen();
+        template.jinja_source = Some(QWEN3_REASONING_TEMPLATE.to_string());
+        let messages = vec![
+            Message::user("What is 39 + 28?"),
+            Message::assistant("Answer: 67."),
+        ];
+        let formatted = template.apply(&messages);
+        assert_eq!(
+            formatted.text,
+            "<|im_start|>user\nWhat is 39 + 28?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\nAnswer: 67.<|im_end|>\n"
+        );
+        assert!(formatted.prompt().ends_with("<think>\n\n</think>\n\n"));
+        assert_eq!(formatted.response(), "Answer: 67.<|im_end|>\n");
+
+        // Reasoning in the answer is trained, after the opening tag.
+        let messages = vec![
+            Message::user("What is 39 + 28?"),
+            Message::assistant("<think>\n39 + 28 = 67\n</think>\n\nAnswer: 67."),
+        ];
+        let formatted = template.apply(&messages);
+        assert!(formatted.prompt().ends_with("<|im_start|>assistant\n"));
+        assert_eq!(
+            formatted.response(),
+            "<think>\n39 + 28 = 67\n</think>\n\nAnswer: 67.<|im_end|>\n"
+        );
     }
 
     #[test]
