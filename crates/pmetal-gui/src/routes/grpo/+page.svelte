@@ -1,6 +1,7 @@
 <script lang="ts">
   import { modelsStore, grpoStore } from '$lib/stores.svelte';
-  import type { GrpoSpec, GrpoRun } from '$lib/api';
+  import type { GrpoSpec, GrpoRun, OptimizerName } from '$lib/api';
+  import { OPTIMIZERS, OPTIMIZER_HINT } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   // Form state
@@ -8,6 +9,7 @@
   let datasetPath = $state('');
   let epochs = $state(1);
   let learningRate = $state(0.00001);
+  let optimizer = $state<OptimizerName>('adamw');
   let batchSize = $state(1);
   let groupSize = $state(8);
   let beta = $state(0.04);
@@ -44,6 +46,7 @@
         dataset: datasetPath,
         epochs,
         learning_rate: learningRate,
+        optimizer,
         num_generations: groupSize,
         beta,
         lora_r: loraRank,
@@ -185,6 +188,15 @@
               <div>
                 <label class="label" for="grpo-lr">Learning Rate</label>
                 <input id="grpo-lr" type="number" class="input" step="0.000001" bind:value={learningRate} />
+              </div>
+              <div>
+                <label class="label" for="grpo-optimizer">Optimizer</label>
+                <select id="grpo-optimizer" class="input" bind:value={optimizer}>
+                  {#each OPTIMIZERS as opt}
+                    <option value={opt}>{opt}</option>
+                  {/each}
+                </select>
+                <p class="text-xs text-surface-400 mt-0.5">{OPTIMIZER_HINT}</p>
               </div>
               <div>
                 <label class="label" for="grpo-batch">Batch Size</label>

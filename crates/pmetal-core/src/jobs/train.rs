@@ -176,6 +176,18 @@ pub struct TrainSpec {
     pub weight_decay: f64,
 
     #[job(
+        label = "Optimizer",
+        group = "Optimization",
+        argv = "--optimizer",
+        kind = "enum",
+        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
+        default = "adamw"
+    )]
+    #[serde(default = "super::default_optimizer")]
+    pub optimizer: String,
+
+    #[job(
         label = "LR Schedule",
         group = "Optimization",
         argv = "--lr-schedule",
@@ -454,6 +466,7 @@ impl Default for TrainSpec {
             max_grad_norm: default_max_grad_norm(),
             warmup_steps: 0,
             weight_decay: default_weight_decay(),
+            optimizer: super::default_optimizer(),
             lr_schedule: default_lr_schedule(),
             seed: default_seed(),
             loss_scale: default_loss_scale(),

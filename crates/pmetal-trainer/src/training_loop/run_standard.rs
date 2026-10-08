@@ -12,30 +12,7 @@ impl TrainingLoop {
     where
         M: TrainableModel,
     {
-        // Initialize optimizer with optional embedding learning rate
-        let base_lr = self.config.training.learning_rate as f32;
-        let weight_decay = self.config.training.weight_decay as f32;
-
-        // Use AdamWGroups when embedding_lr is specified
-        let mut optimizer = crate::AdamWGroupsBuilder::new(base_lr).with_weight_decay(weight_decay);
-
-        if let Some(emb_lr) = self.config.embedding_lr {
-            optimizer = optimizer.with_embedding_lr(emb_lr);
-            tracing::info!(
-                "Using separate embedding LR: {:.2e} (base: {:.2e})",
-                emb_lr,
-                base_lr
-            );
-        }
-
-        // Wire LoRA+ differential learning rates for B vs A matrices
-        if let Some(ratio) = self.config.loraplus_lr_ratio {
-            optimizer = optimizer.with_loraplus_lr_ratio(ratio);
-        }
-
-        let mut optimizer = optimizer
-            .build()
-            .map_err(|_| SftError::Mlx(Exception::custom("Failed to build optimizer")))?;
+        let mut optimizer = self.build_optimizer();
 
         let max_steps = self.config.training.max_steps;
         let num_epochs = self.config.training.num_epochs;

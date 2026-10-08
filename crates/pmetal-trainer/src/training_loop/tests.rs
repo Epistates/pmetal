@@ -849,3 +849,106 @@ fn test_batch_token_overflow_protection() {
         .unwrap_or(usize::MAX);
     assert_eq!(protected, usize::MAX, "Should return MAX on overflow");
 }
+
+type LoraWeights = std::collections::HashMap<std::rc::Rc<str>, Array>;
+
+/// Train on the standard loop with `kind` from LoRA weights `init`, and
+/// return the weights it ends at.
+fn lora_after_loop(
+    model: &mut AdaptedModel,
+    kind: pmetal_core::OptimizerType,
+    init: &LoraWeights,
+    config: &TrainingLoopConfig,
+    dataset: &TrainingDataset,
+) -> LoraWeights {
+    let mut config = config.clone();
+    config.training.optimizer = kind;
+    model.set_lora_parameters(init);
+    TrainingLoop::new(config)
+        .run(model, dataset.clone(), None, None)
+        .unwrap();
+    model.lora_parameters()
+}
+
+/// The same steps through `train_step` with a hand-built optimizer of `kind`.
+fn lora_after_replay(
+    model: &mut AdaptedModel,
+    kind: pmetal_core::OptimizerType,
+    init: &LoraWeights,
+    config: &TrainingLoopConfig,
+    dataset: &TrainingDataset,
+) -> LoraWeights {
+    model.set_lora_parameters(init);
+    let mut optimizer = crate::TrainOptimizer::new(
+        kind,
+        config.training.learning_rate as f32,
+        config.training.weight_decay as f32,
+    );
+    let mut replay = TrainingLoop::new(config.clone());
+    let mut loader = DataLoader::new(dataset.clone(), config.dataloader.clone(), None);
+    for _ in 0..config.training.max_steps.unwrap() {
+        let batch = loader.next_batch().unwrap();
+        replay.train_step(model, &batch, &mut optimizer).unwrap();
+    }
+    model.lora_parameters()
+}
+
+fn max_abs_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .map(|(k, x)| {
+            let mut d = x.subtract(&b[k]).abs().max(None);
+            d.eval();
+            pmetal_bridge::check_last_error().unwrap();
+            d.item_f32()
+        })
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn the_sft_loop_trains_with_the_optimizer_the_config_names() {
+    use pmetal_core::OptimizerType;
+    let kinds = [
+        OptimizerType::AdamW,
+        OptimizerType::Sgd,
+        OptimizerType::Lion,
+        OptimizerType::Adafactor,
+    ];
+    let mut config = TrainingLoopConfig {
+        use_metal_flash_attention: false,
+        ..Default::default()
+    };
+    config.training.learning_rate = 1e-2;
+    config.training.weight_decay = 0.1;
+    config.training.warmup_steps = 0;
+    config.training.lr_scheduler = LrSchedulerType::Constant;
+    config.training.gradient_accumulation_steps = 1;
+    config.training.max_steps = Some(2);
+    config.training.num_epochs = 1;
+    config.dataloader.batch_size = 1;
+    config.dataloader.shuffle = false;
+    let dataset = create_dummy_dataset(2, 16);
+    // One base model throughout: only the LoRA weights are reset between runs.
+    let mut model = small_model();
+    let init = model.lora_parameters();
+
+    for kind in kinds {
+        let trained = lora_after_loop(&mut model, kind, &init, &config, &dataset);
+        assert!(
+            max_abs_diff(&trained, &init) > 1e-4,
+            "{kind:?}: the loop did not move the weights"
+        );
+        for other in kinds {
+            let replayed = lora_after_replay(&mut model, other, &init, &config, &dataset);
+            let diff = max_abs_diff(&trained, &replayed);
+            if other == kind {
+                assert!(diff < 1e-6, "{kind:?}: loop and replay differ by {diff}");
+            } else {
+                assert!(
+                    diff > 1e-5,
+                    "{kind:?} trained exactly like {other:?} (diff {diff})"
+                );
+            }
+        }
+    }
+}

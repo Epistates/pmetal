@@ -180,6 +180,18 @@ pub struct DistillSpec {
     pub learning_rate: f32,
 
     #[job(
+        label = "Optimizer",
+        group = "Optimization",
+        argv = "--optimizer",
+        kind = "enum",
+        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
+        default = "adamw"
+    )]
+    #[serde(default = "super::default_optimizer")]
+    pub optimizer: String,
+
+    #[job(
         label = "Batch Size",
         group = "Training",
         argv = "--batch-size",
@@ -269,6 +281,7 @@ impl Default for DistillSpec {
             lora_r: 16,
             lora_alpha: 32.0,
             learning_rate: default_lr(),
+            optimizer: super::default_optimizer(),
             batch_size: 1,
             epochs: 1,
             max_seq_len: default_max_seq_len(),

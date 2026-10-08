@@ -12,6 +12,7 @@ pub(crate) async fn run_grpo_cli(
     num_generations: usize,
     beta: f64,
     learning_rate: f64,
+    optimizer: pmetal_core::OptimizerType,
     epochs: usize,
     lora_r: usize,
     lora_alpha: f32,
@@ -299,6 +300,7 @@ pub(crate) async fn run_grpo_cli(
     // 7. Setup Trainer
     let training_config = TrainingConfig {
         learning_rate,
+        optimizer,
         batch_size: 1, // GRPO generates num_generations per prompt, so batch_size 1 is typical
         num_epochs: epochs,
         max_seq_len,
@@ -385,9 +387,7 @@ pub(crate) async fn run_grpo_cli(
     trainer.set_checkpoint_manager(checkpoint_manager);
 
     // 7b. Setup Optimizer
-    let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate as f32)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build optimizer: {}", e))?;
+    let mut optimizer = pmetal_trainer::TrainOptimizer::from_config(&trainer.training_config);
 
     // 8. Run Training
     if emit_console_output {
@@ -415,9 +415,7 @@ pub(crate) async fn run_grpo_cli(
                 &dataset,
                 Box::new(rewards),
                 &mut optimizer,
-                |opt, lr| {
-                    opt.lr = pmetal_bridge::array!(lr);
-                },
+                |opt, lr| opt.set_lr(lr),
             )
             .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
     } else {
@@ -429,9 +427,7 @@ pub(crate) async fn run_grpo_cli(
                 &dataset,
                 &rewards,
                 &mut optimizer,
-                |opt, lr| {
-                    opt.lr = pmetal_bridge::array!(lr);
-                },
+                |opt, lr| opt.set_lr(lr),
             )
             .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
     }

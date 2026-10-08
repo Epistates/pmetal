@@ -276,9 +276,7 @@ pub(crate) async fn run_rlkd_cli(
     }
 
     // 11. Build optimizer
-    let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate as f32)
-        .build()
-        .map_err(|e| anyhow::anyhow!("Failed to build optimizer: {}", e))?;
+    let mut optimizer = pmetal_trainer::TrainOptimizer::from_config(&trainer.config.training);
 
     // 12. Run training
     if emit_console_output {
@@ -295,9 +293,7 @@ pub(crate) async fn run_rlkd_cli(
             &dataset,
             &rewards,
             &mut optimizer,
-            |opt, lr| {
-                opt.lr = pmetal_bridge::array!(lr);
-            },
+            |opt, lr| opt.set_lr(lr),
         )
         .map_err(|e| anyhow::anyhow!("RLKD training error: {}", e))?;
 

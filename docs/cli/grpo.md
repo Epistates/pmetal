@@ -63,6 +63,7 @@ GRPO expects a reasoning dataset:
 | `--model` | *required* | Model ID or local path |
 | `--dataset` | *required* | Reasoning dataset (JSONL) |
 | `--dapo` | `false` | Use DAPO variant |
+| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW |
 | `--reasoning-rewards` | `false` | Enable reasoning-aware rewards |
 | `--speculative` | `false` | Speculative decoding for faster rollouts |
 | `--speculative-draft-tokens` | `3` | Draft tokens per speculative step |

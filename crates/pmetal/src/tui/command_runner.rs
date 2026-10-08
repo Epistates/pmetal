@@ -662,6 +662,7 @@ async fn run_training_direct(
             max_grad_norm: parse_arg(&spec.args, "--max-grad-norm", 1.0f64)?,
             warmup_steps: parse_arg(&spec.args, "--warmup-steps", 0usize)?,
             weight_decay: parse_arg(&spec.args, "--weight-decay", 0.01f64)?,
+            optimizer: parse_arg(&spec.args, "--optimizer", pmetal_core::OptimizerType::AdamW)?,
             seed: parse_arg(&spec.args, "--seed", 42u64)?,
             embedding_learning_rate: optional_arg(&spec.args, "--embedding-lr")
                 .and_then(|s| s.parse::<f64>().ok()),
@@ -742,6 +743,7 @@ async fn run_distillation_direct(
         parse_arg(&spec.args, "--lora-r", 16usize)?,
         parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
         parse_arg(&spec.args, "--learning-rate", 2e-5f32)?,
+        parse_arg(&spec.args, "--optimizer", pmetal_core::OptimizerType::AdamW)?,
         parse_arg(&spec.args, "--batch-size", 1usize)?,
         parse_arg(&spec.args, "--epochs", 1usize)?,
         parse_arg(&spec.args, "--max-seq-len", 1024usize)?,
@@ -789,6 +791,7 @@ async fn run_grpo_direct(
         parse_arg(&spec.args, "--num-generations", 8usize)?,
         parse_arg(&spec.args, "--beta", 0.001f64)?,
         parse_arg(&spec.args, "--learning-rate", 5e-6f64)?,
+        parse_arg(&spec.args, "--optimizer", pmetal_core::OptimizerType::AdamW)?,
         parse_arg(&spec.args, "--epochs", 1usize)?,
         parse_arg(&spec.args, "--lora-r", 16usize)?,
         parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,

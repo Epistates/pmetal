@@ -144,9 +144,14 @@ pub struct TrainArgs {
     #[arg(long = "lr-schedule", default_value = "cosine")]
     pub lr_schedule: String,
 
-    /// AdamW weight decay coefficient.
+    /// Weight decay coefficient.
     #[arg(long = "weight-decay", default_value = "0.01")]
     pub weight_decay: f64,
+
+    /// Optimizer: adamw, sgd, lion or adafactor. Lion wants a 3-10x smaller
+    /// learning rate and 3-10x larger weight decay than AdamW.
+    #[arg(long = "optimizer", default_value = "adamw")]
+    pub optimizer: pmetal_core::OptimizerType,
 
     /// Random seed.
     #[arg(long = "seed", default_value = "42")]

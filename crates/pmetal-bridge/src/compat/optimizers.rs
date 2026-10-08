@@ -43,9 +43,13 @@ pub trait Updatable {
 }
 
 /// AdamW optimizer compatible with mlx_rs::optimizers::AdamW interface.
+///
+/// Every parameter trains at the one learning rate [`AdamW::set_lr`] sets;
+/// bias, norm and scale parameters skip weight decay. Separate embedding or
+/// LoRA+ rates are parameter groups, which the trainer builds from several
+/// of these.
 pub struct AdamW {
     inner: crate::optimizer::AdamW,
-    pub lr: Array,
     pub state: State<(Array, Array)>,
 }
 
@@ -57,9 +61,12 @@ impl std::fmt::Debug for AdamW {
 
 impl AdamW {
     pub fn new(lr: f32, weight_decay: f32) -> Self {
+        Self::from_inner(crate::optimizer::AdamW::new(lr, weight_decay))
+    }
+
+    fn from_inner(inner: crate::optimizer::AdamW) -> Self {
         Self {
-            inner: crate::optimizer::AdamW::new(lr, weight_decay),
-            lr: Array::from_f32(lr),
+            inner: inner.with_classifier(crate::optimizer::decay_only_classifier),
             state: HashMap::new(),
         }
     }
@@ -77,10 +84,14 @@ impl AdamW {
         self.inner.step_count()
     }
 
-    /// Update the base learning rate (for LR scheduling).
+    /// Set the learning rate the next update uses (for LR scheduling).
     pub fn set_lr(&mut self, lr: f32) {
         self.inner.set_lr(lr);
-        self.lr = Array::from_f32(lr);
+    }
+
+    /// The learning rate the next update uses.
+    pub fn lr(&self) -> f32 {
+        self.inner.lr()
     }
 
     /// Restore optimizer state from a checkpoint.
@@ -186,7 +197,11 @@ impl AdamWBuilder {
         self
     }
     pub fn build(self) -> Result<AdamW, Exception> {
-        Ok(AdamW::new(self.lr, self.weight_decay))
+        Ok(AdamW::from_inner(
+            crate::optimizer::AdamW::new(self.lr, self.weight_decay)
+                .with_betas(self.betas.0, self.betas.1)
+                .with_eps(self.eps),
+        ))
     }
 }
 

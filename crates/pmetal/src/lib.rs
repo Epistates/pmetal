@@ -155,7 +155,8 @@ pub mod prelude {
     // Trainer types
     #[cfg(feature = "trainer")]
     pub use pmetal_trainer::{
-        AdamWGroupsBuilder, CheckpointManager, TrainingLoop, TrainingLoopConfig,
+        CheckpointManager, ParamGroupOptimizerBuilder, TrainOptimizer, TrainingLoop,
+        TrainingLoopConfig,
     };
 
     // Data types

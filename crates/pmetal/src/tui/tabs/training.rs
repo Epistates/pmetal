@@ -439,6 +439,14 @@ impl TrainingTab {
                 .value("Weight Decay")
                 .parse()
                 .unwrap_or(TrainSpec::default().weight_decay),
+            optimizer: {
+                let v = self.form.value("Optimizer");
+                if v.is_empty() {
+                    TrainSpec::default().optimizer
+                } else {
+                    v
+                }
+            },
             lr_schedule: {
                 let v = self.form.value("LR Schedule");
                 if v.is_empty() {

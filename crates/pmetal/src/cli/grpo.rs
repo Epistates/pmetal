@@ -29,6 +29,11 @@ pub struct GrpoArgs {
     #[arg(long = "learning-rate", default_value = "5e-6")]
     pub learning_rate: f64,
 
+    /// Optimizer: adamw, sgd, lion or adafactor. Lion wants a 3-10x smaller
+    /// learning rate and 3-10x larger weight decay than AdamW.
+    #[arg(long = "optimizer", default_value = "adamw")]
+    pub optimizer: pmetal_core::OptimizerType,
+
     /// Number of training epochs
     #[arg(long = "epochs", default_value = "1")]
     pub epochs: usize,

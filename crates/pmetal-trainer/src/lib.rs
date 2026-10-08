@@ -16,15 +16,16 @@
 //! PMetal supports separate learning rates for embeddings for improved training stability:
 //!
 //! - Embeddings use a lower learning rate (default 5e-5 vs 2e-4 for LoRA)
-//! - Use [`AdamWGroups`] optimizer or the `--embedding-lr` CLI flag
+//! - Use [`ParamGroupOptimizer`] or the `--embedding-lr` CLI flag
 //!
 //! ```ignore
-//! use pmetal_trainer::{AdamWGroups, AdamWGroupsBuilder};
+//! use pmetal_core::OptimizerType;
+//! use pmetal_trainer::ParamGroupOptimizerBuilder;
 //!
-//! let optimizer = AdamWGroupsBuilder::new(2e-4)
+//! let optimizer = ParamGroupOptimizerBuilder::new(OptimizerType::AdamW, 2e-4)
 //!     .with_embedding_lr(5e-5)  // recommended default
 //!     .with_weight_decay(0.01)
-//!     .build()?;
+//!     .build();
 //! ```
 
 // Crate-level lint configuration
@@ -50,7 +51,6 @@
 
 pub mod orchestrator;
 
-pub mod adamw_groups;
 pub mod adaptive_lr;
 pub mod ane_reward;
 pub mod callbacks;
@@ -64,6 +64,7 @@ pub mod grpo;
 pub mod logprob_utils;
 pub mod mlx_metal_optimizer;
 pub mod mtp_training;
+pub mod optimizer;
 pub mod param_groups;
 pub mod preference;
 pub mod pretrain;
@@ -89,7 +90,6 @@ pub use pmetal_metal::ane::dynamic_trainer::{
     DynamicAneTrainer, DynamicAneTrainerConfig, IGNORE_TARGET, VocabMap,
 };
 
-pub use adamw_groups::*;
 pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, LrEvent};
 pub use ane_reward::{AsyncRewardModel, PendingRewards, PipelinedGrpoSession};
 pub use callbacks::*;
@@ -110,6 +110,10 @@ pub use mlx_metal_optimizer::{
     MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
 };
 pub use mtp_training::*;
+pub use optimizer::{
+    Adafactor, Lion, MomentumSgd, ParamGroupOptimizer, ParamGroupOptimizerBuilder, SecondMoment,
+    TrainOptimizer,
+};
 pub use param_groups::*;
 pub use preference::{
     KtoConfig, KtoSample, KtoTrainer, PreferenceError, PreferenceLoss, PreferencePair,

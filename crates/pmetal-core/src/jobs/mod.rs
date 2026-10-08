@@ -53,3 +53,15 @@ pub use rlkd::RlkdSpec;
 pub use serve::ServeSpec;
 pub use tokenize::TokenizeSpec;
 pub use train::TrainSpec;
+
+/// Default of every spec's `optimizer` field.
+pub(crate) fn default_optimizer() -> String {
+    crate::OptimizerType::default().as_str().to_string()
+}
+
+/// The optimizer a spec's `optimizer` field names. `normalize` has already
+/// checked the name against the field's options, so this only fails on a
+/// spec that skipped it.
+pub fn parse_optimizer(name: &str) -> Result<crate::OptimizerType, String> {
+    name.parse()
+}

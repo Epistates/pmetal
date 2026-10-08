@@ -119,6 +119,12 @@ impl AdamW {
         self
     }
 
+    /// Override the denominator epsilon (default: 1e-8).
+    pub fn with_eps(mut self, eps: f32) -> Self {
+        self.eps = eps;
+        self
+    }
+
     /// Override the learning rate applied to `Embedding`-class parameters
     /// (default: 5e-5).
     pub fn with_embedding_lr(mut self, lr: f32) -> Self {
@@ -333,6 +339,21 @@ impl AdamW {
             let wd_lr_arr = InlineArray::from_f32(wd * lr);
             *parameter = parameter.subtract(&parameter.clone().multiply(&wd_lr_arr));
         }
+    }
+}
+
+/// Classifier that only separates out the parameters weight decay must skip.
+///
+/// Bias, norm and scale parameters are [`ParamClass::NoDecay`]; everything
+/// else, embeddings and LoRA B matrices included, is [`ParamClass::Regular`]
+/// and trains at the base learning rate. This is what an optimizer without
+/// parameter groups should do: a separate embedding or LoRA+ rate is a group
+/// the caller configures, not something the optimizer infers from a name.
+pub fn decay_only_classifier(name: &str) -> ParamClass {
+    if name.contains("bias") || name.contains("norm") || name.contains("scale") {
+        ParamClass::NoDecay
+    } else {
+        ParamClass::Regular
     }
 }
 

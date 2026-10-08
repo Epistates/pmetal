@@ -191,6 +191,7 @@ pub(crate) async fn run_distillation_cli(
     lora_r: usize,
     lora_alpha: f32,
     learning_rate: f32,
+    optimizer: pmetal_core::OptimizerType,
     batch_size: usize,
     epochs: usize,
     max_seq_len: usize,
@@ -395,6 +396,7 @@ pub(crate) async fn run_distillation_cli(
     let training_loop_config = TrainingLoopConfig {
         training: pmetal_core::TrainingConfig {
             learning_rate: learning_rate as f64,
+            optimizer,
             batch_size,
             num_epochs: epochs,
             max_seq_len,

@@ -72,6 +72,18 @@ pub struct GrpoSpec {
     pub learning_rate: f64,
 
     #[job(
+        label = "Optimizer",
+        group = "Optimization",
+        argv = "--optimizer",
+        kind = "enum",
+        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
+        default = "adamw"
+    )]
+    #[serde(default = "super::default_optimizer")]
+    pub optimizer: String,
+
+    #[job(
         label = "Epochs",
         group = "Training",
         argv = "--epochs",
@@ -294,6 +306,7 @@ impl Default for GrpoSpec {
             num_generations: default_num_generations(),
             beta: default_beta(),
             learning_rate: default_lr(),
+            optimizer: super::default_optimizer(),
             epochs: default_epochs(),
             lora_r: default_lora_r(),
             lora_alpha: default_lora_alpha(),

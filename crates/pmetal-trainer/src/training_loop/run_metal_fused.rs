@@ -22,6 +22,17 @@ impl TrainingLoop {
     where
         M: TrainableModel,
     {
+        // The fused kernel is an AdamW update; any other optimizer trains on
+        // the standard loop, which runs the one the config names.
+        let kind = self.config.training.optimizer;
+        if kind != pmetal_core::OptimizerType::AdamW {
+            tracing::info!(
+                "The Metal fused optimizer implements AdamW only; training with {kind:?} on \
+                 the standard loop"
+            );
+            return self.run(model, train_dataset, eval_dataset, checkpoint_manager);
+        }
+
         // Check Metal availability
         if !is_mlx_metal_optimizer_available() {
             return Err(SftError::Mlx(Exception::custom(

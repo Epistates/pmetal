@@ -301,18 +301,61 @@ pub enum LrSchedulerType {
 }
 
 /// Optimizer type.
+///
+/// Every training loop runs the optimizer this names; see
+/// `pmetal_trainer::optimizer` for the update rules and their defaults. The
+/// learning rate and weight decay do not carry over between kinds: the Lion
+/// paper recommends a learning rate 3-10x smaller and a weight decay 3-10x
+/// larger than AdamW's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OptimizerType {
-    /// AdamW optimizer.
+    /// AdamW (decoupled weight decay).
+    #[serde(rename = "adamw", alias = "adam_w")]
     #[default]
     AdamW,
-    /// SGD with momentum.
+    /// SGD with momentum 0.9.
     Sgd,
-    /// Adafactor (memory-efficient).
+    /// Adafactor with factored second moments and an external learning rate.
     Adafactor,
-    /// Lion optimizer.
+    /// Lion (sign of an interpolated momentum).
     Lion,
+}
+
+impl OptimizerType {
+    /// Every kind, in the order the CLI lists them.
+    pub const ALL: [Self; 4] = [Self::AdamW, Self::Sgd, Self::Lion, Self::Adafactor];
+
+    /// The name the CLI, job specs and YAML configs use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AdamW => "adamw",
+            Self::Sgd => "sgd",
+            Self::Lion => "lion",
+            Self::Adafactor => "adafactor",
+        }
+    }
+}
+
+impl std::fmt::Display for OptimizerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for OptimizerType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let wanted = s.trim().to_ascii_lowercase().replace(['_', '-'], "");
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == wanted)
+            .ok_or_else(|| {
+                let valid: Vec<_> = Self::ALL.iter().map(|k| k.as_str()).collect();
+                format!("unknown optimizer '{s}'; valid: {}", valid.join(", "))
+            })
+    }
 }
 
 /// Compression strategy for distributed gradient synchronization.
@@ -491,5 +534,24 @@ mod tests {
         };
 
         assert_eq!(config.scaling(), 0.0);
+    }
+
+    #[test]
+    fn optimizer_names_round_trip_through_the_cli_and_yaml() {
+        use super::{OptimizerType, TrainingConfig};
+        for kind in OptimizerType::ALL {
+            assert_eq!(kind.as_str().parse::<OptimizerType>(), Ok(kind));
+            let yaml = serde_yaml::to_string(&kind).unwrap();
+            assert_eq!(yaml.trim(), kind.as_str());
+            let back: OptimizerType = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(back, kind);
+        }
+        assert_eq!("AdamW".parse::<OptimizerType>(), Ok(OptimizerType::AdamW));
+        assert_eq!("adam_w".parse::<OptimizerType>(), Ok(OptimizerType::AdamW));
+        assert!("adam".parse::<OptimizerType>().is_err());
+        let config: TrainingConfig = serde_yaml::from_str("optimizer: adam_w").unwrap();
+        assert_eq!(config.optimizer, OptimizerType::AdamW);
+        let config: TrainingConfig = serde_yaml::from_str("optimizer: lion").unwrap();
+        assert_eq!(config.optimizer, OptimizerType::Lion);
     }
 }

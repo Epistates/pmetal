@@ -125,7 +125,7 @@ fn train_with_checkpoints(
 | `embedding_trainer` | Sentence-transformer fine-tuning |
 | `contrastive_loss` | InfoNCE, Triplet, CoSENT loss functions |
 | `orchestrator` | Unified training pipeline (shared across CLI/GUI/TUI/easy) |
-| `adamw_groups` | AdamW with parameter groups |
+| `optimizer` | AdamW, SGD with momentum, Lion and Adafactor, in parameter groups |
 | `mlx_metal_optimizer` | Metal-accelerated AdamW updates |
 | `adaptive_lr` | EMA-based adaptive learning rate control |
 | `checkpoint` | Checkpoint save/load |

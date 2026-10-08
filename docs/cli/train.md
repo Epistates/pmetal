@@ -64,8 +64,9 @@ pmetal train --config training.yaml
 | `--lr-schedule` | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd` |
 | `--no-gradient-checkpointing` | `false` | Disable gradient checkpointing |
 | `--gradient-checkpointing-layers` | `4` | Layers per checkpoint block |
-| `--warmup-steps` | `100` | Learning rate warmup steps |
-| `--weight-decay` | `0.01` | AdamW weight decay |
+| `--warmup-steps` | `0` | Learning rate warmup steps |
+| `--weight-decay` | `0.01` | Weight decay |
+| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW |
 | `--no-sequence-packing` | `false` | Disable sequence packing |
 | `--cut-cross-entropy` | `false` | Memory-efficient loss (avoids full logit materialization) |
 | `--text-column` | — | Custom JSONL column name for training text |

@@ -1,6 +1,12 @@
 <script lang="ts">
   import { modelsStore } from '$lib/stores.svelte';
-  import { startPreference, type PreferenceSpec } from '$lib/api';
+  import {
+    OPTIMIZERS,
+    OPTIMIZER_HINT,
+    startPreference,
+    type OptimizerName,
+    type PreferenceSpec,
+  } from '$lib/api';
 
   type Loss = NonNullable<PreferenceSpec['loss']>;
 
@@ -24,6 +30,7 @@
   let desirableWeight = $state(1.0);
   let undesirableWeight = $state(1.0);
   let learningRate = $state(1e-5);
+  let optimizer = $state<OptimizerName>('adamw');
   let batchSize = $state(2);
   let gradAccum = $state(8);
   let epochs = $state(1);
@@ -72,6 +79,7 @@
       desirable_weight: desirableWeight,
       undesirable_weight: undesirableWeight,
       learning_rate: learningRate,
+      optimizer,
       batch_size: batchSize,
       gradient_accumulation_steps: gradAccum,
       epochs,
@@ -193,6 +201,15 @@
         <div>
           <label class="label" for="pref-lr">Learning Rate</label>
           <input id="pref-lr" type="number" class="input" step="1e-7" min="1e-9" max="1" bind:value={learningRate} />
+        </div>
+        <div>
+          <label class="label" for="pref-optimizer">Optimizer</label>
+          <select id="pref-optimizer" class="input" bind:value={optimizer}>
+            {#each OPTIMIZERS as opt}
+              <option value={opt}>{opt}</option>
+            {/each}
+          </select>
+          <p class="text-xs text-surface-400 mt-0.5">{OPTIMIZER_HINT}</p>
         </div>
         <div>
           <label class="label" for="pref-epochs">Epochs</label>

@@ -195,6 +195,18 @@ pub struct PreferenceSpec {
     pub weight_decay: f64,
 
     #[job(
+        label = "Optimizer",
+        group = "Optimization",
+        argv = "--optimizer",
+        kind = "enum",
+        enum_options = ["adamw", "sgd", "lion", "adafactor"],
+        help = "Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW",
+        default = "adamw"
+    )]
+    #[serde(default = "super::default_optimizer")]
+    pub optimizer: String,
+
+    #[job(
         label = "LoRA r",
         group = "LoRA",
         argv = "--lora-r",
@@ -276,6 +288,7 @@ impl Default for PreferenceSpec {
             warmup_ratio: default_warmup_ratio(),
             max_grad_norm: default_max_grad_norm(),
             weight_decay: 0.0,
+            optimizer: super::default_optimizer(),
             lora_r: default_lora_r(),
             lora_alpha: default_lora_alpha(),
             max_prompt_length: default_max_prompt_length(),

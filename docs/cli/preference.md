@@ -79,7 +79,8 @@ The last shape is KTO's. KTO also reads paired rows, taking the chosen completio
 | `--max-steps` | — | Stop after this many optimizer steps |
 | `--warmup-ratio` | `0.1` | Share of steps spent warming up |
 | `--max-grad-norm` | `1.0` | Global gradient-norm clip (0 disables) |
-| `--weight-decay` | `0.0` | AdamW weight decay |
+| `--weight-decay` | `0.0` | Weight decay |
+| `--optimizer` | `adamw` | `adamw`, `sgd` (momentum 0.9), `lion`, `adafactor`. Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW |
 | `--lora-r` | `16` | LoRA rank |
 | `--lora-alpha` | `32` | LoRA alpha |
 | `--max-prompt-length` | `512` | Prompt tokens kept |

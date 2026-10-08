@@ -410,6 +410,29 @@ impl TrainingLoop {
         }
     }
 
+    /// The optimizer every loop variant trains with: the kind
+    /// `training.optimizer` names, at the configured learning rate and weight
+    /// decay, with the embedding and LoRA+ groups when they are set.
+    pub fn build_optimizer(&self) -> crate::ParamGroupOptimizer {
+        let training = &self.config.training;
+        let base_lr = training.learning_rate as f32;
+        let mut builder = crate::ParamGroupOptimizerBuilder::new(training.optimizer, base_lr)
+            .with_weight_decay(training.weight_decay as f32);
+        if let Some(emb_lr) = self.config.embedding_lr {
+            builder = builder.with_embedding_lr(emb_lr);
+            tracing::info!("Using separate embedding LR: {emb_lr:.2e} (base: {base_lr:.2e})");
+        }
+        if let Some(ratio) = self.config.loraplus_lr_ratio {
+            builder = builder.with_loraplus_lr_ratio(ratio);
+        }
+        tracing::info!(
+            "Optimizer: {:?}, lr={base_lr:.2e}, weight_decay={}",
+            training.optimizer,
+            training.weight_decay
+        );
+        builder.build()
+    }
+
     /// Run the standard loop while retaining ownership of the model.
     pub(crate) fn run_standard_owned<M>(
         &mut self,

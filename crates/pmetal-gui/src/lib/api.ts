@@ -107,6 +107,13 @@ export interface TrainingConfigSummary {
   gradient_checkpointing: boolean;
 }
 
+/** Optimizers every training job accepts; `adamw` is the default. */
+export const OPTIMIZERS = ['adamw', 'sgd', 'lion', 'adafactor'] as const;
+export type OptimizerName = (typeof OPTIMIZERS)[number];
+/** Shown beside every optimizer picker. */
+export const OPTIMIZER_HINT =
+  'Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW.';
+
 export interface TrainSpec {
   model: string;
   dataset: string;
@@ -123,6 +130,7 @@ export interface TrainSpec {
   max_grad_norm?: number;
   warmup_steps?: number;
   weight_decay?: number;
+  optimizer?: OptimizerName;
   lr_schedule?: string;
   seed?: number;
   loss_scale?: number;
@@ -182,6 +190,7 @@ export interface GrpoSpec {
   num_generations?: number;
   beta?: number;
   learning_rate?: number;
+  optimizer?: OptimizerName;
   epochs?: number;
   lora_r?: number;
   lora_alpha?: number;
@@ -259,6 +268,7 @@ export interface DistillSpec {
   lora_r?: number;
   lora_alpha?: number;
   learning_rate?: number;
+  optimizer?: OptimizerName;
   batch_size?: number;
   epochs?: number;
   max_seq_len?: number;
@@ -1181,6 +1191,7 @@ export interface PreferenceSpec {
   warmup_ratio?: number;
   max_grad_norm?: number;
   weight_decay?: number;
+  optimizer?: OptimizerName;
   lora_r?: number;
   lora_alpha?: number;
   max_prompt_length?: number;

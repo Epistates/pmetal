@@ -10,8 +10,8 @@ use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::with_training_mode;
 
 use crate::{
-    AdamWGroups, AdaptiveAction, CheckpointManager, CheckpointMetadata, Result, SftError,
-    StepStats, TrainingLoop, TrainingLoopConfig,
+    AdaptiveAction, CheckpointManager, CheckpointMetadata, Result, SftError, StepStats,
+    TrainingLoop, TrainingLoopConfig,
 };
 
 /// Trainer for Knowledge Distillation.
@@ -327,21 +327,7 @@ impl DistillationTrainer {
         S: TrainableModel,
         T: TrainableModel,
     {
-        // Setup optimizer with AdamWGroups to support a separate embedding learning rate.
-        let base_lr = self.loop_state.config.training.learning_rate as f32;
-        let weight_decay = self.loop_state.config.training.weight_decay as f32;
-        let embedding_lr = self.loop_state.config.embedding_lr;
-
-        if let Some(emb_lr) = embedding_lr {
-            tracing::info!(
-                "Using separate embedding LR: {:.2e} (base: {:.2e})",
-                emb_lr,
-                base_lr
-            );
-        }
-
-        let mut optimizer =
-            AdamWGroups::new(base_lr, embedding_lr, weight_decay).map_err(SftError::Mlx)?;
+        let mut optimizer = self.loop_state.build_optimizer();
 
         let num_epochs = self.loop_state.config.training.num_epochs;
         let checkpoint_every = self.loop_state.config.checkpoint_every;
@@ -493,20 +479,7 @@ impl DistillationTrainer {
     where
         S: TrainableModel,
     {
-        let base_lr = self.loop_state.config.training.learning_rate as f32;
-        let weight_decay = self.loop_state.config.training.weight_decay as f32;
-        let embedding_lr = self.loop_state.config.embedding_lr;
-
-        if let Some(emb_lr) = embedding_lr {
-            tracing::info!(
-                "Using separate embedding LR: {:.2e} (base: {:.2e})",
-                emb_lr,
-                base_lr
-            );
-        }
-
-        let mut optimizer =
-            AdamWGroups::new(base_lr, embedding_lr, weight_decay).map_err(SftError::Mlx)?;
+        let mut optimizer = self.loop_state.build_optimizer();
 
         let num_epochs = self.loop_state.config.training.num_epochs;
         let checkpoint_every = self.loop_state.config.checkpoint_every;

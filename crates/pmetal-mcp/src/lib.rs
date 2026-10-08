@@ -631,7 +631,11 @@ impl PmetalMcpServer {
         #[description("LR schedule: constant, cosine, linear, wsd")] lr_schedule: Option<String>,
         #[description("Evaluation dataset path (JSONL)")] eval_dataset: Option<String>,
         #[description("Linear warmup steps (default: 0)")] warmup_steps: Option<u64>,
-        #[description("AdamW weight decay (default: 0.01)")] weight_decay: Option<f64>,
+        #[description("Weight decay (default: 0.01)")] weight_decay: Option<f64>,
+        #[description(
+            "Optimizer: adamw, sgd, lion, adafactor (default: adamw). Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW"
+        )]
+        optimizer: Option<String>,
         #[description("Random seed (default: 42)")] seed: Option<u64>,
         #[description("Max gradient norm for clipping (default: 1.0)")] max_grad_norm: Option<f64>,
         #[description("Loss scaling factor for ANE training (default: 1.0)")] loss_scale: Option<
@@ -687,6 +691,7 @@ impl PmetalMcpServer {
             eval_dataset,
             warmup_steps: warmup_steps.unwrap_or(0) as usize,
             weight_decay: weight_decay.unwrap_or(pmetal_core::defaults::WEIGHT_DECAY),
+            optimizer: optimizer.unwrap_or_else(|| TrainSpec::default().optimizer),
             seed: seed.unwrap_or(pmetal_core::defaults::SEED),
             max_grad_norm: max_grad_norm.unwrap_or(pmetal_core::defaults::MAX_GRAD_NORM),
             loss_scale: loss_scale.unwrap_or(pmetal_core::defaults::LOSS_SCALE) as f32,
@@ -823,6 +828,10 @@ impl PmetalMcpServer {
         #[description("Softmax temperature (default: 2.0)")] temperature: Option<f64>,
         #[description("Hard/soft target blend 0.0-1.0 (default: 0.5)")] alpha: Option<f64>,
         #[description("Learning rate (default: 2e-5)")] learning_rate: Option<f64>,
+        #[description(
+            "Optimizer: adamw, sgd, lion, adafactor (default: adamw). Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW"
+        )]
+        optimizer: Option<String>,
         #[description("Number of epochs (default: 1)")] epochs: Option<u64>,
         #[description("Maximum sequence length (default: 1024)")] max_seq_len: Option<u64>,
         #[description("Loss: kl_divergence, jensen_shannon, soft_cross_entropy, mse")]
@@ -846,6 +855,7 @@ impl PmetalMcpServer {
             temperature: temperature.unwrap_or(2.0) as f32,
             alpha: alpha.unwrap_or(0.5) as f32,
             learning_rate: learning_rate.unwrap_or(2e-5) as f32,
+            optimizer: optimizer.unwrap_or_else(|| DistillSpec::default().optimizer),
             epochs: epochs.unwrap_or(1) as usize,
             max_seq_len: max_seq_len.unwrap_or(1024) as usize,
             loss_type: loss_type.unwrap_or_else(|| "kl_divergence".to_string()),
@@ -878,6 +888,10 @@ impl PmetalMcpServer {
         #[description("Generations per prompt (default: 8)")] num_generations: Option<u64>,
         #[description("KL penalty coefficient (default: 0.001)")] beta: Option<f64>,
         #[description("Learning rate (default: 5e-6)")] learning_rate: Option<f64>,
+        #[description(
+            "Optimizer: adamw, sgd, lion, adafactor (default: adamw). Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW"
+        )]
+        optimizer: Option<String>,
         #[description("Number of epochs (default: 1)")] epochs: Option<u64>,
         #[description("LoRA rank (default: 16)")] lora_r: Option<u64>,
         #[description("Enable reasoning-aware rewards")] reasoning_rewards: Option<bool>,
@@ -915,6 +929,7 @@ impl PmetalMcpServer {
             num_generations: num_generations.unwrap_or(8) as usize,
             beta: beta.unwrap_or(0.001),
             learning_rate: learning_rate.unwrap_or(5e-6),
+            optimizer: optimizer.unwrap_or_else(|| GrpoSpec::default().optimizer),
             epochs: epochs.unwrap_or(1) as usize,
             lora_r: lora_r.unwrap_or(16) as usize,
             lora_alpha: lora_alpha.unwrap_or(32.0) as f32,
@@ -1019,6 +1034,10 @@ impl PmetalMcpServer {
         #[description("KTO desirable weight (default: 1.0)")] desirable_weight: Option<f64>,
         #[description("KTO undesirable weight (default: 1.0)")] undesirable_weight: Option<f64>,
         #[description("Learning rate (default: 1e-5)")] learning_rate: Option<f64>,
+        #[description(
+            "Optimizer: adamw, sgd, lion, adafactor (default: adamw). Lion wants a 3-10x smaller learning rate and 3-10x larger weight decay than AdamW"
+        )]
+        optimizer: Option<String>,
         #[description("Micro-batch size (default: 2)")] batch_size: Option<u64>,
         #[description("Gradient accumulation steps (default: 8)")]
         gradient_accumulation_steps: Option<u64>,
@@ -1042,6 +1061,7 @@ impl PmetalMcpServer {
             desirable_weight: desirable_weight.map_or(d.desirable_weight, |v| v as f32),
             undesirable_weight: undesirable_weight.map_or(d.undesirable_weight, |v| v as f32),
             learning_rate: learning_rate.unwrap_or(d.learning_rate),
+            optimizer: optimizer.unwrap_or(d.optimizer.clone()),
             batch_size: batch_size.map_or(d.batch_size, |v| v as usize),
             gradient_accumulation_steps: gradient_accumulation_steps
                 .map_or(d.gradient_accumulation_steps, |v| v as usize),

@@ -1085,6 +1085,7 @@ pub async fn start_training(
     let state_arc = state.training_runs.clone();
     let event_tx = state.event_tx.clone();
     let cancel_flags = state.cancel_flags.clone();
+    let optimizer = pmetal::core::jobs::parse_optimizer(&spec.optimizer).map_err(AppError)?;
 
     // Write training_info.json before spawning so the adapter scanner can
     // find base_model + dataset even if training is still running.
@@ -1221,6 +1222,7 @@ pub async fn start_training(
                 max_seq_len: spec.max_seq_len,
                 gradient_accumulation_steps: spec.gradient_accumulation_steps,
                 weight_decay: spec.weight_decay,
+                optimizer,
                 max_grad_norm: spec.max_grad_norm,
                 warmup_steps: spec.warmup_steps,
                 logging_steps: 10,
@@ -3328,6 +3330,7 @@ async fn run_distillation_in_process(
     let training_loop_config = pmetal::trainer::TrainingLoopConfig {
         training: pmetal::core::TrainingConfig {
             learning_rate: spec.learning_rate as f64,
+            optimizer: pmetal::core::jobs::parse_optimizer(&spec.optimizer).map_err(AppError)?,
             batch_size: spec.batch_size,
             num_epochs: spec.epochs,
             max_seq_len,
@@ -3509,6 +3512,7 @@ async fn run_grpo_in_process(
     let output_dir = spec.output_dir.clone();
     let training_config = pmetal::core::TrainingConfig {
         learning_rate: spec.learning_rate,
+        optimizer: pmetal::core::jobs::parse_optimizer(&spec.optimizer).map_err(AppError)?,
         batch_size: 1,
         num_epochs: spec.epochs,
         max_seq_len,
@@ -3530,10 +3534,7 @@ async fn run_grpo_in_process(
     let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
 
-    let mut optimizer =
-        pmetal_bridge::compat::optimizers::AdamWBuilder::new(spec.learning_rate as f32)
-            .build()
-            .map_err(|e| AppError(e.to_string()))?;
+    let mut optimizer = pmetal::trainer::TrainOptimizer::from_config(&trainer.training_config);
     let mut ref_model =
         pmetal::models::DynamicModel::load(&model_path).map_err(|e| AppError(e.to_string()))?;
 
@@ -3545,9 +3546,7 @@ async fn run_grpo_in_process(
             &dataset,
             &rewards,
             &mut optimizer,
-            |opt, lr| {
-                opt.lr = pmetal_bridge::array!(lr);
-            },
+            |opt, lr| opt.set_lr(lr),
         )
         .map_err(|e| AppError(e.to_string()))?;
 

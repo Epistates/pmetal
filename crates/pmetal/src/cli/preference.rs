@@ -75,9 +75,14 @@ pub struct PreferenceArgs {
     #[arg(long = "max-grad-norm", default_value = "1.0")]
     pub max_grad_norm: f64,
 
-    /// AdamW weight decay.
+    /// Weight decay.
     #[arg(long = "weight-decay", default_value = "0.0")]
     pub weight_decay: f64,
+
+    /// Optimizer: adamw, sgd, lion or adafactor. Lion wants a 3-10x smaller
+    /// learning rate and 3-10x larger weight decay than AdamW.
+    #[arg(long = "optimizer", default_value = "adamw")]
+    pub optimizer: pmetal_core::OptimizerType,
 
     /// LoRA rank.
     #[arg(long = "lora-r", default_value = "16")]
@@ -124,6 +129,7 @@ impl From<PreferenceArgs> for PreferenceSpec {
             warmup_ratio: a.warmup_ratio,
             max_grad_norm: a.max_grad_norm,
             weight_decay: a.weight_decay,
+            optimizer: a.optimizer.to_string(),
             lora_r: a.lora_r,
             lora_alpha: a.lora_alpha,
             max_prompt_length: a.max_prompt_length,

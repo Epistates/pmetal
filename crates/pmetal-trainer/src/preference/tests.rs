@@ -72,7 +72,7 @@ fn adamw(lr: f64) -> AdamW {
 }
 
 fn set_lr(opt: &mut AdamW, lr: f32) {
-    opt.lr = pmetal_bridge::array!(lr);
+    opt.set_lr(lr);
 }
 
 #[test]

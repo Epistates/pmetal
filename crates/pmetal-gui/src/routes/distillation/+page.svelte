@@ -1,6 +1,7 @@
 <script lang="ts">
   import { modelsStore, distillationStore } from '$lib/stores.svelte';
-  import type { DistillSpec, DistillationRun } from '$lib/api';
+  import type { DistillSpec, DistillationRun, OptimizerName } from '$lib/api';
+  import { OPTIMIZERS, OPTIMIZER_HINT } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   const lossTypes = [
@@ -20,6 +21,7 @@
   let alpha = $state(0.5);
   let epochs = $state(3);
   let learningRate = $state(0.0001);
+  let optimizer = $state<OptimizerName>('adamw');
   let batchSize = $state(1);
   let loraRank = $state(16);
   let loraAlpha = $state(32);
@@ -57,6 +59,7 @@
         alpha,
         epochs,
         learning_rate: learningRate,
+        optimizer,
         batch_size: batchSize,
         lora_r: loraRank,
         lora_alpha: loraAlpha,
@@ -214,6 +217,15 @@
               <div>
                 <label class="label" for="distill-lr">Learning Rate</label>
                 <input id="distill-lr" type="number" class="input" step="0.00001" bind:value={learningRate} />
+              </div>
+              <div>
+                <label class="label" for="distill-optimizer">Optimizer</label>
+                <select id="distill-optimizer" class="input" bind:value={optimizer}>
+                  {#each OPTIMIZERS as opt}
+                    <option value={opt}>{opt}</option>
+                  {/each}
+                </select>
+                <p class="text-xs text-surface-400 mt-0.5">{OPTIMIZER_HINT}</p>
               </div>
               <div>
                 <label class="label" for="distill-batch">Batch Size</label>

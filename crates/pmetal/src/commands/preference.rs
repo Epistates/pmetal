@@ -2,13 +2,12 @@
 
 use std::path::PathBuf;
 
-use pmetal_bridge::compat::optimizers::{AdamW, AdamWBuilder};
 use pmetal_core::jobs::PreferenceSpec;
 use pmetal_core::{LoraConfig, TrainingCallback, TrainingConfig};
 use pmetal_data::Tokenizer;
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
 use pmetal_trainer::preference::{self, KtoConfig, PreferenceLoss, PreferenceStepMetrics};
-use pmetal_trainer::{KtoTrainer, PreferenceTrainer};
+use pmetal_trainer::{KtoTrainer, PreferenceTrainer, TrainOptimizer};
 
 /// The objective a spec names.
 enum Objective {
@@ -36,6 +35,27 @@ fn objective(spec: &PreferenceSpec) -> anyhow::Result<Objective> {
             undesirable_weight: spec.undesirable_weight,
         }),
         other => anyhow::bail!("unknown --loss '{other}'"),
+    })
+}
+
+/// The trainer settings a spec describes.
+fn training_config(spec: &PreferenceSpec) -> anyhow::Result<TrainingConfig> {
+    Ok(TrainingConfig {
+        learning_rate: spec.learning_rate,
+        batch_size: spec.batch_size,
+        gradient_accumulation_steps: spec.gradient_accumulation_steps,
+        num_epochs: spec.epochs,
+        max_steps: spec.max_steps,
+        warmup_ratio: Some(spec.warmup_ratio),
+        weight_decay: spec.weight_decay,
+        optimizer: pmetal_core::jobs::parse_optimizer(&spec.optimizer)
+            .map_err(|e| anyhow::anyhow!(e))?,
+        max_grad_norm: spec.max_grad_norm,
+        seed: spec.seed,
+        logging_steps: 1,
+        output_dir: spec.output_dir.clone(),
+        max_seq_len: spec.max_length,
+        ..Default::default()
     })
 }
 
@@ -81,21 +101,7 @@ pub(crate) async fn run_preference(
     tracing::info!("Loading {} with LoRA r={}", spec.model, spec.lora_r);
     let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())?;
 
-    let training = TrainingConfig {
-        learning_rate: spec.learning_rate,
-        batch_size: spec.batch_size,
-        gradient_accumulation_steps: spec.gradient_accumulation_steps,
-        num_epochs: spec.epochs,
-        max_steps: spec.max_steps,
-        warmup_ratio: Some(spec.warmup_ratio),
-        weight_decay: spec.weight_decay,
-        max_grad_norm: spec.max_grad_norm,
-        seed: spec.seed,
-        logging_steps: 1,
-        output_dir: spec.output_dir.clone(),
-        max_seq_len: spec.max_length,
-        ..Default::default()
-    };
+    let training = training_config(&spec)?;
 
     let mut callbacks = extra_callbacks;
     if let Some(metrics_path) = &spec.log_metrics {
@@ -111,11 +117,8 @@ pub(crate) async fn run_preference(
         ));
     }
 
-    let mut optimizer: AdamW = AdamWBuilder::new(spec.learning_rate as f32)
-        .weight_decay(spec.weight_decay as f32)
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to build optimizer: {e}"))?;
-    let set_lr = |opt: &mut AdamW, lr: f32| opt.lr = pmetal_bridge::array!(lr);
+    let mut optimizer = TrainOptimizer::from_config(&training);
+    let set_lr = |opt: &mut TrainOptimizer, lr: f32| opt.set_lr(lr);
 
     let history: Vec<PreferenceStepMetrics> = match objective {
         Objective::Paired(loss) => {
@@ -180,4 +183,22 @@ pub(crate) async fn run_preference(
         println!("LoRA adapter saved to {}", weights.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_spec_optimizer_is_the_one_the_trainer_gets() {
+        for kind in pmetal_core::OptimizerType::ALL {
+            let spec = PreferenceSpec {
+                optimizer: kind.to_string(),
+                ..Default::default()
+            };
+            let training = training_config(&spec).unwrap();
+            assert_eq!(training.optimizer, kind);
+            assert_eq!(TrainOptimizer::from_config(&training).kind(), kind);
+        }
+    }
 }

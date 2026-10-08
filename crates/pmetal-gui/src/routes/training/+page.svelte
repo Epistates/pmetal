@@ -2,8 +2,8 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { modelsStore, trainingStore } from '$lib/stores.svelte';
-  import type { TrainSpec, TrainingRun, CachedDatasetInfo, TrainedAdapter } from '$lib/api';
-  import { fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns, getModelDefaults } from '$lib/api';
+  import type { TrainSpec, TrainingRun, CachedDatasetInfo, TrainedAdapter, OptimizerName } from '$lib/api';
+  import { OPTIMIZERS, OPTIMIZER_HINT, fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns, getModelDefaults } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   let cachedDatasets = $state<CachedDatasetInfo[]>([]);
@@ -50,6 +50,7 @@
   let maxSeqLen = $state(2048);
   let warmupSteps = $state(100);
   let weightDecay = $state(0.01);
+  let optimizer = $state<OptimizerName>('adamw');
   let maxGradNorm = $state(1.0);
   let lrScheduler = $state('cosine');
   let saveSteps = $state(500);
@@ -281,6 +282,7 @@
         no_adaptive_lr: noAdaptiveLr,
         warmup_steps: warmupSteps,
         weight_decay: weightDecay,
+        optimizer,
         max_grad_norm: maxGradNorm,
         lr_schedule: lrScheduler,
         no_sequence_packing: !sequencePacking,
@@ -917,7 +919,16 @@
                 <div>
                   <label class="label" for="weight-decay">Weight Decay</label>
                   <input id="weight-decay" type="number" class="input" step="0.001" bind:value={weightDecay} />
-                  <p class="text-xs text-surface-400 mt-0.5">L2 regularization. 0.01 standard.</p>
+                  <p class="text-xs text-surface-400 mt-0.5">0.01 standard for AdamW.</p>
+                </div>
+                <div>
+                  <label class="label" for="optimizer">Optimizer</label>
+                  <select id="optimizer" class="input" bind:value={optimizer}>
+                    {#each OPTIMIZERS as opt}
+                      <option value={opt}>{opt}</option>
+                    {/each}
+                  </select>
+                  <p class="text-xs text-surface-400 mt-0.5">{OPTIMIZER_HINT}</p>
                 </div>
                 <div>
                   <label class="label" for="max-grad-norm">Max Grad Norm</label>
