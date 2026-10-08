@@ -243,16 +243,6 @@ pub struct InferSpec {
     pub ane_max_seq_len: usize,
 
     #[job(
-        label = "ANE Real-Time",
-        group = "Compute",
-        argv = "--ane-real-time",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub ane_real_time: bool,
-
-    #[job(
         label = "Benchmark",
         group = "Benchmark",
         argv = "--benchmark",
@@ -400,7 +390,6 @@ impl Default for InferSpec {
             experts_dir: None,
             ane: false,
             ane_max_seq_len: default_ane_max_seq_len(),
-            ane_real_time: false,
             benchmark: false,
             benchmark_iters: default_benchmark_iters(),
             benchmark_prompt_tokens: None,

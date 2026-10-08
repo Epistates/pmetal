@@ -69,11 +69,10 @@ Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked vi
 PMetal's ANE pipeline:
 
 - **Dynamic Weight Pipeline**: 9 MIL kernels compiled once at startup
-- **Hybrid Inference**: ANE prefill + CPU decode with KV cache
+- **Inference**: the whole model on the ANE, several layers per program over a KV cache held in IOSurfaces, int8 weights by default
 - **Power-of-2 bucketing**: Optimal kernel compilation for sequence lengths
 - **CPU RMSNorm**: f32 computation on CPU to avoid fp16 ANE overflow
 - **IOSurface Zero-Copy**: Shared memory surfaces for CPU-ANE transfer
-- **Experimental RT Eval**: `infer` / `serve` support `--ane-real-time`, but PMetal still falls back to standard ANE if the private real-time path rejects the request on the current OS/framework; on the local M4 Max, both the tiny-kernel check and the generated SDPA forward probe still hit `ANEProgramProcessRequestDirect() ... Program Inference error` on 2026-03-23
 - **M1–M5 Compatibility**: Per-matrix blobs for M1, single-blob for M3+
 
 ## See Also

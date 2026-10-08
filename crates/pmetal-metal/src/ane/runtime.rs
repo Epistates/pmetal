@@ -7,17 +7,14 @@
 //! - `_ANEInMemoryModel`
 //! - `_ANERequest`
 //! - `_ANEIOSurfaceObject`
-//! - `_ANEClient` (optional real-time / chaining entry point)
+//! - `_ANEPerformanceStats` (optional hardware timing)
 //!
 //! The framework is loaded at runtime via `dlopen` (not linked at build time).
 //! Classes are resolved via `NSClassFromString`. Returns `AneNotAvailable`
 //! gracefully if the framework is missing.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicBool, AtomicPtr, Ordering},
-};
+use std::sync::OnceLock;
 
 use objc2::runtime::{AnyClass, AnyObject, Bool};
 use objc2::{
@@ -69,12 +66,6 @@ pub struct AneRuntime {
     request_class: &'static AnyClass,
     /// `_ANEIOSurfaceObject`
     io_surface_class: &'static AnyClass,
-    /// `_ANEClient` — optional real-time / chaining entry point.
-    client_class: Option<&'static AnyClass>,
-    /// `_ANEChainingRequest` — resolved when available, None if unavailable.
-    /// PMetal can prepare experimental loopback requests, but stable execution
-    /// semantics remain unproven on current hardware.
-    chaining_class: Option<&'static AnyClass>,
     /// `_ANEPerformanceStats` — hardware execution time counters.
     /// Available on all Apple Silicon; populated after eval when perfStatsMask is set.
     perf_stats_class: Option<&'static AnyClass>,
@@ -110,20 +101,6 @@ impl AneRuntime {
         let model_class = resolve_class(c"_ANEInMemoryModel")?;
         let request_class = resolve_class(c"_ANERequest")?;
         let io_surface_class = resolve_class(c"_ANEIOSurfaceObject")?;
-        let client_class = AnyClass::get(c"_ANEClient");
-        if client_class.is_some() {
-            tracing::debug!("ANE client API (_ANEClient) detected");
-        }
-
-        // Probe for chaining API (M4/M5 only, experimental preparation only)
-        let chaining_class = AnyClass::get(c"_ANEChainingRequest");
-        if chaining_class.is_some() {
-            tracing::info!(
-                "ANE chaining API (_ANEChainingRequest) detected — experimental loopback request preparation available"
-            );
-        } else {
-            tracing::debug!("ANE chaining API not available on this hardware");
-        }
 
         // Probe for performance stats API
         let perf_stats_class = AnyClass::get(c"_ANEPerformanceStats");
@@ -136,8 +113,6 @@ impl AneRuntime {
             model_class,
             request_class,
             io_surface_class,
-            client_class,
-            chaining_class,
             perf_stats_class,
         })
     }
@@ -239,15 +214,8 @@ impl AneRuntime {
             // Retain the model object
             let _: *mut AnyObject = msg_send![model, retain];
 
-            let inner_model: *mut AnyObject = msg_send![model, model];
-            let real_time_model = if inner_model.is_null() {
-                model
-            } else {
-                let _: *mut AnyObject = msg_send![inner_model, retain];
-                inner_model
-            };
-
             // Only the inner model: see read_io_layouts.
+            let inner_model: *mut AnyObject = msg_send![model, model];
             let (input_layouts, output_layouts) = if inner_model.is_null() {
                 (Vec::new(), Vec::new())
             } else {
@@ -259,32 +227,6 @@ impl AneRuntime {
                 "ANE kernel I/O layouts"
             );
 
-            // On macOS 27, _ANEClient's load for real-time evaluation fails
-            // with no error detail, for the inner model and the wrapper alike,
-            // while standard dispatch works. Report it unavailable there.
-            let real_time = if self.client_class.is_some() && !macos_27_or_later() {
-                let client: *mut AnyObject = if let Some(client_class) = self.client_class {
-                    let private_client: *mut AnyObject =
-                        msg_send![client_class, sharedPrivateConnection];
-                    if private_client.is_null() {
-                        msg_send![model, sharedConnection]
-                    } else {
-                        private_client
-                    }
-                } else {
-                    std::ptr::null_mut()
-                };
-                if client.is_null() {
-                    tracing::debug!("ANE sharedConnection returned null; real-time eval disabled");
-                    None
-                } else {
-                    let _: *mut AnyObject = msg_send![client, retain];
-                    Some(AneRealTimeState::new(client))
-                }
-            } else {
-                None
-            };
-
             // The descriptor holds a copy of every weight, about as much
             // memory again as the loaded program. A loaded model evaluates,
             // unloads and reloads without it.
@@ -292,12 +234,8 @@ impl AneRuntime {
 
             Ok(AneModel {
                 model,
-                real_time_model,
                 request_class: self.request_class,
                 io_surface_class: self.io_surface_class,
-                real_time,
-                standard_loaded: AtomicBool::new(true),
-                standard_load_lock: Mutex::new(()),
                 input_layouts,
                 output_layouts,
                 staging: Mutex::new(Staging::default()),
@@ -316,22 +254,9 @@ impl AneRuntime {
         self.request_class
     }
 
-    /// Check if the ANE chaining API is available (M4/M5 hardware).
-    ///
-    /// Returns `Some` if `_ANEChainingRequest` was resolved. No working
-    /// invocation pattern exists yet — this is telemetry for future research.
-    pub fn chaining_available(&self) -> bool {
-        self.chaining_class.is_some()
-    }
-
     /// Check if ANE performance stats can be requested on this system.
     pub fn perf_stats_available(&self) -> bool {
         self.perf_stats_class.is_some() && perf_stats_request_supported()
-    }
-
-    /// Check if the ANE real-time evaluation API is available.
-    pub fn real_time_available(&self) -> bool {
-        self.client_class.is_some()
     }
 }
 
@@ -342,255 +267,13 @@ pub struct AnePerformanceStats {
     pub hw_execution_time_ns: u64,
 }
 
-/// ANE evaluation mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AneEvaluationMode {
-    /// Use `_ANEInMemoryModel evaluateWithQoS:...`.
-    Standard,
-    /// Use `_ANEClient evaluateRealTimeWithModel:...`.
-    RealTime,
-}
-
-/// Experimental loopback chaining configuration for `_ANEChainingRequest`.
-///
-/// The private framework exposes symbol-index-based loopback wiring, but the
-/// exact semantics are still under active reverse-engineering. Keep this out of
-/// user-facing hot paths until it has real hardware validation.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AneLoopbackChainConfig {
-    /// Loopback input symbol index for the chained stage.
-    pub loopback_input_symbol_index: usize,
-    /// Loopback output symbol index from the previous stage.
-    pub loopback_output_symbol_index: usize,
-    /// Procedure index within the compiled model (usually 0).
-    pub procedure_index: usize,
-    /// Optional firmware enqueue delay hint.
-    pub fw_enqueue_delay: Option<usize>,
-    /// Optional ANE memory-pool identifier.
-    pub memory_pool_id: Option<usize>,
-}
-
-impl AneLoopbackChainConfig {
-    fn validate(&self, inputs: &[*mut c_void], output_sets: &[&[*mut c_void]]) -> Result<()> {
-        if inputs.is_empty() {
-            return Err(MetalError::InvalidConfig(
-                "ANE chaining requires at least one input surface".into(),
-            ));
-        }
-        if output_sets.is_empty() {
-            return Err(MetalError::InvalidConfig(
-                "ANE chaining requires at least one output set".into(),
-            ));
-        }
-        for (set_idx, output_set) in output_sets.iter().enumerate() {
-            if output_set.is_empty() {
-                return Err(MetalError::InvalidConfig(format!(
-                    "ANE chaining output set {set_idx} must not be empty"
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Prepared experimental loopback chaining request.
-///
-/// This currently only proves that PMetal can construct and submit the private
-/// chaining request to `_ANEClient`. It does not yet expose a public execution
-/// API because the end-to-end invocation pattern is still unproven.
-pub struct AnePreparedLoopbackChain {
-    client: *mut AnyObject,
-    prepared_model: *mut AnyObject,
-    used_inner_model: bool,
-    chain_request: *mut AnyObject,
-    _inputs: objc2::rc::Retained<NSArray<AnyObject>>,
-    _output_sets: objc2::rc::Retained<NSArray<AnyObject>>,
-    _owned_output_sets: Vec<objc2::rc::Retained<NSArray<AnyObject>>>,
-}
-
-// SAFETY: The prepared chain only stores retained ObjC objects; submission is
-// still serialized through the private framework.
-unsafe impl Send for AnePreparedLoopbackChain {}
-unsafe impl Sync for AnePreparedLoopbackChain {}
-
-impl AnePreparedLoopbackChain {
-    /// Re-run the framework's internal validation on the prepared request.
-    pub fn is_valid(&self) -> bool {
-        unsafe {
-            let valid: Bool = msg_send![self.chain_request, validate];
-            valid.as_bool()
-        }
-    }
-
-    /// Human-readable description from the private framework object.
-    pub fn description(&self) -> String {
-        unsafe {
-            let desc: *const AnyObject = msg_send![self.chain_request, description];
-            ns_string_to_rust(desc)
-        }
-    }
-
-    /// Whether the preparation used the inner compiled model object rather than
-    /// the outer `_ANEInMemoryModel` wrapper.
-    pub fn uses_inner_model(&self) -> bool {
-        self.used_inner_model
-    }
-}
-
-impl Drop for AnePreparedLoopbackChain {
-    fn drop(&mut self) {
-        unsafe {
-            let _: () = msg_send![self.chain_request, release];
-            let _: () = msg_send![self.prepared_model, release];
-            let _: () = msg_send![self.client, release];
-        }
-    }
-}
-
-struct AneRealTimeState {
-    client: *mut AnyObject,
-    loaded_model: AtomicPtr<AnyObject>,
-    load_lock: Mutex<()>,
-}
-
-// SAFETY: `_ANEClient` is a process-global ObjC object. We serialize
-// load/unload transitions with `load_lock`; evaluation itself is handled by the
-// framework.
-unsafe impl Send for AneRealTimeState {}
-unsafe impl Sync for AneRealTimeState {}
-
-impl AneRealTimeState {
-    fn new(client: *mut AnyObject) -> Self {
-        Self {
-            client,
-            loaded_model: AtomicPtr::new(std::ptr::null_mut()),
-            load_lock: Mutex::new(()),
-        }
-    }
-
-    fn ensure_loaded(&self, model: *mut AnyObject) -> Result<()> {
-        if self.loaded_model.load(Ordering::Acquire) == model {
-            return Ok(());
-        }
-
-        let _guard = self.load_lock.lock();
-        let current = self.loaded_model.load(Ordering::Acquire);
-        if current == model {
-            return Ok(());
-        }
-        if !current.is_null() {
-            self.unload_locked(current);
-        }
-
-        unsafe {
-            let mut error: *mut NSError = std::ptr::null_mut();
-            let empty_dict = empty_options_dict();
-            let ok: Bool = msg_send![
-                self.client,
-                loadRealTimeModel: model,
-                options: &*empty_dict,
-                qos: ANE_QOS,
-                error: &mut error
-            ];
-            if !ok.as_bool() {
-                return Err(MetalError::AneLoadFailed(error_message(error)));
-            }
-        }
-
-        self.loaded_model.store(model, Ordering::Release);
-        Ok(())
-    }
-
-    fn evaluate(&self, model: *mut AnyObject, request: *mut AnyObject) -> Result<()> {
-        self.ensure_loaded(model)?;
-
-        unsafe {
-            let mut error: *mut NSError = std::ptr::null_mut();
-            let mapped: Bool = msg_send![
-                self.client,
-                mapIOSurfacesWithModel: model,
-                request: request,
-                cacheInference: Bool::NO,
-                error: &mut error
-            ];
-            if !mapped.as_bool() {
-                return Err(MetalError::AneEvalFailed(error_message(error)));
-            }
-
-            let began: Bool = msg_send![self.client, beginRealTimeTask];
-            if !began.as_bool() {
-                let _: () =
-                    msg_send![self.client, unmapIOSurfacesWithModel: model, request: request];
-                return Err(MetalError::AneEvalFailed(
-                    "beginRealTimeTask returned false".into(),
-                ));
-            }
-
-            error = std::ptr::null_mut();
-            let empty_dict = empty_options_dict();
-            let ok: Bool = msg_send![
-                self.client,
-                evaluateRealTimeWithModel: model,
-                options: &*empty_dict,
-                request: request,
-                error: &mut error
-            ];
-
-            let _: Bool = msg_send![self.client, endRealTimeTask];
-            let _: () = msg_send![self.client, unmapIOSurfacesWithModel: model, request: request];
-
-            if !ok.as_bool() {
-                return Err(MetalError::AneEvalFailed(error_message(error)));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn unload_if_loaded(&self) {
-        let current = self.loaded_model.load(Ordering::Acquire);
-        if current.is_null() {
-            return;
-        }
-
-        let _guard = self.load_lock.lock();
-        let current = self.loaded_model.load(Ordering::Acquire);
-        if current.is_null() {
-            return;
-        }
-
-        self.unload_locked(current);
-    }
-
-    fn unload_locked(&self, model: *mut AnyObject) {
-        unsafe {
-            let mut error: *mut NSError = std::ptr::null_mut();
-            let empty_dict = empty_options_dict();
-            let _: Bool = msg_send![
-                self.client,
-                unloadRealTimeModel: model,
-                options: &*empty_dict,
-                qos: ANE_QOS,
-                error: &mut error
-            ];
-        }
-
-        self.loaded_model
-            .store(std::ptr::null_mut(), Ordering::Release);
-    }
-}
-
 /// A compiled ANE model ready for evaluation.
 ///
 /// Implements `Drop` for RAII: unloads from ANE hardware.
 pub struct AneModel {
     model: *mut AnyObject,
-    real_time_model: *mut AnyObject,
     request_class: &'static AnyClass,
     io_surface_class: &'static AnyClass,
-    real_time: Option<AneRealTimeState>,
-    standard_loaded: AtomicBool,
-    standard_load_lock: Mutex<()>,
     input_layouts: Vec<AneTensorLayout>,
     output_layouts: Vec<AneTensorLayout>,
     /// Surfaces laid out the model's way, for callers' packed ones whose
@@ -627,196 +310,11 @@ impl AneModel {
         self.from_cache
     }
 
-    /// Returns true when the real-time evaluation path is available for this model.
-    pub fn real_time_available(&self) -> bool {
-        self.real_time.is_some()
-    }
-
-    /// Returns true when the private chaining API is available.
-    pub fn chaining_available(&self) -> bool {
-        AneRuntime::global()
-            .map(|rt| rt.chaining_available() && self.real_time.is_some())
-            .unwrap_or(false)
-    }
-
-    /// Prepare an experimental loopback chaining request.
-    ///
-    /// This validates and submits `_ANEChainingRequest` to `_ANEClient` but
-    /// does not yet expose an execution API; the private runtime interaction is
-    /// still under active reverse-engineering.
-    pub fn prepare_loopback_chain(
-        &self,
-        inputs: &[*mut c_void],
-        output_sets: &[&[*mut c_void]],
-        config: &AneLoopbackChainConfig,
-    ) -> Result<AnePreparedLoopbackChain> {
-        config.validate(inputs, output_sets)?;
-
-        let rt = AneRuntime::global()?;
-        let chaining_class = rt.chaining_class.ok_or(MetalError::AneNotAvailable)?;
-        let client_state = self.real_time.as_ref().ok_or(MetalError::AneNotAvailable)?;
-
-        self.ensure_standard_loaded()?;
-
-        unsafe {
-            let ns_inputs = wrap_iosurface_array(self.io_surface_class, inputs);
-            let (ns_output_sets, owned_output_sets) =
-                wrap_iosurface_output_sets(self.io_surface_class, output_sets);
-
-            let lb_input = NSNumber::new_usize(config.loopback_input_symbol_index);
-            let lb_output = NSNumber::new_usize(config.loopback_output_symbol_index);
-            let procedure_index = NSNumber::new_usize(config.procedure_index);
-            let signal_events = NSArray::<AnyObject>::new();
-            let fw_enqueue_delay = config.fw_enqueue_delay.map(NSNumber::new_usize);
-            let memory_pool_id = config.memory_pool_id.map(NSNumber::new_usize);
-
-            let chain_alloc: *mut AnyObject = msg_send![chaining_class, alloc];
-            if chain_alloc.is_null() {
-                return Err(MetalError::AneChainingFailed(
-                    "failed to allocate _ANEChainingRequest".into(),
-                ));
-            }
-
-            let chain_request: *mut AnyObject = msg_send![
-                chain_alloc,
-                initWithInputs: &*ns_inputs,
-                outputs: &*ns_output_sets,
-                lbInputSymbolId: &*lb_input,
-                lbOutputSymbolId: &*lb_output,
-                procedureIndex: &*procedure_index,
-                signalEvents: &*signal_events,
-                transactionHandle: std::ptr::null::<AnyObject>(),
-                fwEnqueueDelay: optional_number_ptr(fw_enqueue_delay.as_ref()),
-                memoryPoolId: optional_number_ptr(memory_pool_id.as_ref())
-            ];
-
-            if chain_request.is_null() {
-                return Err(MetalError::AneChainingFailed(
-                    "_ANEChainingRequest init returned null".into(),
-                ));
-            }
-
-            let valid: Bool = msg_send![chain_request, validate];
-            if !valid.as_bool() {
-                let desc: *const AnyObject = msg_send![chain_request, description];
-                let description = ns_string_to_rust(desc);
-                let _: () = msg_send![chain_request, release];
-                return Err(MetalError::AneChainingFailed(format!(
-                    "loopback chain request validation failed: {description}"
-                )));
-            }
-
-            let (prepared_model, used_inner_model) = match self.prepare_chaining_request(
-                client_state.client,
-                self.real_time_model,
-                chain_request,
-            ) {
-                Ok(()) => (self.real_time_model, self.real_time_model != self.model),
-                Err(primary_err)
-                    if self.real_time_model != self.model && client_can_load(self.model) =>
-                {
-                    tracing::debug!(
-                        error = %primary_err,
-                        "ANE chaining preparation failed with the inner model; retrying with the in-memory wrapper"
-                    );
-                    match self.prepare_chaining_request(
-                        client_state.client,
-                        self.model,
-                        chain_request,
-                    ) {
-                        Ok(()) => (self.model, false),
-                        Err(_) => {
-                            let _: () = msg_send![chain_request, release];
-                            return Err(primary_err);
-                        }
-                    }
-                }
-                Err(err) => {
-                    let _: () = msg_send![chain_request, release];
-                    return Err(err);
-                }
-            };
-
-            let _: *mut AnyObject = msg_send![client_state.client, retain];
-            let _: *mut AnyObject = msg_send![prepared_model, retain];
-
-            Ok(AnePreparedLoopbackChain {
-                client: client_state.client,
-                prepared_model,
-                used_inner_model,
-                chain_request,
-                _inputs: ns_inputs,
-                _output_sets: ns_output_sets,
-                _owned_output_sets: owned_output_sets,
-            })
-        }
-    }
-
-    fn ensure_standard_loaded(&self) -> Result<()> {
-        if self.standard_loaded.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        let _guard = self.standard_load_lock.lock();
-        if self.standard_loaded.load(Ordering::Acquire) {
-            return Ok(());
-        }
-
-        unsafe { load_model(self.model)? };
-
-        self.standard_loaded.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    unsafe fn prepare_chaining_request(
-        &self,
-        client: *mut AnyObject,
-        model: *mut AnyObject,
-        chain_request: *mut AnyObject,
-    ) -> Result<()> {
-        let mut error: *mut NSError = std::ptr::null_mut();
-        let empty_dict = empty_options_dict();
-        let ok: Bool = msg_send![
-            client,
-            prepareChainingWithModel: model,
-            options: &*empty_dict,
-            chainingReq: chain_request,
-            qos: ANE_QOS,
-            error: &mut error
-        ];
-
-        if !ok.as_bool() {
-            return Err(MetalError::AneChainingFailed(unsafe {
-                error_message(error)
-            }));
-        }
-
-        Ok(())
-    }
-
-    fn unload_standard_if_loaded(&self) {
-        if !self.standard_loaded.load(Ordering::Acquire) {
-            return;
-        }
-
-        let _guard = self.standard_load_lock.lock();
-        if !self.standard_loaded.load(Ordering::Acquire) {
-            return;
-        }
-
-        unsafe {
-            let mut error: *mut NSError = std::ptr::null_mut();
-            let _: Bool = msg_send![self.model, unloadWithQoS: ANE_QOS, error: &mut error];
-        }
-        self.standard_loaded.store(false, Ordering::Release);
-    }
-
     /// Build a request and evaluate the model.
     ///
     /// `inputs` and `outputs` are IOSurface references for data transfer.
     pub fn evaluate(&self, inputs: &[*mut c_void], outputs: &[*mut c_void]) -> Result<()> {
-        self.evaluate_inner(inputs, outputs, AneEvaluationMode::Standard, false)
-            .map(|_| ())
+        self.evaluate_inner(inputs, outputs, false).map(|_| ())
     }
 
     /// Evaluate the model and collect hardware performance stats.
@@ -829,26 +327,7 @@ impl AneModel {
         inputs: &[*mut c_void],
         outputs: &[*mut c_void],
     ) -> Result<AnePerformanceStats> {
-        self.evaluate_inner(inputs, outputs, AneEvaluationMode::Standard, true)
-    }
-
-    /// Evaluate the model using the experimental ANE real-time path.
-    pub fn evaluate_real_time(
-        &self,
-        inputs: &[*mut c_void],
-        outputs: &[*mut c_void],
-    ) -> Result<()> {
-        self.evaluate_inner(inputs, outputs, AneEvaluationMode::RealTime, false)
-            .map(|_| ())
-    }
-
-    /// Evaluate the model using the experimental ANE real-time path and collect stats.
-    pub fn evaluate_real_time_with_stats(
-        &self,
-        inputs: &[*mut c_void],
-        outputs: &[*mut c_void],
-    ) -> Result<AnePerformanceStats> {
-        self.evaluate_inner(inputs, outputs, AneEvaluationMode::RealTime, true)
+        self.evaluate_inner(inputs, outputs, true)
     }
 
     /// Evaluate, restriding any packed surface the model expects padded:
@@ -859,7 +338,6 @@ impl AneModel {
         &self,
         inputs: &[*mut c_void],
         outputs: &[*mut c_void],
-        mode: AneEvaluationMode,
         collect_stats: bool,
     ) -> Result<AnePerformanceStats> {
         let mut staging = self.staging.lock();
@@ -871,7 +349,7 @@ impl AneModel {
         }
         check_surface_sizes("input", &ins.surfaces, &self.input_layouts)?;
         check_surface_sizes("output", &outs.surfaces, &self.output_layouts)?;
-        let stats = self.evaluate_raw(&ins.surfaces, &outs.surfaces, mode, collect_stats)?;
+        let stats = self.evaluate_raw(&ins.surfaces, &outs.surfaces, collect_stats)?;
         for (i, layout, surface) in &outs.restrided {
             unsafe { restride(*surface, outputs[*i], layout, Direction::FromModel) };
         }
@@ -882,7 +360,6 @@ impl AneModel {
         &self,
         inputs: &[*mut c_void],
         outputs: &[*mut c_void],
-        mode: AneEvaluationMode,
         collect_stats: bool,
     ) -> Result<AnePerformanceStats> {
         unsafe {
@@ -892,7 +369,7 @@ impl AneModel {
                     .perf_stats_class
                     .filter(|_| perf_stats_request_supported())
                 else {
-                    self.evaluate_raw(inputs, outputs, mode, false)?;
+                    self.evaluate_raw(inputs, outputs, false)?;
                     return Ok(AnePerformanceStats::default());
                 };
 
@@ -902,7 +379,7 @@ impl AneModel {
                     statsWithHardwareExecutionNS: &*zero
                 ];
                 if perf_stats.is_null() {
-                    self.evaluate_raw(inputs, outputs, mode, false)?;
+                    self.evaluate_raw(inputs, outputs, false)?;
                     return Ok(AnePerformanceStats::default());
                 }
                 perf_stats
@@ -911,10 +388,7 @@ impl AneModel {
             };
 
             let request = self.build_request(inputs, outputs, perf_stats);
-            match mode {
-                AneEvaluationMode::Standard => self.evaluate_request_standard(request)?,
-                AneEvaluationMode::RealTime => self.evaluate_request_real_time(request)?,
-            }
+            self.evaluate_request(request)?;
 
             let hw_time = if perf_stats.is_null() {
                 0
@@ -974,9 +448,7 @@ impl AneModel {
         ]
     }
 
-    unsafe fn evaluate_request_standard(&self, request: *mut AnyObject) -> Result<()> {
-        self.ensure_standard_loaded()?;
-
+    unsafe fn evaluate_request(&self, request: *mut AnyObject) -> Result<()> {
         let mut error: *mut NSError = std::ptr::null_mut();
         let empty_dict = empty_options_dict();
         let ok: Bool = msg_send![
@@ -993,49 +465,15 @@ impl AneModel {
 
         Ok(())
     }
-
-    unsafe fn evaluate_request_real_time(&self, request: *mut AnyObject) -> Result<()> {
-        let real_time = self.real_time.as_ref().ok_or(MetalError::AneNotAvailable)?;
-        self.unload_standard_if_loaded();
-        match real_time.evaluate(self.real_time_model, request) {
-            Ok(()) => Ok(()),
-            Err(primary_err)
-                if self.real_time_model != self.model && unsafe { client_can_load(self.model) } =>
-            {
-                real_time.unload_if_loaded();
-                tracing::debug!(
-                    error = %primary_err,
-                    "ANE real-time evaluation failed with the inner model; retrying with the in-memory wrapper"
-                );
-                match real_time.evaluate(self.model, request) {
-                    Ok(()) => Ok(()),
-                    Err(_) => Err(primary_err),
-                }
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    /// Unload the model from ANE hardware.
-    fn unload(&self) {
-        self.unload_standard_if_loaded();
-    }
 }
 
 impl Drop for AneModel {
+    /// Unload the model from ANE hardware and release it.
     fn drop(&mut self) {
-        if let Some(real_time) = &self.real_time {
-            real_time.unload_if_loaded();
-            unsafe {
-                let _: () = msg_send![real_time.client, release];
-            }
-        }
-        self.unload();
         unsafe {
+            let mut error: *mut NSError = std::ptr::null_mut();
+            let _: Bool = msg_send![self.model, unloadWithQoS: ANE_QOS, error: &mut error];
             let _: () = msg_send![self.model, release];
-            if self.real_time_model != self.model {
-                let _: () = msg_send![self.real_time_model, release];
-            }
         }
     }
 }
@@ -1546,19 +984,6 @@ impl Drop for CompileDir {
     }
 }
 
-/// Whether `model` can be handed to `_ANEClient`'s load path. On macOS 27 that
-/// path calls `externConstants` on it, which `_ANEInMemoryModel` doesn't
-/// implement: passing one raises an Objective-C exception that Rust can't
-/// catch, and the process aborts. The inner `_ANEModel` does implement it.
-///
-/// # Safety
-/// `model` must be a valid Objective-C object pointer.
-unsafe fn client_can_load(model: *mut AnyObject) -> bool {
-    let sel = objc2::sel!(externConstants);
-    let responds: Bool = msg_send![model, respondsToSelector: sel];
-    responds.as_bool()
-}
-
 /// Whether a request may carry an `_ANEPerformanceStats`. On macOS 27,
 /// `-[_ANERequest validate]` sends `-count` to the `perfStats` argument, so the
 /// single stats object earlier releases take raises an Objective-C exception
@@ -1584,48 +1009,6 @@ fn macos_27_or_later() -> bool {
 
 fn empty_options_dict() -> objc2::rc::Retained<NSDictionary<NSString, AnyObject>> {
     NSDictionary::<NSString, AnyObject>::new()
-}
-
-fn optional_number_ptr(number: Option<&objc2::rc::Retained<NSNumber>>) -> *const AnyObject {
-    number.map_or(std::ptr::null::<AnyObject>(), |value| {
-        (&**value) as *const NSNumber as *const AnyObject
-    })
-}
-
-unsafe fn wrap_iosurface_array(
-    io_surface_class: &'static AnyClass,
-    surfaces: &[*mut c_void],
-) -> objc2::rc::Retained<NSArray<AnyObject>> {
-    let mut wrapped: Vec<*mut AnyObject> = Vec::with_capacity(surfaces.len());
-    for &surface in surfaces {
-        let surface = surface.cast::<__IOSurface>();
-        let wrapped_surface: *mut AnyObject =
-            msg_send![io_surface_class, objectWithIOSurface: surface];
-        wrapped.push(wrapped_surface);
-    }
-
-    unsafe { ns_array_from_raw(&wrapped) }
-}
-
-unsafe fn wrap_iosurface_output_sets(
-    io_surface_class: &'static AnyClass,
-    output_sets: &[&[*mut c_void]],
-) -> (
-    objc2::rc::Retained<NSArray<AnyObject>>,
-    Vec<objc2::rc::Retained<NSArray<AnyObject>>>,
-) {
-    let mut owned_output_sets = Vec::with_capacity(output_sets.len());
-    let mut output_set_ptrs = Vec::with_capacity(output_sets.len());
-
-    for output_set in output_sets {
-        let ns_output_set = unsafe { wrap_iosurface_array(io_surface_class, output_set) };
-        let ns_output_set_ptr = (&*ns_output_set) as *const NSArray<AnyObject> as *mut AnyObject;
-        output_set_ptrs.push(ns_output_set_ptr);
-        owned_output_sets.push(ns_output_set);
-    }
-
-    let outer = unsafe { ns_array_from_raw(&output_set_ptrs) };
-    (outer, owned_output_sets)
 }
 
 /// Build an NSArray from raw AnyObject pointers.
@@ -1659,27 +1042,7 @@ unsafe fn ns_array_from_numbers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ane::{
-        iosurface::IoSurface,
-        kernel::{self, TransformerKernelConfig},
-        mil::MilProgram,
-    };
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::Command;
-    use std::time::Instant;
-
-    const CHAINING_SMOKE_CHILD_ENV: &str = "PMETAL_ANE_CHAINING_SMOKE_CHILD";
-    const CHAINING_SMOKE_TEST_NAME: &str = "ane::runtime::tests::test_prepare_loopback_chain_smoke";
-
-    fn median_f64(values: &mut [f64]) -> f64 {
-        values.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap());
-        let mid = values.len() / 2;
-        if values.len() % 2 == 0 {
-            (values[mid - 1] + values[mid]) * 0.5
-        } else {
-            values[mid]
-        }
-    }
+    use crate::ane::{iosurface::IoSurface, mil::MilProgram};
 
     fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
         lhs.iter()
@@ -1720,8 +1083,6 @@ mod tests {
         let result = AneRuntime::global();
         match result {
             Ok(rt) => {
-                assert_eq!(rt.real_time_available(), rt.client_class.is_some());
-                assert_eq!(rt.chaining_available(), rt.chaining_class.is_some());
                 assert_eq!(
                     rt.perf_stats_available(),
                     rt.perf_stats_class.is_some() && perf_stats_request_supported()
@@ -1730,38 +1091,6 @@ mod tests {
             Err(MetalError::AneNotAvailable) => {}
             Err(e) => panic!("Unexpected error: {e}"),
         }
-    }
-
-    #[test]
-    fn test_loopback_chain_config_default() {
-        let config = AneLoopbackChainConfig::default();
-        assert_eq!(config.loopback_input_symbol_index, 0);
-        assert_eq!(config.loopback_output_symbol_index, 0);
-        assert_eq!(config.procedure_index, 0);
-        assert_eq!(config.fw_enqueue_delay, None);
-        assert_eq!(config.memory_pool_id, None);
-    }
-
-    #[test]
-    fn test_loopback_chain_config_validation_rejects_empty_collections() {
-        let config = AneLoopbackChainConfig::default();
-        let non_empty_input = [std::ptr::dangling_mut::<c_void>()];
-        let non_empty_output = [std::ptr::dangling_mut::<c_void>()];
-        let empty_outputs: [*mut c_void; 0] = [];
-
-        let err = config.validate(&[], &[&non_empty_output]).unwrap_err();
-        assert!(matches!(err, MetalError::InvalidConfig(_)));
-        assert!(err.to_string().contains("at least one input"));
-
-        let err = config.validate(&non_empty_input, &[]).unwrap_err();
-        assert!(matches!(err, MetalError::InvalidConfig(_)));
-        assert!(err.to_string().contains("at least one output set"));
-
-        let err = config
-            .validate(&non_empty_input, &[&empty_outputs])
-            .unwrap_err();
-        assert!(matches!(err, MetalError::InvalidConfig(_)));
-        assert!(err.to_string().contains("output set 0"));
     }
 
     fn two_conv_kernel(w1: &[f32], w2: &[f32], c: usize, sp: usize) -> (String, WeightDict) {
@@ -1931,7 +1260,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires ANE hardware and private AppleNeuralEngine.framework"]
-    fn test_real_time_eval_matches_standard() {
+    fn test_f32_evaluation_round_trips() {
         let rt = match AneRuntime::global() {
             Ok(rt) => rt,
             Err(MetalError::AneNotAvailable) => return,
@@ -1951,224 +1280,18 @@ mod tests {
         // Sized to the bare 16-byte row. On macOS 27 the model pads rows to
         // 64 bytes, so this also exercises AneModel's restriding.
         let input = IoSurface::for_tensor_f32(1, 4).unwrap();
-        let output_std = IoSurface::for_tensor_f32(1, 4).unwrap();
-        let output_rt = IoSurface::for_tensor_f32(1, 4).unwrap();
+        let output = IoSurface::for_tensor_f32(1, 4).unwrap();
         let input_values = [1.5f32, -2.0, 0.25, 7.0];
         input.write_f32_at(0, &input_values, 1, 4);
 
         // An ANE is present, so a failed evaluation is a failure, not a skip:
         // skipping here is how Code=42 on macOS 27 passed unnoticed (#34).
         model
-            .evaluate(&[input.as_ptr()], &[output_std.as_ptr()])
-            .expect("standard ANE evaluation");
-        let mut std_values = [0.0f32; 4];
-        output_std.read_f32(&mut std_values, 0, 1, 4);
+            .evaluate(&[input.as_ptr()], &[output.as_ptr()])
+            .expect("ANE evaluation");
+        let mut values = [0.0f32; 4];
+        output.read_f32(&mut values, 0, 1, 4);
         // The program casts through fp16, which represents these exactly.
-        assert_eq!(std_values, input_values, "standard evaluation round-trips");
-
-        // Real-time is unavailable on macOS 27; the standard path is still tested.
-        if !model.real_time_available() {
-            return;
-        }
-        model
-            .evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()])
-            .expect("real-time ANE evaluation");
-        let mut rt_values = [0.0f32; 4];
-        output_rt.read_f32(&mut rt_values, 0, 1, 4);
-
-        for (standard, realtime) in std_values.iter().zip(rt_values.iter()) {
-            assert!(
-                (standard - realtime).abs() < 1e-3,
-                "standard={standard}, realtime={realtime}"
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires ANE hardware and private AppleNeuralEngine.framework"]
-    fn test_real_time_eval_sdpa_latency_probe() {
-        let rt = match AneRuntime::global() {
-            Ok(rt) => rt,
-            Err(MetalError::AneNotAvailable) => return,
-            Err(e) => panic!("Unexpected error: {e}"),
-        };
-
-        let cfg = TransformerKernelConfig {
-            dim: 64,
-            hidden_dim: 128,
-            n_heads: 4,
-            n_kv_heads: 4,
-            head_dim: 16,
-            seq_len: 16,
-            rope_theta: 10_000.0,
-            rms_norm_eps: 1e-5,
-        };
-        let rms_att = vec![1.0f32; cfg.dim];
-        let wq = (0..cfg.q_dim() * cfg.dim)
-            .map(|idx| ((idx % 19) as f32 - 9.0) * 0.01)
-            .collect::<Vec<_>>();
-        let wk = (0..cfg.kv_dim() * cfg.dim)
-            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.01)
-            .collect::<Vec<_>>();
-        let wv = (0..cfg.kv_dim() * cfg.dim)
-            .map(|idx| ((idx % 13) as f32 - 6.0) * 0.01)
-            .collect::<Vec<_>>();
-        let wo = (0..cfg.dim * cfg.q_dim())
-            .map(|idx| ((idx % 23) as f32 - 11.0) * 0.01)
-            .collect::<Vec<_>>();
-        let sdpa = kernel::gen_sdpa_fwd_taps(&cfg, &rms_att, &wq, &wk, &wv, &wo);
-
-        let model = match rt.compile(sdpa.mil_text.as_bytes(), Some(&sdpa.weights)) {
-            Ok(model) => model,
-            Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
-        };
-        let input = IoSurface::for_tensor(cfg.dim, cfg.seq_len).unwrap();
-        let output_channels = cfg.sdpa_fwd_output_ch();
-        let output_std = IoSurface::for_tensor(output_channels, cfg.seq_len).unwrap();
-        let output_rt = IoSurface::for_tensor(output_channels, cfg.seq_len).unwrap();
-        let input_values = (0..cfg.dim * cfg.seq_len)
-            .map(|idx| ((idx % 29) as f32 - 14.0) * 0.03125)
-            .collect::<Vec<_>>();
-        input.write_f32_as_fp16(&input_values, cfg.dim, cfg.seq_len);
-
-        model
-            .evaluate(&[input.as_ptr()], &[output_std.as_ptr()])
-            .expect("standard ANE evaluation of the SDPA kernel");
-        // Real-time is unavailable on macOS 27; the kernel still compiled and
-        // ran through standard dispatch above.
-        if !model.real_time_available() {
-            return;
-        }
-        model
-            .evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()])
-            .expect("real-time ANE evaluation of the SDPA kernel");
-
-        let mut std_values = vec![0.0f32; output_channels * cfg.seq_len];
-        let mut rt_values = vec![0.0f32; output_channels * cfg.seq_len];
-        output_std.read_fp16_as_f32(&mut std_values, 0, output_channels, cfg.seq_len);
-        output_rt.read_fp16_as_f32(&mut rt_values, 0, output_channels, cfg.seq_len);
-
-        let max_diff = max_abs_diff(&std_values, &rt_values);
-        assert!(
-            max_diff < 5e-2,
-            "SDPA RT output drifted: max_diff={max_diff}"
-        );
-
-        let iterations = 7;
-        let mut standard_wall_ms = Vec::with_capacity(iterations);
-        let mut standard_hw_ms = Vec::with_capacity(iterations);
-        let mut realtime_wall_ms = Vec::with_capacity(iterations);
-        let mut realtime_hw_ms = Vec::with_capacity(iterations);
-
-        for _ in 0..iterations {
-            let start = Instant::now();
-            let stats = model
-                .evaluate_with_stats(&[input.as_ptr()], &[output_std.as_ptr()])
-                .expect("standard ANE evaluation during the latency probe");
-            standard_wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-            standard_hw_ms.push(stats.hw_execution_time_ns as f64 / 1_000_000.0);
-        }
-
-        for _ in 0..iterations {
-            let start = Instant::now();
-            let stats = model
-                .evaluate_real_time_with_stats(&[input.as_ptr()], &[output_rt.as_ptr()])
-                .expect("real-time ANE evaluation during the latency probe");
-            realtime_wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
-            realtime_hw_ms.push(stats.hw_execution_time_ns as f64 / 1_000_000.0);
-        }
-
-        let standard_wall_median = median_f64(&mut standard_wall_ms);
-        let standard_hw_median = median_f64(&mut standard_hw_ms);
-        let realtime_wall_median = median_f64(&mut realtime_wall_ms);
-        let realtime_hw_median = median_f64(&mut realtime_hw_ms);
-
-        eprintln!(
-            "ANE RT SDPA probe seq_len={} dim={} heads={} head_dim={}: standard median wall {:.3} ms / hw {:.3} ms, real-time median wall {:.3} ms / hw {:.3} ms",
-            cfg.seq_len,
-            cfg.dim,
-            cfg.n_heads,
-            cfg.head_dim,
-            standard_wall_median,
-            standard_hw_median,
-            realtime_wall_median,
-            realtime_hw_median
-        );
-    }
-
-    #[test]
-    #[ignore = "requires ANE chaining-capable hardware and private AppleNeuralEngine.framework"]
-    fn test_prepare_loopback_chain_smoke() {
-        if std::env::var_os(CHAINING_SMOKE_CHILD_ENV).is_some() {
-            run_prepare_loopback_chain_smoke_inner();
-            return;
-        }
-
-        let status = Command::new(std::env::current_exe().unwrap())
-            .arg("--ignored")
-            .arg("--exact")
-            .arg(CHAINING_SMOKE_TEST_NAME)
-            .arg("--nocapture")
-            .env(CHAINING_SMOKE_CHILD_ENV, "1")
-            .status()
-            .expect("failed to spawn chaining smoke child process");
-
-        if status.success() {
-            return;
-        }
-
-        let aborted_by_foreign_exception = status.signal() == Some(6) || status.code() == Some(134);
-        if aborted_by_foreign_exception {
-            eprintln!(
-                "Skipping loopback chain smoke test: private ANE chaining call aborted the child process"
-            );
-            return;
-        }
-
-        panic!("loopback chain smoke child failed with status: {status}");
-    }
-
-    fn run_prepare_loopback_chain_smoke_inner() {
-        let rt = match AneRuntime::global() {
-            Ok(rt) => rt,
-            Err(MetalError::AneNotAvailable) => return,
-            Err(e) => panic!("Unexpected error: {e}"),
-        };
-        if !(rt.real_time_available() && rt.chaining_available()) {
-            return;
-        }
-
-        let program = MilProgram::new(1, 4);
-        let mil_text = program.finalize("x");
-        let model = match rt.compile(mil_text.as_bytes(), None) {
-            Ok(model) => model,
-            Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
-        };
-
-        if !model.chaining_available() {
-            return;
-        }
-
-        let input = IoSurface::for_tensor(1, 4).unwrap();
-        let output = IoSurface::for_tensor(1, 4).unwrap();
-        let outputs = [output.as_ptr()];
-
-        let prepared = match model.prepare_loopback_chain(
-            &[input.as_ptr()],
-            &[&outputs],
-            &AneLoopbackChainConfig::default(),
-        ) {
-            Ok(prepared) => prepared,
-            // Chaining is a private API this probes for; its own refusal is a
-            // skip. A compile, load or eval failure on present hardware is not.
-            Err(MetalError::AneChainingFailed(err)) => {
-                eprintln!("Skipping loopback chain smoke test: {err}");
-                return;
-            }
-            Err(e) => panic!("Unexpected error: {e}"),
-        };
-
-        assert!(prepared.is_valid());
-        assert!(!prepared.description().is_empty());
+        assert_eq!(values, input_values, "evaluation round-trips");
     }
 }

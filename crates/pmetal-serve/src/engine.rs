@@ -166,7 +166,6 @@ struct BackendState {
 fn build_generation_config_from_parts(
     stop_token_ids: &[u32],
     max_seq_len: usize,
-    ane_real_time: bool,
     params: &SamplingParams,
 ) -> GenerationConfig {
     let temperature = params.temperature;
@@ -186,13 +185,10 @@ fn build_generation_config_from_parts(
             do_sample: true,
             stop_tokens,
             seed: params.seed,
-            ane_real_time,
             ..GenerationConfig::default()
         }
     } else {
-        GenerationConfig::greedy(max_tokens)
-            .with_stop_tokens(stop_tokens)
-            .with_ane_real_time(ane_real_time)
+        GenerationConfig::greedy(max_tokens).with_stop_tokens(stop_tokens)
     };
 
     if let Some(top_k) = params.top_k {
@@ -467,8 +463,6 @@ pub struct InferenceEngine {
     ane_max_seq_len: usize,
     /// DFlash draft model drafting for the ANE engine, if any.
     ane_draft_path: Option<std::path::PathBuf>,
-    /// Enable the experimental ANE real-time evaluation path for ANE requests.
-    ane_real_time: bool,
     /// Preferred generation backend; falls back to GPU permanently on failure.
     backend: Arc<Mutex<BackendState>>,
     /// Stop token IDs collected from all available sources.
@@ -667,7 +661,6 @@ impl InferenceEngine {
             max_seq_len,
             true,
             1024,
-            false,
         )
     }
 
@@ -680,7 +673,6 @@ impl InferenceEngine {
         max_seq_len: usize,
         ane_enabled: bool,
         ane_max_seq_len: usize,
-        ane_real_time: bool,
     ) -> ServeResult<Self> {
         Self::new_with_options(
             model,
@@ -690,7 +682,6 @@ impl InferenceEngine {
             max_seq_len,
             ane_enabled,
             ane_max_seq_len,
-            ane_real_time,
             None,
         )
     }
@@ -711,7 +702,6 @@ impl InferenceEngine {
         max_seq_len: usize,
         ane_enabled: bool,
         ane_max_seq_len: usize,
-        ane_real_time: bool,
         cache_mode_override: Option<CacheMode>,
     ) -> ServeResult<Self> {
         let chat_template = detect_chat_template(model_path, &model_id);
@@ -756,7 +746,6 @@ impl InferenceEngine {
             backend = ?preferred_backend,
             ane_enabled,
             ane_max_seq_len,
-            ane_real_time,
             "Selected serving generation backend"
         );
 
@@ -771,7 +760,6 @@ impl InferenceEngine {
             max_seq_len,
             ane_max_seq_len,
             ane_draft_path: None,
-            ane_real_time,
             backend: Arc::new(Mutex::new(BackendState {
                 preferred: preferred_backend,
             })),
@@ -1098,12 +1086,7 @@ impl InferenceEngine {
     /// All stop tokens (engine-level + per-request) are merged into the config.
     /// `max_tokens` is silently clamped to `max_seq_len` (matches OpenAI behaviour).
     pub fn build_generation_config(&self, params: &SamplingParams) -> GenerationConfig {
-        build_generation_config_from_parts(
-            &self.stop_token_ids,
-            self.max_seq_len,
-            self.ane_real_time,
-            params,
-        )
+        build_generation_config_from_parts(&self.stop_token_ids, self.max_seq_len, params)
     }
 
     fn backend_or_gpu(backend: &Arc<Mutex<BackendState>>) -> PreferredGenerationBackend {
@@ -2104,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_generation_config_propagates_ane_real_time() {
+    fn test_build_generation_config_merges_request_params() {
         let params = SamplingParams {
             max_tokens: 64,
             temperature: 0.8,
@@ -2120,11 +2103,10 @@ mod tests {
             logprobs_top_n: None,
         };
 
-        let config = build_generation_config_from_parts(&[1, 2], 32, true, &params);
+        let config = build_generation_config_from_parts(&[1, 2], 32, &params);
 
         assert_eq!(config.max_new_tokens, 32);
         assert!(config.do_sample);
-        assert!(config.ane_real_time);
         assert_eq!(config.seed, Some(7));
         assert_eq!(config.stop_tokens, vec![1, 2, 99]);
     }
@@ -2189,7 +2171,6 @@ mod tests {
             64,
             false,
             1024,
-            false,
             Some(override_mode),
         )
         .unwrap();
@@ -2210,7 +2191,6 @@ mod tests {
             64,
             false,
             1024,
-            false,
             None,
         )
         .unwrap();

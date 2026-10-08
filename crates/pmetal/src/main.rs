@@ -1749,8 +1749,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 #[cfg(feature = "ane")]
                 ane_max_seq_len,
                 #[cfg(feature = "ane")]
-                ane_real_time,
-                #[cfg(feature = "ane")]
                 draft_model,
                 continuous_batch,
                 cb_max_slots,
@@ -1767,10 +1765,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             let serve_ane_max_seq_len = ane_max_seq_len;
             #[cfg(not(feature = "ane"))]
             let serve_ane_max_seq_len = 4096;
-            #[cfg(feature = "ane")]
-            let serve_ane_real_time = ane_real_time;
-            #[cfg(not(feature = "ane"))]
-            let serve_ane_real_time = false;
             #[cfg(feature = "ane")]
             let serve_draft_model = draft_model;
             #[cfg(not(feature = "ane"))]
@@ -1790,7 +1784,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 kv_turboquant_preset,
                 ane_enabled,
                 serve_ane_max_seq_len,
-                serve_ane_real_time,
                 serve_draft_model,
                 continuous_batch,
                 cb_max_slots,
@@ -1835,8 +1828,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 ane,
                 #[cfg(feature = "ane")]
                 ane_max_seq_len,
-                #[cfg(feature = "ane")]
-                ane_real_time,
                 benchmark,
                 benchmark_iters,
                 benchmark_prompt_tokens,
@@ -1908,10 +1899,6 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 ane_max_seq_len,
                 #[cfg(not(feature = "ane"))]
                 1024,
-                #[cfg(feature = "ane")]
-                ane_real_time,
-                #[cfg(not(feature = "ane"))]
-                false,
                 benchmark,
                 benchmark_iters,
                 benchmark_prompt_tokens,

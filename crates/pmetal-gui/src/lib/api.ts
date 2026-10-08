@@ -604,7 +604,6 @@ export interface ServeSpec {
   kv_turboquant_preset?: string | null;
   ane?: boolean;
   ane_max_seq_len?: number;
-  ane_real_time?: boolean;
   draft_model?: string | null;
   continuous_batch?: boolean;
   cb_max_slots?: number;

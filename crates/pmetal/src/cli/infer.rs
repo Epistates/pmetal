@@ -133,11 +133,6 @@ pub struct InferArgs {
     #[arg(long = "ane-max-seq-len", default_value = "4096")]
     pub ane_max_seq_len: usize,
 
-    /// Use the experimental ANE real-time evaluation path when ANE inference is selected.
-    #[cfg(feature = "ane")]
-    #[arg(long = "ane-real-time")]
-    pub ane_real_time: bool,
-
     /// Run a prompt and generation throughput benchmark.
     #[arg(long = "benchmark")]
     pub benchmark: bool,

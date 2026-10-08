@@ -61,11 +61,6 @@ pub struct ServeArgs {
     #[arg(long = "ane-max-seq-len", default_value = "4096")]
     pub ane_max_seq_len: usize,
 
-    /// Use the experimental ANE real-time evaluation path when ANE serving is selected.
-    #[cfg(feature = "ane")]
-    #[arg(long = "ane-real-time")]
-    pub ane_real_time: bool,
-
     /// DFlash draft model (HF id or local path) drafting for the model on the
     /// ANE: it runs on the GPU and the ANE verifies its guesses. Needs --ane.
     #[cfg(feature = "ane")]

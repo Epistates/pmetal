@@ -344,8 +344,6 @@ pub struct GenerationConfig {
     pub seed: Option<u64>,
     /// Whether to use greedy decoding (ignores temperature, top_k, top_p, min_p).
     pub do_sample: bool,
-    /// Use the experimental ANE real-time evaluation path when ANE generation is selected.
-    pub ane_real_time: bool,
     /// Maximum prompt tokens to process per cached-prefill chunk (0 = disable chunking).
     pub prefill_step_size: usize,
 }
@@ -364,7 +362,6 @@ impl Default for GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
-            ane_real_time: false,
             prefill_step_size: 2048,
         }
     }
@@ -414,7 +411,6 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
-            ane_real_time: false,
             prefill_step_size: 2048,
         }
     }
@@ -435,7 +431,6 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
-            ane_real_time: false,
             prefill_step_size: 2048,
         }
     }
@@ -456,7 +451,6 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
-            ane_real_time: false,
             prefill_step_size: 2048,
         }
     }
@@ -475,7 +469,6 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
-            ane_real_time: false,
             prefill_step_size: 2048,
         }
     }
@@ -608,12 +601,6 @@ impl GenerationConfig {
     /// Set random seed.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
-        self
-    }
-
-    /// Enable or disable the experimental ANE real-time evaluation path.
-    pub fn with_ane_real_time(mut self, enabled: bool) -> Self {
-        self.ane_real_time = enabled;
         self
     }
 
@@ -2937,7 +2924,6 @@ mod tests {
         assert_eq!(config.frequency_penalty, 0.0);
         assert_eq!(config.presence_penalty, 0.0);
         assert!(config.do_sample);
-        assert!(!config.ane_real_time);
         assert_eq!(config.prefill_step_size, 2048);
     }
 

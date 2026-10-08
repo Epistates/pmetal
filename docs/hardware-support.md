@@ -62,8 +62,8 @@ These are accessed via Metal 4.0 (`-std=metal4.0`) kernels. MLX upstream has pro
 - **Measured FP16 TFLOPS**: 12.17–12.44 (comparable to M4 Pro)
 - **Training**: 101–120 ms/step (vs M4 Max at 64 ms/step)
 - **Weight reload**: NOT supported (weights baked at compile time)
-- **Chaining API**: `_ANEChainingRequest` available (research — PMetal can prepare experimental loopback requests, but stable execution is not solved yet)
-- **Real-time eval**: `_ANEClient.evaluateRealTimeWithModel:` is detected; PMetal exposes an experimental `--ane-real-time` opt-in with automatic fallback to standard ANE if the private path fails
+- **Chaining API**: `_ANEChainingRequest` exists, but submitting a loopback request aborted the process on an M4 Max, so PMetal doesn't use it. PMetal runs several layers per ANE program instead
+- **Real-time eval**: `_ANEClient.evaluateRealTimeWithModel:` exists, but it failed with `Program Inference error` on an M4 Max and won't load a model on macOS 27, so PMetal uses standard evaluation
 - **Perf stats**: `_ANEPerformanceStats.hwExecutionTime` provides ns-precision hardware timing
 
 ### ANE MIL Compatibility
@@ -180,27 +180,7 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 - [ ] Track upstream MLX NAX API changes and update `pmetal-bridge` bindings as needed
 - [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference shapes, including softcapped configs
 
-### P1 — ANE chaining API
-
-`_ANEChainingRequest` with loopback could pipeline multiple layers as a single ANE program:
-
-- [x] Class detection + telemetry
-- [x] Experimental loopback request construction + `_ANEClient.prepareChainingWithModel:` submission API
-- [ ] Stable single-chain execution on hardware without private-framework aborts (`cargo test -p pmetal-metal test_prepare_loopback_chain_smoke -- --ignored --nocapture` on the local M4 Max still aborted the child process on 2026-03-23)
-- [ ] Benchmark chained vs sequential dispatch latency
-- [ ] If viable: integrate into ANE inference engine for multi-layer dispatch
-
-### P2 — ANE real-time evaluation path
-
-`_ANEClient.evaluateRealTimeWithModel:` may provide lower/more predictable latency:
-
-- [x] Runtime probe + `AneModel::evaluate_real_time*` wrapper
-- [x] Experimental `--ane-real-time` opt-in for `infer` / `serve`
-- [x] Automatic fallback to standard ANE dispatch if the private RT path fails
-- [ ] Compare RT vs standard eval latency distribution (PMetal now has both a tiny-kernel check and a generated SDPA forward latency probe, but on the local M4 Max both ignored tests still hit `ANEProgramProcessRequestDirect() ... Program Inference error` on 2026-03-23)
-- [ ] Promote beyond experimental only after measured latency wins and stable correctness
-
-### P3 — UltraFusion-aware distributed
+### P1 — UltraFusion-aware distributed
 
 Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS. UltraFusion's 32 TB/s interconnect bandwidth could enable:
 
@@ -210,7 +190,7 @@ Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS.
 - [ ] Die-affine buffer placement for large models that exceed single-die cache
 - [ ] Hybrid: UltraFusion tensor parallel + network data parallel across machines
 
-### P4 — Dynamic auto-tuning
+### P2 — Dynamic auto-tuning
 
 Replace hardcoded tier-based parameters with runtime optimization:
 

@@ -413,9 +413,6 @@ impl PmetalMcpServer {
         >,
         #[description("Enable ANE (Apple Neural Engine) inference")] ane: Option<bool>,
         #[description("Maximum ANE kernel sequence length")] ane_max_seq_len: Option<u64>,
-        #[description("Use experimental ANE real-time evaluation path")] ane_real_time: Option<
-            bool,
-        >,
         #[description("KV cache quantization bits (8=q8, 4=q4, 0=fp16, default: 8)")]
         kv_quant: Option<u64>,
         #[description("Disable KV cache quantization (use fp16)")] no_kv_quant: Option<bool>,
@@ -474,7 +471,6 @@ impl PmetalMcpServer {
             experts_dir,
             ane: ane.unwrap_or(false),
             ane_max_seq_len: ane_max_seq_len.unwrap_or(1024) as usize,
-            ane_real_time: ane_real_time.unwrap_or(false),
             kv_quant: kv_quant.map(|k| k as u8),
             no_kv_quant: no_kv_quant.unwrap_or(false),
             kv_quant_preset,
@@ -1681,7 +1677,6 @@ impl PmetalMcpServer {
         #[description("Enable ANE (Apple Neural Engine) serving")] ane: Option<bool>,
         #[description("Largest ANE context, prompt plus output (default: 4096)")]
         ane_max_seq_len: Option<u64>,
-        #[description("Use experimental ANE real-time serving path")] ane_real_time: Option<bool>,
         #[description("DFlash draft model drafting for the model on the ANE (needs ane)")]
         draft_model: Option<String>,
     ) -> McpResult<String> {
@@ -1694,7 +1689,6 @@ impl PmetalMcpServer {
             ane: ane.unwrap_or(false),
             ane_max_seq_len: ane_max_seq_len
                 .map_or(ServeSpec::default().ane_max_seq_len, |v| v as usize),
-            ane_real_time: ane_real_time.unwrap_or(false),
             draft_model,
             ..ServeSpec::default()
         };

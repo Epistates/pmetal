@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **The old ANE inference engine** (`pmetal_metal::ane::inference`, `AneInferenceEngine`) and the `inference_ane` example that drove it. `AneLm` replaced it behind `infer --ane` and `serve --ane`, and nothing else called it. Its sampler moved to `pmetal_metal::ane::lm::sample`
+- **`infer --ane-real-time` and `serve --ane-real-time`.** The flag reached only the old engine, so with `AneLm` it did nothing, and the private real-time path it asked for never ran on macOS 27 and failed on earlier releases. It's gone from `InferSpec`, `ServeSpec`, the TUI's Serve form, the GUI and the MCP `infer` and `start_serve` tools, along with `GenerationConfig.ane_real_time` and the runtime's real-time and loopback-chaining probes (`AneModel::evaluate_real_time`, `prepare_loopback_chain`)
 
 ### Fixed
 

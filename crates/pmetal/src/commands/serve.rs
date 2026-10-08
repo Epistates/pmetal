@@ -14,7 +14,6 @@ pub(crate) async fn run_serve(
     kv_turboquant_preset: Option<String>,
     ane_enabled: bool,
     ane_max_seq_len: usize,
-    ane_real_time: bool,
     draft_model: Option<String>,
     continuous_batch: bool,
     cb_max_slots: usize,
@@ -115,7 +114,6 @@ pub(crate) async fn run_serve(
         max_seq_len,
         ane_enabled,
         ane_max_seq_len,
-        ane_real_time,
         cache_mode_override,
     )?;
     let engine = match draft_path {
