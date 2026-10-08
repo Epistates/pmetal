@@ -523,6 +523,20 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     }
     cfg.rotary = rotary;
     cfg.finalize();
+    // Dense Qwen3 carries its scaling in `rope_scaling` (YaRN, `factor` 4 over
+    // the native 32768, as the Qwen3 card documents) or `rope_parameters`.
+    // Read it with the same parser the family's goes through; an unknown
+    // `rope_type` is refused rather than run as plain RoPE.
+    if cfg.rotary.is_none() {
+        let flat: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| format!("failed to parse config: {e}"))?;
+        cfg.rotary = Some(crate::rope::Rotary::from_config(
+            cfg.get_head_dim(),
+            crate::rope::RopeConfig::from_json(&flat),
+            cfg.rope_theta,
+            cfg.effective_partial_rotary_factor(),
+        )?);
+    }
     Ok(cfg)
 }
 
@@ -538,6 +552,31 @@ mod tests {
     use super::{parse_config_text, validate_quantization_runtime_support_for};
     use crate::native_moe::switch_glu_input as moe_switch_glu_input;
     use crate::{compat::Dtype, inline_array::InlineArray};
+
+    /// Dense Qwen3 reads its `rope_scaling` (the card's YaRN) and refuses a
+    /// type it cannot run by name, instead of rotating with plain RoPE.
+    #[test]
+    fn dense_qwen3_reads_rope_scaling_and_refuses_unknown_types() {
+        let config = |scaling: &str| {
+            format!(
+                r#"{{"model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": 2,
+                    "num_attention_heads": 4, "head_dim": 16, "rope_theta": 1000000.0,
+                    "max_position_embeddings": 131072, "rope_scaling": {scaling}}}"#
+            )
+        };
+        let plain = parse_config_text(&config("null")).expect("plain parses");
+        assert!(plain.scaled_rope().is_none());
+        let yarn = parse_config_text(&config(
+            r#"{"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}"#,
+        ))
+        .expect("yarn parses");
+        let rope = yarn.scaled_rope().expect("yarn is scaled");
+        assert_eq!(rope.rotary().scaling.rope_type(), "yarn");
+        assert_eq!(rope.dims(), 16);
+        let err = parse_config_text(&config(r#"{"rope_type": "xpos", "factor": 2.0}"#))
+            .expect_err("unknown type refused");
+        assert!(err.contains("xpos"), "{err}");
+    }
 
     #[test]
     fn parse_nested_qwen35_promotes_rope_parameters() {
