@@ -455,18 +455,30 @@ where
 // Gated RMSNorm (with optional silu gate)
 // ============================================================================
 
-/// RMSNorm with optional gating: `rms_norm(x, w, eps) * silu(gate)`.
+/// RMSNorm with optional gating: `rms_norm(x, w, eps) * act(gate)`.
 ///
 /// Used by GDN linear attention layers (`linear_attn.norm`). Unlike the other
 /// RMSNorm layers in the model, this norm does NOT use the (1+w) convention —
 /// its weights are initialized at 1.0 and used directly. The (1+w) offset in
 /// `sanitize_weights` intentionally excludes `.linear_attn.norm.weight`.
+///
+/// The gate activation is SiLU for Qwen 3.5 / 3.6; Qwen4-Exp configures it with
+/// `output_gate_type` and ships sigmoid.
 #[derive(Debug)]
 pub struct Qwen3NextRMSNormGated {
     pub weight: Param<Array>,
     pub eps: f32,
+    pub gate_activation: GateActivation,
 }
 impl_module_params!(Qwen3NextRMSNormGated; weight);
+
+/// Activation applied to the gate of a [`Qwen3NextRMSNormGated`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GateActivation {
+    #[default]
+    Silu,
+    Sigmoid,
+}
 
 /// Compiled _precise_swiglu: `(silu(gate.f32()) * norm_out.f32()).as(dtype)`.
 ///
@@ -528,18 +540,25 @@ impl Qwen3NextRMSNormGated {
         Ok(Self {
             weight: Param::new(weight),
             eps,
+            gate_activation: GateActivation::Silu,
         })
     }
 
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         let normed = pmetal_bridge::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps);
-        if let Some(g) = gate {
+        match (gate, self.gate_activation) {
             // Compiled _precise_swiglu (shapeless mx.compile).
             // Fuses silu(gate.f32()) * norm.f32() → cast_back into 1 Metal dispatch
             // instead of 6 separate dispatches (2 casts + silu(2 ops) + mul + cast).
-            compiled_precise_swiglu(&normed, g, x.dtype())
-        } else {
-            Ok(normed)
+            (Some(g), GateActivation::Silu) => compiled_precise_swiglu(&normed, g, x.dtype()),
+            // Same f32 product, sigmoid in place of SiLU.
+            (Some(g), GateActivation::Sigmoid) => {
+                let gate_f32 = nn::sigmoid(&g.cast(Dtype::Float32));
+                Ok(gate_f32
+                    .multiply(&normed.cast(Dtype::Float32))
+                    .as_dtype(x.dtype().as_i32()))
+            }
+            (None, _) => Ok(normed),
         }
     }
 }
@@ -928,6 +947,12 @@ pub struct Qwen3NextGatedDeltaNet {
     pub q_norm_weight: Array,
     /// Pre-computed rms_norm weight for K normalization: ones * inv_scale
     pub k_norm_weight: Array,
+    /// Epsilon of the q/k `rms_norm`, which stands in for an L2 norm.
+    ///
+    /// `rms_norm` adds it to the *mean* of squares, so `1e-6` (the default)
+    /// is `head_k_dim · 1e-6` on the sum of squares. transformers' `l2norm`
+    /// adds `1e-6` to the sum; `1e-6 / head_k_dim` here reproduces it exactly.
+    pub qk_norm_eps: f32,
     /// Cached InlineArray weights for zero-alloc decode. Lazily initialized on first decode.
     pub inline_weights: Option<GdnInlineWeights>,
     /// Compiled decode closure (mx.compile). Lazily initialized on first decode.
@@ -1044,6 +1069,7 @@ impl Qwen3NextGatedDeltaNet {
                 let inv = (head_k_dim as f32).sqrt().recip();
                 Array::ones_f32(&[head_k_dim]).multiply(&Array::from_f32(inv))
             },
+            qk_norm_eps: 1e-6,
             inline_weights: None,
             compiled_decode: None,
         })
@@ -1277,8 +1303,8 @@ impl Qwen3NextGatedDeltaNet {
         let v = parts[2].reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim]);
 
         // Q/K normalization (fused fast:: ops)
-        let q = pmetal_bridge::compat::fast::rms_norm(&q, &self.q_norm_weight, 1e-6);
-        let k = pmetal_bridge::compat::fast::rms_norm(&k, &self.k_norm_weight, 1e-6);
+        let q = pmetal_bridge::compat::fast::rms_norm(&q, &self.q_norm_weight, self.qk_norm_eps);
+        let k = pmetal_bridge::compat::fast::rms_norm(&k, &self.k_norm_weight, self.qk_norm_eps);
 
         // GDN recurrence via Metal kernel (1 dispatch) or ops fallback
         let (out, new_ssm) = gated_delta_update(
@@ -1347,6 +1373,7 @@ impl Qwen3NextGatedDeltaNet {
         let kd = self.key_dim;
         let cd = self.conv_dim;
         let ck = self.conv_kernel_size;
+        let qk_eps = self.qk_norm_eps;
 
         let closure =
             pmetal_bridge::compat::compile::Closure::new(move |inputs: &[Array]| -> Vec<Array> {
@@ -1380,8 +1407,8 @@ impl Qwen3NextGatedDeltaNet {
                 let v = parts[2].reshape(&[b, s, nv, dv]);
 
                 // Q/K normalization
-                let q = pmetal_bridge::compat::fast::rms_norm(&q, &q_nw, 1e-6);
-                let k = pmetal_bridge::compat::fast::rms_norm(&k, &k_nw, 1e-6);
+                let q = pmetal_bridge::compat::fast::rms_norm(&q, &q_nw, qk_eps);
+                let k = pmetal_bridge::compat::fast::rms_norm(&k, &k_nw, qk_eps);
 
                 // GDN recurrence — uses Metal kernel (1 dispatch) instead of ops (~15 nodes).
                 // compute_g inlined (not via separately-compiled closure) so the outer
@@ -1488,8 +1515,10 @@ impl Qwen3NextGatedDeltaNet {
         let q_conv = q_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
         let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
         let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim]);
-        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6);
-        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6);
+        let q_normed =
+            pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
+        let k_normed =
+            pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
 
         // Compute g and beta OUTSIDE gated_delta_update so we can stash
         // them in the capture — the internal implementation derives them
@@ -1563,8 +1592,10 @@ impl Qwen3NextGatedDeltaNet {
         let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim]);
 
         // Q/K normalization: fast::rms_norm (fused Metal op) with pre-baked scale weights.
-        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6);
-        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6);
+        let q_normed =
+            pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
+        let k_normed =
+            pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
 
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
@@ -1642,8 +1673,10 @@ impl Qwen3NextGatedDeltaNet {
         // scale factors. inv_scale = 1/sqrt(dk).
         // q gets inv_scale² (because rms_norm divides by sqrt(mean) not sqrt(sum)),
         // k gets inv_scale.
-        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6);
-        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6);
+        let q_normed =
+            pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
+        let k_normed =
+            pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
         let (out, new_state) = gated_delta_update(
             &q_normed,

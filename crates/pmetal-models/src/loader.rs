@@ -1217,7 +1217,7 @@ fn is_qwen3_next_allowed_missing_param(key: &str, options: Qwen3NextLoadOptions)
 /// We validate that the canonical shard path stays within the HF repo root
 /// (the common ancestor of both `snapshots/` and `blobs/`), not just the
 /// snapshot directory itself.
-fn validate_shard_path(
+pub(crate) fn validate_shard_path(
     model_dir: &Path,
     shard_file: &str,
 ) -> Result<std::path::PathBuf, LoadError> {
