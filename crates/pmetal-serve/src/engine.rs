@@ -660,7 +660,7 @@ impl InferenceEngine {
             model_path,
             max_seq_len,
             true,
-            1024,
+            4096,
         )
     }
 

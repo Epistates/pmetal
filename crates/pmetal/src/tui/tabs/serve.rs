@@ -189,7 +189,7 @@ impl ServeTab {
         spec.ane = self.form.value("Use ANE") == "Enabled";
         spec.ane_max_seq_len = self
             .form
-            .value("ANE Max Seq Len")
+            .value("ANE Max Context")
             .parse()
             .unwrap_or(spec.ane_max_seq_len);
         spec.continuous_batch = self.form.value("Continuous Batch") == "Enabled";

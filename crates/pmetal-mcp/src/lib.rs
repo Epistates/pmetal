@@ -412,7 +412,8 @@ impl PmetalMcpServer {
             String,
         >,
         #[description("Enable ANE (Apple Neural Engine) inference")] ane: Option<bool>,
-        #[description("Maximum ANE kernel sequence length")] ane_max_seq_len: Option<u64>,
+        #[description("Largest ANE context, prompt plus output (default: 4096)")]
+        ane_max_seq_len: Option<u64>,
         #[description("KV cache quantization bits (8=q8, 4=q4, 0=fp16, default: 8)")]
         kv_quant: Option<u64>,
         #[description("Disable KV cache quantization (use fp16)")] no_kv_quant: Option<bool>,
@@ -469,7 +470,8 @@ impl PmetalMcpServer {
             fp8: fp8.unwrap_or(false),
             experts_dir,
             ane: ane.unwrap_or(false),
-            ane_max_seq_len: ane_max_seq_len.unwrap_or(1024) as usize,
+            ane_max_seq_len: ane_max_seq_len
+                .map_or(InferSpec::default().ane_max_seq_len, |v| v as usize),
             kv_quant: kv_quant.map(|k| k as u8),
             no_kv_quant: no_kv_quant.unwrap_or(false),
             kv_quant_preset,
