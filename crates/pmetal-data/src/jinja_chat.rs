@@ -115,6 +115,13 @@ pub fn render_chat_template(
     options: &JinjaRenderOptions,
 ) -> Result<String, String> {
     let mut env = Environment::new();
+    // transformers compiles chat templates with `trim_blocks=True,
+    // lstrip_blocks=True`: the newline after a block tag and the whitespace
+    // before one are dropped. Templates that write every tag with `-` render
+    // the same either way; Llama 3.2 Vision's does not, and without these its
+    // prompt gained a newline after `<|begin_of_text|>`.
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
     // `pycompat` lets templates use Python-style attribute access on dicts
     // (e.g. `message.role` and `message['role']` interchangeably), which
     // HF templates rely on heavily.
