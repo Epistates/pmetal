@@ -137,8 +137,10 @@ pub fn get_max_recommended_size() -> usize {
 
 // ── Stream management ────────────────────────────────────────────────────
 
-/// Create a new GPU stream and set it as default for all subsequent ops.
-/// Matches Python's `generation_stream = mx.new_stream(mx.default_device())`.
+/// Create this thread's generation stream, once per thread; make it the
+/// default with [`set_generation_stream`]. Matches Python's
+/// `generation_stream = mx.new_stream(mx.default_device())`. Each thread has
+/// its own, since an MLX stream works only on the thread that created it.
 pub fn new_generation_stream() {
     unsafe {
         mlx_inline_new_stream();

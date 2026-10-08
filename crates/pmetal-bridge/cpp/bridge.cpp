@@ -587,7 +587,12 @@ void mlx_inline_enable_compile(void) { mlx::core::enable_compile(); }
 void mlx_inline_disable_compile(void) { mlx::core::disable_compile(); }
 void mlx_inline_clear_cache(void) { BRIDGE_GUARD("clear_cache", mlx::core::clear_cache()); }
 
-static mlx::core::Stream* generation_stream_ = nullptr;
+// One per thread: an MLX stream belongs to the thread that created it, and
+// making another thread's stream the default fails every op with "There is
+// no Stream(gpu, N) in current thread". A single process-wide one, made by
+// whichever thread asked first, broke every other thread that generates (a
+// server's requests on other threads, a second model thread).
+static thread_local mlx::core::Stream* generation_stream_ = nullptr;
 
 // Raise the wired limit, clamped to what the device actually allows.
 //
