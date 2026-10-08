@@ -5,7 +5,6 @@
 //!
 //! - Optimized kernels for attention, RoPE, and activations
 //! - Gradient checkpointing for memory-efficient training
-//! - NF4/FP4/Int8 quantization implementations
 //! - Memory management utilities for Apple Silicon
 //! - KV caching for efficient inference
 //! - Mixture of Experts (MoE) for sparse models
@@ -35,7 +34,6 @@ pub mod kv_cache;
 pub mod memory;
 pub mod moe;
 pub mod prefix_cache;
-pub mod quantization;
 pub mod speculative;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -68,7 +66,6 @@ pub mod prelude {
     pub use crate::memory::*;
     pub use crate::moe::*;
     pub use crate::prefix_cache::*;
-    pub use crate::quantization::*;
     pub use crate::speculative::*;
     pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
 }

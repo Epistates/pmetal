@@ -8,7 +8,6 @@ This crate provides the bridge between PMetal and Apple's MLX framework, along w
 
 ## Features
 
-- **Quantization**: NF4, FP4, Int8 implementations
 - **Gradient Checkpointing**: Memory-efficient training for large models
 - **KV Cache**: Efficient key-value caching for inference
 - **Mixture of Experts**: MoE layer implementations
@@ -31,19 +30,10 @@ fn setup() {
 |--------|-------------|
 | `kernels` | Custom MLX kernels (fused attention, cut cross entropy, RMS norm, GDN, etc.) |
 | `kernels/gated_delta` | Gated Delta Network (GDN) recurrence with fused Metal shader |
-| `quantization` | Weight quantization implementations |
 | `gradient_checkpoint` | Gradient-checkpointing config (the mechanism lives in `pmetal-bridge`) |
 | `kv_cache` | Key-value cache for efficient inference |
 | `moe` | Mixture of Experts support |
 | `speculative` | Speculative decoding utilities |
-
-## Quantization Formats
-
-| Format | Bits | Memory Savings | Quality |
-|--------|------|----------------|---------|
-| NF4 | 4 | 75% | High |
-| FP4 | 4 | 75% | Medium |
-| Int8 | 8 | 50% | Very High |
 
 ## License
 

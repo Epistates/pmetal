@@ -1488,31 +1488,3 @@ impl Drop for TrainingLoop {
         }
     }
 }
-
-// =============================================================================
-// Custom Autograd Training (memory-efficient LoRA optimization)
-// =============================================================================
-//
-// This module provides custom autograd training that bypasses MLX autodiff
-// for LoRA layers, achieving ~50% memory reduction by avoiding materialization
-// of full intermediate activations, enabling training of larger models on limited memory.
-//
-// NOTE: This is an advanced feature that requires model-specific integration.
-// The standard training loop (run_compiled, run_packed) uses MLX autodiff
-// which is simpler and sufficient for most use cases.
-
-/// Trait for models that support custom autograd training.
-///
-/// This extends TrainableModel with methods for explicit gradient computation.
-/// Implementing this trait enables the memory-efficient custom autograd path.
-pub trait CustomAutogradModel: TrainableModel {
-    /// Apply gradients from the custom autograd accumulator.
-    ///
-    /// This method should iterate over all LoRA layers and apply the
-    /// accumulated gradients using the optimizer or simple SGD.
-    fn apply_accumulated_grads(
-        &mut self,
-        grads: &pmetal_lora::AccumulatedLoraGrads,
-        learning_rate: f32,
-    ) -> Result<()>;
-}

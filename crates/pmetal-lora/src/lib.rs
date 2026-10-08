@@ -35,39 +35,15 @@
 #![allow(clippy::type_complexity)]
 
 pub mod adapted;
-pub mod autograd;
-mod dora;
 mod dynamic;
-pub mod gemma4_lora;
-pub mod gpt_oss_lora;
-pub mod llama4_lora;
 mod lora;
-pub mod lora_helpers;
-pub mod nemotron_h_lora;
 mod qlora;
-pub mod qwen3_moe_lora;
-pub mod qwen3_next_lora;
 mod trainable;
 
 pub use adapted::AdaptedModel;
-pub use autograd::{
-    AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, MlpForwardSaved,
-    MlpLoraGrads, fused_mlp_backward, fused_mlp_forward, lora_backward, lora_forward_with_grad,
-};
-pub use dora::*;
 pub use dynamic::*;
-pub use gemma4_lora::*;
-pub use gpt_oss_lora::*;
-pub use llama4_lora::*;
 pub use lora::*;
-pub use lora_helpers::{
-    LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
-    save_lora_weights_impl, set_lora_parameters,
-};
-pub use nemotron_h_lora::*;
 pub use qlora::*;
-pub use qwen3_moe_lora::*;
-pub use qwen3_next_lora::*;
 pub use trainable::*;
 
 /// Compiles the code blocks in `README.md` as doctests, so the crate's front
