@@ -3,7 +3,7 @@
 //! Supports:
 //! - InfoNCE / Multiple Negatives Ranking Loss — best for large batch sizes
 //! - Triplet margin loss — anchor/positive/negative
-//! - CoSENT (Cosine Sentence Embedding Training) — circle loss formulation
+//! - CoSENT — ranks pairs by their similarity labels
 //! - Cosine similarity MSE loss — direct pairwise regression
 //!
 //! All losses operate on L2-normalised embeddings `[batch, dim]`.
@@ -64,73 +64,52 @@ pub fn triplet_loss(
     Ok(loss.mean(None))
 }
 
-/// CoSENT (Cosine Sentence Embedding Training) loss.
+/// CoSENT loss (Su Jianlin, *CoSENT: A more efficient sentence vector scheme
+/// than Sentence-BERT*, 2022), as sentence-transformers' `CoSENTLoss` computes it.
 ///
-/// Circle-loss style formulation for pairwise binary labels.
-/// For pairs labelled 1 (similar) we want high similarity, for 0 we want low.
+/// Each row is a pair `(a_i, b_i)` with a similarity label `y_i` (binary or
+/// graded). With `s_i = cos(a_i, b_i) / temperature`, every pair labelled
+/// less similar than another should score lower:
 ///
-/// Implementation follows the original CoSENT paper:
-/// `loss = log(1 + Σ_{i≠j, y_i=1, y_j=0} exp(cos(i_neg) - cos(i_pos)) / T)`
+/// ```text
+/// loss = log(1 + Σ_{(i, j): y_i < y_j} exp(s_i − s_j))
+/// ```
 ///
-/// The per-sample approximation used here:
-/// `loss = log(1 + exp(lse(neg_logits) - lse(pos_logits)))`
-/// averaged over the batch.
+/// over all ordered pairs of rows in the batch. `temperature` is 1/λ; the
+/// reference scale λ = 20 is `temperature = 0.05`. A batch whose labels are
+/// all equal has no such pair, and its loss is log 1 = 0.
 pub fn cosent_loss(
     embeddings_a: &Array,
     embeddings_b: &Array,
     labels: &Array,
     temperature: f32,
 ) -> Result<Array, Exception> {
-    // Full similarity matrix [batch, batch]
-    let sim = cosine_similarity_matrix(embeddings_a, embeddings_b)?;
-    let sim_scaled = sim.divide(&Array::from_f32(temperature));
+    let f32_dtype = Dtype::Float32.as_i32();
+    let scores = pairwise_cosine_similarity(
+        &embeddings_a.as_dtype(f32_dtype),
+        &embeddings_b.as_dtype(f32_dtype),
+    )?
+    .divide(&Array::from_f32(temperature)); // [batch]
+    let labels = labels.as_dtype(f32_dtype);
 
-    // Cast labels to float for masking arithmetic
-    let labels_f = labels.as_dtype(Dtype::Float32.as_i32());
-    // labels_f is [batch]; broadcast to [batch, batch] via outer product
-    let pos_mask = labels_f
+    // diff[i, j] = s_i − s_j, kept where y_i < y_j and sent to −∞ elsewhere.
+    let diff = scores.reshape(&[-1, 1]).subtract(&scores.reshape(&[1, -1]));
+    let lower = labels
         .reshape(&[-1, 1])
-        .multiply(&labels_f.reshape(&[1, -1]));
-    let neg_mask = Array::from_f32(1.0).subtract(&pos_mask);
-
-    // Guard: CoSENT requires at least one positive pair; if all labels are 0 the
-    // pos_logits matrix is entirely -1e9 and logsumexp(-1e9) - logsumexp(actual)
-    // overflows to +inf.  Return zero loss instead.
-    let mut pos_count = pos_mask.sum(None);
-    pos_count.eval();
-    if pos_count.item::<f32>() < 0.5 {
-        return Ok(Array::from_f32(0.0));
-    }
-
-    // Mask out diagonal (self-similarity is always pos=1, which is trivial)
-    let batch = embeddings_a.dim(0);
-    let diag_mask = diagonal_zeros(batch)?;
-    let pos_mask = pos_mask.multiply(&diag_mask);
-    let neg_mask = neg_mask.multiply(&diag_mask);
-
-    // Replace zeros with very negative values before logsumexp
-    let neg_large = Array::from_f32(-1e9_f32);
-
-    let pos_logits = sim_scaled.add(
+        .less(&labels.reshape(&[1, -1]))
+        .as_dtype(f32_dtype);
+    let masked = diff.add(
         &Array::from_f32(1.0)
-            .subtract(&pos_mask)
-            .multiply(&neg_large),
-    );
-    let neg_logits = sim_scaled.add(
-        &Array::from_f32(1.0)
-            .subtract(&neg_mask)
-            .multiply(&neg_large),
+            .subtract(&lower)
+            .multiply(&Array::from_f32(-1e12)),
     );
 
-    // LogSumExp over last axis for each row
-    let pos_lse = pos_logits.logsumexp_axis(-1, false); // [batch]
-    let neg_lse = neg_logits.logsumexp_axis(-1, false); // [batch]
-
-    // Softplus, log(1 + exp(neg_lse - pos_lse)), as logaddexp(0, diff): the
-    // exp alone overflows to inf once diff passes ~88 in f32.
-    let diff = neg_lse.subtract(&pos_lse);
-    let loss = ops::logaddexp(&Array::scalar_like(0.0, &diff), &diff);
-    Ok(loss.mean(None))
+    // log(1 + Σ exp(·)): a logsumexp over the pairs with a 0 for the 1.
+    let terms = ops::concatenate_axis(
+        &[&Array::from_f32(0.0).reshape(&[1]), &masked.reshape(&[-1])],
+        0,
+    );
+    Ok(terms.logsumexp_axis(0, false))
 }
 
 /// Multiple Negatives Ranking Loss (MNRL).
@@ -175,28 +154,6 @@ pub(crate) fn pairwise_cosine_similarity(a: &Array, b: &Array) -> Result<Array, 
     let norms = norm_a.multiply(&norm_b);
     let norms = ops::maximum(&norms, &Array::from_f32(1e-8));
     Ok(dot.divide(&norms))
-}
-
-/// Full pairwise cosine similarity matrix between two sets of embeddings.
-///
-/// Returns `[batch_a, batch_b]` matrix.
-pub(crate) fn cosine_similarity_matrix(a: &Array, b: &Array) -> Result<Array, Exception> {
-    let norm_a = a.square().sum_axes(&[-1], true).sqrt();
-    let norm_b = b.square().sum_axes(&[-1], true).sqrt();
-    let a_normed = a.divide(&ops::maximum(&norm_a, &Array::from_f32(1e-8)));
-    let b_normed = b.divide(&ops::maximum(&norm_b, &Array::from_f32(1e-8)));
-    Ok(a_normed.matmul(&b_normed.transpose_axes(&[1, 0])))
-}
-
-/// Return a `[n, n]` float32 matrix that is 0.0 on the diagonal and 1.0 elsewhere.
-///
-/// Used to exclude trivial self-similarity pairs from CoSENT.
-fn diagonal_zeros(n: i32) -> Result<Array, Exception> {
-    let mut data = vec![1.0f32; (n * n) as usize];
-    for i in 0..n as usize {
-        data[i * n as usize + i] = 0.0;
-    }
-    Ok(Array::from_slice(&data, &[n, n]))
 }
 
 #[cfg(test)]
@@ -251,17 +208,18 @@ mod tests {
     }
 
     #[test]
-    fn cosent_loss_softplus_does_not_overflow() {
-        // Row 0's negative (row 2) is far more similar than its positive
-        // (row 1): diff = (1 - (-1)) / 0.01 = 200, past where exp overflows
-        // f32. The softplus must stay finite.
+    fn cosent_loss_does_not_overflow() {
+        // Scores 1/0.01 apart: s = [100, -100, 100] with labels [1, 1, 0], so
+        // the negative row outranks the second positive by 200, where exp
+        // overflows f32. The loss is log(1 + e^0 + e^200) ≈ 200, finite.
         let a = Array::from_slice(&[1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0], &[3, 2]);
         let b = Array::from_slice(&[1.0f32, 0.0, -1.0, 0.0, 1.0, 0.0], &[3, 2]);
         let labels = Array::from_slice(&[1.0f32, 1.0, 0.0], &[3]);
         let loss = cosent_loss(&a, &b, &labels, 0.01).unwrap();
+        loss.eval();
         pmetal_bridge::check_last_error().unwrap();
-        let val: f32 = loss.item();
-        assert!(val.is_finite(), "cosent loss overflowed: {val}");
+        let val = loss.item_f32();
+        assert!((val - 200.0).abs() < 1e-3, "cosent loss: {val}");
     }
 
     #[test]
@@ -273,5 +231,59 @@ mod tests {
         let loss = cosine_similarity_loss(&a, &b, &labels).unwrap();
         let val: f32 = loss.item();
         assert!(val.abs() < 1e-5, "loss should be ~0, got {}", val);
+    }
+
+    /// Pairs whose cosines are `cos`: a_i = [1, 0], b_i = [cos, sin].
+    fn pairs_with_cosines(cos: &[f32]) -> (Array, Array) {
+        let n = cos.len() as i32;
+        let a: Vec<f32> = cos.iter().flat_map(|_| [1.0f32, 0.0]).collect();
+        let b: Vec<f32> = cos
+            .iter()
+            .flat_map(|&c| [c, (1.0 - c * c).sqrt()])
+            .collect();
+        (
+            Array::from_slice(&a, &[n, 2]),
+            Array::from_slice(&b, &[n, 2]),
+        )
+    }
+
+    fn cosent(cos: &[f32], labels: &[f32]) -> f32 {
+        let (a, b) = pairs_with_cosines(cos);
+        let labels = Array::from_slice(labels, &[labels.len() as i32]);
+        let loss = cosent_loss(&a, &b, &labels, 0.05).unwrap();
+        loss.eval();
+        pmetal_bridge::check_last_error().unwrap();
+        loss.item_f32()
+    }
+
+    #[test]
+    fn cosent_matches_a_hand_computed_graded_batch() {
+        // s = 20·cos = [18, 4, 10]. Pairs labelled lower than another:
+        // (1, 0): 4 − 18, (1, 2): 4 − 10, (2, 0): 10 − 18.
+        let want = (1.0 + (-14.0f64).exp() + (-6.0f64).exp() + (-8.0f64).exp()).ln();
+        let got = cosent(&[0.9, 0.2, 0.5], &[1.0, 0.0, 0.5]);
+        assert!((got as f64 - want).abs() < 1e-6, "got {got}, want {want}");
+    }
+
+    #[test]
+    fn cosent_on_a_mixed_binary_batch_is_the_ranking_loss() {
+        // A negative pair scoring above a positive one costs about
+        // 20·(0.9 − 0.1) = 16; ranked the right way round it costs e^-16.
+        let wrong = cosent(&[0.1, 0.9], &[1.0, 0.0]);
+        let want = (1.0 + 16.0f64.exp()).ln();
+        assert!(
+            (wrong as f64 - want).abs() < 1e-4,
+            "got {wrong}, want {want}"
+        );
+        let right = cosent(&[0.9, 0.1], &[1.0, 0.0]);
+        assert!((right as f64 - (-16.0f64).exp().ln_1p()).abs() < 1e-6);
+        // Two positives and two negatives, all ranked correctly by 0.5:
+        // four pairs, each e^-10.
+        let four = cosent(&[0.8, 0.7, 0.3, 0.2], &[1.0, 1.0, 0.0, 0.0]);
+        let want =
+            (1.0 + (-10.0f64).exp() + (-12.0f64).exp() + (-8.0f64).exp() + (-10.0f64).exp()).ln();
+        assert!((four as f64 - want).abs() < 1e-6, "got {four}, want {want}");
+        // Equal labels: no pair to rank, loss 0.
+        assert_eq!(cosent(&[0.3, 0.9], &[1.0, 1.0]), 0.0);
     }
 }

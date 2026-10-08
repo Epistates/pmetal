@@ -10,7 +10,7 @@
 //! |------|-------------|----------|
 //! | `InfoNce` / `Mnrl` | pairs | Large batches, no explicit labels |
 //! | `Triplet` | triplets | Hard negative mining workflows |
-//! | `CoSent` | pairs with labels | Similarity regression + ranking |
+//! | `CoSent` | pairs with labels | Ranks pairs by their labels |
 //! | `CosineSimilarity` | pairs with labels | Direct similarity regression |
 //!
 //! ## Usage
@@ -52,7 +52,8 @@ pub enum EmbeddingLossType {
     InfoNce,
     /// Triplet margin loss. Requires triplet data (anchor, positive, negative).
     Triplet,
-    /// CoSENT (circle loss variant). Works well with binary or continuous labels.
+    /// CoSENT: every pair labelled less similar than another should score a
+    /// lower cosine. Binary or graded labels.
     CoSent,
     /// Multiple Negatives Ranking Loss — alias for InfoNCE.
     Mnrl,
@@ -81,7 +82,8 @@ pub struct EmbeddingTrainerConfig {
     /// Loss function.
     #[serde(default)]
     pub loss_type: EmbeddingLossType,
-    /// Temperature for InfoNCE / CoSENT losses.
+    /// Temperature for InfoNCE, and 1/scale for CoSENT (0.05 is CoSENT's
+    /// reference scale of 20).
     #[serde(default = "default_temperature")]
     pub temperature: f32,
     /// Margin for triplet loss.

@@ -25,7 +25,8 @@ pub struct EmbedTrainArgs {
     #[arg(long = "pooling", default_value = "mean")]
     pub pooling: String,
 
-    /// Temperature for InfoNCE / CoSENT losses.
+    /// Temperature for InfoNCE, and 1/scale for CoSENT (0.05 is CoSENT's
+    /// reference scale of 20).
     #[arg(long = "temperature", default_value = "0.05")]
     pub temperature: f32,
 
