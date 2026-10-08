@@ -6,8 +6,8 @@
 //! drafter projects those into its own KV cache, so every draft attends to the
 //! whole context. A draft ([`DFlashDrafter::propose`]) runs the block
 //! `[last token, mask, mask, ...]` through the draft layers in one pass and
-//! reads its guesses off the target's LM head, as dflash-mlx does
-//! (`dflash_mlx/runtime.py`).
+//! reads its guesses off the target's LM head, as the DFlash reference
+//! implementation does.
 
 use std::path::Path;
 

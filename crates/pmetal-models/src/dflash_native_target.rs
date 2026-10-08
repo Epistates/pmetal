@@ -4,12 +4,12 @@
 //! `pmetal_bridge::qwen3_native::forward_step_with_capture` path instead
 //! of the dynamic `pmetal-models` forward. Two wins fall out:
 //!
-//! 1. **Speed** — the native path matches mlx-lm's parallel-replay
-//!    verify forward in kernel selection and per-op dispatch, so the
-//!    target-forward cost per verify step drops to parity with mlx-lm.
-//! 2. **Numerical parity with upstream** — the native bridge uses the
-//!    same fused attention + MLP kernels as mlx-lm for Qwen3, which is
-//!    what the DFlash draft was trained against. Without this, the
+//! 1. **Speed** — the native path runs the parallel-replay verify
+//!    forward on the fused kernels with minimal per-op dispatch, which
+//!    cuts the target-forward cost per verify step.
+//! 2. **Numerical parity with the reference** — the native bridge uses
+//!    the same fused attention + MLP kernels as the reference Qwen3
+//!    forward, which is what the DFlash draft was trained against. Without this, the
 //!    draft's cross-attention sees subtly different target hidden
 //!    states and acceptance rate drops.
 //!
@@ -123,7 +123,7 @@ impl DFlashTarget for NativeQwen3Target {
             )));
         }
         // Diagnostic: dump last-position values at each tapped layer so
-        // we can compare to upstream mlx-lm's per-layer output and
+        // we can compare to the reference per-layer output and
         // localize the DFlash acceptance-gap divergence. Only active
         // when `PMETAL_DFLASH_TAP_TRACE` is set; the f32 copy costs a
         // few microseconds but is only taken once the var is present.

@@ -28,7 +28,7 @@ use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt};
 /// The layer's interior activations are discarded when it returns and
 /// recomputed during the backward pass, so the trunk's peak activation memory
 /// stops scaling with depth. One decoder layer is the unit, matching what
-/// PyTorch and mlx-lm both checkpoint; there is no block size to tune.
+/// PyTorch checkpoints; there is no block size to tune.
 ///
 /// Only worth calling when a gradient is going to be taken. Inference has no
 /// backward pass to save anything for, so the recompute would be pure cost and

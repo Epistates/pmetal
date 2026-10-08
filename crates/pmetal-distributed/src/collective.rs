@@ -4,8 +4,6 @@
 //! - Ring: Bandwidth-optimal for large tensors
 //! - Tree: Latency-optimal for small tensors
 //! - Centralized: Simple, works for small collectives
-//!
-//! Based on Burn's collective framework for  operations.
 
 use crate::error::{DistributedError, DistributedResult};
 use serde::{Deserialize, Serialize};

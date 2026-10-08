@@ -435,7 +435,7 @@ impl Qwen2Attention {
         }
 
         // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
-        // No transpose needed - cache uses attention format directly (SOTA performance matching mlx_lm)
+        // No transpose needed - cache uses attention format directly
         let (keys, values) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &keys, &values)?
         } else {
@@ -960,7 +960,7 @@ mod tests {
     }
 
     /// A checkpoint that states no `head_dim` derives it, and one that states
-    /// `null` is the same case — `unsloth/Qwen2.5-0.5B-Instruct` ships
+    /// `null` is the same case — a released `Qwen2.5-0.5B-Instruct` ships
     /// `"head_dim": null` and means 896/14 = 64, not the 128 this config used
     /// to assume for every Qwen2.
     #[test]

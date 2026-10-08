@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A new ANE inference engine behind `infer --ane` and `serve --ane`** (`pmetal_metal::ane::lm::AneLm`). The whole model runs on the ANE: several layers per ANE program, each taking a batch of new tokens at once against a KV cache that stays in IOSurfaces between calls, with int8 weights by default (fp16 optional) and the LM head split into pieces sized to the model width. The engine it replaces ran one layer per kernel and kept part of each step on the GPU
   - Each step also checks guesses taken from the prompt (prompt lookup). Checking a few extra tokens costs about the same as computing one, so accepted guesses are free tokens, and the output is identical with or without them
-  - Qwen3-4B on an M4 Max: 24.5 tok/s plain, 37.6 tok/s with prompt lookup on a repetitive prompt, about 7 s to load once the system has cached the compiled programs (with the checkpoint in the page cache or on an internal SSD). Attention runs one softmax over the cache's and the new tokens' scores, and a pass carries 16 tokens: attention's cost grows with both, and over a 4096-slot cache it had been 60% of a layer. Greedy output matches `mlx_lm` (bf16) on Qwen3-0.6B (fp16) and on a Qwen3-4B chat prompt (int8 and fp16), and int8 perplexity on Qwen3-4B matches bf16 (NLL 2.287 vs 2.294)
-  - **DFlash drafting for the ANE engine**: `infer --ane --draft-model z-lab/Qwen3-4B-DFlash-b16` runs the DFlash draft model on the GPU, reading the hidden states the ANE programs output after the layers it was trained on, and the ANE verifies its 15 guesses in one pass. Output is identical to decoding without it. Qwen3-4B goes from 24 tok/s to 59-137 tok/s (3.1-7.1 tokens per pass on three chat prompts, near the 3.2-8.4 upstream dflash-mlx gets with a bf16 target on the GPU). The draft model runs with 8-bit weights, which guess as well as bf16 in half the memory and draft faster. `serve --ane --draft-model` does the same for every request. `--draft-model` still takes a Gemma 4 MTP assistant everywhere else; a DFlash draft model without `--ane` is refused with a pointer to `pmetal dflash`
+  - Qwen3-4B on an M4 Max: 24.5 tok/s plain, 37.6 tok/s with prompt lookup on a repetitive prompt, about 7 s to load once the system has cached the compiled programs (with the checkpoint in the page cache or on an internal SSD). Attention runs one softmax over the cache's and the new tokens' scores, and a pass carries 16 tokens: attention's cost grows with both, and over a 4096-slot cache it had been 60% of a layer. Greedy output matches the bf16 reference implementation on Qwen3-0.6B (fp16) and on a Qwen3-4B chat prompt (int8 and fp16), and int8 perplexity on Qwen3-4B matches bf16 (NLL 2.287 vs 2.294)
+  - **DFlash drafting for the ANE engine**: `infer --ane --draft-model z-lab/Qwen3-4B-DFlash-b16` runs the DFlash draft model on the GPU, reading the hidden states the ANE programs output after the layers it was trained on, and the ANE verifies its 15 guesses in one pass. Output is identical to decoding without it. Qwen3-4B goes from 24 tok/s to 59-137 tok/s (3.1-7.1 tokens per pass on three chat prompts). The draft model runs with 8-bit weights, which guess as well as bf16 in half the memory and draft faster. `serve --ane --draft-model` does the same for every request. `--draft-model` still takes a Gemma 4 MTP assistant everywhere else; a DFlash draft model without `--ane` is refused with a pointer to `pmetal dflash`
   - Output streams token by token in `infer`, and the timing line separates loading from generation
   - Qwen3 only for now; `infer --ane` says why it's using the GPU for anything else
 - **`Linear` can hold its weight packed for MLX's quantized matmul** (`Linear::quantize`, `LinearQuant`), as `mlx.nn.QuantizedLinear` does, with the packed weight's `scales` and `biases` beside it in the parameter tree. A packed layer doesn't train, but a LoRA adapter on it does and computes what it would on the unpacked weight, which is QLoRA; merging the adapter unpacks the layer
@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`pmetal dflash` accepted none of its draft model's guesses** on Qwen3-4B, so it ran slower than decoding without a drafter. Each draft saw only the few tokens the previous step had accepted as context, where the draft model reads the target's hidden states for the whole context, kept in its own KV cache as dflash-mlx does. It now keeps them: tokens per verify step on a chat prompt went from 1.0 to 8.5 (dflash-mlx: 8.5), 192 tokens from 12.1 s to 2.2 s, with the same output. Tree verification (`--tree-budget`) had the same fault and the same fix
+- **`pmetal dflash` accepted none of its draft model's guesses** on Qwen3-4B, so it ran slower than decoding without a drafter. Each draft saw only the few tokens the previous step had accepted as context, where the draft model reads the target's hidden states for the whole context, kept in its own KV cache. It now keeps them: tokens per verify step on a chat prompt went from 1.0 to 8.5, 192 tokens from 12.1 s to 2.2 s, with the same output. Tree verification (`--tree-budget`) had the same fault and the same fix
 - **`serve --ane` loaded the model again for many requests.** The loaded ANE model was kept per thread, and the server runs each request on whichever thread its pool hands out, so two requests at once, or any request after ten idle seconds, compiled or loaded the whole model again (seconds per request) and held another copy. The models now live on one thread of their own that every request runs on, one at a time
 - **`--seed` didn't make training reproducible** (#33). It seeded the data pipeline but not MLX's random key on `train`, `distill`, `rlkd` and `embed-train`, so LoRA initialisation and step-1 gradients differed between runs with the same seed. `train` is seeded where the shared training entry point starts, which covers the CLI, TUI, GUI, MCP and Python
 - **ANE: models the engines don't implement ran anyway and computed the wrong thing** (#34). ANE inference is Qwen3-shaped and now admits only `qwen3`; ANE training is Llama-shaped and admits `llama` and `mistral`. Both refuse MoE, `rope_scaling`, sliding windows, attention/MLP bias and untied `lm_head`, and refuse a checkpoint whose tensors are missing, the wrong size, or in a dtype they can't read (quantized weights used to load as zeros). ANE training now uses the checkpoint's `rope_theta` and `rms_norm_eps`. `infer --ane` warns when it doesn't use the ANE
@@ -53,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   On SmolLM2-135M, step 1 of `train --ane` now matches the GPU trainer's loss (2.568 vs 2.539); it used to start at 6.51 and climb toward 11, about a uniform guess over the vocabulary
 - **`train --ane` never saved what it trained.** Its output directory got `training_state.json` and nothing else, while the result pointed at a `lora_weights.safetensors` that was never written. It now writes the model, `model.safetensors` (f32: at the learning rates ANE training uses, bf16 would round the updates away) beside the base model's config and tokenizer, so `pmetal infer -m <output>` runs it. Checkpoints written every `--save-steps` include the weights too
 - **LoRA training on Qwen3.5 gave NaN loss on its first step**: the GDN layers ran their fused Metal kernel during training, and that kernel has no backward pass. An uncached forward now takes the differentiable path
-- **MLX quantization metadata** (#30). `qwen3_native` ignored MLX's per-module overrides (`"<module>": {"bits", "group_size"}` under `quantization`), so a mixed-precision checkpoint loaded at the file-level width; it now reads them, group size included. Checkpoints written by pmetal's MLX quantizer couldn't be loaded by `mlx_lm` (aux tensors named `<module>.weight.scales`, overrides in a pmetal-only map); it now writes MLX's layout. Checkpoints pmetal quantized before still load
+- **MLX quantization metadata** (#30). `qwen3_native` ignored MLX's per-module overrides (`"<module>": {"bits", "group_size"}` under `quantization`), so a mixed-precision checkpoint loaded at the file-level width; it now reads them, group size included. Checkpoints written by pmetal's MLX quantizer couldn't be loaded as MLX-format checkpoints (aux tensors named `<module>.weight.scales`, overrides in a pmetal-only map); it now writes MLX's layout. Checkpoints pmetal quantized before still load
 - **The GUI reported a Metal library MLX couldn't load only by failing the first job.** It now loads it at startup and shows an error dialog
 - **`init`, `download`, `search`, `dataset` and `tokenize` needed a working Metal library** after the startup check was added; they never use MLX, and now skip it
 - **Dataset downloads returned the wrong directory when the first file was nested** (`data/train-….parquet`), because the snapshot root was taken as the parent of that file
@@ -158,7 +158,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`just preflight`'s lockfile gate could never pass.** It ran `cargo update --locked`, which fails as soon as any transitive dependency publishes a new version; it now runs `cargo metadata --locked`, which fails only when `Cargo.lock` would actually have to change
 - `just fmt` and `just fmt-check` now cover `pmetal-gui/src-tauri`, which is excluded from the workspace and had therefore never been formatted
 - **The toolchain is pinned** (`rust-toolchain.toml`). CI lints with `-D warnings` against unpinned stable, so any stable that adds a lint turns the build red with no change on our side — 1.98 did exactly that. Bumping is now a reviewable commit
-- **Parity oracles migrated from mlx-lm to transformers** across every architecture, with shared fixture helpers and `pmetal_mlx::test_utils`
+- **Parity oracles migrated to Hugging Face transformers** across every architecture, with shared fixture helpers and `pmetal_mlx::test_utils`
 - `MllamaImageProcessor` renamed to `FixedSizeImageProcessor`, reflecting what it actually does
 - Gemma 4 caches pre-transposed expert weights
 - Clean under Rust 1.98 clippy (`chunks_exact` → `as_chunks`, `for_kv_map`, `drain_collect`, `needless_late_init`)
@@ -297,7 +297,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Gemma 4 architecture**: Full Gemma 4 model support with sliding-window attention and per-layer KV head configuration
 
-- **DFlash speculative decoding**: Native Rust port of the dflash-mlx speculative decoding pipeline for accelerated generation
+- **DFlash speculative decoding**: Native Rust implementation of the DFlash speculative decoding pipeline for accelerated generation
 
 - **Jinja chat templates**: Real upstream jinja rendering via minijinja with 16 parity-audited template types (ChatML, Llama2/3/4, Mistral, Gemma/Gemma4, Phi3/4, Qwen, DeepSeek, Cohere, Alpaca, Vicuna, Zephyr, GptOss)
 
@@ -438,7 +438,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Architecture enhancements**: DeepSeek V3/V3.2, GPT-OSS, Jamba, Llama 4, Qwen3, and Qwen3-MoE model improvements and weight sanitization refinements
 
-- **Third-party attribution**: Complete THIRD_PARTY_NOTICES with entries for mlx-lm, llama.cpp/GGML, Candle, and Burn
+- **Third-party attribution**: Complete THIRD_PARTY_NOTICES with entries for all incorporated third-party code
 
 ### Changed
 
@@ -570,8 +570,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Increased grace period: 15% of training steps (was: 10%)
 - **GUI LoRA inference producing garbage** (`_framework` token repeated): GUI was not reading `target_modules` from adapter_config.json (all modules got rank=16 instead of only attention) and was not merging LoRA weights before inference. Now reads `target_modules`/`use_rslora`, calls `merge_lora()` + `eval_all()` matching the working CLI path
 - **GUI fuse with cached models failing**: "Fuse with remote base models is not supported" error removed — now calls `resolve_model_path()` to download/resolve, matching CLI behavior
-- **Fused model not recognized by LM Studio**: Three fixes:
-  - Safetensors metadata now uses `format: mlx` (required by LM Studio on macOS)
+- **Fused model not recognized by MLX-format loaders**: Three fixes:
+  - Safetensors metadata now uses `format: mlx` (required by MLX-format loaders on macOS)
   - Generates `model.safetensors.index.json` with weight map (required for model discovery)
   - Fused weights preserve base model dtype (bf16/f16) instead of upcasting to f32 — halves output file size
 - **`adapter_config.json` missing `base_model`**: Training now saves `base_model` field in adapter config (distillation, GRPO, RLKD paths). Enables auto-detection of base model from LoRA adapter
@@ -884,7 +884,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **LoRA inference garbage output**: Merged LoRA weights into base model at inference time (`W += scale*B@A`), matching mlx-lm's pattern. The separate-forward path had dtype mismatch issues (BF16 base × F32 LoRA)
+- **LoRA inference garbage output**: Merged LoRA weights into base model at inference time (`W += scale*B@A`). The separate-forward path had dtype mismatch issues (BF16 base × F32 LoRA)
 - **Auto-chat mode regression**: Removed heuristic that forced chat template on base models just because their tokenizer has `<|im_end|>`. Chat mode now requires explicit `--chat` or an instruction-tuned model
 - **Missing EOS in training data**: Training sequences now end with the model's actual EOS token (e.g., `<|endoftext|>` for Qwen). Previously only had turn delimiter (`<|im_end|>`) — model never learned to stop generating
 - **Fuse command wrong alpha/rank**: `pmetal fuse` now reads `adapter_config.json` for correct alpha and rank instead of defaulting to `scale=1.0`. Also filters MLP LoRA weights (rank=0) when auto-detecting rank from shapes

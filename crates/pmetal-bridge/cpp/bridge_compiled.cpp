@@ -46,7 +46,7 @@ void mlx_inline_fused_swiglu(mlx_inline_array* dst,
     });
 }
 
-// Tanh-approximation GELU gating matching mlx-lm's `nn.gelu_approx(gate) * up`.
+// Tanh-approximation GELU gating matching MLX's `nn.gelu_approx(gate) * up`.
 // Structure: 0.5 * g * (1 + tanh(sqrt(2/pi) * (g + 0.044715 * g^3))) * u
 // All scalar constants are astype'd to gate.dtype() inside the compiled
 // lambda so bf16 inputs stay bf16 (no silent f32 promotion of the whole
@@ -1544,7 +1544,7 @@ void mlx_inline_compiled_gemma4_mlp_block(
                         auto h = fast::rms_norm(x, pre_w, PRE);
 
                         // Tanh-approx GELU on gate_proj output, multiply by
-                        // up_proj output. Matches mlx-lm's `geglu(gate, x) =
+                        // up_proj output. Matches the reference `geglu(gate, x) =
                         // nn.gelu_approx(gate) * x` (sqrt(2/pi)·(g + 0.044715·g^3)).
                         auto gate = qproj_matmul(h, gate_w, gate_scales, gate_biases, gate_tscale, GS);
                         auto up = qproj_matmul(h, up_w, up_scales, up_biases, up_tscale, US);

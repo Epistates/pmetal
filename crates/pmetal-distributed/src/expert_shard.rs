@@ -18,10 +18,9 @@
 //!
 //! # Why "remainder to the first ranks"?
 //!
-//! This matches DeepSpeed's `distribute_experts` behavior and mlx-lm's
-//! `_shard_experts`. A naïve `rank * base` indexing ignores the remainder
-//! and leaves the tail experts unowned, which is the bug this module
-//! exists to prevent.
+//! Every expert gets an owner and each rank's experts stay contiguous. A
+//! naïve `rank * base` indexing ignores the remainder and leaves the tail
+//! experts unowned, which is the bug this module exists to prevent.
 
 /// Returns `(start_expert_id, count)` for the given rank.
 ///
@@ -143,7 +142,7 @@ mod tests {
 
     #[test]
     fn remainder_concentrates_on_first_ranks() {
-        // 10 experts, 3 ranks → 4, 3, 3 (DeepSpeed convention).
+        // 10 experts, 3 ranks → 4, 3, 3.
         assert_eq!(expert_range(10, 0, 3), (0, 4));
         assert_eq!(expert_range(10, 1, 3), (4, 3));
         assert_eq!(expert_range(10, 2, 3), (7, 3));

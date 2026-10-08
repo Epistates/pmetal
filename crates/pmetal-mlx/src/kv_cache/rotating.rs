@@ -1,10 +1,10 @@
-//! Rotating KV cache - MLX-LM parity implementation.
+//! Rotating KV cache.
 
 use pmetal_bridge::compat::{Array, Exception, ops};
 
 /// Rotating KV cache that acts as a circular buffer.
 ///
-/// This implementation matches MLX-LM's `RotatingKVCache` for full parity.
+/// Same semantics as the reference `RotatingKVCache`.
 /// It maintains a fixed-size buffer that overwrites oldest entries when full,
 /// while optionally preserving initial "keep" tokens (typically prompt tokens).
 ///

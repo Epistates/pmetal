@@ -1,8 +1,8 @@
 //! Gemma 4 language model (text tower only).
 //!
 //! This is the text-only path of the Gemma 4 architecture from
-//! `Gemma4ForConditionalGeneration`. Ported against the mlx-vlm reference
-//! at `mlx_vlm/models/gemma4/language.py`.
+//! `Gemma4ForConditionalGeneration`. Ported against the reference
+//! Gemma 4 language model.
 //!
 //! Supported features (sufficient for the gemma-4-31B checkpoint):
 //! * Per-layer-type attention head_dim and num_kv_heads (full-attention
@@ -16,7 +16,7 @@
 //! * Per-layer-type RoPE base frequency (full = 1e6, sliding = 1e4).
 //! * Partial-rotary RoPE for full-attention layers
 //!   (`partial_rotary_factor = 0.25`) via `apply_gemma4_partial_rope`,
-//!   which translates mlx-lm's `ProportionalRoPE` — `theta_i = base^(-2i / head_dim)`
+//!   which translates the reference `ProportionalRoPE` — `theta_i = base^(-2i / head_dim)`
 //!   — into the standard rope formula by passing
 //!   `effective_base = base^(rotated_dims / head_dim)`.
 //! * Per-layer `layer_scalar` multiplier applied to the layer output.
@@ -24,9 +24,9 @@
 //! * Scale factor of `1.0` on SDPA (not `1/sqrt(head_dim)`).
 //! * Embedding scale by `sqrt(hidden_size)` (shared with Gemma 2/3).
 //! * RMSNorm with learnable scale and NO `+1` offset (a.k.a. `scale_shift=0`
-//!   in the mlx-vlm reference).
+//!   in the reference).
 //! * `gelu_tanh_approx`: the MLP gate activation uses the tanh-based GELU
-//!   approximation (matching mlx-lm `nn.gelu_approx`), NOT pmetal's
+//!   approximation (matching MLX `nn.gelu_approx`), NOT pmetal's
 //!   `nn::gelu_approximate` which maps to the sigmoid fast-approx variant.
 //!
 //! NOT supported:
@@ -36,7 +36,7 @@
 //!
 //! # Correctness status
 //!
-//! Numerically verified against mlx-lm's reference implementation via the
+//! Numerically verified against the reference implementation via the
 //! `gemma4_synthetic_parity` integration test in
 //! `crates/pmetal-models/tests/gemma4_parity.rs`. All tapped checkpoints
 //! (post-embedding, each per-layer hidden state, post-norm hidden, softcap
@@ -199,7 +199,7 @@ fn linear_lora(
 
 /// Apply Gemma 4 partial rotary embedding to a `[B, H, L, head_dim]` tensor.
 ///
-/// Gemma 4's `ProportionalRoPE` (mlx-lm `rope_utils.py::ProportionalRoPE`)
+/// Gemma 4's `ProportionalRoPE` (reference `ProportionalRoPE`)
 /// rotates only a fraction of each head dimension and **uses the full
 /// `head_dim` as the freq denominator**, not the rotated subset:
 ///
@@ -242,7 +242,7 @@ pub(crate) fn apply_gemma4_partial_rope(
     // Fast path: a precomputed `[head_dim / 2]` inverse-frequency array
     // with `inf` in the non-rotated slots lets us call `fast::rope` once
     // over the whole head — no slicing, no concats. This matches
-    // mlx-lm's `ProportionalRoPE` and is ~5-7x faster than the manual
+    // the reference `ProportionalRoPE` and is ~5-7x faster than the manual
     // slice/concat dance (the old fallback path) during decode.
     if let Some(freqs) = partial_freqs {
         return rope_with_periods(x, rope_positions, freqs, head_dim, false, 1.0);
@@ -313,7 +313,7 @@ pub(crate) fn apply_gemma4_partial_rope(
 
 /// Build the `[head_dim / 2]` inverse-frequency array used by the fast
 /// `rope_with_freqs` path. Non-rotated slots are filled with `f32::INF`
-/// so `mx.fast.rope` skips them. Matches mlx-lm's `ProportionalRoPE`:
+/// so `mx.fast.rope` skips them. Matches the reference `ProportionalRoPE`:
 ///
 /// ```text
 ///     freqs[i] = factor * base^(2i / head_dim)   for i in 0..rotated_dims/2
@@ -778,7 +778,7 @@ impl Gemma4Mlp {
         let up = self.up_proj.forward(x);
         // Gemma 4 uses the tanh-approximation GELU as its gate activation.
         // `nn::gelu_approximate` maps to the sigmoid fast-approx variant,
-        // which is NOT what mlx-lm's `gelu_approx` computes — see
+        // which is NOT what MLX's `nn.gelu_approx` computes — see
         // `nn::gelu_tanh_approximate` in the bridge compat layer.
         let gelu_gate = nn::gelu_tanh_approximate(&gate);
         Ok(self.down_proj.forward(&gelu_gate.multiply(&up)))

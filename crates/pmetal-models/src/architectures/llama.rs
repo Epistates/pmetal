@@ -368,7 +368,7 @@ impl LlamaAttention {
         }
 
         // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
-        // No transpose needed - cache uses attention format directly (SOTA performance matching mlx_lm)
+        // No transpose needed - cache uses attention format directly
         let (keys, values) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &keys, &values)?
         } else {

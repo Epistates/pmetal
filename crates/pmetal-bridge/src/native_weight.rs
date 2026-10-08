@@ -3,7 +3,7 @@
 //! MLX models quantization as a property of the *layer*, not of the
 //! architecture: `nn.QuantizedLinear` and `nn.QuantizedEmbedding` are drop-in
 //! replacements, and a model calls `embed_tokens.as_linear(x)` without knowing
-//! which it holds. That is why mlx-lm's architectures contain no `if
+//! which it holds. That is why the reference architectures contain no `if
 //! quantized` branch anywhere.
 //!
 //! The native engines are hand-rolled rather than module-based, so the
@@ -48,7 +48,7 @@ impl QuantParams {
     }
 }
 
-/// A checkpoint's `quantization` block, read the way mlx-lm reads it.
+/// A checkpoint's `quantization` block, read the way MLX-format loaders read it.
 ///
 /// Module paths sit as *sibling* keys beside `group_size` / `bits` / `mode`,
 /// each holding either an override object or `false`:

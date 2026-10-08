@@ -92,7 +92,7 @@ void mlx_inline_compiled_attn_layer_fixed(
 // SDPA + o_proj + post_attention_layernorm into a single Compiled graph.
 //
 // The MLP block fuses pre_feedforward_layernorm + gate/up projections +
-// tanh-approx GELU (matching mlx-lm `nn.gelu_approx`) + multiply +
+// tanh-approx GELU (matching MLX `nn.gelu_approx`) + multiply +
 // down_proj + post_feedforward_layernorm.
 //
 // Residual adds and the per-layer scalar multiply are intentionally

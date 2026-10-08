@@ -344,7 +344,7 @@ void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a) 
 
 void mlx_inline_tri_inv(mlx_inline_array* dst, const mlx_inline_array* a, bool upper, bool use_cpu) {
     // tri_inv has no VJP in MLX — used in WY factorization as a fixed preconditioner.
-    // use_cpu=true routes execution to the CPU device (matching mlx-lm's StreamOrDevice::cpu()).
+    // use_cpu=true routes execution to the CPU device (StreamOrDevice::cpu()).
     BRIDGE_TRY_DST("tri_inv", dst, {
         mlx::core::StreamOrDevice stream = use_cpu
             ? mlx::core::StreamOrDevice{mlx::core::Device(mlx::core::Device::cpu)}

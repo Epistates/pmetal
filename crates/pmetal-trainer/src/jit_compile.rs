@@ -19,7 +19,6 @@
 //!
 //! With proper state initialization (warmup step), this achieves full JIT fusion:
 //! - ~3x throughput improvement over non-compiled execution
-//! - Matches mlx-lm's compiled training performance
 //!
 //! # Example
 //!

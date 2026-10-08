@@ -1,7 +1,7 @@
 //! K-Quant quantization utilities.
 //!
 //! Helper functions for quantizing f32 data to K-quant block formats.
-//! Based on llama.cpp and Candle implementations.
+//! Follows the llama.cpp/GGML reference implementation.
 
 use crate::fp4::{best_index_mxfp4, e8m0_to_fp32_half, fp32_to_ue4m3, ue4m3_to_fp32};
 use crate::k_quants::{

@@ -144,7 +144,7 @@ pub enum LoraError {
 /// single shared implementation that every `load_base_weights_from_dir` method
 /// should call immediately after `Array::load_safetensors`.
 ///
-/// Dtypes are preserved as-is (BF16 models stay BF16, matching mlx-lm behavior).
+/// Dtypes are preserved as-is (BF16 models stay BF16).
 pub fn sanitize_loaded_weights(
     weights: HashMap<String, Array>,
 ) -> Result<HashMap<String, Array>, LoraError> {

@@ -1,7 +1,7 @@
 //! Expert I/O infrastructure for SSD-offloaded MoE inference.
 //!
 //! Implements high-performance parallel `pread()` I/O for loading individual expert
-//! weights from packed binary files. Key design decisions from flash-moe:
+//! weights from packed binary files. Key design decisions:
 //!
 //! - **pread() over mmap()**: 5x faster for cold reads (DMA controller optimization)
 //! - **No custom caching**: OS page cache provides 38% better performance

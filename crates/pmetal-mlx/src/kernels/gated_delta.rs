@@ -28,7 +28,7 @@
 //!
 //! # Reference
 //!
-//! - Ported from `mlx-lm/models/gated_delta.py` (Apple, 2025).
+//! - Ported from the MLX reference implementation (Apple, 2025).
 //! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
 //!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
@@ -762,7 +762,7 @@ pub fn gated_delta_inference_dispatch(
 /// as Qwen3.5: after a verify pass appends `T_verify` tokens but only `M < T`
 /// are accepted, call this with the pre-verify state snapshot and the
 /// accepted-prefix slices of `k`, `v`, `g`, `beta` to reconstruct the GDN
-/// state at exactly the accepted position. Matches dflash-mlx's
+/// state at exactly the accepted position. Matches the DFlash reference's
 /// `advance_gated_delta_states` helper but reuses the existing Metal kernel +
 /// ops path instead of shipping a second kernel.
 ///

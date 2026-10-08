@@ -10,7 +10,7 @@ use super::{
     dtype_size,
 };
 
-/// Pre-allocation step size in tokens (matches Python mlx-lm).
+/// Pre-allocation step size in tokens.
 /// Cache grows in chunks of this size to avoid per-token allocations.
 const CACHE_STEP_SIZE: usize = 256;
 
@@ -407,7 +407,7 @@ impl KVCache {
     /// This is the speculative-decoding primitive: after a verify step that
     /// accepted only some of the drafted tokens, call `rollback(rejected)` to
     /// reclaim the trailing positions. The return value is the same contract
-    /// as MLX-LM / dflash-mlx `trim()` — callers can assert it matches the
+    /// as the reference `trim()` — callers can assert it matches the
     /// expected discard count.
     ///
     /// For the standard path this is an O(1) offset decrement; the buffer is
@@ -439,10 +439,10 @@ impl KVCache {
     /// Update the cache with new keys and values for a layer.
     ///
     /// Keys/values are expected in **attention format** `[B, heads, seq, head_dim]`
-    /// where axis 2 is the sequence dimension. This matches mlx_lm for SOTA performance.
+    /// where axis 2 is the sequence dimension.
     ///
     /// Uses pre-allocation in chunks of CACHE_STEP_SIZE (256 tokens) and in-place
-    /// slice assignment for O(1) amortized per-token updates (matching Python mlx-lm).
+    /// slice assignment for O(1) amortized per-token updates.
     ///
     /// # Arguments
     /// * `layer_idx` - Layer index
@@ -489,7 +489,7 @@ impl KVCache {
             self.total_tokens += new_seq_len;
         }
 
-        // Check if we need to grow the cache (pre-allocation pattern from mlx_lm)
+        // Check if we need to grow the cache (chunked pre-allocation)
         let needs_growth = cache.keys.is_none() || {
             let allocated = cache.keys.as_ref().unwrap().dim(2) as usize;
             prev_offset + new_seq_len > allocated
@@ -656,7 +656,7 @@ impl KVCache {
             }
         };
 
-        // Return slice views up to final_offset — matches Python mlx_lm pattern
+        // Return slice views up to final_offset
         let k = cache.keys.as_ref().unwrap();
         let v = cache.values.as_ref().unwrap();
         let kb = k.dim(0) as usize;

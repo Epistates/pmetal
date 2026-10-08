@@ -5,8 +5,8 @@
 //!
 //! # Design Philosophy
 //!
-//! The Python mlx-lm library achieves 275 tok/s by using compiled sampling with proper
-//! random state tracking:
+//! Fast sampling comes from compiling the sampler with proper random state
+//! tracking:
 //!
 //! ```python
 //! @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
@@ -268,7 +268,7 @@ fn apply_min_p_2d(
 // CompiledSampler - Main Interface
 // ============================================================================
 
-/// A JIT-compiled sampler that matches mlx_lm's performance.
+/// A JIT-compiled sampler.
 ///
 /// This sampler properly tracks random state across compiled function calls,
 /// implementing the same paradigm as Python's:
@@ -283,7 +283,6 @@ fn apply_min_p_2d(
 /// - Operations are fused into single Metal kernels
 /// - Random state updates are correctly propagated
 /// - CPU overhead is minimized (no per-token Python/Rust overhead)
-/// - Achieves 275+ tok/s matching mlx_lm
 ///
 /// # Example
 ///
@@ -414,7 +413,7 @@ impl CompiledSampler {
     ///
     /// # Performance
     ///
-    /// Optimized to match mlx-lm's performance:
+    /// Optimized for throughput:
     /// - Inline log_softmax (like Python: `logits - logsumexp(logits)`)
     /// - O(n) argpartition for top_k (not O(n log n) sort)
     /// - Fused filter application (single 2D reshape, not per-filter)
@@ -426,7 +425,7 @@ impl CompiledSampler {
             return Ok(argmax_axis(logits, -1));
         }
 
-        // Convert logits to log probabilities inline (like Python's mlx-lm)
+        // Convert logits to log probabilities inline
         // logprobs = logits - logsumexp(logits, keepdims=True)
         let lse = logsumexp_axis_keepdims(logits, -1, true);
         let log_probs = logits.subtract(&lse);

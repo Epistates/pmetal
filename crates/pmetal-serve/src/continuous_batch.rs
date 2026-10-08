@@ -39,7 +39,7 @@
 //! # Prefill policy (for D.1)
 //!
 //! At most one slot is in the `Prefilling` state at any time. This
-//! matches the simplest exo `BatchGenerator` pattern: decodes run
+//! is the simplest batching pattern: decodes run
 //! batched, prefills run serially. A later phase can relax this to
 //! chunked interleaved prefill once the batched forward pass is in
 //! place.

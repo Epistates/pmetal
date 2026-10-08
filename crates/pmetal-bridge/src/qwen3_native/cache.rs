@@ -20,7 +20,7 @@ pub struct GdnCache {
 
 /// Affine-quantized KV cache tuple: (packed_uint32, scales, biases).
 ///
-/// Matches mlx-lm's `QuantizedKVCache` storage format. The packed data, scales,
+/// Same storage format as the reference `QuantizedKVCache`. The packed data, scales,
 /// and biases are passed directly to `quantized_matmul` which dequantizes inside
 /// the Metal kernel — zero-overhead vs bf16 SDPA.
 #[derive(Clone)]

@@ -1,12 +1,12 @@
 //! YARN (Yet-another-RoPE-extensioN) frequency + scale math, shared across
-//! architectures whose reference is mlx-lm's `rope_utils.YarnRoPE`.
+//! architectures that follow the reference `YarnRoPE`.
 //!
 //! DeepSeek-V3 and GPT-OSS both extend context with YARN and compute the exact
 //! same per-dimension inverse frequencies and embedding `mscale`; only the RoPE
 //! *application* differs (DeepSeek uses interleaved/`traditional=true` and folds
 //! `mscale²` into the softmax scale; GPT-OSS uses split-half/`traditional=false`
 //! and scales q/k by `mscale` before rotation). The freq/scale derivation here
-//! is byte-for-byte the mlx-lm formula so both callers stay parity-exact.
+//! is byte-for-byte the reference formula so both callers stay parity-exact.
 //!
 //! Callers feed [`YarnRope::inv_freq`] to
 //! [`pmetal_mlx::kernels::rope::apply_rope_with_freqs`] and apply
@@ -17,7 +17,7 @@ use pmetal_bridge::compat::Array;
 
 /// YARN attention/length scale: `0.1 * mscale * ln(scale) + 1` (1.0 for scale ≤ 1).
 ///
-/// Mirrors mlx-lm `YarnRoPE.yarn_get_mscale`.
+/// Mirrors the reference `yarn_get_mscale`.
 pub fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
     if scale <= 1.0 {
         1.0
@@ -57,7 +57,7 @@ pub struct YarnRope {
 /// Build the YARN per-dimension inverse frequencies and embedding mscale.
 ///
 /// `scaling_factor == 1` collapses to standard RoPE (freq_inter == freq_extra).
-/// Mirrors mlx-lm `YarnRoPE.__init__` exactly (correction range in *dimension*
+/// Mirrors the reference `YarnRoPE` constructor exactly (correction range in *dimension*
 /// space, linear ramp over the dim index).
 #[allow(clippy::too_many_arguments)]
 pub fn build_yarn_rope(

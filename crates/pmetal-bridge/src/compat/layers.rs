@@ -98,8 +98,7 @@ impl Linear {
     /// when the fold should be permanent.
     ///
     /// A packed weight is unpacked first: the merged weight isn't the packed
-    /// one plus a delta, so the layer is dense from then on, as mlx-lm's
-    /// `fuse --dequantize` leaves it.
+    /// one plus a delta, so the layer is dense from then on.
     pub fn merge_lora(&mut self) {
         if self.adapter.as_ref().is_some_and(|a| !a.merged) {
             self.dequantize();

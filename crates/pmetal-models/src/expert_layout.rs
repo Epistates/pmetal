@@ -235,11 +235,11 @@ mod tests {
         // gate_scales: [1024, 4096/64] * 2 bytes = [1024, 64] * 2 = 131,072
         assert_eq!(record.gate_scales.size, 1024 * 64 * 2);
 
-        // Verify flash-moe reference value for this config
+        // Verify the expected packed size for this config
         let total = record.total_size();
         assert_eq!(
             total, 7_077_888,
-            "Expert size should match flash-moe's EXPERT_SIZE"
+            "Expert size should match the packed EXPERT_SIZE"
         );
     }
 

@@ -254,7 +254,7 @@ mod tests {
         // `argpartition(-scores, -k, -1)[..., -k:]` was a latent bug:
         // it selects the k LARGEST of `-scores` = k SMALLEST of scores.
         //
-        // The correct sign-flip pattern (mlx-lm hunyuan/llama4 style) uses
+        // The correct sign-flip pattern (as in the reference Hunyuan/Llama 4 routing) uses
         // a positive kth and slices from the front:
         //   argpartition(-scores, k-1, -1)[..., :k]
         //

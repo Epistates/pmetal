@@ -13,7 +13,7 @@
 //!   raw `k_proj` output BEFORE `k_norm` is applied.
 //! * `v_norm`: RMSNorm **without** a learnable scale on the values.
 //! * Per-layer-type partial RoPE. Full layers use a custom inverse-frequency
-//!   array (mlx-lm's `ProportionalRoPE`) — `freqs[i] = base^(2i/head_dim)` for
+//!   array (the reference `ProportionalRoPE`) — `freqs[i] = base^(2i/head_dim)` for
 //!   `i in 0..rotated_dims/2` with the remaining slots filled with `inf` so
 //!   `fast::rope(..., freqs=)` leaves them untouched.
 //! * Per-layer `layer_scalar` multiplier applied at the end of each decoder
@@ -23,7 +23,7 @@
 //! * KV-sharing (`num_kv_shared_layers`) used by the E2B/E4B checkpoints.
 //! * Final logit softcap: `softcap * tanh(logits / softcap)`.
 //! * Embedding scale by `sqrt(hidden_size)` (shared with Gemma 2/3).
-//! * Tanh-approximation GELU in the MLP (matching mlx-lm's `nn.gelu_approx`).
+//! * Tanh-approximation GELU in the MLP (matching MLX's `nn.gelu_approx`).
 //!
 //! Weights are pre-transposed to `[in, out]` at load time (`w.t()`) so the
 //! per-decode matmuls are contiguous.
@@ -809,7 +809,7 @@ fn shared_kv_attention_forward(
 ///
 /// * `model.*` — text-only export (`gemma4_text`).
 /// * `model.language_model.*` — transformers multimodal export, e.g.
-///   `unsloth/gemma-4-31B-it`, with the towers under `model.vision_tower.*`.
+///   `gemma-4-31B-it`, with the towers under `model.vision_tower.*`.
 /// * `language_model.model.*` — unified export (`gemma4_unified`), e.g.
 ///   `mlx-community/gemma-4-12B-it-bf16`, where the towers sit *beside* the
 ///   text backbone as `vision_embedder.*`, `embed_vision.*`, `embed_audio.*`
@@ -877,7 +877,7 @@ pub fn load_model(
         }
     }
 
-    // The `quantization` block, if any, read the way mlx-lm reads it. Its
+    // The `quantization` block, if any, read the way MLX-format loaders read it. Its
     // module paths get the same normalisation as the weight keys, or every
     // per-module override would miss and the 8-bit tensors in a QAT
     // checkpoint would be decoded as 4-bit.
@@ -920,7 +920,7 @@ pub fn load_model(
     }
 
     // One module's three tensors. `scales` decides the variant, which is
-    // upstream's rule too: mlx-lm quantizes a module exactly when
+    // the MLX checkpoint rule too: a module is quantized exactly when
     // `{path}.scales` is in the weights.
     let mut take_proj = |map: &mut std::collections::HashMap<String, InlineArray>,
                          module: &str|
@@ -1048,7 +1048,7 @@ pub fn load_model(
                         config.moe_intermediate_size.unwrap_or_default(),
                     )
                 } else if raw.contains_key(&format!("{experts}.switch_glu.gate_proj.weight")) {
-                    // mlx-lm stacks experts as `switch_glu.*`, `[E, out, in]`.
+                    // MLX-format checkpoints stack experts as `switch_glu.*`, `[E, out, in]`.
                     let mut stacked = |name: &str| -> Result<LayerWeight, String> {
                         let module = format!("{experts}.switch_glu.{name}");
                         if raw.contains_key(&format!("{module}.scales")) {
@@ -1127,7 +1127,7 @@ pub fn load_model(
             None
         };
 
-        // Gemma 4 stores `layer_scalar` as an f32 scalar (mlx-lm uses
+        // Gemma 4 stores `layer_scalar` as an f32 scalar (the reference uses
         // `mx.ones((1,))` which defaults to f32). The hidden state is
         // bf16, so multiplying by an f32 scalar would promote the whole
         // residual to f32 and force every downstream layer's matmul to
@@ -1368,7 +1368,7 @@ fn ensure_cache_capacity(
 /// and the MLP is per-op matmuls + a tanh-approx GELU helper. Wrapping
 /// the norms and MLP inside bigger compiled lambdas made the graph
 /// harder to fuse efficiently; matching Qwen3's layout recovers the
-/// single-compile-per-layer pattern that mlx-lm replays.
+/// single-compile-per-layer pattern.
 pub fn forward_step(
     weights: &NativeWeights,
     input_ids: &InlineArray,
@@ -1801,7 +1801,7 @@ mod tests {
     /// `mlx-community/gemma-4-e4b-it-4bit`: 42 layers, the last 18 shared, so
     /// every shared layer reads the last concrete layer of its own attention
     /// type (22 sliding, 23 full). This is `layer_idx_to_cache_idx` in
-    /// mlx-lm's `gemma3n.py`, which E4B inherits from.
+    /// the reference Gemma 3n model, which E4B inherits from.
     ///
     /// ⚠️ Those 18 layers ship no `k_proj`, `v_proj` or `k_norm` at all, which
     /// is why demanding them kept the whole E2B/E4B family from loading (#31).

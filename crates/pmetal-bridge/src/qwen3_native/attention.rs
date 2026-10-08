@@ -493,7 +493,7 @@ pub(super) fn attn_forward_with_tree_ctx(
         } else {
             // ---- UNIFORM-BIT PATH (unchanged) ----
             // Zero-overhead quantized KV cache path using quantized_matmul.
-            // Matches mlx-lm's QuantizedKVCache: quantize K/V immediately after RoPE,
+            // Same layout as the reference QuantizedKVCache: quantize K/V immediately after RoPE,
             // store as (packed_uint32, scales, biases), pass to quantized_matmul
             // which dequantizes inside the Metal kernel. No separate dequant pass.
             let bits = qcfg.bits as i32;

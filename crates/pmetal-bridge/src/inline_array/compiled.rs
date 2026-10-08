@@ -587,7 +587,7 @@ impl InlineArray {
         }
     }
 
-    /// Fused tanh-approx GEGLU matching mlx-lm's `nn.gelu_approx(gate) * up`.
+    /// Fused tanh-approx GEGLU matching MLX's `nn.gelu_approx(gate) * up`.
     /// All scalar constants are cast to `gate.dtype()` inside the compiled
     /// lambda, so bf16 inputs stay bf16 — avoiding the silent f32 promotion
     /// that otherwise doubled MLP bandwidth on the Gemma 4 hot path.

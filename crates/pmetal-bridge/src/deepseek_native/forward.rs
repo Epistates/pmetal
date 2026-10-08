@@ -121,7 +121,7 @@ fn generate_from_primed_sample_impl(
     )
 }
 
-/// Run one MLX-LM-style benchmark trial on the canonical DeepSeek native path.
+/// Run one benchmark trial on the canonical DeepSeek native path.
 pub fn benchmark_mlx_lm_trial(
     weights: &NativeWeights,
     prompt_ids: &[u32],

@@ -285,7 +285,7 @@ fn load_mlx_quantization_config(
     //
     //   "language_model.model.layers.0.mlp.gate_proj": {"bits": 8, "group_size": 64}
     //
-    // mlx-lm reads these in `class_predicate` when rebuilding the model. Not
+    // MLX-format loaders read these when rebuilding the model. Not
     // reading them unpacks those tensors at the model-wide width, which yields
     // the right byte count and the wrong shape, so the failure surfaces several
     // ops later as a norm complaining about its input.

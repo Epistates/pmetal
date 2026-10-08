@@ -16,7 +16,7 @@
 //! This model loads checkpoints from the `z-lab/*-DFlash*` family on Hugging
 //! Face (currently `z-lab/Qwen3-4B-DFlash-b16` and
 //! `z-lab/Qwen3.5-4B-DFlash`). Weight naming follows the upstream Python
-//! implementation at `dflash_mlx/draft.py`:
+//! implementation:
 //! * `layers.{i}.self_attn.{q,k,v,o}_proj.weight`
 //! * `layers.{i}.self_attn.{q,k}_norm.weight`
 //! * `layers.{i}.{input_layernorm,post_attention_layernorm}.weight`
@@ -70,7 +70,7 @@ pub struct DFlashExtras {
 
 /// Configuration for [`DFlashDraftModel`].
 ///
-/// Matches the Python `DraftArgs` struct in `dflash_mlx/draft.py`. Fields
+/// Matches the reference Python `DraftArgs` struct. Fields
 /// that have sensible defaults in the upstream implementation are given
 /// `#[serde(default)]` so a config.json that omits them still loads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,7 +264,7 @@ impl DFlashAttention {
 
         // RoPE: queries start at offset `cache.offset + context_len`, keys
         // start at offset `cache.offset` (the context rows sit at the front
-        // of the KV sequence). This matches dflash_mlx/draft.py:141-148.
+        // of the KV sequence). This matches the reference implementation.
         let cache_offset = cache
             .as_ref()
             .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
@@ -464,7 +464,7 @@ impl DFlashDraftModel {
     }
 
     /// Pack every projection for MLX's quantized matmul. At 8 bits the
-    /// drafts barely change (dflash-mlx: the same tokens per verify step on
+    /// drafts barely change (the same tokens per verify step on
     /// Qwen3-4B) and a draft reads half the bytes.
     pub fn quantize(
         &mut self,
@@ -493,8 +493,8 @@ impl DFlashDraftModel {
             .collect()
     }
 
-    /// Draft a block against everything drafted against so far, as
-    /// dflash-mlx does: `target_hidden` holds the target's tapped states for
+    /// Draft a block against everything drafted against so far:
+    /// `target_hidden` holds the target's tapped states for
     /// the context positions since the last draft, which join `cache` for
     /// good, and `noise_embedding` the block, whose keys and values are
     /// dropped after. Every draft attends to the whole context.
@@ -520,7 +520,7 @@ impl DFlashDraftModel {
 impl DFlashDraftModel {
     /// Load weights from a flat `name → tensor` map.
     ///
-    /// Accepts both the upstream dflash_mlx naming (`layers.{i}.…`) and a
+    /// Accepts both the upstream DFlash naming (`layers.{i}.…`) and a
     /// `model.layers.{i}.…` prefixed variant so a safetensors file that
     /// follows either convention drops in.
     pub fn load_weights(

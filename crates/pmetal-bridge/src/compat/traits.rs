@@ -224,7 +224,7 @@ where
 /// dotted path.
 ///
 /// This is the Rust stand-in for PyTorch's `named_modules()`, and it exists for
-/// the same reason PEFT and mlx-lm need it: attaching adapters is a pass over a
+/// the same reason PEFT needs it: attaching adapters is a pass over a
 /// *built* model, not a decision the architecture makes when it is constructed.
 /// `ModuleParameters` cannot serve — it flattens to `Array` leaves, and by the
 /// time you have the arrays you have lost the layer they belong to.

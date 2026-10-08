@@ -257,9 +257,9 @@ impl GptOssConfig {
     }
 
     /// Build the YARN rotary state (per-dim inverse frequencies + embedding
-    /// mscale) when `rope_scaling.rope_type == "yarn"`, mirroring mlx-lm's
+    /// mscale) when `rope_scaling.rope_type == "yarn"`, mirroring the reference
     /// `initialize_rope` → `YarnRoPE`. GPT-OSS's config omits `mscale`/
-    /// `mscale_all_dim`, so the mlx-lm defaults (1.0 / 0.0) apply — which still
+    /// `mscale_all_dim`, so the reference defaults (1.0 / 0.0) apply — which still
     /// yields a non-trivial `mscale` for factor > 1.
     fn yarn_rope(&self) -> Option<YarnRope> {
         let rs = self.rope_scaling.as_ref()?;
@@ -561,7 +561,7 @@ impl GptOssMLP {
     }
 }
 
-/// GPT-OSS clamped SwiGLU — matches HF `modeling_gpt_oss` and mlx-lm `swiglu`.
+/// GPT-OSS clamped SwiGLU — matches HF `modeling_gpt_oss`.
 ///
 /// ```text
 ///   x_glu    = clip(gate, max=limit)              // gate: upper clamp only
@@ -588,7 +588,7 @@ fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Ex
 }
 
 /// GPT-OSS router selection — spec of record: HF `modeling_gpt_oss`
-/// (`GptOssTopKRouter`) and mlx-lm `MLPBlock`, which agree: select the top-k
+/// (`GptOssTopKRouter`): select the top-k
 /// experts from the RAW router logits, then take `softmax` over the selected
 /// logits. NOT sigmoid, and NOT renormalized — the softmax over the chosen
 /// logits already sums to 1.
@@ -609,7 +609,7 @@ fn router_topk_softmax(gate_logits: &Array, top_k: i32) -> (Array, Array) {
 }
 
 /// Apply GPT-OSS RoPE to q/k. When `yarn` is `Some`, uses YARN per-dimension
-/// inverse frequencies and scales q/k by the embedding `mscale` first (mlx-lm
+/// inverse frequencies and scales q/k by the embedding `mscale` first (reference
 /// `YarnRoPE`); otherwise plain base RoPE. Split-half (`traditional=false`) in
 /// both cases. Shared by the base and LoRA attention paths.
 fn apply_gpt_oss_rope(
@@ -723,8 +723,8 @@ impl GptOssMoE {
         swiglu_limit: f32,
         router_aux_loss_coef: f32,
     ) -> Result<Self, Exception> {
-        // GPT-OSS router carries a bias (mlx-lm `MLPBlock.router` /
-        // HF `GptOssTopKRouter`): top-k is taken over `logits + bias`.
+        // GPT-OSS router carries a bias (HF `GptOssTopKRouter`): top-k is
+        // taken over `logits + bias`.
         let gate = nn::LinearBuilder::new(hidden_size, num_experts)
             .bias(true)
             .build()?;
@@ -1889,9 +1889,9 @@ mod tests {
     fn clamp_swiglu_matches_gpt_oss_reference_formula() {
         // GPT-OSS clamped SwiGLU — spec of record: HF `modeling_gpt_oss`
         // (`gate.clamp(max=limit)`, `up.clamp(-limit,limit)`,
-        //  `glu = gate*sigmoid(1.702*gate)`, `out = (up+1)*glu`) and mlx-lm
-        // `swiglu()`, which agree exactly. Values chosen so the previous buggy
-        // `clip(silu(gate)*up, ±limit)` form gives a very different answer:
+        //  `glu = gate*sigmoid(1.702*gate)`, `out = (up+1)*glu`). Values chosen
+        // so the previous buggy `clip(silu(gate)*up, ±limit)` form gives a very
+        // different answer:
         // gate>limit exercises the one-sided clamp; up<0 the +1 shift.
         let limit = 7.0_f32;
         let gate = Array::from_slice(&[8.0_f32, -3.0, 1.0], &[3]);
@@ -1919,7 +1919,7 @@ mod tests {
 
     #[test]
     fn router_topk_uses_softmax_over_raw_logits() {
-        // Spec of record: HF `GptOssTopKRouter` / mlx-lm `MLPBlock` — top-k over
+        // Spec of record: HF `GptOssTopKRouter` — top-k over
         // RAW router logits, then softmax over the selected logits. The previous
         // pmetal path used sigmoid + L1-normalization, which gives different
         // weights. One token, 4 experts; top-2 selects experts 3 (4.0) & 1 (2.0).

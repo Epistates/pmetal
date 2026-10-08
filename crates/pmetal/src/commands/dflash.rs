@@ -74,7 +74,7 @@ pub async fn run_dflash(
     // DFlash drafts are trained against chat-templated targets. Running
     // without a template leaves the draft cross-attending to target
     // hidden states that are out-of-distribution, which collapses
-    // acceptance to ~0. Match upstream dflash-mlx's behavior: always
+    // acceptance to ~0. Always
     // apply the model's chat template unless the caller explicitly
     // opts out with --no-chat.
     let prompt_ids: Vec<i32> = if no_chat {
@@ -87,10 +87,9 @@ pub async fn run_dflash(
     } else {
         let template = detect_chat_template(&target_path, &target_path.to_string_lossy());
         let messages = [Message::user(prompt)];
-        // `enable_thinking=false` / `no_thinking=true` matches upstream
-        // dflash-mlx's adapter (which always passes enable_thinking=False)
-        // so the rendered conversation ends at the assistant prompt with
-        // no internal reasoning blocks.
+        // `enable_thinking=false` / `no_thinking=true`, so the rendered
+        // conversation ends at the assistant prompt with no internal
+        // reasoning blocks.
         let rendered = template.apply_inference(&messages, true, None).text;
         if std::env::var_os("PMETAL_DFLASH_DEBUG_PROMPT").is_some() {
             eprintln!("[dflash debug] rendered prompt: {:?}", rendered);
@@ -144,9 +143,8 @@ pub async fn run_dflash(
 
     let start = std::time::Instant::now();
     let output = if wants_native {
-        // Fused native-bridge target: matches mlx-lm's parallel-replay
-        // forward kernel-for-kernel, so the target forward is at parity
-        // with upstream dflash-mlx. Falls back to the dynamic path if
+        // Fused native-bridge target: the parallel-replay verify forward
+        // runs on the fused kernels. Falls back to the dynamic path if
         // the native loader rejects the checkpoint (e.g., quantized or
         // unsupported variant).
         match NativeQwen3Target::load(&target_path) {

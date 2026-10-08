@@ -11,8 +11,8 @@
 //! and nothing is recomputed. Nothing ever called it, which is the other half
 //! of why it went unnoticed.
 //!
-//! `layers_per_block` has no counterpart in the real mechanism. Both PyTorch
-//! and mlx-lm checkpoint one decoder layer at a time; the knob only ever chose
+//! `layers_per_block` has no counterpart in the real mechanism. PyTorch
+//! checkpoints one decoder layer at a time; the knob only ever chose
 //! which trace lines got printed.
 
 /// Configuration for gradient checkpointing.

@@ -1,7 +1,6 @@
 //! Python bindings for DFlash block-diffusion speculative decoding.
 //!
-//! Exposes a thin `DFlashGenerator` class that matches the upstream
-//! `dflash_mlx.DFlashGenerator` Python API. The target must currently be a
+//! Exposes a thin `DFlashGenerator` Python class. The target must currently be a
 //! Qwen3 checkpoint — Qwen3.5 support arrives once the qwen3_next GDN
 //! verify-input capture lands.
 

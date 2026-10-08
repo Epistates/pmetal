@@ -5,13 +5,13 @@
 //! - **compiled_sampler**: JIT-compiled sampling using MLX's compile transform (recommended)
 //! - **metal_sampler**: Fused Metal kernel for single-launch sampling
 //!
-//! The compiled sampler is preferred as it matches mlx_lm's approach of using
+//! The compiled sampler is preferred as it uses the equivalent of
 //! `@partial(mx.compile, inputs=state, outputs=state)` to fuse operations into
 //! optimized Metal kernels with proper state tracking.
 //!
 //! # State Tracking
 //!
-//! The key insight from Python's mlx-lm is that sampling functions must properly
+//! The key insight is that sampling functions must properly
 //! track random state. This is done via:
 //!
 //! ```python

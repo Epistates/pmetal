@@ -494,7 +494,7 @@ pub fn quantize_and_save_mlx(
                 // MLX's layout: the packed tensor keeps its `.weight` name and
                 // the scales and biases are its siblings, `{module}.scales`
                 // and `{module}.biases`. Suffixing the full tensor name
-                // (`{module}.weight.scales`) made checkpoints mlx_lm can't
+                // (`{module}.weight.scales`) made checkpoints other MLX loaders can't
                 // load (#30).
                 let module = module_path(&assignment.name);
                 let scales_key = format!("{module}.scales");
@@ -602,8 +602,8 @@ fn module_path(tensor_name: &str) -> &str {
 /// `"quantization"` block with `group_size`, `bits`, and an override for
 /// each module whose bits differ from the default.
 ///
-/// The block follows MLX's convention, which `mlx_lm` and pmetal's loaders
-/// read: it sits at the top level, and an override is a sibling key named by
+/// The block follows MLX's convention, which MLX-format loaders (pmetal's
+/// included) read: it sits at the top level, and an override is a sibling key named by
 /// module path (`"model.layers.0.mlp.down_proj": {"group_size": 64,
 /// "bits": 8}`). `per_tensor_overrides` is keyed by tensor name
 /// (`….down_proj.weight`), as the quantizer assigns bits.
@@ -632,7 +632,7 @@ pub fn write_quantization_config(
     });
 
     // Only modules that differ from the default get an entry. pmetal used to
-    // write these as its own `per_tensor_overrides` map, which mlx_lm ignores
+    // write these as its own `per_tensor_overrides` map, which other MLX loaders ignore
     // (#30); its loaders still read that for older checkpoints.
     for (tensor, bits) in per_tensor_overrides {
         if *bits != default_bits {

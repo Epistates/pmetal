@@ -19,7 +19,7 @@
 //! - Axis 2: Sequence length (grows during generation)
 //! - Axis 3: Head dimension
 //!
-//! This matches the mlx_lm implementation and eliminates transpose overhead
+//! This eliminates transpose overhead
 //! during cached generation. The sequence dimension is axis 2.
 //!
 //! ## Supported Modes
@@ -95,7 +95,7 @@ pub enum CacheMode {
         /// Maximum number of past tokens to keep in cache.
         window_size: usize,
     },
-    /// Rotating cache - circular buffer with fixed max size (MLX-LM parity).
+    /// Rotating cache - circular buffer with fixed max size.
     /// More memory-efficient than sliding window for long sequences.
     Rotating {
         /// Maximum number of tokens to keep.
@@ -103,7 +103,7 @@ pub enum CacheMode {
         /// Number of initial tokens to always keep (typically prompt tokens).
         keep: usize,
     },
-    /// Quantized cache - stores K/V in lower precision (MLX-LM parity).
+    /// Quantized cache - stores K/V in lower precision.
     /// Reduces memory by 2-8x depending on bits.
     Quantized {
         /// Number of bits for quantization (2, 4, or 8).
@@ -342,7 +342,7 @@ impl KVCacheConfig {
         self
     }
 
-    /// Enable rotating cache mode (MLX-LM style).
+    /// Enable rotating cache mode.
     ///
     /// The rotating cache is a circular buffer that overwrites oldest entries
     /// when full, while optionally preserving `keep` initial tokens.
@@ -355,7 +355,7 @@ impl KVCacheConfig {
         self
     }
 
-    /// Enable quantized cache mode (MLX-LM style).
+    /// Enable quantized cache mode.
     ///
     /// Stores keys/values in lower precision to reduce memory usage.
     /// - 8-bit: ~2x memory reduction

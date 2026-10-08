@@ -16,7 +16,7 @@
 //!
 //! # Reference
 //!
-//! Based on llama.cpp/GGML K-quant implementation and Candle's quantized module.
+//! Follows the llama.cpp/GGML K-quant reference implementation.
 
 use crate::quantize::{
     get_scale_min_k4, make_q3_quants, make_qkx1_quants, make_qx_quants, nearest_int,
@@ -226,7 +226,7 @@ impl BlockQ8K {
 ///   bytes are re-used across 4 shift passes (shift = 0, 2, 4, 6), reading a fresh pair of
 ///   scale bytes each pass.
 ///
-/// Reference: Candle `BlockQ2K::to_float` (candle-core/src/quantized/k_quants.rs)
+/// Reference: GGML `dequantize_row_q2_K`.
 pub fn dequantize_q2k(block: &BlockQ2K, output: &mut [f32; QK_K]) {
     let d = block.d.to_f32();
     let min = block.dmin.to_f32();
@@ -267,7 +267,7 @@ pub fn dequantize_q2k(block: &BlockQ2K, output: &mut [f32; QK_K]) {
 /// Dequantize Q3K block to f32.
 ///
 /// Scale encoding: 12 bytes encode 16 signed 6-bit values (bias 32, range -32..31).
-/// The reconstruction uses a u32-mask approach identical to the GGML reference and Candle:
+/// The reconstruction uses a u32-mask approach identical to the GGML reference:
 ///   aux[0..3] = little-endian u32 from scales[0..12] (3 values)
 ///   tmp = aux[2]  (the third u32 holds the upper-2-bit extensions)
 ///   aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4)
@@ -277,7 +277,7 @@ pub fn dequantize_q2k(block: &BlockQ2K, output: &mut [f32; QK_K]) {
 /// The 16 bytes of aux[0..4] then hold the 16 unsigned 6-bit scale values; subtract 32 for
 /// the signed result.
 ///
-/// Reference: Candle `BlockQ3K::to_float` (candle-core/src/quantized/k_quants.rs)
+/// Reference: GGML `dequantize_row_q3_K`.
 pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
     let d = block.d.to_f32();
 
@@ -477,7 +477,7 @@ pub fn dequantize_q5k(block: &BlockQ5K, output: &mut [f32; QK_K]) {
 ///   - ys[l+64]   uses ql[l]      (high nibble) | (qh[l] bits 4-5) << 4 -> scale sc[l/16 + 4]
 ///   - ys[l+96]   uses ql[l+32]   (high nibble) | (qh[l] bits 6-7) << 4 -> scale sc[l/16 + 6]
 ///
-/// Reference: Candle `BlockQ6K::to_float` (candle-core/src/quantized/k_quants.rs)
+/// Reference: GGML `dequantize_row_q6_K`.
 pub fn dequantize_q6k(block: &BlockQ6K, output: &mut [f32; QK_K]) {
     let d = block.d.to_f32();
 

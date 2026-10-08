@@ -638,7 +638,7 @@
             id="dir-path"
             type="text"
             class="input font-mono text-sm"
-            placeholder="e.g. ~/.lmstudio/models"
+            placeholder="e.g. ~/models"
             bind:value={dirPathInput}
           />
           <p class="text-xs text-surface-500 mt-1">

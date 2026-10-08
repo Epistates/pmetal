@@ -1357,8 +1357,8 @@ impl InferenceEngine {
     /// Because the next forward is scheduled before `token(N)` is
     /// extracted, the repetition / frequency / presence penalty context
     /// at step `N+1` is missing exactly one token (the one that will be
-    /// emitted as `token(N)`). This is the same tradeoff mlx_lm makes in
-    /// its async decode — the alternative (sync-per-step) destroys the
+    /// emitted as `token(N)`). This is the usual tradeoff of
+    /// async decode — the alternative (sync-per-step) destroys the
     /// pipeline. In practice the lag is inaudible for soft penalties
     /// because the missing token is one of `prompt_len + N` history
     /// tokens feeding the scatter.
@@ -1503,7 +1503,7 @@ impl InferenceEngine {
             };
 
             // 2. First iteration: force-eval the token so .item() below
-            //    gets data (matches the mlx_lm n==0 special-case).
+            //    gets data (the n==0 special case).
             if i == 0 {
                 current_y.try_eval().map_err(|e| {
                     ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
@@ -1576,7 +1576,7 @@ impl InferenceEngine {
                 break;
             }
 
-            // 10. Periodic allocation-cache sweep (matches mlx_lm).
+            // 10. Periodic allocation-cache sweep.
             if i > 0 && i % 256 == 0 {
                 clear_generation_caches();
             }

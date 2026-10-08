@@ -189,7 +189,7 @@ impl QuantizedKvCache {
     /// hood, so the clone is O(layers) ref-count bumps — orders of
     /// magnitude cheaper than dequantising and re-encoding the prefix.
     ///
-    /// This is the pmetal equivalent of vLLM's PagedAttention prefix
+    /// This is PagedAttention-style prefix
     /// sharing for the *single-sequence* case: any number of forks can
     /// hold the same cached prefix, and only the appended suffix per
     /// fork costs new memory. It does NOT yet integrate with

@@ -269,7 +269,7 @@ pub(super) fn attn_forward(
         }
     } else if let Some(qcfg) = cache.quant_config {
         // ── Zero-overhead affine-quantized KV cache path ──────────────────
-        // Matches mlx-lm's QuantizedKVCache: quantize K/V immediately after
+        // Same layout as the reference QuantizedKVCache: quantize K/V immediately after
         // RoPE/QK-norm, store as (packed_uint32, scales, biases), pass to
         // quantized_matmul which dequantizes inside the Metal kernel.
         //
@@ -458,7 +458,7 @@ pub(super) fn attn_forward(
             // - For decode (s=1): use causal SDPA (the single query naturally attends
             //   to all cached positions; the chunk constraint is handled by not storing
             //   tokens outside the current chunk — or in this simpler native path, by
-            //   letting the model see a slightly wider window which matches mlx-lm
+            //   letting the model see a slightly wider window which matches the reference
             //   behavior for cached keys).
             // - For prefill (s>1): apply the chunk mask.
             if let Some(mask_int) = chunk_mask {

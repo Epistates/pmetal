@@ -1,6 +1,6 @@
 //! Distributed master election algorithm.
 //!
-//! Implements a seniority-based leader election protocol inspired by exo.
+//! Implements a seniority-based leader election protocol.
 //! The election ensures exactly one master is elected in the cluster,
 //! with deterministic tiebreaking based on seniority and peer ID.
 //!

@@ -120,7 +120,7 @@ pub struct TrainArgs {
     pub no_gradient_checkpointing: bool,
 
     /// Deprecated, has no effect. One decoder layer is the checkpoint unit,
-    /// as in PyTorch and mlx-lm, so there is no block size to pick.
+    /// as in PyTorch, so there is no block size to pick.
     #[arg(long = "gradient-checkpointing-layers", default_value = "1")]
     pub gradient_checkpointing_layers: usize,
 

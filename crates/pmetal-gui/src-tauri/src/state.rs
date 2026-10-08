@@ -16,7 +16,7 @@ pub struct AppConfig {
     pub hf_token: Option<String>,
     pub default_model: Option<String>,
     pub theme: String,
-    /// User-configured directories to scan for models (LM Studio, custom paths, etc.)
+    /// User-configured directories to scan for models (other apps' model folders, etc.)
     #[serde(default)]
     pub custom_model_dirs: Vec<String>,
 }
@@ -45,7 +45,7 @@ pub enum ModelSource {
     HfCache,
     /// Fine-tuned output directory
     Trained,
-    /// User-added custom directory (LM Studio, manual download, etc.)
+    /// User-added custom directory (another app's model folder, manual download, etc.)
     Custom,
 }
 
@@ -1365,7 +1365,7 @@ async fn scan_trained_outputs(models: &mut Vec<CachedModel>) {
     scan_model_subdir(&output_dir, ModelSource::Trained, models, 2).await;
 }
 
-/// Scan well-known third-party model directories (LM Studio, etc.)
+/// Scan well-known third-party model directories.
 async fn scan_well_known_dirs(models: &mut Vec<CachedModel>) {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 

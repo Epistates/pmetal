@@ -1,6 +1,6 @@
 //! Routed-expert dispatch shared by the native engines.
 //!
-//! Every MoE here runs the same SwitchGLU shape as mlx-lm's `SwitchGLU`: each
+//! Every MoE here runs the same SwitchGLU shape as the reference `SwitchGLU`: each
 //! row goes through its `top_k` experts' gate and up projections, an
 //! activation joins them, the down projection brings each back to the hidden
 //! size, and the router's scores weight the sum. Architectures differ in the

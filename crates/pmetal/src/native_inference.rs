@@ -1305,8 +1305,8 @@ fn run_gemma4(
     )
 }
 
-/// Benchmark full prompt + generation throughput using the same workload shape
-/// as `mlx_lm.benchmark`: fixed prompt token ids, one warmup, EOS disabled, and
+/// Benchmark full prompt + generation throughput with a fixed workload shape:
+/// fixed prompt token ids, one warmup, EOS disabled, and
 /// repeated generations from a fresh cache.
 pub fn benchmark_native_mlx_lm(
     model_path: &Path,
@@ -1318,10 +1318,10 @@ pub fn benchmark_native_mlx_lm(
     use pmetal_bridge::qwen3_native;
 
     if prompt_ids.is_empty() {
-        return Err("MLX-LM parity benchmark requires prompt_tokens > 0".to_string());
+        return Err("Inference benchmark requires prompt_tokens > 0".to_string());
     }
     if generation_tokens == 0 {
-        return Err("MLX-LM parity benchmark requires generation_tokens > 0".to_string());
+        return Err("Inference benchmark requires generation_tokens > 0".to_string());
     }
 
     ensure_native_bridge_metal_available()?;

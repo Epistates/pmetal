@@ -68,7 +68,7 @@ impl InlineArray {
     /// RoPE with an explicit inverse-frequency array. Pass the full
     /// `head_dim` as `dims` and an `[rotated_dims / 2]`-sized `freqs`
     /// array; non-rotated dimensions can be padded with `f32::INFINITY`
-    /// so `mx.fast.rope` skips them. This mirrors mlx-lm's
+    /// so `mx.fast.rope` skips them. This mirrors the reference
     /// `ProportionalRoPE` — used by Gemma 4 full-attention layers.
     pub fn rope_with_freqs(
         &self,

@@ -213,10 +213,9 @@ pub fn forward_step_with_capture(
         };
         hidden = h.add(&mlp_out);
 
-        // Tap hidden state POST-residual, matching mlx-lm's
+        // Tap hidden state POST-residual, matching the DFlash reference's
         // `hidden_states = layer(...)` + `if idx in target_layer_ids:
-        // selected_hidden_states.append(hidden_states)` pattern in
-        // `dflash_mlx/adapters.py`.
+        // selected_hidden_states.append(hidden_states)` pattern.
         if tap_layers.contains(&layer_idx) {
             captured.push(hidden.clone());
         }

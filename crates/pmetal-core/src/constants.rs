@@ -16,7 +16,7 @@
 /// `4 bits / 8 = 0.5`.
 ///
 /// Matching is case-insensitive and accepts synonyms from the GGUF,
-/// MLX-LM, AWQ, and GPTQ ecosystems. Unknown strings fall back to fp16
+/// MLX, AWQ, and GPTQ ecosystems. Unknown strings fall back to fp16
 /// (2.0 bytes/param), matching pmetal's default model load path.
 ///
 /// # Examples
@@ -68,7 +68,7 @@ pub fn kv_bytes_per_element(bits: Option<u8>) -> f64 {
 
 /// Heuristically maps a Hugging Face model ID (e.g. `"TheBloke/Llama-2-7B-GGUF"`
 /// or `"mlx-community/Qwen3-32B-4bit"`) to a canonical quantisation label
-/// compatible with [`bytes_per_param`]. Matches the GGUF, MLX-LM, AWQ, and
+/// compatible with [`bytes_per_param`]. Matches the GGUF, MLX, AWQ, and
 /// GPTQ conventions; falls back to `"fp16"` when no marker is present.
 ///
 /// This function is deliberately string-in / string-out so the result can
@@ -180,7 +180,7 @@ mod tests {
             "Q2_K"
         );
         assert_eq!(
-            detect_quantization_from_id("unsloth/Llama-3-70B.Q8_0"),
+            detect_quantization_from_id("someorg/Llama-3-70B.Q8_0"),
             "Q8_0"
         );
     }

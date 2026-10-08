@@ -33,7 +33,7 @@ pub fn gelu(a: &Array) -> Array {
 pub fn gelu_approximate(a: &Array) -> Array {
     a.gelu()
 }
-/// GELU tanh approximation matching mlx-lm's `nn.gelu_approx`:
+/// GELU tanh approximation matching MLX's `nn.gelu_approx`:
 ///
 /// ```text
 ///     0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))

@@ -2024,7 +2024,7 @@ mod tests {
         )
         .unwrap();
 
-        let detected = detect_chat_template(dir.path(), "unsloth/Qwen3.5-0.8B");
+        let detected = detect_chat_template(dir.path(), "Qwen/Qwen3.5-0.8B");
         assert_eq!(detected.template_type, ChatTemplateType::Qwen);
     }
 

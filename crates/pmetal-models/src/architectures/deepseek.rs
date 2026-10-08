@@ -200,11 +200,11 @@ fn default_true() -> bool {
 }
 
 // DeepSeek YARN RoPE: the per-dim frequency + embedding-mscale math is the
-// shared mlx-lm `YarnRoPE` formula, extracted to `common::yarn` and reused by
+// shared reference `YarnRoPE` formula, extracted to `common::yarn` and reused by
 // GPT-OSS. DeepSeek applies it with interleaved RoPE and folds `mscale²` into
 // the softmax scale (see `DeepSeekAttention::new`).
 
-/// Parse a DeepSeek `rope_scaling` JSON block into YARN params, with mlx-lm
+/// Parse a DeepSeek `rope_scaling` JSON block into YARN params, with reference
 /// defaults. Returns `None` if no block is configured.
 fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<YarnScaling> {
     let rs = rope_scaling.as_ref()?;
@@ -260,7 +260,7 @@ impl_module_params!(DeepSeekAttention; q_a_proj, q_a_layernorm, q_b_proj, q_proj
 /// The softmax scale and YARN tables an MLA layer runs with.
 ///
 /// These are one decision, not two: YARN folds `mscale²` into the softmax scale
-/// (mlx-lm `DeepseekV2Attention`) at the same moment it builds the per-dimension
+/// (reference `DeepseekV2Attention`) at the same moment it builds the per-dimension
 /// inverse frequencies. Returning them together is what stops a caller taking
 /// the tables and forgetting the scale, or taking neither.
 ///

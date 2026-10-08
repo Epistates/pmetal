@@ -76,7 +76,7 @@ pub fn scalar_f32_like(value: f32, like: &InlineArray) -> InlineArray {
 
 /// Sampling parameters for the bridge decode loop.
 ///
-/// Includes the full mlx-lm-style filter pipeline: temperature, top-k,
+/// Includes the full filter pipeline: temperature, top-k,
 /// top-p (nucleus), and min-p, plus repetition / frequency / presence
 /// penalties. Defaults are no-ops for every filter so callers that only
 /// care about temperature can use [`SamplingParams::new`] and ignore the
@@ -266,7 +266,7 @@ pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
 /// Sample a token from `[B, vocab]` logits using the full filter
 /// pipeline in `params`: temperature → top-k → top-p → min-p →
 /// categorical. At `temperature == 0` the call collapses to argmax and
-/// every filter is a no-op. Otherwise the filter chain matches mlx-lm's
+/// every filter is a no-op. Otherwise the filter chain matches the reference
 /// per-step sampling pipeline. Use [`sample_token`] when only
 /// temperature matters.
 ///
@@ -288,8 +288,8 @@ pub fn sample_token_with_params(logits_2d: &InlineArray, params: &SamplingParams
     }
     // Pre-construct the negative-infinity sentinel once per call. Filters
     // splat it into masked positions; sample_token is called per step so
-    // the alloc is small but unavoidable. mlx-lm caches it on a sampler
-    // struct — same opportunity exists if/when we factor out a Sampler.
+    // the alloc is small but unavoidable. It could be cached on a
+    // Sampler struct if/when we factor one out.
     let neg_inf = scalar_f32_like(f32::NEG_INFINITY, &log_probs);
     let mut filtered = log_probs;
     if params.top_k > 0 {
@@ -325,11 +325,11 @@ pub fn prefill_first_token<Weights, Cache>(
     sample_token_id(&last_logits, temperature)
 }
 
-/// Match MLX-LM's cache-aware causal-attention behavior.
+/// Cache-aware causal attention.
 ///
-/// Upstream uses `mask=None` for single-token decode (`N == 1`) and `"causal"`
+/// Uses `mask=None` for single-token decode (`N == 1`) and `"causal"`
 /// for multi-token prefill. Keeping decode on the unmasked fast path matters
-/// for apples-to-apples performance against `mlx-lm`.
+/// for decode throughput.
 #[inline(always)]
 pub fn sdpa_causal_like_mlx(
     queries: &InlineArray,
@@ -362,7 +362,7 @@ pub fn try_sdpa_causal_like_mlx(
 
 /// Quantized scaled-dot-product attention using MLX's fused `quantized_matmul`.
 ///
-/// Matches mlx-lm's `quantized_scaled_dot_product_attention` (base.py:64-105).
+/// Same algorithm as the reference `quantized_scaled_dot_product_attention`.
 /// K/V are stored as `(packed_uint32, scales, biases)` tuples and never fully
 /// dequantized — `quantized_matmul` dequantizes inside the Metal kernel during
 /// the matmul, yielding zero overhead vs standard SDPA.

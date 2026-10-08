@@ -1,4 +1,4 @@
-//! Quantized KV cache - MLX-LM parity implementation.
+//! Quantized KV cache.
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
@@ -17,7 +17,7 @@ struct QuantizedTensor {
 
 /// Quantized KV cache that stores keys/values in lower precision.
 ///
-/// This implementation matches MLX-LM's `QuantizedKVCache` for full parity.
+/// Same semantics as the reference `QuantizedKVCache`.
 /// It reduces memory usage significantly while maintaining acceptable quality:
 /// - 8-bit: ~50% memory reduction
 /// - 4-bit: ~75% memory reduction

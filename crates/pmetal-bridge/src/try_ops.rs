@@ -359,7 +359,7 @@ impl InlineArray {
     }
 
     /// Checked tri-inverse (lower or upper triangular). `use_cpu=true` forces
-    /// CPU dispatch (matching mlx-lm's WY-factorization usage).
+    /// CPU dispatch (as the WY factorization uses it).
     pub fn try_tri_inv(&self, upper: bool, use_cpu: bool) -> BridgeResult<Self> {
         let out = self.tri_inv(upper, use_cpu);
         check_last_error()?;

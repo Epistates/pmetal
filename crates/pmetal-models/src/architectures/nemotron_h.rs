@@ -132,7 +132,7 @@ impl QuantizedLinear {
 /// 3. Apply RMS norm within each group
 /// 4. Flatten back and apply learned weight
 ///
-/// This matches the mlx-lm MambaRMSNormGated implementation.
+/// This matches the reference MambaRMSNormGated implementation.
 #[derive(Debug, Clone)]
 pub struct MambaRMSNormGated {
     /// Learnable scale weights [hidden_size].
@@ -356,7 +356,7 @@ pub fn ssm_update_single(
 
 /// SSM attention computation with optional state for incremental generation.
 ///
-/// Implements the SSD-SSM forward pass based on mlx-lm's ssm_attn implementation.
+/// Implements the SSD-SSM forward pass based on the reference ssm_attn implementation.
 /// Returns both the output and the new state for caching.
 ///
 /// # Arguments

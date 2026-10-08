@@ -108,7 +108,7 @@ impl std::fmt::Debug for NativeWeights {
 
 /// Load model weights from a directory containing safetensors shards.
 ///
-/// Applies all sanitization required by the mlx-lm reference implementation:
+/// Applies all sanitization required by the reference implementation:
 /// - Vision / projector weight removal
 /// - Expert weight splitting: `experts.gate_up_proj` → `experts.gate_proj.weight` +
 ///   `experts.up_proj.weight` (split on last axis, then swapaxes(1,2))

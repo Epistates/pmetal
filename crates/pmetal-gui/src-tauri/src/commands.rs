@@ -614,7 +614,7 @@ pub async fn delete_model(state: State<'_, AppState>, model_id: String) -> Resul
     Ok(())
 }
 
-/// Add a custom directory to scan for models (e.g. LM Studio path).
+/// Add a custom directory to scan for models (e.g. another app's model folder).
 #[tauri::command]
 pub async fn add_model_directory(
     state: State<'_, AppState>,
@@ -3690,7 +3690,7 @@ fn run_fuse_in_process(
         .collect();
     pmetal::mlx::Array::save_safetensors(output_file_str, &entries);
 
-    // Generate model.safetensors.index.json (required by LM Studio and other tools)
+    // Generate model.safetensors.index.json (required by many model loaders)
     let mut weight_map = serde_json::Map::new();
     let mut total_size: u64 = 0;
     for (key, arr) in &base_weights {

@@ -24,7 +24,7 @@ pub struct Qwen3NextMtpConfig {
 impl Default for Qwen3NextMtpConfig {
     fn default() -> Self {
         Self {
-            // llama.cpp's initial Qwen3.6-MTP tuning uses draft_max=3.
+            // Three draft tokens per step (draft_max=3).
             num_draft_tokens: 3,
         }
     }

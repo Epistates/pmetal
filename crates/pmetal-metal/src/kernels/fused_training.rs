@@ -38,7 +38,7 @@
 //! # Performance Target
 //!
 //! - Current: ~1740 tok/s (per-kernel sync)
-//! - Target: ~2400 tok/s (match mlx_lm)
+//! - Target: ~2400 tok/s
 //! - Expected gain: ~40% from eliminating sync overhead
 
 use std::ptr::NonNull;

@@ -12,7 +12,7 @@
 //! - Stop token handling
 //! - KV-cached generation for fast inference
 //!
-//! Performance optimizations (matching mlx_lm exactly):
+//! Performance optimizations:
 //! - GPU-native sampling filters (top_k, top_p, min_p) - no CPU round-trips
 //! - Uses pmetal_bridge::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
@@ -793,7 +793,7 @@ impl Sampler {
 
     /// Sample the next token from logits.
     ///
-    /// Matches mlx_lm's sampling approach exactly:
+    /// Sampling order:
     /// 1. Apply penalties (repetition, frequency, presence) on raw logits
     /// 2. Convert logits to log probabilities: logprobs = logits - logsumexp(logits)
     /// 3. Apply filters on log probabilities (top_k, top_p, min_p)
@@ -841,7 +841,7 @@ impl Sampler {
             return Ok(token);
         }
 
-        // Convert logits to log probabilities (exactly like mlx_lm):
+        // Convert logits to log probabilities:
         // logprobs = logits - logsumexp(logits, keepdims=True)
         let log_probs = logits_to_log_probs(&logits)?;
 
@@ -849,7 +849,7 @@ impl Sampler {
         let log_probs = self.apply_filters_fused(&log_probs)?;
 
         // Sample from the distribution using GPU-native categorical
-        // Matches mlx_lm: categorical(logprobs * (1/temp))
+        // categorical(logprobs * (1/temp))
         let token = gpu_categorical_sample(&log_probs, self.config.temperature)?;
         self.update_counts(token);
         Ok(token)
@@ -861,7 +861,7 @@ impl Sampler {
     /// as an Array on the GPU. This is critical for SOTA performance:
     ///
     /// ```text
-    /// mlx_lm pattern (correct):
+    /// Correct pattern:
     ///   sampled = sampler(logprobs)        # Returns Array, stays on GPU
     ///   next_y, next_logprobs = _step(y)   # y is Array, passed directly
     ///   mx.async_eval(next_y, next_logprobs)  # BOTH scheduled async
@@ -899,7 +899,7 @@ impl Sampler {
             &owned_logits
         };
 
-        // Convert logits to log probabilities (exactly like mlx_lm):
+        // Convert logits to log probabilities:
         // logprobs = logits - logsumexp(logits, keepdims=True)
         let log_probs = logits_to_log_probs(logits_f32)?;
 
@@ -1132,7 +1132,7 @@ fn greedy_sample_array(logits: &Array) -> Result<Array, Exception> {
 }
 
 /// Convert logits to log probabilities (log-softmax).
-/// Matches mlx_lm: logprobs = logits - logsumexp(logits, keepdims=True)
+/// logprobs = logits - logsumexp(logits, keepdims=True)
 fn logits_to_log_probs(logits: &Array) -> Result<Array, Exception> {
     let lse = logsumexp_axis_keepdims(logits, -1, true);
     Ok(logits.subtract(&lse))
@@ -1295,13 +1295,13 @@ pub fn token_probability_from_log_probs(log_probs: &Array, token: u32) -> Result
     Ok(log_prob.item::<f32>().exp())
 }
 
-/// GPU-native repetition penalty matching mlx_lm.
+/// GPU-native repetition penalty.
 ///
 /// For positive logits: divide by penalty (reduces probability)
 /// For negative logits: multiply by penalty (reduces probability)
 ///
 /// All operations stay on GPU - no CPU round-trip.
-/// GPU-native repetition penalty (mlx_lm compatible).
+/// GPU-native repetition penalty.
 ///
 /// `logits` can be 1-D `[vocab]` or 2-D `[1, vocab]`. Returns an array of the
 /// same shape with the penalty applied in-place on the GPU (no host sync).
@@ -1358,7 +1358,7 @@ pub fn apply_repetition_penalty(
 
 /// GPU-native top-k filtering - keeps only the k tokens with highest probability.
 ///
-/// Matches mlx_lm's apply_top_k exactly:
+/// Same algorithm as the reference `apply_top_k`:
 /// - Uses argpartition to find the k-th largest element efficiently
 /// - Uses put_along_axis to mask out tokens below top-k
 /// - All operations stay on GPU - no CPU round-trip
@@ -1399,7 +1399,7 @@ fn top_k_filter(logits: &Array, k: usize) -> Result<Array, Exception> {
 
 /// GPU-native top-p (nucleus) filtering.
 ///
-/// Matches mlx_lm's apply_top_p exactly:
+/// Same algorithm as the reference `apply_top_p`:
 /// - Sorts probs in ascending order
 /// - Computes cumulative sum
 /// - Keeps tokens with cumsum > (1 - top_p) threshold
@@ -1440,7 +1440,7 @@ fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
     let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1);
 
     // Keep tokens where cumulative probability > (1 - top_p)
-    // This matches mlx_lm's logic: select tokens with cumsum > 1 - top_p
+    // Select tokens with cumsum > 1 - top_p
     let threshold = Array::from_f32(1.0 - p);
     let mask = cumulative_probs.greater(&threshold);
 
@@ -1458,7 +1458,7 @@ fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
 
 /// GPU-native min-p filtering - dynamic threshold based on top token probability.
 ///
-/// Matches mlx_lm's apply_min_p exactly:
+/// Same algorithm as the reference `apply_min_p`:
 /// - Works in log-probability space for numerical stability
 /// - Computes scaled_min_p = top_logprob + log(min_p)
 /// - Masks tokens with logprob < scaled_min_p
@@ -1577,12 +1577,12 @@ pub fn apply_frequency_presence_penalty(
 
 /// GPU-native categorical sampling from log probabilities.
 ///
-/// Matches mlx_lm exactly: categorical(logprobs * (1/temp))
+/// Computes categorical(logprobs * (1/temp)).
 /// Uses pmetal_bridge::compat::random::categorical for efficient GPU sampling.
 /// This is ~10x faster than CPU sampling for large vocabularies.
 /// Note: item() internally calls eval(), so no explicit eval() needed.
 fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Exception> {
-    // Exactly like mlx_lm: multiply log_probs by inverse temperature
+    // Multiply log_probs by inverse temperature
     // categorical_sampling(logits, temp) -> mx.random.categorical(logits * (1 / temp))
     let scaled = if temperature != 1.0 && temperature > 0.0 {
         let inv_temp = Array::from_f32(1.0 / temperature);
@@ -1601,7 +1601,7 @@ fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Ex
 /// GPU-native categorical sampling returning Array for async pipelining.
 ///
 /// No GPU→CPU sync - stays lazy for maximum performance.
-/// Matches mlx_lm: sampler returns mx.array, not scalar.
+/// The sampler returns an array, not a scalar.
 #[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn gpu_categorical_sample_array(log_probs: &Array, temperature: f32) -> Result<Array, Exception> {
     let scaled = if temperature != 1.0 && temperature > 0.0 {
@@ -1787,14 +1787,14 @@ where
     })
 }
 
-/// SOTA generation with async pipelining matching mlx_lm exactly.
+/// Generation with async pipelining.
 ///
 /// This function uses true async evaluation pipelining where:
 /// - Token N's logits are computed while token N-1 is being extracted
 /// - Tokens stay as Arrays on GPU until after next computation is scheduled
 /// - This eliminates GPU→CPU sync bottleneck that was limiting performance
 ///
-/// The mlx_lm pattern:
+/// The pattern:
 /// ```text
 /// y, logprobs = _step(prompt)
 /// async_eval(y, logprobs)  // Schedule first token
@@ -2444,9 +2444,8 @@ where
 ///
 /// # Performance Benefits
 ///
-/// - **JIT-compiled sampling** - operations fused into single kernel like mlx_lm
+/// - **JIT-compiled sampling** - operations fused into a single kernel
 /// - **Async pipelining** - next forward pass scheduled while extracting current token
-/// - **Matches mlx_lm approach** - uses the same compilation strategy
 ///
 /// # Limitations
 ///
@@ -2550,7 +2549,7 @@ where
         all_tokens.push(token);
         n += 1;
 
-        // Clear cache every 256 tokens (matches Python mlx-lm)
+        // Clear cache every 256 tokens
         if n % 256 == 0 {
             clear_generation_caches();
         }

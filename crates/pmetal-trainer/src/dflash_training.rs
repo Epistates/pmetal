@@ -2,7 +2,7 @@
 //!
 //! DFlash draft models ship pre-trained from the `z-lab/*-DFlash*` Hugging
 //! Face collection. This module is the pmetal-native path for *training a
-//! new draft from scratch*, which upstream `dflash-mlx` cannot do at all.
+//! new draft from scratch*.
 //!
 //! # Objective
 //!

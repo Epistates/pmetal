@@ -7,7 +7,7 @@
 //! - **(1+w) RMSNorm** (Gemma-style, requires f32 upcast)
 //! - **Partial rotary** (25% of head dimensions)
 //!
-//! Reference: `mlx-lm/models/qwen3_next.py` (Apple, 2025).
+//! Ported from the MLX reference implementation (Apple, 2025).
 
 use pmetal_bridge::compat::ops::{
     select_axis, slice_axis, slice_axis_from, slice_last_from, slice_last_to,
@@ -151,7 +151,7 @@ pub struct Qwen3NextConfig {
     /// Number of bundled MTP predictor layers, when present in the checkpoint.
     #[serde(default)]
     pub mtp_num_hidden_layers: Option<i32>,
-    /// Alternate HF/vLLM field name for bundled next-N predictors.
+    /// Alternate field name for bundled next-N predictors.
     #[serde(default)]
     pub num_nextn_predict_layers: Option<i32>,
 }
@@ -470,7 +470,7 @@ impl_module_params!(Qwen3NextRMSNormGated; weight);
 
 /// Compiled _precise_swiglu: `(silu(gate.f32()) * norm_out.f32()).as(dtype)`.
 ///
-/// Matches mlx-lm's `@partial(mx.compile, shapeless=True) def _precise_swiglu(h, gate, x)`.
+/// Equivalent to a `@partial(mx.compile, shapeless=True)` `_precise_swiglu(h, gate, x)`.
 /// Fuses 6 element-wise ops (2 casts, sigmoid, 2 multiplies, cast) into 1 Metal dispatch.
 fn compiled_precise_swiglu(
     norm_out: &Array,
@@ -534,7 +534,7 @@ impl Qwen3NextRMSNormGated {
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         let normed = pmetal_bridge::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps);
         if let Some(g) = gate {
-            // Compiled _precise_swiglu: matches mlx-lm's @mx.compile(shapeless=True).
+            // Compiled _precise_swiglu (shapeless mx.compile).
             // Fuses silu(gate.f32()) * norm.f32() → cast_back into 1 Metal dispatch
             // instead of 6 separate dispatches (2 casts + silu(2 ops) + mul + cast).
             compiled_precise_swiglu(&normed, g, x.dtype())
@@ -1243,7 +1243,6 @@ impl Qwen3NextGatedDeltaNet {
         // Direct decode: uses Metal GDN kernel (1 dispatch for recurrence) +
         // individually dispatched ops for projections/conv/norm.
         // No per-layer mx.compile — relies on MLX global compile for element-wise fusion.
-        // This matches Python's mlx-lm pattern (no @mx.compile on the layer forward).
         let b_dim = inputs.dim(0);
         let s = 1i32;
 
@@ -1397,7 +1396,7 @@ impl Qwen3NextGatedDeltaNet {
                 .expect("gated_delta_inference_dispatch failed");
 
                 // Gated norm + out projection (f32 precision for gate multiply,
-                // matching mlx-lm _precise_swiglu)
+                // as in _precise_swiglu)
                 let out_n = pmetal_bridge::compat::fast::rms_norm(&out, &norm_w, 1e-6);
                 let gate_f32 = nn::silu(&z.cast(pmetal_bridge::compat::Dtype::Float32));
                 let out_f32 = out_n.cast(pmetal_bridge::compat::Dtype::Float32);
@@ -1553,7 +1552,7 @@ impl Qwen3NextGatedDeltaNet {
         cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
         // Split conv output into q, k, v using mx.split (1 op vs 3 index ops).
-        // Matches mlx-lm qwen3_5.py line 163: mx.split(conv_out, [...], -1)
+        // Same as the reference: mx.split(conv_out, [...], -1)
         let splits = ops::split_sections(conv_out, &[self.key_dim, self.key_dim * 2], -1);
         let (q_conv, k_conv, v_conv) = (&splits[0], &splits[1], &splits[2]);
 
@@ -1637,7 +1636,7 @@ impl Qwen3NextGatedDeltaNet {
             self.head_v_dim,
         ]);
         // Q/K normalization: use fast::rms_norm (1 fused Metal op) instead of
-        // l2norm_last_dim (5 separate ops). Matches mlx-lm's qwen3_5.py exactly.
+        // l2norm_last_dim (5 separate ops). Matches the reference exactly.
         // Pass ones weight since mlx-rs binding requires a weight array.
         // Q/K normalization: fast::rms_norm (1 fused Metal op) with pre-baked
         // scale factors. inv_scale = 1/sqrt(dk).
@@ -2278,24 +2277,24 @@ impl Qwen3NextSparseMoeBlock {
         // The earlier hand-rolled version here used the sign-flipped form
         // `argpartition(-gates, -k, -1)[..., -k:]` which selects the k SMALLEST
         // experts — an anti-top-k bug (see moe_routing::tests::
-        // sign_flipped_argpartition_is_anti_topk). Matches the mlx-lm
-        // reference (qwen3_next.py:338) which uses the positive form.
+        // sign_flipped_argpartition_is_anti_topk). Matches the
+        // reference, which uses the positive form.
         let k = self.top_k;
         let (top_indices, top_weights) =
             crate::moe_routing::topk_normalize(&gates, k, self.norm_topk_prob)?;
 
-        // SwitchGLU forward using gather_mm — matches mlx-lm switch_layers.py
+        // SwitchGLU forward using gather_mm — same as the reference SwitchGLU
         // x_flat: [N, D], indices: [N, k]
         let top_indices_i32 = top_indices.cast(pmetal_bridge::compat::Dtype::Int32);
 
-        // Reshape [N, D] → [N, 1, 1, D] — matches mlx-lm's expand_dims(-2, -3).
+        // Reshape [N, D] → [N, 1, 1, D] — same as the reference expand_dims(-2, -3).
         // Critical for gather_mm batch dimension semantics — without this,
         // M=N gets preserved in output producing [N, k, N, out] instead of [N, k, 1, out].
         let x_expanded = x_flat.reshape(&[batch_seq, 1, 1, hidden]);
 
         // Weights are stored as [E, out, in] from checkpoint; gather_mm expects
-        // A[..., M, K] @ B[E, K, N], so we transpose the last two dims (like mlx-lm's
-        // SwitchLinear which calls weight.swapaxes(-1, -2) at forward time).
+        // A[..., M, K] @ B[E, K, N], so we transpose the last two dims (like the reference
+        // SwitchLinear, which calls weight.swapaxes(-1, -2) at forward time).
         let gate_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_gate_proj.as_ref())?;
         let up_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_up_proj.as_ref())?;
         let gate_w = gate_weight.swap_axes(-1, -2);

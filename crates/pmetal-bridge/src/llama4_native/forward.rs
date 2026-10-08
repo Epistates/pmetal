@@ -45,7 +45,7 @@ pub fn forward_step(
     // positions in its chunk, which degenerates to a simple causal window).
     let chunk_mask: Option<InlineArray> = if s > 1 {
         // Bool mask shape [s, offset + s]. We start key positions at zero
-        // because the native path never trims the cache front (mlx-lm's
+        // because the native path never trims the cache front (the reference
         // ChunkedKVCache eviction is replaced here by a mask-only constraint
         // — see KvLayerCache doc-comment).
         Some(build_chunk_mask(offset, s, end, chunk_size))
@@ -160,7 +160,7 @@ fn generate_from_primed_sample_impl(
     )
 }
 
-/// Run one MLX-LM-style benchmark trial on the canonical Llama 4 native path.
+/// Run one benchmark trial on the canonical Llama 4 native path.
 pub fn benchmark_mlx_lm_trial(
     weights: &NativeWeights,
     prompt_ids: &[u32],

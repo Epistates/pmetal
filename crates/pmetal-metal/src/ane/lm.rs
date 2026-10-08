@@ -34,7 +34,7 @@ pub struct AneLmOptions {
     /// Projection weight storage.
     pub weights: WeightFormat,
     /// Weight bytes per layer program, which decides how many layers each
-    /// holds. About 1 GB, as Anemll found works.
+    /// holds. About 1 GB works well.
     pub max_program_bytes: usize,
     /// Layers whose output a [`Drafter`] reads ([`Drafter::taps`]),
     /// ascending; empty for none.

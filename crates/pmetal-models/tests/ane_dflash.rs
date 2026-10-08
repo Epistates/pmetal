@@ -14,8 +14,7 @@ use pmetal_bridge::native_weight::QuantParams;
 use pmetal_metal::ane::lm::{AneLm, AneLmOptions, GenerateOptions, NoDraft};
 use pmetal_models::dflash_drafter::DFlashDrafter;
 
-/// Chat prompts (thinking off), with the tokens per pass upstream dflash-mlx
-/// reaches on them with a bf16 target: 8.4, 5.2 and 3.2.
+/// Chat prompts (thinking off).
 const PROMPTS: [(&str, &[u32]); 3] = [
     (
         "fibonacci",
@@ -120,7 +119,7 @@ fn dflash_keeps_greedy_output_on_the_ane() {
     // The fibonacci prompt, either draft.
     assert!(
         per_pass[0] > 4.0 && per_pass[1] > 4.0,
-        "fibonacci: {:.2} and {:.2} tokens per pass; upstream reaches 8.4",
+        "fibonacci: {:.2} and {:.2} tokens per pass; expected above 4",
         per_pass[0],
         per_pass[1]
     );

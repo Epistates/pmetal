@@ -1,4 +1,4 @@
-//! Prefill / prime / generate loops, MLX-LM-compatible benchmark trials, and
+//! Prefill / prime / generate loops, benchmark trials, and
 //! the optional C++ decode fast path (CppForwardState / CppDecodeSession).
 
 use crate::InlineArray;
@@ -103,7 +103,7 @@ fn generate_from_primed_sample_impl(
 
 /// Prime the canonical decode loop without resetting peak memory.
 ///
-/// This is used by the MLX-LM parity benchmark so the timing path shares the
+/// This is used by `infer --benchmark` so the timing path shares the
 /// same bridge decode implementation as live inference.
 pub fn prime_generation_preserve_peak(
     weights: &NativeWeights,
@@ -164,9 +164,9 @@ pub fn generate_from_primed_sample(
     )
 }
 
-/// Run one MLX-LM-style benchmark trial on the canonical Qwen native path.
+/// Run one benchmark trial on the canonical Qwen native path.
 ///
-/// The timing split matches `mlx_lm.benchmark`: prompt timing includes prefill,
+/// The timing split: prompt timing includes prefill,
 /// first-token sampling, and priming the next decode step; generation timing
 /// covers only the remaining decode loop.
 pub fn benchmark_mlx_lm_trial(

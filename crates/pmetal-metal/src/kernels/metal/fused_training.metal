@@ -12,7 +12,7 @@
 //  - Using threadgroup memory for reductions
 //  - Eliminating per-kernel GPU-CPU synchronization
 //
-//  Performance target: Match mlx_lm's ~2400 tok/s (currently at ~1740)
+//  Performance target: ~2400 tok/s (currently at ~1740)
 
 #include <metal_stdlib>
 using namespace metal;

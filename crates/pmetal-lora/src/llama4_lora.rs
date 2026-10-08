@@ -151,7 +151,7 @@ impl Llama4LoraAttention {
         let uses_rope = config.uses_rope(layer_idx as i32);
 
         // QK norms — weightless RMS norm (eps 1e-6), applied AFTER RoPE and only
-        // on RoPE layers (mlx-lm: `use_qk_norm = args.use_qk_norm and use_rope`).
+        // on RoPE layers (reference: `use_qk_norm = args.use_qk_norm and use_rope`).
         // Weight stays at default ones == `mx.fast.rms_norm(x, None, eps=1e-6)`.
         let (q_norm, k_norm) = if config.use_qk_norm && uses_rope {
             (

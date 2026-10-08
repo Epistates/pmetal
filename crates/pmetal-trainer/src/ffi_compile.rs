@@ -18,7 +18,7 @@
 //!
 //! # Performance
 //!
-//! With proper JIT compilation, this should match mlx-lm's performance:
+//! With proper JIT compilation, this provides:
 //! - Full kernel fusion via `mx.compile`
 //! - Single GPU dispatch per training step
 //! - ~3-4x throughput improvement over eager execution

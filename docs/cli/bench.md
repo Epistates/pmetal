@@ -114,7 +114,7 @@ With `--stage prefill`, it benchmarks the recurrent GDN update on the real layer
 
 That is the right surface for testing prompt-heavy prefill ideas before changing the runtime chunk strategy.
 
-This is the right tool when you want to evaluate flash-moe-style BLAS ideas on the real GDN projection buckets before changing runtime selection.
+This is the right tool when you want to evaluate alternative BLAS kernels on the real GDN projection buckets before changing runtime selection.
 
 ```bash
 pmetal bench-gdn \

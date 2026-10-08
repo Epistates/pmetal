@@ -4228,7 +4228,7 @@ pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
 
 /// Benchmark generation loop timing with a real model.
 ///
-/// This profiles each step of the generation loop to compare with mlx_lm's timing.
+/// This profiles each step of the generation loop.
 pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
     use pmetal_bridge::compat::{Array, indexing::argmax, ops::async_eval, transforms::eval};
     use pmetal_models::DynamicModel;
@@ -4333,13 +4333,6 @@ pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
         .sum::<f64>()
         / times["total"].len() as f64;
     println!("\nEffective tok/s: {:.0}", 1_000_000.0 / total_avg);
-
-    println!("\n=== Comparison ===");
-    println!("Python mlx_lm reference:");
-    println!("  build_graph: 0.570ms");
-    println!("  async_eval:  3.111ms");
-    println!("  item:        0.004ms");
-    println!("  total:       3.686ms (271 tok/s)");
 
     Ok(())
 }

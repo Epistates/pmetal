@@ -2,8 +2,6 @@
 
 Run after `maturin develop`:
     python stub.py
-
-Based on candle-pyo3's introspection pattern.
 """
 
 import inspect

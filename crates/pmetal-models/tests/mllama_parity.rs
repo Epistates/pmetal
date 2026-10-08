@@ -1,7 +1,7 @@
 //! Numerical-parity test for the Rust Mllama (Llama 3.2 Vision) port.
 //!
 //! The oracle is the authoritative HuggingFace
-//! `transformers.models.mllama.modeling_mllama`. There is no mlx-lm port to
+//! `transformers.models.mllama.modeling_mllama`. There is no second reference port to
 //! cross-check against, and the implementation this replaced was a
 //! non-functional skeleton that still produced plausible-looking tensors — so
 //! this fixture is the only thing that distinguishes "runs" from "correct".

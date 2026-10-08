@@ -685,7 +685,7 @@ fn write_component(
 ///
 /// # Quantization scheme
 ///
-/// Matches the MLX `mx.quantize` / flash-moe affine format:
+/// Matches the MLX `mx.quantize` affine format:
 /// - Weight matrix shape: `[out_dim, in_dim]`
 /// - Divided into groups of `group_size` columns
 /// - Per group: `scale = (max − min) / (2^bits − 1)`, `bias = min`

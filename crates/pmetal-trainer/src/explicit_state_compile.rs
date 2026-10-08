@@ -33,7 +33,6 @@
 //!
 //! With proper warmup and Metal FlashAttention, this achieves:
 //! - ~2000+ tok/s on Qwen3-0.6B (batch=4, seq=512)
-//! - Matches mlx-lm's JIT-compiled training throughput
 //! - Full graph fusion for forward + backward + optimizer
 //!
 //! # Example

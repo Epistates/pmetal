@@ -13,8 +13,8 @@
 //!
 //! # Reference
 //!
-//! The Qwen 3.5 `shard()` method in mlx-lm serves as the authoritative
-//! reference for hybrid GDN+Attention+MoE tensor parallelism.
+//! The reference Qwen 3.5 `shard()` implementation is the authoritative
+//! source for hybrid GDN+Attention+MoE tensor parallelism.
 
 use super::sharding::{ShardingDirective, ShardingPlan};
 use anyhow::Result;
@@ -216,7 +216,7 @@ pub fn plan_ffn(prefix: &str) -> Vec<(String, ShardingDirective)> {
 ///
 /// # Reference
 ///
-/// mlx-lm `qwen3_5.py` lines 393-440
+/// The reference Qwen 3.5 `shard()` implementation.
 pub fn plan_gdn(
     prefix: &str,
     _key_dim: usize,

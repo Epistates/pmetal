@@ -35,8 +35,6 @@
 //! - Per-parameter command buffer creation overhead
 //! - Per-parameter GPU-CPU synchronization
 //! - Multiple kernel launches
-//!
-//! Target: EXCEED mlx-lm (~2980 tok/s) by removing mlx-rs limitations
 
 #![allow(unsafe_code)]
 
@@ -85,7 +83,7 @@ pub type MlxMetalOptimizerResult<T> = std::result::Result<T, MlxMetalOptimizerEr
 
 /// Learning rate schedule type.
 ///
-/// Based on SOTA implementations from mlx-lm:
+/// Supported schedules:
 /// - `Constant`: Fixed learning rate
 /// - `CosineDecay`: Cosine annealing from init_lr to 0
 /// - `CosineDecayWithWarmup`: Linear warmup followed by cosine decay
@@ -99,7 +97,6 @@ pub enum LrSchedule {
         total_steps: u32,
     },
     /// Linear warmup followed by cosine decay.
-    /// This is the recommended SOTA schedule used by mlx-lm.
     CosineDecayWithWarmup {
         /// Number of warmup steps (typically 5-10% of total).
         warmup_steps: u32,
@@ -269,7 +266,6 @@ impl ParameterLayout {
 
 /// Pre-computed scalar arrays for optimizer efficiency.
 /// These are created once and reused every step to avoid allocation overhead.
-/// Based on SOTA pattern from mlx-lm.
 struct CachedScalars {
     beta1: Array,
     beta2: Array,
@@ -295,9 +291,8 @@ impl CachedScalars {
 /// This optimizer implements AdamW using fused Metal kernels that process
 /// all parameters in a single dispatch, eliminating per-parameter overhead.
 ///
-/// # SOTA Features
+/// # Features
 ///
-/// Based on analysis of mlx-lm and related SOTA implementations:
 /// - **Learning rate scheduling**: Supports constant, cosine decay, and warmup
 /// - **Pre-computed scalars**: Caches beta1, beta2, eps arrays to avoid allocation
 /// - **MLX-native state**: Stores m/v as MLX Arrays for graph connectivity
@@ -770,8 +765,6 @@ impl MlxMetalOptimizer {
 /// - Per-parameter GPU-CPU synchronization
 /// - Multiple kernel launches
 ///
-/// Target: EXCEED mlx-lm (~2980 tok/s)
-///
 /// # Usage
 ///
 /// ```ignore
@@ -1231,7 +1224,6 @@ impl MlxMetalOptimizerBuilder {
     }
 
     /// Set learning rate schedule to cosine decay.
-    /// SOTA: This is the default schedule used by mlx-lm.
     pub fn cosine_decay(mut self, total_steps: u32) -> Self {
         self.config.lr_schedule = LrSchedule::CosineDecay { total_steps };
         self

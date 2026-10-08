@@ -75,7 +75,7 @@ mlx::core::fast::CustomKernelFunction& get_gdn_kernel() {
 // output projection saves ~50% of the per-step work compared to reusing
 // the full `gated_delta_step` kernel and discarding `y`.
 //
-// Ported from dflash-mlx `adapters.py:34-81` (z-lab, 2026) and adapted to
+// Follows the DFlash reference implementation (z-lab, 2026), adapted to
 // the pmetal convention where keys stay at Hk heads (GQA expansion handled
 // via `hk_idx`).
 static const char* GDN_STATE_UPDATE_METAL_SOURCE = R"(

@@ -48,7 +48,7 @@ void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input, con
 
 // ── Triangular inverse (CPU stream for WY factorization) ────────────────
 // upper=false -> lower triangular (default).
-// Runs on CPU stream matching mlx-lm's tri_inv(StreamOrDevice::cpu()) usage.
+// Runs on the CPU stream: tri_inv(StreamOrDevice::cpu()).
 void mlx_inline_tri_inv(mlx_inline_array* dst, const mlx_inline_array* a, bool upper, bool use_cpu);
 
 // ── SVD ──────────────────────────────────────────────────────────────────

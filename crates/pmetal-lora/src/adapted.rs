@@ -7,7 +7,7 @@
 //! runs — and attaches [`LoraAdapter`](pmetal_bridge::compat::LoraAdapter)s to
 //! its projections. There is one forward pass, so there is nothing to drift.
 //!
-//! This is the shape PEFT and mlx-lm use: build the model, then walk it and
+//! This is the shape PEFT uses: build the model, then walk it and
 //! adapt the layers named by `target_modules`.
 
 use std::collections::HashMap;
@@ -373,8 +373,8 @@ impl crate::TrainableModel for AdaptedModel {
 
     /// `layers_per_block` is accepted and ignored.
     ///
-    /// One decoder layer is the checkpoint unit, which is what PyTorch and
-    /// mlx-lm both use. The parameter stays on the trait because the CLI still
+    /// One decoder layer is the checkpoint unit, which is what PyTorch
+    /// uses. The parameter stays on the trait because the CLI still
     /// carries the flag; it never selected anything.
     fn enable_gradient_checkpointing(&mut self, _layers_per_block: usize) {
         self.model.set_gradient_checkpointing(true);

@@ -105,15 +105,6 @@ Architectures not listed (Llama 4, Qwen3MoE, DeepSeek, Phi4, Cohere, Granite, Ne
 | `trainable` | `TrainableModel` trait definition |
 | `arch_config` | Per-architecture LoRA configuration |
 
-## Performance
-
-Compared to mlx-lm on identical hardware:
-
-| Metric | pmetal-lora | mlx-lm |
-|--------|---------------|--------|
-| Steps/sec | 1.33 | 0.62 |
-| Memory | ~10 GB | 19 GB |
-
 ## License
 
 MIT OR Apache-2.0

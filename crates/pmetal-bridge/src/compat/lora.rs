@@ -7,9 +7,9 @@
 //! bias does, and an architecture never has to mention LoRA to be trainable
 //! with it.
 //!
-//! This is the Rust reading of what PEFT and mlx-lm do at runtime. Both walk a
-//! built model and swap each targeted `Linear` for an adapted one
-//! (`LoRALinear.from_base`, `inject_adapter_in_model`); the base architecture
+//! This is the Rust reading of what PEFT does at runtime. It walks a
+//! built model and swaps each targeted `Linear` for an adapted one
+//! (`inject_adapter_in_model`); the base architecture
 //! never names the adapter. Rust has no duck-typed attribute assignment, so the
 //! swap becomes an `Option` on the layer instead — same property, same
 //! separation, and the architecture files stay unaware.

@@ -210,8 +210,8 @@ fn test_kv_cache_speculative_rollback_preserves_accepted_prefix() {
     //   3. only 2 of the 5 are accepted → trim 3 → offset 6
     //   4. append 1 correction/bonus token → offset 7
     // After the final append we must observe a contiguous [prefill || accepted || bonus]
-    // with the rejected tokens completely overwritten (matching dflash-mlx's
-    // `target.rewind_kv_caches` semantics).
+    // with the rejected tokens completely overwritten (the rewind semantics
+    // DFlash verification needs).
     let config = KVCacheConfig::new(1, 64, 1, 1);
     let mut cache = KVCache::new(config);
 
@@ -535,7 +535,7 @@ fn test_rotating_cache_rotation() {
     let v2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
     let (_cached_k, _) = cache.update_and_fetch(&k2, &v2).unwrap();
 
-    // MLX-LM allows max_size + S - 1 to ensure every token gets at least max_size context
+    // The cache allows max_size + S - 1 to ensure every token gets at least max_size context
     // So cache can grow to max_size + num_steps - 1 before trimming
     // In this case: 20 + 10 - 1 = 29, then trimmed to ~20 region
     // The key behavior is len() is capped at max_size, offset tracks total

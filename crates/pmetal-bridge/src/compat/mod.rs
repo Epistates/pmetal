@@ -529,7 +529,7 @@ pub mod fast {
     /// Rotary position embedding with an explicit inverse-frequency
     /// array. Use this when the template rotates only a subset of the
     /// head dimensions but the rotation pairing still uses the full
-    /// head_dim — for example mlx-lm's `ProportionalRoPE` (Gemma 4).
+    /// head_dim — for example Gemma 4's `ProportionalRoPE`.
     /// The `freqs` array has shape `[head_dim / 2]` where non-rotated
     /// slots are filled with `f32::INFINITY` so mlx skips them.
     pub fn rope_with_freqs(

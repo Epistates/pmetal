@@ -712,8 +712,8 @@ impl InferenceRunner {
         self.chat_template_type
     }
 
-    /// Benchmark the active model using the same workload shape as
-    /// `mlx_lm.benchmark`: fixed random prompt ids, one warmup, EOS disabled,
+    /// Benchmark the active model with a fixed workload shape:
+    /// fixed random prompt ids, one warmup, EOS disabled,
     /// and repeated full prompt+decode runs.
     pub fn benchmark_mlx_lm(
         &mut self,
@@ -738,7 +738,7 @@ impl InferenceRunner {
             )
             .map_err(Exception::custom),
             _ => Err(Exception::custom(
-                "MLX-LM parity benchmark is currently only implemented for the native bridge path",
+                "The inference benchmark is currently only implemented for the native bridge path",
             )),
         }
     }
@@ -879,7 +879,7 @@ impl InferenceGenState {
             // the native path: users passing `--top-k 20 --top-p 0.95`
             // got pure temperature sampling because SamplingParams
             // didn't carry those fields. Now the bridge applies the
-            // same filter chain mlx-lm does.
+            // full filter chain.
             let sampling_params = pmetal_bridge::decode::SamplingParams {
                 temperature: self.gen_config.temperature,
                 top_k: self.gen_config.top_k,
@@ -1238,7 +1238,7 @@ fn native_cache_mode_supported(
     match mode {
         CacheMode::Standard => true,
         CacheMode::TurboQuant { .. } => info.supports_turboquant,
-        // Zero-overhead quantized KV cache via quantized_matmul (matches mlx-lm).
+        // Zero-overhead quantized KV cache via quantized_matmul.
         // MLX supports 2, 3, 4, 5, 6, 8 bits for affine group quantization.
         CacheMode::Quantized { bits, .. } => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
         _ => false,

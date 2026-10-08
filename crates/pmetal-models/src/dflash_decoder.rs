@@ -7,7 +7,7 @@
 //! # Verification mode
 //!
 //! This implementation uses the `parallel-replay` verification mode from the
-//! upstream dflash-mlx Python reference (`dflash_mlx/runtime.py`): the target
+//! DFlash reference implementation: the target
 //! runs one forward pass over the whole proposed block, the verifier's argmax
 //! at every position is compared with the drafted tokens, and the longest
 //! matching prefix is accepted plus one bonus correction token. At
@@ -326,8 +326,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         // eviction boundary would silently produce wrong outputs because
         // the rolled-back positions may already have been dropped from
         // the cache. Refuse to run if the cache window is smaller than the
-        // block size we may need to rewind. (Inspired by mlx-lm's
-        // `can_trim_prompt_cache` guard, commit f56d997.)
+        // block size we may need to rewind.
         let cache_window = match target_cache.config().mode {
             pmetal_mlx::kv_cache::CacheMode::SlidingWindow { window_size } => Some(window_size),
             pmetal_mlx::kv_cache::CacheMode::Rotating { max_size, .. } => Some(max_size),

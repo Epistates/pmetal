@@ -2,8 +2,7 @@
 //!
 //! This module provides training that bypasses mlx-rs's compilation limitations
 //! by using direct Metal command buffer batching. The key insight is that
-//! mlx_lm achieves ~2400 tok/s by using `mx.compile` which fuses operations
-//! into a single Metal command buffer.
+//! `mx.compile` fuses operations into a single Metal command buffer.
 //!
 //! # Architecture
 //!

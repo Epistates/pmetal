@@ -130,7 +130,7 @@ pub struct TrainSpec {
 
     /// Deprecated, has no effect.
     ///
-    /// One decoder layer is the checkpoint unit, as in PyTorch and mlx-lm, so
+    /// One decoder layer is the checkpoint unit, as in PyTorch, so
     /// there is no block size to pick. Kept on the spec so existing job files
     /// and `--gradient-checkpointing-layers` still parse; `min = max = 1` stops
     /// the generated UI offering a control that does nothing.

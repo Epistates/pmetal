@@ -1552,7 +1552,7 @@ impl Qwen3NextLoraForCausalLM {
 
     /// Load base model weights from a HashMap (already loaded SafeTensors).
     ///
-    /// Weight name convention mirrors the Python HuggingFace/MLX-LM layout.
+    /// Weight name convention mirrors the Hugging Face / MLX checkpoint layout.
     /// `sanitize_weights` must be called before invoking this method so that
     /// expert weights are stacked and norm offsets are applied.
     pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {

@@ -28,7 +28,7 @@
 //!
 //! # Reference
 //!
-//! Based on mlx-lm's distributed linear layers and the Qwen 3.5
+//! Based on the reference distributed linear layers and the Qwen 3.5
 //! `shard()` implementation.
 
 pub mod plan;

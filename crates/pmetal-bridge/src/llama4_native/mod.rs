@@ -4,7 +4,7 @@
 //! direct C++ bridge). This eliminates ALL per-op heap allocation, matching
 //! Python/nanobind's direct C++ binding performance.
 //!
-//! Architecture details (from mlx-lm llama4.py):
+//! Architecture details (from the reference implementation):
 //!
 //! - **iRoPE**: interleaved positional encoding.
 //!   - Layers where `(layer_idx + 1) % 4 != 0` are "local" — use chunked attention

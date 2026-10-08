@@ -204,7 +204,7 @@ pub(super) fn mla_forward(
         // MLA stores `kv_latent` (B,1,T,lora_rank) and `k_pe` (B,1,T,rope_dim)
         // — same time axis, different last dims — so each leg uses
         // alloc_or_grow_buffer with a per-leg shape closure. dtype 11 is
-        // bfloat16 (matches mlx-lm's MLA cache layout).
+        // bfloat16 (matches the reference MLA cache layout).
         use crate::native_common::kv_cache::{GrowthPolicy, alloc_or_grow_buffer};
         const BF16: i32 = 11;
         alloc_or_grow_buffer(

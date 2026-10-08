@@ -33,7 +33,6 @@
 //! # Reference
 //!
 //! - Paper: <https://arxiv.org/abs/2212.04356>
-//! - Implementation based on: candle-transformers/src/models/whisper
 
 use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, Param, nn, ops};
 use pmetal_bridge::impl_module_params;

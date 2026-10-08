@@ -189,7 +189,7 @@ impl Llama4TextConfig {
             moe_layers.contains(&layer_idx)
         } else {
             // The LAST layer in each interleave group is MoE (HF default
-            // `moe_layers = range(step-1, n, step)`, mlx-lm `idx % step == step-1`).
+            // `moe_layers = range(step-1, n, step)`).
             // For step == 1 every layer is MoE; for step == 2 the odd layers are.
             layer_idx % self.interleave_moe_layer_step == self.interleave_moe_layer_step - 1
         }
@@ -216,7 +216,7 @@ impl Llama4TextConfig {
                 return no_rope_layers[layer_idx as usize] == 1;
             }
         }
-        // NoPE every no_rope_layer_interval layers. mlx-lm / HF use the 1-based
+        // NoPE every no_rope_layer_interval layers. HF uses the 1-based
         // index `(layer_idx + 1) % interval != 0`, so NoPE lands on layers
         // 3, 7, 11, ... (not 0, 4, 8, ...).
         (layer_idx + 1) % self.no_rope_layer_interval != 0
@@ -333,7 +333,7 @@ impl Llama4Router {
         // x: [total_tokens, hidden]
         let router_logits = Module::forward(&mut self.gate, x)?;
 
-        // Llama4 routing (HF Llama4TextMoe / mlx-lm `MoE`): pick the top-k
+        // Llama4 routing (HF Llama4TextMoe): pick the top-k
         // experts by RAW logit, then gate with `sigmoid(logit)` — NOT a
         // softmax. The previous softmax-then-renormalize collapsed the top-1
         // weight to exactly 1.0 (softmax over a single selected logit is 1),
@@ -513,7 +513,7 @@ impl Llama4MoE {
             // Llama4 scales the expert *input* by the sigmoid gate
             // (`experts(x * scores)`), not the output. The expert MLP is
             // SwiGLU (nonlinear), so input- and output-scaling are NOT
-            // equivalent — the input must be scaled to match HF/mlx-lm.
+            // equivalent — the input must be scaled to match HF.
             let expert_input = flat_x.take_axis(&idx_array, 0).multiply(&weight_array);
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
 
@@ -585,7 +585,7 @@ impl Llama4Attention {
         let uses_rope = config.uses_rope(layer_idx as i32);
 
         // QK norm: weightless RMS norm (eps 1e-6) applied AFTER RoPE, and only on
-        // RoPE layers (mlx-lm: `use_qk_norm = args.use_qk_norm and self.use_rope`).
+        // RoPE layers (reference: `use_qk_norm = args.use_qk_norm and self.use_rope`).
         // The RmsNorm weight stays at its default ones, so it is numerically
         // identical to `mx.fast.rms_norm(x, weight=None, eps=1e-6)`.
         let (q_norm, k_norm) = if config.use_qk_norm && uses_rope {

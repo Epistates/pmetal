@@ -38,13 +38,11 @@
 //!
 //! | Approach | Throughput | Notes |
 //! |----------|------------|-------|
-//! | mlx-lm (JIT) | ~2200-2300 tok/s | Full graph fusion via `mx.compile` |
 //! | pmetal (fused) | ~1700-1800 tok/s | Deferred eval + warmup |
 //! | pmetal (basic) | ~500-600 tok/s | Per-step evaluation |
 //!
-//! The fused training path (`--fused` flag) uses deferred evaluation which achieves
-//! approximately 75-80% of mlx-lm's JIT-compiled throughput. The gap is primarily due
-//! to mlx-rs's `compile_with_state` limitations with complex models.
+//! The fused training path (`--fused` flag) uses deferred evaluation. Full graph fusion
+//! is limited by mlx-rs's `compile_with_state` with complex models.
 //!
 //! ## Using the Optimized Training Path
 //!
@@ -393,8 +391,8 @@ impl TrainingLoop {
             return;
         }
 
-        // One decoder layer is the checkpoint unit, matching what PyTorch and
-        // mlx-lm both do. `--gradient-checkpointing-layers` predates that and
+        // One decoder layer is the checkpoint unit, matching what PyTorch
+        // does. `--gradient-checkpointing-layers` predates that and
         // has never selected anything; say so rather than echo it back as if
         // it had.
         let layers = self.config.gradient_checkpointing_layers.max(1);
@@ -402,7 +400,7 @@ impl TrainingLoop {
             tracing::warn!(
                 layers_per_block = layers,
                 "--gradient-checkpointing-layers has no effect: one decoder layer is the \
-                 checkpoint unit, as in PyTorch and mlx-lm. The flag is accepted for \
+                 checkpoint unit, as in PyTorch. The flag is accepted for \
                  compatibility and will be removed."
             );
         }
@@ -970,7 +968,7 @@ impl TrainingLoop {
         };
 
         // Evaluate loss for this micro-batch
-        // NOTE: Unlike mlx-lm which uses mx.compile for JIT fusion, we need to
+        // NOTE: Without mx.compile JIT fusion, we need to
         // evaluate each step. mlx-rs doesn't expose mx.compile, so deferring
         // evaluation just builds up a massive computation graph.
         if self.step <= 1 {
@@ -1023,7 +1021,7 @@ impl TrainingLoop {
                     // Eval only trainable (LoRA) parameters — NOT the frozen base
                     // model. Evaluating all 600M+ params of a frozen model every step
                     // is wasteful and can spike memory via unnecessary GPU->CPU sync.
-                    // This matches mlx-lm's approach: mx.eval(state, losses, ...).
+                    // Equivalent to mx.eval(state, losses, ...).
                     let _ = pmetal_bridge::compat::eval_params(model.trainable_parameters());
                     // Optimizer state (momentum/variance for Adam)
                     let opt_states: Vec<&Array> =
@@ -1043,7 +1041,7 @@ impl TrainingLoop {
                 // MLX builds a lazy computation graph - forcing evaluation after
                 // every optimizer step is a massive bottleneck (20-50s per step!).
                 // Parameters will be evaluated lazily when needed (at logging or
-                // checkpoint time). This matches mlx-lm's approach.
+                // checkpoint time).
 
                 // Always compute grad_norm when clipping is enabled (tests expect this).
                 // The lazy Array is evaluated here — syncs GPU->CPU.

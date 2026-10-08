@@ -40,7 +40,7 @@ pub struct CohereConfig {
     pub rope_theta: f32,
     pub layer_norm_eps: f32,
     /// Output logit scaling factor. Cohere multiplies the LM-head logits by
-    /// this (HF `CohereForCausalLM` / mlx-lm `Model.__call__`:
+    /// this (HF `CohereForCausalLM`:
     /// `out = out * logit_scale`). Command-R family ships `0.0625`.
     #[serde(default = "default_logit_scale")]
     pub logit_scale: f32,
@@ -315,7 +315,7 @@ impl CohereAttention {
             .transpose_axes(&[0, 2, 1, 3]);
 
         // Cohere uses *traditional* (interleaved) RoPE — HF `CohereRotaryEmbedding`
-        // rotates adjacent pairs, and mlx-lm builds `nn.RoPE(..., traditional=True)`.
+        // rotates adjacent pairs, i.e. `nn.RoPE(..., traditional=True)`.
         // The split-half (`traditional=false`) form rotates the wrong element
         // pairs and silently corrupts every attention score.
         let rope_positions = RopePositions::resolve(

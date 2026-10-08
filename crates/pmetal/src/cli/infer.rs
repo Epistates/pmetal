@@ -138,7 +138,7 @@ pub struct InferArgs {
     #[arg(long = "ane-real-time")]
     pub ane_real_time: bool,
 
-    /// Run an MLX-LM-compatible benchmark.
+    /// Run a prompt and generation throughput benchmark.
     #[arg(long = "benchmark")]
     pub benchmark: bool,
 
