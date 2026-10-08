@@ -28,8 +28,8 @@ use std::path::Path;
 use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_models::architectures::qwen3_next::Qwen3NextRoutedExpertMode;
 use pmetal_models::architectures::qwen4_exp::{
-    CheckpointKeyRole, NgramHash, Qwen4ExpConfig, Qwen4ExpForCausalLM, assign_qwen4_exp_tensors,
-    checkpoint_key_role, ngram_shard_encoding,
+    CheckpointKeyRole, NgramHash, Qwen4ExpConfig, Qwen4ExpForCausalLM, Qwen4ExpLoadOptions,
+    assign_qwen4_exp_tensors, checkpoint_key_role, ngram_shard_encoding,
 };
 use pmetal_models::dispatcher::ModelArchitecture;
 use serial_test::serial;
@@ -114,8 +114,21 @@ fn check_variant(dir: &Path) {
     let mut model =
         Qwen4ExpForCausalLM::new_for_loading(config.clone(), Qwen3NextRoutedExpertMode::Resident)
             .expect("model builds from the released config");
-    let assigned = assign_qwen4_exp_tensors(&mut model, weights, false)
+    let assigned = assign_qwen4_exp_tensors(&mut model, weights, Qwen4ExpLoadOptions::default())
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    // NVFP4 experts stay on packed kernels; everything else loads dense.
+    let packed = model
+        .model
+        .layers
+        .iter()
+        .filter(|l| l.mlp.packed_experts.is_some())
+        .count();
+    let expect_packed = if dir.to_string_lossy().contains("NVFP4") {
+        config.num_hidden_layers as usize
+    } else {
+        0
+    };
+    assert_eq!(packed, expect_packed, "layers with packed experts");
 
     // The n-gram tables: one per PLE layer, split as the config says, rows
     // and width matching the hash.
@@ -142,8 +155,9 @@ fn check_variant(dir: &Path) {
     }
 
     println!(
-        "{}: {} tensors | {weight_count} weights and sidecars -> {assigned} parameters | \
-         {} n-gram shards ({} with an FP8 scale) | {hash_buffers} hash buffers | skipped {skipped:?}",
+        "{}: {} tensors | {weight_count} weights and sidecars -> {assigned} parameters and \
+         packed stacks ({packed} layers packed) | {} n-gram shards ({} with an FP8 scale) | \
+         {hash_buffers} hash buffers | skipped {skipped:?}",
         dir.file_name().unwrap().to_string_lossy(),
         tensors.len(),
         shards.values().map(Vec::len).sum::<usize>(),

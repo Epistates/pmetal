@@ -1057,6 +1057,8 @@ impl DynamicModel {
                     skip_routed_experts,
                     ngram_rows_on_disk: model.config.ngram_table_bytes()
                         > Qwen4ExpLoadOptions::RESIDENT_NGRAM_LIMIT_BYTES,
+                    // NVFP4 experts stay packed.
+                    unpack_quantized_experts: false,
                 };
                 let report = load_qwen4_exp_weights(&mut model, model_dir, load_options)
                     .map_err(|e| Exception::custom(e.to_string()))?;

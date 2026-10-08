@@ -211,8 +211,8 @@ fn qwen4_exp_disk_served_ngram_rows_match_resident() {
             &mut model,
             dir.path(),
             Qwen4ExpLoadOptions {
-                skip_routed_experts: false,
                 ngram_rows_on_disk: on_disk,
+                ..Default::default()
             },
         )
         .expect("load");
@@ -229,4 +229,120 @@ fn qwen4_exp_disk_served_ngram_rows_match_resident() {
         to_f32_vec_eval(&logits[1]),
         "disk-served n-gram rows changed the logits"
     );
+}
+
+/// The fixture with its routed experts in the NVIDIA ModelOpt NVFP4 layout the
+/// `nvidia/Qwen3.8-Flash-Next-NVFP4` release ships: one module per expert, the
+/// e2m1 bytes, an e4m3 scale per 16 values, and a per-expert `weight_scale_2`.
+fn nvfp4_checkpoint_dir() -> tempfile::TempDir {
+    use pmetal_bridge::QuantizedMode;
+
+    let dense = load_shard(&fixture_path("qwen4_exp_synth_weights.safetensors"));
+    let mut out: Vec<(String, Array)> = Vec::new();
+    let scalar = |v: f32| Array::from_f32_slice(&[v], &[]);
+    for (key, value) in &dense {
+        let Some(prefix) = key
+            .strip_suffix(".gate_up_proj")
+            .or_else(|| key.strip_suffix(".down_proj"))
+            .filter(|p| p.ends_with(".mlp.experts"))
+        else {
+            out.push((key.clone(), value.clone()));
+            continue;
+        };
+        let (experts, rows, cols) = (value.dim(0), value.dim(1), value.dim(2));
+        let projections: Vec<(&str, i32, i32)> = if key.ends_with(".gate_up_proj") {
+            vec![("gate_proj", 0, rows / 2), ("up_proj", rows / 2, rows)]
+        } else {
+            vec![("down_proj", 0, rows)]
+        };
+        for e in 0..experts {
+            for &(name, start, stop) in &projections {
+                let w = value
+                    .slice(&[e, start, 0], &[e + 1, stop, cols])
+                    .reshape(&[stop - start, cols]);
+                let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
+                let module = format!("{prefix}.{e}.{name}");
+                out.push((
+                    format!("{module}.weight"),
+                    packed.view(pmetal_bridge::dtype::U8),
+                ));
+                out.push((format!("{module}.weight_scale"), scales));
+                out.push((
+                    format!("{module}.weight_scale_2"),
+                    // Distinct per expert, and powers of two so the dense
+                    // unpacking is exact and the comparison isolates the kernel.
+                    scalar(2f32.powi(e % 4 - 2)),
+                ));
+                out.push((format!("{module}.input_scale"), scalar(1.0)));
+            }
+        }
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let entries: Vec<(&str, &Array)> = out.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    Array::save_safetensors(
+        dir.path().join("model.safetensors").to_str().unwrap(),
+        &entries,
+    );
+    std::fs::copy(
+        fixture_path("qwen4_exp_synth_config.json"),
+        dir.path().join("config.json"),
+    )
+    .expect("copy config");
+    dir
+}
+
+/// NVFP4 experts stay packed and run on MLX's quantized gather kernels, with
+/// each expert's tensor scale applied to its product. Against the same bytes
+/// unpacked to dense, uncached and cached, the logits agree to fp32
+/// accumulation order.
+#[test]
+#[serial]
+fn qwen4_exp_nvfp4_experts_run_packed() {
+    let reference = load_shard(&fixture_path("qwen4_exp_synth_reference.safetensors"));
+    let input_ids = ref_tensor(&reference, "input_ids").clone();
+    let dir = nvfp4_checkpoint_dir();
+
+    let mut runs = Vec::new();
+    for unpack in [true, false] {
+        let mut model = DynamicModel::load(dir.path()).expect("loads");
+        if unpack {
+            let DynamicModel::Qwen4Exp(inner) = &mut model else {
+                unreachable!()
+            };
+            let config = inner.config.clone();
+            *inner =
+                Qwen4ExpForCausalLM::new_for_loading(config, Qwen3NextRoutedExpertMode::Resident)
+                    .expect("model");
+            load_qwen4_exp_weights(
+                inner,
+                dir.path(),
+                Qwen4ExpLoadOptions {
+                    unpack_quantized_experts: true,
+                    ..Default::default()
+                },
+            )
+            .expect("dense load");
+        }
+        let DynamicModel::Qwen4Exp(inner) = &model else {
+            unreachable!()
+        };
+        assert_eq!(
+            inner.model.layers[0].mlp.packed_experts.is_some(),
+            !unpack,
+            "experts packed only when asked"
+        );
+        let logits = model.forward(&input_ids, None).expect("forward");
+        let cached = cached_logits(&mut model, &input_ids);
+        pmetal_bridge::check_last_error().expect("no bridge error");
+        runs.push((logits, cached));
+    }
+    // Observed 6.6e-7 both ways; swapping a gate and up projection moves the
+    // logits by 0.79.
+    let tol = Tolerance::new(5e-6, 4e-6);
+    let reports = vec![
+        ParityReport::compute("nvfp4_packed_vs_dense", &runs[1].0, &runs[0].0, tol),
+        ParityReport::compute("nvfp4_packed_vs_dense_cached", &runs[1].1, &runs[0].1, tol),
+    ];
+    assert_all_pass("NVFP4 packed experts", &reports);
+    assert_eq!(argmax_last_axis(&runs[1].0), argmax_last_axis(&runs[0].0));
 }

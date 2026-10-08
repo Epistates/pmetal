@@ -1434,18 +1434,46 @@ where
     F: FnMut(&str) -> bool,
 {
     let model_dir = model_dir.as_ref();
+    let mut all_weights = load_weights_filtered_raw(model_dir, &mut keep_key)?;
+    unpack_mlx_quantized_weights(model_dir, &mut all_weights)?;
+    dequantize_sidecar_weights(&mut all_weights)?;
+
+    Ok(all_weights
+        .into_iter()
+        .filter(|(key, _)| keep_key(key) && !is_quant_aux_key(key))
+        .collect())
+}
+
+/// The tensors `keep_key` wants, plus the quantization aux tensors and sidecars
+/// of each, read as stored: nothing is unpacked.
+///
+/// For a loader that keeps some quantized weights packed; everyone else wants
+/// [`load_weights_filtered`], which unpacks.
+pub(crate) fn load_weights_filtered_raw<F>(
+    model_dir: &Path,
+    mut keep_key: F,
+) -> Result<HashMap<String, Array>, LoadError>
+where
+    F: FnMut(&str) -> bool,
+{
     let quant_config = load_mlx_quantization_config(model_dir)?;
-    let mut all_weights = HashMap::new();
+    // An aux entry has to come along whenever its packed tensor does, or the
+    // tensor arrives still packed. Which name that is depends on the layout, so
+    // ask about both (see `packed_weight_key_for`).
+    let mut wanted = |key: &str| {
+        keep_key(key)
+            || quant_config.is_some()
+                && quant_aux_base_key(key)
+                    .is_some_and(|base| keep_key(base) || keep_key(&format!("{base}.weight")))
+            || pmetal_bridge::native_loader::quant_sidecar_base(key)
+                .is_some_and(|base| keep_key(&format!("{base}.weight")))
+    };
+
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
-        let mut weights = load_shard(&single_file)?;
-        if let Some(config) = &quant_config {
-            dequantize_mlx_quantized_weights(&mut weights, config);
-        }
-        dequantize_sidecar_weights(&mut weights)?;
-        return Ok(weights
+        return Ok(load_shard(&single_file)?
             .into_iter()
-            .filter(|(key, _)| keep_key(key) && !is_quant_aux_key(key))
+            .filter(|(key, _)| wanted(key))
             .collect());
     }
 
@@ -1462,17 +1490,7 @@ where
     let wanted_keys: HashSet<String> = index
         .weight_map
         .keys()
-        .filter(|key| {
-            // An aux entry has to come along whenever its packed tensor does,
-            // or the tensor arrives still packed. Which name that is depends on
-            // the layout, so ask about both (see `packed_weight_key_for`).
-            keep_key(key)
-                || quant_config.is_some()
-                    && quant_aux_base_key(key)
-                        .is_some_and(|base| keep_key(base) || keep_key(&format!("{base}.weight")))
-                || pmetal_bridge::native_loader::quant_sidecar_base(key)
-                    .is_some_and(|base| keep_key(&format!("{base}.weight")))
-        })
+        .filter(|key| wanted(key))
         .cloned()
         .collect();
     let shard_files: HashSet<&String> = index
@@ -1482,6 +1500,7 @@ where
         .map(|(_, shard_file)| shard_file)
         .collect();
 
+    let mut all_weights = HashMap::new();
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
         let shard_weights = load_shard(&shard_path)?;
@@ -1491,16 +1510,20 @@ where
                 .filter(|(key, _)| wanted_keys.contains(key)),
         );
     }
+    Ok(all_weights)
+}
 
-    if let Some(config) = &quant_config {
-        dequantize_mlx_quantized_weights(&mut all_weights, config);
+/// Unpack an MLX-quantized checkpoint's `.scales` / `.biases` triples in place,
+/// as `config.json`'s quantization block describes them. A no-op for a
+/// checkpoint without one.
+pub(crate) fn unpack_mlx_quantized_weights(
+    model_dir: &Path,
+    weights: &mut HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    if let Some(config) = load_mlx_quantization_config(model_dir)? {
+        dequantize_mlx_quantized_weights(weights, &config);
     }
-    dequantize_sidecar_weights(&mut all_weights)?;
-
-    Ok(all_weights
-        .into_iter()
-        .filter(|(key, _)| keep_key(key) && !is_quant_aux_key(key))
-        .collect())
+    Ok(())
 }
 
 pub fn load_nemotron_weights(

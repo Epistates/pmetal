@@ -756,13 +756,16 @@ impl EmbeddingWeight {
 /// carry the real compute dtype. Scales are the second choice: they are float
 /// by construction and present exactly when the weights are packed.
 pub fn detect_model_dtype(lookup: impl Fn(&str) -> Option<i32>) -> i32 {
-    const CANDIDATES: [&str; 6] = [
+    const CANDIDATES: [&str; 8] = [
         "model.norm.weight",
         "backbone.norm_f.weight",
         "language_model.model.norm.weight",
+        "model.language_model.norm.weight",
         "model.embed_tokens.scales",
         "model.embed_tokens.weight",
         "language_model.model.embed_tokens.weight",
+        // Qwen 3.5 / Qwen4-Exp wrappers; Qwen4-Exp has no final norm at all.
+        "model.language_model.embed_tokens.weight",
     ];
     CANDIDATES
         .iter()

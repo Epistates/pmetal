@@ -28,6 +28,7 @@ use crate::expert_io::ExpertOffloadContext;
 use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
+use pmetal_bridge::native_weight::LayerWeight;
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_mlx::{
@@ -2182,8 +2183,33 @@ pub struct Qwen3NextSparseMoeBlock {
     pub shared_combined_in_proj_weight: Option<Array>,
     /// Weight pointer signature used to invalidate the shared projection cache.
     pub shared_combined_in_proj_signature: Option<Vec<usize>>,
+    /// Routed experts kept packed. When set, forward runs them on MLX's
+    /// quantized gather kernels and the `switch_mlp_*` arrays are placeholders.
+    pub packed_experts: Option<PackedRoutedExperts>,
 }
 impl_module_params!(Qwen3NextSparseMoeBlock; gate, switch_mlp_gate_proj, switch_mlp_up_proj, switch_mlp_down_proj, shared_expert, shared_expert_gate);
+
+/// A MoE layer's routed experts on MLX's packed kernels, each projection
+/// stacked `[E, out, in]` (an NVIDIA ModelOpt NVFP4 checkpoint keeps its
+/// bytes this way, with one tensor scale per expert).
+///
+/// Not parameters: a packed weight has nothing to train, and leaving them out
+/// of the tree keeps a parameter-wide pass (fp8 quantization, adapters) from
+/// touching the packed bytes.
+#[derive(Clone)]
+pub struct PackedRoutedExperts {
+    pub gate: LayerWeight,
+    pub up: LayerWeight,
+    pub down: LayerWeight,
+}
+
+impl std::fmt::Debug for PackedRoutedExperts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackedRoutedExperts")
+            .field("params", &self.gate.params())
+            .finish_non_exhaustive()
+    }
+}
 
 impl Qwen3NextSparseMoeBlock {
     const DEFAULT_PREFILL_EXPERT_WINDOW_TOKENS: usize = 8;
@@ -2271,6 +2297,7 @@ impl Qwen3NextSparseMoeBlock {
             prefill_expert_window_tokens,
             shared_combined_in_proj_weight: None,
             shared_combined_in_proj_signature: None,
+            packed_experts: None,
         })
     }
 
@@ -2369,6 +2396,9 @@ impl Qwen3NextSparseMoeBlock {
         if self.offload_ctx.is_some() {
             return self.forward_offloaded(x, None);
         }
+        if let Some(packed) = self.packed_experts.clone() {
+            return self.forward_packed(x, &packed);
+        }
         if !self.routed_experts_loaded {
             return Err(Exception::custom(
                 "routed expert weights are not resident; enable expert offloading with --experts-dir",
@@ -2445,6 +2475,39 @@ impl Qwen3NextSparseMoeBlock {
             batch_seq,
         );
         Ok(result?.reshape(shape))
+    }
+
+    /// [`forward`](Self::forward) with the routed experts on packed kernels:
+    /// the same router and shared expert, the experts through
+    /// `native_moe::switch_glu`, which applies each expert's tensor scale to
+    /// its product.
+    fn forward_packed(
+        &mut self,
+        x: &Array,
+        packed: &PackedRoutedExperts,
+    ) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
+        let hidden = shape[shape.len() - 1];
+        let x_flat = x.reshape(&[batch_seq, hidden]);
+
+        let gate_logits = self.gate.forward(&x_flat);
+        let gates = ops::softmax_axis(&gate_logits.cast(Dtype::Float32), -1);
+        let (top_indices, top_weights) =
+            crate::moe_routing::topk_normalize(&gates, self.top_k, self.norm_topk_prob)?;
+        let routed = pmetal_bridge::native_moe::switch_glu(
+            &x_flat,
+            &packed.gate,
+            &packed.up,
+            &packed.down,
+            &top_indices.cast(Dtype::Uint32),
+            &top_weights,
+            |gate, up| nn::silu(gate).multiply(up),
+        );
+
+        let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
+        let shared = nn::sigmoid(&shared_gate_logit).multiply(&shared_y);
+        Ok(routed.add(&shared).reshape(shape))
     }
 
     pub fn forward_profiled(
