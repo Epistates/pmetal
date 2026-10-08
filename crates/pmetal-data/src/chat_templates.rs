@@ -69,6 +69,33 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+/// One item of a message whose content is more than text.
+///
+/// A chat template renders an image or video item as the model's own
+/// placeholder (Qwen 3.5's `<|vision_start|><|image_pad|><|vision_end|>`,
+/// Llama 3.2 Vision's `<|image|>`), where the item sits among the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentPart {
+    /// A run of text.
+    Text(String),
+    /// An image.
+    Image,
+    /// A video.
+    Video,
+}
+
+impl ContentPart {
+    /// The item as a chat template reads it: `{"type": "text", "text": ...}`,
+    /// `{"type": "image"}` or `{"type": "video"}`.
+    pub fn to_template_value(&self) -> serde_json::Value {
+        match self {
+            Self::Text(text) => serde_json::json!({"type": "text", "text": text}),
+            Self::Image => serde_json::json!({"type": "image"}),
+            Self::Video => serde_json::json!({"type": "video"}),
+        }
+    }
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -76,6 +103,10 @@ pub struct Message {
     pub role: String,
     /// Content of the message.
     pub content: String,
+    /// The content as a list of items, when it carries images or videos.
+    /// Only the upstream Jinja template places media; `content` holds the
+    /// text alone for everything else.
+    pub parts: Option<Vec<ContentPart>>,
     /// Tool calls made by the assistant (role="assistant" only).
     pub tool_calls: Option<Vec<ToolCall>>,
     /// ID of the tool call this message responds to (role="tool" only).
@@ -88,9 +119,33 @@ impl Message {
         Self {
             role: role.into(),
             content: content.into(),
+            parts: None,
             tool_calls: None,
             tool_call_id: None,
         }
+    }
+
+    /// Create a message whose content is a list of text, image and video
+    /// items. `content` becomes the text items joined.
+    pub fn with_parts(role: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+        let content = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        Self {
+            parts: Some(parts),
+            ..Self::new(role, content)
+        }
+    }
+
+    /// Whether the content carries an image or a video.
+    pub fn has_media(&self) -> bool {
+        self.parts
+            .as_ref()
+            .is_some_and(|parts| parts.iter().any(|p| !matches!(p, ContentPart::Text(_))))
     }
 
     /// Create a system message.
@@ -113,6 +168,7 @@ impl Message {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            parts: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
         }
@@ -123,6 +179,7 @@ impl Message {
         Self {
             role: "tool".into(),
             content: content.into(),
+            parts: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
@@ -580,7 +637,37 @@ impl ChatTemplate {
         no_thinking: bool,
         tools: Option<&[ToolDefinition]>,
     ) -> Option<String> {
-        let src = self.jinja_source.as_deref()?;
+        self.jinja_source.as_deref()?;
+        match self.render_inference_jinja(messages, no_thinking, tools) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                tracing::warn!(
+                    "Jinja chat template render failed, falling back to hardcoded formatter: {e}"
+                );
+                None
+            }
+        }
+    }
+
+    /// [`apply_inference`](Self::apply_inference) through the upstream Jinja
+    /// template only, with no fallback: an error when the checkpoint ships no
+    /// template or it fails to render.
+    ///
+    /// Messages with [`parts`](Message::parts) reach the template as a list
+    /// of items, so it places each image and video placeholder where the
+    /// reference processor's `apply_chat_template` would. The hardcoded
+    /// formatters know nothing of media, which is why a prompt carrying media
+    /// must come through here.
+    pub fn render_inference_jinja(
+        &self,
+        messages: &[Message],
+        no_thinking: bool,
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<String, String> {
+        let src = self
+            .jinja_source
+            .as_deref()
+            .ok_or("the model ships no chat template")?;
 
         // Map pmetal's internal Message into the shape HF Jinja templates
         // expect. We carry tool_calls / tool_call_id through verbatim.
@@ -588,7 +675,12 @@ impl ChatTemplate {
             .iter()
             .map(|m| crate::jinja_chat::JinjaMessage {
                 role: m.role.clone(),
-                content: m.content.clone(),
+                content: match &m.parts {
+                    Some(parts) => serde_json::Value::Array(
+                        parts.iter().map(ContentPart::to_template_value).collect(),
+                    ),
+                    None => serde_json::Value::String(m.content.clone()),
+                },
                 tool_calls: m.tool_calls.as_ref().map(|calls| {
                     calls
                         .iter()
@@ -634,15 +726,7 @@ impl ChatTemplate {
             eos_token: Some(self.eos_token.clone()),
         };
 
-        match crate::jinja_chat::render_chat_template(src, &jinja_messages, &options) {
-            Ok(text) => Some(text),
-            Err(e) => {
-                tracing::warn!(
-                    "Jinja chat template render failed, falling back to hardcoded formatter: {e}"
-                );
-                None
-            }
-        }
+        crate::jinja_chat::render_chat_template(src, &jinja_messages, &options)
     }
 
     /// Format using ChatML / Qwen format with tool support.
@@ -2013,6 +2097,69 @@ mod tests {
         assert!(formatted.text.contains("<|im_start|>user"));
         assert!(formatted.text.contains("<|im_start|>assistant"));
         assert!(formatted.text.contains("<|im_end|>"));
+    }
+
+    /// A message's parts reach the template as the list of items the
+    /// reference processor gives it; Qwen 3.5's `render_content` (verbatim
+    /// below, minus the vision-id and system checks) puts each placeholder
+    /// where its item is. String content still renders as a string.
+    #[test]
+    fn test_media_parts_render_where_the_template_places_them() {
+        let mut template = ChatTemplate::chatml();
+        template.jinja_source = Some(
+            r#"{%- macro render_content(content) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping %}
+        {%- for item in content %}
+            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+            {%- elif 'video' in item or item.type == 'video' %}
+                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+            {%- elif 'text' in item %}
+                {{- item.text }}
+            {%- else %}
+                {{- raise_exception('Unexpected item type in content.') }}
+            {%- endif %}
+        {%- endfor %}
+    {%- endif %}
+{%- endmacro %}
+{%- for message in messages %}<|im_start|>{{ message.role }}
+{{ render_content(message.content) }}<|im_end|>
+{% endfor %}<|im_start|>assistant
+"#
+            .into(),
+        );
+        let messages = [
+            Message::system("Be brief."),
+            Message::with_parts(
+                "user",
+                vec![
+                    ContentPart::Text("Compare ".into()),
+                    ContentPart::Image,
+                    ContentPart::Text(" with ".into()),
+                    ContentPart::Video,
+                ],
+            ),
+        ];
+        assert!(!messages[0].has_media());
+        assert!(messages[1].has_media());
+        assert_eq!(messages[1].content, "Compare  with ");
+        let rendered = template
+            .render_inference_jinja(&messages, false, None)
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nCompare \
+             <|vision_start|><|image_pad|><|vision_end|> with \
+             <|vision_start|><|video_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant"
+        );
+        // No fallback: without a template, a prompt with media has nowhere to go.
+        assert!(
+            ChatTemplate::chatml()
+                .render_inference_jinja(&messages, false, None)
+                .is_err()
+        );
     }
 
     #[test]

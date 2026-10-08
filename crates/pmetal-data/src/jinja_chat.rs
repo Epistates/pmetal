@@ -37,8 +37,10 @@ use serde::Serialize;
 pub struct JinjaMessage {
     /// `"user"` / `"assistant"` / `"system"` / `"tool"`.
     pub role: String,
-    /// Raw message text. Tools-only messages can set this to an empty string.
-    pub content: String,
+    /// The message's content: a string, or a list of `{"type": "text" |
+    /// "image" | "video", ...}` items for a message carrying media. Tools-only
+    /// messages can set this to an empty string.
+    pub content: serde_json::Value,
     /// Structured tool calls (serialized as a list of objects). Kept
     /// optional so the default case stays zero-overhead.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,7 +55,7 @@ impl JinjaMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: content.into(),
+            content: serde_json::Value::String(content.into()),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -62,7 +64,7 @@ impl JinjaMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
-            content: content.into(),
+            content: serde_json::Value::String(content.into()),
             tool_calls: None,
             tool_call_id: None,
         }
@@ -71,7 +73,7 @@ impl JinjaMessage {
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".into(),
-            content: content.into(),
+            content: serde_json::Value::String(content.into()),
             tool_calls: None,
             tool_call_id: None,
         }
