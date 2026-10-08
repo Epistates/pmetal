@@ -1,6 +1,6 @@
 //! HTTP route handlers for the OpenAI-compatible API.
 
-use crate::engine::{InferenceEngine, RequestMetrics, SamplingParams, TokenEvent};
+use crate::engine::{InferenceEngine, PreparedPrompt, RequestMetrics, SamplingParams, TokenEvent};
 use crate::error::ServeError;
 use crate::sse::IncrementalDecoder;
 use crate::types::*;
@@ -59,13 +59,18 @@ pub(crate) fn is_batched_compatible(_params: &SamplingParams) -> bool {
 /// path. Falls through to the legacy path if the pump rejects (e.g.
 /// queue saturated) so saturation degrades to higher latency rather
 /// than 5xx errors.
+///
+/// A prompt with images or videos always takes the single-request path: the
+/// pump drives each slot by token ids alone, so it has no way to feed the
+/// model vision features.
 pub(crate) fn stream_tokens(
     engine: &InferenceEngine,
-    input_ids: &[u32],
+    prompt: &PreparedPrompt,
     params: SamplingParams,
 ) -> tokio::sync::mpsc::Receiver<TokenEvent> {
-    if engine.continuous_batching_enabled() && is_batched_compatible(&params) {
-        match engine.generate_batched(input_ids, params.clone()) {
+    if !prompt.has_media() && engine.continuous_batching_enabled() && is_batched_compatible(&params)
+    {
+        match engine.generate_batched(&prompt.input_ids, params.clone()) {
             Ok(rx) => return rx,
             Err(e) => {
                 tracing::warn!(
@@ -74,7 +79,7 @@ pub(crate) fn stream_tokens(
             }
         }
     }
-    engine.generate_streaming(input_ids, params)
+    engine.generate_streaming_prompt(prompt, params)
 }
 
 impl ServingMetrics {
@@ -214,12 +219,25 @@ pub async fn chat_completions(
 ) -> Result<impl IntoResponse, ServeError> {
     let permit = state.try_acquire_request_permit()?;
 
-    // Format messages using chat template, optionally including tool definitions.
+    if req
+        .mm_processor_kwargs
+        .as_ref()
+        .is_some_and(|kwargs| !kwargs.is_null() && kwargs != &json!({}))
+    {
+        return Err(ServeError::BadRequest(
+            "mm_processor_kwargs is not supported: images and videos are preprocessed with the \
+             checkpoint's own processor settings"
+                .into(),
+        ));
+    }
+
+    // Format messages using chat template, optionally including tool
+    // definitions, and preprocess any images and videos.
     let prompt = state
         .engine
-        .format_chat_with_tools(&req.messages, req.tools.as_deref());
-    let input_ids = state.engine.tokenize(&prompt)?;
-    let prompt_tokens = input_ids.len();
+        .prepare_chat(&req.messages, req.tools.as_deref())
+        .await?;
+    let prompt_tokens = prompt.input_ids.len();
     let tools_requested = req.tools.is_some();
 
     // Resolve stop strings to token IDs.
@@ -269,7 +287,7 @@ pub async fn chat_completions(
         //
         // Token decoding happens on the async side using a cloned Arc to the
         // tokenizer — pmetal_data::Tokenizer is Send + Sync, so this is safe.
-        let rx = stream_tokens(&state.engine, &input_ids, params);
+        let rx = stream_tokens(&state.engine, &prompt, params);
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
 
@@ -292,7 +310,7 @@ pub async fn chat_completions(
 
     // ── Non-streaming path ───────────────────────────────────────────────────
     let (tokens, logprob_entries, finish_reason, metrics) =
-        state.engine.generate(&input_ids, params).await?;
+        state.engine.generate_prompt(&prompt, params).await?;
 
     state.metrics.record(&metrics);
 
@@ -354,6 +372,7 @@ pub async fn chat_completions(
                 role: "assistant".to_string(),
                 content,
                 tool_calls,
+                parts: None,
             },
             finish_reason: Some(reason),
             logprobs,
@@ -375,8 +394,8 @@ pub async fn completions(
 ) -> Result<impl IntoResponse, ServeError> {
     let permit = state.try_acquire_request_permit()?;
 
-    let input_ids = state.engine.tokenize(&req.prompt)?;
-    let prompt_tokens = input_ids.len();
+    let prompt = PreparedPrompt::from_tokens(state.engine.tokenize(&req.prompt)?);
+    let prompt_tokens = prompt.input_ids.len();
 
     let resolved_stops = resolve_stop_sequences(&req.stop, &state.engine);
     let temperature = req.temperature.unwrap_or(0.0);
@@ -408,7 +427,7 @@ pub async fn completions(
 
     if req.stream.unwrap_or(false) {
         // ── Streaming text completions ───────────────────────────────────────
-        let rx = stream_tokens(&state.engine, &input_ids, params);
+        let rx = stream_tokens(&state.engine, &prompt, params);
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
 
@@ -432,7 +451,7 @@ pub async fn completions(
 
     // ── Non-streaming completions ────────────────────────────────────────────
     let (tokens, logprob_entries, finish_reason, metrics) =
-        state.engine.generate(&input_ids, params).await?;
+        state.engine.generate_prompt(&prompt, params).await?;
 
     state.metrics.record(&metrics);
 

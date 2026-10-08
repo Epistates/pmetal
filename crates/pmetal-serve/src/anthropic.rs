@@ -1,14 +1,15 @@
 //! Anthropic-compatible `/v1/messages` endpoint.
 //!
-//! Accepts the Anthropic Messages API request shape (string or text-block
+//! Accepts the Anthropic Messages API request shape (string or block
 //! content, optional `system` prompt, optional `tools`) and delegates to the
 //! same `InferenceEngine::generate` / `generate_streaming` path as
 //! `/v1/chat/completions`. Response shapes differ — see [`MessagesResponse`]
 //! and the streaming event enum below — but the underlying generation is
 //! identical.
 //!
-//! Scope: text + tool calling. Vision / structured output / batch are out of
-//! scope for the first phase and live in the plan's deferred list.
+//! Scope: text, images (base64 `image` blocks, for a model that reads them;
+//! see [`crate::media`]) and tool calling. Structured output and batches are
+//! out of scope.
 
 use crate::error::ServeError;
 use crate::routes::{AppState, resolve_stop_sequences};
@@ -36,9 +37,9 @@ use crate::types::ChatMessage;
 /// Message content — either a plain string or an array of typed blocks.
 ///
 /// Anthropic's spec allows `content` to be either `"text"` or `[{type, ...}]`.
-/// We accept both; non-text blocks (images, tool_use, tool_result) are
-/// flattened to their text portions (or empty strings for now). A follow-on
-/// phase can expand block handling.
+/// We accept both. Text blocks are joined; image blocks go to the model as
+/// images (see [`AnthropicMessage::to_chat_message`]); tool_use and
+/// tool_result blocks are accepted and contribute nothing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -53,8 +54,14 @@ pub enum ContentBlock {
     Text {
         text: String,
     },
-    /// Vision / tool-use / tool-result blocks are accepted but ignored by
-    /// the text extractor — prevents 400s for valid Anthropic payloads.
+    /// `{"type": "image", "source": {"type": "base64", "media_type":
+    /// "image/png", "data": "..."}}`. Other source types are refused when the
+    /// message is read.
+    Image {
+        source: serde_json::Value,
+    },
+    /// Tool-use / tool-result blocks are accepted but ignored by the text
+    /// extractor — prevents 400s for valid Anthropic payloads.
     #[serde(other)]
     Other,
 }
@@ -67,6 +74,41 @@ pub struct AnthropicMessage {
 }
 
 impl AnthropicMessage {
+    /// The message as a chat-completions message. Text-only content is
+    /// flattened by [`text`](Self::text); content with images keeps its
+    /// blocks in order as content parts, each image a `data:` URI.
+    /// `index` names the message in errors.
+    fn to_chat_message(&self, index: usize) -> Result<ChatMessage, ServeError> {
+        let MessageContent::Blocks(blocks) = &self.content else {
+            return Ok(ChatMessage::text(self.role.clone(), self.text()));
+        };
+        if !blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Image { .. }))
+        {
+            return Ok(ChatMessage::text(self.role.clone(), self.text()));
+        }
+        let mut parts = Vec::with_capacity(blocks.len());
+        for (j, block) in blocks.iter().enumerate() {
+            match block {
+                ContentBlock::Text { text } => {
+                    parts.push(serde_json::json!({"type": "text", "text": text}));
+                }
+                ContentBlock::Image { source } => {
+                    let url = image_source_url(source).map_err(|why| {
+                        ServeError::BadRequest(format!("messages[{index}].content[{j}]: {why}"))
+                    })?;
+                    parts.push(serde_json::json!({"type": "image_url", "image_url": {"url": url}}));
+                }
+                ContentBlock::Other => {}
+            }
+        }
+        Ok(ChatMessage {
+            parts: Some(parts),
+            ..ChatMessage::text(self.role.clone(), self.text())
+        })
+    }
+
     /// Flatten content to a plain string. Non-text blocks contribute nothing.
     fn text(&self) -> String {
         match &self.content {
@@ -84,6 +126,25 @@ impl AnthropicMessage {
                 out
             }
         }
+    }
+}
+
+/// The image URL an `image` block's `source` stands for: a `data:` URI for a
+/// base64 source, the URL itself for a `url` source (which
+/// [`crate::media`] then refuses, since the server fetches nothing).
+fn image_source_url(source: &serde_json::Value) -> Result<String, String> {
+    let field = |key: &str| source.get(key).and_then(serde_json::Value::as_str);
+    match field("type") {
+        Some("base64") => {
+            let media_type = field("media_type").ok_or("a base64 image needs a media_type")?;
+            let data = field("data").ok_or("a base64 image needs its data")?;
+            Ok(format!("data:{media_type};base64,{data}"))
+        }
+        Some("url") => Ok(field("url").ok_or("a url image needs its url")?.to_owned()),
+        Some(other) => Err(format!(
+            "image sources of type {other:?} are not supported; send the image as base64"
+        )),
+        None => Err("an image block needs a source with a type".into()),
     }
 }
 
@@ -245,25 +306,17 @@ pub async fn messages(
     // then each Anthropic message with content flattened to plain text.
     let mut messages: Vec<ChatMessage> = Vec::with_capacity(req.messages.len() + 1);
     if let Some(sys) = req.system.as_ref().filter(|s| !s.is_empty()) {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: sys.clone(),
-            tool_calls: None,
-        });
+        messages.push(ChatMessage::text("system", sys.clone()));
     }
-    for m in &req.messages {
-        messages.push(ChatMessage {
-            role: m.role.clone(),
-            content: m.text(),
-            tool_calls: None,
-        });
+    for (i, m) in req.messages.iter().enumerate() {
+        messages.push(m.to_chat_message(i)?);
     }
 
     let prompt = state
         .engine
-        .format_chat_with_tools(&messages, req.tools.as_deref());
-    let input_ids = state.engine.tokenize(&prompt)?;
-    let prompt_tokens = input_ids.len();
+        .prepare_chat(&messages, req.tools.as_deref())
+        .await?;
+    let prompt_tokens = prompt.input_ids.len();
     let tools_requested = req.tools.is_some();
 
     let resolved_stops = resolve_stop_sequences(&req.stop_sequences, &state.engine);
@@ -289,7 +342,7 @@ pub async fn messages(
     state.engine.validate_sampling_params(&params)?;
 
     if req.stream.unwrap_or(false) {
-        let rx = crate::routes::stream_tokens(&state.engine, &input_ids, params);
+        let rx = crate::routes::stream_tokens(&state.engine, &prompt, params);
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
         let sse = anthropic_sse_stream(
@@ -310,7 +363,7 @@ pub async fn messages(
 
     // Non-streaming path — ignore OpenAI-style logprobs slot.
     let (tokens, _logprobs, finish_reason, metrics) =
-        state.engine.generate(&input_ids, params).await?;
+        state.engine.generate_prompt(&prompt, params).await?;
     state.metrics.record(&metrics);
     let text = if tools_requested {
         state.engine.decode_with_special_tokens(&tokens)?

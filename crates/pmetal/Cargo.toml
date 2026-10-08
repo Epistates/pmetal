@@ -133,6 +133,8 @@ flate2 = "1"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true }
 
 [[example]]
 name = "device_info"

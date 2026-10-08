@@ -34,9 +34,12 @@ uuid = { workspace = true, features = ["v4"] }
 chrono = { workspace = true }
 futures = { workspace = true }
 tokio-stream = "0.1"
+base64 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+image = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "continuous_batch"

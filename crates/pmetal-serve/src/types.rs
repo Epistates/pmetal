@@ -52,7 +52,14 @@ where
 }
 
 /// Chat message.
+///
+/// A request's `content` is a string, `null`, or a list of content parts
+/// (`{"type": "text", "text": ...}`, `{"type": "image_url", ...}`, ...).
+/// `content` holds the text parts joined; a list that carries anything else
+/// is kept verbatim in [`parts`](Self::parts) for
+/// [`crate::media`] to validate and place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "WireChatMessage")]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -63,6 +70,68 @@ pub struct ChatMessage {
     /// clients that support tools read `tool_calls` and ignore `content`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// The request's content parts, in order, when they are more than text
+    /// (an image, a video, or a part type this server may not accept). Never
+    /// serialized: responses carry text.
+    #[serde(skip_serializing)]
+    pub parts: Option<Vec<serde_json::Value>>,
+}
+
+impl ChatMessage {
+    /// A message whose content is plain text.
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            parts: None,
+        }
+    }
+}
+
+/// [`ChatMessage`] as it arrives.
+#[derive(Deserialize)]
+struct WireChatMessage {
+    role: String,
+    #[serde(default)]
+    content: WireContent,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// A message's `content`: a string, `null` (an assistant turn that only
+/// calls tools), or a list of parts.
+#[derive(Deserialize, Default)]
+#[serde(untagged)]
+enum WireContent {
+    #[default]
+    Null,
+    Text(String),
+    Parts(Vec<serde_json::Value>),
+}
+
+impl From<WireChatMessage> for ChatMessage {
+    fn from(wire: WireChatMessage) -> Self {
+        let (content, parts) = match wire.content {
+            WireContent::Null => (String::new(), None),
+            WireContent::Text(text) => (text, None),
+            WireContent::Parts(parts) => {
+                let text = |part: &serde_json::Value| -> Option<String> {
+                    (part.get("type")?.as_str()? == "text")
+                        .then(|| part.get("text")?.as_str().map(str::to_owned))?
+                };
+                let content = parts.iter().filter_map(text).collect::<String>();
+                let text_only = parts.iter().all(|part| text(part).is_some());
+                (content, (!text_only).then_some(parts))
+            }
+        };
+        Self {
+            role: wire.role,
+            content,
+            tool_calls: wire.tool_calls,
+            parts,
+        }
+    }
 }
 
 /// Chat completion request (POST /v1/chat/completions).
@@ -111,6 +180,12 @@ pub struct ChatCompletionRequest {
     /// means chosen-token logprob only.
     #[serde(default)]
     pub top_logprobs: Option<u8>,
+    /// Per-request processor overrides (`fps`, pixel budgets, ...), as some
+    /// servers take them for vision models. Read only to be refused: media
+    /// are preprocessed with the checkpoint's own processor settings, and an
+    /// override silently ignored would change what the model sees.
+    #[serde(default)]
+    pub mm_processor_kwargs: Option<serde_json::Value>,
 }
 
 /// Per-token logprob entry as it appears on the wire under
@@ -324,6 +399,7 @@ mod tests {
                 role: "assistant".into(),
                 content: "hi".into(),
                 tool_calls: None,
+                parts: None,
             },
             finish_reason: Some("stop".into()),
             logprobs: None,
@@ -343,6 +419,7 @@ mod tests {
                 role: "assistant".into(),
                 content: "hi".into(),
                 tool_calls: None,
+                parts: None,
             },
             finish_reason: Some("stop".into()),
             logprobs: Some(ChatLogprobs {
