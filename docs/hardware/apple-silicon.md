@@ -68,10 +68,10 @@ Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked vi
 
 PMetal's ANE pipeline:
 
-- **Dynamic Weight Pipeline**: 9 MIL kernels compiled once at startup
+- **Dynamic Weight Pipeline**: training kernels compiled once at startup
 - **Inference**: the whole model on the ANE, several layers per program over a KV cache held in IOSurfaces, int8 weights by default
 - **Power-of-2 bucketing**: Optimal kernel compilation for sequence lengths
-- **CPU RMSNorm**: f32 computation on CPU to avoid fp16 ANE overflow
+- **CPU RMSNorm**: f32 computation on CPU in training to avoid fp16 ANE overflow
 - **IOSurface Zero-Copy**: Shared memory surfaces for CPU-ANE transfer
 - **M1–M5 Compatibility**: Per-matrix blobs for M1, single-blob for M3+
 

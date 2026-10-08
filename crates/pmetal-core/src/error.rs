@@ -91,14 +91,4 @@ pub enum PMetalError {
     #[cfg(feature = "ane")]
     #[error("ANE error: {0}")]
     Ane(String),
-
-    /// ANE compilation budget exhausted.
-    #[cfg(feature = "ane")]
-    #[error("ANE compile budget exhausted: {used}/{max} compilations used")]
-    AneCompileBudgetExhausted {
-        /// Compilations used so far.
-        used: usize,
-        /// Maximum allowed compilations per process.
-        max: usize,
-    },
 }

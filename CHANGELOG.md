@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The old ANE inference engine** (`pmetal_metal::ane::inference`, `AneInferenceEngine`) and the `inference_ane` example that drove it. `AneLm` replaced it behind `infer --ane` and `serve --ane`, and nothing else called it. Its sampler moved to `pmetal_metal::ane::lm::sample`
 - **`infer --ane-real-time` and `serve --ane-real-time`.** The flag reached only the old engine, so with `AneLm` it did nothing, and the private real-time path it asked for never ran on macOS 27 and failed on earlier releases. It's gone from `InferSpec`, `ServeSpec`, the TUI's Serve form, the GUI and the MCP `infer` and `start_serve` tools, along with `GenerationConfig.ane_real_time` and the runtime's real-time and loopback-chaining probes (`AneModel::evaluate_real_time`, `prepare_loopback_chain`)
+- **The static ANE trainer and the code only it used** (`pmetal_metal::ane::{trainer, budget, pipeline, profiler}`, the static kernel generators in `ane::kernel`, and the dynamic `ffn_w2`, `wo_bwd`, `qkv_bwd`, `rmsnorm`, `softmax` and attention-only kernels). `DynamicAneTrainer` replaced the static trainer and runs those layers through its projection kernel; nothing called them. `PMetalError::AneCompileBudgetExhausted`, which nothing raised, is gone too
 
 ### Fixed
 

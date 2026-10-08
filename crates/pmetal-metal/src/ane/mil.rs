@@ -44,15 +44,6 @@ pub struct MilProgram {
     var_counter: usize,
 }
 
-/// The dtype of the MIL program's input tensor.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MilDtype {
-    /// 16-bit floating point.
-    Fp16,
-    /// 32-bit floating point.
-    Fp32,
-}
-
 // MIL text generation uses explicit \n in write!() — each line is a complete
 // MIL statement and the trailing \n is part of the generated program text.
 #[allow(clippy::write_with_newline)]
@@ -414,17 +405,6 @@ impl MilProgram {
         .unwrap();
     }
 
-    /// Emit tile operation (repeat tensor along dimensions).
-    pub fn emit_tile(&mut self, result_name: &str, shape: &[usize], reps_var: &str, input: &str) {
-        let shape_str = format_shape(shape);
-        write!(
-            self.text,
-            "        tensor<fp16, {}> {} = tile(reps={},x={})[name=string(\"{}\")];\n",
-            shape_str, result_name, reps_var, input, result_name
-        )
-        .unwrap();
-    }
-
     /// Emit a dtype cast operation.
     ///
     /// `from_dtype` / `to_dtype` are MIL dtype strings like `"fp16"`, `"fp32"`.
@@ -463,42 +443,6 @@ impl MilProgram {
     pub fn next_var(&mut self, prefix: &str) -> String {
         self.var_counter += 1;
         format!("{}_{}", prefix, self.var_counter)
-    }
-
-    /// Get a reference to the current program text (for debugging).
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-}
-
-/// Kernel implementation strategy for linear projections on ANE.
-///
-/// ANE hardware is fundamentally a convolution engine. Conv1x1 maps directly
-/// to the hardware multiply-accumulate array, potentially offering better
-/// performance than the matmul path for shapes where both IC and OC are
-/// sufficiently large.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ProjectionStrategy {
-    /// Reshape → transpose → matmul → transpose → reshape (7 MIL ops).
-    /// Works for all shapes. Default for small dimensions.
-    #[default]
-    Matmul,
-    /// Reshape weight to `[OC, IC, 1, 1]` → conv2d (4 MIL ops).
-    /// Requires conv constants to be emitted first.
-    Conv1x1,
-}
-
-impl ProjectionStrategy {
-    /// Choose the faster strategy based on dimension sizes.
-    ///
-    /// Conv1x1 is preferred when both dimensions are large enough to
-    /// saturate the ANE MAC array. Threshold determined empirically.
-    pub fn auto(ic: usize, oc: usize) -> Self {
-        if ic >= 64 && oc >= 64 {
-            Self::Conv1x1
-        } else {
-            Self::Matmul
-        }
     }
 }
 
@@ -556,16 +500,6 @@ mod tests {
         let text = prog.finalize("x");
         assert!(text.contains("BLOBFILE(path=string(\"@model_path/weights/wq.bin\")"));
         assert!(text.contains("[768, 768, 1, 1]"));
-    }
-
-    #[test]
-    fn test_mil_tile() {
-        let mut prog = MilProgram::new(768, 256);
-        prog.emit_tensor_const("reps", &[4], "int32", "[1,4,1,1]");
-        prog.emit_tile("tiled", &[1, 48, 256, 64], "reps", "x");
-        let text = prog.finalize("tiled");
-        assert!(text.contains("tile(reps=reps,x=x)"));
-        assert!(text.contains("[1, 48, 256, 64]"));
     }
 
     #[test]

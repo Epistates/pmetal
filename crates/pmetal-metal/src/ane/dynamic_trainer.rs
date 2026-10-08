@@ -2,9 +2,8 @@
 
 //! Dynamic weight ANE trainer — compile once, train forever.
 //!
-//! Replaces the static trainer that recompiled all kernels every N steps.
-//! Instead, 9 kernels compile once at startup; weight updates are `memcpy`
-//! into fp32 IOSurfaces. Zero recompilation after init.
+//! The kernels compile once at startup; weight updates are `memcpy` into
+//! fp32 IOSurfaces. Zero recompilation after init.
 //!
 //! # Architecture
 //!
@@ -565,9 +564,8 @@ impl DynamicAneTrainer {
             n_kv_heads: nkv,
             head_dim: hd,
             seq_len: s,
-            // Both used to be constants here, whatever the checkpoint said (#34).
+            // Used to be a constant here, whatever the checkpoint said (#34).
             rope_theta: config.rope_theta,
-            rms_norm_eps: config.rms_norm_eps,
         };
 
         // Try to initialize Metal GPU dW path

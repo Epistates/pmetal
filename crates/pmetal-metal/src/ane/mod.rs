@@ -1,14 +1,14 @@
 //! Apple Neural Engine (ANE) direct programming support.
 //!
-//! This module provides a complete ANE training pipeline using private
+//! Training and inference on the ANE through the private
 //! `AppleNeuralEngine.framework` APIs. All code is feature-gated behind `ane`.
 //!
-//! # Architecture (Dynamic Weight Pipeline)
+//! # Training (Dynamic Weight Pipeline)
 //!
 //! ```text
 //! ┌────────────────┐    ┌───────────────────┐    ┌──────────┐
 //! │  CPU (vDSP)    │    │ IOSurface (fp32)   │    │   ANE    │
-//! │  RMSNorm fwd   │───►│ act + W packed     │───►│ 9 kernels│
+//! │  RMSNorm fwd   │───►│ act + W packed     │───►│ kernels  │
 //! │  SiLU deriv    │    │ per-ch interleaved  │    │ compiled │
 //! │  CrossEntropy  │◄───│ output results      │◄───│ once     │
 //! │  Adam          │    └───────────────────┘    └──────────┘
@@ -16,9 +16,8 @@
 //! └────────────────┘
 //! ```
 //!
-//! Unlike the previous static pipeline (which recompiled ~60 kernels every
-//! N steps, consuming ~76% of training time), the dynamic pipeline packs
-//! weights alongside activations in the IOSurface spatial dimension:
+//! Weights travel alongside activations in the IOSurface spatial dimension,
+//! so the kernels compile once and a weight update never recompiles:
 //!
 //! ```text
 //! IOSurface [1, IC, 1, SEQ + weight_cols] fp32
@@ -34,13 +33,15 @@
 //! - [`runtime`]: Private API FFI via dlopen + objc2
 //! - [`iosurface`]: IOSurface zero-copy data transfer (fp16 and fp32)
 //! - [`mil`]: MIL 1.3 program builder (builder pattern)
-//! - [`kernel`]: Static kernel generators + weight blob format (used by inference)
-//! - [`dynamic_kernel`]: Dynamic weight kernel generators (9 kernels, compile once)
-//! - [`dynamic_trainer`]: Compile-once training loop (replaces static trainer)
+//! - [`kernel`]: Weight blob format, int8 quantization and RoPE helpers
+//!   shared by the kernel generators
+//! - [`dynamic_kernel`]: Dynamic weight kernel generators (compile once)
+//! - [`dynamic_trainer`]: Compile-once training loop
 //! - [`extend`]: Multi-layer inference kernels over an IOSurface KV cache, one
 //!   family for prefill, decode and speculative verification
 //! - [`lm`]: Text generation from a Hugging Face checkpoint on the extend
 //!   kernels
+//! - [`inference_hybrid`]: CPU decode engine for Qwen3.5 hybrid models
 
 pub(crate) mod checkpoint;
 pub mod dynamic_kernel;
@@ -52,11 +53,5 @@ pub mod kernel;
 pub mod lm;
 pub mod loss;
 pub mod mil;
-pub mod pipeline;
-pub mod profiler;
 pub mod runtime;
 pub mod scratch;
-
-// Legacy modules kept for reference but no longer used in training
-pub mod budget;
-pub mod trainer;

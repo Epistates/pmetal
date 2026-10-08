@@ -36,32 +36,29 @@ pmetal-metal/
 │       ├── runtime.rs        # Private API FFI (dlopen + objc2)
 │       ├── iosurface.rs      # IOSurface zero-copy (fp16 + fp32)
 │       ├── mil.rs            # MIL 1.3 program builder
-│       ├── kernel.rs         # Static kernel generators + TransformerKernelConfig
-│       ├── dynamic_kernel.rs # Dynamic weight kernel generators (9 kernels)
+│       ├── kernel.rs         # Weight blobs, int8 quantization, RoPE helpers
+│       ├── dynamic_kernel.rs # Dynamic weight kernel generators (training)
 │       ├── dynamic_trainer.rs# Compile-once training loop
 │       ├── extend.rs         # Multi-layer prefill/decode/verify kernels over an IOSurface KV cache
 │       ├── lm.rs             # ANE text generation from a Hugging Face checkpoint
-│       ├── inference_hybrid.rs # CPU decode engine for Qwen3.5 hybrid models
-│       └── budget.rs         # ANE compile budget tracking
+│       └── inference_hybrid.rs # CPU decode engine for Qwen3.5 hybrid models
 ```
 
 ### ANE Dynamic Weight Pipeline
 
-The ANE module provides a complete training and inference pipeline using Apple's private `AppleNeuralEngine.framework` APIs. The dynamic weight pipeline compiles 9 MIL kernels once at startup and packs weights alongside activations in the IOSurface spatial dimension — eliminating all recompilation during training.
+The ANE module provides a complete training and inference pipeline using Apple's private `AppleNeuralEngine.framework` APIs. The dynamic weight pipeline compiles its training kernels once at startup and packs weights alongside activations in the IOSurface spatial dimension, so training never recompiles.
 
 **Inference** (`ane::lm::AneLm`) runs the model's layers as a few multi-layer extend programs over a KV cache held in IOSurfaces, with int8 weights by default. The same programs handle prefill, decode and speculative verification, and they compile once: Apple's ANE service caches them for later runs.
 
-| # | Kernel | Purpose |
-|---|--------|---------|
-| 1 | `sdpa_fwd` | Self-attention forward (QKV projection + SDPA + output projection) |
-| 2 | `ffn_w13` | FFN forward (W1 gate + W3 up + SiLU) |
-| 3 | `ffn_w2` | FFN forward (W2 down projection) |
-| 4 | `ffn_bwd_w2t` | FFN backward through W2 |
-| 5 | `ffn_bwd_w13t` | FFN backward through W1/W3 |
-| 6 | `wo_bwd` | Output projection backward |
-| 7 | `sdpa_bwd1` | Attention backward part 1 (dV, attention probs) |
-| 8 | `sdpa_bwd2` | Attention backward part 2 (dQ, dK) |
-| 9 | `qkv_bwd` | QKV projection backward |
+| Kernel | Purpose |
+|--------|---------|
+| `projection` | One linear layer, compiled once per weight shape: the FFN down projection, the QKV and output projection backward, and the decomposed forward pass when a fused kernel doesn't fit in ANE memory |
+| `sdpa_fwd` | Self-attention forward (QKV projection + SDPA + output projection) |
+| `ffn_w13` | FFN forward (W1 gate + W3 up + SiLU) |
+| `ffn_bwd_w2t` | FFN backward through W2 |
+| `ffn_bwd_w13t` | FFN backward through W1/W3 |
+| `sdpa_bwd1` | Attention backward part 1 (dV, attention probs), fused with the output projection |
+| `sdpa_bwd2` | Attention backward part 2 (dQ, dK) |
 
 ## Usage
 

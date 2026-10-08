@@ -520,11 +520,10 @@ Custom Metal shaders provide significant speedups:
 
 Native ANE integration for power-efficient training and inference:
 
-- **Dynamic Weight Pipeline**: 9 MIL kernels compiled once at startup; weights packed alongside activations in IOSurface spatial dimension
-- **Hybrid Inference**: ANE prefill + CPU decode with KV cache. Power-of-2 sequence bucketing for optimal kernel compilation
-- **CPU RMSNorm**: RMSNorm computed in f32 on CPU to avoid fp16 overflow on ANE (saturation arithmetic)
+- **Dynamic Weight Pipeline**: training kernels compiled once at startup; weights packed alongside activations in IOSurface spatial dimension. Attention and FFN kernels too large for ANE memory fall back to per-projection kernels with the rest on the CPU
+- **Inference**: the whole model on the ANE, several layers per program over a KV cache held in IOSurfaces, int8 weights by default. Power-of-2 context bucketing for kernel compilation
+- **CPU RMSNorm**: training computes RMSNorm in f32 on CPU to avoid fp16 overflow on ANE (saturation arithmetic)
 - **IOSurface Zero-Copy**: fp32 shared memory surfaces for CPU-ANE data transfer with no serialization overhead
-- **M1-M5 Compatibility**: Per-matrix weight blobs for M1, single-blob for M3+. CPU FFN fallback for 4B+ models
 
 ### TurboQuant KV Cache
 

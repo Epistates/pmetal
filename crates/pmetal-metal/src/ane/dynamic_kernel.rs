@@ -1,6 +1,6 @@
 //! Dynamic weight kernel generators for ANE.
 //!
-//! Generates 9 MIL programs that compile once at startup and accept weights
+//! Generates MIL programs that compile once at startup and accept weights
 //! packed alongside activations in the IOSurface spatial dimension.
 //!
 //! Instead of `conv(const_weight, x)`, each kernel uses:
@@ -15,25 +15,22 @@
 //!
 //! # Kernel Table
 //!
-//! | # | Kernel | IC | Spatial | Weights Packed |
-//! |---|--------|---|----|---|
-//! | 1 | `sdpa_fwd` | DIM | SEQ + 2*Q_DIM + 2*KV_DIM | xnorm, Wq, Wk, Wv, Wo |
-//! | 2 | `ffn_w13` | DIM | SEQ + 2*HIDDEN | x2norm, W1, W3 (+ SiLU/gate inside) |
-//! | 3 | `ffn_w2` | HIDDEN | SEQ + DIM | gate, W2 |
-//! | 4 | `ffn_bwd_w2t` | DIM | SEQ + HIDDEN | dffn, W2^T |
-//! | 5 | `ffn_bwd_w13t` | HIDDEN | 2*SEQ + 2*DIM | dh1, dh3, W1^T, W3^T |
-//! | 6 | `wo_bwd` | DIM | SEQ + Q_DIM | dy, Wo^T (deprecated by fusion) |
-//! | 7 | `sdpa_bwd1` | Q_DIM+2*KV_DIM+DIM | SEQ + Q_DIM | Q, K, V, dy, Wo^T (Fused) |
-//! | 8 | `sdpa_bwd2` | 2*SCORE+Q_DIM+KV_DIM | SEQ | probs, dp, Q, K (weight-free) |
-//! | 9a | `qkv_bwd_q` | Q_DIM | SEQ + DIM | dQ, Wq^T |
-//! | 9b | `qkv_bwd_kv` | KV_DIM | 2*SEQ + 2*DIM | dK, dV, Wk^T, Wv^T |
-//! | 9 | `qkv_bwd` | Q_DIM | 3*SEQ + 3*DIM | dQ, dK, dV, Wq^T, Wk^T, Wv^T (MHA only) |
-//! | 10 | `rmsnorm_bwd` | 2*DIM | SEQ + 1 | dy, x, RMSNorm weight (1 spatial col) |
-//! | 11 | `rmsnorm_fwd` | DIM | SEQ + 1 | x, RMSNorm weight (1 spatial col) |
-//! | 12 | `softmax` | VOCAB | SEQ | None (weight-free, fp16 in/out) |
+//! | Kernel | IC | Spatial | Weights Packed |
+//! |--------|---|----|---|
+//! | `projection` | IC | SEQ + OC | x, W (one per weight shape) |
+//! | `sdpa_fwd` | DIM | SEQ + 2*Q_DIM + 2*KV_DIM | xnorm, Wq, Wk, Wv, Wo |
+//! | `ffn_w13` | DIM | SEQ + 2*HIDDEN | x2norm, W1, W3 (+ SiLU/gate inside) |
+//! | `ffn_bwd_w2t` | DIM | SEQ + HIDDEN | dffn, W2^T |
+//! | `ffn_bwd_w13t` | HIDDEN | 2*SEQ + 2*DIM | dh1, dh3, W1^T, W3^T |
+//! | `sdpa_bwd1` | Q_DIM+2*KV_DIM+DIM | SEQ + Q_DIM | Q, K, V, dy, Wo^T (Fused) |
+//! | `sdpa_bwd2` | 2*SCORE+Q_DIM+KV_DIM | SEQ | probs, dp, Q, K (weight-free) |
 //!
-//! **GQA support:** Kernels 7-8 handle GQA natively via tile+reduce_sum.
-//! Kernel 9 is split into 9a+9b for GQA (mixed IC dimensions).
+//! The projection kernel covers the FFN down projection, the QKV backward
+//! and, when a fused kernel's intermediates won't fit in ANE memory, the
+//! decomposed forward pass.
+//!
+//! **GQA support:** the attention kernels expand K/V heads with concat (the
+//! ANE's tile is unreliable) and reduce their gradients with reduce_sum.
 
 use crate::ane::kernel::{TransformerKernelConfig, WeightBlob, build_rope_tables, emit_rope};
 use crate::ane::mil::MilProgram;
@@ -83,51 +80,6 @@ pub struct DynamicKernelOutput {
 // ============================================================================
 // Helpers: MIL program fragments
 // ============================================================================
-
-/// Helper for fused RMSNorm.
-fn emit_rmsnorm_fuse(
-    p: &mut MilProgram,
-    prefix: &str,
-    x_in: &str,
-    w_in: &str,
-    d: usize,
-    s: usize,
-    eps_val: f32,
-) -> String {
-    let sq = p.next_var(&format!("{prefix}_sq"));
-    p.emit_mul(&sq, &[1, d, 1, s], x_in, x_in);
-
-    let rax = p.next_var(&format!("{prefix}_rax"));
-    p.emit_tensor_const(&rax, &[1], "int32", "[1]");
-    let kd = p.next_var(&format!("{prefix}_kd"));
-    p.emit_scalar_const(&kd, "bool", "true");
-    let ss = p.next_var(&format!("{prefix}_ss"));
-    p.emit_reduce_sum(&ss, &[1, 1, 1, s], &sq, &rax, &kd);
-
-    let inv_d = p.next_var(&format!("{prefix}_id"));
-    let inv_d_val = 1.0 / (d as f32);
-    p.emit_scalar_const(&inv_d, "fp16", &format!("{inv_d_val}"));
-    let ss2 = p.next_var(&format!("{prefix}_ss2"));
-    p.emit_mul(&ss2, &[1, 1, 1, s], &ss, &inv_d);
-
-    let eps = p.next_var(&format!("{prefix}_eps"));
-    p.emit_scalar_const(&eps, "fp16", &format!("{eps_val}"));
-    let ss3 = p.next_var(&format!("{prefix}_ss3"));
-    p.emit_add(&ss3, &[1, 1, 1, s], &ss2, &eps);
-
-    let nhalf = p.next_var(&format!("{prefix}_nh"));
-    p.emit_scalar_const(&nhalf, "fp16", "-0.5");
-    let rrms = p.next_var(&format!("{prefix}_rrm"));
-    p.emit_pow(&rrms, &[1, 1, 1, s], &ss3, &nhalf);
-
-    let xr = p.next_var(&format!("{prefix}_xr"));
-    p.emit_mul(&xr, &[1, d, 1, s], x_in, &rrms);
-
-    let xn = p.next_var(&format!("{prefix}_xn"));
-    p.emit_mul(&xn, &[1, d, 1, s], &xr, w_in);
-
-    xn
-}
 
 /// Helper for matmul using pre-computed activations and sliced weights from spatial dimension.
 #[allow(clippy::too_many_arguments)]
@@ -448,7 +400,7 @@ fn emit_variant_noop(
 }
 
 // ============================================================================
-// Decomposed kernels: single-projection + attention-only
+// Projection: one linear layer, any weight shape
 // ============================================================================
 
 /// Generate a standalone single linear projection kernel.
@@ -490,167 +442,6 @@ pub fn gen_dynamic_projection(
     }
 }
 
-/// Generate the attention-only SDPA kernel (no weight projections).
-///
-/// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
-pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let qd = c.q_dim();
-    let kvd = c.kv_dim();
-    let s = c.seq_len;
-    let nh = c.n_heads;
-    let nkv = c.n_kv_heads;
-    let groups = c.n_groups();
-    let hd = c.head_dim;
-    let in_ch = qd + 2 * kvd;
-    let scale = 1.0 / (hd as f32).sqrt();
-
-    let mut p = MilProgram::new_fp32(in_ch, s);
-    p.emit_cast("x16", &[1, in_ch, 1, s], "x", "fp16");
-
-    let sb = |p: &mut MilProgram, name: &str, ch_off: usize, ch: usize| -> String {
-        let begin = p.next_var(&format!("{name}_b"));
-        p.emit_tensor_const(&begin, &[4], "int32", &format!("[0,{ch_off},0,0]"));
-        let size = p.next_var(&format!("{name}_s"));
-        p.emit_tensor_const(&size, &[4], "int32", &format!("[1,{ch},1,{s}]"));
-        let out = p.next_var(name);
-        p.emit_slice_by_size(&out, &[1, ch, 1, s], "x16", &begin, &size);
-        out
-    };
-
-    let q_flat = sb(&mut p, "qf", 0, qd);
-    let k_flat = sb(&mut p, "kf", qd, kvd);
-    let v_flat = sb(&mut p, "vf", qd + kvd, kvd);
-
-    let q_rsh = p.next_var("qrs");
-    p.emit_tensor_const(&q_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
-    let q_heads = p.next_var("qh");
-    p.emit_reshape(&q_heads, &[1, nh, hd, s], &q_rsh, &q_flat);
-
-    let perm23 = p.next_var("p23");
-    p.emit_tensor_const(&perm23, &[4], "int32", "[0,1,3,2]");
-    let qt = p.next_var("qt");
-    p.emit_transpose(&qt, &[1, nh, s, hd], &perm23, &q_heads);
-
-    let kv_rsh = p.next_var("kvrs");
-    p.emit_tensor_const(&kv_rsh, &[4], "int32", &format!("[1,{nkv},{hd},{s}]"));
-    let k_kv = p.next_var("kkv");
-    p.emit_reshape(&k_kv, &[1, nkv, hd, s], &kv_rsh, &k_flat);
-
-    let (k_heads, v_h) = if groups > 1 {
-        let k_final = emit_gqa_expand(&mut p, "ke", &k_kv, nkv, nh, hd, s, groups);
-        let v_kv = p.next_var("vkv");
-        p.emit_reshape(&v_kv, &[1, nkv, hd, s], &kv_rsh, &v_flat);
-        let v_final = emit_gqa_expand(&mut p, "ve", &v_kv, nkv, nh, hd, s, groups);
-        (k_final, v_final)
-    } else {
-        let k_h = p.next_var("kh");
-        p.emit_reshape(&k_h, &[1, nh, hd, s], &q_rsh, &k_flat);
-        let v_h = p.next_var("vh");
-        p.emit_reshape(&v_h, &[1, nh, hd, s], &q_rsh, &v_flat);
-        (k_h, v_h)
-    };
-
-    let mm_false = p.next_var("mmf");
-    p.emit_scalar_const(&mm_false, "bool", "false");
-    let scores_raw = p.next_var("sr");
-    p.emit_matmul(
-        &scores_raw,
-        &[1, nh, s, s],
-        &mm_false,
-        &mm_false,
-        &qt,
-        &k_heads,
-    );
-
-    let scale_var = p.next_var("sc");
-    p.emit_scalar_const(&scale_var, "fp16", &format!("{scale}"));
-    let scores_scaled = p.next_var("ss");
-    p.emit_mul(&scores_scaled, &[1, nh, s, s], &scores_raw, &scale_var);
-
-    let mask_path = "@model_path/weights/mask.bin";
-    p.emit_weight_const("mask", &[1, 1, s, s], mask_path);
-    let scores_masked = p.next_var("sm");
-    p.emit_add(&scores_masked, &[1, nh, s, s], &scores_scaled, "mask");
-
-    let ax3 = p.next_var("ax3");
-    p.emit_scalar_const(&ax3, "int32", "3");
-    let probs = p.next_var("probs");
-    p.emit_softmax(&probs, &[1, nh, s, s], &ax3, &scores_masked);
-
-    let vt = p.next_var("vt");
-    p.emit_transpose(&vt, &[1, nh, s, hd], &perm23, &v_h);
-    let attn = p.next_var("attn");
-    p.emit_matmul(&attn, &[1, nh, s, hd], &mm_false, &mm_false, &probs, &vt);
-
-    let attn_t = p.next_var("at");
-    p.emit_transpose(&attn_t, &[1, nh, hd, s], &perm23, &attn);
-
-    let qd_rsh = p.next_var("qdrs");
-    p.emit_tensor_const(&qd_rsh, &[4], "int32", &format!("[1,{qd},1,{s}]"));
-    let attn_flat = p.next_var("af");
-    p.emit_reshape(&attn_flat, &[1, qd, 1, s], &qd_rsh, &attn_t);
-
-    let out32 = p.next_var("out32");
-    p.emit_cast(&out32, &[1, qd, 1, s], &attn_flat, "fp32");
-    let final_out_sa = emit_variant_noop(&mut p, &out32, &[1, qd, 1, s], "fp32", variant);
-
-    let mil_text = p.finalize(&final_out_sa);
-    let mut static_weights = WeightDict::new();
-    static_weights.add(mask_path, build_causal_mask(s));
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights,
-        input_layout: SpatialLayout {
-            ic: in_ch,
-            seq_len: s,
-            total_spatial: s,
-            oc: in_ch,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: qd,
-            seq_len: s,
-            total_spatial: s,
-            oc: qd,
-            out_spatial: s,
-        },
-    }
-}
-
-/// Generate a standalone softmax kernel over the channel (vocab) dimension.
-///
-/// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
-pub fn gen_dynamic_softmax(vocab: usize, seq: usize, variant: u8) -> DynamicKernelOutput {
-    let mut p = MilProgram::new(vocab, seq);
-    let ax = p.next_var("ax");
-    p.emit_scalar_const(&ax, "int32", "1");
-    let out = p.next_var("sm");
-    p.emit_softmax(&out, &[1, vocab, 1, seq], &ax, "x");
-    let final_out_sm = emit_variant_noop(&mut p, &out, &[1, vocab, 1, seq], "fp16", variant);
-    let mil_text = p.finalize(&final_out_sm);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: vocab,
-            seq_len: seq,
-            total_spatial: seq,
-            oc: vocab,
-            out_spatial: seq,
-        },
-        output_layout: SpatialLayout {
-            ic: vocab,
-            seq_len: seq,
-            total_spatial: seq,
-            oc: vocab,
-            out_spatial: seq,
-        },
-    }
-}
-
 fn build_causal_mask(seq_len: usize) -> Vec<u8> {
     let n = seq_len * seq_len;
     let mut mask = vec![0.0f32; n];
@@ -663,7 +454,7 @@ fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 }
 
 // ============================================================================
-// Kernel 1: SDPA Forward (dynamic Wq, Wk, Wv, Wo + Fused RMSNorm)
+// SDPA Forward (dynamic Wq, Wk, Wv, Wo)
 // ============================================================================
 
 /// Generate the dynamic SDPA forward kernel with tap outputs.
@@ -866,7 +657,7 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKe
 }
 
 // ============================================================================
-// Kernel 2: FFN W1+W3 Forward (dynamic W1, W3 + SiLU gate + Fused RMSNorm)
+// FFN W1+W3 Forward (dynamic W1, W3 + SiLU gate)
 // ============================================================================
 
 /// Generate the dynamic FFN forward kernel. The input is already
@@ -942,46 +733,7 @@ pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKer
 }
 
 // ============================================================================
-// Kernel 3: FFN W2 Forward (dynamic W2)
-// ============================================================================
-
-/// Generate the dynamic FFN W2 forward kernel.
-pub fn gen_dynamic_ffn_w2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let d = c.dim;
-    let h = c.hidden_dim;
-    let s = c.seq_len;
-    let sp = s + d;
-
-    let mut p = MilProgram::new_fp32(h, sp);
-    p.emit_cast("x16", &[1, h, 1, sp], "x", "fp16");
-    let y = emit_dyn_matmul(&mut p, "w2", "x16", h, d, s, 0, s);
-    let out32 = p.next_var("out32");
-    p.emit_cast(&out32, &[1, d, 1, s], &y, "fp32");
-    let mil_text = p.finalize(&out32);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: h,
-            seq_len: s,
-            total_spatial: sp,
-            oc: d,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: s,
-            oc: d,
-            out_spatial: s,
-        },
-    }
-}
-
-// ============================================================================
-// Kernel 4: FFN Backward W2^T (dynamic W2^T)
+// FFN Backward W2^T (dynamic W2^T)
 // ============================================================================
 
 /// Generate the dynamic FFN backward W2^T kernel.
@@ -1020,7 +772,7 @@ pub fn gen_dynamic_ffn_bwd_w2t(dkc: &DynamicKernelConfig) -> DynamicKernelOutput
 }
 
 // ============================================================================
-// Kernel 5: FFN Backward W1^T + W3^T (dynamic W1^T, W3^T)
+// FFN Backward W1^T + W3^T (dynamic W1^T, W3^T)
 // ============================================================================
 
 /// Generate the dynamic FFN backward W1^T + W3^T kernel.
@@ -1062,46 +814,7 @@ pub fn gen_dynamic_ffn_bwd_w13t(dkc: &DynamicKernelConfig) -> DynamicKernelOutpu
 }
 
 // ============================================================================
-// Kernel 6: Wo^T Backward (dynamic Wo^T)
-// ============================================================================
-
-/// Generate the dynamic Wo^T backward kernel.
-pub fn gen_dynamic_wo_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let d = c.dim;
-    let qd = c.q_dim();
-    let s = c.seq_len;
-    let sp = s + qd;
-
-    let mut p = MilProgram::new_fp32(d, sp);
-    p.emit_cast("x16", &[1, d, 1, sp], "x", "fp16");
-    let da = emit_dyn_matmul(&mut p, "wot", "x16", d, qd, s, 0, s);
-    let out32 = p.next_var("out32");
-    p.emit_cast(&out32, &[1, qd, 1, s], &da, "fp32");
-    let mil_text = p.finalize(&out32);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: sp,
-            oc: d,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: qd,
-            seq_len: s,
-            total_spatial: s,
-            oc: qd,
-            out_spatial: s,
-        },
-    }
-}
-
-// ============================================================================
-// Kernel 7: SDPA Backward Part 1 (Fused with Wo^T)
+// SDPA Backward Part 1 (Fused with Wo^T)
 // ============================================================================
 
 /// Generate the dynamic SDPA backward kernel part 1 fused with Wo^T projection.
@@ -1270,7 +983,7 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 }
 
 // ============================================================================
-// Kernel 8: SDPA Backward Part 2 (pure computation, weight-free)
+// SDPA Backward Part 2 (pure computation, weight-free)
 // ============================================================================
 
 /// Generate the dynamic SDPA backward kernel part 2 (weight-free).
@@ -1424,259 +1137,6 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     }
 }
 
-// ============================================================================
-// Kernel 9: QKV Backward (dynamic Wq^T, Wk^T, Wv^T)
-// ============================================================================
-
-/// Generate the dynamic QKV backward Q kernel.
-pub fn gen_dynamic_qkv_bwd_q(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let d = c.dim;
-    let qd = c.q_dim();
-    let s = c.seq_len;
-    let sp = s + d;
-    let mut p = MilProgram::new_fp32(qd, sp);
-    p.emit_cast("x16", &[1, qd, 1, sp], "x", "fp16");
-    let dxq = emit_dyn_matmul(&mut p, "wqt", "x16", qd, d, s, 0, s);
-    let out32 = p.next_var("out32");
-    p.emit_cast(&out32, &[1, d, 1, s], &dxq, "fp32");
-    let mil_text = p.finalize(&out32);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: qd,
-            seq_len: s,
-            total_spatial: sp,
-            oc: qd,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: s,
-            oc: d,
-            out_spatial: s,
-        },
-    }
-}
-
-/// Generate the dynamic QKV backward KV kernel.
-pub fn gen_dynamic_qkv_bwd_kv(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let d = c.dim;
-    let kvd = c.kv_dim();
-    let s = c.seq_len;
-    let sp = 2 * s + 2 * d;
-    let mut p = MilProgram::new_fp32(kvd, sp);
-    p.emit_cast("x16", &[1, kvd, 1, sp], "x", "fp16");
-    let dxk = emit_dyn_matmul(&mut p, "wkt", "x16", kvd, d, s, 0, 2 * s);
-    let dxv = emit_dyn_matmul(&mut p, "wvt", "x16", kvd, d, s, s, 2 * s + d);
-    let dxkv = p.next_var("dxkv");
-    p.emit_add(&dxkv, &[1, d, 1, s], &dxk, &dxv);
-    let out32 = p.next_var("out32");
-    p.emit_cast(&out32, &[1, d, 1, s], &dxkv, "fp32");
-    let mil_text = p.finalize(&out32);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: kvd,
-            seq_len: s,
-            total_spatial: sp,
-            oc: kvd,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: s,
-            oc: d,
-            out_spatial: s,
-        },
-    }
-}
-
-/// Generate the combined QKV backward kernel (MHA-only convenience).
-pub fn gen_dynamic_qkv_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let d = c.dim;
-    let qd = c.q_dim();
-    let s = c.seq_len;
-    let sp = 3 * s + 3 * d;
-    assert_eq!(
-        c.n_kv_heads, c.n_heads,
-        "Combined QKV backward requires MHA."
-    );
-    let mut p = MilProgram::new_fp32(qd, sp);
-    p.emit_cast("x16", &[1, qd, 1, sp], "x", "fp16");
-    let dxq = emit_dyn_matmul(&mut p, "wqt", "x16", qd, d, s, 0, 3 * s);
-    let dxk = emit_dyn_matmul(&mut p, "wkt", "x16", qd, d, s, s, 3 * s + d);
-    let dxv = emit_dyn_matmul(&mut p, "wvt", "x16", qd, d, s, 2 * s, 3 * s + 2 * d);
-    let dx12 = p.next_var("dx12");
-    p.emit_add(&dx12, &[1, d, 1, s], &dxq, &dxk);
-    let dx = p.next_var("dx");
-    p.emit_add(&dx, &[1, d, 1, s], &dx12, &dxv);
-    let out32 = p.next_var("out32");
-    p.emit_cast(&out32, &[1, d, 1, s], &dx, "fp32");
-    let mil_text = p.finalize(&out32);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: qd,
-            seq_len: s,
-            total_spatial: sp,
-            oc: qd,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: s,
-            oc: d,
-            out_spatial: s,
-        },
-    }
-}
-
-/// Generate the dynamic RMSNorm forward kernel.
-pub fn gen_dynamic_rmsnorm_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let d = c.dim;
-    let s = c.seq_len;
-    let sp = s + 1;
-    let mut p = MilProgram::new_fp32(d, sp);
-    p.emit_cast("x16", &[1, d, 1, sp], "x", "fp16");
-    let x_begin = p.next_var("xb");
-    p.emit_tensor_const(&x_begin, &[4], "int32", "[0,0,0,0]");
-    let x_size = p.next_var("xs");
-    p.emit_tensor_const(&x_size, &[4], "int32", &format!("[1,{d},1,{s}]"));
-    let x_in = p.next_var("xi");
-    p.emit_slice_by_size(&x_in, &[1, d, 1, s], "x16", &x_begin, &x_size);
-    let w_begin = p.next_var("wb");
-    p.emit_tensor_const(&w_begin, &[4], "int32", &format!("[0,0,0,{s}]"));
-    let w_size = p.next_var("ws");
-    p.emit_tensor_const(&w_size, &[4], "int32", &format!("[1,{d},1,1]"));
-    let w_in = p.next_var("wi");
-    p.emit_slice_by_size(&w_in, &[1, d, 1, 1], "x16", &w_begin, &w_size);
-    let xn = emit_rmsnorm_fuse(&mut p, "rn", &x_in, &w_in, d, s, c.rms_norm_eps);
-    let out32 = p.next_var("out32");
-    p.emit_cast(&out32, &[1, d, 1, s], &xn, "fp32");
-    let mil_text = p.finalize(&out32);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: sp,
-            oc: d,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: s,
-            oc: d,
-            out_spatial: s,
-        },
-    }
-}
-
-/// Generate the dynamic RMSNorm backward kernel.
-pub fn gen_dynamic_rmsnorm_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
-    let c = &dkc.cfg;
-    let d = c.dim;
-    let s = c.seq_len;
-    let in_ch = 2 * d;
-    let sp = s + 1;
-    let mut p = MilProgram::new_fp32(in_ch, sp);
-    p.emit_cast("x16", &[1, in_ch, 1, sp], "x", "fp16");
-    let dy_begin = p.next_var("dyb");
-    p.emit_tensor_const(&dy_begin, &[4], "int32", "[0,0,0,0]");
-    let dy_size = p.next_var("dys");
-    p.emit_tensor_const(&dy_size, &[4], "int32", &format!("[1,{d},1,{s}]"));
-    let dy = p.next_var("dy");
-    p.emit_slice_by_size(&dy, &[1, d, 1, s], "x16", &dy_begin, &dy_size);
-    let xin_begin = p.next_var("xib");
-    p.emit_tensor_const(&xin_begin, &[4], "int32", &format!("[0,{d},0,0]"));
-    let xin_size = p.next_var("xis");
-    p.emit_tensor_const(&xin_size, &[4], "int32", &format!("[1,{d},1,{s}]"));
-    let x_in = p.next_var("xin");
-    p.emit_slice_by_size(&x_in, &[1, d, 1, s], "x16", &xin_begin, &xin_size);
-    let w_begin = p.next_var("wb");
-    p.emit_tensor_const(&w_begin, &[4], "int32", &format!("[0,0,0,{s}]"));
-    let w_size = p.next_var("wss");
-    p.emit_tensor_const(&w_size, &[4], "int32", &format!("[1,{d},1,1]"));
-    let w = p.next_var("rw");
-    p.emit_slice_by_size(&w, &[1, d, 1, 1], "x16", &w_begin, &w_size);
-    let dy_w = p.next_var("dyw");
-    p.emit_mul(&dy_w, &[1, d, 1, s], &dy, &w);
-    let x_sq = p.next_var("xsq");
-    p.emit_mul(&x_sq, &[1, d, 1, s], &x_in, &x_in);
-    let ax1 = p.next_var("ax1");
-    p.emit_tensor_const(&ax1, &[1], "int32", "[1]");
-    let kd_true = p.next_var("kdt");
-    p.emit_scalar_const(&kd_true, "bool", "true");
-    let ss = p.next_var("ss");
-    p.emit_reduce_sum(&ss, &[1, 1, 1, s], &x_sq, &ax1, &kd_true);
-    let inv_d = p.next_var("invd");
-    p.emit_scalar_const(&inv_d, "fp16", &format!("{}", 1.0 / d as f32));
-    let mean_sq = p.next_var("msq");
-    p.emit_mul(&mean_sq, &[1, 1, 1, s], &ss, &inv_d);
-    let eps_var = p.next_var("eps");
-    p.emit_scalar_const(&eps_var, "fp16", &format!("{}", c.rms_norm_eps));
-    let ms_eps = p.next_var("mse");
-    p.emit_add(&ms_eps, &[1, 1, 1, s], &mean_sq, &eps_var);
-    let neg_half = p.next_var("nh");
-    p.emit_scalar_const(&neg_half, "fp16", "-0.5");
-    let rrms = p.next_var("rrms");
-    p.emit_pow(&rrms, &[1, 1, 1, s], &ms_eps, &neg_half);
-    let dyw_x = p.next_var("dwx");
-    p.emit_mul(&dyw_x, &[1, d, 1, s], &dy_w, &x_in);
-    let dot = p.next_var("dot");
-    p.emit_reduce_sum(&dot, &[1, 1, 1, s], &dyw_x, &ax1, &kd_true);
-    let dot_invd = p.next_var("did");
-    p.emit_mul(&dot_invd, &[1, 1, 1, s], &dot, &inv_d);
-    let rrms2 = p.next_var("rr2");
-    p.emit_mul(&rrms2, &[1, 1, 1, s], &rrms, &rrms);
-    let corr_sc = p.next_var("crs");
-    p.emit_mul(&corr_sc, &[1, 1, 1, s], &dot_invd, &rrms2);
-    let corr = p.next_var("corr");
-    p.emit_mul(&corr, &[1, d, 1, s], &x_in, &corr_sc);
-    let diff = p.next_var("diff");
-    p.emit_sub(&diff, &[1, d, 1, s], &dy_w, &corr);
-    let dx16 = p.next_var("dx16");
-    p.emit_mul(&dx16, &[1, d, 1, s], &diff, &rrms);
-    let dx32 = p.next_var("dx32");
-    p.emit_cast(&dx32, &[1, d, 1, s], &dx16, "fp32");
-    let mil_text = p.finalize(&dx32);
-
-    DynamicKernelOutput {
-        mil_text,
-        static_weights: WeightDict::new(),
-        input_layout: SpatialLayout {
-            ic: in_ch,
-            seq_len: s,
-            total_spatial: sp,
-            oc: d,
-            out_spatial: s,
-        },
-        output_layout: SpatialLayout {
-            ic: d,
-            seq_len: s,
-            total_spatial: s,
-            oc: d,
-            out_spatial: s,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1690,7 +1150,6 @@ mod tests {
             head_dim: 16,
             seq_len: 32,
             rope_theta: 1_000_000.0,
-            rms_norm_eps: 1e-6,
         })
     }
 
@@ -1716,15 +1175,6 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_ffn_w2_generates_valid_mil() {
-        let dkc = test_config();
-        let out = gen_dynamic_ffn_w2(&dkc);
-        assert!(out.mil_text.contains("program(1.3)"));
-        assert_eq!(out.input_layout.ic, 128);
-        assert_eq!(out.input_layout.total_spatial, 32 + 64);
-    }
-
-    #[test]
     fn test_dynamic_ffn_bwd_w2t() {
         let dkc = test_config();
         let out = gen_dynamic_ffn_bwd_w2t(&dkc);
@@ -1738,14 +1188,6 @@ mod tests {
         let out = gen_dynamic_ffn_bwd_w13t(&dkc);
         assert!(out.mil_text.contains("add("));
         assert_eq!(out.input_layout.total_spatial, 2 * 32 + 2 * 64);
-    }
-
-    #[test]
-    fn test_dynamic_wo_bwd() {
-        let dkc = test_config();
-        let out = gen_dynamic_wo_bwd(&dkc);
-        assert!(out.mil_text.contains("matmul("));
-        assert_eq!(out.input_layout.total_spatial, 32 + 64);
     }
 
     #[test]
@@ -1765,33 +1207,6 @@ mod tests {
         assert_eq!(out.output_layout.ic, 2 * 64);
     }
 
-    #[test]
-    fn test_dynamic_qkv_bwd() {
-        let dkc = test_config();
-        let out = gen_dynamic_qkv_bwd(&dkc);
-        assert!(out.mil_text.contains("add("));
-        assert_eq!(out.input_layout.total_spatial, 3 * 32 + 3 * 64);
-        assert_eq!(out.output_layout.ic, 64);
-    }
-
-    #[test]
-    fn test_dynamic_rmsnorm_fwd() {
-        let dkc = test_config();
-        let out = gen_dynamic_rmsnorm_fwd(&dkc);
-        assert!(out.mil_text.contains("pow("));
-        assert_eq!(out.input_layout.total_spatial, 32 + 1);
-    }
-
-    #[test]
-    fn test_dynamic_rmsnorm_bwd() {
-        let dkc = test_config();
-        let out = gen_dynamic_rmsnorm_bwd(&dkc);
-        assert!(out.mil_text.contains("pow("));
-        assert!(out.mil_text.contains("reduce_sum("));
-        assert_eq!(out.input_layout.ic, 2 * 64);
-        assert_eq!(out.input_layout.total_spatial, 32 + 1);
-    }
-
     /// Qwen3-0.6B style config: dim=1024, n_heads=16, head_dim=128 → q_dim=2048.
     fn qwen3_config() -> DynamicKernelConfig {
         DynamicKernelConfig::new(TransformerKernelConfig {
@@ -1802,7 +1217,6 @@ mod tests {
             head_dim: 32,
             seq_len: 16,
             rope_theta: 1_000_000.0,
-            rms_norm_eps: 1e-6,
         })
     }
 
@@ -1838,7 +1252,6 @@ mod tests {
             head_dim: 16,
             seq_len: 32,
             rope_theta: 1_000_000.0,
-            rms_norm_eps: 1e-6,
         })
     }
 
@@ -1905,14 +1318,5 @@ mod tests {
         let fb = gen_dynamic_ffn_w13(&dkc, 1);
         assert_ne!(fa.mil_text, fb.mil_text);
         assert_eq!(fa.output_layout.ic, fb.output_layout.ic);
-
-        // Softmax kernels (fp16 output)
-        let sa = gen_dynamic_softmax(100, 32, 0);
-        let sb = gen_dynamic_softmax(100, 32, 1);
-        assert_ne!(sa.mil_text, sb.mil_text);
-        assert!(
-            sb.mil_text.contains("fp16"),
-            "Softmax variant noop must be fp16"
-        );
     }
 }

@@ -89,7 +89,7 @@ pub enum Phase {
     CompilingAneKernels,
     /// ANE attempted but fell back to GPU; carries the reason.
     AneFallback {
-        /// Why ANE was unavailable (e.g. compile budget exhausted).
+        /// Why ANE was unavailable (e.g. an unsupported architecture).
         reason: String,
     },
     /// Training loop is running.
