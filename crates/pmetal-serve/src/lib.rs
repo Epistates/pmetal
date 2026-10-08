@@ -11,6 +11,9 @@
 //! - `GET /v1/models` — list loaded models
 //! - `GET /v1/metrics` — rolling serving metrics (tok/s, latencies, request counts)
 //! - `GET /health` — liveness check
+//!
+//! A decision model (a Clef release) is served by its own router instead, with
+//! `POST /v1/systemone`, `GET /v1/models` and `GET /health`; see [`decision`].
 
 #![allow(clippy::too_many_arguments)]
 
@@ -18,6 +21,7 @@ pub mod anthropic;
 pub mod continuous_batch;
 pub mod continuous_driver;
 pub mod continuous_pump;
+pub mod decision;
 pub mod engine;
 pub mod error;
 pub mod prefix_cache;
@@ -35,6 +39,7 @@ pub use continuous_driver::{
     drive_prefill_step,
 };
 pub use continuous_pump::{ContinuousPump, Tick};
+pub use decision::DecisionEngine;
 pub use engine::{InferenceEngine, RequestMetrics};
 pub use prefix_cache::ServePrefixCache;
 pub use routes::ServingMetrics;

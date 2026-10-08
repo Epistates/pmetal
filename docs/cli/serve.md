@@ -38,6 +38,11 @@ The server speaks both the OpenAI and the Anthropic wire formats:
 
 Request bodies are capped at 2 MiB.
 
+Serving a decision model (a Clef release, recognized by its `joint_head_config.json`) starts a
+different router: `POST /v1/systemone` answers typed questions about a state, next to
+`GET /v1/models` and `GET /health`. A decision model never generates, so the generation flags do
+not apply. See [pmetal decide](/cli/decide/) for the request and response bodies.
+
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \

@@ -16,6 +16,9 @@ This crate provides a drop-in local inference backend compatible with the OpenAI
 | `/v1/metrics` | GET | Rolling serving metrics (tok/s, latencies, request counts) |
 | `/health` | GET | Liveness check |
 
+A decision model (a Clef release) is served by its own router instead: `POST /v1/systemone`
+answers typed questions about a state, beside `GET /v1/models` and `GET /health`.
+
 ## Usage
 
 ### Via CLI

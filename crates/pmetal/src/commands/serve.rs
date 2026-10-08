@@ -30,6 +30,9 @@ pub(crate) async fn run_serve(
     // Resolve model path
     tracing::info!("Resolving model: {}", model_id);
     let model_path = pmetal_hub::resolve_model_path(&model_id, None, None).await?;
+    if pmetal_models::decision::is_decision_model(&model_path) {
+        return run_decision_serve(model_id, &model_path, port, host).await;
+    }
     let draft_path = match draft_model {
         Some(draft) => {
             let path = pmetal_hub::resolve_model_path(&draft, None, None).await?;
@@ -143,4 +146,33 @@ pub(crate) async fn run_serve(
     pmetal_serve::server::run_server(engine, config).await?;
 
     Ok(())
+}
+
+/// Serve a decision model (a Clef release) on `/v1/systemone`.
+///
+/// A decision model answers in one forward pass and never generates, so none of
+/// the generation flags (KV cache, ANE, drafting, batching) apply; prompts use
+/// the release's own 16,384-token budget.
+async fn run_decision_serve(
+    model_id: String,
+    model_path: &std::path::Path,
+    port: u16,
+    host: String,
+) -> anyhow::Result<()> {
+    use pmetal_models::decision::DEFAULT_MAX_LENGTH;
+    use pmetal_serve::{DecisionEngine, ServeConfig};
+
+    tracing::info!("Loading decision model from {:?}...", model_path);
+    let started = std::time::Instant::now();
+    let engine = DecisionEngine::load(model_path.to_path_buf(), model_id, DEFAULT_MAX_LENGTH)?;
+    tracing::info!(
+        "Decision model loaded in {:.1}s; generation endpoints are off, POST /v1/systemone answers",
+        started.elapsed().as_secs_f64()
+    );
+    let config = ServeConfig {
+        port,
+        host,
+        ..Default::default()
+    };
+    pmetal_serve::decision::run_decision_server(engine, config).await
 }

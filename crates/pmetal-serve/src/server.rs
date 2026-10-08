@@ -57,6 +57,10 @@ pub fn build_router(engine: InferenceEngine, max_concurrent: usize) -> Router {
         .route("/v1/completions", axum::routing::post(routes::completions))
         .route("/v1/embeddings", axum::routing::post(routes::embeddings))
         .route("/v1/messages", axum::routing::post(anthropic::messages))
+        .route(
+            "/v1/systemone",
+            axum::routing::post(crate::decision::not_a_decision_model),
+        )
         .layer(TraceLayer::new_for_http())
         // Reject request bodies larger than 2 MiB to prevent memory exhaustion.
         .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
