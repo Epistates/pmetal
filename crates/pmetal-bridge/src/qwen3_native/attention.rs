@@ -158,7 +158,14 @@ pub(super) fn attn_forward_with_tree_ctx(
         dtype,
     );
 
-    if s == 1 && mrope.is_none() && cache.turboquant.is_none() && cache.quant_config.is_none() {
+    // The compiled layer rotates by `(base, scale)`, which a scaled rotary
+    // embedding (YaRN) has no equivalent for.
+    if s == 1
+        && mrope.is_none()
+        && lw.attn_scaled_rope.is_none()
+        && cache.turboquant.is_none()
+        && cache.quant_config.is_none()
+    {
         if let (
             Some(LayerWeight::Dense(q_w)),
             Some(LayerWeight::Dense(k_w)),
@@ -247,6 +254,18 @@ pub(super) fn attn_forward_with_tree_ctx(
     let (queries, keys) = if let Some(tables) = mrope {
         // A prompt with media: three positions per token (see `mrope`).
         (tables.apply(&queries), tables.apply(&keys))
+    } else if let Some(scaled) = &lw.attn_scaled_rope {
+        // YaRN: explicit frequencies and the attention factor.
+        match tree_ctx {
+            Some(ctx) => (
+                scaled.apply_at(&queries, ctx.pos_ids),
+                scaled.apply_at(&keys, ctx.pos_ids),
+            ),
+            None => (
+                scaled.apply(&queries, rope_offset),
+                scaled.apply(&keys, rope_offset),
+            ),
+        }
     } else if let Some(ctx) = tree_ctx {
         (
             apply_per_position_rope(

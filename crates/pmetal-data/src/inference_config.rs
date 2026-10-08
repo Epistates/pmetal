@@ -569,15 +569,41 @@ pub fn default_max_tokens(model_path: &Path, thinking: bool) -> MaxTokensDefault
 }
 
 /// The model's context window: `max_position_embeddings` from
-/// `config.json` (its `text_config` first, for multimodal wrappers), else
-/// the tokenizer's `model_max_length` when that is a real bound.
+/// `config.json` (its `text_config` first, for multimodal wrappers), or the
+/// stretched length a static YaRN `rope_parameters` (or `rope_scaling`)
+/// gives, `original_max_position_embeddings * factor`, when longer; else the
+/// tokenizer's `model_max_length` when that is a real bound.
 pub fn context_window(model_path: &Path) -> Option<usize> {
     let config = read_json(&model_path.join("config.json"));
     let from_config = config.as_ref().and_then(|c| {
-        c.get("text_config")
-            .and_then(|t| t.get("max_position_embeddings"))
+        let text = c.get("text_config").filter(|t| t.is_object()).unwrap_or(c);
+        let max_pos = text
+            .get("max_position_embeddings")
             .or_else(|| c.get("max_position_embeddings"))
-            .and_then(|v| v.as_u64())
+            .and_then(|v| v.as_u64());
+        let rope = text
+            .get("rope_parameters")
+            .filter(|r| r.is_object())
+            .or_else(|| text.get("rope_scaling").filter(|r| r.is_object()));
+        let yarn = rope
+            .filter(|r| {
+                r.get("rope_type")
+                    .or_else(|| r.get("type"))
+                    .and_then(|t| t.as_str())
+                    == Some("yarn")
+            })
+            .and_then(|r| {
+                let factor = r.get("factor")?.as_f64()?;
+                let original = r
+                    .get("original_max_position_embeddings")
+                    .and_then(|v| v.as_f64())
+                    .or(max_pos.map(|m| m as f64))?;
+                Some((original * factor) as u64)
+            });
+        match (max_pos, yarn) {
+            (Some(m), Some(y)) => Some(m.max(y)),
+            (m, y) => m.or(y),
+        }
     });
     let from_tokenizer = || {
         read_json(&model_path.join("tokenizer_config.json"))
@@ -691,5 +717,13 @@ mod tests {
             r#"{"model_max_length": 1000000000000000019884624838656}"#,
         )]);
         assert_eq!(context_window(dir.path()), None);
+
+        // The Qwen3.8 card's YaRN block stretches 262,144 to 1,048,576.
+        let dir = model_dir(&[(
+            "config.json",
+            r#"{"text_config": {"max_position_embeddings": 262144, "rope_parameters":
+                {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144}}}"#,
+        )]);
+        assert_eq!(context_window(dir.path()), Some(1_048_576));
     }
 }

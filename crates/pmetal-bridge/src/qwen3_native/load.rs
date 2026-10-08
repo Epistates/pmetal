@@ -587,6 +587,7 @@ pub fn load_model(
     let rope_dims = config.rope_dims();
     let rope_base = config.rope_theta as f32;
     let rope_scale = 1.0_f32;
+    let scaled_rope = config.scaled_rope();
     let attn_gated = !config.is_qwen3_dense();
     let gdn_gate = if config.is_qwen3_dense() {
         family::GdnGateActivation::Silu
@@ -723,6 +724,7 @@ pub fn load_model(
             attn_rope_dims: 0,
             attn_rope_base: 0.0,
             attn_rope_scale: 0.0,
+            attn_scaled_rope: None,
             attn_gated,
             // GDN — filled below when is_linear
             gdn_qkv_w: None,
@@ -820,6 +822,7 @@ pub fn load_model(
             lw.attn_rope_dims = rope_dims;
             lw.attn_rope_base = rope_base;
             lw.attn_rope_scale = rope_scale;
+            lw.attn_scaled_rope = scaled_rope.clone();
         }
 
         layers.push(lw);

@@ -10,7 +10,7 @@
 //! tower and bundled `mtp.*` predictor included), and the reference
 //! activations. Both engines load it through their production loaders.
 //!
-//! Two profiles cover the config surface Qwen3.8 exercises:
+//! Three profiles cover the config surface Qwen3.8 exercises:
 //!
 //! * `swish`: Qwen3.8-27B's text config shrunk. `output_gate_type: "swish"`,
 //!   `layer_types` omitted so the layout comes from `full_attention_interval`,
@@ -20,6 +20,9 @@
 //!   the text config says untied (transformers goes by the outer one; the
 //!   checkpoint has no `lm_head.weight`), and a legacy top-level `rope_theta`
 //!   that `rope_parameters` overrides.
+//! * `yarn`: `swish` with the static YaRN block the Qwen3.8 card gives for
+//!   long contexts (`factor` 4), shrunk to `original_max_position_embeddings`
+//!   16 so the prompt runs past it.
 //!
 //! `vocab_size` differs from `hidden_size`, so a head applied untransposed is
 //! a bridge error here, which every step drains, instead of a silently wrong
@@ -417,4 +420,34 @@ fn swish_cpu_hybrid_matches_transformers() {
 #[serial]
 fn sigmoid_cpu_hybrid_matches_transformers() {
     hybrid_cpu_decode("sigmoid");
+}
+
+// Static YaRN (`rope_parameters.rope_type: "yarn"`), the long-context setting
+// the Qwen3.8 card documents: blended frequencies, and the attention factor on
+// the rotated quarter of each head only. The 70-token prompt runs past
+// `original_max_position_embeddings` (16), and the cached decode continues
+// there, through the fused kernel's explicit periods.
+
+#[test]
+#[serial]
+fn yarn_dynamic_prefill_matches_transformers() {
+    dynamic_prefill("yarn");
+}
+
+#[test]
+#[serial]
+fn yarn_dynamic_cached_decode_matches_transformers() {
+    dynamic_cached_decode("yarn");
+}
+
+#[test]
+#[serial]
+fn yarn_mtp_head_matches_reference() {
+    dynamic_mtp("yarn");
+}
+
+#[test]
+#[serial]
+fn yarn_native_matches_transformers() {
+    native_prefill_and_decode("yarn");
 }

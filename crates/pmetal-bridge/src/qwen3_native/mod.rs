@@ -224,6 +224,12 @@ pub struct Qwen3Config {
     /// `parse_config_text`; `None` when unquantized or a sidecar scheme.
     #[serde(skip)]
     pub mlx_quantization: Option<crate::native_weight::MlxQuantization>,
+
+    /// The Qwen3.5 family's rotary embedding, as
+    /// [`family::normalize_text_config`] resolved it (YaRN included). Set by
+    /// `parse_config_text`; `None` for dense Qwen3.
+    #[serde(skip)]
+    pub rotary: Option<family::Rotary>,
 }
 
 /// Weight quantization parameters (from `quantization_config` in config.json).
@@ -370,8 +376,19 @@ impl Qwen3Config {
             .map_or([11, 11, 10], |s| s.map(|v| v.max(0) as usize))
     }
 
+    /// The rotation for a rotary embedding the fused kernel's `theta` cannot
+    /// describe (YaRN); `None` for plain RoPE.
+    pub fn scaled_rope(&self) -> Option<mrope::ScaledRope> {
+        self.rotary
+            .as_ref()
+            .and_then(|r| mrope::ScaledRope::new(r, self.get_head_dim()))
+    }
+
     /// The mRoPE tables for a prompt's `[3, T]` int32 positions.
     pub fn mrope_tables(&self, positions: &crate::InlineArray) -> mrope::MropeTables {
+        if let Some(scaled) = self.scaled_rope() {
+            return scaled.tables(positions, self.mrope_section());
+        }
         mrope::MropeTables::new(
             positions,
             self.rope_dims(),
@@ -433,6 +450,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     let qwen35 = family::is_qwen35_family(text_model_type);
+    let mut rotary = None;
 
     // Qwen3.5 nests the LM config under `text_config`.
     // For plain Qwen3, the config.json is flat.
@@ -451,17 +469,8 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
                 tc["model_type"] = mt.clone();
             }
         }
-        if qwen35 && let Some(rs) = tc.get("rope_scaling").filter(|v| !v.is_null()) {
-            let kind = rs
-                .get("rope_type")
-                .or_else(|| rs.get("type"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("default");
-            if !matches!(kind, "default" | "mrope") {
-                return Err(format!(
-                    "rope_scaling type {kind:?} is not implemented by the native engine"
-                ));
-            }
+        if qwen35 {
+            rotary = Some(family::Rotary::from_text_config(&tc)?);
         }
         // Promote quantization metadata from the outer JSON into text_config
         // when present at the top level but absent from the nested config.
@@ -510,6 +519,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         cfg.quantization_config = None;
         cfg.mlx_quantization = None;
     }
+    cfg.rotary = rotary;
     cfg.finalize();
     Ok(cfg)
 }

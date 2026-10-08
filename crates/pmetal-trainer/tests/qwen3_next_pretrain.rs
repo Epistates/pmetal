@@ -31,6 +31,7 @@ fn tiny_qwen3_next_config() -> Qwen3NextConfig {
             rope_type: Some("default".to_string()),
             mrope_interleaved: None,
             mrope_section: None,
+            ..Default::default()
         }),
         ..Default::default()
     }

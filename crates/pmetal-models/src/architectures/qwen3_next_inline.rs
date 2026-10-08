@@ -67,6 +67,7 @@ pub struct InlineLayerWeights {
     attn_rope_dims: i32,
     attn_rope_base: f32,
     attn_rope_scale: f32,
+    attn_scaled_rope: Option<pmetal_bridge::qwen3_native::mrope::ScaledRope>,
 
     // GDN-specific (only if is_linear)
     gdn_qkv_w: Option<InlineArray>, // in_proj_qkv, pre-transposed [hidden, conv_dim]
@@ -292,6 +293,7 @@ impl InlineModelWeights {
                 attn_rope_dims: 0,
                 attn_rope_base: 0.0,
                 attn_rope_scale: 0.0,
+                attn_scaled_rope: None,
                 // GDN
                 gdn_qkv_w: None,
                 gdn_z_w: None,
@@ -380,6 +382,7 @@ impl InlineModelWeights {
                 lw.attn_rope_dims = attn.rope_dims;
                 lw.attn_rope_base = attn.effective_base;
                 lw.attn_rope_scale = attn.rope_scale;
+                lw.attn_scaled_rope = attn.scaled_rope.clone();
             }
 
             layers.push(lw);
@@ -659,20 +662,29 @@ fn inline_attn_forward_pure(
     let values = values.transpose_axes(&[0, 2, 1, 3]);
 
     // RoPE — pure InlineArray
-    let queries = queries.rope(
-        lw.attn_rope_dims,
-        false,
-        lw.attn_rope_base,
-        lw.attn_rope_scale,
-        rope_offset,
-    );
-    let keys = keys.rope(
-        lw.attn_rope_dims,
-        false,
-        lw.attn_rope_base,
-        lw.attn_rope_scale,
-        rope_offset,
-    );
+    let (queries, keys) = if let Some(scaled) = &lw.attn_scaled_rope {
+        (
+            scaled.apply(&queries, rope_offset),
+            scaled.apply(&keys, rope_offset),
+        )
+    } else {
+        (
+            queries.rope(
+                lw.attn_rope_dims,
+                false,
+                lw.attn_rope_base,
+                lw.attn_rope_scale,
+                rope_offset,
+            ),
+            keys.rope(
+                lw.attn_rope_dims,
+                false,
+                lw.attn_rope_base,
+                lw.attn_rope_scale,
+                rope_offset,
+            ),
+        )
+    };
 
     // KV cache update — O(1) slice_set into pre-allocated buffer (matching Python)
     let prev = cache.offset;

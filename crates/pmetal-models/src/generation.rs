@@ -2662,6 +2662,12 @@ pub fn hybrid_cpu_inference_config(
             "the CPU hybrid engine has no MoE layers (num_experts = {num_experts})"
         )));
     }
+    if text["rope_parameters"]["rope_type"] != "default" {
+        return Err(MetalError::InvalidConfig(format!(
+            "the CPU hybrid engine runs plain RoPE only, not rope_type {}",
+            text["rope_parameters"]["rope_type"]
+        )));
+    }
 
     let gdn_output_gate = match GdnGateActivation::resolve(text["output_gate_type"].as_str(), None)
         .map_err(MetalError::InvalidConfig)?

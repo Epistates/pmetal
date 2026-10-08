@@ -59,6 +59,9 @@ pub(crate) struct LayerWeights {
     pub(crate) attn_rope_dims: i32,
     pub(crate) attn_rope_base: f32,
     pub(crate) attn_rope_scale: f32,
+    /// Set when the rotary embedding is scaled (YaRN): rotate with it
+    /// instead of `attn_rope_base` / `attn_rope_scale`.
+    pub(crate) attn_scaled_rope: Option<super::mrope::ScaledRope>,
     pub(crate) attn_gated: bool,
 
     // GDN-specific (only when is_linear)

@@ -18,7 +18,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps;
-use pmetal_bridge::qwen3_native::mrope::MropeTables;
+use pmetal_bridge::qwen3_native::mrope::{MropeTables, ScaledRope};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -187,7 +187,12 @@ pub struct Qwen3NextSanitizeOptions {
 }
 
 /// Nested RoPE parameters from HuggingFace config format.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The YaRN keys arrive resolved by
+/// [`family::normalize_text_config`](pmetal_bridge::qwen3_native::family::normalize_text_config)
+/// (defaults filled in, `attention_factor` computed); see
+/// [`Qwen3NextConfig::rotary`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RopeParameters {
     #[serde(default)]
     pub rope_theta: Option<f64>,
@@ -199,6 +204,18 @@ pub struct RopeParameters {
     pub mrope_interleaved: Option<bool>,
     #[serde(default)]
     pub mrope_section: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factor: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_max_position_embeddings: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beta_fast: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beta_slow: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncate: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_factor: Option<f64>,
 }
 
 fn default_model_type() -> String {
@@ -317,6 +334,43 @@ impl Qwen3NextConfig {
     /// RoPE dimensions for partial rotary.
     pub fn rope_dims(&self) -> i32 {
         (self.get_head_dim() as f32 * self.partial_rotary_factor) as i32
+    }
+
+    /// The rotary embedding, YaRN included, as the native engine reads it.
+    ///
+    /// A YaRN `rope_parameters` comes resolved from
+    /// [`from_config_value`](Self::from_config_value); a config built in code
+    /// without its resolved keys gets transformers' defaults.
+    pub fn rotary(&self) -> pmetal_bridge::qwen3_native::family::Rotary {
+        use pmetal_bridge::qwen3_native::family::{Rotary, Yarn};
+        let rope = self.rope_parameters.as_ref();
+        let yarn = rope
+            .filter(|r| r.rope_type.as_deref() == Some("yarn"))
+            .map(|r| {
+                let original = r
+                    .original_max_position_embeddings
+                    .unwrap_or(self.max_position_embeddings as f64);
+                let factor = r
+                    .factor
+                    .unwrap_or(self.max_position_embeddings as f64 / original);
+                Yarn {
+                    factor,
+                    original_max_position_embeddings: original,
+                    beta_fast: r.beta_fast.unwrap_or(32.0),
+                    beta_slow: r.beta_slow.unwrap_or(1.0),
+                    truncate: r.truncate.unwrap_or(true),
+                    attention_factor: r.attention_factor.unwrap_or(if factor <= 1.0 {
+                        1.0
+                    } else {
+                        0.1 * factor.ln() + 1.0
+                    }),
+                }
+            });
+        Rotary {
+            dims: self.rope_dims(),
+            theta: self.rope_theta as f64,
+            yarn,
+        }
     }
 
     /// How many rotary frequencies each position axis (temporal, row,
@@ -667,6 +721,9 @@ pub struct Qwen3NextAttention {
     pub rope_scale: f32,
     /// Rotary frequencies per position axis for a prompt with media.
     pub mrope_section: [usize; 3],
+    /// Set when the rotary embedding is scaled (YaRN); it then rotates in
+    /// place of `effective_base` / `rope_scale`.
+    pub scaled_rope: Option<ScaledRope>,
 }
 impl_module_params!(Qwen3NextAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
@@ -726,6 +783,7 @@ impl Qwen3NextAttention {
             effective_base,
             rope_scale,
             mrope_section: config.mrope_section(),
+            scaled_rope: ScaledRope::new(&config.rotary(), head_dim),
         })
     }
 
@@ -932,6 +990,16 @@ impl Qwen3NextAttention {
         positions: Option<&Array>,
         offset: i32,
     ) -> Result<(Array, Array), Exception> {
+        if let Some(scaled) = &self.scaled_rope {
+            return Ok(match positions {
+                Some(p) if p.ndim() == 2 => {
+                    let tables = scaled.tables(p, self.mrope_section);
+                    (tables.apply(queries), tables.apply(keys))
+                }
+                Some(p) => (scaled.apply_at(queries, p), scaled.apply_at(keys, p)),
+                None => (scaled.apply(queries, offset), scaled.apply(keys, offset)),
+            });
+        }
         if let Some(positions) = positions.filter(|p| p.ndim() == 2) {
             let tables = MropeTables::new(
                 positions,

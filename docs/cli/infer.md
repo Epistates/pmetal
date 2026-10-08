@@ -140,6 +140,32 @@ recommends up to 262,144 reasoning tokens plus 131,072 answer tokens for
 long agentic tasks. `pmetal serve` applies the same rule to a request without
 `max_tokens`.
 
+## Long Context (YaRN)
+
+Qwen3.5, 3.6 and 3.8 run 262,144 tokens natively. For longer inputs their
+cards recommend static YaRN, set in the model's `config.json`: change
+`rope_parameters` in `text_config` to
+
+```json
+{
+  "mrope_interleaved": true,
+  "mrope_section": [11, 11, 10],
+  "rope_type": "yarn",
+  "rope_theta": 10000000,
+  "partial_rotary_factor": 0.25,
+  "factor": 4.0,
+  "original_max_position_embeddings": 262144
+}
+```
+
+Both of PMetal's engines then compute the rotary embedding as transformers
+does (the blended frequencies, and the attention factor `0.1 * ln(factor) + 1`
+on the rotated channels), and the context window, which bounds the default
+output budget, becomes `original_max_position_embeddings * factor`. Static
+YaRN applies the same scaling to every input, which the cards note can hurt
+short texts, so enable it only for long ones, and size `factor` to the
+context you need (2.0 for 524,288 tokens).
+
 ## Thinking Controls
 
 Chat templates take keyword arguments the way Hugging Face transformers'
