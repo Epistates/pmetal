@@ -1,11 +1,17 @@
-//! Pillow-exact image resampling.
+//! Pillow-exact image resampling, and its torchvision twin.
 //!
-//! Every HuggingFace image processor resamples through Pillow — the fast
-//! torchvision backends reimplement its filters rather than the other way round
-//! — so Pillow's output *is* the definition of a released VLM's pixel input.
-//! Matching it is not a nicety: a vision tower sees whatever the resampler
-//! produced, and a systematically different resize is a silent, permanent
-//! distribution shift on every image the model ever sees.
+//! HuggingFace image processors resample through Pillow, or, on the
+//! torchvision backend, through torch's CPU `uint8` antialiased kernel, which is
+//! a port of Pillow's. A released VLM's pixel input *is* whichever of the two
+//! its processor runs. Matching it is not a nicety: a vision tower sees
+//! whatever the resampler produced, and a systematically different resize is a
+//! silent, permanent distribution shift on every image the model ever sees.
+//!
+//! The port is not bit-identical to Pillow, so both are here
+//! ([`resize_rgb8`], [`resize_rgb8_torchvision`]). They share every step but
+//! one: Pillow quantises its taps to a fixed 22 fractional bits, torch to
+//! `int16` at the largest precision the axis's biggest tap fits in, which
+//! moves 0.2 to 1% of the output bytes by one or two levels.
 //!
 //! The `image` crate's `imageops::resize` gets the kernel, the half-pixel
 //! alignment, and the downscale support scaling right, but still differs from
@@ -37,8 +43,37 @@ use image::RgbImage;
 /// panic if a future filter has fatter lobes.
 const PRECISION_BITS: u32 = 32 - 8 - 2;
 
-/// Half an output unit, added before the shift so the truncation rounds.
-const ROUND_BIAS: i64 = 1 << (PRECISION_BITS - 1);
+/// How the normalised taps become integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TapQuantization {
+    /// Pillow: [`PRECISION_BITS`] fractional bits, whatever the taps.
+    Pillow,
+    /// torch's `_compute_index_ranges_int16_weights`: `int16` taps, at the
+    /// largest precision for which twice the axis's biggest tap still rounds
+    /// below `2^15`.
+    TorchInt16,
+}
+
+impl TapQuantization {
+    /// Fractional bits for an axis whose largest normalised tap is `max_tap`.
+    fn precision(self, max_tap: f64) -> u32 {
+        match self {
+            Self::Pillow => PRECISION_BITS,
+            Self::TorchInt16 => {
+                // The loop torch runs, including its exit at 22.
+                let mut bits = 0;
+                while bits < 22 {
+                    let next = (0.5 + max_tap * (1u64 << (bits + 1)) as f64) as i64;
+                    if next >= 1 << 15 {
+                        break;
+                    }
+                    bits += 1;
+                }
+                bits
+            }
+        }
+    }
+}
 
 /// Resampling filters, defined exactly as Pillow defines them.
 ///
@@ -135,6 +170,8 @@ struct AxisCoeffs {
     taps: Vec<i64>,
     /// Stride into `taps`.
     ksize: usize,
+    /// Fractional bits of `taps`.
+    precision: u32,
 }
 
 impl AxisCoeffs {
@@ -144,6 +181,21 @@ impl AxisCoeffs {
         let base = out * self.ksize;
         (start, &self.taps[base..base + count])
     }
+
+    /// Half an output unit, added before the shift so the truncation rounds.
+    fn round_bias(&self) -> i64 {
+        1 << (self.precision - 1)
+    }
+
+    /// Shift the fixed-point accumulator back down and clamp, as Pillow's
+    /// `clip8`.
+    ///
+    /// Pillow spells the clamp as a lookup table sized for the maximum
+    /// overshoot a cubic filter can produce; the arithmetic is a plain
+    /// saturating shift.
+    fn clip8(&self, acc: i64) -> u8 {
+        (acc >> self.precision).clamp(0, 255) as u8
+    }
 }
 
 /// Build one axis' filter taps.
@@ -152,8 +204,14 @@ impl AxisCoeffs {
 /// `center = (out + 0.5) · scale`, stretches the kernel by `max(1, scale)` when
 /// downscaling (so the filter averages rather than aliases), normalises the taps
 /// to sum to 1, and only then quantises to fixed point — rounding away from
-/// zero, which is why the sign test below is on the normalised weight.
-fn precompute_coeffs(in_size: usize, out_size: usize, filter: ResampleFilter) -> AxisCoeffs {
+/// zero, which is why the sign test below is on the normalised weight. torch's
+/// port computes the same normalised taps and differs only in `quantization`.
+fn precompute_coeffs(
+    in_size: usize,
+    out_size: usize,
+    filter: ResampleFilter,
+    quantization: TapQuantization,
+) -> AxisCoeffs {
     let scale = in_size as f64 / out_size as f64;
     let filter_scale = scale.max(1.0);
     let support = filter.support() * filter_scale;
@@ -161,8 +219,9 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: ResampleFilter) ->
     let inv_scale = 1.0 / filter_scale;
 
     let mut bounds = Vec::with_capacity(out_size);
-    let mut taps = vec![0i64; out_size * ksize];
+    let mut normalised = vec![0f64; out_size * ksize];
     let mut weights = vec![0f64; ksize];
+    let mut max_tap = 0f64;
 
     for out in 0..out_size {
         let center = (out as f64 + 0.5) * scale;
@@ -180,31 +239,34 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: ResampleFilter) ->
 
         let base = out * ksize;
         for (i, &weight) in weights.iter().take(count).enumerate() {
-            let normalised = if sum != 0.0 { weight / sum } else { 0.0 };
-            let scaled = normalised * (1i64 << PRECISION_BITS) as f64;
-            // Round half away from zero, as Pillow's `normalize_coeffs_8bpc`.
-            taps[base + i] = (if normalised < 0.0 {
-                scaled - 0.5
-            } else {
-                scaled + 0.5
-            }) as i64;
+            let tap = if sum != 0.0 { weight / sum } else { 0.0 };
+            max_tap = max_tap.max(tap);
+            normalised[base + i] = tap;
         }
         bounds.push((first, count));
     }
+
+    let precision = quantization.precision(max_tap);
+    let taps = normalised
+        .into_iter()
+        .map(|tap| {
+            let scaled = tap * (1i64 << precision) as f64;
+            // Round half away from zero, as Pillow's `normalize_coeffs_8bpc`
+            // and torch's int16 conversion both do.
+            (if tap < 0.0 {
+                scaled - 0.5
+            } else {
+                scaled + 0.5
+            }) as i64
+        })
+        .collect();
 
     AxisCoeffs {
         bounds,
         taps,
         ksize,
+        precision,
     }
-}
-
-/// Shift the fixed-point accumulator back down and clamp, as Pillow's `clip8`.
-///
-/// Pillow spells the clamp as a lookup table sized for the maximum overshoot a
-/// cubic filter can produce; the arithmetic is a plain saturating shift.
-fn clip8(acc: i64) -> u8 {
-    (acc >> PRECISION_BITS).clamp(0, 255) as u8
 }
 
 /// Resample along x: `[src_h, src_w, 3]` → `[src_h, out_w, 3]`, interleaved RGB.
@@ -222,11 +284,11 @@ fn horizontal_pass(
             let (first, taps) = c.taps_for(x);
             let dst = (y * out_w + x) * 3;
             for ch in 0..3 {
-                let mut acc = ROUND_BIAS;
+                let mut acc = c.round_bias();
                 for (i, &tap) in taps.iter().enumerate() {
                     acc += row[(first + i) * 3 + ch] as i64 * tap;
                 }
-                out[dst + ch] = clip8(acc);
+                out[dst + ch] = c.clip8(acc);
             }
         }
     }
@@ -241,11 +303,11 @@ fn vertical_pass(src: &[u8], width: usize, out_h: usize, c: &AxisCoeffs) -> Vec<
         for x in 0..width {
             let dst = (y * width + x) * 3;
             for ch in 0..3 {
-                let mut acc = ROUND_BIAS;
+                let mut acc = c.round_bias();
                 for (i, &tap) in taps.iter().enumerate() {
                     acc += src[((first + i) * width + x) * 3 + ch] as i64 * tap;
                 }
-                out[dst + ch] = clip8(acc);
+                out[dst + ch] = c.clip8(acc);
             }
         }
     }
@@ -259,6 +321,31 @@ fn vertical_pass(src: &[u8], width: usize, out_h: usize, c: &AxisCoeffs) -> Vec<
 /// 1:1 axis are an identity kernel, so this is a shortcut rather than a
 /// behavioural difference.
 pub fn resize_rgb8(src: &RgbImage, width: u32, height: u32, filter: ResampleFilter) -> RgbImage {
+    resize_rgb8_quantized(src, width, height, filter, TapQuantization::Pillow)
+}
+
+/// Resize an RGB8 image, bit-exactly reproducing torchvision's
+/// `resize(antialias=True)` on a CPU `uint8` tensor, the resize a HuggingFace
+/// processor's torchvision backend runs.
+///
+/// Same two passes, order and clamping as [`resize_rgb8`]; only the tap
+/// precision differs (see the module docs).
+pub fn resize_rgb8_torchvision(
+    src: &RgbImage,
+    width: u32,
+    height: u32,
+    filter: ResampleFilter,
+) -> RgbImage {
+    resize_rgb8_quantized(src, width, height, filter, TapQuantization::TorchInt16)
+}
+
+fn resize_rgb8_quantized(
+    src: &RgbImage,
+    width: u32,
+    height: u32,
+    filter: ResampleFilter,
+    quantization: TapQuantization,
+) -> RgbImage {
     let (src_w, src_h) = (src.width() as usize, src.height() as usize);
     let (out_w, out_h) = (width as usize, height as usize);
     if src_w == 0 || src_h == 0 || out_w == 0 || out_h == 0 {
@@ -271,12 +358,12 @@ pub fn resize_rgb8(src: &RgbImage, width: u32, height: u32, filter: ResampleFilt
     let mut buffer = src.as_raw().clone();
     let mut buffer_w = src_w;
     if out_w != src_w {
-        let coeffs = precompute_coeffs(src_w, out_w, filter);
+        let coeffs = precompute_coeffs(src_w, out_w, filter, quantization);
         buffer = horizontal_pass(&buffer, buffer_w, src_h, out_w, &coeffs);
         buffer_w = out_w;
     }
     if out_h != src_h {
-        let coeffs = precompute_coeffs(src_h, out_h, filter);
+        let coeffs = precompute_coeffs(src_h, out_h, filter, quantization);
         buffer = vertical_pass(&buffer, buffer_w, out_h, &coeffs);
     }
 
@@ -316,17 +403,41 @@ mod tests {
     /// upscale (kernel at unit width).
     #[test]
     fn taps_are_normalised() {
-        for (in_size, out_size) in [(100, 37), (37, 100), (16, 16)] {
-            let coeffs = precompute_coeffs(in_size, out_size, ResampleFilter::Bicubic);
-            for out in 0..out_size {
-                let (_, taps) = coeffs.taps_for(out);
-                let sum: i64 = taps.iter().sum();
-                let one = 1i64 << PRECISION_BITS;
-                assert!(
-                    (sum - one).abs() <= taps.len() as i64,
-                    "{in_size}->{out_size} out {out}: taps sum to {sum}, want {one}"
-                );
+        for quantization in [TapQuantization::Pillow, TapQuantization::TorchInt16] {
+            for (in_size, out_size) in [(100, 37), (37, 100), (16, 16)] {
+                let coeffs =
+                    precompute_coeffs(in_size, out_size, ResampleFilter::Bicubic, quantization);
+                for out in 0..out_size {
+                    let (_, taps) = coeffs.taps_for(out);
+                    let sum: i64 = taps.iter().sum();
+                    let one = 1i64 << coeffs.precision;
+                    assert!(
+                        (sum - one).abs() <= taps.len() as i64,
+                        "{quantization:?} {in_size}->{out_size} out {out}: taps sum to {sum}, \
+                         want {one}"
+                    );
+                }
             }
+        }
+    }
+
+    /// torch's taps must fit `int16`, and use as much of it as they can: the
+    /// largest tap lands in `[2^14, 2^15)`.
+    #[test]
+    fn torch_taps_fill_int16() {
+        for (in_size, out_size) in [(100, 37), (37, 100), (1000, 64), (5, 1344)] {
+            let coeffs = precompute_coeffs(
+                in_size,
+                out_size,
+                ResampleFilter::Bicubic,
+                TapQuantization::TorchInt16,
+            );
+            let max = coeffs.taps.iter().copied().max().unwrap();
+            assert!(
+                (1 << 14..1 << 15).contains(&max),
+                "{in_size}->{out_size}: largest tap {max} at {} bits",
+                coeffs.precision
+            );
         }
     }
 

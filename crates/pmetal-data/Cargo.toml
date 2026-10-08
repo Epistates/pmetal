@@ -30,6 +30,7 @@ memmap2 = { workspace = true }
 rand = { workspace = true }
 rayon = "1"
 image = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
