@@ -59,7 +59,7 @@ use crate::continuous_driver::{
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
 use crate::prefix_cache::ServePrefixCache;
 use pmetal_bridge::compat::{Array, Exception};
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::generation::{GenerationConfig, Sampler, token_logprobs};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -88,6 +88,8 @@ struct SlotRecord {
     /// detection; kept separate from `all_tokens` so we can decode only
     /// the output text without re-decoding the prompt each tick.
     generated: Vec<u32>,
+    /// Token ids that end the request without being part of the reply.
+    stop_tokens: Vec<u32>,
     /// Raw text stop sequences to scan for after each emitted token.
     stop_sequences: Vec<String>,
     /// When set, emit per-token logprobs with top-N alternatives.
@@ -166,13 +168,27 @@ impl ContinuousPump {
         }
     }
 
+    /// Give each slot its own recurrent (Mamba / gated-delta-net) state,
+    /// for a hybrid model; `template` is the model's empty
+    /// `create_mamba_cache()`. Such a pump keeps no prefix cache, since a KV
+    /// snapshot can't restore the recurrent layers' state.
+    pub fn with_recurrent_state(self, template: &MambaCache) -> Self {
+        Self {
+            state: self.state.with_recurrent_state(template),
+            prefix_cache: None,
+            ..self
+        }
+    }
+
     /// Enqueue a new request. Returns its `SlotId` plus a receiver that
     /// will emit one `TokenEvent::Token` per generated token, followed
     /// by exactly one `TokenEvent::Done` (or `TokenEvent::Error`).
     ///
-    /// `channel_capacity` bounds the receiver buffer; pick something
-    /// small (16-64) to apply back-pressure if the route handler falls
-    /// behind.
+    /// The pump never waits on a slow reader (that would stall every other
+    /// slot), so the channel holds the whole response: its capacity is
+    /// `channel_capacity` or [`events_capacity`](Self::events_capacity),
+    /// whichever is larger. A tokio channel allocates as it fills, so a
+    /// large capacity costs nothing up front.
     pub fn enqueue(
         &mut self,
         prompt: Vec<u32>,
@@ -180,12 +196,20 @@ impl ContinuousPump {
         gen_config: GenerationConfig,
         channel_capacity: usize,
     ) -> Result<(SlotId, mpsc::Receiver<TokenEvent>), EnqueueError> {
-        let (tx, rx) = mpsc::channel(channel_capacity);
+        let capacity = channel_capacity.max(Self::events_capacity(&params));
+        let (tx, rx) = mpsc::channel(capacity);
         let slot = self.enqueue_with_sender(prompt, params, gen_config, tx)?;
         Ok((slot, rx))
     }
 
-    /// [`enqueue`](Self::enqueue) into a channel the caller made. On error
+    /// How many events a request with `params` can produce: one per token
+    /// and one to finish. Its channel must hold that many.
+    pub fn events_capacity(params: &SlotParams) -> usize {
+        params.max_new_tokens.saturating_add(1)
+    }
+
+    /// [`enqueue`](Self::enqueue) into a channel the caller made, which must
+    /// hold [`events_capacity`](Self::events_capacity) events. On error
     /// nothing is sent, so the caller can still use `tx` for the request.
     pub fn enqueue_with_sender(
         &mut self,
@@ -194,7 +218,15 @@ impl ContinuousPump {
         gen_config: GenerationConfig,
         tx: mpsc::Sender<TokenEvent>,
     ) -> Result<SlotId, EnqueueError> {
+        let needed = Self::events_capacity(&params);
+        if tx.max_capacity() < needed {
+            return Err(EnqueueError::ChannelTooSmall {
+                capacity: tx.max_capacity(),
+                needed,
+            });
+        }
         let prompt_tokens = prompt.len();
+        let stop_tokens = params.stop_tokens.clone();
         let stop_sequences = params.stop_sequences.clone();
         let logprobs_top_n = params.logprobs_top_n;
         let reserved_tokens = prompt_tokens.saturating_add(params.max_new_tokens);
@@ -255,6 +287,7 @@ impl ContinuousPump {
                 gen_config,
                 all_tokens,
                 generated: Vec::new(),
+                stop_tokens,
                 stop_sequences,
                 logprobs_top_n,
                 stripped_tokens: 0,
@@ -299,8 +332,62 @@ impl ContinuousPump {
     ///
     /// Returns `Tick::Idle` if the scheduler has nothing to do (caller
     /// should park until the next enqueue), else `Tick::Ran`.
+    ///
+    /// A step that fails (the forward returns an error, or an MLX op inside
+    /// it threw) fails the requests it was for: each gets one
+    /// `TokenEvent::Error` and its slot is freed. Retrying would fail the
+    /// same way on every tick and leave those clients waiting for good.
     pub fn tick<F: SlotForward>(&mut self, forward: &mut F) -> Result<Tick, Exception> {
         let instruction = self.batcher.next_instruction();
+        let involved = match &instruction {
+            StepInstruction::Idle => return Ok(Tick::Idle),
+            StepInstruction::Prefill { slot, .. } => vec![*slot],
+            StepInstruction::Decode { slots } => slots.clone(),
+        };
+        // An error another job left behind on this thread is not this step's.
+        if let Err(stale) = pmetal_bridge::check_last_error() {
+            tracing::debug!(
+                target: "pmetal_serve::continuous_pump",
+                "discarding an earlier bridge error: {stale}"
+            );
+        }
+        let stepped = self.run_instruction(forward, instruction).and_then(|tick| {
+            pmetal_bridge::check_last_error()
+                .map(|()| tick)
+                .map_err(|e| Exception::custom(e.to_string()))
+        });
+        match stepped {
+            Ok(tick) => Ok(tick),
+            Err(error) => {
+                self.fail_slots(&involved, &error);
+                Ok(Tick::Ran)
+            }
+        }
+    }
+
+    /// Send `error` to each of `slots` and free them.
+    fn fail_slots(&mut self, slots: &[SlotId], error: &Exception) {
+        tracing::warn!(
+            target: "pmetal_serve::continuous_pump",
+            requests = slots.len(),
+            "continuous-batching step failed: {error}"
+        );
+        for &slot in slots {
+            // Removing the record first means retiring the slot sends no
+            // Done after the Error.
+            if let Some(rec) = self.records.remove(&slot) {
+                let _ = rec.tx.try_send(TokenEvent::Error(error.to_string()));
+            }
+            self.batcher.cancel(slot);
+        }
+        self.drain_retired();
+    }
+
+    fn run_instruction<F: SlotForward>(
+        &mut self,
+        forward: &mut F,
+        instruction: StepInstruction,
+    ) -> Result<Tick, Exception> {
         match instruction {
             StepInstruction::Idle => Ok(Tick::Idle),
 
@@ -511,12 +598,18 @@ impl ContinuousPump {
                 None => return Ok(false),
             };
             rec.current_token = Some(token);
-            rec.emitted = rec.emitted.saturating_add(1);
             rec.all_tokens.push(token);
-            rec.generated.push(token);
             if rec.first_token_ms.is_none() {
                 rec.first_token_ms = Some(rec.start.elapsed().as_secs_f64() * 1000.0);
             }
+            // A stop token ends the request without being part of the
+            // reply, as on the single-request path; the scheduler sees it
+            // and retires the slot.
+            if rec.stop_tokens.contains(&token) {
+                return Ok(false);
+            }
+            rec.emitted = rec.emitted.saturating_add(1);
+            rec.generated.push(token);
 
             let send_res = rec.tx.try_send(TokenEvent::Token { id: token, logprob });
             let closed = matches!(send_res, Err(mpsc::error::TrySendError::Closed(_)));
@@ -598,7 +691,7 @@ impl ContinuousPump {
 mod tests {
     use super::*;
     use pmetal_bridge::compat::Array;
-    use pmetal_mlx::kv_cache::KVCache;
+    use pmetal_mlx::kv_cache::{KVCache, MambaCache};
 
     fn cache_cfg() -> KVCacheConfig {
         KVCacheConfig::new(2, 32, 4, 64)
@@ -624,7 +717,12 @@ mod tests {
     }
 
     impl SlotForward for Stub {
-        fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
+        fn forward(
+            &mut self,
+            tokens: &[u32],
+            cache: &mut KVCache,
+            _recurrent: Option<&mut MambaCache>,
+        ) -> Result<Array, Exception> {
             let (h, d) = {
                 let c = cache.config();
                 (c.num_kv_heads as i32, c.head_dim as i32)
@@ -651,6 +749,118 @@ mod tests {
             prefill_step_size: 64,
             logprobs_top_n: None,
         }
+    }
+
+    /// Drain every event queued on `rx` so far.
+    fn drain(rx: &mut mpsc::Receiver<TokenEvent>) -> Vec<TokenEvent> {
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        events
+    }
+
+    /// The scheduler never waits on a reader, so the channel has to hold a
+    /// whole reply: with a small requested capacity and a client that reads
+    /// nothing until the end, tokens past the capacity were dropped and so
+    /// was `Done`.
+    #[tokio::test]
+    async fn a_reader_that_falls_behind_loses_nothing() {
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let next: HashMap<u32, u32> = (1..40).map(|t| (t, t + 1)).collect();
+        let mut stub = Stub { vocab: 64, next };
+        let (_slot, mut rx) = pump
+            .enqueue(vec![1], params(20, vec![]), GenerationConfig::default(), 4)
+            .unwrap();
+        while pump.tick(&mut stub).unwrap() == Tick::Ran {}
+
+        let events = drain(&mut rx);
+        let tokens: Vec<u32> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                TokenEvent::Token { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tokens, (2..22).collect::<Vec<u32>>());
+        assert!(matches!(events.last(), Some(TokenEvent::Done { .. })));
+    }
+
+    #[test]
+    fn a_channel_too_small_for_the_reply_is_refused() {
+        let mut pump = ContinuousPump::new(BatcherConfig::default(), cache_cfg(), None);
+        let (tx, _rx) = mpsc::channel(8);
+        let err = pump
+            .enqueue_with_sender(vec![1], params(20, vec![]), GenerationConfig::default(), tx)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            EnqueueError::ChannelTooSmall {
+                capacity: 8,
+                needed: 21
+            }
+        ));
+    }
+
+    /// A step whose forward fails ends the requests it was for with an
+    /// `Error` and frees their slots; the others go on. It used to leave the
+    /// failing step to run again on every tick, so those clients waited
+    /// forever while the log filled with the same error.
+    #[tokio::test]
+    async fn a_failing_step_fails_its_requests_and_frees_their_slots() {
+        struct FailOn {
+            inner: Stub,
+            poison: u32,
+        }
+        impl SlotForward for FailOn {
+            fn forward(
+                &mut self,
+                tokens: &[u32],
+                cache: &mut KVCache,
+                recurrent: Option<&mut MambaCache>,
+            ) -> Result<Array, Exception> {
+                if tokens.contains(&self.poison) {
+                    return Err(Exception::custom("forward failed"));
+                }
+                self.inner.forward(tokens, cache, recurrent)
+            }
+        }
+        let mut pump = ContinuousPump::new(
+            BatcherConfig {
+                max_slots: 1,
+                ..BatcherConfig::default()
+            },
+            cache_cfg(),
+            None,
+        );
+        let mut next = HashMap::new();
+        next.insert(1u32, 2u32);
+        next.insert(2u32, 3u32);
+        let mut stub = FailOn {
+            inner: Stub { vocab: 64, next },
+            poison: 9,
+        };
+        // The first request's prefill fails; the second waits for its slot.
+        let (_bad, mut bad_rx) = pump
+            .enqueue(vec![9], params(4, vec![]), GenerationConfig::default(), 8)
+            .unwrap();
+        let (_good, mut good_rx) = pump
+            .enqueue(vec![1], params(2, vec![]), GenerationConfig::default(), 8)
+            .unwrap();
+        let mut ticks = 0;
+        while pump.tick(&mut stub).unwrap() == Tick::Ran {
+            ticks += 1;
+            assert!(ticks < 20, "the pump never went idle");
+        }
+
+        let bad = drain(&mut bad_rx);
+        assert!(
+            matches!(&bad[..], [TokenEvent::Error(e)] if e.contains("forward failed")),
+            "the failed request gets exactly one Error"
+        );
+        let good = drain(&mut good_rx);
+        assert!(matches!(good.last(), Some(TokenEvent::Done { .. })));
+        assert_eq!(pump.active_slots(), 0);
     }
 
     #[tokio::test]
@@ -703,7 +913,12 @@ mod tests {
         }
 
         impl SlotForward for RecordingStub {
-            fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
+            fn forward(
+                &mut self,
+                tokens: &[u32],
+                cache: &mut KVCache,
+                _recurrent: Option<&mut MambaCache>,
+            ) -> Result<Array, Exception> {
                 self.calls.push(tokens.to_vec());
                 let (h, d) = {
                     let c = cache.config();
@@ -793,13 +1008,10 @@ mod tests {
                 break;
             }
         }
-        // Stop token 7 was emitted once (it's also counted toward max,
-        // but we retire on Stop first). Actually the first-token path
-        // records the token THEN the scheduler checks stop_tokens, so
-        // the stop token DOES appear in the output stream exactly
-        // once. That matches single-slot behavior where the stop
-        // token is returned to the caller.
-        assert_eq!(tokens, vec![7], "stop token emitted before retirement");
+        // The stop token ends the request and is not part of the reply,
+        // as on the single-request path, which breaks out of its decode
+        // loop on it before emitting anything.
+        assert_eq!(tokens, Vec::<u32>::new(), "stop token is not emitted");
         assert_eq!(finish.as_deref(), Some("stop"));
     }
 
@@ -962,7 +1174,12 @@ mod tests {
             vocab: i32,
         }
         impl SlotForward for BiasedStub {
-            fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
+            fn forward(
+                &mut self,
+                tokens: &[u32],
+                cache: &mut KVCache,
+                _recurrent: Option<&mut MambaCache>,
+            ) -> Result<Array, Exception> {
                 let (h, d) = {
                     let c = cache.config();
                     (c.num_kv_heads as i32, c.head_dim as i32)

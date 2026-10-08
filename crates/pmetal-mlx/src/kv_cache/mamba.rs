@@ -59,6 +59,15 @@ impl SequenceKey {
     }
 }
 
+/// Two keys are equal when they name the same sequence.
+impl PartialEq for SequenceKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ptr_eq(&other.0)
+    }
+}
+
+impl Eq for SequenceKey {}
+
 /// Cache entry for a single Mamba layer.
 #[derive(Debug, Clone, Default)]
 pub struct MambaCacheEntry {

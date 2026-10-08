@@ -27,7 +27,7 @@
 
 use crate::continuous_batch::SlotId;
 use pmetal_bridge::compat::{Array, Exception};
-use pmetal_mlx::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig};
+use pmetal_mlx::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::generation::Sampler;
 use std::collections::HashMap;
 
@@ -38,18 +38,30 @@ use std::collections::HashMap;
 /// `DynamicModel::forward_with_hybrid_cache`.
 pub trait SlotForward {
     /// Forward `tokens` (shape `[1, tokens.len()]`) through the model,
-    /// extending `cache` with the produced K/V pairs. Returns the
-    /// *lazy* logits tensor — the driver batches `async_eval` across
-    /// all slots so the caller doesn't pay a host sync per slot.
-    fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception>;
+    /// extending `cache` with the produced K/V pairs and, for a hybrid
+    /// model, advancing the slot's `recurrent` (Mamba / gated-delta-net)
+    /// state. Returns the *lazy* logits tensor — the driver batches
+    /// `async_eval` across all slots so the caller doesn't pay a host sync
+    /// per slot.
+    fn forward(
+        &mut self,
+        tokens: &[u32],
+        cache: &mut KVCache,
+        recurrent: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception>;
 }
 
 impl<F> SlotForward for F
 where
-    F: FnMut(&[u32], &mut KVCache) -> Result<Array, Exception>,
+    F: FnMut(&[u32], &mut KVCache, Option<&mut MambaCache>) -> Result<Array, Exception>,
 {
-    fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
-        self(tokens, cache)
+    fn forward(
+        &mut self,
+        tokens: &[u32],
+        cache: &mut KVCache,
+        recurrent: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        self(tokens, cache, recurrent)
     }
 }
 
@@ -156,6 +168,10 @@ impl SlotIdxMap {
 /// empty" briefly between release and the next allocate.
 pub struct ContinuousEngineState {
     caches: BatchKVCache,
+    /// Per-row recurrent (Mamba / gated-delta-net) state for a hybrid
+    /// model, `None` for a pure-attention one. Reset when a row is freed,
+    /// like its KV cache, so the next request starts from nothing.
+    recurrent: Option<Vec<MambaCache>>,
     /// Fused per-layer KV cache used when the model supports fused
     /// batched decode. When `None`, the driver falls back to the
     /// per-slot `caches` path.
@@ -173,10 +189,23 @@ impl ContinuousEngineState {
         let map = SlotIdxMap::with_capacity(max_slots);
         Self {
             caches,
+            recurrent: None,
             fused_cache: None,
             samplers,
             map,
         }
+    }
+
+    /// Give every row its own recurrent state for a hybrid model, each a
+    /// copy of the empty `template` (the model's `create_mamba_cache()`).
+    pub fn with_recurrent_state(mut self, template: &MambaCache) -> Self {
+        self.recurrent = Some((0..self.capacity()).map(|_| template.clone()).collect());
+        self
+    }
+
+    /// Whether rows carry recurrent state (the model is hybrid).
+    pub fn has_recurrent_state(&self) -> bool {
+        self.recurrent.is_some()
     }
 
     /// Create engine state that also owns a [`FusedBatchKVCache`] for
@@ -241,6 +270,9 @@ impl ContinuousEngineState {
         if let Some(idx) = self.map.release(slot) {
             self.samplers[idx] = None;
             self.caches.reset_indices(&[idx]);
+            if let Some(recurrent) = self.recurrent.as_mut() {
+                recurrent[idx].reset();
+            }
             if let Some(fused) = self.fused_cache.as_mut() {
                 fused.release(idx);
             }
@@ -256,6 +288,18 @@ impl ContinuousEngineState {
     pub fn cache_for(&mut self, slot: SlotId) -> Option<&mut KVCache> {
         let idx = self.map.get(slot)?;
         self.caches.get_mut(idx)
+    }
+
+    /// Borrow the slot's KV cache and, for a hybrid model, its recurrent
+    /// state: everything a forward for that slot reads and advances.
+    pub fn slot_caches(&mut self, slot: SlotId) -> Option<(&mut KVCache, Option<&mut MambaCache>)> {
+        let idx = self.map.get(slot)?;
+        let cache = self.caches.get_mut(idx)?;
+        let recurrent = match self.recurrent.as_mut() {
+            Some(rows) => Some(rows.get_mut(idx)?),
+            None => None,
+        };
+        Some((cache, recurrent))
     }
 
     /// Replace a slot's KV cache with a forked prefix cache.
@@ -285,10 +329,10 @@ pub fn drive_prefill_step<F: SlotForward>(
     chunk: &[u32],
     final_chunk: bool,
 ) -> Result<Option<Array>, Exception> {
-    let cache = state
-        .cache_for(slot)
+    let (cache, recurrent) = state
+        .slot_caches(slot)
         .ok_or_else(|| Exception::custom(format!("prefill: slot {slot:?} not admitted")))?;
-    let logits = forward.forward(chunk, cache)?;
+    let logits = forward.forward(chunk, cache, recurrent)?;
 
     if final_chunk {
         let last = extract_last_logits(&logits)?;
@@ -343,11 +387,11 @@ pub fn drive_decode_step<F: SlotForward>(
     // Phase 1: schedule forwards, collect lazy logits per slot.
     let mut lazy: Vec<(SlotId, Array)> = Vec::with_capacity(slots.len());
     for &(slot, token, _) in slots {
-        let cache = state
-            .cache_for(slot)
+        let (cache, recurrent) = state
+            .slot_caches(slot)
             .ok_or_else(|| Exception::custom(format!("decode: slot {slot:?} not admitted")))?;
         let tokens = [token];
-        let logits = forward.forward(&tokens, cache)?;
+        let logits = forward.forward(&tokens, cache, recurrent)?;
         lazy.push((slot, logits));
     }
 
@@ -414,6 +458,11 @@ pub fn drive_fused_decode_step<F: FusedBatchForward>(
 
     if slots.is_empty() {
         return Ok(Vec::new());
+    }
+    if state.has_recurrent_state() {
+        return Err(Exception::custom(
+            "fused decode carries no recurrent state; hybrid models decode per slot",
+        ));
     }
 
     // Resolve batch indices in the same order the caller passed.
@@ -555,7 +604,12 @@ mod tests {
     }
 
     impl SlotForward for StubForward {
-        fn forward(&mut self, tokens: &[u32], cache: &mut KVCache) -> Result<Array, Exception> {
+        fn forward(
+            &mut self,
+            tokens: &[u32],
+            cache: &mut KVCache,
+            _recurrent: Option<&mut MambaCache>,
+        ) -> Result<Array, Exception> {
             self.calls += 1;
             // Extend the cache a tiny bit so seq_len advances — mirrors
             // the real forward's side effect.
@@ -689,5 +743,80 @@ mod tests {
         let err = drive_decode_step(&mut stub, &mut state, &[(SlotId(99), 1, empty)]).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("not admitted"), "unexpected error: {msg}");
+    }
+
+    /// Records, per forward, the first input token, whether the recurrent
+    /// state it was handed was empty, and which sequence that state was;
+    /// then marks the state used, as a hybrid model's forward would.
+    struct RecurrentStub {
+        seen: Vec<(u32, bool, pmetal_mlx::kv_cache::SequenceKey)>,
+    }
+
+    impl SlotForward for RecurrentStub {
+        fn forward(
+            &mut self,
+            tokens: &[u32],
+            _cache: &mut KVCache,
+            recurrent: Option<&mut MambaCache>,
+        ) -> Result<Array, Exception> {
+            let recurrent = recurrent.expect("a hybrid slot gets recurrent state");
+            self.seen
+                .push((tokens[0], recurrent.is_empty(), recurrent.sequence_key()));
+            recurrent.get_mut(0).unwrap().ssm_state = Some(Array::from_f32(1.0));
+            let s = tokens.len() as i32;
+            Ok(Array::from_f32_slice(
+                &vec![0.0; (s * 4) as usize],
+                &[1, s, 4],
+            ))
+        }
+    }
+
+    /// Each slot of a hybrid model advances its own recurrent state, and a
+    /// row a finished request frees starts the next one from empty.
+    #[test]
+    fn hybrid_slots_each_get_their_own_recurrent_state() {
+        let sampler = || Sampler::new(pmetal_models::generation::GenerationConfig::default());
+        let mut state =
+            ContinuousEngineState::new(2, make_config()).with_recurrent_state(&MambaCache::new(1));
+        let (a, b, c) = (SlotId(1), SlotId(2), SlotId(3));
+        state.admit(a, sampler()).unwrap();
+        state.admit(b, sampler()).unwrap();
+        let mut stub = RecurrentStub { seen: Vec::new() };
+
+        drive_prefill_step(&mut stub, &mut state, a, &[10, 11], true).unwrap();
+        drive_prefill_step(&mut stub, &mut state, b, &[20, 21], true).unwrap();
+        let empty: &[u32] = &[];
+        drive_decode_step(&mut stub, &mut state, &[(a, 12, empty), (b, 22, empty)]).unwrap();
+
+        let first_four = stub.seen.clone();
+        let [pa, pb, da, db] = &first_four[..] else {
+            panic!("expected four forwards, got {}", stub.seen.len());
+        };
+        assert!(pa.1 && pb.1, "both prefills start from empty state");
+        assert!(!da.1 && !db.1, "decodes continue from their prefill");
+        assert!(pa.2 == da.2 && pb.2 == db.2);
+        assert!(pa.2 != pb.2, "slots share no state");
+
+        // `a` finishes; `c` takes its row and must not inherit its state.
+        state.retire(a);
+        assert_eq!(state.admit(c, sampler()).unwrap(), 0);
+        drive_prefill_step(&mut stub, &mut state, c, &[30], true).unwrap();
+        let pc = stub.seen.last().unwrap();
+        assert!(pc.1, "a reused row starts from empty state");
+        assert!(pc.2 != pa.2);
+    }
+
+    #[test]
+    fn fused_decode_refuses_recurrent_state() {
+        let mut state =
+            ContinuousEngineState::new(1, make_config()).with_recurrent_state(&MambaCache::new(1));
+        let mut never = |_: &Array,
+                         _: &[usize],
+                         _: &mut FusedBatchKVCache|
+         -> Result<Array, Exception> { unreachable!() };
+        let empty: &[u32] = &[];
+        let err =
+            drive_fused_decode_step(&mut never, &mut state, &[(SlotId(1), 1, empty)]).unwrap_err();
+        assert!(format!("{err:?}").contains("recurrent"));
     }
 }

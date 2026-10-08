@@ -72,11 +72,13 @@
 //!
 //! # Hybrid models
 //!
-//! Mamba / GDN / recurrent architectures (Qwen3Next, NemotronH,
-//! FalconH1, RecurrentGemma, Jamba) are **not supported** in either
-//! path: their per-sequence state doesn't fit the batched `[N, 1]`
-//! decode shape without a significant rework of the recurrent kernels.
-//! Callers must fall back to the single-request path for those models.
+//! Models with recurrent layers (Qwen 3.5 / 3.6 / 3.8 and Qwen4Exp
+//! gated-delta-net, NemotronH Mamba2) take the serial path, each slot
+//! with its own recurrent state beside its KV cache
+//! ([`crate::continuous_driver::ContinuousEngineState::with_recurrent_state`]),
+//! reset when the slot is freed. They keep no prefix cache, since a KV
+//! snapshot can't restore recurrent state. The fused `[N, 1]` decode
+//! carries no recurrent state and refuses them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -230,6 +232,11 @@ pub enum EnqueueError {
     Saturated,
     #[error("empty prompt")]
     EmptyPrompt,
+    /// The request's event channel can't hold every event it may produce.
+    /// The scheduler never waits on one slow reader, since that would stall
+    /// every other slot, so a full channel would lose tokens.
+    #[error("event channel holds {capacity} events; the request can produce {needed}")]
+    ChannelTooSmall { capacity: usize, needed: usize },
 }
 
 /// Pending request, queued but not yet assigned to a slot.

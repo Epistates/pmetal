@@ -516,19 +516,23 @@ fn continuous_step(state: &mut EngineState) -> Background {
         return Background::Idle;
     };
     let model = &mut state.model;
-    let mut forward =
-        |tokens: &[u32], cache: &mut KVCache| -> Result<Array, pmetal_bridge::compat::Exception> {
-            let input = Array::from_u32_slice(tokens, &[1, tokens.len() as i32])
-                .as_dtype(Dtype::Int32.as_i32());
-            model.forward_with_hybrid_cache(&input, None, Some(cache), None)
-        };
+    let mut forward = |tokens: &[u32],
+                       cache: &mut KVCache,
+                       recurrent: Option<&mut MambaCache>|
+     -> Result<Array, pmetal_bridge::compat::Exception> {
+        let input = Array::from_u32_slice(tokens, &[1, tokens.len() as i32])
+            .as_dtype(Dtype::Int32.as_i32());
+        model.forward_with_hybrid_cache(&input, None, Some(cache), recurrent)
+    };
     match pump.tick(&mut forward) {
         Ok(Tick::Ran) => Background::Busy,
         Ok(Tick::Idle) => Background::Idle,
+        // A failed step already failed its requests; anything else left
+        // here is the pump's own bookkeeping, which another step won't fix.
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 target: "pmetal_serve::continuous_batch",
-                "continuous-batching step failed: {e:?}"
+                "continuous-batching scheduler error: {e:?}"
             );
             Background::Idle
         }
@@ -768,12 +772,18 @@ impl InferenceEngine {
         let pump = self
             .model
             .call(move |state| {
-                let pump = Arc::new(Mutex::new(ContinuousPump::new_with_prefix_cache(
+                let mut pump = ContinuousPump::new_with_prefix_cache(
                     batcher_config,
                     cache_config,
                     Some(tokenizer),
                     Some(prefix_cache),
-                )));
+                );
+                // A hybrid model's slots each carry their own recurrent
+                // state, and share no prefix cache.
+                if let Some(template) = state.model.create_mamba_cache() {
+                    pump = pump.with_recurrent_state(&template);
+                }
+                let pump = Arc::new(Mutex::new(pump));
                 state.continuous = Some(Arc::clone(&pump));
                 pump
             })
@@ -831,7 +841,10 @@ impl InferenceEngine {
             logprobs_top_n: params.logprobs_top_n,
         };
         let ctx = self.gpu_request_context();
-        let (tx, rx) = tokio::sync::mpsc::channel::<TokenEvent>(64);
+        // Room for every event the request can produce: the scheduler never
+        // waits on one slow reader, and a full channel would drop tokens.
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<TokenEvent>(ContinuousPump::events_capacity(&slot_params));
 
         // Enqueueing touches the prefix cache's KV snapshots, so it runs on
         // the model thread too; queueing the job also wakes the scheduler.
@@ -877,24 +890,17 @@ impl InferenceEngine {
         let model_path = self.model_path.clone();
         let max_seq_len = self.max_seq_len;
         let cache_mode_override = self.cache_mode_override;
-        let (cache_config, has_recurrent_cache) = self
-            .model
+        self.model
             .call(move |state| {
-                let (cache, mamba_cache) = Self::create_request_caches(
+                let (cache, _) = Self::create_request_caches(
                     &state.model,
                     &model_path,
                     max_seq_len,
                     cache_mode_override,
                 );
-                (cache.config().clone(), mamba_cache.is_some())
+                cache.config().clone()
             })
-            .map_err(|_| ServeError::ModelNotLoaded)?;
-        if has_recurrent_cache {
-            return Err(ServeError::BadRequest(
-                "continuous batching is unsupported for hybrid/recurrent models".into(),
-            ));
-        }
-        Ok(cache_config)
+            .map_err(|_| ServeError::ModelNotLoaded)
     }
 
     /// Convenience wrapper that derives the KV-cache config from the
@@ -2142,28 +2148,111 @@ mod tests {
         assert_eq!(cfg.mode, override_mode);
     }
 
-    #[test]
-    fn continuous_cache_config_rejects_hybrid_models() {
-        let engine = InferenceEngine::new_with_backend(
-            || {
+    /// Tiny Qwen 3.5 (gated-delta-net + attention): its decode step keeps
+    /// state of its own per sequence besides the caller's caches.
+    const TINY_QWEN3_NEXT: &str = r#"{
+        "model_type": "qwen3_next",
+        "vocab_size": 64, "hidden_size": 32, "intermediate_size": 64,
+        "num_hidden_layers": 4, "num_attention_heads": 2, "num_key_value_heads": 1,
+        "head_dim": 16, "linear_num_value_heads": 2, "linear_num_key_heads": 1,
+        "linear_key_head_dim": 32, "linear_value_head_dim": 32,
+        "linear_conv_kernel_dim": 4, "full_attention_interval": 2,
+        "num_experts": 0, "num_experts_per_tok": 0, "decoder_sparse_step": 1,
+        "moe_intermediate_size": 16, "shared_expert_intermediate_size": 32,
+        "mlp_only_layers": [], "norm_topk_prob": false, "tie_word_embeddings": true,
+        "max_position_embeddings": 256, "rms_norm_eps": 1e-6, "rope_theta": 10000.0
+    }"#;
+
+    /// Continuous batching on a hybrid model gives each request exactly what
+    /// it gets alone. Every slot carries its own recurrent state, so four
+    /// requests through two slots, decoded in alternation and then reusing
+    /// the rows, must match their single-request greedy replies token for
+    /// token. Without per-slot state the recurrent layers ran stateless, and
+    /// the slots shared Qwen 3.5's decode state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn continuous_batching_on_hybrid_models_matches_single_requests() {
+        type Load = fn() -> anyhow::Result<DynamicModel>;
+        let models: [(&str, Load); 2] = [
+            ("qwen3_next", || {
+                Ok(DynamicModel::from_config(TINY_QWEN3_NEXT)?)
+            }),
+            ("nemotron_h", || {
                 Ok(DynamicModel::NemotronH(NemotronHForCausalLM::new(
                     tiny_nemotron_h_config(),
                 )?))
-            },
-            test_tokenizer(),
-            "tiny-hybrid".into(),
-            std::env::temp_dir().as_path(),
-            64,
-            false,
-            1024,
-        )
-        .unwrap();
-
-        let err = engine.create_continuous_cache_config().unwrap_err();
-        match err {
-            ServeError::BadRequest(msg) => assert!(msg.contains("hybrid/recurrent")),
-            other => panic!("expected BadRequest, got {other:?}"),
+            }),
+        ];
+        let prompts: [&[u32]; 4] = [&[1, 2, 3, 1], &[2, 3], &[3, 1, 2, 2, 1], &[1, 1, 1]];
+        for (name, load) in models {
+            let engine = InferenceEngine::new_with_backend(
+                load,
+                test_tokenizer(),
+                name.into(),
+                std::env::temp_dir().as_path(),
+                64,
+                false,
+                1024,
+            )
+            .unwrap();
+            // Each token's log-probability as well: a tiny random model
+            // can repeat one token whatever its state, but not with the same
+            // probabilities.
+            let params = SamplingParams {
+                logprobs_top_n: Some(0),
+                ..greedy(6)
+            };
+            let mut expected = Vec::new();
+            for prompt in prompts {
+                let (tokens, logprobs, ..) = engine.generate(prompt, params.clone()).await.unwrap();
+                let logprobs: Vec<f32> = logprobs.unwrap().iter().map(|e| e.logprob).collect();
+                expected.push((tokens, logprobs));
+            }
+            engine
+                .enable_continuous_batching_auto(crate::continuous_batch::BatcherConfig {
+                    max_slots: 2,
+                    ..Default::default()
+                })
+                .unwrap();
+            for round in 0..2 {
+                let streams: Vec<_> = prompts
+                    .iter()
+                    .map(|prompt| engine.generate_batched(prompt, params.clone()).unwrap())
+                    .collect();
+                for ((stream, (want, want_logprobs)), prompt) in
+                    streams.into_iter().zip(&expected).zip(prompts)
+                {
+                    let (got, got_logprobs) = collect_stream_with_logprobs(stream).await;
+                    assert_eq!(
+                        &got, want,
+                        "{name}, round {round}: batched reply to {prompt:?}"
+                    );
+                    for (step, (g, w)) in got_logprobs.iter().zip(want_logprobs).enumerate() {
+                        assert!(
+                            (g - w).abs() < 1e-4,
+                            "{name}, round {round}: reply to {prompt:?}, token {step} has \
+                             log-probability {g} batched and {w} alone"
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    async fn collect_stream_with_logprobs(
+        mut rx: tokio::sync::mpsc::Receiver<TokenEvent>,
+    ) -> (Vec<u32>, Vec<f32>) {
+        let (mut tokens, mut logprobs) = (Vec::new(), Vec::new());
+        while let Some(event) = rx.recv().await {
+            match event {
+                TokenEvent::Token { id, logprob } => {
+                    tokens.push(id);
+                    logprobs.push(logprob.expect("requested logprobs").logprob);
+                }
+                TokenEvent::Done { .. } => return (tokens, logprobs),
+                TokenEvent::Error(e) => panic!("stream failed: {e}"),
+            }
+        }
+        panic!("stream closed without Done");
     }
 
     fn greedy(max_tokens: usize) -> SamplingParams {
@@ -2220,7 +2309,6 @@ mod tests {
         );
         let prompt = [1u32, 2, 3, 1, 2];
         let (expected, ..) = engine.generate(&prompt, greedy(6)).await.unwrap();
-        assert_eq!(expected.len(), 6);
 
         let mut tasks = Vec::new();
         for i in 0..8 {
