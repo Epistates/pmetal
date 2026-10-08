@@ -16,7 +16,8 @@
 //! before it, so the output is greedy decoding's, up to bf16 ties: the
 //! verify's block-shaped forward rounds differently from one-token decoding,
 //! and where the target's top two logits are a rounding apart the two can
-//! pick differently.
+//! pick differently ([`DFlashDecoder::generate_greedy`] and
+//! [`DFlashDecoder::next_token_top_two`] measure it).
 //!
 //! The other four upstream verification modes (stream, chunked,
 //! parallel-lazy-logits, parallel-greedy-argmax) are straight-line variants
@@ -366,6 +367,8 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         let mut target_hidden = capture.stack_hidden()?;
 
         let mut metrics = DFlashMetrics::default();
+        // Where the last step's tokens start, to count only those kept.
+        let mut last_step_from = output_tokens.len();
 
         // ── Decode loop ───────────────────────────────────────────────────
         while output_tokens.len() < total_max_tokens {
@@ -456,6 +459,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             }
 
             // Commit: append the accepted block tokens and the bonus.
+            last_step_from = output_tokens.len();
             let accepted_slice = &block_tokens[1..accepted_inputs];
             output_tokens.extend_from_slice(accepted_slice);
             output_tokens.push(bonus_token);
@@ -484,12 +488,92 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         if output_tokens.len() > total_max_tokens {
             output_tokens.truncate(total_max_tokens);
         }
+        // A stop token or the length limit can cut the last step short;
+        // count the tokens it kept, as the reference does.
+        if let Some(last) = metrics.acceptance_lengths.last_mut() {
+            *last = output_tokens.len().saturating_sub(last_step_from);
+        }
         metrics.num_generated = output_tokens.len().saturating_sub(prompt_len);
 
         Ok(DFlashOutput {
             tokens: output_tokens,
             metrics,
         })
+    }
+
+    /// Plain greedy decoding with the same target, one token per forward and
+    /// no draft: what [`Self::generate`] must reproduce at temperature 0, and
+    /// the speed it is measured against. The metrics count one token per step.
+    pub fn generate_greedy(
+        &mut self,
+        prompt_ids: &Array,
+        config: &DFlashConfig,
+    ) -> Result<DFlashOutput, Exception> {
+        let prompt_len = prompt_ids.dim(1) as usize;
+        let total_max_tokens = prompt_len + config.max_new_tokens;
+        self.target.reset_state();
+        let mut target_cache = self.target.make_kv_cache(total_max_tokens + 1);
+        let mut mamba_cache = self.target.make_mamba_cache();
+        let mut capture = SpecCapture::with_layers(Vec::new());
+
+        let mut output_tokens = tokens_from_array(prompt_ids)?;
+        let mut input = prompt_ids.clone();
+        let mut metrics = DFlashMetrics::default();
+        while output_tokens.len() < total_max_tokens {
+            capture.clear();
+            let logits = self.target.forward_with_capture(
+                &input,
+                None,
+                Some(&mut target_cache),
+                mamba_cache.as_mut(),
+                &mut capture,
+            )?;
+            let token = sample_token_argmax(&slice_last_time_step(&logits)?)?;
+            pmetal_bridge::check_last_error()
+                .map_err(|e| Exception::custom(format!("greedy decode: {e}")))?;
+            output_tokens.push(token);
+            metrics.acceptance_lengths.push(1);
+            if config.stop_tokens.contains(&token) {
+                break;
+            }
+            input = array_from_i32_row(&[token]);
+        }
+        metrics.num_generated = output_tokens.len() - prompt_len;
+        Ok(DFlashOutput {
+            tokens: output_tokens,
+            metrics,
+        })
+    }
+
+    /// The target's two likeliest next tokens after `prefix` `[1, T]` and
+    /// their logits, from one forward over it: how close a call it was where
+    /// two decodings of the same target part ways.
+    pub fn next_token_top_two(&mut self, prefix: &Array) -> Result<[(i32, f32); 2], Exception> {
+        self.target.reset_state();
+        let mut kv = self.target.make_kv_cache(prefix.dim(1) as usize + 1);
+        let mut mamba = self.target.make_mamba_cache();
+        let mut capture = SpecCapture::with_layers(Vec::new());
+        let logits = self.target.forward_with_capture(
+            prefix,
+            None,
+            Some(&mut kv),
+            mamba.as_mut(),
+            &mut capture,
+        )?;
+        let last = slice_last_time_step(&logits)?.as_dtype(Dtype::Float32.as_i32());
+        let _ = last.eval();
+        pmetal_bridge::check_last_error()
+            .map_err(|e| Exception::custom(format!("top two: {e}")))?;
+        let values = last.as_slice::<f32>();
+        let mut best = [(0, f32::NEG_INFINITY); 2];
+        for (token, &logit) in values.iter().enumerate() {
+            if logit > best[0].1 {
+                best = [(token as i32, logit), best[0]];
+            } else if logit > best[1].1 {
+                best[1] = (token as i32, logit);
+            }
+        }
+        Ok(best)
     }
 
     /// Tree-verify variant of [`Self::generate`]. For each draft round

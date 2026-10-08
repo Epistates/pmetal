@@ -166,6 +166,7 @@ impl DflashTab {
             .value("Tree Budget")
             .parse()
             .unwrap_or(spec.tree_budget);
+        spec.compare_greedy = self.form.value("Compare With Greedy") == "Enabled";
         spec
     }
 }

@@ -1167,6 +1167,7 @@ export interface DflashConfig {
   json?: boolean | null;
   no_chat?: boolean | null;
   tree_budget?: number | null;
+  compare_greedy?: boolean | null;
 }
 
 export async function startDflash(

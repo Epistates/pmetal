@@ -1954,6 +1954,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 json,
                 no_chat,
                 tree_budget,
+                compare_greedy,
             } = args;
             commands::dflash::run_dflash(
                 &target,
@@ -1966,6 +1967,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 json,
                 no_chat,
                 tree_budget,
+                compare_greedy,
             )
             .await?;
         }

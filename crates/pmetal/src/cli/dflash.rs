@@ -44,4 +44,9 @@ pub struct DflashArgs {
     /// Tree-verify budget.
     #[arg(long = "tree-budget", default_value = "0")]
     pub tree_budget: usize,
+
+    /// Also decode the prompt greedily, one token per forward with the same
+    /// target, and report its speed and whether DFlash's tokens match it.
+    #[arg(long = "compare-greedy")]
+    pub compare_greedy: bool,
 }

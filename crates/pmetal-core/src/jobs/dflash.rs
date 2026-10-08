@@ -104,6 +104,16 @@ pub struct DflashSpec {
     )]
     #[serde(default)]
     pub tree_budget: usize,
+
+    #[job(
+        label = "Compare With Greedy",
+        group = "Output",
+        argv = "--compare-greedy",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub compare_greedy: bool,
 }
 
 impl Default for DflashSpec {
@@ -119,6 +129,7 @@ impl Default for DflashSpec {
             json: false,
             no_chat: false,
             tree_budget: 0,
+            compare_greedy: false,
         }
     }
 }

@@ -1,8 +1,7 @@
 //! Python bindings for DFlash block-diffusion speculative decoding.
 //!
-//! Exposes a thin `DFlashGenerator` Python class. The target must currently be a
-//! Qwen3 checkpoint — Qwen3.5 support arrives once the qwen3_next GDN
-//! verify-input capture lands.
+//! Exposes a thin `DFlashGenerator` Python class over either generation of
+//! DFlash draft, with a Qwen3 or Qwen3.5 target.
 
 use std::path::PathBuf;
 
@@ -11,9 +10,8 @@ use pyo3::types::PyList;
 
 use pmetal_mlx::Array;
 use pmetal_models::DynamicModel;
-use pmetal_models::dflash_decoder::{
-    DFlashConfig, DFlashDecoder, DFlashOutput, load_dflash_draft_from_dir,
-};
+use pmetal_models::dflash_decoder::{DFlashConfig, DFlashDecoder, DFlashDraftQuant, DFlashOutput};
+use pmetal_models::dflash_drafts::load_dflash_draft;
 
 use crate::error::runtime_err;
 use crate::hub::is_hf_model_id;
@@ -62,20 +60,13 @@ impl PyDFlashGenerator {
         // explicit runtime error on the first forward.
         let target = DynamicModel::load(&target_path).map_err(runtime_err)?;
 
-        // Load DFlash draft.
-        let (draft, report) = load_dflash_draft_from_dir(&draft_path).map_err(runtime_err)?;
-        if !report.skipped.is_empty() {
-            tracing::info!(
-                "DFlashGenerator: loaded {} draft params ({} unused keys)",
-                report.loaded,
-                report.skipped.len()
-            );
-        }
-        if target.vocab_size() != draft.config.vocab_size {
+        // Load the DFlash draft, either generation; the loader is strict.
+        let draft = load_dflash_draft(&draft_path, DFlashDraftQuant::None).map_err(runtime_err)?;
+        if target.vocab_size() != draft.config().vocab_size {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "DFlashGenerator: target vocab_size {} does not match draft vocab_size {}",
                 target.vocab_size(),
-                draft.config.vocab_size
+                draft.config().vocab_size
             )));
         }
 

@@ -1782,6 +1782,8 @@ impl PmetalMcpServer {
         #[description("Speculative tokens per step")] speculative_tokens: Option<u64>,
         #[description("Use FP8 for draft model")] draft_fp8: Option<bool>,
         #[description("Tree budget (0 = disabled)")] tree_budget: Option<u64>,
+        #[description("Also decode greedily and report the speedup and whether the tokens match")]
+        compare_greedy: Option<bool>,
     ) -> McpResult<String> {
         let mut spec = DflashSpec {
             target,
@@ -1792,6 +1794,7 @@ impl PmetalMcpServer {
             speculative_tokens: speculative_tokens.map(|t| t as usize),
             draft_fp8: draft_fp8.unwrap_or(false),
             tree_budget: tree_budget.unwrap_or(0) as usize,
+            compare_greedy: compare_greedy.unwrap_or(false),
             ..DflashSpec::default()
         };
         spec.normalize().map_err(into_mcp_error)?;

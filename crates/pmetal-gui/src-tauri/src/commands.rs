@@ -4109,6 +4109,7 @@ pub struct DflashDto {
     pub json: Option<bool>,
     pub no_chat: Option<bool>,
     pub tree_budget: Option<usize>,
+    pub compare_greedy: Option<bool>,
 }
 
 #[tauri::command]
@@ -4155,6 +4156,9 @@ pub async fn start_dflash(
     let tree_budget = config.tree_budget.unwrap_or(0);
     if tree_budget > 0 {
         args.extend(["--tree-budget".into(), tree_budget.to_string()]);
+    }
+    if config.compare_greedy.unwrap_or(false) {
+        args.push("--compare-greedy".into());
     }
 
     spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
