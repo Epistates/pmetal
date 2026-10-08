@@ -355,9 +355,27 @@ size_t mlx_inline_nbytes(const mlx_inline_array* a) {
     return as_arr(a).nbytes();
 }
 
+// Pointer to `size()` row-major elements of `a`, evaluated. A strided view is
+// materialized first (see `make_row_contiguous_for_read`), so the pointer is
+// valid for a flat read of the logical array for as long as `a` lives.
+// Returns -1 with a null pointer, and the error on the channel, on failure;
+// an empty array yields a null pointer and 0. A success leaves the channel
+// alone, like `BRIDGE_GUARD`: this is a readback, often issued between an op
+// and its error check.
 int mlx_inline_data_ptr(const mlx_inline_array* a, const void** out_ptr) {
-    *out_ptr = as_arr(a).data<void>();
-    return 0;
+    *out_ptr = nullptr;
+    int rc = -1;
+    BRIDGE_GUARD("data_ptr", {
+        // MLX arrays are internally mutable: eval and the layout swap act on
+        // the shared array desc, not on the handle Rust holds.
+        array& x = const_cast<array&>(as_arr(a));
+        make_row_contiguous_for_read(x);
+        if (x.size() > 0) {
+            *out_ptr = x.data<void>();
+        }
+        rc = 0;
+    });
+    return rc;
 }
 
 uintptr_t mlx_inline_array_id(const mlx_inline_array* a) {

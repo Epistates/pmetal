@@ -525,10 +525,11 @@ void mlx_inline_from_u16_bits_slice(
     });
 }
 
-// Copy the evaluated f32 data of an array into a caller-provided buffer.
-// The array is cast to float32 and eval'd first. `n` must equal the total
-// element count (product of all dimensions). Returns 0 on success, -1 on a
-// count mismatch or caught C++ exception. Callers can disambiguate via
+// Copy the evaluated f32 data of an array into a caller-provided buffer, in
+// row-major order. The array is cast to float32, eval'd and, if it is a
+// strided view, materialized first. `n` must equal the total element count
+// (product of all dimensions). Returns 0 on success, -1 on a count mismatch
+// or caught C++ exception. Callers can disambiguate via
 // `pmetal_bridge_last_error_code()`.
 int mlx_inline_to_f32_slice(mlx_inline_array* a, float* out, size_t n) {
     try {
@@ -536,12 +537,14 @@ int mlx_inline_to_f32_slice(mlx_inline_array* a, float* out, size_t n) {
         array f32_arr = src.dtype() == mlx::core::float32
             ? src
             : mlx::core::astype(src, mlx::core::float32);
-        f32_arr.eval();
+        make_row_contiguous_for_read(f32_arr);
         if ((size_t)f32_arr.size() != n) {
             pmetal_bridge_set_last_error("to_f32_slice", "size mismatch");
             return -1;
         }
-        std::memcpy(out, f32_arr.data<float>(), n * sizeof(float));
+        if (n > 0) {
+            std::memcpy(out, f32_arr.data<float>(), n * sizeof(float));
+        }
         pmetal_bridge_clear_error_internal();
         return 0;
     } catch (const std::exception& e) {

@@ -208,8 +208,12 @@ impl HiddenStateLoss {
         let student_elements = num_tokens * student_dim;
 
         // Flatten to [num_tokens, hidden] for Metal kernel
-        let teacher_flat = teacher_hidden.reshape(&[-1, teacher_dim as i32]);
-        let student_flat = student_hidden.reshape(&[-1, student_dim as i32]);
+        let teacher_flat = teacher_hidden
+            .as_type::<f32>()
+            .reshape(&[-1, teacher_dim as i32]);
+        let student_flat = student_hidden
+            .as_type::<f32>()
+            .reshape(&[-1, student_dim as i32]);
 
         // Evaluate the arrays to ensure data is computed and available
         teacher_flat.eval();

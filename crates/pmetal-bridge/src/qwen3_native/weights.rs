@@ -283,7 +283,7 @@ pub fn apply_outlier_permutation(weights: &mut NativeWeights, outlier_fraction: 
 
     // Build per-head permutation: sort channels by norm (descending), outliers first.
     // The permutation is the same for all heads (same relative ordering).
-    let first_head_norms = col_norms.slice(&[0], &[head_dim]);
+    let first_head_norms = col_norms.slice(&[0], &[head_dim]).as_type::<f32>();
     first_head_norms.eval();
     let norms_slice: &[f32] = first_head_norms.as_slice();
     let mut indices: Vec<usize> = (0..head_dim as usize).collect();

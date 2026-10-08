@@ -114,6 +114,10 @@ impl ArrayElement for usize {
 /// reads through `&InlineArray` because the underlying readback is logically
 /// const (eval is interior-mutable on the MLX side).
 pub trait BridgeScalar: private::Sealed {
+    /// The array dtypes (MLX dtype ids) whose buffer [`InlineArray::as_slice`]
+    /// may read as `Self`: same element width and kind. The two 32-bit integer
+    /// types accept each other, a plain bit reinterpretation.
+    const SLICE_DTYPES: &'static [i32];
     fn extract(arr: &InlineArray) -> Self;
 }
 
@@ -125,18 +129,21 @@ mod private {
 }
 
 impl BridgeScalar for f32 {
+    const SLICE_DTYPES: &'static [i32] = &[10];
     fn extract(arr: &InlineArray) -> f32 {
         arr.item_f32()
     }
 }
 
 impl BridgeScalar for u32 {
+    const SLICE_DTYPES: &'static [i32] = &[3, 7];
     fn extract(arr: &InlineArray) -> u32 {
         arr.item_u32()
     }
 }
 
 impl BridgeScalar for i32 {
+    const SLICE_DTYPES: &'static [i32] = &[7, 3];
     fn extract(arr: &InlineArray) -> i32 {
         arr.item_u32() as i32
     }

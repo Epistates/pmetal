@@ -1087,9 +1087,8 @@ pub fn token_logprobs(
         .shape()
         .last()
         .ok_or_else(|| Exception::custom("token_logprobs: empty logits shape"))?;
-    let flat = log_probs.reshape(&[vocab]);
-    // Force evaluation before reading raw bytes — lazy MLX arrays segfault
-    // on `.as_slice()` without a prior `.eval()`.
+    // Log-probs keep the logits' dtype (bf16 for most checkpoints).
+    let flat = log_probs.as_type::<f32>().reshape(&[vocab]);
     flat.eval();
     let values: Vec<f32> = flat.as_slice().to_vec();
 

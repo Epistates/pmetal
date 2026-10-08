@@ -60,21 +60,37 @@ impl InlineArray {
 
     // ── Slice access (requires prior eval) ───────────────────────────────
 
-    /// Return a borrowed slice of the array's f32 data.
+    /// Borrow the array's elements as a flat slice, in row-major order.
+    ///
+    /// Evaluates the array if it isn't already (and waits on an in-flight
+    /// `async_eval`). A strided view (a transpose, a slice of an inner axis
+    /// or with a step, a broadcast) is materialized into a row-contiguous
+    /// buffer first, in place on the shared MLX array; a row-contiguous array
+    /// is borrowed with no copy. An empty array gives an empty slice.
     ///
     /// # Panics
-    /// Panics if the array has not been evaluated (GPU→CPU sync), if the
-    /// dtype is not Float32, or if the data pointer is null.
+    /// If `T` doesn't match the dtype (`f32` needs float32; `u32`/`i32` need
+    /// a 32-bit integer dtype), or if evaluation fails.
     pub fn as_slice<T: crate::inline_array::BridgeScalar>(&self) -> &[T] {
-        let ptr = self.data_ptr() as *const T;
+        let dtype = self.dtype_raw();
         assert!(
-            !ptr.is_null(),
-            "as_slice: array not evaluated (null data ptr)"
+            T::SLICE_DTYPES.contains(&dtype),
+            "as_slice::<{}>() on a {:?} array",
+            std::any::type_name::<T>(),
+            crate::compat::Dtype::from_raw(dtype),
         );
         let n = self.size();
-        // SAFETY: `data_ptr` returns a valid pointer into MLX's heap allocation
-        // for the lifetime of `self`. The array must have been `eval()`d first
-        // so the pointer is on the CPU (not on the GPU).
+        let ptr = match self.try_data_ptr() {
+            Ok(ptr) => ptr as *const T,
+            Err(e) => panic!("as_slice: evaluating the array failed: {e}"),
+        };
+        if n == 0 {
+            return &[];
+        }
+        assert!(!ptr.is_null(), "as_slice: null data pointer");
+        // SAFETY: `data_ptr` evaluated the array and left it row-contiguous,
+        // so `ptr` addresses `n` elements of `T` (dtype checked above) in a
+        // buffer the array desc owns for as long as `self` lives.
         unsafe { std::slice::from_raw_parts(ptr, n) }
     }
 

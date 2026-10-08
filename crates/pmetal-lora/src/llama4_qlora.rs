@@ -331,7 +331,7 @@ impl Llama4QloraMoE {
             .iter()
             .map(|&v| v as i32)
             .collect();
-        let routing_weights: Vec<f32> = expert_weights.as_slice().to_vec();
+        let routing_weights: Vec<f32> = expert_weights.as_type::<f32>().as_slice().to_vec();
 
         let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
         for token_idx in 0..n_tokens {

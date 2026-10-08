@@ -120,6 +120,30 @@ static inline void bridge_placeholder(mlx_inline_array* dst) noexcept {
         } \
     } while (0)
 
+// Make `x` safe to read as `x.size()` contiguous elements starting at
+// `x.data<T>()`, in row-major order.
+//
+// MLX arrays are strided. A transpose, a slice of an inner axis or a step,
+// and a broadcast all share their source's buffer and only change strides
+// (a broadcast also has `data_size() < size()`), so walking `size()` elements
+// from the data pointer reads the wrong elements, or runs past the end of
+// the buffer. This evaluates `x` (waiting on an in-flight async eval) and,
+// only when it is not row-contiguous, swaps a row-contiguous copy into `x`
+// with `copy_shared_buffer`, the same move MLX's `Contiguous` primitive makes
+// on its output. The logical values are unchanged, so every handle sharing
+// `x` still sees the same array; views of the same source keep their own
+// buffer. A row-contiguous array is left alone, so the common case stays
+// zero-copy.
+static inline void make_row_contiguous_for_read(array& x) {
+    x.eval();
+    if (x.size() == 0 || x.flags().row_contiguous) {
+        return;
+    }
+    array packed = mlx::core::contiguous(x);
+    packed.eval();
+    x.copy_shared_buffer(packed);
+}
+
 // The three GELUs, evaluated in f32 (f64 stays f64). A bf16/f16 input comes
 // back as f32, which is what these activations have always returned: their
 // f32 constants promoted the input. Rounding the result back to the input's

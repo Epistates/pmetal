@@ -210,12 +210,31 @@ impl InlineArray {
         unsafe { mlx_inline_nbytes(&self.raw) }
     }
 
-    /// Get a raw const pointer to the evaluated data.
-    /// Array must be evaluated first.
+    /// Raw pointer to the array's `size()` elements, flat and row-major.
+    ///
+    /// Evaluates the array if needed and, if it is a strided view (transpose,
+    /// inner-axis or stepped slice, broadcast), materializes it into a
+    /// row-contiguous buffer in place first, so the pointer is always valid
+    /// for a flat read of the logical array while `self` lives. Null for an
+    /// empty array, or on failure (the error is on
+    /// [`check_last_error`](crate::check_last_error)).
     pub fn data_ptr(&self) -> *const std::ffi::c_void {
         let mut ptr: *const std::ffi::c_void = std::ptr::null();
         unsafe { mlx_inline_data_ptr(&self.raw, &mut ptr) };
         ptr
+    }
+
+    /// [`data_ptr`](Self::data_ptr), returning the bridge error on failure.
+    /// A success leaves the thread's error channel untouched, so an earlier
+    /// op's unchecked error is still there for its own check.
+    pub fn try_data_ptr(&self) -> crate::error::BridgeResult<*const std::ffi::c_void> {
+        let mut ptr: *const std::ffi::c_void = std::ptr::null();
+        if unsafe { mlx_inline_data_ptr(&self.raw, &mut ptr) } == 0 {
+            Ok(ptr)
+        } else {
+            crate::error::check_last_error()?;
+            Err(crate::error::BridgeError::Unknown("data_ptr failed".into()))
+        }
     }
 
     /// Stable identity of the underlying MLX array desc.

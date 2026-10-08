@@ -2300,8 +2300,10 @@ impl InferenceEngine {
                         .model
                         .forward_hidden(&ids, None)
                         .map_err(ServeError::Model)?;
+                    // CLS and last-token pooling keep the hidden states' dtype.
                     let pooled = pmetal_models::pooling::pool(&hidden, &mask, mode)
-                        .map_err(ServeError::Model)?;
+                        .map_err(ServeError::Model)?
+                        .as_type::<f32>();
                     pooled.try_eval().map_err(|e| {
                         ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
                     })?;

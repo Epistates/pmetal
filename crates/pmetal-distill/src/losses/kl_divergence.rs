@@ -151,8 +151,12 @@ impl KlDivergenceLoss {
         let total_elements = num_tokens * vocab_size;
 
         // Flatten to [num_tokens, vocab] for Metal kernel
-        let teacher_flat = teacher_logits.reshape(&[-1, vocab_size as i32]);
-        let student_flat = student_logits.reshape(&[-1, vocab_size as i32]);
+        let teacher_flat = teacher_logits
+            .as_type::<f32>()
+            .reshape(&[-1, vocab_size as i32]);
+        let student_flat = student_logits
+            .as_type::<f32>()
+            .reshape(&[-1, vocab_size as i32]);
 
         // Evaluate the arrays to ensure data is computed and available
         teacher_flat.eval();
