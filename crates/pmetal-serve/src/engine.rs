@@ -1195,7 +1195,7 @@ impl InferenceEngine {
 
     /// The sampling a request gets for every parameter it leaves out: the
     /// model maker's recommendation for `thinking` or non-thinking mode,
-    /// else `generation_config.json`, else the global fallback (see
+    /// else `generation_config.json` with transformers' defaults (see
     /// [`pmetal_data::inference_config::load_sampling_defaults`]).
     pub fn sampling_defaults(
         &self,

@@ -146,8 +146,10 @@ long agentic tasks. `pmetal serve` applies the same rule to a request without
 
 Any sampling parameter left unset comes from the model maker's published
 settings for the model's family and mode (thinking or not, or `--mode`), else
-the model's `generation_config.json`, else PMetal's fallback (temperature 0.7,
-top-p 0.8, top-k 20). `pmetal serve` fills a request's unset parameters the
+the model's `generation_config.json` read as transformers reads it, with
+transformers' `GenerationConfig` defaults for the fields it leaves out: greedy
+unless it sets `do_sample: true`, and temperature 1.0, top-p 1.0 and top-k 50
+when sampling. `pmetal serve` fills a request's unset parameters the
 same way. The family is read from `config.json` and the model's name.
 
 | Family | Thinking | Non-thinking | Output budget |

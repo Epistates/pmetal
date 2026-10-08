@@ -148,8 +148,8 @@ inside the context window and `--max-seq-len`.
 
 Sampling parameters a request leaves out (temperature, top-p, top-k, min-p,
 the penalties) take the model maker's settings for the model's family and for
-whether it is thinking, else its `generation_config.json`, else PMetal's
-fallback, as in [`pmetal infer`](/cli/infer/#sampling-defaults). Pass
+whether it is thinking, else its `generation_config.json` with transformers'
+defaults for what it leaves out (greedy unless `do_sample` is true), as in [`pmetal infer`](/cli/infer/#sampling-defaults). Pass
 `"temperature": 0` for plain greedy decoding (no default penalties then).
 
 ### Thinking controls

@@ -249,8 +249,12 @@ fn run_audit_on(dir: &Path) -> ModelReport {
                 true
             }
         };
+        // transformers samples only with `do_sample: true`; otherwise the
+        // file's temperature is ignored and generation is greedy.
+        let samples = obj.get("do_sample").and_then(|v| v.as_bool()) == Some(true);
         if let Some(v) = obj.get("temperature").and_then(|v| v.as_f64()) {
-            if !check_f32(v as f32, loaded.temperature, "temperature", &mut report) {
+            let want = if samples { v as f32 } else { 0.0 };
+            if !check_f32(want, loaded.temperature, "temperature", &mut report) {
                 sampling_ok = false;
             }
         }

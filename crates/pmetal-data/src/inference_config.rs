@@ -14,8 +14,11 @@
 //! 2. **Model-card preset** — the maker's settings for the model's family
 //!    ([`ModelFamily`]) and the mode (`--mode`, or thinking / instruct by
 //!    whether the model thinks)
-//! 3. **`generation_config.json`** — model's declared defaults
-//! 4. **Global fallback** — `SamplingDefaults::default()` (temp=0.7, top_p=0.8)
+//! 3. **`generation_config.json`** — model's declared defaults, greedy
+//!    unless it sets `do_sample: true`, as transformers reads it
+//! 4. **transformers' defaults** for a field it leaves out —
+//!    `SamplingDefaults::default()` (temperature 1.0 when sampling, top_k 50,
+//!    top_p 1.0)
 
 use std::path::Path;
 
@@ -113,8 +116,15 @@ pub fn collect_all_stop_tokens(
     tokens
 }
 
+/// transformers' `GenerationConfig` default `top_k`.
+const TRANSFORMERS_TOP_K: usize = 50;
+
+/// transformers' `GenerationConfig` default `temperature`, which a model that
+/// samples (`do_sample: true`) without naming one generates at.
+const TRANSFORMERS_TEMPERATURE: f32 = 1.0;
+
 /// Sampling hyperparameter defaults loaded from model config.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SamplingDefaults {
     /// Sampling temperature (0 = greedy).
     pub temperature: f32,
@@ -132,12 +142,16 @@ pub struct SamplingDefaults {
     pub presence_penalty: f32,
 }
 
+/// What transformers' `GenerationConfig` generates with when neither the
+/// model nor the caller sets a field (`_get_default_generation_params`):
+/// greedy, since `do_sample` is false, with temperature 1.0, top_k 50 and
+/// top_p 1.0 for a caller that samples, and no min_p or penalties.
 impl Default for SamplingDefaults {
     fn default() -> Self {
         Self {
-            temperature: 0.7,
-            top_k: 20,
-            top_p: 0.8,
+            temperature: 0.0,
+            top_k: TRANSFORMERS_TOP_K,
+            top_p: 1.0,
             min_p: 0.0,
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
@@ -321,7 +335,8 @@ impl std::str::FromStr for InferenceBackend {
 ///
 /// Families whose makers publish nothing (Llama, Gemma 2/3, Phi-3/4,
 /// Mistral 7B, Mixtral, Cohere, Granite, SmolLM2, Qwen2.5) are absent: their
-/// `generation_config.json` and the global fallback apply.
+/// `generation_config.json` and transformers' defaults apply
+/// ([`load_sampling_from_generation_config`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
     /// Qwen3 with switchable thinking (Qwen3-0.6B to 235B-A22B, April 2025).
@@ -569,8 +584,8 @@ pub fn available_modes(family: Option<ModelFamily>) -> &'static [SamplingMode] {
 }
 
 /// Resolve a sampling mode to the maker's settings for a model family, or
-/// `None` without a family (use `generation_config.json` and the global
-/// fallback instead). Sources, per family, are on [`ModelFamily::preset`].
+/// `None` without a family (use `generation_config.json` and transformers'
+/// defaults instead). Sources, per family, are on [`ModelFamily::preset`].
 pub fn model_preset(family: Option<ModelFamily>, mode: SamplingMode) -> Option<SamplingDefaults> {
     family?.preset(mode)
 }
@@ -587,29 +602,27 @@ pub fn resolve_auto_mode(mode: SamplingMode, thinking: bool) -> SamplingMode {
     }
 }
 
-/// Read `generation_config.json` into a [`SamplingDefaults`], starting from
-/// the global fallback and overriding each field that the file explicitly
-/// provides. Missing fields leave the global default in place. This is the
-/// raw stage-2 of the loading pipeline (step 1+2 in [`load_sampling_defaults`])
-/// and is exposed so the chat-template audit can verify that HF's declared
-/// values are actually picked up, independent of any mode preset that might
-/// override them later.
+/// Read `generation_config.json` into a [`SamplingDefaults`] the way
+/// transformers' `generate` reads it: each field the file sets, and
+/// transformers' default ([`SamplingDefaults::default`]) for each it leaves
+/// out. It samples only with `do_sample: true`, at its `temperature` (1.0
+/// when unset); otherwise it is greedy (temperature 0), whatever temperature
+/// the file names, and its top_k and top_p apply to a caller that asks for
+/// sampling. No file at all is greedy too. This is the raw stage-2 of the
+/// loading pipeline (step 1+2 in [`load_sampling_defaults`]) and is exposed
+/// so the chat-template audit can verify that HF's declared values are
+/// actually picked up, independent of any mode preset that might override
+/// them later.
 pub fn load_sampling_from_generation_config(model_path: &Path) -> SamplingDefaults {
     let mut defaults = SamplingDefaults::default();
-    let config_path = model_path.join("generation_config.json");
-    if !config_path.exists() {
+    let Some(config) = read_json(&model_path.join("generation_config.json")) else {
         return defaults;
-    }
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(c) => c,
-        Err(_) => return defaults,
     };
-    let config: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(c) => c,
-        Err(_) => return defaults,
-    };
-    if let Some(v) = config.get("temperature").and_then(|v| v.as_f64()) {
-        defaults.temperature = v as f32;
+    if config.get("do_sample").and_then(|v| v.as_bool()) == Some(true) {
+        defaults.temperature = config
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map_or(TRANSFORMERS_TEMPERATURE, |v| v as f32);
     }
     if let Some(v) = config.get("top_k").and_then(|v| v.as_u64()) {
         defaults.top_k = v as usize;
@@ -809,8 +822,9 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
 
 /// Load sampling defaults with the full resolution chain:
 ///
-/// 1. Start with global fallback (`SamplingDefaults::default()`)
-/// 2. Override with `generation_config.json` (if present)
+/// 1. Start with transformers' defaults (`SamplingDefaults::default()`: greedy)
+/// 2. Override with `generation_config.json` (if present), as transformers
+///    reads it ([`load_sampling_from_generation_config`])
 /// 3. Override with mode preset (if mode is set and model family has presets)
 ///
 /// CLI/GUI explicit overrides happen in the caller (inference_runner.rs), not here.
@@ -970,6 +984,68 @@ mod tests {
         assert!(Qwen3_8.preset(Auto).is_none());
         assert_eq!(Qwen3Instruct2507.recommended_max_tokens(), Some(16_384));
         assert_eq!(GptOss.recommended_max_tokens(), None);
+    }
+
+    #[test]
+    fn generation_config_is_read_as_transformers_reads_it() {
+        let load = |files: &[(&str, &str)]| {
+            let dir = model_dir(files);
+            load_sampling_defaults(dir.path(), SamplingMode::Auto, false)
+        };
+        let greedy = SamplingDefaults {
+            temperature: 0.0,
+            top_k: 50,
+            top_p: 1.0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+        };
+        // No generation_config.json, or one without do_sample: greedy.
+        assert_eq!(load(&[]), greedy);
+        assert_eq!(
+            load(&[("generation_config.json", r#"{"eos_token_id": 2}"#)]),
+            greedy
+        );
+        // A temperature without do_sample is ignored, as transformers does.
+        assert_eq!(
+            load(&[(
+                "generation_config.json",
+                r#"{"temperature": 0.6, "top_p": 0.9}"#
+            )]),
+            SamplingDefaults {
+                top_p: 0.9,
+                ..greedy.clone()
+            }
+        );
+        // do_sample: every field it sets, transformers' default for the rest.
+        assert_eq!(
+            load(&[(
+                "generation_config.json",
+                r#"{"do_sample": true, "temperature": 0.6, "top_p": 0.9,
+                    "repetition_penalty": 1.05}"#
+            )]),
+            SamplingDefaults {
+                temperature: 0.6,
+                top_p: 0.9,
+                repetition_penalty: 1.05,
+                ..greedy.clone()
+            }
+        );
+        assert_eq!(
+            load(&[("generation_config.json", r#"{"do_sample": true}"#)]),
+            SamplingDefaults {
+                temperature: 1.0,
+                ..greedy.clone()
+            }
+        );
+        // A family with a card keeps its preset over the file.
+        let dir = model_dir(&[
+            ("config.json", r#"{"model_type": "gemma4_text"}"#),
+            ("generation_config.json", r#"{"do_sample": false}"#),
+        ]);
+        let gemma = load_sampling_defaults(dir.path(), SamplingMode::Auto, true);
+        assert_eq!((gemma.temperature, gemma.top_k), (1.0, 64));
     }
 
     #[test]

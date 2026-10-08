@@ -486,7 +486,7 @@ impl InferenceRunner {
             }
         };
 
-        // 6b. Load sampling defaults: global fallback → generation_config.json → mode preset
+        // 6b. Load sampling defaults: transformers' defaults → generation_config.json → mode preset
         let defaults =
             pmetal_data::inference_config::load_sampling_defaults(model_path, config.mode, thinks);
         let temperature = config.temperature.unwrap_or(defaults.temperature);
