@@ -662,6 +662,66 @@ impl MllamaImageProcessor {
     pub fn preprocess_one(&self, img: &DynamicImage) -> Result<MllamaImageBatch, Exception> {
         self.preprocess(std::slice::from_ref(&vec![img.clone()]))
     }
+
+    /// How many tiles an image of this size becomes, without preprocessing it.
+    pub fn num_tiles(&self, height: u32, width: u32) -> Result<usize, Exception> {
+        let (tiles_h, tiles_w) = self.optimal_tiling(height, width)?;
+        Ok(tiles_h * tiles_w)
+    }
+}
+
+/// Which tiles of which image each prompt token may attend to: the reference
+/// processor's `get_cross_attention_token_mask` followed by
+/// `convert_sparse_cross_attention_mask_to_dense`, for one prompt.
+///
+/// Returns a row-major `[input_ids.len(), num_tiles.len(), max_tiles]` 0/1
+/// mask. An image's span runs from its `<|image|>` token to the next image's
+/// token, the last image's to the end of the prompt; a run of consecutive
+/// image tokens all take the span after the run. Tokens before the first
+/// image see nothing. `num_tiles` holds each image's real tile count, in
+/// prompt order, and must have one entry per image token.
+pub fn mllama_cross_attention_mask(
+    input_ids: &[u32],
+    image_token_id: u32,
+    num_tiles: &[usize],
+    max_tiles: usize,
+) -> Result<Vec<f32>, Exception> {
+    let locations: Vec<usize> = input_ids
+        .iter()
+        .enumerate()
+        .filter(|&(_, &id)| id == image_token_id)
+        .map(|(i, _)| i)
+        .collect();
+    if locations.len() != num_tiles.len() {
+        return Err(Exception::custom(format!(
+            "the prompt has {} image tokens for {} images",
+            locations.len(),
+            num_tiles.len()
+        )));
+    }
+    let len = input_ids.len();
+    let mut spans: Vec<(usize, usize)> = locations
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| (start, locations.get(i + 1).copied().unwrap_or(len)))
+        .collect();
+    // Consecutive image tokens share the span that follows the run.
+    let mut last_end = len;
+    for span in spans.iter_mut().rev() {
+        if span.0 + 1 == span.1 {
+            span.1 = last_end;
+        }
+        last_end = span.1;
+    }
+    let images = num_tiles.len();
+    let mut mask = vec![0f32; len * images * max_tiles];
+    for (image, (&(start, end), &tiles)) in spans.iter().zip(num_tiles).enumerate() {
+        for token in start..end {
+            let row = (token * images + image) * max_tiles;
+            mask[row..row + tiles.min(max_tiles)].fill(1.0);
+        }
+    }
+    Ok(mask)
 }
 
 /// Soft-token budgets Gemma 4 was trained with. Anything else is rejected, as
@@ -977,6 +1037,58 @@ impl Gemma4ImageProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The masks transformers 5.19's `get_cross_attention_token_mask` +
+    /// `convert_sparse_cross_attention_mask_to_dense` give for one image, two
+    /// images with text between them, and two consecutive images.
+    #[test]
+    fn mllama_cross_attention_mask_matches_the_reference() {
+        const I: u32 = 9;
+        let rows = |mask: Vec<f32>, images: usize| -> Vec<Vec<Vec<u8>>> {
+            mask.chunks(images * 4)
+                .map(|row| {
+                    row.chunks(4)
+                        .map(|t| t.iter().map(|&v| v as u8).collect())
+                        .collect()
+                })
+                .collect()
+        };
+        let one = mllama_cross_attention_mask(&[1, I, 2, 3], I, &[2], 4).unwrap();
+        assert_eq!(
+            rows(one, 1),
+            [
+                vec![vec![0, 0, 0, 0]],
+                vec![vec![1, 1, 0, 0]],
+                vec![vec![1, 1, 0, 0]],
+                vec![vec![1, 1, 0, 0]],
+            ]
+        );
+        let two = mllama_cross_attention_mask(&[I, 5, I, 6, 7], I, &[1, 3], 4).unwrap();
+        let (a, b) = (vec![1, 0, 0, 0], vec![1, 1, 1, 0]);
+        let z = vec![0, 0, 0, 0];
+        assert_eq!(
+            rows(two, 2),
+            [
+                vec![a.clone(), z.clone()],
+                vec![a, z.clone()],
+                vec![z.clone(), b.clone()],
+                vec![z.clone(), b.clone()],
+                vec![z, b],
+            ]
+        );
+        let run = mllama_cross_attention_mask(&[5, I, I, 6], I, &[4, 2], 4).unwrap();
+        let (all, half, z) = (vec![1, 1, 1, 1], vec![1, 1, 0, 0], vec![0, 0, 0, 0]);
+        assert_eq!(
+            rows(run, 2),
+            [
+                vec![z.clone(), z.clone()],
+                vec![all.clone(), z],
+                vec![all.clone(), half.clone()],
+                vec![all, half],
+            ]
+        );
+        assert!(mllama_cross_attention_mask(&[I, I], I, &[1], 4).is_err());
+    }
 
     #[test]
     fn test_processor_creation() {
