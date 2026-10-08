@@ -26,6 +26,29 @@ const QWEN3_NEXT: &str = r#"{
     "max_position_embeddings": 256, "rms_norm_eps": 1e-6, "rope_theta": 10000.0
 }"#;
 
+/// Granite 4.0-H's layout: Mamba-2 and NoPE attention, routed experts plus a
+/// shared MLP. Its recurrent state lives entirely in the caller's
+/// `MambaCache`, so this holds the serving contract from the other side: no
+/// state of the model's own for a second sequence to inherit.
+const GRANITE_HYBRID: &str = r#"{
+    "model_type": "granitemoehybrid",
+    "vocab_size": 64, "hidden_size": 32, "intermediate_size": 16,
+    "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2,
+    "layer_types": ["mamba", "attention", "mamba", "mamba"],
+    "position_embedding_type": "nope",
+    "num_local_experts": 4, "num_experts_per_tok": 2, "shared_intermediate_size": 24,
+    "mamba_n_heads": 8, "mamba_d_state": 8, "mamba_chunk_size": 4,
+    "embedding_multiplier": 12.0, "residual_multiplier": 0.22,
+    "logits_scaling": 6.0, "attention_multiplier": 0.125,
+    "tie_word_embeddings": true,
+    "max_position_embeddings": 256, "rms_norm_eps": 1e-5
+}"#;
+
+const HYBRIDS: &[(&str, &str)] = &[
+    ("qwen3_next", QWEN3_NEXT),
+    ("granitemoehybrid", GRANITE_HYBRID),
+];
+
 const STEPS: usize = 4;
 
 struct Sequence {
@@ -87,38 +110,45 @@ impl Sequence {
 /// A sequence decoded after another one on the same model.
 #[test]
 fn second_sequence_decodes_against_its_own_state() {
-    let mut model = DynamicModel::from_config(QWEN3_NEXT).expect("qwen3_next builds");
+    for (name, config) in HYBRIDS {
+        let mut model = DynamicModel::from_config(config).expect("hybrid builds");
 
-    let mut first = Sequence::start(&mut model, &[3, 11, 7, 2, 9]);
-    for _ in 0..STEPS {
-        first.step(&mut model);
-    }
-    first.assert_matches_recompute(&mut model, "first sequence");
-    drop(first);
+        let mut first = Sequence::start(&mut model, &[3, 11, 7, 2, 9]);
+        for _ in 0..STEPS {
+            first.step(&mut model);
+        }
+        first.assert_matches_recompute(&mut model, &format!("{name}: first sequence"));
+        drop(first);
 
-    let mut second = Sequence::start(&mut model, &[40, 5, 17]);
-    for step in 0..STEPS {
-        second.step(&mut model);
-        second.assert_matches_recompute(&mut model, &format!("second sequence, step {step}"));
+        let mut second = Sequence::start(&mut model, &[40, 5, 17]);
+        for step in 0..STEPS {
+            second.step(&mut model);
+            second.assert_matches_recompute(
+                &mut model,
+                &format!("{name}: second sequence, step {step}"),
+            );
+        }
+        pmetal_bridge::check_last_error().expect("no bridge op failed");
     }
-    pmetal_bridge::check_last_error().expect("no bridge op failed");
 }
 
 /// Two sequences decoded in alternation on one model, as continuous batching
 /// does with its slots: each step has to see only its own sequence.
 #[test]
 fn interleaved_sequences_keep_their_own_state() {
-    let mut model = DynamicModel::from_config(QWEN3_NEXT).expect("qwen3_next builds");
+    for (name, config) in HYBRIDS {
+        let mut model = DynamicModel::from_config(config).expect("hybrid builds");
 
-    let mut a = Sequence::start(&mut model, &[3, 11, 7, 2, 9]);
-    let mut b = Sequence::start(&mut model, &[40, 5, 17]);
-    for step in 0..STEPS {
-        a.step(&mut model);
-        b.step(&mut model);
-        a.assert_matches_recompute(&mut model, &format!("sequence a, step {step}"));
-        b.assert_matches_recompute(&mut model, &format!("sequence b, step {step}"));
+        let mut a = Sequence::start(&mut model, &[3, 11, 7, 2, 9]);
+        let mut b = Sequence::start(&mut model, &[40, 5, 17]);
+        for step in 0..STEPS {
+            a.step(&mut model);
+            b.step(&mut model);
+            a.assert_matches_recompute(&mut model, &format!("{name}: sequence a, step {step}"));
+            b.assert_matches_recompute(&mut model, &format!("{name}: sequence b, step {step}"));
+        }
+        pmetal_bridge::check_last_error().expect("no bridge op failed");
     }
-    pmetal_bridge::check_last_error().expect("no bridge op failed");
 }
 
 fn ids(tokens: &[i32]) -> Array {

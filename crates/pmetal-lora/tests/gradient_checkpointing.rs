@@ -98,6 +98,26 @@ const CASES: &[(&str, &str)] = &[
         }"#,
     ),
     (
+        // Mamba-2 layers and routed experts: gradients have to reach the
+        // adapters through the scan and the expert gather.
+        "granitemoehybrid",
+        r#"{
+            "model_type": "granitemoehybrid",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 32,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-5,
+            "layer_types": ["mamba", "attention", "mamba", "mamba"],
+            "position_embedding_type": "nope",
+            "num_local_experts": 4, "num_experts_per_tok": 2,
+            "shared_intermediate_size": 48,
+            "mamba_n_heads": 8, "mamba_d_state": 16, "mamba_chunk_size": 4,
+            "attention_multiplier": 0.125, "embedding_multiplier": 12.0,
+            "residual_multiplier": 0.22, "logits_scaling": 6.0,
+            "tie_word_embeddings": false
+        }"#,
+    ),
+    (
         "gemma",
         r#"{
             "model_type": "gemma",

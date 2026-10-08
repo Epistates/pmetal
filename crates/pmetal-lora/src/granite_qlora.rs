@@ -5,11 +5,13 @@
 //! LoRA adapters (A, B matrices) remain in full precision for training.
 //!
 //! Granite-specific notes:
-//! - Hybrid models (Granite 4.0-H) have alternating Attention and Mamba2 layers.
-//!   Mamba2 layers are frozen passthrough — no LoRA is applied to them.
-//! - Dense-attention models (Granite 4.0) use the same LoRA targets as Llama.
+//! - Plain `granite` only. The MoE and hybrid families (`granitemoe`,
+//!   `granitemoeshared`, `granitemoehybrid`) are refused at construction:
+//!   their experts, shared MLP and Mamba-2 layers have no QLoRA counterpart
+//!   here, and a model missing them is a different model.
+//! - Same LoRA targets as Llama, and the same four Granite multipliers as the
+//!   base model.
 //! - No per-head Q/K normalization (unlike Qwen3).
-//! - RoPE is currently a no-op stub matching the base model implementation.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -21,7 +23,7 @@ use pmetal_bridge::compat::{
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kv_cache::KVCache;
-use pmetal_models::architectures::granite::{GraniteConfig, GraniteLayerType, GraniteMamba2};
+use pmetal_models::architectures::granite::{GraniteConfig, GraniteFamily};
 use pmetal_models::architectures::utils::create_causal_mask;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear};
@@ -42,7 +44,7 @@ pub struct GraniteQLoraAttention {
     pub n_kv_heads: i32,
     /// Head dimension.
     pub head_dim: i32,
-    /// Attention scale factor (1 / sqrt(head_dim)).
+    /// Attention scale factor: `config.attention_scale()`.
     pub scale: f32,
 
     /// Query projection with QLoRA.
@@ -105,8 +107,6 @@ impl GraniteQLoraAttention {
         let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
         let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-
-        // RoPE is a stub in the base model; omit here for parity.
 
         // Transpose: [B, heads, L, head_dim]
         let q = q.transpose_axes(&[0, 2, 1, 3]);
@@ -241,25 +241,19 @@ impl GraniteQloraMLP {
 }
 
 // =============================================================================
-// Decoder layer — attention or frozen Mamba2 passthrough
+// Decoder layer
 // =============================================================================
 
-/// QLoRA-enabled Granite decoder layer.
-///
-/// Attention layers get QLoRA on q/k/v/o and gate/up/down.
-/// Mamba2 layers are kept fully frozen — no LoRA is applied.
+/// QLoRA-enabled Granite decoder layer: QLoRA on q/k/v/o and gate/up/down.
 #[derive(Debug)]
 pub struct GraniteQloraDecoderLayer {
-    /// Layer type tag (Attention or Mamba2).
-    pub layer_type: GraniteLayerType,
     /// `config.residual_multiplier`, applied to both residual branches, so a
     /// QLoRA adapter is fit against the same math inference runs.
     pub residual_multiplier: f32,
 
-    /// QLoRA attention (present for Attention layers, None for Mamba2).
+    /// QLoRA attention. Always present; an `Option` so the parameter walks
+    /// below read the same way as the other QLoRA architectures'.
     pub attention: Option<GraniteQLoraAttention>,
-    /// Frozen Mamba2 layer (present for Mamba2 layers, None for Attention).
-    pub mamba: Option<GraniteMamba2>,
     /// MLP with QLoRA.
     pub mlp: GraniteQloraMLP,
     /// Input layer norm (frozen).
@@ -275,18 +269,8 @@ impl GraniteQloraDecoderLayer {
         qlora_config: &QLoraConfig,
         layer_idx: usize,
     ) -> Result<Self, LoraError> {
-        let layer_type = config.layer_type(layer_idx);
-
-        let (attention, mamba) = match layer_type {
-            GraniteLayerType::Attention => (
-                Some(GraniteQLoraAttention::new(config, qlora_config)?),
-                None,
-            ),
-            GraniteLayerType::Mamba2 => (
-                None,
-                Some(GraniteMamba2::new(config).map_err(LoraError::Mlx)?),
-            ),
-        };
+        let _ = layer_idx;
+        let attention = Some(GraniteQLoraAttention::new(config, qlora_config)?);
 
         let mlp = GraniteQloraMLP::new(config, qlora_config)?;
 
@@ -300,10 +284,8 @@ impl GraniteQloraDecoderLayer {
             .map_err(LoraError::Mlx)?;
 
         Ok(Self {
-            layer_type,
             residual_multiplier: config.residual_multiplier,
             attention,
-            mamba,
             mlp,
             input_layernorm,
             post_attention_layernorm,
@@ -316,18 +298,12 @@ impl GraniteQloraDecoderLayer {
         let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)
             .map_err(LoraError::Mlx)?;
 
-        // Mixer: QLoRA attention or frozen Mamba2
-        let mixer_out = match self.layer_type {
-            GraniteLayerType::Attention => {
-                self.attention.as_mut().unwrap().forward(&normed, mask)?
-            }
-            GraniteLayerType::Mamba2 => {
-                // Frozen passthrough — Mamba2 is not differentiably adapted.
-                self.mamba
-                    .as_mut()
-                    .unwrap()
-                    .forward(&normed)
-                    .map_err(LoraError::Mlx)?
+        let mixer_out = match self.attention.as_mut() {
+            Some(attention) => attention.forward(&normed, mask)?,
+            None => {
+                return Err(LoraError::InvalidState(
+                    "Granite QLoRA layer without attention".into(),
+                ));
             }
         };
 
@@ -389,6 +365,15 @@ pub struct GraniteQloraModel {
 impl GraniteQloraModel {
     /// Create a new QLoRA Granite model with random weights.
     pub fn new(config: GraniteConfig, qlora_config: QLoraConfig) -> Result<Self, LoraError> {
+        config.validate().map_err(LoraError::Mlx)?;
+        let family = config.family().map_err(LoraError::Mlx)?;
+        if family != GraniteFamily::Dense {
+            return Err(LoraError::InvalidState(format!(
+                "Granite QLoRA covers plain `granite` only; `{}` has experts, a shared MLP or \
+                 Mamba-2 layers this model does not build. Train it with LoRA instead.",
+                config.model_type
+            )));
+        }
         let embed_tokens =
             nn::Embedding::new(config.vocab_size, config.hidden_size).map_err(LoraError::Mlx)?;
 
@@ -479,8 +464,7 @@ impl GraniteQloraModel {
 /// Memory-efficient fine-tuning with 4-bit quantized base weights.
 /// Typical memory usage for a 1B model: ~0.8 GB (vs ~6 GB for full precision).
 ///
-/// Hybrid (Mamba2 + Attention) variants are supported: Mamba2 layers are
-/// frozen passthrough while attention layers receive LoRA adapters.
+/// Plain `granite` only; see the module docs.
 #[derive(Debug)]
 pub struct GraniteQloraForCausalLM {
     /// Trunk model.
@@ -1285,23 +1269,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             tie_word_embeddings: true,
-            is_hybrid: false,
-            layer_types: None,
-            mamba_state_dim: 32,
-            mamba_conv_dim: 4,
-            is_moe: false,
-            num_experts: 8,
-            num_experts_per_tok: 2,
-            use_shared_expert: true,
             ..Default::default()
-        }
-    }
-
-    fn small_hybrid_config() -> GraniteConfig {
-        GraniteConfig {
-            is_hybrid: true,
-            layer_types: Some(vec![GraniteLayerType::Attention, GraniteLayerType::Mamba2]),
-            ..small_config()
         }
     }
 
@@ -1344,14 +1312,22 @@ mod tests {
     }
 
     #[test]
-    fn test_granite_qlora_hybrid_forward() {
-        let config = small_hybrid_config();
-        let qlora_config = small_qlora_config();
-        let mut model = GraniteQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
-
-        let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
-        let logits = model.forward(&input_ids, None).unwrap();
-        assert_eq!(logits.shape(), &[1, 4, 256]);
+    fn test_granite_qlora_refuses_the_moe_and_hybrid_families() {
+        // These used to build, with a stateless stand-in for every Mamba layer
+        // and the experts dropped; an adapter trained on that is fit to a
+        // model nobody serves.
+        for model_type in ["granitemoe", "granitemoeshared", "granitemoehybrid"] {
+            let config = GraniteConfig {
+                model_type: model_type.into(),
+                layer_types: Some(vec!["attention".into(); 2]),
+                num_local_experts: Some(4),
+                shared_intermediate_size: Some(32),
+                ..small_config()
+            };
+            let err = GraniteQloraForCausalLM::with_qlora_config(config, small_qlora_config())
+                .expect_err(model_type);
+            assert!(err.to_string().contains(model_type), "{err}");
+        }
     }
 
     #[test]
@@ -1363,32 +1339,6 @@ mod tests {
         assert!(model.num_trainable_params() > 0);
         let params = model.lora_parameters();
         assert!(!params.is_empty());
-    }
-
-    #[test]
-    fn test_granite_qlora_hybrid_mamba_layers_have_no_lora() {
-        // For a 4-layer hybrid (attn, mamba, attn, mamba) only attention layers
-        // should appear in the LoRA parameter map.
-        let config = GraniteConfig {
-            num_hidden_layers: 4,
-            is_hybrid: true,
-            layer_types: Some(vec![
-                GraniteLayerType::Attention,
-                GraniteLayerType::Mamba2,
-                GraniteLayerType::Attention,
-                GraniteLayerType::Mamba2,
-            ]),
-            ..small_config()
-        };
-        let qlora_config = small_qlora_config();
-        let model = GraniteQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
-
-        let params = model.lora_parameters();
-        // Parameters should only be keyed under layers.0 and layers.2, not layers.1 or layers.3.
-        assert!(params.keys().any(|k| k.starts_with("layers.0.")));
-        assert!(params.keys().any(|k| k.starts_with("layers.2.")));
-        assert!(!params.keys().any(|k| k.starts_with("layers.1.")));
-        assert!(!params.keys().any(|k| k.starts_with("layers.3.")));
     }
 
     #[test]

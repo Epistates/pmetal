@@ -26,7 +26,7 @@ These architectures are wired into the `ModelArchitecture` dispatcher and can be
 | `Phi` | Phi | 3, 3.5 |
 | `Phi4` | Phi | 4 |
 | `Cohere` | Cohere | Command R |
-| `Granite` | Granite | 3.0, 3.1, Hybrid MoE |
+| `Granite` | Granite | 3.x dense and MoE, 4.0 / 4.0-H (Mamba-2 hybrid, dense and MoE), 4.1, 4.2 |
 | `NemotronH` | NemotronH | Hybrid (Mamba+Attention) |
 | `StarCoder2` | StarCoder2 | 3B, 7B, 15B |
 | `RecurrentGemma` | RecurrentGemma | Griffin |

@@ -225,6 +225,36 @@ fn cases() -> Vec<ArchCase> {
             }"#,
             known_divergence: None,
         },
+        // Granite 4.0-H: Mamba-2 and NoPE attention, routed experts plus a
+        // shared MLP.
+        ArchCase {
+            name: "granitemoehybrid",
+            config_json: r#"{
+                "model_type": "granitemoehybrid",
+                "vocab_size": 256,
+                "hidden_size": 64,
+                "intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "max_position_embeddings": 512,
+                "rms_norm_eps": 1e-5,
+                "layer_types": ["mamba", "attention", "mamba", "mamba"],
+                "position_embedding_type": "nope",
+                "num_local_experts": 4,
+                "num_experts_per_tok": 2,
+                "shared_intermediate_size": 48,
+                "mamba_n_heads": 8,
+                "mamba_d_state": 16,
+                "mamba_chunk_size": 8,
+                "attention_multiplier": 0.125,
+                "embedding_multiplier": 12.0,
+                "residual_multiplier": 0.22,
+                "logits_scaling": 6.0,
+                "tie_word_embeddings": true
+            }"#,
+            known_divergence: None,
+        },
         ArchCase {
             name: "qwen3_moe",
             config_json: r#"{

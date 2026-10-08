@@ -2163,6 +2163,22 @@ mod tests {
         "max_position_embeddings": 256, "rms_norm_eps": 1e-6, "rope_theta": 10000.0
     }"#;
 
+    /// Tiny Granite 4.0-H (Mamba-2 + NoPE attention, routed experts plus a
+    /// shared MLP): all of its recurrent state is in the caller's cache.
+    const TINY_GRANITE_HYBRID: &str = r#"{
+        "model_type": "granitemoehybrid",
+        "vocab_size": 64, "hidden_size": 32, "intermediate_size": 16,
+        "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2,
+        "layer_types": ["mamba", "attention", "mamba", "mamba"],
+        "position_embedding_type": "nope",
+        "num_local_experts": 4, "num_experts_per_tok": 2, "shared_intermediate_size": 24,
+        "mamba_n_heads": 8, "mamba_d_state": 8, "mamba_chunk_size": 4,
+        "embedding_multiplier": 12.0, "residual_multiplier": 0.22,
+        "logits_scaling": 6.0, "attention_multiplier": 0.125,
+        "tie_word_embeddings": true,
+        "max_position_embeddings": 256, "rms_norm_eps": 1e-5
+    }"#;
+
     /// Continuous batching on a hybrid model gives each request exactly what
     /// it gets alone. Every slot carries its own recurrent state, so four
     /// requests through two slots, decoded in alternation and then reusing
@@ -2172,7 +2188,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn continuous_batching_on_hybrid_models_matches_single_requests() {
         type Load = fn() -> anyhow::Result<DynamicModel>;
-        let models: [(&str, Load); 2] = [
+        let models: [(&str, Load); 3] = [
             ("qwen3_next", || {
                 Ok(DynamicModel::from_config(TINY_QWEN3_NEXT)?)
             }),
@@ -2180,6 +2196,9 @@ mod tests {
                 Ok(DynamicModel::NemotronH(NemotronHForCausalLM::new(
                     tiny_nemotron_h_config(),
                 )?))
+            }),
+            ("granitemoehybrid", || {
+                Ok(DynamicModel::from_config(TINY_GRANITE_HYBRID)?)
             }),
         ];
         let prompts: [&[u32]; 4] = [&[1, 2, 3, 1], &[2, 3], &[3, 1, 2, 2, 1], &[1, 1, 1]];

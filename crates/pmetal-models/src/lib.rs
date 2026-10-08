@@ -11,7 +11,7 @@
 //! - Gemma (2, 3, 4)
 //! - Phi (3, 4)
 //! - Cohere (Command R)
-//! - Granite (3.0, 3.1)
+//! - Granite (3.x dense and MoE, 4.0 and 4.0-H Mamba+Attention hybrids, 4.1, 4.2)
 //! - NemotronH (Mamba+Attention hybrid)
 //! - GPT-OSS
 //!

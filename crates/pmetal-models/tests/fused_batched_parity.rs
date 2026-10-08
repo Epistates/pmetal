@@ -997,14 +997,6 @@ fn tiny_granite_config() -> GraniteConfig {
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
         tie_word_embeddings: true,
-        is_hybrid: false,
-        layer_types: None,
-        mamba_state_dim: 128,
-        mamba_conv_dim: 4,
-        is_moe: false,
-        num_experts: 8,
-        num_experts_per_tok: 2,
-        use_shared_expert: true,
         // Neutral multipliers: this fixture compares the fused and serial
         // paths against each other, and `forward_batched_impl` cannot express
         // a scaled residual. A real Granite config sets `residual_multiplier`,

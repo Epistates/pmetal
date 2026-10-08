@@ -271,7 +271,11 @@ impl ModelArchitecture {
             "phi3" => Some(Self::Phi),
             "deepseek" | "deepseek2" | "deepseek_v2" | "deepseek_v3" => Some(Self::DeepSeek),
             "cohere" | "cohere2" | "command_r" | "command-r" => Some(Self::Cohere),
-            "granite" | "granitehybrid" | "granite_moe" => Some(Self::Granite),
+            // The four families `GraniteForCausalLM` computes. Every other
+            // `granite*` model_type is refused by name; see `granite_refusal`.
+            "granite" | "granitemoe" | "granitemoeshared" | "granitemoehybrid" => {
+                Some(Self::Granite)
+            }
             "nemotron_h" | "nemotronh" | "nemotron-h" => Some(Self::NemotronH),
             "flux" | "flux-1" | "flux.1" => Some(Self::Flux),
             // Only real BERT. `roberta`, `xlm-roberta` and `distilbert` used to
@@ -363,7 +367,16 @@ impl ModelArchitecture {
             {
                 return Some(Self::Cohere);
             }
-            if lower.contains("granite") {
+            // Exact class names only. A substring match sent every
+            // `Granite*` class here, including the sliding-window, speech and
+            // vision variants this does not compute.
+            if matches!(
+                lower.as_str(),
+                "graniteforcausallm"
+                    | "granitemoeforcausallm"
+                    | "granitemoesharedforcausallm"
+                    | "granitemoehybridforcausallm"
+            ) {
                 return Some(Self::Granite);
             }
             if lower.contains("gptoss") || lower.contains("gpt_oss") || lower.contains("gpt-oss") {
@@ -427,7 +440,8 @@ impl ModelArchitecture {
             Self::Phi | Self::Phi4 => round_trip!(PhiConfig, config_content),
             Self::DeepSeek => round_trip!(DeepSeekConfig, config_content),
             Self::Cohere => round_trip!(CohereConfig, config_content),
-            Self::Granite => round_trip!(GraniteConfig, config_content),
+            Self::Granite => serde_json::to_value(GraniteConfig::from_config_json(config_content)?)
+                .map_err(|e| Exception::custom(e.to_string())),
             Self::NemotronH => round_trip!(NemotronHConfig, config_content),
             Self::Qwen3Next => {
                 serde_json::to_value(Qwen3NextConfig::from_config_json(config_content)?)
@@ -475,7 +489,12 @@ impl ModelArchitecture {
                     .as_ref()
                     .and_then(|a| Self::from_architectures(a))
             })
-            .ok_or_else(|| Exception::custom(format!("Unsupported model type: {}", model_type)))
+            .ok_or_else(|| {
+                Exception::custom(
+                    granite_refusal(model_type)
+                        .unwrap_or_else(|| format!("Unsupported model type: {}", model_type)),
+                )
+            })
     }
 }
 
@@ -574,7 +593,12 @@ fn resolve_architecture(config_content: &str) -> Result<ModelArchitecture, Excep
                 .as_ref()
                 .and_then(|a| ModelArchitecture::from_architectures(a))
         })
-        .ok_or_else(|| Exception::custom(format!("Unsupported architecture: {}", model_type)))
+        .ok_or_else(|| {
+            Exception::custom(
+                granite_refusal(model_type)
+                    .unwrap_or_else(|| format!("Unsupported architecture: {}", model_type)),
+            )
+        })
 }
 
 /// Parse a Gemma config, deriving the generation flags from `model_type`.
@@ -776,14 +800,9 @@ impl DynamicModel {
             ModelArchitecture::Cohere => {
                 simple_new!(CohereConfig, CohereForCausalLM::new, config_content, Cohere)
             }
-            ModelArchitecture::Granite => {
-                simple_new!(
-                    GraniteConfig,
-                    GraniteForCausalLM::new,
-                    config_content,
-                    Granite
-                )
-            }
+            ModelArchitecture::Granite => Ok(Self::Granite(GraniteForCausalLM::new(
+                GraniteConfig::from_config_json(config_content)?,
+            )?)),
             ModelArchitecture::NemotronH => {
                 simple_new!(
                     NemotronHConfig,
@@ -993,13 +1012,21 @@ impl DynamicModel {
                 model_dir,
                 Cohere
             ),
-            ModelArchitecture::Granite => simple_load!(
-                GraniteConfig,
-                GraniteForCausalLM::new,
-                &config_content,
-                model_dir,
-                Granite
-            ),
+            // All of the checkpoint or none of it: see `load_granite_weights`.
+            ModelArchitecture::Granite => {
+                let mut model =
+                    GraniteForCausalLM::new(GraniteConfig::from_config_json(&config_content)?)?;
+                let report = crate::architectures::granite_hybrid::load_granite_weights(
+                    &mut model, model_dir,
+                )?;
+                tracing::debug!(
+                    "Granite weight load: {} loaded, {} ignored by design",
+                    report.loaded,
+                    report.ignored.len()
+                );
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Granite(model))
+            }
             // NemotronH uses a bespoke weight loader (load_nemotron_weights) so we
             // can't route through simple_load_moe!, but the init_post_load_fast_paths
             // step still applies after weights are materialised.
@@ -1423,6 +1450,12 @@ impl DynamicModel {
     ///
     /// [`forward_with_positions`]: Self::forward_with_positions
     pub fn supports_packed_positions(&self) -> bool {
+        // A Granite hybrid's attention layers carry no positions (NoPE), and
+        // its Mamba layers take their order from the recurrence, which no
+        // position can restart.
+        if let Self::Granite(m) = self {
+            return m.config.uses_rope() && !m.config.has_mamba_layers();
+        }
         matches!(
             self,
             Self::Llama(_)
@@ -1438,7 +1471,6 @@ impl DynamicModel {
                 | Self::Phi4(_)
                 | Self::DeepSeek(_)
                 | Self::Cohere(_)
-                | Self::Granite(_)
                 | Self::GptOss(_)
                 | Self::Mllama(_)
         )
@@ -1859,6 +1891,9 @@ impl DynamicModel {
             Self::Qwen3Next(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
             // GDN state plus the indexer and PLE states; see `Qwen4ExpCacheLayout`.
             Self::Qwen4Exp(m) => Some(m.create_mamba_cache()),
+            // Only a Granite with Mamba layers; plain and MoE Granite are
+            // attention-only.
+            Self::Granite(m) => m.create_mamba_cache(),
             _ => None,
         }
     }
@@ -1874,6 +1909,7 @@ impl DynamicModel {
             Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             Self::Qwen3Next(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             Self::Qwen4Exp(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
+            Self::Granite(m) => m.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache(input_ids, mask, kv_cache),
         }
     }
@@ -1937,17 +1973,16 @@ impl DynamicModel {
             // Sliding-window-with-non-global-layers configs need a per-layer
             // sliding overlay; defer those to a follow-up.
             Self::Cohere(m) => !m.config.use_sliding_window,
-            // Granite: pure-attention configs route through
-            // `batched_prenorm_layer`. Hybrid (Mamba2 + Attention) configs
-            // stay on serial until the simplified Mamba2 stub is replaced
-            // with a real stateful implementation.
+            // Granite: plain `granite` configs route through
+            // `batched_prenorm_layer`. The MoE and hybrid families (experts,
+            // shared MLP, Mamba state) stay on serial.
             //
             // So do configs with a non-unit `residual_multiplier` — which is
             // every released Granite. `batched_prenorm_layer` adds both
             // residual branches unscaled and has no channel for the scale, so
             // taking the fused path would silently drop it. Lifting this means
             // threading the multiplier into that helper.
-            Self::Granite(m) => !m.config.is_hybrid && m.config.residual_multiplier == 1.0,
+            Self::Granite(m) => m.supports_fused_batched(),
             _ => false,
         }
     }

@@ -119,10 +119,12 @@ impl DynamicQloraModel {
                 Ok(Self::Mistral(model))
             }
             ModelArchitecture::Granite => {
-                let cfg: pmetal_models::architectures::granite::GraniteConfig =
-                    serde_json::from_str(&config_content).map_err(|e| {
-                        LoraError::InvalidState(format!("Failed to parse Granite config: {}", e))
-                    })?;
+                let cfg = pmetal_models::architectures::granite::GraniteConfig::from_config_json(
+                    &config_content,
+                )
+                .map_err(|e| {
+                    LoraError::InvalidState(format!("Failed to parse Granite config: {}", e))
+                })?;
                 let model = GraniteQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
                 Ok(Self::Granite(model))
             }

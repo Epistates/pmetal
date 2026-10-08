@@ -17,6 +17,7 @@ pub mod gemma4_assistant;
 pub mod gemma4_vision;
 pub mod gpt_oss;
 pub mod granite;
+pub mod granite_hybrid;
 pub mod llama;
 pub mod llama4;
 pub mod mistral;

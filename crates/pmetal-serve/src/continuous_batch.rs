@@ -60,20 +60,21 @@
 //! peri-norm + per-layer sliding + attn logit softcap), Phi/Phi4 (partial
 //! RoPE; SuRoPE and sliding-window configs deferred), Cohere (parallel
 //! decoder block; non-global sliding-window configs deferred), Granite
-//! (pure-attention configs; hybrid Mamba2 stays on serial).
+//! (plain `granite` with a unit `residual_multiplier`, which no release has).
 //!
 //! Currently on the serial fallback (no `forward_batched_impl` yet, see
 //! `dispatcher::supports_fused_batched`):
 //!
-//! - Granite hybrid (Mamba2 + Attention): the simplified Mamba2 stub does
-//!   not yet maintain state — fused decode is gated to `is_hybrid = false`.
+//! - Granite MoE and hybrid families (`granitemoe`, `granitemoeshared`,
+//!   `granitemoehybrid`): routed experts, the shared MLP and Mamba-2 state
+//!   have no fused path.
 //! - Bespoke attention: Llama4 (MoD per-token skip), DeepSeek (MLA
 //!   compressed latents).
 //!
 //! # Hybrid models
 //!
 //! Models with recurrent layers (Qwen 3.5 / 3.6 / 3.8 and Qwen4Exp
-//! gated-delta-net, NemotronH Mamba2) take the serial path, each slot
+//! gated-delta-net, NemotronH and Granite 4.0-H Mamba2) take the serial path, each slot
 //! with its own recurrent state beside its KV cache
 //! ([`crate::continuous_driver::ContinuousEngineState::with_recurrent_state`]),
 //! reset when the slot is freed. They keep no prefix cache, since a KV
