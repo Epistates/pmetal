@@ -4,9 +4,8 @@
 //! - **JACCL**: RDMA over Thunderbolt 5 (~3µs latency, 45 GB/s)
 //! - **Ring**: TCP-based ring communication
 //!
-//! These wrappers call the auto-generated `mlx_sys` FFI bindings for
-//! `mlx_distributed_*` functions. The MLX C API is included via `mlx.h`
-//! which pulls in `distributed.h` and `distributed_group.h`.
+//! These wrap [`pmetal_bridge::distributed`], which calls MLX's C++
+//! distributed API (`mlx/distributed/`) in the libmlx the bridge links.
 //!
 //! # Environment Variables
 //!

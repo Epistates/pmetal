@@ -528,6 +528,7 @@ fn build_and_link() {
         "bridge_native.cpp",
         "bridge_training.cpp",
         "bridge_gdn.cpp",
+        "bridge_distributed.cpp",
     ];
 
     let mut build = cc::Build::new();
