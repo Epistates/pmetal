@@ -180,7 +180,8 @@ pub struct TrainingConfig {
     #[serde(default)]
     pub max_steps: Option<usize>,
 
-    /// Warmup steps.
+    /// Warmup steps (default 0, as on the CLI and in the reference
+    /// trainers). Ignored when `warmup_ratio` is set.
     #[serde(default = "default_warmup")]
     pub warmup_steps: usize,
 
@@ -496,7 +497,7 @@ fn default_epochs() -> usize {
     3
 }
 fn default_warmup() -> usize {
-    100
+    0
 }
 fn default_weight_decay() -> f64 {
     0.01

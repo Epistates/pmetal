@@ -342,8 +342,10 @@ impl BatchedRlGenerator {
                 let logits = forward_fn(&prompt_input, &mut caches[seq_idx])?;
                 logits.eval();
 
-                // Sample first token
-                let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, -1, 1);
+                // Sample the first token from the last prompt position:
+                // logits [1, L, V] -> [1, V].
+                let last_logits =
+                    pmetal_bridge::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
                 let token = self.sample(&last_logits)?;
                 current_tokens[seq_idx] = token;
                 sequences[seq_idx].push(token);
@@ -363,8 +365,9 @@ impl BatchedRlGenerator {
             }
         }
 
-        // Decode loop
-        for _step in 0..self.config.max_new_tokens {
+        // Decode loop: the token sampled from the prompt was the first of
+        // `max_new_tokens`.
+        for _step in 1..self.config.max_new_tokens {
             // Check if all sequences are done
             if finished.iter().all(|&f| f) {
                 break;
@@ -383,8 +386,8 @@ impl BatchedRlGenerator {
                 let logits = forward_fn(&token_input, &mut caches[seq_idx])?;
                 logits.eval();
 
-                // Sample next token
-                let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, 1, 0);
+                // Sample the next token: logits [1, 1, V] -> [1, V].
+                let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, 0, 1);
                 let token = self.sample(&last_logits)?;
                 current_tokens[seq_idx] = token;
                 sequences[seq_idx].push(token);
@@ -504,8 +507,9 @@ impl BatchedRlGenerator {
             let logits = verify_fn(&prompt_input, &mut verify_caches[seq_idx])?;
             logits.eval();
 
-            // Sample or take greedy first token
-            let last_logits = pmetal_bridge::compat::ops::select_axis(&logits, -1, 1);
+            // Sample the first token from the last prompt position.
+            let last_logits =
+                pmetal_bridge::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
             let token = self.sample(&last_logits)?;
             last_tokens[seq_idx] = token;
             sequences[seq_idx].push(token);
@@ -616,7 +620,7 @@ impl BatchedRlGenerator {
                 // Remove batch dim once: verify_logits [1, k+1, vocab] -> [k+1, vocab]
                 let vl_no_batch = pmetal_bridge::compat::ops::select_axis(&verify_logits, 0, 0);
                 for (i, &draft_tok) in draft_tokens.iter().enumerate() {
-                    let row = pmetal_bridge::compat::ops::select_axis(&vl_no_batch, 0, i as i32);
+                    let row = pmetal_bridge::compat::ops::select_axis(&vl_no_batch, i as i32, 0);
                     let verifier_tok = greedy_argmax_1d(&row);
 
                     if verifier_tok == draft_tok {
@@ -640,7 +644,7 @@ impl BatchedRlGenerator {
                 // use deterministic verification to keep accept/reject semantics clean.
                 if n_accepted_draft == k {
                     let bonus_row =
-                        pmetal_bridge::compat::ops::select_axis(&vl_no_batch, 0, k as i32);
+                        pmetal_bridge::compat::ops::select_axis(&vl_no_batch, k as i32, 0);
                     let bonus_tok = greedy_argmax_1d(&bonus_row);
                     accepted_tokens.push(bonus_tok);
                 }
@@ -875,6 +879,81 @@ mod tests {
         assert_eq!(gen_config.max_new_tokens, 100);
         assert_eq!(gen_config.temperature, 0.6);
         assert!(gen_config.do_sample);
+    }
+
+    /// A stand-in model whose logits put 30 on (token + 1) mod 16 at every
+    /// position, so its greedy continuation of any prompt counts upward.
+    fn counting_model(input: &Array, _cache: &mut KVCache) -> RlGenResult<Array> {
+        const VOCAB: usize = 16;
+        input.eval();
+        let ids: Vec<i32> = input.as_slice::<i32>().to_vec();
+        let mut logits = vec![0.0f32; ids.len() * VOCAB];
+        for (pos, &id) in ids.iter().enumerate() {
+            logits[pos * VOCAB + (id as usize + 1) % VOCAB] = 30.0;
+        }
+        Ok(Array::from_slice(
+            &logits,
+            &[1, ids.len() as i32, VOCAB as i32],
+        ))
+    }
+
+    #[test]
+    fn rollouts_continue_the_prompt_from_the_model_logits() {
+        let config = BatchedRlConfig {
+            use_prefix_cache: false,
+            temperature: 1.0,
+            ..BatchedRlConfig::new(3)
+                .with_max_new_tokens(5)
+                .with_stop_tokens(vec![15])
+                .with_seed(1)
+        };
+        let mut generator = BatchedRlGenerator::new(config, create_test_kv_config());
+        let out = generator.generate(counting_model, &[2, 3, 4]).unwrap();
+        pmetal_bridge::check_last_error().unwrap();
+        for (seq, n) in out.token_ids.iter().zip(&out.num_generated) {
+            // The first token comes from the last prompt position, every later
+            // one from the token before it, and exactly max_new_tokens are made.
+            assert_eq!(seq, &vec![2, 3, 4, 5, 6, 7, 8, 9]);
+            assert_eq!(*n, 5);
+        }
+        assert!(out.stopped_by_length.iter().all(|&b| b));
+
+        // A stop token ends the completion early.
+        let mut generator = BatchedRlGenerator::new(
+            BatchedRlConfig {
+                use_prefix_cache: false,
+                ..BatchedRlConfig::new(1)
+                    .with_max_new_tokens(8)
+                    .with_stop_tokens(vec![7])
+            },
+            create_test_kv_config(),
+        );
+        let out = generator.generate(counting_model, &[4]).unwrap();
+        assert_eq!(out.token_ids[0], vec![4, 5, 6, 7]);
+        assert!(out.stopped_by_token[0] && !out.stopped_by_length[0]);
+
+        // Speculative rollouts verify each draft against the right row of the
+        // verifier's logits, so a draft that agrees is accepted in full.
+        let mut generator = BatchedRlGenerator::new(
+            BatchedRlConfig {
+                use_prefix_cache: false,
+                ..BatchedRlConfig::new(2)
+                    .with_max_new_tokens(7)
+                    .with_stop_tokens(vec![15])
+                    .with_speculative(3)
+            },
+            create_test_kv_config(),
+        );
+        let out = generator
+            .generate_speculative(counting_model, counting_model, &[1, 2])
+            .unwrap();
+        pmetal_bridge::check_last_error().unwrap();
+        for seq in &out.token_ids {
+            assert_eq!(&seq[..6], &[1, 2, 3, 4, 5, 6]);
+            assert!(seq.windows(2).all(|w| w[1] == (w[0] + 1) % 16), "{seq:?}");
+        }
+        let stats = generator.last_speculative_stats().unwrap();
+        assert_eq!(stats.total_draft_accepted, stats.total_draft_proposed);
     }
 
     #[test]

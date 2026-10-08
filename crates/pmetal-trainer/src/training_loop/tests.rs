@@ -941,11 +941,14 @@ fn the_sft_loop_trains_with_the_optimizer_the_config_names() {
         for other in kinds {
             let replayed = lora_after_replay(&mut model, other, &init, &config, &dataset);
             let diff = max_abs_diff(&trained, &replayed);
+            // The same optimizer agrees to float rounding (GPU reductions are
+            // not bit-reproducible, and drift further with other tests on the
+            // GPU); a different one lands 1e-2 or more away.
             if other == kind {
-                assert!(diff < 1e-6, "{kind:?}: loop and replay differ by {diff}");
+                assert!(diff < 1e-4, "{kind:?}: loop and replay differ by {diff}");
             } else {
                 assert!(
-                    diff > 1e-5,
+                    diff > 1e-3,
                     "{kind:?} trained exactly like {other:?} (diff {diff})"
                 );
             }
