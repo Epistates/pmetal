@@ -14,17 +14,6 @@ use super::{InlineArray, RawBuf};
 impl InlineArray {
     // ── Scalar / identity / iterator constructors ────────────────────────
 
-    /// Create an uninitialised slot — caller MUST ensure C++ does placement-new
-    /// into `self.raw` before this is read or dropped.
-    ///
-    /// Used as the destination buffer for C++ functions that return arrays via
-    /// placement-new (e.g. `mlx_inline_qwen35_decode_step`).
-    pub(crate) fn uninit() -> Self {
-        // We initialise to a scalar 0.0 so the Drop impl always runs a valid
-        // destructor even if the C++ side never fills the slot.
-        Self::from_f32(0.0)
-    }
-
     /// Identity constructor — clone an existing array.
     ///
     /// Compatible with mlx-rs `Array::from_array(arr)` which was a no-op copy.

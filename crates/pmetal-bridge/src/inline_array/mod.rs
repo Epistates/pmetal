@@ -73,46 +73,6 @@ pub(crate) struct QWeightRaw<'a> {
 mod ffi;
 use ffi::*;
 
-// ── Full Qwen3.5 forward pass ─────────────────────────────────────────────
-
-/// Run the entire Qwen3.5 forward pass (all N layers) as a single C++ call,
-/// eliminating per-op FFI overhead (~1800 round trips per decode step).
-///
-/// # Safety
-/// All raw pointers in `weight_ptrs` and `cache_ptrs` must point to live,
-/// placement-new'd `mlx::core::array` objects (i.e. valid `InlineArray.raw`
-/// fields).  The arrays must remain live for the duration of this call.
-///
-/// `attn_kv_offsets` and `rope_offset` are updated in-place by C++.
-pub(crate) unsafe fn qwen35_decode_step(
-    token_ids: &InlineArray,
-    weight_ptrs: &[*const RawBuf],
-    cache_ptrs: &mut [*mut RawBuf],
-    attn_kv_offsets: &mut [i32],
-    rope_offset: &mut i32,
-    config_ints: &[i32],
-    config_floats: &[f32],
-) -> InlineArray {
-    let mut dst = InlineArray::uninit();
-    unsafe {
-        mlx_inline_qwen35_decode_step(
-            dst.as_raw_ptr_mut(),
-            token_ids.as_raw_ptr(),
-            weight_ptrs.as_ptr(),
-            weight_ptrs.len() as i32,
-            cache_ptrs.as_mut_ptr(),
-            cache_ptrs.len() as i32,
-            attn_kv_offsets.as_mut_ptr(),
-            rope_offset,
-            config_ints.as_ptr(),
-            config_ints.len() as i32,
-            config_floats.as_ptr(),
-            config_floats.len() as i32,
-        );
-    }
-    dst
-}
-
 // ── InlineArray ───────────────────────────────────────────────────────────
 
 /// Stack-allocated MLX array. Zero heap allocation per op.

@@ -126,43 +126,6 @@ impl std::fmt::Debug for NativeWeights {
     }
 }
 
-impl NativeWeights {
-    pub(crate) fn projection_weights_are_dense(&self) -> bool {
-        self.embed_scales.is_none()
-            && self.embed_biases.is_none()
-            && self.lm_head_w.as_ref().is_none_or(LayerWeight::is_dense)
-            && self
-                .layers
-                .iter()
-                .all(LayerWeights::projection_weights_are_dense)
-    }
-}
-
-impl LayerWeights {
-    fn projection_weights_are_dense(&self) -> bool {
-        let is_dense = |w: &Option<LayerWeight>| w.as_ref().is_none_or(LayerWeight::is_dense);
-
-        is_dense(&self.mlp_gate_w)
-            && is_dense(&self.mlp_up_w)
-            && is_dense(&self.mlp_down_w)
-            && is_dense(&self.moe_gate_w)
-            && is_dense(&self.moe_up_w)
-            && is_dense(&self.moe_down_w)
-            && is_dense(&self.shared_gate_w)
-            && is_dense(&self.shared_up_w)
-            && is_dense(&self.shared_down_w)
-            && is_dense(&self.attn_q_w)
-            && is_dense(&self.attn_k_w)
-            && is_dense(&self.attn_v_w)
-            && is_dense(&self.attn_o_w)
-            && is_dense(&self.gdn_qkv_w)
-            && is_dense(&self.gdn_z_w)
-            && is_dense(&self.gdn_b_w)
-            && is_dense(&self.gdn_a_w)
-            && is_dense(&self.gdn_out_w)
-    }
-}
-
 /// Seed for KV cache preconditioning rotation (distinct from TURBOQUANT_SEED).
 const KV_PRECONDITION_SEED: u64 = 0x4b56_5052_4543_4f4e; // "KVPRECON"
 

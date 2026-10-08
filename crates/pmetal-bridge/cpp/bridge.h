@@ -23,6 +23,5 @@
 #include "bridge/diagnostics.h"   // graph/metal capture/memory/stream helpers
 #include "bridge/safetensors.h"   // load/save safetensors, random_seed
 #include "bridge/autograd.h"      // value_and_grad + checkpoint
-#include "bridge/qwen35.h"        // full Qwen3.5 forward pass
 
 #endif

@@ -59,10 +59,4 @@ impl InlineArray {
     pub(crate) fn as_raw_ptr(&self) -> *const RawBuf {
         &self.raw
     }
-
-    /// Return a mutable raw pointer to the inline buffer (for C++ bridge calls).
-    #[inline]
-    pub(crate) fn as_raw_ptr_mut(&mut self) -> *mut RawBuf {
-        &mut self.raw
-    }
 }

@@ -18,7 +18,7 @@
 //!   * [`attention`] — per-position RoPE + attn_forward + tree-verify variant
 //!   * [`mlp_moe`] — dense SwiGLU + SwitchGLU MoE + GDN step
 //!   * [`forward`] — forward_step + capture + tree-verify + compact/rollback
-//!   * [`generate`] — prefill/prime/generate loops + benchmarks + C++ decode session
+//!   * [`generate`] — prefill/prime/generate loops + benchmarks
 
 use serde::Deserialize;
 
@@ -39,11 +39,10 @@ pub use forward::{
     forward_step_with_capture, rollback_cache,
 };
 pub use generate::{
-    CppDecodeSession, CppForwardState, QwenDecodeBackend, benchmark_mlx_lm_trial,
-    benchmark_mlx_lm_trial_canonical, build_cpp_forward_state, canonical_decode_backend, generate,
-    generate_canonical, generate_from_primed_sample, generate_from_primed_sample_silent,
-    generate_preserve_peak, prefill_first_token, prime_generation_preserve_peak,
-    prime_generation_preserve_peak_silent,
+    QwenDecodeBackend, benchmark_mlx_lm_trial, benchmark_mlx_lm_trial_canonical,
+    canonical_decode_backend, generate, generate_canonical, generate_from_primed_sample,
+    generate_from_primed_sample_silent, generate_preserve_peak, prefill_first_token,
+    prime_generation_preserve_peak, prime_generation_preserve_peak_silent,
 };
 pub use load::load_model;
 pub use weights::{

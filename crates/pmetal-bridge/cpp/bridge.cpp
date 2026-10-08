@@ -6,7 +6,7 @@
 //   bridge_inference.cpp  — Additional inference ops, sampling, memory
 //   bridge_turboquant.cpp — TurboQuant Metal kernels + bridge functions
 //   bridge_compiled.cpp   — Fused compiled ops (@mx.compile equivalents)
-//   bridge_native.cpp     — GDN/Attention/MoE native forward pass
+//   bridge_native.cpp     — Gated-delta-net Metal kernels
 //   bridge_training.cpp   — Training ops, autograd, FFT
 
 #include "bridge_internal.h"

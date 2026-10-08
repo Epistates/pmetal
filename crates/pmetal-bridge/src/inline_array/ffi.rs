@@ -1419,21 +1419,4 @@ unsafe extern "C" {
         dil_w: i32,
         groups: i32,
     );
-
-    // ── Full Qwen3.5 forward pass — single C++ function, zero FFI overhead ──
-    // See bridge.h for the complete weight/cache/config layout documentation.
-    pub(super) fn mlx_inline_qwen35_decode_step(
-        dst_logits: *mut RawBuf,
-        token_ids: *const RawBuf,
-        weight_ptrs: *const *const RawBuf,
-        num_weights: i32,
-        cache_ptrs: *mut *mut RawBuf,
-        num_cache: i32,
-        attn_kv_offsets: *mut i32,
-        rope_offset: *mut i32,
-        config_ints: *const i32,
-        num_config_ints: i32,
-        config_floats: *const f32,
-        num_config_floats: i32,
-    );
 }
