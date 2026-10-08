@@ -2548,6 +2548,89 @@ mod tests {
         refuses(serde_json::json!({"eos_token_id": null}), "eos_token_id");
     }
 
+    /// E4M3 (bias 7, no infinities) to f32, written out independently of MLX.
+    fn e4m3(byte: u8) -> f32 {
+        let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+        let exponent = i32::from((byte >> 3) & 0xf);
+        let mantissa = f32::from(byte & 0x7);
+        let magnitude = if exponent == 0 {
+            mantissa / 8.0 * 2f32.powi(-6)
+        } else {
+            (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7)
+        };
+        sign * magnitude
+    }
+
+    /// The FP8 release stores the n-gram table as E4M3 shards plus one
+    /// per-tensor `weight_scale`; served rows must be the bytes times it, in
+    /// table order across the shards.
+    #[test]
+    fn fp8_ngram_rows_decode_with_their_scale() {
+        let mut config = released_config();
+        config.ple_embed_dim = Some(16);
+        config.heads_per_ngram = 2;
+        config.split_ngram_parts = 2;
+        let (rows_per_shard, dim) = (6usize, 4usize);
+        let bytes: Vec<u8> = (0..2 * rows_per_shard * dim)
+            .map(|i| ((i * 5) % 0x70) as u8 | if i % 3 == 0 { 0x80 } else { 0 })
+            .collect();
+        let scale_bits = 0x3e80u16.to_le_bytes(); // bf16 0.25
+        let base = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+        let half = rows_per_shard * dim;
+        let views = vec![
+            (
+                format!("{base}.shard_0.weight"),
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F8_E4M3,
+                    vec![rows_per_shard, dim],
+                    &bytes[..half],
+                )
+                .unwrap(),
+            ),
+            (
+                format!("{base}.shard_1.weight"),
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F8_E4M3,
+                    vec![rows_per_shard, dim],
+                    &bytes[half..],
+                )
+                .unwrap(),
+            ),
+            (
+                format!("{base}.weight_scale"),
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::BF16,
+                    vec![1],
+                    &scale_bits,
+                )
+                .unwrap(),
+            ),
+        ];
+        let dir = std::env::temp_dir().join(format!("qwen4_exp_fp8_rows_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+
+        let mut files = CheckpointFiles::open(&dir).unwrap();
+        let rows = ngram_row_source(&mut files, &config, 1, Dtype::Float32).unwrap();
+        assert_eq!(rows.encoding, NgramRowEncoding::Fp8E4m3 { scale: 0.25 });
+        let ids: Vec<i32> = vec![11, 0, 6, 5, 7];
+        let got = rows.gather(&ids).unwrap();
+        got.eval();
+        let got: Vec<f32> = got.as_slice::<f32>().to_vec();
+        let expected: Vec<f32> = ids
+            .iter()
+            .flat_map(|&r| {
+                let r = r as usize;
+                bytes[r * dim..(r + 1) * dim]
+                    .iter()
+                    .map(|&b| e4m3(b) * 0.25)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(got, expected);
+    }
+
     #[test]
     fn checkpoint_keys_classify_by_role() {
         use CheckpointKeyRole::*;
