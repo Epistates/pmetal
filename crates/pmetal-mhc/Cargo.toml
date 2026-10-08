@@ -9,16 +9,8 @@ keywords = ["deep-learning", "transformer", "residual-connections", "training"]
 categories = ["science", "mathematics"]
 
 [dependencies]
-# Core - use workspace references
-pmetal-core = { workspace = true }
-pmetal-metal = { workspace = true, optional = true }
-
 # Math
 ndarray = { workspace = true, features = ["serde"] }
-num-traits = { workspace = true }
-
-# Async - use workspace
-tokio = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
@@ -26,20 +18,12 @@ parking_lot = { workspace = true }
 # Serialization - use workspace
 serde = { workspace = true }
 
-# Logging - use workspace
-tracing = { workspace = true }
-
 # Error handling - use workspace
 thiserror = { workspace = true }
 
 # Random (for initialization)
 rand = { workspace = true }
 rand_distr = "0.6"
-
-# Metal (optional, using modern objc2 ecosystem)
-objc2 = { workspace = true, optional = true }
-objc2-foundation = { workspace = true, optional = true }
-objc2-metal = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
@@ -54,14 +38,5 @@ harness = false
 name = "mhc_kernels"
 harness = false
 
-[features]
-default = ["metal"]
-# Enable Metal GPU acceleration for Apple Silicon (macOS)
-metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "pmetal-metal"]
-# Enable CUDA backend for NVIDIA GPUs (future)
-cuda = []
-
-# Inherit workspace lints (`unsafe_code = "deny"` among others).
-# The Metal FFI module opts back in via `#![allow(unsafe_code)]` locally.
 [lints]
 workspace = true

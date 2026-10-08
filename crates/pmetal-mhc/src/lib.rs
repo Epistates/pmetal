@@ -38,13 +38,6 @@
 //! });
 //! ```
 //!
-//! # Metal Acceleration
-//!
-//! When the `metal` feature is enabled, GPU-accelerated kernels are used for:
-//! - Fused RMSNorm + projection
-//! - Batched Sinkhorn-Knopp iterations
-//! - Fused post-mapping + residual merge
-//!
 //! # References
 //!
 //! - [mHC Paper](https://arxiv.org/abs/2512.24880): "mHC: Manifold-Constrained Hyper-Connections"
@@ -55,7 +48,6 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod config;
-pub mod kernels;
 pub mod layer;
 pub mod mappings;
 pub mod params;

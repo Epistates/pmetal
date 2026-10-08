@@ -27,7 +27,7 @@ gguf = ["dep:pmetal-gguf", "core"]
 metal = ["dep:pmetal-metal", "core"]
 hub = ["dep:pmetal-hub", "core"]
 distributed = ["dep:pmetal-distributed", "pmetal-trainer?/distributed"]
-mhc = ["dep:pmetal-mhc", "core", "metal"]
+mhc = ["dep:pmetal-mhc"]
 
 # MLX-dependent crates
 mlx = ["dep:pmetal-mlx", "core", "metal"]

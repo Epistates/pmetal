@@ -6322,19 +6322,11 @@ name = "pmetal-mhc"
 version = "0.6.0"
 dependencies = [
  "ndarray",
- "num-traits",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
  "parking_lot",
- "pmetal-core",
- "pmetal-metal",
  "rand 0.10.3",
  "rand_distr",
  "serde",
  "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]

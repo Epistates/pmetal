@@ -1,4 +1,4 @@
-//! Benchmarks for mHC Metal kernels.
+//! Benchmarks for the mHC mapping computations.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ndarray::Array3;

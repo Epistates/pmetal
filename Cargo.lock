@@ -5340,20 +5340,12 @@ dependencies = [
  "approx",
  "criterion",
  "ndarray",
- "num-traits",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
  "parking_lot",
- "pmetal-core",
- "pmetal-metal",
  "proptest",
  "rand 0.10.3",
  "rand_distr",
  "serde",
  "thiserror 2.0.21",
- "tokio",
- "tracing",
 ]
 
 [[package]]

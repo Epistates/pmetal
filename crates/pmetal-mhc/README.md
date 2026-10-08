@@ -43,7 +43,6 @@ Output [batch, n, C]
 - **Training Stability**: Doubly stochastic constraints guarantee bounded signal flow across arbitrary depth
 - **Compositional Closure**: Products of doubly stochastic matrices remain doubly stochastic
 - **Dynamic Mappings**: Input-dependent via learned projections, or static for reduced parameters
-- **Metal GPU Acceleration**: Fused kernels for RMSNorm + projection, batched Sinkhorn, and residual merging
 - **Mixed Precision**: BF16 activations with FP32 mappings
 - **Complete Training Support**: Forward and backward passes with gradient accumulation
 
@@ -122,13 +121,6 @@ The doubly stochastic constraint is enforced via iterative row/column normalizat
 
 This guarantees the residual mixing matrix preserves signal magnitude, enabling stable training at depth.
 
-## Feature Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `metal` | Yes | Apple Silicon GPU acceleration via Metal compute shaders |
-| `cuda` | No | Reserved for future NVIDIA GPU support |
-
 ## Benchmarks
 
 ```bash
@@ -145,7 +137,6 @@ cargo bench --bench mhc_kernels    # Mapping computation across presets
 | `layer` | MhcLayer and MhcTransformerBlock |
 | `mappings` | Mapping computation pipeline |
 | `sinkhorn` | Sinkhorn-Knopp forward and backward |
-| `kernels` | Metal GPU compute kernels |
 
 ## References
 
