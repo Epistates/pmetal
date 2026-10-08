@@ -663,6 +663,7 @@ fn run_infer(py: Python<'_>, opts: InferOptions) -> PyResult<InferRunResult> {
                 chat: opts.chat,
                 no_thinking: opts.no_thinking,
                 tools: None,
+                images: Vec::new(),
                 temperature: Some(opts.temperature),
                 top_k: opts.top_k,
                 top_p: opts.top_p,

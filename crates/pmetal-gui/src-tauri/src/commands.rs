@@ -2381,6 +2381,7 @@ async fn run_inference_streaming(
         chat: false, // let the shared runner auto-detect chat-capable models
         no_thinking: spec.no_thinking,
         tools: None,
+        images: Vec::new(),
         temperature: spec.temperature,
         top_k: spec.top_k,
         top_p: spec.top_p,

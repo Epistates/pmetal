@@ -1794,6 +1794,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 model,
                 lora,
                 prompt,
+                image,
                 max_tokens,
                 temperature,
                 top_k,
@@ -1910,6 +1911,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 kv_qjl,
                 detect_repetition,
                 experts_dir.as_deref(),
+                &image,
             )
             .await?;
         }

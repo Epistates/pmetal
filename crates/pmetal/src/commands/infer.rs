@@ -312,6 +312,7 @@ pub(crate) async fn run_inference(
     kv_qjl: bool,
     detect_repetition: bool,
     experts_dir: Option<&str>,
+    images: &[String],
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
     if ane {
@@ -349,6 +350,27 @@ pub(crate) async fn run_inference(
             }
         }
     };
+
+    if !images.is_empty() {
+        // Images go through the native engine's multimodal prefill; every
+        // other generation path would ignore them.
+        let other = [
+            (benchmark, "--benchmark"),
+            (profile_layers, "--profile-layers"),
+            (mtp, "--mtp"),
+            (draft_model.is_some(), "--draft-model"),
+            (lora_path.is_some(), "--lora"),
+            (fp8, "--fp8"),
+            (experts_dir.is_some(), "--experts-dir"),
+            (metal_sampler, "--metal-sampler / --backend metal-sampler"),
+            (compiled, "--compiled / --backend compiled"),
+            (minimal, "--minimal / --backend minimal"),
+            (ane, "--ane / --backend ane"),
+        ];
+        if let Some((_, flag)) = other.iter().find(|(set, _)| *set) {
+            anyhow::bail!("--image cannot be combined with {flag}");
+        }
+    }
 
     tracing::info!(model = %model_id, "Loading model for inference");
     if mtp && draft_model.is_some() {
@@ -425,6 +447,7 @@ pub(crate) async fn run_inference(
         chat,
         no_thinking,
         tools: tools.map(|t| t.to_vec()),
+        images: images.iter().map(std::path::PathBuf::from).collect(),
         temperature,
         top_k,
         top_p,

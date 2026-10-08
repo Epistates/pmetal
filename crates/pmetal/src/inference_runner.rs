@@ -16,11 +16,13 @@ use pmetal_bridge::turboquant::{
 };
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateType, Message, ToolDefinition};
+use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
 use pmetal_mlx::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, TurboQuantTensorConfig,
     sanitize_cache_mode_for_config,
 };
 use pmetal_mlx::{Array, Dtype, Exception, ModuleParameters as _};
+use pmetal_models::architectures::qwen3_5_vision::Qwen3_5MultimodalConfig;
 use pmetal_models::architectures::{
     Gemma4AssistantForCausalLM, Qwen3NextConfig, Qwen3NextMtpForCausalLM,
     load_gemma4_assistant_from_dir, load_qwen3_next_mtp_from_dir,
@@ -78,6 +80,10 @@ pub struct InferenceRunnerConfig {
     pub no_thinking: bool,
     /// Optional tool/function definitions for tool-calling models.
     pub tools: Option<Vec<ToolDefinition>>,
+    /// Images to show a Qwen3.5-family vision model, in order. Each gets a
+    /// placeholder ahead of the prompt text, where the chat template would
+    /// put an image item that precedes the text.
+    pub images: Vec<PathBuf>,
 
     // ── Sampling ─────────────────────────────────────────────────────────
     pub temperature: Option<f32>,
@@ -146,6 +152,7 @@ impl Default for InferenceRunnerConfig {
             chat: false,
             no_thinking: false,
             tools: None,
+            images: Vec::new(),
             temperature: None,
             top_k: None,
             top_p: None,
@@ -226,6 +233,8 @@ pub struct InferenceGenState {
     pub last_decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
     /// Enable n-gram repetition loop detection (opt-in).
     detect_repetition: bool,
+    /// Preprocessed images the prompt's image tokens stand for.
+    media: Vec<ProcessedMedia>,
 }
 
 impl InferenceGenState {
@@ -250,7 +259,20 @@ impl InferenceRunner {
     /// 9. Enable expert offloading
     /// 10. Create KV cache (with quantization mode)
     /// 11. Create Mamba cache (for hybrid models)
-    pub fn prepare(config: InferenceRunnerConfig) -> Result<Self, Exception> {
+    pub fn prepare(mut config: InferenceRunnerConfig) -> Result<Self, Exception> {
+        let images = std::mem::take(&mut config.images);
+        if !images.is_empty() {
+            // One `<|vision_start|><|image_pad|><|vision_end|>` per image, ahead
+            // of the text: what the chat template renders for image items
+            // before a text item, and the processor's input otherwise.
+            let placeholder = format!(
+                "{}{}{}",
+                pmetal_data::qwen_vl_processing::VISION_START,
+                pmetal_data::qwen_vl_processing::IMAGE_PAD,
+                pmetal_data::qwen_vl_processing::VISION_END
+            );
+            config.prompt = format!("{}{}", placeholder.repeat(images.len()), config.prompt);
+        }
         let model_path = &config.model_path;
         if config.qwen_mtp && config.mtp_assistant_path.is_some() {
             return Err(Exception::custom(
@@ -299,6 +321,20 @@ impl InferenceRunner {
             None
         };
         let native_bridge_candidate = native_bridge_info.is_some();
+        let multimodal = if images.is_empty() {
+            None
+        } else {
+            if mtp_requested
+                || !native_bridge_info
+                    .is_some_and(|info| info.arch == crate::native_inference::NativeArch::Qwen3_5)
+            {
+                return Err(Exception::custom(
+                    "images need a Qwen3.5-family vision model on the native engine (no LoRA, \
+                     FP8, expert offload or MTP)",
+                ));
+            }
+            Some(Qwen3_5MultimodalConfig::from_model_dir(model_path)?)
+        };
 
         // 4. Prime the Metal runtime before MLX model construction. The stable
         // benchmark path always initializes Metal first, and doing the same here
@@ -366,6 +402,32 @@ impl InferenceRunner {
                 .encode(&prompt_text)
                 .map_err(|e| Exception::custom(e.to_string()))?;
             (ids, None)
+        };
+
+        let (input_ids, media) = match &multimodal {
+            None => (input_ids, Vec::new()),
+            Some(multimodal) => {
+                let processor = QwenVlProcessor::from_model_dir(model_path)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let media = images
+                    .iter()
+                    .map(|path| {
+                        let image = pmetal_data::qwen_vl_processing::load_image_source(
+                            &path.to_string_lossy(),
+                        )
+                        .and_then(|image| processor.preprocess_image(&image))
+                        .map_err(|e| Exception::custom(format!("{}: {e}", path.display())))?;
+                        tracing::info!(
+                            image = %path.display(),
+                            grid = ?image.grid_thw,
+                            tokens = image.num_tokens(multimodal.vision.spatial_merge_size),
+                            "Image preprocessed"
+                        );
+                        Ok(image)
+                    })
+                    .collect::<Result<Vec<_>, Exception>>()?;
+                (multimodal.expand_image_tokens(&input_ids, &media)?, media)
+            }
         };
 
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
@@ -696,6 +758,7 @@ impl InferenceRunner {
                 model_path: config.model_path.clone(),
                 last_decode_metrics: None,
                 detect_repetition: config.detect_repetition,
+                media,
             },
             chat_template_type: template_type,
             is_chat: use_chat,
@@ -889,15 +952,31 @@ impl InferenceGenState {
                 frequency_penalty: self.gen_config.frequency_penalty,
                 presence_penalty: self.gen_config.presence_penalty,
             };
-            let output = crate::native_inference::run_native_inference_ext(
-                &self.model_path,
-                &self.input_ids,
-                self.gen_config.max_new_tokens,
-                sampling_params,
-                self.native_turboquant,
-                self.native_quant_config,
-                |token| forward_native_token(&stop_tokens, &mut on_token_guarded, token),
-            )
+            let on_native_token =
+                |token| forward_native_token(&stop_tokens, &mut on_token_guarded, token);
+            let output = if self.media.is_empty() {
+                crate::native_inference::run_native_inference_ext(
+                    &self.model_path,
+                    &self.input_ids,
+                    self.gen_config.max_new_tokens,
+                    sampling_params,
+                    self.native_turboquant,
+                    self.native_quant_config,
+                    on_native_token,
+                )
+            } else {
+                crate::native_inference::run_native_multimodal_inference_ext(
+                    &self.model_path,
+                    &self.input_ids,
+                    &self.media,
+                    &[],
+                    self.gen_config.max_new_tokens,
+                    sampling_params,
+                    self.native_turboquant,
+                    self.native_quant_config,
+                    on_native_token,
+                )
+            }
             .map_err(Exception::custom)?;
 
             self.last_decode_metrics = output.decode_metrics;

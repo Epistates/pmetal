@@ -17,6 +17,11 @@ pub struct InferArgs {
     #[arg(short, long = "prompt")]
     pub prompt: String,
 
+    /// Image file to show the model, before the prompt text (repeatable, in
+    /// order). Qwen3.5-family vision models (Qwen3.5 / 3.6 / 3.8).
+    #[arg(long = "image")]
+    pub image: Vec<String>,
+
     /// Maximum tokens to generate
     #[arg(long = "max-tokens", default_value = "256")]
     pub max_tokens: usize,

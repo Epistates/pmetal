@@ -518,6 +518,7 @@ pub fn run_native_inference_ext(
             turboquant,
             quant_config,
             &mut on_token,
+            pmetal_bridge::qwen3_native::prefill_first_token,
         ),
         NativeArch::Llama4 => run_llama4(
             model_path,
@@ -547,6 +548,82 @@ pub fn run_native_inference_ext(
         ),
         NativeArch::Gemma4 => run_gemma4(model_path, input_ids, max_tokens, params, &mut on_token),
     }
+}
+
+/// [`run_native_inference_ext`] for a Qwen3.5-family prompt carrying images
+/// or videos.
+///
+/// `input_ids` is the expanded prompt (one token per merged patch); `images`
+/// and `videos` are preprocessed, each in prompt order. The vision tower runs
+/// first and is dropped before the text weights load; the prompt is then
+/// prefilled from the merged embeddings at its 3-D positions and decoded on the
+/// ordinary native path, from one past the prompt's largest position.
+#[allow(clippy::too_many_arguments)]
+pub fn run_native_multimodal_inference_ext(
+    model_path: &Path,
+    input_ids: &[u32],
+    images: &[pmetal_data::qwen_vl_processing::ProcessedMedia],
+    videos: &[pmetal_data::qwen_vl_processing::ProcessedMedia],
+    max_tokens: usize,
+    params: pmetal_bridge::decode::SamplingParams,
+    turboquant: Option<TurboQuantConfig>,
+    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Result<NativeGenerationOutput, String> {
+    use pmetal_bridge::qwen3_native;
+    use pmetal_models::architectures::qwen3_5_vision::Qwen3_5Vision;
+
+    if detect_arch(model_path) != Some(NativeArch::Qwen3_5) {
+        return Err("images need a Qwen3.5-family model".into());
+    }
+    ensure_native_bridge_metal_available()?;
+    let started = std::time::Instant::now();
+    let vision = Qwen3_5Vision::load(model_path).map_err(|e| e.to_string())?;
+    let encoded = vision
+        .encode(input_ids, images, videos)
+        .map_err(|e| e.to_string())?;
+    let multimodal = vision.config.clone();
+    drop(vision);
+    tracing::info!(
+        elapsed_s = format!("{:.1}", started.elapsed().as_secs_f64()),
+        "Vision tower encoded {} images and {} videos",
+        images.len(),
+        videos.len()
+    );
+    let config = qwen3_native::load_config(model_path)?;
+    let tables = config.mrope_tables(&encoded.positions.array());
+    let prompt_ids = input_ids.to_vec();
+    run_qwen3(
+        model_path,
+        input_ids,
+        max_tokens,
+        params,
+        turboquant,
+        quant_config,
+        &mut on_token,
+        move |weights, cache, ids, temperature| {
+            pmetal_bridge::decode::prefill_first_token(
+                weights,
+                cache,
+                ids,
+                temperature,
+                |weights, prompt, cache| {
+                    let text = qwen3_native::embed_tokens(weights, prompt);
+                    let embeddings = encoded
+                        .merge(&text, &prompt_ids, &multimodal)
+                        .expect("media token counts were checked by the vision encode");
+                    qwen3_native::forward_embeddings_hidden(
+                        weights,
+                        &embeddings,
+                        &tables,
+                        encoded.positions.next_position,
+                        cache,
+                    )
+                    .1
+                },
+            )
+        },
+    )
 }
 
 /// Run Qwen3Next/Qwen3.6 MTP with the bridge-native Qwen target as verifier.
@@ -1177,6 +1254,7 @@ fn run_benchmark_trials(
 // Qwen3 / Qwen3.5
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn run_qwen3(
     model_path: &Path,
     input_ids: &[u32],
@@ -1185,6 +1263,12 @@ fn run_qwen3(
     turboquant: Option<TurboQuantConfig>,
     quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
+    prefill_first_token: impl Fn(
+        &pmetal_bridge::qwen3_native::NativeWeights,
+        &mut pmetal_bridge::qwen3_native::NativeCache,
+        &[u32],
+        f32,
+    ) -> u32,
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::qwen3_native;
 
@@ -1232,7 +1316,7 @@ fn run_qwen3(
             Ok(weights)
         },
         |weights, _| build_qwen3_cache_with_quant(weights, turboquant, quant_config),
-        qwen3_native::prefill_first_token,
+        prefill_first_token,
         |weights, config, cache, first_tok, remaining, params, on_token| {
             qwen3_native::generate_canonical(
                 weights, cache, config, first_tok, remaining, params, turboquant, on_token,
