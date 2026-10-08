@@ -7,20 +7,16 @@
 //! whole context. A draft ([`DFlashDrafter::propose`]) runs the block
 //! `[last token, mask, mask, ...]` through the draft layers in one pass and
 //! reads its guesses off the target's LM head, as the DFlash reference
-//! implementation does.
+//! implementation does. Either generation of draft fits ([`DFlashDraft`]).
 
 use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_bridge::compat::{Array, Exception};
 use pmetal_bridge::native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 use pmetal_mlx::kv_cache::KVCache;
 
-use crate::architectures::dflash_draft::DFlashDraftModel;
-use crate::dflash_decoder::load_dflash_draft_from_dir;
-
-/// Tensors per draft layer: q, k, v, o, q/k norms, two layer norms, and the
-/// three MLP projections.
-const TENSORS_PER_LAYER: usize = 11;
+use crate::dflash_decoder::DFlashDraftQuant;
+use crate::dflash_drafts::{DFlashDraft, load_dflash_draft};
 
 /// Whether the model in `dir` is a DFlash draft model, by its `config.json`.
 pub fn is_dflash_draft(dir: &Path) -> bool {
@@ -32,7 +28,7 @@ pub fn is_dflash_draft(dir: &Path) -> bool {
 
 /// A DFlash draft model paired with its target's embedding and LM head.
 pub struct DFlashDrafter {
-    draft: DFlashDraftModel,
+    draft: DFlashDraft,
     /// One per draft layer: the projected context, and the block while a
     /// draft runs.
     cache: Vec<KVCache>,
@@ -61,16 +57,7 @@ impl DFlashDrafter {
         max_context: usize,
         quant: Option<QuantParams>,
     ) -> Result<Self, Exception> {
-        let (mut draft, report) = load_dflash_draft_from_dir(draft_dir)?;
-        let expected = TENSORS_PER_LAYER * draft.num_layers() + 3;
-        if report.loaded != expected || !report.skipped.is_empty() {
-            return Err(Exception::custom(format!(
-                "DFlash draft {}: loaded {} of {expected} tensors; unrecognised: {:?}",
-                draft_dir.display(),
-                report.loaded,
-                report.skipped
-            )));
-        }
+        let mut draft = load_dflash_draft(draft_dir, DFlashDraftQuant::None)?;
 
         let target: serde_json::Value = std::fs::read_to_string(target_dir.join("config.json"))
             .ok()
@@ -81,7 +68,7 @@ impl DFlashDrafter {
                     target_dir.display()
                 ))
             })?;
-        let cfg = &draft.config;
+        let cfg = draft.config();
         let dim = cfg.hidden_size as usize;
         let get = |key: &str| target[key].as_u64().unwrap_or(0) as usize;
         let (target_dim, target_vocab) = (get("hidden_size"), get("vocab_size"));
@@ -238,15 +225,21 @@ impl DFlashDrafter {
         let noise = self.embed.lookup(&ids).reshape(&[1, bs as i32, dim as i32]);
         let context =
             Array::from_slice(&self.pending, &[1, n as i32, row as i32]).as_dtype(self.dtype);
-        let hidden = self.draft.draft_block(&noise, &context, &mut self.cache)?;
+        let (embed, lm_head) = (&self.embed, &self.lm_head);
+        let tokens = self.draft.propose(
+            &noise,
+            last as i32,
+            &context,
+            &mut self.cache,
+            &mut |guesses| {
+                Ok(match lm_head {
+                    Some(head) => head.matmul_from(guesses),
+                    None => embed.as_linear(guesses),
+                })
+            },
+            max,
+        )?;
         self.pending.clear();
-
-        let guesses = hidden.slice(&[0, 1, 0], &[1, 1 + max as i32, dim as i32]);
-        let logits = match &self.lm_head {
-            Some(head) => head.matmul_from(&guesses),
-            None => self.embed.as_linear(&guesses),
-        };
-        let tokens = ops::argmax_axis(&logits, -1);
         let _ = tokens.eval();
         pmetal_bridge::check_last_error()
             .map_err(|e| Exception::custom(format!("DFlash draft: {e}")))?;

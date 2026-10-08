@@ -1,0 +1,44 @@
+{
+  "fp32_vs_fp64_hidden": 8.964800315425236e-07,
+  "fp32_vs_fp64_logits": 3.532996623256679e-06,
+  "new_context": [
+    7,
+    3,
+    2,
+    4,
+    1
+  ],
+  "oracle": "transformers",
+  "paths": [
+    [
+      269,
+      109,
+      109
+    ],
+    [
+      200,
+      285,
+      200
+    ],
+    [
+      284,
+      230,
+      200
+    ],
+    [
+      285,
+      200,
+      46
+    ],
+    [
+      200,
+      285,
+      109
+    ]
+  ],
+  "reference": "z-lab/dflash dflash/model.py DFlash2DraftModel @ 07ebd93",
+  "selector_min_margin": 0.02147197723388672,
+  "steps": 5,
+  "torch_version": "2.14.1",
+  "transformers_version": "5.19.0"
+}

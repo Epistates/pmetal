@@ -1,8 +1,9 @@
 //! DFlash speculative-decoding loop.
 //!
-//! Glues a [`crate::architectures::dflash_draft::DFlashDraftModel`] together
-//! with a Qwen3 / Qwen3.5 target so a single call to [`DFlashDecoder::generate`]
-//! runs the full draft→verify→accept→rollback cycle.
+//! Glues a DFlash draft model of either generation
+//! ([`crate::dflash_drafts::DFlashDraft`]) together with a Qwen3 / Qwen3.5
+//! target so a single call to [`DFlashDecoder::generate`] runs the full
+//! draft→verify→accept→rollback cycle.
 //!
 //! # Verification mode
 //!
@@ -35,6 +36,7 @@ use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_mlx::speculative::SpecCapture;
 
 use crate::architectures::dflash_draft::{DFlashDraftConfig, DFlashDraftModel};
+use crate::dflash_drafts::DFlashDraft;
 use crate::traits::ModelConfig;
 
 // ----------------------------------------------------------------------------
@@ -240,7 +242,7 @@ pub struct DFlashOutput {
 /// are allocated fresh.
 pub struct DFlashDecoder<T: DFlashTarget> {
     target: T,
-    draft: DFlashDraftModel,
+    draft: DFlashDraft,
     target_layer_ids: Vec<usize>,
 }
 
@@ -249,11 +251,11 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
     ///
     /// `target_layer_ids` tells the loop which target layers to tap for the
     /// draft's conditioning input; it must match the
-    /// `dflash_config.target_layer_ids` the draft was trained with. Use
-    /// [`DFlashDraftModel::config`]`.target_layer_ids()` to obtain this list
-    /// from the draft checkpoint.
-    pub fn new(target: T, draft: DFlashDraftModel) -> Self {
-        let target_layer_ids = draft.config.target_layer_ids();
+    /// `dflash_config.target_layer_ids` the draft was trained with, which
+    /// it takes from the draft (either generation).
+    pub fn new(target: T, draft: impl Into<DFlashDraft>) -> Self {
+        let draft = draft.into();
+        let target_layer_ids = draft.target_layer_ids();
         Self {
             target,
             draft,
@@ -267,7 +269,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
     }
 
     /// Borrow the underlying draft model.
-    pub fn draft(&self) -> &DFlashDraftModel {
+    pub fn draft(&self) -> &DFlashDraft {
         &self.draft
     }
 
@@ -355,13 +357,16 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
 
             // `target_hidden` holds only the positions since the last draft;
             // the draft cache holds the rest of the context.
-            let draft_hidden =
-                self.draft
-                    .draft_block(&noise_embedding, &target_hidden, &mut draft_cache)?;
-            let draft_suffix = slice_axis_1(&draft_hidden, 1, block_size as i32);
-            let draft_logits = self.target.lm_head_project(&draft_suffix)?;
-            let drafted_tokens = argmax_last_axis(&draft_logits)?;
-            for (i, tok) in drafted_tokens.into_iter().enumerate() {
+            let target = &mut self.target;
+            let drafted = self.draft.propose(
+                &noise_embedding,
+                seed_token,
+                &target_hidden,
+                &mut draft_cache,
+                &mut |hidden| target.lm_head_project(hidden),
+                block_size - 1,
+            )?;
+            for (i, tok) in token_ids(&drafted)?.into_iter().enumerate() {
                 block_tokens[i + 1] = tok;
             }
 
@@ -505,14 +510,16 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
     ///
     /// Falls back to linear [`Self::generate`] when the target does
     /// not override [`DFlashTarget::supports_tree_verify`] (i.e.,
-    /// anything that's not `NativeQwen3Target` today).
+    /// anything that's not `NativeQwen3Target` today), and for a DFlash 2
+    /// draft, whose selector proposes one path rather than per-position
+    /// distributions to branch on.
     pub fn generate_ddtree(
         &mut self,
         prompt_ids: &Array,
         config: &DFlashConfig,
         tree_budget: usize,
     ) -> Result<DFlashOutput, Exception> {
-        if !self.target.supports_tree_verify() || tree_budget == 0 {
+        if !self.target.supports_tree_verify() || tree_budget == 0 || self.draft.is_dflash2() {
             return self.generate(prompt_ids, config);
         }
         let prompt_len = prompt_ids.dim(1) as usize;
@@ -630,13 +637,18 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             }
             let block_input = array_from_i32_row(&block_tokens);
             let noise_embedding = self.target.embed_tokens(&block_input)?;
-            let draft_hidden =
-                self.draft
-                    .draft_block(&noise_embedding, &target_hidden, &mut draft_cache)?;
-            // [1, draft_horizon, hidden] — slice away the root position.
-            let draft_suffix = slice_axis_1(&draft_hidden, 1, (1 + draft_horizon) as i32);
-            // [1, draft_horizon, vocab]
-            let draft_logits = self.target.lm_head_project(&draft_suffix)?;
+            // [1, draft_horizon, vocab], the root position sliced away.
+            let target = &mut self.target;
+            let draft_logits = self
+                .draft
+                .guess_logits(
+                    &noise_embedding,
+                    &target_hidden,
+                    &mut draft_cache,
+                    &mut |hidden| target.lm_head_project(hidden),
+                    draft_horizon,
+                )?
+                .ok_or_else(|| Exception::custom("DFlash 2 drafts don't tree-verify"))?;
             // [draft_horizon, vocab]
             let draft_logits_2d =
                 draft_logits.reshape(&[draft_horizon as i32, draft_logits.dim(2)]);
@@ -836,6 +848,15 @@ fn argmax_last_axis(logits: &Array) -> Result<Vec<i32>, Exception> {
     Ok(argmax.as_slice::<u32>().iter().map(|&u| u as i32).collect())
 }
 
+/// Materialize a lazy `[1, n]` array of unsigned token ids.
+fn token_ids(ids: &Array) -> Result<Vec<i32>, Exception> {
+    let ids = ids.as_dtype(Dtype::Int32.as_i32());
+    let _ = ids.eval();
+    pmetal_bridge::check_last_error()
+        .map_err(|e| Exception::custom(format!("DFlash draft: {e}")))?;
+    Ok(ids.as_slice::<i32>().to_vec())
+}
+
 fn argmax_over_sequence(logits: &Array) -> Result<Vec<i32>, Exception> {
     if logits.ndim() != 3 {
         return Err(Exception::custom(format!(
@@ -930,6 +951,12 @@ pub fn load_dflash_draft_from_dir_quantized(
             cfg_path.display()
         ))
     })?;
+    if cfg.is_dflash2() {
+        return Err(Exception::custom(format!(
+            "DFlash draft {} is DFlash 2; load it with dflash_drafts::load_dflash_draft",
+            dir.display()
+        )));
+    }
 
     // Build the model skeleton.
     let mut draft = DFlashDraftModel::new(cfg)?;
@@ -1317,17 +1344,17 @@ mod tests {
             rms_norm_eps: 1e-6,
             vocab_size: 64,
             max_position_embeddings: 64,
-            rope_theta: 10_000.0,
+            rope_theta: Some(10_000.0),
             head_dim: 16,
             tie_word_embeddings: true,
-            attention_bias: false,
-            rope_scaling: None,
             block_size: 4,
             dflash_config: DFlashExtras {
                 // Tap the last two layers of the tiny 4-layer target.
                 target_layer_ids: vec![2, 3],
                 mask_token_id: 5,
+                ..Default::default()
             },
+            ..Default::default()
         };
         DFlashDraftModel::new(config).unwrap()
     }

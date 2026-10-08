@@ -50,31 +50,67 @@ fn default_rms_norm_eps() -> f32 {
     1e-6
 }
 
-fn default_rope_theta() -> f32 {
-    1_000_000.0
-}
-
 fn default_block_size() -> i32 {
     16
 }
 
+/// The RoPE base when a config names none, the reference implementation's.
+const DEFAULT_ROPE_THETA: f32 = 10_000.0;
+
+/// The architecture name a DFlash 2 checkpoint declares.
+pub const DFLASH2_ARCHITECTURE: &str = "DFlash2DraftModel";
+
 /// Extra DFlash-specific config section (stored under `dflash_config` in
 /// the upstream config.json).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Everything after `mask_token_id` arrived with DFlash 2 and is absent from
+/// the first generation's checkpoints.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DFlashExtras {
     /// Target-model layer indices whose hidden states the drafter consumes.
     pub target_layer_ids: Vec<i32>,
     /// Token id of the `[MASK]` token used for block-diffusion noise.
     pub mask_token_id: i32,
+    /// Block size. The reference reads it here first and falls back to the
+    /// top-level `block_size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_size: Option<i32>,
+    /// Taps of each dynamic convolution (DFlash 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_kernel_size: Option<i32>,
+    /// Channels sharing one dynamic kernel weight (DFlash 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_group_size: Option<i32>,
+    /// Rank of the candidate selector's codebooks (DFlash 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_rank: Option<i32>,
+    /// Candidates the selector chooses among at each position (DFlash 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector_top_k: Option<i32>,
+    /// Multiplies the target's token embedding of the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_embedding_scale: Option<f32>,
+    /// Multiplies the draft logits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_multiplier: Option<f32>,
+    /// `cap * tanh(logits / cap)` on the draft logits when positive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_logit_softcapping: Option<f32>,
 }
 
-/// Configuration for [`DFlashDraftModel`].
+/// Configuration for [`DFlashDraftModel`] and
+/// [`DFlash2DraftModel`](super::dflash2_draft::DFlash2DraftModel).
 ///
-/// Matches the reference Python `DraftArgs` struct. Fields
-/// that have sensible defaults in the upstream implementation are given
-/// `#[serde(default)]` so a config.json that omits them still loads.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Matches the reference implementation's `DFlashConfig`, which both
+/// generations share. Fields that have sensible defaults in the upstream
+/// implementation are given `#[serde(default)]` so a config.json that omits
+/// them still loads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DFlashDraftConfig {
+    /// `["DFlash2DraftModel"]` for DFlash 2; the first generation says
+    /// `DFlashDraftModel` or nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub architectures: Vec<String>,
     pub model_type: String,
     pub hidden_size: i32,
     pub num_hidden_layers: i32,
@@ -86,17 +122,32 @@ pub struct DFlashDraftConfig {
     pub vocab_size: i32,
     #[serde(default)]
     pub max_position_embeddings: i32,
-    #[serde(default = "default_rope_theta")]
-    pub rope_theta: f32,
+    /// The legacy top-level RoPE base; see [`Self::rope_theta`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_theta: Option<f32>,
     pub head_dim: i32,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default)]
     pub attention_bias: bool,
     #[serde(default)]
-    pub rope_scaling: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub rope_scaling: Option<HashMap<String, serde_json::Value>>,
+    /// The newer home of the RoPE base and scaling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_parameters: Option<HashMap<String, serde_json::Value>>,
+    /// The legacy top-level block size; see [`Self::block_size`].
     #[serde(default = "default_block_size")]
     pub block_size: i32,
+    /// `full_attention` or `sliding_attention` per layer; all full when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_types: Option<Vec<String>>,
+    /// Context window of the `sliding_attention` layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<i32>,
+    /// Whether a block attends to itself causally. When absent, sliding layers
+    /// are causal and full ones aren't, as in the reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_causal: Option<bool>,
     /// DFlash-specific hyperparameters.
     pub dflash_config: DFlashExtras,
 }
@@ -115,6 +166,114 @@ impl DFlashDraftConfig {
     /// Number of layers the drafter conditions on.
     pub fn num_target_layers(&self) -> usize {
         self.dflash_config.target_layer_ids.len()
+    }
+
+    /// Whether the checkpoint is a DFlash 2 draft, by its declared
+    /// architecture, as the reference implementation tells them apart.
+    pub fn is_dflash2(&self) -> bool {
+        self.architectures.iter().any(|a| a == DFLASH2_ARCHITECTURE)
+    }
+
+    /// Tokens per drafted block, the anchor included: `dflash_config`'s,
+    /// else the top-level one.
+    pub fn block_size(&self) -> i32 {
+        self.dflash_config.block_size.unwrap_or(self.block_size)
+    }
+
+    /// RoPE base: the top-level `rope_theta`, else `rope_parameters`'.
+    pub fn rope_theta(&self) -> f32 {
+        self.rope_theta
+            .or_else(|| {
+                self.rope_parameters
+                    .as_ref()
+                    .and_then(|p| p.get("rope_theta"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+            })
+            .unwrap_or(DEFAULT_ROPE_THETA)
+    }
+
+    /// RoPE scaling from `rope_scaling`, else `rope_parameters`.
+    pub fn rope_scaling(&self) -> RopeScaling {
+        self.rope_scaling
+            .as_ref()
+            .or(self.rope_parameters.as_ref())
+            .map(RopeScaling::from_config_map)
+            .unwrap_or(RopeScaling::None)
+    }
+
+    /// The sliding window of layer `layer`, `None` for a full-attention one.
+    pub fn layer_window(&self, layer: usize) -> Option<i32> {
+        let sliding = self
+            .layer_types
+            .as_ref()
+            .and_then(|types| types.get(layer))
+            .is_some_and(|t| t == "sliding_attention");
+        if sliding { self.sliding_window } else { None }
+    }
+
+    /// Whether layer `layer`'s block attends to itself causally.
+    pub fn layer_is_causal(&self, layer: usize) -> bool {
+        self.is_causal
+            .unwrap_or_else(|| self.layer_window(layer).is_some())
+    }
+
+    /// What the target's token embedding of the block is multiplied by.
+    pub fn input_embedding_scale(&self) -> f32 {
+        self.dflash_config.input_embedding_scale.unwrap_or(1.0)
+    }
+
+    /// The draft's logits from the LM head's: times `output_multiplier`,
+    /// then soft-capped by `final_logit_softcapping`, as the reference does
+    /// for both generations.
+    pub fn scale_logits(&self, head_logits: Array) -> Array {
+        let extras = &self.dflash_config;
+        let dtype = head_logits.dtype().as_i32();
+        let mut logits = head_logits;
+        if let Some(m) = extras.output_multiplier.filter(|&m| m != 1.0) {
+            logits = logits.multiply(&Array::from_f32(m).as_dtype(dtype));
+        }
+        if let Some(cap) = extras.final_logit_softcapping.filter(|&c| c > 0.0) {
+            let cap = Array::from_f32(cap).as_dtype(dtype);
+            logits = ops::tanh(&logits.divide(&cap)).multiply(&cap);
+        }
+        logits
+    }
+
+    /// Reject what the reference rejects: a layer type it doesn't know, a
+    /// `layer_types` of the wrong length, or sliding layers with no window.
+    pub fn validate(&self) -> Result<(), Exception> {
+        if let Some(types) = &self.layer_types {
+            if types.len() != self.num_hidden_layers as usize {
+                return Err(Exception::custom(format!(
+                    "DFlash draft: {} layer_types for {} layers",
+                    types.len(),
+                    self.num_hidden_layers
+                )));
+            }
+            if let Some(t) = types
+                .iter()
+                .find(|t| *t != "full_attention" && *t != "sliding_attention")
+            {
+                return Err(Exception::custom(format!(
+                    "DFlash draft: unsupported layer type {t:?}"
+                )));
+            }
+            if types.iter().any(|t| t == "sliding_attention")
+                && !self.sliding_window.is_some_and(|w| w > 0)
+            {
+                return Err(Exception::custom(
+                    "DFlash draft: sliding_attention layers need a positive sliding_window",
+                ));
+            }
+        }
+        if self.block_size() < 1 {
+            return Err(Exception::custom(format!(
+                "DFlash draft: block_size {} is not positive",
+                self.block_size()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -161,12 +320,15 @@ impl DFlashMlp {
 
 /// DFlash cross-attention.
 ///
-/// Structurally this is a standard Q/K/V attention, but the K/V projection
-/// input is the concatenation `[target_hidden || query_hidden_states]`
-/// rather than just the query's own hidden states. Queries only see the
-/// positions they contribute; keys and values are taken from every position
-/// in the concatenated sequence. RoPE is applied with an offset that
-/// accounts for the target-hidden prefix length.
+/// Queries come from the block alone. Keys and values come from the context
+/// (the target's hidden states, projected) followed by the block, so the
+/// block attends to everything decided so far and to itself. With a cache,
+/// only the context's keys and values are kept: each draft adds the context
+/// rows decided since the last one, and the block's are dropped with the
+/// draft, as in the reference implementation.
+///
+/// A sliding layer sees the context within `window` positions of each query;
+/// a causal one sees the block only up to its own position.
 #[derive(Debug)]
 pub struct DFlashAttention {
     pub q_proj: nn::Linear,
@@ -181,22 +343,24 @@ pub struct DFlashAttention {
     pub scale: f32,
     pub rope_scale: f32,
     pub effective_base: f32,
+    /// Context window of a sliding layer, `None` for a full one.
+    pub window: Option<i32>,
+    /// Whether the block attends to itself causally.
+    pub causal: bool,
 }
 impl_module_params!(DFlashAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
 impl DFlashAttention {
-    pub fn new(config: &DFlashDraftConfig) -> Result<Self, Exception> {
+    /// Attention for draft layer `layer`, whose window and causality the
+    /// config's `layer_types` and `is_causal` decide.
+    pub fn new(config: &DFlashDraftConfig, layer: usize) -> Result<Self, Exception> {
         let head_dim = config.head_dim;
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
 
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(RopeScaling::from_config_map)
-            .unwrap_or(RopeScaling::None);
+        let rope_scaling = config.rope_scaling();
         let rope_scale = rope_scaling.scale();
-        let effective_base = rope_scaling.effective_base(config.rope_theta, head_dim);
+        let effective_base = rope_scaling.effective_base(config.rope_theta(), head_dim);
 
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(config.attention_bias)
@@ -230,75 +394,85 @@ impl DFlashAttention {
             scale: (head_dim as f32).powf(-0.5),
             rope_scale,
             effective_base,
+            window: config.layer_window(layer),
+            causal: config.layer_is_causal(layer),
         })
     }
 
+    /// Keys (normed) and values of `x`, `[B, kv_heads, T, head_dim]`.
+    fn keys_values(&mut self, x: &Array) -> (Array, Array) {
+        let (batch, len) = (x.dim(0), x.dim(1));
+        let shape = [batch, len, self.n_kv_heads, self.head_dim];
+        let keys = self.k_norm.forward(&self.k_proj.forward(x).reshape(&shape));
+        let values = self.v_proj.forward(x).reshape(&shape);
+        (
+            keys.transpose_axes(&[0, 2, 1, 3]),
+            values.transpose_axes(&[0, 2, 1, 3]),
+        )
+    }
+
+    fn rope(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
+        rope(
+            x,
+            RopePositions::Offset(offset),
+            self.head_dim,
+            false,
+            self.effective_base,
+            self.rope_scale,
+        )
+    }
+
+    /// Attend the block `hidden_states` `[B, L, hidden]` to the context and
+    /// itself. `target_hidden` `[B, S, hidden]` is the projected context: with
+    /// a `cache` (a single-layer [`KVCache`]) the rows new since the last
+    /// call, which join it; without one, the whole context, from position 0.
     pub fn forward(
         &mut self,
         hidden_states: &Array,
         target_hidden: &Array,
-        mut cache: Option<(&mut KVCache, usize)>,
+        cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let batch = hidden_states.dim(0);
         let query_len = hidden_states.dim(1);
-        let context_len = target_hidden.dim(1);
+        let new_context = target_hidden.dim(1);
 
-        // Queries come from the draft's own hidden states only.
-        let queries = self.q_proj.forward(hidden_states);
-        let mut queries = queries.reshape(&[batch, query_len, self.n_heads, self.head_dim]);
-        queries = self.q_norm.forward(&queries);
-        let queries = queries.transpose_axes(&[0, 2, 1, 3]);
-
-        // K/V projection input is [target_hidden || hidden_states].
-        let kv_input = ops::concatenate_axis(&[target_hidden, hidden_states], 1);
-        let kv_len = context_len + query_len;
-        let keys = self.k_proj.forward(&kv_input);
-        let values = self.v_proj.forward(&kv_input);
-
-        let mut keys = keys.reshape(&[batch, kv_len, self.n_kv_heads, self.head_dim]);
-        keys = self.k_norm.forward(&keys);
-        let keys = keys.transpose_axes(&[0, 2, 1, 3]);
-        let values = values
-            .reshape(&[batch, kv_len, self.n_kv_heads, self.head_dim])
+        let queries = self
+            .q_norm
+            .forward(&self.q_proj.forward(hidden_states).reshape(&[
+                batch,
+                query_len,
+                self.n_heads,
+                self.head_dim,
+            ]))
             .transpose_axes(&[0, 2, 1, 3]);
+        let (context_keys, context_values) = self.keys_values(target_hidden);
+        let (block_keys, block_values) = self.keys_values(hidden_states);
 
-        // RoPE: queries start at offset `cache.offset + context_len`, keys
-        // start at offset `cache.offset` (the context rows sit at the front
-        // of the KV sequence). This matches the reference implementation.
-        let cache_offset = cache
-            .as_ref()
-            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
-        let queries = rope(
-            &queries,
-            RopePositions::Offset(cache_offset + context_len),
-            self.head_dim,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
-        let keys = rope(
-            &keys,
-            RopePositions::Offset(cache_offset),
-            self.head_dim,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
+        // The context rows take the positions after those already cached and
+        // the block the ones after them, as in the reference implementation.
+        let start = cache.as_ref().map_or(0, |c| c.rope_offset_for(0));
+        let block_start = start + new_context;
+        let queries = self.rope(&queries, block_start)?;
+        let context_keys = self.rope(&context_keys, start)?;
+        let block_keys = self.rope(&block_keys, block_start)?;
 
-        let (keys, values) = if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-            (*cache_ref).update_and_fetch(*layer_idx, &keys, &values)?
-        } else {
-            (keys, values)
+        let (context_keys, context_values) = match cache {
+            Some(cache) => cache.update_and_fetch(0, &context_keys, &context_values)?,
+            None => (context_keys, context_values),
         };
+        let context_len = context_keys.dim(2);
+        let keys = ops::concatenate_axis(&[&context_keys, &block_keys], 2);
+        let values = ops::concatenate_axis(&[&context_values, &block_values], 2);
 
-        // DFlash draft runs with `mask_mode = "none"` by default — every
-        // query position can see every key position (including future ones
-        // from the same proposed block). The upstream implementation only
-        // flips this to causal for debugging.
-        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-            .with_scale(self.scale)
-            .with_mask_type(AttentionMaskType::None);
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, None)?;
+        let mask = block_attention_mask(context_len, query_len, self.window, self.causal)
+            .map(|m| m.as_dtype(queries.dtype().as_i32()));
+        let output = pmetal_bridge::compat::fast::scaled_dot_product_attention_masked(
+            &queries,
+            &keys,
+            &values,
+            self.scale,
+            mask.as_ref(),
+        );
 
         let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
             batch,
@@ -307,6 +481,37 @@ impl DFlashAttention {
         ]);
         Ok(self.o_proj.forward(&output))
     }
+}
+
+/// The additive mask `[1, 1, L, C + L]` for a block of `L` queries over `C`
+/// context keys and the block's own, or `None` when every key is visible.
+///
+/// The context keys are the `C` positions just before the block, so query
+/// `i` and context key `j` are `C + i - j` apart; a sliding layer hides those
+/// `window` or more apart. A causal layer hides the block's later positions.
+pub fn block_attention_mask(
+    context_len: i32,
+    block_len: i32,
+    window: Option<i32>,
+    causal: bool,
+) -> Option<Array> {
+    let windowed = window.is_some_and(|w| context_len + block_len > w);
+    if !windowed && !causal {
+        return None;
+    }
+    let keys = context_len + block_len;
+    let mut mask = Vec::with_capacity((block_len * keys) as usize);
+    for i in 0..block_len {
+        for j in 0..keys {
+            let visible = if j < context_len {
+                window.is_none_or(|w| context_len + i - j < w)
+            } else {
+                !causal || j - context_len <= i
+            };
+            mask.push(if visible { 0.0f32 } else { f32::NEG_INFINITY });
+        }
+    }
+    Some(Array::from_slice(&mask, &[1, 1, block_len, keys]))
 }
 
 // ----------------------------------------------------------------------------
@@ -323,11 +528,11 @@ pub struct DFlashDecoderLayer {
 impl_module_params!(DFlashDecoderLayer; input_layernorm, self_attn, post_attention_layernorm, mlp);
 
 impl DFlashDecoderLayer {
-    pub fn new(config: &DFlashDraftConfig) -> Result<Self, Exception> {
+    pub fn new(config: &DFlashDraftConfig, layer: usize) -> Result<Self, Exception> {
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()?;
-        let self_attn = DFlashAttention::new(config)?;
+        let self_attn = DFlashAttention::new(config, layer)?;
         let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()?;
@@ -344,7 +549,7 @@ impl DFlashDecoderLayer {
         &mut self,
         hidden_states: &Array,
         target_hidden: &Array,
-        cache: Option<(&mut KVCache, usize)>,
+        cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let residual = hidden_states.clone();
         let normed = self.input_layernorm.forward(hidden_states);
@@ -390,8 +595,9 @@ impl DFlashDraftModel {
             ));
         }
 
-        let layers = (0..config.num_hidden_layers)
-            .map(|_| DFlashDecoderLayer::new(&config))
+        config.validate()?;
+        let layers = (0..config.num_hidden_layers as usize)
+            .map(|layer| DFlashDecoderLayer::new(&config, layer))
             .collect::<Result<Vec<_>, _>>()?;
 
         let fc = nn::LinearBuilder::new(l * config.hidden_size, config.hidden_size)
@@ -415,7 +621,7 @@ impl DFlashDraftModel {
 
     /// DFlash block size — how many tokens the drafter proposes per step.
     pub fn block_size(&self) -> usize {
-        self.config.block_size as usize
+        self.config.block_size() as usize
     }
 
     /// Token id used to fill proposal slots in the noise embedding.
@@ -440,8 +646,9 @@ impl DFlashDraftModel {
     ///   captured from the target model's most recent forward pass,
     ///   concatenated along the hidden dimension in the order of
     ///   [`DFlashExtras::target_layer_ids`].
-    /// * `cache`: optional per-layer KV cache. Must have one entry per
-    ///   layer; pass `None` for cacheless operation.
+    /// * `cache`: optional per-layer KV cache from
+    ///   [`make_cache`](Self::make_cache), which `target_hidden` joins; pass
+    ///   `None` for cacheless operation over a whole context.
     pub fn forward(
         &mut self,
         noise_embedding: &Array,
@@ -454,10 +661,7 @@ impl DFlashDraftModel {
 
         let mut hidden = noise_embedding.clone();
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            let layer_cache = cache
-                .as_deref_mut()
-                .and_then(|caches| caches.get_mut(i))
-                .map(|c| (c, 0_usize));
+            let layer_cache = cache.as_deref_mut().and_then(|caches| caches.get_mut(i));
             hidden = layer.forward(&hidden, &target_hidden, layer_cache)?;
         }
         Ok(self.norm.forward(&hidden))
@@ -479,38 +683,47 @@ impl DFlashDraftModel {
         result
     }
 
-    /// A KV cache per layer, with room for `context` positions of context
-    /// and a block, for [`draft_block`](Self::draft_block).
+    /// A KV cache per layer, with room for `context` positions of context,
+    /// for [`draft_block`](Self::draft_block).
     pub fn make_cache(&self, context: usize) -> Vec<KVCache> {
-        let config = pmetal_mlx::kv_cache::KVCacheConfig::new(
-            1,
-            context + self.block_size(),
-            self.config.num_key_value_heads as usize,
-            self.config.head_dim as usize,
-        );
-        (0..self.layers.len())
-            .map(|_| KVCache::new(config.clone()))
-            .collect()
+        make_context_cache(&self.config, context)
     }
 
     /// Draft a block against everything drafted against so far:
     /// `target_hidden` holds the target's tapped states for
     /// the context positions since the last draft, which join `cache` for
-    /// good, and `noise_embedding` the block, whose keys and values are
-    /// dropped after. Every draft attends to the whole context.
+    /// good, and `noise_embedding` the block, whose keys and values never
+    /// enter it. Every draft attends to the whole context (a sliding layer
+    /// to its window of it).
     pub fn draft_block(
         &mut self,
         noise_embedding: &Array,
         target_hidden: &Array,
         cache: &mut [KVCache],
     ) -> Result<Array, Exception> {
-        let block = noise_embedding.dim(1) as usize;
-        let hidden = self.forward(noise_embedding, target_hidden, Some(cache))?;
-        for layer in cache.iter_mut() {
-            layer.rollback(block);
-        }
-        Ok(hidden)
+        self.forward(noise_embedding, target_hidden, Some(cache))
     }
+}
+
+/// One single-layer [`KVCache`] per draft layer, holding the context only.
+/// A sliding layer keeps the `window - 1` positions its next block can see
+/// (the reference's rotating cache); a full one room for `context`.
+pub fn make_context_cache(config: &DFlashDraftConfig, context: usize) -> Vec<KVCache> {
+    (0..config.num_hidden_layers as usize)
+        .map(|layer| {
+            let kv = pmetal_mlx::kv_cache::KVCacheConfig::new(
+                1,
+                context.max(1),
+                config.num_key_value_heads as usize,
+                config.head_dim as usize,
+            );
+            let kv = match config.layer_window(layer) {
+                Some(window) => kv.with_sliding_window((window - 1).max(1) as usize),
+                None => kv,
+            };
+            KVCache::new(kv)
+        })
+        .collect()
 }
 
 // ----------------------------------------------------------------------------
@@ -617,16 +830,15 @@ mod tests {
             rms_norm_eps: 1e-6,
             vocab_size: 128,
             max_position_embeddings: 64,
-            rope_theta: 10_000.0,
+            rope_theta: Some(10_000.0),
             head_dim: 8,
-            tie_word_embeddings: false,
-            attention_bias: false,
-            rope_scaling: None,
             block_size: 4,
             dflash_config: DFlashExtras {
                 target_layer_ids: vec![1, 3],
                 mask_token_id: 7,
+                ..Default::default()
             },
+            ..Default::default()
         }
     }
 

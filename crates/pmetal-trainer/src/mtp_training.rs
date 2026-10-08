@@ -721,16 +721,15 @@ mod tests {
             rms_norm_eps: 1e-6,
             vocab_size: 64,
             max_position_embeddings: 64,
-            rope_theta: 10_000.0,
+            rope_theta: Some(10_000.0),
             head_dim: 8,
-            tie_word_embeddings: false,
-            attention_bias: false,
-            rope_scaling: None,
             block_size: 4,
             dflash_config: DFlashExtras {
                 target_layer_ids: vec![0],
                 mask_token_id: 7,
+                ..Default::default()
             },
+            ..Default::default()
         }
     }
 
