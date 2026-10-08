@@ -19,9 +19,9 @@
 //!
 //! - Flux (1-dev, 1-schnell) via [`pipelines::FluxPipeline`]
 //!
-//! ## Vision & Multimodal (architecture components only, not yet dispatched)
+//! ## Diffusion components
 //!
-//! - Pixtral, Qwen2-VL, MLlama, CLIP, T5, VAE, Whisper
+//! - CLIP and T5 text encoders and the VAE, loaded by the Flux pipeline
 //!
 //! # Architecture Support
 //!

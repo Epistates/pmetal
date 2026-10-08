@@ -33,19 +33,15 @@ These architectures are wired into the `ModelArchitecture` dispatcher and can be
 | `Jamba` | Jamba | 1.5 |
 | `Flux` | Flux | 1-dev, 1-schnell (diffusion) |
 
-### Architecture Modules (Not Dispatched)
+### Pipeline Components (Not Dispatched)
 
-These have implementations but are not wired into `DynamicModel` — use their types directly:
+These are loaded by the Flux pipeline rather than by `DynamicModel`:
 
 | Module | Family | Notes |
 |--------|--------|-------|
-| `gpt_oss` | GPT-OSS | 20B, 120B MoE |
-| `pixtral` | Pixtral | 12B vision-language |
-| `qwen2_vl` | Qwen2-VL | 2B, 7B vision-language |
-| `mllama` | MLlama | 3.2-Vision |
-| `clip` | CLIP | ViT-L/14 vision encoder |
-| `whisper` | Whisper | Base, Small, Medium, Large |
-| `t5` | T5 | Encoder-decoder |
+| `clip` | CLIP | Text encoder |
+| `t5` | T5 | Text encoder |
+| `vae` | VAE | Latent decoder |
 
 ## Features
 

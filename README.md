@@ -452,25 +452,13 @@ LoRA training is supported for models that have implementations in `DynamicLoraM
 | GPT-OSS | Yes | Yes | MoE variants. |
 | DiffusionGemma | Yes | Yes | Block-diffusion; trained via `pmetal train-diffusion` (add `--qlora`). |
 
-### Architecture Modules (Not Yet in Dispatcher)
-
-The following architectures have implementations in `pmetal-models` but are not wired into the `DynamicModel` dispatcher and cannot be loaded via the CLI or `DynamicModel::load()`:
-
-| Family | Module | Notes |
-|--------|--------|-------|
-| Pixtral | `pixtral` | 12B vision-language model |
-| Qwen2-VL | `qwen2_vl` | 2B, 7B vision-language model |
-| CLIP | `clip` | ViT-L/14 vision encoder |
-| Whisper | `whisper` | Base, Small, Medium, Large speech models |
-| T5 | `t5` | Encoder-decoder architecture |
-
-These modules can be used directly via their Rust types (e.g., `pmetal_models::architectures::pixtral::Pixtral`) but require manual weight loading.
-
 ### Diffusion Models
 
 | Family | Variants | Status |
 |--------|----------|--------|
 | Flux | 1-dev, 1-schnell | Dispatcher + pipeline implemented |
+
+The Flux pipeline loads its CLIP and T5 text encoders and its VAE from `pmetal-models`.
 
 ## Training Methods
 

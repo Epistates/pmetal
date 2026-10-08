@@ -72,25 +72,13 @@ to export DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 | GPT-OSS | Yes | Yes | MoE variants. |
 | DiffusionGemma | Yes | Yes | Block-diffusion; trained via `pmetal train-diffusion` (add `--qlora`). |
 
-## Architecture Modules (Not Yet in Dispatcher)
-
-These have implementations in `pmetal-models` but are not in the `DynamicModel` dispatcher:
-
-| Family | Module | Notes |
-|--------|--------|-------|
-| Pixtral | `pixtral` | 12B vision-language |
-| Qwen2-VL | `qwen2_vl` | 2B, 7B vision-language |
-| CLIP | `clip` | ViT-L/14 vision encoder |
-| Whisper | `whisper` | Base–Large speech models |
-| T5 | `t5` | Encoder-decoder architecture |
-
-These can be used directly via their Rust types (e.g., `pmetal_models::architectures::pixtral::Pixtral`).
-
 ## Diffusion Models
 
 | Family | Variants | Status |
 |--------|----------|--------|
 | Flux | 1-dev, 1-schnell | Dispatcher + pipeline implemented |
+
+The Flux pipeline loads its CLIP and T5 text encoders and its VAE from `pmetal-models`.
 
 ## See Also
 
