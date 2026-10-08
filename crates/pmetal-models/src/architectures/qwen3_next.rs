@@ -2315,10 +2315,10 @@ impl Qwen3NextSparseMoeBlock {
         // Shared expert forward + gate logit
         let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
 
-        // Combine: residual + weighted expert sum + sigmoid-gated shared expert
+        // Combine: weighted expert sum + sigmoid-gated shared expert. The
+        // decoder layer adds the residual.
         // Pure MLX ops — all async on GPU, no synchronization barriers
         let result = moe_combine_mlx(
-            &x_flat,
             &down_out,
             &top_weights,
             &shared_y,
@@ -2658,7 +2658,6 @@ impl Qwen3NextSparseMoeBlock {
                 let window_down_out =
                     ops::stack_axis(&window_down_tokens, 0).reshape(&[window_len, k, hidden]);
                 let window_output = moe_combine_mlx(
-                    &window_input,
                     &window_down_out,
                     &window_top_weights,
                     &shared_y,
@@ -2899,7 +2898,7 @@ impl Qwen3NextSparseMoeBlock {
                 }
             }
 
-            // ---- Combine: weighted sum + shared expert + residual ----
+            // ---- Combine: weighted sum + shared expert ----
             let combine_start = Instant::now();
             // Convert Metal output buffers to MLX arrays (zero-copy)
             let output_wrap_start = Instant::now();
@@ -2916,7 +2915,6 @@ impl Qwen3NextSparseMoeBlock {
             }
 
             let result = moe_combine_mlx(
-                &x_flat,
                 &down_out,
                 &top_weights,
                 &shared_y,
@@ -5039,6 +5037,36 @@ mod tests {
         assert_ne!(
             moe.shared_combined_in_proj_signature.as_ref().unwrap(),
             &initial_signature
+        );
+    }
+
+    /// The sparse block returns its own output; the decoder layer adds the
+    /// residual. With every weight zero nothing should come out. It used to
+    /// return its input, which the decoder then added to the residual stream a
+    /// second time.
+    #[test]
+    #[serial]
+    fn test_sparse_moe_block_output_excludes_its_input() {
+        use pmetal_bridge::compat::ModuleParametersExt;
+
+        let config = Qwen3NextConfig {
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            norm_topk_prob: true,
+            ..tiny_config()
+        };
+        let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
+        for (_, p) in moe.flatten_params_mut() {
+            let shape = p.shape().to_vec();
+            *p = Array::zeros_f32(&shape);
+        }
+        let x = Array::ones_f32(&[1, 3, config.hidden_size]);
+        let y = moe.forward(&x).unwrap();
+        y.eval();
+        let values: Vec<f32> = y.as_slice().to_vec();
+        assert!(
+            values.iter().all(|&v| v == 0.0),
+            "zero-weight MoE block returned its input: {values:?}"
         );
     }
 
