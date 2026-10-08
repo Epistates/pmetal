@@ -277,10 +277,14 @@ impl InlineModelWeights {
         let mut embed_w = ia_from_weight(model.model.embed_tokens.weight.as_ref());
         let mut final_norm_w = ia_from_weight(model.model.norm.weight.as_ref());
         let final_norm_eps = model.model.norm.eps;
+        // Pre-transposed like every other projection here: the decode step
+        // computes `hidden @ lm_head_w`. Kept as the `[vocab, hidden]` weight,
+        // that matmul threw on any untied model and silently used the wrong
+        // matrix when vocab == hidden.
         let mut lm_head_w = model
             .lm_head
             .as_ref()
-            .map(|l| ia_from_weight(l.weight.as_ref()));
+            .map(|l| ia_from_weight(l.weight.as_ref()).t());
 
         let mut layers = Vec::with_capacity(model.model.layers.len());
         for (li, layer) in model.model.layers.iter_mut().enumerate() {
@@ -686,7 +690,8 @@ impl InlineModelWeights {
         let lm_head_w = if config.tie_word_embeddings {
             None
         } else {
-            Some(get("lm_head.weight")?)
+            // Pre-transposed for `hidden @ lm_head_w`, as in `from_model`.
+            Some(get("lm_head.weight")?.t())
         };
 
         // Derive model dtype from embedding weights.
