@@ -11,9 +11,10 @@ use pmetal_bridge::compat::{
     indexing, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, RopeScaling, rope},
+    rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
 // MoE block uses pmetal_mlx::moe::Expert directly for individual expert MLPs
@@ -76,9 +77,13 @@ pub struct Qwen3MoEConfig {
     /// Whether to normalize top-k routing probabilities.
     #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
-    /// RoPE scaling configuration.
+    /// RoPE scaling (YaRN on the Qwen3 cards), read by
+    /// [`pmetal_bridge::rope`].
     #[serde(default)]
-    pub rope_scaling: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub rope_scaling: Option<serde_json::Value>,
+    /// transformers v5's spelling of the same, with `rope_theta` inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_parameters: Option<serde_json::Value>,
 }
 
 fn default_model_type() -> String {
@@ -113,6 +118,24 @@ fn default_norm_topk_prob() -> bool {
 }
 
 impl Qwen3MoEConfig {
+    /// The rotary embedding `rope_scaling` / `rope_parameters` describe; an
+    /// unknown `rope_type` is an error naming it.
+    pub fn rotary(&self) -> Result<RotaryEmbedding, Exception> {
+        crate::common::rotary_embedding(
+            &self.model_type,
+            self.head_dim,
+            RopeConfig {
+                rope_scaling: self.rope_scaling.as_ref(),
+                rope_parameters: self.rope_parameters.as_ref(),
+                rope_theta: Some(self.rope_theta as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                ..RopeConfig::default()
+            },
+            1.0,
+            false,
+        )
+    }
+
     /// Get the number of KV heads (defaults to num_attention_heads if not specified).
     pub fn num_kv_heads(&self) -> i32 {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
@@ -160,6 +183,7 @@ impl Default for Qwen3MoEConfig {
             mlp_only_layers: vec![],
             norm_topk_prob: true,
             rope_scaling: None,
+            rope_parameters: None,
         }
     }
 }
@@ -175,10 +199,8 @@ pub struct Qwen3MoEAttention {
     head_dim: i32,
     /// Attention scale.
     scale: f32,
-    /// RoPE position scale (from rope_scaling config).
-    rope_scale: f32,
-    /// Effective RoPE base after scaling.
-    effective_base: f32,
+    /// The rotary embedding, YaRN or other scaling included.
+    pub rotary: RotaryEmbedding,
     /// Query projection.
     pub q_proj: nn::Linear,
     /// Key projection.
@@ -203,14 +225,7 @@ impl Qwen3MoEAttention {
         let hidden_size = config.hidden_size;
         let scale = (head_dim as f32).powf(-0.5);
 
-        // Parse rope_scaling from config
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(RopeScaling::from_config_map)
-            .unwrap_or(RopeScaling::None);
-        let rope_scale = rope_scaling.scale();
-        let effective_base = rope_scaling.effective_base(config.rope_theta, head_dim);
+        let rotary = config.rotary()?;
 
         let q_proj = nn::LinearBuilder::new(hidden_size, n_heads * head_dim)
             .bias(false)
@@ -233,8 +248,7 @@ impl Qwen3MoEAttention {
             .build()?;
 
         Ok(Self {
-            rope_scale,
-            effective_base,
+            rotary,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -287,22 +301,8 @@ impl Qwen3MoEAttention {
                 .as_ref()
                 .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
-        let q = rope(
-            &q,
-            rope_positions,
-            self.head_dim,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
-        let k = rope(
-            &k,
-            rope_positions,
-            self.head_dim,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
+        let q = rope_embedding(&q, rope_positions, &self.rotary);
+        let k = rope_embedding(&k, rope_positions, &self.rotary);
 
         // Use fused SDPA
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
@@ -1000,6 +1000,15 @@ pub struct Qwen3MoE {
 impl_module_params!(Qwen3MoE; model, lm_head);
 
 impl Qwen3MoE {
+    /// Whether RoPE is a scalar base and position scale, which the fused
+    /// batched decode path carries; YaRN is not.
+    pub fn has_scalar_rope(&self) -> bool {
+        self.model
+            .layers
+            .first()
+            .is_some_and(|layer| layer.self_attn.rotary.scalar().is_some())
+    }
+
     /// Create a new model.
     pub fn new(config: Qwen3MoEConfig) -> Result<Self, Exception> {
         let model = Qwen3MoEModel::new(config.clone())?;
@@ -1100,13 +1109,12 @@ impl Qwen3MoE {
 
         let cfg = &self.config;
         let head_dim = cfg.head_dim;
-        let attn_cfg = BatchedGqaAttnCfg::new(
+        let attn_cfg = BatchedGqaAttnCfg::for_rotary(
             cfg.num_attention_heads,
             cfg.num_kv_heads(),
             head_dim,
-            self.model.layers[0].self_attn.effective_base,
-            self.model.layers[0].self_attn.rope_scale,
-        );
+            &self.model.layers[0].self_attn.rotary,
+        )?;
         let mut hidden =
             pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)?;
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {

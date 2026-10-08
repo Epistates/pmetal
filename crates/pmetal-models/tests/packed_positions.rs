@@ -204,24 +204,10 @@ packing_case!(llama, LlamaForCausalLM::new(llama_config()).unwrap());
 packing_case!(
     llama3_frequency_band_scaling,
     LlamaForCausalLM::new(LlamaConfig {
-        rope_scaling: Some(
-            [
-                ("rope_type", serde_json::Value::from("llama3")),
-                ("factor", serde_json::Value::from(32.0)),
-                ("low_freq_factor", serde_json::Value::from(1.0)),
-                ("high_freq_factor", serde_json::Value::from(4.0)),
-                (
-                    "original_max_position_embeddings",
-                    serde_json::Value::from(8192.0),
-                ),
-            ]
-            .into_iter()
-            .map(|(key, value)| (
-                key.to_string(),
-                serde_json::from_value(value).expect("rope_scaling value")
-            ))
-            .collect(),
-        ),
+        rope_scaling: Some(serde_json::json!({
+            "rope_type": "llama3", "factor": 32.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+        })),
         ..llama_config()
     })
     .unwrap()

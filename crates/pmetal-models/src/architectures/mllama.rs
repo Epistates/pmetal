@@ -43,7 +43,7 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
-use crate::architectures::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RopeScalingValue};
+use crate::architectures::llama::{LlamaAttention, LlamaConfig, LlamaMLP};
 use crate::architectures::utils::{
     Activation, LoadReport, coerce_mask_dtype, load_layer_norm, load_linear, load_optional_param,
     load_param, resolve_activation,

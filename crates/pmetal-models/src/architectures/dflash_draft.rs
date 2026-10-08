@@ -36,10 +36,8 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, RopeScaling, rope},
-};
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_mlx::kv_cache::KVCache;
 
 // ----------------------------------------------------------------------------
@@ -131,10 +129,10 @@ pub struct DFlashDraftConfig {
     #[serde(default)]
     pub attention_bias: bool,
     #[serde(default)]
-    pub rope_scaling: Option<HashMap<String, serde_json::Value>>,
+    pub rope_scaling: Option<serde_json::Value>,
     /// The newer home of the RoPE base and scaling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rope_parameters: Option<HashMap<String, serde_json::Value>>,
+    pub rope_parameters: Option<serde_json::Value>,
     /// The legacy top-level block size; see [`Self::block_size`].
     #[serde(default = "default_block_size")]
     pub block_size: i32,
@@ -193,13 +191,24 @@ impl DFlashDraftConfig {
             .unwrap_or(DEFAULT_ROPE_THETA)
     }
 
-    /// RoPE scaling from `rope_scaling`, else `rope_parameters`.
-    pub fn rope_scaling(&self) -> RopeScaling {
-        self.rope_scaling
-            .as_ref()
-            .or(self.rope_parameters.as_ref())
-            .map(RopeScaling::from_config_map)
-            .unwrap_or(RopeScaling::None)
+    /// The rotary embedding `rope_scaling` (else `rope_parameters`)
+    /// describes, at [`Self::rope_theta`]; an unknown `rope_type` is an error
+    /// naming it.
+    pub fn rotary(&self) -> Result<RotaryEmbedding, Exception> {
+        crate::common::rotary_embedding(
+            "dflash draft",
+            self.head_dim,
+            RopeConfig {
+                rope_scaling: self.rope_scaling.as_ref(),
+                rope_parameters: self.rope_parameters.as_ref(),
+                rope_theta: Some(self.rope_theta() as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64)
+                    .filter(|&m| m > 0.0),
+                ..RopeConfig::default()
+            },
+            1.0,
+            false,
+        )
     }
 
     /// The sliding window of layer `layer`, `None` for a full-attention one.
@@ -341,8 +350,8 @@ pub struct DFlashAttention {
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
-    pub rope_scale: f32,
-    pub effective_base: f32,
+    /// The rotary embedding, scaling included.
+    pub rotary: RotaryEmbedding,
     /// Context window of a sliding layer, `None` for a full one.
     pub window: Option<i32>,
     /// Whether the block attends to itself causally.
@@ -358,9 +367,7 @@ impl DFlashAttention {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
 
-        let rope_scaling = config.rope_scaling();
-        let rope_scale = rope_scaling.scale();
-        let effective_base = rope_scaling.effective_base(config.rope_theta(), head_dim);
+        let rotary = config.rotary()?;
 
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(config.attention_bias)
@@ -392,8 +399,7 @@ impl DFlashAttention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
-            rope_scale,
-            effective_base,
+            rotary,
             window: config.layer_window(layer),
             causal: config.layer_is_causal(layer),
         })
@@ -412,14 +418,7 @@ impl DFlashAttention {
     }
 
     fn rope(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
-        rope(
-            x,
-            RopePositions::Offset(offset),
-            self.head_dim,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )
+        Ok(self.rotary.apply(x, offset))
     }
 
     /// Attend the block `hidden_states` `[B, L, hidden]` to the context and

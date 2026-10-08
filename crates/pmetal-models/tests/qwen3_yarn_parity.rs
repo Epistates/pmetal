@@ -88,6 +88,58 @@ fn assert_all_pass(title: &str, reports: &[ParityReport]) {
     assert!(failed.is_empty(), "{title}: {failed:?} out of tolerance");
 }
 
+/// The `DynamicModel` path (`architectures/qwen3.rs`), which training,
+/// LoRA and `serve` run. Its "yarn" used to be an NTK-style base change plus
+/// a 1/4 position scale, wrong from the first token.
+#[test]
+#[serial]
+fn dynamic_qwen3_yarn_matches_transformers() {
+    use pmetal_models::DynamicModel;
+
+    let fx = checkpoint();
+    let mut model = DynamicModel::load(fx.path()).expect("checkpoint loads");
+    let ids = fx.tensor("input_ids");
+    let t = ids.dim(1);
+    let want = fx.tensor("logits");
+
+    let logits = model.forward(&ids, None).expect("prefill");
+    drain_bridge("dynamic prefill");
+    assert_all_pass(
+        "dynamic prefill",
+        &[ParityReport::compute_with_per_position(
+            "logits", &logits, &want, TOL,
+        )],
+    );
+    assert_eq!(argmax_last_axis(&logits), argmax_last_axis(&want));
+
+    let mut cache = model.create_cache(t as usize + 1);
+    let prefill = model
+        .forward_with_cache(&rows(&ids, 0, PREFILL), None, Some(&mut cache))
+        .expect("cached prefill");
+    drain_bridge("dynamic cached prefill");
+    let mut reports = vec![ParityReport::compute(
+        "prefill_logits",
+        &prefill,
+        &rows(&want, 0, PREFILL),
+        TOL,
+    )];
+    for pos in PREFILL..t {
+        let step = model
+            .forward_with_cache(&rows(&ids, pos, pos + 1), None, Some(&mut cache))
+            .expect("decode step");
+        drain_bridge("dynamic decode step");
+        reports.push(ParityReport::compute(
+            &format!("step_{pos}"),
+            &step,
+            &rows(&want, pos, pos + 1),
+            TOL,
+        ));
+    }
+    assert_all_pass("dynamic cached decode", &reports);
+    // Continuous batching keeps a scaled RoPE on the serial path.
+    assert!(!model.supports_fused_batched());
+}
+
 #[test]
 #[serial]
 fn native_qwen3_yarn_matches_transformers() {

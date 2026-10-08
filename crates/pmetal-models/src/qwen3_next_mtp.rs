@@ -845,6 +845,9 @@ mod tests {
             num_attention_heads: 1,
             num_key_value_heads: Some(1),
             head_dim: Some(4),
+            // Two rotary channels: the default quarter of a 4-wide head is
+            // one, which no rotation pairs.
+            partial_rotary_factor: 0.5,
             vocab_size: 16,
             num_experts: 0,
             mtp_num_hidden_layers: Some(1),
@@ -866,6 +869,9 @@ mod tests {
             num_attention_heads: 1,
             num_key_value_heads: Some(1),
             head_dim: Some(4),
+            // Two rotary channels: the default quarter of a 4-wide head is
+            // one, which no rotation pairs.
+            partial_rotary_factor: 0.5,
             vocab_size: 16,
             num_experts: 0,
             mtp_num_hidden_layers: Some(2),

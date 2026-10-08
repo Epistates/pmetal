@@ -19,7 +19,7 @@ pub enum PretrainModel {
     Llama(architectures::LlamaForCausalLM),
     Qwen2(architectures::Qwen2ForCausalLM),
     Qwen3(architectures::Qwen3ForCausalLM),
-    Qwen3MoE(architectures::Qwen3MoE),
+    Qwen3MoE(Box<architectures::Qwen3MoE>),
     Qwen3Next(Box<architectures::Qwen3NextForCausalLM>),
     Gemma(architectures::GemmaForCausalLM),
     Gemma4(Box<architectures::Gemma4ForCausalLM>),
@@ -186,9 +186,9 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
                     .map_err(|e| Exception::custom(format!("qwen3-moe config: {e}")))?,
                 None => architectures::Qwen3MoEConfig::default(),
             };
-            Ok(PretrainModel::Qwen3MoE(architectures::Qwen3MoE::new(
-                config,
-            )?))
+            Ok(PretrainModel::Qwen3MoE(Box::new(
+                architectures::Qwen3MoE::new(config)?,
+            )))
         }
         "qwen3.5" | "qwen3_5" | "qwen3_next" | "qwen3-next" | "qwen35" | "qwen3.6" | "qwen3_6"
         | "qwen36" => {

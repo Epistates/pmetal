@@ -91,6 +91,33 @@ impl BatchedGqaAttnCfg {
         }
     }
 
+    /// [`new`](Self::new) with the RoPE a layer's [`RotaryEmbedding`] runs:
+    /// its base, position scale, rotated dims and pair layout.
+    ///
+    /// The block rotates by a scalar base, so a rotary embedding that needs
+    /// more (YaRN, Llama 3 bands, LongRoPE, dynamic NTK) is an error: the
+    /// architecture's `supports_fused_batched` keeps those on the serial
+    /// path, and this refuses rather than rotate them as plain RoPE.
+    ///
+    /// [`RotaryEmbedding`]: pmetal_bridge::rope::RotaryEmbedding
+    pub fn for_rotary(
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rotary: &pmetal_bridge::rope::RotaryEmbedding,
+    ) -> Result<Self, Exception> {
+        let (base, scale) = rotary.scalar().ok_or_else(|| {
+            Exception::custom(format!(
+                "fused batched decode rotates by a scalar RoPE base; rope_type {:?} needs the \
+                 serial path",
+                rotary.rotary().scaling.rope_type()
+            ))
+        })?;
+        Ok(Self::new(n_heads, n_kv_heads, head_dim, base, scale)
+            .with_rope_dims(rotary.dims())
+            .with_rope_traditional(rotary.traditional()))
+    }
+
     /// Set a custom scale (overrides the default `1/sqrt(head_dim)`).
     pub fn with_scale(mut self, scale: f32) -> Self {
         self.scale = scale;

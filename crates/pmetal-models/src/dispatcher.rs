@@ -1926,20 +1926,20 @@ impl DynamicModel {
     /// default to `false` and expose `true` only after a parity test.
     pub fn supports_fused_batched(&self) -> bool {
         match self {
-            // Llama: standard GQA rides the shared fused block. Llama 3
-            // (`"rope_type": "llama3"`) takes the serial fallback — it rescales
-            // three RoPE frequency bands separately, and `BatchedGqaAttnCfg`
-            // is scalar-only by design, carrying a single `rope_base`. Taking
-            // the fused path would silently rotate with unscaled RoPE and
-            // disagree with this model's own serial decode.
-            Self::Llama(m) => !m.has_banded_rope(),
-            Self::Mistral(m) => m.config().sliding_window.is_none(),
-            Self::Qwen2(m) => !m.config().use_sliding_window,
-            Self::Qwen3(m) => !m.config.use_sliding_window,
+            // Every arch below gates on `has_scalar_rope`: `BatchedGqaAttnCfg`
+            // is scalar-only by design, carrying one `rope_base` and position
+            // scale, so a scaled RoPE (Llama 3 bands, YaRN, LongRoPE, dynamic
+            // NTK) takes the serial fallback. The fused path would rotate it
+            // as plain RoPE and disagree with the model's own serial decode;
+            // `BatchedGqaAttnCfg::for_rotary` refuses if one slips through.
+            Self::Llama(m) => m.has_scalar_rope(),
+            Self::Mistral(m) => m.config().sliding_window.is_none() && m.has_scalar_rope(),
+            Self::Qwen2(m) => !m.config().use_sliding_window && m.has_scalar_rope(),
+            Self::Qwen3(m) => !m.config.use_sliding_window && m.has_scalar_rope(),
             // Qwen3-MoE reuses the GQA attention block (with qk-norm); the
             // token-level MoE router already flattens `[N, 1, H]` cleanly
             // via `forward_stacked`.
-            Self::Qwen3MoE(_) => true,
+            Self::Qwen3MoE(m) => m.has_scalar_rope(),
             // GPT-OSS: takes the serial decode path. Its attention has learned
             // per-head *sinks* (an extra softmax-denominator term) and YARN
             // per-dim RoPE frequencies, neither of which the shared scalar
@@ -1959,15 +1959,13 @@ impl DynamicModel {
             // `layers[0]`, which for Gemma 3 is a *sliding* layer, so every
             // global layer would get the local base. Correct and serial beats
             // fast and wrong.
-            Self::Gemma(m) => !m.config().is_gemma3,
+            Self::Gemma(m) => !m.config().is_gemma3 && m.has_scalar_rope(),
             // Phi/Phi4: partial RoPE handled by `BatchedGqaAttnCfg::with_rope_dims`.
-            // SuRoPE configs (`rope_scaling = Some(...)`) take the serial fallback
-            // because the fused cfg carries a single scalar `rope_base`, not a
-            // per-dim freq array. Sliding-window Phi configs likewise stay on
-            // serial until the per-layer overlay is wired into the arch loop.
+            // LongRoPE configs take the serial fallback like every scaled RoPE.
+            // Sliding-window Phi configs likewise stay on serial until the
+            // per-layer overlay is wired into the arch loop.
             Self::Phi(m) | Self::Phi4(m) => {
-                let c = m.config();
-                c.rope_scaling.is_none() && c.sliding_window.is_none()
+                m.config().sliding_window.is_none() && m.has_scalar_rope()
             }
             // Cohere: parallel decoder block via `batched_parallel_block`.
             // Sliding-window-with-non-global-layers configs need a per-layer

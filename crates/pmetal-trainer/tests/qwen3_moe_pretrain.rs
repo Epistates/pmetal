@@ -24,6 +24,7 @@ fn tiny_qwen3_moe_config() -> Qwen3MoEConfig {
         mlp_only_layers: vec![],
         norm_topk_prob: true,
         rope_scaling: None,
+        rope_parameters: None,
     }
 }
 

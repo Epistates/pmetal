@@ -698,6 +698,23 @@ impl RotaryEmbedding {
         Self::new(Rotary::plain(head_dim, dims, theta), traditional)
     }
 
+    /// [`Rotary::from_config`], ready to rotate.
+    pub fn from_config(
+        head_dim: i32,
+        config: RopeConfig<'_>,
+        default_theta: f64,
+        default_partial_rotary_factor: f64,
+        traditional: bool,
+    ) -> Result<Self, String> {
+        Rotary::from_config(
+            head_dim,
+            config,
+            default_theta,
+            default_partial_rotary_factor,
+        )
+        .map(|rotary| Self::new(rotary, traditional))
+    }
+
     /// The rotary embedding this applies.
     pub fn rotary(&self) -> &Rotary {
         &self.rotary

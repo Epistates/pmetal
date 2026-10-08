@@ -6,9 +6,10 @@ use std::collections::HashMap;
 
 use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, random};
 use pmetal_bridge::impl_module_params;
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa, get_training_context,
-    rope::{RopePositions, RopeScaling, apply_rope, apply_rope_scaled, rope, rope_with_periods},
+    rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -47,9 +48,13 @@ pub struct LlamaConfig {
     /// RoPE base frequency.
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
-    /// RoPE scaling configuration.
+    /// RoPE scaling (`rope_type` `"llama3"` for Llama 3.1 onward), read by
+    /// [`pmetal_bridge::rope`].
     #[serde(default)]
-    pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
+    pub rope_scaling: Option<serde_json::Value>,
+    /// transformers v5's spelling of the same, with `rope_theta` inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_parameters: Option<serde_json::Value>,
     /// Hidden activation function.
     #[serde(default = "default_hidden_act")]
     pub hidden_act: String,
@@ -74,16 +79,6 @@ fn default_hidden_act() -> String {
     "silu".to_string()
 }
 
-/// RoPE scaling configuration value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RopeScalingValue {
-    /// Floating point value.
-    Float(f32),
-    /// String value.
-    String(String),
-}
-
 impl LlamaConfig {
     /// Get the number of KV heads (defaults to num_attention_heads if not specified).
     pub fn num_kv_heads(&self) -> i32 {
@@ -96,34 +91,25 @@ impl LlamaConfig {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
-    /// Parse `rope_scaling` into the shared [`RopeScaling`] spec.
-    pub fn rope_scaling_spec(&self) -> RopeScaling {
-        let Some(map) = self.rope_scaling.as_ref() else {
-            return RopeScaling::None;
-        };
-        let json_map: HashMap<String, serde_json::Value> = map
-            .iter()
-            .map(|(k, v)| {
-                let json_v = match v {
-                    RopeScalingValue::Float(f) => serde_json::Value::from(*f as f64),
-                    RopeScalingValue::String(s) => serde_json::Value::from(s.clone()),
-                };
-                (k.clone(), json_v)
-            })
-            .collect();
-        RopeScaling::from_config_map(&json_map)
-    }
-
-    /// Build the per-dimension RoPE period table, if this config needs one.
-    ///
-    /// `Some` for Llama 3 (`"rope_type": "llama3"`), whose three frequency
-    /// bands no scalar `(base, scale)` pair can express. Every path that
-    /// rotates Q/K — inference, LoRA, QLoRA — has to honour it or the model
-    /// silently runs on unscaled RoPE.
-    pub fn rope_period_table(&self) -> Option<Array> {
-        self.rope_scaling_spec()
-            .rope_periods(self.get_head_dim(), self.rope_theta)
-            .map(|periods| Array::from_f32_slice(&periods, &[periods.len() as i32]))
+    /// The rotary embedding `rope_scaling` / `rope_parameters` describe:
+    /// Llama 3's frequency bands, or any other scaling transformers defines.
+    /// Every path that rotates Q/K (inference, LoRA, QLoRA, packed training)
+    /// rotates with this, so none can run unscaled RoPE by accident; an
+    /// unknown `rope_type` is an error naming it.
+    pub fn rotary(&self) -> Result<RotaryEmbedding, Exception> {
+        crate::common::rotary_embedding(
+            &self.model_type,
+            self.get_head_dim(),
+            RopeConfig {
+                rope_scaling: self.rope_scaling.as_ref(),
+                rope_parameters: self.rope_parameters.as_ref(),
+                rope_theta: Some(self.rope_theta as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                ..RopeConfig::default()
+            },
+            1.0,
+            false,
+        )
     }
 }
 
@@ -143,6 +129,7 @@ impl Default for LlamaConfig {
             rms_norm_eps: 1e-5,
             rope_theta: 500000.0,
             rope_scaling: None,
+            rope_parameters: None,
             hidden_act: "silu".to_string(),
             tie_word_embeddings: true,
         }
@@ -160,16 +147,8 @@ pub struct LlamaAttention {
     pub head_dim: i32,
     /// Attention scale factor.
     pub scale: f32,
-    /// RoPE base frequency (for apply_rope with offset).
-    pub rope_theta: f32,
-    /// RoPE position scale (from rope_scaling config).
-    pub rope_scale: f32,
-    /// Effective RoPE base after scaling.
-    pub effective_base: f32,
-    /// Per-dimension RoPE period table, present only for Llama 3 frequency-band
-    /// scaling. When set it supersedes `effective_base`/`rope_scale`, neither of
-    /// which can express the three-band rescale.
-    pub rope_periods: Option<Array>,
+    /// The rotary embedding, Llama 3 bands or other scaling included.
+    pub rotary: RotaryEmbedding,
     /// Layer index (set during model construction).
     pub layer_id: usize,
 
@@ -195,12 +174,7 @@ impl LlamaAttention {
         let n_kv_heads = config.num_kv_heads();
         let head_dim = config.get_head_dim();
         let scale = (head_dim as f32).sqrt().recip();
-        let rope_theta = config.rope_theta;
-
-        let rope_scaling = config.rope_scaling_spec();
-        let rope_scale = rope_scaling.scale();
-        let effective_base = rope_scaling.effective_base(rope_theta, head_dim);
-        let rope_periods = config.rope_period_table();
+        let rotary = config.rotary()?;
 
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
@@ -220,38 +194,13 @@ impl LlamaAttention {
             n_kv_heads,
             head_dim,
             scale,
-            rope_theta,
-            rope_scale,
-            effective_base,
-            rope_periods,
+            rotary,
             layer_id,
             q_proj,
             k_proj,
             v_proj,
             o_proj,
         })
-    }
-
-    /// Rotate `x` by RoPE at `positions`.
-    ///
-    /// Routes through the per-dimension period table when the checkpoint ships
-    /// Llama 3 frequency-band scaling, and through the scalar base otherwise.
-    /// A contiguous run stays on the fused `mx.fast.rope` kernel either way, so
-    /// the banded path costs no more than the plain one.
-    fn apply_rotary(&self, x: &Array, positions: RopePositions<'_>) -> Result<Array, Exception> {
-        match self.rope_periods.as_ref() {
-            Some(periods) => {
-                rope_with_periods(x, positions, periods, self.head_dim, false, self.rope_scale)
-            }
-            None => rope(
-                x,
-                positions,
-                self.head_dim,
-                false,
-                self.effective_base,
-                self.rope_scale,
-            ),
-        }
     }
 
     /// Forward pass through attention using fused Metal kernels.
@@ -322,8 +271,8 @@ impl LlamaAttention {
                 .as_ref()
                 .map_or(0, |(cache_ref, layer)| cache_ref.rope_offset_for(*layer)),
         );
-        let queries = self.apply_rotary(&queries, rope_positions)?;
-        let keys = self.apply_rotary(&keys, rope_positions)?;
+        let queries = rope_embedding(&queries, rope_positions, &self.rotary);
+        let keys = rope_embedding(&keys, rope_positions, &self.rotary);
 
         // Use fused attention kernel - handles GQA natively (no KV head expansion needed)
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
@@ -793,13 +742,12 @@ impl LlamaForCausalLM {
 
         let cfg = &self.model.config;
         let head_dim = cfg.get_head_dim();
-        let attn_cfg = BatchedGqaAttnCfg::new(
+        let attn_cfg = BatchedGqaAttnCfg::for_rotary(
             cfg.num_attention_heads,
             cfg.num_kv_heads(),
             head_dim,
-            self.model.layers[0].self_attn.effective_base,
-            self.model.layers[0].self_attn.rope_scale,
-        );
+            &self.model.layers[0].self_attn.rotary,
+        )?;
         let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
             hidden = batched_prenorm_layer(
@@ -851,14 +799,13 @@ impl LlamaForCausalLM {
         &self.model.config
     }
 
-    /// Whether RoPE needs a per-dimension period table (Llama 3 banded scaling).
-    ///
-    /// Gates the fused batched decode path, which carries one scalar base.
-    pub fn has_banded_rope(&self) -> bool {
+    /// Whether RoPE is a scalar base and position scale (plain or linear),
+    /// which the fused batched decode path carries; Llama 3 bands are not.
+    pub fn has_scalar_rope(&self) -> bool {
         self.model
             .layers
             .first()
-            .is_some_and(|layer| layer.self_attn.rope_periods.is_some())
+            .is_some_and(|layer| layer.self_attn.rotary.scalar().is_some())
     }
 }
 

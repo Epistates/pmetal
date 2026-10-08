@@ -11,9 +11,10 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, RopeScaling, rope},
+    rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -100,9 +101,14 @@ pub struct GemmaConfig {
     /// This is set automatically when `model_type == "gemma3"` is detected.
     #[serde(default)]
     pub is_gemma3: bool,
-    /// RoPE scaling configuration.
+    /// RoPE scaling (Gemma 3's `linear` on its global layers), read by
+    /// [`pmetal_bridge::rope`].
     #[serde(default)]
-    pub rope_scaling: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub rope_scaling: Option<serde_json::Value>,
+    /// transformers v5's spelling: one dict, or Gemma 3's pair keyed
+    /// `full_attention` / `sliding_attention`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_parameters: Option<serde_json::Value>,
 }
 
 fn default_model_type() -> String {
@@ -137,6 +143,53 @@ impl GemmaConfig {
     pub fn get_head_dim(&self) -> i32 {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// The rotary embedding of a global (`local = false`) or sliding-window
+    /// layer; an unknown `rope_type` is an error naming it.
+    ///
+    /// Gemma 3 scales only its global layers: transformers' `Gemma3Config`
+    /// moves `rope_scaling` into `rope_parameters["full_attention"]` and
+    /// runs `sliding_attention` as plain RoPE at `rope_local_base_freq`.
+    /// Gemma 1 and 2 have one rotation for every layer.
+    pub fn rotary(&self, local: bool) -> Result<RotaryEmbedding, Exception> {
+        let nested = |key: &str| {
+            self.rope_parameters
+                .as_ref()
+                .and_then(|p| p.get(key))
+                .filter(|v| v.is_object())
+        };
+        let is_nested = nested("full_attention").is_some() || nested("sliding_attention").is_some();
+        let (rope_scaling, rope_parameters, theta) = match (self.is_gemma3, local) {
+            (true, true) => (
+                None,
+                nested("sliding_attention"),
+                self.rope_local_base_freq.unwrap_or(self.rope_theta),
+            ),
+            (true, false) if is_nested => (
+                self.rope_scaling.as_ref(),
+                nested("full_attention"),
+                self.rope_theta,
+            ),
+            _ => (
+                self.rope_scaling.as_ref(),
+                self.rope_parameters.as_ref(),
+                self.rope_theta,
+            ),
+        };
+        crate::common::rotary_embedding(
+            &self.model_type,
+            self.get_head_dim(),
+            RopeConfig {
+                rope_scaling,
+                rope_parameters,
+                rope_theta: Some(theta as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                ..RopeConfig::default()
+            },
+            1.0,
+            false,
+        )
     }
 
     /// Get the embedding scaling factor.
@@ -189,6 +242,7 @@ impl Default for GemmaConfig {
             is_gemma2: false,
             is_gemma3: false,
             rope_scaling: None,
+            rope_parameters: None,
         }
     }
 }
@@ -353,12 +407,9 @@ pub struct GemmaAttention {
     pub scale: f32,
     /// Attention logit softcapping (Gemma2).
     pub logit_softcapping: Option<f32>,
-    /// RoPE base frequency.
-    pub rope_theta: f32,
-    /// RoPE position scale (from rope_scaling config).
-    pub rope_scale: f32,
-    /// Effective RoPE base after scaling.
-    pub effective_base: f32,
+    /// The rotary embedding: Gemma 3's local base on its sliding-window
+    /// layers, the global base and any scaling otherwise.
+    pub rotary: RotaryEmbedding,
     /// Layer index (for Gemma2 alternating sliding window).
     pub layer_idx: usize,
     /// Whether this layer uses local (sliding window) attention (Gemma2: even layers).
@@ -402,20 +453,9 @@ impl GemmaAttention {
             config.is_gemma2 && (layer_idx % 2 == 0)
         };
 
-        // Gemma 3 runs a second, much smaller RoPE base on its local layers.
-        let rope_theta = match config.rope_local_base_freq {
-            Some(local) if is_local_attention => local,
-            _ => config.rope_theta,
-        };
-
-        // Parse rope_scaling from config
-        let rope_scaling_cfg = config
-            .rope_scaling
-            .as_ref()
-            .map(RopeScaling::from_config_map)
-            .unwrap_or(RopeScaling::None);
-        let rope_scale = rope_scaling_cfg.scale();
-        let effective_base = rope_scaling_cfg.effective_base(rope_theta, head_dim);
+        // Gemma 3 runs a second, much smaller RoPE base on its local layers,
+        // unscaled.
+        let rotary = config.rotary(is_local_attention)?;
 
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
@@ -447,9 +487,7 @@ impl GemmaAttention {
             head_dim,
             scale,
             logit_softcapping: config.attn_logit_softcapping,
-            rope_theta,
-            rope_scale,
-            effective_base,
+            rotary,
             layer_idx,
             is_local_attention,
             sliding_window: config.sliding_window,
@@ -517,22 +555,8 @@ impl GemmaAttention {
                 .as_ref()
                 .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
-        let queries = rope(
-            &queries,
-            rope_positions,
-            self.head_dim,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
-        let keys = rope(
-            &keys,
-            rope_positions,
-            self.head_dim,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
+        let queries = rope_embedding(&queries, rope_positions, &self.rotary);
+        let keys = rope_embedding(&keys, rope_positions, &self.rotary);
 
         // Build fused attention config with optional softcapping
         // Gemma2: even layers use sliding window, odd layers use full causal
@@ -1114,6 +1138,17 @@ impl GemmaForCausalLM {
         &self.model.config
     }
 
+    /// Whether every layer's RoPE is a scalar base and position scale,
+    /// which the fused batched decode path carries.
+    pub fn has_scalar_rope(&self) -> bool {
+        let layers = &self.model.layers;
+        match (layers.gemma1.as_ref(), layers.gemma2.as_ref()) {
+            (Some(l), _) => l.iter().all(|l| l.self_attn.rotary.scalar().is_some()),
+            (_, Some(l)) => l.iter().all(|l| l.self_attn.rotary.scalar().is_some()),
+            _ => false,
+        }
+    }
+
     /// Fused batched decode forward.
     ///
     /// Gemma1 only — Gemma2/3's 4-norm peri-norm pattern (with
@@ -1143,17 +1178,12 @@ impl GemmaForCausalLM {
 
         if let Some(layers) = self.model.layers.gemma1.as_mut() {
             // Gemma1: standard pre-norm, no softcap, no per-layer sliding.
-            let (rope_base, rope_scale) = (
-                layers[0].self_attn.effective_base,
-                layers[0].self_attn.rope_scale,
-            );
-            let attn_cfg = BatchedGqaAttnCfg::new(
+            let attn_cfg = BatchedGqaAttnCfg::for_rotary(
                 cfg.num_attention_heads,
                 cfg.num_kv_heads(),
                 head_dim,
-                rope_base,
-                rope_scale,
-            )
+                &layers[0].self_attn.rotary,
+            )?
             .with_scale(cfg.attention_scale());
 
             for (layer_idx, layer) in layers.iter_mut().enumerate() {
@@ -1178,17 +1208,12 @@ impl GemmaForCausalLM {
             // Gemma2 / Gemma3: 4-norm peri-norm, optional softcap, per-layer
             // sliding-window override (Gemma2 even layers; Gemma3 layers
             // where (idx+1) % 6 != 0).
-            let (rope_base, rope_scale) = (
-                layers[0].self_attn.effective_base,
-                layers[0].self_attn.rope_scale,
-            );
-            let mut base_cfg = BatchedGqaAttnCfg::new(
+            let mut base_cfg = BatchedGqaAttnCfg::for_rotary(
                 cfg.num_attention_heads,
                 cfg.num_kv_heads(),
                 head_dim,
-                rope_base,
-                rope_scale,
-            )
+                &layers[0].self_attn.rotary,
+            )?
             .with_scale(cfg.attention_scale());
             if let Some(cap) = cfg.attn_logit_softcapping {
                 base_cfg = base_cfg.with_logit_softcap(cap);
@@ -1323,6 +1348,48 @@ mod tests {
             rope_theta: 10000.0,
             ..Default::default()
         }
+    }
+
+    /// Gemma 3 scales only its global layers, as transformers'
+    /// `Gemma3Config` moves `rope_scaling` into `full_attention`: the 4B-and-up
+    /// releases ship `linear` factor 8, and the sliding layers keep plain RoPE
+    /// at `rope_local_base_freq`. pmetal used to scale every layer.
+    #[test]
+    fn gemma3_scales_global_layers_only() {
+        let config = GemmaConfig {
+            model_type: "gemma3".into(),
+            is_gemma3: true,
+            rope_theta: 1_000_000.0,
+            rope_local_base_freq: Some(10_000.0),
+            rope_scaling: Some(serde_json::json!({"rope_type": "linear", "factor": 8.0})),
+            ..small_config()
+        };
+        assert_eq!(
+            config.rotary(false).unwrap().scalar(),
+            Some((1_000_000.0, 0.125))
+        );
+        assert_eq!(config.rotary(true).unwrap().scalar(), Some((10_000.0, 1.0)));
+
+        // transformers v5's nested spelling reads the same way.
+        let nested = GemmaConfig {
+            rope_scaling: None,
+            rope_parameters: Some(serde_json::json!({
+                "full_attention": {"rope_type": "linear", "factor": 8.0, "rope_theta": 1e6},
+                "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}
+            })),
+            ..config.clone()
+        };
+        assert_eq!(nested.rotary(false).unwrap().scalar(), Some((1e6, 0.125)));
+        assert_eq!(nested.rotary(true).unwrap().scalar(), Some((1e4, 1.0)));
+
+        // Gemma 2 has one rotation for every layer.
+        let gemma2 = GemmaConfig {
+            model_type: "gemma2".into(),
+            is_gemma3: false,
+            is_gemma2: true,
+            ..config
+        };
+        assert_eq!(gemma2.rotary(true).unwrap().scalar(), Some((1e6, 0.125)));
     }
 
     #[test]

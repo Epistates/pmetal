@@ -10,9 +10,10 @@ use pmetal_bridge::impl_module_params;
 
 use std::collections::HashMap;
 
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, rope},
+    rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -61,9 +62,12 @@ pub struct MistralConfig {
     /// RoPE base frequency.
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
-    /// RoPE scaling configuration.
+    /// RoPE scaling, read by [`pmetal_bridge::rope`].
     #[serde(default)]
-    pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
+    pub rope_scaling: Option<serde_json::Value>,
+    /// transformers v5's spelling of the same, with `rope_theta` inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_parameters: Option<serde_json::Value>,
     /// Hidden activation function.
     #[serde(default = "default_hidden_act")]
     pub hidden_act: String,
@@ -106,10 +110,25 @@ fn default_hidden_act() -> String {
     "silu".to_string()
 }
 
-// Re-use RopeScalingValue from llama module
-pub use super::llama::RopeScalingValue;
-
 impl MistralConfig {
+    /// The rotary embedding `rope_scaling` / `rope_parameters` describe; an
+    /// unknown `rope_type` is an error naming it.
+    pub fn rotary(&self) -> Result<RotaryEmbedding, Exception> {
+        crate::common::rotary_embedding(
+            &self.model_type,
+            self.get_head_dim(),
+            RopeConfig {
+                rope_scaling: self.rope_scaling.as_ref(),
+                rope_parameters: self.rope_parameters.as_ref(),
+                rope_theta: Some(self.rope_theta as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                ..RopeConfig::default()
+            },
+            1.0,
+            false,
+        )
+    }
+
     /// Get the number of KV heads (defaults to 8 for GQA if not specified).
     pub fn num_kv_heads(&self) -> i32 {
         self.num_key_value_heads.unwrap_or(8)
@@ -139,6 +158,7 @@ impl Default for MistralConfig {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             rope_scaling: None,
+            rope_parameters: None,
             hidden_act: "silu".to_string(),
             tie_word_embeddings: false,
         }
@@ -158,8 +178,8 @@ pub struct MistralAttention {
     pub scale: f32,
     /// Sliding window size (None for full attention).
     pub sliding_window: Option<i32>,
-    /// RoPE base frequency.
-    pub rope_theta: f32,
+    /// The rotary embedding, scaling included.
+    pub rotary: RotaryEmbedding,
 
     /// Query projection.
     pub q_proj: nn::Linear,
@@ -179,7 +199,7 @@ impl MistralAttention {
         let n_kv_heads = config.num_kv_heads();
         let head_dim = config.get_head_dim();
         let scale = (head_dim as f32).sqrt().recip();
-        let rope_theta = config.rope_theta;
+        let rotary = config.rotary()?;
 
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
@@ -200,7 +220,7 @@ impl MistralAttention {
             head_dim,
             scale,
             sliding_window: config.sliding_window,
-            rope_theta,
+            rotary,
             q_proj,
             k_proj,
             v_proj,
@@ -250,22 +270,8 @@ impl MistralAttention {
                 .as_ref()
                 .map_or(0, |(cache_ref, layer)| cache_ref.rope_offset_for(*layer)),
         );
-        let queries = rope(
-            &queries,
-            rope_positions,
-            self.head_dim,
-            false,
-            self.rope_theta,
-            1.0,
-        )?;
-        let keys = rope(
-            &keys,
-            rope_positions,
-            self.head_dim,
-            false,
-            self.rope_theta,
-            1.0,
-        )?;
+        let queries = rope_embedding(&queries, rope_positions, &self.rotary);
+        let keys = rope_embedding(&keys, rope_positions, &self.rotary);
 
         // Determine mask type for fused attention
         let mask_type = if mask.is_some() {
@@ -684,13 +690,12 @@ impl MistralForCausalLM {
 
         let cfg = &self.model.config;
         let head_dim = cfg.get_head_dim();
-        let attn_cfg = BatchedGqaAttnCfg::new(
+        let attn_cfg = BatchedGqaAttnCfg::for_rotary(
             cfg.num_attention_heads,
             cfg.num_kv_heads(),
             head_dim,
-            cfg.rope_theta,
-            1.0,
-        );
+            &self.model.layers[0].self_attn.rotary,
+        )?;
         let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
             hidden = batched_prenorm_layer(
@@ -733,6 +738,15 @@ impl MistralForCausalLM {
     /// Get configuration.
     pub fn config(&self) -> &MistralConfig {
         &self.model.config
+    }
+
+    /// Whether RoPE is a scalar base and position scale, which the fused
+    /// batched decode path carries.
+    pub fn has_scalar_rope(&self) -> bool {
+        self.model
+            .layers
+            .first()
+            .is_some_and(|layer| layer.self_attn.rotary.scalar().is_some())
     }
 }
 

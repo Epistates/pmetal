@@ -156,13 +156,13 @@ fn attn_layer0_matches_at_position_zero() {
 
     // Fused: batched_gqa_attn directly on the same q/k/v/o projections.
     let head_dim = config.get_head_dim();
-    let attn_cfg = BatchedGqaAttnCfg::new(
+    let attn_cfg = BatchedGqaAttnCfg::for_rotary(
         config.num_attention_heads,
         config.num_kv_heads(),
         head_dim,
-        model.model.layers[0].self_attn.effective_base,
-        model.model.layers[0].self_attn.rope_scale,
-    );
+        &model.model.layers[0].self_attn.rotary,
+    )
+    .expect("plain RoPE is scalar");
     let mut fused = FBC::new(
         KVCacheConfig::new(
             config.num_hidden_layers as usize,
@@ -358,6 +358,7 @@ fn tiny_qwen3_config() -> Qwen3Config {
         tie_word_embeddings: true,
         hidden_act: "silu".to_string(),
         rope_scaling: None,
+        rope_parameters: None,
         model_type: "qwen3".to_string(),
     }
 }
