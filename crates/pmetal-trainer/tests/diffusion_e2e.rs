@@ -106,6 +106,28 @@ fn test_forward_process_gpu() {
     assert!(has_mask || has_original, "Should have some masking effect");
 }
 
+/// The masking step's seed decides the mask. It used to be ignored, so a
+/// training step masked different positions on every run: the configured
+/// seed reproduced nothing, and a test asserting a positive loss failed
+/// whenever the draw masked no token at all.
+#[test]
+#[serial]
+fn test_forward_process_gpu_is_reproducible_from_its_seed() {
+    let input_ids = Array::from_i32_slice_shaped(&(0..64).collect::<Vec<i32>>(), &[2, 32]);
+    let mask_of = |seed| {
+        let (_, mask) = forward_process_gpu(&input_ids, 0.5, 255, Some(seed)).unwrap();
+        let mask = mask.as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+        mask.eval();
+        mask.as_slice::<i32>().to_vec()
+    };
+    let first = mask_of(7);
+    // Something else draws from the generator in between.
+    let _ = pmetal_bridge::compat::random::uniform(&[16], pmetal_bridge::compat::Dtype::Float32);
+    assert_eq!(mask_of(7), first, "same seed, same mask");
+    assert_ne!(mask_of(8), first, "another seed masks other positions");
+    pmetal_bridge::check_last_error().expect("no bridge op failed");
+}
+
 #[test]
 #[serial]
 fn test_diffusion_loss_gpu() {
@@ -166,9 +188,12 @@ fn test_diffusion_training_step() {
     // Create Qwen3 LoRA model
     let mut model = small_model();
 
-    // Create diffusion config
+    // Create diffusion config. A noise level of at least 0.5 masks some of
+    // the 32 tokens (the chance it masks none is 0.5^32); a lower one can
+    // mask none, which leaves no targets and a loss of exactly 0.
     let config = DiffusionConfig {
         mask_token_id: 255,
+        min_noise_level: 0.5,
         training: TrainingConfig {
             learning_rate: 1e-4,
             batch_size: 2,
@@ -215,8 +240,9 @@ fn test_diffusion_training_step() {
         .expect("Diffusion training step should succeed");
 
     // Verify stats
+    assert!(stats.mask_ratio > 0.0, "some tokens are masked");
     assert!(
-        stats.loss > 0.0,
+        stats.loss > 0.0 && stats.loss.is_finite(),
         "Loss should be positive, got {}",
         stats.loss
     );

@@ -180,6 +180,10 @@ pub struct DiffusionStepStats {
 ///
 /// Given clean tokens x_0 and noise level t, produce masked x_t.
 /// Returns the masked tokens and a boolean mask array (both on GPU).
+///
+/// With `seed`, the mask is a function of it: MLX's random state is reseeded
+/// first (as the sampler does for a seeded request), so the same seed masks
+/// the same positions. Without one it continues from MLX's current state.
 pub fn forward_process_gpu(
     x_0: &Array,
     t: f32,
@@ -188,10 +192,11 @@ pub fn forward_process_gpu(
 ) -> std::result::Result<(Array, Array), Exception> {
     let shape = x_0.shape();
 
-    // Generate random values on GPU: shape = x_0.shape(), values in [0, 1)
-    // Note: seed is ignored in bridge (stateless RNG); use uniform_range.
-    let _ = seed; // suppress unused warning
+    // Random values in [0, 1), one per token.
     use pmetal_bridge::compat::random;
+    if let Some(seed) = seed {
+        random::seed(seed);
+    }
     let random_vals = random::uniform_range(0.0_f32, 1.0_f32, shape, Dtype::Float32);
 
     // Create mask: positions where random < t should be masked
