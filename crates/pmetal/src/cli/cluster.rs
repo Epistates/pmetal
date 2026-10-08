@@ -12,7 +12,6 @@ pub struct ClusterArgs {
 }
 
 #[derive(Subcommand, Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum ClusterSubcommand {
     /// Join the cluster: probe local NICs, advertise via mDNS, wait for
     /// peers, and form a ring. Holds the connection open so other nodes
@@ -32,15 +31,6 @@ pub enum ClusterSubcommand {
     /// transport + result loopback work correctly across machines.
     /// (The model integration is wired separately in the inference engine.)
     PipelineBench(PipelineBenchArgs),
-
-    /// Train a model with auto-discovered peers. Forwards remaining args
-    /// to `pmetal train --distributed-auto`.
-    Train(super::train::TrainArgs),
-
-    /// Serve a model with pipeline-parallel inference across discovered peers.
-    /// Forwards remaining args to `pmetal serve --distributed-auto`.
-    #[cfg(feature = "serve")]
-    Serve(super::serve::ServeArgs),
 }
 
 #[derive(Args, Debug)]

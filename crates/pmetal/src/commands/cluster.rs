@@ -27,23 +27,6 @@ pub async fn run(cmd: ClusterSubcommand) -> Result<()> {
         ClusterSubcommand::Status(args) => run_status(args).await,
         ClusterSubcommand::Bench(args) => run_bench(args).await,
         ClusterSubcommand::PipelineBench(args) => run_pipeline_bench(args).await,
-        ClusterSubcommand::Train(_) => {
-            anyhow::bail!(
-                "`pmetal cluster train` is forwarded directly to `pmetal train --distributed-auto`; \
-                 use that until the wrapper handler is split out (Phase 7)."
-            )
-        }
-        #[cfg(feature = "serve")]
-        ClusterSubcommand::Serve(_) => {
-            anyhow::bail!(
-                "`pmetal cluster serve` requires partial-layer execution support \
-                 in pmetal-models (per-architecture refactor outside the current scope). \
-                 The pipeline harness is functional — drive it programmatically \
-                 from `pmetal-distributed::pipeline_harness::PipelineHarness` once \
-                 your model has a `forward_layer_range(start, end, hidden, cache)` API. \
-                 For a transport-level smoke test of the harness, run `cluster pipeline-bench`."
-            )
-        }
     }
 }
 

@@ -595,7 +595,6 @@ export interface ServeSpec {
   port?: number;
   max_seq_len?: number;
   experts_dir?: string | null;
-  lora?: string | null;
   fp8?: boolean;
   kv_quant?: number | null;
   no_kv_quant?: boolean;

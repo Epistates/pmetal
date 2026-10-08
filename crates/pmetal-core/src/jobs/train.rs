@@ -7,8 +7,7 @@ use serde::{Deserialize, Serialize};
 /// Spec for `pmetal train`.
 ///
 /// Holds the user-facing input fields. Conversion to the trainer's internal
-/// `TrainingJobConfig` happens at the consumer boundary (currently inside the
-/// CLI's `commands::run_training` after Phase 4).
+/// `TrainingJobConfig` happens at the consumer boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
 #[spec(kind = "Train", subcommand = "train")]
 #[serde(rename_all = "snake_case")]

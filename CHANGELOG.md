@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`pmetal_mlx::offloading`** (`ActivationOffloader`, `GradientOffloader`, `FrozenParameterManager`, `OffloadedEmbedding` and their configs). The module described itself as not yet integrated, and nothing in pmetal used it
 - **`pmetal_trainer::SftTrainer`**, a legacy trainer whose `train`, `evaluate`, `save_checkpoint` and `load_checkpoint` only returned "not implemented", along with its `TrainingState` (a second type of that name beside `pmetal_core::TrainingState`) and `lm_loss`. `TrainingLoop` is the trainer
 - **`CompressionStrategy::PowerSGD`** in pmetal-distributed. It logged a warning and sent the gradients uncompressed, while the crate README listed it as a working strategy
+- **`pmetal cluster train` and `pmetal cluster serve`.** Both only exited with an error: `cluster train` pointed at `pmetal train --distributed-auto`, which is how to train across the cluster, and `cluster serve` needed per-layer model execution that doesn't exist. `cluster up`, `status`, `bench` and `pipeline-bench` are unchanged
 
 ### Fixed
 
@@ -75,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The CLI ignored `PMETAL_METALLIB_PATH`**, though 0.6.0's notes say it is honoured as an operator override. Only the GUI read it. The CLI now checks it before every other location. Both warn and fall back to the normal search when it doesn't name a usable Metal library, where the GUI used to hand a mistyped path to MLX and fail on the first kernel
 - **A bad `mlx.metallib` aborted the process** (`libc++abi: terminating due to uncaught exception`) instead of reporting an error. MLX builds its Metal device on the first allocation, and when the library wouldn't load, the throw escaped into Rust, including from the bridge's own error handlers, whose fallback array allocated through the same failing device. Now a wrong, empty or truncated file is rejected by its header before MLX sees it (a corrupt cached copy is skipped and re-extracted), the CLI loads the library before any command and exits with a clear error if MLX still refuses it, and the bridge's error paths no longer allocate on the GPU
 - **`pmetal-py` could not be published to crates.io**: its dependency on the `pmetal` crate was a bare path with no version, which `cargo publish` rejects. It now inherits `pmetal-lib` from the workspace table, so `just bump` keeps the version current
+- **`pmetal train --log-events <path>` wrote nothing.** It created the file, then warned that event streaming needed a branch that had long since merged. It now writes every job event to the file as a JSONL line, as its help text says
 
 ## [0.6.0] - 2026-09-10
 

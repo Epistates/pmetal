@@ -1674,34 +1674,17 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             // sink the same way, box it as `Box<dyn pmetal_core::TrainingCallback>`,
             // and push it into the `extra_callbacks` vec that each run_* fn
             // already accepts.  See `src/cli/README.md` for the full pattern.
-            // `mut` is needed post-substrate-merge when push() is called.
-            #[allow(unused_mut)]
             let mut extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = Vec::new();
             if let Some(path) = log_events_path {
-                // Validate the path is writable immediately so the user gets a
-                // clear error before training starts rather than partway through.
-                std::fs::File::create(&path).map_err(|e| {
+                // Created before training starts, so a bad path fails at once
+                // rather than partway through.
+                let file = std::fs::File::create(&path).map_err(|e| {
                     anyhow::anyhow!("--log-events: could not create '{}': {e}", path.display())
                 })?;
-                // TODO(Phase 4 substrate adoption): once this worktree merges
-                // `main` (commit ce2f770 carrying pmetal_core::events), replace
-                // the file-create-and-drop above with the full sink wiring:
-                //
-                //   use pmetal_core::{JsonlSink, TrainingCallbackToSink};
-                //   let file = std::fs::File::create(&path)?;
-                //   let sink = JsonlSink::new(file);
-                //   extra_callbacks.push(Box::new(TrainingCallbackToSink::new(
-                //       job_config.model_id.clone(),
-                //       sink,
-                //   )));
-                //
-                // See `src/cli/README.md` §Wiring --log-events for the pattern.
-                tracing::warn!(
-                    "--log-events stub: file '{}' created but event streaming \
-                     requires merging the substrate branch (ce2f770). \
-                     Events will not be written until the merge is complete.",
-                    path.display()
-                );
+                extra_callbacks.push(Box::new(pmetal_core::TrainingCallbackToSink::new(
+                    job_config.model_id.clone(),
+                    pmetal_core::JsonlSink::new(file),
+                )));
             }
 
             orchestrator::run_training(job_config, None, extra_callbacks).await?;
@@ -2869,13 +2852,6 @@ fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
 // See `crates/pmetal/src/cli/README.md` for the future migration pattern that
 // would move `Cli`/`Commands` to `lib.rs` and make integration tests possible.
 //
-// COMPILATION PREREQUISITE: These tests require `pmetal_core::jobs::*` which
-// is added in commit ce2f770 (Phase 3 substrate).  They will not compile until
-// this worktree is rebased/merged onto main.  The feature gate
-// `feature = "core"` is necessary but not sufficient on its own — the crate
-// must also have the jobs module.
-//
-// To run after the merge:
 //   cargo test -p pmetal --features trainer -- argv_roundtrip
 // ---------------------------------------------------------------------------
 #[cfg(all(test, feature = "trainer", feature = "core"))]
