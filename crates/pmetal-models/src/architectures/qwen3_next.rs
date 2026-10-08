@@ -40,7 +40,6 @@ use pmetal_mlx::{
         fused_moe::moe_combine_mlx,
         fused_sdpa,
         gated_delta::{self, gated_delta_update},
-        metal_swiglu::fused_swiglu_forward,
         rope::{RopePositions, RopeScaling, rope},
     },
 };
@@ -689,14 +688,11 @@ impl Qwen3NextMLP {
         })
     }
 
+    /// Through each `Linear`'s own forward, so that an adapter or a packed
+    /// weight on a projection is honoured.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        fused_swiglu_forward(
-            x,
-            self.gate_proj.weight.as_ref(),
-            self.up_proj.weight.as_ref(),
-            self.down_proj.weight.as_ref(),
-        )
-        .map_err(|e| Exception::custom(e.to_string()))
+        let hidden = nn::silu(&self.gate_proj.forward(x)).multiply(&self.up_proj.forward(x));
+        Ok(self.down_proj.forward(&hidden))
     }
 }
 
@@ -1304,14 +1300,33 @@ impl Qwen3NextGatedDeltaNet {
         Ok(projected.reshape(&[batch, 1, self.hidden_size]))
     }
 
+    /// Whether every projection is a plain dense weight. The decode fast
+    /// paths multiply by the weights directly (concatenated, or flattened),
+    /// which would skip an adapter and misread a packed weight.
+    fn projections_are_plain(&self) -> bool {
+        [
+            &self.in_proj_qkv,
+            &self.in_proj_z,
+            &self.in_proj_b,
+            &self.in_proj_a,
+            &self.out_proj,
+        ]
+        .iter()
+        .all(|linear| linear.adapter.is_none() && linear.quant.is_none())
+    }
+
     fn should_use_flattened_decode_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
-        mask.is_none() && inputs.dim(1) == 1 && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+        mask.is_none()
+            && inputs.dim(1) == 1
+            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+            && self.projections_are_plain()
     }
 
     fn should_use_combined_input_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
         mask.is_none()
             && inputs.dim(1) == 1
             && self.hidden_size <= Self::COMBINED_INPUT_PROJ_MAX_HIDDEN
+            && self.projections_are_plain()
     }
 
     /// Decode forward (T=1) — compiled via mx.compile for fused GPU evaluation.
@@ -1519,7 +1534,11 @@ impl Qwen3NextGatedDeltaNet {
             cache.ssm_state = Some(new_state);
         }
         let out = self.norm.forward(&out, Some(z))?;
-        if mask.is_none() && seq_len == 1 && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN {
+        if mask.is_none()
+            && seq_len == 1
+            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+            && self.projections_are_plain()
+        {
             self.decode_out_projection(&out, batch)
         } else {
             Ok(self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])))
@@ -1581,7 +1600,11 @@ impl Qwen3NextGatedDeltaNet {
 
         // Apply gated norm and output projection
         let out = self.norm.forward(&out, Some(z))?;
-        if mask.is_none() && seq_len == 1 && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN {
+        if mask.is_none()
+            && seq_len == 1
+            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+            && self.projections_are_plain()
+        {
             self.decode_out_projection(&out, batch)
         } else {
             Ok(self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])))
@@ -1659,6 +1682,7 @@ impl Qwen3NextGatedDeltaNet {
         let projected = if mask.is_none()
             && seq_len == 1
             && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+            && self.projections_are_plain()
         {
             self.decode_out_projection(&out, batch)?
         } else {
@@ -2300,6 +2324,25 @@ impl Qwen3NextSparseMoeBlock {
         } else {
             x.reshape(&[batch_seq, hidden])
         };
+
+        // The concatenated weights below are a fast path for plain dense
+        // projections; an adapter or a packed weight goes through its layer.
+        let plain = [
+            &self.shared_expert.gate_proj,
+            &self.shared_expert.up_proj,
+            &self.shared_expert.down_proj,
+            &self.shared_expert_gate,
+        ]
+        .iter()
+        .all(|linear| linear.adapter.is_none() && linear.quant.is_none());
+        if !plain {
+            let shared_y = self.shared_expert.forward(&x_flat)?;
+            let shared_gate_logit = self
+                .shared_expert_gate
+                .forward(&x_flat)
+                .reshape(&[batch_seq, 1]);
+            return Ok((shared_y, shared_gate_logit));
+        }
 
         let combined_weight = self.ensure_shared_combined_input_proj_weight()?;
         let projected = ops::matmul(&x_flat, &combined_weight.t());

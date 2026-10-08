@@ -976,6 +976,20 @@ impl<T: ModuleParameters> ModuleParameters for Vec<T> {
         }
         out
     }
+
+    /// Each element's own trainable set. The default would be every
+    /// parameter, a frozen or packed base weight included, and a checkpointed
+    /// layer differentiates whatever this reports.
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        let mut out = HashMap::new();
+        for (i, m) in self.iter().enumerate() {
+            for (k, v) in m.trainable_parameters() {
+                let full: Rc<str> = format!("{i}.{k}").into();
+                out.insert(full, unsafe { super::clone_nested_ref_lifetime(v) });
+            }
+        }
+        out
+    }
 }
 
 // ── Option<T> where T: ModuleParameters ──────────────────────────────────
@@ -991,6 +1005,12 @@ impl<T: ModuleParameters> ModuleParameters for Option<T> {
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         self.as_mut().map_or(HashMap::new(), |m| m.parameters_mut())
+    }
+
+    /// The module's own trainable set; see `Vec<T>`'s.
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        self.as_ref()
+            .map_or(HashMap::new(), |m| m.trainable_parameters())
     }
 }
 

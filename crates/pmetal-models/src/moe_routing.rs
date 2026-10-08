@@ -155,14 +155,14 @@ pub fn noaux_tc_topk(
 
         // group_scores = sum of the top-2 experts per group -> [N, n_group, 1].
         let part = ops::argpartition_axis(&grouped, -2, -1);
-        let top2_idx = ops::slice_last_from(&part, -2);
+        let top2_idx = ops::stop_gradient(&ops::slice_last_from(&part, -2));
         let top2_vals = grouped.take_along_axis(&top2_idx, -1);
         let group_scores = ops::sum_axis(&top2_vals, -1, true);
 
         // Indices of the `n_group - topk_group` LOWEST groups, masked to 0.
         let drop = n_group - topk_group;
         let g_part = ops::argpartition_axis(&group_scores, drop - 1, -2);
-        let group_idx = ops::slice_axis(&g_part, -2, 0, drop);
+        let group_idx = ops::stop_gradient(&ops::slice_axis(&g_part, -2, 0, drop));
         let group_idx = ops::broadcast_to(&group_idx, &[n, drop, per_group]);
         let zeros = ops::zeros_dtype(&[n, drop, per_group], grouped.dtype());
         let masked = ops::put_along_axis(&grouped, &group_idx, &zeros, -2);
@@ -171,7 +171,10 @@ pub fn noaux_tc_topk(
 
     // Select top-k from the (group-masked) bias-corrected scores …
     let part_indices = ops::argpartition_axis(&scores_with_bias, neg_k, -1);
-    let top_indices = ops::slice_last_from(&part_indices, neg_k).as_type::<i32>();
+    // Indices carry no gradient, and MLX refuses to differentiate a gather
+    // with respect to them.
+    let top_indices =
+        ops::stop_gradient(&ops::slice_last_from(&part_indices, neg_k).as_type::<i32>());
 
     // … but gather weights from the ORIGINAL scores (no bias).
     let top_weights = scores.take_along_axis(&top_indices, -1);

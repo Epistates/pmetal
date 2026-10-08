@@ -65,8 +65,27 @@ fn linear_forward_with_optional_fp8(
     }
 }
 
+/// A projection, through `Linear::forward` so that an adapter or a packed
+/// weight on it is honoured, unless an FP8 checkpoint's per-tensor scale sits
+/// beside it outside the layer.
+fn scaled_linear_forward(
+    linear: &nn::Linear,
+    x: &Array,
+    weight_scale: Option<&Array>,
+) -> Result<Array, Exception> {
+    match weight_scale {
+        None => Ok(linear.forward(x)),
+        Some(_) => linear_forward_with_optional_fp8(
+            x,
+            linear.weight.as_ref(),
+            linear.bias.as_ref(),
+            weight_scale,
+        ),
+    }
+}
+
 fn linear_module_forward(linear: &mut nn::Linear, x: &Array) -> Result<Array, Exception> {
-    linear_forward_with_optional_fp8(x, linear.weight.as_ref(), linear.bias.as_ref(), None)
+    scaled_linear_forward(linear, x, None)
 }
 
 fn quantize_linear_weights_fp8(linear: &mut nn::Linear) -> Result<(), Exception> {
@@ -553,20 +572,14 @@ impl Expert {
     /// Note: input_scale is NOT applied - it's for dynamic FP8 quantization which we don't use.
     /// We only dequantize weights with weight_scale for float inference.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let up = linear_forward_with_optional_fp8(
-            x,
-            self.up_proj.weight.as_ref(),
-            self.up_proj.bias.as_ref(),
-            self.up_proj_weight_scale.as_ref(),
-        )?;
+        let up = scaled_linear_forward(&self.up_proj, x, self.up_proj_weight_scale.as_ref())?;
 
         // ReLU² activation
         let activated = nn::relu(&up).square();
 
-        linear_forward_with_optional_fp8(
+        scaled_linear_forward(
+            &self.down_proj,
             &activated,
-            self.down_proj.weight.as_ref(),
-            self.down_proj.bias.as_ref(),
             self.down_proj_weight_scale.as_ref(),
         )
     }
@@ -687,7 +700,11 @@ impl MoERouter {
         let neg_scores = scores_for_selection.negative();
         let k = self.top_k - 1;
         let inds = pmetal_bridge::compat::ops::argpartition_axis(&neg_scores, k, -1);
-        let inds = pmetal_bridge::compat::ops::slice_last_to(&inds, self.top_k as i32);
+        // Indices carry no gradient, and MLX refuses to differentiate a gather
+        // with respect to them.
+        let inds = pmetal_bridge::compat::ops::stop_gradient(
+            &pmetal_bridge::compat::ops::slice_last_to(&inds, self.top_k as i32),
+        );
 
         // Get original scores for selected experts (not bias-corrected)
         let scores = orig_scores.take_along_axis(&inds, -1);
@@ -1595,12 +1612,7 @@ impl NemotronHMixer {
 
         // Input projection with FP8 weight dequantization
         // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
-        let projected = linear_forward_with_optional_fp8(
-            x,
-            in_proj.weight.as_ref(),
-            in_proj.bias.as_ref(),
-            self.in_proj_weight_scale.as_ref(),
-        )?;
+        let projected = scaled_linear_forward(in_proj, x, self.in_proj_weight_scale.as_ref())?;
 
         // Use split_sections for efficient splitting (optimization #1)
         // Split at: [intermediate_size, intermediate_size + conv_dim]
@@ -1706,12 +1718,7 @@ impl NemotronHMixer {
 
         // Output projection with FP8 weight dequantization
         // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
-        linear_forward_with_optional_fp8(
-            &y_normed,
-            out_proj.weight.as_ref(),
-            out_proj.bias.as_ref(),
-            self.out_proj_weight_scale.as_ref(),
-        )
+        scaled_linear_forward(out_proj, &y_normed, self.out_proj_weight_scale.as_ref())
     }
 
     /// Takes no positions: Nemotron-H's attention blocks carry no positional

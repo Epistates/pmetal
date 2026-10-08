@@ -74,7 +74,8 @@ impl AdaptedModel {
             }
             // Read the base weight before attaching: DoRA seeds its magnitude
             // from it, and the `&mut` to the adapter would rule that out after.
-            let weight = use_dora.then(|| linear.weight.value.clone());
+            // Unpacked, when the base is packed for QLoRA.
+            let weight = use_dora.then(|| linear.dense_weight());
             match linear.attach_lora(rank, alpha, use_rslora) {
                 Ok(adapter) => {
                     adapter.dropout = dropout;
@@ -260,12 +261,36 @@ impl AdaptedModel {
 ///
 /// Matches on the final path segment, which is the projection's name as a
 /// checkpoint and `target_modules` both spell it (`q_proj`, `gate_proj`).
+/// MoE routers and routed experts never do; see [`moe_role`].
 fn is_targeted(path: &str, targets: &[String]) -> bool {
+    if moe_role(path).is_some() {
+        return false;
+    }
     if targets.is_empty() {
         return true;
     }
     let name = path.rsplit('.').next().unwrap_or(path);
     targets.iter().any(|t| t == name)
+}
+
+/// What a projection does in a mixture-of-experts block that puts it out of
+/// LoRA's and QLoRA's reach, if anything.
+///
+/// Routed experts run through stacked or gathered expert kernels that read
+/// their weights directly, so an adapter on one is never applied (GPT-OSS's
+/// experts are named `gate_proj`, so targeting the MLP would have adapted
+/// them). A router's adapter is not reliably applied either, and its argmax
+/// picks which computation runs at all. DeepSeek's router keeps its `Linear`
+/// in a field named `weight`, so its path ends `mlp.weight`.
+pub(crate) fn moe_role(path: &str) -> Option<&'static str> {
+    let name = path.rsplit('.').next().unwrap_or(path);
+    if matches!(name, "gate" | "router" | "shared_expert_gate") || path.ends_with(".mlp.weight") {
+        return Some("a router picks experts by argmax");
+    }
+    if path.contains(".experts.") {
+        return Some("routed experts are read by the stacked expert kernels");
+    }
+    None
 }
 
 fn is_adapter_key(path: &str) -> bool {

@@ -27,574 +27,26 @@
 //! Step 1 is what keeps this architecture-agnostic: no per-architecture weight
 //! generator, and a checkpoint that is correct by construction.
 
+mod common;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{Array, ModuleParametersExt, eval};
+use common::{ArchCase, SEQ_LEN, cases, config_int, input_ids, stage};
+use pmetal_bridge::compat::{Array, ModuleParametersExt};
 use pmetal_core::LoraConfig;
-use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel, save_safetensors_map};
+use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel};
 use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, max_abs_diff, max_abs_value, print_report_table,
 };
 use pmetal_models::dispatcher::DynamicModel;
-
-/// One architecture under test.
-struct ArchCase {
-    /// Display name, also the temp-directory discriminator.
-    name: &'static str,
-    /// Minimal `config.json`. Every config struct is `#[serde(default)]`, so
-    /// only the fields that shape the forward pass need stating.
-    config_json: &'static str,
-    /// Set when the training path is *known* to compute something else, with
-    /// the reason. `None` means the two must agree.
-    known_divergence: Option<&'static str>,
-}
-
-/// Sequence fed to both paths. Long enough to cross a sliding-window boundary
-/// in the cases that set one, short enough that a 2-layer model is quick.
-const SEQ_LEN: i32 = 24;
 
 /// Both paths run the same ops in f32 over the same weights, so the only
 /// legitimate difference is op-ordering noise (a fused SDPA on one side and an
 /// explicit softmax on the other reassociate the same sums). The relative part
 /// carries the gate; `atol` only keeps near-zero logits from tripping it.
 const TOLERANCE: Tolerance = Tolerance::new(1e-3, 1e-3);
-
-fn cases() -> Vec<ArchCase> {
-    vec![
-        ArchCase {
-            name: "llama",
-            config_json: r#"{
-                "model_type": "llama",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "mistral",
-            config_json: r#"{
-                "model_type": "mistral",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "qwen3",
-            config_json: r#"{
-                "model_type": "qwen3",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        // Gemma 1: uniformly causal, so this case isolates the GeGLU / embedding
-        // scaling path from the window handling exercised by `gemma2` below.
-        ArchCase {
-            name: "gemma",
-            config_json: r#"{
-                "model_type": "gemma",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0
-            }"#,
-            known_divergence: None,
-        },
-        // Gemma 2 alternates local and global attention. `sliding_window` is
-        // deliberately below SEQ_LEN so the window actually bites: with a full
-        // causal mask every layer sees the whole prefix and the divergence is
-        // invisible.
-        ArchCase {
-            name: "gemma2",
-            config_json: r#"{
-                "model_type": "gemma2",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "sliding_window": 8,
-                "attn_logit_softcapping": 50.0,
-                "final_logit_softcapping": 30.0,
-                "query_pre_attn_scalar": 16
-            }"#,
-            known_divergence: None,
-        },
-        // Phi-3 with LongRoPE. `max_position_embeddings` exceeds
-        // `original_max_position_embeddings`, which is what selects the long
-        // factor table in the inference path.
-        ArchCase {
-            name: "phi3_longrope",
-            config_json: r#"{
-                "model_type": "phi3",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 4,
-                "max_position_embeddings": 512,
-                "original_max_position_embeddings": 128,
-                "rms_norm_eps": 1e-5,
-                "rope_theta": 10000.0,
-                "hidden_act": "silu",
-                "tie_word_embeddings": false,
-                "rope_scaling": {
-                    "type": "longrope",
-                    "short_factor": [1.0, 1.02, 1.04, 1.06, 1.08, 1.10, 1.12, 1.14],
-                    "long_factor": [1.0, 1.4, 1.8, 2.2, 2.6, 3.0, 3.4, 3.8]
-                }
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "cohere",
-            config_json: r#"{
-                "model_type": "cohere",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 512,
-                "layer_norm_eps": 1e-5,
-                "rope_theta": 10000.0,
-                "logit_scale": 0.0625
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "granite",
-            config_json: r#"{
-                "model_type": "granite",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "attention_multiplier": 0.125,
-                "embedding_multiplier": 12.0,
-                "residual_multiplier": 0.22,
-                "logits_scaling": 8.0,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        // Granite 4.0-H: Mamba-2 and NoPE attention, routed experts plus a
-        // shared MLP.
-        ArchCase {
-            name: "granitemoehybrid",
-            config_json: r#"{
-                "model_type": "granitemoehybrid",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 32,
-                "num_hidden_layers": 4,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-5,
-                "layer_types": ["mamba", "attention", "mamba", "mamba"],
-                "position_embedding_type": "nope",
-                "num_local_experts": 4,
-                "num_experts_per_tok": 2,
-                "shared_intermediate_size": 48,
-                "mamba_n_heads": 8,
-                "mamba_d_state": 16,
-                "mamba_chunk_size": 8,
-                "attention_multiplier": 0.125,
-                "embedding_multiplier": 12.0,
-                "residual_multiplier": 0.22,
-                "logits_scaling": 6.0,
-                "tie_word_embeddings": true
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "qwen3_moe",
-            config_json: r#"{
-                "model_type": "qwen3_moe",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "moe_intermediate_size": 32,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "num_experts": 4,
-                "num_experts_per_tok": 2,
-                "decoder_sparse_step": 1,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "gpt_oss",
-            config_json: r#"{
-                "model_type": "gpt_oss",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 32,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "num_local_experts": 4,
-                "num_experts_per_tok": 2,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-5,
-                "rope_theta": 10000.0,
-                "sliding_window": 8,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        // Gemma 3 makes every layer local except one in `sliding_window_pattern`,
-        // a different interleave from Gemma 2.
-        ArchCase {
-            name: "gemma3",
-            config_json: r#"{
-                "model_type": "gemma3",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "rope_local_base_freq": 10000.0,
-                "sliding_window": 8,
-                "sliding_window_pattern": 2
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "gemma4",
-            config_json: r#"{
-                "model_type": "gemma4_text",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "sliding_window": 8
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "llama4",
-            config_json: r#"{
-                "model_type": "llama4_text",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 32,
-                "intermediate_size_mlp": 128,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "num_local_experts": 4,
-                "num_experts_per_tok": 2,
-                "interleave_moe_layer_step": 1,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-5,
-                "rope_theta": 10000.0,
-                "attention_chunk_size": 8192,
-                "tie_word_embeddings": false
-            }"#,
-            // Llama 4's training and inference paths used to name the MoE
-            // block differently (`feed_forward` against `moe`) and disagree
-            // about the router's key, so neither could load a real checkpoint
-            // and the two could not agree. There is one forward pass now, so
-            // the question no longer arises. What a real Llama 4 checkpoint
-            // needs is a loader that splits `Llama4TextExperts`' fused 3-D
-            // `gate_up_proj` / `down_proj` into per-expert 2-D Linears, and
-            // that is a loader gap rather than a divergence.
-            known_divergence: None,
-        },
-        // Dense DeepSeek (no routed experts) isolates MLA from the MoE.
-        ArchCase {
-            name: "deepseek_dense",
-            config_json: r#"{
-                "model_type": "deepseek_v3",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "moe_intermediate_size": 32,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 4,
-                "num_experts_per_tok": 1,
-                "n_group": 1,
-                "topk_group": 1,
-                "first_k_dense_replace": 8,
-                "routed_scaling_factor": 1.0,
-                "topk_method": "greedy",
-                "scoring_func": "softmax",
-                "norm_topk_prob": true,
-                "attention_bias": false,
-                "moe_layer_freq": 1,
-                "kv_lora_rank": 16,
-                "q_lora_rank": null,
-                "qk_rope_head_dim": 8,
-                "qk_nope_head_dim": 8,
-                "v_head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "deepseek",
-            config_json: r#"{
-                "model_type": "deepseek_v3",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "moe_intermediate_size": 32,
-                "num_hidden_layers": 2,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 4,
-                "n_routed_experts": 4,
-                "n_shared_experts": 1,
-                "num_experts_per_tok": 2,
-                "n_group": 1,
-                "topk_group": 1,
-                "first_k_dense_replace": 0,
-                "routed_scaling_factor": 1.0,
-                "topk_method": "greedy",
-                "scoring_func": "softmax",
-                "norm_topk_prob": true,
-                "attention_bias": false,
-                "moe_layer_freq": 1,
-                "kv_lora_rank": 16,
-                "q_lora_rank": null,
-                "qk_rope_head_dim": 8,
-                "qk_nope_head_dim": 8,
-                "v_head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-        ArchCase {
-            name: "qwen3_next",
-            config_json: r#"{
-                "model_type": "qwen3_next",
-                "vocab_size": 256,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 4,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 512,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 10000.0,
-                "linear_num_value_heads": 4,
-                "linear_num_key_heads": 2,
-                "linear_key_head_dim": 32,
-                "linear_value_head_dim": 16,
-                "linear_conv_kernel_dim": 4,
-                "full_attention_interval": 4,
-                "num_experts": 0,
-                "num_experts_per_tok": 0,
-                "moe_intermediate_size": 32,
-                "shared_expert_intermediate_size": 128,
-                "partial_rotary_factor": 0.25,
-                "tie_word_embeddings": false
-            }"#,
-            known_divergence: None,
-        },
-    ]
-}
-
-/// Read an integer out of the case's `config.json`.
-fn config_int(case: &ArchCase, key: &str) -> Result<i32, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(case.config_json).map_err(|e| format!("parse config.json: {e}"))?;
-    value[key]
-        .as_i64()
-        .map(|v| v as i32)
-        .ok_or_else(|| format!("config.json has no integer `{key}`"))
-}
-
-/// Stage `config.json` and a placeholder checkpoint, then materialise a real
-/// one from the architecture's own random init.
-///
-/// Returns the staged directory. The caller removes it.
-fn stage(case: &ArchCase) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!(
-        "pmetal_lora_base_parity_{}_{}",
-        case.name,
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create temp dir: {e}"))?;
-    std::fs::write(dir.join("config.json"), case.config_json)
-        .map_err(|e| format!("write config.json: {e}"))?;
-
-    // `from_config` is the sized constructor, so every parameter already has
-    // its real shape and a random value. `flatten_params` then keys them by the
-    // parameter paths, which for most architectures *are* the checkpoint keys.
-    let donor =
-        DynamicModel::from_config(case.config_json).map_err(|e| format!("build donor: {e}"))?;
-    let params = donor.flatten_params();
-    if params.is_empty() {
-        return Err("donor model exposed no parameters".to_string());
-    }
-    eval(params.values()).map_err(|e| format!("eval checkpoint tensors: {e}"))?;
-
-    // Which `mlp` prefixes are DeepSeek MoE blocks, recognised by the `w1/w2/w3`
-    // expert naming `deepseek_param_name` produces. Keying on the rename's own
-    // signature rather than on "has experts" keeps other MoE architectures,
-    // whose parameter paths already are checkpoint keys, out of the rewrite.
-    let moe_prefixes: std::collections::HashSet<String> = params
-        .keys()
-        .filter_map(|path| {
-            let idx = path.find(".mlp.experts.")?;
-            let (prefix, tail) = path.split_at(idx + ".mlp.".len());
-            let member = tail.strip_prefix("experts.")?.split_once('.')?.1;
-            matches!(member, "w1.weight" | "w2.weight" | "w3.weight").then(|| prefix.to_string())
-        })
-        .collect();
-
-    let checkpoint: HashMap<Rc<str>, Array> = params
-        .into_iter()
-        .map(|(path, value)| {
-            let key = checkpoint_key(&path, |prefix| moe_prefixes.contains(prefix));
-            (Rc::from(key.as_str()), value)
-        })
-        .collect();
-    save_safetensors_map(dir.join("model.safetensors"), &checkpoint)
-        .map_err(|e| format!("write checkpoint: {e}"))?;
-
-    Ok(dir)
-}
-
-/// Rewrite a pmetal parameter path into the key a checkpoint would use.
-///
-/// The two are the same almost everywhere, which is what lets
-/// `assign_loaded_weights` match by exact name. Two architectures differ, and
-/// both handle it with a bespoke loader that walks the struct instead of
-/// matching names, so nothing in production notices — but it does mean their
-/// flattened parameters are not a valid checkpoint, and this test has to bridge
-/// the gap itself.
-///
-/// **Gemma.** `GemmaLayers` holds `gemma1` and `gemma2` as separate fields so
-/// one struct can carry either layer shape, and `impl_module_params!` puts that
-/// field name into the path: `model.layers.gemma1.0.self_attn.q_proj.weight`
-/// where the checkpoint says `model.layers.0.self_attn.q_proj.weight`.
-///
-/// **DeepSeek.** `deepseek_param_name` renames three things inside a MoE `mlp`
-/// on the way in; this is its inverse. `is_moe_layer` distinguishes the shared
-/// expert (which pmetal merges into `mlp` with no prefix) from a dense MLP,
-/// which would otherwise be the same path.
-fn checkpoint_key(param_path: &str, is_moe_layer: impl Fn(&str) -> bool) -> String {
-    for variant in ["model.layers.gemma1.", "model.layers.gemma2."] {
-        if let Some(rest) = param_path.strip_prefix(variant) {
-            return format!("model.layers.{rest}");
-        }
-    }
-
-    let Some(idx) = param_path.find(".mlp.") else {
-        return param_path.to_string();
-    };
-    let (prefix, tail) = param_path.split_at(idx + ".mlp.".len());
-    if !is_moe_layer(prefix) {
-        return param_path.to_string();
-    }
-
-    // `mlp.weight.weight` is the router: `DeepSeekMoEGate`'s own Linear field is
-    // called `weight`, so the flattened path double-nests.
-    if tail == "weight.weight" {
-        return format!("{prefix}gate.weight");
-    }
-    if let Some(rest) = tail.strip_prefix("experts.") {
-        if let Some((index, member)) = rest.split_once('.') {
-            let renamed = match member {
-                "w1.weight" => Some("gate_proj.weight"),
-                "w3.weight" => Some("up_proj.weight"),
-                "w2.weight" => Some("down_proj.weight"),
-                _ => None,
-            };
-            if let Some(renamed) = renamed {
-                return format!("{prefix}experts.{index}.{renamed}");
-            }
-        }
-        return param_path.to_string();
-    }
-    // Anything else directly under a MoE layer's `mlp` is the shared expert,
-    // which pmetal merges in with no prefix.
-    format!("{prefix}shared_experts.{tail}")
-}
-
-/// Deterministic token ids inside the configured vocab.
-fn input_ids(vocab_size: i32) -> Array {
-    let ids: Vec<i32> = (0..SEQ_LEN).map(|i| (i * 7 + 3) % vocab_size).collect();
-    Array::from_slice(&ids, &[1, SEQ_LEN])
-}
 
 /// Run one architecture and return its report, or the reason it could not run.
 fn run_case(case: &ArchCase) -> Result<ParityReport, String> {
@@ -668,7 +120,7 @@ fn lora_forward_matches_base_forward() {
     let mut failures = Vec::new();
     let mut fixed = Vec::new();
 
-    for case in cases() {
+    for case in cases().into_iter().filter(|case| case.stages) {
         match run_case(&case) {
             Ok(report) => {
                 let detail = format!(
@@ -914,6 +366,55 @@ fn attaching_adapters_changes_nothing() {
         checked += 1;
     }
     assert!(checked >= 15, "only {checked} architectures were exercised");
+}
+
+/// Every adapter changes what the model computes once it is trained.
+///
+/// The fresh-adapter tests above can't see an adapter the forward pass never
+/// reads, since a zero `B` contributes nothing either way. Nemotron-H's
+/// projections and Qwen 3.5's MLPs multiplied by their weights directly, so a
+/// LoRA run trained adapters that the model ignored.
+#[test]
+fn every_adapter_reaches_the_output() {
+    let silent = common::silent_adapters(|_| {});
+    assert!(
+        silent.is_empty(),
+        "adapters that never reach the output:\n  {}",
+        silent.join("\n  ")
+    );
+}
+
+/// Every architecture takes a finite training step and comes out the other
+/// side with a lower loss.
+///
+/// DeepSeek's and Nemotron-H's routers handed the expert gather indices that
+/// still carried a gradient path, which MLX refuses to differentiate: every
+/// LoRA step on either produced a NaN loss.
+#[test]
+fn every_architecture_trains() {
+    let lora = LoraConfig {
+        r: 8,
+        alpha: 16.0,
+        dropout: 0.0,
+        ..Default::default()
+    };
+    let mut failures = Vec::new();
+    for case in cases() {
+        let Ok(base) = DynamicModel::from_config(case.config_json) else {
+            continue;
+        };
+        let mut model = AdaptedModel::attach(base, lora.clone()).expect("attach");
+        let ids = input_ids(config_int(&case, "vocab_size").expect("vocab"));
+        let mut optimizer = pmetal_bridge::compat::optimizers::AdamW::new(1e-2, 0.0);
+        let losses: Vec<f32> = (0..8)
+            .map(|_| common::train_step(&mut model, &mut optimizer, &ids))
+            .collect();
+        let _ = pmetal_bridge::check_last_error();
+        if !losses.iter().all(|l| l.is_finite()) || losses[7] >= losses[0] {
+            failures.push(format!("{}: {losses:?}", case.name));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Cut cross-entropy needs the LM head matrix, and falls back to standard CE

@@ -602,10 +602,14 @@ impl TokenSelector {
             scores.clone()
         };
         let neg_k = -self.top_k;
-        Ok(pmetal_bridge::compat::ops::slice_axis_from(
-            &pmetal_bridge::compat::ops::argpartition_axis(&masked_scores, neg_k, -1),
-            -1,
-            neg_k,
+        // Indices carry no gradient, and MLX refuses to differentiate a gather
+        // with respect to them.
+        Ok(pmetal_bridge::compat::ops::stop_gradient(
+            &pmetal_bridge::compat::ops::slice_axis_from(
+                &pmetal_bridge::compat::ops::argpartition_axis(&masked_scores, neg_k, -1),
+                -1,
+                neg_k,
+            ),
         ))
     }
 }
