@@ -346,8 +346,6 @@ impl Default for GptOssConfig {
 /// GPT-OSS attention with alternating sliding/full patterns and GQA.
 #[derive(Debug)]
 pub struct GptOssAttention {
-    /// Configuration.
-    config: GptOssConfig,
     /// Layer index.
     layer_idx: usize,
     /// Number of attention heads.
@@ -414,7 +412,6 @@ impl GptOssAttention {
             sliding_window: config.sliding_window,
             attention_type,
             layer_idx,
-            config,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -1484,9 +1481,6 @@ pub struct GptOssLoraAttention {
     pub v_proj: LoraLinear,
     /// Output projection with LoRA.
     pub o_proj: LoraLinear,
-    /// Config reference.
-    #[allow(dead_code)] // Retained for LoRA merge/export which needs full arch config
-    config: GptOssConfig,
 }
 
 impl GptOssLoraAttention {
@@ -1538,7 +1532,6 @@ impl GptOssLoraAttention {
             k_proj,
             v_proj,
             o_proj,
-            config: attn.config,
         })
     }
 

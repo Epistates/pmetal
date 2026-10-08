@@ -772,32 +772,6 @@ impl SimpoTrainer {
         Ok(logps_array.multiply(&target_mask_f32))
     }
 
-    #[allow(dead_code)] // Convenience wrapper for testing without a full trainer instance
-    fn compute_loss_with_cpo_static(
-        config: &SimpoConfig,
-        chosen_logps: &Array,
-        rejected_logps: &Array,
-        chosen_mask: &Array,
-        rejected_mask: &Array,
-        ref_chosen_logps: Option<&Array>,
-    ) -> Result<(Array, SimpoMetrics), Exception> {
-        let trainer = Self {
-            config: config.clone(),
-            training_config: TrainingConfig::default(),
-            step: 0,
-            callbacks: Vec::new(),
-        };
-        trainer
-            .compute_loss_with_cpo(
-                chosen_logps,
-                rejected_logps,
-                chosen_mask,
-                rejected_mask,
-                ref_chosen_logps,
-            )
-            .map_err(|e| Exception::custom(e.to_string()))
-    }
-
     /// Gradient-safe variant of `compute_loss_with_cpo` for use inside autograd closures.
     ///
     /// Unlike the instance method, this function does NOT call `.eval()` or `.item()` on any

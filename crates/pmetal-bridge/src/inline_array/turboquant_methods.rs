@@ -209,7 +209,6 @@ impl InlineArray {
     #[allow(clippy::too_many_arguments)]
     // TODO(turboquant): staged for the TurboQuant KV-cache rollout
     // (see project_turboquant_impl.md). Not yet wired into attention path.
-    #[allow(dead_code)]
     pub fn turboquant_mixed_score(
         regular_query_rot: &Self,
         regular_query_proj: &Self,
@@ -430,7 +429,6 @@ impl InlineArray {
     ///   high byte = value centroid index
     // TODO(turboquant): staged for TurboQuant KV-cache rollout
     // (see project_turboquant_impl.md).
-    #[allow(dead_code)]
     pub fn turboquant_pack_q8_kvbytes_seq(
         indices: &Self,
         qjl_signs: &Self,
@@ -1470,7 +1468,6 @@ impl InlineArray {
 
     /// Gather selected coordinates from a `[N, D]` f32 tensor.
     // TODO(turboquant): staged for TurboQuant KV-cache rollout.
-    #[allow(dead_code)]
     pub fn turboquant_gather_last_dim(
         input: &Self,
         positions: &Self,
@@ -1501,7 +1498,6 @@ impl InlineArray {
     /// Scatter regular/outlier component rows back into `[N, D]` f32 rows.
     #[allow(clippy::too_many_arguments)]
     // TODO(turboquant): staged for TurboQuant KV-cache rollout.
-    #[allow(dead_code)]
     pub fn turboquant_scatter_last_dim(
         regular: &Self,
         outlier: &Self,

@@ -265,7 +265,7 @@ fn test_jit_training_step() {
     let labels = Array::from_i32_slice_shaped(&[2_i32, 3, 4, 5], &[1, 4]);
 
     // Run the JIT training step
-    let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+    let loss = jit_training_step_inner(&mut state, (&input_ids, &labels), None).unwrap();
     loss.eval();
 
     let loss_val = loss.item_f32();
@@ -295,7 +295,7 @@ fn test_jit_training_step_multiple_steps() {
     // Run multiple training steps
     let mut losses = Vec::new();
     for _ in 0..5 {
-        let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+        let loss = jit_training_step_inner(&mut state, (&input_ids, &labels), None).unwrap();
         loss.eval();
         losses.push(loss.item_f32());
     }
@@ -442,7 +442,8 @@ fn test_single_sequence_packed_step_matches_standard_step() {
     );
     let packed_batch = single_sequence_packed_batch(&tokens, &labels);
 
-    let standard_loss = jit_training_step(&mut standard_state, (&input_ids, &label_ids)).unwrap();
+    let standard_loss =
+        jit_training_step_inner(&mut standard_state, (&input_ids, &label_ids), None).unwrap();
     standard_loss.eval();
     let packed_loss = jit_training_step_packed(&mut packed_state, &packed_batch, 0.0).unwrap();
     packed_loss.eval();
@@ -507,7 +508,7 @@ fn test_jit_training_step_with_warmup() {
     // PHASE 2: WARMUP - Run one uncompiled step
     // ========================================
     // This initializes optimizer momentum/velocity buffers
-    let warmup_loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+    let warmup_loss = jit_training_step_inner(&mut state, (&input_ids, &labels), None).unwrap();
     warmup_loss.eval();
     let warmup_loss_val = warmup_loss.item_f32();
     println!("Warmup loss: {:.4}", warmup_loss_val);
@@ -535,7 +536,7 @@ fn test_jit_training_step_with_warmup() {
     // PHASE 4: Run SECOND warmup step to verify stability
     // ========================================
     println!("Running second warmup step to verify state stability...");
-    let warmup2_loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+    let warmup2_loss = jit_training_step_inner(&mut state, (&input_ids, &labels), None).unwrap();
     warmup2_loss.eval();
     let warmup2_loss_val = warmup2_loss.item_f32();
     println!("Second warmup loss: {:.4}", warmup2_loss_val);
@@ -569,7 +570,7 @@ fn test_jit_training_step_with_warmup() {
 
     let mut losses = vec![warmup_loss_val, warmup2_loss_val];
     for i in 0..3 {
-        let loss = jit_training_step(&mut state, (&input_ids, &labels)).unwrap();
+        let loss = jit_training_step_inner(&mut state, (&input_ids, &labels), None).unwrap();
         loss.eval();
         let loss_val = loss.item_f32();
         losses.push(loss_val);

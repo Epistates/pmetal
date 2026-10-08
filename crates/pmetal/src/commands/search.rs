@@ -180,14 +180,3 @@ pub(crate) async fn run_search(
 
     Ok(())
 }
-
-/// Truncate a string to max_len, appending ".." if truncated.
-#[allow(dead_code)] // Used by TUI search display
-pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len.saturating_sub(2)).collect();
-        format!("{truncated}..")
-    }
-}

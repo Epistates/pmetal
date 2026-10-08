@@ -111,39 +111,6 @@ fn with_cached_hybrid_cpu_engine<R>(
     )
 }
 
-/// Wait for a specific array to be ready (computed).
-///
-/// This is the key to matching Python's async_eval behavior. Python's async_eval
-/// internally blocks when there's memory pressure (MAX_ACTIVE_TASKS=10), waiting
-/// for previous work to complete. This creates perfect pipelining where:
-///
-/// - Python: blocking happens in async_eval, GPU is productive
-/// - Rust without fix: blocking happens in item(), GPU may be idle
-/// - Rust with fix: we explicitly wait before scheduling next work
-///
-/// By calling array_wait(current_y) BEFORE scheduling the next computation,
-/// we ensure the GPU has finished the current token and can immediately
-/// start the next one. The subsequent item() call is instant.
-#[allow(dead_code)] // Available for callers that need explicit CPU sync before the next dispatch
-#[inline]
-fn array_wait(arr: &Array) {
-    // Use the bridge synchronize function to ensure all GPU work is complete.
-    // The bridge handles this via the C++ inline array eval mechanism.
-    let _ = arr; // arr is already evaluated by the time we call this
-    pmetal_bridge::inline_array::synchronize();
-}
-
-/// Check if an array is available (computed) without blocking.
-///
-/// Returns true if the array's data is ready on CPU.
-#[inline]
-#[allow(dead_code)]
-fn array_is_available(_arr: &Array) -> bool {
-    // The bridge doesn't expose async availability checks.
-    // Return true to assume arrays are always available after eval.
-    true
-}
-
 /// Set the wired memory limit for Metal.
 ///
 /// This matches Python's `mx.set_wired_limit()` which prevents page faults
@@ -709,36 +676,20 @@ pub struct Sampler {
     config: GenerationConfig,
     /// Token frequency counts for frequency penalty
     token_counts: HashMap<u32, usize>,
-    /// Tracks whether MLX RNG was seeded (stored for debugging/introspection).
-    /// The actual seeding happens as a side-effect during construction.
-    #[allow(dead_code)]
-    seeded: bool,
     /// Cached -inf scalar for filter operations (avoids allocation per token)
     neg_inf: Array,
     /// Cached inverse temperature for categorical sampling (1.0 / temp)
     /// None if temp == 1.0 (no scaling needed)
     inv_temp: Option<Array>,
-    /// Cached vocab_range array for filter operations [0, 1, 2, ..., vocab_size-1]
-    /// Lazily initialized on first filter use. Avoids ~600KB allocation per filter call.
-    #[allow(dead_code)]
-    // Used by get_vocab_range; dead only when Metal fused sampler is active
-    cached_vocab_range: Option<Array>,
-    /// Cached vocab size to detect when vocab_range needs regeneration
-    #[allow(dead_code)]
-    // Paired with cached_vocab_range; both dead when Metal sampler is active
-    cached_vocab_size: usize,
 }
 
 impl Sampler {
     /// Create a new sampler.
     pub fn new(config: GenerationConfig) -> Self {
         // Seed MLX random state if a seed was provided
-        let seeded = if let Some(seed) = config.seed {
+        if let Some(seed) = config.seed {
             pmetal_bridge::inline_array::random_seed(seed);
-            true
-        } else {
-            false
-        };
+        }
 
         // Pre-allocate cached scalar arrays (avoids allocation per token)
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
@@ -755,27 +706,9 @@ impl Sampler {
         Self {
             config,
             token_counts: HashMap::new(),
-            seeded,
             neg_inf,
             inv_temp,
-            cached_vocab_range: None,
-            cached_vocab_size: 0,
         }
-    }
-
-    /// Get cached vocab_range array, creating it if needed.
-    /// This avoids allocating ~600KB per filter call for large vocabularies.
-    #[allow(dead_code)] // Consumed by MLX filter path; suppressed when Metal fused sampler is active
-    #[inline]
-    fn get_vocab_range(&mut self, vocab_size: usize) -> &Array {
-        if self.cached_vocab_size != vocab_size || self.cached_vocab_range.is_none() {
-            self.cached_vocab_range = Some(Array::from_iter(
-                0..vocab_size as i32,
-                &[1, vocab_size as i32],
-            ));
-            self.cached_vocab_size = vocab_size;
-        }
-        self.cached_vocab_range.as_ref().unwrap()
     }
 
     /// Sample the next token from logits.
@@ -1583,23 +1516,6 @@ fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Ex
 
     // Extract the scalar token ID (item() calls eval() internally)
     Ok(sampled.item::<u32>())
-}
-
-/// GPU-native categorical sampling returning Array for async pipelining.
-///
-/// No GPU→CPU sync - stays lazy for maximum performance.
-/// The sampler returns an array, not a scalar.
-#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
-fn gpu_categorical_sample_array(log_probs: &Array, temperature: f32) -> Result<Array, Exception> {
-    let scaled = if temperature != 1.0 && temperature > 0.0 {
-        let inv_temp = Array::from_f32(1.0 / temperature);
-        log_probs.multiply(&inv_temp)
-    } else {
-        log_probs.clone()
-    };
-
-    // Returns Array - no .item() call, stays on GPU
-    Ok(categorical(&scaled, -1))
 }
 
 /// Simple generation function that works with any model that has a `forward` method.

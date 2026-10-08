@@ -2016,25 +2016,6 @@ fn load_rms_norm_weight(
     Ok(())
 }
 
-#[allow(dead_code)] // Utility for architectures that use LayerNorm (e.g. GPT-style models)
-fn load_layer_norm_weight(
-    norm: &mut pmetal_bridge::compat::nn::LayerNorm,
-    weights: &HashMap<String, Array>,
-    prefix: &str,
-) -> Result<(), LoadError> {
-    let weight_key = format!("{prefix}.weight");
-    if let Some(w) = weights.get(&weight_key) {
-        norm.weight = pmetal_bridge::compat::module::Param::new(Some(w.clone()));
-    } else {
-        return Err(LoadError::MissingWeight(weight_key));
-    }
-    let bias_key = format!("{prefix}.bias");
-    if let Some(b) = weights.get(&bias_key) {
-        norm.bias = pmetal_bridge::compat::module::Param::new(Some(b.clone()));
-    }
-    Ok(())
-}
-
 fn load_gemma_rms_norm_weight(
     norm: &mut crate::architectures::gemma::GemmaRmsNorm,
     weights: &HashMap<String, Array>,

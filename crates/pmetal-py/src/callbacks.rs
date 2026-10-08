@@ -59,7 +59,6 @@ where
 /// - `on_step_start(step: int)`
 /// - `on_step_end(step: int, loss: float)`
 /// - `on_save(path: str)`
-#[allow(dead_code)]
 pub struct PythonCallbackBridge {
     pub(crate) py_callbacks: Vec<Py<PyAny>>,
 }

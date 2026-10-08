@@ -11,10 +11,9 @@ impl TrainingLoop {
     ///
     /// ## Implementation Note
     ///
-    /// While mlx-rs provides `compile_with_state` for JIT compilation, it has known
-    /// limitations with complex models + optimizers where state count changes during
-    /// execution. This method uses the non-JIT `jit_training_step` which still benefits
-    /// from MLX's lazy evaluation and graph fusion.
+    /// The step is not traced with MLX's `compile`, which has known limitations with
+    /// models + optimizers whose state count changes during execution. It still
+    /// benefits from MLX's lazy evaluation and graph fusion.
     ///
     /// ## Warmup Pattern
     ///
@@ -93,7 +92,7 @@ impl TrainingLoop {
         );
 
         // Create state tuple that owns both model and optimizer
-        // This allows jit_training_step to mutate both in a single function
+        // This allows the step function to mutate both in a single function
         let mut state = (model, optimizer);
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset

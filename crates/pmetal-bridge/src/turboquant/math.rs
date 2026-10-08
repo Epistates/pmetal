@@ -253,20 +253,6 @@ pub fn signed_fwht_forward(values: &mut [f32], left_signs: &[f32], right_signs: 
     }
 }
 
-#[allow(dead_code)] // Inverse path for TurboQuant CPU dequantization — paired with signed_fwht_forward
-fn signed_fwht_inverse(values: &mut [f32], left_signs: &[f32], right_signs: &[f32]) {
-    debug_assert_eq!(values.len(), left_signs.len());
-    debug_assert_eq!(values.len(), right_signs.len());
-    let scale = 1.0f32 / (values.len() as f32).sqrt();
-    for (v, &left) in values.iter_mut().zip(left_signs.iter()) {
-        *v *= left * scale;
-    }
-    fwht_in_place(values);
-    for (v, &right) in values.iter_mut().zip(right_signs.iter()) {
-        *v *= right;
-    }
-}
-
 /// CPU fallback: row-major [dim × dim] matrix applied to a batch of row vectors.
 ///
 /// output[row, out_dim] = sum_in( matrix[out_dim, in_dim] * input[row, in_dim] )

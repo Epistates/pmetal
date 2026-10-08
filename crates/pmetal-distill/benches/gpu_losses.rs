@@ -6,7 +6,6 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use pmetal_bridge::compat::Array;
 use pmetal_distill::losses::{
     DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, SoftCrossEntropyLoss,
-    is_gpu_available,
 };
 use std::hint::black_box;
 
@@ -329,13 +328,6 @@ fn bench_comparison_all_losses(c: &mut Criterion) {
     });
 
     group.finish();
-}
-
-#[allow(dead_code)]
-fn gpu_status() {
-    println!("\n=== GPU Distillation Loss Benchmarks ===");
-    println!("GPU available: {}", is_gpu_available());
-    println!();
 }
 
 criterion_group!(

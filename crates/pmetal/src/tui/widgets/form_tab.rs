@@ -332,10 +332,6 @@ impl JobLog {
         &self.lines
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
     /// Render the tail of the buffer that fits into `area`, with a two-
     /// space indent and the given title. Uses the default paragraph wrap
     /// so long lines don't disappear off the right edge.

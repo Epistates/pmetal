@@ -211,29 +211,6 @@ impl GpuMerger {
         Ok(base.add(&result))
     }
 
-    /// Optimized CPU path using batch sparsification.
-    fn ties_merge_cpu_optimized(
-        &self,
-        tensors: &[Array],
-        base: &Array,
-        weights: &[f32],
-        densities: &[f32],
-        lambda: f32,
-    ) -> Result<Array> {
-        // Step 1: Compute task vectors
-        let task_vectors: Vec<Array> = tensors.iter().map(|t| t.subtract(base)).collect();
-
-        // Step 2: Batch sparsify (uses O(n) quickselect)
-        let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
-
-        // Step 3: Compute sign consensus (returns weighted sum of agreeing contributions).
-        let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
-
-        // Step 4: Scale by lambda and add to base
-        let result = weighted_sum.multiply(&Array::from_f32(lambda));
-        Ok(base.add(&result))
-    }
-
     /// Standard CPU path for TIES merge.
     fn ties_merge_cpu(
         &self,

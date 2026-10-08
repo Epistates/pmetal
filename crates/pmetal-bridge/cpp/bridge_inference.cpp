@@ -144,17 +144,6 @@ void mlx_inline_eval_many(mlx_inline_array** arrays, int count) {
     });
 }
 
-void mlx_inline_async_eval_many(mlx_inline_array** arrays, int count) {
-    BRIDGE_TRY_VOID("async_eval_many", {
-        std::vector<array> arrs;
-        arrs.reserve(count);
-        for (int i = 0; i < count; ++i) {
-            arrs.push_back(as_arr(arrays[i]));
-        }
-        mlx::core::async_eval(std::move(arrs));
-    });
-}
-
 void mlx_inline_quantized_matmul(mlx_inline_array* dst,
                                    const mlx_inline_array* x, const mlx_inline_array* w,
                                    const mlx_inline_array* scales, const mlx_inline_array* biases,
@@ -306,12 +295,6 @@ int mlx_inline_load_safetensors_all(
     } catch (...) {
         pmetal_bridge_set_last_error("load_safetensors_all", "unknown C++ exception");
         return -1;
-    }
-}
-
-void mlx_inline_free_key_strings(char** keys, int count) {
-    for (int i = 0; i < count; ++i) {
-        free(keys[i]);
     }
 }
 

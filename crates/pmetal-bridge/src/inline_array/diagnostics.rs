@@ -32,7 +32,6 @@ pub fn graph_dump(arr: &InlineArray) {
 /// Must run with MTL_CAPTURE_ENABLED=1 environment variable.
 ///
 /// Diagnostic entry point for Xcode GPU traces — retained for ad-hoc profiling.
-#[allow(dead_code)]
 pub fn metal_start_capture(path: &str) -> bool {
     let c_path = std::ffi::CString::new(path).unwrap();
     unsafe { mlx_inline_metal_start_capture(c_path.as_ptr()) == 0 }
@@ -99,7 +98,6 @@ pub fn validate_metallib(path: &std::path::Path) -> std::io::Result<()> {
 /// Stop the Metal GPU capture.
 ///
 /// Diagnostic entry point — retained for ad-hoc profiling.
-#[allow(dead_code)]
 pub fn metal_stop_capture() {
     unsafe { mlx_inline_metal_stop_capture() }
 }
@@ -186,7 +184,6 @@ pub fn clear_cache() {
 ///
 /// Diagnostic toggle — retained for A/B perf experiments; not wired into
 /// production paths (compile is managed per-fn via `mlx::core::compile`).
-#[allow(dead_code)]
 pub fn enable_compile() {
     unsafe { mlx_inline_enable_compile() }
 }
@@ -194,7 +191,6 @@ pub fn enable_compile() {
 /// Disable MLX global compilation.
 ///
 /// Diagnostic toggle — retained for A/B perf experiments.
-#[allow(dead_code)]
 pub fn disable_compile() {
     unsafe { mlx_inline_disable_compile() }
 }
@@ -248,7 +244,6 @@ pub fn reset_peak_memory() {
 
 /// Panic at runtime if the Rust buffer constants don't match the C++ values.
 /// Call once at program startup (or in a test).
-#[allow(dead_code)] // Diagnostic — only invoked by the layout sanity test.
 pub fn verify_buffer_layout() {
     let sz = unsafe { mlx_inline_array_size() };
     let al = unsafe { mlx_inline_array_align() };

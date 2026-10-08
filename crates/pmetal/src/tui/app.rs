@@ -1866,34 +1866,6 @@ impl App {
                 // Rescan jobs
                 self.jobs.scan_jobs();
             }
-            AppMsg::DownloadProgress { model_id, progress } => {
-                // Could update a progress modal if one exists
-                if let Some(Modal::Progress {
-                    progress: p,
-                    message,
-                    ..
-                }) = self.modal_stack.last_mut()
-                {
-                    *p = progress;
-                    *message = format!("Downloading {model_id}... {:.0}%", progress * 100.0);
-                }
-            }
-            AppMsg::DownloadComplete {
-                model_id: _,
-                success,
-                message,
-            } => {
-                // Pop any progress modal
-                if matches!(self.modal_stack.last(), Some(Modal::Progress { .. })) {
-                    self.modal_stack.pop();
-                }
-                if success {
-                    self.models.scan_models();
-                } else {
-                    self.modal_stack
-                        .push(Modal::error("Download Failed", message));
-                }
-            }
             AppMsg::InferenceToken { token } => {
                 self.inference.append_token(&token);
             }

@@ -185,60 +185,6 @@ impl OnlineDpoTrainer {
         }
     }
 
-    /// Compute log probabilities for sequences.
-    fn compute_log_probs(&self, logits: &Array, labels: &Array) -> Result<Array, Exception> {
-        crate::logprob_utils::compute_log_probs(logits, labels)
-    }
-
-    /// Compute DPO loss for a batch of pairs.
-    fn compute_dpo_loss(
-        &self,
-        policy_chosen_logps: &Array,
-        policy_rejected_logps: &Array,
-        ref_chosen_logps: &Array,
-        ref_rejected_logps: &Array,
-    ) -> Result<(Array, Array, Array), Exception> {
-        let is_simpo = matches!(self.config.dpo_config.loss_type, DpoLossType::SimPo);
-        let reference_free = self.config.dpo_config.reference_free || is_simpo;
-
-        // Compute rewards (log ratios)
-        let chosen_rewards = if reference_free {
-            policy_chosen_logps.clone()
-        } else {
-            policy_chosen_logps.subtract(ref_chosen_logps)
-        };
-
-        let rejected_rewards = if reference_free {
-            policy_rejected_logps.clone()
-        } else {
-            policy_rejected_logps.subtract(ref_rejected_logps)
-        };
-
-        // Compute logits
-        let reward_diff = chosen_rewards.subtract(&rejected_rewards);
-        let beta = Array::from_f32(self.config.dpo_config.beta as f32);
-        let mut logits = reward_diff.multiply(&beta);
-
-        // SimPO margin
-        if is_simpo {
-            let gamma = Array::from_f32(self.config.dpo_config.simpo_gamma as f32);
-            logits = logits.subtract(&gamma);
-        }
-
-        // Sigmoid loss: -log(sigmoid(logits)) = softplus(-logits)
-        let neg_logits = logits.negative();
-        let loss = nn::softplus(&neg_logits);
-
-        // Mean loss
-        let loss = loss.mean(None);
-
-        Ok((
-            loss,
-            chosen_rewards.multiply(&beta),
-            rejected_rewards.multiply(&beta),
-        ))
-    }
-
     /// Generate completions for a batch of prompts.
     ///
     /// Returns: Vec of (prompt_tokens, Vec<completion_tokens>)

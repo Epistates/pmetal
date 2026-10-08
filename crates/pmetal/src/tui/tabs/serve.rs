@@ -24,7 +24,6 @@ pub enum ServeStatus {
     Idle,
     Starting {
         bind_url: String,
-        started_at: Instant,
     },
     Running {
         bind_url: String,
@@ -87,10 +86,7 @@ impl ServeTab {
 
     pub fn mark_starting(&mut self, bind_url: String) {
         self.log.clear();
-        self.status = ServeStatus::Starting {
-            bind_url,
-            started_at: Instant::now(),
-        };
+        self.status = ServeStatus::Starting { bind_url };
     }
 
     /// Append a stdout/stderr line. Triggers the Starting → Running

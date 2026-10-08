@@ -33,12 +33,14 @@ pub(crate) mod train_draft;
 #[cfg(feature = "trainer")]
 pub(crate) mod train_mtp;
 
+#[cfg(any(feature = "trainer", feature = "dashboard"))]
 use pmetal_data::DatasetColumnConfig;
 
 /// Build an optional `DatasetColumnConfig` from the column-selection CLI flags.
 ///
 /// Returns `None` when none of the flags were supplied (standard behavior),
 /// and `Some(cfg)` when at least one column specifier is present.
+#[cfg(any(feature = "trainer", feature = "dashboard"))]
 pub(crate) fn build_column_config(
     text_column: Option<String>,
     text_columns: Option<Vec<String>>,

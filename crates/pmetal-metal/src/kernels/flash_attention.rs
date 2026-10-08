@@ -748,17 +748,6 @@ impl FlashAttention {
         )
     }
 
-    /// Get a configuration key for pipeline caching.
-    #[allow(dead_code)]
-    fn config_key(&self) -> String {
-        format!(
-            "bq{}_bk{}_gqa{}",
-            self.block_q,
-            self.block_k,
-            self.config.gqa_ratio()
-        )
-    }
-
     /// Create kernel parameters struct.
     fn create_kernel_params(&self) -> FlashAttentionParams {
         FlashAttentionParams {
@@ -1134,17 +1123,6 @@ impl FlashAttentionVarlen {
             total += seq_len.div_ceil(self.block_q);
         }
         total
-    }
-
-    /// Compute total number of query blocks across all sequences (legacy estimate).
-    ///
-    /// Kept as a fallback for callers that do not have cu_seqlens available.
-    #[allow(dead_code)]
-    fn compute_total_q_blocks(&self) -> usize {
-        // Estimate: assuming average sequence length
-        let avg_len = self.config.total_tokens / self.config.num_seqs.max(1);
-        let blocks_per_seq = avg_len.div_ceil(self.block_q);
-        blocks_per_seq * self.config.num_seqs
     }
 
     /// Get kernel function name.

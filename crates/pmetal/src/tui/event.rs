@@ -26,7 +26,7 @@ pub enum Event {
     App(AppMsg),
 }
 
-/// Messages sent from background tasks (training, inference, downloads) to the TUI.
+/// Messages sent from background tasks (jobs and inference) to the TUI.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub enum AppMsg {
@@ -64,14 +64,6 @@ pub enum AppMsg {
     /// A background job has finished.
     JobFinished {
         job_id: String,
-        success: bool,
-        message: String,
-    },
-    /// Progress update for a model download (0.0..1.0).
-    DownloadProgress { model_id: String, progress: f64 },
-    /// A model download completed.
-    DownloadComplete {
-        model_id: String,
         success: bool,
         message: String,
     },

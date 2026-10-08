@@ -12,14 +12,12 @@
 //!
 //! TopK is typically the best choice, as most probability mass is in the top few tokens.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use pmetal_bridge::compat::Array;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
 
 use crate::{CompressionMethod, DistillError, Result};
 
@@ -724,29 +722,6 @@ impl LogitCompressor {
 
         dequantized.truncate(num_elements);
         Ok(Array::from_f32_slice(&dequantized, shape))
-    }
-}
-
-/// Compression statistics for reporting.
-#[derive(Debug)]
-pub struct CompressionStats {
-    /// Original size in bytes.
-    pub original_bytes: usize,
-    /// Compressed size in bytes.
-    pub compressed_bytes: usize,
-    /// Compression ratio.
-    pub ratio: f32,
-}
-
-impl CompressionStats {
-    /// Calculate compression ratio.
-    pub fn new(original_bytes: usize, compressed_bytes: usize) -> Self {
-        let ratio = original_bytes as f32 / compressed_bytes.max(1) as f32;
-        Self {
-            original_bytes,
-            compressed_bytes,
-            ratio,
-        }
     }
 }
 

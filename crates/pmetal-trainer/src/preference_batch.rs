@@ -35,7 +35,7 @@ pub(crate) fn pad_i64_sequences(
     Ok(Array::from_slice(&values, &[batch as i32, max_len as i32]))
 }
 
-#[allow(dead_code)] // Symmetric to pad_i32_sequences, available for future preference training
+#[cfg(feature = "experimental-trainers")]
 pub(crate) fn pad_f32_sequences(
     sequences: &[Vec<f32>],
     pad_value: f32,

@@ -578,7 +578,7 @@ impl MixedKeySubvectorEncoding {
     /// need to call this — that function's `collect_for_detach` barrier
     /// already covers every output, and re-barriering here would
     /// serialise the four parallel encode chains.
-    #[allow(dead_code)] // currently only used by tests
+    #[cfg(test)]
     pub(super) fn eval_and_detach(&mut self) {
         let mut to_eval: Vec<&mut InlineArray> = Vec::new();
         to_eval.push(&mut self.indices);
@@ -635,21 +635,6 @@ pub(super) fn gpu_encode_value_subvector(
         indices_t: Some(indices_t),
         norms,
     })
-}
-
-impl MixedValueSubvectorEncoding {
-    /// See [`MixedKeySubvectorEncoding::eval_and_detach`] — same rationale,
-    /// only `indices`/`indices_t`/`norms` need detaching for the value path.
-    #[allow(dead_code)]
-    pub(super) fn eval_and_detach(&mut self) {
-        let mut to_eval: Vec<&mut InlineArray> = Vec::new();
-        to_eval.push(&mut self.indices);
-        if let Some(t) = self.indices_t.as_mut() {
-            to_eval.push(t);
-        }
-        to_eval.push(&mut self.norms);
-        crate::inline_array::eval_and_detach_many(&mut to_eval);
-    }
 }
 
 pub(super) struct MixedValueSubvectorEncoding {

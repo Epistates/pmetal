@@ -80,14 +80,11 @@ pub enum ElectionState {
 
 /// Information about a candidate in the election.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct CandidateInfo {
     /// Peer ID of the candidate.
     peer_id: PeerId,
     /// Seniority of the candidate.
     seniority: Duration,
-    /// Session proposed by this candidate.
-    proposed_session: u64,
     /// Commands seen by this candidate.
     commands_seen: u64,
     /// When we last heard from this candidate.
@@ -230,7 +227,6 @@ impl ElectionManager {
             CandidateInfo {
                 peer_id: self.local_peer_id,
                 seniority: self.seniority(),
-                proposed_session: new_session,
                 commands_seen: *self.commands_seen.read(),
                 last_seen: Instant::now(),
             },
@@ -277,7 +273,6 @@ impl ElectionManager {
                 CandidateInfo {
                     peer_id: msg.sender,
                     seniority: msg.seniority,
-                    proposed_session: msg.proposed_session,
                     commands_seen: msg.commands_seen,
                     last_seen: Instant::now(),
                 },

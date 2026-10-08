@@ -241,7 +241,6 @@ pub fn dispatch_kernel_with_params<T>(
 // dispatch module rather than rediscovering the std::sync import. Kept
 // unexported for now — revisit if helper variants end up stashing
 // command-queue state.
-#[allow(dead_code)]
 type _ArcMetalContext = Arc<MetalContext>;
 
 #[cfg(test)]
@@ -258,7 +257,6 @@ mod tests {
         scale: f32,
     }
 
-    #[allow(dead_code)]
     fn _signature_check(
         ctx: &crate::context::MetalContext,
         bufs: &[&super::MetalBufferRef],

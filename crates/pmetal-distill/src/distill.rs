@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 
 use pmetal_bridge::compat::{Array, Dtype, ops};
-use tracing::{debug, info};
 
 use crate::{
     DistillConfig, DistillError, DistillMethod, LossType, Result,

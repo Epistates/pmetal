@@ -6,7 +6,6 @@
 
 use pyo3::prelude::*;
 
-mod array_bridge;
 mod callbacks;
 mod config;
 mod dflash;

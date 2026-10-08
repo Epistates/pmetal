@@ -47,9 +47,6 @@ pub struct QuantizedKVCache {
     value_bits: u8,
     /// Group size for quantization.
     pub(crate) group_size: usize,
-    /// Allocation step size.
-    #[allow(dead_code)] // Stored for future pre-allocation strategy
-    step: usize,
     /// Original dtype for dequantization.
     dtype: Dtype,
 }
@@ -72,7 +69,6 @@ impl QuantizedKVCache {
             bits,
             value_bits: bits,
             group_size,
-            step: 256,
             dtype: Dtype::Float16,
         }
     }
@@ -99,7 +95,6 @@ impl QuantizedKVCache {
             bits: key_bits,
             value_bits,
             group_size,
-            step: 256,
             dtype: Dtype::Float16,
         }
     }

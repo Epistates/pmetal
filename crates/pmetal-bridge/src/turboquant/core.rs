@@ -444,7 +444,6 @@ impl TurboQuantCore {
     }
 
     /// Experimental signed-FWHT QJL projection path for power-of-two dims.
-    #[allow(dead_code)]
     pub(super) fn project_rows_wht(&self, input_rows: &InlineArray) -> Option<InlineArray> {
         self.apply_signed_fwht_rows(
             input_rows,

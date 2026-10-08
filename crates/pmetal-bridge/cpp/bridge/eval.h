@@ -17,8 +17,6 @@ void mlx_inline_async_eval(mlx_inline_array* a);
 void mlx_inline_eval_2(mlx_inline_array* a, mlx_inline_array* b);
 // Eval many arrays in one call (single GPU submission, no per-array sync)
 void mlx_inline_eval_many(mlx_inline_array** arrays, int count);
-// Async eval many arrays in one call
-void mlx_inline_async_eval_many(mlx_inline_array** arrays, int count);
 // Async eval for a single borrowed InlineArray
 void mlx_inline_async_eval_arr(const mlx_inline_array* a);
 

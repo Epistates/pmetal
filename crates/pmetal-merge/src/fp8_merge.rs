@@ -191,8 +191,6 @@ pub struct Fp8Tensor {
     shape: Vec<i32>,
     /// Block size used for quantization.
     block_size: usize,
-    /// FP8 format used.
-    format: Fp8Format,
 }
 
 impl Fp8Tensor {
@@ -287,7 +285,6 @@ impl Fp8Merger {
             scales,
             shape,
             block_size,
-            format: self.config.format,
         })
     }
 

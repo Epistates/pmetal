@@ -5,7 +5,6 @@
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::needless_borrows_for_generic_args)]
 #![allow(clippy::unnecessary_unwrap)]
-#![allow(dead_code)] // Chat template formatters — pending migration to pmetal-data
 
 pub mod cli;
 mod commands;
@@ -2763,6 +2762,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
 }
 
 /// Save adapter config alongside LoRA weights.
+#[cfg(feature = "trainer")]
 fn save_adapter_config(
     lora_weights_path: &std::path::Path,
     r: usize,

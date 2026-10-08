@@ -20,7 +20,6 @@
 use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
 use crate::Result;
 use pmetal_bridge::compat::{Array, ops};
-use tracing;
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;

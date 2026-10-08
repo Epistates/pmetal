@@ -66,10 +66,6 @@ pub struct RationaleLoss {
 
     /// Epsilon for numerical stability in log computations.
     pub eps: f32,
-
-    /// Cached Metal context for GPU acceleration.
-    #[cfg(feature = "metal")]
-    ctx: Option<std::sync::Arc<pmetal_metal::context::MetalContext>>,
 }
 
 impl RationaleLoss {
@@ -81,8 +77,6 @@ impl RationaleLoss {
             start_marker: None,
             end_marker: None,
             eps: 1e-6,
-            #[cfg(feature = "metal")]
-            ctx: pmetal_metal::context::MetalContext::global().ok(),
         }
     }
 
@@ -100,8 +94,6 @@ impl RationaleLoss {
             start_marker: Some(start_marker.to_string()),
             end_marker: Some(end_marker.to_string()),
             eps: 1e-6,
-            #[cfg(feature = "metal")]
-            ctx: pmetal_metal::context::MetalContext::global().ok(),
         }
     }
 

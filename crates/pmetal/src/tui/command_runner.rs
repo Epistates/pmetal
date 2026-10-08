@@ -14,19 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tui::event::{AppMsg, CommandSpec, JobType};
 
-/// A currently running background job.
-#[allow(dead_code)]
-pub struct RunningJob {
-    pub id: String,
-    pub job_type: JobType,
-    pub cancel: CancellationToken,
-    pub metrics_file: Option<PathBuf>,
-}
-
 /// Manages background pmetal child processes.
 pub struct CommandRunner {
     app_tx: mpsc::Sender<AppMsg>,
-    jobs: HashMap<String, RunningJob>,
+    /// Cancellation token of each running job, by job id.
+    jobs: HashMap<String, CancellationToken>,
     next_id: u32,
 }
 
@@ -53,8 +45,6 @@ impl CommandRunner {
         let cancel_child = cancel.clone();
         let tx = self.app_tx.clone();
         let job_id_clone = job_id.clone();
-        let job_type = spec.job_type;
-        let metrics_file = spec.metrics_file.clone();
 
         // Notify TUI that job started (sync context — use try_send, drop on full)
         let _ = tx.try_send(AppMsg::JobStarted {
@@ -79,50 +69,24 @@ impl CommandRunner {
                 .await;
         });
 
-        self.jobs.insert(
-            job_id.clone(),
-            RunningJob {
-                id: job_id.clone(),
-                job_type,
-                cancel,
-                metrics_file,
-            },
-        );
+        self.jobs.insert(job_id.clone(), cancel);
 
         job_id
     }
 
     /// Cancel a running job by ID.
     pub fn cancel(&mut self, job_id: &str) {
-        if let Some(job) = self.jobs.get(job_id) {
-            job.cancel.cancel();
+        if let Some(cancel) = self.jobs.get(job_id) {
+            cancel.cancel();
         }
     }
 
     /// Remove a finished job from tracking, cancelling its token so that any
     /// background tasks (e.g. the metrics-file poller) stop promptly.
     pub fn remove(&mut self, job_id: &str) {
-        if let Some(job) = self.jobs.remove(job_id) {
-            job.cancel.cancel();
+        if let Some(cancel) = self.jobs.remove(job_id) {
+            cancel.cancel();
         }
-    }
-
-    /// Check if a job is being tracked.
-    #[allow(dead_code)]
-    pub fn has_job(&self, job_id: &str) -> bool {
-        self.jobs.contains_key(job_id)
-    }
-
-    /// Get all running job IDs.
-    #[allow(dead_code)]
-    pub fn running_jobs(&self) -> Vec<&str> {
-        self.jobs.keys().map(|s| s.as_str()).collect()
-    }
-
-    /// Get the metrics file for a job (if any).
-    #[allow(dead_code)]
-    pub fn metrics_file(&self, job_id: &str) -> Option<&PathBuf> {
-        self.jobs.get(job_id).and_then(|j| j.metrics_file.as_ref())
     }
 }
 

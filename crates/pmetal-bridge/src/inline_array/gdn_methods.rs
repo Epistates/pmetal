@@ -96,7 +96,6 @@ impl InlineArray {
     // TODO(gdn): candidate entry point for Qwen3Next GDN; current code calls
     // the fused kernel directly via `pmetal_mlx::kernels::gated_delta`. Keep
     // until the bridge-level wrapper is chosen as the canonical surface.
-    #[allow(dead_code)]
     pub fn gdn_update(
         q: &Self,
         k: &Self,

@@ -59,8 +59,6 @@ pub struct KVCacheSnapshot {
     values: Vec<Array>,
     /// Sequence length at snapshot time.
     seq_len: usize,
-    #[allow(dead_code)] // Stored for diagnostics
-    total_tokens: usize,
 }
 
 impl KVCacheSnapshot {
@@ -81,7 +79,6 @@ impl KVCacheSnapshot {
             keys,
             values,
             seq_len: cache.seq_len(),
-            total_tokens: cache.total_tokens(),
         }
     }
 

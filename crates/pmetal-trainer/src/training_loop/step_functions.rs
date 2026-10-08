@@ -16,22 +16,13 @@ fn clip_grads(grads: &mut FlattenedModuleParam, max_norm: f32) {
     pmetal_bridge::training::clip_grad_norm_map(grads, max_norm);
 }
 
-/// JIT-compiled training step for maximum throughput.
+/// Training step shared by the JIT step variants.
 ///
-/// This function is defined at module level so it can access external functions
-/// and be used as a function pointer (which is `Copy`).
+/// Defined at module level so it can access external functions and be used as
+/// a function pointer (which is `Copy`).
 ///
 /// When `neftune_alpha` is `Some(alpha)`, NEFTune embedding noise is applied via
 /// `model.forward_noised()` instead of the regular `model.forward()`.
-#[allow(dead_code)]
-pub(crate) fn jit_training_step<M: TrainableModel, O: Optimizer>(
-    state: &mut (M, O),
-    (input_ids, labels): (&Array, &Array),
-) -> std::result::Result<Array, Exception> {
-    jit_training_step_inner(state, (input_ids, labels), None)
-}
-
-/// Inner implementation shared by JIT step variants.
 pub(crate) fn jit_training_step_inner<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     (input_ids, labels): (&Array, &Array),

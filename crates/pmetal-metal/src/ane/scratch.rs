@@ -18,39 +18,20 @@ pub struct ScratchId(u32);
 pub struct BackwardScratch {
     storage: Vec<f32>,
     regions: Vec<(usize, usize)>,
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)]
-    names: Vec<&'static str>,
 }
 
 impl BackwardScratch {
     /// Plan and allocate the pool from a list of `(name, element_count)` entries.
-    ///
-    /// Names are stored only in debug builds for diagnostics.
     pub fn build(entries: &[(&'static str, usize)]) -> Self {
         let total: usize = entries.iter().map(|(_, len)| len).sum();
         let storage = vec![0.0f32; total];
         let mut regions = Vec::with_capacity(entries.len());
         let mut offset = 0;
-
-        #[cfg(debug_assertions)]
-        let mut names = Vec::with_capacity(entries.len());
-
-        for &(_name, len) in entries {
+        for &(_, len) in entries {
             regions.push((offset, len));
             offset += len;
-            #[cfg(debug_assertions)]
-            {
-                names.push(_name);
-            }
         }
-
-        Self {
-            storage,
-            regions,
-            #[cfg(debug_assertions)]
-            names,
-        }
+        Self { storage, regions }
     }
 
     /// Look up the `ScratchId` for a named entry.

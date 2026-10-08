@@ -14,8 +14,6 @@
 
 #![allow(unsafe_code)]
 
-use std::ops::Neg;
-
 use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, softmax};
 use crate::Result;
 use pmetal_bridge::compat::{Array, ops};

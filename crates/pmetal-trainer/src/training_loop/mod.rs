@@ -9,7 +9,7 @@
 //!
 //! # Optimized Training Path
 //!
-//! The training loop uses a fused `jit_training_step` function that combines
+//! The training loop uses a fused step function (`jit_training_step_inner`) that combines
 //! forward pass, backward pass, and optimizer update. MLX's lazy evaluation
 //! automatically optimizes the computation graph.
 //!
@@ -92,9 +92,9 @@ mod tests;
 
 // Re-export step functions so run_*.rs submodules can access them via `use super::*`
 pub(crate) use step_functions::{
-    compute_cce_loss, eval_training_state, jit_training_step, jit_training_step_cce,
-    jit_training_step_cce_clipped, jit_training_step_inner, jit_training_step_inner_clipped,
-    jit_training_step_packed, jit_training_step_packed_cce,
+    compute_cce_loss, eval_training_state, jit_training_step_cce, jit_training_step_cce_clipped,
+    jit_training_step_inner, jit_training_step_inner_clipped, jit_training_step_packed,
+    jit_training_step_packed_cce,
 };
 
 /// Training loop configuration.
@@ -833,40 +833,6 @@ impl TrainingLoop {
 
         // Return lazy norm - caller can eval() for logging if needed
         Ok(Some(norm))
-    }
-
-    /// Clip gradients by global norm with CPU sync for accurate logging.
-    ///
-    /// Uses a GPU-CPU sync to get the actual gradient norm value.
-    /// For maximum throughput, use clip_gradients_gpu() instead.
-    #[allow(dead_code)] // Available for callers that need precise grad_norm values
-    fn clip_gradients_with_sync(&self, grads: &mut FlattenedModuleParam) -> Result<Option<f32>> {
-        let max_norm = self.config.training.max_grad_norm as f32;
-        if max_norm <= 0.0 {
-            return Ok(None);
-        }
-
-        // Build lazy computation graph: sum of all squared norms
-        let mut norm_sq_sum = Array::from_f32(0.0);
-        for grad in grads.values() {
-            let norm_sq = grad.multiply(grad).sum(None);
-            norm_sq_sum = norm_sq_sum.add(&norm_sq);
-        }
-
-        // Single eval() for norm computation
-        norm_sq_sum.eval();
-        let total_norm = norm_sq_sum.item_f32().sqrt();
-
-        // Only clip if norm exceeds max and is finite (NaN/Inf gradients should not be scaled)
-        if total_norm > max_norm && total_norm.is_finite() {
-            let scale = max_norm / (total_norm + 1e-6);
-            let scale_arr = Array::from_f32(scale);
-            for grad in grads.values_mut() {
-                *grad = grad.multiply(&scale_arr);
-            }
-        }
-
-        Ok(Some(total_norm))
     }
 
     /// Accumulate gradients.

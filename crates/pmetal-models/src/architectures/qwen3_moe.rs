@@ -167,10 +167,6 @@ impl Default for Qwen3MoEConfig {
 /// Qwen3-MoE attention with Q/K normalization before RoPE.
 #[derive(Debug)]
 pub struct Qwen3MoEAttention {
-    /// Configuration.
-    #[allow(dead_code)]
-    // Retained for future dynamic config access (e.g. sliding window, rope scaling)
-    config: Qwen3MoEConfig,
     /// Number of attention heads.
     n_heads: i32,
     /// Number of KV heads.
@@ -179,10 +175,6 @@ pub struct Qwen3MoEAttention {
     head_dim: i32,
     /// Attention scale.
     scale: f32,
-    /// RoPE theta.
-    #[allow(dead_code)]
-    // Retained as authoritative source; effective_base is the derived working value
-    rope_theta: f32,
     /// RoPE position scale (from rope_scaling config).
     rope_scale: f32,
     /// Effective RoPE base after scaling.
@@ -241,10 +233,8 @@ impl Qwen3MoEAttention {
             .build()?;
 
         Ok(Self {
-            rope_theta: config.rope_theta,
             rope_scale,
             effective_base,
-            config,
             n_heads,
             n_kv_heads,
             head_dim,

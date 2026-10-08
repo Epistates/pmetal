@@ -467,7 +467,6 @@ impl DistillConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
     fn test_parse_basic_config() {

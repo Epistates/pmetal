@@ -145,12 +145,7 @@ struct AdapterConfigJson {
     r: u32,
     lora_alpha: f64,
     #[serde(default)]
-    target_modules: Vec<String>,
-    #[serde(default)]
     fan_in_fan_out: bool,
-    /// Accept any string for peft_type; we only support "LORA".
-    #[serde(default)]
-    peft_type: String,
 }
 
 impl AdapterConfigJson {

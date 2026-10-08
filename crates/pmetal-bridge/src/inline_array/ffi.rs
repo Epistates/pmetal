@@ -5,7 +5,6 @@
 
 use super::{QWeightRaw, RawBuf};
 
-#[allow(dead_code)]
 unsafe extern "C" {
     pub(super) fn mlx_inline_destroy(a: *mut RawBuf);
     pub(super) fn mlx_inline_init_copy(dst: *mut RawBuf, src: *const RawBuf);
@@ -425,7 +424,6 @@ unsafe extern "C" {
 
     // Batch eval — single GPU submission for multiple arrays
     pub(super) fn mlx_inline_eval_many(arrays: *mut *mut RawBuf, count: i32);
-    pub(super) fn mlx_inline_async_eval_many(arrays: *mut *mut RawBuf, count: i32);
 
     // Metal memory instrumentation
     pub(super) fn mlx_inline_get_active_memory() -> usize;
@@ -1348,9 +1346,6 @@ unsafe extern "C" {
         arr_buf: *mut RawBuf,
         max_entries: i32,
     ) -> i32;
-
-    // Free key strings allocated by mlx_inline_load_safetensors_all.
-    pub(super) fn mlx_inline_free_key_strings(keys: *mut *mut std::ffi::c_char, count: i32);
 
     // Create a 1-D int32 array from a Rust slice.
     pub(super) fn mlx_inline_from_i32_slice(dst: *mut RawBuf, data: *const i32, len: i32);

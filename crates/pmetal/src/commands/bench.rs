@@ -420,7 +420,6 @@ struct GdnLinearProjectionBenchmarkSetup {
 struct GdnPrefillBenchmarkSetup {
     model_path: PathBuf,
     layer_idx: usize,
-    batch_size: usize,
     seq_len: usize,
     input_dim: usize,
     output_dim: usize,
@@ -1735,7 +1734,6 @@ fn build_gdn_decode_benchmark_setup(
             Ok(GdnBenchmarkSetup::Prefill(GdnPrefillBenchmarkSetup {
                 model_path: model_path.to_path_buf(),
                 layer_idx,
-                batch_size,
                 seq_len,
                 input_dim,
                 output_dim,

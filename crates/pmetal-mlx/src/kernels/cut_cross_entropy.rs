@@ -136,8 +136,6 @@ pub struct CutCrossEntropyOutput {
 
     /// Cached values for backward pass.
     cached_logsumexp: Option<Array>,
-    #[allow(dead_code)] // Stored for future backward pass implementation
-    cached_target_logits: Option<Array>,
 }
 
 impl CutCrossEntropyOutput {
@@ -226,11 +224,7 @@ impl CutCrossEntropy {
         let loss = masked_loss.sum_all().divide(&n_valid_arr);
 
         // Cache for backward if needed
-        let (cached_lse, cached_target) = if self.config.compute_grad {
-            (Some(logsumexp), Some(target_logits))
-        } else {
-            (None, None)
-        };
+        let cached_lse = self.config.compute_grad.then_some(logsumexp);
 
         Ok(CutCrossEntropyOutput {
             loss,
@@ -241,7 +235,6 @@ impl CutCrossEntropy {
                 None
             },
             cached_logsumexp: cached_lse,
-            cached_target_logits: cached_target,
         })
     }
 

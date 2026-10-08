@@ -595,7 +595,8 @@ mod neon {
 // Scalar fallback implementations
 // =============================================================================
 
-#[allow(dead_code)]
+// The NEON versions run on aarch64; these serve every other target.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 mod scalar {
     use super::*;
 

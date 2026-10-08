@@ -191,7 +191,6 @@ mod tests {
     //! tests. These assertions just verify the API shape (compile-time
     //! contracts) — no GPU work happens here.
 
-    #[allow(dead_code)]
     fn _signature_check(ctx: &crate::context::MetalContext) -> crate::error::Result<()> {
         use super::BatchEncoder;
         let batch = BatchEncoder::new(ctx)?;
