@@ -80,16 +80,11 @@ pub mod diffusion_gemma_train;
 pub mod distillation;
 pub mod dpo;
 pub mod embedding_trainer;
-pub mod explicit_state_compile;
-pub mod ffi_compile;
 pub mod grpo;
 pub mod gspo;
-pub mod jit_compile;
 #[cfg(feature = "experimental-trainers")]
 pub mod kto;
 pub mod logprob_utils;
-pub mod lora_trainer;
-pub mod metal_fused;
 pub mod mlx_metal_optimizer;
 pub mod mtp_training;
 #[cfg(feature = "experimental-trainers")]
@@ -146,11 +141,7 @@ pub use diffusion_gemma_train::{
 };
 pub use distillation::*;
 pub use dpo::*;
-pub use explicit_state_compile::*;
-pub use ffi_compile::*;
 pub use gspo::*;
-pub use jit_compile::*;
-pub use metal_fused::*;
 pub use mlx_metal_optimizer::{
     MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig, MlxMetalOptimizerError,
     MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
@@ -164,7 +155,6 @@ pub use embedding_trainer::{
 pub use grpo::*;
 #[cfg(feature = "experimental-trainers")]
 pub use kto::*;
-pub use lora_trainer::*;
 #[cfg(feature = "experimental-trainers")]
 pub use online_dpo::{
     LengthRewardFunction, OnlineDpoConfig, OnlineDpoIterationStats, OnlineDpoTrainer,

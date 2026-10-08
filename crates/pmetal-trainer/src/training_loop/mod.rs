@@ -52,9 +52,6 @@
 //! ```
 //!
 //! Note: Fused training requires `gradient_accumulation_steps=1`.
-//!
-//! The `jit_compile` module provides experimental utilities for future JIT support
-//! when mlx-rs improves its compile_with_state implementation.
 
 use pmetal_bridge::compat::{
     Array, Dtype, Exception,

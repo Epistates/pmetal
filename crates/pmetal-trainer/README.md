@@ -123,7 +123,6 @@ fn train_with_checkpoints(
 |--------|-------------|
 | `training_loop` | Main training orchestration |
 | `sft` | Supervised fine-tuning trainer |
-| `lora_trainer` | LoRA-specific training |
 | `dpo` | Direct Preference Optimization |
 | `grpo` | Group Relative Policy Optimization |
 | `gspo` | Group Sequence Policy Optimization |
@@ -143,7 +142,7 @@ fn train_with_checkpoints(
 | `adamw_groups` | AdamW with parameter groups |
 | `adam8bit` | 8-bit Adam optimizer |
 | `schedule_free` | Schedule-free optimizer |
-| `metal_fused` | Metal-accelerated optimizer |
+| `mlx_metal_optimizer` | Metal-accelerated AdamW updates |
 | `adaptive_lr` | EMA-based adaptive learning rate control |
 | `checkpoint` | Checkpoint save/load |
 | `checkpointing` | Gradient checkpointing |
