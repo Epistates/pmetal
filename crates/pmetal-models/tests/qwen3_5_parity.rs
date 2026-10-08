@@ -223,6 +223,16 @@ fn dynamic_cached_decode(profile: &str) {
         ));
     }
     assert_all_pass(&format!("{profile}: dynamic cached decode"), &reports);
+
+    // The InlineArray decode path is tried on the first step only: the swish
+    // checkpoint takes it, and the sigmoid one keeps the reason it can't
+    // rather than trying, and logging, again every step.
+    let DynamicModel::Qwen3Next(qwen) = &model else {
+        panic!("{profile}: a Qwen3.5 checkpoint loads as Qwen3Next");
+    };
+    let inline = qwen.inline_weights.as_ref().map(Result::is_ok);
+    let want_inline = Some(profile != "sigmoid");
+    assert_eq!(inline, want_inline, "{profile}: InlineArray decode weights");
 }
 
 fn dynamic_mtp(profile: &str) {

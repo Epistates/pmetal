@@ -3652,8 +3652,10 @@ pub struct Qwen3NextForCausalLM {
     pub model: Qwen3NextModel,
     pub lm_head: Option<nn::Linear>,
     pub config: Qwen3NextConfig,
-    /// InlineArray weights for zero-overhead decode. Built lazily on first decode call.
-    pub inline_weights: Option<super::qwen3_next_inline::InlineModelWeights>,
+    /// InlineArray weights for zero-overhead decode, built on the first decode
+    /// step: `None` until then, then the weights or why this model can't take
+    /// that path (a sigmoid-gated checkpoint, say), so it is tried once.
+    pub inline_weights: Option<Result<super::qwen3_next_inline::InlineModelWeights, String>>,
     /// InlineArray decode state, one per sequence being decoded, keyed by the
     /// caller's `MambaCache`. It lives across decode steps (no conversion per
     /// step) and takes over from the caller's caches, which the inline path
@@ -3724,25 +3726,24 @@ impl Qwen3NextForCausalLM {
     ) -> Result<Array, Exception> {
         // Decode (T=1): use InlineArray path for zero-overhead graph build
         if mask.is_none() && input_ids.dim(1) == 1 && kv_cache.is_some() && mamba_cache.is_some() {
-            // Lazily build InlineArray weights on first decode
+            // Build the InlineArray weights on the first decode step, once:
+            // a model that can't take that path decodes on the standard one
+            // from then on.
             if self.inline_weights.is_none() {
-                eprintln!("[INLINE] Building InlineArray weights...");
-                match super::qwen3_next_inline::InlineModelWeights::from_model(self) {
-                    Ok(w) => {
-                        eprintln!(
-                            "[INLINE] InlineArray weights ready ({} layers)",
-                            w.layers.len()
-                        );
-                        self.inline_weights = Some(w);
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[INLINE] Failed to build InlineArray weights: {e}, falling back"
-                        );
+                let built = super::qwen3_next_inline::InlineModelWeights::from_model(self)
+                    .map_err(|e| e.to_string());
+                match &built {
+                    Ok(weights) => tracing::debug!(
+                        layers = weights.layers.len(),
+                        "InlineArray decode weights ready"
+                    ),
+                    Err(reason) => {
+                        tracing::info!("Decoding on the standard path: {reason}");
                     }
                 }
+                self.inline_weights = Some(built);
             }
-            if let (Some(weights), Some(kv), Some(mb)) = (
+            if let (Some(Ok(weights)), Some(kv), Some(mb)) = (
                 self.inline_weights.as_ref(),
                 kv_cache.as_ref(),
                 mamba_cache.as_ref(),
