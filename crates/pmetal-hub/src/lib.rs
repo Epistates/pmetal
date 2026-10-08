@@ -2,7 +2,7 @@
 //!
 //! This crate provides:
 //! - Model downloading from HuggingFace Hub
-//! - Model uploading to HuggingFace Hub
+//! - Publishing a model directory to HuggingFace Hub
 //! - Local cache management
 
 #![warn(missing_docs)]

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 ///
 /// The cache directory is pmetal's own resolution, so a download lands where
 /// [`crate::cache::find_cached_model`] looks for it.
-fn build_client(token: Option<&SecretString>) -> Result<HFClient> {
+pub(crate) fn build_client(token: Option<&SecretString>) -> Result<HFClient> {
     let mut builder = HFClient::builder().cache_dir(crate::cache::cache_dir());
 
     if let Some(secret) = token {
@@ -20,7 +20,7 @@ fn build_client(token: Option<&SecretString>) -> Result<HFClient> {
     builder.build().map_err(hub_error)
 }
 
-fn hub_error(e: HFError) -> pmetal_core::PMetalError {
+pub(crate) fn hub_error(e: HFError) -> pmetal_core::PMetalError {
     pmetal_core::PMetalError::Hub(e.to_string())
 }
 

@@ -6236,7 +6236,6 @@ dependencies = [
 name = "pmetal-hub"
 version = "0.6.0"
 dependencies = [
- "base64 0.23.1",
  "dirs 7.0.0",
  "hf-hub",
  "indicatif",
@@ -6245,7 +6244,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
