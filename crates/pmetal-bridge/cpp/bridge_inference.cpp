@@ -82,6 +82,18 @@ void mlx_inline_expand_dims(mlx_inline_array* dst, const mlx_inline_array* a, in
         new (dst->buf) array(mlx::core::expand_dims(as_arr(a), axis)));
 }
 
+void mlx_inline_squeeze_axes(mlx_inline_array* dst, const mlx_inline_array* a,
+                             const int* axes, int num_axes) {
+    BRIDGE_TRY_DST("squeeze_axes", dst,
+        new (dst->buf) array(mlx::core::squeeze(as_arr(a), std::vector<int>(axes, axes + num_axes))));
+}
+
+void mlx_inline_expand_dims_axes(mlx_inline_array* dst, const mlx_inline_array* a,
+                                 const int* axes, int num_axes) {
+    BRIDGE_TRY_DST("expand_dims_axes", dst,
+        new (dst->buf) array(mlx::core::expand_dims(as_arr(a), std::vector<int>(axes, axes + num_axes))));
+}
+
 void mlx_inline_transpose_axes(mlx_inline_array* dst, const mlx_inline_array* a,
                                  const int* axes, int ndim) {
     BRIDGE_TRY_DST("transpose_axes", dst,

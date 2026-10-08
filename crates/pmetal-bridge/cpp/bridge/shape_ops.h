@@ -34,6 +34,10 @@ void mlx_inline_squeeze(mlx_inline_array* dst, const mlx_inline_array* a, int ax
 // Remove all size-1 dimensions
 void mlx_inline_squeeze_all(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_expand_dims(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
+// Multi-axis squeeze / expand_dims with NumPy's axes: squeeze's name axes of
+// the input, expand_dims' positions in the output.
+void mlx_inline_squeeze_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes);
+void mlx_inline_expand_dims_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes);
 // Transpose with explicit axis permutation
 void mlx_inline_transpose_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int ndim);
 

@@ -488,6 +488,18 @@ unsafe extern "C" {
     pub(super) fn mlx_inline_repeat(dst: *mut RawBuf, a: *const RawBuf, repeats: i32, axis: i32);
     pub(super) fn mlx_inline_squeeze(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
     pub(super) fn mlx_inline_expand_dims(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
+    pub(super) fn mlx_inline_squeeze_axes(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        axes: *const i32,
+        num_axes: i32,
+    );
+    pub(super) fn mlx_inline_expand_dims_axes(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        axes: *const i32,
+        num_axes: i32,
+    );
     pub(super) fn mlx_inline_transpose_axes(
         dst: *mut RawBuf,
         a: *const RawBuf,

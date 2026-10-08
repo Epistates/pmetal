@@ -117,23 +117,27 @@ impl InlineArray {
         }
     }
 
-    /// Squeeze all size-1 dimensions (multi-axis compat alias).
+    /// Remove the listed size-1 axes, like `mx.squeeze(a, axes)`.
     ///
-    /// Process axes in descending order so each squeeze leaves the remaining
-    /// axis indices valid. Avoids an initial `self.clone()` by performing the
-    /// first squeeze directly against `self`.
+    /// The axes name axes of `self`, negative ones counted from the end, in
+    /// any order.
     #[inline]
     pub fn squeeze_axes(&self, axes: &[i32]) -> Self {
         if axes.is_empty() {
             return self.clone();
         }
-        let mut sorted = axes.to_vec();
-        sorted.sort_unstable_by(|a, b| b.cmp(a));
-        let mut result = self.squeeze(sorted[0]);
-        for &ax in &sorted[1..] {
-            result = result.squeeze(ax);
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_squeeze_axes(
+                dst.as_mut_ptr(),
+                &self.raw,
+                axes.as_ptr(),
+                axes.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
-        result
     }
 
     #[inline]
@@ -147,24 +151,28 @@ impl InlineArray {
         }
     }
 
-    /// Multi-axis expand_dims — insert a new size-1 axis at each position.
+    /// Insert a size-1 axis at each listed position, like
+    /// `mx.expand_dims(a, axes)`.
     ///
-    /// Compatible with mlx-rs `expand_dims_axes(&[ax1, ax2, ...])`. Insert in
-    /// ascending order so each prior insertion remains at its requested axis.
-    /// Avoids an initial `self.clone()` by performing the first insertion
-    /// directly against `self`.
+    /// The axes are positions in the *output*, negative ones counted from
+    /// its end, in any order: `[3]` with `[-2, -1]` is `[3, 1, 1]`.
     #[inline]
     pub fn expand_dims_axes(&self, axes: &[i32]) -> Self {
         if axes.is_empty() {
             return self.clone();
         }
-        let mut sorted = axes.to_vec();
-        sorted.sort_unstable();
-        let mut result = self.expand_dims(sorted[0]);
-        for &ax in &sorted[1..] {
-            result = result.expand_dims(ax);
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_expand_dims_axes(
+                dst.as_mut_ptr(),
+                &self.raw,
+                axes.as_ptr(),
+                axes.len() as i32,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
         }
-        result
     }
 
     #[inline]
