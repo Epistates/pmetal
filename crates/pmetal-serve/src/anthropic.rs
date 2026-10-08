@@ -352,19 +352,26 @@ pub async fn messages(
     let tools_requested = req.tools.is_some();
 
     let resolved_stops = resolve_stop_sequences(&req.stop_sequences, &state.engine);
-    let temperature = req.temperature.unwrap_or(0.0);
+    // Sampling the request leaves out follows the model maker's
+    // recommendation for the mode it runs in, as `pmetal infer` does.
+    let defaults = state
+        .engine
+        .sampling_defaults(state.engine.thinks_with(&template_kwargs));
+    let temperature = req.temperature.unwrap_or(defaults.temperature);
     let request_id = format!("msg_{}", uuid::Uuid::new_v4());
     let model_id = state.engine.model_id().to_string();
 
     let params = SamplingParams {
         max_tokens: req.max_tokens,
         temperature,
-        top_k: req.top_k,
-        top_p: req.top_p,
-        min_p: None,
-        repetition_penalty: None,
-        frequency_penalty: None,
-        presence_penalty: None,
+        top_k: req.top_k.or(Some(defaults.top_k)),
+        top_p: req.top_p.or(Some(defaults.top_p)),
+        min_p: Some(defaults.min_p),
+        // An explicitly greedy request decodes plain argmax: no default
+        // penalties shift it.
+        repetition_penalty: (temperature > 0.0).then_some(defaults.repetition_penalty),
+        frequency_penalty: (temperature > 0.0).then_some(defaults.frequency_penalty),
+        presence_penalty: (temperature > 0.0).then_some(defaults.presence_penalty),
         seed: None,
         extra_stop_token_ids: resolved_stops.token_ids.clone(),
         stop_sequences: resolved_stops.sequences.clone(),

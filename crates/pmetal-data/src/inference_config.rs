@@ -10,8 +10,10 @@
 //!
 //! ## Sampling parameter resolution order
 //!
-//! 1. **CLI/GUI explicit override** — always wins
-//! 2. **`--mode` preset** — model-family-specific preset (e.g., `thinking-coding`)
+//! 1. **CLI/GUI/request explicit value** — always wins
+//! 2. **Model-card preset** — the maker's settings for the model's family
+//!    ([`ModelFamily`]) and the mode (`--mode`, or thinking / instruct by
+//!    whether the model thinks)
 //! 3. **`generation_config.json`** — model's declared defaults
 //! 4. **Global fallback** — `SamplingDefaults::default()` (temp=0.7, top_p=0.8)
 
@@ -307,97 +309,270 @@ impl std::str::FromStr for InferenceBackend {
     }
 }
 
-/// Return the available sampling modes for a model family.
+// =============================================================================
+// Model families with maker-recommended settings
+// =============================================================================
+
+/// A model generation whose maker publishes recommended inference settings
+/// (sampling per mode, output length). Detected from the checkpoint's
+/// `config.json` `model_type` and its name (the Hugging Face repo name in the
+/// cache path, or `_name_or_path`), since several generations share one
+/// `model_type`: Qwen3.5, 3.6 and 3.8 are all `qwen3_5`.
 ///
-/// Models without specific recommendations return an empty slice.
-pub fn available_modes(template: Option<ChatTemplateType>) -> &'static [SamplingMode] {
-    match template {
-        Some(ChatTemplateType::Qwen) => &[
-            SamplingMode::ThinkingGeneral,
-            SamplingMode::ThinkingCoding,
-            SamplingMode::InstructGeneral,
-            SamplingMode::InstructReasoning,
-        ],
-        _ => &[],
+/// Families whose makers publish nothing (Llama, Gemma 2/3, Phi-3/4,
+/// Mistral 7B, Mixtral, Cohere, Granite, SmolLM2, Qwen2.5) are absent: their
+/// `generation_config.json` and the global fallback apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    /// Qwen3 with switchable thinking (Qwen3-0.6B to 235B-A22B, April 2025).
+    Qwen3,
+    /// Qwen3-2507 Instruct and Qwen3-Next Instruct: non-thinking only.
+    Qwen3Instruct2507,
+    /// Qwen3-2507 Thinking and Qwen3-Next Thinking: thinking only.
+    Qwen3Thinking2507,
+    /// Qwen3.5.
+    Qwen3_5,
+    /// Qwen3.6.
+    Qwen3_6,
+    /// Qwen3.8 and Qwen3.8-Flash-Next, and a Qwen3.5-family checkpoint the
+    /// name does not place (the latest card's settings).
+    Qwen3_8,
+    /// Gemma 4.
+    Gemma4,
+    /// gpt-oss.
+    GptOss,
+    /// Mistral Small 3.x.
+    MistralSmall3,
+    /// Magistral.
+    Magistral,
+    /// Phi-4-reasoning and Phi-4-reasoning-plus.
+    Phi4Reasoning,
+    /// DeepSeek-R1 and its distillations.
+    DeepSeekR1,
+    /// DeepSeek-V3-0324.
+    DeepSeekV3_0324,
+    /// NVIDIA Nemotron Nano 2 (9B / 12B v2).
+    NemotronNanoV2,
+}
+
+impl ModelFamily {
+    /// Detect the family of the checkpoint in `model_path`, or `None` when
+    /// its maker publishes no settings (or it is not recognised).
+    pub fn detect(model_path: &Path) -> Option<Self> {
+        let config = read_json(&model_path.join("config.json"));
+        let model_type = config
+            .as_ref()
+            .and_then(|c| {
+                c.get("text_config")
+                    .and_then(|t| t.get("model_type"))
+                    .or_else(|| c.get("model_type"))
+            })
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let name_or_path = config
+            .as_ref()
+            .and_then(|c| c.get("_name_or_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let name = format!("{} {}", model_name(model_path), name_or_path).to_ascii_lowercase();
+        Self::from_model_type_and_name(&model_type, &name)
+    }
+
+    /// [`detect`](Self::detect) on an already-read `model_type` and name
+    /// (both lower case).
+    pub fn from_model_type_and_name(model_type: &str, name: &str) -> Option<Self> {
+        let has = |needle: &str| name.contains(needle);
+        let model_type = model_type.strip_suffix("_mtp").unwrap_or(model_type);
+        if model_type.starts_with("qwen3_5")
+            || model_type.starts_with("qwen3_6")
+            || model_type.starts_with("qwen4_exp")
+            || model_type == "qwen3_next"
+        {
+            return Some(if has("qwen3-next") || model_type == "qwen3_next" {
+                if has("thinking") {
+                    Self::Qwen3Thinking2507
+                } else {
+                    Self::Qwen3Instruct2507
+                }
+            } else if has("qwen3.5") || has("qwen3_5") {
+                Self::Qwen3_5
+            } else if has("qwen3.6") || has("qwen3_6") || model_type.starts_with("qwen3_6") {
+                Self::Qwen3_6
+            } else {
+                Self::Qwen3_8
+            });
+        }
+        if model_type == "qwen3" || model_type == "qwen3_moe" {
+            return Some(if has("thinking") {
+                Self::Qwen3Thinking2507
+            } else if has("2507") || has("instruct") {
+                Self::Qwen3Instruct2507
+            } else {
+                Self::Qwen3
+            });
+        }
+        if model_type.starts_with("gemma4") {
+            return Some(Self::Gemma4);
+        }
+        if matches!(model_type, "gpt_oss" | "gptoss" | "gpt-oss") {
+            return Some(Self::GptOss);
+        }
+        if has("magistral") {
+            return Some(Self::Magistral);
+        }
+        if has("mistral-small") {
+            return Some(Self::MistralSmall3);
+        }
+        if has("phi-4-reasoning") {
+            return Some(Self::Phi4Reasoning);
+        }
+        if has("deepseek-r1") {
+            return Some(Self::DeepSeekR1);
+        }
+        if has("deepseek-v3-0324") {
+            return Some(Self::DeepSeekV3_0324);
+        }
+        if model_type.starts_with("nemotron") && (has("nano-9b-v2") || has("nano-12b-v2")) {
+            return Some(Self::NemotronNanoV2);
+        }
+        None
+    }
+
+    /// The modes the maker gives settings for.
+    pub fn modes(self) -> &'static [SamplingMode] {
+        use SamplingMode::*;
+        match self {
+            Self::Qwen3_5 => &[
+                ThinkingGeneral,
+                ThinkingCoding,
+                InstructGeneral,
+                InstructReasoning,
+            ],
+            Self::Qwen3_6 => &[ThinkingGeneral, ThinkingCoding, InstructGeneral],
+            Self::Qwen3 | Self::Qwen3_8 | Self::Gemma4 | Self::NemotronNanoV2 => {
+                &[ThinkingGeneral, InstructGeneral]
+            }
+            Self::Qwen3Instruct2507 | Self::MistralSmall3 | Self::DeepSeekV3_0324 => {
+                &[InstructGeneral]
+            }
+            Self::Qwen3Thinking2507
+            | Self::GptOss
+            | Self::Magistral
+            | Self::Phi4Reasoning
+            | Self::DeepSeekR1 => &[ThinkingGeneral],
+        }
+    }
+
+    /// The maker's sampling settings for `mode`. A mode the maker gives none
+    /// for falls back to its general thinking or instruct mode, then to
+    /// whichever mode the family has.
+    pub fn preset(self, mode: SamplingMode) -> Option<SamplingDefaults> {
+        use SamplingMode::*;
+        let modes = self.modes();
+        let mode = match mode {
+            Auto => return None,
+            m if modes.contains(&m) => m,
+            ThinkingCoding if modes.contains(&ThinkingGeneral) => ThinkingGeneral,
+            InstructReasoning if modes.contains(&InstructGeneral) => InstructGeneral,
+            _ => modes[0],
+        };
+        // (temperature, top_p, top_k, presence_penalty); top_k 0 = off.
+        let (temperature, top_p, top_k, presence_penalty) = match (self, mode) {
+            // Qwen3 card: thinking 0.6/0.95/20, non-thinking 0.7/0.8/20.
+            (Self::Qwen3 | Self::Qwen3Thinking2507, _) if mode == ThinkingGeneral => {
+                (0.6, 0.95, 20, 0.0)
+            }
+            (Self::Qwen3 | Self::Qwen3Instruct2507, _) => (0.7, 0.8, 20, 0.0),
+            (Self::Qwen3Thinking2507, _) => (0.6, 0.95, 20, 0.0),
+            // Qwen3.5 card. Thinking-general's presence penalty is 1.5 on the
+            // card; pmetal keeps 0.0, which ended thinking chains early less
+            // often and which the Qwen3.6 and 3.8 cards adopted.
+            (Self::Qwen3_5, ThinkingGeneral) => (1.0, 0.95, 20, 0.0),
+            (Self::Qwen3_5, ThinkingCoding) => (0.6, 0.95, 20, 0.0),
+            (Self::Qwen3_5, InstructReasoning) => (1.0, 1.0, 40, 2.0),
+            (Self::Qwen3_5, _) => (0.7, 0.8, 20, 1.5),
+            // Qwen3.6 card.
+            (Self::Qwen3_6, ThinkingGeneral) => (1.0, 0.95, 20, 0.0),
+            (Self::Qwen3_6, ThinkingCoding) => (0.6, 0.95, 20, 0.0),
+            (Self::Qwen3_6, _) => (0.7, 0.8, 20, 1.5),
+            // Qwen3.8 card.
+            (Self::Qwen3_8, ThinkingGeneral) => (1.0, 0.95, 20, 0.0),
+            (Self::Qwen3_8, _) => (0.7, 0.8, 20, 1.5),
+            // Gemma 4 card: one configuration for all use cases.
+            (Self::Gemma4, _) => (1.0, 0.95, 64, 0.0),
+            // gpt-oss README: temperature 1.0, top_p 1.0.
+            (Self::GptOss, _) => (1.0, 1.0, 0, 0.0),
+            // Mistral Small 3.x card: a low temperature, such as 0.15.
+            (Self::MistralSmall3, _) => (0.15, 1.0, 0, 0.0),
+            // Magistral card: top_p 0.95, temperature 0.7.
+            (Self::Magistral, _) => (0.7, 0.95, 0, 0.0),
+            // Phi-4-reasoning card: temperature 0.8, top_k 50, top_p 0.95.
+            (Self::Phi4Reasoning, _) => (0.8, 0.95, 50, 0.0),
+            // DeepSeek-R1 card: temperature 0.6 (0.5-0.7), top_p 0.95.
+            (Self::DeepSeekR1, _) => (0.6, 0.95, 0, 0.0),
+            // DeepSeek-V3-0324 card: temperature 0.3.
+            (Self::DeepSeekV3_0324, _) => (0.3, 1.0, 0, 0.0),
+            // Nemotron Nano 2 card: 0.6 / 0.95 with reasoning, greedy without.
+            (Self::NemotronNanoV2, ThinkingGeneral) => (0.6, 0.95, 0, 0.0),
+            (Self::NemotronNanoV2, _) => (0.0, 1.0, 0, 0.0),
+        };
+        Some(SamplingDefaults {
+            temperature,
+            top_p,
+            top_k,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty,
+        })
+    }
+
+    /// The output length the maker recommends, when it names one: 32,768
+    /// "for most queries" on the Qwen3 to 3.6 cards (Qwen3.8's card gives
+    /// only its long agentic budget), 16,384 on the Qwen3-2507 Instruct
+    /// cards, 40,960 on Magistral's and 32,768 on Phi-4-reasoning's.
+    pub fn recommended_max_tokens(self) -> Option<usize> {
+        match self {
+            Self::Qwen3
+            | Self::Qwen3Thinking2507
+            | Self::Qwen3_5
+            | Self::Qwen3_6
+            | Self::Qwen3_8
+            | Self::Phi4Reasoning => Some(THINKING_MAX_TOKENS),
+            Self::Qwen3Instruct2507 => Some(16_384),
+            Self::Magistral => Some(40_960),
+            _ => None,
+        }
     }
 }
 
-/// Resolve a sampling mode to concrete parameters for a model family.
-///
-/// Returns `None` if the model family has no presets (use generation_config.json
-/// or global defaults instead).
-///
-/// Sources:
-/// - Qwen3.5 README "Best Practices" section (2026-04)
-/// - Qwen3 README "Best Practices" section (2025-04)
-/// - DeepSeek-R1 README (params match generation_config.json, no extra presets needed)
-pub fn model_preset(
-    template: Option<ChatTemplateType>,
-    mode: SamplingMode,
-) -> Option<SamplingDefaults> {
-    let template = template?;
-
-    match template {
-        ChatTemplateType::Qwen => qwen_preset(mode),
-        _ => None,
+/// The checkpoint's name from its path: the repo name of a Hugging Face
+/// cache entry (`models--Qwen--Qwen3.8-27B/snapshots/<hash>`), else the
+/// directory's own name.
+fn model_name(model_path: &Path) -> String {
+    for component in model_path.components().rev() {
+        let part = component.as_os_str().to_string_lossy();
+        if let Some(repo) = part.strip_prefix("models--") {
+            return repo.replacen("--", "/", 1);
+        }
     }
+    model_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
-/// Qwen3 / Qwen3.5 recommended sampling presets.
-///
-/// From Qwen3.5 model card (applies to all Qwen3.5 sizes):
-///   - Thinking general:     temp=1.0, top_p=0.95, top_k=20, presence_penalty=0.0 (card says 1.5, causes early EOS)
-///   - Thinking coding:      temp=0.6, top_p=0.95, top_k=20, presence_penalty=0.0
-///   - Instruct general:     temp=0.7, top_p=0.8,  top_k=20, presence_penalty=1.5
-///   - Instruct reasoning:   temp=1.0, top_p=1.0,  top_k=40, presence_penalty=2.0
-///
-/// Qwen3 uses the same thinking/non-thinking split with slightly different defaults
-/// (temp=0.6 thinking, temp=0.7 non-thinking) which are close enough that the
-/// Qwen3.5 presets work well for both.
-fn qwen_preset(mode: SamplingMode) -> Option<SamplingDefaults> {
-    let preset = match mode {
-        SamplingMode::Auto => return None, // caller resolves Auto before calling
-        SamplingMode::ThinkingGeneral => SamplingDefaults {
-            temperature: 1.0,
-            top_p: 0.95,
-            top_k: 20,
-            min_p: 0.0,
-            // Model card says 1.5, but presence penalty during thinking chains
-            // penalizes common tokens ("the", "is", etc.) and causes early EOS.
-            // ThinkingCoding already uses 0.0; keep thinking modes penalty-free.
-            presence_penalty: 0.0,
-            repetition_penalty: 1.0,
-            frequency_penalty: 0.0,
-        },
-        SamplingMode::ThinkingCoding => SamplingDefaults {
-            temperature: 0.6,
-            top_p: 0.95,
-            top_k: 20,
-            min_p: 0.0,
-            presence_penalty: 0.0,
-            repetition_penalty: 1.0,
-            frequency_penalty: 0.0,
-        },
-        SamplingMode::InstructGeneral => SamplingDefaults {
-            temperature: 0.7,
-            top_p: 0.8,
-            top_k: 20,
-            min_p: 0.0,
-            presence_penalty: 1.5,
-            repetition_penalty: 1.0,
-            frequency_penalty: 0.0,
-        },
-        SamplingMode::InstructReasoning => SamplingDefaults {
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: 40,
-            min_p: 0.0,
-            presence_penalty: 2.0,
-            repetition_penalty: 1.0,
-            frequency_penalty: 0.0,
-        },
-    };
-    Some(preset)
+/// The sampling modes a model's maker gives settings for; empty when none.
+pub fn available_modes(family: Option<ModelFamily>) -> &'static [SamplingMode] {
+    family.map_or(&[], ModelFamily::modes)
+}
+
+/// Resolve a sampling mode to the maker's settings for a model family, or
+/// `None` without a family (use `generation_config.json` and the global
+/// fallback instead). Sources, per family, are on [`ModelFamily::preset`].
+pub fn model_preset(family: Option<ModelFamily>, mode: SamplingMode) -> Option<SamplingDefaults> {
+    family?.preset(mode)
 }
 
 /// Resolve `SamplingMode::Auto` to a concrete mode based on thinking flag.
@@ -478,6 +653,8 @@ pub enum MaxTokensSource {
     GenerationConfigMaxNewTokens,
     /// `generation_config.json` `max_length` (prompt included, as in transformers).
     GenerationConfigMaxLength,
+    /// The model card's recommendation ([`ModelFamily::recommended_max_tokens`]).
+    ModelCard,
     /// [`THINKING_MAX_TOKENS`]: the model thinks and names no budget.
     Thinking,
     /// [`FALLBACK_MAX_TOKENS`].
@@ -489,6 +666,7 @@ impl std::fmt::Display for MaxTokensSource {
         f.write_str(match self {
             Self::GenerationConfigMaxNewTokens => "generation_config.json max_new_tokens",
             Self::GenerationConfigMaxLength => "generation_config.json max_length",
+            Self::ModelCard => "model card",
             Self::Thinking => "thinking-model default",
             Self::Fallback => "default",
         })
@@ -528,9 +706,11 @@ impl MaxTokensDefault {
 /// 1. `generation_config.json` `max_new_tokens`;
 /// 2. `generation_config.json` `max_length`, which transformers counts with
 ///    the prompt;
-/// 3. [`THINKING_MAX_TOKENS`] when `thinking` (the chat template thinks and
+/// 3. the model card's figure, for the families whose makers give one
+///    ([`ModelFamily::recommended_max_tokens`]);
+/// 4. [`THINKING_MAX_TOKENS`] when `thinking` (the chat template thinks and
 ///    thinking is on);
-/// 4. [`FALLBACK_MAX_TOKENS`].
+/// 5. [`FALLBACK_MAX_TOKENS`].
 ///
 /// [`MaxTokensDefault::for_prompt`] then keeps it inside the context window.
 pub fn default_max_tokens(model_path: &Path, thinking: bool) -> MaxTokensDefault {
@@ -553,6 +733,12 @@ pub fn default_max_tokens(model_path: &Path, thinking: bool) -> MaxTokensDefault
         return MaxTokensDefault {
             tokens,
             source: MaxTokensSource::GenerationConfigMaxLength,
+        };
+    }
+    if let Some(tokens) = ModelFamily::detect(model_path).and_then(|f| f.recommended_max_tokens()) {
+        return MaxTokensDefault {
+            tokens,
+            source: MaxTokensSource::ModelCard,
         };
     }
     if thinking {
@@ -630,7 +816,6 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
 /// CLI/GUI explicit overrides happen in the caller (inference_runner.rs), not here.
 pub fn load_sampling_defaults(
     model_path: &Path,
-    template: Option<ChatTemplateType>,
     mode: SamplingMode,
     thinking: bool,
 ) -> SamplingDefaults {
@@ -641,8 +826,10 @@ pub fn load_sampling_defaults(
     // mode-specific params like presence_penalty that the JSON usually
     // lacks).
     let resolved_mode = resolve_auto_mode(mode, thinking);
-    if let Some(preset) = model_preset(template, resolved_mode) {
+    let family = ModelFamily::detect(model_path);
+    if let Some(preset) = model_preset(family, resolved_mode) {
         tracing::info!(
+            family = ?family,
             mode = %resolved_mode,
             temp = preset.temperature,
             top_p = preset.top_p,
@@ -725,5 +912,70 @@ mod tests {
                 {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 262144}}}"#,
         )]);
         assert_eq!(context_window(dir.path()), Some(1_048_576));
+    }
+
+    #[test]
+    fn families_are_told_apart_by_model_type_and_name() {
+        use ModelFamily::*;
+        let f = ModelFamily::from_model_type_and_name;
+        assert_eq!(f("qwen3_5_text", "qwen/qwen3.8-27b"), Some(Qwen3_8));
+        assert_eq!(f("qwen3_5_text", "qwen/qwen3.6-27b"), Some(Qwen3_6));
+        assert_eq!(f("qwen3_5_text", "qwen/qwen3.5-0.8b"), Some(Qwen3_5));
+        assert_eq!(f("qwen3_5_moe_text", "my-finetune"), Some(Qwen3_8));
+        assert_eq!(
+            f("qwen4_exp_text", "qwen/qwen3.8-flash-next"),
+            Some(Qwen3_8)
+        );
+        assert_eq!(
+            f("qwen3_next", "qwen/qwen3-next-80b-a3b-thinking"),
+            Some(Qwen3Thinking2507)
+        );
+        assert_eq!(f("qwen3", "qwen/qwen3-8b"), Some(Qwen3));
+        assert_eq!(
+            f("qwen3_moe", "qwen/qwen3-30b-a3b-instruct-2507"),
+            Some(Qwen3Instruct2507)
+        );
+        assert_eq!(f("gemma4_text", "google/gemma-4-31b-it"), Some(Gemma4));
+        assert_eq!(f("gpt_oss", "openai/gpt-oss-20b"), Some(GptOss));
+        assert_eq!(
+            f("qwen2", "deepseek-ai/deepseek-r1-distill-qwen-7b"),
+            Some(DeepSeekR1)
+        );
+        assert_eq!(
+            f("phi3", "microsoft/phi-4-reasoning-plus"),
+            Some(Phi4Reasoning)
+        );
+        assert_eq!(f("llama", "meta-llama/llama-3.1-8b-instruct"), None);
+        assert_eq!(f("qwen2", "qwen/qwen2.5-7b-instruct"), None);
+    }
+
+    #[test]
+    fn presets_are_the_cards_values() {
+        use ModelFamily::*;
+        use SamplingMode::*;
+        let p = |family: ModelFamily, mode| {
+            let d = family.preset(mode).unwrap();
+            (d.temperature, d.top_p, d.top_k, d.presence_penalty)
+        };
+        assert_eq!(p(Qwen3_8, ThinkingGeneral), (1.0, 0.95, 20, 0.0));
+        assert_eq!(p(Qwen3_8, InstructGeneral), (0.7, 0.8, 20, 1.5));
+        // A mode the card has no row for falls back to its general one.
+        assert_eq!(p(Qwen3_8, ThinkingCoding), (1.0, 0.95, 20, 0.0));
+        assert_eq!(p(Qwen3_6, ThinkingCoding), (0.6, 0.95, 20, 0.0));
+        assert_eq!(p(Qwen3, ThinkingGeneral), (0.6, 0.95, 20, 0.0));
+        assert_eq!(p(Qwen3, InstructGeneral), (0.7, 0.8, 20, 0.0));
+        assert_eq!(p(Gemma4, ThinkingGeneral), (1.0, 0.95, 64, 0.0));
+        assert_eq!(p(GptOss, InstructGeneral), (1.0, 1.0, 0, 0.0));
+        assert_eq!(p(NemotronNanoV2, InstructGeneral).0, 0.0);
+        assert!(Qwen3_8.preset(Auto).is_none());
+        assert_eq!(Qwen3Instruct2507.recommended_max_tokens(), Some(16_384));
+        assert_eq!(GptOss.recommended_max_tokens(), None);
+    }
+
+    #[test]
+    fn hugging_face_cache_paths_name_the_repo() {
+        let path = Path::new("/hf/models--Qwen--Qwen3.8-27B/snapshots/1d4bf0f2");
+        assert_eq!(model_name(path), "Qwen/Qwen3.8-27B");
+        assert_eq!(model_name(Path::new("/m/gpt-oss-20b")), "gpt-oss-20b");
     }
 }

@@ -47,7 +47,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure generation — load model's recommended defaults
     let defaults = pmetal::data::inference_config::load_sampling_defaults(
         &model_path,
-        None,
         pmetal::data::inference_config::SamplingMode::Auto,
         false,
     );

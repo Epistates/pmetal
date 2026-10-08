@@ -138,8 +138,16 @@ under 4096. Pass `--max-seq-len` for longer contexts.
 A chat or text completion without `max_tokens` (or `max_completion_tokens`)
 gets the model's own budget, by the rule `pmetal infer` uses (see
 [Output Length](/cli/infer/#output-length)): `generation_config.json`, else
-32,768 tokens for a thinking model, else 256, inside the context window and
-`--max-seq-len`.
+the model card's length, else 32,768 tokens for a thinking model, else 256,
+inside the context window and `--max-seq-len`.
+
+### Sampling defaults
+
+Sampling parameters a request leaves out (temperature, top-p, top-k, min-p,
+the penalties) take the model maker's settings for the model's family and for
+whether it is thinking, else its `generation_config.json`, else PMetal's
+fallback, as in [`pmetal infer`](/cli/infer/#sampling-defaults). Pass
+`"temperature": 0` for plain greedy decoding (no default penalties then).
 
 ### Thinking controls
 

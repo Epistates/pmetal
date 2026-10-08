@@ -126,19 +126,50 @@ Without `--max-tokens`, the output budget is the model's own:
 
 1. `max_new_tokens` from the model's `generation_config.json`;
 2. else its `max_length`, which counts the prompt, as in transformers;
-3. else 32,768 tokens when the model thinks (its chat template has a
+3. else the length the model's card recommends, for the families that give
+   one (see [Sampling Defaults](#sampling-defaults));
+4. else 32,768 tokens when the model thinks (its chat template has a
    thinking control or writes a thinking block, and thinking is on, by
    `--no-thinking` or by the template's default). That is the length the Qwen3,
    Qwen3.5 and Qwen3.6 cards recommend for most queries; a thinking model
    spends most of its budget reasoning, so a few hundred tokens stop it
    mid-thought;
-4. else 256 tokens.
+5. else 256 tokens.
 
 The budget never runs past the context window (`max_position_embeddings`)
 once the prompt is in. An explicit `--max-tokens` always wins; the Qwen3.8 card
 recommends up to 262,144 reasoning tokens plus 131,072 answer tokens for
 long agentic tasks. `pmetal serve` applies the same rule to a request without
 `max_tokens`.
+
+## Sampling Defaults
+
+Any sampling parameter left unset comes from the model maker's published
+settings for the model's family and mode (thinking or not, or `--mode`), else
+the model's `generation_config.json`, else PMetal's fallback (temperature 0.7,
+top-p 0.8, top-k 20). `pmetal serve` fills a request's unset parameters the
+same way. The family is read from `config.json` and the model's name.
+
+| Family | Thinking | Non-thinking | Output budget |
+|--------|----------|--------------|---------------|
+| Qwen3 (hybrid) | 0.6 / 0.95 / 20 | 0.7 / 0.8 / 20 | 32,768 |
+| Qwen3-2507 Instruct, Qwen3-Next Instruct | — | 0.7 / 0.8 / 20 | 16,384 |
+| Qwen3-2507 Thinking, Qwen3-Next Thinking | 0.6 / 0.95 / 20 | — | 32,768 |
+| Qwen3.5 | 1.0 / 0.95 / 20 (coding 0.6) | 0.7 / 0.8 / 20, presence 1.5 (reasoning 1.0 / 1.0 / 40, presence 2.0) | 32,768 |
+| Qwen3.6 | 1.0 / 0.95 / 20 (coding 0.6) | 0.7 / 0.8 / 20, presence 1.5 | 32,768 |
+| Qwen3.8, Qwen3.8-Flash-Next | 1.0 / 0.95 / 20 | 0.7 / 0.8 / 20, presence 1.5 | 32,768 |
+| Gemma 4 | 1.0 / 0.95 / 64 | 1.0 / 0.95 / 64 | — |
+| gpt-oss | 1.0 / 1.0 | — | — |
+| Mistral Small 3.x | — | 0.15 | — |
+| Magistral | 0.7 / 0.95 | — | 40,960 |
+| Phi-4-reasoning | 0.8 / 0.95 / 50 | — | 32,768 |
+| DeepSeek-R1 and distillations | 0.6 / 0.95 | — | — |
+| DeepSeek-V3-0324 | — | 0.3 | — |
+| Nemotron Nano 2 | 0.6 / 0.95 | greedy | — |
+
+Values are temperature / top-p / top-k. Families not listed (Llama 3.x and 4,
+Gemma 2/3, Phi-3/4, Mistral 7B, Mixtral, Cohere, Granite, SmolLM2, Qwen2.5)
+publish no recommendation beyond their `generation_config.json`.
 
 ## Long Context (YaRN)
 

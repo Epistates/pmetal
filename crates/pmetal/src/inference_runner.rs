@@ -487,12 +487,8 @@ impl InferenceRunner {
         };
 
         // 6b. Load sampling defaults: global fallback → generation_config.json → mode preset
-        let defaults = pmetal_data::inference_config::load_sampling_defaults(
-            model_path,
-            template_type,
-            config.mode,
-            thinks,
-        );
+        let defaults =
+            pmetal_data::inference_config::load_sampling_defaults(model_path, config.mode, thinks);
         let temperature = config.temperature.unwrap_or(defaults.temperature);
         let top_k = config.top_k.unwrap_or(defaults.top_k);
         let top_p = config.top_p.unwrap_or(defaults.top_p);

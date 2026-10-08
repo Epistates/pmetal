@@ -245,8 +245,12 @@ pub async fn chat_completions(
     // Resolve stop strings to token IDs.
     let resolved_stops = resolve_stop_sequences(&req.stop, &state.engine);
 
-    // temperature == None or 0.0 → greedy decoding.
-    let temperature = req.temperature.unwrap_or(0.0);
+    // Sampling the request leaves out follows the model maker's
+    // recommendation for the mode it runs in (thinking or not), as
+    // `pmetal infer` does; temperature 0 is greedy.
+    let thinking = state.engine.thinks_with(&template_kwargs);
+    let defaults = state.engine.sampling_defaults(thinking);
+    let temperature = req.temperature.unwrap_or(defaults.temperature);
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.engine.model_id().to_string();
     // Use request-time timestamp per OpenAI spec — not model creation time.
@@ -263,20 +267,26 @@ pub async fn chat_completions(
 
     let max_tokens = match req.max_completion_tokens.or(req.max_tokens) {
         Some(max_tokens) => max_tokens,
-        None => state
-            .engine
-            .default_max_tokens(state.engine.thinks_with(&template_kwargs), prompt_tokens),
+        None => state.engine.default_max_tokens(thinking, prompt_tokens),
     };
 
     let params = SamplingParams {
         max_tokens,
         temperature,
-        top_k: req.top_k,
-        top_p: req.top_p,
-        min_p: req.min_p,
-        repetition_penalty: req.repetition_penalty,
-        frequency_penalty: req.frequency_penalty,
-        presence_penalty: req.presence_penalty,
+        top_k: req.top_k.or(Some(defaults.top_k)),
+        top_p: req.top_p.or(Some(defaults.top_p)),
+        min_p: req.min_p.or(Some(defaults.min_p)),
+        // An explicitly greedy request decodes plain argmax: no default
+        // penalties shift it.
+        repetition_penalty: req
+            .repetition_penalty
+            .or((temperature > 0.0).then_some(defaults.repetition_penalty)),
+        frequency_penalty: req
+            .frequency_penalty
+            .or((temperature > 0.0).then_some(defaults.frequency_penalty)),
+        presence_penalty: req
+            .presence_penalty
+            .or((temperature > 0.0).then_some(defaults.presence_penalty)),
         seed: req.seed,
         extra_stop_token_ids: resolved_stops.token_ids.clone(),
         stop_sequences: resolved_stops.sequences.clone(),
@@ -408,7 +418,10 @@ pub async fn completions(
     let prompt_tokens = prompt.input_ids.len();
 
     let resolved_stops = resolve_stop_sequences(&req.stop, &state.engine);
-    let temperature = req.temperature.unwrap_or(0.0);
+    // A raw completion has no chat template, so no thinking; sampling the
+    // request leaves out follows the model maker's recommendation.
+    let defaults = state.engine.sampling_defaults(false);
+    let temperature = req.temperature.unwrap_or(defaults.temperature);
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.engine.model_id().to_string();
     // Use request-time timestamp per OpenAI spec — not model creation time.
@@ -427,12 +440,20 @@ pub async fn completions(
     let params = SamplingParams {
         max_tokens,
         temperature,
-        top_k: req.top_k,
-        top_p: req.top_p,
-        min_p: req.min_p,
-        repetition_penalty: req.repetition_penalty,
-        frequency_penalty: req.frequency_penalty,
-        presence_penalty: req.presence_penalty,
+        top_k: req.top_k.or(Some(defaults.top_k)),
+        top_p: req.top_p.or(Some(defaults.top_p)),
+        min_p: req.min_p.or(Some(defaults.min_p)),
+        // An explicitly greedy request decodes plain argmax: no default
+        // penalties shift it.
+        repetition_penalty: req
+            .repetition_penalty
+            .or((temperature > 0.0).then_some(defaults.repetition_penalty)),
+        frequency_penalty: req
+            .frequency_penalty
+            .or((temperature > 0.0).then_some(defaults.frequency_penalty)),
+        presence_penalty: req
+            .presence_penalty
+            .or((temperature > 0.0).then_some(defaults.presence_penalty)),
         seed: req.seed,
         extra_stop_token_ids: resolved_stops.token_ids.clone(),
         stop_sequences: resolved_stops.sequences.clone(),

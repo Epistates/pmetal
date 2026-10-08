@@ -1193,6 +1193,21 @@ impl InferenceEngine {
             .for_prompt(prompt_len, Some(context))
     }
 
+    /// The sampling a request gets for every parameter it leaves out: the
+    /// model maker's recommendation for `thinking` or non-thinking mode,
+    /// else `generation_config.json`, else the global fallback (see
+    /// [`pmetal_data::inference_config::load_sampling_defaults`]).
+    pub fn sampling_defaults(
+        &self,
+        thinking: bool,
+    ) -> pmetal_data::inference_config::SamplingDefaults {
+        pmetal_data::inference_config::load_sampling_defaults(
+            &self.model_path,
+            pmetal_data::inference_config::SamplingMode::Auto,
+            thinking,
+        )
+    }
+
     fn template_messages(messages: &[ChatMessage]) -> Vec<pmetal_data::chat_templates::Message> {
         messages
             .iter()
