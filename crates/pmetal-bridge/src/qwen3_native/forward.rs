@@ -7,6 +7,7 @@ use crate::InlineArray;
 use super::attention::{TreeVerifyInputs, attn_forward, attn_forward_with_tree_ctx};
 use super::cache::NativeCache;
 use super::mlp_moe::{dense_mlp_forward, gdn_forward, moe_forward};
+use super::mrope::MropeTables;
 use super::weights::NativeWeights;
 
 fn assert_tree_verify_plain_kv(cache: &NativeCache, op: &str) {
@@ -43,26 +44,71 @@ pub fn forward_step_hidden(
     token_ids: &InlineArray, // [B, T]
     cache: &mut NativeCache,
 ) -> (InlineArray, InlineArray) {
-    let b = token_ids.dim(0);
-    let s = token_ids.dim(1);
-    let dtype = weights.model_dtype;
+    let hidden = embed_tokens(weights, token_ids);
+    let hidden = decoder_trunk(weights, hidden, cache, None);
+    let logits = lm_head(weights, &hidden);
+    (hidden, logits)
+}
 
-    // Debug removed
-    // Embedding lookup: [B, T, hidden]
-    // For quantized models: index into weight/scales/biases rows, then dequantize.
-    // Matches Python's QuantizedEmbedding: dequantize(weight[x], scales[x], biases[x])
-    let mut hidden =
-        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
-            let qcfg = weights.quantization_config.as_ref();
-            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-            let w_rows = weights.embed_w.take_axis(token_ids, 0); // [B, T, hidden/pack]
-            let s_rows = scales.take_axis(token_ids, 0); // [B, T, hidden/group_size]
-            let b_rows = biases.take_axis(token_ids, 0); // [B, T, hidden/group_size]
-            w_rows.dequantize(&s_rows, &b_rows, gs, bits) // [B, T, hidden] bf16
-        } else {
-            weights.embed_w.take_axis(token_ids, 0)
-        };
+/// Forward a prompt given as input embeddings, with three positions per
+/// token: the prefill of a prompt carrying images or videos, whose media
+/// tokens' embeddings have been replaced by vision features.
+///
+/// `mrope` holds the prompt's `[3, T]` positions (see [`super::mrope`]).
+/// Decoding continues at `next_rope_offset`, which is one past the largest
+/// position in the prompt rather than its length, so `cache.rope_offset` is
+/// set to it; every later token is ordinary RoPE from there.
+///
+/// Returns the final normalized hidden states and logits.
+pub fn forward_embeddings_hidden(
+    weights: &NativeWeights,
+    embeddings: &InlineArray, // [B, T, hidden]
+    mrope: &MropeTables,
+    next_rope_offset: i32,
+    cache: &mut NativeCache,
+) -> (InlineArray, InlineArray) {
+    assert_eq!(
+        mrope.len(),
+        embeddings.dim(1),
+        "one mRoPE position per prompt token"
+    );
+    let embeddings = embeddings.as_dtype(weights.model_dtype);
+    let hidden = decoder_trunk(weights, embeddings, cache, Some(mrope));
+    cache.rope_offset = next_rope_offset;
+    let logits = lm_head(weights, &hidden);
+    (hidden, logits)
+}
+
+/// Token embeddings, `[B, T, hidden]` in the model dtype.
+///
+/// For quantized models: index into weight/scales/biases rows, then
+/// dequantize, matching Python's `QuantizedEmbedding`:
+/// `dequantize(weight[x], scales[x], biases[x])`.
+pub fn embed_tokens(weights: &NativeWeights, token_ids: &InlineArray) -> InlineArray {
+    if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+        let qcfg = weights.quantization_config.as_ref();
+        let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+        let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+        let w_rows = weights.embed_w.take_axis(token_ids, 0); // [B, T, hidden/pack]
+        let s_rows = scales.take_axis(token_ids, 0); // [B, T, hidden/group_size]
+        let b_rows = biases.take_axis(token_ids, 0); // [B, T, hidden/group_size]
+        w_rows.dequantize(&s_rows, &b_rows, gs, bits) // [B, T, hidden] bf16
+    } else {
+        weights.embed_w.take_axis(token_ids, 0)
+    }
+}
+
+/// Every decoder layer and the final norm: `[B, T, hidden]` embeddings to
+/// normalized hidden states. Advances `cache.rope_offset` by `T`.
+fn decoder_trunk(
+    weights: &NativeWeights,
+    mut hidden: InlineArray,
+    cache: &mut NativeCache,
+    mrope: Option<&MropeTables>,
+) -> InlineArray {
+    let b = hidden.dim(0);
+    let s = hidden.dim(1);
+    let dtype = weights.model_dtype;
     let trace_qwen35 = std::env::var_os("PMETAL_TRACE_QWEN35").is_some();
 
     let mut gdn_slot = 0usize;
@@ -83,7 +129,7 @@ pub fn forward_step_hidden(
             gdn_slot += 1;
             result
         } else {
-            let result = attn_forward(
+            let result = attn_forward_with_tree_ctx(
                 lw,
                 &normed,
                 b,
@@ -92,6 +138,8 @@ pub fn forward_step_hidden(
                 cache.rope_offset,
                 dtype,
                 weights.qjl_matrix.as_ref(),
+                None,
+                mrope,
             );
             attn_slot += 1;
             result
@@ -121,9 +169,12 @@ pub fn forward_step_hidden(
     // Advance position counter
     cache.rope_offset += s;
 
-    // Final norm + LM head
-    let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
-    let logits = if weights.tie_word_embeddings {
+    hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps)
+}
+
+/// The LM head over normalized hidden states.
+fn lm_head(weights: &NativeWeights, hidden: &InlineArray) -> InlineArray {
+    if weights.tie_word_embeddings {
         // For quantized models: use quantized_matmul with the packed embedding weight
         if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
             let qcfg = weights.quantization_config.as_ref();
@@ -134,9 +185,8 @@ pub fn forward_step_hidden(
             hidden.matmul(&weights.embed_w.t())
         }
     } else {
-        weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
-    };
-    (hidden, logits)
+        weights.lm_head_w.as_ref().unwrap().matmul_from(hidden)
+    }
 }
 
 /// Variant of [`forward_step`] that tees post-layer hidden states at the
@@ -313,6 +363,7 @@ pub fn forward_step_tree_verify(
                 dtype,
                 weights.qjl_matrix.as_ref(),
                 Some(tree_ctx),
+                None,
             );
             attn_slot += 1;
             result

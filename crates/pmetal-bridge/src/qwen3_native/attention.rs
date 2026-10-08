@@ -5,6 +5,7 @@
 use crate::InlineArray;
 
 use super::cache::{KvLayerCache, QuantizedTuple};
+use super::mrope::MropeTables;
 use super::weights::{LayerWeight, LayerWeights};
 
 // ============================================================================
@@ -123,6 +124,7 @@ pub(super) fn attn_forward(
         dtype,
         qjl_matrix,
         None,
+        None,
     )
 }
 
@@ -137,6 +139,7 @@ pub(super) fn attn_forward_with_tree_ctx(
     dtype: i32,
     qjl_matrix: Option<&InlineArray>,
     tree_ctx: Option<TreeVerifyInputs>,
+    mrope: Option<&MropeTables>,
 ) -> InlineArray {
     let n_heads = lw.attn_n_heads;
     let n_kv_heads = lw.attn_n_kv_heads;
@@ -155,7 +158,7 @@ pub(super) fn attn_forward_with_tree_ctx(
         dtype,
     );
 
-    if s == 1 && cache.turboquant.is_none() && cache.quant_config.is_none() {
+    if s == 1 && mrope.is_none() && cache.turboquant.is_none() && cache.quant_config.is_none() {
         if let (
             Some(LayerWeight::Dense(q_w)),
             Some(LayerWeight::Dense(k_w)),
@@ -241,7 +244,10 @@ pub(super) fn attn_forward_with_tree_ctx(
     // hand-rolled rope, no bf16 ULP drift between the two modes, so
     // tree DFlash output stays bit-exact with linear DFlash
     // (and therefore with greedy decode at temperature=0).
-    let (queries, keys) = if let Some(ctx) = tree_ctx {
+    let (queries, keys) = if let Some(tables) = mrope {
+        // A prompt with media: three positions per token (see `mrope`).
+        (tables.apply(&queries), tables.apply(&keys))
+    } else if let Some(ctx) = tree_ctx {
         (
             apply_per_position_rope(
                 &queries,

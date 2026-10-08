@@ -18,6 +18,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps;
+use pmetal_bridge::qwen3_native::mrope::MropeTables;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -316,6 +317,17 @@ impl Qwen3NextConfig {
     /// RoPE dimensions for partial rotary.
     pub fn rope_dims(&self) -> i32 {
         (self.get_head_dim() as f32 * self.partial_rotary_factor) as i32
+    }
+
+    /// How many rotary frequencies each position axis (temporal, row,
+    /// column) of a multimodal prompt drives; transformers' default when the
+    /// config names none.
+    pub fn mrope_section(&self) -> [usize; 3] {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|r| r.mrope_section.as_deref())
+            .and_then(|s| <[i32; 3]>::try_from(s).ok())
+            .map_or([11, 11, 10], |s| s.map(|v| v.max(0) as usize))
     }
 
     /// Number of bundled MTP predictor layers advertised by the config.
@@ -653,6 +665,8 @@ pub struct Qwen3NextAttention {
     pub rope_dims: i32,
     pub effective_base: f32,
     pub rope_scale: f32,
+    /// Rotary frequencies per position axis for a prompt with media.
+    pub mrope_section: [usize; 3],
 }
 impl_module_params!(Qwen3NextAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
@@ -711,6 +725,7 @@ impl Qwen3NextAttention {
             rope_dims: config.rope_dims(),
             effective_base,
             rope_scale,
+            mrope_section: config.mrope_section(),
         })
     }
 
@@ -751,27 +766,13 @@ impl Qwen3NextAttention {
         let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply partial RoPE
-        let rope_positions = RopePositions::resolve(
+        let (queries, keys) = self.rotate(
+            &queries,
+            &keys,
             positions,
             cache
                 .as_ref()
                 .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
-        );
-        let queries = rope(
-            &queries,
-            rope_positions,
-            self.rope_dims,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
-        let keys = rope(
-            &keys,
-            rope_positions,
-            self.rope_dims,
-            false,
-            self.effective_base,
-            self.rope_scale,
         )?;
 
         // Fused SDPA with GQA
@@ -853,27 +854,13 @@ impl Qwen3NextAttention {
         layer_profile.push_section("attn_prepare_qkv", prep_start);
 
         let rope_cache_start = Instant::now();
-        let rope_positions = RopePositions::resolve(
+        let (queries, keys) = self.rotate(
+            &queries,
+            &keys,
             positions,
             cache
                 .as_ref()
                 .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
-        );
-        let queries = rope(
-            &queries,
-            rope_positions,
-            self.rope_dims,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
-        let keys = rope(
-            &keys,
-            rope_positions,
-            self.rope_dims,
-            false,
-            self.effective_base,
-            self.rope_scale,
         )?;
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
@@ -932,6 +919,46 @@ impl Qwen3NextAttention {
         projected.eval();
         layer_profile.push_section("attn_out_proj", out_start);
         Ok(projected)
+    }
+
+    /// Rotate queries and keys `[B, heads, L, head_dim]`: one position per
+    /// token (`positions` `[L]`, or the contiguous run from `offset`), or
+    /// three, for a prompt carrying images or videos (`positions` `[3, L]`,
+    /// interleaved mRoPE; see `pmetal_bridge::qwen3_native::mrope`).
+    fn rotate(
+        &self,
+        queries: &Array,
+        keys: &Array,
+        positions: Option<&Array>,
+        offset: i32,
+    ) -> Result<(Array, Array), Exception> {
+        if let Some(positions) = positions.filter(|p| p.ndim() == 2) {
+            let tables = MropeTables::new(
+                positions,
+                self.rope_dims,
+                self.effective_base,
+                self.mrope_section,
+            );
+            return Ok((tables.apply(queries), tables.apply(keys)));
+        }
+        let positions = RopePositions::resolve(positions, offset);
+        let queries = rope(
+            queries,
+            positions,
+            self.rope_dims,
+            false,
+            self.effective_base,
+            self.rope_scale,
+        )?;
+        let keys = rope(
+            keys,
+            positions,
+            self.rope_dims,
+            false,
+            self.effective_base,
+            self.rope_scale,
+        )?;
+        Ok((queries, keys))
     }
 
     fn mask_type_for_call(
@@ -3439,13 +3466,35 @@ impl Qwen3NextModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+    ) -> Result<Array, Exception> {
+        let hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
+        self.forward_embeddings_with_cache_and_capture(
+            hidden,
+            mask,
+            kv_cache,
+            positions,
+            mamba_cache,
+            capture,
+        )
+    }
+
+    /// [`forward_with_cache_and_capture`](Self::forward_with_cache_and_capture)
+    /// from input embeddings `[B, L, hidden]` instead of token ids: a prompt
+    /// whose image and video tokens carry vision features. Such a prompt also
+    /// has three positions per token, passed as `[3, L]` `positions`.
+    pub fn forward_embeddings_with_cache_and_capture(
+        &mut self,
+        mut hidden: Array,
+        mask: Option<&Array>,
         mut kv_cache: Option<&mut KVCache>,
         positions: Option<&Array>,
         mut mamba_cache: Option<&mut MambaCache>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
-        let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
-
         // Create separate masks for full attention vs GDN layers (matching MLX reference):
         // - Full attention: uses the causal mask from the caller (or None for cached decode)
         // - GDN (linear attention): uses None (no left-padding in our MambaCache impl)
@@ -3750,6 +3799,56 @@ impl Qwen3NextForCausalLM {
         let h = self
             .model
             .forward_with_positions(input_ids, mask, positions)?;
+        self.lm_head_forward(&h)
+    }
+
+    /// Forward from input embeddings `[B, L, hidden]` at explicit positions,
+    /// with optional caches: a prompt carrying images or videos, whose media
+    /// tokens' embeddings are vision features and whose positions are `[3, L]`
+    /// (see [`Qwen3NextModel::forward_embeddings_with_cache_and_capture`]).
+    ///
+    /// Returns the final normalized hidden states and the logits. Decoding
+    /// after such a prompt passes each token's position explicitly
+    /// ([`forward_with_cache_at`](Self::forward_with_cache_at)), since it
+    /// continues from one past the prompt's largest position rather than from
+    /// its length.
+    pub fn forward_embeddings(
+        &mut self,
+        embeddings: &Array,
+        positions: &Array,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<(Array, Array), Exception> {
+        let h = self.model.forward_embeddings_with_cache_and_capture(
+            embeddings.clone(),
+            None,
+            kv_cache,
+            Some(positions),
+            mamba_cache,
+            None,
+        )?;
+        let logits = self.lm_head_forward(&h)?;
+        Ok((h, logits))
+    }
+
+    /// Cached forward of token ids at explicit `[L]` positions: decoding after
+    /// a prompt with media, where positions run from one past the prompt's
+    /// largest position.
+    pub fn forward_with_cache_at(
+        &mut self,
+        input_ids: &Array,
+        positions: &Array,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        let h = self.model.forward_with_cache_and_capture(
+            input_ids,
+            None,
+            kv_cache,
+            Some(positions),
+            mamba_cache,
+            None,
+        )?;
         self.lm_head_forward(&h)
     }
 

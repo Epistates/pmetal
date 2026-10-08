@@ -29,14 +29,15 @@ mod forward;
 mod generate;
 mod load;
 mod mlp_moe;
+pub mod mrope;
 mod weights;
 
 pub use cache::{
     GdnCache, KvLayerCache, MixedBitConfig, NativeCache, QuantCacheConfig, QuantizedTuple,
 };
 pub use forward::{
-    compact_tree_cache, forward_step, forward_step_hidden, forward_step_tree_verify,
-    forward_step_with_capture, rollback_cache,
+    compact_tree_cache, embed_tokens, forward_embeddings_hidden, forward_step, forward_step_hidden,
+    forward_step_tree_verify, forward_step_with_capture, rollback_cache,
 };
 pub use generate::{
     QwenDecodeBackend, benchmark_trial, benchmark_trial_canonical, canonical_decode_backend,
@@ -266,6 +267,8 @@ struct RopeParameters {
     partial_rotary_factor: Option<f64>,
     #[serde(default)]
     rope_theta: Option<f64>,
+    #[serde(default)]
+    mrope_section: Option<Vec<i32>>,
 }
 
 impl Qwen3Config {
@@ -352,6 +355,27 @@ impl Qwen3Config {
     /// RoPE dimensions for partial rotary.
     pub fn rope_dims(&self) -> i32 {
         (self.get_head_dim() as f64 * self.effective_partial_rotary_factor()) as i32
+    }
+
+    /// How many rotary frequencies each position axis (temporal, row,
+    /// column) of a multimodal prompt drives; transformers' default when the
+    /// config names none.
+    pub fn mrope_section(&self) -> [usize; 3] {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|r| r.mrope_section.as_deref())
+            .and_then(|s| <[i32; 3]>::try_from(s).ok())
+            .map_or([11, 11, 10], |s| s.map(|v| v.max(0) as usize))
+    }
+
+    /// The mRoPE tables for a prompt's `[3, T]` int32 positions.
+    pub fn mrope_tables(&self, positions: &crate::InlineArray) -> mrope::MropeTables {
+        mrope::MropeTables::new(
+            positions,
+            self.rope_dims(),
+            self.rope_theta as f32,
+            self.mrope_section(),
+        )
     }
 
     /// Returns `true` when layer `i` is a GDN (linear-attention) layer.
