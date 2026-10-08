@@ -456,8 +456,9 @@ impl Qwen3NextLoraGDN {
         );
 
         // Frozen norm
-        let norm =
+        let mut norm =
             Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps).map_err(LoraError::Mlx)?;
+        norm.gate_activation = config.gdn_gate().map_err(LoraError::Mlx)?;
 
         // LoRA projections — 3 separate linears matching HF weight format
         let alpha = lora_config.alpha;

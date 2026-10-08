@@ -429,7 +429,10 @@ impl ModelArchitecture {
             Self::Cohere => round_trip!(CohereConfig, config_content),
             Self::Granite => round_trip!(GraniteConfig, config_content),
             Self::NemotronH => round_trip!(NemotronHConfig, config_content),
-            Self::Qwen3Next => round_trip!(Qwen3NextConfig, &nested),
+            Self::Qwen3Next => {
+                serde_json::to_value(Qwen3NextConfig::from_config_json(config_content)?)
+                    .map_err(|e| Exception::custom(e.to_string()))
+            }
             Self::GptOss => round_trip!(GptOssConfig, config_content),
             Self::Gemma4 => round_trip!(crate::architectures::gemma4::Gemma4Config, &nested),
             Self::Bert => round_trip!(BertConfig, config_content),
@@ -789,13 +792,9 @@ impl DynamicModel {
                     NemotronH
                 )
             }
-            ModelArchitecture::Qwen3Next => {
-                let text_config_str = unwrap_text_config(config_content)?;
-                let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                config.apply_rope_parameters();
-                Ok(Self::Qwen3Next(Qwen3NextForCausalLM::new(config)?))
-            }
+            ModelArchitecture::Qwen3Next => Ok(Self::Qwen3Next(Qwen3NextForCausalLM::new(
+                Qwen3NextConfig::from_config_json(config_content)?,
+            )?)),
             ModelArchitecture::GptOss => {
                 simple_new!(GptOssConfig, GptOssForCausalLM::new, config_content, GptOss)
             }
@@ -1016,10 +1015,7 @@ impl DynamicModel {
                 Ok(model)
             }
             ModelArchitecture::Qwen3Next => {
-                let text_config_str = unwrap_text_config(&config_content)?;
-                let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                config.apply_rope_parameters();
+                let config = Qwen3NextConfig::from_config_json(&config_content)?;
                 let skip_routed_experts = options.prefer_expert_offload && config.num_experts > 0;
                 let routed_expert_mode = if skip_routed_experts {
                     Qwen3NextRoutedExpertMode::Placeholder
@@ -2424,6 +2420,7 @@ mod tests {
             ]),
             mtp_num_hidden_layers: None,
             num_nextn_predict_layers: None,
+            ..Default::default()
         }
     }
 

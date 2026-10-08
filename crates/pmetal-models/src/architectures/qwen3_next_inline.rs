@@ -267,6 +267,13 @@ impl InlineModelWeights {
     /// Convert all model weights from Array to InlineArray. Called once.
     pub fn from_model(model: &mut Qwen3NextForCausalLM) -> Result<Self, Exception> {
         let config = &model.config;
+        // This decode path hard-wires the SiLU output gate. A sigmoid-gated
+        // checkpoint declines it and decodes on the standard path instead.
+        if config.gdn_gate()? != super::qwen3_next::GateActivation::Silu {
+            return Err(Exception::custom(
+                "the InlineArray decode path implements only the SiLU gated-delta-net gate",
+            ));
+        }
         let mut embed_w = ia_from_weight(model.model.embed_tokens.weight.as_ref());
         let mut final_norm_w = ia_from_weight(model.model.norm.weight.as_ref());
         let final_norm_eps = model.model.norm.eps;
@@ -507,6 +514,14 @@ impl InlineModelWeights {
             return Err(
                 "InlineModelWeights::from_safetensors: MoE models are not supported; \
                  use the mlx-rs loader path instead"
+                    .to_string(),
+            );
+        }
+        if config.gdn_gate().map_err(|e| e.to_string())? != super::qwen3_next::GateActivation::Silu
+        {
+            return Err(
+                "InlineModelWeights::from_safetensors: only the SiLU gated-delta-net gate is \
+                 implemented on this path"
                     .to_string(),
             );
         }

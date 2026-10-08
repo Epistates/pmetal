@@ -141,27 +141,13 @@ impl DynamicQloraModel {
                 Ok(Self::Gemma(model))
             }
             ModelArchitecture::Qwen3Next => {
-                let config_json: serde_json::Value = serde_json::from_str(&config_content)
+                let cfg =
+                    pmetal_models::architectures::qwen3_next::Qwen3NextConfig::from_config_json(
+                        &config_content,
+                    )
                     .map_err(|e| {
-                        LoraError::InvalidState(format!("Failed to parse Qwen3Next JSON: {}", e))
+                        LoraError::InvalidState(format!("Failed to parse Qwen3Next config: {e}"))
                     })?;
-                let text_config_str = if config_json.get("text_config").is_some()
-                    && config_json.get("hidden_size").is_none()
-                {
-                    serde_json::to_string(&config_json["text_config"]).map_err(|e| {
-                        LoraError::InvalidState(format!(
-                            "Failed to serialize Qwen3Next text config: {}",
-                            e
-                        ))
-                    })?
-                } else {
-                    config_content.clone()
-                };
-                let mut cfg: pmetal_models::architectures::qwen3_next::Qwen3NextConfig =
-                    serde_json::from_str(&text_config_str).map_err(|e| {
-                        LoraError::InvalidState(format!("Failed to parse Qwen3Next config: {}", e))
-                    })?;
-                cfg.apply_rope_parameters();
                 let model = Qwen3NextQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
                 Ok(Self::Qwen3Next(model))
             }
@@ -692,7 +678,9 @@ mod tests {
             vocab_size: 100,
             linear_num_value_heads: 2,
             linear_num_key_heads: 1,
-            linear_key_head_dim: 16,
+            // The gated-delta-net Metal kernel needs a multiple of 32, and a
+            // config read from disk is refused without one.
+            linear_key_head_dim: 32,
             linear_value_head_dim: 16,
             linear_conv_kernel_dim: 4,
             full_attention_interval: 4,

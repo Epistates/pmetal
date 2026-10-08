@@ -56,26 +56,7 @@ fn quant_params_for(config: &Qwen3Config, base_key: &str, default: QuantParams) 
         .unwrap_or(default)
 }
 
-/// The key a checkpoint tensor or module path has once sanitized: VLM
-/// prefixes reduced to `model.`, `A_log` renamed `a_log`. Also applied to the
-/// module paths in the quantization block, so its overrides match.
-pub(super) fn canonical_key(key: &str) -> String {
-    let mut key = if key.starts_with("language_model.model.") {
-        // "language_model.model.X" → "model.X"
-        key.replacen("language_model.", "", 1)
-    } else if key.starts_with("language_model.") {
-        // "language_model.lm_head.weight" → "lm_head.weight"
-        key.replacen("language_model.", "", 1)
-    } else if key.starts_with("model.language_model.") {
-        key.replacen("model.language_model.", "model.", 1)
-    } else {
-        key.to_string()
-    };
-    if key.contains(".A_log") {
-        key = key.replace(".A_log", ".a_log");
-    }
-    key
-}
+use super::family::{self, canonical_checkpoint_key as canonical_key};
 
 const MXFP8_GROUP_SIZE: i32 = 32;
 const MXFP8_BITS: i32 = 8;

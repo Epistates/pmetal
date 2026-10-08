@@ -192,20 +192,10 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
         }
         "qwen3.5" | "qwen3_5" | "qwen3_next" | "qwen3-next" | "qwen35" | "qwen3.6" | "qwen3_6"
         | "qwen36" => {
-            let mut config: architectures::Qwen3NextConfig = match &json {
-                Some(v) => {
-                    let effective =
-                        if v.get("text_config").is_some() && v.get("hidden_size").is_none() {
-                            v["text_config"].clone()
-                        } else {
-                            v.clone()
-                        };
-                    serde_json::from_value(effective)
-                        .map_err(|e| Exception::custom(format!("qwen3.5/3.6 config: {e}")))?
-                }
+            let config = match &json {
+                Some(v) => architectures::Qwen3NextConfig::from_config_value(v)?,
                 None => architectures::Qwen3NextConfig::default(),
             };
-            config.apply_rope_parameters();
             Ok(PretrainModel::Qwen3Next(Box::new(
                 architectures::Qwen3NextForCausalLM::new(config)?,
             )))

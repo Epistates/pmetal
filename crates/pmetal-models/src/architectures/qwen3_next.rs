@@ -155,6 +155,22 @@ pub struct Qwen3NextConfig {
     /// Alternate field name for bundled next-N predictors.
     #[serde(default)]
     pub num_nextn_predict_layers: Option<i32>,
+    /// Whether the bundled MTP predictor ships its own embedding table
+    /// (`mtp.embed_tokens.weight`) instead of sharing the model's.
+    #[serde(default)]
+    pub mtp_use_dedicated_embeddings: Option<bool>,
+
+    /// MLP / convolution activation. Only SiLU exists in this family.
+    #[serde(default)]
+    pub hidden_act: Option<String>,
+    /// Activation of the gated-delta-net output gate (`"silu"`/`"swish"`
+    /// or `"sigmoid"`); `hidden_act` when absent.
+    #[serde(default)]
+    pub output_gate_type: Option<String>,
+    /// Whether full-attention layers gate their output. Always `true` in
+    /// this family; `false` is refused.
+    #[serde(default)]
+    pub attn_output_gate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,30 +243,42 @@ fn default_partial_rotary_factor() -> f32 {
 }
 
 impl Qwen3NextConfig {
-    /// Apply post-deserialization fixups.
+    /// Parse a checkpoint's `config.json`, flat or nested under `text_config`.
     ///
-    /// Extracts rope_theta and partial_rotary_factor from nested `rope_parameters`
-    /// if they weren't set at the top level.
-    pub fn apply_rope_parameters(&mut self) {
-        if let Some(ref rp) = self.rope_parameters {
-            // Only override if still at default values
-            if self.rope_theta == default_rope_theta() {
-                if let Some(theta) = rp.rope_theta {
-                    self.rope_theta = theta as f32;
-                }
-            }
-            if self.partial_rotary_factor == default_partial_rotary_factor() {
-                if let Some(prf) = rp.partial_rotary_factor {
-                    self.partial_rotary_factor = prf;
-                }
-            }
-        }
+    /// The text config is read through
+    /// [`family::normalize_text_config`](pmetal_bridge::qwen3_native::family::normalize_text_config),
+    /// the reading the native engine parses too: transformers' defaults for
+    /// absent keys, the outer `tie_word_embeddings` for a nested config,
+    /// `rope_parameters` over the legacy RoPE keys, `layer_types` expanded,
+    /// and every value this implementation cannot run refused by name.
+    pub fn from_config_json(config_json: &str) -> Result<Self, Exception> {
+        // json5, like the rest of the dispatcher: some exporters write
+        // `Infinity`/`NaN`, which strict JSON rejects.
+        let value: serde_json::Value = json5::from_str(config_json)
+            .map_err(|e| Exception::custom(format!("config.json: {e}")))?;
+        Self::from_config_value(&value)
+    }
 
-        if self.intermediate_size <= 0 {
-            self.intermediate_size = self
+    /// [`from_config_json`](Self::from_config_json) on an already-parsed value.
+    pub fn from_config_value(config: &serde_json::Value) -> Result<Self, Exception> {
+        let text = pmetal_bridge::qwen3_native::family::normalize_text_config(config)
+            .map_err(|e| Exception::custom(format!("Qwen3.5 config: {e}")))?;
+        let mut parsed: Self = serde_json::from_value(text)
+            .map_err(|e| Exception::custom(format!("Qwen3.5 config: {e}")))?;
+        // Qwen3.5 MoE configs carry no dense `intermediate_size`; the dense
+        // MLP of an `mlp_only_layers` layer is sized like the shared expert.
+        if parsed.intermediate_size <= 0 {
+            parsed.intermediate_size = parsed
                 .shared_expert_intermediate_size
-                .max(self.moe_intermediate_size);
+                .max(parsed.moe_intermediate_size);
         }
+        Ok(parsed)
+    }
+
+    /// Activation of the gated-delta-net output gate.
+    pub fn gdn_gate(&self) -> Result<GateActivation, Exception> {
+        GateActivation::resolve(self.output_gate_type.as_deref(), self.hidden_act.as_deref())
+            .map_err(Exception::custom)
     }
 
     /// Get head dimension.
@@ -372,6 +400,10 @@ impl Default for Qwen3NextConfig {
             layer_types: None,
             mtp_num_hidden_layers: None,
             num_nextn_predict_layers: None,
+            mtp_use_dedicated_embeddings: None,
+            hidden_act: None,
+            output_gate_type: None,
+            attn_output_gate: None,
         }
     }
 }
@@ -463,8 +495,8 @@ where
 /// its weights are initialized at 1.0 and used directly. The (1+w) offset in
 /// `sanitize_weights` intentionally excludes `.linear_attn.norm.weight`.
 ///
-/// The gate activation is SiLU for Qwen 3.5 / 3.6; Qwen4-Exp configures it with
-/// `output_gate_type` and ships sigmoid.
+/// The gate activation is the config's `output_gate_type`: SiLU (`"swish"`)
+/// for Qwen 3.5 / 3.6 / 3.8, sigmoid for Qwen4-Exp.
 #[derive(Debug)]
 pub struct Qwen3NextRMSNormGated {
     pub weight: Param<Array>,
@@ -473,13 +505,9 @@ pub struct Qwen3NextRMSNormGated {
 }
 impl_module_params!(Qwen3NextRMSNormGated; weight);
 
-/// Activation applied to the gate of a [`Qwen3NextRMSNormGated`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum GateActivation {
-    #[default]
-    Silu,
-    Sigmoid,
-}
+/// Activation applied to the gate of a [`Qwen3NextRMSNormGated`]: the one
+/// type the native engine uses too, so the two read `output_gate_type` alike.
+pub use pmetal_bridge::qwen3_native::family::GdnGateActivation as GateActivation;
 
 /// Compiled _precise_swiglu: `(silu(gate.f32()) * norm_out.f32()).as(dtype)`.
 ///
@@ -629,6 +657,12 @@ impl_module_params!(Qwen3NextAttention; q_proj, k_proj, v_proj, o_proj, q_norm, 
 
 impl Qwen3NextAttention {
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
+        if config.attn_output_gate == Some(false) {
+            return Err(Exception::custom(
+                "attn_output_gate = false is not supported: Qwen3.5-family attention always \
+                 gates its output",
+            ));
+        }
         let head_dim = config.get_head_dim();
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.get_num_kv_heads();
@@ -1033,7 +1067,8 @@ impl Qwen3NextGatedDeltaNet {
             .log(),
         );
 
-        let norm = Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps)?;
+        let mut norm = Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps)?;
+        norm.gate_activation = config.gdn_gate()?;
 
         let out_proj = nn::LinearBuilder::new(value_dim, hidden_size)
             .bias(false)
@@ -4530,22 +4565,11 @@ pub fn sanitize_weights(
         .any(|(k, v)| k.contains("conv1d.weight") && v.ndim() == 3 && v.dim(2) != 1);
     let should_shift_norms = has_mtp || has_unsanitized_conv;
 
-    // Strip HF prefix: model.language_model. → model. (VLM wrapper format)
-    // Also rename A_log → a_log
+    // Strip the vision-language wrapper prefixes and rename A_log → a_log,
+    // the same canonicalization the native loader applies.
     let original_keys: Vec<String> = weights.keys().cloned().collect();
     for old_key in original_keys {
-        let mut new_key = old_key.clone();
-
-        // Strip VLM wrapper prefix
-        if new_key.starts_with("model.language_model.") {
-            new_key = new_key.replacen("model.language_model.", "model.", 1);
-        }
-
-        // Rename A_log → a_log (Python field self.A_log, Rust uses lowercase)
-        if new_key.contains(".A_log") {
-            new_key = new_key.replace(".A_log", ".a_log");
-        }
-
+        let new_key = pmetal_bridge::qwen3_native::family::canonical_checkpoint_key(&old_key);
         if new_key != old_key {
             if let Some(v) = weights.remove(&old_key) {
                 weights.insert(new_key, v);
@@ -5545,17 +5569,7 @@ mod tests {
             }
         }"#;
 
-        // Simulate the dispatcher's text_config extraction logic
-        let config_json: serde_json::Value = serde_json::from_str(nested_json).unwrap();
-        let text_config_str = if config_json.get("text_config").is_some()
-            && config_json.get("hidden_size").is_none()
-        {
-            serde_json::to_string(&config_json["text_config"]).unwrap()
-        } else {
-            nested_json.to_string()
-        };
-        let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str).unwrap();
-        config.apply_rope_parameters();
+        let config = Qwen3NextConfig::from_config_json(nested_json).unwrap();
 
         assert_eq!(config.hidden_size, 1536);
         assert_eq!(config.num_hidden_layers, 28);
@@ -5589,15 +5603,11 @@ mod tests {
                 "num_experts_per_tok": 8,
                 "moe_intermediate_size": 1024,
                 "shared_expert_intermediate_size": 1024,
-                "mlp_only_layers": [],
-                "layer_types": ["linear_attention", "full_attention"]
+                "mlp_only_layers": []
             }
         }"#;
 
-        let config_json: serde_json::Value = serde_json::from_str(nested_json).unwrap();
-        let text_config_str = serde_json::to_string(&config_json["text_config"]).unwrap();
-        let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str).unwrap();
-        config.apply_rope_parameters();
+        let config = Qwen3NextConfig::from_config_json(nested_json).unwrap();
 
         assert_eq!(config.intermediate_size, 1024);
         assert!(config.use_moe_at(0));

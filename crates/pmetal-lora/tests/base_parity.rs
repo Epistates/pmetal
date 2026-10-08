@@ -424,7 +424,7 @@ fn cases() -> Vec<ArchCase> {
                 "rope_theta": 10000.0,
                 "linear_num_value_heads": 4,
                 "linear_num_key_heads": 2,
-                "linear_key_head_dim": 16,
+                "linear_key_head_dim": 32,
                 "linear_value_head_dim": 16,
                 "linear_conv_kernel_dim": 4,
                 "full_attention_interval": 4,

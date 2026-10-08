@@ -701,6 +701,7 @@ mod tests {
             ]),
             mtp_num_hidden_layers: Some(1),
             num_nextn_predict_layers: Some(1),
+            ..Default::default()
         }
     }
 

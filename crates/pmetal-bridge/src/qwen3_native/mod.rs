@@ -24,6 +24,7 @@ use serde::Deserialize;
 
 mod attention;
 mod cache;
+pub mod family;
 mod forward;
 mod generate;
 mod load;
@@ -169,6 +170,17 @@ pub struct Qwen3Config {
 
     #[serde(default = "default_conv_kernel")]
     pub linear_conv_kernel_dim: i32,
+
+    /// Per-layer `"linear_attention"` / `"full_attention"`. Always present
+    /// for the Qwen3.5 family once [`family::normalize_text_config`] has run
+    /// (it expands `full_attention_interval`); absent for Qwen3 dense.
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+
+    /// Activation of the gated-delta-net output gate, normalized to
+    /// `"silu"` or `"sigmoid"`. See [`family::GdnGateActivation`].
+    #[serde(default)]
+    pub output_gate_type: Option<String>,
 
     // MoE fields (Qwen3.5 MoE only)
     #[serde(default)]
@@ -344,13 +356,22 @@ impl Qwen3Config {
     /// Returns `true` when layer `i` is a GDN (linear-attention) layer.
     ///
     /// For Qwen3 dense, all layers are attention — never GDN.
-    /// For Qwen3.5: every `full_attention_interval`-th layer (1-indexed) is
-    /// a full-attention layer; all others are GDN.
+    /// For Qwen3.5 the checkpoint's `layer_types` decides. When a config
+    /// carries none (only one built in code, since parsing expands it), every
+    /// `full_attention_interval`-th layer (1-indexed) is full attention.
     pub fn is_linear_layer(&self, i: usize) -> bool {
         if self.is_qwen3_dense() {
             return false;
         }
+        if let Some(types) = self.layer_types.as_ref().and_then(|t| t.get(i)) {
+            return types == "linear_attention";
+        }
         ((i as i32) + 1) % self.full_attention_interval != 0
+    }
+
+    /// Activation of the gated-delta-net output gate.
+    pub fn gdn_gate(&self) -> Result<family::GdnGateActivation, String> {
+        family::GdnGateActivation::resolve(self.output_gate_type.as_deref(), None)
     }
 
     // GDN dimension accessors (with Qwen3.5 defaults)
@@ -378,15 +399,41 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     let json: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("failed to parse config.json: {e}"))?;
 
+    let text_model_type = json
+        .get("text_config")
+        .and_then(|tc| tc.get("model_type"))
+        .or_else(|| json.get("model_type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let qwen35 = family::is_qwen35_family(text_model_type);
+
     // Qwen3.5 nests the LM config under `text_config`.
     // For plain Qwen3, the config.json is flat.
-    let config_str = if json.get("text_config").is_some() {
-        // Inject `model_type` from the outer object if absent from text_config,
-        // so `is_qwen3_dense()` can distinguish the families.
-        let mut tc = json["text_config"].clone();
+    let config_str = if json.get("text_config").is_some() || qwen35 {
+        // The Qwen3.5 family is read the way transformers reads it, shared
+        // with the `DynamicModel` path. Otherwise inject `model_type` from the
+        // outer object if absent from text_config, so `is_qwen3_dense()` can
+        // distinguish the families.
+        let mut tc = if qwen35 {
+            family::normalize_text_config(&json)?
+        } else {
+            json["text_config"].clone()
+        };
         if tc.get("model_type").is_none() {
             if let Some(mt) = json.get("model_type") {
                 tc["model_type"] = mt.clone();
+            }
+        }
+        if qwen35 && let Some(rs) = tc.get("rope_scaling").filter(|v| !v.is_null()) {
+            let kind = rs
+                .get("rope_type")
+                .or_else(|| rs.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("default");
+            if !matches!(kind, "default" | "mrope") {
+                return Err(format!(
+                    "rope_scaling type {kind:?} is not implemented by the native engine"
+                ));
             }
         }
         // Promote quantization metadata from the outer JSON into text_config
@@ -422,7 +469,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         })
         .and_then(|block| {
             crate::native_weight::MlxQuantization::from_json(&block, |path| {
-                Some(load::canonical_key(path))
+                Some(family::canonical_checkpoint_key(path))
             })
         });
     // Sidecar schemes are normalised from their own tensors, so their metadata
@@ -590,8 +637,7 @@ mod tests {
                     "num_hidden_layers": 64,
                     "num_attention_heads": 20,
                     "num_key_value_heads": 2,
-                    "head_dim": 256,
-                    "layer_types": ["linear_attention", "full_attention"]
+                    "head_dim": 256
                 }
             }"#,
         )
@@ -625,8 +671,7 @@ mod tests {
                     "num_hidden_layers": 64,
                     "num_attention_heads": 20,
                     "num_key_value_heads": 2,
-                    "head_dim": 256,
-                    "layer_types": ["linear_attention", "full_attention"]
+                    "head_dim": 256
                 }
             }"#,
         )

@@ -16,7 +16,7 @@ fn tiny_qwen3_next_config() -> Qwen3NextConfig {
         max_position_embeddings: 256,
         linear_num_value_heads: 2,
         linear_num_key_heads: 2,
-        linear_key_head_dim: 16,
+        linear_key_head_dim: 32,
         linear_value_head_dim: 16,
         linear_conv_kernel_dim: 2,
         full_attention_interval: 1,
