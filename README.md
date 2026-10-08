@@ -152,7 +152,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `quantize` | GGUF quantization (24 methods) |
 | `fuse` | Fuse LoRA adapter weights into base model |
 | `eval` | Evaluate model perplexity on a dataset |
-| `serve` | OpenAI- and Anthropic-compatible inference server |
+| `serve` | OpenAI- and Anthropic-compatible inference server; chat requests may carry images (Qwen3.5-family vision models, Llama 3.2 Vision) and videos (Qwen3.5 family) |
 | `tui` | Full TUI control center (21 tabs) |
 | `dashboard` | Real-time training metrics visualization |
 | `dataset` | Dataset utilities: `analyze`, `download`, `convert` |

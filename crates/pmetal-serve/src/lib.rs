@@ -6,7 +6,8 @@
 //! # Supported Endpoints
 //!
 //! - `POST /v1/chat/completions` — non-streaming and SSE streaming chat completions;
-//!   a Qwen3.5-family vision model also reads images and videos (see [`media`])
+//!   Qwen3.5-family vision models also read images and videos, Llama 3.2
+//!   Vision images (see [`media`])
 //! - `POST /v1/completions` — raw text completions
 //! - `POST /v1/messages` — Anthropic-compatible message generation
 //! - `GET /v1/models` — list loaded models

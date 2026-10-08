@@ -10,11 +10,18 @@ This crate provides a drop-in local inference backend compatible with the OpenAI
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/chat/completions` | POST | Chat completions (non-streaming and SSE streaming) |
+| `/v1/chat/completions` | POST | Chat completions (non-streaming and SSE streaming), with images and videos |
 | `/v1/completions` | POST | Raw text completions |
+| `/v1/embeddings` | POST | Pooled sentence embeddings |
+| `/v1/messages` | POST | Anthropic-compatible messages, with image blocks |
 | `/v1/models` | GET | List loaded models |
 | `/v1/metrics` | GET | Rolling serving metrics (tok/s, latencies, request counts) |
 | `/health` | GET | Liveness check |
+
+Qwen3.5-family vision models read images (`image_url` parts holding a `data:image/...;base64,`
+URI) and videos (a `video` part holding frames) in chat messages, and Llama 3.2 Vision reads
+images; see `media` for the accepted forms and what is refused. Any other model answers such a
+request with a 400 that names it.
 
 A decision model (a Clef release) is served by its own router instead: `POST /v1/systemone`
 answers typed questions about a state, beside `GET /v1/models` and `GET /health`.
@@ -85,6 +92,8 @@ async fn serve(model_dir: &str) -> anyhow::Result<()> {
 | `routes` | Axum route handlers and `ServingMetrics` |
 | `server` | `ServeConfig` and server startup |
 | `types` | OpenAI-compatible request/response types |
+| `media` | Image and video content parts: parsing, validation, decoding |
+| `anthropic` | The `/v1/messages` endpoint |
 | `error` | Error handling |
 
 ## Dependencies
