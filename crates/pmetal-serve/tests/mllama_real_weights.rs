@@ -76,7 +76,10 @@ async fn serve_replies_to_an_image_as_transformers_does() {
         ]}
     ]))
     .unwrap();
-    let prompt = engine.prepare_chat(&messages, None).await.unwrap();
+    let prompt = engine
+        .prepare_chat(&messages, None, &Default::default())
+        .await
+        .unwrap();
     assert_eq!(
         prompt.input_ids,
         ids("input_ids"),

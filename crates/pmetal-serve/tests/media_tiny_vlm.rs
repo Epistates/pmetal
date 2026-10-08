@@ -363,7 +363,10 @@ async fn media_prompts_decode_like_an_uncached_recompute() {
         {"type": "image_url", "image_url": {"url": data_uri(&picture)}},
         {"type": "text", "text": "this"}
     ]));
-    let prompt = engine.prepare_chat(&messages, None).await.unwrap();
+    let prompt = engine
+        .prepare_chat(&messages, None, &Default::default())
+        .await
+        .unwrap();
     assert!(prompt.has_media());
     let expected = tokenizer()
         .encode(&format!(
@@ -407,6 +410,7 @@ async fn media_prompts_decode_like_an_uncached_recompute() {
                 {"type": "text", "text": "this"}
             ])),
             None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -429,6 +433,7 @@ async fn media_prompts_decode_like_an_uncached_recompute() {
                 {"type": "text", "text": "describe"}
             ])),
             None,
+            &Default::default(),
         )
         .await
         .unwrap();
@@ -546,7 +551,7 @@ async fn images_over_http() {
         {"type": "text", "text": "this"}
     ]);
     let prompt = engine
-        .prepare_chat(&chat_messages(content.clone()), None)
+        .prepare_chat(&chat_messages(content.clone()), None, &Default::default())
         .await
         .unwrap();
     let want = recompute_greedy(dir.path(), &prompt.input_ids, &[picture], &[], STEPS);

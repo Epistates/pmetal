@@ -92,7 +92,10 @@ base64 = "0.23"
 # Jinja template engine for executing upstream chat_template strings from
 # tokenizer_config.json. `minijinja-contrib` adds the `now`/`strftime_now`
 # helpers that Llama 3 chat templates use for dynamic date injection.
-minijinja = { version = "2", features = ["loader", "builtins", "macros"] }
+# `preserve_order` keeps maps in insertion order and `loop_controls` enables
+# `{% break %}` / `{% continue %}`: Python dicts and the loopcontrols extension
+# that Hugging Face transformers renders chat templates with.
+minijinja = { version = "2", features = ["loader", "builtins", "macros", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["datetime", "pycompat"] }
 
 # Serialization (binary)

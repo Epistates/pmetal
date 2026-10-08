@@ -15,7 +15,7 @@ use pmetal_bridge::turboquant::{
     TurboQuantTensorConfig as BridgeTurboQuantTensorConfig,
 };
 use pmetal_data::Tokenizer;
-use pmetal_data::chat_templates::{ChatTemplateType, Message, ToolDefinition};
+use pmetal_data::chat_templates::{ChatTemplateKwargs, ChatTemplateType, Message, ToolDefinition};
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
 use pmetal_mlx::kv_cache::{
     CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, TurboQuantTensorConfig,
@@ -89,6 +89,13 @@ pub struct InferenceRunnerConfig {
     pub chat: bool,
     /// Disable thinking mode for models that support it.
     pub no_thinking: bool,
+    /// Keyword arguments for the model's chat template, the `**kwargs` of
+    /// `apply_chat_template`: `reasoning_effort`, `preserve_thinking`, or
+    /// anything else the template reads. `no_thinking` wins over an
+    /// `enable_thinking` here, and `reasoning_effort` / `preserve_thinking`
+    /// must be controls the template has (see
+    /// [`ChatTemplate::check_thinking_controls`](pmetal_data::chat_templates::ChatTemplate::check_thinking_controls)).
+    pub chat_template_kwargs: ChatTemplateKwargs,
     /// Optional tool/function definitions for tool-calling models.
     pub tools: Option<Vec<ToolDefinition>>,
     /// Images to show a Qwen3.5-family vision model, in order. Each gets a
@@ -165,6 +172,7 @@ impl Default for InferenceRunnerConfig {
             system_message: None,
             chat: false,
             no_thinking: false,
+            chat_template_kwargs: ChatTemplateKwargs::new(),
             tools: None,
             images: Vec::new(),
             videos: Vec::new(),
@@ -319,11 +327,15 @@ impl InferenceRunner {
         // 2. Determine chat mode (auto-detect instruction-tuned models)
         let is_instruct = model_looks_instruction_tuned(model_path);
         let use_chat = config.chat || is_instruct || config.tools.is_some();
-        let no_thinking = if !is_instruct && !config.no_thinking && use_chat {
-            true // base models don't understand <think> tags
-        } else {
-            config.no_thinking
-        };
+        let mut template_kwargs = config.chat_template_kwargs.clone();
+        template_kwargs
+            .check_reserved()
+            .map_err(Exception::custom)?;
+        if config.no_thinking || (!is_instruct && use_chat) {
+            // Base models don't understand <think> tags.
+            template_kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, false);
+        }
+        let no_thinking = template_kwargs.enable_thinking() == Some(false);
 
         // 3. Sampling defaults are loaded after template detection (step 6b)
         //    because mode presets depend on the detected model family.
@@ -411,9 +423,17 @@ impl InferenceRunner {
                 &config.prompt,
             );
 
+            detected
+                .check_thinking_controls(&template_kwargs)
+                .map_err(Exception::custom)?;
             let formatted = expand_media(
                 detected
-                    .apply_inference(&messages, no_thinking, config.tools.as_deref())
+                    .apply_inference_with_kwargs(
+                        &messages,
+                        config.tools.as_deref(),
+                        &template_kwargs,
+                    )
+                    .map_err(Exception::custom)?
                     .text,
             )?;
 

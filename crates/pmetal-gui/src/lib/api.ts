@@ -286,6 +286,12 @@ export interface InferSpec {
   seed?: number | null;
   system?: string | null;
   no_thinking?: boolean;
+  /** For chat templates with a reasoning_effort control (Qwen3.8, gpt-oss). */
+  reasoning_effort?: string | null;
+  /** Drop the thinking of earlier turns (chat templates with preserve_thinking). */
+  no_preserve_thinking?: boolean;
+  /** Extra chat template keyword arguments, as a JSON object string. */
+  chat_template_kwargs?: string | null;
   fp8?: boolean;
   experts_dir?: string | null;
   kv_quant?: number | null;

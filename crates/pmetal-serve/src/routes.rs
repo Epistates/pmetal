@@ -232,10 +232,12 @@ pub async fn chat_completions(
     }
 
     // Format messages using chat template, optionally including tool
-    // definitions, and preprocess any images and videos.
+    // definitions and the request's template kwargs, and preprocess any
+    // images and videos.
+    let template_kwargs = req.template_kwargs();
     let prompt = state
         .engine
-        .prepare_chat(&req.messages, req.tools.as_deref())
+        .prepare_chat(&req.messages, req.tools.as_deref(), &template_kwargs)
         .await?;
     let prompt_tokens = prompt.input_ids.len();
     let tools_requested = req.tools.is_some();
@@ -373,6 +375,7 @@ pub async fn chat_completions(
                 content,
                 tool_calls,
                 parts: None,
+                reasoning_content: None,
             },
             finish_reason: Some(reason),
             logprobs,

@@ -406,6 +406,16 @@ impl PmetalMcpServer {
         #[description("Disable thinking mode for models that support it")] no_thinking: Option<
             bool,
         >,
+        #[description(
+            "Reasoning effort for chat templates with that control: xhigh, medium or low (Qwen3.8); low, medium or high (gpt-oss)"
+        )]
+        reasoning_effort: Option<String>,
+        #[description(
+            "Drop the thinking of earlier turns from the prompt (chat templates with preserve_thinking, e.g. Qwen3.8)"
+        )]
+        no_preserve_thinking: Option<bool>,
+        #[description("Extra chat template keyword arguments, as a JSON object string")]
+        chat_template_kwargs: Option<String>,
         #[description("Hide thinking trace from output (shown by default)")] hide_thinking: Option<
             bool,
         >,
@@ -467,6 +477,9 @@ impl PmetalMcpServer {
             presence_penalty: presence_penalty.map(|p| p as f32),
             seed,
             no_thinking: no_thinking.unwrap_or(false),
+            reasoning_effort,
+            no_preserve_thinking: no_preserve_thinking.unwrap_or(false),
+            chat_template_kwargs,
             hide_thinking: hide_thinking.unwrap_or(false),
             fp8: fp8.unwrap_or(false),
             experts_dir,

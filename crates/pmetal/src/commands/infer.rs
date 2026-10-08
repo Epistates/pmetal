@@ -282,6 +282,7 @@ pub(crate) async fn run_inference(
     chat: bool,
     system: Option<&str>,
     no_thinking: bool,
+    chat_template_kwargs: pmetal_data::chat_templates::ChatTemplateKwargs,
     mode: pmetal_data::inference_config::SamplingMode,
     backend: pmetal_data::inference_config::InferenceBackend,
     draft_model: Option<&str>,
@@ -317,6 +318,9 @@ pub(crate) async fn run_inference(
     if ane {
         anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
     }
+    // `--chat-template-kwargs '{"enable_thinking": false}'` is --no-thinking.
+    let no_thinking = no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
+    let reasoning_effort = chat_template_kwargs.reasoning_effort().map(str::to_string);
     use pmetal_data::inference_config::InferenceBackend;
     use pmetal_models::{
         GenerationOutput, generate_cached_compiled, generate_cached_metal, generate_minimal_async,
@@ -448,6 +452,7 @@ pub(crate) async fn run_inference(
         system_message: system.map(|s| s.to_string()),
         chat,
         no_thinking,
+        chat_template_kwargs,
         tools: tools.map(|t| t.to_vec()),
         images: images.iter().map(std::path::PathBuf::from).collect(),
         videos: videos
@@ -569,6 +574,8 @@ pub(crate) async fn run_inference(
     println!("Max tokens:  {}", max_tokens);
     if use_chat && no_thinking {
         println!("Thinking:    disabled");
+    } else if let Some(effort) = reasoning_effort.as_deref().filter(|_| use_chat) {
+        println!("Reasoning:   {effort}");
     }
     println!("========================================");
     println!();

@@ -58,6 +58,18 @@ const SETTING_NAMES: &[&str] = &[
     "FP8",
     "No Thinking",
     "Backend",
+    "Reasoning",
+];
+
+/// `Reasoning` setting values: the chat template's default, then the levels
+/// Qwen3.8 (`low`, `medium`, `xhigh`) and gpt-oss (`low`, `medium`, `high`)
+/// accept. A level the loaded model refuses is reported by `pmetal infer`.
+const REASONING_EFFORTS: &[Option<&str>] = &[
+    None,
+    Some("low"),
+    Some("medium"),
+    Some("high"),
+    Some("xhigh"),
 ];
 
 /// Focus mode for the inference tab.
@@ -92,6 +104,8 @@ pub struct InferenceTab {
     pub kv_quant_mode: u8,
     pub fp8: bool,
     pub no_thinking: bool,
+    /// Index into [`REASONING_EFFORTS`] (0 = the chat template's default).
+    pub reasoning_effort: usize,
     /// Execution backend (Auto lets `pmetal infer` pick the fastest path).
     pub backend: InferenceBackend,
     pub focus: InferenceFocus,
@@ -136,6 +150,7 @@ impl InferenceTab {
             kv_quant_mode: 0, // auto
             fp8: false,
             no_thinking: false,
+            reasoning_effort: 0,
             backend: InferenceBackend::Auto,
             focus: InferenceFocus::Input,
             settings_selected: 0,
@@ -403,6 +418,7 @@ impl InferenceTab {
             10 => self.fp8 = !self.fp8,
             11 => self.no_thinking = !self.no_thinking,
             12 => self.backend = cycle_backend(self.backend, 1),
+            13 => self.reasoning_effort = (self.reasoning_effort + 1) % REASONING_EFFORTS.len(),
             _ => {}
         }
     }
@@ -438,6 +454,10 @@ impl InferenceTab {
             10 => self.fp8 = !self.fp8,
             11 => self.no_thinking = !self.no_thinking,
             12 => self.backend = cycle_backend(self.backend, -1),
+            13 => {
+                self.reasoning_effort =
+                    (self.reasoning_effort + REASONING_EFFORTS.len() - 1) % REASONING_EFFORTS.len()
+            }
             _ => {}
         }
     }
@@ -659,6 +679,7 @@ impl InferenceTab {
             chat: true,
             fp8: self.fp8,
             no_thinking: self.no_thinking,
+            reasoning_effort: REASONING_EFFORTS[self.reasoning_effort].map(str::to_string),
             backend,
             kv_quant,
             kv_turboquant,
@@ -1120,7 +1141,7 @@ impl InferenceTab {
             Some(s) => format!("{s}"),
             None => "Random".to_string(),
         };
-        let setting_values: [String; 13] = [
+        let setting_values: [String; 14] = [
             format!("{:.1}", self.temperature),
             format!("{}", self.max_tokens),
             format!("{}", self.top_k),
@@ -1142,6 +1163,9 @@ impl InferenceTab {
                 "Off".to_string()
             },
             self.backend.label().to_string(),
+            REASONING_EFFORTS[self.reasoning_effort]
+                .unwrap_or("Default")
+                .to_string(),
         ];
 
         for (i, (name, val)) in SETTING_NAMES.iter().zip(setting_values.iter()).enumerate() {

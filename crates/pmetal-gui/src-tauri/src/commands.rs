@@ -2380,6 +2380,12 @@ async fn run_inference_streaming(
         system_message: spec.system.clone(),
         chat: false, // let the shared runner auto-detect chat-capable models
         no_thinking: spec.no_thinking,
+        chat_template_kwargs: pmetal::data::chat_templates::ChatTemplateKwargs::from_controls(
+            spec.chat_template_kwargs.as_deref(),
+            spec.no_thinking,
+            spec.reasoning_effort.as_deref(),
+            spec.no_preserve_thinking,
+        )?,
         tools: None,
         images: Vec::new(),
         videos: Vec::new(),

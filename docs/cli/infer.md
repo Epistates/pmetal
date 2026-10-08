@@ -115,6 +115,35 @@ pmetal infer \
 | `--ane-max-seq-len` | `4096` | Largest context (prompt plus output) the ANE compiles a model for |
 | `--tools` | — | Tool definitions file (OpenAI format) |
 | `--system` | — | System message |
+| `--no-thinking` | `false` | Turn thinking off (the chat template's `enable_thinking`) |
+| `--reasoning-effort` | template default | How long the model thinks, for chat templates with a `reasoning_effort` control |
+| `--no-preserve-thinking` | `false` | Keep only the current turn's thinking in the prompt, for chat templates with a `preserve_thinking` control |
+| `--chat-template-kwargs` | — | Extra chat template keyword arguments as a JSON object |
+
+## Thinking Controls
+
+Chat templates take keyword arguments the way Hugging Face transformers'
+`apply_chat_template(messages, **kwargs)` passes them, and PMetal renders them
+byte for byte the same. The flags above set the ones model makers document:
+
+| Model | Control | Values |
+|-------|---------|--------|
+| Qwen3.8 | `reasoning_effort` | `xhigh` (default), `medium`, `low` |
+| Qwen3.8 | `preserve_thinking` | on by default; `--no-preserve-thinking` turns it off |
+| gpt-oss | `reasoning_effort` | `low`, `medium` (default), `high` |
+| Qwen3 onwards, Gemma 4, SmolLM3 | `enable_thinking` | `--no-thinking` turns it off |
+
+```bash
+pmetal infer --model Qwen/Qwen3.8-27B --chat --reasoning-effort low \
+  --prompt "Is 2^31 - 1 prime?"
+```
+
+`--reasoning-effort` or `--no-preserve-thinking` on a model whose template has
+no such control is an error rather than a silent no-op, and so is a level the
+template refuses. Anything else a template
+reads goes through `--chat-template-kwargs`, e.g.
+`--chat-template-kwargs '{"model_identity": "You are a test model."}'` on
+gpt-oss.
 
 ## Layer Profiling
 

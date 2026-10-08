@@ -79,6 +79,7 @@ pub(crate) fn template_message(message: &ChatMessage, parts: Option<Vec<ContentP
         None => Message::new(message.role.clone(), message.content.clone()),
     };
     out.tool_calls = message.tool_calls.clone();
+    out.reasoning_content = message.reasoning_content.clone();
     out
 }
 

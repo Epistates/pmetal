@@ -51,6 +51,8 @@ struct InferOptions {
     chat: bool,
     system_message: Option<String>,
     no_thinking: bool,
+    reasoning_effort: Option<String>,
+    no_preserve_thinking: bool,
     kv_quant: Option<u8>,
     no_kv_quant: bool,
     detect_repetition: bool,
@@ -170,6 +172,9 @@ pub fn finetune<'py>(
 ///     mtp_model: Optional Qwen MTP checkpoint
 ///     chat: Force chat-template formatting
 ///     no_thinking: Disable thinking mode for models/templates that support it
+///     reasoning_effort: Reasoning effort for chat templates with that control
+///         (xhigh/medium/low on Qwen3.8, low/medium/high on gpt-oss)
+///     no_preserve_thinking: Drop the thinking of earlier turns (Qwen3.8)
 ///     kv_quant: KV cache quantization bits (8, 4, or 0)
 ///     detect_repetition: Stop on repeated n-gram loops
 ///
@@ -198,6 +203,8 @@ pub fn finetune<'py>(
     chat=false,
     system_message=None,
     no_thinking=false,
+    reasoning_effort=None,
+    no_preserve_thinking=false,
     kv_quant=None,
     no_kv_quant=false,
     detect_repetition=false,
@@ -226,6 +233,8 @@ pub fn infer(
     chat: bool,
     system_message: Option<&str>,
     no_thinking: bool,
+    reasoning_effort: Option<&str>,
+    no_preserve_thinking: bool,
     kv_quant: Option<u8>,
     no_kv_quant: bool,
     detect_repetition: bool,
@@ -254,6 +263,8 @@ pub fn infer(
             chat,
             system_message,
             no_thinking,
+            reasoning_effort,
+            no_preserve_thinking,
             kv_quant,
             no_kv_quant,
             detect_repetition,
@@ -286,6 +297,8 @@ pub fn infer(
     chat=false,
     system_message=None,
     no_thinking=false,
+    reasoning_effort=None,
+    no_preserve_thinking=false,
     kv_quant=None,
     no_kv_quant=false,
     detect_repetition=false,
@@ -314,6 +327,8 @@ pub fn infer_with_metrics<'py>(
     chat: bool,
     system_message: Option<&str>,
     no_thinking: bool,
+    reasoning_effort: Option<&str>,
+    no_preserve_thinking: bool,
     kv_quant: Option<u8>,
     no_kv_quant: bool,
     detect_repetition: bool,
@@ -342,6 +357,8 @@ pub fn infer_with_metrics<'py>(
             chat,
             system_message,
             no_thinking,
+            reasoning_effort,
+            no_preserve_thinking,
             kv_quant,
             no_kv_quant,
             detect_repetition,
@@ -538,6 +555,8 @@ impl InferOptions {
         chat: bool,
         system_message: Option<&str>,
         no_thinking: bool,
+        reasoning_effort: Option<&str>,
+        no_preserve_thinking: bool,
         kv_quant: Option<u8>,
         no_kv_quant: bool,
         detect_repetition: bool,
@@ -564,6 +583,8 @@ impl InferOptions {
             chat,
             system_message: system_message.map(String::from),
             no_thinking,
+            reasoning_effort: reasoning_effort.map(String::from),
+            no_preserve_thinking,
             kv_quant,
             no_kv_quant,
             detect_repetition,
@@ -662,6 +683,13 @@ fn run_infer(py: Python<'_>, opts: InferOptions) -> PyResult<InferRunResult> {
                 system_message: opts.system_message,
                 chat: opts.chat,
                 no_thinking: opts.no_thinking,
+                chat_template_kwargs:
+                    pmetal_data::chat_templates::ChatTemplateKwargs::from_controls(
+                        None,
+                        opts.no_thinking,
+                        opts.reasoning_effort.as_deref(),
+                        opts.no_preserve_thinking,
+                    )?,
                 tools: None,
                 images: Vec::new(),
                 videos: Vec::new(),

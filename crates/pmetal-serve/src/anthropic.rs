@@ -18,7 +18,7 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json};
 use futures::stream::{self, StreamExt};
-use pmetal_data::chat_templates::{ToolCall, ToolDefinition};
+use pmetal_data::chat_templates::{ChatTemplateKwargs, ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -170,6 +170,37 @@ pub struct MessagesRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub tools: Option<Vec<ToolDefinition>>,
+    /// `{"type": "enabled", "budget_tokens": N}` or `{"type": "disabled"}`:
+    /// the chat template's `enable_thinking`. Absent leaves the template's
+    /// default.
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+}
+
+/// The `thinking` field of a messages request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThinkingConfig {
+    /// `"enabled"` or `"disabled"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+impl MessagesRequest {
+    /// The chat template kwargs this request asks for.
+    fn template_kwargs(&self) -> Result<ChatTemplateKwargs, ServeError> {
+        let mut kwargs = ChatTemplateKwargs::new();
+        match self.thinking.as_ref().map(|t| t.kind.as_str()) {
+            None => {}
+            Some("enabled") => kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, true),
+            Some("disabled") => kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, false),
+            Some(other) => {
+                return Err(ServeError::BadRequest(format!(
+                    "thinking.type must be \"enabled\" or \"disabled\", not {other:?}"
+                )));
+            }
+        }
+        Ok(kwargs)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -312,9 +343,10 @@ pub async fn messages(
         messages.push(m.to_chat_message(i)?);
     }
 
+    let template_kwargs = req.template_kwargs()?;
     let prompt = state
         .engine
-        .prepare_chat(&messages, req.tools.as_deref())
+        .prepare_chat(&messages, req.tools.as_deref(), &template_kwargs)
         .await?;
     let prompt_tokens = prompt.input_ids.len();
     let tools_requested = req.tools.is_some();
@@ -620,6 +652,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req.messages[0].text(), "hello\nworld");
+    }
+
+    #[test]
+    fn thinking_maps_to_enable_thinking() {
+        let parse = |thinking: &str| -> MessagesRequest {
+            serde_json::from_str(&format!(
+                r#"{{"model":"m","max_tokens":10,"messages":[]{thinking}}}"#
+            ))
+            .unwrap()
+        };
+        let kwargs = |req: MessagesRequest| req.template_kwargs().map(|k| k.enable_thinking());
+        assert_eq!(kwargs(parse("")).unwrap(), None);
+        assert_eq!(
+            kwargs(parse(r#","thinking":{"type":"disabled"}"#)).unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            kwargs(parse(
+                r#","thinking":{"type":"enabled","budget_tokens":1024}"#
+            ))
+            .unwrap(),
+            Some(true)
+        );
+        assert!(kwargs(parse(r#","thinking":{"type":"sometimes"}"#)).is_err());
     }
 
     #[test]

@@ -1,0 +1,1201 @@
+{
+ "transformers_version": "5.19.0",
+ "frozen_date": "2026-01-15",
+ "templates": {
+  "qwen3_8": {
+   "source": "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- set reasoning_instructions = '' %}\n{%- if enable_thinking is undefined or enable_thinking is true %}\n    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\n    {%- endif %}\n    {%- if resolved_reasoning_effort == 'xhigh' %}\n        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}\n    {%- elif resolved_reasoning_effort == 'low' %}\n        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}\n    {%- endif %}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if reasoning_instructions %}\n        {{- reasoning_instructions + '\\n\\n' }}\n    {%- endif %}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '<|im_start|>system\\n' + (reasoning_instructions + '\\n\\n' if reasoning_instructions else '')  + content + '<|im_end|>\\n' }}\n        {%- elif reasoning_instructions %}\n            {{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- elif reasoning_instructions %}\n        {{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is defined and tool_call.arguments != '' %}\n                    {%- for args_name, args_value in tool_call.arguments|items %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- else %}\n        {{- '<think>\\n' }}\n    {%- endif %}\n{%- endif %}",
+   "special_tokens": {
+    "eos_token": "<|im_end|>",
+    "pad_token": "<|endoftext|>",
+    "audio_bos_token": "<|audio_start|>",
+    "audio_eos_token": "<|audio_end|>",
+    "audio_token": "<|audio_pad|>",
+    "image_token": "<|image_pad|>",
+    "video_token": "<|video_pad|>",
+    "vision_bos_token": "<|vision_start|>",
+    "vision_eos_token": "<|vision_end|>"
+   }
+  },
+  "gpt_oss": {
+   "source": "{#-\n  In addition to the normal inputs of `messages` and `tools`, this template also accepts the\n  following kwargs:\n  - \"builtin_tools\": A list, can contain \"browser\" and/or \"python\".\n  - \"model_identity\": A string that optionally describes the model identity.\n  - \"reasoning_effort\": A string that describes the reasoning effort, defaults to \"medium\".\n #}\n\n{#- Tool Definition Rendering ============================================== #}\n{%- macro render_typescript_type(param_spec, required_params, is_nullable=false) -%}\n    {%- if param_spec.type == \"array\" -%}\n        {%- if param_spec['items'] -%}\n            {%- if param_spec['items']['type'] == \"string\" -%}\n                {{- \"string[]\" }}\n            {%- elif param_spec['items']['type'] == \"number\" -%}\n                {{- \"number[]\" }}\n            {%- elif param_spec['items']['type'] == \"integer\" -%}\n                {{- \"number[]\" }}\n            {%- elif param_spec['items']['type'] == \"boolean\" -%}\n                {{- \"boolean[]\" }}\n            {%- else -%}\n                {%- set inner_type = render_typescript_type(param_spec['items'], required_params) -%}\n                {%- if inner_type == \"object | object\" or inner_type|length > 50 -%}\n                    {{- \"any[]\" }}\n                {%- else -%}\n                    {{- inner_type + \"[]\" }}\n                {%- endif -%}\n            {%- endif -%}\n            {%- if param_spec.nullable -%}\n                {{- \" | null\" }}\n            {%- endif -%}\n        {%- else -%}\n            {{- \"any[]\" }}\n            {%- if param_spec.nullable -%}\n                {{- \" | null\" }}\n            {%- endif -%}\n        {%- endif -%}\n    {%- elif param_spec.type is defined and param_spec.type is iterable and param_spec.type is not string and param_spec.type is not mapping and param_spec.type[0] is defined -%}\n        {#- Handle array of types like [\"object\", \"object\"] from Union[dict, list] #}\n        {%- if param_spec.type | length > 1 -%}\n            {{- param_spec.type | join(\" | \") }}\n        {%- else -%}\n            {{- param_spec.type[0] }}\n        {%- endif -%}\n    {%- elif param_spec.oneOf -%}\n        {#- Handle oneOf schemas - check for complex unions and fallback to any #}\n        {%- set has_object_variants = false -%}\n        {%- for variant in param_spec.oneOf -%}\n            {%- if variant.type == \"object\" -%}\n                {%- set has_object_variants = true -%}\n            {%- endif -%}\n        {%- endfor -%}\n        {%- if has_object_variants and param_spec.oneOf|length > 1 -%}\n            {{- \"any\" }}\n        {%- else -%}\n            {%- for variant in param_spec.oneOf -%}\n                {{- render_typescript_type(variant, required_params) -}}\n                {%- if variant.description %}\n                    {{- \"// \" + variant.description }}\n                {%- endif -%}\n                {%- if variant.default is defined %}\n                    {{ \"// default: \" + variant.default|tojson }}\n                {%- endif -%}\n                {%- if not loop.last %}\n                    {{- \" | \" }}\n                {% endif -%}\n            {%- endfor -%}\n        {%- endif -%}\n    {%- elif param_spec.type == \"string\" -%}\n        {%- if param_spec.enum -%}\n            {{- '\"' + param_spec.enum|join('\" | \"') + '\"' -}}\n        {%- else -%}\n            {{- \"string\" }}\n            {%- if param_spec.nullable %}\n                {{- \" | null\" }}\n            {%- endif -%}\n        {%- endif -%}\n    {%- elif param_spec.type == \"number\" -%}\n        {{- \"number\" }}\n    {%- elif param_spec.type == \"integer\" -%}\n        {{- \"number\" }}\n    {%- elif param_spec.type == \"boolean\" -%}\n        {{- \"boolean\" }}\n\n    {%- elif param_spec.type == \"object\" -%}\n        {%- if param_spec.properties -%}\n            {{- \"{\\n\" }}\n            {%- for prop_name, prop_spec in param_spec.properties.items() -%}\n                {{- prop_name -}}\n                {%- if prop_name not in (param_spec.required or []) -%}\n                    {{- \"?\" }}\n                {%- endif -%}\n                {{- \": \" }}\n                {{ render_typescript_type(prop_spec, param_spec.required or []) }}\n                {%- if not loop.last -%}\n                    {{-\", \" }}\n                {%- endif -%}\n            {%- endfor -%}\n            {{- \"}\" }}\n        {%- else -%}\n            {{- \"object\" }}\n        {%- endif -%}\n    {%- else -%}\n        {{- \"any\" }}\n    {%- endif -%}\n{%- endmacro -%}\n\n{%- macro render_tool_namespace(namespace_name, tools) -%}\n    {{- \"## \" + namespace_name + \"\\n\\n\" }}\n    {{- \"namespace \" + namespace_name + \" {\\n\\n\" }}\n    {%- for tool in tools %}\n        {%- set tool = tool.function %}\n        {{- \"// \" + tool.description + \"\\n\" }}\n        {{- \"type \"+ tool.name + \" = \" }}\n        {%- if tool.parameters and tool.parameters.properties %}\n            {{- \"(_: {\\n\" }}\n            {%- for param_name, param_spec in tool.parameters.properties.items() %}\n                {%- if param_spec.description %}\n                    {{- \"// \" + param_spec.description + \"\\n\" }}\n                {%- endif %}\n                {{- param_name }}\n                {%- if param_name not in (tool.parameters.required or []) -%}\n                    {{- \"?\" }}\n                {%- endif -%}\n                {{- \": \" }}\n                {{- render_typescript_type(param_spec, tool.parameters.required or []) }}\n                {%- if param_spec.default is defined -%}\n                    {%- if param_spec.enum %}\n                        {{- \", // default: \" + param_spec.default }}\n                    {%- elif param_spec.oneOf %}\n                        {{- \"// default: \" + param_spec.default }}\n                    {%- else %}\n                        {{- \", // default: \" + param_spec.default|tojson }}\n                    {%- endif -%}\n                {%- endif -%}\n                {%- if not loop.last %}\n                    {{- \",\\n\" }}\n                {%- else %}\n                    {{- \",\\n\" }}\n                {%- endif -%}\n            {%- endfor %}\n            {{- \"}) => any;\\n\\n\" }}\n        {%- else -%}\n            {{- \"() => any;\\n\\n\" }}\n        {%- endif -%}\n    {%- endfor %}\n    {{- \"} // namespace \" + namespace_name }}\n{%- endmacro -%}\n\n{%- macro render_builtin_tools(browser_tool, python_tool) -%}\n    {%- if browser_tool %}\n        {{- \"## browser\\n\\n\" }}\n        {{- \"// Tool for browsing.\\n\" }}\n        {{- \"// The `cursor` appears in brackets before each browsing display: `[{cursor}]`.\\n\" }}\n        {{- \"// Cite information from the tool using the following format:\\n\" }}\n        {{- \"// `【{cursor}†L{line_start}(-L{line_end})?】`, for example: `【6†L9-L11】` or `【8†L3】`.\\n\" }}\n        {{- \"// Do not quote more than 10 words directly from the tool output.\\n\" }}\n        {{- \"// sources=web (default: web)\\n\" }}\n        {{- \"namespace browser {\\n\\n\" }}\n        {{- \"// Searches for information related to `query` and displays `topn` results.\\n\" }}\n        {{- \"type search = (_: {\\n\" }}\n        {{- \"query: string,\\n\" }}\n        {{- \"topn?: number, // default: 10\\n\" }}\n        {{- \"source?: string,\\n\" }}\n        {{- \"}) => any;\\n\\n\" }}\n        {{- \"// Opens the link `id` from the page indicated by `cursor` starting at line number `loc`, showing `num_lines` lines.\\n\" }}\n        {{- \"// Valid link ids are displayed with the formatting: `【{id}†.*】`.\\n\" }}\n        {{- \"// If `cursor` is not provided, the most recent page is implied.\\n\" }}\n        {{- \"// If `id` is a string, it is treated as a fully qualified URL associated with `source`.\\n\" }}\n        {{- \"// If `loc` is not provided, the viewport will be positioned at the beginning of the document or centered on the most relevant passage, if available.\\n\" }}\n        {{- \"// Use this function without `id` to scroll to a new location of an opened page.\\n\" }}\n        {{- \"type open = (_: {\\n\" }}\n        {{- \"id?: number | string, // default: -1\\n\" }}\n        {{- \"cursor?: number, // default: -1\\n\" }}\n        {{- \"loc?: number, // default: -1\\n\" }}\n        {{- \"num_lines?: number, // default: -1\\n\" }}\n        {{- \"view_source?: boolean, // default: false\\n\" }}\n        {{- \"source?: string,\\n\" }}\n        {{- \"}) => any;\\n\\n\" }}\n        {{- \"// Finds exact matches of `pattern` in the current page, or the page given by `cursor`.\\n\" }}\n        {{- \"type find = (_: {\\n\" }}\n        {{- \"pattern: string,\\n\" }}\n        {{- \"cursor?: number, // default: -1\\n\" }}\n        {{- \"}) => any;\\n\\n\" }}\n        {{- \"} // namespace browser\\n\\n\" }}\n    {%- endif -%}\n\n    {%- if python_tool %}\n        {{- \"## python\\n\\n\" }}\n        {{- \"Use this tool to execute Python code in your chain of thought. The code will not be shown to the user. This tool should be used for internal reasoning, but not for code that is intended to be visible to the user (e.g. when creating plots, tables, or files).\\n\\n\" }}\n        {{- \"When you send a message containing Python code to python, it will be executed in a stateful Jupyter notebook environment. python will respond with the output of the execution or time out after 120.0 seconds. The drive at '/mnt/data' can be used to save and persist user files. Internet access for this session is UNKNOWN. Depends on the cluster.\\n\\n\" }}\n    {%- endif -%}\n{%- endmacro -%}\n\n{#- System Message Construction ============================================ #}\n{%- macro build_system_message() -%}\n    {%- if model_identity is not defined %}\n        {%- set model_identity = \"You are ChatGPT, a large language model trained by OpenAI.\" %}\n    {%- endif %}\n    {{- model_identity + \"\\n\" }}\n    {{- \"Knowledge cutoff: 2024-06\\n\" }}\n    {{- \"Current date: \" + strftime_now(\"%Y-%m-%d\") + \"\\n\\n\" }}\n    {%- if reasoning_effort is not defined %}\n        {%- set reasoning_effort = \"medium\" %}\n    {%- endif %}\n    {{- \"Reasoning: \" + reasoning_effort + \"\\n\\n\" }}\n    {%- if builtin_tools %}\n        {{- \"# Tools\\n\\n\" }}\n        {%- set available_builtin_tools = namespace(browser=false, python=false) %}\n        {%- for tool in builtin_tools %}\n            {%- if tool == \"browser\" %}\n                {%- set available_builtin_tools.browser = true %}\n            {%- elif tool == \"python\" %}\n                {%- set available_builtin_tools.python = true %}\n            {%- endif %}\n        {%- endfor %}\n        {{- render_builtin_tools(available_builtin_tools.browser, available_builtin_tools.python) }}\n    {%- endif -%}\n    {{- \"# Valid channels: analysis, commentary, final. Channel must be included for every message.\" }}\n    {%- if tools -%}\n        {{- \"\\nCalls to these tools must go to the commentary channel: 'functions'.\" }}\n    {%- endif -%}\n{%- endmacro -%}\n\n{#- Main Template Logic ================================================= #}\n{#- Set defaults #}\n\n{#- Render system message #}\n{{- \"<|start|>system<|message|>\" }}\n{{- build_system_message() }}\n{{- \"<|end|>\" }}\n\n{#- Extract developer message #}\n{%- if messages[0].role == \"developer\" or messages[0].role == \"system\" %}\n    {%- set developer_message = messages[0].content %}\n    {%- set loop_messages = messages[1:] %}\n{%- else %}\n    {%- set developer_message = \"\" %}\n    {%- set loop_messages = messages %}\n{%- endif %}\n\n{#- Render developer message #}\n{%- if developer_message or tools %}\n    {{- \"<|start|>developer<|message|>\" }}\n    {%- if developer_message %}\n        {{- \"# Instructions\\n\\n\" }}\n        {{- developer_message }}\n        {{- \"\\n\\n\" }}\n    {%- endif %}\n    {%- if tools -%}\n        {{- \"# Tools\\n\\n\" }}\n        {{- render_tool_namespace(\"functions\", tools) }}\n    {%- endif -%}\n    {{- \"<|end|>\" }}\n{%- endif %}\n\n{#- Render messages #}\n{%- set last_tool_call = namespace(name=none) %}\n{%- for message in loop_messages -%}\n    {#- At this point only assistant/user/tool messages should remain #}\n    {%- if message.role == 'assistant' -%}\n        {#- Checks to ensure the messages are being passed in the format we expect #}\n        {%- if \"content\" in message %}\n            {%- if \"<|channel|>analysis<|message|>\" in message.content or \"<|channel|>final<|message|>\" in message.content %}\n                {{- raise_exception(\"You have passed a message containing <|channel|> tags in the content field. Instead of doing this, you should pass analysis messages (the string between '<|message|>' and '<|end|>') in the 'thinking' field, and final messages (the string between '<|message|>' and '<|end|>') in the 'content' field.\") }}\n            {%- endif %}\n        {%- endif %}\n        {%- if \"thinking\" in message %}\n            {%- if \"<|channel|>analysis<|message|>\" in message.thinking or \"<|channel|>final<|message|>\" in message.thinking %}\n                {{- raise_exception(\"You have passed a message containing <|channel|> tags in the thinking field. Instead of doing this, you should pass analysis messages (the string between '<|message|>' and '<|end|>') in the 'thinking' field, and final messages (the string between '<|message|>' and '<|end|>') in the 'content' field.\") }}\n            {%- endif %}\n        {%- endif %}\n        {%- if \"tool_calls\" in message %}\n            {#- We need very careful handling here - we want to drop the tool call analysis message if the model #}\n            {#- has output a later <|final|> message, but otherwise we want to retain it. This is the only case #}\n            {#- when we render CoT/analysis messages in inference. #}\n            {%- set future_final_message = namespace(found=false) %}\n            {%- for future_message in loop_messages[loop.index:] %}\n                {%- if future_message.role == 'assistant' and \"tool_calls\" not in future_message %}\n                    {%- set future_final_message.found = true %}\n                {%- endif %}\n            {%- endfor %}\n            {#- We assume max 1 tool call per message, and so we infer the tool call name #}\n            {#- in \"tool\" messages from the most recent assistant tool call name #}\n            {%- set tool_call = message.tool_calls[0] %}\n            {%- if tool_call.function %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {%- if message.content and message.thinking %}\n                {{- raise_exception(\"Cannot pass both content and thinking in an assistant message with tool calls! Put the analysis message in one or the other, but not both.\") }}\n            {%- elif message.content and not future_final_message.found %}\n                {{- \"<|start|>assistant<|channel|>analysis<|message|>\" + message.content + \"<|end|>\" }}\n            {%- elif message.thinking and not future_final_message.found %}\n                {{- \"<|start|>assistant<|channel|>analysis<|message|>\" + message.thinking + \"<|end|>\" }}\n            {%- endif %}\n            {{- \"<|start|>assistant to=\" }}\n            {{- \"functions.\" + tool_call.name + \"<|channel|>commentary \" }}\n            {{- (tool_call.content_type if tool_call.content_type is defined else \"json\") + \"<|message|>\" }}\n            {{- tool_call.arguments|tojson }}\n            {{- \"<|call|>\" }}\n            {%- set last_tool_call.name = tool_call.name %}\n        {%- elif loop.last and not add_generation_prompt %}\n            {#- Only render the CoT if the final turn is an assistant turn and add_generation_prompt is false #}\n            {#- This is a situation that should only occur in training, never in inference. #}\n            {%- if \"thinking\" in message %}\n                {{- \"<|start|>assistant<|channel|>analysis<|message|>\" + message.thinking + \"<|end|>\" }}\n            {%- endif %}\n            {#- <|return|> indicates the end of generation, but <|end|> does not #}\n            {#- <|return|> should never be an input to the model, but we include it as the final token #}\n            {#- when training, so the model learns to emit it. #}\n            {{- \"<|start|>assistant<|channel|>final<|message|>\" + message.content + \"<|return|>\" }}\n        {%- else %}\n            {#- CoT is dropped during all previous turns, so we never render it for inference #}\n            {{- \"<|start|>assistant<|channel|>final<|message|>\" + message.content + \"<|end|>\" }}\n            {%- set last_tool_call.name = none %}\n        {%- endif %}\n    {%- elif message.role == 'tool' -%}\n        {%- if last_tool_call.name is none %}\n            {{- raise_exception(\"Message has tool role, but there was no previous assistant message with a tool call!\") }}\n        {%- endif %}\n        {{- \"<|start|>functions.\" + last_tool_call.name }}\n        {{- \" to=assistant<|channel|>commentary<|message|>\" + message.content|tojson + \"<|end|>\" }}\n    {%- elif message.role == 'user' -%}\n        {{- \"<|start|>user<|message|>\" + message.content + \"<|end|>\" }}\n    {%- endif -%}\n{%- endfor -%}\n\n{#- Generation prompt #}\n{%- if add_generation_prompt -%}\n<|start|>assistant\n{%- endif -%}",
+   "special_tokens": {
+    "bos_token": "<|startoftext|>",
+    "eos_token": "<|return|>",
+    "pad_token": "<|reserved_200017|>"
+   }
+  }
+ },
+ "cases": [
+  {
+   "name": "qwen3_8/history/defaults",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/effort=xhigh/preserve=True",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "xhigh",
+    "preserve_thinking": true
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/effort=xhigh/preserve=False",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "xhigh",
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/effort=medium/preserve=True",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "medium",
+    "preserve_thinking": true
+   },
+   "expected": "<|im_start|>system\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/effort=medium/preserve=False",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "medium",
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>system\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/effort=low/preserve=True",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "low",
+    "preserve_thinking": true
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/effort=low/preserve=False",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/thinking_off",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "enable_thinking": false,
+    "reasoning_effort": "low"
+   },
+   "expected": "<|im_start|>system\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/thinking_on_explicit",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are a careful assistant.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/defaults",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/effort=xhigh/preserve=True",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "xhigh",
+    "preserve_thinking": true
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/effort=xhigh/preserve=False",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "xhigh",
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/effort=medium/preserve=True",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "medium",
+    "preserve_thinking": true
+   },
+   "expected": "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/effort=medium/preserve=False",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "medium",
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/effort=low/preserve=True",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "low",
+    "preserve_thinking": true
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/effort=low/preserve=False",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "low",
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/thinking_off",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "enable_thinking": false,
+    "reasoning_effort": "low"
+   },
+   "expected": "<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/no_system/thinking_on_explicit",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "enable_thinking": true,
+    "preserve_thinking": false
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/history/invalid_effort",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a careful assistant."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "high"
+   },
+   "expected": null,
+   "error": "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."
+  },
+  {
+   "name": "qwen3_8/tool_loop/preserve=True",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Call the tool.",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 2
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "{\"temp_c\": 18}"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "It is 18 C.",
+     "content": "18 C in Paris."
+    },
+    {
+     "role": "user",
+     "content": "And in Rome?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Call the tool again.",
+     "content": "Checking.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome",
+         "units": "c"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "{\"temp_c\": 24}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city. Units: \"c\" or \"f\" (default <c> & 'metric').",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ],
+         "default": "c"
+        },
+        "days": {
+         "type": "integer",
+         "description": "Forecast days"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "kwargs": {
+    "preserve_thinking": true,
+    "reasoning_effort": "medium"
+   },
+   "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Units: \\\"c\\\" or \\\"f\\\" (default <c> & 'metric').\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"], \"default\": \"c\"}, \"days\": {\"type\": \"integer\", \"description\": \"Forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nCall the tool.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp_c\": 18}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nIt is 18 C.\n</think>\n\n18 C in Paris.<|im_end|>\n<|im_start|>user\nAnd in Rome?<|im_end|>\n<|im_start|>assistant\n<think>\nCall the tool again.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=units>\nc\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp_c\": 24}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/tool_loop/preserve=False",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Call the tool.",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "days": 2
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_1",
+     "content": "{\"temp_c\": 18}"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "It is 18 C.",
+     "content": "18 C in Paris."
+    },
+    {
+     "role": "user",
+     "content": "And in Rome?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Call the tool again.",
+     "content": "Checking.",
+     "tool_calls": [
+      {
+       "id": "call_2",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome",
+         "units": "c"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_2",
+     "content": "{\"temp_c\": 24}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city. Units: \"c\" or \"f\" (default <c> & 'metric').",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ],
+         "default": "c"
+        },
+        "days": {
+         "type": "integer",
+         "description": "Forecast days"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "kwargs": {
+    "preserve_thinking": false,
+    "reasoning_effort": "medium"
+   },
+   "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Units: \\\"c\\\" or \\\"f\\\" (default <c> & 'metric').\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"], \"default\": \"c\"}, \"days\": {\"type\": \"integer\", \"description\": \"Forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp_c\": 18}\n</tool_response><|im_end|>\n<|im_start|>assistant\n18 C in Paris.<|im_end|>\n<|im_start|>user\nAnd in Rome?<|im_end|>\n<|im_start|>assistant\n<think>\nCall the tool again.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n<parameter=units>\nc\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp_c\": 24}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "qwen3_8/tools/low",
+   "template": "qwen3_8",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n",
+     "content": "17 * 23 = 391."
+    },
+    {
+     "role": "user",
+     "content": "And divided by 17?"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "391 / 17 = 23.",
+     "content": "It is 23."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city. Units: \"c\" or \"f\" (default <c> & 'metric').",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ],
+         "default": "c"
+        },
+        "days": {
+         "type": "integer",
+         "description": "Forecast days"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "kwargs": {
+    "reasoning_effort": "low"
+   },
+   "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather for a city. Units: \\\"c\\\" or \\\"f\\\" (default <c> & 'metric').\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Zürich\"}, \"units\": {\"type\": \"string\", \"enum\": [\"c\", \"f\"], \"default\": \"c\"}, \"days\": {\"type\": \"integer\", \"description\": \"Forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is 17 * 23?<|im_end|>\n<|im_start|>assistant\n<think>\n17 * 23 = 17 * 20 + 17 * 3 = 340 + 51 = 391.\n</think>\n\n17 * 23 = 391.<|im_end|>\n<|im_start|>user\nAnd divided by 17?<|im_end|>\n<|im_start|>assistant\n<think>\n391 / 17 = 23.\n</think>\n\nIt is 23.<|im_end|>\n<|im_start|>user\nNow square it.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "error": null
+  },
+  {
+   "name": "gpt_oss/defaults",
+   "template": "gpt_oss",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "content": "391."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "expected": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-15\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nAnswer briefly.\n\n<|end|><|start|>user<|message|>What is 17 * 23?<|end|><|start|>assistant<|channel|>final<|message|>391.<|end|><|start|>user<|message|>Now square it.<|end|><|start|>assistant",
+   "error": null
+  },
+  {
+   "name": "gpt_oss/effort=low",
+   "template": "gpt_oss",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "content": "391."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "low"
+   },
+   "expected": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-15\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nAnswer briefly.\n\n<|end|><|start|>user<|message|>What is 17 * 23?<|end|><|start|>assistant<|channel|>final<|message|>391.<|end|><|start|>user<|message|>Now square it.<|end|><|start|>assistant",
+   "error": null
+  },
+  {
+   "name": "gpt_oss/effort=medium",
+   "template": "gpt_oss",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "content": "391."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "medium"
+   },
+   "expected": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-15\n\nReasoning: medium\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nAnswer briefly.\n\n<|end|><|start|>user<|message|>What is 17 * 23?<|end|><|start|>assistant<|channel|>final<|message|>391.<|end|><|start|>user<|message|>Now square it.<|end|><|start|>assistant",
+   "error": null
+  },
+  {
+   "name": "gpt_oss/effort=high",
+   "template": "gpt_oss",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "content": "391."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "high"
+   },
+   "expected": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-15\n\nReasoning: high\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nAnswer briefly.\n\n<|end|><|start|>user<|message|>What is 17 * 23?<|end|><|start|>assistant<|channel|>final<|message|>391.<|end|><|start|>user<|message|>Now square it.<|end|><|start|>assistant",
+   "error": null
+  },
+  {
+   "name": "gpt_oss/model_identity",
+   "template": "gpt_oss",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "content": "391."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "model_identity": "You are a test model.",
+    "reasoning_effort": "high"
+   },
+   "expected": "<|start|>system<|message|>You are a test model.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-15\n\nReasoning: high\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.<|end|><|start|>developer<|message|># Instructions\n\nAnswer briefly.\n\n<|end|><|start|>user<|message|>What is 17 * 23?<|end|><|start|>assistant<|channel|>final<|message|>391.<|end|><|start|>user<|message|>Now square it.<|end|><|start|>assistant",
+   "error": null
+  },
+  {
+   "name": "gpt_oss/tools",
+   "template": "gpt_oss",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Answer briefly."
+    },
+    {
+     "role": "user",
+     "content": "What is 17 * 23?"
+    },
+    {
+     "role": "assistant",
+     "content": "391."
+    },
+    {
+     "role": "user",
+     "content": "Now square it."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the weather for a city. Units: \"c\" or \"f\" (default <c> & 'metric').",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name, e.g. Zürich"
+        },
+        "units": {
+         "type": "string",
+         "enum": [
+          "c",
+          "f"
+         ],
+         "default": "c"
+        },
+        "days": {
+         "type": "integer",
+         "description": "Forecast days"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "kwargs": {
+    "reasoning_effort": "low"
+   },
+   "expected": "<|start|>system<|message|>You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: 2026-01-15\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.\nCalls to these tools must go to the commentary channel: 'functions'.<|end|><|start|>developer<|message|># Instructions\n\nAnswer briefly.\n\n# Tools\n\n## functions\n\nnamespace functions {\n\n// Get the weather for a city. Units: \"c\" or \"f\" (default <c> & 'metric').\ntype get_weather = (_: {\n// City name, e.g. Zürich\ncity: string,\nunits?: \"c\" | \"f\", // default: c,\n// Forecast days\ndays?: number,\n}) => any;\n\n} // namespace functions<|end|><|start|>user<|message|>What is 17 * 23?<|end|><|start|>assistant<|channel|>final<|message|>391.<|end|><|start|>user<|message|>Now square it.<|end|><|start|>assistant",
+   "error": null
+  }
+ ]
+}

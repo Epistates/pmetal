@@ -130,6 +130,34 @@ pub struct InferSpec {
     pub no_thinking: bool,
 
     #[job(
+        label = "Reasoning Effort",
+        group = "Input",
+        argv = "--reasoning-effort",
+        help = "For chat templates with a reasoning_effort control: xhigh | medium | low on Qwen3.8, low | medium | high on gpt-oss"
+    )]
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+
+    #[job(
+        label = "No Preserved Thinking",
+        group = "Input",
+        argv = "--no-preserve-thinking",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub no_preserve_thinking: bool,
+
+    #[job(
+        label = "Chat Template Kwargs",
+        group = "Input",
+        argv = "--chat-template-kwargs",
+        help = "JSON object of extra chat template keyword arguments"
+    )]
+    #[serde(default)]
+    pub chat_template_kwargs: Option<String>,
+
+    #[job(
         label = "Hide Thinking",
         group = "Output",
         argv = "--hide-thinking",
@@ -348,6 +376,9 @@ impl Default for InferSpec {
             chat: false,
             system: None,
             no_thinking: false,
+            reasoning_effort: None,
+            no_preserve_thinking: false,
+            chat_template_kwargs: None,
             hide_thinking: false,
             mode: default_mode(),
             backend: default_backend(),

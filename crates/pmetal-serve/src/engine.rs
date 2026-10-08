@@ -1142,14 +1142,43 @@ impl InferenceEngine {
         messages: &[ChatMessage],
         tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
     ) -> String {
-        let msgs: Vec<pmetal_data::chat_templates::Message> = messages
-            .iter()
-            .map(|m| crate::media::template_message(m, None))
-            .collect();
+        let msgs = Self::template_messages(messages);
         // apply_inference prefers the upstream Jinja template when present, so
         // tool definitions land in the exact shape the model was trained on.
         let formatted = self.chat_template.apply_inference(&msgs, false, tools);
         formatted.text
+    }
+
+    /// Format chat messages with tool definitions and chat template kwargs
+    /// (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, …), as
+    /// `apply_chat_template(messages, tools=tools, add_generation_prompt=True,
+    /// **kwargs)` renders them.
+    ///
+    /// A kwarg the template does not read is ignored, as it is there. A
+    /// value the template refuses (its own `raise_exception`), or a
+    /// `reasoning_effort` outside the levels a model documents, is a bad
+    /// request.
+    pub fn format_chat_with_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
+        kwargs: &pmetal_data::chat_templates::ChatTemplateKwargs,
+    ) -> ServeResult<String> {
+        self.chat_template
+            .check_reasoning_effort_level(kwargs)
+            .map_err(ServeError::BadRequest)?;
+        let msgs = Self::template_messages(messages);
+        self.chat_template
+            .apply_inference_with_kwargs(&msgs, tools, kwargs)
+            .map(|formatted| formatted.text)
+            .map_err(ServeError::BadRequest)
+    }
+
+    fn template_messages(messages: &[ChatMessage]) -> Vec<pmetal_data::chat_templates::Message> {
+        messages
+            .iter()
+            .map(|m| crate::media::template_message(m, None))
+            .collect()
     }
 
     /// Whether the model reads images and videos.
@@ -1166,17 +1195,25 @@ impl InferenceEngine {
     /// message, and preprocessed by the checkpoint's processor, which also
     /// expands each placeholder to the media's token run.
     ///
+    /// `kwargs` are the request's chat template kwargs, as
+    /// [`format_chat_with_kwargs`](Self::format_chat_with_kwargs) takes them.
+    ///
     /// Errors with a 400 when the model reads no images, when a part is
-    /// unusable, or when the expanded prompt does not fit in the context.
+    /// unusable, when the template refuses a kwarg, or when the expanded
+    /// prompt does not fit in the context.
     pub async fn prepare_chat(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
+        kwargs: &pmetal_data::chat_templates::ChatTemplateKwargs,
     ) -> ServeResult<PreparedPrompt> {
         if !crate::media::has_media(messages) {
-            let prompt = self.format_chat_with_tools(messages, tools);
+            let prompt = self.format_chat_with_kwargs(messages, tools, kwargs)?;
             return Ok(PreparedPrompt::from_tokens(self.tokenize(&prompt)?));
         }
+        self.chat_template
+            .check_reasoning_effort_level(kwargs)
+            .map_err(ServeError::BadRequest)?;
         if let Vision::Unsupported(why) = &self.vision {
             return Err(ServeError::BadRequest(format!(
                 "model '{}' does not accept images or videos: {why}",
@@ -1186,7 +1223,7 @@ impl InferenceEngine {
         let chat = crate::media::split_messages(messages)?;
         let text = self
             .chat_template
-            .render_inference_jinja(&chat.messages, false, tools)
+            .render_inference_jinja_with_kwargs(&chat.messages, tools, kwargs)
             .map_err(|e| {
                 ServeError::BadRequest(format!(
                     "the model's chat template could not place the images and videos: {e}"

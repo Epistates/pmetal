@@ -1847,6 +1847,9 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 chat,
                 system,
                 no_thinking,
+                reasoning_effort,
+                no_preserve_thinking,
+                chat_template_kwargs,
                 mode,
                 backend,
                 draft_model,
@@ -1895,6 +1898,13 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 .as_deref()
                 .map(|path| validate_output_path(path, "infer profile output"))
                 .transpose()?;
+            let template_kwargs = pmetal_data::chat_templates::ChatTemplateKwargs::from_controls(
+                chat_template_kwargs.as_deref(),
+                no_thinking,
+                reasoning_effort.as_deref(),
+                no_preserve_thinking,
+            )
+            .map_err(anyhow::Error::msg)?;
 
             commands::infer::run_inference(
                 &model,
@@ -1912,6 +1922,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 chat,
                 system.as_deref(),
                 no_thinking,
+                template_kwargs,
                 mode,
                 backend,
                 draft_model.as_deref(),

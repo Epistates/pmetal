@@ -47,6 +47,8 @@
   let seed = $state<number | null>(null);
   let fp8 = $state(false);
   let noThinking = $state(false);
+  let reasoningEffort = $state(''); // '' = the chat template's default
+  let noPreserveThinking = $state(false);
   let expertsDir = $state('');
   let kvQuant = $state<string>('auto'); // 'auto' | '0' | '4' | '8' | 'tq4' | 'tq8' | 'tq2_5' | 'tq3_5'
   let showParams = $state(false);
@@ -228,6 +230,8 @@
           seed,
           fp8: fp8 || undefined,
           no_thinking: noThinking || undefined,
+          reasoning_effort: reasoningEffort || undefined,
+          no_preserve_thinking: noPreserveThinking || undefined,
           experts_dir: expertsDir || undefined,
           kv_quant:
             kvQuant === 'tq4'
@@ -473,7 +477,21 @@
             <input type="checkbox" class="rounded" bind:checked={noThinking} />
             <span class="text-surface-600 dark:text-surface-400">Disable thinking</span>
           </label>
-          <div class="col-span-2 md:col-span-3">
+          <label class="flex items-center gap-2 text-sm cursor-pointer" title="Keep only the current turn's thinking in the prompt (models with preserve_thinking, e.g. Qwen3.8)">
+            <input type="checkbox" class="rounded" bind:checked={noPreserveThinking} />
+            <span class="text-surface-600 dark:text-surface-400">Drop earlier thinking</span>
+          </label>
+          <div>
+            <label class="label" for="inf-effort">Reasoning Effort</label>
+            <select id="inf-effort" class="input text-sm" bind:value={reasoningEffort} title="For models with a reasoning_effort control: xhigh, medium, low (Qwen3.8); low, medium, high (gpt-oss)">
+              <option value="">Model default</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="xhigh">XHigh</option>
+            </select>
+          </div>
+          <div class="col-span-2 md:col-span-5">
             <label class="label" for="inf-experts">Experts Dir</label>
             <input id="inf-experts" type="text" class="input text-sm" placeholder="Path to packed experts (optional)" bind:value={expertsDir} />
           </div>

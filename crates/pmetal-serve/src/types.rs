@@ -1,6 +1,6 @@
 //! OpenAI-compatible request/response types.
 
-use pmetal_data::chat_templates::{FunctionCall, ToolCall, ToolDefinition};
+use pmetal_data::chat_templates::{ChatTemplateKwargs, FunctionCall, ToolCall, ToolDefinition};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Deserialize a field that may be either a single string or an array of strings.
@@ -75,6 +75,13 @@ pub struct ChatMessage {
     /// serialized: responses carry text.
     #[serde(skip_serializing)]
     pub parts: Option<Vec<serde_json::Value>>,
+    /// The thinking behind an assistant turn, sent back apart from its
+    /// `content`. Chat templates that render thinking themselves read it,
+    /// e.g. to keep earlier turns' thinking under Qwen3.8's
+    /// `preserve_thinking`. A `<think>…</think>` left inside `content` is
+    /// split out the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ChatMessage {
@@ -85,6 +92,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: None,
             parts: None,
+            reasoning_content: None,
         }
     }
 }
@@ -97,6 +105,8 @@ struct WireChatMessage {
     content: WireContent,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// A message's `content`: a string, `null` (an assistant turn that only
@@ -130,6 +140,7 @@ impl From<WireChatMessage> for ChatMessage {
             content,
             tool_calls: wire.tool_calls,
             parts,
+            reasoning_content: wire.reasoning_content,
         }
     }
 }
@@ -186,6 +197,29 @@ pub struct ChatCompletionRequest {
     /// override silently ignored would change what the model sees.
     #[serde(default)]
     pub mm_processor_kwargs: Option<serde_json::Value>,
+    /// OpenAI `reasoning_effort`, passed to the chat template as the
+    /// `reasoning_effort` kwarg (Qwen3.8: xhigh | medium | low; gpt-oss:
+    /// low | medium | high). A value in `chat_template_kwargs` wins.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Keyword arguments for the chat template, as `apply_chat_template`
+    /// takes them: `{"enable_thinking": false}`, `{"preserve_thinking":
+    /// false}`, or anything else the model's template reads.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+impl ChatCompletionRequest {
+    /// The chat template kwargs this request asks for: its
+    /// `chat_template_kwargs`, plus the top-level `reasoning_effort` when
+    /// those do not set one.
+    pub fn template_kwargs(&self) -> ChatTemplateKwargs {
+        let mut kwargs = self.chat_template_kwargs.clone().unwrap_or_default();
+        if let Some(effort) = &self.reasoning_effort {
+            kwargs.set_default(ChatTemplateKwargs::REASONING_EFFORT, effort.as_str());
+        }
+        kwargs
+    }
 }
 
 /// Per-token logprob entry as it appears on the wire under
@@ -381,6 +415,37 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_template_kwargs() {
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[
+                {"role":"assistant","content":"a","reasoning_content":"r"}],
+                "reasoning_effort":"low",
+                "chat_template_kwargs":{"enable_thinking":false,"preserve_thinking":false}}"#,
+        )
+        .unwrap();
+        let kwargs = req.template_kwargs();
+        assert_eq!(kwargs.enable_thinking(), Some(false));
+        assert_eq!(kwargs.reasoning_effort(), Some("low"));
+        assert_eq!(
+            kwargs.get("preserve_thinking"),
+            Some(&serde_json::Value::Bool(false))
+        );
+        assert_eq!(req.messages[0].reasoning_content.as_deref(), Some("r"));
+
+        // A reasoning_effort inside chat_template_kwargs beats the top-level one.
+        let req: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[],"reasoning_effort":"low",
+                "chat_template_kwargs":{"reasoning_effort":"medium"}}"#,
+        )
+        .unwrap();
+        assert_eq!(req.template_kwargs().reasoning_effort(), Some("medium"));
+
+        let req: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"m","messages":[]}"#).unwrap();
+        assert!(req.template_kwargs().is_empty());
+    }
+
+    #[test]
     fn chat_request_parses_logprobs_fields() {
         let req: ChatCompletionRequest =
             serde_json::from_str(r#"{"model":"m","messages":[],"logprobs":true,"top_logprobs":5}"#)
@@ -400,6 +465,7 @@ mod tests {
                 content: "hi".into(),
                 tool_calls: None,
                 parts: None,
+                reasoning_content: None,
             },
             finish_reason: Some("stop".into()),
             logprobs: None,
@@ -420,6 +486,7 @@ mod tests {
                 content: "hi".into(),
                 tool_calls: None,
                 parts: None,
+                reasoning_content: None,
             },
             finish_reason: Some("stop".into()),
             logprobs: Some(ChatLogprobs {

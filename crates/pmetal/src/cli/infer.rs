@@ -92,6 +92,24 @@ pub struct InferArgs {
     #[arg(long = "no-thinking")]
     pub no_thinking: bool,
 
+    /// How long the model thinks, for chat templates with a
+    /// `reasoning_effort` control: xhigh | medium | low on Qwen3.8 (default
+    /// xhigh), low | medium | high on gpt-oss (default medium).
+    #[arg(long = "reasoning-effort")]
+    pub reasoning_effort: Option<String>,
+
+    /// Drop the thinking of earlier turns from the prompt, keeping only the
+    /// current turn's, for chat templates with a `preserve_thinking` control
+    /// (Qwen3.8 keeps it by default).
+    #[arg(long = "no-preserve-thinking")]
+    pub no_preserve_thinking: bool,
+
+    /// Extra chat template keyword arguments as a JSON object, e.g.
+    /// '{"enable_thinking": false}'. --no-thinking, --reasoning-effort and
+    /// --no-preserve-thinking win over the same keys here.
+    #[arg(long = "chat-template-kwargs")]
+    pub chat_template_kwargs: Option<String>,
+
     /// Sampling mode preset with model-card recommended parameters.
     #[arg(long = "mode", default_value = "auto")]
     pub mode: pmetal_data::inference_config::SamplingMode,

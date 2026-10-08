@@ -125,6 +125,29 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+### Thinking controls
+
+Chat completions accept OpenAI's top-level `reasoning_effort` and a
+`chat_template_kwargs` object, both handed to the model's chat template as
+keyword arguments, exactly as `apply_chat_template(messages, **kwargs)` takes
+them (a value inside `chat_template_kwargs` wins). Qwen3.8 reads
+`reasoning_effort` (`xhigh`, `medium`, `low`), `enable_thinking` and
+`preserve_thinking`; gpt-oss reads `reasoning_effort` (`low`, `medium`,
+`high`). A level the model refuses is a 400.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3.8-27B", "reasoning_effort": "low",
+       "chat_template_kwargs": {"preserve_thinking": false},
+       "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+For multi-turn conversations, send an assistant turn's thinking back as
+`reasoning_content` next to its `content`; a `<think>…</think>` left at the
+head of `content` is split out the same way. `/v1/messages` maps
+`"thinking": {"type": "disabled"}` (or `"enabled"`) to `enable_thinking`.
+
 :::note
 The prebuilt release binary and the Homebrew formula both ship this command. If you build PMetal
 yourself, `serve` is opt-in: `cargo install pmetal --features serve`.

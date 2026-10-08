@@ -107,6 +107,11 @@ pub struct Message {
     /// Only the upstream Jinja template places media; `content` holds the
     /// text alone for everything else.
     pub parts: Option<Vec<ContentPart>>,
+    /// The thinking behind an assistant turn, apart from its `content`
+    /// (the OpenAI-style `reasoning_content` field). Templates that render
+    /// thinking themselves read it; see [`ChatTemplate::apply_inference_with_kwargs`]
+    /// for how a `<think>…</think>` left inside `content` is handled.
+    pub reasoning_content: Option<String>,
     /// Tool calls made by the assistant (role="assistant" only).
     pub tool_calls: Option<Vec<ToolCall>>,
     /// ID of the tool call this message responds to (role="tool" only).
@@ -120,6 +125,7 @@ impl Message {
             role: role.into(),
             content: content.into(),
             parts: None,
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -148,6 +154,12 @@ impl Message {
             .is_some_and(|parts| parts.iter().any(|p| !matches!(p, ContentPart::Text(_))))
     }
 
+    /// Attach the thinking that preceded this (assistant) message.
+    pub fn with_reasoning_content(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning_content = Some(reasoning.into());
+        self
+    }
+
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self::new("system", content)
@@ -166,28 +178,211 @@ impl Message {
     /// Create an assistant message with tool calls.
     pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
         Self {
-            role: "assistant".into(),
-            content: content.into(),
-            parts: None,
             tool_calls: Some(tool_calls),
-            tool_call_id: None,
+            ..Self::new("assistant", content)
         }
     }
 
     /// Create a tool response message.
     pub fn tool(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
         Self {
-            role: "tool".into(),
-            content: content.into(),
-            parts: None,
-            tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            ..Self::new("tool", content)
         }
     }
 
     /// Check if this message contains tool calls.
     pub fn has_tool_calls(&self) -> bool {
         self.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+    }
+}
+
+/// Split a `<think>…</think>` left at the head of an assistant `content`
+/// into `(reasoning, answer)`, the way Qwen3's own template does:
+/// reasoning is the text before `</think>` (after any `<think>`, newlines
+/// trimmed at both ends), the answer is the text after the last `</think>`
+/// with leading newlines trimmed. `None` when there is no `</think>`.
+pub fn split_reasoning_content(content: &str) -> Option<(String, String)> {
+    let (before, _) = content.split_once("</think>")?;
+    let (_, after) = content.rsplit_once("</think>")?;
+    let before = before.trim_end_matches('\n');
+    let reasoning = before
+        .rsplit_once("<think>")
+        .map_or(before, |(_, r)| r)
+        .trim_start_matches('\n');
+    Some((
+        reasoning.to_string(),
+        after.trim_start_matches('\n').to_string(),
+    ))
+}
+
+/// Tool-call arguments as chat templates expect them: an object.
+///
+/// OpenAI clients send `arguments` as a JSON-encoded string, while the
+/// templates iterate it as a mapping (`tool_call.arguments|items`), which a
+/// string cannot do. A string that holds a JSON object is decoded; anything
+/// else is passed through unchanged.
+fn tool_call_arguments(arguments: &serde_json::Value) -> serde_json::Value {
+    if let Some(s) = arguments.as_str() {
+        if let Ok(object @ serde_json::Value::Object(_)) = serde_json::from_str(s) {
+            return object;
+        }
+    }
+    arguments.clone()
+}
+
+/// Keyword arguments for a chat template: the `**kwargs` of transformers'
+/// `apply_chat_template`, which a template reads as plain variables.
+///
+/// The model makers document theirs: `enable_thinking` (Qwen3 onwards,
+/// Gemma 4, SmolLM3), `reasoning_effort` (gpt-oss: `low|medium|high`;
+/// Qwen3.8: `xhigh|medium|low`), `preserve_thinking` (Qwen3.8), and the
+/// rest are whatever a given template happens to read. Serialized as a
+/// plain JSON object, insertion-ordered.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChatTemplateKwargs(serde_json::Map<String, serde_json::Value>);
+
+impl ChatTemplateKwargs {
+    /// `enable_thinking`: whether the model thinks before it answers.
+    pub const ENABLE_THINKING: &'static str = "enable_thinking";
+    /// `reasoning_effort`: how long the model thinks.
+    pub const REASONING_EFFORT: &'static str = "reasoning_effort";
+    /// `preserve_thinking`: keep the thinking of earlier turns in the prompt.
+    pub const PRESERVE_THINKING: &'static str = "preserve_thinking";
+
+    /// No kwargs.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build from a JSON object, refusing the names the renderer binds
+    /// itself (`messages`, `tools`, `documents`, `add_generation_prompt`).
+    pub fn from_map(map: serde_json::Map<String, serde_json::Value>) -> Result<Self, String> {
+        let kwargs = Self(map);
+        kwargs.check_reserved()?;
+        Ok(kwargs)
+    }
+
+    /// Parse a JSON object string, e.g. `{"enable_thinking": false}`.
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        match serde_json::from_str::<serde_json::Value>(json) {
+            Ok(serde_json::Value::Object(map)) => Self::from_map(map),
+            Ok(_) => Err("chat template kwargs must be a JSON object".into()),
+            Err(e) => Err(format!("chat template kwargs are not valid JSON: {e}")),
+        }
+    }
+
+    /// The kwargs of a `pmetal infer`-style surface: a JSON object (the
+    /// `--chat-template-kwargs` value), with the dedicated controls set over
+    /// it (`--no-thinking`, `--reasoning-effort`, `--no-preserve-thinking`).
+    pub fn from_controls(
+        json: Option<&str>,
+        no_thinking: bool,
+        reasoning_effort: Option<&str>,
+        no_preserve_thinking: bool,
+    ) -> Result<Self, String> {
+        let mut kwargs = match json.filter(|j| !j.trim().is_empty()) {
+            Some(json) => Self::from_json(json)?,
+            None => Self::new(),
+        };
+        if no_thinking {
+            kwargs.set(Self::ENABLE_THINKING, false);
+        }
+        if let Some(effort) = reasoning_effort.filter(|e| !e.is_empty()) {
+            kwargs.set(Self::REASONING_EFFORT, effort);
+        }
+        if no_preserve_thinking {
+            kwargs.set(Self::PRESERVE_THINKING, false);
+        }
+        Ok(kwargs)
+    }
+
+    /// Refuse a name the renderer binds itself.
+    pub fn check_reserved(&self) -> Result<(), String> {
+        match self
+            .0
+            .keys()
+            .find(|k| crate::jinja_chat::RESERVED_TEMPLATE_KWARGS.contains(&k.as_str()))
+        {
+            Some(key) => Err(format!(
+                "`{key}` cannot be a chat template kwarg: it is set from the request itself"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Set one kwarg, replacing any earlier value.
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) {
+        self.0.insert(key.into(), value.into());
+    }
+
+    /// Set one kwarg (builder form).
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        self.set(key, value);
+        self
+    }
+
+    /// Set a kwarg only when the caller has not set it already, so an
+    /// explicit value always beats a default.
+    pub fn set_default(&mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) {
+        self.0.entry(key.into()).or_insert_with(|| value.into());
+    }
+
+    /// Copy every kwarg of `other` over this one.
+    pub fn extend(&mut self, other: &ChatTemplateKwargs) {
+        for (k, v) in &other.0 {
+            self.0.insert(k.clone(), v.clone());
+        }
+    }
+
+    /// Look up one kwarg.
+    pub fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.0.get(key)
+    }
+
+    /// Remove one kwarg.
+    pub fn remove(&mut self, key: &str) -> Option<serde_json::Value> {
+        self.0.shift_remove(key)
+    }
+
+    /// `enable_thinking` when it is set to a boolean.
+    pub fn enable_thinking(&self) -> Option<bool> {
+        self.get(Self::ENABLE_THINKING).and_then(|v| v.as_bool())
+    }
+
+    /// `reasoning_effort` when it is set to a string.
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.get(Self::REASONING_EFFORT).and_then(|v| v.as_str())
+    }
+
+    /// Whether no kwarg is set.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Kwarg names, in insertion order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    /// The kwargs as a JSON object.
+    pub fn as_map(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.0
+    }
+}
+
+/// The `reasoning_effort` levels a template family is documented to accept,
+/// for templates that do not check the value themselves. gpt-oss's harmony
+/// template writes any string into its system message, while OpenAI's model
+/// card names three levels. Templates that validate (Qwen3.8 raises on
+/// anything but `xhigh|medium|low`) are checked by rendering them.
+pub fn documented_reasoning_effort_levels(
+    template: ChatTemplateType,
+) -> Option<&'static [&'static str]> {
+    match template {
+        ChatTemplateType::GptOss => Some(&["low", "medium", "high"]),
+        _ => None,
     }
 }
 
@@ -610,42 +805,133 @@ impl ChatTemplate {
         no_thinking: bool,
         tools: Option<&[ToolDefinition]>,
     ) -> FormattedChat {
-        // 1. Prefer the upstream Jinja template when present. This is the
-        //    only path that gets model-specific default system messages
-        //    (Qwen2.5, SmolLM2), dynamic date injection (Llama 3), and
-        //    multi-channel GPT-OSS preambles correct.
-        if let Some(rendered) = self.render_jinja(messages, no_thinking, tools) {
-            return FormattedChat {
-                text: rendered,
-                response_start: 0, // training masks set this separately
-                template_type: self.template_type,
-            };
-        }
-        // 2. Hardcoded fallback for base models without a chat_template.
-        match self.template_type {
-            ChatTemplateType::Qwen => self.format_qwen_inference(messages, tools, no_thinking),
-            _ => self.apply_with_tools(messages, tools),
-        }
+        let kwargs =
+            ChatTemplateKwargs::new().with(ChatTemplateKwargs::ENABLE_THINKING, !no_thinking);
+        self.apply_inference_with_kwargs(messages, tools, &kwargs)
+            .unwrap_or_else(|e| {
+                tracing::warn!("{e}; falling back to the built-in formatter");
+                self.apply_builtin_inference(messages, tools, no_thinking)
+            })
     }
 
-    /// Try to render the template via the upstream Jinja source. Returns
-    /// `None` when no Jinja source is attached, or when rendering fails —
-    /// callers should fall back to the hardcoded formatter in that case.
-    fn render_jinja(
+    /// Format an inference prompt with template kwargs, as transformers'
+    /// `apply_chat_template(messages, tools=tools, add_generation_prompt=True,
+    /// **kwargs)` renders it.
+    ///
+    /// `kwargs` reach the upstream Jinja template verbatim
+    /// (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, …). When
+    /// `enable_thinking` is absent it is passed as `true`, the default every
+    /// thinking template documents.
+    ///
+    /// An assistant message without `reasoning_content` whose `content`
+    /// still carries `<think>…</think>` (the raw text a thinking model
+    /// generated) is split into the two, as Qwen3's template does itself,
+    /// but only for templates that read `reasoning_content`: those render
+    /// the thinking block from it, so leaving it inside `content` would
+    /// print a second, nested one.
+    ///
+    /// Without a Jinja template the built-in formatter runs, honouring
+    /// `enable_thinking` only. A template that fails to render falls back
+    /// the same way when the kwargs are `enable_thinking` alone; with any
+    /// other kwarg the error is returned, because the built-in formatter
+    /// cannot honour it and a template's own `raise_exception` (an
+    /// unsupported `reasoning_effort` level, say) is the caller's to see.
+    pub fn apply_inference_with_kwargs(
         &self,
         messages: &[Message],
-        no_thinking: bool,
         tools: Option<&[ToolDefinition]>,
-    ) -> Option<String> {
-        self.jinja_source.as_deref()?;
-        match self.render_inference_jinja(messages, no_thinking, tools) {
-            Ok(text) => Some(text),
-            Err(e) => {
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<FormattedChat, String> {
+        kwargs.check_reserved()?;
+        let no_thinking = kwargs.enable_thinking() == Some(false);
+        let Some(src) = self.jinja_source.as_deref() else {
+            return Ok(self.apply_builtin_inference(messages, tools, no_thinking));
+        };
+        let mut kwargs = kwargs.clone();
+        kwargs.set_default(ChatTemplateKwargs::ENABLE_THINKING, true);
+        match self.render_jinja(src, messages, tools, &kwargs) {
+            Ok(text) => Ok(FormattedChat {
+                text,
+                response_start: 0, // training masks set this separately
+                template_type: self.template_type,
+            }),
+            Err(e)
+                if kwargs
+                    .keys()
+                    .all(|k| k == ChatTemplateKwargs::ENABLE_THINKING) =>
+            {
                 tracing::warn!(
                     "Jinja chat template render failed, falling back to hardcoded formatter: {e}"
                 );
-                None
+                Ok(self.apply_builtin_inference(messages, tools, no_thinking))
             }
+            Err(e) => Err(format!("chat template: {e}")),
+        }
+    }
+
+    /// Whether the attached Jinja template reads `name` (a template kwarg
+    /// such as `reasoning_effort`). `false` without a Jinja template.
+    pub fn reads_kwarg(&self, name: &str) -> bool {
+        let Some(src) = self.jinja_source.as_deref() else {
+            return false;
+        };
+        let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        src.match_indices(name).any(|(at, _)| {
+            let before = src[..at].chars().next_back();
+            let after = src[at + name.len()..].chars().next();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+    }
+
+    /// Check caller-chosen thinking controls against this template, for a
+    /// surface that should say so rather than ignore them (the CLI flags).
+    ///
+    /// Each of `reasoning_effort` / `preserve_thinking` that is set must be
+    /// read by the template, and a `reasoning_effort` must be one of the
+    /// documented levels where the template does not validate it itself
+    /// (see [`documented_reasoning_effort_levels`]).
+    pub fn check_thinking_controls(&self, kwargs: &ChatTemplateKwargs) -> Result<(), String> {
+        for key in [
+            ChatTemplateKwargs::REASONING_EFFORT,
+            ChatTemplateKwargs::PRESERVE_THINKING,
+        ] {
+            if kwargs.get(key).is_some() && !self.reads_kwarg(key) {
+                return Err(format!(
+                    "this model's chat template has no `{key}` control ({:?} template)",
+                    self.template_type
+                ));
+            }
+        }
+        self.check_reasoning_effort_level(kwargs)
+    }
+
+    /// Refuse a `reasoning_effort` outside the documented levels of a
+    /// template that does not check it itself. Other kwargs pass.
+    pub fn check_reasoning_effort_level(&self, kwargs: &ChatTemplateKwargs) -> Result<(), String> {
+        let Some(effort) = kwargs.get(ChatTemplateKwargs::REASONING_EFFORT) else {
+            return Ok(());
+        };
+        if let Some(levels) = documented_reasoning_effort_levels(self.template_type) {
+            if !effort.as_str().is_some_and(|e| levels.contains(&e)) {
+                return Err(format!(
+                    "unsupported reasoning_effort {effort}: this model accepts {}",
+                    levels.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The hardcoded formatter, for models without a Jinja chat template.
+    fn apply_builtin_inference(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        no_thinking: bool,
+    ) -> FormattedChat {
+        match self.template_type {
+            ChatTemplateType::Qwen => self.format_qwen_inference(messages, tools, no_thinking),
+            _ => self.apply_with_tools(messages, tools),
         }
     }
 
@@ -664,66 +950,100 @@ impl ChatTemplate {
         no_thinking: bool,
         tools: Option<&[ToolDefinition]>,
     ) -> Result<String, String> {
+        let kwargs =
+            ChatTemplateKwargs::new().with(ChatTemplateKwargs::ENABLE_THINKING, !no_thinking);
+        self.render_inference_jinja_with_kwargs(messages, tools, &kwargs)
+    }
+
+    /// [`render_inference_jinja`](Self::render_inference_jinja) with template
+    /// kwargs, as [`apply_inference_with_kwargs`](Self::apply_inference_with_kwargs)
+    /// passes them, and no fallback.
+    pub fn render_inference_jinja_with_kwargs(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<String, String> {
+        kwargs.check_reserved()?;
         let src = self
             .jinja_source
             .as_deref()
             .ok_or("the model ships no chat template")?;
+        let mut kwargs = kwargs.clone();
+        kwargs.set_default(ChatTemplateKwargs::ENABLE_THINKING, true);
+        self.render_jinja(src, messages, tools, &kwargs)
+    }
+
+    /// Render the upstream Jinja template.
+    fn render_jinja(
+        &self,
+        src: &str,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<String, String> {
+        let split_thinking = self.reads_kwarg("reasoning_content");
 
         // Map pmetal's internal Message into the shape HF Jinja templates
         // expect. We carry tool_calls / tool_call_id through verbatim.
         let jinja_messages: Vec<crate::jinja_chat::JinjaMessage> = messages
             .iter()
-            .map(|m| crate::jinja_chat::JinjaMessage {
-                role: m.role.clone(),
-                content: match &m.parts {
-                    Some(parts) => serde_json::Value::Array(
-                        parts.iter().map(ContentPart::to_template_value).collect(),
-                    ),
-                    None => serde_json::Value::String(m.content.clone()),
-                },
-                tool_calls: m.tool_calls.as_ref().map(|calls| {
-                    calls
-                        .iter()
-                        .map(|c| {
-                            serde_json::json!({
-                                "id": c.id,
-                                "type": "function",
-                                "function": {
-                                    "name": c.function.name,
-                                    "arguments": c.function.arguments,
-                                },
+            .map(|m| {
+                let (reasoning_content, content) = match (&m.reasoning_content, split_thinking) {
+                    (Some(r), _) => (Some(r.clone()), m.content.clone()),
+                    (None, true) if m.role == "assistant" && m.parts.is_none() => {
+                        match split_reasoning_content(&m.content) {
+                            Some((r, c)) => (Some(r), c),
+                            None => (None, m.content.clone()),
+                        }
+                    }
+                    (None, _) => (None, m.content.clone()),
+                };
+                crate::jinja_chat::JinjaMessage {
+                    role: m.role.clone(),
+                    content: match &m.parts {
+                        Some(parts) => serde_json::Value::Array(
+                            parts.iter().map(ContentPart::to_template_value).collect(),
+                        ),
+                        None => serde_json::Value::String(content),
+                    },
+                    reasoning_content,
+                    tool_calls: m.tool_calls.as_ref().map(|calls| {
+                        calls
+                            .iter()
+                            .map(|c| {
+                                serde_json::json!({
+                                    "id": c.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": c.function.name,
+                                        "arguments": tool_call_arguments(&c.function.arguments),
+                                    },
+                                })
                             })
-                        })
-                        .collect()
-                }),
-                tool_call_id: m.tool_call_id.clone(),
+                            .collect()
+                    }),
+                    tool_call_id: m.tool_call_id.clone(),
+                }
             })
             .collect();
 
-        // Serialize tools into the exact shape HF expects: a list of
-        // `{ "type": "function", "function": { ... } }` objects.
+        // Tools go in as the caller wrote them: `{"type": "function",
+        // "function": {"name", "description"?, "parameters"?}}`.
         let tools_json: Option<Vec<serde_json::Value>> = tools.map(|tool_defs| {
             tool_defs
                 .iter()
-                .map(|td| {
-                    serde_json::json!({
-                        "type": td.tool_type,
-                        "function": {
-                            "name": td.function.name,
-                            "description": td.function.description,
-                            "parameters": td.function.parameters,
-                        },
-                    })
-                })
+                .map(|td| serde_json::to_value(td).unwrap_or(serde_json::Value::Null))
                 .collect()
         });
 
         let options = crate::jinja_chat::JinjaRenderOptions {
             add_generation_prompt: true,
-            enable_thinking: Some(!no_thinking),
+            enable_thinking: None,
             tools: tools_json,
             bos_token: self.bos_token.clone(),
             eos_token: Some(self.eos_token.clone()),
+            template_kwargs: kwargs.as_map().clone(),
         };
 
         crate::jinja_chat::render_chat_template(src, &jinja_messages, &options)
