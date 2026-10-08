@@ -32,6 +32,8 @@ pub mod distributed;
 pub mod optimizer;
 pub use optimizer::{AdamW, ParamClass, ParamSet};
 
+pub mod rope;
+
 pub mod mlx_quant;
 pub mod training;
 pub mod turboquant;
