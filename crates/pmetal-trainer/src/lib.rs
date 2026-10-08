@@ -53,8 +53,6 @@
 pub mod orchestrator;
 pub mod preference_data;
 
-#[cfg(feature = "experimental-trainers")]
-pub mod adam8bit;
 pub mod adamw_groups;
 pub mod adaptive_lr;
 pub mod ane_reward;
@@ -80,8 +78,6 @@ mod preference_batch;
 pub mod pretrain;
 pub mod reward_model;
 pub mod rlkd;
-#[cfg(feature = "experimental-trainers")]
-pub mod schedule_free;
 pub mod scheduler;
 pub mod sft;
 #[cfg(feature = "experimental-trainers")]
@@ -104,8 +100,6 @@ pub use pmetal_metal::ane::dynamic_trainer::{
     DynamicAneTrainer, DynamicAneTrainerConfig, IGNORE_TARGET, VocabMap,
 };
 
-#[cfg(feature = "experimental-trainers")]
-pub use adam8bit::*;
 pub use adamw_groups::*;
 pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, LrEvent};
 pub use ane_reward::{AsyncRewardModel, PendingRewards, PipelinedGrpoSession};
@@ -134,10 +128,6 @@ pub use mtp_training::*;
 pub use orpo::*;
 pub use param_groups::*;
 pub use rlkd::{RlkdConfig, RlkdStepStats, RlkdTrainer};
-#[cfg(feature = "experimental-trainers")]
-pub use schedule_free::{
-    ScheduleFreeConfig, ScheduleFreeError, ScheduleFreeOptimizer, ScheduleFreeResult,
-};
 pub use scheduler::*;
 pub use sft::*;
 #[cfg(feature = "experimental-trainers")]

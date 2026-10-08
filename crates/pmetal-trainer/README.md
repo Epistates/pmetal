@@ -98,8 +98,6 @@ fn train_with_checkpoints(
 | Optimizer | Description |
 |-----------|-------------|
 | **AdamW Groups** | AdamW with per-parameter-group learning rates |
-| **Adam 8-bit** | Memory-efficient 8-bit Adam optimizer |
-| **Schedule-Free** | Optimizer without learning rate schedules |
 | **Metal Fused** | GPU-accelerated AdamW parameter updates |
 
 ## Learning Rate Schedulers
@@ -131,8 +129,6 @@ fn train_with_checkpoints(
 | `contrastive_loss` | InfoNCE, Triplet, CoSENT loss functions |
 | `orchestrator` | Unified training pipeline (shared across CLI/GUI/TUI/easy) |
 | `adamw_groups` | AdamW with parameter groups |
-| `adam8bit` | 8-bit Adam optimizer |
-| `schedule_free` | Schedule-free optimizer |
 | `mlx_metal_optimizer` | Metal-accelerated AdamW updates |
 | `adaptive_lr` | EMA-based adaptive learning rate control |
 | `checkpoint` | Checkpoint save/load |

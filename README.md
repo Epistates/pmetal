@@ -531,9 +531,7 @@ Near-optimal KV cache compression for long-context inference:
 - **Callback System**: `TrainingCallback` trait with lifecycle hooks (`on_step_start`, `on_step_end`, `should_stop`) for metrics logging, progress reporting, and clean cancellation
 - **Checkpoint Management**: Save and resume training from checkpoints with best-loss rollback
 - **Tool/Function Calling**: Chat templates with native tool definitions for Qwen, Gemma 4, Llama 3.1+, Mistral v3+, and DeepSeek
-- **Schedule-Free Optimizer**: Memory-efficient optimizer without learning rate schedules
 - **Metal Fused Optimizer**: GPU-accelerated AdamW parameter updates
-- **8-bit Adam**: Memory-efficient optimizer for large models
 - **LoRA+**: Differentiated learning rates for LoRA A and B matrices
 - **NEFTune**: Noise-augmented fine-tuning for improved generation quality
 - **Distributed Training**: mDNS auto-discovery, Ring All-Reduce with gradient compression

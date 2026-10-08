@@ -39,8 +39,6 @@ EMA-based anomaly detection with automatic spike recovery, plateau reduction, an
 |-----------|-------------|
 | AdamW | Standard with configurable weight decay |
 | Metal Fused AdamW | GPU-accelerated parameter updates |
-| Schedule-Free | Memory-efficient, no LR schedule needed |
-| 8-bit Adam | Memory-efficient for large models |
 | LoRA+ | Differentiated LR for A and B matrices |
 
 ### LR Schedules
