@@ -167,7 +167,7 @@ pub fn generate_from_primed_sample(
 /// The timing split: prompt timing includes prefill,
 /// first-token sampling, and priming the next decode step; generation timing
 /// covers only the remaining decode loop.
-pub fn benchmark_mlx_lm_trial(
+pub fn benchmark_trial(
     weights: &NativeWeights,
     prompt_ids: &[u32],
     generation_tokens: usize,
@@ -287,7 +287,7 @@ pub fn generate_canonical(
     }
 }
 
-pub fn benchmark_mlx_lm_trial_canonical(
+pub fn benchmark_trial_canonical(
     weights: &NativeWeights,
     config: &Qwen3Config,
     prompt_ids: &[u32],
@@ -296,7 +296,7 @@ pub fn benchmark_mlx_lm_trial_canonical(
 ) -> crate::decode::BenchmarkTrial {
     match canonical_decode_backend(config, turboquant) {
         QwenDecodeBackend::RustBridge => {
-            benchmark_mlx_lm_trial(weights, prompt_ids, generation_tokens, turboquant)
+            benchmark_trial(weights, prompt_ids, generation_tokens, turboquant)
         }
     }
 }

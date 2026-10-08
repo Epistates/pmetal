@@ -29,7 +29,7 @@ mod moe;
 mod weights;
 
 pub use cache::{KvLayerCache, NativeCache};
-pub use forward::{benchmark_mlx_lm_trial, forward_step, generate, prefill_first_token};
+pub use forward::{benchmark_trial, forward_step, generate, prefill_first_token};
 pub use weights::{NativeWeights, load_model};
 
 // ============================================================================

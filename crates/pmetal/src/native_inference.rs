@@ -452,7 +452,7 @@ pub struct NativeGenerationOutput {
 }
 
 #[derive(Debug, Clone)]
-pub struct MlxLmBenchmarkTrial {
+pub struct BenchmarkTrialMetrics {
     pub prompt_tps: f64,
     pub generation_tps: f64,
     pub peak_memory_gb: f64,
@@ -1146,12 +1146,12 @@ fn run_bridge_inference<Config, Weights, Cache>(
     ))
 }
 
-fn mlx_lm_trial_metrics(
+fn trial_metrics(
     trial: pmetal_bridge::decode::BenchmarkTrial,
     prompt_tokens: usize,
     generation_tokens: usize,
-) -> MlxLmBenchmarkTrial {
-    MlxLmBenchmarkTrial {
+) -> BenchmarkTrialMetrics {
+    BenchmarkTrialMetrics {
         prompt_tps: prompt_tokens as f64 / trial.prompt_secs.max(f64::MIN_POSITIVE),
         generation_tps: generation_tokens as f64 / trial.generation_secs.max(f64::MIN_POSITIVE),
         peak_memory_gb: trial.peak_memory_bytes as f64 / 1e9,
@@ -1163,16 +1163,12 @@ fn run_benchmark_trials(
     generation_tokens: usize,
     num_trials: usize,
     mut run_once: impl FnMut() -> pmetal_bridge::decode::BenchmarkTrial,
-) -> Vec<MlxLmBenchmarkTrial> {
+) -> Vec<BenchmarkTrialMetrics> {
     let _warmup = run_once();
 
     let mut trials = Vec::with_capacity(num_trials);
     for _ in 0..num_trials {
-        trials.push(mlx_lm_trial_metrics(
-            run_once(),
-            prompt_tokens,
-            generation_tokens,
-        ));
+        trials.push(trial_metrics(run_once(), prompt_tokens, generation_tokens));
     }
     trials
 }
@@ -1308,13 +1304,13 @@ fn run_gemma4(
 /// Benchmark full prompt + generation throughput with a fixed workload shape:
 /// fixed prompt token ids, one warmup, EOS disabled, and
 /// repeated generations from a fresh cache.
-pub fn benchmark_native_mlx_lm(
+pub fn benchmark_native(
     model_path: &Path,
     prompt_ids: &[u32],
     generation_tokens: usize,
     turboquant: Option<TurboQuantConfig>,
     num_trials: usize,
-) -> Result<Vec<MlxLmBenchmarkTrial>, String> {
+) -> Result<Vec<BenchmarkTrialMetrics>, String> {
     use pmetal_bridge::qwen3_native;
 
     if prompt_ids.is_empty() {
@@ -1345,7 +1341,7 @@ pub fn benchmark_native_mlx_lm(
                 let config = qwen3_native::load_config(model_path)?;
                 let weights = qwen3_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    qwen3_native::benchmark_mlx_lm_trial_canonical(
+                    qwen3_native::benchmark_trial_canonical(
                         &weights,
                         &config,
                         prompt_ids,
@@ -1359,7 +1355,7 @@ pub fn benchmark_native_mlx_lm(
                 let config = llama4_native::load_config(model_path)?;
                 let weights = llama4_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    llama4_native::benchmark_mlx_lm_trial(&weights, prompt_ids, generation_tokens)
+                    llama4_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
                 })
             }
             NativeArch::DeepSeek => {
@@ -1367,7 +1363,7 @@ pub fn benchmark_native_mlx_lm(
                 let config = deepseek_native::load_config(model_path)?;
                 let weights = deepseek_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    deepseek_native::benchmark_mlx_lm_trial(&weights, prompt_ids, generation_tokens)
+                    deepseek_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
                 })
             }
             NativeArch::GptOss => {
@@ -1375,7 +1371,7 @@ pub fn benchmark_native_mlx_lm(
                 let config = gpt_oss_native::load_config(model_path)?;
                 let weights = gpt_oss_native::load_model(model_path, &config)?;
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
-                    gpt_oss_native::benchmark_mlx_lm_trial(&weights, prompt_ids, generation_tokens)
+                    gpt_oss_native::benchmark_trial(&weights, prompt_ids, generation_tokens)
                 })
             }
             NativeArch::Gemma4 => {

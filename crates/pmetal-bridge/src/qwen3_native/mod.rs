@@ -39,10 +39,10 @@ pub use forward::{
     forward_step_with_capture, rollback_cache,
 };
 pub use generate::{
-    QwenDecodeBackend, benchmark_mlx_lm_trial, benchmark_mlx_lm_trial_canonical,
-    canonical_decode_backend, generate, generate_canonical, generate_from_primed_sample,
-    generate_from_primed_sample_silent, generate_preserve_peak, prefill_first_token,
-    prime_generation_preserve_peak, prime_generation_preserve_peak_silent,
+    QwenDecodeBackend, benchmark_trial, benchmark_trial_canonical, canonical_decode_backend,
+    generate, generate_canonical, generate_from_primed_sample, generate_from_primed_sample_silent,
+    generate_preserve_peak, prefill_first_token, prime_generation_preserve_peak,
+    prime_generation_preserve_peak_silent,
 };
 pub use load::load_model;
 pub use weights::{

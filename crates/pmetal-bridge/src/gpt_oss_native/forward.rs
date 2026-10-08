@@ -136,7 +136,7 @@ fn generate_from_primed_sample_impl(
 }
 
 /// Run one benchmark trial on the canonical GPT-OSS native path.
-pub fn benchmark_mlx_lm_trial(
+pub fn benchmark_trial(
     weights: &NativeWeights,
     prompt_ids: &[u32],
     generation_tokens: usize,

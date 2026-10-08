@@ -715,21 +715,21 @@ impl InferenceRunner {
     /// Benchmark the active model with a fixed workload shape:
     /// fixed random prompt ids, one warmup, EOS disabled,
     /// and repeated full prompt+decode runs.
-    pub fn benchmark_mlx_lm(
+    pub fn benchmark(
         &mut self,
         prompt_tokens: usize,
         generation_tokens: usize,
         num_trials: usize,
         seed: u64,
-    ) -> Result<Vec<crate::native_inference::MlxLmBenchmarkTrial>, Exception> {
+    ) -> Result<Vec<crate::native_inference::BenchmarkTrialMetrics>, Exception> {
         let vocab_size = self.tokenizer.vocab_size();
         if vocab_size == 0 {
             return Err(Exception::custom("tokenizer vocabulary is empty"));
         }
 
-        let prompt_ids = build_mlx_lm_benchmark_prompt(prompt_tokens, vocab_size, seed);
+        let prompt_ids = build_benchmark_prompt(prompt_tokens, vocab_size, seed);
         match &mut self.state.model {
-            LoadedModel::NativeOnly => crate::native_inference::benchmark_native_mlx_lm(
+            LoadedModel::NativeOnly => crate::native_inference::benchmark_native(
                 &self.state.model_path,
                 &prompt_ids,
                 generation_tokens,
@@ -1174,7 +1174,7 @@ pub fn explicit_cache_mode_override(
     Some(sanitize_cache_mode_for_config(base_cache_config, mode))
 }
 
-fn build_mlx_lm_benchmark_prompt(prompt_tokens: usize, vocab_size: usize, seed: u64) -> Vec<u32> {
+fn build_benchmark_prompt(prompt_tokens: usize, vocab_size: usize, seed: u64) -> Vec<u32> {
     let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
     let upper = vocab_size.max(1) as u64;
     let mut out = Vec::with_capacity(prompt_tokens);
@@ -2359,10 +2359,10 @@ mod tests {
     }
 
     #[test]
-    fn mlx_lm_benchmark_prompt_is_deterministic() {
-        let a = build_mlx_lm_benchmark_prompt(8, 1024, 0);
-        let b = build_mlx_lm_benchmark_prompt(8, 1024, 0);
-        let c = build_mlx_lm_benchmark_prompt(8, 1024, 1);
+    fn benchmark_prompt_is_deterministic() {
+        let a = build_benchmark_prompt(8, 1024, 0);
+        let b = build_benchmark_prompt(8, 1024, 0);
+        let c = build_benchmark_prompt(8, 1024, 1);
 
         assert_eq!(a, b);
         assert_ne!(a, c);

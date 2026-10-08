@@ -470,7 +470,7 @@ pub(crate) async fn run_inference(
         println!(
             "Timing with prompt_tokens={prompt_tokens}, generation_tokens={max_tokens}, batch_size=1."
         );
-        let trials = runner.benchmark_mlx_lm(
+        let trials = runner.benchmark(
             prompt_tokens,
             max_tokens,
             benchmark_iters,
@@ -488,7 +488,7 @@ pub(crate) async fn run_inference(
         }
 
         if !trials.is_empty() {
-            let avg = |f: fn(&pmetal::native_inference::MlxLmBenchmarkTrial) -> f64| -> f64 {
+            let avg = |f: fn(&pmetal::native_inference::BenchmarkTrialMetrics) -> f64| -> f64 {
                 trials.iter().map(f).sum::<f64>() / trials.len() as f64
             };
             println!(
