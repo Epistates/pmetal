@@ -166,11 +166,8 @@ impl ServeTab {
             if v.is_empty() { spec.host } else { v }
         };
         spec.port = self.form.value("Port").parse().unwrap_or(spec.port);
-        spec.max_seq_len = self
-            .form
-            .value("Max Seq Len")
-            .parse()
-            .unwrap_or(spec.max_seq_len);
+        // Empty: the model's context window, capped by device memory.
+        spec.max_seq_len = self.form.value("Max Seq Len").parse().ok();
         spec.fp8 = self.form.value("FP8 Weights") == "Enabled";
         spec.kv_quant = self.form.value("KV Cache Bits").parse().ok();
         spec.no_kv_quant = self.form.value("Disable KV Quant") == "Enabled";

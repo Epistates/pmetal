@@ -1897,6 +1897,96 @@ fn estimate_weight_bytes_from_param_count(param_count: usize, fp8: bool) -> u64 
     (param_count as f64 * bpp) as u64
 }
 
+/// The context a server holds per sequence when none is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultContextLength {
+    /// The chosen length.
+    pub tokens: usize,
+    /// The model's context window, when its config names one.
+    pub context_window: Option<usize>,
+    /// What the device's memory holds after the weights, when known.
+    pub memory_cap: Option<usize>,
+}
+
+/// Shortest default context: what every model this server runs takes.
+pub const MIN_DEFAULT_CONTEXT: usize = 4096;
+
+/// Longest default context. 32,768 tokens holds the output budget Qwen's
+/// cards recommend for most queries, or a prompt with a couple of
+/// full-budget images; a model's whole window (262,144 tokens for Qwen3.5)
+/// timed the GPU out on the server's first request, so anything past this
+/// is asked for with `--max-seq-len`.
+pub const MAX_DEFAULT_CONTEXT: usize = 32_768;
+
+/// The default per-sequence context of `pmetal serve`: the model's context
+/// window ([`context_window`](pmetal_data::inference_config::context_window),
+/// YaRN included), capped so the weights plus `sequences` full-length fp16 KV
+/// caches stay within 70% of the device's recommended working set (the line
+/// above which the server already switches the cache to 8 bits) and at
+/// [`MAX_DEFAULT_CONTEXT`], rounded down to a multiple of 1024 and never
+/// under [`MIN_DEFAULT_CONTEXT`].
+///
+/// The KV estimate counts every layer that keeps one (full and sliding
+/// attention alike, so a sliding window is overestimated); recurrent layers
+/// keep none.
+pub fn default_serve_context_len(model_path: &Path, sequences: usize) -> DefaultContextLength {
+    let context_window = pmetal_data::inference_config::context_window(model_path);
+    let working_set = pmetal_metal::context::MetalContext::global()
+        .ok()
+        .map(|ctx| ctx.properties().recommended_working_set_size);
+    let kv_per_token = kv_bytes_per_token(model_path);
+    let weights = sum_model_weight_file_bytes(model_path).unwrap_or(0);
+    let memory_cap = match (working_set, kv_per_token) {
+        (Some(ws), Some(per_token)) if per_token > 0 => {
+            let budget = ((ws as f64) * 0.70) as u64;
+            let free = budget.saturating_sub(weights);
+            Some((free / (per_token * sequences.max(1) as u64)) as usize)
+        }
+        _ => None,
+    };
+    let tokens = match (context_window, memory_cap) {
+        (Some(c), Some(m)) => c.min(m),
+        (Some(c), None) => c,
+        (None, Some(m)) => m,
+        (None, None) => MIN_DEFAULT_CONTEXT,
+    };
+    let tokens = (tokens.min(MAX_DEFAULT_CONTEXT) / 1024 * 1024).max(MIN_DEFAULT_CONTEXT);
+    DefaultContextLength {
+        tokens,
+        context_window,
+        memory_cap,
+    }
+}
+
+/// fp16 KV-cache bytes one token costs, from `config.json` (its
+/// `text_config` for a multimodal wrapper).
+fn kv_bytes_per_token(model_path: &Path) -> Option<u64> {
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(model_path.join("config.json")).ok()?)
+            .ok()?;
+    let text = config
+        .get("text_config")
+        .filter(|t| t.is_object())
+        .unwrap_or(&config);
+    let int = |key: &str| text.get(key).and_then(serde_json::Value::as_u64);
+    let layers = int("num_hidden_layers")?;
+    let heads = int("num_attention_heads")?;
+    let kv_heads = int("num_key_value_heads").unwrap_or(heads);
+    let head_dim = int("head_dim").unwrap_or(int("hidden_size")? / heads.max(1));
+    let kv_layers = match text.get("layer_types").and_then(|t| t.as_array()) {
+        Some(types) => types
+            .iter()
+            .filter_map(|t| t.as_str())
+            .filter(|t| t.contains("attention") && !t.contains("linear"))
+            .count() as u64,
+        None => match int("full_attention_interval") {
+            Some(interval) if interval > 0 => layers / interval,
+            _ => layers,
+        },
+    };
+    Some(kv_layers * kv_heads * head_dim * 2 * 2)
+}
+
 fn estimate_local_model_weight_bytes(
     model_path: &Path,
     fp8: bool,

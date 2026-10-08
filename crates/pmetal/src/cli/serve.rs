@@ -17,9 +17,12 @@ pub struct ServeArgs {
     #[arg(long = "host", default_value = "127.0.0.1")]
     pub host: String,
 
-    /// Maximum sequence length for KV cache
-    #[arg(long = "max-seq-len", default_value = "4096")]
-    pub max_seq_len: usize,
+    /// Context length the server holds per sequence (prompt plus output).
+    /// Default: the model's context window (max_position_embeddings, or the
+    /// YaRN-stretched length), capped by what the device's memory holds for
+    /// the weights plus that much KV cache and at 32768, and never under 4096.
+    #[arg(long = "max-seq-len")]
+    pub max_seq_len: Option<usize>,
 
     /// Path to packed expert weights directory for SSD-offloaded MoE inference.
     #[arg(long = "experts-dir")]

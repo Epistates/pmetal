@@ -4,7 +4,7 @@ pub(crate) async fn run_serve(
     model_id: String,
     port: u16,
     host: String,
-    max_seq_len: usize,
+    max_seq_len: Option<usize>,
     experts_dir: Option<String>,
     fp8: bool,
     kv_quant: Option<u8>,
@@ -33,6 +33,26 @@ pub(crate) async fn run_serve(
     if pmetal_models::decision::is_decision_model(&model_path) {
         return run_decision_serve(model_id, &model_path, port, host).await;
     }
+    let max_seq_len = match max_seq_len {
+        Some(tokens) => tokens,
+        None => {
+            // One full-length cache per continuous-batching slot.
+            let sequences = if continuous_batch {
+                cb_max_slots.max(1)
+            } else {
+                1
+            };
+            let default =
+                pmetal::inference_runner::default_serve_context_len(&model_path, sequences);
+            tracing::info!(
+                tokens = default.tokens,
+                context_window = ?default.context_window,
+                memory_cap = ?default.memory_cap,
+                "Context length (--max-seq-len) from the model"
+            );
+            default.tokens
+        }
+    };
     let draft_path = match draft_model {
         Some(draft) => {
             let path = pmetal_hub::resolve_model_path(&draft, None, None).await?;

@@ -16,7 +16,7 @@
   let selectedModel = $state('');
   let host = $state('0.0.0.0');
   let port = $state(8080);
-  let maxSeqLen = $state(4096);
+  let maxSeqLen = $state<number | null>(null); // null: the model's context window, capped by memory
   let fp8 = $state(false);
   let kvCache = $state('auto');
   let kvGroupSize = $state(64);
@@ -68,7 +68,7 @@
         model: selectedModel,
         host,
         port,
-        max_seq_len: maxSeqLen,
+        max_seq_len: maxSeqLen || undefined,
         fp8,
         kv_quant:
           kvCache === 'q8' ? 8 :
@@ -161,7 +161,7 @@
           <div>
             <div class="text-xs text-surface-500 uppercase tracking-wide">Max Seq Len</div>
             <div class="text-sm font-mono text-surface-900 dark:text-surface-100">
-              {activeInstance.max_seq_len}
+              {activeInstance.max_seq_len || 'model default'}
             </div>
           </div>
         </div>
@@ -266,8 +266,9 @@
                 id="serve-max-seq-len"
                 type="number"
                 min="256"
-                max="131072"
+                max="4194304"
                 step="256"
+                placeholder="Model default"
                 class="input"
                 bind:value={maxSeqLen}
               />

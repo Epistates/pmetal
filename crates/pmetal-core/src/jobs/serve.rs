@@ -43,10 +43,12 @@ pub struct ServeSpec {
         label = "Max Seq Len",
         group = "Inference",
         argv = "--max-seq-len",
-        default_int = 4096
+        min = 256,
+        max = 4_194_304,
+        help = "Default: the model's context window, capped by device memory and at 32768"
     )]
-    #[serde(default = "default_max_seq_len")]
-    pub max_seq_len: usize,
+    #[serde(default)]
+    pub max_seq_len: Option<usize>,
 
     #[job(
         label = "Experts Dir",
@@ -204,7 +206,7 @@ impl Default for ServeSpec {
             model: String::new(),
             host: default_host(),
             port: default_port(),
-            max_seq_len: default_max_seq_len(),
+            max_seq_len: None,
             experts_dir: None,
             fp8: false,
             kv_quant: None,
@@ -243,9 +245,6 @@ fn default_host() -> String {
 }
 fn default_port() -> u16 {
     8080
-}
-fn default_max_seq_len() -> usize {
-    4096
 }
 fn default_kv_group_size() -> usize {
     64

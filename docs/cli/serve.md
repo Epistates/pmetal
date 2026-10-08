@@ -91,8 +91,8 @@ put it among the text, so its placeholder lands exactly where the reference proc
 
 - **Qwen3.5 family:** the checkpoint's processor expands each placeholder to the media's tokens,
   one per 32×32 pixels after resizing. The released budget keeps up to 16.7 megapixels (16,384
-  tokens), so a 640×480 picture is 300 tokens and a 12-megapixel photo about 11,700: raise
-  `--max-seq-len` from its default of 4096 for large photos, or downscale them first. The vision
+  tokens), so a 640×480 picture is 300 tokens and a 12-megapixel photo about 11,700: the default
+  context (see below) holds a couple of those; raise `--max-seq-len` for more. The vision
   tower loads with the first request that carries media and stays loaded.
 - **Llama 3.2 Vision:** each image is one `<|image|>` token; the processor fits it into up to four
   560×560 tiles, and the text model's cross-attention layers read them. Text after an image
@@ -124,6 +124,14 @@ curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
+
+### Context length
+
+Without `--max-seq-len`, each sequence gets the model's context window
+(`max_position_embeddings`, or the YaRN-stretched length), capped so the
+weights plus a full-length fp16 KV cache per sequence (per continuous-batching
+slot) fit in 70% of the device's working set, and at 32,768 tokens; never
+under 4096. Pass `--max-seq-len` for longer contexts.
 
 ### Output length
 

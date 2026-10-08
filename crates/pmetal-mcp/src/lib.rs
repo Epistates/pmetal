@@ -1828,7 +1828,10 @@ impl PmetalMcpServer {
         #[description("Model ID or local path")] model: String,
         #[description("Port to listen on (default: 8080)")] port: Option<u64>,
         #[description("Host to bind to (default: 0.0.0.0)")] host: Option<String>,
-        #[description("Max sequence length for KV cache (default: 4096)")] max_seq_len: Option<u64>,
+        #[description(
+            "Context length per sequence (default: the model's context window, capped by device memory and at 32768)"
+        )]
+        max_seq_len: Option<u64>,
         #[description("Packed expert weights dir for SSD-offloaded MoE")] experts_dir: Option<
             String,
         >,
@@ -1842,7 +1845,7 @@ impl PmetalMcpServer {
             model,
             port: port.unwrap_or(8080) as u16,
             host: host.unwrap_or_else(|| "0.0.0.0".to_string()),
-            max_seq_len: max_seq_len.unwrap_or(4096) as usize,
+            max_seq_len: max_seq_len.map(|m| m as usize),
             experts_dir,
             ane: ane.unwrap_or(false),
             ane_max_seq_len: ane_max_seq_len

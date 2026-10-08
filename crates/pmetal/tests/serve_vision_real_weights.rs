@@ -82,7 +82,7 @@ fn infer(dir: &Path, image: &Path) -> (Vec<u32>, Vec<u32>) {
         chat: true,
         images: vec![image.to_path_buf()],
         temperature: Some(0.0),
-        max_tokens: MAX_TOKENS,
+        max_tokens: Some(MAX_TOKENS),
         ..Default::default()
     })
     .unwrap();
@@ -192,7 +192,7 @@ fn serve_replies_to_an_image_as_infer_does() {
         ]);
         let messages: Vec<pmetal_serve::types::ChatMessage> =
             serde_json::from_value(json!([{"role": "user", "content": content}])).unwrap();
-        let prompt = engine.prepare_chat(&messages, None).await.unwrap();
+        let prompt = engine.prepare_chat(&messages, None, &Default::default()).await.unwrap();
         assert_eq!(prompt.input_ids, infer_prompt, "the server's prompt is infer's");
         let (tokens, ..) = engine
             .generate_prompt(

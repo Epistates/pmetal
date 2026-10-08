@@ -1612,7 +1612,8 @@ pub async fn start_serve(
 
     let host = spec.host.clone();
     let port = spec.port;
-    let max_seq_len = spec.max_seq_len;
+    // 0: the model's own default, which `pmetal serve` picks.
+    let max_seq_len = spec.max_seq_len.unwrap_or(0);
     let fp8 = spec.fp8;
     // Derive a display kv_cache string from spec fields (for ServeInstance display).
     let kv_cache_display = if spec.kv_turboquant {
