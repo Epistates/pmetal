@@ -1,7 +1,8 @@
 //! QLoRA (Quantized LoRA) implementation.
 //!
 //! QLoRA enables memory-efficient fine-tuning by:
-//! - Storing base weights in 4-bit NF4 format (87.5% memory reduction)
+//! - Storing base weights in 4-bit NF4 (the default), 4-bit FP4 (E2M1) or 8-bit int8,
+//!   each with a per-block absmax scale
 //! - Keeping LoRA adapters A and B in full precision (trainable)
 //! - Dequantizing base weights on-the-fly during forward pass
 //! - Optional dequantization caching for frozen weights (avoids redundant computation per forward pass)
@@ -23,7 +24,8 @@ use std::cell::RefCell;
 use pmetal_bridge::compat::{Array, Exception};
 use pmetal_core::LoraConfig;
 use pmetal_mlx::quantization::{
-    NF4Config, NF4Quantizer, QuantScheme, QuantizedTensor, QuantizerOps,
+    FP4Config, FP4Quantizer, Int8Config, Int8Quantizer, NF4Config, NF4Quantizer, QuantScheme,
+    QuantizedTensor, QuantizerOps,
 };
 
 use super::LoraError;
@@ -84,12 +86,52 @@ impl QLoraConfig {
     }
 }
 
+/// The quantizer that stores a QLoRA layer's frozen base weight.
+#[derive(Debug, Clone)]
+enum BaseQuantizer {
+    Nf4(NF4Quantizer),
+    Fp4(FP4Quantizer),
+    Int8(Int8Quantizer),
+}
+
+impl BaseQuantizer {
+    /// The quantizer `config.quant_scheme` names, or an error naming a scheme
+    /// that can't hold a base weight.
+    fn for_config(config: &QLoraConfig) -> Result<Self, LoraError> {
+        let block_size = config.block_size;
+        match config.quant_scheme {
+            QuantScheme::NF4 => Ok(Self::Nf4(NF4Quantizer::with_config(NF4Config {
+                block_size,
+                double_quant: config.double_quant,
+            }))),
+            QuantScheme::FP4 => Ok(Self::Fp4(FP4Quantizer::with_config(FP4Config {
+                block_size,
+            }))),
+            QuantScheme::Int8 => Ok(Self::Int8(Int8Quantizer::with_config(Int8Config {
+                block_size,
+                symmetric: true,
+            }))),
+            other => Err(LoraError::InvalidState(format!(
+                "QLoRA can store base weights as nf4, fp4 or int8, not {other:?}"
+            ))),
+        }
+    }
+
+    fn ops(&self) -> &dyn QuantizerOps {
+        match self {
+            Self::Nf4(q) => q,
+            Self::Fp4(q) => q,
+            Self::Int8(q) => q,
+        }
+    }
+}
+
 /// QLoRA Linear layer with quantized base weights and full-precision LoRA adapters.
 ///
 /// Implements: `y = x @ dequant(W_q).T + scale * (x @ A.T) @ B.T`
 ///
 /// Where:
-/// - `W_q` is the quantized base weight (4-bit NF4)
+/// - `W_q` is the quantized base weight (NF4, FP4 or int8, per `QLoraConfig::quant_scheme`)
 /// - `dequant(W_q)` dequantizes to full precision on-the-fly (or cached)
 /// - `A` is the LoRA down-projection (trainable, full precision)
 /// - `B` is the LoRA up-projection (trainable, full precision)
@@ -112,8 +154,8 @@ pub struct QLoraLinear {
 
     /// Quantized base weight.
     pub quantized_weight: QuantizedTensor,
-    /// Quantizer for dequantization.
-    quantizer: NF4Quantizer,
+    /// Quantizer for dequantization, the one `QLoraConfig::quant_scheme` names.
+    quantizer: BaseQuantizer,
     /// Optional bias [out_features] - kept in full precision.
     pub bias: Option<Array>,
     /// LoRA A matrix [rank, in_features] - trainable, full precision.
@@ -167,12 +209,7 @@ impl QLoraLinear {
         let out_features = weight.dim(-2);
         let in_features = weight.dim(-1);
 
-        // Create quantizer
-        let nf4_config = NF4Config {
-            block_size: config.block_size,
-            double_quant: config.double_quant,
-        };
-        let quantizer = NF4Quantizer::with_config(nf4_config);
+        let quantizer = BaseQuantizer::for_config(config)?;
 
         // Cast weight to Float32 if needed (handles BFloat16, Float16, etc.)
         // This is necessary because models like Qwen3 use BFloat16 weights
@@ -187,6 +224,7 @@ impl QLoraLinear {
         let weight_data: Vec<f32> = weight_f32.as_slice().to_vec();
         let shape = vec![out_features as usize, in_features as usize];
         let quantized_weight = quantizer
+            .ops()
             .quantize(&weight_data, &shape)
             .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?;
 
@@ -296,6 +334,7 @@ impl QLoraLinear {
         // Dequantize
         let weight_data = self
             .quantizer
+            .ops()
             .dequantize(&self.quantized_weight)
             .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?;
 
@@ -459,7 +498,7 @@ impl QLoraLinear {
     ///
     /// Returns (quantized_bytes, lora_bytes, total_bytes)
     pub fn memory_usage(&self) -> (usize, usize, usize) {
-        // Quantized weight: packed 4-bit data
+        // Quantized weight: one byte per int8 value, two per byte for the 4-bit schemes
         let absmax_bytes = if self.quantized_weight.absmax_quant.is_some() {
             // Double quantization: 1 byte per absmax + 8 bytes overhead (offset + scale)
             self.quantized_weight.absmax.len() + 8
@@ -713,5 +752,66 @@ mod tests {
         // Warm the cache
         qlora.warm_cache().unwrap();
         assert!(qlora.is_weight_cached());
+    }
+
+    /// Largest |dequant(W_q) − W| over a fixed weight stored with `scheme`.
+    fn base_weight_error(scheme: QuantScheme) -> (QuantScheme, usize, f32) {
+        let (out_f, in_f) = (32, 64);
+        let values: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i as f32) * 0.618).sin() * 0.05)
+            .collect();
+        let weight = Array::from_slice(&values, &[out_f as i32, in_f as i32]);
+        let config = QLoraConfig {
+            quant_scheme: scheme,
+            double_quant: false,
+            ..default_config()
+        };
+        let qlora = QLoraLinear::from_weight(&weight, None, &config).unwrap();
+        let back = qlora.dequantize_weight().unwrap();
+        back.eval();
+        pmetal_bridge::check_last_error().unwrap();
+        let max_err = back
+            .as_slice::<f32>()
+            .iter()
+            .zip(values.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        (
+            qlora.quant_scheme(),
+            qlora.quantized_weight.data.len(),
+            max_err,
+        )
+    }
+
+    /// `--quantization fp4` and `int8` reach `QLoraConfig::quant_scheme`; the
+    /// layer used to quantize with NF4 whatever it said.
+    #[test]
+    fn base_weight_is_stored_in_the_configured_scheme() {
+        let n = 32 * 64;
+
+        let (scheme, bytes, err) = base_weight_error(QuantScheme::NF4);
+        assert_eq!((scheme, bytes), (QuantScheme::NF4, n / 2));
+        let nf4_err = err;
+
+        let (scheme, bytes, err) = base_weight_error(QuantScheme::FP4);
+        assert_eq!((scheme, bytes), (QuantScheme::FP4, n / 2));
+        // E2M1's widest gap is between 4 and 6 of the block's 6: a third of absmax.
+        assert!(err <= 0.05 / 6.0 + 1e-6, "fp4 error {err}");
+
+        let (scheme, bytes, err) = base_weight_error(QuantScheme::Int8);
+        assert_eq!((scheme, bytes), (QuantScheme::Int8, n));
+        // Half of an int8 step at absmax 0.05.
+        assert!(err <= 0.05 / 254.0 + 1e-6, "int8 error {err}");
+        assert!(err < nf4_err, "int8 ({err}) should beat nf4 ({nf4_err})");
+    }
+
+    #[test]
+    fn schemes_that_cannot_hold_a_base_weight_are_refused_by_name() {
+        let config = QLoraConfig {
+            quant_scheme: QuantScheme::FP8,
+            ..default_config()
+        };
+        let err = QLoraLinear::new(16, 16, &config, false).unwrap_err();
+        assert!(err.to_string().contains("FP8"), "{err}");
     }
 }

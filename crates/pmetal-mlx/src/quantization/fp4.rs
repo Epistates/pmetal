@@ -1,19 +1,23 @@
 //! FP4 (Floating Point 4-bit) quantization.
 //!
-//! FP4 uses a simpler quantization scheme with 8 magnitude levels + sign bit.
+//! Each value is a sign bit and one of the eight E2M1 magnitudes
+//! (0, 0.5, 1, 1.5, 2, 3, 4, 6), scaled per block so that the block's
+//! largest magnitude lands on 6, as the MX and NVFP4 formats scale it.
 
 use super::{QuantScheme, QuantizedTensor, QuantizerOps};
 use pmetal_core::Result;
 
-/// FP4 quantization bins (positive values only, sign is separate).
+/// FP4 (E2M1) magnitudes divided by the largest, 6, so a block's absmax maps
+/// to the last bin. The sign is stored separately in the code's high bit.
 pub const FP4_BINS: [f32; 8] = [
-    0.0, 0.0625, // 2^-4
-    0.125,  // 2^-3
-    0.25,   // 2^-2
-    0.5,    // 2^-1
-    1.0,    // 2^0
-    2.0,    // 2^1
-    4.0,    // 2^2 (scaled)
+    0.0,
+    0.5 / 6.0,
+    1.0 / 6.0,
+    1.5 / 6.0,
+    2.0 / 6.0,
+    3.0 / 6.0,
+    4.0 / 6.0,
+    1.0,
 ];
 
 /// FP4 quantizer configuration.
@@ -147,5 +151,42 @@ impl QuantizerOps for FP4Quantizer {
 
     fn scheme(&self) -> QuantScheme {
         QuantScheme::FP4
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn e2m1_grid_values_round_trip_exactly() {
+        // One block holding every E2M1 magnitude with both signs: absmax is 6,
+        // so each value sits exactly on a bin and must come back unchanged.
+        let grid = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        let data: Vec<f32> = grid
+            .iter()
+            .copied()
+            .chain(grid.iter().map(|v| -v))
+            .collect();
+        let q = FP4Quantizer::with_config(FP4Config { block_size: 16 });
+        let packed = q.quantize(&data, &[16]).unwrap();
+        assert_eq!(packed.data.len(), 8, "two codes per byte");
+        assert_eq!(packed.scheme, QuantScheme::FP4);
+        let back = q.dequantize(&packed).unwrap();
+        for (a, b) in data.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 1e-6, "{a} came back as {b}");
+        }
+    }
+
+    #[test]
+    fn rounds_to_the_nearest_magnitude() {
+        // absmax 6: 2.4 is nearer 2 than 3, 3.6 nearer 4 than 3, -5.2 nearer -6.
+        let q = FP4Quantizer::with_config(FP4Config { block_size: 4 });
+        let packed = q.quantize(&[2.4, 3.6, -5.2, 6.0], &[4]).unwrap();
+        let back = q.dequantize(&packed).unwrap();
+        let expected = [2.0f32, 4.0, -6.0, 6.0];
+        for (a, b) in back.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
     }
 }

@@ -112,3 +112,32 @@ impl QuantizerOps for Int8Quantizer {
         QuantScheme::Int8
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_error_is_within_half_a_step() {
+        let data: Vec<f32> = (0..130).map(|i| ((i as f32) * 0.37).sin() * 3.0).collect();
+        let q = Int8Quantizer::with_config(Int8Config {
+            block_size: 64,
+            symmetric: true,
+        });
+        let packed = q.quantize(&data, &[130]).unwrap();
+        assert_eq!(packed.data.len(), 130, "one byte per value");
+        assert_eq!(packed.absmax.len(), 3);
+        assert_eq!(packed.scheme, QuantScheme::Int8);
+        let back = q.dequantize(&packed).unwrap();
+        for (block, chunk) in data.chunks(64).enumerate() {
+            let step = packed.absmax[block] / 127.0;
+            for (i, &v) in chunk.iter().enumerate() {
+                let err = (v - back[block * 64 + i]).abs();
+                assert!(
+                    err <= step / 2.0 + 1e-6,
+                    "error {err} above half a step {step}"
+                );
+            }
+        }
+    }
+}
