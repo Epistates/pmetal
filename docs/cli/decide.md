@@ -78,12 +78,13 @@ curl http://localhost:8080/v1/systemone \
 ```
 
 :::note
-Text only for now. A request with `images` or `videos` is refused, since the Qwen3.5 vision
-encoder is not ported yet. The backbone must be unquantized: the head reads option vectors from
-its LM head.
+A record's `images` are base64 strings, data URIs or, in `pmetal decide` only, file paths; its
+`videos` are lists of frames, or `{"frames": [...], "fps": N}`. Video files are not decoded. The
+backbone must be unquantized: the head reads option vectors from its LM head.
 :::
 
 ## See Also
 
 - [pmetal serve](/cli/serve/) — Serve a decision model on `/v1/systemone`
-- [pmetal mcp](/cli/mcp/) — The `decide` MCP tool
+- [pmetal mcp](/cli/mcp/) — The `decide` MCP tool, which loads the model for one call, or with
+  `port` asks a decision model `start_serve` is already serving

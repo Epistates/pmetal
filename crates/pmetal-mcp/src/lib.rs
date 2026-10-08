@@ -493,21 +493,60 @@ impl PmetalMcpServer {
     /// Answer typed questions about a state with a decision model (Clef,
     /// Clef-flash). Takes a `/v1/systemone` request body and returns the
     /// response body: one probability per allowed option of every question.
-    /// Blocks until answered; loads the model per call, so use start_serve for
-    /// many requests.
+    /// Blocks until answered. With `model`, loads the model for this one call;
+    /// with `port`, asks a decision-model server already running there
+    /// (start_serve on the model), which answers many requests without
+    /// loading it again.
     #[tool]
     async fn decide(
         &self,
-        #[description("Decision model ID or path, e.g. Cloudflare/clef-flash")] model: String,
+        #[description(
+            "Decision model ID or path, e.g. Cloudflare/clef-flash, loaded for this call. \
+             Leave out when port is given"
+        )]
+        model: Option<String>,
         #[description(
             "Request body as JSON: {\"model\", \"state\", \"questions\": {id: {\"type\": \
              \"noul\"|\"choice\"|\"score\", \"instructions\", \"criteria\"}}}"
         )]
         request: String,
-        #[description("Longest prompt in tokens (default: 16384)")] max_length: Option<u64>,
+        #[description(
+            "Longest prompt in tokens (default: 16384). For a server, set it when starting it"
+        )]
+        max_length: Option<u64>,
+        #[description(
+            "Port of a running decision-model server (start_serve) to send the request to, \
+             instead of loading the model. Its images must be base64, not file paths"
+        )]
+        port: Option<u64>,
     ) -> McpResult<String> {
-        serde_json::from_str::<serde_json::Value>(&request)
+        let body = serde_json::from_str::<serde_json::Value>(&request)
             .map_err(|e| McpError::invalid_params(format!("request is not JSON: {e}")))?;
+        let model = match (model, port) {
+            (Some(_), Some(_)) => {
+                return Err(McpError::invalid_params(
+                    "give model or port, not both: a server answers with the model it serves",
+                ));
+            }
+            (None, Some(port)) => {
+                if max_length.is_some() {
+                    return Err(McpError::invalid_params(
+                        "max_length is the server's: set it when starting the server",
+                    ));
+                }
+                return post_to_serve(port, "/v1/systemone", &body)
+                    .await?
+                    .text()
+                    .await
+                    .map_err(|e| McpError::internal(format!("invalid response from serve: {e}")));
+            }
+            (Some(model), None) => model,
+            (None, None) => {
+                return Err(McpError::invalid_params(
+                    "give model to load it for this call, or port to ask a running server",
+                ));
+            }
+        };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -2084,9 +2123,6 @@ impl PmetalMcpServer {
         #[description("Sampling temperature")] temperature: Option<f64>,
         #[description("Maximum tokens to generate")] max_tokens: Option<u64>,
     ) -> McpResult<String> {
-        let port = port.unwrap_or(8080);
-        let url = format!("http://localhost:{port}/v1/chat/completions");
-
         let mut messages = Vec::new();
         if let Some(sys) = &system {
             messages.push(serde_json::json!({"role": "system", "content": sys}));
@@ -2103,29 +2139,12 @@ impl PmetalMcpServer {
             body["max_tokens"] = serde_json::json!(m);
         }
 
-        let client = reqwest::Client::new();
-        let response = client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| McpError::internal(format!("failed to reach serve at {url}: {e}")))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.map_err(|e| {
-                tracing::warn!("serve returned {status}: could not read response body: {e}");
-                McpError::internal(format!("serve returned {status}: <body unreadable: {e}>"))
-            })?;
-            return Err(McpError::internal(format!(
-                "serve returned {status}: {text}"
-            )));
-        }
-
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| McpError::internal(format!("invalid response from serve: {e}")))?;
+        let result: serde_json::Value =
+            post_to_serve(port.unwrap_or(8080), "/v1/chat/completions", &body)
+                .await?
+                .json()
+                .await
+                .map_err(|e| McpError::internal(format!("invalid response from serve: {e}")))?;
 
         // Extract the assistant's message content
         if let Some(content) = result
@@ -2146,6 +2165,42 @@ impl PmetalMcpServer {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// POST `body` to `path` on the serve instance listening on `port`. A status
+/// other than success is an error carrying the server's message: the
+/// caller's (invalid params) for a 4xx, the server's for anything else.
+async fn post_to_serve(
+    port: u64,
+    path: &str,
+    body: &serde_json::Value,
+) -> McpResult<reqwest::Response> {
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|&p| p != 0)
+        .ok_or_else(|| McpError::invalid_params(format!("{port} is not a port")))?;
+    let url = format!("http://localhost:{port}{path}");
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| McpError::internal(format!("failed to reach serve at {url}: {e}")))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.map_err(|e| {
+            tracing::warn!("serve returned {status}: could not read response body: {e}");
+            McpError::internal(format!("serve returned {status}: <body unreadable: {e}>"))
+        })?;
+        let message = format!("serve returned {status}: {text}");
+        return Err(if status.is_client_error() {
+            McpError::invalid_params(message)
+        } else {
+            McpError::internal(message)
+        });
+    }
+    Ok(response)
+}
 
 fn job_started_response(id: &str, command: &str) -> McpResult<String> {
     serde_json::to_string_pretty(&serde_json::json!({
@@ -2173,4 +2228,129 @@ fn dir_size(path: &std::path::Path) -> u64 {
         }
     }
     size
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// What a one-request HTTP server received: the request line and body.
+    struct Received {
+        request_line: String,
+        body: String,
+    }
+
+    /// Serve one request on a free local port with `status` and `body`, and
+    /// hand back what the request was.
+    async fn serve_once(
+        status: &'static str,
+        body: &'static str,
+    ) -> (u16, tokio::task::JoinHandle<Received>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let (head_len, content_length) = loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while raw.len() < head_len + content_length {
+                let n = stream.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+            }
+            let text = String::from_utf8(raw).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            Received {
+                request_line: text.lines().next().unwrap().to_string(),
+                body: text[head_len..].to_string(),
+            }
+        });
+        (port, handle)
+    }
+
+    const REQUEST: &str =
+        r#"{"model":"clef-flash","state":"door open","questions":{"q":{"type":"noul"}}}"#;
+
+    #[tokio::test]
+    async fn decide_asks_a_running_server() {
+        let answer = r#"{"model":"clef-flash","answers":{"q":{"yes":0.9,"no":0.1}}}"#;
+        let (port, server) = serve_once("200 OK", answer).await;
+        let reply = PmetalMcpServer::new()
+            .decide(None, REQUEST.into(), None, Some(port.into()))
+            .await
+            .unwrap();
+        assert_eq!(reply, answer);
+        let received = server.await.unwrap();
+        assert_eq!(received.request_line, "POST /v1/systemone HTTP/1.1");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&received.body).unwrap(),
+            serde_json::from_str::<serde_json::Value>(REQUEST).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn decide_reports_the_server_refusal() {
+        let (port, server) = serve_once(
+            "400 Bad Request",
+            r#"{"error":{"message":"q: criteria must not be empty"}}"#,
+        )
+        .await;
+        let error = PmetalMcpServer::new()
+            .decide(None, REQUEST.into(), None, Some(port.into()))
+            .await
+            .unwrap_err();
+        // A request the server refuses is the caller's to fix.
+        assert_eq!(format!("{:?}", error.kind), "InvalidParams");
+        let message = error.to_string();
+        assert!(message.contains("criteria must not be empty"), "{message}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn decide_needs_exactly_one_of_model_and_port() {
+        let server = PmetalMcpServer::new();
+        for (model, max_length, port) in [
+            (None, None, None),
+            (Some("m".to_string()), None, Some(18_999)),
+            (None, Some(512), Some(18_999)),
+            (None, None, Some(70_000)),
+            (None, None, Some(0)),
+        ] {
+            assert!(
+                server
+                    .decide(model.clone(), REQUEST.into(), max_length, port)
+                    .await
+                    .is_err(),
+                "{model:?} {max_length:?} {port:?}"
+            );
+        }
+        assert!(
+            server
+                .decide(None, "not json".into(), None, Some(18_999))
+                .await
+                .is_err()
+        );
+    }
 }
