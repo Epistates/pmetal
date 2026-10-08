@@ -1867,14 +1867,10 @@ fn load_qwen3_next_config_for_mtp(model_path: &Path) -> Result<Qwen3NextConfig, 
             config_path.display()
         ))
     })?;
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        Exception::custom(format!(
-            "parse Qwen target config for native MTP {}: {e}",
-            config_path.display()
-        ))
-    })?;
-    let config_value = value.get("text_config").cloned().unwrap_or(value);
-    serde_json::from_value(config_value).map_err(|e| {
+    // The same reading the target gets: a raw `text_config` deserialize
+    // missed `rope_parameters`, so the predictor rotated with the default
+    // RoPE base instead of the checkpoint's.
+    Qwen3NextConfig::from_config_json(&text).map_err(|e| {
         Exception::custom(format!(
             "decode Qwen3Next config for native MTP {}: {e}",
             config_path.display()

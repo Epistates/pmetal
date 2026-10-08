@@ -458,7 +458,12 @@ pub fn save_qwen3_next_mtp_checkpoint(
 ) -> Result<(), Exception> {
     std::fs::create_dir_all(dir)
         .map_err(|e| Exception::custom(format!("create qwen MTP checkpoint dir: {e}")))?;
-    write_json(dir.join("config.json"), config)?;
+    // The export carries the predictor's embedding table as
+    // `mtp.embed_tokens.weight`, so its config says so; the loader refuses a
+    // checkpoint whose table and flag disagree.
+    let mut config = config.clone();
+    config.mtp_use_dedicated_embeddings = Some(true);
+    write_json(dir.join("config.json"), &config)?;
     write_json(
         dir.join("generation_config.json"),
         &serde_json::json!({ "mtp_draft_tokens": 3 }),

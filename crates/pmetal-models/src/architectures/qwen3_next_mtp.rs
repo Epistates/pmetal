@@ -15,6 +15,7 @@ use pmetal_bridge::compat::{
     Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, transforms,
 };
 use pmetal_bridge::impl_module_params;
+use pmetal_bridge::qwen3_native::family::canonical_checkpoint_key;
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 
 use super::qwen3_next::{Qwen3NextConfig, Qwen3NextDecoderLayer, Qwen3NextRoutedExpertMode};
@@ -174,6 +175,18 @@ pub fn load_qwen3_next_mtp_from_dir(
     if config.mtp_num_hidden_layers() == 0 {
         config.mtp_num_hidden_layers = Some(1);
     }
+    // A predictor exported on its own (`--mtp-model`) says in its own
+    // config whether it carries its own embedding table.
+    if let Ok(text) = std::fs::read_to_string(model_dir.join("config.json"))
+        && let Ok(own) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(dedicated) = own
+            .get("text_config")
+            .unwrap_or(&own)
+            .get("mtp_use_dedicated_embeddings")
+            .and_then(serde_json::Value::as_bool)
+    {
+        config.mtp_use_dedicated_embeddings = Some(dedicated);
+    }
 
     let mut model = Qwen3NextMtpForCausalLM::new(config.clone())?;
     let mut weights = crate::loader::load_weights_filtered(model_dir, keep_qwen3_next_mtp_weight)
@@ -184,12 +197,16 @@ pub fn load_qwen3_next_mtp_from_dir(
     Ok(model)
 }
 
+/// The predictor's own tensors plus the two it shares with the target: the
+/// embedding table and the head. Keys are matched in canonical form, so the
+/// released `model.language_model.embed_tokens.weight` is kept like an
+/// MLX-style `model.embed_tokens.weight`.
 fn keep_qwen3_next_mtp_weight(key: &str) -> bool {
-    let stripped = key.strip_prefix("model.language_model.").unwrap_or(key);
-    stripped.starts_with("mtp.")
-        || stripped.starts_with("model.mtp.")
-        || stripped == "model.embed_tokens.weight"
-        || stripped == "lm_head.weight"
+    let key = canonical_checkpoint_key(key);
+    key.starts_with("mtp.")
+        || key.starts_with("model.mtp.")
+        || key == "model.embed_tokens.weight"
+        || key == "lm_head.weight"
 }
 
 fn sanitize_qwen3_next_mtp_weights(
@@ -200,25 +217,43 @@ fn sanitize_qwen3_next_mtp_weights(
         key.contains("mtp.") || key.contains("conv1d.weight") && weights[key].ndim() == 3
     });
 
-    let original_keys: Vec<String> = weights.keys().cloned().collect();
-    for old_key in original_keys {
-        let mut new_key = old_key.clone();
-        if new_key.starts_with("model.language_model.") {
-            new_key = new_key.replacen("model.language_model.", "", 1);
+    // Canonicalize, then decide which embedding table the predictor reads.
+    let mut canonical: HashMap<String, Array> = weights
+        .drain()
+        .map(|(key, value)| (canonical_checkpoint_key(&key), value))
+        .collect();
+    let dedicated = config.mtp_use_dedicated_embeddings.unwrap_or(false);
+    let own_embed = ["mtp.embed_tokens.weight", "model.mtp.embed_tokens.weight"]
+        .into_iter()
+        .find_map(|key| canonical.remove(key));
+    match (dedicated, own_embed) {
+        (true, Some(embed)) => {
+            canonical.insert("model.embed_tokens.weight".into(), embed);
         }
-        if let Some(rest) = new_key.strip_prefix("model.mtp.") {
-            new_key = format!("model.{rest}");
-        } else if let Some(rest) = new_key.strip_prefix("mtp.") {
-            new_key = format!("model.{rest}");
+        (true, None) => {
+            return Err(Exception::custom(
+                "mtp_use_dedicated_embeddings is set but the checkpoint has no \
+                 mtp.embed_tokens.weight",
+            ));
         }
-        if new_key.contains(".A_log") {
-            new_key = new_key.replace(".A_log", ".a_log");
+        (false, Some(_)) => {
+            return Err(Exception::custom(
+                "the checkpoint ships mtp.embed_tokens.weight but mtp_use_dedicated_embeddings \
+                 is not set; refusing to guess which table the predictor reads",
+            ));
         }
-        if new_key != old_key
-            && let Some(value) = weights.remove(&old_key)
-        {
-            weights.insert(new_key, value);
-        }
+        (false, None) => {}
+    }
+
+    for (key, value) in canonical {
+        let key = if let Some(rest) = key.strip_prefix("model.mtp.") {
+            format!("model.{rest}")
+        } else if let Some(rest) = key.strip_prefix("mtp.") {
+            format!("model.{rest}")
+        } else {
+            key
+        };
+        weights.insert(key, value);
     }
 
     stack_mtp_expert_weights(weights, config)?;
