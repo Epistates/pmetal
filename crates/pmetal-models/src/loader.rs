@@ -423,7 +423,9 @@ fn dequantize_mlx_quantized_weights(
 /// warning, and the packed bytes were assigned to dense `Linear` weights. The
 /// load reported every weight matched, and anything trained on it trained on
 /// noise.
-fn dequantize_sidecar_weights(weights: &mut HashMap<String, Array>) -> Result<(), LoadError> {
+pub(crate) fn dequantize_sidecar_weights(
+    weights: &mut HashMap<String, Array>,
+) -> Result<(), LoadError> {
     use pmetal_bridge::native_loader as nl;
 
     if !weights

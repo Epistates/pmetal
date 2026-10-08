@@ -2045,6 +2045,35 @@ fn read_header(path: &Path) -> Result<(u64, HashMap<String, TensorHeader>), Load
     Ok((8 + len, tensors))
 }
 
+/// How an n-gram table shard of `dtype` and `shape` encodes its rows, given the
+/// table's per-tensor `scale` (FP8 checkpoints carry one). Refuses a shard whose
+/// row width is not `ple_embed_dim / ngram_heads` or whose encoding is unknown.
+pub fn ngram_shard_encoding(
+    config: &Qwen4ExpConfig,
+    key: &str,
+    dtype: &str,
+    shape: &[u64],
+    scale: Option<f32>,
+) -> Result<NgramRowEncoding, LoadError> {
+    let dim = (config.ple_embed_dim() / config.ngram_heads()) as u64;
+    if shape.len() != 2 || shape[1] != dim {
+        return Err(LoadError::ShapeMismatch {
+            key: key.to_string(),
+            expected: vec![-1, dim as i32],
+            actual: shape.iter().map(|&d| d as i32).collect(),
+        });
+    }
+    match (dtype, scale) {
+        ("BF16", None) => Ok(NgramRowEncoding::Bf16),
+        ("F16", None) => Ok(NgramRowEncoding::F16),
+        ("F32", None) => Ok(NgramRowEncoding::F32),
+        ("F8_E4M3", Some(scale)) => Ok(NgramRowEncoding::Fp8E4m3 { scale }),
+        (dtype, scale) => Err(LoadError::SafeTensors(format!(
+            "{key}: n-gram rows of dtype {dtype} with scale {scale:?} are not supported"
+        ))),
+    }
+}
+
 /// The n-gram table rows for PLE layer `layer`, as file ranges in table order.
 fn ngram_row_source(
     files: &mut CheckpointFiles,
@@ -2091,24 +2120,7 @@ fn ngram_row_source(
     let mut opened: HashMap<PathBuf, Arc<std::fs::File>> = HashMap::new();
     for key in keys.drain(..) {
         let (path, start, header) = files.locate(&key)?;
-        if header.shape.len() != 2 || header.shape[1] != dim {
-            return Err(LoadError::ShapeMismatch {
-                key,
-                expected: vec![-1, dim as i32],
-                actual: header.shape.iter().map(|&d| d as i32).collect(),
-            });
-        }
-        let this = match (header.dtype.as_str(), scale) {
-            ("BF16", None) => NgramRowEncoding::Bf16,
-            ("F16", None) => NgramRowEncoding::F16,
-            ("F32", None) => NgramRowEncoding::F32,
-            ("F8_E4M3", Some(scale)) => NgramRowEncoding::Fp8E4m3 { scale },
-            (dtype, scale) => {
-                return Err(LoadError::SafeTensors(format!(
-                    "{key}: n-gram rows of dtype {dtype} with scale {scale:?} are not supported"
-                )));
-            }
-        };
+        let this = ngram_shard_encoding(config, &key, &header.dtype, &header.shape, scale)?;
         if encoding.is_some_and(|e| e != this) {
             return Err(LoadError::SafeTensors(format!(
                 "{base}: shards disagree on their encoding"
@@ -2138,6 +2150,92 @@ fn ngram_row_source(
     ))
 }
 
+/// The tensor half of [`load_qwen4_exp_weights`]: unpack quantization sidecars
+/// (block FP8, ModelOpt NVFP4 / FP8), apply `qwen3_next`'s sanitization, and
+/// assign every tensor in `weights` (checkpoint-named, [`CheckpointKeyRole::Weight`]
+/// only) to its parameter. Returns how many were assigned.
+///
+/// Strict both ways: a tensor that matches no parameter, a shape that differs,
+/// or a parameter left unfilled is an error. The n-gram tables are the one
+/// parameter it does not fill (the caller does), and routed experts are
+/// allowed to stay empty when `skip_routed_experts` (they will be offloaded).
+///
+/// Public so a checkpoint's layout can be checked against the model from its
+/// safetensors headers alone, with lazy placeholders standing in for the data.
+pub fn assign_qwen4_exp_tensors(
+    model: &mut Qwen4ExpForCausalLM,
+    mut weights: HashMap<String, Array>,
+    skip_routed_experts: bool,
+) -> Result<usize, LoadError> {
+    crate::loader::dequantize_sidecar_weights(&mut weights)?;
+    let dtypes: HashMap<String, i32> = weights
+        .iter()
+        .filter(|(k, _)| k.ends_with(".q_norm.weight") || k.ends_with(".k_norm.weight"))
+        .map(|(k, v)| (k.clone(), v.dtype_raw()))
+        .collect();
+    sanitize_weights(
+        &mut weights,
+        &model.config.qwen3_next_view(),
+        Qwen3NextSanitizeOptions {
+            skip_routed_experts,
+        },
+    )
+    .map_err(LoadError::from)?;
+    // `sanitize_weights` shifts the attention q/k norms to `1 + w` (they run as
+    // plain RMSNorms) and promotes them to f32 doing it; keep the checkpoint's
+    // dtype so a bf16 model's attention stays bf16.
+    for (key, dtype) in dtypes {
+        let renamed = key.replacen("model.language_model.", "model.", 1);
+        if let Some(w) = weights.get_mut(&renamed) {
+            *w = w.as_dtype(dtype);
+        }
+    }
+
+    let mut params = model.flatten_params_mut();
+    let expected: HashSet<String> = params.keys().map(|k| k.to_string()).collect();
+    let mut unmatched = Vec::new();
+    let mut loaded: HashSet<String> = HashSet::new();
+    for (key, value) in weights {
+        match params.get_mut(key.as_str()) {
+            Some(param) => {
+                if param.shape() != value.shape() {
+                    return Err(LoadError::ShapeMismatch {
+                        key,
+                        expected: param.shape().to_vec(),
+                        actual: value.shape().to_vec(),
+                    });
+                }
+                **param = value;
+                loaded.insert(key);
+            }
+            None => unmatched.push(key),
+        }
+    }
+    if !unmatched.is_empty() {
+        unmatched.sort();
+        return Err(LoadError::SafeTensors(format!(
+            "qwen4_exp: {} checkpoint tensors match no parameter (first: {:?})",
+            unmatched.len(),
+            &unmatched[..unmatched.len().min(10)]
+        )));
+    }
+    let mut missing: Vec<&String> = expected
+        .iter()
+        .filter(|k| !loaded.contains(*k))
+        .filter(|k| !k.contains(".ngram_embedding."))
+        .filter(|k| !(skip_routed_experts && k.contains(".mlp.switch_mlp_")))
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(LoadError::SafeTensors(format!(
+            "qwen4_exp: {} parameters missing from the checkpoint (first: {:?})",
+            missing.len(),
+            &missing[..missing.len().min(10)]
+        )));
+    }
+    Ok(loaded.len())
+}
+
 /// Load a Qwen4-Exp checkpoint (the released `Qwen4ExpForConditionalGeneration`
 /// layout, bf16, block-FP8 or ModelOpt NVFP4) into `model`.
 ///
@@ -2152,7 +2250,6 @@ pub fn load_qwen4_exp_weights(
     options: Qwen4ExpLoadOptions,
 ) -> Result<LoadReport, LoadError> {
     let config = model.config.clone();
-    let view = config.qwen3_next_view();
     let mut files = CheckpointFiles::open(model_dir)?;
 
     let mut report = LoadReport::default();
@@ -2172,78 +2269,11 @@ pub fn load_qwen4_exp_weights(
     }
 
     let skip_routed = options.skip_routed_experts;
-    let mut weights = crate::loader::load_weights_filtered(model_dir, |key| {
+    let weights = crate::loader::load_weights_filtered(model_dir, |key| {
         checkpoint_key_role(key) == CheckpointKeyRole::Weight
             && !(skip_routed && key.contains(".mlp.experts."))
     })?;
-    let dtypes: HashMap<String, i32> = weights
-        .iter()
-        .filter(|(k, _)| k.ends_with(".q_norm.weight") || k.ends_with(".k_norm.weight"))
-        .map(|(k, v)| (k.clone(), v.dtype_raw()))
-        .collect();
-    sanitize_weights(
-        &mut weights,
-        &view,
-        Qwen3NextSanitizeOptions {
-            skip_routed_experts: skip_routed,
-        },
-    )
-    .map_err(LoadError::from)?;
-    // `sanitize_weights` shifts the attention q/k norms to `1 + w` (they run as
-    // plain RMSNorms) and promotes them to f32 doing it; keep the checkpoint's
-    // dtype so a bf16 model's attention stays bf16.
-    for (key, dtype) in dtypes {
-        let renamed = key.replacen("model.language_model.", "model.", 1);
-        if let Some(w) = weights.get_mut(&renamed) {
-            *w = w.as_dtype(dtype);
-        }
-    }
-
-    {
-        let mut params = model.flatten_params_mut();
-        let expected: HashSet<String> = params.keys().map(|k| k.to_string()).collect();
-        let mut unmatched = Vec::new();
-        let mut loaded: HashSet<String> = HashSet::new();
-        for (key, value) in weights {
-            match params.get_mut(key.as_str()) {
-                Some(param) => {
-                    if param.shape() != value.shape() {
-                        return Err(LoadError::ShapeMismatch {
-                            key,
-                            expected: param.shape().to_vec(),
-                            actual: value.shape().to_vec(),
-                        });
-                    }
-                    **param = value;
-                    loaded.insert(key);
-                    report.loaded += 1;
-                }
-                None => unmatched.push(key),
-            }
-        }
-        if !unmatched.is_empty() {
-            unmatched.sort();
-            return Err(LoadError::SafeTensors(format!(
-                "qwen4_exp: {} checkpoint tensors match no parameter (first: {:?})",
-                unmatched.len(),
-                &unmatched[..unmatched.len().min(10)]
-            )));
-        }
-        let mut missing: Vec<&String> = expected
-            .iter()
-            .filter(|k| !loaded.contains(*k))
-            .filter(|k| !k.contains(".ngram_embedding."))
-            .filter(|k| !(skip_routed && k.contains(".mlp.switch_mlp_")))
-            .collect();
-        if !missing.is_empty() {
-            missing.sort();
-            return Err(LoadError::SafeTensors(format!(
-                "qwen4_exp: {} parameters missing from the checkpoint (first: {:?})",
-                missing.len(),
-                &missing[..missing.len().min(10)]
-            )));
-        }
-    }
+    report.loaded += assign_qwen4_exp_tensors(model, weights, skip_routed)?;
 
     let dtype = model.model.embed_tokens.weight.as_ref().dtype();
     for (layer_idx, layer) in model.model.layers.iter_mut().enumerate() {
