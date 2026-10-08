@@ -32,6 +32,8 @@ void mlx_inline_min_axis(mlx_inline_array* dst, const mlx_inline_array* a, int a
 // ── Multi-axis sum/mean ──────────────────────────────────────────────────
 void mlx_inline_sum_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes, bool keepdims);
 void mlx_inline_mean_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes, bool keepdims);
+// Logical-OR reduction to bool. `axes == NULL` reduces every axis.
+void mlx_inline_any(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes, bool keepdims);
 
 // ── Top-k ────────────────────────────────────────────────────────────────
 void mlx_inline_topk(mlx_inline_array* dst, const mlx_inline_array* a, int k, int axis);

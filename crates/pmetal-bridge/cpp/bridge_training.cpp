@@ -577,14 +577,15 @@ void mlx_inline_squeeze_all(mlx_inline_array* dst, const mlx_inline_array* a) {
 // ── pad ───────────────────────────────────────────────────────────────────────
 
 void mlx_inline_pad(mlx_inline_array* dst, const mlx_inline_array* a,
-                    const int* pad_widths, int ndim, float fill_value) {
+                    const int* pad_widths, int ndim, float fill_value,
+                    const char* mode) {
     BRIDGE_TRY_DST("pad", dst, {
         const auto& x = as_arr(a);
                 std::vector<std::pair<int,int>> pw(ndim);
                 for (int i = 0; i < ndim; ++i) {
                     pw[i] = { pad_widths[2*i], pad_widths[2*i+1] };
                 }
-                new (dst->buf) array(mlx::core::pad(x, pw, array(fill_value)));
+                new (dst->buf) array(mlx::core::pad(x, pw, array(fill_value), std::string(mode)));
     });
 }
 

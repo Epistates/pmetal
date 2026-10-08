@@ -55,6 +55,20 @@ impl InlineArray {
     unop!(gelu_fast_approx, mlx_inline_gelu_fast_approx);
     unop!(erf, mlx_inline_erf);
     unop!(stop_gradient, mlx_inline_stop_gradient);
+    // MLX's primitives: the input dtype is kept (bf16 stays bf16), values
+    // past the i32 range and NaN/inf come through exactly, `round` breaks
+    // ties to even, and `log1p`/`tanh` stay accurate for tiny arguments.
+    unop!(floor, mlx_inline_floor);
+    unop!(ceil, mlx_inline_ceil);
+    unop!(round, mlx_inline_round);
+    unop!(tanh, mlx_inline_tanh);
+    unop!(log1p, mlx_inline_log1p);
+    unop!(isnan, mlx_inline_isnan);
+    unop!(isinf, mlx_inline_isinf);
+    unop!(logical_not, mlx_inline_logical_not);
+    binop!(logaddexp, mlx_inline_logaddexp);
+    binop!(logical_and, mlx_inline_logical_and);
+    binop!(logical_or, mlx_inline_logical_or);
 
     // ── Softmax / norm / reshape / sum_axis ──────────────────────────────
 

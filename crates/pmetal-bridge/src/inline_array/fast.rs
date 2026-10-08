@@ -1,6 +1,6 @@
 //! Fused neural-net ops: rms_norm, rope*, sdpa*, conv*, layer_norm,
 //! linalg (tri_inv, svd, addmm), and other "fast" math primitives
-//! (clip, log_softmax, cross_entropy, pad_constant, split).
+//! (clip, log_softmax, cross_entropy, pad, split).
 //!
 //! These wrap high-throughput Metal kernels that encode full sub-graphs in a
 //! single dispatch, avoiding op-by-op FFI overhead.
@@ -357,7 +357,17 @@ impl InlineArray {
         }
     }
 
+    /// Pad every axis with `fill_value`. `pad_widths_flat` is
+    /// `[before_0, after_0, before_1, after_1, ...]`, one pair per axis.
     pub fn pad_constant(&self, pad_widths_flat: &[i32], fill_value: f32) -> Self {
+        self.pad(pad_widths_flat, PadMode::Constant, fill_value)
+    }
+
+    /// Pad every axis in `mode`, like `mx.pad`. `pad_widths_flat` is
+    /// `[before_0, after_0, before_1, after_1, ...]`, one pair per axis;
+    /// `fill_value` is cast to the array's dtype and used by
+    /// [`PadMode::Constant`] only.
+    pub fn pad(&self, pad_widths_flat: &[i32], mode: PadMode, fill_value: f32) -> Self {
         debug_assert_eq!(pad_widths_flat.len(), 2 * self.ndim() as usize);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -367,10 +377,76 @@ impl InlineArray {
                 pad_widths_flat.as_ptr(),
                 (pad_widths_flat.len() / 2) as i32,
                 fill_value,
+                mode.as_c_str().as_ptr(),
             );
             Self {
                 raw: dst.assume_init(),
             }
+        }
+    }
+}
+
+/// How [`InlineArray::pad`] fills the new elements: the four modes `mx.pad`
+/// has, with NumPy's meaning for each. For `[1, 2, 3]` padded by two on the
+/// left:
+///
+/// | mode        | result            |
+/// |-------------|-------------------|
+/// | `Constant`  | `[c, c, 1, 2, 3]` |
+/// | `Edge`      | `[1, 1, 1, 2, 3]` |
+/// | `Reflect`   | `[3, 2, 1, 2, 3]` |
+/// | `Symmetric` | `[2, 1, 1, 2, 3]` |
+///
+/// NumPy's other modes (`wrap`, `linear_ramp`, `maximum`, `mean`, `median`,
+/// `minimum`, `empty`) have no MLX counterpart, and parsing one of those names
+/// is an error rather than a silent constant pad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PadMode {
+    /// A constant value (the pad call's `fill_value`).
+    #[default]
+    Constant,
+    /// The edge element repeated.
+    Edge,
+    /// Mirror image that excludes the edge element.
+    Reflect,
+    /// Mirror image that includes the edge element.
+    Symmetric,
+}
+
+impl PadMode {
+    /// The mode's name in MLX and NumPy.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Constant => "constant",
+            Self::Edge => "edge",
+            Self::Reflect => "reflect",
+            Self::Symmetric => "symmetric",
+        }
+    }
+
+    fn as_c_str(self) -> &'static std::ffi::CStr {
+        match self {
+            Self::Constant => c"constant",
+            Self::Edge => c"edge",
+            Self::Reflect => c"reflect",
+            Self::Symmetric => c"symmetric",
+        }
+    }
+}
+
+impl std::str::FromStr for PadMode {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "constant" => Ok(Self::Constant),
+            "edge" => Ok(Self::Edge),
+            "reflect" => Ok(Self::Reflect),
+            "symmetric" => Ok(Self::Symmetric),
+            other => Err(format!(
+                "pad mode `{other}` is not supported; MLX pads in `constant`, `edge`, \
+                 `reflect` or `symmetric` mode"
+            )),
         }
     }
 }

@@ -28,6 +28,7 @@ mod compiled;
 mod eval;
 mod factory;
 mod fast;
+pub use fast::PadMode;
 mod gather;
 mod gdn_methods;
 mod interop;

@@ -450,6 +450,7 @@ unsafe extern "C" {
         pad_widths: *const i32,
         ndim: i32,
         fill_value: f32,
+        mode: *const std::ffi::c_char,
     );
 
     // ── Additional ops for complete model inference ──
@@ -1217,6 +1218,19 @@ unsafe extern "C" {
     pub(super) fn mlx_inline_gelu_fast_approx(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_erf(dst: *mut RawBuf, a: *const RawBuf);
 
+    // ── Element-wise primitives (MLX's own: dtype-preserving, NaN/inf-exact) ──
+    pub(super) fn mlx_inline_floor(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_ceil(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_round(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_tanh(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_log1p(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_logaddexp(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
+    pub(super) fn mlx_inline_isnan(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_isinf(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_logical_not(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_logical_and(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
+    pub(super) fn mlx_inline_logical_or(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
+
     // ── Training ops: comparison ──
     pub(super) fn mlx_inline_equal(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
     pub(super) fn mlx_inline_not_equal(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
@@ -1260,6 +1274,14 @@ unsafe extern "C" {
         keepdims: bool,
     );
     pub(super) fn mlx_inline_mean_axes(
+        dst: *mut RawBuf,
+        a: *const RawBuf,
+        axes: *const i32,
+        num_axes: i32,
+        keepdims: bool,
+    );
+    /// `axes == null` reduces every axis.
+    pub(super) fn mlx_inline_any(
         dst: *mut RawBuf,
         a: *const RawBuf,
         axes: *const i32,

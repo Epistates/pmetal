@@ -74,9 +74,12 @@ void mlx_inline_cross_entropy_sparse(mlx_inline_array* dst, const mlx_inline_arr
 void mlx_inline_addmm(mlx_inline_array* dst, const mlx_inline_array* c, const mlx_inline_array* a, const mlx_inline_array* b);
 
 // ── Pad ──────────────────────────────────────────────────────────────────
-// pad_widths: flat array of [before_0, after_0, before_1, after_1, ...] length 2*ndim
+// pad_widths: flat array of [before_0, after_0, before_1, after_1, ...] length 2*ndim.
+// mode: an MLX pad mode ("constant", "edge", "reflect", "symmetric"); MLX
+// throws on any other. fill_value is used by "constant" only.
 void mlx_inline_pad(mlx_inline_array* dst, const mlx_inline_array* a,
-                    const int* pad_widths, int ndim, float fill_value);
+                    const int* pad_widths, int ndim, float fill_value,
+                    const char* mode);
 
 #ifdef __cplusplus
 }

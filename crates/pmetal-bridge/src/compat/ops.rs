@@ -1,4 +1,5 @@
 use super::{Array, Dtype};
+pub use crate::inline_array::PadMode;
 use crate::inline_array::RawBuf;
 use std::mem::MaybeUninit;
 
@@ -14,10 +15,17 @@ pub fn matmul(a: &Array, b: &Array) -> Array {
 pub fn softmax_axis(a: &Array, axis: i32) -> Array {
     a.softmax(axis)
 }
-/// log(1 + x) — numerically stable log1p.
+/// `log(1 + x)`, accurate for tiny `x` (where `1 + x` rounds to 1), like
+/// `mx.log1p`. Keeps a floating input's dtype.
 pub fn log1p(a: &Array) -> Array {
-    let one = Array::from_f32(1.0);
-    a.add(&one).log()
+    a.log1p()
+}
+/// `log(exp(a) + exp(b))` without overflow, like `mx.logaddexp`.
+///
+/// `logaddexp(0, x)` is softplus, `log(1 + exp(x))`, finite for every finite
+/// `x`.
+pub fn logaddexp(a: &Array, b: &Array) -> Array {
+    a.logaddexp(b)
 }
 pub fn broadcast_to(a: &Array, shape: &[i32]) -> Array {
     a.broadcast_to(shape)
@@ -188,8 +196,7 @@ pub fn arange_from(start: i32, stop: i32) -> Array {
     if start == 0 {
         base
     } else {
-        let offset = crate::InlineArray::from_f32(start as f32).as_dtype(Dtype::Int32.as_i32());
-        base.add(&offset)
+        base.add(&Array::from_i32(start))
     }
 }
 pub fn zeros_like(a: &Array) -> Array {
@@ -290,23 +297,25 @@ pub fn take_axis(a: &Array, indices: &Array, axis: i32) -> Array {
 pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> Array {
     a.take_along_axis(indices, axis)
 }
-/// Pad array. `pad_widths`: `&[(before, after)]` per axis.
+/// Pad every axis, like `mx.pad`. `pad_widths` is one `(before, after)` per
+/// axis; `mode` defaults to [`PadMode::Constant`], and `fill_value` (default
+/// 0) is used by that mode only.
 pub fn pad(
     a: &Array,
     pad_widths: &[(i32, i32)],
-    _mode: Option<&str>,
+    mode: Option<PadMode>,
     fill_value: Option<f32>,
 ) -> Array {
     let fill = fill_value.unwrap_or(0.0);
     let flat: Vec<i32> = pad_widths.iter().flat_map(|(b, e)| [*b, *e]).collect();
-    a.pad_constant(&flat, fill)
+    a.pad(&flat, mode.unwrap_or_default(), fill)
 }
 /// Wrapper matching `mlx_rs::ops::arange::<i32, f32>` signature used in vocoder.
 /// Produces a float32 arange from `start` to `stop` (exclusive), step 1.
 pub fn arange_range(start: i32, stop: i32) -> Array {
     let n = (stop - start).max(0);
     // arange(n) gives [0..n); add start offset if needed
-    let a = Array::arange(n, 10); // dtype=10=float32
+    let a = Array::arange(n, Dtype::Float32.as_i32());
     if start == 0 {
         a
     } else {
@@ -324,14 +333,9 @@ pub fn conv1d(
 ) -> Array {
     input.conv1d(weight, stride, padding, dilation, groups)
 }
+/// Hyperbolic tangent, `mx.tanh`. Keeps the input dtype.
 pub fn tanh(a: &Array) -> Array {
-    // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) = 2*sigmoid(2x) - 1
-    let two = Array::from_f32(2.0);
-    let two_x = a.multiply(&two);
-    let sig = two_x.sigmoid();
-    let one = Array::from_f32(1.0);
-    let two2 = Array::from_f32(2.0);
-    sig.multiply(&two2).subtract(&one)
+    a.tanh()
 }
 
 // ── arithmetic helpers ────────────────────────────────────────────────────
@@ -352,10 +356,9 @@ pub fn multiply(a: &Array, b: &Array) -> Array {
 pub fn divide(a: &Array, b: &Array) -> Array {
     a.divide(b)
 }
-/// Negate: `-a`.
+/// Negate: `-a`, `mx.negative`. Keeps the input dtype.
 pub fn negative(a: &Array) -> Array {
-    let neg_one = Array::from_f32(-1.0);
-    a.multiply(&neg_one)
+    a.negative()
 }
 
 // ── trigonometry ─────────────────────────────────────────────────────────
@@ -386,46 +389,23 @@ pub fn which(cond: &Array, x: &Array, y: &Array) -> Array {
     cond.where_cond(x, y)
 }
 
-/// Tile array `reps` times along each dimension.
+/// Tile the whole array `reps` times along each dimension, like `mx.tile` /
+/// `np.tile`: `tile([1, 2], [2])` is `[1, 2, 1, 2]`.
 ///
-/// `reps` is the number of repetitions per axis (broadcast from the end).
+/// `reps` lines up with the array's trailing axes; whichever is shorter is
+/// padded with leading 1s.
 pub fn tile(a: &Array, reps: &[i32]) -> Array {
-    let ndim = a.ndim() as usize;
-    let nrep = reps.len();
-    let mut arr = a.clone();
-    // Extend ndim to match reps length if needed (prepend 1-dims).
-    if nrep > ndim {
-        for _ in ndim..nrep {
-            arr = arr.expand_dims(0);
-        }
-    }
-    let effective_ndim = arr.ndim() as usize;
-    let pad = effective_ndim.saturating_sub(nrep);
-    let full_reps: Vec<i32> = std::iter::repeat_n(1, pad)
-        .chain(reps.iter().copied())
-        .collect();
-    for (axis, &rep) in full_reps.iter().enumerate() {
-        if rep > 1 {
-            arr = arr.repeat(rep, axis as i32);
-        }
-    }
-    arr
+    a.tile(reps)
 }
 
-/// Split array into `num_sections` equal pieces along `axis`.
+/// Split array into `num_sections` equal pieces along `axis`, like
+/// `mx.split(a, num_sections, axis)`.
 ///
-/// Equivalent to `np.split(a, num_sections, axis=axis)` or `mx.split(a, num_sections, axis)`.
+/// The axis must divide evenly, as in MLX and `np.split`. Otherwise MLX's
+/// error is on [`check_last_error`](crate::check_last_error) and the result
+/// is empty.
 pub fn split(a: &Array, num_sections: i32, axis: i32) -> Vec<Array> {
-    let ax = if axis < 0 {
-        (a.ndim() + axis) as usize
-    } else {
-        axis as usize
-    };
-    let dim = a.shape()[ax];
-    let section_size = dim / num_sections;
-    // Build split indices: [section_size, 2*section_size, ..., (n-1)*section_size]
-    let indices: Vec<i32> = (1..num_sections).map(|i| i * section_size).collect();
-    a.split(&indices, axis)
+    a.split_sections(num_sections, axis)
 }
 
 /// Split array at given indices along `axis`.
@@ -490,96 +470,57 @@ pub fn linspace(start: f32, stop: f32, n: i32, dtype: Dtype) -> Array {
     Array::linspace(start, stop, n, dtype.as_i32())
 }
 
-/// Floor: largest integer ≤ x.
-///
-/// Implemented as `cast to int32, then cast back` for float inputs.
-/// For inputs already of integer dtype, this is a no-op.
+/// Floor, `mx.floor`: largest integer ≤ x. Keeps the input dtype; exact for
+/// every float, including values past the `i32` range, ±inf and NaN.
 pub fn floor(a: &Array) -> Array {
-    // floor(x) = cast_to_int(x - (x < 0) * 1) — approximate for int casts
-    // More robustly: use the fact that int32 truncates toward zero:
-    // floor(x) = trunc(x) - (x < 0 AND x != trunc(x))
-    let int_vals = a.as_dtype(Dtype::Int32.as_i32());
-    let float_int = int_vals.as_dtype(a.dtype_raw());
-    // Correction: if original < float_int (negative truncation direction), subtract 1.
-    let one = Array::from_f32(1.0).as_dtype(a.dtype_raw());
-    let needs_correction = a.less(&float_int);
-    let correction = needs_correction.as_dtype(a.dtype_raw()).multiply(&one);
-    float_int.subtract(&correction)
+    a.floor()
 }
 
-/// Ceil: smallest integer ≥ x.
+/// Ceil, `mx.ceil`: smallest integer ≥ x. Keeps the input dtype.
 pub fn ceil(a: &Array) -> Array {
-    // ceil(x) = -floor(-x)
-    let neg = a.multiply(&Array::from_f32(-1.0));
-    let floored = floor(&neg);
-    floored.multiply(&Array::from_f32(-1.0))
+    a.ceil()
 }
 
-/// Round to nearest integer.
+/// Round to the nearest integer, ties to even, like `mx.round` / `np.round`:
+/// `0.5 → 0`, `1.5 → 2`, `2.5 → 2`. Keeps the input dtype.
 pub fn round(a: &Array) -> Array {
-    // round(x) = floor(x + 0.5)
-    let half = Array::from_f32(0.5).as_dtype(a.dtype_raw());
-    floor(&a.add(&half))
+    a.round()
 }
 
-/// Logical NOT: bool → !bool.
+/// Logical NOT to bool, `mx.logical_not`: true where `a` is zero.
 pub fn logical_not(a: &Array) -> Array {
-    let zero = Array::zeros(&[1], Dtype::Bool.as_i32());
-    a.equal(&zero)
+    a.logical_not()
 }
 
-/// Logical AND: cast both to bool then multiply (AND).
+/// Logical AND to bool, `mx.logical_and`.
 pub fn logical_and(a: &Array, b: &Array) -> Array {
-    let ab = a.as_dtype(Dtype::Bool.as_i32());
-    let bb = b.as_dtype(Dtype::Bool.as_i32());
-    // bool multiply = AND
-    ab.multiply(&bb)
+    a.logical_and(b)
 }
 
-/// Logical OR: cast both to bool then add and clamp (OR).
+/// Logical OR to bool, `mx.logical_or`.
 pub fn logical_or(a: &Array, b: &Array) -> Array {
-    let ab = a.as_dtype(Dtype::Bool.as_i32());
-    let bb = b.as_dtype(Dtype::Bool.as_i32());
-    let sum = ab.add(&bb);
-    // Any nonzero = true: cast to bool clips to {0,1}
-    sum.as_dtype(Dtype::Bool.as_i32())
+    a.logical_or(b)
 }
 
-/// Returns a bool array — true where x is NaN (using x != x identity).
+/// Bool array, true where `a` is NaN, `mx.isnan`.
 pub fn is_nan(a: &Array) -> Array {
-    // NaN != NaN is the IEEE 754 definition
-    a.not_equal(a)
+    a.isnan()
 }
 
-/// Returns a bool array — true where x is ±Inf.
+/// Bool array, true where `a` is ±inf, `mx.isinf`.
 pub fn is_inf(a: &Array) -> Array {
-    // |x| > f32::MAX  iff  x is ±Inf
-    let abs_a = a.abs_val();
-    let max_finite = Array::from_f32(f32::MAX);
-    abs_a.greater(&max_finite)
+    a.isinf()
 }
 
-/// Reduce a bool/numeric array with logical-OR along all axes (or a given axis).
-/// Equivalent to mlx_rs::ops::any(a, axes, keepdims).
-/// `axes`: None = reduce all axes.
-pub fn any(a: &Array, axes: Option<&[i32]>, _keep_dims: bool) -> Array {
-    // Cast to bool first, then sum. Any nonzero sum → true.
-    let b = a.as_dtype(Dtype::Bool.as_i32());
-    let s = match axes {
-        None => b.sum(None),
-        Some(ax) => {
-            // sum over each axis
-            let mut result = b.clone();
-            for &axis in ax {
-                result = result.sum(Some(axis));
-            }
-            result
-        }
-    };
-    s.as_dtype(Dtype::Bool.as_i32())
+/// Logical-OR reduction to bool, `mx.any(a, axes, keepdims)`.
+///
+/// `axes: None` reduces every axis. The listed axes are reduced together
+/// (order and sign don't matter), and `keep_dims` keeps each one as size 1.
+pub fn any(a: &Array, axes: Option<&[i32]>, keep_dims: bool) -> Array {
+    a.any(axes, keep_dims)
 }
 
-/// Returns `true` (scalar bool) if any element is NaN.
+/// The value of a one-element bool array, evaluating it first.
 pub fn item_bool(a: &Array) -> bool {
     let a_clone = a.clone();
     a_clone.eval();

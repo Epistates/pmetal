@@ -173,6 +173,25 @@ impl InlineArray {
         }
     }
 
+    /// Logical-OR reduction to a bool array, like `mx.any` / `np.any`.
+    ///
+    /// `axes: None` reduces every axis. The axes are reduced together, so
+    /// their order and sign don't matter, and `keepdims` leaves each reduced
+    /// axis in place with size 1.
+    pub fn any(&self, axes: Option<&[i32]>, keepdims: bool) -> Self {
+        let (ptr, len) = match axes {
+            Some(ax) => (ax.as_ptr(), ax.len() as i32),
+            None => (std::ptr::null(), 0),
+        };
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_any(dst.as_mut_ptr(), &self.raw, ptr, len, keepdims);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
     // ── Top-k ───────────────────────────────────────────────────────────
 
     /// Top-k values along `axis`.

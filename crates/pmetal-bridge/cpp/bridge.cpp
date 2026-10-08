@@ -179,6 +179,77 @@ void mlx_inline_negative(mlx_inline_array* dst, const mlx_inline_array* a) {
         new (dst->buf) array(mlx::core::negative(as_arr(a))));
 }
 
+// MLX's own element-wise primitives, so the values, the dtype (bf16 stays
+// bf16) and the NaN/inf behaviour are MLX's: floor/ceil/round keep the input
+// dtype and work past the i32 range, round breaks ties to even, log1p and
+// tanh stay accurate for tiny arguments.
+void mlx_inline_floor(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("floor", dst,
+        new (dst->buf) array(mlx::core::floor(as_arr(a))));
+}
+
+void mlx_inline_ceil(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("ceil", dst,
+        new (dst->buf) array(mlx::core::ceil(as_arr(a))));
+}
+
+void mlx_inline_round(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("round", dst,
+        new (dst->buf) array(mlx::core::round(as_arr(a))));
+}
+
+void mlx_inline_tanh(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("tanh", dst,
+        new (dst->buf) array(mlx::core::tanh(as_arr(a))));
+}
+
+void mlx_inline_log1p(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("log1p", dst,
+        new (dst->buf) array(mlx::core::log1p(as_arr(a))));
+}
+
+void mlx_inline_logaddexp(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    BRIDGE_TRY_DST("logaddexp", dst,
+        new (dst->buf) array(mlx::core::logaddexp(as_arr(a), as_arr(b))));
+}
+
+void mlx_inline_isnan(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("isnan", dst,
+        new (dst->buf) array(mlx::core::isnan(as_arr(a))));
+}
+
+void mlx_inline_isinf(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("isinf", dst,
+        new (dst->buf) array(mlx::core::isinf(as_arr(a))));
+}
+
+void mlx_inline_logical_not(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("logical_not", dst,
+        new (dst->buf) array(mlx::core::logical_not(as_arr(a))));
+}
+
+void mlx_inline_logical_and(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    BRIDGE_TRY_DST("logical_and", dst,
+        new (dst->buf) array(mlx::core::logical_and(as_arr(a), as_arr(b))));
+}
+
+void mlx_inline_logical_or(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
+    BRIDGE_TRY_DST("logical_or", dst,
+        new (dst->buf) array(mlx::core::logical_or(as_arr(a), as_arr(b))));
+}
+
+void mlx_inline_any(mlx_inline_array* dst, const mlx_inline_array* a,
+                    const int* axes, int num_axes, bool keepdims) {
+    BRIDGE_TRY_DST("any", dst, {
+        const auto& x = as_arr(a);
+        if (axes == nullptr) {
+            new (dst->buf) array(mlx::core::any(x, keepdims));
+        } else {
+            new (dst->buf) array(mlx::core::any(x, std::vector<int>(axes, axes + num_axes), keepdims));
+        }
+    });
+}
+
 void mlx_inline_exp(mlx_inline_array* dst, const mlx_inline_array* a) {
     BRIDGE_TRY_DST("exp", dst,
         new (dst->buf) array(mlx::core::exp(as_arr(a))));

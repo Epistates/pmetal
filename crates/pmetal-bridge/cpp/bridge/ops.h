@@ -42,6 +42,18 @@ void mlx_inline_gelu_tanh(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_gelu_fast_approx(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_erf(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_floor(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_ceil(mlx_inline_array* dst, const mlx_inline_array* a);
+// Round half to even, like `mx.round` / `np.round`.
+void mlx_inline_round(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_tanh(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_log1p(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_logaddexp(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_isnan(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_isinf(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_logical_not(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_logical_and(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
+void mlx_inline_logical_or(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
 
 // ── Element-wise comparisons ─────────────────────────────────────────────
 void mlx_inline_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b);
