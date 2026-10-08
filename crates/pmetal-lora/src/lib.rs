@@ -3,10 +3,7 @@
 //! This crate provides:
 //! - Standard LoRA (Low-Rank Adaptation)
 //! - QLoRA (Quantized LoRA with 4-bit base weights)
-//! - Q-BLoRA (Quantized Balanced LoRA - addresses underfitting in QLoRA)
 //! - DoRA (Weight-Decomposed Low-Rank Adaptation)
-//! - GaLore (Gradient Low-Rank Projection, ICML 2024)
-//! - Adapter management utilities
 //! - LoRA-enabled model architectures
 //! - Dynamic model dispatch for architecture-agnostic training
 //!
@@ -39,15 +36,12 @@
 #![allow(clippy::type_complexity)]
 
 pub mod adapted;
-mod adapter;
-pub mod arch_config;
 pub mod autograd;
 pub mod cohere_qlora;
 pub mod deepseek_qlora;
 mod dora;
 mod dynamic;
 mod dynamic_qlora;
-pub mod galore;
 pub mod gemma4_lora;
 pub mod gemma4_qlora;
 pub mod gemma_qlora;
@@ -62,9 +56,7 @@ pub mod lora_helpers;
 pub mod mistral_qlora;
 pub mod nemotron_h_lora;
 pub mod nemotron_h_qlora;
-mod patcher;
 pub mod phi_qlora;
-mod qblora;
 mod qlora;
 pub mod qwen3_moe_lora;
 pub mod qwen3_moe_qlora;
@@ -74,8 +66,6 @@ pub mod qwen3_qlora;
 mod trainable;
 
 pub use adapted::AdaptedModel;
-pub use adapter::*;
-pub use arch_config::LoraArchitectureConfig;
 pub use autograd::{
     AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, MlpForwardSaved,
     MlpLoraGrads, fused_mlp_backward, fused_mlp_forward, lora_backward, lora_forward_with_grad,
@@ -85,9 +75,6 @@ pub use deepseek_qlora::*;
 pub use dora::*;
 pub use dynamic::*;
 pub use dynamic_qlora::DynamicQloraModel;
-pub use galore::{
-    GaloreConfig, GaloreParamState, GaloreProjectionState, GaloreProjectionType, GaloreProjector,
-};
 pub use gemma_qlora::*;
 pub use gemma4_lora::*;
 pub use gemma4_qlora::*;
@@ -105,9 +92,7 @@ pub use lora_helpers::{
 pub use mistral_qlora::*;
 pub use nemotron_h_lora::*;
 pub use nemotron_h_qlora::*;
-pub use patcher::*;
 pub use phi_qlora::*;
-pub use qblora::*;
 pub use qlora::*;
 pub use qwen3_moe_lora::*;
 pub use qwen3_moe_qlora::*;

@@ -67,19 +67,12 @@ fn infer(model_dir: &str, input_ids: &Array) -> Result<Array, Box<dyn std::error
 
 ## Architecture Support
 
-The following architectures are supported via `DynamicLoraModel` (auto-detection + loading):
+`DynamicLoraModel` wraps an `AdaptedModel`: the same `DynamicModel` the inference path loads, with
+adapters attached to its projections. Every architecture `DynamicModel` loads can be LoRA-trained
+this way, so a fine-tune trains exactly the forward pass `pmetal infer` and `pmetal serve` run.
 
-| Architecture | LoRA | QLoRA | Notes |
-|--------------|------|-------|-------|
-| Llama (2, 3, 3.1, 3.2, 3.3) | Yes | Yes | Gradient checkpointing supported |
-| Qwen 2 (2, 2.5) | Yes | — | Uses Qwen3 LoRA implementation internally |
-| Qwen 3 | Yes | Yes | Gradient checkpointing supported |
-| Qwen 3.5 (Next) | Yes | — | Hybrid GDN + Attention, nested text_config |
-| Mistral (7B, Mixtral 8x7B) | Yes | Yes | Sliding window attention |
-| Gemma (2, 3) | Yes | Yes | GeGLU activation, special RMSNorm |
-| Phi (3, 3.5) | Yes | — | Partial RoPE, fused gate_up |
-
-Architectures not listed (Llama 4, Qwen3MoE, DeepSeek, Phi4, Cohere, Granite, NemotronH, StarCoder2, RecurrentGemma, Jamba) return `DynamicLoraError::NotImplemented`. The `generic_lora` module provides reusable LoRA attention and MLP components for building custom LoRA models for these architectures.
+QLoRA (`DynamicQloraModel`) has dedicated modules for Llama, Mistral, Granite, Qwen 2 / 3,
+Qwen 3.5 (Next), Qwen3 MoE, Gemma, Gemma 4, GPT-OSS, Llama 4, DeepSeek, NemotronH, Phi and Cohere.
 
 ## Configuration
 
@@ -94,16 +87,14 @@ Architectures not listed (Llama 4, Qwen3MoE, DeepSeek, Phi4, Cohere, Granite, Ne
 
 | Module | Description |
 |--------|-------------|
-| `dynamic` | `DynamicLoraModel` with auto-detection |
-| `llama_lora` | LLaMA-specific LoRA (also covers Granite, Cohere, StarCoder2) |
-| `qwen3_lora` | Qwen3-specific LoRA |
-| `qwen3_next_lora` | Qwen 3.5 (Next) hybrid LoRA |
-| `mistral_lora` | Mistral-specific LoRA |
-| `gemma_lora` | Gemma-specific LoRA |
-| `phi_lora` | Phi-specific LoRA |
-| `generic_lora` | Generic LoRA for architectures without dedicated implementations |
+| `adapted` | `AdaptedModel`: LoRA adapters attached to a `DynamicModel` |
+| `dynamic` | `DynamicLoraModel`, the trainer-facing shell over `AdaptedModel` |
+| `dynamic_qlora` | `DynamicQloraModel` with per-architecture QLoRA dispatch |
+| `lora` / `dora` / `qlora` | `LoraLinear`, `DoraLinear`, `QLoraLinear` |
+| `*_qlora`, `*_lora` | Per-architecture QLoRA models and the LoRA stacks they build on |
+| `autograd` | Hand-written LoRA and fused-MLP backward passes |
+| `lora_helpers` | Shared parameter collection and adapter save/load |
 | `trainable` | `TrainableModel` trait definition |
-| `arch_config` | Per-architecture LoRA configuration |
 
 ## License
 
