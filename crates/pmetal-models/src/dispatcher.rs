@@ -2109,13 +2109,15 @@ impl DynamicModel {
 
     /// Enable SSD-offloaded MoE inference with expert prefetching.
     ///
-    /// Only supported for architectures with MoE (currently Qwen3Next).
+    /// Only supported for architectures built on the Qwen 3.5 MoE block
+    /// (Qwen3Next, Qwen4Exp).
     /// The `experts_dir` should contain packed expert files from `pmetal pack-experts`.
     pub fn enable_expert_offloading(&mut self, experts_dir: &Path) -> Result<(), Exception> {
         match self {
             Self::Qwen3Next(m) => m.enable_expert_offloading(experts_dir),
+            Self::Qwen4Exp(m) => m.enable_expert_offloading(experts_dir),
             _ => Err(Exception::custom(
-                "expert offloading is only supported for qwen3_next architecture",
+                "expert offloading is only supported for the qwen3_next and qwen4_exp architectures",
             )),
         }
     }
@@ -2123,6 +2125,7 @@ impl DynamicModel {
     pub fn requires_expert_offloading(&self) -> bool {
         match self {
             Self::Qwen3Next(m) => m.requires_expert_offloading(),
+            Self::Qwen4Exp(m) => m.requires_expert_offloading(),
             _ => false,
         }
     }
@@ -2131,14 +2134,17 @@ impl DynamicModel {
     pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
         match self {
             Self::Qwen3Next(m) => m.prefetch_stats(),
+            Self::Qwen4Exp(m) => m.prefetch_stats(),
             _ => None,
         }
     }
 
     /// Reset prefetch hit/miss statistics (if expert offloading is enabled).
     pub fn reset_prefetch_stats(&self) {
-        if let Self::Qwen3Next(m) = self {
-            m.reset_prefetch_stats();
+        match self {
+            Self::Qwen3Next(m) => m.reset_prefetch_stats(),
+            Self::Qwen4Exp(m) => m.reset_prefetch_stats(),
+            _ => {}
         }
     }
 }
