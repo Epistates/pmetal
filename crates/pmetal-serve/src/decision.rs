@@ -20,7 +20,6 @@ use pmetal_models::decision::{DecisionError, DecisionModel};
 use pmetal_models::model_thread::{ModelThread, ModelThreadStartError};
 use serde_json::Value;
 use tokio::sync::{Semaphore, oneshot};
-use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::error::{ServeError, ServeResult};
@@ -127,14 +126,12 @@ pub fn build_decision_router(engine: DecisionEngine, max_concurrent: usize) -> R
         engine,
         request_permits: Arc::new(Semaphore::new(max_concurrent.max(1))),
     });
-    Router::new()
+    let router = Router::new()
         .route("/health", axum::routing::get(crate::routes::health))
         .route("/v1/models", axum::routing::get(list_models))
         .route("/v1/systemone", axum::routing::post(systemone))
-        .layer(TraceLayer::new_for_http())
-        // Images and video frames arrive base64-encoded in the body.
-        .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
-        .with_state(state)
+        .layer(TraceLayer::new_for_http());
+    crate::server::limit_request_bodies(router).with_state(state)
 }
 
 /// Serve a decision model until the process exits.

@@ -5,6 +5,7 @@ use crate::continuous_batch::BatcherConfig;
 use crate::engine::InferenceEngine;
 use crate::routes::{self, AppState, ServingMetrics};
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -38,6 +39,10 @@ impl Default for ServeConfig {
     }
 }
 
+/// The largest request body the server reads: room for a few base64-encoded
+/// photos or a short clip's frames (base64 adds a third to the bytes).
+pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Build the axum router with all routes.
 pub fn build_router(engine: InferenceEngine, max_concurrent: usize) -> Router {
     let state = Arc::new(AppState {
@@ -46,7 +51,7 @@ pub fn build_router(engine: InferenceEngine, max_concurrent: usize) -> Router {
         request_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
     });
 
-    Router::new()
+    let router = Router::new()
         .route("/health", axum::routing::get(routes::health))
         .route("/v1/models", axum::routing::get(routes::list_models))
         .route("/v1/metrics", axum::routing::get(routes::serving_metrics))
@@ -61,10 +66,24 @@ pub fn build_router(engine: InferenceEngine, max_concurrent: usize) -> Router {
             "/v1/systemone",
             axum::routing::post(crate::decision::not_a_decision_model),
         )
-        .layer(TraceLayer::new_for_http())
-        // Reject request bodies larger than 2 MiB to prevent memory exhaustion.
-        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
-        .with_state(state)
+        .layer(TraceLayer::new_for_http());
+    limit_request_bodies(router).with_state(state)
+}
+
+/// Cap request bodies at [`MAX_REQUEST_BODY_BYTES`]: images and video frames
+/// arrive base64-encoded in the body, and anything past the cap is refused
+/// before it is buffered.
+///
+/// axum's `Json` extractor carries a 2 MiB limit of its own
+/// (`DefaultBodyLimit`), which refused any request holding a photo however
+/// high the outer limit was set; it is lifted so this one limit holds.
+pub(crate) fn limit_request_bodies<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
 }
 
 /// Start the server.
