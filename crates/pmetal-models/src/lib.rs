@@ -65,6 +65,7 @@ pub mod fp8_utils;
 pub mod gemma4_mtp;
 pub mod generation;
 pub mod loader;
+pub mod model_thread;
 pub mod moe;
 pub mod moe_routing;
 pub mod ollama;
