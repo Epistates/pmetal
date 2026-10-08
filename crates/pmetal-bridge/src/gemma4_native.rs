@@ -809,7 +809,7 @@ fn shared_kv_attention_forward(
 ///
 /// * `model.*` — text-only export (`gemma4_text`).
 /// * `model.language_model.*` — transformers multimodal export, e.g.
-///   `gemma-4-31B-it`, with the towers under `model.vision_tower.*`.
+///   `google/gemma-4-31B-it`, with the towers under `model.vision_tower.*`.
 /// * `language_model.model.*` — unified export (`gemma4_unified`), e.g.
 ///   `mlx-community/gemma-4-12B-it-bf16`, where the towers sit *beside* the
 ///   text backbone as `vision_embedder.*`, `embed_vision.*`, `embed_audio.*`
