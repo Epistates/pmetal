@@ -43,6 +43,128 @@ pub struct LinearQuant {
     pub scales: Array,
     pub biases: Option<Array>,
     pub params: QuantParams,
+    /// The weight's dtype before packing, which the layer keeps computing
+    /// in. The floating-point modes' scales are `uint8` (E8M0, E4M3), so
+    /// they can't stand in for it the way affine scales do.
+    pub dtype: super::Dtype,
+    /// NVFP4's per-tensor FP32 scale, which the product is multiplied by.
+    /// See [`Linear::quantize`].
+    pub tensor_scale: Option<Array>,
+    /// Set for a codebook format such as NF4, where `weight` holds 4-bit
+    /// indices into a table rather than affine levels. See
+    /// [`Linear::quantize_codebook`].
+    pub codebook: Option<Codebook>,
+}
+
+/// A 4-bit codebook weight format: each weight is `values[code] · absmax`
+/// over its group, the scheme NF4 (Dettmers et al., 2023, §3) uses.
+///
+/// The codes are packed in MLX's 4-bit layout, so MLX's own dequantize, run
+/// with unit scales and zero biases, unpacks them; the table lookup and the
+/// absmax scale follow on the GPU. MLX has no codebook mode of its own.
+///
+/// [`LinearQuant::scales`] holds the per-group absmax, `[out, in / group]`,
+/// unless it is itself packed (`absmax_packing`): QLoRA's double
+/// quantization, here 8-bit affine over runs of 64 absmax values.
+#[derive(Debug, Clone)]
+pub struct Codebook {
+    /// The 16 code values, in ascending order, in `[-1, 1]`. A value may
+    /// repeat (E2M1 has a negative zero).
+    pub values: Array,
+    /// When the absmax is packed: its scales and biases, and the shape it
+    /// unpacks to.
+    pub absmax_packing: Option<(Array, Array)>,
+}
+
+/// Group size of the 8-bit affine packing double quantization applies to
+/// the absmax values.
+const ABSMAX_GROUP: i32 = 64;
+
+/// Group size the packed codes are unpacked over, independent of the absmax
+/// group: the smallest MLX's affine dequantize takes.
+const CODE_GROUP: i32 = 32;
+
+/// Pack `dense` (`[out, in]`) as indices into `codebook`, by absmax over
+/// groups of `group_size`. Returns the packed codes `[out, in / 8]` and the
+/// absmax `[out, in / group_size]` in f32.
+fn codebook_pack(
+    dense: &Array,
+    codebook: &[f32],
+    group_size: i32,
+) -> Result<(Array, Array), Exception> {
+    let (out, inp) = (dense.dim(0), dense.dim(1));
+    if codebook.len() != 16 || codebook.windows(2).any(|w| w[0] > w[1]) {
+        return Err(Exception::custom(
+            "Linear::quantize_codebook: the codebook must hold 16 values in ascending order",
+        ));
+    }
+    if group_size <= 0 || inp % group_size != 0 || inp % CODE_GROUP != 0 {
+        return Err(Exception::custom(format!(
+            "Linear::quantize_codebook: {inp} input features don't divide into groups of \
+             {group_size} and words of {CODE_GROUP}"
+        )));
+    }
+    let f32_ = super::Dtype::Float32.as_i32();
+    let u32_ = super::Dtype::Uint32.as_i32();
+    let groups = inp / group_size;
+    let w = dense.as_dtype(f32_).reshape(&[out, groups, group_size]);
+    let absmax = w
+        .abs()
+        .max_axis(-1, true)
+        .maximum(&Array::from_f32(f32::MIN_POSITIVE));
+    let normalized = w.divide(&absmax);
+    // The nearest code is the number of midpoints below the value.
+    let mut codes = ops::zeros(&[out, groups, group_size], super::Dtype::Uint32);
+    for pair in codebook.windows(2) {
+        let midpoint = Array::from_f32((pair[0] + pair[1]) / 2.0);
+        codes = codes.add(&normalized.greater(&midpoint).as_dtype(u32_));
+    }
+    // Eight codes to a word, lowest bits first: MLX's 4-bit layout.
+    let places: Vec<u32> = (0..8).map(|j| 1u32 << (4 * j)).collect();
+    let packed = codes
+        .reshape(&[out, inp / 8, 8])
+        .multiply(&Array::from_u32_slice(&places, &[8]))
+        .sum_axis(-1, false);
+    Ok((packed, absmax.reshape(&[out, groups])))
+}
+
+/// Unpack a codebook weight to dense `[out, in]` in `dtype`.
+fn codebook_dense(
+    packed: &Array,
+    absmax: &Array,
+    codebook: &Codebook,
+    group_size: i32,
+    dtype: super::Dtype,
+) -> Array {
+    let (out, inp) = (packed.dim(0), packed.dim(1) * 8);
+    let groups = inp / group_size;
+    // Everything at the layer's own width: a dense f32 copy per layer is
+    // twice the transient memory, and the table's values lose nothing that
+    // four bits had kept.
+    let absmax = match &codebook.absmax_packing {
+        Some((scales, biases)) => absmax
+            .dequantize(scales, biases, ABSMAX_GROUP, 8)
+            .reshape(&[out, groups]),
+        None => absmax.clone(),
+    }
+    .as_dtype(dtype.as_i32());
+    // Unit scales and zero biases dequantize each code to its own value,
+    // exactly: the codes are 0..15, which bf16 holds exactly.
+    let code_groups = inp / CODE_GROUP;
+    let bf16 = super::Dtype::Bfloat16;
+    let codes = packed.dequantize(
+        &ops::ones(&[out, code_groups], bf16),
+        &ops::zeros(&[out, code_groups], bf16),
+        CODE_GROUP,
+        4,
+    );
+    codebook
+        .values
+        .as_dtype(dtype.as_i32())
+        .take_axis(&codes.as_dtype(super::Dtype::Uint32.as_i32()), 0)
+        .reshape(&[out, groups, group_size])
+        .multiply(&absmax.expand_dims(-1))
+        .reshape(&[out, inp])
 }
 
 /// Affine linear layer: `y = x @ W^T + b`, optionally low-rank adapted.
@@ -165,17 +287,28 @@ impl Linear {
 
     pub fn forward(&self, x: &Array) -> Array {
         let bias = self.bias.value.as_ref();
-        let Some(quant) = &self.quant else {
-            return match self.adapter.as_deref() {
-                None => linear_forward_array(x, &self.weight.value, bias),
-                Some(adapter) => adapter.apply(x, &self.weight.value, bias),
-            };
+        let quant = match &self.quant {
+            Some(quant) if quant.codebook.is_none() => quant,
+            // A codebook has no fused kernel: unpack, then multiply dense.
+            Some(_) => {
+                let weight = self.dense_weight();
+                return match self.adapter.as_deref() {
+                    None => linear_forward_array(x, &weight, bias),
+                    Some(adapter) => adapter.apply(x, &weight, bias),
+                };
+            }
+            None => {
+                return match self.adapter.as_deref() {
+                    None => linear_forward_array(x, &self.weight.value, bias),
+                    Some(adapter) => adapter.apply(x, &self.weight.value, bias),
+                };
+            }
         };
-        // The kernel takes the activations in the scales' dtype.
-        let x = if x.dtype() == quant.scales.dtype() {
+        // The kernel takes the activations in the dtype the weight had.
+        let x = if x.dtype() == quant.dtype {
             x.clone()
         } else {
-            x.as_dtype(quant.scales.dtype().as_i32())
+            x.as_dtype(quant.dtype.as_i32())
         };
         let y = x.quantized_matmul_mode(
             &self.weight.value,
@@ -186,6 +319,10 @@ impl Linear {
             quant.params.bits,
             quant.params.mode,
         );
+        let y = match &quant.tensor_scale {
+            Some(scale) => y.multiply(&scale.as_dtype(y.dtype().as_i32())),
+            None => y,
+        };
         match self.adapter.as_deref() {
             None => match bias {
                 Some(b) => y.add(b),
@@ -221,6 +358,29 @@ impl Linear {
             ));
         }
         let dense = fp8_weight_for_compute(&self.weight.value);
+        let dtype = dense.dtype();
+        // NVFP4 is two-level: an FP32 scale per tensor, so that each block's
+        // E4M3 scale lands in E4M3's normal range, then E2M1 values over
+        // blocks of 16. One level alone puts a typical weight's block scales
+        // (absmax / 6, around 1e-3) among E4M3's subnormals, which hold two
+        // bits or fewer: Qwen3-0.6B lost 0.10 nats instead of 0.06. The scale
+        // is MLX's: the tensor's amax over 448 · 6, the largest product of an
+        // E4M3 scale and an E2M1 value.
+        let tensor_scale = (params.mode == QuantizedMode::Nvfp4).then(|| {
+            dense
+                .as_dtype(super::Dtype::Float32.as_i32())
+                .abs()
+                .max(None)
+                .maximum(&Array::from_f32(f32::MIN_POSITIVE))
+                .divide(&Array::from_f32(448.0 * 6.0))
+        });
+        let dense = match &tensor_scale {
+            Some(scale) => dense
+                .as_dtype(super::Dtype::Float32.as_i32())
+                .divide(scale)
+                .as_dtype(dtype.as_i32()),
+            None => dense,
+        };
         let (weight, scales, biases) = match params.mode {
             QuantizedMode::Affine => {
                 let (w, s, b) = dense.quantize_weights(params.group_size, params.bits);
@@ -238,21 +398,100 @@ impl Linear {
             scales,
             biases,
             params,
+            dtype,
+            tensor_scale,
+            codebook: None,
+        });
+        Ok(())
+    }
+
+    /// Pack the weight as 4-bit indices into `codebook` (16 ascending values
+    /// in `[-1, 1]`), scaled by each group's absmax: NF4 when `codebook` is
+    /// NF4's table. `double_quant` packs the absmax values themselves to 8
+    /// bits, QLoRA's double quantization.
+    ///
+    /// Same contract as [`quantize`](Self::quantize): the layer stops
+    /// training, an adapter on it still trains, and merging unpacks it.
+    pub fn quantize_codebook(
+        &mut self,
+        codebook: &[f32],
+        group_size: i32,
+        double_quant: bool,
+    ) -> Result<(), Exception> {
+        if self.quant.is_some() {
+            return Ok(());
+        }
+        if self.adapter.as_ref().is_some_and(|a| a.merged) {
+            return Err(Exception::custom(
+                "Linear::quantize_codebook: unmerge the adapter before packing the weight",
+            ));
+        }
+        let dense = fp8_weight_for_compute(&self.weight.value);
+        let dtype = dense.dtype();
+        let (packed, absmax) = codebook_pack(&dense, codebook, group_size)?;
+        let count = absmax.dim(0) * absmax.dim(1);
+        let (scales, absmax_packing) = if double_quant && count % ABSMAX_GROUP == 0 {
+            // bf16 first, so the packing's scales and biases are bf16 too.
+            let (q, s, b) = absmax
+                .reshape(&[count / ABSMAX_GROUP, ABSMAX_GROUP])
+                .as_dtype(super::Dtype::Bfloat16.as_i32())
+                .quantize_weights(ABSMAX_GROUP, 8);
+            (q, Some((s, b)))
+        } else {
+            (absmax.as_dtype(super::Dtype::Bfloat16.as_i32()), None)
+        };
+        crate::check_last_error()
+            .map_err(|e| Exception::custom(format!("Linear::quantize_codebook: {e}")))?;
+        self.weight.value = packed;
+        self.quant = Some(LinearQuant {
+            scales,
+            biases: None,
+            params: QuantParams {
+                group_size,
+                bits: 4,
+                mode: QuantizedMode::Affine,
+            },
+            dtype,
+            tensor_scale: None,
+            codebook: Some(Codebook {
+                values: Array::from_f32_slice(codebook, &[16]),
+                absmax_packing,
+            }),
         });
         Ok(())
     }
 
     /// The weight as a dense `[out, in]` array, unpacked if it's packed.
     pub fn dense_weight(&self) -> Array {
-        match &self.quant {
-            Some(quant) => self.weight.value.dequantize_mode(
+        let Some(quant) = &self.quant else {
+            return fp8_weight_for_compute(&self.weight.value);
+        };
+        if let Some(codebook) = &quant.codebook {
+            return codebook_dense(
+                &self.weight.value,
                 &quant.scales,
-                quant.biases.as_ref(),
+                codebook,
                 quant.params.group_size,
-                quant.params.bits,
-                quant.params.mode,
-            ),
-            None => fp8_weight_for_compute(&self.weight.value),
+                quant.dtype,
+            );
+        }
+        let dense = self.weight.value.dequantize_mode(
+            &quant.scales,
+            quant.biases.as_ref(),
+            quant.params.group_size,
+            quant.params.bits,
+            quant.params.mode,
+        );
+        let dense = match &quant.tensor_scale {
+            Some(scale) => dense
+                .as_dtype(super::Dtype::Float32.as_i32())
+                .multiply(scale),
+            None => dense,
+        };
+        if dense.dtype() == quant.dtype {
+            dense
+        } else {
+            dense.as_dtype(quant.dtype.as_i32())
         }
     }
 
@@ -284,10 +523,13 @@ impl ModuleParameters for Linear {
     fn num_parameters(&self) -> usize {
         Parameter::count_params(&self.weight)
             + Parameter::count_params(&self.bias)
-            + self
-                .quant
-                .as_ref()
-                .map_or(0, |q| 1 + usize::from(q.biases.is_some()))
+            + self.quant.as_ref().map_or(0, |q| {
+                1 + usize::from(q.biases.is_some())
+                    + usize::from(q.tensor_scale.is_some())
+                    + q.codebook
+                        .as_ref()
+                        .map_or(0, |c| 1 + 2 * usize::from(c.absmax_packing.is_some()))
+            })
             + self
                 .adapter
                 .as_ref()
@@ -302,6 +544,16 @@ impl ModuleParameters for Linear {
             out.insert(Rc::from("scales"), NestedValue::Value(&quant.scales));
             if let Some(biases) = &quant.biases {
                 out.insert(Rc::from("biases"), NestedValue::Value(biases));
+            }
+            if let Some(scale) = &quant.tensor_scale {
+                out.insert(Rc::from("tensor_scale"), NestedValue::Value(scale));
+            }
+            if let Some(codebook) = &quant.codebook {
+                out.insert(Rc::from("codebook"), NestedValue::Value(&codebook.values));
+                if let Some((scales, biases)) = &codebook.absmax_packing {
+                    out.insert(Rc::from("absmax_scales"), NestedValue::Value(scales));
+                    out.insert(Rc::from("absmax_biases"), NestedValue::Value(biases));
+                }
             }
         }
         if let Some(adapter) = self.adapter.as_deref() {
@@ -322,6 +574,19 @@ impl ModuleParameters for Linear {
             out.insert(Rc::from("scales"), NestedValue::Value(&mut quant.scales));
             if let Some(biases) = &mut quant.biases {
                 out.insert(Rc::from("biases"), NestedValue::Value(biases));
+            }
+            if let Some(scale) = &mut quant.tensor_scale {
+                out.insert(Rc::from("tensor_scale"), NestedValue::Value(scale));
+            }
+            if let Some(codebook) = &mut quant.codebook {
+                out.insert(
+                    Rc::from("codebook"),
+                    NestedValue::Value(&mut codebook.values),
+                );
+                if let Some((scales, biases)) = &mut codebook.absmax_packing {
+                    out.insert(Rc::from("absmax_scales"), NestedValue::Value(scales));
+                    out.insert(Rc::from("absmax_biases"), NestedValue::Value(biases));
+                }
             }
         }
         if let Some(adapter) = self.adapter.as_deref_mut() {

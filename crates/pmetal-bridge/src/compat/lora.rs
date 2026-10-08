@@ -506,4 +506,144 @@ mod tests {
             assert!((w - m).abs() < 1e-4, "merged {m} vs adapted {w}");
         }
     }
+
+    /// A bf16 layer packed in `mode` computes, in bf16, close to what it did
+    /// dense. The floating-point modes' scales are `uint8`, and the layer
+    /// used to cast its activations to them.
+    #[test]
+    fn floating_point_modes_compute_in_the_weights_dtype() {
+        let mut dense = Linear::new(128, 16, false).expect("layer");
+        dense.weight.value = dense.weight.value.as_dtype(Dtype::Bfloat16.as_i32());
+        let x = random::uniform_range(-1.0, 1.0, &[2, 128], Dtype::Bfloat16);
+        let want = values(dense.forward(&x).as_dtype(Dtype::Float32.as_i32()));
+        let norm = want.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for (mode, group_size) in [
+            (crate::QuantizedMode::Mxfp4, 32),
+            (crate::QuantizedMode::Nvfp4, 16),
+            (crate::QuantizedMode::Mxfp8, 32),
+        ] {
+            let mut packed = dense.clone();
+            packed
+                .quantize(crate::native_weight::QuantParams {
+                    group_size,
+                    bits: if mode == crate::QuantizedMode::Mxfp8 {
+                        8
+                    } else {
+                        4
+                    },
+                    mode,
+                })
+                .expect("quantize");
+            let y = packed.forward(&x);
+            assert_eq!(y.dtype(), Dtype::Bfloat16, "{mode:?}");
+            assert_eq!(packed.dense_weight().dtype(), Dtype::Bfloat16, "{mode:?}");
+            let got = values(y.as_dtype(Dtype::Float32.as_i32()));
+            crate::check_last_error().expect("no bridge error");
+            let err = want
+                .iter()
+                .zip(&got)
+                .map(|(w, g)| (w - g) * (w - g))
+                .sum::<f32>()
+                .sqrt();
+            assert!(err < 0.2 * norm, "{mode:?}: relative error {}", err / norm);
+        }
+    }
+
+    /// NF4's table, `[-1, 1]`, from Dettmers et al. (2023), appendix E.
+    const NF4: [f32; 16] = [
+        -1.0,
+        -0.696_192_8,
+        -0.525_073_05,
+        -0.394_917_5,
+        -0.284_441_38,
+        -0.184_773_43,
+        -0.091_050_036,
+        0.0,
+        0.079_580_3,
+        0.160_930_2,
+        0.246_112_3,
+        0.337_915_24,
+        0.440_709_83,
+        0.562_617,
+        0.722_956_84,
+        1.0,
+    ];
+
+    /// Every unpacked weight is the nearest table value times its group's
+    /// absmax, and the group's largest magnitude comes back exactly.
+    #[test]
+    fn a_codebook_weight_rounds_each_value_to_the_nearest_entry() {
+        let mut layer = Linear::new(128, 4, false).expect("layer");
+        let dense = values(layer.weight.value.clone());
+        layer.quantize_codebook(&NF4, 64, false).expect("pack");
+        assert_eq!(layer.shape(), (4, 128));
+        let back = values(layer.dense_weight());
+        crate::check_last_error().expect("no bridge error");
+        for (group, (orig, got)) in dense.chunks(64).zip(back.chunks(64)).enumerate() {
+            let absmax = orig.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            // bf16 absmax: 2^-8 relative.
+            let tol = absmax / 256.0;
+            for (o, g) in orig.iter().zip(got) {
+                let nearest = NF4
+                    .iter()
+                    .map(|c| c * absmax)
+                    .min_by(|a, b| (a - o).abs().total_cmp(&(b - o).abs()))
+                    .unwrap();
+                assert!(
+                    (g - nearest).abs() <= tol,
+                    "group {group}: {o} came back as {g}, nearest entry is {nearest}"
+                );
+            }
+        }
+    }
+
+    /// QLoRA on a codebook weight: the adapter computes what it does on the
+    /// unpacked weight, trains alone, and double quantization of the absmax
+    /// barely moves the result.
+    #[test]
+    fn an_adapter_on_a_codebook_weight_is_qlora() {
+        // 32 rows of two groups: 64 absmax values, one run to pack.
+        let base = Linear::new(128, 32, true).expect("layer");
+        let x = random::uniform_range(-1.0, 1.0, &[2, 128], Dtype::Float32);
+        for double_quant in [false, true] {
+            let mut packed = base.clone();
+            packed
+                .quantize_codebook(&NF4, 64, double_quant)
+                .expect("pack");
+            {
+                let adapter = packed.attach_lora(4, 8.0, false).expect("attach");
+                adapter.b = random::uniform_range(-0.5, 0.5, &[32, 4], Dtype::Float32);
+            }
+            let mut unpacked = packed.clone();
+            unpacked.dequantize();
+            let (want, got) = (values(unpacked.forward(&x)), values(packed.forward(&x)));
+            for (w, g) in want.iter().zip(&got) {
+                assert!((w - g).abs() < 1e-4, "packed {g} vs unpacked {w}");
+            }
+            assert_eq!(packed.trainable_parameters().len(), 2);
+            let names: Vec<String> = packed.parameters().keys().map(|k| k.to_string()).collect();
+            assert!(names.iter().any(|n| n == "codebook"), "{names:?}");
+            assert_eq!(
+                names.iter().any(|n| n == "absmax_scales"),
+                double_quant,
+                "{names:?}"
+            );
+        }
+        let dense_y = values(base.forward(&x));
+        let mut single = base.clone();
+        single.quantize_codebook(&NF4, 64, false).expect("pack");
+        let mut double = base.clone();
+        double.quantize_codebook(&NF4, 64, true).expect("pack");
+        let err = |l: &Linear| {
+            values(l.forward(&x))
+                .iter()
+                .zip(&dense_y)
+                .map(|(a, b)| (a - b).powi(2))
+                .sum::<f32>()
+                .sqrt()
+        };
+        let (e1, e2) = (err(&single), err(&double));
+        crate::check_last_error().expect("no bridge error");
+        assert!(e2 < e1 * 1.05 + 1e-6, "double quant error {e2} vs {e1}");
+    }
 }
