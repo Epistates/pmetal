@@ -22,6 +22,7 @@ use pmetal_bridge::compat::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
+use pmetal_mlx::kernels::rope::{RopePositions, rope};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::architectures::granite::{GraniteConfig, GraniteFamily};
 use pmetal_models::architectures::utils::create_causal_mask;
@@ -46,6 +47,8 @@ pub struct GraniteQLoraAttention {
     pub head_dim: i32,
     /// Attention scale factor: `config.attention_scale()`.
     pub scale: f32,
+    /// RoPE base.
+    pub rope_theta: f32,
 
     /// Query projection with QLoRA.
     pub q_proj: QLoraLinear,
@@ -87,6 +90,7 @@ impl GraniteQLoraAttention {
             n_kv_heads,
             head_dim,
             scale,
+            rope_theta: config.resolved_rope_theta(),
             q_proj,
             k_proj,
             v_proj,
@@ -112,6 +116,16 @@ impl GraniteQLoraAttention {
         let q = q.transpose_axes(&[0, 2, 1, 3]);
         let k = k.transpose_axes(&[0, 2, 1, 3]);
         let v = v.transpose_axes(&[0, 2, 1, 3]);
+
+        // RoPE, as the base model applies it. This used to be skipped on the
+        // grounds that the base model's RoPE was a stub; the base model has
+        // rotated for a long time since, so an adapter trained here was fit to
+        // a position-blind model and served on a rotating one.
+        let positions = RopePositions::resolve(None, 0);
+        let q = rope(&q, positions, self.head_dim, false, self.rope_theta, 1.0)
+            .map_err(LoraError::Mlx)?;
+        let k = rope(&k, positions, self.head_dim, false, self.rope_theta, 1.0)
+            .map_err(LoraError::Mlx)?;
 
         // Expand KV heads for GQA if needed
         let (k, v) = if self.n_kv_heads < self.n_heads {
@@ -1190,8 +1204,10 @@ impl crate::TrainableModel for GraniteQloraForCausalLM {
         GraniteQloraForCausalLM::forward(self, input_ids, mask)
     }
 
+    /// `false`: `forward_with_cache` above ignores the cache, so a decode
+    /// through it would see one token at a time with no context.
     fn supports_kv_cache(&self) -> bool {
-        true
+        false
     }
 
     fn num_trainable_params(&self) -> usize {
@@ -1309,6 +1325,38 @@ mod tests {
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
         assert_eq!(logits.shape(), &[1, 4, 256]);
+    }
+
+    #[test]
+    fn test_granite_qlora_attention_sees_token_order() {
+        // Attention without positions is blind to the order of the tokens a
+        // query attends to: the last position's output is the same for
+        // `a b c d` and `b a c d`. The base model rotates, so the adapter's
+        // model has to as well, and then the two orders differ. One layer: a
+        // second would see the first's causally mixed outputs and tell the
+        // orders apart without any positions.
+        let config = GraniteConfig {
+            num_hidden_layers: 1,
+            ..small_config()
+        };
+        let mut model =
+            GraniteQloraForCausalLM::with_qlora_config(config, small_qlora_config()).unwrap();
+        let last = |model: &mut GraniteQloraForCausalLM, ids: [i32; 4]| {
+            let logits = model
+                .forward(&Array::from_i32_slice(&ids).reshape(&[1, 4]), None)
+                .unwrap();
+            let mut row = ops::slice_axis(&logits, 1, 3, 4);
+            row.eval();
+            row.to_f32_vec(256).unwrap()
+        };
+        let forward = last(&mut model, [5, 9, 13, 2]);
+        let swapped = last(&mut model, [9, 5, 13, 2]);
+        let diff = forward
+            .iter()
+            .zip(&swapped)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(diff > 1e-4, "token order had no effect (max diff {diff})");
     }
 
     #[test]

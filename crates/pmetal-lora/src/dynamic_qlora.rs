@@ -470,7 +470,7 @@ impl TrainableModel for DynamicQloraModel {
             Self::Qwen3MoE(m) => TrainableModel::supports_kv_cache(m),
             Self::Gemma4(m) => TrainableModel::supports_kv_cache(m),
             Self::GptOss(m) => TrainableModel::supports_kv_cache(m),
-            Self::Granite(_) => true,
+            Self::Granite(m) => TrainableModel::supports_kv_cache(m),
             Self::Llama4(_) => true,
             Self::DeepSeek(_) => true,
             Self::NemotronH(_) => false,
