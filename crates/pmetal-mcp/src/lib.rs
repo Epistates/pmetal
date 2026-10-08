@@ -424,12 +424,11 @@ impl PmetalMcpServer {
             "Enable QJL residual correction for Q2-Q3 uniform KV cache (reduces accuracy loss at low bits)"
         )]
         kv_qjl: Option<bool>,
-        // ── Parity gap 1: newly added inference flags ──────────────────────
-        #[description(
-            "Inference backend: auto, standard, compiled, metal-sampler, ane, minimal, dflash"
-        )]
+        #[description("Inference backend: auto, standard, compiled, metal-sampler, ane, minimal")]
         backend: Option<String>,
-        #[description("Draft model for speculative decoding (required when backend=dflash)")]
+        #[description(
+            "Draft model for exact speculative decoding: a Gemma 4 MTP assistant, or with ane a DFlash draft model"
+        )]
         draft_model: Option<String>,
         #[description("Enable compiled sampling path")] compiled: Option<bool>,
         #[description("Run in benchmark mode (reports tok/s, prefill latency)")] benchmark: Option<

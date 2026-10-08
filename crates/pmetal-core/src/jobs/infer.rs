@@ -155,7 +155,7 @@ pub struct InferSpec {
         group = "Compute",
         argv = "--backend",
         kind = "enum",
-        enum_options = ["auto", "standard", "compiled", "metal-sampler", "ane", "minimal", "dflash"],
+        enum_options = ["auto", "standard", "compiled", "metal-sampler", "ane", "minimal"],
         default = "auto"
     )]
     #[serde(default = "default_backend")]
@@ -412,13 +412,7 @@ impl Default for InferSpec {
 impl InferSpec {
     /// Run descriptor + cross-field validation.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
-        let mut errs = self.validate_descriptors();
-        if self.backend == "dflash" && self.draft_model.is_none() {
-            errs.push(FieldError::new(
-                "draft_model",
-                "required when backend = dflash",
-            ));
-        }
+        let errs = self.validate_descriptors();
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }
@@ -459,14 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn dflash_requires_draft() {
+    fn unknown_backend_is_rejected() {
+        // DFlash runs as `pmetal dflash`, not an `infer` backend.
         let mut spec = InferSpec {
             model: "m".into(),
             prompt: "hi".into(),
             backend: "dflash".into(),
             ..Default::default()
         };
-        let res = spec.normalize();
-        assert!(res.is_err());
+        assert!(spec.normalize().is_err());
     }
 }

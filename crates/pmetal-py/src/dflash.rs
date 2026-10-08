@@ -129,7 +129,6 @@ impl PyDFlashGenerator {
             temperature,
             stop_tokens: stop_tokens.unwrap_or_default(),
             speculative_tokens,
-            ..Default::default()
         };
 
         let output: DFlashOutput = self

@@ -122,7 +122,6 @@ pub async fn run_dflash(
         temperature,
         stop_tokens,
         speculative_tokens,
-        ..Default::default()
     };
 
     let use_tree = tree_budget > 0;

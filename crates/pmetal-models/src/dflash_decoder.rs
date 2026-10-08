@@ -160,25 +160,6 @@ pub trait DFlashTarget {
 // Configuration / outputs
 // ----------------------------------------------------------------------------
 
-/// Which device runs the DFlash draft model.
-///
-/// Today only [`DraftBackend::Gpu`] is supported. [`DraftBackend::Ane`] is
-/// the roadmap path — it would offload the draft to the Apple Neural
-/// Engine while the target keeps running on the GPU, removing contention
-/// on the draft→target critical path. The ANE MIL compilation of
-/// `DFlashAttention`'s cross-attention (which has to consume the
-/// `target_hidden` tensor alongside the draft hidden states) is not
-/// plumbed yet; requesting `Ane` returns an explicit error so callers can
-/// feature-detect rather than silently fall back.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum DraftBackend {
-    /// Run the draft on the GPU via mlx-rs (the default today).
-    #[default]
-    Gpu,
-    /// Run the draft on the Apple Neural Engine — not yet implemented.
-    Ane,
-}
-
 /// Runtime configuration for [`DFlashDecoder::generate`].
 #[derive(Debug, Clone)]
 pub struct DFlashConfig {
@@ -191,8 +172,6 @@ pub struct DFlashConfig {
     /// Optional override for the draft block size. `None` uses the value
     /// stored in the draft model config.
     pub speculative_tokens: Option<usize>,
-    /// Which device runs the draft. See [`DraftBackend`].
-    pub draft_backend: DraftBackend,
 }
 
 impl Default for DFlashConfig {
@@ -202,7 +181,6 @@ impl Default for DFlashConfig {
             temperature: 0.0,
             stop_tokens: Vec::new(),
             speculative_tokens: None,
-            draft_backend: DraftBackend::default(),
         }
     }
 }
@@ -300,13 +278,6 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         prompt_ids: &Array,
         config: &DFlashConfig,
     ) -> Result<DFlashOutput, Exception> {
-        if config.draft_backend == DraftBackend::Ane {
-            return Err(Exception::custom(
-                "DFlashDecoder: draft_backend=Ane is not yet implemented. \
-                 The DFlashAttention cross-attention (target_hidden || hidden_states) \
-                 needs ANE MIL compilation; tracked in the project roadmap.",
-            ));
-        }
         let prompt_len = prompt_ids.dim(1) as usize;
         let total_max_tokens = prompt_len + config.max_new_tokens;
         let block_size = config
@@ -543,11 +514,6 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
     ) -> Result<DFlashOutput, Exception> {
         if !self.target.supports_tree_verify() || tree_budget == 0 {
             return self.generate(prompt_ids, config);
-        }
-        if config.draft_backend == DraftBackend::Ane {
-            return Err(Exception::custom(
-                "DFlashDecoder::generate_ddtree: draft_backend=Ane is not yet implemented",
-            ));
         }
         let prompt_len = prompt_ids.dim(1) as usize;
         let total_max_tokens = prompt_len + config.max_new_tokens;
@@ -1385,7 +1351,6 @@ mod tests {
             temperature: 0.0,
             stop_tokens: vec![],
             speculative_tokens: None,
-            ..Default::default()
         };
         let output = decoder.generate(&prompt, &config).unwrap();
 
@@ -1424,7 +1389,6 @@ mod tests {
             temperature: 0.0,
             stop_tokens: vec![],
             speculative_tokens: None,
-            ..Default::default()
         };
         let observed = decoder.generate(&prompt, &observe_config).unwrap();
         let first_generated = observed.tokens[3];
@@ -1436,7 +1400,6 @@ mod tests {
             temperature: 0.0,
             stop_tokens: vec![first_generated],
             speculative_tokens: None,
-            ..Default::default()
         };
         let stopped = decoder.generate(&prompt, &stop_config).unwrap();
         assert_eq!(

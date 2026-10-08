@@ -348,22 +348,6 @@ pub(crate) async fn run_inference(
                 (false, false, false, true)
             }
         }
-        InferenceBackend::Dflash => {
-            // DFlash owns its own target+draft loop and isn't yet wired into
-            // this dispatch. The dedicated `pmetal dflash` subcommand is the
-            // supported path; Phase 2 will fold it in behind `--backend dflash`.
-            let draft = draft_model.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--backend dflash requires --draft-model <hf-id-or-path>. \
-                     For the full DFlash pipeline (tree-verify, metrics), use \
-                     `pmetal dflash` directly."
-                )
-            })?;
-            anyhow::bail!(
-                "--backend dflash is not yet wired into `pmetal infer`; \
-                 run `pmetal dflash --target {model_id} --draft {draft}` instead."
-            );
-        }
     };
 
     tracing::info!(model = %model_id, "Loading model for inference");

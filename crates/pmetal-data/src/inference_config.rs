@@ -228,13 +228,10 @@ pub enum InferenceBackend {
     Compiled,
     /// Fused Metal sampling kernel — matches `--metal-sampler`.
     MetalSampler,
-    /// Apple Neural Engine hybrid path — matches `--ane` (requires `ane` feature).
+    /// Apple Neural Engine — matches `--ane` (requires `ane` feature).
     Ane,
     /// Minimal async generation (debug path) — matches `--minimal`.
     Minimal,
-    /// DFlash block-diffusion speculative decoding. Requires a draft model
-    /// path. Auto resolves to this only when a draft is explicitly provided.
-    Dflash,
 }
 
 impl InferenceBackend {
@@ -247,7 +244,6 @@ impl InferenceBackend {
             Self::MetalSampler => "metal-sampler",
             Self::Ane => "ane",
             Self::Minimal => "minimal",
-            Self::Dflash => "dflash",
         }
     }
 
@@ -260,7 +256,6 @@ impl InferenceBackend {
             Self::MetalSampler => "Metal",
             Self::Ane => "ANE",
             Self::Minimal => "Minimal",
-            Self::Dflash => "DFlash",
         }
     }
 
@@ -271,9 +266,8 @@ impl InferenceBackend {
             Self::Standard => "streaming MLX path (token-by-token)",
             Self::Compiled => "JIT-compiled sampling (mlx.compile)",
             Self::MetalSampler => "fused Metal sampling kernel",
-            Self::Ane => "Apple Neural Engine hybrid (experimental)",
+            Self::Ane => "Apple Neural Engine (experimental)",
             Self::Minimal => "minimal async loop (debug only)",
-            Self::Dflash => "block-diffusion speculative (needs draft)",
         }
     }
 
@@ -286,7 +280,6 @@ impl InferenceBackend {
         Self::MetalSampler,
         Self::Ane,
         Self::Minimal,
-        Self::Dflash,
     ];
 }
 
@@ -306,10 +299,9 @@ impl std::str::FromStr for InferenceBackend {
             "metal-sampler" | "metal_sampler" | "metal" => Ok(Self::MetalSampler),
             "ane" => Ok(Self::Ane),
             "minimal" => Ok(Self::Minimal),
-            "dflash" => Ok(Self::Dflash),
             _ => Err(format!(
                 "unknown backend '{s}': expected auto, standard, compiled, \
-                 metal-sampler, ane, minimal, or dflash"
+                 metal-sampler, ane or minimal"
             )),
         }
     }
