@@ -8,8 +8,6 @@
 //! - NF4/FP4/Int8 quantization implementations
 //! - Memory management utilities for Apple Silicon
 //! - KV caching for efficient inference
-//! - Sequence packing for efficient SFT training
-//! - NEFTune for improved fine-tuning quality
 //! - Mixture of Experts (MoE) for sparse models
 //! - Speculative decoding for faster inference
 
@@ -28,19 +26,16 @@
 #![allow(clippy::derivable_impls)]
 #![allow(clippy::arc_with_non_send_sync)]
 
-pub mod attention;
 pub mod bridge;
 pub mod error;
 pub mod fp8_quantization;
 pub mod gradient_checkpoint;
-pub mod grouped_gemm_moe;
 pub mod kernels;
 pub mod kv_cache;
 pub mod memory;
 pub mod moe;
 pub mod prefix_cache;
 pub mod quantization;
-pub mod sequence_packing;
 pub mod speculative;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -52,11 +47,9 @@ pub use array_ext::*;
 pub use bridge::MlxMetalBridge;
 pub use fp8_quantization::*;
 pub use gradient_checkpoint::*;
-pub use grouped_gemm_moe::*;
 pub use kv_cache::*;
 pub use moe::*;
 pub use prefix_cache::*;
-pub use sequence_packing::*;
 pub use speculative::*;
 
 // Re-export bridge types for convenience
@@ -68,17 +61,14 @@ pub type Result<T> = std::result::Result<T, Exception>;
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::array_ext::*;
-    pub use crate::attention::*;
     pub use crate::fp8_quantization::*;
     pub use crate::gradient_checkpoint::*;
-    pub use crate::grouped_gemm_moe::*;
     pub use crate::kernels::*;
     pub use crate::kv_cache::*;
     pub use crate::memory::*;
     pub use crate::moe::*;
     pub use crate::prefix_cache::*;
     pub use crate::quantization::*;
-    pub use crate::sequence_packing::*;
     pub use crate::speculative::*;
     pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
 }

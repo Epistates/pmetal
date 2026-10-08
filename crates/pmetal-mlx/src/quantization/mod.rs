@@ -4,15 +4,12 @@
 //! - NF4 (Normal Float 4-bit) - optimal for neural network weights
 //! - FP4 (Floating Point 4-bit) - simpler alternative
 //! - Int8 (8-bit integer) - for activations
-//! - Group-wise quantization (GPTQ/AWQ format) - for loading pre-quantized models
 
 pub mod fp4;
-pub mod group;
 pub mod int8;
 pub mod nf4;
 
 pub use fp4::*;
-pub use group::*;
 pub use int8::*;
 pub use nf4::*;
 
@@ -57,14 +54,6 @@ pub enum QuantScheme {
     Int8,
     /// FP8 quantization.
     FP8,
-    /// Group-wise 2-bit quantization (GPTQ/AWQ compatible).
-    Group2,
-    /// Group-wise 3-bit quantization (GPTQ/AWQ compatible).
-    Group3,
-    /// Group-wise 4-bit quantization (GPTQ/AWQ compatible).
-    Group4,
-    /// Group-wise 8-bit quantization (GPTQ/AWQ compatible).
-    Group8,
 }
 
 /// Common interface for all quantizers.

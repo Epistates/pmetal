@@ -40,7 +40,6 @@
 
 mod fused_batch;
 mod mamba;
-mod paged;
 mod quantized;
 mod rotating;
 mod standard;
@@ -50,7 +49,6 @@ mod turboquant;
 
 pub use fused_batch::*;
 pub use mamba::*;
-pub use paged::*;
 pub use quantized::*;
 pub use rotating::*;
 pub use standard::*;

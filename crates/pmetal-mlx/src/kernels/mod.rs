@@ -5,43 +5,32 @@
 //! - Differentiable attention with Metal FlashAttention backward pass
 //! - Fused LoRA forward/backward
 //! - Rotary position embeddings (RoPE)
-//! - RMS layer normalization (including novel fused RMSNorm+LoRA)
-//! - SwiGLU/GEGLU activations (including Metal-optimized fused MLP)
-//! - Cross-entropy loss computation
-//! - Cut Cross Entropy for 13x longer context
-//! - Metal-accelerated fused linear + cross-entropy (memory-efficient loss without full logit materialization)
+//! - RMS layer normalization
+//! - Metal-optimized fused SwiGLU MLP
+//! - Cut Cross Entropy (loss without materializing the full logits)
+//! - Gated DeltaNet recurrence
 
-pub mod cross_entropy;
 pub mod cut_cross_entropy;
 pub mod differentiable_attention;
 pub mod fast_lora;
 pub mod fused_attention;
 pub mod fused_moe;
 pub mod gated_delta;
-pub mod metal_cross_entropy;
-pub mod metal_norm_lora;
 pub mod metal_swiglu;
 mod persistent_cache;
 pub mod quantized_matmul;
 pub mod rms_norm;
 pub mod rope;
-pub mod swiglu;
-pub mod training_attention;
 pub mod utils;
 
-pub use cross_entropy::*;
 pub use cut_cross_entropy::*;
 pub use differentiable_attention::*;
 pub use fast_lora::*;
 pub use fused_attention::*;
 pub use fused_moe::*;
 pub use gated_delta::*;
-pub use metal_cross_entropy::*;
-pub use metal_norm_lora::*;
 pub use metal_swiglu::*;
 pub use quantized_matmul::*;
 pub use rms_norm::*;
 pub use rope::*;
-pub use swiglu::*;
-pub use training_attention::*;
 pub use utils::*;

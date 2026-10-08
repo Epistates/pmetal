@@ -12,8 +12,6 @@ This crate provides the bridge between PMetal and Apple's MLX framework, along w
 - **Gradient Checkpointing**: Memory-efficient training for large models
 - **KV Cache**: Efficient key-value caching for inference
 - **Mixture of Experts**: MoE layer implementations
-- **NEFTune**: Noise injection for improved fine-tuning
-- **Sequence Packing**: Efficient batching for variable-length sequences
 - **Speculative Decoding**: Faster inference with draft models
 
 ## Usage
@@ -21,14 +19,9 @@ This crate provides the bridge between PMetal and Apple's MLX framework, along w
 ```rust,no_run
 use pmetal_mlx::prelude::*;
 
-fn setup(sequences: &[(&Array, &Array)]) -> std::result::Result<(), Exception> {
+fn setup() {
     // KV cache for inference: (layers, max_seq_len, kv_heads, head_dim)
     let _cache = KVCache::new(KVCacheConfig::new(28, 4096, 8, 128));
-
-    // Sequence packing for training
-    let packer = SequencePacker::new(PackingConfig::new(2048));
-    let _packed = packer.pack_sequences(sequences)?;
-    Ok(())
 }
 ```
 
@@ -36,13 +29,12 @@ fn setup(sequences: &[(&Array, &Array)]) -> std::result::Result<(), Exception> {
 
 | Module | Description |
 |--------|-------------|
-| `kernels` | Custom MLX kernels (cross entropy, RMS norm, GDN, etc.) |
+| `kernels` | Custom MLX kernels (fused attention, cut cross entropy, RMS norm, GDN, etc.) |
 | `kernels/gated_delta` | Gated Delta Network (GDN) recurrence with fused Metal shader |
 | `quantization` | Weight quantization implementations |
 | `gradient_checkpoint` | Gradient-checkpointing config (the mechanism lives in `pmetal-bridge`) |
 | `kv_cache` | Key-value cache for efficient inference |
 | `moe` | Mixture of Experts support |
-| `sequence_packing` | Efficient sequence batching |
 | `speculative` | Speculative decoding utilities |
 
 ## Quantization Formats
