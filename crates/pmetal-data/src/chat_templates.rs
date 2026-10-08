@@ -819,9 +819,10 @@ impl ChatTemplate {
     /// **kwargs)` renders it.
     ///
     /// `kwargs` reach the upstream Jinja template verbatim
-    /// (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, …). When
-    /// `enable_thinking` is absent it is passed as `true`, the default every
-    /// thinking template documents.
+    /// (`enable_thinking`, `reasoning_effort`, `preserve_thinking`, …). A
+    /// kwarg left out stays undefined, so the template's own default applies,
+    /// as it does in transformers (Qwen3.8 thinks unless told not to; Gemma 4
+    /// and Qwen3.5-0.8B do not unless told to).
     ///
     /// An assistant message without `reasoning_content` whose `content`
     /// still carries `<think>…</think>` (the raw text a thinking model
@@ -847,9 +848,7 @@ impl ChatTemplate {
         let Some(src) = self.jinja_source.as_deref() else {
             return Ok(self.apply_builtin_inference(messages, tools, no_thinking));
         };
-        let mut kwargs = kwargs.clone();
-        kwargs.set_default(ChatTemplateKwargs::ENABLE_THINKING, true);
-        match self.render_jinja(src, messages, tools, &kwargs) {
+        match self.render_jinja(src, messages, tools, kwargs) {
             Ok(text) => Ok(FormattedChat {
                 text,
                 response_start: 0, // training masks set this separately
@@ -881,6 +880,49 @@ impl ChatTemplate {
             let after = src[at + name.len()..].chars().next();
             !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
         })
+    }
+
+    /// Whether the model thinks before it answers, as far as its Jinja chat
+    /// template shows: it has a thinking control (`enable_thinking`,
+    /// `reasoning_effort`, `thinking`) or writes a thinking block (`<think>`,
+    /// `[THINK]`). `false` without a Jinja template.
+    pub fn has_thinking(&self) -> bool {
+        let Some(src) = self.jinja_source.as_deref() else {
+            return false;
+        };
+        ["enable_thinking", "reasoning_effort", "thinking"]
+            .iter()
+            .any(|kwarg| self.reads_kwarg(kwarg))
+            || src.contains("<think>")
+            || src.contains("[THINK]")
+    }
+
+    /// Whether the model thinks under `kwargs`. It must [have
+    /// thinking](Self::has_thinking); a template with an `enable_thinking`
+    /// control thinks when that is `true`, and when it is unset, when the
+    /// template's own default is on (Qwen3 and Qwen3.8 think by default,
+    /// Gemma 4 and Qwen3.5-0.8B do not). That default is read by
+    /// rendering a one-turn probe with and without `enable_thinking: true`.
+    pub fn thinks_with(&self, kwargs: &ChatTemplateKwargs) -> bool {
+        if !self.has_thinking() {
+            return false;
+        }
+        if !self.reads_kwarg(ChatTemplateKwargs::ENABLE_THINKING) {
+            return true;
+        }
+        if let Some(enabled) = kwargs.enable_thinking() {
+            return enabled;
+        }
+        let probe = [Message::user("hi")];
+        let mut on = kwargs.clone();
+        on.set(ChatTemplateKwargs::ENABLE_THINKING, true);
+        match (
+            self.apply_inference_with_kwargs(&probe, None, kwargs),
+            self.apply_inference_with_kwargs(&probe, None, &on),
+        ) {
+            (Ok(default), Ok(on)) => default.text == on.text,
+            _ => true,
+        }
     }
 
     /// Check caller-chosen thinking controls against this template, for a
@@ -969,9 +1011,7 @@ impl ChatTemplate {
             .jinja_source
             .as_deref()
             .ok_or("the model ships no chat template")?;
-        let mut kwargs = kwargs.clone();
-        kwargs.set_default(ChatTemplateKwargs::ENABLE_THINKING, true);
-        self.render_jinja(src, messages, tools, &kwargs)
+        self.render_jinja(src, messages, tools, kwargs)
     }
 
     /// Render the upstream Jinja template.

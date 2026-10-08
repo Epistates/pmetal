@@ -1174,6 +1174,25 @@ impl InferenceEngine {
             .map_err(ServeError::BadRequest)
     }
 
+    /// Whether the model thinks under these chat template kwargs: its
+    /// template has a thinking control or block and `enable_thinking` is not
+    /// `false`.
+    pub fn thinks_with(&self, kwargs: &pmetal_data::chat_templates::ChatTemplateKwargs) -> bool {
+        self.chat_template.thinks_with(kwargs)
+    }
+
+    /// The output budget for a request that sets none: the model's
+    /// recommendation ([`pmetal_data::inference_config::default_max_tokens`]:
+    /// `generation_config.json`, else 32768 tokens for a thinking model,
+    /// else 256), within the context window and this server's
+    /// `--max-seq-len` once the prompt's `prompt_len` tokens are in.
+    pub fn default_max_tokens(&self, thinking: bool, prompt_len: usize) -> usize {
+        let context = pmetal_data::inference_config::context_window(&self.model_path)
+            .map_or(self.max_seq_len, |c| c.min(self.max_seq_len));
+        pmetal_data::inference_config::default_max_tokens(&self.model_path, thinking)
+            .for_prompt(prompt_len, Some(context))
+    }
+
     fn template_messages(messages: &[ChatMessage]) -> Vec<pmetal_data::chat_templates::Message> {
         messages
             .iter()

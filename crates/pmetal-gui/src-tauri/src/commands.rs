@@ -530,7 +530,18 @@ pub async fn get_model_defaults(
         defaults.top_k = cfg["top_k"].as_u64().map(|v| v as u32);
         defaults.top_p = cfg["top_p"].as_f64().map(|v| v as f32);
         defaults.repetition_penalty = cfg["repetition_penalty"].as_f64().map(|v| v as f32);
-        defaults.max_new_tokens = cfg["max_new_tokens"].as_u64().map(|v| v as u32);
+    }
+
+    // The output budget `pmetal infer` would pick: generation_config.json's,
+    // else the thinking-model default when the chat template thinks.
+    {
+        use pmetal::data::chat_templates::{ChatTemplateKwargs, detect_chat_template};
+        use pmetal::data::inference_config::{context_window, default_max_tokens};
+        let thinking =
+            detect_chat_template(&model_path, &model_id).thinks_with(&ChatTemplateKwargs::new());
+        let budget =
+            default_max_tokens(&model_path, thinking).for_prompt(0, context_window(&model_path));
+        defaults.max_new_tokens = Some(u32::try_from(budget).unwrap_or(u32::MAX));
     }
 
     // Read config.json for model arch info

@@ -667,7 +667,7 @@ impl InferenceTab {
             model,
             prompt,
             lora,
-            max_tokens: self.max_tokens,
+            max_tokens: Some(self.max_tokens),
             temperature,
             top_k,
             top_p,

@@ -111,7 +111,10 @@ pub struct InferenceRunnerConfig {
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
     pub min_p: Option<f32>,
-    pub max_tokens: usize,
+    /// Output budget. `None`: the model's recommendation, see
+    /// [`default_max_tokens`](pmetal_data::inference_config::default_max_tokens),
+    /// kept inside the context window.
+    pub max_tokens: Option<usize>,
     pub repetition_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
@@ -180,7 +183,7 @@ impl Default for InferenceRunnerConfig {
             top_k: None,
             top_p: None,
             min_p: None,
-            max_tokens: 256,
+            max_tokens: None,
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
@@ -228,6 +231,7 @@ pub struct InferenceRunner {
     pub state: InferenceGenState,
     chat_template_type: Option<ChatTemplateType>,
     is_chat: bool,
+    thinks: bool,
 }
 
 /// Mutable generation state (model, caches, config).
@@ -335,7 +339,6 @@ impl InferenceRunner {
             // Base models don't understand <think> tags.
             template_kwargs.set(ChatTemplateKwargs::ENABLE_THINKING, false);
         }
-        let no_thinking = template_kwargs.enable_thinking() == Some(false);
 
         // 3. Sampling defaults are loaded after template detection (step 6b)
         //    because mode presets depend on the detected model family.
@@ -411,7 +414,7 @@ impl InferenceRunner {
         };
 
         // 6. Apply chat template + tokenize
-        let (input_ids, template_type) = if use_chat {
+        let (input_ids, template_type, thinks) = if use_chat {
             let detected = pmetal_data::chat_templates::detect_chat_template(
                 model_path,
                 &model_path.to_string_lossy(),
@@ -440,7 +443,11 @@ impl InferenceRunner {
             let ids = tokenizer
                 .encode_with_special_tokens(&formatted)
                 .map_err(|e| Exception::custom(e.to_string()))?;
-            (ids, Some(detected.template_type))
+            (
+                ids,
+                Some(detected.template_type),
+                detected.thinks_with(&template_kwargs),
+            )
         } else {
             let prompt_text = if config.chat_messages.is_some()
                 || config
@@ -459,17 +466,32 @@ impl InferenceRunner {
             let ids = tokenizer
                 .encode(&expand_media(prompt_text)?)
                 .map_err(|e| Exception::custom(e.to_string()))?;
-            (ids, None)
+            (ids, None, false)
         };
 
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
+
+        // 6a. Output budget: the caller's, else the model's recommendation
+        //     inside its context window.
+        let max_tokens = match config.max_tokens {
+            Some(max_tokens) => max_tokens,
+            None => {
+                let default = pmetal_data::inference_config::default_max_tokens(model_path, thinks);
+                let max_tokens = default.for_prompt(
+                    input_ids.len(),
+                    pmetal_data::inference_config::context_window(model_path),
+                );
+                tracing::info!(max_tokens, source = %default.source, "Default output budget");
+                max_tokens
+            }
+        };
 
         // 6b. Load sampling defaults: global fallback → generation_config.json → mode preset
         let defaults = pmetal_data::inference_config::load_sampling_defaults(
             model_path,
             template_type,
             config.mode,
-            use_chat && !no_thinking,
+            thinks,
         );
         let temperature = config.temperature.unwrap_or(defaults.temperature);
         let top_k = config.top_k.unwrap_or(defaults.top_k);
@@ -493,9 +515,9 @@ impl InferenceRunner {
 
         // 8. Build GenerationConfig
         let gen_config = if temperature < 1e-6 {
-            GenerationConfig::greedy(config.max_tokens).with_stop_tokens(stop_tokens)
+            GenerationConfig::greedy(max_tokens).with_stop_tokens(stop_tokens)
         } else {
-            let mut gc = GenerationConfig::sampling(config.max_tokens, temperature)
+            let mut gc = GenerationConfig::sampling(max_tokens, temperature)
                 .with_top_k(top_k)
                 .with_top_p(top_p)
                 .with_min_p(min_p)
@@ -510,7 +532,7 @@ impl InferenceRunner {
         };
 
         // 9. Load model (standard or LoRA-merged)
-        let max_seq_len = input_ids.len() + config.max_tokens + 64;
+        let max_seq_len = input_ids.len() + max_tokens + 64;
 
         let mut cache_request = cache_mode_request_from_config(&config);
         if mtp_requested {
@@ -795,12 +817,20 @@ impl InferenceRunner {
             },
             chat_template_type: template_type,
             is_chat: use_chat,
+            thinks,
         })
     }
 
     /// Whether chat mode is active.
     pub fn is_chat(&self) -> bool {
         self.is_chat
+    }
+
+    /// Whether the prompt asks the model to think before it answers (chat
+    /// mode, a thinking template, and thinking on, by flag or by the
+    /// template's default).
+    pub fn thinks(&self) -> bool {
+        self.thinks
     }
 
     /// The detected chat template type (if chat mode is active).

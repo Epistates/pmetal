@@ -38,10 +38,10 @@ pub struct InferSpec {
         argv = "--max-tokens",
         min = 1,
         max = 1_048_576,
-        default_int = 256
+        help = "Default: the model's generation_config.json, else 32768 for a thinking model, else 256"
     )]
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
 
     #[job(
         label = "Temperature",
@@ -364,7 +364,7 @@ impl Default for InferSpec {
             model: String::new(),
             lora: None,
             prompt: String::new(),
-            max_tokens: default_max_tokens(),
+            max_tokens: None,
             temperature: None,
             top_k: None,
             top_p: None,
@@ -415,9 +415,6 @@ impl InferSpec {
     }
 }
 
-fn default_max_tokens() -> usize {
-    256
-}
 fn default_mode() -> String {
     "auto".to_string()
 }

@@ -150,8 +150,13 @@ impl From<WireChatMessage> for ChatMessage {
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
+    /// Output budget; absent means the model's default (see
+    /// [`InferenceEngine::default_max_tokens`](crate::engine::InferenceEngine::default_max_tokens)).
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// OpenAI's newer name for `max_tokens`; wins when both are set.
+    #[serde(default)]
+    pub max_completion_tokens: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]
@@ -255,17 +260,15 @@ pub struct ChatLogprobs {
     pub content: Vec<TokenLogprobContent>,
 }
 
-fn default_max_tokens() -> usize {
-    256
-}
-
 /// Text completion request (POST /v1/completions).
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionRequest {
     pub model: String,
     pub prompt: String,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: usize,
+    /// Output budget; absent means the model's default (see
+    /// [`InferenceEngine::default_max_tokens`](crate::engine::InferenceEngine::default_max_tokens)).
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]

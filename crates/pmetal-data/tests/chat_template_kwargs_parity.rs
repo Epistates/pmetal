@@ -221,3 +221,39 @@ fn unsupported_controls_are_reported() {
     // A reserved name is refused rather than silently shadowed.
     assert!(ChatTemplateKwargs::from_json(r#"{"messages": []}"#).is_err());
 }
+
+#[test]
+fn thinking_is_detected_from_the_template() {
+    let fixture = load_fixture();
+    let qwen = template_for(&fixture, "qwen3_8");
+    let gpt_oss = template_for(&fixture, "gpt_oss");
+    let off = ChatTemplateKwargs::new().with("enable_thinking", false);
+    assert!(qwen.thinks_with(&ChatTemplateKwargs::new()));
+    assert!(!qwen.thinks_with(&off));
+    assert!(gpt_oss.has_thinking());
+
+    let mut chatml = ChatTemplate::new(ChatTemplateType::ChatMl);
+    chatml.jinja_source = Some(
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}"
+            .into(),
+    );
+    assert!(!chatml.has_thinking());
+
+    // A template that thinks only when asked (Qwen3.5-0.8B, Gemma 4): its
+    // default is read from the template, not assumed.
+    let mut opt_in = ChatTemplate::new(ChatTemplateType::Qwen);
+    opt_in.jinja_source = Some(
+        "{{ messages[0].content }}{% if enable_thinking is defined and enable_thinking is true %}<think>\n{% endif %}"
+            .into(),
+    );
+    assert!(opt_in.has_thinking());
+    assert!(!opt_in.thinks_with(&ChatTemplateKwargs::new()));
+    assert!(opt_in.thinks_with(&ChatTemplateKwargs::new().with("enable_thinking", true)));
+    // With no kwargs the template sees `enable_thinking` undefined, as in
+    // transformers.
+    let text = opt_in
+        .apply_inference_with_kwargs(&[Message::user("hi")], None, &ChatTemplateKwargs::new())
+        .unwrap()
+        .text;
+    assert_eq!(text, "hi");
+}

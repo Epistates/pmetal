@@ -125,6 +125,14 @@ curl http://localhost:8080/v1/chat/completions \
   -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+### Output length
+
+A chat or text completion without `max_tokens` (or `max_completion_tokens`)
+gets the model's own budget, by the rule `pmetal infer` uses (see
+[Output Length](/cli/infer/#output-length)): `generation_config.json`, else
+32,768 tokens for a thinking model, else 256, inside the context window and
+`--max-seq-len`.
+
 ### Thinking controls
 
 Chat completions accept OpenAI's top-level `reasoning_effort` and a

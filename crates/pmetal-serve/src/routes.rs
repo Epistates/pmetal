@@ -261,8 +261,15 @@ pub async fn chat_completions(
         None
     };
 
+    let max_tokens = match req.max_completion_tokens.or(req.max_tokens) {
+        Some(max_tokens) => max_tokens,
+        None => state
+            .engine
+            .default_max_tokens(state.engine.thinks_with(&template_kwargs), prompt_tokens),
+    };
+
     let params = SamplingParams {
-        max_tokens: req.max_tokens,
+        max_tokens,
         temperature,
         top_k: req.top_k,
         top_p: req.top_p,
@@ -412,8 +419,13 @@ pub async fn completions(
     // paths — streaming deltas emit per-token 4-parallel-array chunks.
     let logprobs_top_n = req.logprobs.map(|n| n as usize);
 
+    // A raw completion has no chat template, so no thinking.
+    let max_tokens = req
+        .max_tokens
+        .unwrap_or_else(|| state.engine.default_max_tokens(false, prompt_tokens));
+
     let params = SamplingParams {
-        max_tokens: req.max_tokens,
+        max_tokens,
         temperature,
         top_k: req.top_k,
         top_p: req.top_p,

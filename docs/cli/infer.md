@@ -103,7 +103,7 @@ pmetal infer \
 | `--top-k` | model default | Top-k sampling |
 | `--top-p` | model default | Nucleus sampling |
 | `--min-p` | model default | Min-p dynamic sampling |
-| `--max-tokens` | `256` | Maximum generation length |
+| `--max-tokens` | model default | Maximum generation length (see [Output Length](#output-length)) |
 | `--repetition-penalty` | `1.0` | Repetition penalty |
 | `--frequency-penalty` | `0.0` | Frequency penalty |
 | `--presence-penalty` | `0.0` | Presence penalty |
@@ -120,6 +120,26 @@ pmetal infer \
 | `--no-preserve-thinking` | `false` | Keep only the current turn's thinking in the prompt, for chat templates with a `preserve_thinking` control |
 | `--chat-template-kwargs` | — | Extra chat template keyword arguments as a JSON object |
 
+## Output Length
+
+Without `--max-tokens`, the output budget is the model's own:
+
+1. `max_new_tokens` from the model's `generation_config.json`;
+2. else its `max_length`, which counts the prompt, as in transformers;
+3. else 32,768 tokens when the model thinks (its chat template has a
+   thinking control or writes a thinking block, and thinking is on, by
+   `--no-thinking` or by the template's default). That is the length the Qwen3,
+   Qwen3.5 and Qwen3.6 cards recommend for most queries; a thinking model
+   spends most of its budget reasoning, so a few hundred tokens stop it
+   mid-thought;
+4. else 256 tokens.
+
+The budget never runs past the context window (`max_position_embeddings`)
+once the prompt is in. An explicit `--max-tokens` always wins; the Qwen3.8 card
+recommends up to 262,144 reasoning tokens plus 131,072 answer tokens for
+long agentic tasks. `pmetal serve` applies the same rule to a request without
+`max_tokens`.
+
 ## Thinking Controls
 
 Chat templates take keyword arguments the way Hugging Face transformers'
@@ -131,7 +151,11 @@ byte for byte the same. The flags above set the ones model makers document:
 | Qwen3.8 | `reasoning_effort` | `xhigh` (default), `medium`, `low` |
 | Qwen3.8 | `preserve_thinking` | on by default; `--no-preserve-thinking` turns it off |
 | gpt-oss | `reasoning_effort` | `low`, `medium` (default), `high` |
-| Qwen3 onwards, Gemma 4, SmolLM3 | `enable_thinking` | `--no-thinking` turns it off |
+| Qwen3 onwards, Gemma 4 | `enable_thinking` | `--no-thinking` turns it off |
+
+Unset, each control keeps the template's own default: Qwen3 and Qwen3.8 think,
+while Gemma 4 and Qwen3.5-0.8B answer directly unless
+given `--chat-template-kwargs '{"enable_thinking": true}'`.
 
 ```bash
 pmetal infer --model Qwen/Qwen3.8-27B --chat --reasoning-effort low \

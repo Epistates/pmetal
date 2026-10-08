@@ -33,7 +33,7 @@ struct InferOptions {
     model_id: String,
     prompt: String,
     lora: Option<String>,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     temperature: f32,
     seed: Option<u64>,
     top_k: Option<usize>,
@@ -164,7 +164,7 @@ pub fn finetune<'py>(
 ///     model_id: HuggingFace model ID or local path
 ///     prompt: Text prompt
 ///     lora: Optional path to LoRA weights
-///     max_tokens: Maximum tokens to generate (default 256)
+///     max_tokens: Maximum tokens to generate (default: the model's generation_config.json, else 32768 for a thinking model, else 256)
 ///     temperature: Sampling temperature (default 0.7)
 ///     seed: Random seed for reproducibility
 ///     draft_model: Optional Gemma 4 MTP assistant model
@@ -185,7 +185,7 @@ pub fn finetune<'py>(
     model_id,
     prompt,
     lora=None,
-    max_tokens=256,
+    max_tokens=None,
     temperature=0.7,
     seed=None,
     top_k=None,
@@ -215,7 +215,7 @@ pub fn infer(
     model_id: &str,
     prompt: &str,
     lora: Option<&str>,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     temperature: f32,
     seed: Option<u64>,
     top_k: Option<usize>,
@@ -279,7 +279,7 @@ pub fn infer(
     model_id,
     prompt,
     lora=None,
-    max_tokens=256,
+    max_tokens=None,
     temperature=0.7,
     seed=None,
     top_k=None,
@@ -309,7 +309,7 @@ pub fn infer_with_metrics<'py>(
     model_id: &str,
     prompt: &str,
     lora: Option<&str>,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     temperature: f32,
     seed: Option<u64>,
     top_k: Option<usize>,
@@ -537,7 +537,7 @@ impl InferOptions {
         model_id: &str,
         prompt: &str,
         lora: Option<&str>,
-        max_tokens: usize,
+        max_tokens: Option<usize>,
         temperature: f32,
         seed: Option<u64>,
         top_k: Option<usize>,

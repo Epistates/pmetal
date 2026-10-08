@@ -270,7 +270,7 @@ pub(crate) async fn run_inference(
     model_id: &str,
     lora_path: Option<&str>,
     prompt: &str,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     temperature: Option<f32>,
     top_k: Option<usize>,
     top_p: Option<f32>,
@@ -486,6 +486,10 @@ pub(crate) async fn run_inference(
 
     let mut runner = InferenceRunner::prepare(runner_config)?;
     let use_chat = runner.is_chat();
+    // Whether the output opens with thinking: asked for, or the chat
+    // template's own default (Gemma 4 and Qwen3.5-0.8B don't).
+    let thinking_requested_off = no_thinking;
+    let no_thinking = !runner.thinks();
     let gen_config = runner.state.gen_config();
 
     if profile_layers {
@@ -503,6 +507,8 @@ pub(crate) async fn run_inference(
     if benchmark {
         let prompt_tokens = benchmark_prompt_tokens
             .ok_or_else(|| anyhow::anyhow!("--benchmark requires --benchmark-prompt-tokens"))?;
+        // A benchmark times a fixed generation length, not the model's budget.
+        let max_tokens = max_tokens.unwrap_or(pmetal_data::inference_config::FALLBACK_MAX_TOKENS);
         println!("Running warmup..");
         println!(
             "Timing with prompt_tokens={prompt_tokens}, generation_tokens={max_tokens}, batch_size=1."
@@ -571,11 +577,25 @@ pub(crate) async fn run_inference(
     if let Some(s) = gen_config.seed {
         println!("Seed:        {}", s);
     }
-    println!("Max tokens:  {}", max_tokens);
-    if use_chat && no_thinking {
+    println!(
+        "Max tokens:  {}{}",
+        gen_config.max_new_tokens,
+        if max_tokens.is_none() {
+            " (model default)"
+        } else {
+            ""
+        }
+    );
+    if use_chat && thinking_requested_off {
         println!("Thinking:    disabled");
-    } else if let Some(effort) = reasoning_effort.as_deref().filter(|_| use_chat) {
-        println!("Reasoning:   {effort}");
+    } else if use_chat && !no_thinking {
+        println!(
+            "Thinking:    on{}",
+            reasoning_effort
+                .as_deref()
+                .map(|effort| format!(" (reasoning effort {effort})"))
+                .unwrap_or_default()
+        );
     }
     println!("========================================");
     println!();

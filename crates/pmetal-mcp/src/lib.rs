@@ -389,7 +389,10 @@ impl PmetalMcpServer {
         &self,
         #[description("Model ID or local path")] model: String,
         #[description("Input prompt text")] prompt: String,
-        #[description("Maximum tokens to generate (default: 256)")] max_tokens: Option<u64>,
+        #[description(
+            "Maximum tokens to generate (default: the model's generation_config.json, else 32768 for a thinking model, else 256)"
+        )]
+        max_tokens: Option<u64>,
         #[description("Sampling temperature 0.0-2.0")] temperature: Option<f64>,
         #[description("Apply chat template (auto-detected from model)")] chat: Option<bool>,
         #[description("System message for chat mode")] system: Option<String>,
@@ -464,7 +467,7 @@ impl PmetalMcpServer {
         let spec = InferSpec {
             model,
             prompt,
-            max_tokens: max_tokens.unwrap_or(256) as usize,
+            max_tokens: max_tokens.map(|m| m as usize),
             temperature: temperature.map(|t| t as f32),
             chat: chat.unwrap_or(false),
             system,

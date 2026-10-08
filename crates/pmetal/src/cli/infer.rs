@@ -44,9 +44,11 @@ pub struct InferArgs {
     #[arg(long = "video-fps", value_name = "FPS", requires = "video", value_parser = parse_fps)]
     pub video_fps: Option<f64>,
 
-    /// Maximum tokens to generate
-    #[arg(long = "max-tokens", default_value = "256")]
-    pub max_tokens: usize,
+    /// Maximum tokens to generate. Default: the model's generation_config.json
+    /// max_new_tokens (or max_length), else 32768 for a thinking model, else
+    /// 256; never past the context window.
+    #[arg(long = "max-tokens")]
+    pub max_tokens: Option<usize>,
 
     /// Temperature for sampling (0 = greedy). Defaults to model's generation_config.json
     #[arg(long = "temperature")]

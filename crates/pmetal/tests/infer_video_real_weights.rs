@@ -55,7 +55,7 @@ fn describe(model: &Path, video: PathBuf) -> String {
             fps: Some(FPS),
         }],
         temperature: Some(0.0),
-        max_tokens: 40,
+        max_tokens: Some(40),
         ..Default::default()
     })
     .expect("prepare");

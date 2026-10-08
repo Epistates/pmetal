@@ -457,6 +457,144 @@ pub fn load_sampling_from_generation_config(model_path: &Path) -> SamplingDefaul
     defaults
 }
 
+// =============================================================================
+// Output length
+// =============================================================================
+
+/// Output budget for a thinking model when its `generation_config.json`
+/// names none: the length Qwen's cards recommend "for most queries" (Qwen3,
+/// Qwen3.5, Qwen3.6, and the Qwen3-2507 Thinking models), which DeepSeek-R1
+/// and Phi-4-reasoning also generate with. A thinking model spends most of
+/// it reasoning, so a budget of a few hundred tokens ends it mid-thought.
+pub const THINKING_MAX_TOKENS: usize = 32_768;
+
+/// Output budget for a model that neither thinks nor names one.
+pub const FALLBACK_MAX_TOKENS: usize = 256;
+
+/// Where a default output budget came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxTokensSource {
+    /// `generation_config.json` `max_new_tokens`.
+    GenerationConfigMaxNewTokens,
+    /// `generation_config.json` `max_length` (prompt included, as in transformers).
+    GenerationConfigMaxLength,
+    /// [`THINKING_MAX_TOKENS`]: the model thinks and names no budget.
+    Thinking,
+    /// [`FALLBACK_MAX_TOKENS`].
+    Fallback,
+}
+
+impl std::fmt::Display for MaxTokensSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::GenerationConfigMaxNewTokens => "generation_config.json max_new_tokens",
+            Self::GenerationConfigMaxLength => "generation_config.json max_length",
+            Self::Thinking => "thinking-model default",
+            Self::Fallback => "default",
+        })
+    }
+}
+
+/// A model's default output budget, before the context window bounds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxTokensDefault {
+    /// The budget. With [`MaxTokensSource::GenerationConfigMaxLength`] it
+    /// counts the prompt too.
+    pub tokens: usize,
+    /// Where it came from.
+    pub source: MaxTokensSource,
+}
+
+impl MaxTokensDefault {
+    /// New tokens left for a `prompt_len`-token prompt: the budget less the
+    /// prompt for a `max_length`, and never past the context window.
+    pub fn for_prompt(&self, prompt_len: usize, context_window: Option<usize>) -> usize {
+        let budget = match self.source {
+            MaxTokensSource::GenerationConfigMaxLength => self.tokens.saturating_sub(prompt_len),
+            _ => self.tokens,
+        };
+        let budget = match context_window {
+            Some(context) => budget.min(context.saturating_sub(prompt_len)),
+            None => budget,
+        };
+        budget.max(1)
+    }
+}
+
+/// The default output budget for a model, used when the caller sets none
+/// (`pmetal infer` without `--max-tokens`, a server request without
+/// `max_tokens`). In order:
+///
+/// 1. `generation_config.json` `max_new_tokens`;
+/// 2. `generation_config.json` `max_length`, which transformers counts with
+///    the prompt;
+/// 3. [`THINKING_MAX_TOKENS`] when `thinking` (the chat template thinks and
+///    thinking is on);
+/// 4. [`FALLBACK_MAX_TOKENS`].
+///
+/// [`MaxTokensDefault::for_prompt`] then keeps it inside the context window.
+pub fn default_max_tokens(model_path: &Path, thinking: bool) -> MaxTokensDefault {
+    let config = read_json(&model_path.join("generation_config.json"));
+    let field = |name: &str| {
+        config
+            .as_ref()
+            .and_then(|c| c.get(name))
+            .and_then(|v| v.as_u64())
+            .filter(|&v| v > 0)
+            .map(|v| v as usize)
+    };
+    if let Some(tokens) = field("max_new_tokens") {
+        return MaxTokensDefault {
+            tokens,
+            source: MaxTokensSource::GenerationConfigMaxNewTokens,
+        };
+    }
+    if let Some(tokens) = field("max_length") {
+        return MaxTokensDefault {
+            tokens,
+            source: MaxTokensSource::GenerationConfigMaxLength,
+        };
+    }
+    if thinking {
+        MaxTokensDefault {
+            tokens: THINKING_MAX_TOKENS,
+            source: MaxTokensSource::Thinking,
+        }
+    } else {
+        MaxTokensDefault {
+            tokens: FALLBACK_MAX_TOKENS,
+            source: MaxTokensSource::Fallback,
+        }
+    }
+}
+
+/// The model's context window: `max_position_embeddings` from
+/// `config.json` (its `text_config` first, for multimodal wrappers), else
+/// the tokenizer's `model_max_length` when that is a real bound.
+pub fn context_window(model_path: &Path) -> Option<usize> {
+    let config = read_json(&model_path.join("config.json"));
+    let from_config = config.as_ref().and_then(|c| {
+        c.get("text_config")
+            .and_then(|t| t.get("max_position_embeddings"))
+            .or_else(|| c.get("max_position_embeddings"))
+            .and_then(|v| v.as_u64())
+    });
+    let from_tokenizer = || {
+        read_json(&model_path.join("tokenizer_config.json"))
+            .and_then(|t| t.get("model_max_length").and_then(|v| v.as_u64()))
+            // transformers writes a huge sentinel when there is no bound.
+            .filter(|&v| v < 1 << 40)
+    };
+    from_config
+        .or_else(from_tokenizer)
+        .filter(|&v| v > 0)
+        .map(|v| v as usize)
+}
+
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
 /// Load sampling defaults with the full resolution chain:
 ///
 /// 1. Start with global fallback (`SamplingDefaults::default()`)
@@ -490,4 +628,68 @@ pub fn load_sampling_defaults(
     }
 
     defaults
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn max_tokens_follows_generation_config_then_thinking_then_fallback() {
+        let dir = model_dir(&[(
+            "generation_config.json",
+            r#"{"max_new_tokens": 131072, "max_length": 9}"#,
+        )]);
+        let d = default_max_tokens(dir.path(), false);
+        assert_eq!(d.source, MaxTokensSource::GenerationConfigMaxNewTokens);
+        assert_eq!(d.tokens, 131_072);
+
+        let dir = model_dir(&[("generation_config.json", r#"{"max_length": 32768}"#)]);
+        let d = default_max_tokens(dir.path(), true);
+        assert_eq!(d.source, MaxTokensSource::GenerationConfigMaxLength);
+        // transformers counts the prompt inside max_length.
+        assert_eq!(d.for_prompt(1000, None), 31_768);
+
+        let dir = model_dir(&[("generation_config.json", r#"{"temperature": 0.6}"#)]);
+        assert_eq!(
+            default_max_tokens(dir.path(), true),
+            MaxTokensDefault {
+                tokens: THINKING_MAX_TOKENS,
+                source: MaxTokensSource::Thinking
+            }
+        );
+        assert_eq!(
+            default_max_tokens(dir.path(), false).tokens,
+            FALLBACK_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn max_tokens_stays_inside_the_context_window() {
+        let dir = model_dir(&[(
+            "config.json",
+            r#"{"text_config": {"max_position_embeddings": 40960}, "max_position_embeddings": 1}"#,
+        )]);
+        let context = context_window(dir.path());
+        assert_eq!(context, Some(40_960));
+        let d = default_max_tokens(dir.path(), true);
+        assert_eq!(d.for_prompt(10_000, context), 30_960);
+        assert_eq!(d.for_prompt(100, context), THINKING_MAX_TOKENS);
+        // A prompt that fills the window still gets one token.
+        assert_eq!(d.for_prompt(50_000, context), 1);
+
+        let dir = model_dir(&[(
+            "tokenizer_config.json",
+            r#"{"model_max_length": 1000000000000000019884624838656}"#,
+        )]);
+        assert_eq!(context_window(dir.path()), None);
+    }
 }
