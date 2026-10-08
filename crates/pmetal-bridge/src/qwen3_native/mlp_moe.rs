@@ -5,6 +5,7 @@ use crate::InlineArray;
 
 use super::cache::GdnCache;
 use super::family::{GdnGateActivation, gdn_qk_rms_norm_eps};
+use super::speculative::GdnReplay;
 use super::weights::{LayerWeight, LayerWeights};
 
 // ============================================================================
@@ -156,6 +157,20 @@ pub(super) fn gdn_forward(
     cache: &mut GdnCache,
     dtype: i32,
 ) -> InlineArray {
+    gdn_forward_recording(lw, normed, cache, dtype, None)
+}
+
+/// [`gdn_forward`], appending the recurrence's inputs to `replays` when
+/// given, so a speculative verify can rewind the layer to any prefix of the
+/// block (see [`super::speculative`]). Recording takes the general path at
+/// every length: the single-token tape doesn't expose its inputs.
+pub(super) fn gdn_forward_recording(
+    lw: &LayerWeights,
+    normed: &InlineArray,
+    cache: &mut GdnCache,
+    dtype: i32,
+    replays: Option<&mut Vec<GdnReplay>>,
+) -> InlineArray {
     let nv = lw.gdn_nv;
     let nk = lw.gdn_nk;
     let dk = lw.gdn_dk;
@@ -168,7 +183,7 @@ pub(super) fn gdn_forward(
 
     // For decode-time T=1 on dense checkpoints, replay the fixed-shape compiled
     // GDN tape instead of rebuilding the full op graph every step.
-    if s == 1 {
+    if s == 1 && replays.is_none() {
         if let (
             Some(LayerWeight::Dense(qkv_w)),
             Some(LayerWeight::Dense(z_w)),
@@ -284,6 +299,18 @@ pub(super) fn gdn_forward(
         .take()
         .unwrap_or_else(|| InlineArray::zeros(&[b, nv, dv, dk], 10));
     let (out, new_state) = InlineArray::gdn_metal_step(&q, &k, &v, &g, &beta, &ssm_state, s);
+    if let Some(replays) = replays {
+        replays.push(GdnReplay {
+            queries: q,
+            keys: k,
+            values: v,
+            g,
+            beta,
+            initial_state: ssm_state,
+            conv_input: conv_in,
+            conv_kernel: ck,
+        });
+    }
 
     cache.conv_state = Some(new_conv);
     cache.ssm_state = Some(new_state);

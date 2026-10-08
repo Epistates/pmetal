@@ -12,8 +12,11 @@
 //! runs one forward pass over the whole proposed block, the verifier's argmax
 //! at every position is compared with the drafted tokens, and the longest
 //! matching prefix is accepted plus one bonus correction token. At
-//! `temperature = 0` this produces output that is bit-identical to greedy
-//! baseline decoding.
+//! `temperature = 0` every token is the target's argmax given the tokens
+//! before it, so the output is greedy decoding's, up to bf16 ties: the
+//! verify's block-shaped forward rounds differently from one-token decoding,
+//! and where the target's top two logits are a rounding apart the two can
+//! pick differently.
 //!
 //! The other four upstream verification modes (stream, chunked,
 //! parallel-lazy-logits, parallel-greedy-argmax) are straight-line variants
@@ -22,11 +25,11 @@
 //!
 //! # Target model support
 //!
-//! Targets plug in via the [`DFlashTarget`] trait. Qwen3 is the primary
-//! target today — its [`crate::architectures::qwen3::Qwen3ForCausalLM`]
-//! implementation is at the bottom of this file. Qwen3.5 (`qwen3_next`) will
-//! implement the same trait once its GDN verify-input capture is wired
-//! through the mixer; the loop above is architecture-agnostic.
+//! Targets plug in via the [`DFlashTarget`] trait: Qwen3 and Qwen3.5 on both
+//! engines. On Qwen3.5 a rejected tail is rewound out of the GDN layers'
+//! recurrent state as well as the attention caches, by replaying the
+//! verify's recurrence inputs over the accepted prefix (a [`MambaCache`] on
+//! the `DynamicModel` engine, the native target's own on the native one).
 
 use std::path::Path;
 
@@ -68,6 +71,21 @@ pub trait DFlashTarget {
         capture: &mut SpecCapture,
     ) -> Result<Array, Exception>;
 
+    /// Forward over a drafted block (the last accepted token, then the
+    /// guesses), which [`Self::rollback_rejected`] may then partly undo.
+    /// Defaults to [`Self::forward_with_capture`]; a target that owns
+    /// recurrent state it can't simply trim records here what it needs to
+    /// rewind.
+    fn verify_with_capture(
+        &mut self,
+        input_ids: &Array,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: &mut SpecCapture,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, None, kv_cache, mamba_cache, capture)
+    }
+
     /// Apply the target's lm_head to hidden states of shape `[B, T, hidden]`.
     fn lm_head_project(&mut self, hidden: &Array) -> Result<Array, Exception>;
 
@@ -88,6 +106,11 @@ pub trait DFlashTarget {
     fn target_needs_mamba_cache(&self) -> bool {
         false
     }
+
+    /// Forget any state the target keeps itself between forwards, before a
+    /// new generation. The default keeps none: its caches are the ones
+    /// [`Self::make_kv_cache`] and [`Self::make_mamba_cache`] hand out.
+    fn reset_state(&mut self) {}
 
     /// Construct a fresh KV cache sized for `max_seq_len` tokens.
     fn make_kv_cache(&self, max_seq_len: usize) -> KVCache {
@@ -111,11 +134,14 @@ pub trait DFlashTarget {
     /// provided external cache.
     ///
     /// Native-bridge targets own their own cache and override this to
-    /// rewind the internal state, ignoring the external `kv_cache` arg.
+    /// rewind the internal state (recurrent layers included, from what
+    /// [`Self::verify_with_capture`] recorded), ignoring the external
+    /// `kv_cache` arg.
     /// Such targets should also return a dummy cache from
     /// [`DFlashTarget::make_kv_cache`] that is never touched.
-    fn rollback_rejected(&mut self, kv_cache: &mut KVCache, n: usize) {
+    fn rollback_rejected(&mut self, kv_cache: &mut KVCache, n: usize) -> Result<(), Exception> {
         kv_cache.rollback(n);
+        Ok(())
     }
 
     /// Whether this target supports tree-verify — per-position RoPE +
@@ -293,6 +319,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         // enough headroom to absorb one full speculative block past the
         // final-emitted-token mark.
         let cache_max_tokens = total_max_tokens + block_size;
+        self.target.reset_state();
         let mut target_cache = self.target.make_kv_cache(cache_max_tokens);
 
         // Defensive sanity check: rolling back across a sliding-window
@@ -380,9 +407,8 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             // Verify: one target forward pass over the whole block.
             capture.clear();
             let verify_input = array_from_i32_row(&block_tokens);
-            let verify_logits = self.target.forward_with_capture(
+            let verify_logits = self.target.verify_with_capture(
                 &verify_input,
-                None,
                 Some(&mut target_cache),
                 mamba_cache.as_mut(),
                 &mut capture,
@@ -412,7 +438,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             // Rollback rejected positions in the target's KV cache.
             let rejected = block_size - accepted_inputs;
             if rejected > 0 {
-                self.target.rollback_rejected(&mut target_cache, rejected);
+                self.target.rollback_rejected(&mut target_cache, rejected)?;
                 if let (Some(ref mut mamba), Some(snaps)) =
                     (mamba_cache.as_mut(), mamba_snapshot.as_ref())
                 {
@@ -543,6 +569,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         // (tree_budget) after compaction. So the cache needs to hold
         // `prompt + max_new_tokens + max_tree_nodes` tokens at peak.
         let cache_max_tokens = total_max_tokens + max_tree_nodes;
+        self.target.reset_state();
         let mut target_cache = self.target.make_kv_cache(cache_max_tokens);
 
         let mut mamba_cache: Option<MambaCache> = self.target.make_mamba_cache();

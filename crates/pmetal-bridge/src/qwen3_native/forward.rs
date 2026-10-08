@@ -6,8 +6,9 @@ use crate::InlineArray;
 
 use super::attention::{TreeVerifyInputs, attn_forward, attn_forward_with_tree_ctx};
 use super::cache::NativeCache;
-use super::mlp_moe::{dense_mlp_forward, gdn_forward, moe_forward};
+use super::mlp_moe::{dense_mlp_forward, gdn_forward, gdn_forward_recording, moe_forward};
 use super::mrope::MropeTables;
+use super::speculative::GdnReplay;
 use super::weights::NativeWeights;
 
 fn assert_tree_verify_plain_kv(cache: &NativeCache, op: &str) {
@@ -206,14 +207,22 @@ fn lm_head(weights: &NativeWeights, hidden: &InlineArray) -> InlineArray {
 /// let refs: Vec<&InlineArray> = captured.iter().collect();
 /// let target_hidden = ops::concatenate_axis(&refs, -1);
 /// ```
+///
+/// With `gdn_replays`, which it clears first, each GDN layer appends its
+/// recurrence inputs, from which [`super::rewind_verify`] can undo any tail
+/// of `token_ids`.
 pub fn forward_step_with_capture(
     weights: &NativeWeights,
     token_ids: &InlineArray,
     cache: &mut NativeCache,
     tap_layers: &[usize],
     captured: &mut Vec<InlineArray>,
+    mut gdn_replays: Option<&mut Vec<GdnReplay>>,
 ) -> InlineArray {
     captured.clear();
+    if let Some(replays) = gdn_replays.as_deref_mut() {
+        replays.clear();
+    }
     let b = token_ids.dim(0);
     let s = token_ids.dim(1);
     let dtype = weights.model_dtype;
@@ -237,7 +246,13 @@ pub fn forward_step_with_capture(
     for (layer_idx, lw) in weights.layers.iter().enumerate() {
         let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
         let r = if lw.is_linear {
-            let result = gdn_forward(lw, &normed, b, s, &mut cache.gdn_caches[gdn_slot], dtype);
+            let result = gdn_forward_recording(
+                lw,
+                &normed,
+                &mut cache.gdn_caches[gdn_slot],
+                dtype,
+                gdn_replays.as_deref_mut(),
+            );
             gdn_slot += 1;
             result
         } else {

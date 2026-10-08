@@ -18,6 +18,7 @@
 //!   * [`attention`] — per-position RoPE + attn_forward + tree-verify variant
 //!   * [`mlp_moe`] — dense SwiGLU + SwitchGLU MoE + GDN step
 //!   * [`forward`] — forward_step + capture + tree-verify + compact/rollback
+//!   * [`speculative`] — rewinding GDN layers to a verified block's accepted prefix
 //!   * [`generate`] — prefill/prime/generate loops + benchmarks
 
 use serde::Deserialize;
@@ -30,6 +31,7 @@ mod generate;
 mod load;
 mod mlp_moe;
 pub mod mrope;
+mod speculative;
 mod weights;
 
 pub use cache::{
@@ -46,6 +48,7 @@ pub use generate::{
     prime_generation_preserve_peak_silent,
 };
 pub use load::load_model;
+pub use speculative::{GdnReplay, rewind_verify};
 pub use weights::{
     LayerWeight, NativeWeights, apply_kv_preconditioning, apply_outlier_permutation,
     apply_qjl_matrix,

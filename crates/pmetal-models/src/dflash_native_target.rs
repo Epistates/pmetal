@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use pmetal_bridge::qwen3_native::{self, NativeCache, NativeWeights};
+use pmetal_bridge::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::{Array, Exception};
@@ -27,9 +27,18 @@ use pmetal_mlx::{Array, Exception};
 use crate::dflash_decoder::DFlashTarget;
 
 /// DFlash target backed by the fused native-bridge Qwen3 forward.
+///
+/// On Qwen3.5 (GDN + gated attention) a verify records each GDN layer's
+/// recurrence inputs, and a partial accept replays them over the accepted
+/// prefix ([`qwen3_native::rewind_verify`]): a GDN state can't be trimmed
+/// like a KV cache.
 pub struct NativeQwen3Target {
     weights: NativeWeights,
     cache: NativeCache,
+    /// The last verify's GDN recurrence inputs, one per GDN layer.
+    gdn_replays: Vec<GdnReplay>,
+    /// Tokens in the last verify.
+    verified: i32,
     hidden_size: i32,
     num_layers: usize,
     num_kv_heads: i32,
@@ -64,11 +73,99 @@ impl NativeQwen3Target {
         Ok(Self {
             weights,
             cache,
+            gdn_replays: Vec::new(),
+            verified: 0,
             hidden_size,
             num_layers,
             num_kv_heads,
             head_dim,
         })
+    }
+}
+
+impl NativeQwen3Target {
+    /// Whether the model has GDN layers, whose state a rejected tail has to
+    /// be replayed out of.
+    fn has_gdn(&self) -> bool {
+        !self.cache.gdn_caches.is_empty()
+    }
+
+    /// Forward `input_ids`, recording the tapped layers into `capture` and,
+    /// when `rewindable`, what undoing a tail of it takes.
+    fn forward_tapped(
+        &mut self,
+        input_ids: &Array,
+        capture: &mut SpecCapture,
+        rewindable: bool,
+    ) -> Result<Array, Exception> {
+        // Snapshot the requested layers the decoder is tapping. The
+        // native forward writes them in ascending layer order; we then
+        // record each into the SpecCapture at the same key.
+        let tap_layers: Vec<usize> = capture.requested_hidden_layers.clone();
+        let mut captured: Vec<Array> = Vec::with_capacity(tap_layers.len());
+        let replays = (rewindable && self.has_gdn()).then_some(&mut self.gdn_replays);
+        let logits = qwen3_native::forward_step_with_capture(
+            &self.weights,
+            input_ids,
+            &mut self.cache,
+            &tap_layers,
+            &mut captured,
+            replays,
+        );
+        if captured.len() != tap_layers.len() {
+            return Err(Exception::custom(format!(
+                "NativeQwen3Target: forward_step_with_capture returned {} hidden states, \
+                 expected {} (taps={:?})",
+                captured.len(),
+                tap_layers.len(),
+                tap_layers
+            )));
+        }
+        // Diagnostic: dump last-position values at each tapped layer so
+        // we can compare to the reference per-layer output and
+        // localize the DFlash acceptance-gap divergence. Only active
+        // when `PMETAL_DFLASH_TAP_TRACE` is set; the f32 copy costs a
+        // few microseconds but is only taken once the var is present.
+        if std::env::var_os("PMETAL_DFLASH_TAP_TRACE").is_some() {
+            trace_taps(&tap_layers, &captured);
+        }
+        for (idx, h) in tap_layers.iter().zip(captured) {
+            capture.record_hidden(*idx, h);
+        }
+        Ok(logits)
+    }
+}
+
+/// Dump per-position tap values so we can diff against upstream
+/// iter-by-iter. When the tap sequence is short (verify block or
+/// accepted-prefix slice) we print every position; for a full prompt we
+/// only print the last.
+fn trace_taps(tap_layers: &[usize], captured: &[Array]) {
+    use pmetal_bridge::compat::Dtype;
+    for (idx, h) in tap_layers.iter().zip(captured.iter()) {
+        let t = h.dim(1);
+        let hidden_dim = h.dim(2);
+        let positions: Vec<i32> = if t <= 16 {
+            (0..t).collect()
+        } else {
+            vec![t - 1]
+        };
+        for pos in positions {
+            let slice = h.slice(&[0, pos, 0], &[1, pos + 1, hidden_dim]);
+            let slice_f32 = slice.as_dtype(Dtype::Float32.as_i32());
+            let _ = slice_f32.eval();
+            let data = slice_f32.as_slice::<f32>();
+            let first4: Vec<f32> = data.iter().take(4).copied().collect();
+            let l2: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
+            eprintln!(
+                "[pmetal tap] layer_{idx:02} pos={pos:02} [:4]={:?} ||.||={:.4}",
+                first4
+                    .iter()
+                    .map(|x| (x * 10000.0).round() / 10000.0)
+                    .collect::<Vec<_>>(),
+                l2
+            );
+        }
     }
 }
 
@@ -101,68 +198,20 @@ impl DFlashTarget for NativeQwen3Target {
         _mamba_cache: Option<&mut MambaCache>,
         capture: &mut SpecCapture,
     ) -> Result<Array, Exception> {
-        // Snapshot the requested layers the decoder is tapping. The
-        // native forward writes them in ascending layer order; we then
-        // record each into the SpecCapture at the same key.
-        let tap_layers: Vec<usize> = capture.requested_hidden_layers.clone();
-        let mut captured: Vec<Array> = Vec::with_capacity(tap_layers.len());
-        let logits = qwen3_native::forward_step_with_capture(
-            &self.weights,
-            input_ids,
-            &mut self.cache,
-            &tap_layers,
-            &mut captured,
-        );
-        if captured.len() != tap_layers.len() {
-            return Err(Exception::custom(format!(
-                "NativeQwen3Target: forward_step_with_capture returned {} hidden states, \
-                 expected {} (taps={:?})",
-                captured.len(),
-                tap_layers.len(),
-                tap_layers
-            )));
-        }
-        // Diagnostic: dump last-position values at each tapped layer so
-        // we can compare to the reference per-layer output and
-        // localize the DFlash acceptance-gap divergence. Only active
-        // when `PMETAL_DFLASH_TAP_TRACE` is set; the f32 copy costs a
-        // few microseconds but is only taken once the var is present.
-        if std::env::var_os("PMETAL_DFLASH_TAP_TRACE").is_some() {
-            use pmetal_bridge::compat::Dtype;
-            // Dump per-position tap values so we can diff against
-            // upstream iter-by-iter. When the tap sequence is short
-            // (verify block or accepted-prefix slice) we print every
-            // position; for a full prompt we only print the last.
-            for (idx, h) in tap_layers.iter().zip(captured.iter()) {
-                let t = h.dim(1);
-                let hidden_dim = h.dim(2);
-                let positions: Vec<i32> = if t <= 16 {
-                    (0..t).collect()
-                } else {
-                    vec![t - 1]
-                };
-                for pos in positions {
-                    let slice = h.slice(&[0, pos, 0], &[1, pos + 1, hidden_dim]);
-                    let slice_f32 = slice.as_dtype(Dtype::Float32.as_i32());
-                    let _ = slice_f32.eval();
-                    let data = slice_f32.as_slice::<f32>();
-                    let first4: Vec<f32> = data.iter().take(4).copied().collect();
-                    let l2: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
-                    eprintln!(
-                        "[pmetal tap] layer_{idx:02} pos={pos:02} [:4]={:?} ||.||={:.4}",
-                        first4
-                            .iter()
-                            .map(|x| (x * 10000.0).round() / 10000.0)
-                            .collect::<Vec<_>>(),
-                        l2
-                    );
-                }
-            }
-        }
-        for (idx, h) in tap_layers.iter().zip(captured) {
-            capture.record_hidden(*idx, h);
-        }
-        Ok(logits)
+        self.gdn_replays.clear();
+        self.verified = 0;
+        self.forward_tapped(input_ids, capture, false)
+    }
+
+    fn verify_with_capture(
+        &mut self,
+        input_ids: &Array,
+        _kv_cache: Option<&mut KVCache>,
+        _mamba_cache: Option<&mut MambaCache>,
+        capture: &mut SpecCapture,
+    ) -> Result<Array, Exception> {
+        self.verified = input_ids.dim(1);
+        self.forward_tapped(input_ids, capture, true)
     }
 
     fn lm_head_project(&mut self, hidden: &Array) -> Result<Array, Exception> {
@@ -195,6 +244,12 @@ impl DFlashTarget for NativeQwen3Target {
         }
     }
 
+    fn reset_state(&mut self) {
+        self.cache = NativeCache::new_empty(&self.weights);
+        self.gdn_replays.clear();
+        self.verified = 0;
+    }
+
     fn target_hidden_size(&self) -> i32 {
         self.hidden_size
     }
@@ -214,12 +269,24 @@ impl DFlashTarget for NativeQwen3Target {
     /// The external KV cache from [`DFlashTarget::make_kv_cache`] is a
     /// placeholder that the decode loop never writes to. Rewind our
     /// internal `NativeCache` instead.
-    fn rollback_rejected(&mut self, _kv_cache: &mut KVCache, n: usize) {
-        qwen3_native::rollback_cache(&mut self.cache, n as i32);
+    fn rollback_rejected(&mut self, _kv_cache: &mut KVCache, n: usize) -> Result<(), Exception> {
+        if !self.has_gdn() {
+            qwen3_native::rollback_cache(&mut self.cache, n as i32);
+            return Ok(());
+        }
+        // Only a verify recorded what replaying its GDN layers takes, and
+        // only `verified - n` of its tokens stay.
+        let accepted = self.verified - n as i32;
+        qwen3_native::rewind_verify(&mut self.cache, &self.gdn_replays, self.verified, accepted)
+            .map_err(|e| Exception::custom(format!("NativeQwen3Target: {e}")))?;
+        self.gdn_replays.clear();
+        Ok(())
     }
 
+    /// Tree verify ranks siblings by attention masking, which a GDN layer,
+    /// reading the tree as one sequence, can't honour.
     fn supports_tree_verify(&self) -> bool {
-        true
+        !self.has_gdn()
     }
 
     fn forward_tree_verify(
