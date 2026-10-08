@@ -12,11 +12,16 @@ categories.workspace = true
 [dependencies]
 pmetal-bridge = { workspace = true }
 pmetal-core = { workspace = true }
+pmetal-data = { workspace = true }
 pmetal-gguf = { workspace = true }
 pmetal-metal = { workspace = true }
 pmetal-mlx = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `preserve_order`: a decision request's questions are encoded, and answered, in
+# the order the client wrote them. `float_roundtrip`: a float in a request is
+# re-rendered into the prompt, and the default parser can land one ulp off, which
+# then prints as different digits (see `decision::encode`).
+serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 safetensors = { workspace = true }

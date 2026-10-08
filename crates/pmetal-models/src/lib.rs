@@ -51,6 +51,7 @@ pub mod architectures;
 pub(crate) mod checkpointing;
 pub mod common;
 pub mod ddtree;
+pub mod decision;
 pub mod decoder_layer;
 pub mod dflash_decoder;
 pub mod dflash_drafter;

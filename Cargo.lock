@@ -5384,6 +5384,7 @@ dependencies = [
  "objc2-metal",
  "pmetal-bridge",
  "pmetal-core",
+ "pmetal-data",
  "pmetal-gguf",
  "pmetal-metal",
  "pmetal-mlx",
