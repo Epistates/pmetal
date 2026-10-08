@@ -126,10 +126,10 @@ pub fn cosent_loss(
     let pos_lse = pos_logits.logsumexp_axis(-1, false); // [batch]
     let neg_lse = neg_logits.logsumexp_axis(-1, false); // [batch]
 
-    // Softplus: log(1 + exp(neg_lse - pos_lse))
+    // Softplus, log(1 + exp(neg_lse - pos_lse)), as logaddexp(0, diff): the
+    // exp alone overflows to inf once diff passes ~88 in f32.
     let diff = neg_lse.subtract(&pos_lse);
-    // softplus(x) = log(1 + exp(x)) — use log1p for numerical stability
-    let loss = ops::log1p(&diff.exp());
+    let loss = ops::logaddexp(&Array::scalar_like(0.0, &diff), &diff);
     Ok(loss.mean(None))
 }
 
@@ -248,6 +248,20 @@ mod tests {
         let loss = triplet_loss(&anchor, &pos, &neg, 0.0).unwrap();
         let val: f32 = loss.item();
         assert!(val.abs() < 1e-5, "loss should be ~0, got {}", val);
+    }
+
+    #[test]
+    fn cosent_loss_softplus_does_not_overflow() {
+        // Row 0's negative (row 2) is far more similar than its positive
+        // (row 1): diff = (1 - (-1)) / 0.01 = 200, past where exp overflows
+        // f32. The softplus must stay finite.
+        let a = Array::from_slice(&[1.0f32, 0.0, 1.0, 0.0, 1.0, 0.0], &[3, 2]);
+        let b = Array::from_slice(&[1.0f32, 0.0, -1.0, 0.0, 1.0, 0.0], &[3, 2]);
+        let labels = Array::from_slice(&[1.0f32, 1.0, 0.0], &[3]);
+        let loss = cosent_loss(&a, &b, &labels, 0.01).unwrap();
+        pmetal_bridge::check_last_error().unwrap();
+        let val: f32 = loss.item();
+        assert!(val.is_finite(), "cosent loss overflowed: {val}");
     }
 
     #[test]
