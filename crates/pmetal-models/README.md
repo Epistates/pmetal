@@ -10,28 +10,31 @@ This crate provides implementations of popular LLM architectures optimized for A
 
 ### Dispatched Models (via `DynamicModel`)
 
-These architectures are wired into the `ModelArchitecture` dispatcher and can be loaded automatically from `config.json`:
+These are the `ModelArchitecture` variants. Each is detected from `config.json` (its `model_type`, or failing that its `architectures`), and every one but `Flux` loads as a `DynamicModel`:
 
-| Architecture | Family | Variants |
-|-------------|--------|----------|
-| `Llama` | Llama | 2, 3, 3.1, 3.2, 3.3 |
-| `Llama4` | Llama 4 | Scout, Maverick |
-| `Qwen2` | Qwen | 2, 2.5 |
-| `Qwen3` | Qwen | 3 |
-| `Qwen3MoE` | Qwen | 3-MoE |
-| `Qwen3Next` | Qwen | 3.5 (Next) |
-| `DeepSeek` | DeepSeek | V3, V3.2, V3.2-Speciale |
-| `Mistral` | Mistral | 7B, Mixtral 8x7B (MoE) |
-| `Gemma` | Gemma | 2, 3 |
-| `Phi` | Phi | 3, 3.5 |
-| `Phi4` | Phi | 4 |
-| `Cohere` | Cohere | Command R |
-| `Granite` | Granite | 3.x dense and MoE, 4.0 / 4.0-H (Mamba-2 hybrid, dense and MoE), 4.1, 4.2 |
-| `NemotronH` | NemotronH | Hybrid (Mamba+Attention) |
-| `StarCoder2` | StarCoder2 | 3B, 7B, 15B |
-| `RecurrentGemma` | RecurrentGemma | Griffin |
-| `Jamba` | Jamba | 1.5 |
-| `Flux` | Flux | 1-dev, 1-schnell (diffusion) |
+| Architecture | `model_type` | Models |
+|-------------|--------------|--------|
+| `Llama` | `llama`, `llama3` | Llama 2, 3, 3.1, 3.2, 3.3 |
+| `Llama4` | `llama4`, `llama4_text` | Llama 4 Scout, Maverick |
+| `Mllama` | `mllama` | Llama 3.2 Vision |
+| `Qwen2` | `qwen2`, `qwen2_5` | Qwen 2, 2.5 |
+| `Qwen3` | `qwen3` | Qwen 3 |
+| `Qwen3MoE` | `qwen3_moe` | Qwen 3 MoE |
+| `Qwen3Next` | `qwen3_next`, `qwen3_5`, `qwen3_5_moe`, `qwen3_6`, `qwen3_6_moe` | Qwen 3.5, 3.6, 3.8 (hybrid Gated DeltaNet and attention) |
+| `Qwen4Exp` | `qwen4_exp` | Qwen3.8-Flash-Next |
+| `Gemma` | `gemma`, `gemma2`, `gemma3` | Gemma, Gemma 2, Gemma 3 |
+| `Gemma4` | `gemma4`, `gemma4_text`, `gemma4_unified` | Gemma 4, dense and MoE |
+| `DiffusionGemma` | `diffusion_gemma` | DiffusionGemma (block-autoregressive diffusion) |
+| `Mistral` | `mistral`, `mixtral` | Mistral 7B, Mixtral (MoE) |
+| `Phi` | `phi3` | Phi 3, 3.5 |
+| `Phi4` | `phi4` | Phi 4 |
+| `DeepSeek` | `deepseek`, `deepseek_v2`, `deepseek_v3` | DeepSeek V2, V3, R1 |
+| `Cohere` | `cohere`, `cohere2`, `command_r` | Command R |
+| `Granite` | `granite`, `granitemoe`, `granitemoeshared`, `granitemoehybrid` | Granite 3.x dense and MoE, 4.0 / 4.0-H (Mamba-2 hybrid), 4.1, 4.2 |
+| `NemotronH` | `nemotron_h` | Nemotron-H (hybrid Mamba and attention) |
+| `GptOss` | `gpt_oss` | GPT-OSS 20B, 120B (MoE) |
+| `Bert` | `bert` | BERT (encoder only) |
+| `Flux` | `flux` | Flux.1 (diffusion): detected, but built with `pipelines::FluxPipeline` rather than `DynamicModel` |
 
 ### Pipeline Components (Not Dispatched)
 
