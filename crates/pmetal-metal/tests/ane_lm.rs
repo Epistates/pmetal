@@ -15,7 +15,8 @@ fn model_dir() -> Option<std::path::PathBuf> {
     Some(dir.into())
 }
 
-/// Greedy continuations from mlx_lm (bf16) for Qwen3-0.6B.
+/// Greedy continuations from the bf16 reference implementation for
+/// Qwen3-0.6B.
 const CASES: [(&[u32], &[u32]); 2] = [
     // "The capital of France is" -> " Paris. The capital of France is also the"
     (
@@ -31,7 +32,7 @@ const CASES: [(&[u32], &[u32]); 2] = [
 
 #[test]
 #[ignore = "requires ANE hardware and PMETAL_TEST_QWEN3_0_6B"]
-fn greedy_generation_matches_mlx_lm() {
+fn greedy_generation_matches_the_reference() {
     let Some(dir) = model_dir() else {
         eprintln!("PMETAL_TEST_QWEN3_0_6B not set; skipping");
         return;
@@ -176,7 +177,7 @@ fn qwen3_4b_throughput() {
 }
 
 /// Qwen3-4B (`PMETAL_TEST_QWEN3_4B`) answering a chat prompt, int8 and fp16,
-/// against mlx_lm's greedy answer (bf16). The prompt opens with the
+/// against the bf16 reference implementation's greedy answer. The prompt opens with the
 /// attention-sink special tokens, whose activations reach the thousands:
 /// int8 weights used to overflow the ANE's int8 convolution there and
 /// answer with end-of-text.

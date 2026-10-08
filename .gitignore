@@ -9,7 +9,6 @@ output_*/
 
 # Test datasets
 test_dataset*.jsonl
-mlx_lm_data/
 
 # IDE / Editor
 .idea/
