@@ -255,7 +255,7 @@ pub(super) fn attn_forward_with_tree_ctx(
         // A prompt with media: three positions per token (see `mrope`).
         (tables.apply(&queries), tables.apply(&keys))
     } else if let Some(scaled) = &lw.attn_scaled_rope {
-        // YaRN: explicit frequencies and the attention factor.
+        // Scaled RoPE (YaRN): its frequencies and attention factor.
         match tree_ctx {
             Some(ctx) => (
                 scaled.apply_at(&queries, ctx.pos_ids),

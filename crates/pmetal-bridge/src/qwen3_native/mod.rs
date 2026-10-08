@@ -225,11 +225,12 @@ pub struct Qwen3Config {
     #[serde(skip)]
     pub mlx_quantization: Option<crate::native_weight::MlxQuantization>,
 
-    /// The Qwen3.5 family's rotary embedding, as
-    /// [`family::normalize_text_config`] resolved it (YaRN included). Set by
-    /// `parse_config_text`; `None` for dense Qwen3.
+    /// The rotary embedding `config.json` describes, scaling included (YaRN,
+    /// as the Qwen3 and Qwen3.5-family cards document). Set by
+    /// `parse_config_text`; `None` for a config built in code, which rotates
+    /// with plain RoPE at `rope_theta`.
     #[serde(skip)]
-    pub rotary: Option<family::Rotary>,
+    pub rotary: Option<crate::rope::Rotary>,
 }
 
 /// Weight quantization parameters (from `quantization_config` in config.json).
@@ -376,25 +377,26 @@ impl Qwen3Config {
             .map_or([11, 11, 10], |s| s.map(|v| v.max(0) as usize))
     }
 
-    /// The rotation for a rotary embedding the fused kernel's `theta` cannot
-    /// describe (YaRN); `None` for plain RoPE.
-    pub fn scaled_rope(&self) -> Option<mrope::ScaledRope> {
-        self.rotary
-            .as_ref()
-            .and_then(|r| mrope::ScaledRope::new(r, self.get_head_dim()))
+    /// The rotary embedding: [`rotary`](Self::rotary) when the config carried
+    /// one, plain RoPE at `rope_theta` otherwise.
+    pub fn rotary_embedding(&self) -> crate::rope::RotaryEmbedding {
+        let rotary = self.rotary.clone().unwrap_or_else(|| {
+            crate::rope::Rotary::plain(self.get_head_dim(), self.rope_dims(), self.rope_theta)
+        });
+        crate::rope::RotaryEmbedding::new(rotary, false)
+    }
+
+    /// The rotation for a scaled rotary embedding (YaRN and the rest), which
+    /// the fused kernel's `theta` alone cannot describe; `None` for plain
+    /// RoPE.
+    pub fn scaled_rope(&self) -> Option<crate::rope::RotaryEmbedding> {
+        let rope = self.rotary_embedding();
+        (rope.rotary().scaling != crate::rope::RopeScaling::Default).then_some(rope)
     }
 
     /// The mRoPE tables for a prompt's `[3, T]` int32 positions.
     pub fn mrope_tables(&self, positions: &crate::InlineArray) -> mrope::MropeTables {
-        if let Some(scaled) = self.scaled_rope() {
-            return scaled.tables(positions, self.mrope_section());
-        }
-        mrope::MropeTables::new(
-            positions,
-            self.rope_dims(),
-            self.rope_theta as f32,
-            self.mrope_section(),
-        )
+        mrope::MropeTables::new(positions, &self.rotary_embedding(), self.mrope_section())
     }
 
     /// Returns `true` when layer `i` is a GDN (linear-attention) layer.
@@ -470,7 +472,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
             }
         }
         if qwen35 {
-            rotary = Some(family::Rotary::from_text_config(&tc)?);
+            rotary = Some(family::rotary(&tc)?);
         }
         // Promote quantization metadata from the outer JSON into text_config
         // when present at the top level but absent from the nested config.

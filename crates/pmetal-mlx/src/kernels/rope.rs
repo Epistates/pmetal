@@ -25,6 +25,7 @@
 //! the effective context length.
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, fast, ops};
+use pmetal_bridge::rope::{RotaryEmbedding, rotate_with_cos_sin};
 
 /// RoPE scaling type for extended context.
 #[derive(Debug, Clone)]
@@ -393,6 +394,15 @@ pub fn rope(
     }
 }
 
+/// Rotate `x` at `positions` with a [`RotaryEmbedding`]: whatever scaling its
+/// config named, its attention factor included.
+pub fn rope_embedding(x: &Array, positions: RopePositions<'_>, rope: &RotaryEmbedding) -> Array {
+    match positions {
+        RopePositions::Offset(offset) => rope.apply(x, offset),
+        RopePositions::Explicit(ids) => rope.apply_at(x, ids),
+    }
+}
+
 /// [`rope`] with an explicit `[dims / 2]` inverse-frequency table.
 ///
 /// Needed wherever no single `base` describes the rotation: Phi-3 LongRoPE
@@ -561,88 +571,13 @@ fn rope_with_positions_and_inv_freq(
     let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims]);
     let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims]);
 
-    Ok(rope_rotate_with_cos_sin(
+    Ok(rotate_with_cos_sin(
         x,
         &cos_theta,
         &sin_theta,
         dims,
         traditional,
     ))
-}
-
-/// Core RoPE rotation given precomputed `cos`/`sin` tables (broadcastable to
-/// `[batch, heads, seq_len, half_dims]`). Shared by the position-ID and
-/// custom-frequency entry points so the interleaved/split-half rotation lives
-/// in exactly one place.
-fn rope_rotate_with_cos_sin(
-    x: &Array,
-    cos_theta: &Array,
-    sin_theta: &Array,
-    dims: i32,
-    traditional: bool,
-) -> Array {
-    let head_dim = x.shape()[3];
-    let half_dims = dims / 2;
-
-    if traditional {
-        // Traditional (interleaved) RoPE: pairs are (x[0], x[1]), (x[2], x[3]), ...
-        let x_rope = if dims < head_dim {
-            let parts = x.split(&[dims], -1);
-            parts[0].clone()
-        } else {
-            x.clone()
-        };
-
-        let rope_shape = x_rope.shape();
-        let batch = rope_shape[0];
-        let heads = rope_shape[1];
-        let seq_len = rope_shape[2];
-        let x_pairs = x_rope.reshape(&[batch, heads, seq_len, half_dims, 2]);
-
-        let x_even = x_pairs
-            .slice(&[0, 0, 0, 0, 0], &[batch, heads, seq_len, half_dims, 1])
-            .squeeze(-1);
-        let x_odd = x_pairs
-            .slice(&[0, 0, 0, 0, 1], &[batch, heads, seq_len, half_dims, 2])
-            .squeeze(-1);
-
-        let r_even = x_even
-            .multiply(cos_theta)
-            .subtract(&x_odd.multiply(sin_theta));
-        let r_odd = x_even.multiply(sin_theta).add(&x_odd.multiply(cos_theta));
-
-        let stacked = ops::stack_axis(vec![r_even, r_odd].as_slice(), -1);
-        let x_rotated = stacked.reshape(&[batch, heads, seq_len, dims]);
-
-        if dims < head_dim {
-            let parts = x.split(&[dims], -1);
-            ops::concatenate_axis(&[&x_rotated, &parts[1]], -1)
-        } else {
-            x_rotated
-        }
-    } else {
-        // Non-traditional (split-half) RoPE: first half and second half
-        let parts = if dims == head_dim {
-            x.split(&[half_dims], -1)
-        } else {
-            x.split(&[half_dims, dims], -1)
-        };
-
-        let x1 = &parts[0];
-        let x2 = &parts[1];
-
-        let rx1 = x1.multiply(cos_theta).subtract(&x2.multiply(sin_theta));
-        let rx2 = x1.multiply(sin_theta).add(&x2.multiply(cos_theta));
-
-        let x_rotated = ops::concatenate_axis(&[&rx1, &rx2], -1);
-
-        if dims < head_dim && parts.len() > 2 {
-            let x_pass = &parts[2];
-            ops::concatenate_axis(&[&x_rotated, x_pass], -1)
-        } else {
-            x_rotated
-        }
-    }
 }
 
 /// Apply RoPE using explicit per-dimension inverse frequencies.
@@ -682,7 +617,7 @@ pub fn apply_rope_with_freqs(
     let cos_theta = angles.cos().reshape(&[1, 1, -1, half_dims]);
     let sin_theta = angles.sin().reshape(&[1, 1, -1, half_dims]);
 
-    Ok(rope_rotate_with_cos_sin(
+    Ok(rotate_with_cos_sin(
         x,
         &cos_theta,
         &sin_theta,

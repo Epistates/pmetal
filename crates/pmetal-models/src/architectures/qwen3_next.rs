@@ -18,7 +18,8 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps;
-use pmetal_bridge::qwen3_native::mrope::{MropeTables, ScaledRope};
+use pmetal_bridge::qwen3_native::mrope::MropeTables;
+use pmetal_bridge::rope::RotaryEmbedding;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -40,7 +41,7 @@ use pmetal_mlx::{
         fused_moe::moe_combine_mlx,
         fused_sdpa,
         gated_delta::{self, gated_delta_update},
-        rope::{RopePositions, RopeScaling, rope},
+        rope::{RopePositions, rope_embedding},
     },
 };
 
@@ -335,41 +336,33 @@ impl Qwen3NextConfig {
         (self.get_head_dim() as f32 * self.partial_rotary_factor) as i32
     }
 
-    /// The rotary embedding, YaRN included, as the native engine reads it.
+    /// The rotary embedding, YaRN included, read by the same
+    /// [`pmetal_bridge::rope`] parser the native engine uses.
     ///
     /// A YaRN `rope_parameters` comes resolved from
     /// [`from_config_value`](Self::from_config_value); a config built in code
     /// without its resolved keys gets transformers' defaults.
-    pub fn rotary(&self) -> pmetal_bridge::qwen3_native::family::Rotary {
-        use pmetal_bridge::qwen3_native::family::{Rotary, Yarn};
-        let rope = self.rope_parameters.as_ref();
-        let yarn = rope
-            .filter(|r| r.rope_type.as_deref() == Some("yarn"))
-            .map(|r| {
-                let original = r
-                    .original_max_position_embeddings
-                    .unwrap_or(self.max_position_embeddings as f64);
-                let factor = r
-                    .factor
-                    .unwrap_or(self.max_position_embeddings as f64 / original);
-                Yarn {
-                    factor,
-                    original_max_position_embeddings: original,
-                    beta_fast: r.beta_fast.unwrap_or(32.0),
-                    beta_slow: r.beta_slow.unwrap_or(1.0),
-                    truncate: r.truncate.unwrap_or(true),
-                    attention_factor: r.attention_factor.unwrap_or(if factor <= 1.0 {
-                        1.0
-                    } else {
-                        0.1 * factor.ln() + 1.0
-                    }),
-                }
-            });
-        Rotary {
-            dims: self.rope_dims(),
-            theta: self.rope_theta as f64,
-            yarn,
-        }
+    pub fn rotary(&self) -> Result<pmetal_bridge::rope::Rotary, Exception> {
+        let to_json = |v: Option<serde_json::Result<serde_json::Value>>| {
+            v.transpose()
+                .map_err(|e| Exception::custom(format!("rope config: {e}")))
+        };
+        let rope_scaling = to_json(self.rope_scaling.as_ref().map(serde_json::to_value))?;
+        let rope_parameters = to_json(self.rope_parameters.as_ref().map(serde_json::to_value))?;
+        pmetal_bridge::rope::Rotary::from_config(
+            self.get_head_dim(),
+            pmetal_bridge::rope::RopeConfig {
+                rope_scaling: rope_scaling.as_ref(),
+                rope_parameters: rope_parameters.as_ref(),
+                rope_theta: Some(self.rope_theta as f64),
+                partial_rotary_factor: Some(self.partial_rotary_factor as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                original_max_position_embeddings: None,
+            },
+            10_000.0,
+            0.25,
+        )
+        .map_err(|e| Exception::custom(format!("Qwen3.5 config: {e}")))
     }
 
     /// How many rotary frequencies each position axis (temporal, row,
@@ -717,9 +710,11 @@ pub struct Qwen3NextAttention {
     pub rope_scale: f32,
     /// Rotary frequencies per position axis for a prompt with media.
     pub mrope_section: [usize; 3],
-    /// Set when the rotary embedding is scaled (YaRN); it then rotates in
-    /// place of `effective_base` / `rope_scale`.
-    pub scaled_rope: Option<ScaledRope>,
+    /// The rotary embedding every position path rotates with.
+    pub rope: RotaryEmbedding,
+    /// Set when the rotary embedding is scaled (YaRN), which the inline
+    /// decode path's `effective_base` / `rope_scale` cannot express.
+    pub scaled_rope: Option<RotaryEmbedding>,
 }
 impl_module_params!(Qwen3NextAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
@@ -735,13 +730,10 @@ impl Qwen3NextAttention {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.get_num_kv_heads();
 
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(RopeScaling::from_config_map)
-            .unwrap_or(RopeScaling::None);
-        let rope_scale = rope_scaling.scale();
-        let effective_base = rope_scaling.effective_base(config.rope_theta, head_dim);
+        let rope = RotaryEmbedding::new(config.rotary()?, false);
+        let (effective_base, rope_scale) =
+            rope.scalar().unwrap_or((rope.rotary().theta as f32, 1.0));
+        let scaled_rope = rope.scalar().is_none().then(|| rope.clone());
 
         // q_proj outputs 2x for gated output: n_heads * head_dim * 2
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim * 2)
@@ -775,11 +767,12 @@ impl Qwen3NextAttention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
-            rope_dims: config.rope_dims(),
+            rope_dims: rope.dims(),
             effective_base,
             rope_scale,
             mrope_section: config.mrope_section(),
-            scaled_rope: ScaledRope::new(&config.rotary(), head_dim),
+            rope,
+            scaled_rope,
         })
     }
 
@@ -986,43 +979,15 @@ impl Qwen3NextAttention {
         positions: Option<&Array>,
         offset: i32,
     ) -> Result<(Array, Array), Exception> {
-        if let Some(scaled) = &self.scaled_rope {
-            return Ok(match positions {
-                Some(p) if p.ndim() == 2 => {
-                    let tables = scaled.tables(p, self.mrope_section);
-                    (tables.apply(queries), tables.apply(keys))
-                }
-                Some(p) => (scaled.apply_at(queries, p), scaled.apply_at(keys, p)),
-                None => (scaled.apply(queries, offset), scaled.apply(keys, offset)),
-            });
-        }
         if let Some(positions) = positions.filter(|p| p.ndim() == 2) {
-            let tables = MropeTables::new(
-                positions,
-                self.rope_dims,
-                self.effective_base,
-                self.mrope_section,
-            );
+            let tables = MropeTables::new(positions, &self.rope, self.mrope_section);
             return Ok((tables.apply(queries), tables.apply(keys)));
         }
         let positions = RopePositions::resolve(positions, offset);
-        let queries = rope(
-            queries,
-            positions,
-            self.rope_dims,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
-        let keys = rope(
-            keys,
-            positions,
-            self.rope_dims,
-            false,
-            self.effective_base,
-            self.rope_scale,
-        )?;
-        Ok((queries, keys))
+        Ok((
+            rope_embedding(queries, positions, &self.rope),
+            rope_embedding(keys, positions, &self.rope),
+        ))
     }
 
     fn mask_type_for_call(

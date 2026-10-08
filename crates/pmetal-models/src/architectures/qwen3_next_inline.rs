@@ -67,7 +67,7 @@ pub struct InlineLayerWeights {
     attn_rope_dims: i32,
     attn_rope_base: f32,
     attn_rope_scale: f32,
-    attn_scaled_rope: Option<pmetal_bridge::qwen3_native::mrope::ScaledRope>,
+    attn_scaled_rope: Option<pmetal_bridge::rope::RotaryEmbedding>,
 
     // GDN-specific (only if is_linear)
     gdn_qkv_w: Option<InlineArray>, // in_proj_qkv, pre-transposed [hidden, conv_dim]

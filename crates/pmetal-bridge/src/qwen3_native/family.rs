@@ -12,6 +12,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::rope::{RopeConfig, RopeScaling, Rotary};
+
 /// Activation on the gated-delta-net output gate, `rms_norm(o) * act(z)`.
 ///
 /// `output_gate_type` in the text config names it. transformers' `qwen3_5`
@@ -106,163 +108,21 @@ pub fn is_unused_by_text_model(key: &str) -> bool {
         || key.starts_with("model.mtp.")
 }
 
-/// Static YaRN (`rope_parameters.rope_type: "yarn"`), the long-context RoPE
-/// scaling the Qwen3.5-family cards document, resolved the way transformers'
-/// `_compute_yarn_parameters` resolves it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Yarn {
-    /// How far the context is stretched.
-    pub factor: f64,
-    /// The context length the model was pretrained for.
-    pub original_max_position_embeddings: f64,
-    /// Rotations past which a frequency is left as trained (default 32).
-    pub beta_fast: f64,
-    /// Rotations under which a frequency is fully interpolated (default 1).
-    pub beta_slow: f64,
-    /// Whether the correction range is rounded out to whole frequencies.
-    pub truncate: bool,
-    /// Gain on the rotated channels of queries and keys (`cos` and `sin`
-    /// both carry it), `0.1 * ln(factor) + 1` unless the config names one.
-    pub attention_factor: f64,
+/// The rotary embedding of a text config [`normalize_text_config`] returned:
+/// partial, at `rope_theta`, and YaRN-scaled when `rope_parameters` says so.
+pub fn rotary(text: &Value) -> Result<Rotary, String> {
+    let head_dim = text
+        .get("head_dim")
+        .and_then(Value::as_i64)
+        .ok_or("config key `head_dim` must be an integer")?;
+    Rotary::from_config(head_dim as i32, RopeConfig::from_json(text), 10_000.0, 0.25)
 }
 
-/// The rotary embedding of a Qwen3.5-family text config: which channels
-/// rotate, at what base, and how the frequencies are scaled.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Rotary {
-    /// Rotated channels per head, `head_dim * partial_rotary_factor`.
-    pub dims: i32,
-    /// `rope_theta`.
-    pub theta: f64,
-    /// `None` for plain RoPE.
-    pub yarn: Option<Yarn>,
-}
-
-impl Rotary {
-    /// Read a text config [`normalize_text_config`] returned.
-    pub fn from_text_config(text: &Value) -> Result<Self, String> {
-        let head_dim = text
-            .get("head_dim")
-            .and_then(Value::as_i64)
-            .ok_or("config key `head_dim` must be an integer")?;
-        let partial = text
-            .get("partial_rotary_factor")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.25);
-        let theta = text
-            .get("rope_theta")
-            .and_then(Value::as_f64)
-            .unwrap_or(10_000.0);
-        let rope = text.get("rope_parameters").and_then(Value::as_object);
-        let rope_type = rope
-            .and_then(|r| r.get("rope_type"))
-            .and_then(Value::as_str)
-            .unwrap_or("default");
-        let yarn = if rope_type == "yarn" {
-            let rope = rope.expect("a yarn rope_type comes from rope_parameters");
-            let num = |key: &str| rope.get(key).and_then(Value::as_f64);
-            Some(Yarn {
-                factor: num("factor").ok_or("yarn needs a factor")?,
-                original_max_position_embeddings: num("original_max_position_embeddings")
-                    .ok_or("yarn needs original_max_position_embeddings")?,
-                beta_fast: num("beta_fast").unwrap_or(32.0),
-                beta_slow: num("beta_slow").unwrap_or(1.0),
-                truncate: rope
-                    .get("truncate")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
-                attention_factor: num("attention_factor").unwrap_or(1.0),
-            })
-        } else {
-            None
-        };
-        Ok(Self {
-            dims: (head_dim as f64 * partial) as i32,
-            theta,
-            yarn,
-        })
-    }
-
-    /// The `[dims / 2]` inverse frequencies, computed in f32 the way
-    /// transformers computes them (`_compute_default_rope_parameters`, or
-    /// `_compute_yarn_parameters`: the trained frequencies blended with the
-    /// interpolated ones, `1 / (factor * base^(2i/dims))`, by a linear ramp
-    /// over the correction range).
-    pub fn inverse_frequencies(&self) -> Vec<f32> {
-        let dims = self.dims as usize;
-        let half = dims / 2;
-        let base = self.theta as f32;
-        let pos_freqs: Vec<f32> = (0..half)
-            .map(|i| base.powf((2 * i) as f32 / dims as f32))
-            .collect();
-        let Some(yarn) = self.yarn else {
-            return pos_freqs.iter().map(|p| 1.0 / p).collect();
-        };
-        let correction_dim = |rotations: f64| {
-            (dims as f64
-                * (yarn.original_max_position_embeddings
-                    / (rotations * 2.0 * std::f64::consts::PI))
-                    .ln())
-                / (2.0 * self.theta.ln())
-        };
-        let (mut low, mut high) = (
-            correction_dim(yarn.beta_fast),
-            correction_dim(yarn.beta_slow),
-        );
-        if yarn.truncate {
-            low = low.floor();
-            high = high.ceil();
-        }
-        let low = low.max(0.0);
-        let mut high = high.min((dims - 1) as f64);
-        if low == high {
-            high += 0.001; // transformers' guard against a zero-width ramp
-        }
-        let factor = yarn.factor as f32;
-        (0..half)
-            .map(|i| {
-                let ramp = ((i as f32 - low as f32) / (high as f32 - low as f32)).clamp(0.0, 1.0);
-                let extrapolation = 1.0 - ramp;
-                let inv_extrapolation = 1.0 / pos_freqs[i];
-                let inv_interpolation = 1.0 / (factor * pos_freqs[i]);
-                inv_interpolation * (1.0 - extrapolation) + inv_extrapolation * extrapolation
-            })
-            .collect()
-    }
-
-    /// `[dims / 2]` periods, the reciprocals of
-    /// [`inverse_frequencies`](Self::inverse_frequencies): what the fused RoPE
-    /// kernel's `freqs` argument takes.
-    pub fn periods(&self) -> Vec<f32> {
-        self.inverse_frequencies().iter().map(|f| 1.0 / f).collect()
-    }
-
-    /// Gain on the rotated channels (`1.0` without YaRN).
-    pub fn attention_factor(&self) -> f32 {
-        self.yarn.map_or(1.0, |y| y.attention_factor as f32)
-    }
-
-    /// Whether this is the plain RoPE `(theta, dims)` describes.
-    pub fn is_plain(&self) -> bool {
-        self.yarn.is_none()
-    }
-}
-
-/// transformers' `get_mscale`.
-fn yarn_get_mscale(scale: f64, mscale: f64) -> f64 {
-    if scale <= 1.0 {
-        1.0
-    } else {
-        0.1 * mscale * scale.ln() + 1.0
-    }
-}
-
-/// The `rope_parameters` of a text config, resolved the way transformers'
-/// `standardize_rope_params` and `_compute_yarn_parameters` resolve them, into
-/// the canonical object both engines read: `rope_type` (`"default"` or
-/// `"yarn"`), `rope_theta`, `partial_rotary_factor`, the mRoPE keys, and for
-/// YaRN every parameter with its default filled in and `attention_factor`
-/// computed. A legacy `rope_scaling` stands in when `rope_parameters` is
+/// The `rope_parameters` of a text config, resolved into the canonical object
+/// both engines read: `rope_type` (`"default"` or `"yarn"`), `rope_theta`,
+/// `partial_rotary_factor`, the mRoPE keys, and for YaRN every parameter
+/// [`crate::rope`] resolved (defaults filled in, `attention_factor`
+/// computed). A legacy `rope_scaling` stands in when `rope_parameters` is
 /// absent.
 fn resolve_rope_parameters(
     text: &Map<String, Value>,
@@ -278,67 +138,41 @@ fn resolve_rope_parameters(
         Some(other) => return Err(format!("rope_parameters must be an object, got {other}")),
         None => Map::new(),
     };
-    let rope_type = rope
-        .get("rope_type")
-        .or_else(|| rope.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or("default")
-        .to_string();
+    let max_pos = text.get("max_position_embeddings").and_then(Value::as_f64);
+    let scaling = RopeScaling::from_params(
+        Some(&rope),
+        &RopeConfig {
+            max_position_embeddings: max_pos,
+            original_max_position_embeddings: text
+                .get("original_max_position_embeddings")
+                .and_then(Value::as_f64),
+            ..RopeConfig::default()
+        },
+    )?;
     rope.remove("type");
     rope.insert("rope_theta".into(), rope_theta.into());
     rope.insert("partial_rotary_factor".into(), partial.into());
-    match rope_type.as_str() {
-        "default" | "mrope" => {
+    match scaling {
+        RopeScaling::Default => {
             rope.insert("rope_type".into(), "default".into());
         }
-        "yarn" => {
-            let num = |key: &str| {
-                rope.get(key)
-                    .filter(|v| !v.is_null())
-                    .and_then(Value::as_f64)
-            };
-            let max_pos = text
-                .get("max_position_embeddings")
-                .and_then(Value::as_f64)
-                .ok_or("config key `max_position_embeddings` must be a number")?;
-            let original = num("original_max_position_embeddings")
-                .or_else(|| {
-                    text.get("original_max_position_embeddings")
-                        .and_then(Value::as_f64)
-                })
-                .unwrap_or(max_pos);
-            let factor = num("factor").unwrap_or(max_pos / original);
-            if !(factor.is_finite() && factor >= 1.0) {
-                return Err(format!("yarn factor {factor} must be at least 1"));
-            }
-            let attention_factor = match num("attention_factor") {
-                Some(af) => af,
-                None => match (num("mscale"), num("mscale_all_dim")) {
-                    (Some(m), Some(all)) if m != 0.0 && all != 0.0 => {
-                        yarn_get_mscale(factor, m) / yarn_get_mscale(factor, all)
-                    }
-                    _ => yarn_get_mscale(factor, 1.0),
-                },
-            };
-            // `beta_fast or 32`: a zero falls back too, as in transformers.
-            let beta_fast = num("beta_fast").filter(|&b| b != 0.0).unwrap_or(32.0);
-            let beta_slow = num("beta_slow").filter(|&b| b != 0.0).unwrap_or(1.0);
-            let truncate = rope
-                .get("truncate")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
+        RopeScaling::Yarn(yarn) => {
             rope.insert("rope_type".into(), "yarn".into());
-            rope.insert("factor".into(), factor.into());
-            rope.insert("original_max_position_embeddings".into(), original.into());
-            rope.insert("attention_factor".into(), attention_factor.into());
-            rope.insert("beta_fast".into(), beta_fast.into());
-            rope.insert("beta_slow".into(), beta_slow.into());
-            rope.insert("truncate".into(), truncate.into());
+            rope.insert("factor".into(), yarn.factor.into());
+            rope.insert(
+                "original_max_position_embeddings".into(),
+                yarn.original_max_position_embeddings.into(),
+            );
+            rope.insert("attention_factor".into(), yarn.attention_factor.into());
+            rope.insert("beta_fast".into(), yarn.beta_fast.into());
+            rope.insert("beta_slow".into(), yarn.beta_slow.into());
+            rope.insert("truncate".into(), yarn.truncate.into());
         }
         other => {
             return Err(format!(
-                "rope_parameters.rope_type {other:?} is not supported; this family runs the \
-                 default (partial, multimodal-sectioned) rotary embedding and static \"yarn\""
+                "rope_parameters.rope_type {:?} is not supported; this family runs the \
+                 default (partial, multimodal-sectioned) rotary embedding and static \"yarn\"",
+                other.rope_type()
             ));
         }
     }
@@ -724,14 +558,14 @@ mod tests {
         assert_eq!(rope["beta_slow"], 1.0);
         assert_eq!(rope["truncate"], true);
 
-        let rotary = Rotary::from_text_config(&t).unwrap();
+        let rotary = rotary(&t).unwrap();
         assert_eq!(rotary.dims, 64);
-        let inv = rotary.inverse_frequencies();
+        let inv = rotary.inverse_frequencies(0);
         let plain = Rotary {
-            yarn: None,
-            ..rotary
+            scaling: RopeScaling::Default,
+            ..rotary.clone()
         }
-        .inverse_frequencies();
+        .inverse_frequencies(0);
         // The highest frequencies stay as trained, the lowest are divided by
         // the factor, and the ones between are blended.
         assert_eq!(inv[0], plain[0]);
@@ -765,12 +599,9 @@ mod tests {
         let mut c = qwen38_card_yarn();
         c["text_config"]["rope_parameters"]["attention_factor"] = 1.0.into();
         let t = normalize_text_config(&c).unwrap();
-        assert_eq!(
-            Rotary::from_text_config(&t).unwrap().attention_factor(),
-            1.0
-        );
+        assert_eq!(rotary(&t).unwrap().attention_factor(), 1.0);
         let plain = normalize_text_config(&qwen38_27b()).unwrap();
-        assert!(Rotary::from_text_config(&plain).unwrap().is_plain());
+        assert_eq!(rotary(&plain).unwrap().scaling, RopeScaling::Default);
     }
 
     #[test]
