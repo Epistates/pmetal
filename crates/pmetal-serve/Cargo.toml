@@ -35,10 +35,10 @@ chrono = { workspace = true }
 futures = { workspace = true }
 tokio-stream = "0.1"
 base64 = { workspace = true }
+image = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-image = { workspace = true }
 tempfile = { workspace = true }
 
 [[bench]]

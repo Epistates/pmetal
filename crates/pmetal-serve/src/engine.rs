@@ -4,10 +4,14 @@ use crate::continuous_pump::ContinuousPump;
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
+use pmetal_data::image_processing::{
+    MllamaImageProcessor, MllamaImageProcessorConfig, mllama_cross_attention_mask,
+};
 use pmetal_data::inference_config::collect_all_stop_tokens;
-use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
+use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor, RgbImage};
 use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
 use pmetal_mlx::{Array, Dtype, ModuleParameters as _};
+use pmetal_models::architectures::mllama::{CrossAttentionInputs, MllamaVisionInputs};
 use pmetal_models::architectures::qwen3_5_vision::{Qwen3_5MultimodalConfig, Qwen3_5Vision};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
@@ -520,6 +524,13 @@ enum Vision {
         processor: Box<QwenVlProcessor>,
         config: Box<Qwen3_5MultimodalConfig>,
     },
+    /// Llama 3.2 Vision: images only, one `<|image|>` token each, read by
+    /// the text model's cross-attention layers. The tower is part of the
+    /// loaded model.
+    Mllama {
+        processor: Box<MllamaImageProcessor>,
+        image_token_id: u32,
+    },
     /// It can't; the reason goes into the 400.
     Unsupported(String),
 }
@@ -545,7 +556,31 @@ impl Vision {
             });
             return vision.unwrap_or_else(|e| Self::Unsupported(e.to_string()));
         }
-        if config.get("vision_config").is_some_and(|v| v.is_object()) {
+        let has_tower = config.get("vision_config").is_some_and(|v| v.is_object());
+        if model_type == "mllama" && has_tower {
+            // The processor's settings; every field has the released
+            // checkpoint's value as its default.
+            let processor_config =
+                match std::fs::read_to_string(model_path.join("preprocessor_config.json")) {
+                    Ok(text) => match serde_json::from_str::<MllamaImageProcessorConfig>(&text) {
+                        Ok(config) => config,
+                        Err(e) => {
+                            return Self::Unsupported(format!(
+                                "its preprocessor_config.json is unreadable: {e}"
+                            ));
+                        }
+                    },
+                    Err(_) => MllamaImageProcessorConfig::default(),
+                };
+            return match MllamaImageProcessor::new(processor_config) {
+                Ok(processor) => Self::Mllama {
+                    processor: Box::new(processor),
+                    image_token_id: config["image_token_index"].as_u64().unwrap_or(128_256) as u32,
+                },
+                Err(e) => Self::Unsupported(e.to_string()),
+            };
+        }
+        if has_tower {
             return Self::Unsupported(format!(
                 "pmetal does not run the vision tower of {model_type} checkpoints in generation"
             ));
@@ -591,6 +626,14 @@ enum PromptMedia {
         images: Vec<ProcessedMedia>,
         videos: Vec<ProcessedMedia>,
     },
+    /// The decoded images (their tiles are cut on the model thread, where
+    /// the processor's arrays are made) and which tiles each prompt token
+    /// may attend to, `[prompt, images, max_tiles]`.
+    Mllama {
+        processor: Box<MllamaImageProcessor>,
+        images: Vec<RgbImage>,
+        cross_attention_mask: Vec<f32>,
+    },
 }
 
 /// A prompt's media, encoded on the model thread: what its prefill and decode
@@ -604,6 +647,26 @@ enum MediaForward {
         positions: Array,
         next_position: i32,
     },
+    /// The prompt's ids and the projected image features with the prompt's
+    /// cross-attention mask; decoding reads the features with the mask's
+    /// last row, as the reference extends it for each generated token.
+    Mllama {
+        input_ids: Array,
+        prefill: Box<CrossAttentionInputs>,
+        decode: Box<CrossAttentionInputs>,
+    },
+}
+
+/// The model as Llama 3.2 Vision, for a prompt the Mllama processor prepared.
+fn mllama(
+    model: &mut DynamicModel,
+) -> Result<
+    &mut pmetal_models::architectures::mllama::MllamaForConditionalGeneration,
+    pmetal_bridge::compat::Exception,
+> {
+    model
+        .as_mllama_mut()
+        .ok_or_else(|| pmetal_bridge::compat::Exception::custom("not a Llama 3.2 Vision model"))
 }
 
 /// One continuous-batching step, run by the model thread between jobs: a
@@ -1114,17 +1177,12 @@ impl InferenceEngine {
             let prompt = self.format_chat_with_tools(messages, tools);
             return Ok(PreparedPrompt::from_tokens(self.tokenize(&prompt)?));
         }
-        let (processor, merge_size) = match &self.vision {
-            Vision::Qwen3_5 { processor, config } => {
-                (processor.clone(), config.vision.spatial_merge_size)
-            }
-            Vision::Unsupported(why) => {
-                return Err(ServeError::BadRequest(format!(
-                    "model '{}' does not accept images or videos: {why}",
-                    self.model_id
-                )));
-            }
-        };
+        if let Vision::Unsupported(why) = &self.vision {
+            return Err(ServeError::BadRequest(format!(
+                "model '{}' does not accept images or videos: {why}",
+                self.model_id
+            )));
+        }
         let chat = crate::media::split_messages(messages)?;
         let text = self
             .chat_template
@@ -1135,32 +1193,90 @@ impl InferenceEngine {
                 ))
             })?;
         let sources = chat.media;
-        let (text, images, videos) = tokio::task::spawn_blocking(move || {
-            let mut images = Vec::new();
-            let mut videos = Vec::new();
-            for media in crate::media::decode_media(&sources)? {
-                match media {
-                    crate::media::DecodedMedia::Image(image) => images.push(
-                        processor
-                            .preprocess_image(&image)
-                            .map_err(|e| ServeError::BadRequest(format!("image: {e}")))?,
-                    ),
-                    crate::media::DecodedMedia::Video(video) => videos.push(
-                        processor
-                            .preprocess_video(&video)
-                            .map_err(|e| ServeError::BadRequest(format!("video: {e}")))?,
-                    ),
-                }
+        let (input_ids, media) = match &self.vision {
+            Vision::Qwen3_5 { processor, config } => {
+                let processor = processor.clone();
+                let merge_size = config.vision.spatial_merge_size;
+                let (text, images, videos) = tokio::task::spawn_blocking(move || {
+                    let mut images = Vec::new();
+                    let mut videos = Vec::new();
+                    for media in crate::media::decode_media(&sources)? {
+                        match media {
+                            crate::media::DecodedMedia::Image(image) => images.push(
+                                processor
+                                    .preprocess_image(&image)
+                                    .map_err(|e| ServeError::BadRequest(format!("image: {e}")))?,
+                            ),
+                            crate::media::DecodedMedia::Video(video) => videos.push(
+                                processor
+                                    .preprocess_video(&video)
+                                    .map_err(|e| ServeError::BadRequest(format!("video: {e}")))?,
+                            ),
+                        }
+                    }
+                    let text = pmetal_data::qwen_vl_processing::expand_placeholders(
+                        &text, &images, &videos, merge_size,
+                    )
+                    .map_err(|e| ServeError::BadRequest(e.to_string()))?;
+                    Ok::<_, ServeError>((text, images, videos))
+                })
+                .await
+                .map_err(|e| ServeError::Internal(e.to_string()))??;
+                (
+                    self.tokenize(&text)?,
+                    PromptMedia::Qwen3_5 { images, videos },
+                )
             }
-            let text = pmetal_data::qwen_vl_processing::expand_placeholders(
-                &text, &images, &videos, merge_size,
-            )
-            .map_err(|e| ServeError::BadRequest(e.to_string()))?;
-            Ok::<_, ServeError>((text, images, videos))
-        })
-        .await
-        .map_err(|e| ServeError::Internal(e.to_string()))??;
-        let input_ids = self.tokenize(&text)?;
+            Vision::Mllama {
+                processor,
+                image_token_id,
+            } => {
+                if sources
+                    .iter()
+                    .any(|s| matches!(s, crate::media::MediaSource::Video { .. }))
+                {
+                    return Err(ServeError::BadRequest(format!(
+                        "model '{}' reads images, not videos",
+                        self.model_id
+                    )));
+                }
+                let input_ids = self.tokenize(&text)?;
+                let processor = processor.clone();
+                let image_token_id = *image_token_id;
+                tokio::task::spawn_blocking(move || {
+                    let images: Vec<RgbImage> = crate::media::decode_media(&sources)?
+                        .into_iter()
+                        .filter_map(|media| match media {
+                            crate::media::DecodedMedia::Image(image) => Some(image),
+                            crate::media::DecodedMedia::Video(_) => None,
+                        })
+                        .collect();
+                    let num_tiles = images
+                        .iter()
+                        .map(|image| processor.num_tiles(image.height(), image.width()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| ServeError::BadRequest(format!("image: {e}")))?;
+                    let cross_attention_mask = mllama_cross_attention_mask(
+                        &input_ids,
+                        image_token_id,
+                        &num_tiles,
+                        processor.config().max_image_tiles,
+                    )
+                    .map_err(|e| ServeError::BadRequest(e.to_string()))?;
+                    Ok::<_, ServeError>((
+                        input_ids,
+                        PromptMedia::Mllama {
+                            processor,
+                            images,
+                            cross_attention_mask,
+                        },
+                    ))
+                })
+                .await
+                .map_err(|e| ServeError::Internal(e.to_string()))??
+            }
+            Vision::Unsupported(_) => unreachable!("refused above"),
+        };
         if input_ids.len() >= self.max_seq_len {
             return Err(ServeError::BadRequest(format!(
                 "the prompt is {} tokens with its images and videos, which leaves no room to \
@@ -1171,7 +1287,7 @@ impl InferenceEngine {
         }
         Ok(PreparedPrompt {
             input_ids,
-            media: Some(Arc::new(PromptMedia::Qwen3_5 { images, videos })),
+            media: Some(Arc::new(media)),
         })
     }
 
@@ -1519,6 +1635,56 @@ impl InferenceEngine {
                     next_position: encoded.positions.next_position,
                 })
             }
+            PromptMedia::Mllama {
+                processor,
+                images,
+                cross_attention_mask,
+            } => {
+                use pmetal_bridge::compat::ops::slice_axis;
+
+                let images: Vec<image::DynamicImage> = images
+                    .iter()
+                    .map(|image| image::DynamicImage::ImageRgb8(image.clone()))
+                    .collect();
+                let batch = processor.preprocess(&[images])?;
+                let mllama = state.model.as_mllama_mut().ok_or_else(|| {
+                    ServeError::Internal(
+                        "a Llama 3.2 Vision checkpoint loaded another model".into(),
+                    )
+                })?;
+                let (len, count) = (input_ids.len() as i32, batch.num_tiles[0].len() as i32);
+                let max_tiles = processor.config().max_image_tiles as i32;
+                let mask = Array::from_f32_slice(cross_attention_mask, &[1, len, count, max_tiles]);
+                let prefill = mllama.prepare_cross_attention(
+                    MllamaVisionInputs {
+                        pixel_values: &batch.pixel_values,
+                        aspect_ratio_ids: &batch.aspect_ratio_ids,
+                        aspect_ratio_mask: &batch.aspect_ratio_mask,
+                    },
+                    Some(&mask),
+                )?;
+                // The tower runs once, here; every step reuses its output.
+                prefill
+                    .states
+                    .try_eval()
+                    .map_err(|e| ServeError::Internal(format!("vision tower: {e}")))?;
+                pmetal_bridge::check_last_error()
+                    .map_err(|e| ServeError::Internal(format!("vision tower: {e}")))?;
+                let last_row = |array: &Option<Array>, axis: i32| {
+                    array.as_ref().map(|a| slice_axis(a, axis, len - 1, len))
+                };
+                let decode = CrossAttentionInputs {
+                    states: prefill.states.clone(),
+                    mask: last_row(&prefill.mask, 2),
+                    full_text_row_mask: last_row(&prefill.full_text_row_mask, 1),
+                };
+                let ids: Vec<i32> = input_ids.iter().map(|&id| id as i32).collect();
+                Ok(MediaForward::Mllama {
+                    input_ids: Array::from_i32_slice_shaped(&ids, &[1, len]),
+                    prefill: Box::new(prefill),
+                    decode: Box::new(decode),
+                })
+            }
         }
     }
 
@@ -1543,6 +1709,9 @@ impl InferenceEngine {
                     qwen.forward_embeddings(embeddings, positions, Some(cache), mamba_cache)?;
                 Ok(logits)
             }
+            MediaForward::Mllama {
+                input_ids, prefill, ..
+            } => mllama(model)?.forward_full(input_ids, Some(prefill.as_ref()), None, Some(cache)),
         }
     }
 
@@ -1565,6 +1734,9 @@ impl InferenceEngine {
                 })?;
                 let at = Array::from_i32_slice(&[next_position + step as i32]);
                 qwen.forward_with_cache_at(input, &at, Some(cache), mamba_cache)
+            }
+            Some(MediaForward::Mllama { decode, .. }) => {
+                mllama(model)?.forward_full(input, Some(decode.as_ref()), None, Some(cache))
             }
         }
     }
@@ -2332,7 +2504,7 @@ mod tests {
             std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
             match Vision::detect(dir.path()) {
                 Vision::Unsupported(why) => why,
-                Vision::Qwen3_5 { .. } => "reads images".into(),
+                Vision::Qwen3_5 { .. } | Vision::Mllama { .. } => "reads images".into(),
             }
         };
         assert_eq!(
@@ -2345,7 +2517,7 @@ mod tests {
         );
         assert_eq!(
             why(serde_json::json!({"model_type": "mllama", "vision_config": {}})),
-            "pmetal does not run the vision tower of mllama checkpoints in generation"
+            "reads images"
         );
         assert!(
             why(serde_json::json!({"model_type": "qwen3_5", "text_config": {}}))
