@@ -26,8 +26,7 @@
 //! * RMSNorm with learnable scale and NO `+1` offset (a.k.a. `scale_shift=0`
 //!   in the reference).
 //! * `gelu_tanh_approx`: the MLP gate activation uses the tanh-based GELU
-//!   approximation (matching MLX `nn.gelu_approx`), NOT pmetal's
-//!   `nn::gelu_approximate` which maps to the sigmoid fast-approx variant.
+//!   approximation (matching MLX `nn.gelu_approx`), not the exact erf GELU.
 //!
 //! NOT supported:
 //! * MoE block (`enable_moe_block`)
@@ -776,10 +775,8 @@ impl Gemma4Mlp {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-        // Gemma 4 uses the tanh-approximation GELU as its gate activation.
-        // `nn::gelu_approximate` maps to the sigmoid fast-approx variant,
-        // which is NOT what MLX's `nn.gelu_approx` computes — see
-        // `nn::gelu_tanh_approximate` in the bridge compat layer.
+        // Gemma 4 uses the tanh-approximation GELU (MLX's `nn.gelu_approx`)
+        // as its gate activation, not the exact erf GELU.
         let gelu_gate = nn::gelu_tanh_approximate(&gate);
         Ok(self.down_proj.forward(&gelu_gate.multiply(&up)))
     }

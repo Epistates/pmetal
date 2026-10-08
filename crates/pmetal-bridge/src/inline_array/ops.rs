@@ -48,7 +48,11 @@ impl InlineArray {
     unop!(ones_like, mlx_inline_ones_like);
     unop!(square, mlx_inline_square);
     unop!(relu, mlx_inline_relu);
+    // The three GELUs (exact erf, tanh approximation, sigmoid approximation),
+    // named as in MLX's `nn` module. Evaluated in f32.
     unop!(gelu, mlx_inline_gelu);
+    unop!(gelu_approx, mlx_inline_gelu_tanh);
+    unop!(gelu_fast_approx, mlx_inline_gelu_fast_approx);
     unop!(erf, mlx_inline_erf);
     unop!(stop_gradient, mlx_inline_stop_gradient);
 

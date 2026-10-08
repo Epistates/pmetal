@@ -58,7 +58,7 @@ fn bert_intermediate_applies_the_activation_its_config_names() {
     for (hidden_act, want) in [
         ("gelu", nn::gelu_erf as Activation),
         ("gelu_new", nn::gelu_tanh_approximate),
-        ("quick_gelu", nn::gelu),
+        ("quick_gelu", nn::gelu_fast_approximate),
         ("relu", nn::relu),
     ] {
         let config = BertConfig {
@@ -97,7 +97,7 @@ fn clip_mlp_distinguishes_all_three_gelus() {
     // some variants `"gelu_new"`. This was a `use_quick_gelu: bool`, so both
     // non-quick spellings collapsed onto the same (wrong) function.
     for (hidden_act, want) in [
-        ("quick_gelu", nn::gelu as Activation),
+        ("quick_gelu", nn::gelu_fast_approximate as Activation),
         ("gelu", nn::gelu_erf),
         ("gelu_new", nn::gelu_tanh_approximate),
     ] {

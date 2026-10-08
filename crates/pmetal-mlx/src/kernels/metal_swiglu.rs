@@ -295,8 +295,8 @@ fn apply_activation(x: &Array, activation: GatedActivationType) -> Array {
             x.silu()
         }
         // Tanh approximation: what `gelu_pytorch_tanh` / `gelu_new` name, and
-        // what every GEGLU architecture actually uses. `Array::gelu()` is the
-        // sigmoid fast-approx, which no real config asks for.
+        // what every GEGLU architecture actually uses, not the exact erf
+        // `Array::gelu()`.
         GatedActivationType::GEGLU => pmetal_bridge::compat::nn::gelu_tanh_approximate(x),
         GatedActivationType::ReGLU => x.relu(),
     }

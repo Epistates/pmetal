@@ -17,60 +17,46 @@ pub fn sigmoid(a: &Array) -> Array {
 pub fn relu(a: &Array) -> Array {
     a.relu()
 }
-/// GELU "fast approximation" using `x * sigmoid(1.702 * x)`. This is
-/// the same formula used by mlx-rs's `nn::gelu_fast_approx` and by the
-/// `mlx_inline_gelu` kernel in `bridge_training.cpp`. This is NOT the
-/// tanh approximation (`mx.fast.rms_norm(x, None, eps)` style) — for
-/// that see `gelu_tanh_approximate` below.
-pub fn gelu(a: &Array) -> Array {
-    a.gelu()
-}
-/// Alias of [`gelu`] kept for source compatibility with mlx-rs's
-/// `nn::gelu_approximate`, which was also the sigmoid fast-approx (and
-/// not the tanh approximation, despite the name). Prefer calling
-/// [`gelu_tanh_approximate`] when you need the tanh variant — see the
-/// Gemma 4 parity investigation for the drift this discrepancy caused.
-pub fn gelu_approximate(a: &Array) -> Array {
-    a.gelu()
-}
-/// GELU tanh approximation matching MLX's `nn.gelu_approx`:
-///
-/// ```text
-///     0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
-/// ```
-///
-/// Implemented in pure ops since there's no dedicated bridge kernel.
-pub fn gelu_tanh_approximate(a: &Array) -> Array {
-    use super::ops;
-    let k = Array::from_f32(0.797_884_6); // sqrt(2/pi)
-    let c = Array::from_f32(0.044_715);
-    let half = Array::from_f32(0.5);
-    let one = Array::from_f32(1.0);
-    let x2 = a.multiply(a);
-    let x3 = x2.multiply(a);
-    let inner = a.add(&c.multiply(&x3));
-    let scaled = k.multiply(&inner);
-    let t = ops::tanh(&scaled);
-    half.multiply(a).multiply(&one.add(&t))
-}
-/// **Exact** GELU — the erf definition, and the one HuggingFace's
-/// `ACT2FN["gelu"]` (`GELUActivation`) computes:
+/// **Exact** GELU, `x·Φ(x)`:
 ///
 /// ```text
 ///     0.5 * x * (1 + erf(x / √2))
 /// ```
 ///
-/// Use this whenever a reference config says `hidden_act: "gelu"`. Neither
-/// [`gelu`] (sigmoid fast-approx, ~1e-2 off) nor [`gelu_tanh_approximate`]
-/// (~1e-3 off) is a parity-grade substitute; those correspond to
-/// `"gelu_pytorch_tanh"` / `"quick_gelu"`-style activations, which real configs
-/// name explicitly.
+/// What MLX's `nn.gelu`, PyTorch's `nn.GELU()` and HuggingFace's
+/// `ACT2FN["gelu"]` (`GELUActivation`) compute, so this is the one a reference
+/// config saying `hidden_act: "gelu"` means. The two approximations are not
+/// substitutes at parity tolerances: [`gelu_tanh_approximate`] is ~1.5e-4 off
+/// and [`gelu_fast_approximate`] ~1.9e-2. Configs name those explicitly
+/// (`"gelu_pytorch_tanh"`, `"quick_gelu"`).
+///
+/// All three GELUs here are evaluated in f32, and a bf16/f16 input comes back
+/// as f32.
+pub fn gelu(a: &Array) -> Array {
+    a.gelu()
+}
+/// Exact GELU under the name the GELU audit gave it; identical to [`gelu`].
 pub fn gelu_erf(a: &Array) -> Array {
-    let half = Array::from_f32(0.5);
-    let one = Array::from_f32(1.0);
-    let inv_sqrt2 = Array::from_f32(std::f32::consts::FRAC_1_SQRT_2);
-    half.multiply(a)
-        .multiply(&one.add(&a.multiply(&inv_sqrt2).erf()))
+    a.gelu()
+}
+/// GELU tanh approximation, MLX's `nn.gelu_approx` and PyTorch's
+/// `GELU(approximate="tanh")`; HuggingFace's `"gelu_pytorch_tanh"` /
+/// `"gelu_new"`:
+///
+/// ```text
+///     0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+/// ```
+pub fn gelu_tanh_approximate(a: &Array) -> Array {
+    a.gelu_approx()
+}
+/// GELU sigmoid approximation, MLX's `nn.gelu_fast_approx` and HuggingFace's
+/// `"quick_gelu"` (`QuickGELUActivation`, OpenAI CLIP):
+///
+/// ```text
+///     x * sigmoid(1.702 * x)
+/// ```
+pub fn gelu_fast_approximate(a: &Array) -> Array {
+    a.gelu_fast_approx()
 }
 pub fn silu(a: &Array) -> Array {
     a.silu()
@@ -268,6 +254,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat::Dtype;
 
     /// `0.5·x·(1 + erf(x/√2))` at f64 precision, from
     /// `0.5*x*(1+math.erf(x/math.sqrt(2)))`.
@@ -284,41 +271,85 @@ mod tests {
         (7.0, 7.0),
     ];
 
-    #[test]
-    fn gelu_erf_matches_the_exact_definition() {
+    fn probe() -> (Array, usize) {
         let xs: Vec<f32> = GELU_ERF_TABLE.iter().map(|&(x, _)| x).collect();
         let n = xs.len();
-        let mut got = gelu_erf(&Array::from_f32_slice(&xs, &[n as i32]));
-        got.eval();
-        let got = got.to_f32_vec(n).expect("to_f32_vec");
+        (Array::from_f32_slice(&xs, &[n as i32]), n)
+    }
 
-        for (i, &(x, want)) in GELU_ERF_TABLE.iter().enumerate() {
+    fn values(mut a: Array, n: usize) -> Vec<f32> {
+        a.eval();
+        let out = a.to_f32_vec(n).expect("to_f32_vec");
+        crate::check_last_error().expect("bridge error");
+        out
+    }
+
+    /// `gelu` is MLX's `nn.gelu` / PyTorch's `nn.GELU()`: the exact erf
+    /// definition. It used to be the sigmoid approximation, which is what
+    /// `quick_gelu` means, not `gelu`.
+    #[test]
+    fn gelu_is_the_exact_erf_definition() {
+        let (x, n) = probe();
+        for (name, f) in [
+            ("gelu", gelu as fn(&Array) -> Array),
+            ("gelu_erf", gelu_erf),
+        ] {
+            let got = values(f(&x), n);
+            for (i, &(x, want)) in GELU_ERF_TABLE.iter().enumerate() {
+                assert!(
+                    (got[i] as f64 - want).abs() < 1e-6,
+                    "{name}({x}) = {}, want {want}",
+                    got[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gelu_tanh_approximate_is_the_tanh_formula() {
+        let (x, n) = probe();
+        let got = values(gelu_tanh_approximate(&x), n);
+        for (i, &(x, _)) in GELU_ERF_TABLE.iter().enumerate() {
+            let x = x as f64;
+            let k = (2.0 / std::f64::consts::PI).sqrt();
+            let want = 0.5 * x * (1.0 + (k * (x + 0.044_715 * x.powi(3))).tanh());
             assert!(
                 (got[i] as f64 - want).abs() < 1e-6,
-                "gelu_erf({x}) = {}, want {want}",
+                "gelu_tanh_approximate({x}) = {}, want {want}",
                 got[i]
             );
         }
     }
 
-    /// The reason [`gelu_erf`] exists: the two approximations are *not*
-    /// interchangeable with it at parity tolerances. `gelu` (sigmoid) is ~1.9e-2
-    /// off at x = -2 and `gelu_tanh_approximate` ~1.5e-4 off at x = -1 — both
-    /// orders of magnitude above the 1e-5 band a forward-pass parity test runs
-    /// at. If this ever starts failing, the bridge's `gelu` changed meaning and
-    /// every `hidden_act` mapping needs re-checking.
+    #[test]
+    fn gelu_fast_approximate_is_the_sigmoid_formula() {
+        let (x, n) = probe();
+        let got = values(gelu_fast_approximate(&x), n);
+        for (i, &(x, _)) in GELU_ERF_TABLE.iter().enumerate() {
+            let x = x as f64;
+            let want = x / (1.0 + (-1.702 * x).exp());
+            assert!(
+                (got[i] as f64 - want).abs() < 1e-6,
+                "gelu_fast_approximate({x}) = {}, want {want}",
+                got[i]
+            );
+        }
+    }
+
+    /// The two approximations are *not* interchangeable with exact GELU at
+    /// parity tolerances. The sigmoid one is ~1.9e-2 off at x = -2 and the tanh
+    /// one ~1.5e-4 off at x = -1, both orders of magnitude above the 1e-5 band a
+    /// forward-pass parity test runs at. If this ever starts failing, one of
+    /// these functions changed meaning and every `hidden_act` mapping needs
+    /// re-checking.
     #[test]
     fn the_gelu_approximations_are_not_parity_substitutes() {
-        let xs: Vec<f32> = GELU_ERF_TABLE.iter().map(|&(x, _)| x).collect();
-        let n = xs.len();
-        let x = Array::from_f32_slice(&xs, &[n as i32]);
-
-        for (name, mut approx, min_gap) in [
-            ("gelu (sigmoid)", gelu(&x), 1e-2_f64),
+        let (x, n) = probe();
+        for (name, approx, min_gap) in [
+            ("gelu_fast_approximate", gelu_fast_approximate(&x), 1e-2_f64),
             ("gelu_tanh_approximate", gelu_tanh_approximate(&x), 1e-4),
         ] {
-            approx.eval();
-            let approx = approx.to_f32_vec(n).expect("to_f32_vec");
+            let approx = values(approx, n);
             let worst = GELU_ERF_TABLE
                 .iter()
                 .zip(&approx)
@@ -326,10 +357,35 @@ mod tests {
                 .fold(0.0_f64, f64::max);
             assert!(
                 worst > min_gap,
-                "{name} is within {worst:.3e} of exact gelu — closer than the \
+                "{name} is within {worst:.3e} of exact gelu, closer than the \
                  documented {min_gap:.0e}; the doc comments on these functions \
                  are now misleading"
             );
+        }
+    }
+
+    /// A bf16/f16 input is evaluated in f32 and comes back as f32, as these
+    /// activations always have (their f32 constants promoted it). Keeping the
+    /// input's dtype instead is a deliberate, separate decision: it moves Gemma
+    /// 3 off transformers (see `gelu_family` in the bridge). The probe is dense
+    /// so that computing in the input's dtype would differ somewhere.
+    #[test]
+    fn the_gelus_evaluate_a_half_precision_input_in_f32() {
+        let n = 321;
+        let xs: Vec<f32> = (0..n).map(|i| -8.0 + 0.05 * i as f32).collect();
+        let x = Array::from_f32_slice(&xs, &[n as i32]);
+        for dtype in [Dtype::Bfloat16, Dtype::Float16] {
+            let half = x.as_dtype(dtype.as_i32());
+            let upcast = half.as_dtype(Dtype::Float32.as_i32());
+            for (name, f) in [
+                ("gelu", gelu as fn(&Array) -> Array),
+                ("gelu_tanh_approximate", gelu_tanh_approximate),
+                ("gelu_fast_approximate", gelu_fast_approximate),
+            ] {
+                let out = f(&half);
+                assert_eq!(out.dtype(), Dtype::Float32, "{name} on {dtype:?}");
+                assert_eq!(values(out, n), values(f(&upcast), n), "{name} on {dtype:?}");
+            }
         }
     }
 }

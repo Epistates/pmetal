@@ -120,6 +120,24 @@ static inline void bridge_placeholder(mlx_inline_array* dst) noexcept {
         } \
     } while (0)
 
+// The three GELUs, evaluated in f32 (f64 stays f64). A bf16/f16 input comes
+// back as f32, which is what these activations have always returned: their
+// f32 constants promoted the input. Rounding the result back to the input's
+// dtype is what PyTorch does, and it is a one-line change here, but it is not
+// a free one. Every op after the activation then runs in bf16 too, and on
+// Gemma 3 that exposes MLX's bf16 attention, which is less precise than
+// PyTorch's: 640 tokens of the 1B model drift to 204x the bf16 noise floor
+// against transformers, where the f32 stream this keeps stays inside it.
+template <typename F>
+static inline array gelu_family(const array& in, F formula) {
+    using namespace mlx::core;
+    const auto dt = in.dtype();
+    const bool exact_float = dt == float32 || dt == float64;
+    const array x = exact_float ? in : astype(in, float32);
+    const auto c = [&](float v) { return array(v, x.dtype()); };
+    return formula(x, c);
+}
+
 // GDN Metal kernel getter — defined in bridge_native.cpp, used across files.
 mlx::core::fast::CustomKernelFunction& get_gdn_kernel();
 

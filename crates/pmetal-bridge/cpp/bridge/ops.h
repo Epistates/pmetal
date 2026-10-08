@@ -36,7 +36,10 @@ void mlx_inline_cos(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_rsqrt(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_square(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_relu(mlx_inline_array* dst, const mlx_inline_array* a);
+// Exact erf GELU / tanh approximation / sigmoid (`x·σ(1.702·x)`) approximation.
 void mlx_inline_gelu(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_gelu_tanh(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_gelu_fast_approx(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_erf(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a);
 

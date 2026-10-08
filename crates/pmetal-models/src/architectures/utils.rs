@@ -157,7 +157,7 @@ pub fn resolve_activation(name: &str) -> Option<Activation> {
         "gelu_new" | "gelu_pytorch_tanh" | "gelu_python_tanh" | "gelu_fast" | "gelu_accurate" => {
             nn::gelu_tanh_approximate
         }
-        "quick_gelu" => nn::gelu,
+        "quick_gelu" => nn::gelu_fast_approximate,
         "relu" => nn::relu,
         "silu" | "swish" => nn::silu,
         "tanh" => ops::tanh,
@@ -250,7 +250,7 @@ mod tests {
             assert_resolves_to(tanh_spelling, nn::gelu_tanh_approximate);
         }
 
-        assert_resolves_to("quick_gelu", nn::gelu);
+        assert_resolves_to("quick_gelu", nn::gelu_fast_approximate);
         assert_resolves_to("relu", nn::relu);
         assert_resolves_to("silu", nn::silu);
         assert_resolves_to("swish", nn::silu);
@@ -265,7 +265,7 @@ mod tests {
         let variants = [
             ("gelu", nn::gelu_erf as Activation),
             ("gelu_new", nn::gelu_tanh_approximate),
-            ("quick_gelu", nn::gelu),
+            ("quick_gelu", nn::gelu_fast_approximate),
         ];
         for (i, (a_name, a)) in variants.iter().enumerate() {
             for (b_name, b) in &variants[i + 1..] {

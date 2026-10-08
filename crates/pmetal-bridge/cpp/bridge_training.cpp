@@ -2,6 +2,7 @@
 // Extracted from bridge.cpp for maintainability.
 
 #include "bridge_internal.h"
+#include <cmath>
 #include <memory>
 #include <numeric>
 
@@ -190,12 +191,41 @@ void mlx_inline_relu(mlx_inline_array* dst, const mlx_inline_array* a) {
         new (dst->buf) array(mlx::core::maximum(as_arr(a), array(0.0f))));
 }
 
+// Exact GELU, `x·Φ(x) = 0.5·x·(1 + erf(x/√2))`: MLX's `nn.gelu`, PyTorch's
+// `nn.GELU()` and HuggingFace's `ACT2FN["gelu"]`.
 void mlx_inline_gelu(mlx_inline_array* dst, const mlx_inline_array* a) {
     BRIDGE_TRY_DST("gelu", dst, {
-        // GELU fast approx: x * sigmoid(1.702 * x)
-                const auto& x = as_arr(a);
-                new (dst->buf) array(mlx::core::multiply(
-                    x, mlx::core::sigmoid(mlx::core::multiply(array(1.702f), x))));
+        using namespace mlx::core;
+        new (dst->buf) array(gelu_family(as_arr(a), [](const array& x, auto c) {
+            return multiply(
+                multiply(c(0.5f), x),
+                add(c(1.0f), erf(multiply(x, c(static_cast<float>(M_SQRT1_2))))));
+        }));
+    });
+}
+
+// Tanh approximation, `0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³)))`: MLX's
+// `nn.gelu_approx`, PyTorch's `GELU(approximate="tanh")`.
+void mlx_inline_gelu_tanh(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("gelu_tanh", dst, {
+        using namespace mlx::core;
+        new (dst->buf) array(gelu_family(as_arr(a), [](const array& x, auto c) {
+            const auto x3 = multiply(multiply(x, x), x);
+            const auto inner = add(x, multiply(c(0.044715f), x3));
+            const auto t = tanh(multiply(c(0.7978846f), inner));
+            return multiply(multiply(c(0.5f), x), add(c(1.0f), t));
+        }));
+    });
+}
+
+// Sigmoid approximation, `x·σ(1.702·x)`: MLX's `nn.gelu_fast_approx`,
+// HuggingFace's `ACT2FN["quick_gelu"]`.
+void mlx_inline_gelu_fast_approx(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("gelu_fast_approx", dst, {
+        using namespace mlx::core;
+        new (dst->buf) array(gelu_family(as_arr(a), [](const array& x, auto c) {
+            return multiply(x, sigmoid(multiply(c(1.702f), x)));
+        }));
     });
 }
 
