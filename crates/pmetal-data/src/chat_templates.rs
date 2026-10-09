@@ -2192,59 +2192,63 @@ impl ChatTemplate {
 /// This is the preferred entry point — it gives consistent results across training, inference,
 /// and distillation because the same Jinja patterns are checked everywhere.
 pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> ChatTemplate {
-    // 1. Try tokenizer_config.json Jinja string
+    // 1. The Jinja template: a standalone `chat_template.jinja`, which
+    //    transformers writes since v4.43 and reads ahead of the config (the
+    //    gpt-oss release ships its template only there), else the
+    //    `chat_template` in tokenizer_config.json.
     let config_path = model_path.join("tokenizer_config.json");
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(jinja) = extract_jinja_template(&json) {
-                // Detect the template family (for the eos_token lookup and
-                // fallback path), but we'll also attach the raw Jinja so
-                // `apply_inference` can execute the upstream template
-                // verbatim and get a bit-exact match.
-                let detected_family = detect_template_from_jinja(&jinja)
-                    // When the detector can't classify the Jinja family,
-                    // fall back to a ChatML skeleton so eos/bos defaults
-                    // are sensible. The attached Jinja source is what
-                    // actually drives rendering.
-                    .unwrap_or_else(ChatTemplate::chatml);
-                let mut template = detected_family;
+    let json = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let standalone = std::fs::read_to_string(model_path.join("chat_template.jinja")).ok();
+    if let Some(jinja) = standalone.or_else(|| extract_jinja_template(&json)) {
+        // Detect the template family (for the eos_token lookup and
+        // fallback path), but we'll also attach the raw Jinja so
+        // `apply_inference` can execute the upstream template
+        // verbatim and get a bit-exact match.
+        let detected_family = detect_template_from_jinja(&jinja)
+            // When the detector can't classify the Jinja family,
+            // fall back to a ChatML skeleton so eos/bos defaults
+            // are sensible. The attached Jinja source is what
+            // actually drives rendering.
+            .unwrap_or_else(ChatTemplate::chatml);
+        let mut template = detected_family;
 
-                // Refine: ChatML-looking Qwen checkpoints get the Qwen
-                // variant so the hardcoded fallback (for base models)
-                // uses the right defaults. The Jinja source still wins
-                // for the rendering path.
-                if template.template_type == ChatTemplateType::ChatMl {
-                    let is_qwen = json
-                        .get("model_type")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|t| t.to_lowercase().contains("qwen"))
-                        || model_name.to_lowercase().contains("qwen");
-                    if is_qwen {
-                        template = ChatTemplate::qwen();
-                    }
-                }
-
-                // Pull bos / eos token strings from the tokenizer config
-                // so the Jinja renderer can substitute `{{ bos_token }}`
-                // and `{{ eos_token }}` exactly like HF does.
-                if let Some(bos) = extract_token_string_field(&json, "bos_token") {
-                    template.bos_token = Some(bos);
-                }
-                if let Some(eos) = extract_token_string_field(&json, "eos_token") {
-                    template.eos_token = eos;
-                }
-
-                // Attach the raw Jinja source — this is what `apply_inference`
-                // executes first, falling back to `format_*` on failure.
-                template.jinja_source = Some(jinja);
-
-                tracing::info!(
-                    "Chat template: {:?} (from tokenizer_config.json, jinja attached)",
-                    template.template_type
-                );
-                return template;
+        // Refine: ChatML-looking Qwen checkpoints get the Qwen
+        // variant so the hardcoded fallback (for base models)
+        // uses the right defaults. The Jinja source still wins
+        // for the rendering path.
+        if template.template_type == ChatTemplateType::ChatMl {
+            let is_qwen = json
+                .get("model_type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| t.to_lowercase().contains("qwen"))
+                || model_name.to_lowercase().contains("qwen");
+            if is_qwen {
+                template = ChatTemplate::qwen();
             }
         }
+
+        // Pull bos / eos token strings from the tokenizer config
+        // so the Jinja renderer can substitute `{{ bos_token }}`
+        // and `{{ eos_token }}` exactly like HF does.
+        if let Some(bos) = extract_token_string_field(&json, "bos_token") {
+            template.bos_token = Some(bos);
+        }
+        if let Some(eos) = extract_token_string_field(&json, "eos_token") {
+            template.eos_token = eos;
+        }
+
+        // Attach the raw Jinja source — this is what `apply_inference`
+        // executes first, falling back to `format_*` on failure.
+        template.jinja_source = Some(jinja);
+
+        tracing::info!(
+            "Chat template: {:?} (jinja attached)",
+            template.template_type
+        );
+        return template;
     }
 
     // 2. Fall back to model-name heuristics
@@ -2495,6 +2499,38 @@ impl TrainingSampleBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gpt-oss release keeps its template in a standalone
+    /// `chat_template.jinja` (tokenizer_config.json has none), which
+    /// transformers reads ahead of the config. It was ignored, so gpt-oss
+    /// prompts were built by a hand-written fallback.
+    #[test]
+    fn a_standalone_chat_template_jinja_is_read_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"eos_token": "<|return|>", "chat_template": "{{ 'from the config' }}"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "{{ '<|start|>assistant' }}",
+        )
+        .unwrap();
+        let template = detect_chat_template(dir.path(), "gpt-oss-20b");
+        assert_eq!(
+            template.jinja_source.as_deref(),
+            Some("{{ '<|start|>assistant' }}")
+        );
+        assert_eq!(template.eos_token, "<|return|>");
+
+        std::fs::remove_file(dir.path().join("chat_template.jinja")).unwrap();
+        let template = detect_chat_template(dir.path(), "gpt-oss-20b");
+        assert_eq!(
+            template.jinja_source.as_deref(),
+            Some("{{ 'from the config' }}")
+        );
+    }
 
     #[test]
     fn test_chatml_format() {
