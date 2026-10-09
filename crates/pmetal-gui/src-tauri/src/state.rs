@@ -316,29 +316,6 @@ impl GrpoRun {
 }
 
 // ---------------------------------------------------------------------------
-// Inference
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceStatus {
-    Idle,
-    Running,
-    Stopped,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InferenceSession {
-    pub id: String,
-    pub model: String,
-    pub status: InferenceStatus,
-    pub tokens_per_second: Option<f64>,
-    pub started_at: DateTime<Utc>,
-}
-
-// ---------------------------------------------------------------------------
 // Bench / Eval — one-shot measurement jobs
 // ---------------------------------------------------------------------------
 
@@ -729,7 +706,6 @@ impl ServeInstance {
 // Events
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppEvent {
@@ -754,9 +730,7 @@ pub enum AppEvent {
     PretrainStarted { run: PretrainRun },
     PretrainStopped { run_id: String },
     PretrainUpdate { run: PretrainRun },
-    ModelCached { model: CachedModel },
     ModelRemoved { model_id: String },
-    ProcessLog { run_id: String, line: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -784,7 +758,6 @@ pub struct AppState {
     pub download_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
-#[allow(dead_code)]
 impl AppState {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(512);
@@ -824,16 +797,6 @@ impl AppState {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("pmetal")
             .join("config.json")
-    }
-
-    pub async fn load_config(&self) {
-        let path = Self::config_path();
-        if let Ok(data) = tokio::fs::read_to_string(&path).await
-            && let Ok(cfg) = serde_json::from_str::<AppConfig>(&data)
-        {
-            *self.config.write().await = cfg;
-            tracing::info!("Loaded config from {}", path.display());
-        }
     }
 
     pub async fn save_config(&self) {
@@ -900,19 +863,6 @@ impl AppState {
         self.training_runs.write().await.push(run);
     }
 
-    pub async fn update_training_run<F>(&self, id: &str, f: F)
-    where
-        F: FnOnce(&mut TrainingRun),
-    {
-        let mut runs = self.training_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            f(run);
-            let _ = self
-                .event_tx
-                .send(AppEvent::TrainingUpdate { run: run.clone() });
-        }
-    }
-
     pub async fn get_training_run(&self, id: &str) -> Option<TrainingRun> {
         self.training_runs
             .read()
@@ -959,19 +909,6 @@ impl AppState {
             .event_tx
             .send(AppEvent::DistillationStarted { run: run.clone() });
         self.distillation_runs.write().await.push(run);
-    }
-
-    pub async fn update_distillation_run<F>(&self, id: &str, f: F)
-    where
-        F: FnOnce(&mut DistillationRun),
-    {
-        let mut runs = self.distillation_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            f(run);
-            let _ = self
-                .event_tx
-                .send(AppEvent::DistillationUpdate { run: run.clone() });
-        }
     }
 
     pub async fn get_distillation_run(&self, id: &str) -> Option<DistillationRun> {
@@ -1024,19 +961,6 @@ impl AppState {
         self.grpo_runs.write().await.push(run);
     }
 
-    pub async fn update_grpo_run<F>(&self, id: &str, f: F)
-    where
-        F: FnOnce(&mut GrpoRun),
-    {
-        let mut runs = self.grpo_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            f(run);
-            let _ = self
-                .event_tx
-                .send(AppEvent::GrpoUpdate { run: run.clone() });
-        }
-    }
-
     pub async fn get_grpo_run(&self, id: &str) -> Option<GrpoRun> {
         self.grpo_runs
             .read()
@@ -1082,19 +1006,6 @@ impl AppState {
         self.serve_instances.write().await.push(instance);
     }
 
-    pub async fn update_serve_instance<F>(&self, id: &str, f: F)
-    where
-        F: FnOnce(&mut ServeInstance),
-    {
-        let mut instances = self.serve_instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            f(inst);
-            let _ = self.event_tx.send(AppEvent::ServeUpdate {
-                instance: inst.clone(),
-            });
-        }
-    }
-
     pub async fn list_serve_instances(&self) -> Vec<ServeInstance> {
         self.serve_instances.read().await.clone()
     }
@@ -1108,19 +1019,6 @@ impl AppState {
             .event_tx
             .send(AppEvent::BenchStarted { run: run.clone() });
         self.bench_runs.write().await.push(run);
-    }
-
-    pub async fn update_bench_run<F>(&self, id: &str, f: F)
-    where
-        F: FnOnce(&mut BenchRun),
-    {
-        let mut runs = self.bench_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            f(run);
-            let _ = self
-                .event_tx
-                .send(AppEvent::BenchUpdate { run: run.clone() });
-        }
     }
 
     pub async fn list_bench_runs(&self) -> Vec<BenchRun> {
@@ -1146,19 +1044,6 @@ impl AppState {
             .event_tx
             .send(AppEvent::EvalStarted { run: run.clone() });
         self.eval_runs.write().await.push(run);
-    }
-
-    pub async fn update_eval_run<F>(&self, id: &str, f: F)
-    where
-        F: FnOnce(&mut EvalRun),
-    {
-        let mut runs = self.eval_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            f(run);
-            let _ = self
-                .event_tx
-                .send(AppEvent::EvalUpdate { run: run.clone() });
-        }
     }
 
     pub async fn list_eval_runs(&self) -> Vec<EvalRun> {

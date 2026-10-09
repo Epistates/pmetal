@@ -3823,17 +3823,9 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
                             "pretrain-update",
                             serde_json::to_value(run).unwrap_or_default(),
                         ),
-                        AppEvent::ModelCached { model } => (
-                            "model-cached",
-                            serde_json::to_value(model).unwrap_or_default(),
-                        ),
                         AppEvent::ModelRemoved { model_id } => {
                             ("model-removed", serde_json::json!({ "model_id": model_id }))
                         }
-                        AppEvent::ProcessLog { run_id, line } => (
-                            "process-log",
-                            serde_json::json!({ "run_id": run_id, "line": line }),
-                        ),
                     };
                     if let Err(e) = app_handle.emit(event_name, payload) {
                         tracing::debug!("Event emit error (no listeners): {}", e);
