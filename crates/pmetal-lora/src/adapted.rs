@@ -281,10 +281,14 @@ fn is_targeted(path: &str, targets: &[String]) -> bool {
 /// experts are named `gate_proj`, so targeting the MLP would have adapted
 /// them). A router's adapter is not reliably applied either, and its argmax
 /// picks which computation runs at all. DeepSeek's router keeps its `Linear`
-/// in a field named `weight`, so its path ends `mlp.weight`.
+/// in a field named `weight`, so its path ends `mlp.weight`, and Granite 4's
+/// in one named `layer`, so its path ends `router.layer`.
 pub(crate) fn moe_role(path: &str) -> Option<&'static str> {
     let name = path.rsplit('.').next().unwrap_or(path);
-    if matches!(name, "gate" | "router" | "shared_expert_gate") || path.ends_with(".mlp.weight") {
+    if matches!(name, "gate" | "router" | "shared_expert_gate")
+        || path.ends_with(".mlp.weight")
+        || path.ends_with(".router.layer")
+    {
         return Some("a router picks experts by argmax");
     }
     if path.contains(".experts.") {
