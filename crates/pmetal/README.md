@@ -99,7 +99,7 @@ rest come in transitively.
 | `distributed` | `pmetal-distributed` | yes | Distributed training (mDNS, Ring All-Reduce) and the `cluster` subcommand |
 | `ane` | `pmetal-metal` | yes | Apple Neural Engine direct programming |
 | `dashboard` | — | yes | TUI control center |
-| `native-only` | `pmetal-bridge` | no | Bridge-only build with no mlx-rs/mlx-sys |
+| `native-only` | `pmetal-bridge` | no | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
 | `vocoder` | `pmetal-vocoder` | no | BigVGAN neural vocoder |
 | `mhc` | `pmetal-mhc` | no | Manifold-Constrained Hyper-Connections |
 | `serve` | `pmetal-serve` | no | OpenAI-compatible inference server (`pmetal serve`) |

@@ -210,8 +210,8 @@ enum LoadedModel {
     Standard(DynamicModel),
     #[cfg(feature = "lora")]
     Lora(DynamicLoraModel),
-    /// Native InlineArray path — no mlx-rs model needed.
-    /// All weights loaded through pmetal-bridge's MLX.
+    /// Native InlineArray path — no `DynamicModel` needed.
+    /// All weights loaded by the pmetal-bridge native engine.
     NativeOnly,
 }
 
@@ -253,8 +253,7 @@ pub struct InferenceGenState {
     native_turboquant: Option<BridgeTurboQuantConfig>,
     /// Zero-overhead affine KV cache quantization config for native path
     native_quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
-    /// Model directory path — used for native InlineArray weight loading
-    /// (bypasses mlx-rs to avoid dual-MLX-instance 6x slowdown).
+    /// Model directory path — used for native InlineArray weight loading.
     model_path: PathBuf,
     /// Decode throughput metrics from the last native generation run.
     /// `None` on non-native paths or when fewer than 20 steps were measured.

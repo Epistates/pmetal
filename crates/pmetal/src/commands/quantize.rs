@@ -1304,7 +1304,7 @@ pub(crate) async fn run_quantization(
                 None => continue,
             };
 
-            let shape_i32: Vec<i32> = tensor.shape().iter().map(|&d| d as i32).collect();
+            let shape_i32: Vec<i32> = tensor.shape().to_vec();
             float_cache.insert(name.clone(), (data_f32.clone(), shape_i32.clone()));
             tensor_data.push((name.clone(), data_f32, shape_i32));
         }

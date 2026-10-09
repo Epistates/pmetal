@@ -21,7 +21,7 @@ required-features = ["cli"]
 # opt out via `pmetal = { version = "x", default-features = false, features = [...] }`.
 default = ["cli", "dashboard", "trainer", "lora", "merge", "ane", "distributed"]
 
-# Foundation crates (no mlx-rs dependency)
+# Foundation crates (no MLX dependency)
 core = ["dep:pmetal-core"]
 gguf = ["dep:pmetal-gguf", "core"]
 metal = ["dep:pmetal-metal", "core"]
@@ -32,7 +32,7 @@ mhc = ["dep:pmetal-mhc"]
 # MLX-dependent crates
 mlx = ["dep:pmetal-mlx", "core", "metal"]
 models = ["dep:pmetal-models", "dep:pmetal-bridge", "core", "gguf", "metal", "mlx"]
-# Native-only: uses pmetal-bridge exclusively, NO mlx-rs/mlx-sys (single libmlx.a)
+# Native-only: inference through pmetal-bridge alone, without pmetal-mlx or pmetal-models
 native-only = ["dep:pmetal-bridge", "core", "metal"]
 lora = ["dep:pmetal-lora", "core", "gguf", "metal", "mlx", "models"]
 # Opt-in: enables fused Metal kernels for ~2x LoRA training speedup (requires Float16 inputs)

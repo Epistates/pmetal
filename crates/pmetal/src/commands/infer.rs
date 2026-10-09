@@ -550,8 +550,8 @@ pub(crate) async fn run_inference(
     println!("  PMetal Inference");
     println!("========================================");
     println!("Model:       {}", model_id);
-    if lora_path.is_some() {
-        println!("LoRA:        {}", lora_path.unwrap());
+    if let Some(path) = lora_path {
+        println!("LoRA:        {}", path);
     }
     if let Some(path) = mtp_assistant_path.as_ref() {
         println!("MTP:         {}", path.display());

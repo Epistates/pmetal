@@ -6,37 +6,29 @@
 use ratatui::style::{Color, Modifier, Style};
 
 /// PMetal brand palette — Apple-inspired with warm neutrals.
-#[allow(dead_code)]
 pub mod palette {
     use ratatui::style::Color;
 
     // Primary — electric blue
-    pub const PRIMARY: Color = Color::Rgb(59, 130, 246); // blue-500
     pub const PRIMARY_DIM: Color = Color::Rgb(37, 99, 235); // blue-600
     pub const PRIMARY_BRIGHT: Color = Color::Rgb(96, 165, 250); // blue-400
 
     // Accent — amber/gold
     pub const ACCENT: Color = Color::Rgb(251, 191, 36); // amber-400
-    pub const ACCENT_DIM: Color = Color::Rgb(217, 119, 6); // amber-600
 
     // Success
     pub const SUCCESS: Color = Color::Rgb(34, 197, 94); // green-500
-    pub const SUCCESS_DIM: Color = Color::Rgb(22, 163, 74); // green-600
-    pub const SUCCESS_BRIGHT: Color = Color::Rgb(74, 222, 128); // green-400
 
     // Warning
     pub const WARNING: Color = Color::Rgb(234, 179, 8); // yellow-500
-    pub const WARNING_DIM: Color = Color::Rgb(202, 138, 4); // yellow-600
 
     // Error / destructive
     pub const ERROR: Color = Color::Rgb(239, 68, 68); // red-500
-    pub const ERROR_DIM: Color = Color::Rgb(220, 38, 38); // red-600
 
     // Surfaces
     pub const SURFACE_0: Color = Color::Rgb(15, 23, 42); // slate-900
     pub const SURFACE_1: Color = Color::Rgb(30, 41, 59); // slate-800
     pub const SURFACE_2: Color = Color::Rgb(51, 65, 85); // slate-700
-    pub const SURFACE_3: Color = Color::Rgb(71, 85, 105); // slate-600
 
     // Text
     pub const TEXT: Color = Color::Rgb(226, 232, 240); // slate-200
@@ -54,7 +46,6 @@ pub mod palette {
     pub const CHART_3: Color = Color::Rgb(168, 85, 247); // purple-500
     pub const CHART_4: Color = Color::Rgb(251, 191, 36); // amber-400
     pub const CHART_5: Color = Color::Rgb(236, 72, 153); // pink-500
-    pub const CHART_6: Color = Color::Rgb(20, 184, 166); // teal-500
 
     // Gauge colors
     pub const GAUGE_LOW: Color = Color::Rgb(34, 197, 94); // green
@@ -63,7 +54,6 @@ pub mod palette {
 }
 
 /// Application-wide theme with semantic style names.
-#[allow(dead_code)]
 pub struct Theme {
     // Layout
     pub root: Style,
@@ -72,7 +62,6 @@ pub struct Theme {
     pub footer: Style,
     pub footer_key: Style,
     pub footer_desc: Style,
-    pub content: Style,
 
     // Tabs
     pub tab_active: Style,
@@ -101,7 +90,6 @@ pub struct Theme {
 
     // Charts
     pub chart_axis: Style,
-    pub chart_label: Style,
 
     // Gauge
     pub gauge_label: Style,
@@ -133,7 +121,6 @@ pub const THEME: Theme = Theme {
         .fg(palette::ACCENT)
         .add_modifier(Modifier::BOLD),
     footer_desc: Style::new().fg(palette::TEXT_DIM),
-    content: Style::new().bg(palette::SURFACE_0).fg(palette::TEXT),
 
     tab_active: Style::new()
         .fg(palette::PRIMARY_BRIGHT)
@@ -170,7 +157,6 @@ pub const THEME: Theme = Theme {
         .add_modifier(Modifier::BOLD),
 
     chart_axis: Style::new().fg(palette::TEXT_DIM),
-    chart_label: Style::new().fg(palette::TEXT_MUTED),
 
     gauge_label: Style::new().fg(palette::TEXT).add_modifier(Modifier::BOLD),
 

@@ -18,8 +18,7 @@ pub enum Event {
     /// A mouse event occurred.
     Mouse(MouseEvent),
     /// The terminal was resized.
-    #[allow(dead_code)]
-    Resize(u16, u16),
+    Resize,
     /// A tick event for periodic updates.
     Tick,
     /// A message from a background process.
@@ -28,7 +27,6 @@ pub enum Event {
 
 /// Messages sent from background tasks (jobs and inference) to the TUI.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum AppMsg {
     /// Canonical [`pmetal_core::JobEvent`] from a running job.
     ///
@@ -39,9 +37,14 @@ pub enum AppMsg {
     /// this one.
     Job(pmetal_core::JobEvent),
     /// A background job has started.
-    JobStarted { job_id: String, job_type: JobType },
+    JobStarted {
+        #[expect(dead_code, reason = "the TUI does not route job state by id yet")]
+        job_id: String,
+        job_type: JobType,
+    },
     /// Real-time metrics from a running training job.
     JobMetrics {
+        #[expect(dead_code, reason = "the TUI does not route job state by id yet")]
         job_id: String,
         step: usize,
         epoch: usize,
@@ -58,7 +61,11 @@ pub enum AppMsg {
         total_ms: f64,
     },
     /// Status phase update from a running job (e.g. "Loading model...", "Tokenizing...").
-    JobPhase { job_id: String, phase: String },
+    JobPhase {
+        #[expect(dead_code, reason = "the TUI does not route job state by id yet")]
+        job_id: String,
+        phase: String,
+    },
     /// A line of stdout/stderr from a running job.
     JobOutput { job_id: String, line: String },
     /// A background job has finished.
@@ -201,7 +208,7 @@ impl EventHandler {
                                         }
                                     }
                                     CrosstermEvent::Mouse(mouse) => Some(Event::Mouse(mouse)),
-                                    CrosstermEvent::Resize(w, h) => Some(Event::Resize(w, h)),
+                                    CrosstermEvent::Resize(..) => Some(Event::Resize),
                                     _ => None,
                                 };
                                 if let Some(event) = event {

@@ -156,7 +156,7 @@ pub(crate) async fn run_grpo_cli(
     tracing::info!("Loading model with LoRA...");
     let lora_config = LoraConfig {
         r: lora_r,
-        alpha: lora_alpha as f32,
+        alpha: lora_alpha,
         ..Default::default()
     };
     let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())?;
@@ -300,7 +300,7 @@ pub(crate) async fn run_grpo_cli(
         };
 
         let ml_reward = pmetal_trainer::reward_model::MLRewardModel::from_pretrained(
-            &rm_path,
+            rm_path,
             rm_tokenizer,
             rm_config,
         )

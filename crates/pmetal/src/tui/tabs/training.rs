@@ -21,7 +21,6 @@ use crate::tui::widgets::{FieldKind, FormAction, FormField, FormTabState};
 
 /// Training run status.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum TrainingStatus {
     Idle,
     Running {
@@ -29,7 +28,6 @@ pub enum TrainingStatus {
         epoch: usize,
         total_epochs: usize,
         total_steps: usize,
-        loss: f64,
     },
     Completed {
         final_loss: f64,
@@ -264,14 +262,12 @@ impl TrainingTab {
         epoch: usize,
         total_epochs: usize,
         total_steps: usize,
-        loss: f64,
     ) {
         self.status = TrainingStatus::Running {
             step,
             epoch,
             total_epochs,
             total_steps,
-            loss,
         };
     }
 
@@ -654,7 +650,6 @@ pub fn render_status_with_metrics(
             epoch,
             total_epochs,
             total_steps,
-            loss: _,
         } => {
             // Split into: stats | sparkline | timing
             let [stats_area, spark_area, timing_area, hint_area] = Layout::vertical([

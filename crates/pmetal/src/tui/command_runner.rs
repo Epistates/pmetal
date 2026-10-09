@@ -252,11 +252,7 @@ async fn run_command(
     // Place child in its own process group so cancellation kills the entire
     // process tree (child + any grandchildren it spawns), not just the direct child.
     #[cfg(unix)]
-    {
-        #[allow(unused_imports)]
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    cmd.process_group(0);
 
     let mut child = cmd.spawn()?;
 

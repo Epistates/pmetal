@@ -63,6 +63,7 @@ pub(crate) async fn run_ollama_command(action: OllamaAction) -> anyhow::Result<(
 }
 
 /// Generate a Modelfile for Ollama.
+#[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
 fn generate_modelfile(
     base: &str,
     lora: Option<&str>,
@@ -214,6 +215,7 @@ pub(crate) fn validate_file_path(
 ///
 /// PMetal intentionally does not invoke the Ollama runtime here. Keeping this
 /// path file-based avoids coupling export to a locally installed service.
+#[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
 fn prepare_ollama_model(
     name: &str,
     base: &str,

@@ -1,11 +1,5 @@
 //! PMetal CLI - LLM fine-tuning for Apple Silicon.
 
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::derivable_impls)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::unnecessary_unwrap)]
-
 pub mod cli;
 mod commands;
 mod dashboard;

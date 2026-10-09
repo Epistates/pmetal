@@ -1,4 +1,4 @@
-//! Native inference — all models through pmetal-bridge, zero mlx-rs.
+//! Native inference — all models through the pmetal-bridge native engines.
 //!
 //! Each architecture has its own `run_{arch}` function that owns the full
 //! pipeline: load config → load weights → prefill → decode.  The module is

@@ -291,7 +291,7 @@ impl App {
                 Some(Event::Key(key)) => self.handle_key(key),
                 Some(Event::Mouse(mouse)) => self.handle_mouse(mouse),
                 Some(Event::Tick) => self.on_tick(),
-                Some(Event::Resize(_, _)) => {} // Terminal handles resize
+                Some(Event::Resize) => {} // Terminal handles resize
                 Some(Event::App(msg)) => self.handle_app_msg(msg),
                 None => self.should_quit = true,
             }
@@ -1572,7 +1572,7 @@ impl App {
                 job_type,
             } => match job_type {
                 JobType::Train => {
-                    self.training.set_status_running(0, 0, 0, 0, 0.0);
+                    self.training.set_status_running(0, 0, 0, 0);
                     self.dashboard.job_phase = Some("Starting training job...".to_string());
                 }
                 JobType::Distill => {
@@ -1581,7 +1581,6 @@ impl App {
                         epoch: 0,
                         total_epochs: 0,
                         total_steps: 0,
-                        loss: 0.0,
                     };
                 }
                 JobType::Grpo => {
@@ -1590,7 +1589,6 @@ impl App {
                         epoch: 0,
                         total_epochs: 0,
                         total_steps: 0,
-                        loss: 0.0,
                     };
                 }
                 JobType::Pretrain => {
@@ -1599,7 +1597,6 @@ impl App {
                         epoch: 0,
                         total_epochs: 0,
                         total_steps: 0,
-                        loss: 0.0,
                     };
                     self.dashboard.job_phase = Some("Starting pretrain job...".to_string());
                 }
@@ -1644,19 +1641,14 @@ impl App {
                     epoch,
                     total_epochs,
                     total_steps,
-                    loss,
                 };
                 match self.active_job_type {
                     Some(JobType::Distill) => self.distillation.status = running,
                     Some(JobType::Grpo) => self.grpo.status = running,
                     Some(JobType::Pretrain) => self.pretrain.status = running,
-                    _ => self.training.set_status_running(
-                        step,
-                        epoch,
-                        total_epochs,
-                        total_steps,
-                        loss,
-                    ),
+                    _ => self
+                        .training
+                        .set_status_running(step, epoch, total_epochs, total_steps),
                 }
             }
             AppMsg::JobPhase { job_id: _, phase } => {
@@ -1794,7 +1786,7 @@ impl App {
                         // Offer to test inference with the trained model
                         self.pending_modal_context = Some(PendingModalTarget::TestInference);
                         self.modal_stack.push(Modal::confirm(
-                            &format!("{job_label} Complete"),
+                            format!("{job_label} Complete"),
                             vec![
                                 format!("Final loss: {loss:.4} over {steps} steps"),
                                 String::new(),
@@ -2580,7 +2572,6 @@ impl App {
                 epoch: 0,
                 total_epochs: 1,
                 total_steps,
-                loss: 0.0,
             };
         }
     }

@@ -896,6 +896,10 @@ fn quantize_and_write_matrix(
 ///
 /// Probes expert 0 (and expert 1 for large models where experts may span shard
 /// boundaries) for each projection and suffix.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the layout of one layer's expert tensors"
+)]
 fn collect_needed_shards(
     layer_idx: usize,
     num_experts: usize,

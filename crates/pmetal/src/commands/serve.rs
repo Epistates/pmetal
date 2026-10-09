@@ -1,5 +1,6 @@
 /// Start the OpenAI-compatible inference server.
 #[cfg(feature = "serve")]
+#[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
 pub(crate) async fn run_serve(
     model_id: String,
     port: u16,

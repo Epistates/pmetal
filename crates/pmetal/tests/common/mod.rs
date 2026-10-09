@@ -1,7 +1,5 @@
 //! HTTP helpers for the tests that drive a real `pmetal serve`.
 
-#![allow(dead_code)]
-
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

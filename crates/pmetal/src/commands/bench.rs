@@ -669,6 +669,7 @@ pub(crate) fn run_kernel_benchmark_corpus(
     Ok(())
 }
 
+#[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
 pub(crate) async fn run_gdn_decode_benchmark(
     model_id: &str,
     stage: GdnBenchmarkStage,
@@ -1264,6 +1265,7 @@ fn run_gdn_prefill_backend(
     })
 }
 
+#[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
 pub(crate) async fn run_workload_benchmark(
     model_id: &str,
     dataset_id: &str,
@@ -1335,6 +1337,7 @@ pub(crate) async fn run_workload_benchmark_preset(
     .await
 }
 
+#[expect(clippy::too_many_arguments, reason = "one argument per CLI flag")]
 async fn run_workload_benchmark_internal(
     preset: Option<String>,
     model_id: &str,
@@ -1849,6 +1852,10 @@ fn mlx_split_projection_rhs_transposed(
     Ok(ops::concatenate_axis(&[&qkv, &z, &b_val, &a], -1))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the projection's weights and dimensions"
+)]
 fn mlx_combined_split_projection(
     input: &Array,
     combined_weight: &Array,
@@ -1871,6 +1878,10 @@ fn mlx_combined_split_projection(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the projection's weights and dimensions"
+)]
 fn mlx_combined_split_projection_rhs_transposed(
     input: &Array,
     combined_weight_t: &Array,
@@ -1893,6 +1904,10 @@ fn mlx_combined_split_projection_rhs_transposed(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the projection's weights and dimensions"
+)]
 fn mlx_qkv_z_combined_split_projection(
     input: &Array,
     qkv_z_combined_weight: &Array,
@@ -1920,6 +1935,10 @@ fn mlx_qkv_z_combined_split_projection(
     Ok((qkv, z, b_val, a))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the projection's weights and dimensions"
+)]
 fn mlx_qkv_z_combined_split_projection_rhs_transposed(
     input: &Array,
     qkv_z_combined_weight_t: &Array,
@@ -1979,6 +1998,10 @@ fn accelerate_combined_projection(
     output
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the projection's weights and dimensions"
+)]
 fn accelerate_roundtrip_split_projection(
     input: &Array,
     combined_weight: &[f32],
@@ -2167,6 +2190,10 @@ struct InferenceSessionMetrics {
     prefetch_total: Option<usize>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per benchmark setting"
+)]
 fn benchmark_real_inference(
     model_path: &Path,
     experts_dir: Option<&str>,
@@ -2346,6 +2373,10 @@ fn benchmark_real_inference(
     ))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per benchmark setting"
+)]
 fn benchmark_real_inference_session(
     model_path: &Path,
     experts_dir: Option<&str>,
@@ -4150,7 +4181,7 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Benchmark FFI overhead to compare Rust mlx-rs vs Python mlx performance.
+/// Benchmark FFI overhead of the Rust bridge against Python MLX.
 ///
 /// Python baseline: ~7420 argmax ops/sec (~0.135ms per op) on Qwen3 vocab size.
 pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
@@ -4174,7 +4205,7 @@ pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
     let vocab_size = 151936; // Qwen3 vocab size
     println!("Creating logits array with vocab_size = {}", vocab_size);
     let logits_data: Vec<f32> = (0..vocab_size).map(|i| (i as f32) * 0.001).collect();
-    let logits = Array::from_slice(&logits_data, &[1, vocab_size as i32]);
+    let logits = Array::from_slice(&logits_data, &[1, vocab_size]);
     eval([&logits])?;
 
     // Benchmark 1: argmax operations
