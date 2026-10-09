@@ -43,18 +43,14 @@
 
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::async_scheduler::GpuCompletionToken;
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
@@ -181,139 +177,7 @@ impl BatchedCommandBuffer {
         command_buffer.commit();
         Ok(command_buffer)
     }
-
-    /// Execute without waiting and return a completion token.
-    ///
-    /// This provides a richer async experience with completion tracking.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let mut batch = BatchedCommandBuffer::new(&ctx)?;
-    /// // ... queue operations ...
-    ///
-    /// let token = batch.execute_with_token()?;
-    ///
-    /// // Do other work while GPU executes
-    /// prepare_next_batch();
-    ///
-    /// // Wait when results are needed
-    /// token.wait();
-    /// ```
-    pub fn execute_with_token(mut self) -> Result<BatchCompletionToken> {
-        static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-        if let Some(encoder) = self.encoder.take() {
-            encoder.endEncoding();
-        }
-
-        let command_buffer = self
-            .command_buffer
-            .take()
-            .ok_or(MetalError::CommandBufferCreation)?;
-
-        let operation_id = OPERATION_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dispatch_count = self.dispatch_count;
-
-        command_buffer.commit();
-
-        tracing::trace!(
-            "BatchedCommandBuffer async submitted {} dispatches (op_id={})",
-            dispatch_count,
-            operation_id
-        );
-
-        Ok(BatchCompletionToken {
-            command_buffer,
-            operation_id,
-            dispatch_count,
-        })
-    }
 }
-
-/// Token for tracking async batched command buffer completion.
-///
-/// Provides methods to check and wait for GPU work completion.
-/// Implements [`GpuCompletionToken`] for use in generic contexts.
-pub struct BatchCompletionToken {
-    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-    operation_id: u64,
-    dispatch_count: usize,
-}
-
-impl BatchCompletionToken {
-    /// Get the number of dispatches in this batch.
-    ///
-    /// This is specific to BatchCompletionToken (not in the trait).
-    #[inline]
-    pub fn dispatch_count(&self) -> usize {
-        self.dispatch_count
-    }
-
-    /// Wait and return an error if execution failed.
-    ///
-    /// Alias for `wait_checked()` for backwards compatibility.
-    #[deprecated(since = "0.1.0", note = "Use wait_checked() instead")]
-    pub fn wait_and_check(&self) -> Result<()> {
-        self.wait_checked()
-    }
-}
-
-impl GpuCompletionToken for BatchCompletionToken {
-    fn wait(&self) {
-        self.command_buffer.waitUntilCompleted();
-    }
-
-    fn wait_checked(&self) -> Result<()> {
-        self.command_buffer.waitUntilCompleted();
-        if let Some(err) = self.command_buffer.error() {
-            return Err(MetalError::ExecutionFailed(err.to_string()));
-        }
-        Ok(())
-    }
-
-    #[inline]
-    fn is_complete(&self) -> bool {
-        let status = self.command_buffer.status();
-        status == MTLCommandBufferStatus::Completed || status == MTLCommandBufferStatus::Error
-    }
-
-    fn wait_timeout(&self, timeout: Duration) -> Result<bool> {
-        use std::time::Instant;
-
-        const POLL_INTERVAL: Duration = Duration::from_micros(100);
-        let deadline = Instant::now() + timeout;
-
-        while !self.is_complete() {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(false);
-            }
-            // Sleep for poll interval or remaining time, whichever is smaller
-            let remaining = deadline - now;
-            std::thread::sleep(POLL_INTERVAL.min(remaining));
-        }
-
-        // Check for GPU errors after completion
-        if let Some(err) = self.command_buffer.error() {
-            return Err(MetalError::ExecutionFailed(err.to_string()));
-        }
-        Ok(true)
-    }
-
-    #[inline]
-    fn operation_id(&self) -> u64 {
-        self.operation_id
-    }
-
-    fn error(&self) -> Option<String> {
-        self.command_buffer.error().map(|e| e.to_string())
-    }
-}
-
-// SAFETY: BatchCompletionToken wraps Metal objects which are thread-safe.
-unsafe impl Send for BatchCompletionToken {}
-unsafe impl Sync for BatchCompletionToken {}
 
 impl Drop for BatchedCommandBuffer {
     fn drop(&mut self) {

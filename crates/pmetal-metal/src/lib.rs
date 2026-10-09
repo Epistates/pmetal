@@ -64,7 +64,6 @@
 pub mod accelerate;
 #[cfg(feature = "ane")]
 pub mod ane;
-pub mod async_scheduler;
 pub mod backend;
 pub mod bridge;
 pub mod buffer;
@@ -119,13 +118,6 @@ pub use kernels::mpp_flash_attention::{
 pub use kernels::mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
 pub use kernels::turboquant::TurboQuantTransform;
 pub use pipeline::{FunctionConstant, PipelineCache};
-
-// Async command buffer scheduling — DoubleBuffer and TripleBuffer are available
-// via async_scheduler module but not re-exported (no external consumers yet).
-pub use async_scheduler::{
-    AsyncBatchBuilder, AsyncScheduler, CompletionToken, DEFAULT_GPU_TIMEOUT, GpuCompletionToken,
-    InFlightBuffer, SchedulerStats,
-};
 
 /// Prelude for convenient imports.
 pub mod prelude {

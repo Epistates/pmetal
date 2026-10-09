@@ -704,9 +704,7 @@ impl ExpertBufferPool {
     ///
     /// The caller **must** ensure that all GPU work using this buffer has
     /// completed before calling `release`.  The simplest way is to call
-    /// `commandBuffer.waitUntilCompleted()` (or the equivalent
-    /// [`CompletionToken::wait`](crate::async_scheduler::GpuCompletionToken::wait))
-    /// before releasing.
+    /// `commandBuffer.waitUntilCompleted()` before releasing.
     ///
     /// # Panics
     ///
