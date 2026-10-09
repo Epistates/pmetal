@@ -138,7 +138,7 @@ pub fn expand_dims(a: &Array, axis: i32) -> Array {
 pub fn repeat_axis(a: Array, repeats: i32, axis: i32) -> Array {
     a.repeat(repeats, axis)
 }
-/// Stack arrays along a new axis 0 — equivalent to `mlx_rs::ops::stack`.
+/// Stack arrays along a new axis 0.
 pub fn stack(arrays: &[Array]) -> Array {
     stack_axis(arrays, 0)
 }
@@ -189,7 +189,7 @@ pub fn arange(n: i32, dtype: Dtype) -> Array {
 pub fn arange_n(n: i32) -> Array {
     Array::arange(n, Dtype::Int32.as_i32())
 }
-/// `arange(start, stop, 1)` — integer range; equivalent to `mlx_rs::ops::arange::<i32,i32>(start, stop, 1)`.
+/// `arange(start, stop, 1)` — an int32 range.
 pub fn arange_from(start: i32, stop: i32) -> Array {
     let n = (stop - start).max(0);
     let base = Array::arange(n, Dtype::Int32.as_i32());
@@ -265,7 +265,7 @@ pub fn pow(a: &Array, b: &Array) -> Array {
 pub fn where_fn(cond: &Array, a: &Array, b: &Array) -> Array {
     cond.where_cond(a, b)
 }
-/// `r#where` — alias for `where_fn` matching the mlx-rs `ops::r#where` name.
+/// `r#where` — alias for [`where_fn`].
 #[allow(non_snake_case)]
 pub fn r#where(cond: &Array, a: &Array, b: &Array) -> Array {
     cond.where_cond(a, b)
@@ -310,7 +310,6 @@ pub fn pad(
     let flat: Vec<i32> = pad_widths.iter().flat_map(|(b, e)| [*b, *e]).collect();
     a.pad(&flat, mode.unwrap_or_default(), fill)
 }
-/// Wrapper matching `mlx_rs::ops::arange::<i32, f32>` signature used in vocoder.
 /// Produces a float32 arange from `start` to `stop` (exclusive), step 1.
 pub fn arange_range(start: i32, stop: i32) -> Array {
     let n = (stop - start).max(0);
@@ -372,7 +371,7 @@ pub fn cos(a: &Array) -> Array {
 
 // ── aliases and missing variants ──────────────────────────────────────────
 
-/// Alias for `zeros` — `zeros_dtype(shape, dtype)` matches mlx-rs naming.
+/// Alias for `zeros` taking a [`Dtype`].
 pub fn zeros_dtype(shape: &[i32], dtype: Dtype) -> Array {
     Array::zeros(shape, dtype.as_i32())
 }
@@ -420,7 +419,6 @@ pub fn split_sections(a: &Array, indices: &[i32], axis: i32) -> Vec<Array> {
 /// Scatter: create a new array where `a[indices]` = `updates` along `axis`.
 ///
 /// Returns a new array; does not modify `a` in place.
-/// Equivalent to `mlx_rs::ops::put_along_axis`.
 pub fn put_along_axis(a: &Array, indices: &Array, updates: &Array, axis: i32) -> Array {
     a.put_along_axis_op(indices, updates, axis)
 }

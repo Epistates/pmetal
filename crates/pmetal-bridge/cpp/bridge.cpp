@@ -162,20 +162,6 @@ void mlx_inline_destroy(mlx_inline_array* a) {
     as_arr(a).~array();
 }
 
-// Convert from legacy mlx_array handle (for interop with existing mlx-rs code)
-void mlx_inline_from_handle(mlx_inline_array* dst, void* handle_ctx) {
-    if (handle_ctx) {
-        new (dst->buf) array(*static_cast<array*>(handle_ctx));
-    } else {
-        bridge_placeholder(dst);
-    }
-}
-
-// Convert TO legacy mlx_array handle
-void* mlx_inline_to_handle(const mlx_inline_array* src) {
-    return new array(as_arr(src));
-}
-
 // ── Core ops — write result directly into caller's stack buffer ──
 
 void mlx_inline_matmul(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {

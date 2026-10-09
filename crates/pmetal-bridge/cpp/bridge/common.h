@@ -55,10 +55,6 @@ void mlx_inline_init_copy(mlx_inline_array* dst, const mlx_inline_array* src);
 void mlx_inline_init_move(mlx_inline_array* dst, mlx_inline_array* src);
 void mlx_inline_destroy(mlx_inline_array* a);
 
-// ── Interop with legacy mlx_array handles ─────────────────────────────────
-void mlx_inline_from_handle(mlx_inline_array* dst, void* handle_ctx);
-void* mlx_inline_to_handle(const mlx_inline_array* src);
-
 // ── Size query (for Rust build-time verification) ─────────────────────────
 size_t mlx_inline_array_size(void);
 size_t mlx_inline_array_align(void);

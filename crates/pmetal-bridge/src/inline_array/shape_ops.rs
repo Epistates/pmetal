@@ -26,8 +26,6 @@ impl InlineArray {
     }
 
     /// Returns the dtype as a [`crate::compat::Dtype`] enum.
-    ///
-    /// Equivalent to mlx-rs `Array::dtype()`.
     #[inline]
     pub fn dtype(&self) -> crate::compat::Dtype {
         crate::compat::Dtype::from_raw(self.dtype_raw())
@@ -226,7 +224,7 @@ impl InlineArray {
 
     /// Index or slice this array using the compatibility bridge.
     ///
-    /// Supports gather indexing with an index array as well as mlx-rs style
+    /// Supports gather indexing with an index array as well as
     /// integer and tuple/range slicing via `compat::indexing::IndexOp`.
     #[inline]
     pub fn index<Idx>(&self, idx: Idx) -> Self

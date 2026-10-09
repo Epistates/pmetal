@@ -53,7 +53,7 @@ pub(super) struct LayerWeights {
     pub(super) swiglu_limit: f32,
 }
 
-/// All GPT-OSS model weights as InlineArray. Zero dependency on mlx-rs.
+/// All GPT-OSS model weights as InlineArray.
 pub struct NativeWeights {
     pub embed_w: InlineArray,
     pub final_norm_w: InlineArray,

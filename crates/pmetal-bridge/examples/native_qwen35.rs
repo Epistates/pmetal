@@ -1,5 +1,5 @@
-//! Standalone Qwen3.5 inference — SINGLE libmlx.a, no mlx-rs.
-//! Proves the performance achievable without dual-MLX-instance interference.
+//! Standalone Qwen3.5 inference through the bridge alone, on a single
+//! statically linked libmlx.
 //!
 //! Usage: cargo run -p pmetal-bridge --release --example native_qwen35 -- \
 //!          --model /path/to/Qwen3.5-0.8B --max-tokens 200

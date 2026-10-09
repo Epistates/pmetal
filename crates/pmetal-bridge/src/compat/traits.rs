@@ -6,8 +6,6 @@ use super::{
 // ── ModuleParametersExt ───────────────────────────────────────────────────────
 
 /// Extension trait adding convenience methods to `ModuleParameters`.
-///
-/// Mirrors `mlx_rs::module::ModuleParametersExt`.
 pub trait ModuleParametersExt: ModuleParameters {
     /// Flatten all parameters into an owned `FlattenedModuleParam`.
     ///
@@ -56,8 +54,7 @@ impl<T: ModuleParameters> ModuleParametersExt for T {}
 
 /// Helper trait used by `impl_module_params!` macro to collect arrays.
 ///
-/// Implements the visitor pattern for parameter trees, mirroring mlx-rs's
-/// `module::Parameter` trait but adapted for compat's `NestedValue` types.
+/// Implements the visitor pattern over compat's `NestedValue` parameter trees.
 pub trait Parameter {
     /// Insert borrowed array references into the `ModuleParamRef` map.
     fn collect_params<'a>(&'a self, key: &str, out: &mut ModuleParamRef<'a>);

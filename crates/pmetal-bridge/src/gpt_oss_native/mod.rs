@@ -1,4 +1,4 @@
-//! Standalone GPT-OSS inference engine — zero dependency on mlx-rs or pmetal-models.
+//! Standalone GPT-OSS inference engine, independent of pmetal-models.
 //!
 //! GPT-OSS is OpenAI's first Apache-2.0 open-weight model (Aug 2025).  Available
 //! in 20B and 120B variants, it uses:

@@ -1,5 +1,4 @@
-// Re-export layer types so `use pmetal_bridge::compat::nn` works
-// as a drop-in for `use mlx_rs::nn`.
+// Layer types, activations and autograd, under one `nn` path.
 pub use super::layers::{
     Conv1d, Conv1dBuilder, Conv2d, Conv2dBuilder, Embedding, GroupNorm, GroupNormBuilder,
     LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, Sequential,
@@ -83,8 +82,8 @@ pub fn cross_entropy(logits: &Array, targets: &Array, axis: i32) -> Array {
 /// return a scalar loss array.  Gradients are computed w.r.t. the first
 /// `params.len()` arrays.
 ///
-/// This is a thin shim over the bridge `value_and_grad` function; the
-/// `Result` wrapper is present only for API parity with `mlx_rs`.
+/// This is a thin shim over the bridge `value_and_grad` function; it never
+/// returns `Err`.
 pub fn value_and_grad_explicit<F>(
     loss_fn: F,
     params: &[Array],
@@ -96,9 +95,8 @@ where
     Ok(crate::inline_array::value_and_grad(loss_fn, params, inputs))
 }
 
-/// mlx-rs compatible closure-returning form of `value_and_grad`.
+/// Closure-returning form of `value_and_grad` over a module's parameters.
 ///
-/// Mirrors the mlx-rs API:
 /// ```ignore
 /// let mut vag = nn::value_and_grad(loss_fn);
 /// let (loss, grads) = vag(model, inputs)?;
@@ -188,7 +186,7 @@ where
     }
 }
 
-/// mlx-rs compatible `keyed_value_and_grad`.
+/// `value_and_grad` over a flattened, named parameter map.
 ///
 /// Takes a closure `loss_fn(params: FlattenedModuleParam, inputs: T) -> Result<Vec<Array>>`
 /// and returns a closure that computes `(values, grad_map)` via autograd over

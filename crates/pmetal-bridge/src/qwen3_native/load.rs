@@ -147,7 +147,7 @@ fn get_stacked_expert_weight(
 //     shared expert. Per-expert weights are stacked into [E, in, out] tensors at
 //     load time (matches Python's sanitize() stacking).
 //
-// Applies the same sanitization as the mlx-rs loader:
+// Applies the same sanitization as the pmetal-models loader:
 // - VLM prefix stripping (model.language_model. -> model.)
 // - A_log -> a_log rename
 // - mtp.* key drop

@@ -1,8 +1,8 @@
-//! TurboQuant KV cache — zero mlx-rs dependency.
+//! TurboQuant KV cache.
 //!
 //! Self-contained implementation of the TurboQuant-inspired KV cache using only
 //! [`InlineArray`] and pure-Rust math.  The module is intentionally free of any
-//! mlx-rs or pmetal-metal imports; all GPU work is driven through
+//! pmetal-metal imports; all GPU work is driven through
 //! `InlineArray::matmul` which dispatches to MLX's Metal backend automatically.
 //!
 //! ## Storage layout invariants (audit-pinned 2026-04-25)
@@ -69,7 +69,6 @@
 //!
 //! # What is NOT in this module
 //!
-//! - The mlx-rs `Array` integration code.
 //! - The `TurboQuantKvCache` struct (see `KvLayerCache` in qwen3_native).
 //! - The pmetal-metal `TurboQuantTransform` (InlineArray.matmul replaces it).
 
@@ -80,7 +79,7 @@ use crate::InlineArray;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Deterministic seed — same as the mlx-rs reference implementation.
+/// Deterministic seed — the same as `pmetal_mlx::kv_cache::turboquant`'s.
 const TURBOQUANT_SEED: u64 = 0x5442_5155_414e_544d;
 /// Vectors with L2 norm below this are treated as zero.
 pub(super) const ZERO_EPSILON: f32 = 1e-12;

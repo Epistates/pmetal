@@ -3,7 +3,7 @@
 //! Covers scalar constructors (`from_f32`, `from_i32`), shaped-slice loaders
 //! (`from_{f32,u32,u8,u16_bits,i32}_slice`, `from_slice<T>`), shape-only
 //! constructors (`zeros`, `ones`, `full`, `eye`, `tri`, `arange`, `linspace`),
-//! random samplers, and mlx-rs compat constructors.
+//! random samplers, and typed convenience constructors.
 
 use std::mem::MaybeUninit;
 
@@ -16,16 +16,13 @@ impl InlineArray {
 
     /// Identity constructor — clone an existing array.
     ///
-    /// Compatible with mlx-rs `Array::from_array(arr)` which was a no-op copy.
     /// Since `Array = InlineArray` in this bridge, this is just `.clone()`.
     #[inline]
     pub fn from_array(other: &Self) -> Self {
         other.clone()
     }
 
-    /// Scalar integer array constructor.
-    ///
-    /// Compatible with mlx-rs `Array::from_int(val)`.
+    /// Scalar integer array constructor; alias for [`Self::from_i32`].
     #[inline]
     pub fn from_int(val: i32) -> Self {
         Self::from_i32(val)
@@ -33,7 +30,6 @@ impl InlineArray {
 
     /// Construct an array from an iterator of integers with an explicit shape.
     ///
-    /// Compatible with mlx-rs `Array::from_iter(iter, shape)`.
     /// The iterator is collected into a `Vec<i32>` and shaped.
     pub fn from_iter(iter: impl IntoIterator<Item = i32>, shape: &[i32]) -> Self {
         let v: Vec<i32> = iter.into_iter().collect();
@@ -173,7 +169,7 @@ impl InlineArray {
         Self::from_i32_slice(data).reshape(shape)
     }
 
-    /// Generic `from_slice` compatible with mlx-rs `Array::from_slice::<T>(data, shape)`.
+    /// Generic `from_slice::<T>(data, shape)`.
     ///
     /// Supports `i32`, `f32`, and `u32` element types via the [`ArrayElement`] trait.
     /// Typical usage:
@@ -306,28 +302,27 @@ impl InlineArray {
         }
     }
 
-    // ── mlx-rs compat constructors ──────────────────────────────────────
+    // ── Typed convenience constructors ──────────────────────────────────
 
+    /// Convenience constructor: zeros with float32 dtype.
     pub fn zeros_f32(shape: &[i32]) -> Self {
         Self::zeros(shape, crate::compat::Dtype::Float32.as_i32())
     }
 
     /// Convenience constructor: ones with float32 dtype.
-    /// Matches mlx-rs `Array::ones::<f32>(&[n])`.
     #[inline]
     pub fn ones_f32(shape: &[i32]) -> Self {
         Self::ones(shape, crate::compat::Dtype::Float32.as_i32())
     }
 
     /// Convenience constructor: zeros with int32 dtype.
-    /// Matches mlx-rs `Array::zeros::<i32>(&[n])`.
     #[inline]
     pub fn zeros_i32(shape: &[i32]) -> Self {
         Self::zeros(shape, crate::compat::Dtype::Int32.as_i32())
     }
 
-    /// Cast to the specified dtype enum value.
-    /// Matches mlx-rs `as_dtype(Dtype::X)` — bridge normally takes `i32`.
+    /// Cast to the specified dtype enum value; [`Self::as_dtype`] takes the
+    /// raw `i32` code.
     #[inline]
     pub fn cast(&self, dtype: crate::compat::Dtype) -> Self {
         self.as_dtype(dtype.as_i32())

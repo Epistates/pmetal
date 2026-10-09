@@ -1,14 +1,12 @@
-//! mlx-rs compatibility layer — drop-in types backed by InlineArray.
-//!
-//! Switch `use mlx_rs::*` to `use pmetal_bridge::compat::*` for zero-allocation
-//! MLX access with the same API surface.
+//! The model-building API the rest of the workspace programs against: arrays,
+//! modules, parameters, layers and ops, all backed by [`InlineArray`](crate::InlineArray).
 //!
 //! # What is covered
 //!
 //! - `Array` — re-export of [`InlineArray`](crate::InlineArray)
 //! - `Dtype` — integer codes matching MLX's encoding (same as bridge.h)
-//! - `Exception` — drop-in for `mlx_rs::error::Exception`
-//! - `Param<T>` — trainable-parameter wrapper matching mlx-rs's struct
+//! - `Exception` — the error type of every fallible op
+//! - `Param<T>` — trainable-parameter wrapper with a freeze flag
 //! - `Module` / `ModuleParameters` traits
 //! - `ModuleParamRef` / `ModuleParamMut` / `FlattenedModuleParam` type aliases
 //! - `eval` / `eval_params` free functions
@@ -67,8 +65,6 @@ impl Dtype {
     }
 
     /// Convert a raw MLX dtype integer back to [`Dtype`].
-    ///
-    /// Compatible with mlx-rs `Dtype::from(raw_i32)`.
     pub fn from_raw(raw: i32) -> Self {
         match raw {
             0 => Dtype::Bool,
@@ -106,8 +102,8 @@ impl Dtype {
     /// Type promotion following MLX's rules (subset — covers float/int cases).
     pub fn promote_with(self, other: Self) -> Self {
         use Dtype::*;
-        // Simplified promotion — matches the cases that arise in model code.
-        // Full table lives in mlx-rs; we cover the common paths here.
+        // Simplified promotion: the cases that arise in model code, not MLX's
+        // full promotion table.
         match (self, other) {
             (a, b) if a == b => a,
             (Float32, _) | (_, Float32) => Float32,
@@ -129,7 +125,7 @@ impl Dtype {
 
 // ── Exception ────────────────────────────────────────────────────────────────
 
-/// Drop-in for `mlx_rs::error::Exception`.
+/// The error type of every fallible op and module call.
 ///
 /// Constructed either from a `String`/`&str` message or via [`Exception::custom`].
 #[derive(Debug)]
@@ -174,7 +170,7 @@ impl From<&str> for Exception {
 
 // ── Param ────────────────────────────────────────────────────────────────────
 
-/// A trainable-parameter wrapper, matching `mlx_rs::module::Param<T>`.
+/// A trainable-parameter wrapper.
 ///
 /// Derefs transparently to `T`, carries a freeze flag.
 #[derive(Debug, Clone)]
@@ -241,7 +237,7 @@ impl<T: AsRef<U>, U> AsRef<U> for Param<T> {
 
 // ── Module parameter tree types ───────────────────────────────────────────────
 
-/// Nested parameter value — mirrors `mlx_rs::nested::NestedValue`.
+/// Nested parameter value.
 ///
 /// Used to represent a tree of named parameters for `ModuleParameters`.
 pub enum NestedValue<V> {
@@ -282,51 +278,23 @@ pub type ModuleParamMut<'a> =
 /// Owned, flattened parameter map (used by optimizers and `value_and_grad`).
 pub type FlattenedModuleParam = std::collections::HashMap<std::rc::Rc<str>, Array>;
 
-// ── mlx-rs compatibility type aliases ────────────────────────────────────────
+// ── Stream placeholder ───────────────────────────────────────────────────────
 
-/// Stub for `mlx_rs::StreamOrDevice` — the bridge is always synchronous.
+/// A placeholder for an MLX stream: every bridge op runs on the default
+/// stream, so this carries no state.
 ///
-/// All methods that accepted a `Stream` argument should be replaced with
-/// equivalent no-`Stream` bridge calls.  This type exists only to satisfy
-/// type-checking in code that has not yet been updated.
+/// `pmetal_models::generation` still threads one through its decode loop;
+/// nothing else uses it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stream;
 
 impl Stream {
+    /// The CPU stream (the same placeholder).
     pub fn cpu() -> Self {
         Self
     }
+    /// The GPU stream (the same placeholder).
     pub fn gpu() -> Self {
-        Self
-    }
-}
-
-/// Stub for `mlx_rs::fast::ScaledDotProductAttentionMask`.
-///
-/// In the bridge, use `fast::scaled_dot_product_attention_masked()` directly
-/// or pass `None` / an explicit mask array.
-#[derive(Debug, Clone)]
-pub enum ScaledDotProductAttentionMask {
-    /// Causal mask (upper-triangular -inf).
-    Causal,
-    /// Explicit additive mask array.
-    Array(Array),
-    /// No mask.
-    None,
-}
-
-/// Stub for `std::collections::hash_map::RandomState` compatibility.
-pub use std::collections::hash_map::RandomState;
-
-/// Stub for `mlx_rs::Device` / `mlx_rs::StreamOrDevice`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Device;
-
-impl Device {
-    pub fn gpu() -> Self {
-        Self
-    }
-    pub fn cpu() -> Self {
         Self
     }
 }
@@ -335,8 +303,7 @@ impl Device {
 
 /// Forward-pass trait for neural-network modules.
 ///
-/// The generic `Input` parameter mirrors `mlx_rs::module::Module<Input>`,
-/// allowing both `&Array` and tuple inputs.
+/// The generic `Input` parameter allows both `&Array` and tuple inputs.
 pub trait Module<Input>: ModuleParameters + std::fmt::Debug {
     /// Output type produced by the forward pass.
     type Output;
@@ -423,7 +390,7 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
 
 // ── random sub-module ─────────────────────────────────────────────────────────
 
-/// Free functions mirroring `mlx_rs::random::*`.
+/// Random sampling on the global MLX key.
 pub mod random {
     use super::{Array, Dtype};
 
@@ -442,7 +409,7 @@ pub mod random {
     pub fn bernoulli(p: &Array, shape: &[i32]) -> Array {
         Array::random_bernoulli(p, shape)
     }
-    /// Uniform random in [lo, hi).  Equivalent to `mlx_rs::random::uniform(-b, b, shape, None)`.
+    /// Uniform random in [lo, hi).
     pub fn uniform_range(lo: f32, hi: f32, shape: &[i32], dtype: Dtype) -> Array {
         // uniform() gives [0,1); scale and shift to [lo, hi).
         let u = Array::random_uniform(shape, Dtype::Float32.as_i32());
@@ -464,8 +431,6 @@ pub mod random {
     ///
     /// `logits`: unnormalized log-probabilities of shape `[..., num_classes]`.
     /// Returns integer indices of shape `[...]` (the last axis is reduced).
-    ///
-    /// Equivalent to `mlx_rs::random::categorical(logits, axis, None, None)`.
     pub fn categorical(logits: &Array, _axis: i32) -> Array {
         // InlineArray::categorical() uses the built-in MLX sampling
         logits.categorical()
@@ -474,13 +439,12 @@ pub mod random {
 
 // ── linalg sub-module ────────────────────────────────────────────────────────
 
-/// Free functions mirroring `mlx_rs::linalg::*`.
+/// Linear algebra.
 pub mod linalg {
     use super::Array;
 
     /// Compute the inverse of a triangular matrix (batched over leading dims).
     ///
-    /// Equivalent to `mlx_rs::linalg::tri_inv_device(a, upper, StreamOrDevice::cpu())`.
     /// Dispatches on the CPU stream because `tri_inv` has no registered VJP — it is
     /// used as a fixed preconditioner in the GDN WY factorization and must not appear
     /// on the autograd tape.
@@ -490,7 +454,6 @@ pub mod linalg {
 
     /// Economy SVD — returns `(U, S, Vt)`.
     ///
-    /// Equivalent to `mlx_rs::linalg::svd_device(a, StreamOrDevice::cpu())`.
     /// Always runs on the CPU stream (GPU SVD is not available in MLX).
     pub fn svd(a: &Array) -> (Array, Array, Array) {
         a.svd()
@@ -499,7 +462,7 @@ pub mod linalg {
 
 // ── fast sub-module ───────────────────────────────────────────────────────────
 
-/// Free functions mirroring `mlx_rs::fast::*`.
+/// MLX's fused kernels: RMS norm, RoPE and scaled dot-product attention.
 pub mod fast {
     use super::Array;
 
@@ -564,15 +527,11 @@ pub mod fast {
     ) -> Array {
         q.sdpa_with_mask(k, v, scale, mask)
     }
-
-    /// Re-export `ScaledDotProductAttentionMask` into the `fast` module so that
-    /// `use pmetal_bridge::compat::fast::ScaledDotProductAttentionMask` resolves.
-    pub use super::ScaledDotProductAttentionMask;
 }
 
 // ── fft sub-module ────────────────────────────────────────────────────────────
 
-/// Free functions mirroring `mlx_rs::fft::*`.
+/// Real FFTs.
 pub mod fft {
     use super::Array;
 
@@ -589,7 +548,7 @@ pub mod fft {
 
 // ── IoError ───────────────────────────────────────────────────────────────────
 
-/// Drop-in for `mlx_rs::error::IoError` — IO errors from safetensors loading.
+/// An IO error from safetensors loading.
 #[derive(Debug)]
 pub struct IoError {
     message: String,
@@ -723,77 +682,6 @@ fn update_trainable_param_recurse(
     }
 }
 
-// ── NestedHashMap (mlx_rs::nested compat) ────────────────────────────────────
-
-/// Drop-in for `mlx_rs::nested::NestedHashMap<K, V>`.
-///
-/// A named-key tree structure used for manual `ModuleParameters` impls.
-#[derive(Debug, Clone)]
-pub struct NestedHashMap<K, V> {
-    pub entries: std::collections::HashMap<K, NestedValue2<K, V>>,
-}
-
-/// Two-parameter nested value — mirrors `mlx_rs::nested::NestedValue<K, V>`.
-#[derive(Debug, Clone)]
-pub enum NestedValue2<K, V> {
-    Value(V),
-    Map(std::collections::HashMap<K, NestedValue2<K, V>>),
-}
-
-impl<K, V> Default for NestedHashMap<K, V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<K, V> NestedHashMap<K, V> {
-    pub fn new() -> Self {
-        Self {
-            entries: std::collections::HashMap::new(),
-        }
-    }
-
-    pub fn insert(&mut self, key: K, value: NestedValue2<K, V>)
-    where
-        K: Eq + std::hash::Hash,
-    {
-        self.entries.insert(key, value);
-    }
-
-    /// Flatten the nested map into a `HashMap<Rc<str>, V>`.
-    pub fn flatten(self) -> std::collections::HashMap<std::rc::Rc<str>, V>
-    where
-        K: AsRef<str> + std::fmt::Display,
-    {
-        fn go<K: AsRef<str> + std::fmt::Display, V>(
-            prefix: &str,
-            v: NestedValue2<K, V>,
-            out: &mut std::collections::HashMap<std::rc::Rc<str>, V>,
-        ) {
-            match v {
-                NestedValue2::Value(val) => {
-                    out.insert(prefix.into(), val);
-                }
-                NestedValue2::Map(m) => {
-                    for (k, child) in m {
-                        let key = if prefix.is_empty() {
-                            k.to_string()
-                        } else {
-                            format!("{prefix}.{k}")
-                        };
-                        go(&key, child, out);
-                    }
-                }
-            }
-        }
-        let mut out = std::collections::HashMap::new();
-        for (k, v) in self.entries {
-            go(k.as_ref(), v, &mut out);
-        }
-        out
-    }
-}
-
 // ── ops extras (sin, cos, rsqrt, etc.) ────────────────────────────────────────
 
 pub mod ops_ext {
@@ -845,12 +733,11 @@ pub mod ops_ext {
     }
 }
 
-// ── compile shims (mlx_rs::compile compat) ───────────────────────────────────
+// ── compile placeholder ──────────────────────────────────────────────────────
 //
-// These are lightweight shims.  The bridge already provides `enable_compile()`
-// and `disable_compile()`.  The `Closure` type is a no-op wrapper — the bridge
-// dispatches directly via FFI-compiled ops rather than using MLX's Rust
-// closure machinery.
+// `compile` does NOT call MLX's compiler: it returns the closure unchanged, so
+// the closure runs op by op. Fused graphs live in C++ (`inline_array::compiled`)
+// and are reached through their own bridge entry points.
 pub mod compile {
     use super::Array;
 
@@ -859,10 +746,7 @@ pub mod compile {
         crate::inline_array::clear_cache();
     }
 
-    /// Placeholder for `mlx_rs::compile::Closure` (boxed, type-erased version).
-    ///
-    /// The bridge does not need this type for its own code paths; it exists solely
-    /// to satisfy compilation of model files that reference it.
+    /// A boxed, type-erased array function.
     pub struct Closure {
         #[allow(clippy::type_complexity)]
         f: Box<dyn Fn(&[Array]) -> Vec<Array>>,
@@ -881,19 +765,19 @@ pub mod compile {
         pub fn call(&self, args: &[Array]) -> Vec<Array> {
             (self.f)(args)
         }
-        /// `apply` — alias for `call`, matches the mlx-rs Closure API.
+        /// [`Self::call`], wrapped in `Ok`.
         pub fn apply(&self, args: &[Array]) -> Result<Vec<Array>, super::Exception> {
             Ok((self.f)(args))
         }
     }
 
-    /// Compile a closure (no-op shim — bridge uses pre-compiled C++ ops).
+    /// Returns `f` unchanged; see the module note.
     pub fn compile(f: Closure, _shapeless: bool) -> Result<Closure, super::Exception> {
         Ok(f)
     }
 }
 
-// ── losses shims (mlx_rs::losses compat) ─────────────────────────────────────
+// ── losses ───────────────────────────────────────────────────────────────────
 pub mod losses {
     use super::{Array, Exception};
 
@@ -904,7 +788,7 @@ pub mod losses {
         Mean,
     }
 
-    /// Categorical cross-entropy loss — drop-in for `mlx_rs::losses::CrossEntropy`.
+    /// Categorical cross-entropy loss.
     ///
     /// Computes `softmax_cross_entropy(logits, targets, axis=-1)` element-wise.
     /// `targets` must be integer class indices.
@@ -1007,15 +891,6 @@ pub mod transforms {
     }
 
     pub mod compile {
-        /// Placeholder: the bridge pre-compiles all ops in C++.
-        /// Returns the function unchanged.
-        pub fn compile_with_state<S, F>(f: F) -> F
-        where
-            F: FnMut(&mut S) -> Vec<super::super::Array>,
-        {
-            f
-        }
-
         /// Clear the MLX compilation cache.
         pub fn clear_cache() {
             crate::inline_array::clear_cache();
@@ -1040,9 +915,9 @@ pub mod transforms {
 
 // ── builder compat ─────────────────────────────────────────────────────────────
 
-/// Drop-in for `mlx_rs::builder::Builder`.
+/// The builder trait the layer builders implement.
 pub mod builder {
-    /// Helper trait for builder pattern — matches mlx_rs::builder::Builder.
+    /// A builder that produces a `T`, or fails with `Self::Error`.
     pub trait Builder<T> {
         type Error: std::error::Error;
         fn build(self) -> Result<T, Self::Error>;

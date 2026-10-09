@@ -1,4 +1,4 @@
-//! AdamW optimizer for InlineArray parameters — zero mlx-rs dependency.
+//! AdamW optimizer for InlineArray parameters.
 //!
 //! Operates purely on [`InlineArray`] values. All arithmetic builds MLX
 //! lazy computation graph nodes; no `eval()` is called here. The caller
@@ -24,8 +24,7 @@ use std::collections::HashMap;
 
 /// Named parameter set — maps parameter names to their [`InlineArray`] values.
 ///
-/// This is the bridge-native replacement for mlx-rs's
-/// `FlattenedModuleParam` (`HashMap<Rc<str>, Array>`).
+/// The `String`-keyed counterpart of `compat::FlattenedModuleParam`.
 pub type ParamSet = HashMap<String, InlineArray>;
 
 /// Parameter classification for differential learning rates.

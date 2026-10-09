@@ -4,9 +4,9 @@
 //! `mlx::core::array` with no per-op heap allocation.  All C++ calls go
 //! directly through `extern "C"` declarations.
 //!
-//! The `compat` module provides drop-in replacements for mlx-rs types
-//! (`Array`, `Dtype`, `Module`, `ModuleParameters`, optimizers, layers, etc.)
-//! so that model code can use a familiar API backed by the zero-allocation bridge.
+//! The `compat` module builds the model-facing API on top of it (`Array`,
+//! `Dtype`, `Module`, `ModuleParameters`, optimizers, layers, etc.), so model
+//! code never touches the FFI directly.
 
 pub mod inline_array;
 pub use inline_array::{InlineArray, QuantizedMode};

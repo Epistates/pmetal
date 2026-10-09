@@ -1,4 +1,4 @@
-//! Standalone Llama 4 inference engine — zero dependency on mlx-rs or pmetal-models.
+//! Standalone Llama 4 inference engine, independent of pmetal-models.
 //!
 //! Every op on the hot path uses [`InlineArray`] (stack-allocated `mlx::core::array`,
 //! direct C++ bridge). This eliminates ALL per-op heap allocation, matching

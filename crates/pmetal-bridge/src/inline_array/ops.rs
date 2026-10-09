@@ -177,7 +177,7 @@ impl InlineArray {
         }
     }
 
-    /// Cast to a Rust primitive type `T` — compatible with mlx-rs `as_type::<T>()`.
+    /// Cast to the MLX dtype of the Rust primitive type `T`.
     ///
     /// Uses the [`AsDtype`] sealed trait to map Rust types to MLX dtypes.
     #[inline]
@@ -191,7 +191,7 @@ impl InlineArray {
         self.pow(other)
     }
 
-    /// gt/lt/ge/le aliases for compat with mlx-rs naming.
+    /// Short comparison aliases (`eq`, `ne`, `gt`, `lt`, `ge`, `le`).
     pub fn eq(&self, other: &Self) -> Self {
         self.equal(other)
     }

@@ -1226,8 +1226,8 @@ impl<T: ModuleParameters> ModuleParameters for Option<T> {
 
 // ── Module<&Array> impls for layer types ──────────────────────────────────
 //
-// These allow `Module::forward(&mut self.layer, x)?` to work, matching
-// the mlx-rs call pattern used throughout the architecture files.
+// These allow `Module::forward(&mut self.layer, x)?`, the call pattern used
+// throughout the architecture files.
 
 impl super::Module<&Array> for Linear {
     type Output = Array;
@@ -1415,9 +1415,7 @@ impl super::builder::Builder<Conv2d> for Conv2dBuilder {
 
 // ── Sequential ────────────────────────────────────────────────────────────
 
-/// Sequential container — applies a list of modules in order.
-///
-/// Equivalent to `mlx_rs::nn::Sequential` but works with any `Module<&Array>`.
+/// Sequential container — applies a list of `Module<&Array>`s in order.
 pub struct Sequential {
     layers: Vec<Box<dyn super::Module<&'static Array, Output = Array, Error = super::Exception>>>,
 }

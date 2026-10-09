@@ -205,9 +205,8 @@ impl InlineArray {
         }
     }
 
-    // ── Scalar reductions (mlx-rs compat) ───────────────────────────────
+    // ── Optional-axis reductions ────────────────────────────────────────
     //
-    // The optional `axis` argument is now honored to match mlx-rs semantics:
     //   * `Some(ax)`: reduce along that axis (no keepdims).
     //   * `None`:     global reduction (flatten then reduce).
 
@@ -243,7 +242,7 @@ impl InlineArray {
         }
     }
 
-    /// mlx-rs compat alias.
+    /// Alias for [`Self::logsumexp`].
     pub fn logsumexp_axis(&self, axis: i32, keepdims: bool) -> Self {
         self.logsumexp(axis, keepdims)
     }

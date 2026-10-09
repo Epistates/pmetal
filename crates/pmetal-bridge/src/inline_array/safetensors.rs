@@ -194,8 +194,8 @@ unsafe fn libc_free(ptr: *mut std::ffi::c_void) {
 
 impl InlineArray {
     /// Load a single array from a safetensors file by key name.
-    /// Uses pmetal-bridge's MLX instance (not mlx-rs) — critical for avoiding
-    /// dual-allocator interference.
+    /// Loads through the bridge's own MLX instance, so the array shares its
+    /// allocator with every other bridge op.
     pub fn load_safetensors(path: &str, key: &str) -> Option<Self> {
         let c_path = std::ffi::CString::new(path).ok()?;
         let c_key = std::ffi::CString::new(key).ok()?;

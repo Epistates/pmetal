@@ -8,8 +8,6 @@ use super::{QWeightRaw, RawBuf};
 unsafe extern "C" {
     pub(super) fn mlx_inline_destroy(a: *mut RawBuf);
     pub(super) fn mlx_inline_init_copy(dst: *mut RawBuf, src: *const RawBuf);
-    pub(super) fn mlx_inline_from_handle(dst: *mut RawBuf, handle_ctx: *mut std::ffi::c_void);
-    pub(super) fn mlx_inline_to_handle(src: *const RawBuf) -> *mut std::ffi::c_void;
 
     pub(super) fn mlx_inline_matmul(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
     pub(super) fn mlx_inline_add(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);

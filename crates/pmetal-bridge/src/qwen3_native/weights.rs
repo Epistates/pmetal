@@ -92,7 +92,7 @@ pub(crate) struct LayerWeights {
 // Full model weights
 // ============================================================================
 
-/// All model weights as InlineArray. Zero dependency on mlx-rs.
+/// All model weights as InlineArray.
 pub struct NativeWeights {
     pub embed_w: InlineArray,
     /// Quantized embedding: scales + biases (None for dense models)

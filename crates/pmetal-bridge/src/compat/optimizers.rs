@@ -5,7 +5,7 @@ use std::rc::Rc;
 /// Optimizer state: stores (momentum, velocity) tensors per parameter.
 pub type State<V> = HashMap<Rc<str>, V>;
 
-/// Common optimizer interface — matches `mlx_rs::optimizers::Optimizer`.
+/// Common optimizer interface.
 pub trait Optimizer {
     type State;
     fn state(&self) -> &Self::State;
@@ -42,7 +42,7 @@ pub trait Updatable {
     fn updatable_states_mut(&mut self) -> Vec<&mut Array>;
 }
 
-/// AdamW optimizer compatible with mlx_rs::optimizers::AdamW interface.
+/// AdamW optimizer.
 ///
 /// Every parameter trains at the one learning rate [`AdamW::set_lr`] sets;
 /// bias, norm and scale parameters skip weight decay. Separate embedding or

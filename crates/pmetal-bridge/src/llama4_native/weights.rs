@@ -78,7 +78,7 @@ pub(super) struct LayerWeights {
     pub(super) moe: Option<MoeWeights>,
 }
 
-/// All model weights as InlineArrays. Zero dependency on mlx-rs.
+/// All model weights as InlineArrays.
 pub struct NativeWeights {
     pub embed_w: InlineArray,      // [vocab, hidden]
     pub final_norm_w: InlineArray, // [hidden]

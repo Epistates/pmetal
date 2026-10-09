@@ -1,4 +1,4 @@
-//! Training utilities for pmetal-bridge — zero mlx-rs dependency.
+//! Training utilities for pmetal-bridge.
 //!
 //! Provides loss functions, gradient utilities, and training helpers
 //! that operate purely on InlineArray.

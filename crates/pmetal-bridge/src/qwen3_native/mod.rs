@@ -1,4 +1,4 @@
-//! Standalone Qwen3/Qwen3.5 inference engine — zero dependency on mlx-rs or pmetal-models.
+//! Standalone Qwen3/Qwen3.5 inference engine, independent of pmetal-models.
 //!
 //! Supports three variants:
 //!   - **Qwen3 dense** (`model_type = "qwen3"`): standard attention (no gate), full RoPE.

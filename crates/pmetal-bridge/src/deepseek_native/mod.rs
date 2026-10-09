@@ -1,4 +1,4 @@
-//! Standalone DeepSeek V3/R1 inference engine — zero dependency on mlx-rs or pmetal-models.
+//! Standalone DeepSeek V3/R1 inference engine, independent of pmetal-models.
 //!
 //! Implements Multi-head Latent Attention (MLA), the defining innovation of
 //! DeepSeek V3. Instead of caching full K,V tensors, MLA caches a compressed

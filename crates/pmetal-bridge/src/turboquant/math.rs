@@ -1,7 +1,7 @@
 //! Pure-Rust math primitives for the TurboQuant cache.
 //!
-//! No external dependencies beyond `rand` and `mlx-rs`-free InlineArray
-//! marshalling — every function here is deterministic in its inputs so
+//! No external dependencies beyond `rand` and InlineArray marshalling —
+//! every function here is deterministic in its inputs so
 //! call sites can rely on byte-identical results across crates (notably
 //! `pmetal-mlx` mirrors several of these).
 
