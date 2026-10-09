@@ -34,12 +34,13 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # Extract the pinned MLX tag from build.rs so the cache key tracks it.
+      # Extract the pinned MLX revision (tag or commit) from build.rs so the
+      # cache key tracks it.
       - name: Resolve MLX tag
         id: mlx
         run: |
           tag=$(grep -E '^const BUNDLED_MLX_GIT_TAG' \
-            crates/pmetal-bridge/build.rs | sed -E 's/.*"(v[^"]+)".*/\1/')
+            crates/pmetal-bridge/build.rs | sed -E 's/.*"([^"]+)".*/\1/')
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Resolved MLX tag: $tag"
 

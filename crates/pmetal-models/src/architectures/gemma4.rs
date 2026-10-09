@@ -2224,8 +2224,8 @@ mod moe_tests {
     /// QLoRA training takes to reach every adapter below an MoE layer.
     ///
     /// MLX's `GatherQMM::vjp` has the gradient with respect to `x` (a
-    /// `gather_qmm` against the transposed packed weight; the MLX version this
-    /// workspace pins, 0.32.3). It refuses only the indices and the packed
+    /// `gather_qmm` against the transposed packed weight, in the MLX this
+    /// workspace pins). It refuses only the indices and the packed
     /// weight, and the router's indices never enter the trace. So the fused
     /// kernel trains: its gradient matches the unpacked layer's, and a
     /// central difference of the loss along it.

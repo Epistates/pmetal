@@ -374,8 +374,8 @@ void mlx_inline_sdpa(mlx_inline_array* dst,
                       const mlx_inline_array* v, float scale, const char* mask_mode) {
     BRIDGE_TRY_DST("sdpa", dst, {
         std::string mode = mask_mode ? mask_mode : "";
-        new (dst->buf) array(mlx::core::fast::scaled_dot_product_attention(
-            as_arr(q), as_arr(k), as_arr(v), scale, mode));
+        new (dst->buf) array(bridge_sdpa(
+            as_arr(q), as_arr(k), as_arr(v), scale, mode, std::nullopt, std::nullopt));
     });
 }
 

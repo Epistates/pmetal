@@ -4,6 +4,7 @@
 
 #include "bridge.h"
 #include "mlx/mlx.h"
+#include "mlx/transforms_impl.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -57,11 +58,43 @@ static inline void bridge_placeholder(mlx_inline_array* dst) noexcept {
         new (dst->buf) array(0.0f);
     } catch (...) {
         new (dst->buf) array(
-            mlx::core::allocator::Buffer(nullptr),
+            mlx::core::allocator::Data(
+                mlx::core::allocator::Buffer(nullptr),
+                [](mlx::core::allocator::Buffer) {}),
             mlx::core::Shape{0},
-            mlx::core::float32,
-            [](mlx::core::allocator::Buffer) {});
+            mlx::core::float32);
     }
+}
+
+// `fast::scaled_dot_product_attention`, as every bridge entry point runs it.
+//
+// Under autograd with no array mask, MLX (since #4563) runs a fused forward
+// that also outputs the logsumexp its fused Metal backward reads. Two cases
+// can't take that path, and MLX sends them down it anyway:
+//   - 8 queries or fewer: the forward picks the vector kernel, which outputs
+//     no logsumexp, and evaluation throws;
+//   - attention sinks: the fused backward has none ("NYI: attention sinks").
+// For those, the mask goes in as an array (causal, or all-true), which keeps
+// the forward and its gradient on MLX's unfused ops. The result is the same.
+// Drop this once MLX routes these cases to the unfused path itself.
+static inline array bridge_sdpa(const array& q, const array& k, const array& v, float scale,
+                                const std::string& mask_mode,
+                                const std::optional<array>& mask,
+                                const std::optional<array>& sinks) {
+    namespace mx = mlx::core;
+    if (!mask && mx::detail::in_grad_tracing() && (sinks || q.shape(2) <= 8)) {
+        const int q_len = q.shape(2);
+        const int k_len = k.shape(2);
+        // MLX's causal mask: query i sees keys up to i + (k_len - q_len).
+        array explicit_mask = mask_mode == "causal"
+            ? mx::greater_equal(
+                  mx::expand_dims(mx::arange(k_len - q_len, k_len, mx::int32), 1),
+                  mx::expand_dims(mx::arange(k_len, mx::int32), 0))
+            : mx::ones({q_len, k_len}, mx::bool_);
+        return mx::fast::scaled_dot_product_attention(
+            q, k, v, scale, "", std::optional<array>(explicit_mask), sinks);
+    }
+    return mx::fast::scaled_dot_product_attention(q, k, v, scale, mask_mode, mask, sinks);
 }
 
 // Standard try/catch wrapper for ops that construct a single output via

@@ -3,9 +3,8 @@ use std::{env, path::PathBuf, process::Command};
 
 /// The MLX revision this crate builds against, tag or commit.
 ///
-/// Currently a commit: see `cmake/CMakeLists.txt` for which kernels and
-/// quantized-matmul fixes v0.32.2 is missing.
-const BUNDLED_MLX_GIT_TAG: &str = "09e67c686f627ca371ebcce82f8f79110d8e186e";
+/// Currently a commit on upstream main: see `cmake/CMakeLists.txt` for why.
+const BUNDLED_MLX_GIT_TAG: &str = "99f109b567b969ef06974f1e0450ce0e2eeb4de2";
 
 // ── Deployment target ──────────────────────────────────────────────────────
 

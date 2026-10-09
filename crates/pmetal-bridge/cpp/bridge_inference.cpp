@@ -136,8 +136,8 @@ void mlx_inline_sdpa_with_mask(mlx_inline_array* dst,
         auto mask_opt = mask
             ? std::optional<array>(as_arr(mask))
             : std::optional<array>(std::nullopt);
-        new (dst->buf) array(mlx::core::fast::scaled_dot_product_attention(
-            as_arr(q), as_arr(k), as_arr(v), scale, /*mask_mode=*/"", mask_opt));
+        new (dst->buf) array(bridge_sdpa(
+            as_arr(q), as_arr(k), as_arr(v), scale, /*mask_mode=*/"", mask_opt, std::nullopt));
     });
 }
 
@@ -150,7 +150,7 @@ void mlx_inline_sdpa_sinks(mlx_inline_array* dst,
         auto mask_opt = mask
             ? std::optional<array>(as_arr(mask))
             : std::optional<array>(std::nullopt);
-        new (dst->buf) array(mlx::core::fast::scaled_dot_product_attention(
+        new (dst->buf) array(bridge_sdpa(
             as_arr(q), as_arr(k), as_arr(v), scale, mode, mask_opt,
             std::optional<array>(as_arr(sinks))));
     });

@@ -15,17 +15,17 @@ set(MLX_BUILD_EXAMPLES OFF)
 set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
-# Pinned to a commit rather than a tag. v0.32.2 (2026-08-25) predates the
-# Metal kernels Gemma 4 decodes through: D512 vector attention (#4459) covers
-# its full-attention layers, and the fused NAX head-dim-256 prefill path
-# (#4416) covers its sliding ones. It also predates several quantized-matmul
-# correctness fixes, including the non-transposed affine qmm dispatch (#4392)
-# that the packed-weight path depends on. Move this back to a tag at the next
-# release that contains them.
+# Pinned to a commit on upstream main, which we track: the latest release
+# (v0.32.3, 2026-09-28) trails main by the fused Metal SDPA backward
+# (#4563), the expert-offset gather_qmm rework (#4572), f32 split-K qmm
+# accumulation (#4641), the M1/M2 SDPA threadgroup fix (#4643) and the
+# macOS 27 build fix for the gated-delta VJP kernels (#4594), among others.
+# `just deps-check` reports how far this is behind main and the latest tag.
+# build.rs's BUNDLED_MLX_GIT_TAG must name the same commit.
 FetchContent_Declare(
   mlx
   GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-  GIT_TAG 09e67c686f627ca371ebcce82f8f79110d8e186e)
+  GIT_TAG 99f109b567b969ef06974f1e0450ce0e2eeb4de2)
 FetchContent_MakeAvailable(mlx)
 
 # ── Expose include dir and libmlx.a for the cc::Build step ──

@@ -107,8 +107,8 @@ fn attend(
 
 ## Requirements
 
-- macOS 13+ (Ventura or later)
-- Apple Silicon (M1/M2/M3/M4)
+- macOS 14+ (Sonoma or later), MLX's floor
+- Apple Silicon (M1/M2/M3/M4/M5)
 - Metal Toolchain (via Xcode or `xcodebuild -downloadComponent MetalToolchain`)
 - ANE features require `--features ane` at build time
 
