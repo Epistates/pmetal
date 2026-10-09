@@ -1,7 +1,7 @@
-// Field-level docs in this module are carried by `#[job(label = "...", help = "...")]`
-// attributes, which the missing-docs lint cannot see. Allow the lint here so
-// specs stay declarative without duplicating every label as a doc comment.
-#![allow(missing_docs)]
+#![expect(
+    missing_docs,
+    reason = "field docs live in `#[job(label, help)]` attributes, which the lint cannot see"
+)]
 
 //! Canonical per-job specs — one struct per `pmetal` subcommand.
 //!

@@ -8,7 +8,6 @@ use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 use turbomcp::prelude::*;
 
 use crate::util;
@@ -72,8 +71,6 @@ struct Job {
     metrics: Arc<RwLock<JobMetrics>>,
     child_pid: Option<u32>,
     stop_requested: Arc<AtomicBool>,
-    #[allow(dead_code)]
-    handle: JoinHandle<()>,
 }
 
 /// Manages the lifecycle of background pmetal subprocesses.
@@ -135,7 +132,9 @@ impl JobManager {
         let s_metrics = metrics.clone();
         let s_stop_requested = stop_requested.clone();
 
-        let handle = tokio::spawn(async move {
+        // The supervisor task is detached: it records the exit status into the
+        // shared job state, so nothing needs to join it.
+        tokio::spawn(async move {
             // Read stdout in a separate task.
             //
             // Event parsing strategy:
@@ -251,7 +250,6 @@ impl JobManager {
             metrics,
             child_pid,
             stop_requested,
-            handle,
         };
 
         self.jobs.insert(id.clone(), job);
