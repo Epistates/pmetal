@@ -6159,7 +6159,6 @@ dependencies = [
  "indicatif",
  "pmetal-bridge",
  "pmetal-core",
- "pmetal-metal",
  "pmetal-mlx",
  "safetensors",
  "serde",

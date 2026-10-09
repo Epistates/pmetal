@@ -11,7 +11,7 @@ use pmetal_mlx::kernels::with_training_mode;
 
 use crate::{
     AdaptiveAction, CheckpointManager, CheckpointMetadata, Result, SftError, StepStats,
-    TrainingLoop, TrainingLoopConfig,
+    TrainingLoop, TrainingLoopConfig, rlkd::TeacherModel,
 };
 
 /// Trainer for Knowledge Distillation.
@@ -180,7 +180,7 @@ impl DistillationTrainer {
     ) -> Result<StepStats>
     where
         S: TrainableModel,
-        T: TrainableModel, // Teacher must be forward-able
+        T: TeacherModel,
         O: Optimizer,
     {
         let start_time = std::time::Instant::now();
@@ -192,8 +192,8 @@ impl DistillationTrainer {
         // 1. Teacher Forward Pass (No Grad)
         // We run this outside the autodiff scope to save memory/compute
         let teacher_logits = teacher
-            .forward(&batch.input_ids, None)
-            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
+            .forward_teacher(&batch.input_ids)
+            .map_err(SftError::Mlx)?;
         self.train_step_with_teacher_logits(
             student,
             batch,
@@ -334,7 +334,7 @@ impl DistillationTrainer {
     ) -> Result<()>
     where
         S: TrainableModel,
-        T: TrainableModel,
+        T: TeacherModel,
     {
         let mut optimizer = self.loop_state.build_optimizer();
 
@@ -643,7 +643,7 @@ impl DistillationTrainer {
     ) -> Result<f64>
     where
         S: TrainableModel,
-        T: TrainableModel,
+        T: TeacherModel,
     {
         let mut eval_config = self.loop_state.config.dataloader.clone();
         eval_config.shuffle = false;
@@ -660,8 +660,8 @@ impl DistillationTrainer {
         {
             // Teacher forward (no gradient needed; teacher is outside autodiff scope).
             let teacher_logits = teacher
-                .forward(&batch.input_ids, None)
-                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
+                .forward_teacher(&batch.input_ids)
+                .map_err(SftError::Mlx)?;
 
             // Student forward (no gradient needed during eval).
             let student_logits = student
@@ -707,7 +707,7 @@ pub fn generate_teacher_logit_cache<T>(
     max_seq_len: usize,
 ) -> Result<()>
 where
-    T: TrainableModel,
+    T: TeacherModel,
 {
     let mut vocab_size = cache.metadata().vocab_size;
 
@@ -724,9 +724,7 @@ where
             .map(|&token| token as i32)
             .collect();
         let input = Array::from_i32_slice(&input_ids).reshape(&[1, seq_len as i32]);
-        let logits = teacher
-            .forward(&input, None)
-            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
+        let logits = teacher.forward_teacher(&input).map_err(SftError::Mlx)?;
         logits.eval();
 
         if vocab_size == 0 {
@@ -823,5 +821,69 @@ mod tests {
         assert_eq!(&values[9..15], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert!(values[6..9].iter().all(|v| *v < -1.0e9));
         assert!(values[15..18].iter().all(|v| *v < -1.0e9));
+    }
+
+    /// Every adapter value, in parameter-name order.
+    fn adapter_values(model: &impl TrainableModel) -> Vec<f32> {
+        let mut params: Vec<_> = model.lora_parameters().into_iter().collect();
+        params.sort_by(|a, b| a.0.cmp(&b.0));
+        params
+            .into_iter()
+            .flat_map(|(_, mut p)| {
+                let n = p.size();
+                p.to_f32_vec(n).unwrap()
+            })
+            .collect()
+    }
+
+    /// The teacher is a plain loaded model, frozen and without adapters, as
+    /// `pmetal distill` loads it, and a step moves the student's adapters.
+    #[test]
+    fn frozen_teacher_trains_the_student() {
+        use pmetal_bridge::compat::optimizers::AdamW;
+        use pmetal_lora::AdaptedModel;
+        use pmetal_models::DynamicModel;
+
+        let config = r#"{
+            "model_type": "llama", "vocab_size": 64, "hidden_size": 32,
+            "intermediate_size": 64, "num_hidden_layers": 1,
+            "num_attention_heads": 2, "num_key_value_heads": 1,
+            "max_position_embeddings": 64, "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0
+        }"#;
+        let mut teacher = DynamicModel::from_config(config).unwrap();
+        let mut student = AdaptedModel::attach(
+            DynamicModel::from_config(config).unwrap(),
+            pmetal_core::LoraConfig {
+                r: 4,
+                alpha: 8.0,
+                target_modules: vec!["q_proj".into(), "v_proj".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = adapter_values(&student);
+
+        let batch = TrainingBatch {
+            input_ids: Array::from_i32_slice(&[1, 2, 3, 4, 5, 6]).reshape(&[2, 3]),
+            labels: Array::from_i32_slice(&[1, 2, 3, 4, 5, 6]).reshape(&[2, 3]),
+            attention_mask: Array::from_i32_slice(&[1; 6]).reshape(&[2, 3]),
+            pixel_values: None,
+            batch_size: 2,
+            seq_len: 3,
+            sample_indices: vec![0, 1],
+        };
+        let mut optimizer = AdamW::new(1e-2, 0.0);
+        let stats = test_trainer()
+            .train_step(&mut student, &mut teacher, &batch, &mut optimizer, 1)
+            .unwrap();
+        pmetal_bridge::check_last_error().unwrap();
+        assert!(stats.loss.is_finite(), "loss {}", stats.loss);
+
+        let after = adapter_values(&student);
+        assert_ne!(
+            before, after,
+            "the step left the student's adapters as they were"
+        );
     }
 }

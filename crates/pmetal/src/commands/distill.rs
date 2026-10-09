@@ -479,13 +479,9 @@ pub(crate) async fn run_distillation_cli(
 
     match method {
         pmetal_distill::DistillMethod::Online | pmetal_distill::DistillMethod::Progressive => {
-            tracing::info!("Loading teacher model...");
-            let teacher_lora_config = LoraConfig {
-                r: 0,
-                ..Default::default()
-            };
-            let mut teacher_model =
-                DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)?;
+            tracing::info!("Loading teacher model (frozen)...");
+            let mut teacher_model = pmetal_models::DynamicModel::load(&teacher_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load teacher model: {}", e))?;
             trainer
                 .run(
                     &mut student_model,
@@ -518,12 +514,8 @@ pub(crate) async fn run_distillation_cli(
                     "Generating teacher logits for offline distillation into {:?}",
                     offline_cfg.logits_path
                 );
-                let teacher_lora_config = LoraConfig {
-                    r: 0,
-                    ..Default::default()
-                };
-                let mut teacher_model =
-                    DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)?;
+                let mut teacher_model = pmetal_models::DynamicModel::load(&teacher_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to load teacher model: {}", e))?;
                 generate_teacher_logit_cache(
                     &mut teacher_model,
                     &train_dataset,

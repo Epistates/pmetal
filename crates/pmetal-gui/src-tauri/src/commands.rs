@@ -3274,13 +3274,8 @@ async fn run_distillation_in_process(
         .map_err(|e| AppError(e.to_string()))?
     };
 
-    let teacher_lora_config = pmetal::core::LoraConfig {
-        r: 0,
-        ..Default::default()
-    };
     let mut teacher_model =
-        pmetal::lora::DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)
-            .map_err(|e| AppError(e.to_string()))?;
+        pmetal::models::DynamicModel::load(&teacher_path).map_err(|e| AppError(e.to_string()))?;
 
     let student_lora_config = pmetal::core::LoraConfig {
         r: spec.lora_r,
