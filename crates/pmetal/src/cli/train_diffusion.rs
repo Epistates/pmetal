@@ -32,7 +32,9 @@ pub struct TrainDiffusionArgs {
     #[arg(long = "lora-alpha", default_value = "32")]
     pub lora_alpha: f32,
 
-    /// Comma-separated attention projections to adapt.
+    /// Comma-separated projections to adapt, by name (`q_proj`, `gate_proj`,
+    /// ...), in the encoder and the decoder. MoE routers and experts are never
+    /// adapted.
     #[arg(
         long = "lora-targets",
         value_delimiter = ',',
@@ -61,19 +63,20 @@ pub struct TrainDiffusionArgs {
     #[arg(long = "corrupted-only", default_value = "true")]
     pub corrupted_only: bool,
 
-    /// QLoRA: quantize the frozen base weights (attention + MoE experts) so only
-    /// the f32 LoRA adapters are trained. Large memory reduction for big MoE
-    /// models.
-    #[arg(long = "qlora", default_value = "false")]
-    pub qlora: bool,
+    /// Quantization method for QLoRA (none, nf4, fp4, int8), as for `pmetal
+    /// train`. Packs every projection but the routers, and the MoE experts
+    /// (4-bit affine for nf4 and fp4, 8-bit for int8), so only the f32 LoRA
+    /// adapters train. A large memory reduction for the 26B MoE model.
+    #[arg(long = "quantization", value_enum, default_value = "none")]
+    pub quantization: crate::QuantizationMethod,
 
-    /// QLoRA quantization group size (32, 64, or 128).
-    #[arg(long = "qlora-group-size", default_value = "64")]
-    pub qlora_group_size: i32,
+    /// Weights per scale for nf4 and int8 (32, 64 or 128; fp4's block is 16)
+    #[arg(long = "quant-block-size", default_value = "64")]
+    pub quant_block_size: usize,
 
-    /// QLoRA quantization bits (one of 2, 3, 4, 5, 6, 8).
-    #[arg(long = "qlora-bits", default_value = "4")]
-    pub qlora_bits: i32,
+    /// Pack nf4's absmax values to 8 bits as well (QLoRA double quantization)
+    #[arg(long = "double-quant")]
+    pub double_quant: bool,
 
     /// Truncate each tokenized prompt to at most this many context tokens.
     #[arg(long = "max-context-len", default_value = "512")]

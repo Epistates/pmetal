@@ -52,151 +52,11 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
-use pmetal_core::LoraConfig;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope, rope_with_periods},
 };
 use pmetal_mlx::kv_cache::KVCache;
-
-/// A single low-rank adapter `ΔW = scale · Bᵀ · Aᵀ` applied additively to a
-/// base `nn::Linear` output (PEFT-style, baked into the module rather than a
-/// parallel model). `a` is `[rank, in]`, `b` is `[out, rank]`; `create_lora_params`
-/// zero-initialises `b`, so a freshly-attached adapter is a numerical no-op until
-/// trained — attaching LoRA never perturbs inference parity.
-#[derive(Debug, Clone)]
-pub struct LoraDelta {
-    pub a: Array,
-    pub b: Array,
-    pub scale: f32,
-}
-
-impl LoraDelta {
-    fn new(in_features: i32, out_features: i32, rank: i32, alpha: f32) -> Result<Self, Exception> {
-        // `A` uniform in ±sqrt(3 / in) (Kaiming), `B` zero.
-        let bound = (3.0_f32 / in_features as f32).sqrt();
-        let a = random::uniform_range(-bound, bound, &[rank, in_features], Dtype::Float32);
-        let b = ops::zeros(&[out_features, rank], Dtype::Float32);
-        Ok(Self {
-            a,
-            b,
-            scale: alpha / rank as f32,
-        })
-    }
-
-    /// `scale · (x · Aᵀ) · Bᵀ` — the additive delta for input `x [.., in]`.
-    fn delta(&self, x: &Array) -> Array {
-        x.matmul(&self.a.t())
-            .matmul(&self.b.t())
-            .multiply(&Array::from_f32(self.scale))
-    }
-}
-
-/// Optional per-projection LoRA adapters for [`Gemma4Attention`]. Populated by
-/// `attach_lora`; `None` slots (and the whole `Option` on the attention) mean
-/// the base projection is used unchanged. Trainable state is collected via
-/// `lora_parameters` / `lora_parameters_mut`, deliberately *outside* the
-/// `impl_module_params!` tree so base-weight loading never touches it.
-#[derive(Debug, Default, Clone)]
-pub struct Gemma4AttnLora {
-    pub q: Option<LoraDelta>,
-    pub k: Option<LoraDelta>,
-    pub v: Option<LoraDelta>,
-    pub o: Option<LoraDelta>,
-}
-
-/// A 4-/8-bit affine-quantized replacement for a `nn::Linear` weight, used by
-/// the QLoRA base. Holds the packed weights + per-group `scales`/`biases`; the
-/// forward is MLX's fused `quantized_matmul` (`x @ dequant(w)ᵀ`), so the base
-/// weight is never materialised at full precision. `bias`-free, matching the
-/// Gemma 4 attention projections.
-#[derive(Debug, Clone)]
-pub struct QuantLinear {
-    pub w_q: Array,
-    pub scales: Array,
-    pub biases: Array,
-    pub group_size: i32,
-    pub bits: i32,
-}
-
-impl QuantLinear {
-    /// Quantize a dense `nn::Linear` weight `[out, in]`. `in` must be a multiple
-    /// of `group_size`, and `group_size ∈ {32, 64, 128}` / `bits ∈ {2,3,4,5,6,8}`
-    /// (MLX affine quantization). These are validated up front: MLX's `quantize`
-    /// throws a *foreign* C++ exception that Rust cannot catch, so an unchecked
-    /// bad argument would abort the process.
-    pub fn from_linear(proj: &nn::Linear, group_size: i32, bits: i32) -> Result<Self, Exception> {
-        if !matches!(group_size, 32 | 64 | 128) {
-            return Err(Exception::custom(format!(
-                "QuantLinear: unsupported group_size {group_size} (expected 32, 64, or 128)"
-            )));
-        }
-        if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
-            return Err(Exception::custom(format!(
-                "QuantLinear: unsupported bits {bits} (expected one of 2,3,4,5,6,8)"
-            )));
-        }
-        let in_features = proj.weight.as_ref().dim(1);
-        if in_features % group_size != 0 {
-            return Err(Exception::custom(format!(
-                "QuantLinear: in_features {in_features} is not a multiple of group_size {group_size}"
-            )));
-        }
-        let (w_q, scales, biases) = proj.weight.as_ref().quantize_weights(group_size, bits);
-        Ok(Self {
-            w_q,
-            scales,
-            biases,
-            group_size,
-            bits,
-        })
-    }
-
-    /// `x @ dequant(w)ᵀ` via the fused quantized matmul (transpose = weight is
-    /// `[out, in]`, matching `nn::Linear`).
-    pub fn forward(&self, x: &Array) -> Array {
-        x.quantized_matmul(
-            &self.w_q,
-            &self.scales,
-            Some(&self.biases),
-            true,
-            self.group_size,
-            self.bits,
-        )
-    }
-}
-
-/// Optional per-projection quantized base for [`Gemma4Attention`] (QLoRA). When
-/// present, the projection forward runs through [`QuantLinear`] instead of the
-/// dense `nn::Linear`; `None` slots fall back to the dense weight. Populated by
-/// `quantize_projections`; kept outside the module-parameter tree like the LoRA
-/// bake-in, so it composes with [`Gemma4AttnLora`].
-#[derive(Debug, Default, Clone)]
-pub struct Gemma4AttnQuant {
-    pub q: Option<QuantLinear>,
-    pub k: Option<QuantLinear>,
-    pub v: Option<QuantLinear>,
-    pub o: Option<QuantLinear>,
-}
-
-/// Base projection (dense `nn::Linear` or an optional quantized `quant`) plus an
-/// optional LoRA delta. Byte-identical to `proj.forward(x)` when both `quant`
-/// and `lora` are `None`, preserving inference parity.
-fn linear_lora(
-    proj: &nn::Linear,
-    quant: Option<&QuantLinear>,
-    x: &Array,
-    lora: Option<&LoraDelta>,
-) -> Array {
-    let base = match quant {
-        Some(q) => q.forward(x),
-        None => proj.forward(x),
-    };
-    match lora {
-        Some(l) => base.add(&l.delta(x)),
-        None => base,
-    }
-}
 
 /// Apply Gemma 4 partial rotary embedding to a `[B, H, L, head_dim]` tensor.
 ///
@@ -1300,14 +1160,6 @@ pub struct Gemma4Attention {
     /// per layer at construction time — `None` for full-rotation layers
     /// that already use the fused-kernel direct path.
     pub rope_partial_freqs: Option<Array>,
-    /// Optional LoRA adapters for the q/k/v/o projections (PEFT bake-in).
-    /// `None` = plain attention. Attached via [`Gemma4Attention::attach_lora`];
-    /// managed outside the module-parameter tree.
-    pub lora: Option<Gemma4AttnLora>,
-    /// Optional quantized (QLoRA) base for the q/k/v/o projections. `None` =
-    /// dense `nn::Linear`. Populated by [`Gemma4Attention::quantize_projections`];
-    /// managed outside the module-parameter tree and composes with `lora`.
-    pub qbase: Option<Gemma4AttnQuant>,
 }
 impl_module_params!(Gemma4Attention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
@@ -1367,103 +1219,7 @@ impl Gemma4Attention {
             use_k_eq_v,
             sliding_window,
             rope_partial_freqs,
-            lora: None,
-            qbase: None,
         })
-    }
-
-    /// Quantize the q/k/v/o projection weights to `bits`-bit affine (group size
-    /// `group_size`) for the QLoRA base. After this the projection forward runs
-    /// through [`QuantLinear`] (fused `quantized_matmul`) instead of the dense
-    /// `nn::Linear`. `hidden_size` (and `n_heads·head_dim` for `o_proj`) must be
-    /// a multiple of `group_size`. Composes with LoRA adapters attached before
-    /// or after.
-    pub fn quantize_projections(&mut self, group_size: i32, bits: i32) -> Result<(), Exception> {
-        let v = match self.v_proj.as_ref() {
-            Some(vp) => Some(QuantLinear::from_linear(vp, group_size, bits)?),
-            None => None,
-        };
-        self.qbase = Some(Gemma4AttnQuant {
-            q: Some(QuantLinear::from_linear(&self.q_proj, group_size, bits)?),
-            k: Some(QuantLinear::from_linear(&self.k_proj, group_size, bits)?),
-            v,
-            o: Some(QuantLinear::from_linear(&self.o_proj, group_size, bits)?),
-        });
-        Ok(())
-    }
-
-    /// Attach LoRA adapters to the projections named in `config.target_modules`
-    /// (`q_proj` / `k_proj` / `v_proj` / `o_proj`). `v_proj` is skipped on
-    /// `k_eq_v` (full-attention) layers that have no value projection. Adapters
-    /// initialise to a no-op (`B = 0`), so inference is unchanged until trained.
-    pub fn attach_lora(&mut self, config: &LoraConfig) -> Result<(), Exception> {
-        let rank = config.r as i32;
-        let alpha = config.alpha;
-        let has = |m: &str| config.target_modules.iter().any(|t| t == m);
-        let shape = |proj: &nn::Linear| {
-            let w = proj.weight.as_ref();
-            (w.dim(1), w.dim(0)) // (in, out) from [out, in]
-        };
-        let mk = |proj: &nn::Linear| -> Result<LoraDelta, Exception> {
-            let (i, o) = shape(proj);
-            LoraDelta::new(i, o, rank, alpha)
-        };
-        self.lora = Some(Gemma4AttnLora {
-            q: if has("q_proj") {
-                Some(mk(&self.q_proj)?)
-            } else {
-                None
-            },
-            k: if has("k_proj") {
-                Some(mk(&self.k_proj)?)
-            } else {
-                None
-            },
-            v: match (self.v_proj.as_ref(), has("v_proj")) {
-                (Some(vp), true) => Some(mk(vp)?),
-                _ => None,
-            },
-            o: if has("o_proj") {
-                Some(mk(&self.o_proj)?)
-            } else {
-                None
-            },
-        });
-        Ok(())
-    }
-
-    /// Named LoRA parameters (`{proj}.lora_{a,b}`) for inventory / counting.
-    pub fn lora_parameters(&self) -> Vec<(String, &Array)> {
-        let mut out = Vec::new();
-        if let Some(l) = &self.lora {
-            for (name, slot) in [
-                ("q_proj", &l.q),
-                ("k_proj", &l.k),
-                ("v_proj", &l.v),
-                ("o_proj", &l.o),
-            ] {
-                if let Some(d) = slot {
-                    out.push((format!("{name}.lora_a"), &d.a));
-                    out.push((format!("{name}.lora_b"), &d.b));
-                }
-            }
-        }
-        out
-    }
-
-    /// Mutable LoRA parameters for the optimiser (`{proj}.lora_{a,b}`).
-    pub fn lora_parameters_mut(&mut self) -> Vec<(String, &mut Array)> {
-        let mut out = Vec::new();
-        if let Some(lora) = self.lora.as_mut() {
-            let Gemma4AttnLora { q, k, v, o } = lora;
-            for (name, slot) in [("q_proj", q), ("k_proj", k), ("v_proj", v), ("o_proj", o)] {
-                if let Some(d) = slot.as_mut() {
-                    out.push((format!("{name}.lora_a"), &mut d.a));
-                    out.push((format!("{name}.lora_b"), &mut d.b));
-                }
-            }
-        }
-        out
     }
 
     fn attention_mask_type(
@@ -1506,12 +1262,7 @@ impl Gemma4Attention {
             query_len,
             self.n_heads * self.head_dim,
         ]);
-        Ok(linear_lora(
-            &self.o_proj,
-            self.qbase.as_ref().and_then(|q| q.o.as_ref()),
-            &output,
-            self.lora.as_ref().and_then(|l| l.o.as_ref()),
-        ))
+        Ok(self.o_proj.forward(&output))
     }
 
     fn project_queries(
@@ -1522,13 +1273,10 @@ impl Gemma4Attention {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
-        let q = linear_lora(
-            &self.q_proj,
-            self.qbase.as_ref().and_then(|q| q.q.as_ref()),
-            x,
-            self.lora.as_ref().and_then(|l| l.q.as_ref()),
-        )
-        .reshape(&[b, l, self.n_heads, self.head_dim]);
+        let q = self
+            .q_proj
+            .forward(x)
+            .reshape(&[b, l, self.n_heads, self.head_dim]);
         let q = self.q_norm.forward(&q).transpose_axes(&[0, 2, 1, 3]);
         apply_gemma4_partial_rope(
             &q,
@@ -1549,30 +1297,18 @@ impl Gemma4Attention {
         let b = shape[0];
         let l = shape[1];
 
-        let lora = self.lora.as_ref();
-        let qbase = self.qbase.as_ref();
-        let q = linear_lora(
-            &self.q_proj,
-            qbase.and_then(|q| q.q.as_ref()),
-            x,
-            lora.and_then(|l| l.q.as_ref()),
-        )
-        .reshape(&[b, l, self.n_heads, self.head_dim]);
-        let k = linear_lora(
-            &self.k_proj,
-            qbase.and_then(|q| q.k.as_ref()),
-            x,
-            lora.and_then(|l| l.k.as_ref()),
-        )
-        .reshape(&[b, l, self.n_kv_heads, self.head_dim]);
+        let q = self
+            .q_proj
+            .forward(x)
+            .reshape(&[b, l, self.n_heads, self.head_dim]);
+        let k = self
+            .k_proj
+            .forward(x)
+            .reshape(&[b, l, self.n_kv_heads, self.head_dim]);
         let v_raw = match self.v_proj.as_ref() {
-            Some(v_proj) => linear_lora(
-                v_proj,
-                qbase.and_then(|q| q.v.as_ref()),
-                x,
-                lora.and_then(|l| l.v.as_ref()),
-            )
-            .reshape(&[b, l, self.n_kv_heads, self.head_dim]),
+            Some(v_proj) => v_proj
+                .forward(x)
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim]),
             None => k.clone(),
         };
 
@@ -2400,44 +2136,14 @@ mod moe_tests {
             .fold(0.0f32, f32::max)
     }
 
-    /// A quantized projection (`QuantLinear`) must track its dense `nn::Linear`
-    /// within the expected quantization tolerance: tight at 8-bit, looser at
-    /// 4-bit.
+    /// Packing the attention projections (QLoRA's base) keeps `forward` close
+    /// to the dense output: the attention reaches its projections only
+    /// through `Linear::forward`, never their stored weight.
     #[test]
     #[serial]
-    fn quant_linear_matches_dense_within_tolerance() {
-        use pmetal_bridge::compat::{Dtype, random};
-        let (in_f, out_f, gs) = (32, 24, 32);
-        let w = random::uniform_range(-0.5, 0.5, &[out_f, in_f], Dtype::Float32);
-        let mut lin = nn::LinearBuilder::new(in_f, out_f)
-            .bias(false)
-            .build()
-            .unwrap();
-        lin.weight = Param::new(w);
-        let x = random::uniform_range(-1.0, 1.0, &[3, in_f], Dtype::Float32);
-        let dense = lin.forward(&x);
-        let len = (3 * out_f) as usize;
-
-        let q8 = QuantLinear::from_linear(&lin, gs, 8).unwrap();
-        let d8 = max_abs_diff(&dense, &q8.forward(&x), len);
-        assert!(d8 < 0.1, "8-bit quant diff too large: {d8}");
-
-        let q4 = QuantLinear::from_linear(&lin, gs, 4).unwrap();
-        let d4 = max_abs_diff(&dense, &q4.forward(&x), len);
-        assert!(d4 < 1.5, "4-bit quant diff implausibly large: {d4}");
-        // 4-bit must still be coarser than 8-bit (sanity that bits matter).
-        assert!(
-            d4 >= d8,
-            "4-bit ({d4}) should be no tighter than 8-bit ({d8})"
-        );
-    }
-
-    /// Quantizing the attention projections keeps `forward` finite and close to
-    /// the dense output; the default (`qbase = None`) path is unchanged.
-    #[test]
-    #[serial]
-    fn quantize_projections_preserves_attention_within_tolerance() {
-        use pmetal_bridge::compat::{Dtype, random};
+    fn packed_projections_preserve_attention_within_tolerance() {
+        use pmetal_bridge::compat::{Dtype, VisitLinears, random};
+        use pmetal_bridge::native_weight::QuantParams;
         let rand = |shape: &[i32]| random::uniform_range(-0.5, 0.5, shape, Dtype::Float32);
         let cfg = tiny_config(false);
         let mut attn = Gemma4Attention::new(&cfg, 0).unwrap();
@@ -2452,10 +2158,18 @@ mod moe_tests {
 
         let x = rand(&[1, 5, HIDDEN]);
         let dense = attn.forward(&x, None, None, None).unwrap();
-        assert!(attn.qbase.is_none(), "no quant base before quantize");
-
-        attn.quantize_projections(32, 8).unwrap();
-        assert!(attn.qbase.is_some(), "quant base present after quantize");
+        let mut packed = 0;
+        attn.visit_linears_mut("", &mut |_, linear| {
+            linear
+                .quantize(QuantParams {
+                    group_size: 32,
+                    bits: 8,
+                    mode: pmetal_bridge::QuantizedMode::Affine,
+                })
+                .unwrap();
+            packed += 1;
+        });
+        assert_eq!(packed, 3 + usize::from(attn.v_proj.is_some()));
         let quant = attn.forward(&x, None, None, None).unwrap();
 
         let len = (5 * HIDDEN) as usize;

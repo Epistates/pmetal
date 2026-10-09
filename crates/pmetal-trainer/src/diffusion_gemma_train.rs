@@ -26,11 +26,15 @@
 //! training loop that consumes these primitives.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use pmetal_bridge::compat::nn::value_and_grad_explicit;
 use pmetal_bridge::compat::{Array, Dtype, Exception, eval, ops, random};
 use pmetal_bridge::training::per_token_cross_entropy_loss;
+use pmetal_lora::{AdaptedModel, PackedBase, QLoraConfig, QLoraScheme, quantize_base};
+#[cfg(doc)]
 use pmetal_models::architectures::diffusion_gemma::DiffusionGemmaForBlockDiffusion;
+use pmetal_models::dispatcher::DynamicModel;
 use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 
 /// Corrupt a clean canvas with the uniform-categorical forward kernel.
@@ -118,11 +122,11 @@ pub fn encoder_ar_loss(encoder_logits: &Array, input_ids: &Array, ignore_index: 
 
 /// Hyperparameters for the DiffusionGemma LoRA training loop.
 ///
-/// The optimiser is decoupled-weight-decay AdamW applied *only* to the bake-in
-/// LoRA adapters (`Gemma4Attention::lora`), which live outside the model's
-/// `ModuleParameters` tree by design. Gradients are obtained with
-/// [`value_and_grad_explicit`] over the explicit adapter array list rather than
-/// the module tree, so the frozen base weights never receive gradients.
+/// The optimiser is decoupled-weight-decay AdamW applied *only* to the LoRA
+/// adapters, which are a property of the model's `Linear` projections, as
+/// for every other architecture ([`AdaptedModel`]). Gradients are taken with
+/// [`value_and_grad_explicit`] over the adapter arrays alone, so the frozen
+/// base weights never receive gradients.
 #[derive(Debug, Clone)]
 pub struct DiffusionGemmaTrainConfig {
     /// AdamW learning rate.
@@ -176,6 +180,31 @@ pub struct DiffusionGemmaStepStats {
     pub grad_norm: Option<f32>,
 }
 
+/// Pack a DiffusionGemma's base for QLoRA: every projection as
+/// [`pmetal_lora::quantize_base`] packs any model's, and the routed experts,
+/// which are fused 3-D tensors rather than `Linear`s, through
+/// [`DiffusionGemmaForBlockDiffusion::quantize_experts`].
+///
+/// MLX's gather kernel has no codebook format, so the experts are affine:
+/// 8-bit for `int8`, 4-bit for `nf4` and `fp4`, over the config's group (64
+/// for `fp4`, whose own block is 16).
+pub fn quantize_diffusion_gemma_base(
+    model: &mut DynamicModel,
+    qlora: &QLoraConfig,
+) -> Result<PackedBase, Exception> {
+    let packed = quantize_base(model, qlora).map_err(|e| Exception::custom(e.to_string()))?;
+    let (bits, group) = match qlora.scheme {
+        QLoraScheme::Int8 => (8, qlora.group_size),
+        QLoraScheme::Nf4 => (4, qlora.group_size),
+        QLoraScheme::Fp4 => (4, 64),
+    };
+    model
+        .as_diffusion_gemma_mut()
+        .ok_or_else(|| Exception::custom("not a DiffusionGemma model"))?
+        .quantize_experts(group, bits)?;
+    Ok(packed)
+}
+
 /// DiffusionGemma block-diffusion LoRA trainer.
 ///
 /// Owns the AdamW moment buffers (keyed by adapter parameter name) and the
@@ -184,15 +213,16 @@ pub struct DiffusionGemmaStepStats {
 /// [`Self::train_on_batch`] with a caller-supplied corruption for a
 /// deterministic step (reproducible runs, curriculum, overfit checks).
 ///
-/// The model must have adapters attached (`model.attach_lora(..)`) before the
-/// first step; otherwise there are no trainable parameters and the step errors.
+/// The model is an [`AdaptedModel`] over a DiffusionGemma checkpoint: the
+/// same adapters, parameter names and adapter files as `pmetal train`
+/// produces, so `infer --lora` and `fuse` read what this writes.
 pub struct DiffusionGemmaTrainer {
     config: DiffusionGemmaTrainConfig,
     vocab: i32,
     /// AdamW first moments, keyed by adapter parameter name.
-    m: HashMap<String, Array>,
+    m: HashMap<Rc<str>, Array>,
     /// AdamW second moments, keyed by adapter parameter name.
-    v: HashMap<String, Array>,
+    v: HashMap<Rc<str>, Array>,
     /// Completed optimiser steps (drives bias correction).
     step: u64,
     /// Noise-level sampler.
@@ -223,7 +253,7 @@ impl DiffusionGemmaTrainer {
     /// conditioned on `context_ids`, and take one AdamW step on the adapters.
     pub fn train_step(
         &mut self,
-        model: &mut DiffusionGemmaForBlockDiffusion,
+        model: &mut AdaptedModel,
         context_ids: &Array,
         canvas_x0: &Array,
     ) -> Result<DiffusionGemmaStepStats, Exception> {
@@ -250,44 +280,52 @@ impl DiffusionGemmaTrainer {
     /// over corrupted positions only) mirrors [`diffusion_denoising_loss`].
     pub fn train_on_batch(
         &mut self,
-        model: &mut DiffusionGemmaForBlockDiffusion,
+        model: &mut AdaptedModel,
         context_ids: &Array,
         noised_canvas: &Array,
         targets: &Array,
         corrupted_mask: Option<&Array>,
     ) -> Result<DiffusionGemmaStepStats, Exception> {
-        // Snapshot adapter parameters in a stable order. Cloning detaches the
-        // owned array *handles* (same underlying nodes) so the model borrow ends
-        // before the differentiable closure re-borrows it mutably.
-        let (keys, param_arrays): (Vec<String>, Vec<Array>) = model
-            .lora_parameters()
-            .into_iter()
-            .map(|(k, a)| (k, a.clone()))
-            .unzip();
+        // Adapter parameters in a stable order.
+        let live = model.lora_parameters();
+        let mut keys: Vec<Rc<str>> = live.keys().cloned().collect();
+        keys.sort();
         if keys.is_empty() {
             return Err(Exception::custom(
-                "DiffusionGemmaTrainer: no LoRA adapters attached (call model.attach_lora first)",
+                "DiffusionGemmaTrainer: the model carries no LoRA adapters",
             ));
         }
-        let n_params = keys.len();
+        let param_arrays: Vec<Array> = keys.iter().map(|k| live[k].clone()).collect();
         let ignore_index = self.config.ignore_index;
 
-        // Loss closure: `all[..n_params]` are the traced adapter leaves. Inject
-        // them into the model's adapter slots so `forward_train`'s LoRA deltas
-        // are computed from the differentiated arrays, then denoise + CE.
+        // Loss closure: `all` are the traced adapter leaves. Put them in the
+        // model's adapters so `forward_train` computes from the differentiated
+        // arrays, then denoise + CE. An error is handed back after autograd
+        // returns rather than becoming a NaN loss.
+        let mut failure: Option<Exception> = None;
         let loss_fn = |all: &[Array]| -> Array {
-            for (i, (_, slot)) in model.lora_parameters_mut().into_iter().enumerate() {
-                *slot = all[i].clone();
-            }
-            match model.forward_train(context_ids, noised_canvas, None) {
+            let restored: HashMap<Rc<str>, Array> =
+                keys.iter().cloned().zip(all.iter().cloned()).collect();
+            model.set_lora_parameters(&restored);
+            let logits = model
+                .model_mut()
+                .as_diffusion_gemma_mut()
+                .ok_or_else(|| Exception::custom("not a DiffusionGemma model"))
+                .and_then(|m| m.forward_train(context_ids, noised_canvas, None));
+            match logits {
                 Ok(logits) => {
                     diffusion_denoising_loss(&logits, targets, corrupted_mask, ignore_index)
                 }
-                Err(_) => Array::from_f32(f32::NAN),
+                Err(e) => {
+                    failure = Some(e);
+                    Array::from_f32(f32::NAN)
+                }
             }
         };
         let (mut loss, grads) = value_and_grad_explicit(loss_fn, &param_arrays, &[])?;
-        // Model borrow released here; loss/grads reference the traced leaves.
+        if let Some(e) = failure {
+            return Err(e);
+        }
         loss.eval();
         let loss_val = crate::step_check::check_step(self.step as usize + 1, loss.item_f32())?;
 
@@ -315,10 +353,8 @@ impl DiffusionGemmaTrainer {
         // AdamW update on the adapter arrays, then write the new values back.
         self.step += 1;
         let new_params = self.adamw_step(&keys, &param_arrays, &grads)?;
-        for ((_, slot), np) in model.lora_parameters_mut().into_iter().zip(&new_params) {
-            *slot = np.clone();
-        }
-        eval(model.lora_parameters().into_iter().map(|(_, a)| a))?;
+        model.set_lora_parameters(&keys.iter().cloned().zip(new_params).collect());
+        eval(model.lora_parameters().values())?;
 
         Ok(DiffusionGemmaStepStats {
             step: self.step,
@@ -331,7 +367,7 @@ impl DiffusionGemmaTrainer {
     /// buffers and returns the new parameter values (already evaluated).
     fn adamw_step(
         &mut self,
-        keys: &[String],
+        keys: &[Rc<str>],
         params: &[Array],
         grads: &[Array],
     ) -> Result<Vec<Array>, Exception> {
@@ -393,38 +429,6 @@ impl DiffusionGemmaTrainer {
         }
         Ok(new_params)
     }
-}
-
-/// Save the model's attached LoRA adapters to a safetensors file, keyed by the
-/// `{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{a,b}` namespace.
-pub fn save_lora_adapters(
-    model: &DiffusionGemmaForBlockDiffusion,
-    path: impl AsRef<std::path::Path>,
-) -> Result<(), Exception> {
-    let map: HashMap<String, Array> = model
-        .lora_parameters()
-        .into_iter()
-        .map(|(k, a)| (k, a.clone()))
-        .collect();
-    pmetal_lora::save_safetensors_map(path, &map).map_err(|e| Exception::custom(e.to_string()))
-}
-
-/// Load LoRA adapter weights from a safetensors file into the model's attached
-/// adapters (matching by name). Adapters must already be attached; missing keys
-/// are left at their current value.
-pub fn load_lora_adapters(
-    model: &mut DiffusionGemmaForBlockDiffusion,
-    path: impl AsRef<std::path::Path>,
-) -> Result<(), Exception> {
-    let loaded =
-        pmetal_lora::load_safetensors_map(path).map_err(|e| Exception::custom(e.to_string()))?;
-    for (name, slot) in model.lora_parameters_mut() {
-        if let Some(a) = loaded.get(&name) {
-            *slot = a.clone();
-        }
-    }
-    eval(model.lora_parameters().into_iter().map(|(_, a)| a))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -499,12 +503,28 @@ mod tests {
         );
     }
 
+    use pmetal_bridge::compat::ModuleParametersExt;
     use pmetal_core::LoraConfig;
-    use pmetal_models::architectures::diffusion_gemma::DiffusionGemmaTextConfig;
+    use pmetal_models::architectures::diffusion_gemma::{
+        DiffusionGemmaForBlockDiffusion, DiffusionGemmaTextConfig,
+    };
 
-    /// Tiny DiffusionGemma with q/k/v/o LoRA attached — mirrors the model-crate
-    /// `tiny_config` so the trainer exercises the real architecture.
-    fn tiny_model_with_lora(moe_intermediate: i32) -> (DiffusionGemmaForBlockDiffusion, i32, i32) {
+    fn lora_config() -> LoraConfig {
+        LoraConfig {
+            r: 4,
+            alpha: 8.0,
+            target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Tiny DiffusionGemma, mirroring the model crate's `tiny_config` so the
+    /// trainer exercises the real architecture. The same seed gives the same
+    /// base weights.
+    fn tiny_base(moe_intermediate: i32) -> (DynamicModel, i32, i32) {
         let cfg = DiffusionGemmaTextConfig {
             vocab_size: 64,
             hidden_size: 32,
@@ -525,58 +545,68 @@ mod tests {
         };
         let vocab = cfg.vocab_size;
         let canvas = cfg.canvas_length;
-        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg).unwrap();
-        let lora_cfg = LoraConfig {
-            r: 4,
-            alpha: 8.0,
-            target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            ..Default::default()
-        };
-        model.attach_lora(&lora_cfg).unwrap();
-        (model, vocab, canvas)
+        random::seed(17);
+        let model = DiffusionGemmaForBlockDiffusion::new(cfg).unwrap();
+        (DynamicModel::DiffusionGemma(model), vocab, canvas)
     }
 
-    fn logits_vec(
-        model: &mut DiffusionGemmaForBlockDiffusion,
-        ctx: &Array,
-        canvas: &Array,
-    ) -> Vec<f32> {
-        let mut l = model.forward_train(ctx, canvas, None).unwrap();
+    /// The tiny model with q/k/v/o adapters in the encoder and the decoder.
+    fn tiny_model_with_lora(moe_intermediate: i32) -> (AdaptedModel, i32, i32) {
+        let (base, vocab, canvas) = tiny_base(moe_intermediate);
+        (
+            AdaptedModel::attach(base, lora_config()).unwrap(),
+            vocab,
+            canvas,
+        )
+    }
+
+    fn logits_vec(model: &mut AdaptedModel, ctx: &Array, canvas: &Array) -> Vec<f32> {
+        let mut l = model
+            .model_mut()
+            .as_diffusion_gemma_mut()
+            .unwrap()
+            .forward_train(ctx, canvas, None)
+            .unwrap();
         let n = (l.dim(1) * l.dim(2)) as usize;
         l.to_f32_vec(n).unwrap()
     }
 
-    #[test]
-    #[serial]
-    fn train_on_batch_reduces_overfit_loss() {
-        let (mut model, vocab, canvas) = tiny_model_with_lora(16);
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
 
+    /// A context, a clean canvas, and the canvas with `corrupt` positions
+    /// replaced.
+    fn batch(vocab: i32, canvas: i32, corrupt: &[usize]) -> (Array, Array, Array) {
         let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
-        let context = Array::from_slice(&ctx_ids, &[1, 5]);
-        // Clean targets and a fixed corruption of a few canvas positions.
         let clean: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
-        let targets = Array::from_slice(&clean, &[1, canvas]);
         let mut noised = clean.clone();
-        for &p in &[1usize, 3, 6] {
+        for &p in corrupt {
             noised[p] = (noised[p] + 17) % vocab;
         }
-        let x_t = Array::from_slice(&noised, &[1, canvas]);
+        (
+            Array::from_slice(&ctx_ids, &[1, 5]),
+            Array::from_slice(&clean, &[1, canvas]),
+            Array::from_slice(&noised, &[1, canvas]),
+        )
+    }
 
+    fn overfit(model: &mut AdaptedModel, vocab: i32, canvas: i32, steps: usize) -> (f32, f32) {
+        let (context, targets, x_t) = batch(vocab, canvas, &[1, 3, 6]);
         let config = DiffusionGemmaTrainConfig {
             learning_rate: 3e-3,
             corrupted_only: false, // full-canvas loss ⇒ deterministic, monotone signal
             ..Default::default()
         };
         let mut trainer = DiffusionGemmaTrainer::new(config, vocab);
-
         let mut first = f32::NAN;
         let mut last = f32::NAN;
-        for i in 0..60 {
+        for i in 0..steps {
             let stats = trainer
-                .train_on_batch(&mut model, &context, &x_t, &targets, None)
+                .train_on_batch(model, &context, &x_t, &targets, None)
                 .unwrap();
             assert!(stats.loss.is_finite(), "step {i} produced non-finite loss");
             if i == 0 {
@@ -584,6 +614,18 @@ mod tests {
             }
             last = stats.loss;
         }
+        pmetal_bridge::check_last_error().expect("a bridge op threw");
+        (first, last)
+    }
+
+    #[test]
+    #[serial]
+    fn train_on_batch_reduces_overfit_loss() {
+        let (mut model, vocab, canvas) = tiny_model_with_lora(16);
+        // q, k and o on every layer, v where the layer has one, in the
+        // encoder and the decoder.
+        assert!(model.adapted_projections().len() >= 3 * 2 * 3);
+        let (first, last) = overfit(&mut model, vocab, canvas, 60);
         assert!(
             last < first,
             "overfit loss did not decrease: first={first}, last={last}"
@@ -598,109 +640,90 @@ mod tests {
     #[test]
     #[serial]
     fn trains_lora_on_quantized_base() {
-        // QLoRA: 4-bit frozen base (attention + MoE experts) + f32 LoRA. The
-        // trainer's gradients flow only to the adapters, so the loss must still
-        // decrease even though the base is quantized. moe_intermediate = 32 to
-        // satisfy the minimum quantization group size.
-        let (mut model, vocab, canvas) = tiny_model_with_lora(32);
-        model.quantize_base(32, 4, true).unwrap();
-
-        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
-        let context = Array::from_slice(&ctx_ids, &[1, 5]);
-        let clean: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
-        let targets = Array::from_slice(&clean, &[1, canvas]);
-        let mut noised = clean.clone();
-        for &p in &[1usize, 3, 6] {
-            noised[p] = (noised[p] + 17) % vocab;
-        }
-        let x_t = Array::from_slice(&noised, &[1, canvas]);
-
-        let config = DiffusionGemmaTrainConfig {
-            learning_rate: 3e-3,
-            corrupted_only: false,
-            ..Default::default()
+        // QLoRA: the frozen base packed (projections and MoE experts) and f32
+        // adapters. The gradients flow only to the adapters, so the loss must
+        // still decrease. moe_intermediate = 32 to satisfy the minimum group
+        // size.
+        let (mut base, vocab, canvas) = tiny_base(32);
+        let qlora = QLoraConfig {
+            scheme: QLoraScheme::Nf4,
+            group_size: 32,
+            double_quant: false,
         };
-        let mut trainer = DiffusionGemmaTrainer::new(config, vocab);
+        let packed = quantize_diffusion_gemma_base(&mut base, &qlora).unwrap();
+        // Every attention projection in both towers, and none of the routers.
+        assert!(packed.packed >= 3 * 2 * 3, "{packed:?}");
+        assert!(
+            packed.kept.iter().any(|(p, _)| p.ends_with("router.proj")),
+            "the routers were packed: {packed:?}"
+        );
+        let mut model = AdaptedModel::attach(base, lora_config()).unwrap();
+        assert!(
+            model
+                .model()
+                .flatten_params()
+                .keys()
+                .any(|k| k.ends_with("self_attn.q_proj.scales")),
+            "the projections are not packed"
+        );
 
-        let mut first = f32::NAN;
-        let mut last = f32::NAN;
-        for i in 0..60 {
-            let stats = trainer
-                .train_on_batch(&mut model, &context, &x_t, &targets, None)
-                .unwrap();
-            assert!(stats.loss.is_finite(), "step {i} produced non-finite loss");
-            if i == 0 {
-                first = stats.loss;
-            }
-            last = stats.loss;
-        }
+        let (first, last) = overfit(&mut model, vocab, canvas, 60);
         assert!(
             last < first && first - last > 0.02,
             "LoRA-on-quantized-base did not train: first={first}, last={last}"
         );
     }
 
+    /// The adapter file holds the keys the dedicated adapter mechanism this
+    /// replaced wrote, `{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{a,b}`,
+    /// and loads the way `pmetal infer --lora` loads one: attach to a fresh
+    /// copy of the base, read the file, merge.
     #[test]
     #[serial]
-    fn lora_checkpoint_save_load_roundtrip() {
+    fn adapters_round_trip_through_the_inference_path() {
         let (mut model, vocab, canvas) = tiny_model_with_lora(16);
-
-        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
-        let context = Array::from_slice(&ctx_ids, &[1, 5]);
-        let clean: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
-        let targets = Array::from_slice(&clean, &[1, canvas]);
-        let mut noised = clean.clone();
-        noised[2] = (noised[2] + 9) % vocab;
-        let x_t = Array::from_slice(&noised, &[1, canvas]);
-
-        // Train a few steps so the adapters are meaningfully non-zero.
-        let mut trainer = DiffusionGemmaTrainer::new(
-            DiffusionGemmaTrainConfig {
-                learning_rate: 5e-3,
-                corrupted_only: false,
-                ..Default::default()
-            },
-            vocab,
-        );
-        for _ in 0..8 {
-            trainer
-                .train_on_batch(&mut model, &context, &x_t, &targets, None)
-                .unwrap();
-        }
+        overfit(&mut model, vocab, canvas, 8);
+        let (context, _, x_t) = batch(vocab, canvas, &[2]);
         let trained = logits_vec(&mut model, &context, &x_t);
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("dg_lora.safetensors");
-        save_lora_adapters(&model, &path).unwrap();
+        let path = dir.path().join("lora_weights.safetensors");
+        model.save_lora_weights(&path).unwrap();
 
-        // Zero the live adapters so their effect is removed, then confirm the
-        // forward actually changed (the mutation took hold).
-        for (_, slot) in model.lora_parameters_mut() {
-            *slot = slot.multiply(&Array::from_f32(0.0));
+        let saved = pmetal_lora::load_safetensors_map(&path).unwrap();
+        assert!(!saved.is_empty());
+        for key in saved.keys() {
+            let parts: Vec<&str> = key.split('.').collect();
+            assert!(
+                matches!(
+                    parts.as_slice(),
+                    [
+                        "encoder" | "decoder",
+                        "layers",
+                        _,
+                        "self_attn",
+                        "q_proj" | "k_proj" | "v_proj" | "o_proj",
+                        "lora_a" | "lora_b"
+                    ]
+                ),
+                "unexpected adapter key {key}"
+            );
         }
-        eval(model.lora_parameters().into_iter().map(|(_, a)| a)).unwrap();
-        let zeroed = logits_vec(&mut model, &context, &x_t);
-        let mutated_diff = trained
-            .iter()
-            .zip(&zeroed)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            mutated_diff > 1e-5,
-            "zeroing adapters should change the forward (diff={mutated_diff})"
-        );
 
-        // Restore from the checkpoint and confirm the trained forward returns.
-        load_lora_adapters(&mut model, &path).unwrap();
-        let restored = logits_vec(&mut model, &context, &x_t);
-        let restore_diff = trained
-            .iter()
-            .zip(&restored)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let (base, _, _) = tiny_base(16);
+        let mut fresh = AdaptedModel::attach(base, lora_config()).unwrap();
+        let untrained = logits_vec(&mut fresh, &context, &x_t);
         assert!(
-            restore_diff < 1e-6,
-            "checkpoint did not restore adapters exactly (diff={restore_diff})"
+            max_diff(&trained, &untrained) > 1e-5,
+            "training did not change the forward"
+        );
+        fresh.load_lora_weights(&path).unwrap();
+        fresh.merge();
+        let restored = logits_vec(&mut fresh, &context, &x_t);
+        let diff = max_diff(&trained, &restored);
+        assert!(
+            diff < 1e-5,
+            "the saved adapters did not restore the trained forward (diff={diff})"
         );
     }
 

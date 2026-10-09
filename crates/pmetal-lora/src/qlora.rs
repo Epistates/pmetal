@@ -320,6 +320,14 @@ mod tests {
             kept_because("model.layers.1.block_sparse_moe.router.layer").is_some(),
             "Granite 4's router"
         );
+        assert!(
+            kept_because("model.layers.2.router.proj").is_some(),
+            "Gemma 4's router"
+        );
+        assert!(
+            kept_because("decoder.layers.0.router.proj").is_some(),
+            "DiffusionGemma's router"
+        );
         assert!(kept_because("model.layers.0.mlp.gate_proj").is_none());
         assert!(kept_because("model.layers.0.self_attn.q_proj").is_none());
 

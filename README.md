@@ -453,7 +453,7 @@ LoRA training is supported for models that have implementations in `DynamicLoraM
 | Granite | Yes | Yes | Dense and hybrid variants. |
 | NemotronH | Yes | Yes | Hybrid architecture support. |
 | GPT-OSS | Yes | Yes | MoE variants. |
-| DiffusionGemma | Yes | Yes | Block-diffusion; trained via `pmetal train-diffusion` (add `--qlora`). |
+| DiffusionGemma | Yes | Yes | Block-diffusion; trained via `pmetal train-diffusion` (add `--quantization nf4` for QLoRA). |
 
 ### Diffusion Models
 

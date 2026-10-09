@@ -1,9 +1,10 @@
 //! `pmetal train-diffusion` — block-diffusion LoRA fine-tuning for DiffusionGemma.
 //!
 //! DiffusionGemma has no causal `forward(ids) -> logits`, so it does not fit the
-//! `DynamicLoraModel` training path used by `pmetal train`. This command wires
-//! the dedicated [`DiffusionGemmaTrainer`] directly: it loads the model through
-//! the inference dispatcher, attaches bake-in LoRA adapters, collates each
+//! training loop `pmetal train` runs. This command drives the dedicated
+//! [`DiffusionGemmaTrainer`] instead, over the same adapted model: it loads the
+//! model through the inference dispatcher, packs its base for QLoRA when asked
+//! and attaches LoRA adapters exactly as `pmetal train` does, collates each
 //! `(prompt, response)` example into an encoder context + fixed-length decoder
 //! canvas, and runs the denoising objective. Only the LoRA adapters are trained.
 
@@ -14,9 +15,14 @@ use anyhow::{Context, Result, bail};
 use pmetal_bridge::compat::Array;
 use pmetal_core::LoraConfig;
 use pmetal_data::Tokenizer;
+use pmetal_lora::{AdaptedModel, QLoraConfig, QLoraScheme};
 use pmetal_models::DynamicModel;
-use pmetal_trainer::{DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, save_lora_adapters};
+use pmetal_trainer::orchestrator::save_adapter_config;
+use pmetal_trainer::{
+    DiffusionGemmaTrainConfig, DiffusionGemmaTrainer, quantize_diffusion_gemma_base,
+};
 
+use crate::QuantizationMethod;
 use crate::cli::train_diffusion::TrainDiffusionArgs;
 
 pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> {
@@ -24,14 +30,16 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
     let model_path = pmetal_hub::resolve_model_path(&args.model, None, None)
         .await
         .map_err(|e| anyhow::anyhow!("resolve model {}: {e}", args.model))?;
-    let mut model =
-        match DynamicModel::load(&model_path).map_err(|e| anyhow::anyhow!("load model: {e}"))? {
-            DynamicModel::DiffusionGemma(m) => m,
-            other => bail!(
-                "train-diffusion requires a DiffusionGemma model, got {:?}",
-                other.architecture()
-            ),
-        };
+    let mut base =
+        DynamicModel::load(&model_path).map_err(|e| anyhow::anyhow!("load model: {e}"))?;
+    let Some(dg) = base.as_diffusion_gemma_mut() else {
+        bail!(
+            "train-diffusion requires a DiffusionGemma model, got {:?}",
+            base.architecture()
+        );
+    };
+    let canvas_len = dg.canvas_length as usize;
+    let vocab = dg.vocab_size;
 
     // 2. Tokenizer + pad token for canvas padding.
     let tokenizer = Tokenizer::from_model_dir(&model_path)
@@ -42,35 +50,43 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
         .unwrap_or(0);
     let bos_id = tokenizer.bos_token_id();
 
-    // 3. Attach LoRA adapters to the encoder + decoder attention.
+    // 3. Optionally pack the frozen base (QLoRA), as `pmetal train` does,
+    //    then attach LoRA adapters to the encoder and decoder projections.
+    //    Packing first seeds a DoRA magnitude from the weight the layer
+    //    computes with.
+    let scheme = match args.quantization {
+        QuantizationMethod::None => None,
+        QuantizationMethod::Nf4 => Some(QLoraScheme::Nf4),
+        QuantizationMethod::Fp4 => Some(QLoraScheme::Fp4),
+        QuantizationMethod::Int8 => Some(QLoraScheme::Int8),
+    };
+    if let Some(scheme) = scheme {
+        let qlora = QLoraConfig {
+            scheme,
+            group_size: args.quant_block_size as i32,
+            double_quant: args.double_quant,
+        };
+        let packed = quantize_diffusion_gemma_base(&mut base, &qlora)
+            .map_err(|e| anyhow::anyhow!("QLoRA base quantization: {e}"))?;
+        tracing::info!(
+            "QLoRA: {} projections packed as {scheme}, {:.1} MB -> {:.1} MB, and the experts",
+            packed.packed,
+            packed.dense_bytes as f64 / 1e6,
+            packed.packed_bytes as f64 / 1e6,
+        );
+    }
     let lora_cfg = LoraConfig {
         r: args.lora_r,
         alpha: args.lora_alpha,
         target_modules: args.lora_targets.clone(),
         ..Default::default()
     };
-    model
-        .attach_lora(&lora_cfg)
-        .map_err(|e| anyhow::anyhow!("attach LoRA: {e}"))?;
+    // Seeded here so the adapters' initialisation is reproducible too.
+    pmetal_bridge::compat::random::seed(args.seed);
+    let mut model = AdaptedModel::attach(base, lora_cfg.clone()).map_err(|e| {
+        anyhow::anyhow!("attach LoRA (--lora-targets {:?}): {e}", args.lora_targets)
+    })?;
     let n_adapter_params = model.lora_parameters().len();
-    anyhow::ensure!(
-        n_adapter_params > 0,
-        "no LoRA adapters attached — check --lora-targets ({:?})",
-        args.lora_targets
-    );
-
-    // Optionally quantize the frozen base (QLoRA). Adapters stay f32, so the
-    // trainer's gradients still flow only to them.
-    if args.qlora {
-        model
-            .quantize_base(args.qlora_group_size, args.qlora_bits, true)
-            .map_err(|e| anyhow::anyhow!("QLoRA base quantization: {e}"))?;
-        tracing::info!(
-            "QLoRA: base quantized to {}-bit (group_size {})",
-            args.qlora_bits,
-            args.qlora_group_size
-        );
-    }
 
     // 4. Load the (prompt, response) dataset.
     let examples = load_prompt_response_jsonl(&args.dataset)
@@ -78,9 +94,6 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
     anyhow::ensure!(!examples.is_empty(), "dataset {} is empty", args.dataset);
 
     // 5. Trainer.
-    pmetal_bridge::compat::random::seed(args.seed);
-    let canvas_len = model.canvas_length as usize;
-    let vocab = model.vocab_size;
     let train_cfg = DiffusionGemmaTrainConfig {
         learning_rate: args.learning_rate,
         weight_decay: args.weight_decay,
@@ -140,21 +153,43 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
 
         if args.checkpoint_every > 0 && step > 0 && step % args.checkpoint_every == 0 {
             let ckpt = output_dir.join("lora_weights.safetensors");
-            save_lora_adapters(&model, &ckpt)
-                .map_err(|e| anyhow::anyhow!("checkpoint save: {e}"))?;
+            save_adapters(&model, &lora_cfg, &ckpt, &args.model)
+                .with_context(|| "checkpoint save")?;
             tracing::info!("checkpoint at step {step} → {}", ckpt.display());
         }
     }
 
     // 7. Save the final adapters.
     let final_path = output_dir.join("lora_weights.safetensors");
-    save_lora_adapters(&model, &final_path).map_err(|e| anyhow::anyhow!("save adapters: {e}"))?;
+    save_adapters(&model, &lora_cfg, &final_path, &args.model).with_context(|| "save adapters")?;
     println!(
         "DiffusionGemma LoRA adapters saved to {} (final ema loss={:.4})",
         final_path.display(),
         running_loss
     );
     Ok(())
+}
+
+/// Write the adapters and the `adapter_config.json` beside them that
+/// `infer --lora` and `fuse` read their rank, alpha and targets from, as
+/// `pmetal train` does.
+fn save_adapters(
+    model: &AdaptedModel,
+    lora: &LoraConfig,
+    path: &Path,
+    base_model: &str,
+) -> Result<()> {
+    model
+        .save_lora_weights(path)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    save_adapter_config(
+        path,
+        lora.r,
+        lora.alpha,
+        &lora.target_modules,
+        lora.use_rslora,
+        Some(base_model),
+    )
 }
 
 /// Build the encoder context `[1, ctx]` from a prompt's token ids, truncated to

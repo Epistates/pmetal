@@ -1205,91 +1205,27 @@ impl DiffusionGemmaForBlockDiffusion {
         Ok(self.lm_logits(&hidden))
     }
 
-    /// Attach LoRA adapters to every encoder and decoder attention layer, for
-    /// the projections named in `config.target_modules`. Adapters initialise to
-    /// a no-op (`B = 0`), so `forward_train` / `generate` are numerically
-    /// unchanged until the adapters are trained.
+    /// Pack every encoder and decoder layer's routed experts to `bits`-bit
+    /// affine (group size `group_size`), the experts' share of a QLoRA base.
     ///
-    /// The encoder and decoder trunks carry *independent* adapters — they are
-    /// separate module instances in pmetal even though their base weights are
-    /// tied — so a fine-tune adapts both the causal context encoder and the
-    /// bidirectional denoising decoder.
-    pub fn attach_lora(&mut self, config: &pmetal_core::LoraConfig) -> Result<(), Exception> {
-        for layer in &mut self.encoder.layers {
-            layer.self_attn.attach_lora(config)?;
-        }
-        for layer in &mut self.decoder.layers {
-            layer.self_attn.attach_lora(config)?;
+    /// The projections are `Linear`s, which `pmetal_lora::quantize_base`
+    /// packs and `pmetal_lora::AdaptedModel` adapts like any other model's;
+    /// the experts are fused 3-D tensors MLX multiplies with `gather_qmm`, so
+    /// they are packed here. They are frozen and carry no adapter either way.
+    ///
+    /// `hidden_size` and `moe_intermediate_size` must be multiples of
+    /// `group_size ∈ {32, 64, 128}`; a violation returns a clean error rather
+    /// than aborting.
+    pub fn quantize_experts(&mut self, group_size: i32, bits: i32) -> Result<(), Exception> {
+        for layer in self
+            .encoder
+            .layers
+            .iter_mut()
+            .chain(self.decoder.layers.iter_mut())
+        {
+            layer.experts.quantize(group_size, bits)?;
         }
         Ok(())
-    }
-
-    /// Quantize the base weights of every encoder + decoder attention projection
-    /// and MoE expert block to `bits`-bit affine (group size `group_size`) for
-    /// QLoRA. The frozen base then runs through MLX's fused quantized matmuls
-    /// (`quantized_matmul` / `gather_qmm`) while the LoRA adapters stay in f32 —
-    /// so `attach_lora` composes with this in either order, and the block-
-    /// diffusion trainer's gradients still flow only to the f32 adapters.
-    ///
-    /// `hidden_size`, `moe_intermediate_size`, and each attention projection's
-    /// input dimension must be multiples of `group_size ∈ {32, 64, 128}`; a
-    /// violation returns a clean error rather than aborting.
-    ///
-    /// `for_training` selects the quantized experts' backward path: `true` uses
-    /// the exact dequantize-to-dense forward (required for QLoRA training, since
-    /// the fused `gather_qmm` has no input-activation vjp); `false` uses the
-    /// fast fused `gather_qmm` inference path.
-    pub fn quantize_base(
-        &mut self,
-        group_size: i32,
-        bits: i32,
-        for_training: bool,
-    ) -> Result<(), Exception> {
-        for layer in &mut self.encoder.layers {
-            layer.self_attn.quantize_projections(group_size, bits)?;
-            layer.experts.quantize(group_size, bits)?;
-            layer.experts.set_dequant_backward(for_training);
-        }
-        for layer in &mut self.decoder.layers {
-            layer.self_attn.quantize_projections(group_size, bits)?;
-            layer.experts.quantize(group_size, bits)?;
-            layer.experts.set_dequant_backward(for_training);
-        }
-        Ok(())
-    }
-
-    /// All LoRA parameters, namespaced
-    /// `{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{a,b}`.
-    pub fn lora_parameters(&self) -> Vec<(String, &Array)> {
-        let mut out = Vec::new();
-        for (tower, layers) in [
-            ("encoder", &self.encoder.layers),
-            ("decoder", &self.decoder.layers),
-        ] {
-            for (i, layer) in layers.iter().enumerate() {
-                for (name, arr) in layer.self_attn.lora_parameters() {
-                    out.push((format!("{tower}.layers.{i}.self_attn.{name}"), arr));
-                }
-            }
-        }
-        out
-    }
-
-    /// Mutable LoRA parameters for the optimiser (same namespacing). Two
-    /// sequential loops keep the encoder/decoder mutable borrows disjoint.
-    pub fn lora_parameters_mut(&mut self) -> Vec<(String, &mut Array)> {
-        let mut out = Vec::new();
-        for (i, layer) in self.encoder.layers.iter_mut().enumerate() {
-            for (name, arr) in layer.self_attn.lora_parameters_mut() {
-                out.push((format!("encoder.layers.{i}.self_attn.{name}"), arr));
-            }
-        }
-        for (i, layer) in self.decoder.layers.iter_mut().enumerate() {
-            for (name, arr) in layer.self_attn.lora_parameters_mut() {
-                out.push((format!("decoder.layers.{i}.self_attn.{name}"), arr));
-            }
-        }
-        out
     }
 
     /// Generate by block-autoregressive discrete diffusion (batch size 1).
@@ -2038,14 +1974,28 @@ mod tests {
         );
     }
 
-    /// A QLoRA-quantized DiffusionGemma (4-bit base + f32 LoRA) must run
-    /// `forward_train` end-to-end and produce finite, correctly-shaped logits.
-    /// Uses a config whose `hidden`/`moe_intermediate` are multiples of the
-    /// minimum group size (32).
+    /// Adapters on the attention projections, in the encoder and the decoder.
+    fn attach_attention_adapters(model: &mut DiffusionGemmaForBlockDiffusion) -> usize {
+        use pmetal_bridge::compat::VisitLinears;
+        let mut attached = 0;
+        model.visit_linears_mut("", &mut |path, linear| {
+            if path.contains(".self_attn.") {
+                linear.attach_lora(4, 8.0, false).unwrap();
+                attached += 1;
+            }
+        });
+        attached
+    }
+
+    /// A QLoRA DiffusionGemma (4-bit projections and experts, f32 adapters)
+    /// must run `forward_train` end-to-end and produce finite,
+    /// correctly-shaped logits. Uses a config whose `hidden`/`moe_intermediate`
+    /// are multiples of the minimum group size (32).
     #[test]
     #[serial]
-    fn quantize_base_forward_train_finite() {
-        use pmetal_core::LoraConfig;
+    fn quantized_base_forward_train_finite() {
+        use pmetal_bridge::compat::VisitLinears;
+        use pmetal_bridge::native_weight::QuantParams;
         let cfg = DiffusionGemmaTextConfig {
             moe_intermediate_size: 32,
             ..tiny_config()
@@ -2054,18 +2004,23 @@ mod tests {
         let canvas = cfg.canvas_length;
         let mut model = DiffusionGemmaForBlockDiffusion::new(cfg).unwrap();
 
-        let lora_cfg = LoraConfig {
-            r: 4,
-            alpha: 8.0,
-            target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            ..Default::default()
-        };
-        model.attach_lora(&lora_cfg).unwrap();
-        // for_training = false exercises the fused gather_qmm inference path.
-        model.quantize_base(32, 4, false).unwrap();
+        attach_attention_adapters(&mut model);
+        model.visit_linears_mut("", &mut |path, linear| {
+            if path.contains(".self_attn.") {
+                linear
+                    .quantize(QuantParams {
+                        group_size: 32,
+                        bits: 4,
+                        mode: pmetal_bridge::QuantizedMode::Affine,
+                    })
+                    .unwrap();
+            }
+        });
+        model.quantize_experts(32, 4).unwrap();
+        assert!(
+            model.quantize_experts(48, 4).is_err(),
+            "48 is not a group size"
+        );
 
         let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
         let context = Array::from_slice(&ctx_ids, &[1, 5]);
@@ -2084,7 +2039,7 @@ mod tests {
     #[test]
     #[serial]
     fn lora_attach_is_noop_until_trained() {
-        use pmetal_core::LoraConfig;
+        use pmetal_bridge::compat::ModuleParametersExt;
         let cfg = tiny_config();
         let vocab = cfg.vocab_size;
         let canvas = cfg.canvas_length;
@@ -2097,23 +2052,18 @@ mod tests {
 
         let mut before = model.forward_train(&context, &canvas_arr, None).unwrap();
         let before_v = before.to_f32_vec((canvas * vocab) as usize).unwrap();
-        assert!(
-            model.lora_parameters().is_empty(),
-            "no adapters before attach"
-        );
 
-        let mut lora_cfg = LoraConfig::default();
-        lora_cfg.r = 4;
-        lora_cfg.alpha = 8.0;
-        lora_cfg.target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        model.attach_lora(&lora_cfg).unwrap();
-
-        let n = model.lora_parameters().len();
-        assert!(n > 0, "expected LoRA params after attach");
-        assert_eq!(model.lora_parameters_mut().len(), n, "mut count matches");
+        // q, k and o everywhere, and v on the layers that have one, in both
+        // the encoder and the decoder.
+        let attached = attach_attention_adapters(&mut model);
+        let layers = 2 * model.encoder.layers.len();
+        assert!(attached >= 3 * layers, "only {attached} adapters attached");
+        let adapter_keys = model
+            .flatten_params()
+            .keys()
+            .filter(|k| k.ends_with(".lora_a") || k.ends_with(".lora_b"))
+            .count();
+        assert_eq!(adapter_keys, 2 * attached, "adapters in the parameter tree");
 
         // B is zero-initialised, so the adapters must not change the output yet.
         let mut after = model.forward_train(&context, &canvas_arr, None).unwrap();
