@@ -14,9 +14,10 @@
 //!
 //! - **MoE**: `interleave_moe_layer_step` controls which layers are MoE.
 //!   `(layer_idx % step) == (step - 1)` → MoE layer; others are dense MLP.
-//!   Top-1 routing with sigmoid scores, shared expert added after routed output.
-//!   Expert weights stored as `[num_experts, out, in]` (SwitchLinear convention);
-//!   sanitization splits and transposes the gate_up_proj block from safetensors.
+//!   Top-1 routing with sigmoid scores on the expert's input, shared expert
+//!   added after routed output. Expert weights are held `[num_experts, in, out]`
+//!   for `gather_mm`, which is how transformers' fused `gate_up_proj` /
+//!   `down_proj` already store them (the former split into gate and up).
 //!
 //! The stack is split across focused submodules:
 //!   * [`weights`] — layer weight struct, safetensors loading, expert sanitization

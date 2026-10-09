@@ -4,9 +4,8 @@
 //! * Vision / projector weight removal
 //! * VLM prefix stripping (`language_model.model.X` → `model.X`)
 //! * Expert weight split: `experts.gate_up_proj` → `experts.gate_proj.weight`
-//!   + `experts.up_proj.weight` (split last axis)
-//! * Expert down projection: `experts.down_proj` → `experts.down_proj.weight`
-//!   (swapaxes(1,2))
+//!   and `experts.up_proj.weight` (split last axis); `experts.down_proj` is
+//!   already `[E, in, out]`
 //! * All projection weights pre-transposed to `[in, out]` form for efficient matmul
 
 use crate::InlineArray;
@@ -111,9 +110,8 @@ impl std::fmt::Debug for NativeWeights {
 /// Applies all sanitization required by the reference implementation:
 /// - Vision / projector weight removal
 /// - Expert weight splitting: `experts.gate_up_proj` → `experts.gate_proj.weight` +
-///   `experts.up_proj.weight` (split on last axis, then swapaxes(1,2))
-/// - Expert down projection: `experts.down_proj` → `experts.down_proj.weight`
-///   (swapaxes(1,2))
+///   `experts.up_proj.weight` (split on last axis); `experts.down_proj` kept as
+///   `[E, expert_hidden, hidden]`
 /// - `language_model.` prefix stripping for VLM checkpoints
 /// - All projection weights pre-transposed to `[in, out]` form for efficient matmul
 pub fn load_model(
@@ -158,43 +156,37 @@ pub fn load_model(
         }
     }
 
-    // 3b. Expert weight sanitization (matches Python's Model.sanitize()).
+    // 3b. Experts, to the `[E, in, out]` layout `gather_mm(x, b, None, idx)`
+    // takes as `b` (`[E, K, N]`).
     //
-    // Raw safetensors format:
-    //   `layers.{l}.feed_forward.experts.gate_up_proj` — shape [E, in_dim, 2*expert_hidden]
-    //   `layers.{l}.feed_forward.experts.down_proj`    — shape [E, hidden_size, expert_hidden]
-    //
-    // Target format (after sanitize + our pre-transpose for direct gather_mm):
-    //   `experts.gate_proj.weight` : [E, in_dim, expert_hidden] (split only, no swapaxes)
-    //   `experts.up_proj.weight`   : [E, in_dim, expert_hidden]
-    //   `experts.down_proj.weight` : [E, expert_hidden, hidden_size] (swapaxes(1,2))
-    //
-    // At runtime, gather_mm(x, b, None, indices) expects b in shape [E, K, N].
-    // - gate/up: x=[B,1,1,in_dim], b=[E,in_dim,expert_hidden] → [B,1,1,expert_hidden] ✓
-    // - down:    x=[B,1,1,expert_hidden], b=[E,expert_hidden,hidden_size] → [B,1,1,hidden_size] ✓
-
+    // transformers' layout (`Llama4TextExperts`, every release) is already
+    // applied as `x @ W`:
+    //   `experts.gate_up_proj` [E, hidden, 2 * expert_hidden], gate then up
+    //   (`gate_up.chunk(2, dim=-1)`), and `experts.down_proj`
+    //   [E, expert_hidden, hidden]. Neither needs a transpose.
+    // A stacked per-projection layout (`experts.{gate,up,down}_proj.weight`,
+    // `[E, out, in]` like a Linear) is transposed to `[E, in, out]`.
     for li in 0..tc.num_hidden_layers as usize {
         if !config.is_moe_layer(li) {
             continue;
         }
         let prefix = format!("model.layers.{li}.feed_forward.experts");
-
-        // gate_up_proj: [E, in_dim, 2*expert_hidden]
         if let Some(gate_up) = raw.remove(&format!("{prefix}.gate_up_proj")) {
-            let expert_hidden = tc.intermediate_size;
-            // split along last axis at position expert_hidden
-            let mut parts = gate_up.split(&[expert_hidden], -1);
-            let up = parts.pop().unwrap(); // [E, in_dim, expert_hidden]
-            let gate = parts.pop().unwrap(); // [E, in_dim, expert_hidden]
+            let mut parts = gate_up.split(&[tc.intermediate_size], -1);
+            let up = parts.pop().unwrap();
+            let gate = parts.pop().unwrap();
             raw.insert(format!("{prefix}.gate_proj.weight"), gate);
             raw.insert(format!("{prefix}.up_proj.weight"), up);
-        }
-
-        // down_proj: [E, hidden_size, expert_hidden] → store as [E, expert_hidden, hidden_size]
-        if let Some(down) = raw.remove(&format!("{prefix}.down_proj")) {
-            // swapaxes(1, 2) on a 3D array: transpose dims 1 and 2
-            let down_t = down.transpose_axes(&[0, 2, 1]);
-            raw.insert(format!("{prefix}.down_proj.weight"), down_t);
+            if let Some(down) = raw.remove(&format!("{prefix}.down_proj")) {
+                raw.insert(format!("{prefix}.down_proj.weight"), down);
+            }
+        } else {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                let key = format!("{prefix}.{proj}.weight");
+                if let Some(w) = raw.remove(&key) {
+                    raw.insert(key, w.transpose_axes(&[0, 2, 1]));
+                }
+            }
         }
     }
 

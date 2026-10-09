@@ -46,21 +46,24 @@ impl Fixture {
     }
 }
 
-fn checkpoint() -> Fixture {
+/// The `llama4_<variant>_*` fixture as a checkpoint directory.
+fn checkpoint(variant: &str) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(
-        fixture_path("llama4_text_config.json"),
+        fixture_path(&format!("llama4_{variant}_config.json")),
         dir.path().join("config.json"),
     )
     .expect("copy config");
     std::fs::copy(
-        fixture_path("llama4_text_weights.safetensors"),
+        fixture_path(&format!("llama4_{variant}_weights.safetensors")),
         dir.path().join("model.safetensors"),
     )
     .expect("copy weights");
     Fixture {
         dir,
-        reference: load_shard(&fixture_path("llama4_text_reference.safetensors")),
+        reference: load_shard(&fixture_path(&format!(
+            "llama4_{variant}_reference.safetensors"
+        ))),
     }
 }
 
@@ -110,14 +113,12 @@ fn step_reports(steps: &[Array], want: &Array) -> Vec<ParityReport> {
 }
 
 /// The `DynamicModel` path (`architectures/llama4.rs`), which training,
-/// LoRA and `serve` run. It rotated every forward from position 0 and kept
-/// no cache, so a cached decode attended to nothing but the new token.
-#[test]
-#[serial]
-fn dynamic_llama4_matches_transformers() {
+/// LoRA and `serve` run: an uncached forward, the same with explicit
+/// positions, and a cached decode.
+fn check_dynamic(variant: &str) {
     use pmetal_models::DynamicModel;
 
-    let fx = checkpoint();
+    let fx = checkpoint(variant);
     let mut model = DynamicModel::load(fx.path()).expect("checkpoint loads");
     let ids = fx.tensor("input_ids");
     let t = ids.dim(1);
@@ -126,7 +127,7 @@ fn dynamic_llama4_matches_transformers() {
     let logits = model.forward(&ids, None).expect("forward");
     drain_bridge("dynamic forward");
     assert_all_pass(
-        "dynamic forward",
+        &format!("{variant}: dynamic forward"),
         &[ParityReport::compute_with_per_position(
             "logits", &logits, &want, TOL,
         )],
@@ -155,18 +156,19 @@ fn dynamic_llama4_matches_transformers() {
         );
         drain_bridge("dynamic decode step");
     }
-    assert_all_pass("dynamic cached decode", &step_reports(&steps, &want));
+    assert_all_pass(
+        &format!("{variant}: dynamic cached decode"),
+        &step_reports(&steps, &want),
+    );
 }
 
-/// The native engine (`pmetal_bridge::llama4_native`): its compiled
-/// single-token graph rotates by the bands' period table, and must give what
-/// the per-op path gives and what transformers gives.
-#[test]
-#[serial]
-fn native_llama4_matches_transformers() {
+/// The native engine (`pmetal_bridge::llama4_native`): a prefill, then a
+/// cached decode through its compiled single-token graph and through the
+/// per-op path, which must agree with each other and with transformers.
+fn check_native(variant: &str) {
     use pmetal_bridge::llama4_native::{NativeCache, forward_step, load_config, load_model};
 
-    let fx = checkpoint();
+    let fx = checkpoint(variant);
     let config = load_config(fx.path()).expect("native config parses");
     let weights = load_model(fx.path(), &config).expect("native weights load");
     drain_bridge("native load");
@@ -178,7 +180,7 @@ fn native_llama4_matches_transformers() {
     let logits = forward_step(&weights, &ids, &mut cache);
     drain_bridge("native prefill");
     assert_all_pass(
-        "native prefill",
+        &format!("{variant}: native prefill"),
         &[ParityReport::compute_with_per_position(
             "logits", &logits, &want, TOL,
         )],
@@ -201,15 +203,50 @@ fn native_llama4_matches_transformers() {
     };
     let compiled = decode(true);
     let per_op = decode(false);
-    assert_all_pass("native cached decode", &step_reports(&compiled, &want));
+    assert_all_pass(
+        &format!("{variant}: native cached decode"),
+        &step_reports(&compiled, &want),
+    );
     let graph_vs_ops = compiled
         .iter()
         .zip(&per_op)
         .map(|(a, b)| max_abs_diff(a, b))
         .fold(0f32, f32::max);
-    println!("compiled decode vs per-op decode: max |diff| {graph_vs_ops:e}");
+    println!("{variant}: compiled decode vs per-op decode: max |diff| {graph_vs_ops:e}");
     assert!(
         graph_vs_ops <= 1e-5,
-        "the compiled decode graph drifted from the per-op path by {graph_vs_ops:e}"
+        "{variant}: the compiled decode graph drifted from the per-op path by {graph_vs_ops:e}"
     );
+}
+
+/// Dense layers only: rotation, QK-norm and temperature at the cache's
+/// offset. The `DynamicModel` path rotated every forward from position 0
+/// and kept no cache, so a cached decode attended to nothing but the new
+/// token.
+#[test]
+#[serial]
+fn dynamic_llama4_matches_transformers() {
+    check_dynamic("text");
+}
+
+#[test]
+#[serial]
+fn native_llama4_matches_transformers() {
+    check_native("text");
+}
+
+/// Layers 1 and 3 are MoE with the checkpoint's fused experts
+/// (`experts.gate_up_proj [E, H, 2I]`, `experts.down_proj [E, I, H]`, applied
+/// `x @ W`), expert width 48 against hidden 32 so a transposed tensor cannot
+/// pass, and a top-1 router whose sigmoid gate scales the expert's input.
+#[test]
+#[serial]
+fn dynamic_llama4_moe_matches_transformers() {
+    check_dynamic("moe");
+}
+
+#[test]
+#[serial]
+fn native_llama4_moe_matches_transformers() {
+    check_native("moe");
 }

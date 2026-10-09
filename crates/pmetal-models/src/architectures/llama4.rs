@@ -869,6 +869,81 @@ impl Llama4ForCausalLM {
 }
 
 // =============================================================================
+// Checkpoint layout
+// =============================================================================
+
+/// A Llama 4 checkpoint's tensors under this module's parameter names.
+///
+/// transformers (and every release) names the text model
+/// `language_model.model.*` / `model.language_model.*` in the multimodal
+/// checkpoints and calls each layer's feed-forward `feed_forward`, with the
+/// routed experts fused (`Llama4TextExperts`):
+///
+/// * `experts.gate_up_proj` `[E, hidden, 2 * expert_hidden]`, applied as
+///   `x @ W`, gate then up (`gate_up.chunk(2, dim=-1)`),
+/// * `experts.down_proj` `[E, expert_hidden, hidden]`, applied as `x @ W`.
+///
+/// Here a dense layer's MLP is `mlp`, a MoE layer is `moe` with a
+/// `router.gate` and per-expert `Linear`s (`[out, in]`), so the fused tensors
+/// are split per expert and transposed. Vision-tower tensors are dropped.
+pub fn sanitize_checkpoint(
+    weights: std::collections::HashMap<String, Array>,
+) -> Result<std::collections::HashMap<String, Array>, Exception> {
+    let mut out = std::collections::HashMap::with_capacity(weights.len());
+    for (key, value) in weights {
+        if key.contains("vision_model") || key.contains("multi_modal_projector") {
+            continue;
+        }
+        let key = if let Some(rest) = key.strip_prefix("language_model.") {
+            rest.to_string()
+        } else if let Some(rest) = key.strip_prefix("model.language_model.") {
+            format!("model.{rest}")
+        } else {
+            key
+        };
+        let Some((layer, rest)) = key.split_once(".feed_forward.") else {
+            out.insert(key, value);
+            continue;
+        };
+        match rest {
+            "experts.gate_up_proj" => {
+                let (experts, inter) = (value.dim(0), value.dim(2) / 2);
+                for e in 0..experts {
+                    let w = ops::slice_axis(&value, 0, e, e + 1).squeeze(0);
+                    for (name, start) in [("gate_proj", 0), ("up_proj", inter)] {
+                        out.insert(
+                            format!("{layer}.moe.experts.{e}.{name}.weight"),
+                            ops::slice_axis(&w, 1, start, start + inter).t(),
+                        );
+                    }
+                }
+            }
+            "experts.down_proj" => {
+                for e in 0..value.dim(0) {
+                    out.insert(
+                        format!("{layer}.moe.experts.{e}.down_proj.weight"),
+                        ops::slice_axis(&value, 0, e, e + 1).squeeze(0).t(),
+                    );
+                }
+            }
+            "router.weight" => {
+                out.insert(format!("{layer}.moe.router.gate.weight"), value);
+            }
+            _ => {
+                let target = match rest.strip_prefix("shared_expert.") {
+                    Some(shared) => format!("{layer}.moe.shared_expert.{shared}"),
+                    None => format!("{layer}.mlp.{rest}"),
+                };
+                out.insert(target, value);
+            }
+        }
+    }
+    pmetal_bridge::check_last_error()
+        .map_err(|e| Exception::custom(format!("llama4: splitting the experts failed: {e}")))?;
+    Ok(out)
+}
+
+// =============================================================================
 // Preset Configurations
 // =============================================================================
 

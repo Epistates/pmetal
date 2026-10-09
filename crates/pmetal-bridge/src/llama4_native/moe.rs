@@ -2,6 +2,7 @@
 //! with shared expert.
 
 use crate::InlineArray;
+use crate::native_weight::LayerWeight;
 
 use super::weights::{LayerWeights, MoeWeights};
 
@@ -49,25 +50,30 @@ pub(super) fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> 
 
     // Gather scores for the top-1 expert, apply sigmoid in f32 for numerical stability.
     let scores_raw = logits.take_along_axis(&indices, -1); // [B, T, 1]
-    let scores_sig = scores_raw.as_dtype(0).sigmoid().as_dtype(dtype); // [B, T, 1]
+    // (Dtype id 0 is bool, which turned every logit into 1 and every gate
+    // into sigmoid(1).)
+    let scores_sig = scores_raw
+        .as_dtype(crate::dtype::F32)
+        .sigmoid()
+        .as_dtype(dtype); // [B, T, 1]
 
     // Scale the routed input.
     let x_scaled = x.multiply(&scores_sig); // [B, T, hidden]
 
-    // Reshape for gather_mm: [bt, 1, hidden]. rhs_indices: [bt, 1] as uint32.
-    let x_g = x_scaled.reshape(&[bt, 1, hidden_size]);
-    let rhs_idx = indices_flat.as_dtype(5); // dtype 5 = uint32 in MLX
-
-    // Gate and up projections via gather_mm → [bt, 1, expert_h]
-    let gate_out = x_g.gather_mm(&moe.experts_gate_w, None, Some(&rhs_idx), false);
-    let up_out = x_g.gather_mm(&moe.experts_up_w, None, Some(&rhs_idx), false);
-
-    // SwiGLU activation
-    let activated = InlineArray::fused_swiglu(&gate_out, &up_out);
-
-    // Down projection → [bt, 1, hidden]
-    let down_out = activated.gather_mm(&moe.experts_down_w, None, Some(&rhs_idx), false);
-    let routed_out = down_out.reshape(&[b, s, hidden_size]);
+    // The shared routed-expert dispatch, with the gate already applied to
+    // the input (so the output weights are 1).
+    let x_flat = x_scaled.reshape(&[bt, hidden_size]);
+    let ones = InlineArray::ones(&[bt, 1], dtype);
+    let routed_out = crate::native_moe::switch_glu(
+        &x_flat,
+        &LayerWeight::Dense(moe.experts_gate_w.clone()),
+        &LayerWeight::Dense(moe.experts_up_w.clone()),
+        &LayerWeight::Dense(moe.experts_down_w.clone()),
+        &indices_flat,
+        &ones,
+        InlineArray::fused_swiglu,
+    )
+    .reshape(&[b, s, hidden_size]);
 
     // Shared expert: standard dense SwiGLU MLP
     let sh_gate = x.matmul(&moe.shared_gate_w);

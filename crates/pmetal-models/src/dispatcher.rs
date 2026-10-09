@@ -936,24 +936,10 @@ impl DynamicModel {
                 let mut model = Llama4ForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let weights = crate::architectures::llama4::sanitize_checkpoint(weights)?;
                 let mut params = model.flatten_params_mut();
                 for (key, value) in weights {
-                    let remapped = key
-                        .strip_prefix("model.language_model.")
-                        .map(|rest| format!("model.{rest}"))
-                        .unwrap_or(key);
-                    // A dense layer's MLP is `feed_forward` in the checkpoint
-                    // (transformers' `Llama4TextMLP`) and `mlp` here.
-                    let remapped = ["gate_proj", "up_proj", "down_proj"]
-                        .iter()
-                        .find_map(|proj| {
-                            let from = format!(".feed_forward.{proj}.");
-                            remapped
-                                .contains(&from)
-                                .then(|| remapped.replace(&from, &format!(".mlp.{proj}.")))
-                        })
-                        .unwrap_or(remapped);
-                    if let Some(param) = params.get_mut(&remapped) {
+                    if let Some(param) = params.get_mut(key.as_str()) {
                         **param = value;
                     }
                 }
