@@ -63,17 +63,6 @@ fn default_true() -> bool {
     true
 }
 
-/// Nested rope_scaling config — only a handful of fields matter for iRoPE.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct RopeScalingConfig {
-    #[serde(rename = "type", default)]
-    pub scaling_type: Option<String>,
-    #[serde(default)]
-    pub factor: Option<f64>,
-    #[serde(default)]
-    pub rope_type: Option<String>,
-}
-
 /// Text-level config (lives under `text_config` in the outer JSON, or at the
 /// top level for text-only models).
 #[derive(Debug, Clone, Deserialize)]
@@ -102,8 +91,10 @@ pub struct Llama4TextConfig {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
 
+    /// Llama 4 Scout ships `rope_type: "llama3"` (factor 16), read by
+    /// [`crate::rope`].
     #[serde(default)]
-    pub rope_scaling: Option<RopeScalingConfig>,
+    pub rope_scaling: Option<serde_json::Value>,
 
     /// Chunk size for local (chunked) attention — matches Python's `attention_chunk_size`.
     pub attention_chunk_size: i32,
@@ -180,6 +171,26 @@ impl Llama4Config {
         t.head_dim.unwrap_or(t.hidden_size / t.num_attention_heads)
     }
 
+    /// The interleaved rotary embedding of the RoPE layers, with the Llama 3
+    /// frequency bands `rope_scaling` gives (Scout: factor 16); an unknown
+    /// `rope_type` is an error naming it.
+    pub fn rotary(&self) -> Result<crate::rope::RotaryEmbedding, String> {
+        let t = self.text();
+        crate::rope::RotaryEmbedding::from_config(
+            self.head_dim(),
+            crate::rope::RopeConfig {
+                rope_scaling: t.rope_scaling.as_ref(),
+                rope_theta: Some(t.rope_theta),
+                max_position_embeddings: Some(t.max_position_embeddings as f64),
+                ..crate::rope::RopeConfig::default()
+            },
+            t.rope_theta,
+            1.0,
+            true,
+        )
+        .map_err(|e| format!("llama4 config: {e}"))
+    }
+
     /// Number of KV heads.
     pub fn num_kv_heads(&self) -> i32 {
         let t = self.text();
@@ -218,5 +229,47 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Llama4Config, String> 
         let cfg: Llama4Config = serde_json::from_str(&config_str)
             .map_err(|e| format!("failed to parse Llama4Config (flat): {e}"))?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Llama4Config;
+
+    /// Llama 4 Scout ships `rope_type: "llama3"` (factor 16, low and high
+    /// band factors both 1). The native engine ran it as plain RoPE; it now
+    /// rotates with transformers' bands (the shared fixture's
+    /// `llama4_scout` case), interleaved, and so leaves the scalar-base
+    /// compiled decode graph.
+    #[test]
+    fn scout_rotates_with_the_llama3_bands() {
+        let config: Llama4Config = serde_json::from_value(serde_json::json!({
+            "model_type": "llama4_text", "hidden_size": 256, "num_hidden_layers": 4,
+            "num_attention_heads": 2, "head_dim": 128, "intermediate_size_mlp": 64,
+            "intermediate_size": 64, "vocab_size": 32, "attention_chunk_size": 8192,
+            "num_local_experts": 2, "num_experts_per_tok": 1,
+            "max_position_embeddings": 10485760, "rope_theta": 500000.0,
+            "rope_scaling": {"factor": 16.0, "high_freq_factor": 1.0, "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192, "rope_type": "llama3"}
+        }))
+        .unwrap();
+        let rotary = config.rotary().unwrap();
+        assert!(rotary.traditional());
+        assert!(rotary.scalar().is_none());
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/rope_scaling_reference.json"
+        ))
+        .unwrap();
+        let case = reference["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "llama4_scout")
+            .unwrap();
+        let got = rotary.inverse_frequencies(0);
+        for (g, w) in got.iter().zip(case["inv_freq"].as_array().unwrap()) {
+            let w = w.as_f64().unwrap();
+            assert!(((*g as f64) - w).abs() <= 2e-6 * w, "{g} vs {w}");
+        }
     }
 }

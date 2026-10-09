@@ -197,6 +197,22 @@ YaRN applies the same scaling to every input, which the cards note can hurt
 short texts, so enable it only for long ones, and size `factor` to the
 context you need (2.0 for 524,288 tokens).
 
+Dense Qwen3 works the same way from 32,768 tokens: its card adds
+
+```json
+"rope_scaling": {
+  "rope_type": "yarn",
+  "factor": 4.0,
+  "original_max_position_embeddings": 32768
+}
+```
+
+to `config.json`. Every architecture reads `rope_scaling` and
+`rope_parameters` with the same code, which implements each `rope_type`
+transformers defines (`linear`, `dynamic`, `yarn`, `longrope`, `llama3`,
+`proportional`). A type an architecture cannot run is refused by name when
+the model loads.
+
 ## Thinking Controls
 
 Chat templates take keyword arguments the way Hugging Face transformers'

@@ -17,7 +17,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 
-use pmetal_mlx::kernels::rope::apply_rope as rope_apply;
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
@@ -101,6 +101,14 @@ pub struct Llama4TextConfig {
     /// Default 2 = every other layer is a MoD layer.
     #[serde(default = "default_mod_layer_interval")]
     pub mod_layer_interval: i32,
+
+    /// RoPE scaling (Scout: `rope_type: "llama3"`, factor 16), read by
+    /// [`pmetal_bridge::rope`].
+    #[serde(default)]
+    pub rope_scaling: Option<serde_json::Value>,
+    /// transformers v5's spelling of the same, with `rope_theta` inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_parameters: Option<serde_json::Value>,
 }
 
 fn default_intermediate_size_mlp() -> i32 {
@@ -178,6 +186,8 @@ impl Default for Llama4TextConfig {
             mod_capacity: 0.5,
             mod_layers: None,
             mod_layer_interval: 2,
+            rope_scaling: None,
+            rope_parameters: None,
         }
     }
 }
@@ -545,8 +555,8 @@ pub struct Llama4Attention {
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
-    pub rope_theta: f32,
-    pub rope_scale: f32,
+    /// Interleaved RoPE (Llama 3 bands on Scout); unused on NoPE layers.
+    pub rotary: RotaryEmbedding,
     pub attn_temperature_tuning: bool,
     pub floor_scale: f32,
     pub attn_scale: f32,
@@ -604,8 +614,19 @@ impl Llama4Attention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            rope_theta: config.rope_theta,
-            rope_scale: 1.0,
+            rotary: crate::common::rotary_embedding(
+                "llama4",
+                head_dim,
+                RopeConfig {
+                    rope_scaling: config.rope_scaling.as_ref(),
+                    rope_parameters: config.rope_parameters.as_ref(),
+                    rope_theta: Some(config.rope_theta as f64),
+                    max_position_embeddings: Some(config.max_position_embeddings as f64),
+                    ..RopeConfig::default()
+                },
+                1.0,
+                true,
+            )?,
             attn_temperature_tuning: config.attn_temperature_tuning,
             floor_scale: config.floor_scale as f32,
             attn_scale: config.attn_scale,
@@ -740,14 +761,8 @@ impl Llama4Attention {
     fn apply_rope(&self, x: &Array, _position_ids: &Array) -> Result<Array, Exception> {
         // [B, T, H, D] -> [B, H, T, D]
         let x_t = x.transpose_axes(&[0, 2, 1, 3]);
-        let result = rope_apply(
-            &x_t,
-            self.head_dim,
-            true, // Llama 4 uses traditional (interleaved) RoPE
-            self.rope_theta,
-            self.rope_scale,
-            0,
-        )?;
+        // Interleaved pairs, Llama 3 bands when configured.
+        let result = self.rotary.apply(&x_t, 0);
         // [B, H, T, D] -> [B, T, H, D]
         Ok(result.transpose_axes(&[0, 2, 1, 3]))
     }

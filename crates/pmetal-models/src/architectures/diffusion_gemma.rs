@@ -256,11 +256,13 @@ impl DiffusionGemmaTextConfig {
                 partial_rotary_factor: 0.25,
                 rope_theta: Some(1_000_000.0),
                 rope_type: Some("proportional".to_string()),
+                factor: None,
             },
             sliding_attention: Gemma4RopeLayerConfig {
                 partial_rotary_factor: 1.0,
                 rope_theta: Some(10_000.0),
                 rope_type: Some("default".to_string()),
+                factor: None,
             },
         })
     }

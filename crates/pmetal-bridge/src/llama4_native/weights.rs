@@ -61,8 +61,8 @@ pub(super) struct LayerWeights {
     pub(super) n_kv_heads: i32,
     pub(super) head_dim: i32,
     pub(super) attn_scale: f32,
-    pub(super) rope_base: f32,
-    pub(super) rope_scale: f32,
+    /// Interleaved RoPE of the RoPE layers, Llama 3 bands included.
+    pub(super) rotary: crate::rope::RotaryEmbedding,
 
     // Temperature tuning for NoPE layers
     pub(super) attn_temperature_tuning: i32,
@@ -229,14 +229,10 @@ pub fn load_model(
     let n_kv_heads = config.num_kv_heads();
     let head_dim = config.head_dim();
     let attn_scale = (head_dim as f32).powi(-1).sqrt(); // 1/sqrt(head_dim)
-    // rope_theta from config — Llama 4 uses 500_000 by default.
-    let rope_base = tc.rope_theta as f32;
-    // rope_scale: for Llama 4 iRoPE with rope_scaling.type=="llama3", factor is the
-    // high-frequency scale. For simplicity in the native path we use scale=1.0
-    // (standard RoPE, no long-context extension) because chunked attention limits
-    // effective context to attention_chunk_size tokens per chunk anyway.
-    // Users needing long-context should use the mlx-rs full path.
-    let rope_scale = 1.0_f32;
+    // The RoPE layers' rotation: rope_theta (500_000) with the Llama 3 bands
+    // Scout's `rope_scaling` gives. The bands divide the low frequencies at
+    // every position, not only past the chunk, so they are not optional.
+    let rotary = config.rotary()?;
 
     let mut layers = Vec::with_capacity(tc.num_hidden_layers as usize);
 
@@ -323,8 +319,7 @@ pub fn load_model(
             n_kv_heads,
             head_dim,
             attn_scale,
-            rope_base,
-            rope_scale,
+            rotary: rotary.clone(),
             attn_temperature_tuning: tc.attn_temperature_tuning,
             floor_scale: tc.floor_scale,
             layer_attn_scale: tc.attn_scale,

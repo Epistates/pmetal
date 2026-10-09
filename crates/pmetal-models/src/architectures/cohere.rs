@@ -14,9 +14,10 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 
+use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, rope},
+    rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
 
@@ -56,6 +57,33 @@ pub struct CohereConfig {
     /// Pattern: every 4th layer uses global attention.
     #[serde(default)]
     pub global_attention_layers: Option<Vec<i32>>,
+    /// RoPE scaling, read by [`pmetal_bridge::rope`]; the Command-R
+    /// releases ship none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_scaling: Option<serde_json::Value>,
+    /// transformers v5's spelling of the same, with `rope_theta` inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_parameters: Option<serde_json::Value>,
+}
+
+impl CohereConfig {
+    /// The interleaved rotary embedding, scaling included; an unknown
+    /// `rope_type` is an error naming it.
+    pub fn rotary(&self) -> Result<RotaryEmbedding, Exception> {
+        crate::common::rotary_embedding(
+            "cohere",
+            self.head_dim,
+            RopeConfig {
+                rope_scaling: self.rope_scaling.as_ref(),
+                rope_parameters: self.rope_parameters.as_ref(),
+                rope_theta: Some(self.rope_theta as f64),
+                max_position_embeddings: Some(self.max_position_embeddings as f64),
+                ..RopeConfig::default()
+            },
+            1.0,
+            true,
+        )
+    }
 }
 
 fn default_sliding_window() -> i32 {
@@ -85,6 +113,8 @@ impl Default for CohereConfig {
             use_sliding_window: true,
             sliding_window: 4096,
             global_attention_layers: None,
+            rope_scaling: None,
+            rope_parameters: None,
         }
     }
 }
@@ -218,7 +248,8 @@ pub struct CohereAttention {
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
-    pub rope_theta: f32,
+    /// Interleaved RoPE, scaling included.
+    pub rotary: RotaryEmbedding,
     pub use_sliding_window: bool,
     pub sliding_window: i32,
 
@@ -259,7 +290,7 @@ impl CohereAttention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
-            rope_theta: config.rope_theta,
+            rotary: config.rotary()?,
             use_sliding_window,
             sliding_window: config.sliding_window,
             q_proj,
@@ -324,22 +355,8 @@ impl CohereAttention {
                 .as_ref()
                 .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
-        let q = rope(
-            &q,
-            rope_positions,
-            self.head_dim,
-            true,
-            self.rope_theta,
-            1.0,
-        )?;
-        let k = rope(
-            &k,
-            rope_positions,
-            self.head_dim,
-            true,
-            self.rope_theta,
-            1.0,
-        )?;
+        let q = rope_embedding(&q, rope_positions, &self.rotary);
+        let k = rope_embedding(&k, rope_positions, &self.rotary);
 
         let (k, v) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &k, &v)?
@@ -560,6 +577,15 @@ pub struct CohereForCausalLM {
 impl_module_params!(CohereForCausalLM; model, lm_head);
 
 impl CohereForCausalLM {
+    /// Whether RoPE is a scalar base and position scale, which the fused
+    /// batched decode path carries.
+    pub fn has_scalar_rope(&self) -> bool {
+        self.model
+            .layers
+            .first()
+            .is_some_and(|layer| layer.self_attn.rotary.scalar().is_some())
+    }
+
     pub fn new(config: CohereConfig) -> Result<Self, Exception> {
         let lm_head = if config.tie_word_embeddings {
             None
@@ -655,14 +681,12 @@ impl CohereForCausalLM {
         use crate::common::{BatchedGqaAttnCfg, batched_parallel_block};
 
         let cfg = &self.config;
-        let attn_cfg = BatchedGqaAttnCfg::new(
+        let attn_cfg = BatchedGqaAttnCfg::for_rotary(
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
             cfg.head_dim,
-            cfg.rope_theta,
-            1.0,
-        )
-        .with_rope_traditional(true);
+            &self.model.layers[0].self_attn.rotary,
+        )?;
 
         let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {

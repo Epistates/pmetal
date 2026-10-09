@@ -86,7 +86,19 @@ pub(super) fn attn_forward(
     // Each flag combo gets its own compile trace. Quantized/turboquant
     // caches and prefill (S>1) stay on the per-op paths below.
     let dtype_for_dummy = normed.dtype_raw();
-    if s == 1 && chunk_mask.is_none() && cache.turboquant.is_none() && cache.quant_config.is_none()
+    // The compiled graph rotates by a scalar `(base, scale)`; a RoPE layer
+    // whose rotation needs a period table (Scout's Llama 3 bands) takes the
+    // per-op path. NoPE layers never rotate, so any rotation will do there.
+    let scalar_rope = match lw.rotary.scalar() {
+        Some(pair) => Some(pair),
+        None if !lw.use_rope => Some((lw.rotary.rotary().theta as f32, 1.0)),
+        None => None,
+    };
+    if s == 1
+        && chunk_mask.is_none()
+        && cache.turboquant.is_none()
+        && cache.quant_config.is_none()
+        && let Some((rope_base, rope_scale)) = scalar_rope
     {
         // Biases are all-or-none in real Llama 4 configs (audited at load
         // time). Disallow the mixed case to keep the compiled graph simple
@@ -143,8 +155,8 @@ pub(super) fn attn_forward(
                     n_kv_heads,
                     head_dim,
                     scale,
-                    lw.rope_base,
-                    lw.rope_scale,
+                    rope_base,
+                    rope_scale,
                     lw.use_rope,
                     lw.attn_qk_norm,
                     has_biases,
@@ -188,10 +200,10 @@ pub(super) fn attn_forward(
 
     // iRoPE: only RoPE layers apply positional encoding
     let (queries, keys) = if lw.use_rope {
-        // Traditional RoPE (rope_theta = 500_000, traditional=true for Llama 4).
-        // Python: initialize_rope(head_dim, rope_theta, traditional=True, ...)
-        let q = queries.rope(head_dim, true, lw.rope_base, lw.rope_scale, rope_offset);
-        let k = keys.rope(head_dim, true, lw.rope_base, lw.rope_scale, rope_offset);
+        // Traditional (interleaved) RoPE at rope_theta (500_000), with the
+        // Llama 3 bands when `rope_scaling` sets them.
+        let q = lw.rotary.apply(&queries, rope_offset);
+        let k = lw.rotary.apply(&keys, rope_offset);
         (q, k)
     } else {
         (queries, keys)

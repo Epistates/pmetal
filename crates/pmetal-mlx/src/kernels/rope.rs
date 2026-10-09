@@ -74,27 +74,6 @@ pub fn rope_embedding(x: &Array, positions: RopePositions<'_>, rope: &RotaryEmbe
     }
 }
 
-/// [`rope`] with an explicit `[dims / 2]` inverse-frequency table.
-///
-/// Needed wherever no single `base` describes the rotation: Phi-3 LongRoPE
-/// scales each band by its own `long_factor`, and YaRN blends per-band ramps.
-pub fn rope_with_inv_freq(
-    x: &Array,
-    positions: RopePositions<'_>,
-    inv_freq: &Array,
-    dims: i32,
-    traditional: bool,
-) -> Result<Array, Exception> {
-    match positions {
-        RopePositions::Offset(offset) => {
-            apply_rope_with_freqs(x, inv_freq, dims, traditional, offset)
-        }
-        RopePositions::Explicit(ids) => {
-            rope_with_positions_and_inv_freq(x, ids, inv_freq, dims, traditional, 1.0)
-        }
-    }
-}
-
 /// [`rope`] with an explicit `[dims / 2]` *period* table, the form
 /// `mx.fast.rope` takes through its `freqs=` argument.
 ///
@@ -241,52 +220,6 @@ fn rope_with_positions_and_inv_freq(
     // Reshape for broadcasting with x: [1, 1, seq_len, half_dims]
     let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims]);
     let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims]);
-
-    Ok(rotate_with_cos_sin(
-        x,
-        &cos_theta,
-        &sin_theta,
-        dims,
-        traditional,
-    ))
-}
-
-/// Apply RoPE using explicit per-dimension inverse frequencies.
-///
-/// Unlike [`apply_rope`] (which derives `inv_freq[i] = base^(-2i/dims)` from a
-/// single scalar `base`), this takes a precomputed `inv_freq` table of length
-/// `dims/2`. This is required for Phi-3 LongRoPE / SuRoPE, where each
-/// frequency is independently scaled by a per-dimension `long_factor`:
-/// `inv_freq[i] = 1 / (long_factor[i] * base^(2i/dims))`.
-///
-/// Positions are the contiguous range `[offset, offset + seq_len)`. Any
-/// magnitude (mscale) rescaling of the activations must be applied by the
-/// caller *before* this call — this function only rotates.
-///
-/// # Arguments
-/// * `x` - `[batch, heads, seq_len, head_dim]`
-/// * `inv_freq` - `[dims/2]` angular frequencies
-/// * `dims` - rotary dimension (may be < head_dim for partial RoPE)
-/// * `traditional` - interleaved (true) vs split-half (false)
-/// * `offset` - absolute position of the first token (KV-cache aware)
-pub fn apply_rope_with_freqs(
-    x: &Array,
-    inv_freq: &Array,
-    dims: i32,
-    traditional: bool,
-    offset: i32,
-) -> Result<Array, Exception> {
-    let seq_len = x.shape()[2];
-    let half_dims = dims / 2;
-
-    // positions: [offset, offset+1, ..., offset+seq_len-1] as float32
-    let positions = ops::arange_range(offset, offset + seq_len);
-    let angles = positions
-        .expand_dims(-1) // [seq_len, 1]
-        .multiply(&inv_freq.expand_dims(0)); // [1, half_dims] → [seq_len, half_dims]
-
-    let cos_theta = angles.cos().reshape(&[1, 1, -1, half_dims]);
-    let sin_theta = angles.sin().reshape(&[1, 1, -1, half_dims]);
 
     Ok(rotate_with_cos_sin(
         x,
@@ -520,26 +453,6 @@ mod tests {
             let diff = max_abs_diff(&contiguous, &explicit);
             assert!(diff < 1e-4, "traditional={traditional}: max |Δ| = {diff:e}");
         }
-    }
-
-    #[test]
-    fn contiguous_and_explicit_positions_agree_with_an_inv_freq_table() {
-        let (seq_len, dims) = (5, 16);
-        let x = ramp(&[1, 2, seq_len, dims]);
-        // A table no scalar base produces: every other band stretched.
-        let table: Vec<f32> = (0..dims / 2)
-            .map(|i| 1.0 / (10000.0f32.powf(2.0 * i as f32 / dims as f32) * (1.0 + i as f32)))
-            .collect();
-        let inv_freq = Array::from_slice(&table, &[dims / 2]);
-        let ids = contiguous_positions(2, seq_len);
-
-        let contiguous =
-            rope_with_inv_freq(&x, RopePositions::Offset(2), &inv_freq, dims, false).unwrap();
-        let explicit =
-            rope_with_inv_freq(&x, RopePositions::Explicit(&ids), &inv_freq, dims, false).unwrap();
-
-        let diff = max_abs_diff(&contiguous, &explicit);
-        assert!(diff < 1e-4, "max |Δ| = {diff:e}");
     }
 
     #[test]

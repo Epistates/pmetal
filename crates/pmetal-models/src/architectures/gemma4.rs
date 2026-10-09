@@ -310,46 +310,6 @@ pub(crate) fn apply_gemma4_partial_rope(
     Ok(ops::concatenate_axis(&[&new_left, &new_right], -1))
 }
 
-/// Build the `[head_dim / 2]` inverse-frequency array used by the fast
-/// `rope_with_freqs` path. Non-rotated slots are filled with `f32::INF`
-/// so `mx.fast.rope` skips them. Matches the reference `ProportionalRoPE`:
-///
-/// ```text
-///     freqs[i] = factor * base^(2i / head_dim)   for i in 0..rotated_dims/2
-///     freqs[i] = +inf                             for i in rotated_dims/2..head_dim/2
-/// ```
-///
-/// The full `head_dim / 2` length pads the array out to the shape
-/// `mx.fast.rope` expects when `dims = head_dim`. Infinity as an inverse
-/// frequency means `angle = pos * inf = inf`, which mlx's kernel special-
-/// cases to the identity rotation (cos=1, sin=0) — leaving those
-/// dimensions untouched.
-pub(crate) fn build_gemma4_partial_rope_freqs(
-    head_dim: i32,
-    rotated_dims: i32,
-    base: f32,
-) -> Option<Array> {
-    if rotated_dims == 0 || rotated_dims == head_dim {
-        return None;
-    }
-    if rotated_dims % 2 != 0 || head_dim % 2 != 0 {
-        return None;
-    }
-    let half = (head_dim / 2) as usize;
-    let rot_half = (rotated_dims / 2) as usize;
-    let mut freqs = Vec::with_capacity(half);
-    for i in 0..rot_half {
-        // Inverse frequency: base^(2i / head_dim). factor=1.0 here; the
-        // rope scaling is applied via the `scale` argument to mlx_rope.
-        let exponent = (2 * i) as f32 / head_dim as f32;
-        freqs.push(base.powf(exponent));
-    }
-    for _ in rot_half..half {
-        freqs.push(f32::INFINITY);
-    }
-    Some(Array::from_f32_slice(&freqs, &[half as i32]))
-}
-
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
@@ -402,6 +362,9 @@ pub struct Gemma4RopeLayerConfig {
     pub rope_theta: Option<f32>,
     #[serde(default)]
     pub rope_type: Option<String>,
+    /// Proportional RoPE's frequency divisor; Gemma 4 releases set none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factor: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -514,24 +477,35 @@ impl Gemma4Config {
         self.attention_k_eq_v && self.is_full_attention(layer_idx)
     }
 
-    pub fn layer_rope(&self, layer_idx: usize) -> (f32, f32) {
+    /// Layer `layer_idx`'s rotation, resolved the way the native engine
+    /// resolves it ([`pmetal_bridge::gemma4_native::gemma4_layer_rope`]):
+    /// an unsupported `rope_type` is an error naming it.
+    pub fn layer_rope(
+        &self,
+        layer_idx: usize,
+    ) -> Result<pmetal_bridge::gemma4_native::Gemma4LayerRope, Exception> {
         let is_full = self.is_full_attention(layer_idx);
-        let defaults = if is_full {
+        let (default_base, default_frac) = if is_full {
             (default_rope_theta_global(), 0.25)
         } else {
             (default_rope_theta_sliding(), 1.0)
         };
-        if let Some(ref rp) = self.rope_parameters {
-            let cfg = if is_full {
+        let cfg = self.rope_parameters.as_ref().map(|rp| {
+            if is_full {
                 &rp.full_attention
             } else {
                 &rp.sliding_attention
-            };
-            let base = cfg.rope_theta.unwrap_or(defaults.0);
-            let frac = cfg.partial_rotary_factor;
-            return (base, frac);
-        }
-        defaults
+            }
+        });
+        pmetal_bridge::gemma4_native::gemma4_layer_rope(
+            self.layer_head_dim(layer_idx),
+            cfg.and_then(|c| c.rope_type.as_deref()),
+            cfg.and_then(|c| c.rope_theta).unwrap_or(default_base),
+            cfg.map_or(default_frac, |c| c.partial_rotary_factor),
+            cfg.and_then(|c| c.factor),
+            is_full,
+        )
+        .map_err(Exception::custom)
     }
 
     pub fn uses_per_layer_inputs(&self) -> bool {
@@ -1340,11 +1314,8 @@ impl Gemma4Attention {
         let n_kv_heads = config.layer_num_kv_heads(layer_idx);
         let use_k_eq_v = config.layer_uses_k_eq_v(layer_idx);
         let is_full = config.is_full_attention(layer_idx);
-        let (rope_base, rope_factor) = config.layer_rope(layer_idx);
-        let rope_partial_dims = {
-            let angles = ((rope_factor * head_dim as f32) / 2.0) as i32;
-            (2 * angles).max(0).min(head_dim)
-        };
+        let rope = config.layer_rope(layer_idx)?;
+        let (rope_base, rope_partial_dims) = (rope.base, rope.rotated_dims);
         let sliding_window = if is_full {
             None
         } else {
@@ -1372,8 +1343,9 @@ impl Gemma4Attention {
         let q_norm = Gemma4RmsNorm::new(head_dim, config.rms_norm_eps);
         let k_norm = Gemma4RmsNorm::new(head_dim, config.rms_norm_eps);
 
-        let rope_partial_freqs =
-            build_gemma4_partial_rope_freqs(head_dim, rope_partial_dims, rope_base);
+        let rope_partial_freqs = rope
+            .periods
+            .map(|p| Array::from_f32_slice(&p, &[p.len() as i32]));
         Ok(Self {
             q_proj,
             k_proj,

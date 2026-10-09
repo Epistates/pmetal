@@ -908,6 +908,8 @@ fn tiny_cohere_config() -> CohereConfig {
         use_sliding_window: false,
         sliding_window: 4096,
         global_attention_layers: None,
+        rope_scaling: None,
+        rope_parameters: None,
     }
 }
 

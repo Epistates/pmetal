@@ -1970,7 +1970,7 @@ impl DynamicModel {
             // Cohere: parallel decoder block via `batched_parallel_block`.
             // Sliding-window-with-non-global-layers configs need a per-layer
             // sliding overlay; defer those to a follow-up.
-            Self::Cohere(m) => !m.config.use_sliding_window,
+            Self::Cohere(m) => !m.config.use_sliding_window && m.has_scalar_rope(),
             // Granite: plain `granite` configs route through
             // `batched_prenorm_layer`. The MoE and hybrid families (experts,
             // shared MLP, Mamba state) stay on serial.

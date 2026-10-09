@@ -66,6 +66,9 @@ pub struct Gemma4RopeLayerConfig {
     pub rope_theta: Option<f32>,
     #[serde(default)]
     pub rope_type: Option<String>,
+    /// Proportional RoPE's frequency divisor; Gemma 4 releases set none.
+    #[serde(default)]
+    pub factor: Option<f32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -173,24 +176,30 @@ impl Gemma4Config {
         self.attention_k_eq_v && self.is_full_attention(layer_idx)
     }
 
-    pub fn layer_rope(&self, layer_idx: usize) -> (f32, f32) {
+    /// Layer `layer_idx`'s rotation; see [`gemma4_layer_rope`].
+    pub fn layer_rope(&self, layer_idx: usize) -> Result<Gemma4LayerRope, String> {
         let is_full = self.is_full_attention(layer_idx);
-        let defaults = if is_full {
+        let head_dim = self.layer_head_dim(layer_idx);
+        let (default_base, default_frac) = if is_full {
             (default_rope_theta_global(), 0.25)
         } else {
             (default_rope_theta_sliding(), 1.0)
         };
-        if let Some(ref rp) = self.rope_parameters {
-            let cfg = if is_full {
+        let cfg = self.rope_parameters.as_ref().map(|rp| {
+            if is_full {
                 &rp.full_attention
             } else {
                 &rp.sliding_attention
-            };
-            let base = cfg.rope_theta.unwrap_or(defaults.0);
-            let frac = cfg.partial_rotary_factor;
-            return (base, frac);
-        }
-        defaults
+            }
+        });
+        gemma4_layer_rope(
+            head_dim,
+            cfg.and_then(|c| c.rope_type.as_deref()),
+            cfg.and_then(|c| c.rope_theta).unwrap_or(default_base),
+            cfg.map_or(default_frac, |c| c.partial_rotary_factor),
+            cfg.and_then(|c| c.factor),
+            is_full,
+        )
     }
 
     pub fn embed_scale(&self) -> f32 {
@@ -523,24 +532,73 @@ pub fn build_cache(_weights: &NativeWeights, config: &Gemma4Config) -> NativeCac
 
 const CACHE_STEP_SIZE: i32 = 256;
 
-fn build_partial_rope_freqs(head_dim: i32, rotated_dims: i32, base: f32) -> Option<InlineArray> {
-    if rotated_dims == 0 || rotated_dims == head_dim {
-        return None;
+/// One Gemma 4 layer's rotation, as both engines run it: the channels it
+/// rotates, and for a partial (`proportional`) layer the `[head_dim / 2]`
+/// period table `fast::rope` takes, `+inf` past the rotated pairs.
+#[derive(Debug, Clone)]
+pub struct Gemma4LayerRope {
+    /// `rope_theta`.
+    pub base: f32,
+    /// `2 * int(partial_rotary_factor * head_dim / 2)`.
+    pub rotated_dims: i32,
+    /// The period table, when fewer than `head_dim` channels rotate.
+    pub periods: Option<Vec<f32>>,
+}
+
+/// Resolve one layer's `rope_parameters` entry (`full_attention` or
+/// `sliding_attention`) through [`crate::rope`].
+///
+/// Gemma 4 runs `default` (sliding layers) and `proportional` (global
+/// layers: the exponent over the whole head, the tail at frequency 0).
+/// Anything else, a `default` that is partial, or a proportional `factor`
+/// is refused by name rather than rotated some other way.
+pub fn gemma4_layer_rope(
+    head_dim: i32,
+    rope_type: Option<&str>,
+    theta: f32,
+    partial_rotary_factor: f32,
+    factor: Option<f32>,
+    is_full: bool,
+) -> Result<Gemma4LayerRope, String> {
+    let rope_type = rope_type.unwrap_or(if is_full { "proportional" } else { "default" });
+    let mut params = serde_json::json!({
+        "rope_type": rope_type,
+        "rope_theta": theta,
+        "partial_rotary_factor": partial_rotary_factor,
+    });
+    if let Some(factor) = factor {
+        params["factor"] = factor.into();
     }
-    if rotated_dims % 2 != 0 || head_dim % 2 != 0 {
-        return None;
+    let rotary = crate::rope::Rotary::from_config(
+        head_dim,
+        crate::rope::RopeConfig {
+            rope_parameters: Some(&params),
+            ..crate::rope::RopeConfig::default()
+        },
+        theta as f64,
+        1.0,
+    )
+    .map_err(|e| format!("Gemma 4 rope_parameters: {e}"))?;
+    let rotated_dims =
+        (2 * ((partial_rotary_factor * head_dim as f32) / 2.0) as i32).clamp(0, head_dim);
+    match rotary.scaling {
+        crate::rope::RopeScaling::Default if rotated_dims == head_dim => {}
+        crate::rope::RopeScaling::Proportional { factor: 1.0 } => {}
+        ref other => {
+            return Err(format!(
+                "Gemma 4 rope_parameters: rope_type {:?} with partial_rotary_factor \
+                 {partial_rotary_factor} and factor {factor:?} is not supported; Gemma 4 runs \
+                 \"default\" over the whole head and \"proportional\" without a factor",
+                other.rope_type()
+            ));
+        }
     }
-    let half = (head_dim / 2) as usize;
-    let rot_half = (rotated_dims / 2) as usize;
-    let mut freqs = Vec::with_capacity(half);
-    for i in 0..rot_half {
-        let exponent = (2 * i) as f32 / head_dim as f32;
-        freqs.push(base.powf(exponent));
-    }
-    for _ in rot_half..half {
-        freqs.push(f32::INFINITY);
-    }
-    Some(InlineArray::from_f32_slice(&freqs, &[half as i32]))
+    let periods = (rotated_dims < head_dim).then(|| rotary.periods(0));
+    Ok(Gemma4LayerRope {
+        base: theta,
+        rotated_dims,
+        periods,
+    })
 }
 
 fn apply_gemma4_partial_rope(
@@ -983,17 +1041,16 @@ pub fn load_model(
         let head_dim = config.layer_head_dim(idx);
         let n_kv_heads = config.layer_num_kv_heads(idx);
         let use_k_eq_v = config.layer_uses_k_eq_v(idx);
-        let (rope_base, rope_factor) = config.layer_rope(idx);
-        let rope_dims = {
-            let angles = ((rope_factor * head_dim as f32) / 2.0) as i32;
-            (2 * angles).max(0).min(head_dim)
-        };
+        let rope = config.layer_rope(idx)?;
+        let (rope_base, rope_dims) = (rope.base, rope.rotated_dims);
         let sliding_window = if is_full {
             None
         } else {
             Some(config.sliding_window)
         };
-        let rope_freqs = build_partial_rope_freqs(head_dim, rope_dims, rope_base);
+        let rope_freqs = rope
+            .periods
+            .map(|p| InlineArray::from_f32_slice(&p, &[p.len() as i32]));
         let shared_source = if idx >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0 {
             Some(config.kv_shared_source_layer(idx).ok_or_else(|| {
                 format!(
@@ -1632,6 +1689,46 @@ pub fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gemma 4's global layers rotate with transformers' proportional RoPE
+    /// (the shared fixture's `proportional` case: head 256, partial 0.25,
+    /// theta 1e6), its sliding layers with plain RoPE over the whole head;
+    /// any other rotation is refused by name rather than run as one of those.
+    #[test]
+    fn gemma4_layer_rope_is_proportional_or_refused() {
+        let global = gemma4_layer_rope(256, Some("proportional"), 1e6, 0.25, None, true).unwrap();
+        assert_eq!(global.rotated_dims, 64);
+        let periods = global.periods.expect("a partial layer has a table");
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/rope_scaling_reference.json"
+        ))
+        .unwrap();
+        let case = reference["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "proportional")
+            .unwrap();
+        for (p, w) in periods.iter().zip(case["inv_freq"].as_array().unwrap()) {
+            let w = w.as_f64().unwrap();
+            if w == 0.0 {
+                assert!(p.is_infinite());
+            } else {
+                assert!(((1.0 / *p as f64) - w).abs() <= 2e-6 * w, "{p} vs 1/{w}");
+            }
+        }
+        let sliding = gemma4_layer_rope(256, Some("default"), 1e4, 1.0, None, false).unwrap();
+        assert_eq!((sliding.rotated_dims, sliding.periods), (256, None));
+
+        for (rope_type, partial, factor, needle) in [
+            (Some("yarn"), 1.0, None, "yarn"),
+            (Some("default"), 0.25, None, "default"),
+            (Some("proportional"), 0.25, Some(8.0), "proportional"),
+        ] {
+            let err = gemma4_layer_rope(256, rope_type, 1e6, partial, factor, true).unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
 
     /// Gate is the first half of `gate_up_proj`, checked where GELU is far
     /// from linear so that swapping the halves changes the answer. The
