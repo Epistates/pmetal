@@ -847,19 +847,9 @@ impl Sampler {
             return Ok((token, empty_logprobs));
         }
 
-        // For sampling, ensure Float32 - only convert if not already f32
-        // This avoids clone for the common Float32 case
-        let owned_logits;
-        let logits_f32: &Array = if is_f32(logits) {
-            logits // Borrow, no clone needed
-        } else {
-            owned_logits = logits.cast(Dtype::Float32);
-            &owned_logits
-        };
-
-        // Convert logits to log probabilities:
+        // Convert logits to log probabilities, in f32:
         // logprobs = logits - logsumexp(logits, keepdims=True)
-        let log_probs = logits_to_log_probs(logits_f32)?;
+        let log_probs = logits_to_log_probs(logits)?;
 
         // Apply fused GPU-native filters (cached arrays, single reshape)
         let log_probs = self.apply_filters_fused(&log_probs)?;
@@ -1089,9 +1079,22 @@ fn greedy_sample_array(logits: &Array) -> Result<Array, Exception> {
     Ok(argmax_axis(logits, -1)) // axis=-1 like Python's mx.argmax(x, axis=-1)
 }
 
-/// Convert logits to log probabilities (log-softmax).
+/// Convert logits to log probabilities (log-softmax), in f32.
 /// logprobs = logits - logsumexp(logits, keepdims=True)
+///
+/// Computed in f32 whatever the model's dtype, as transformers' `generate`
+/// upcasts next-token logits before scoring them. In bf16 the result rounds
+/// to the logits' own precision, steps of 1/8 for logits between 16 and 32,
+/// so reported logprobs came out coarse and the sampling filters cut on
+/// rounded values.
 fn logits_to_log_probs(logits: &Array) -> Result<Array, Exception> {
+    let owned;
+    let logits = if is_f32(logits) {
+        logits
+    } else {
+        owned = logits.cast(Dtype::Float32);
+        &owned
+    };
     let lse = logsumexp_axis_keepdims(logits, -1, true);
     Ok(logits.subtract(&lse))
 }
@@ -1125,8 +1128,7 @@ pub fn token_logprobs(
         .shape()
         .last()
         .ok_or_else(|| Exception::custom("token_logprobs: empty logits shape"))?;
-    // Log-probs keep the logits' dtype (bf16 for most checkpoints).
-    let flat = log_probs.as_type::<f32>().reshape(&[vocab]);
+    let flat = log_probs.reshape(&[vocab]);
     flat.eval();
     let values: Vec<f32> = flat.as_slice().to_vec();
 
@@ -2868,6 +2870,16 @@ mod tests {
         // Descending logprobs.
         assert!(top[0].1 >= top[1].1);
         assert!(top[1].1 >= top[2].1);
+    }
+
+    #[test]
+    fn token_logprobs_are_computed_in_f32_from_bf16_logits() {
+        // Two logits one bf16 step apart: log-softmax is -ln(1 + e^0.125)
+        // = -0.75764, which bf16 arithmetic rounds to -0.75.
+        let logits = Array::from_slice(&[16.0f32, 16.125], &[2]).cast(Dtype::Bfloat16);
+        let (chosen, _) = token_logprobs(&logits, 0, 0).unwrap();
+        let expected = -(1.0f32 + 0.125f32.exp()).ln();
+        assert!((chosen - expected).abs() < 1e-5, "{chosen} vs {expected}");
     }
 
     #[test]
