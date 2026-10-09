@@ -127,13 +127,16 @@ urlencoding = "2"
 secrecy = "0.10"
 
 # Jinja template engine for executing upstream chat_template strings from
-# tokenizer_config.json. `minijinja-contrib` adds the `now`/`strftime_now`
-# helpers that Llama 3 chat templates use for dynamic date injection.
+# tokenizer_config.json. `minijinja-contrib` adds the `now()` and date
+# filters; `strftime_now`, which Llama 3 chat templates use for dynamic date
+# injection, is ours, on `jiff` (what minijinja-contrib's dates use too).
 # `preserve_order` keeps maps in insertion order and `loop_controls` enables
 # `{% break %}` / `{% continue %}`: Python dicts and the loopcontrols extension
-# that Hugging Face transformers renders chat templates with.
-minijinja = { version = "2", features = ["loader", "builtins", "macros", "preserve_order", "loop_controls"] }
-minijinja-contrib = { version = "2", features = ["datetime", "pycompat"] }
+# that Hugging Face transformers renders chat templates with. `serde` converts
+# the messages, tools and template kwargs into template values.
+minijinja = { version = "3", features = ["builtins", "macros", "preserve_order", "loop_controls", "serde"] }
+minijinja-contrib = { version = "3", features = ["datetime", "pycompat"] }
+jiff = "0.2.38"
 
 # Serialization (binary)
 bitcode = { version = "0.6", features = ["serde"] }
@@ -159,8 +162,8 @@ half = { version = "2", features = ["zerocopy"] }
 num-traits = "0.2"
 ndarray = { version = "0.17", features = ["rayon"] }
 rayon = "1"
-# Floors at or past RUSTSEC-2026-0097 (rand), RUSTSEC-2026-0186 (memmap2) and
-# RUSTSEC-2026-0009 (time), so a library consumer can't resolve below them.
+# Floors at or past RUSTSEC-2026-0097 (rand) and RUSTSEC-2026-0186 (memmap2),
+# so a library consumer can't resolve below them.
 rand = "0.10.3"
 rand_distr = "0.6"
 ordered-float = "5"
@@ -172,7 +175,6 @@ dirs = "7"
 walkdir = "2"
 memmap2 = "0.9.11"
 chrono = "0.4.45"
-time = "0.3.55"
 image = "0.25.10"
 flate2 = "1"
 libc = "0.2.190"

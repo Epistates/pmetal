@@ -17,9 +17,9 @@
 //! * **Python-compatible attribute access.** HF templates use `message.role`,
 //!   `message['role']`, and `messages[0]`. We enable the `pycompat` syntax
 //!   support from `minijinja-contrib` so dict / attr access just works.
-//! * **`strftime_now`** is installed from `minijinja-contrib::datetime` —
-//!   Llama 3.1/3.2 uses it to inject `Today Date: <today>` into its default
-//!   system block.
+//! * **`strftime_now`** is installed as a function formatting the current
+//!   UTC time with `jiff` — Llama 3.1/3.2 uses it to inject
+//!   `Today Date: <today>` into its default system block.
 //! * **`raise_exception`** is a no-op that returns an error message — HF
 //!   templates use it to assert invariants that we should surface as a
 //!   render failure rather than panic.
@@ -38,7 +38,7 @@
 //!   Python's `json.dumps` (`", "` / `": "` separators, no HTML escaping)
 //!   rather than minijinja's compact, HTML-safe one.
 
-use minijinja::value::{Kwargs, ValueKind};
+use minijinja::value::{Kwargs, Serde, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
 
@@ -151,8 +151,14 @@ pub fn render_chat_template(
     // before one are dropped. Templates that write every tag with `-` render
     // the same either way; Llama 3.2 Vision's does not, and without these its
     // prompt gained a newline after `<|begin_of_text|>`.
-    env.set_trim_blocks(true);
-    env.set_lstrip_blocks(true);
+    let syntax = env
+        .syntax()
+        .to_builder()
+        .trim_blocks(true)
+        .lstrip_blocks(true)
+        .build()
+        .map_err(|e| format!("syntax: {e}"))?;
+    env.set_syntax(syntax);
     // ...and with its own `tojson`, Python's `json.dumps`.
     env.add_filter("tojson", py_tojson);
     // `pycompat` lets templates use Python-style attribute access on dicts
@@ -160,7 +166,7 @@ pub fn render_chat_template(
     // HF templates rely on heavily.
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
 
-    // `strftime_now` / `now` — used by Llama 3.1/3.2 `Today Date: ...`.
+    // `now()` and the date filters.
     minijinja_contrib::add_to_environment(&mut env);
 
     // HF templates call `raise_exception(...)` to signal invalid input.
@@ -170,13 +176,10 @@ pub fn render_chat_template(
         Err(Error::new(ErrorKind::InvalidOperation, msg))
     });
 
-    // Some templates call `strftime_now(fmt)` without any date argument.
-    // minijinja-contrib exposes it as `now().strftime(fmt)`, so add the
-    // upstream-HF shim that matches `transformers`' default handler.
+    // `strftime_now(fmt)`, which transformers installs and Llama 3.1/3.2 use
+    // for `Today Date: ...`. minijinja-contrib has no such function.
     env.add_function("strftime_now", |fmt: String| -> Result<String, Error> {
-        let now =
-            chrono_now_strftime(&fmt).map_err(|e| Error::new(ErrorKind::InvalidOperation, e))?;
-        Ok(now)
+        now_strftime(&fmt).map_err(|e| Error::new(ErrorKind::InvalidOperation, e))
     });
 
     // Register the template under a stable name. minijinja requires the
@@ -208,14 +211,14 @@ pub fn render_chat_template(
     }
     for (key, value) in &options.template_kwargs {
         ctx.retain(|(existing, _)| existing != key);
-        ctx.push((key.clone(), Value::from_serialize(value)));
+        ctx.push((key.clone(), Value::from(Serde(value))));
     }
     let tools_value = match options.tools.as_ref() {
-        Some(t) => Value::from_serialize(t),
+        Some(t) => Value::from(Serde(t)),
         None => Value::from(()),
     };
     ctx.extend([
-        ("messages".into(), Value::from_serialize(messages)),
+        ("messages".into(), Value::from(Serde(messages))),
         ("tools".into(), tools_value),
         ("documents".into(), Value::from(())),
         (
@@ -224,7 +227,7 @@ pub fn render_chat_template(
         ),
     ]);
 
-    tmpl.render(Value::from_iter(ctx))
+    tmpl.render(Value::from_pairs(ctx))
         .map_err(|e| format!("render: {e}"))
 }
 
@@ -442,8 +445,9 @@ fn py_float_repr(f: f64) -> String {
     }
 }
 
-/// Format the current time via `chrono` in the caller's requested strftime
-/// pattern. Used as the fallback implementation of HF's `strftime_now`.
+/// Format the current time (UTC) with the caller's strftime pattern: HF's
+/// `strftime_now`. jiff implements the C directives itself, so a template's
+/// pattern is formatted as written rather than through a translation table.
 ///
 /// The `PMETAL_CHAT_TEMPLATE_FROZEN_DATE` env var overrides the "current"
 /// date with a fixed `YYYY-MM-DD` value (midnight UTC). This lets parity
@@ -451,67 +455,18 @@ fn py_float_repr(f: f64) -> String {
 /// fixtures stay reproducible — without this, `chat_template_audit` flips
 /// from green to red at UTC midnight because the rendered date no longer
 /// matches the dumped fixture. Any non-empty value that fails to parse is
-/// ignored silently (falls through to real `now_utc()`), so the override
-/// is strictly additive.
-fn chrono_now_strftime(fmt: &str) -> Result<String, String> {
-    // We avoid pulling in `chrono` by delegating to `time`, which is
-    // already in the dep tree via minijinja-contrib. Format follows the
-    // same `%d %b %Y`-style directives.
-    use time::OffsetDateTime;
-    use time::format_description;
-    use time::macros::format_description as fd_macro;
+/// ignored silently (falls through to the real time), so the override is
+/// strictly additive.
+fn now_strftime(fmt: &str) -> Result<String, String> {
+    use jiff::tz::TimeZone;
 
-    let fmt_owned = translate_strftime(fmt);
-    let desc = format_description::parse_borrowed::<2>(&fmt_owned)
-        .map_err(|e| format!("strftime_now: bad format {fmt:?}: {e}"))?;
-    let now = match std::env::var("PMETAL_CHAT_TEMPLATE_FROZEN_DATE") {
-        Ok(v) if !v.is_empty() => {
-            let iso = fd_macro!("[year]-[month]-[day]");
-            match time::Date::parse(&v, &iso) {
-                Ok(d) => d.midnight().assume_utc(),
-                Err(_) => OffsetDateTime::now_utc(),
-            }
-        }
-        _ => OffsetDateTime::now_utc(),
-    };
-    now.format(&desc)
-        .map_err(|e| format!("strftime_now: format error: {e}"))
-}
-
-/// Translate a subset of C-style `strftime` directives into the
-/// `time` crate's format description syntax. Only the directives actually
-/// used by Llama 3 / Mistral / upstream HF templates are supported —
-/// anything else passes through verbatim.
-fn translate_strftime(src: &str) -> String {
-    let mut out = String::with_capacity(src.len() + 16);
-    let mut chars = src.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('Y') => out.push_str("[year]"),
-            Some('y') => out.push_str("[year repr:last_two]"),
-            Some('m') => out.push_str("[month]"),
-            Some('B') => out.push_str("[month repr:long]"),
-            Some('b') | Some('h') => out.push_str("[month repr:short]"),
-            Some('d') => out.push_str("[day]"),
-            Some('e') => out.push_str("[day padding:space]"),
-            Some('H') => out.push_str("[hour]"),
-            Some('I') => out.push_str("[hour repr:12]"),
-            Some('M') => out.push_str("[minute]"),
-            Some('S') => out.push_str("[second]"),
-            Some('p') => out.push_str("[period]"),
-            Some('%') => out.push('%'),
-            Some(other) => {
-                out.push('%');
-                out.push(other);
-            }
-            None => out.push('%'),
-        }
-    }
-    out
+    let frozen = std::env::var("PMETAL_CHAT_TEMPLATE_FROZEN_DATE")
+        .ok()
+        .and_then(|v| v.parse::<jiff::civil::Date>().ok())
+        .and_then(|d| d.to_zoned(TimeZone::UTC).ok());
+    let now = frozen.unwrap_or_else(|| jiff::Timestamp::now().to_zoned(TimeZone::UTC));
+    jiff::fmt::strtime::format(fmt, &now)
+        .map_err(|e| format!("strftime_now: bad format {fmt:?}: {e}"))
 }
 
 #[cfg(test)]

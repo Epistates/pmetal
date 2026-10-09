@@ -25,9 +25,9 @@ tokenizers = { workspace = true }
 ahash = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
-# `time` is already pulled in transitively by minijinja-contrib; depending
-# on it directly lets us format "now" for the Llama 3 `strftime_now` shim.
-time = { workspace = true, features = ["formatting", "macros"] }
+# Already in the tree through minijinja-contrib's dates; formats "now" for the
+# Llama 3 `strftime_now` shim with real strftime directives.
+jiff = { workspace = true }
 memmap2 = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
