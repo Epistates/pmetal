@@ -41,7 +41,8 @@ use crate::error::{MetalError, Result};
 ///
 /// This function is designed for zero-copy bridging from MLX arrays to Metal:
 /// ```ignore
-/// let mlx_ptr = mlx_sys::mlx_array_data_float32(array.as_ptr());
+/// array.eval(); // data_ptr() needs a materialised array
+/// let mlx_ptr = array.data_ptr() as *mut f32;
 /// let view = unsafe { metal_buffer_from_ptr(&ctx, mlx_ptr, array.size())? };
 /// ```
 pub unsafe fn metal_buffer_from_ptr<'src, T: Copy + FromBytes + IntoBytes>(

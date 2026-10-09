@@ -44,9 +44,6 @@ pub struct MilProgram {
     var_counter: usize,
 }
 
-// MIL text generation uses explicit \n in write!() — each line is a complete
-// MIL statement and the trailing \n is part of the generated program text.
-#[allow(clippy::write_with_newline)]
 impl MilProgram {
     /// Create a new MIL program with header and fp16 function signature.
     ///
@@ -54,9 +51,9 @@ impl MilProgram {
     pub fn new(input_channels: usize, seq_len: usize) -> Self {
         let mut text = String::with_capacity(8192);
         text.push_str(MIL_HEADER);
-        write!(
+        writeln!(
             text,
-            "    func main<ios18>(tensor<fp16, [1, {}, 1, {}]> x) {{\n",
+            "    func main<ios18>(tensor<fp16, [1, {}, 1, {}]> x) {{",
             input_channels, seq_len
         )
         .unwrap();
@@ -73,9 +70,9 @@ impl MilProgram {
     pub fn new_fp32(input_channels: usize, spatial: usize) -> Self {
         let mut text = String::with_capacity(16384);
         text.push_str(MIL_HEADER);
-        write!(
+        writeln!(
             text,
-            "    func main<ios18>(tensor<fp32, [1, {}, 1, {}]> x) {{\n",
+            "    func main<ios18>(tensor<fp32, [1, {}, 1, {}]> x) {{",
             input_channels, spatial
         )
         .unwrap();
@@ -102,7 +99,7 @@ impl MilProgram {
             .iter()
             .map(|(name, shape)| format!("tensor<fp16, {}> {}", format_shape(shape), name))
             .collect();
-        write!(text, "    func main<ios18>({}) {{\n", params.join(", ")).unwrap();
+        writeln!(text, "    func main<ios18>({}) {{", params.join(", ")).unwrap();
         Self {
             text,
             var_counter: 0,
@@ -123,9 +120,9 @@ impl MilProgram {
     ) {
         let shape_str = format_shape(shape);
         let scale_shape = format_shape(&[shape[0], 1, 1, 1]);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {shape_str}> {name} = constexpr_blockwise_shift_scale(data=tensor<int8, {shape_str}>(BLOBFILE(path=string(\"{data_path}\"), offset=uint64(64))), scale=tensor<fp16, {scale_shape}>(BLOBFILE(path=string(\"{scale_path}\"), offset=uint64(64))))[name=string(\"{name}\")];\n"
+            "        tensor<fp16, {shape_str}> {name} = constexpr_blockwise_shift_scale(data=tensor<int8, {shape_str}>(BLOBFILE(path=string(\"{data_path}\"), offset=uint64(64))), scale=tensor<fp16, {scale_shape}>(BLOBFILE(path=string(\"{scale_path}\"), offset=uint64(64))))[name=string(\"{name}\")];"
         )
         .unwrap();
     }
@@ -133,9 +130,9 @@ impl MilProgram {
     /// Emit a unary op (`exp`, `abs`, `sqrt`, `silu`, ...).
     pub fn emit_unary(&mut self, op: &str, result_name: &str, shape: &[usize], x: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={x})[name=string(\"{result_name}\")];\n"
+            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={x})[name=string(\"{result_name}\")];"
         )
         .unwrap();
     }
@@ -143,9 +140,9 @@ impl MilProgram {
     /// Emit a binary elementwise op (`real_div`, `maximum`, ...).
     pub fn emit_binary(&mut self, op: &str, result_name: &str, shape: &[usize], x: &str, y: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={x},y={y})[name=string(\"{result_name}\")];\n"
+            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={x},y={y})[name=string(\"{result_name}\")];"
         )
         .unwrap();
     }
@@ -161,9 +158,9 @@ impl MilProgram {
         keep_dims_name: &str,
     ) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={input},axes={axes_name},keep_dims={keep_dims_name})[name=string(\"{result_name}\")];\n"
+            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={input},axes={axes_name},keep_dims={keep_dims_name})[name=string(\"{result_name}\")];"
         )
         .unwrap();
     }
@@ -179,9 +176,9 @@ impl MilProgram {
     /// at byte 64, which contains the actual data offset (128) in its own fields.
     pub fn emit_weight_const(&mut self, name: &str, shape: &[usize], blob_path: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = const()[name=string(\"{}\"), val=tensor<fp16, {}>(BLOBFILE(path=string(\"{}\"), offset=uint64(64)))];\n",
+            "        tensor<fp16, {}> {} = const()[name=string(\"{}\"), val=tensor<fp16, {}>(BLOBFILE(path=string(\"{}\"), offset=uint64(64)))];",
             shape_str, name, name, shape_str, blob_path
         )
         .unwrap();
@@ -189,9 +186,9 @@ impl MilProgram {
 
     /// Emit a const scalar value.
     pub fn emit_scalar_const(&mut self, name: &str, dtype: &str, value: &str) {
-        write!(
+        writeln!(
             self.text,
-            "        {} {} = const()[name=string(\"{}\"), val={}({})];\n",
+            "        {} {} = const()[name=string(\"{}\"), val={}({})];",
             dtype, name, name, dtype, value
         )
         .unwrap();
@@ -200,9 +197,9 @@ impl MilProgram {
     /// Emit a const tensor value (inline, not BLOBFILE).
     pub fn emit_tensor_const(&mut self, name: &str, shape: &[usize], dtype: &str, value: &str) {
         let shape_str = format_shape_dtype(shape, dtype);
-        write!(
+        writeln!(
             self.text,
-            "        {} {} = const()[name=string(\"{}\"), val={}({})];\n",
+            "        {} {} = const()[name=string(\"{}\"), val={}({})];",
             shape_str, name, name, shape_str, value
         )
         .unwrap();
@@ -217,9 +214,9 @@ impl MilProgram {
         input_name: &str,
     ) {
         let shape_str = format_shape(result_shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight={},x={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight={},x={})[name=string(\"{}\")];",
             shape_str, result_name, weight_name, input_name, result_name
         )
         .unwrap();
@@ -228,9 +225,9 @@ impl MilProgram {
     /// Emit element-wise multiply.
     pub fn emit_mul(&mut self, result_name: &str, shape: &[usize], x: &str, y: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = mul(x={},y={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = mul(x={},y={})[name=string(\"{}\")];",
             shape_str, result_name, x, y, result_name
         )
         .unwrap();
@@ -239,9 +236,9 @@ impl MilProgram {
     /// Emit element-wise add.
     pub fn emit_add(&mut self, result_name: &str, shape: &[usize], x: &str, y: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = add(x={},y={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = add(x={},y={})[name=string(\"{}\")];",
             shape_str, result_name, x, y, result_name
         )
         .unwrap();
@@ -250,9 +247,9 @@ impl MilProgram {
     /// Emit element-wise subtract.
     pub fn emit_sub(&mut self, result_name: &str, shape: &[usize], x: &str, y: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = sub(x={},y={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = sub(x={},y={})[name=string(\"{}\")];",
             shape_str, result_name, x, y, result_name
         )
         .unwrap();
@@ -268,9 +265,9 @@ impl MilProgram {
         keep_dims_name: &str,
     ) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = reduce_sum(x={},axes={},keep_dims={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = reduce_sum(x={},axes={},keep_dims={})[name=string(\"{}\")];",
             shape_str, result_name, input, axes_name, keep_dims_name, result_name
         )
         .unwrap();
@@ -279,9 +276,9 @@ impl MilProgram {
     /// Emit pow operation.
     pub fn emit_pow(&mut self, result_name: &str, shape: &[usize], x: &str, y: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = pow(x={},y={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = pow(x={},y={})[name=string(\"{}\")];",
             shape_str, result_name, x, y, result_name
         )
         .unwrap();
@@ -296,9 +293,9 @@ impl MilProgram {
         input: &str,
     ) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = reshape(shape={},x={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = reshape(shape={},x={})[name=string(\"{}\")];",
             shape_str, result_name, shape_var, input, result_name
         )
         .unwrap();
@@ -313,9 +310,9 @@ impl MilProgram {
         input: &str,
     ) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = transpose(perm={},x={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = transpose(perm={},x={})[name=string(\"{}\")];",
             shape_str, result_name, perm_var, input, result_name
         )
         .unwrap();
@@ -332,9 +329,9 @@ impl MilProgram {
         y: &str,
     ) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = matmul(transpose_x={},transpose_y={},x={},y={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = matmul(transpose_x={},transpose_y={},x={},y={})[name=string(\"{}\")];",
             shape_str, result_name, transpose_x, transpose_y, x, y, result_name
         )
         .unwrap();
@@ -349,9 +346,9 @@ impl MilProgram {
         input: &str,
     ) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = softmax(axis={},x={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = softmax(axis={},x={})[name=string(\"{}\")];",
             shape_str, result_name, axis_var, input, result_name
         )
         .unwrap();
@@ -360,9 +357,9 @@ impl MilProgram {
     /// Emit sigmoid.
     pub fn emit_sigmoid(&mut self, result_name: &str, shape: &[usize], input: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = sigmoid(x={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = sigmoid(x={})[name=string(\"{}\")];",
             shape_str, result_name, input, result_name
         )
         .unwrap();
@@ -379,9 +376,9 @@ impl MilProgram {
     ) {
         let shape_str = format_shape(shape);
         let vals = values.join(",");
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = concat(axis={},interleave={},values=({}))[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = concat(axis={},interleave={},values=({}))[name=string(\"{}\")];",
             shape_str, result_name, axis_var, interleave_var, vals, result_name
         )
         .unwrap();
@@ -397,9 +394,9 @@ impl MilProgram {
         size_var: &str,
     ) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<fp16, {}> {} = slice_by_size(x={},begin={},size={})[name=string(\"{}\")];\n",
+            "        tensor<fp16, {}> {} = slice_by_size(x={},begin={},size={})[name=string(\"{}\")];",
             shape_str, result_name, input, begin_var, size_var, result_name
         )
         .unwrap();
@@ -410,9 +407,9 @@ impl MilProgram {
     /// `from_dtype` / `to_dtype` are MIL dtype strings like `"fp16"`, `"fp32"`.
     pub fn emit_cast(&mut self, result_name: &str, shape: &[usize], input: &str, to_dtype: &str) {
         let shape_str = format_shape(shape);
-        write!(
+        writeln!(
             self.text,
-            "        tensor<{}, {}> {} = cast(dtype=string(\"{}\"),x={})[name=string(\"{}\")];\n",
+            "        tensor<{}, {}> {} = cast(dtype=string(\"{}\"),x={})[name=string(\"{}\")];",
             to_dtype, shape_str, result_name, to_dtype, input, result_name
         )
         .unwrap();

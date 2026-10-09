@@ -1583,7 +1583,7 @@ impl Tuner {
             })?;
 
         // Create params buffer
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "read by the kernel through the params buffer")]
         struct FusedLoraParams {
             batch_size: u32,
             in_features: u32,

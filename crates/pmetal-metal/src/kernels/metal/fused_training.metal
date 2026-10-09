@@ -69,12 +69,12 @@ struct ParamInfo {
 /// - v: Second moment estimates [total_elements]
 /// - param_info: Metadata for each parameter [num_params]
 ///
-/// The kernel computes (matching mlx-rs's AdamW without bias correction):
+/// The kernel computes (MLX's AdamW default, without bias correction):
 ///   m = beta1 * m + (1 - beta1) * grad
 ///   v = beta2 * v + (1 - beta2) * grad^2
 ///   param = param * (1 - lr * weight_decay) - lr * m / (sqrt(v) + eps)
 ///
-/// Note: Unlike PyTorch's AdamW, mlx-rs does NOT use bias correction.
+/// Note: Unlike PyTorch's AdamW, MLX's does not use bias correction by default.
 /// This matches the original decoupled weight decay paper's formulation.
 ///
 /// Grid: [ceil(max_param_size / WARP_SIZE), num_params, 1]
@@ -112,7 +112,7 @@ kernel void fused_adamw_update(
     float m_val = m[m_idx];
     float v_val = v[v_idx];
 
-    // AdamW update (mlx-rs style - NO bias correction)
+    // AdamW update (MLX's default - NO bias correction)
     // m = beta1 * m + (1 - beta1) * grad
     m_val = config.beta1 * m_val + (1.0f - config.beta1) * grad_val;
 
@@ -230,7 +230,7 @@ kernel void fused_adamw_update_bias_corrected_f16(
     v[v_idx]      = v_val;
 }
 
-/// Half-precision version for memory efficiency (mlx-rs style, no bias correction)
+/// Half-precision version for memory efficiency (no bias correction)
 kernel void fused_adamw_update_f16(
     device half* params [[buffer(0)]],
     device const half* grads [[buffer(1)]],
@@ -259,11 +259,11 @@ kernel void fused_adamw_update_f16(
     float m_val = m[m_idx];
     float v_val = v[v_idx];
 
-    // AdamW update (mlx-rs style - NO bias correction)
+    // AdamW update (MLX's default - NO bias correction)
     m_val = config.beta1 * m_val + (1.0f - config.beta1) * grad_val;
     v_val = config.beta2 * v_val + (1.0f - config.beta2) * grad_val * grad_val;
 
-    // NO bias correction - matching mlx-rs
+    // NO bias correction - MLX's default
     float update = m_val / (sqrt(v_val) + config.epsilon);
     param_val = param_val * (1.0f - config.learning_rate * config.weight_decay)
                 - config.learning_rate * update;

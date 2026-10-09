@@ -43,7 +43,7 @@ pub struct MppFusedAdamWConfig {
     pub max_param_elements: usize,
     /// Use fp16 params / fp32 moments (true) or all fp32 (false).
     pub use_fp16: bool,
-    /// Current optimizer step (0 = disable bias correction, mlx-rs style).
+    /// Current optimizer step (0 = disable bias correction, MLX's default).
     pub step: u32,
 }
 

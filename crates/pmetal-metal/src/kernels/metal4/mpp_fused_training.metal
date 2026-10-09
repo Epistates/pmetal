@@ -35,7 +35,7 @@ struct MppAdamWConfig {
     float beta2;
     float epsilon;
     float weight_decay;
-    uint  step;           // 0 = no bias correction (mlx-rs style)
+    uint  step;           // 0 = no bias correction (MLX's default)
 };
 
 struct MppParamInfo {
@@ -95,7 +95,7 @@ kernel void mpp_fused_adamw_f32(
         float v_hat  = v_val / (1.0f - metal::fast::exp(step_f * metal::fast::log(config.beta2)));
         update = m_hat / (metal::fast::sqrt(v_hat) + config.epsilon);
     } else {
-        // No bias correction (mlx-rs style)
+        // No bias correction (MLX's default)
         update = m_val / (metal::fast::sqrt(v_val) + config.epsilon);
     }
 

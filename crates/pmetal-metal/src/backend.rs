@@ -375,7 +375,6 @@ pub struct MoeExpertDescriptor<'a> {
 /// Before calling any GEMM method, callers should invoke [`should_handle_gemm`] to
 /// confirm the backend can efficiently handle the shape. If it returns `false`, the
 /// caller should fall back to the other backend.
-#[allow(clippy::too_many_arguments)]
 pub trait KernelBackend: Send + Sync {
     // ---- Capabilities -------------------------------------------------------
 
@@ -412,6 +411,10 @@ pub trait KernelBackend: Send + Sync {
     ) -> Result<()>;
 
     /// Execute quantized GEMM: Y = X @ W_q^T (dequant on the fly).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the kernel's buffers one-to-one"
+    )]
     fn quantized_gemm(
         &self,
         ctx: &Arc<MetalContext>,
@@ -427,6 +430,10 @@ pub trait KernelBackend: Send + Sync {
     ///
     /// C = alpha * A[M,K] @ B[N,K]^T + beta * C (read-modify-write).
     /// Used for the backward pass dW computation across all layers.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the kernel's buffers one-to-one"
+    )]
     fn dw_gemm_accum(
         &self,
         batch: &mut BatchedCommandBuffer,
@@ -448,6 +455,10 @@ pub trait KernelBackend: Send + Sync {
     /// output when `desc.fuse_mul` is set.
     ///
     /// Returns a `MetalBuffer<f32>` of shape `[total_tokens, intermediate_size]`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the kernel's buffers one-to-one"
+    )]
     fn grouped_gemm(
         &self,
         ctx: &Arc<MetalContext>,
@@ -477,6 +488,10 @@ pub trait KernelBackend: Send + Sync {
     /// FlashAttention backward pass.
     ///
     /// Returns `(dQ, dK, dV)`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the kernel's buffers one-to-one"
+    )]
     fn flash_attention_backward(
         &self,
         ctx: &Arc<MetalContext>,
@@ -494,6 +509,10 @@ pub trait KernelBackend: Send + Sync {
     /// Fused SwiGLU forward: output = silu(gate_proj(x)) * up_proj(x)
     ///
     /// If LoRA rank > 0 in `config`, all four LoRA weight buffers must be provided.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the kernel's buffers one-to-one"
+    )]
     fn fused_swiglu(
         &self,
         ctx: &Arc<MetalContext>,
@@ -521,6 +540,10 @@ pub trait KernelBackend: Send + Sync {
     /// Fused RMSNorm + LoRA projection.
     ///
     /// output = (norm(x) @ W^T) + scale * ((norm(x) @ A^T) @ B^T)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the kernel's buffers one-to-one"
+    )]
     fn fused_norm_lora(
         &self,
         ctx: &Arc<MetalContext>,

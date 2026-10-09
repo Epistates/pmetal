@@ -2,7 +2,7 @@
 
 //! Fused sampling kernel for high-performance token generation.
 //!
-//! This module bypasses mlx-rs for the sampling hot path, executing all
+//! This module bypasses the op-by-op MLX sampling path, executing all
 //! sampling operations in a single Metal kernel:
 //!
 //! - Argmax (greedy decoding)
@@ -14,7 +14,7 @@
 //!
 //! # Performance Benefits
 //!
-//! - **Single kernel launch**: vs 10+ separate launches with mlx-rs
+//! - **Single kernel launch**: vs 10+ separate launches op by op
 //! - **Zero intermediate allocations**: all work in threadgroup memory
 //! - **Minimal CPU overhead**: critical for battery mode performance
 //!
@@ -140,8 +140,8 @@ impl Default for FusedSamplerConfig {
 
 /// Fused sampler that executes all sampling operations in a single Metal kernel.
 ///
-/// This is the high-performance path for token generation, bypassing mlx-rs
-/// to eliminate CPU overhead.
+/// This is the high-performance path for token generation, bypassing the
+/// op-by-op MLX path to eliminate CPU overhead.
 pub struct FusedSampler {
     /// Metal context.
     ctx: Arc<MetalContext>,

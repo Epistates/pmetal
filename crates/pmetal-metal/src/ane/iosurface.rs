@@ -13,7 +13,6 @@ use crate::error::{MetalError, Result};
 use crate::neon_convert::{f16_to_f32_bulk, f32_to_f16_bulk};
 
 // IOSurface.framework FFI (linked at build time when ane feature is active)
-#[allow(dead_code)]
 mod ffi {
     use std::ffi::c_void;
 
@@ -28,7 +27,6 @@ mod ffi {
         pub fn IOSurfaceLock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
         pub fn IOSurfaceUnlock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
         pub fn IOSurfaceGetBaseAddress(surface: *mut c_void) -> *mut c_void;
-        pub fn IOSurfaceGetAllocSize(surface: *mut c_void) -> usize;
         pub fn IOSurfaceGetBytesPerRow(surface: *mut c_void) -> usize;
         pub fn IOSurfaceGetHeight(surface: *mut c_void) -> usize;
 
