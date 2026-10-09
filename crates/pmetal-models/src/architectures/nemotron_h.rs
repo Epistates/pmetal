@@ -66,21 +66,29 @@ fn linear_forward_with_optional_fp8(
 }
 
 /// A projection, through `Linear::forward` so that an adapter or a packed
-/// weight on it is honoured, unless an FP8 checkpoint's per-tensor scale sits
-/// beside it outside the layer.
+/// weight on it is honoured. An FP8 checkpoint's per-tensor scale sits beside
+/// the layer rather than in it, so a scaled projection multiplies by the
+/// scaled weight itself, and still applies the layer's adapter on top.
 fn scaled_linear_forward(
     linear: &nn::Linear,
     x: &Array,
     weight_scale: Option<&Array>,
 ) -> Result<Array, Exception> {
-    match weight_scale {
-        None => Ok(linear.forward(x)),
-        Some(_) => linear_forward_with_optional_fp8(
-            x,
-            linear.weight.as_ref(),
-            linear.bias.as_ref(),
-            weight_scale,
-        ),
+    let Some(scale) = weight_scale else {
+        return Ok(linear.forward(x));
+    };
+    let bias = linear.bias.as_ref();
+    match linear.adapter.as_deref() {
+        None => linear_forward_with_optional_fp8(x, linear.weight.as_ref(), bias, Some(scale)),
+        Some(adapter) => {
+            let weight = materialize_linear_weight(linear.weight.as_ref(), Some(scale))?;
+            let x = if weight.dtype() == Dtype::Bfloat16 && x.dtype() != Dtype::Bfloat16 {
+                x.as_dtype(Dtype::Bfloat16.as_i32())
+            } else {
+                x.clone()
+            };
+            Ok(adapter.apply(&x, &weight, bias))
+        }
     }
 }
 
@@ -2549,5 +2557,68 @@ mod tests {
         let logits = model.forward(&input_ids, None).unwrap();
         logits.eval().unwrap();
         assert_eq!(logits.shape(), &[1, 8, 1000]);
+    }
+
+    /// An FP8 checkpoint's Mamba and expert projections carry a per-tensor
+    /// `weight_scale` outside the layer. An adapter on one of them still
+    /// applies, and its `B` gets the gradient the primitive form gives it:
+    /// `d/dB sum(s · (x·Aᵀ)·Bᵀ)` is `s` times the column sums of `x·Aᵀ`.
+    #[test]
+    fn an_adapter_on_an_fp8_scaled_projection_applies_and_trains() {
+        use pmetal_bridge::compat::random;
+        use pmetal_bridge::inline_array::value_and_grad;
+
+        random::seed(5);
+        let (inputs, outputs, rank) = (32, 16, 4);
+        let mut linear = nn::Linear::new(inputs, outputs, false).unwrap();
+        linear.weight = Param::new(ops::to_fp8(linear.weight.as_ref()).unwrap());
+        let scale = Array::from_f32(0.5);
+        let b = random::uniform_range(-0.1, 0.1, &[outputs, rank], Dtype::Float32);
+        let adapter = linear.attach_lora(rank, 8.0, false).unwrap();
+        adapter.b = b.clone();
+        let (a, lora_scale) = (adapter.a.clone(), adapter.scale);
+        let x = random::normal(&[3, inputs], Dtype::Float32);
+
+        // The base the scale describes (what the projection computes without
+        // an adapter), plus the adapter's update.
+        let base = linear_forward_with_optional_fp8(&x, linear.weight.as_ref(), None, Some(&scale))
+            .unwrap();
+        let xa = x.matmul(&a.t());
+        let expected = base.add(&xa.matmul(&b.t()).multiply(&Array::from_f32(lora_scale)));
+        let got = scaled_linear_forward(&linear, &x, Some(&scale)).unwrap();
+        let err = got
+            .subtract(&expected)
+            .abs()
+            .max(None)
+            .as_dtype(Dtype::Float32.as_i32())
+            .item_f32();
+        assert!(
+            err < 1e-5,
+            "scaled projection with an adapter is off by {err}"
+        );
+
+        let (_, grads) = value_and_grad(
+            |arrays| {
+                linear.adapter.as_mut().unwrap().b = arrays[0].clone();
+                scaled_linear_forward(&linear, &x, Some(&scale))
+                    .unwrap()
+                    .as_dtype(Dtype::Float32.as_i32())
+                    .sum_all()
+            },
+            std::slice::from_ref(&b),
+            &[],
+        );
+        pmetal_bridge::check_last_error().expect("a bridge op threw");
+        let want = xa
+            .as_dtype(Dtype::Float32.as_i32())
+            .sum_axis(0, true)
+            .multiply(&Array::from_f32(lora_scale))
+            .broadcast_to(&[outputs, rank]);
+        let err = grads[0].subtract(&want).abs().max(None).item_f32();
+        let size = want.abs().max(None).item_f32();
+        assert!(
+            size > 0.0 && err <= 1e-4 * size,
+            "B's gradient is off by {err} of {size}"
+        );
     }
 }

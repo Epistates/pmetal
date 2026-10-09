@@ -179,7 +179,7 @@ impl LoraAdapter {
     /// Never materialises `W + s·B·A`: the update is applied as two small
     /// matmuls against the activations, which is the whole point of the
     /// factorisation.
-    pub(crate) fn apply(&self, x: &Array, weight: &Array, bias: Option<&Array>) -> Array {
+    pub fn apply(&self, x: &Array, weight: &Array, bias: Option<&Array>) -> Array {
         self.apply_to_product(x, x.matmul(&weight.t()), &|| weight.clone(), bias)
     }
 
