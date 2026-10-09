@@ -713,7 +713,7 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
 // (RoPE/NoPE × qk_norm × temp_tuning × has_biases) variant gets its own
 // trace.
 //   * use_rope    — `q.rope(head_dim, traditional=true, ...)` on Q and K.
-//   * use_qk_norm — `rms_norm(weight=None, eps=1e-6)` on Q and K.
+//   * use_qk_norm — `rms_norm(weight=None, eps=qk_norm_eps)` on Q and K.
 //   * has_biases  — add q/k/v/o biases.
 //   * temp_tuning — NoPE-only multiplicative scale on Q built from
 //                   `log(floor((rope_offset+1)/floor_scale)+1) * attn_scale + 1`.
@@ -748,7 +748,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     bool has_biases,
     bool temp_tuning,
     int floor_scale,
-    float temp_attn_scale
+    float temp_attn_scale,
+    float qk_norm_eps
 ) {
     struct Entry {
         int batch;
@@ -764,7 +765,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
         int has_freqs;
         int has_gain;
         // Baked into the trace, so they key it too.
-        float scale, rope_base, rope_scale, temp_attn_scale;
+        float scale, rope_base, rope_scale, temp_attn_scale, qk_norm_eps;
         int floor_scale;
         CompiledFn compiled;
     };
@@ -795,6 +796,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                 && entry.rope_base == rope_base
                 && entry.rope_scale == rope_scale
                 && entry.temp_attn_scale == temp_attn_scale
+                && entry.qk_norm_eps == qk_norm_eps
                 && entry.floor_scale == floor_scale) {
                 compiled = &entry.compiled;
                 break;
@@ -815,6 +817,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
             bool TTUNE = temp_tuning;
             int FLOOR = floor_scale;
             float TSCALE = temp_attn_scale;
+            float QKEPS = qk_norm_eps;
             bool HAS_FREQS = has_freqs == 1;
             bool HAS_GAIN = has_gain == 1;
 
@@ -835,10 +838,11 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                 rope_base,
                 rope_scale,
                 temp_attn_scale,
+                qk_norm_eps,
                 floor_scale,
                 *make_compiled_fixed(
                     [NH, NKV, HD, L, SCALE, RBASE, RSCALE,
-                     UROPE, UQKN, HBIAS, TTUNE, FLOOR, TSCALE, HAS_FREQS, HAS_GAIN]
+                     UROPE, UQKN, HBIAS, TTUNE, FLOOR, TSCALE, QKEPS, HAS_FREQS, HAS_GAIN]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
 
@@ -889,9 +893,9 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                         }
 
                         if (UQKN) {
-                            // Weight-less RMS norm (eps=1e-6).
-                            queries = fast::rms_norm(queries, std::nullopt, 1e-6f);
-                            keys = fast::rms_norm(keys, std::nullopt, 1e-6f);
+                            // Weight-less RMS norm at the model's rms_norm_eps.
+                            queries = fast::rms_norm(queries, std::nullopt, QKEPS);
+                            keys = fast::rms_norm(keys, std::nullopt, QKEPS);
                         }
 
                         if (TTUNE && !UROPE) {

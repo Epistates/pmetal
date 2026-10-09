@@ -18,6 +18,11 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopePositions, rope_embedding},
+};
+use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
@@ -597,15 +602,18 @@ impl Llama4Attention {
 
         let uses_rope = config.uses_rope(layer_idx as i32);
 
-        // QK norm: weightless RMS norm (eps 1e-6) applied AFTER RoPE, and only on
-        // RoPE layers (reference: `use_qk_norm = args.use_qk_norm and self.use_rope`).
-        // The RmsNorm weight stays at its default ones, so it is numerically
-        // identical to `mx.fast.rms_norm(x, weight=None, eps=1e-6)`.
+        // QK norm: weightless RMS norm applied AFTER RoPE, and only on RoPE
+        // layers, at the model's `rms_norm_eps` (transformers'
+        // `Llama4TextL2Norm(config.rms_norm_eps)`, the reference's
+        // `rmsnorm(x, norm_eps)`). The RmsNorm weight stays at its default
+        // ones, so it is the weightless norm.
+        let qk_norm = || {
+            nn::RmsNormBuilder::new(head_dim)
+                .eps(config.rms_norm_eps)
+                .build()
+        };
         let (q_norm, k_norm) = if config.use_qk_norm && uses_rope {
-            (
-                Some(nn::RmsNormBuilder::new(head_dim).eps(1e-6).build()?),
-                Some(nn::RmsNormBuilder::new(head_dim).eps(1e-6).build()?),
-            )
+            (Some(qk_norm()?), Some(qk_norm()?))
         } else {
             (None, None)
         };
@@ -642,38 +650,56 @@ impl Llama4Attention {
         })
     }
 
+    /// Forward pass without a cache; see [`Self::forward_with_cache`].
     pub fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
+        self.forward_with_cache(x, mask, None, position_ids)
+    }
+
+    /// Forward pass with an optional KV cache.
+    ///
+    /// Each token sits at its explicit position when `positions` (`[seq_len]`)
+    /// is given (a packed batch), else at the cache's offset plus its index,
+    /// so a cached decode rotates new keys where they belong. The NoPE
+    /// layers' temperature reads the same positions. `mask` is an additive
+    /// mask; without one, attention is causal.
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
         let batch = x.shape()[0];
         let seq_len = x.shape()[1];
 
-        let mut q = Module::forward(&mut self.q_proj, x)?;
-        let mut k = Module::forward(&mut self.k_proj, x)?;
-        let v = Module::forward(&mut self.v_proj, x)?;
+        let heads = |x: Array, n: i32| {
+            x.reshape(&[batch, seq_len, n, self.head_dim])
+                .transpose_axes(&[0, 2, 1, 3])
+        };
+        let q = heads(Module::forward(&mut self.q_proj, x)?, self.n_heads);
+        let k = heads(Module::forward(&mut self.k_proj, x)?, self.n_kv_heads);
+        let v = heads(Module::forward(&mut self.v_proj, x)?, self.n_kv_heads);
 
-        // Reshape for attention
-        q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
-        k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(cache, layer)| cache.rope_offset_for(*layer));
+        let rope_positions = RopePositions::resolve(positions, offset);
 
-        // Apply RoPE if this is a RoPE layer (not NoPE)
-        if self.uses_rope {
-            if let Some(pos_ids) = position_ids {
-                // Apply RoPE with position IDs
-                q = self.apply_rope(&q, pos_ids)?;
-                k = self.apply_rope(&k, pos_ids)?;
-            } else {
-                // Apply RoPE with sequential positions
-                let positions = Array::from_iter(0..seq_len, &[seq_len]);
-                q = self.apply_rope(&q, &positions)?;
-                k = self.apply_rope(&k, &positions)?;
-            }
-        }
-        // NoPE layers: no positional encoding applied
+        // RoPE layers rotate (interleaved, Llama 3 bands when configured);
+        // NoPE layers do not.
+        let (mut q, mut k) = if self.uses_rope {
+            (
+                rope_embedding(&q, rope_positions, &self.rotary),
+                rope_embedding(&k, rope_positions, &self.rotary),
+            )
+        } else {
+            (q, k)
+        };
 
         // QK normalization: weightless RMS norm applied AFTER RoPE, only on RoPE
         // layers (q_norm/k_norm are None on NoPE layers per construction).
@@ -682,92 +708,41 @@ impl Llama4Attention {
             k = Module::forward(kn, &k)?;
         }
 
-        // Transpose for attention: [B, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let mut k = k.transpose_axes(&[0, 2, 1, 3]);
-        let mut v = v.transpose_axes(&[0, 2, 1, 3]);
-
-        // GQA: repeat KV heads to match query heads
-        let repeat = self.n_heads / self.n_kv_heads;
-        if repeat > 1 {
-            // [B, n_kv, T, D] -> [B, n_kv, 1, T, D] -> broadcast -> [B, n_heads, T, D]
-            let k_shape = k.shape().to_vec();
-            let v_shape = v.shape().to_vec();
-            k = k.reshape(&[k_shape[0], self.n_kv_heads, 1, k_shape[2], self.head_dim]);
-            k = ops::broadcast_to(
-                &k,
-                &[
-                    k_shape[0],
-                    self.n_kv_heads,
-                    repeat,
-                    k_shape[2],
-                    self.head_dim,
-                ],
-            );
-            k = k.reshape(&[k_shape[0], self.n_heads, k_shape[2], self.head_dim]);
-            v = v.reshape(&[v_shape[0], self.n_kv_heads, 1, v_shape[2], self.head_dim]);
-            v = ops::broadcast_to(
-                &v,
-                &[
-                    v_shape[0],
-                    self.n_kv_heads,
-                    repeat,
-                    v_shape[2],
-                    self.head_dim,
-                ],
-            );
-            v = v.reshape(&[v_shape[0], self.n_heads, v_shape[2], self.head_dim]);
+        // Attention temperature on the NoPE layers (arXiv 2501.19399):
+        // `log(floor((p + 1) / floor_scale) + 1) * attn_scale + 1` at each
+        // token's position p, in f32, back in the query dtype.
+        if !self.uses_rope && self.attn_temperature_tuning {
+            let p = match rope_positions {
+                RopePositions::Explicit(ids) => ids.as_dtype(Dtype::Float32.as_i32()),
+                RopePositions::Offset(offset) => {
+                    ops::arange_from(offset, offset + seq_len).as_dtype(Dtype::Float32.as_i32())
+                }
+            };
+            let one = Array::from_f32(1.0);
+            let floored = ops::floor(&p.add(&one).divide(&Array::from_f32(self.floor_scale)));
+            let scales = ops::log(&floored.add(&one))
+                .multiply(&Array::from_f32(self.attn_scale))
+                .add(&one)
+                .reshape(&[1, 1, seq_len, 1]);
+            q = q.multiply(&scales).as_dtype(x.dtype().as_i32());
         }
 
-        // Temperature scaling for NoPE layers (long-context attention stabilization).
-        // Formula: scale_i = log(floor((i + 1) / floor_scale) + 1) * attn_scale + 1
-        // Applied to Q states before QK matmul, only when attn_temperature_tuning is enabled.
-        let q = if !self.uses_rope && self.attn_temperature_tuning {
-            let ones = ops::ones(&[seq_len], Dtype::Float32);
-            let positions = ops::arange_from(0, seq_len).as_dtype(Dtype::Float32.as_i32());
-            let pos_plus_one = positions.add(&ones);
-            let floored = ops::floor(&pos_plus_one.divide(&Array::from_f32(self.floor_scale)));
-            let log_vals = ops::log(&floored.add(&ones));
-            let scales = log_vals
-                .multiply(&Array::from_f32(self.attn_scale))
-                .add(&ones);
-            // [T] -> [1, 1, T, 1] to broadcast over [B, H, T, D]
-            let scales = scales.reshape(&[1, 1, seq_len, 1]);
-            q.multiply(&scales)
-        } else {
-            q
+        let (k, v) = match cache {
+            Some((cache, layer)) => cache.update_and_fetch(layer, &k, &v)?,
+            None => (k, v),
         };
 
-        // Attention scores
-        let k_t = k.transpose_axes(&[0, 1, 3, 2]);
-        let mut scores = q.matmul(&k_t);
-        scores = scores.multiply(&Array::from_f32(self.scale));
-
-        // Apply mask
-        if let Some(m) = mask {
-            scores = scores.add(m);
-        }
-
-        let probs = ops::softmax_axis(&scores, -1);
-        let output = probs.matmul(&v);
-
-        // Reshape and project
-        let output = output.transpose_axes(&[0, 2, 1, 3]);
-        let output = output.reshape(&[batch, seq_len, -1]);
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(if mask.is_some() {
+                AttentionMaskType::None
+            } else {
+                AttentionMaskType::Causal
+            });
+        let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         Module::forward(&mut self.o_proj, &output)
-    }
-
-    /// Apply RoPE embeddings.
-    ///
-    /// `x` arrives as `[B, T, n_heads, head_dim]`.  `rope_apply` (pmetal_bridge::compat::fast::rope)
-    /// expects `[B, heads, T, head_dim]`, so we transpose before and after.
-    fn apply_rope(&self, x: &Array, _position_ids: &Array) -> Result<Array, Exception> {
-        // [B, T, H, D] -> [B, H, T, D]
-        let x_t = x.transpose_axes(&[0, 2, 1, 3]);
-        // Interleaved pairs, Llama 3 bands when configured.
-        let result = self.rotary.apply(&x_t, 0);
-        // [B, H, T, D] -> [B, T, H, D]
-        Ok(result.transpose_axes(&[0, 2, 1, 3]))
     }
 }
 
@@ -854,10 +829,27 @@ impl Llama4DecoderLayer {
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
+        self.forward_with_cache(x, mask, None, position_ids)
+    }
+
+    /// Forward pass with an optional KV cache (`(cache, layer index)`).
+    /// A MoD layer routes a subset of the tokens and runs without a cache.
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+        position_ids: Option<&Array>,
+    ) -> Result<Array, Exception> {
         if let Some(capacity) = self.mod_capacity {
+            if cache.is_some() {
+                return Err(Exception::custom(
+                    "Llama 4 Mixture-of-Depths layers have no cached decode",
+                ));
+            }
             self.forward_mod(x, mask, position_ids, capacity)
         } else {
-            self.forward_full(x, mask, position_ids)
+            self.forward_full(x, mask, cache, position_ids)
         }
     }
 
@@ -866,11 +858,14 @@ impl Llama4DecoderLayer {
         &mut self,
         x: &Array,
         mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
         // Self attention with residual
         let normed = Module::forward(&mut self.input_layernorm, x)?;
-        let attn_out = self.self_attn.forward(&normed, mask, position_ids)?;
+        let attn_out = self
+            .self_attn
+            .forward_with_cache(&normed, mask, cache, position_ids)?;
         let h = x.add(&attn_out);
 
         // FFN with residual (MoE or dense)
@@ -924,14 +919,13 @@ impl Llama4DecoderLayer {
         let gathered = x.take_along_axis(&idx_expanded, 1);
 
         // ---- Run transformer block on gathered sub-batch ----
-        // Note: we pass `None` for mask here — the gathered tokens form a
-        // dense sub-sequence and causal masking at this level would be wrong.
-        // Position IDs are also omitted; RoPE on the full sequence is correct
-        // only when all positions are present. For the selected sub-batch we
-        // skip positional encoding (NoPE behaviour) which is consistent with
-        // how iRoPE NoPE layers work in this model.
+        // Note: the gathered tokens attend to each other unmasked (an all-zero
+        // additive mask; without one attention is causal) — they form a dense
+        // sub-sequence and causal masking at this level would be wrong.
+        // Position IDs are also omitted, so the sub-batch rotates at 0..k.
         let normed = Module::forward(&mut self.input_layernorm, &gathered)?;
-        let attn_out = self.self_attn.forward(&normed, None, None)?;
+        let unmasked = Array::zeros_f32(&[k, k]);
+        let attn_out = self.self_attn.forward(&normed, Some(&unmasked), None)?;
         let h_sel = gathered.add(&attn_out);
 
         let normed2 = Module::forward(&mut self.post_attention_layernorm, &h_sel)?;
@@ -1018,12 +1012,27 @@ impl Llama4TextModel {
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
+        self.forward_with_cache(input_ids, mask, None, position_ids)
+    }
+
+    /// Forward pass with an optional KV cache: each layer rotates and
+    /// attends from the cache's offset, and appends its keys and values.
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut KVCache>,
+        position_ids: Option<&Array>,
+    ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Hoisted: the loop below borrows `self.layers` mutably.
         let grad_checkpoint = self.grad_checkpoint;
-        for layer in &mut self.layers {
-            hidden_states = if grad_checkpoint {
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            let layer_cache = cache.as_deref_mut().map(|c| (c, idx));
+            // A cache means generation, which has no backward pass for the
+            // recompute to pay for.
+            hidden_states = if grad_checkpoint && layer_cache.is_none() {
                 checkpointed_layer(
                     layer,
                     &hidden_states,
@@ -1032,7 +1041,7 @@ impl Llama4TextModel {
                     |layer, h, mask, positions| layer.forward(h, mask, positions),
                 )?
             } else {
-                layer.forward(&hidden_states, mask, position_ids)?
+                layer.forward_with_cache(&hidden_states, mask, layer_cache, position_ids)?
             };
         }
 
@@ -1115,19 +1124,19 @@ impl Llama4ForCausalLM {
         self.forward(input_ids, mask, positions)
     }
 
-    /// Forward pass accepting a KV cache parameter for API compatibility.
-    ///
-    /// Llama 4 attention uses iRoPE (interleaved RoPE/NoPE layers) and the
-    /// per-layer cache threading has not been implemented yet. The `_cache`
-    /// argument is accepted but ignored; full KV cache support will be added
-    /// in a future revision.
+    /// Forward pass with an optional KV cache. New tokens rotate and attend
+    /// from the cache's offset, so a prefill followed by one token at a time
+    /// gives the logits of one forward over the whole sequence.
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
-        _cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
+        cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward(input_ids, mask, None)
+        let hidden_states = self
+            .model
+            .forward_with_cache(input_ids, mask, cache, None)?;
+        Module::forward(&mut self.lm_head, &hidden_states)
     }
 
     /// Aggregate MoD auxiliary losses across all layers after a forward pass.

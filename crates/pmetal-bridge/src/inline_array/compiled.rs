@@ -258,7 +258,8 @@ impl InlineArray {
     /// the compiled closure (each combo gets its own trace):
     ///   * `use_rope`    — traditional=true RoPE on Q/K (vs NoPE), rotated by
     ///     `rope` (Llama 3 bands included).
-    ///   * `use_qk_norm` — weight-less RMS norm (eps=1e-6) on Q and K.
+    ///   * `use_qk_norm` — weight-less RMS norm (eps `qk_norm_eps`, the
+    ///     model's `rms_norm_eps`) on Q and K.
     ///   * `has_biases`  — gate q/k/v/o bias adds. When false, the four
     ///     `*_b` slots may be any same-dtype dummy array.
     ///   * `temp_tuning` — NoPE temperature scaling on Q derived from
@@ -289,6 +290,7 @@ impl InlineArray {
         temp_tuning: bool,
         floor_scale: i32,
         temp_attn_scale: f32,
+        qk_norm_eps: f32,
     ) -> (Self, Self, Self) {
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let mut cache_keys = MaybeUninit::<RawBuf>::uninit();
@@ -325,6 +327,7 @@ impl InlineArray {
                 temp_tuning,
                 floor_scale,
                 temp_attn_scale,
+                qk_norm_eps,
             );
             (
                 Self {

@@ -54,7 +54,7 @@ pub(super) struct LayerWeights {
     pub(super) attn_o_b: Option<InlineArray>,
 
     // QK-norm (only on RoPE layers — same flag for both Q and K, no learned weight)
-    pub(super) attn_qk_norm: bool, // true → apply rms_norm(eps=1e-6) to both Q and K
+    pub(super) attn_qk_norm: bool, // true → weightless rms_norm(eps = norm_eps) on Q and K
 
     // Attention shape config (stored per-layer for self-containedness)
     pub(super) n_heads: i32,

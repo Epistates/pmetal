@@ -228,7 +228,7 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
 // Fixed-shape compiled Llama 4 iRoPE attention decode layer (shapeless=false).
 // One kernel covers both layer flavours via captured static flags:
 //   * use_rope     — RoPE layer (traditional=true) vs NoPE (no rotation).
-//   * use_qk_norm  — apply rms_norm(weight=None, eps=1e-6) to Q and K.
+//   * use_qk_norm  — apply rms_norm(weight=None, eps=qk_norm_eps) to Q and K.
 //   * temp_tuning  — NoPE-only attention temperature scaling.
 //   * has_biases   — gate q/k/v/o bias adds (real models keep all-or-none).
 // Cache layout matches the bf16 path: `[B, n_kv, L, head_dim]`, allocated
@@ -263,7 +263,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     bool has_biases,
     bool temp_tuning,
     int floor_scale,
-    float temp_attn_scale);
+    float temp_attn_scale,
+    float qk_norm_eps);
 
 // Fixed-shape compiled dense MoE decode block (shapeless=false).
 // Replays the routed-expert + shared-expert graph for T=1 decode.

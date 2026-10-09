@@ -345,6 +345,7 @@ unsafe extern "C" {
         temp_tuning: bool,
         floor_scale: i32,
         temp_attn_scale: f32,
+        qk_norm_eps: f32,
     );
 
     pub(super) fn mlx_inline_compiled_gemma4_attn_block(

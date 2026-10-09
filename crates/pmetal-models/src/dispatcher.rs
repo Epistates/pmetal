@@ -945,6 +945,17 @@ impl DynamicModel {
                         .strip_prefix("model.language_model.")
                         .map(|rest| format!("model.{rest}"))
                         .unwrap_or(key);
+                    // A dense layer's MLP is `feed_forward` in the checkpoint
+                    // (transformers' `Llama4TextMLP`) and `mlp` here.
+                    let remapped = ["gate_proj", "up_proj", "down_proj"]
+                        .iter()
+                        .find_map(|proj| {
+                            let from = format!(".feed_forward.{proj}.");
+                            remapped
+                                .contains(&from)
+                                .then(|| remapped.replace(&from, &format!(".mlp.{proj}.")))
+                        })
+                        .unwrap_or(remapped);
                     if let Some(param) = params.get_mut(&remapped) {
                         **param = value;
                     }
@@ -1885,7 +1896,7 @@ impl DynamicModel {
                 m.config.num_hidden_layers as usize,
                 max_seq_len,
                 m.config.num_key_value_heads as usize,
-                (m.config.hidden_size / m.config.num_attention_heads) as usize,
+                m.config.head_dim as usize,
             )),
             Self::Qwen2(m) => KVCache::new(KVCacheConfig::new(
                 m.config().num_hidden_layers() as usize,

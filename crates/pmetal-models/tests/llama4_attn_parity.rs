@@ -8,15 +8,17 @@
 //!
 //!   * traditional (interleaved) RoPE — transformers rotates via
 //!     `view_as_complex`, which is the interleaved pairing,
-//!   * weightless QK-norm applied AFTER RoPE on RoPE layers only (eps 1e-6),
+//!   * weightless QK-norm applied AFTER RoPE on RoPE layers only, at
+//!     `rms_norm_eps` (transformers' `Llama4TextL2Norm(config.rms_norm_eps)`),
 //!   * the NoPE temperature-tuning path on a no-rope layer.
 //!
 //! Layer 0 exercises RoPE + QK-norm; layer 3 — where the config's
 //! `no_rope_layers` is 0, since `(3 + 1) % 4 == 0` — exercises NoPE +
 //! temperature tuning. Each replays the SAME input and additive
 //! causal mask the oracle saw. Before the fixes the layer-0 output diverges
-//! (split-half RoPE, pre-RoPE/weighted/eps-1e-5 QK-norm) and the layer mapping
-//! flips which layers are NoPE.
+//! (split-half RoPE, pre-RoPE/weighted QK-norm) and the layer mapping flips
+//! which layers are NoPE. The whole-model test (`llama4_text_parity`) covers
+//! the cached decode.
 
 mod common;
 

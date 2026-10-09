@@ -168,6 +168,7 @@ pub(super) fn attn_forward(
                     temp_tuning_enabled,
                     lw.floor_scale,
                     lw.layer_attn_scale,
+                    lw.norm_eps,
                 );
             cache.keys = Some(new_cache_keys);
             cache.values = Some(new_cache_vals);
@@ -214,11 +215,12 @@ pub(super) fn attn_forward(
         (queries, keys)
     };
 
-    // QK-norm: only on RoPE layers (use_qk_norm = args.use_qk_norm AND use_rope)
-    // Python: rms_norm(queries, weight=None, eps=1e-6)
+    // QK-norm: only on RoPE layers (use_qk_norm = args.use_qk_norm AND use_rope),
+    // weightless, at the model's `rms_norm_eps` (transformers'
+    // `Llama4TextL2Norm(config.rms_norm_eps)`).
     let (queries, keys) = if lw.attn_qk_norm {
-        let q = queries.rms_norm(None, 1e-6);
-        let k = keys.rms_norm(None, 1e-6);
+        let q = queries.rms_norm(None, lw.norm_eps);
+        let k = keys.rms_norm(None, lw.norm_eps);
         (q, k)
     } else {
         (queries, keys)
@@ -545,25 +547,8 @@ fn apply_temperature_tuning(
         scales.push(scale_val);
     }
 
-    // Encode as [S] float32 array, cast to model dtype, reshape to [1, 1, S, 1]
-    // so it broadcasts over [B, H, S, D].
-    let scale_arr = {
-        // We create the scale array from individual f32 scalars and concatenate.
-        // For S=1 (decode) this is trivial.
-        if s == 1 {
-            InlineArray::scalar_with_dtype(scales[0], dtype).reshape(&[1, 1, 1, 1])
-        } else {
-            // Build as i32 array trick won't work for f32. Instead: create each
-            // element, concatenate along axis 0, then reshape.
-            // For prefill this only runs once so perf is not critical.
-            let mut arr = InlineArray::scalar_with_dtype(scales[0], dtype);
-            for &sv in scales[1..].iter() {
-                let elem = InlineArray::scalar_with_dtype(sv, dtype);
-                arr = arr.concatenate_2(&elem, 0);
-            }
-            arr.reshape(&[1, 1, s, 1])
-        }
-    };
-
+    // [1, 1, S, 1] so it broadcasts over [B, H, S, D]; the product is taken
+    // in f32 and cast back, as transformers does.
+    let scale_arr = InlineArray::from_f32_slice(&scales, &[1, 1, s, 1]);
     queries.multiply(&scale_arr).as_dtype(dtype)
 }

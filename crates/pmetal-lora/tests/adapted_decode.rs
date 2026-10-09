@@ -136,11 +136,7 @@ fn worst_disagreement(
 /// no adapter attached (`B` zero): a cache defect of their own, which this
 /// test can't tell apart from an adapter being skipped. Each is checked to
 /// still fail that way, so the entry goes when it is fixed.
-const BASE_DECODE_DEFECTS: &[&str] = &[
-    // Llama 4's first cached decode step picks a different token from the
-    // uncached forward over the same prefix.
-    "llama4",
-];
+const BASE_DECODE_DEFECTS: &[&str] = &[];
 
 #[test]
 fn an_adapted_model_decodes_what_its_forward_computes() {

@@ -63,6 +63,20 @@ fn default_true() -> bool {
     true
 }
 
+/// A JSON bool (`true` → 1) or integer.
+fn bool_or_int<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Bool(b) => Ok(i32::from(b)),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| serde::de::Error::custom(format!("expected an integer, got {n}"))),
+        other => Err(serde::de::Error::custom(format!(
+            "expected a bool or an integer, got {other}"
+        ))),
+    }
+}
+
 /// Text-level config (lives under `text_config` in the outer JSON, or at the
 /// top level for text-only models).
 #[derive(Debug, Clone, Deserialize)]
@@ -116,9 +130,24 @@ pub struct Llama4TextConfig {
 
     pub max_position_embeddings: i32,
 
-    /// Attention temperature tuning for NoPE (global) layers.
-    #[serde(default = "default_attn_temperature_tuning")]
+    /// Attention temperature tuning for NoPE (global) layers: on when
+    /// positive. transformers' configs (Scout's included) say `true`; older
+    /// ones gave a number.
+    #[serde(
+        default = "default_attn_temperature_tuning",
+        deserialize_with = "bool_or_int"
+    )]
     pub attn_temperature_tuning: i32,
+
+    /// The MoE layers, when listed (Scout lists every layer). Without it
+    /// `interleave_moe_layer_step` decides.
+    #[serde(default)]
+    pub moe_layers: Option<Vec<i32>>,
+
+    /// Per layer, 1 for RoPE and 0 for NoPE, when listed. Without it every
+    /// fourth layer is NoPE.
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<i32>>,
 
     #[serde(default = "default_floor_scale")]
     pub floor_scale: i32,
@@ -150,19 +179,28 @@ impl Llama4Config {
         self.text_config.as_ref().unwrap_or(&self.text)
     }
 
-    /// Returns `true` when layer `li` (0-indexed) is a MoE layer.
-    ///
-    /// Python: `(layer_idx % interleave_moe_layer_step) == (interleave_moe_layer_step - 1)`
+    /// Returns `true` when layer `li` (0-indexed) is a MoE layer: listed in
+    /// `moe_layers`, or else
+    /// `(layer_idx % interleave_moe_layer_step) == (interleave_moe_layer_step - 1)`.
     pub fn is_moe_layer(&self, li: usize) -> bool {
-        let step = self.text().interleave_moe_layer_step;
-        (li as i32 % step) == (step - 1)
+        let t = self.text();
+        match &t.moe_layers {
+            Some(layers) => layers.contains(&(li as i32)),
+            None => {
+                let step = t.interleave_moe_layer_step;
+                (li as i32 % step) == (step - 1)
+            }
+        }
     }
 
-    /// Returns `true` when layer `li` (0-indexed) uses RoPE (local / chunked attention).
-    ///
-    /// Python: `use_rope = int((layer_idx + 1) % 4 != 0)`
+    /// Returns `true` when layer `li` (0-indexed) uses RoPE (local / chunked
+    /// attention): its `no_rope_layers` entry, or else
+    /// `(layer_idx + 1) % 4 != 0`.
     pub fn use_rope(&self, li: usize) -> bool {
-        ((li as i32) + 1) % 4 != 0
+        match self.text().no_rope_layers.as_ref().and_then(|l| l.get(li)) {
+            Some(&flag) => flag != 0,
+            None => ((li as i32) + 1) % 4 != 0,
+        }
     }
 
     /// Head dimension.
@@ -235,6 +273,35 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Llama4Config, String> 
 #[cfg(test)]
 mod tests {
     use super::Llama4Config;
+
+    /// transformers' configs, Scout's included, say
+    /// `"attn_temperature_tuning": true` and list `moe_layers` and
+    /// `no_rope_layers`; the engine refused the bool and ignored the lists.
+    #[test]
+    fn released_config_keys_are_read() {
+        let config: Llama4Config = serde_json::from_value(serde_json::json!({
+            "model_type": "llama4_text", "hidden_size": 32, "num_hidden_layers": 4,
+            "num_attention_heads": 4, "head_dim": 8, "intermediate_size_mlp": 48,
+            "intermediate_size": 48, "vocab_size": 64, "attention_chunk_size": 64,
+            "num_local_experts": 2, "num_experts_per_tok": 1, "max_position_embeddings": 64,
+            "attn_temperature_tuning": true, "moe_layers": [], "no_rope_layers": [1, 0, 1, 1]
+        }))
+        .unwrap();
+        assert_eq!(config.text().attn_temperature_tuning, 1);
+        assert!((0..4).all(|l| !config.is_moe_layer(l)));
+        assert!(!config.use_rope(1) && config.use_rope(3));
+
+        let numeric: Llama4Config = serde_json::from_value(serde_json::json!({
+            "model_type": "llama4_text", "hidden_size": 32, "num_hidden_layers": 4,
+            "num_attention_heads": 4, "intermediate_size_mlp": 48, "intermediate_size": 48,
+            "vocab_size": 64, "attention_chunk_size": 64, "num_local_experts": 2,
+            "num_experts_per_tok": 1, "max_position_embeddings": 64,
+            "attn_temperature_tuning": 0
+        }))
+        .unwrap();
+        assert_eq!(numeric.text().attn_temperature_tuning, 0);
+        assert!(numeric.is_moe_layer(0) && !numeric.use_rope(3));
+    }
 
     /// Llama 4 Scout ships `rope_type: "llama3"` (factor 16, low and high
     /// band factors both 1). The native engine ran it as plain RoPE; it now

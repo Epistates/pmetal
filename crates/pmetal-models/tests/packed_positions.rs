@@ -33,6 +33,7 @@ use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4ForCausalLM};
 use pmetal_models::architectures::gpt_oss::{GptOssConfig, GptOssForCausalLM};
 use pmetal_models::architectures::granite::{GraniteConfig, GraniteForCausalLM};
 use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
+use pmetal_models::architectures::llama4::{Llama4ForCausalLM, Llama4TextConfig};
 use pmetal_models::architectures::mistral::{MistralConfig, MistralForCausalLM};
 use pmetal_models::architectures::phi::{PhiConfig, PhiForCausalLM};
 use pmetal_models::architectures::qwen2::{Qwen2Config, Qwen2ForCausalLM};
@@ -209,6 +210,27 @@ packing_case!(
             "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
         })),
         ..llama_config()
+    })
+    .unwrap()
+);
+
+// Layer 3 is NoPE, and its temperature (`floor_scale` 2) reads each token's
+// absolute position, so a record must see its own restart there too.
+packing_case!(
+    llama4,
+    Llama4ForCausalLM::new(Llama4TextConfig {
+        vocab_size: 64,
+        hidden_size: 32,
+        intermediate_size: 64,
+        intermediate_size_mlp: 64,
+        num_hidden_layers: 4,
+        num_attention_heads: 4,
+        num_key_value_heads: 2,
+        head_dim: 8,
+        rope_theta: 10_000.0,
+        moe_layers: Some(vec![]),
+        floor_scale: 2,
+        ..Default::default()
     })
     .unwrap()
 );
