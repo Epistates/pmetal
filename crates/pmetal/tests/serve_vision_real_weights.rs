@@ -23,15 +23,17 @@
 
 #![cfg(feature = "serve")]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
+use common::sse_data;
 use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
 use pmetal_models::DynamicModel;
 use pmetal_serve::engine::SamplingParams;
 use pmetal_serve::{BatcherConfig, InferenceEngine, ServeConfig};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const QUESTION: &str = "Describe this image in one sentence.";
 const MAX_TOKENS: usize = 96;
@@ -100,49 +102,7 @@ fn infer(dir: &Path, image: &Path) -> (Vec<u32>, Vec<u32>) {
 }
 
 async fn post(path: &str, body: &Value) -> (u16, String) {
-    let body = body.to_string();
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", PORT))
-        .await
-        .unwrap();
-    stream
-        .write_all(
-            format!(
-                "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await.unwrap();
-    let raw = String::from_utf8(raw).unwrap();
-    let (head, mut rest) = raw.split_once("\r\n\r\n").unwrap();
-    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-    if !head
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
-        return (status, rest.to_owned());
-    }
-    let mut body = String::new();
-    loop {
-        let (size, tail) = rest.split_once("\r\n").unwrap();
-        let size = usize::from_str_radix(size.trim(), 16).unwrap();
-        if size == 0 {
-            return (status, body);
-        }
-        body.push_str(&tail[..size]);
-        rest = &tail[size + 2..];
-    }
-}
-
-fn sse_data(body: &str) -> Vec<Value> {
-    body.lines()
-        .filter_map(|line| line.strip_prefix("data: ").or(line.strip_prefix("data:")))
-        .filter_map(|data| serde_json::from_str(data).ok())
-        .collect()
+    common::post(PORT, path, body).await
 }
 
 #[test]
@@ -218,6 +178,8 @@ fn serve_replies_to_an_image_as_infer_does() {
         let text = tokenizer.decode(&tokens).unwrap();
         println!("serve: reply {text:?}");
         assert_eq!(tokens, infer_tokens, "the server's reply is infer's, token for token");
+        // A chat reply's content starts at its first visible character.
+        let text = text.trim_start().to_string();
 
         // Over HTTP, with batching on.
         engine
@@ -233,12 +195,7 @@ fn serve_replies_to_an_image_as_infer_does() {
                 ..Default::default()
             },
         ));
-        for _ in 0..100 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", PORT)).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        common::wait_for(PORT).await;
         let chat = |stream: bool| {
             json!({
                 "model": "qwen3_5-vl", "max_tokens": MAX_TOKENS, "temperature": 0,

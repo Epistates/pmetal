@@ -107,12 +107,6 @@ impl<Aux> IncrementalDecoder<Aux> {
             .unwrap_or_default()
     }
 
-    /// Number of tokens seen so far. Used by the Anthropic stream to
-    /// report `output_tokens` on the terminal `message_delta`.
-    pub fn token_count(&self) -> usize {
-        self.buffer.len()
-    }
-
     /// Advance `emitted` to the current decoded length and return the
     /// suffix that crossed the boundary. Shared by [`push`] and [`flush`].
     fn consume_newly_decoded(&mut self) -> String {
@@ -127,13 +121,148 @@ impl<Aux> IncrementalDecoder<Aux> {
     }
 }
 
+/// The text one or more generated tokens added, split into the model's
+/// reasoning and its answer.
+#[derive(Debug)]
+pub struct ChannelDelta<Aux> {
+    /// New reasoning text (empty when none).
+    pub reasoning: String,
+    /// New answer text (empty when none).
+    pub content: String,
+    /// Aux payloads of the answer tokens behind `content`.
+    pub aux: Vec<Aux>,
+}
+
+/// An [`IncrementalDecoder`] per channel, fed by the
+/// [`ReasoningSplitter`](pmetal_data::stream_format::ReasoningSplitter): a
+/// chat stream's reasoning and answer come out apart, with the markers
+/// between them dropped. Each channel's leading whitespace (the newlines
+/// after `<think>` and `</think>`) is dropped too. Aux payloads (logprobs)
+/// follow the answer.
+pub struct ChannelDecoder<Aux = ()> {
+    splitter: pmetal_data::stream_format::ReasoningSplitter,
+    reasoning: IncrementalDecoder<()>,
+    answer: IncrementalDecoder<Aux>,
+    reasoning_started: bool,
+    answer_started: bool,
+    tokens: usize,
+}
+
+impl<Aux> ChannelDecoder<Aux> {
+    /// A decoder for the tokens generated after `prompt`, whose markers
+    /// set the channel generation starts in.
+    pub fn new(tokenizer: Arc<pmetal_data::Tokenizer>, prompt: &[u32]) -> Self {
+        let mut splitter = pmetal_data::stream_format::ReasoningSplitter::new(&tokenizer);
+        splitter.prime(prompt);
+        Self {
+            splitter,
+            reasoning: IncrementalDecoder::new(Arc::clone(&tokenizer)),
+            answer: IncrementalDecoder::new(tokenizer),
+            reasoning_started: false,
+            answer_started: false,
+            tokens: 0,
+        }
+    }
+
+    /// Push a generated token; its aux payload is kept when it belongs to
+    /// the answer and dropped otherwise.
+    pub fn push_with_aux(&mut self, token_id: u32, aux: Aux) -> ChannelDelta<Aux> {
+        use pmetal_data::stream_format::Route;
+        self.tokens += 1;
+        let (reasoning, content, aux) = match self.splitter.route(token_id) {
+            Route::Reasoning => (self.reasoning.push(token_id), String::new(), Vec::new()),
+            Route::Answer => {
+                let (text, aux) = self.answer.push_with_aux(token_id, aux);
+                (String::new(), text, aux)
+            }
+            Route::Markup => (String::new(), String::new(), Vec::new()),
+        };
+        self.delta(reasoning, content, aux)
+    }
+
+    /// Flush both channels at end of stream.
+    pub fn flush_aux(&mut self) -> ChannelDelta<Aux> {
+        let reasoning = self.reasoning.flush();
+        let (content, aux) = self.answer.flush_aux();
+        self.delta(reasoning, content, aux)
+    }
+
+    /// The answer decoded with special tokens kept, for tool-call parsing.
+    pub fn answer_with_special_tokens(&self) -> String {
+        self.answer.decoded_text_with_special_tokens()
+    }
+
+    /// Number of tokens generated so far, markers and reasoning included.
+    pub fn token_count(&self) -> usize {
+        self.tokens
+    }
+
+    fn delta(&mut self, reasoning: String, content: String, aux: Vec<Aux>) -> ChannelDelta<Aux> {
+        ChannelDelta {
+            reasoning: trim_channel_start(reasoning, &mut self.reasoning_started),
+            content: trim_channel_start(content, &mut self.answer_started),
+            aux,
+        }
+    }
+}
+
+impl ChannelDecoder<()> {
+    /// [`push_with_aux`](Self::push_with_aux) without a payload.
+    pub fn push(&mut self, token_id: u32) -> ChannelDelta<()> {
+        self.push_with_aux(token_id, ())
+    }
+}
+
+/// `text` with leading whitespace dropped until a channel's first visible
+/// character; `started` records that it has come.
+fn trim_channel_start(text: String, started: &mut bool) -> String {
+    if *started {
+        return text;
+    }
+    let trimmed = text.trim_start();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    *started = true;
+    trimmed.to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    // Note: IncrementalDecoder depends on `pmetal_data::Tokenizer`, which
-    // loads real tokenizer JSON files. End-to-end SSE behaviour is covered
-    // by the downstream handlers; the assertions here are kept to pure
-    // state-transition invariants that don't require a concrete tokenizer.
-    //
-    // If you add a mock tokenizer to `pmetal-data::tokenizer::testing`,
-    // plumb it in here to cover the BPE-boundary edge case directly.
+    use super::*;
+    use pmetal_data::tokenizer::testing::word_level;
+
+    #[test]
+    fn channels_stream_apart_and_aux_follows_the_answer() {
+        let tok = Arc::new(word_level(
+            &["[UNK]", "assistant", "plan", "add", "Paris", "is", "here"],
+            &[
+                ("<|im_start|>", true),
+                ("<think>", false),
+                ("</think>", false),
+            ],
+        ));
+        let ids = |text: &str| tok.encode_with_special_tokens(text).unwrap();
+        // The template opened the thinking block.
+        let mut decoder: ChannelDecoder<u32> =
+            ChannelDecoder::new(Arc::clone(&tok), &ids("<|im_start|> assistant <think>"));
+        let (mut reasoning, mut content, mut aux) = (String::new(), String::new(), Vec::new());
+        for (i, token) in ids("plan add </think> Paris is here")
+            .into_iter()
+            .enumerate()
+        {
+            let delta = decoder.push_with_aux(token, i as u32);
+            reasoning.push_str(&delta.reasoning);
+            content.push_str(&delta.content);
+            aux.extend(delta.aux);
+        }
+        let tail = decoder.flush_aux();
+        assert!(tail.reasoning.is_empty() && tail.content.is_empty());
+        assert_eq!(reasoning, "plan add");
+        assert_eq!(content, "Paris is here");
+        // Only the answer's tokens (3, 4, 5) carry their payloads through.
+        assert_eq!(aux, vec![3, 4, 5]);
+        assert_eq!(decoder.token_count(), 6);
+        assert_eq!(decoder.answer_with_special_tokens(), "Paris is here");
+    }
 }

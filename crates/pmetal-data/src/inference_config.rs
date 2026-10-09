@@ -95,7 +95,15 @@ pub fn collect_all_stop_tokens(
         "<｜end▁of▁sentence｜>",
         "</s>",
     ];
+    // gpt-oss's harmony format ends each message with `<|end|>`, the
+    // reasoning one included, and the turn with `<|return|>`: stopping at
+    // `<|end|>` there ends the reply before its answer.
+    let harmony = tokenizer.inner().token_to_id("<|channel|>").is_some()
+        && tokenizer.inner().token_to_id("<|return|>").is_some();
     for candidate in &candidates {
+        if harmony && *candidate == "<|end|>" {
+            continue;
+        }
         if let Ok(encoded) = tokenizer.encode(candidate) {
             if encoded.len() == 1 {
                 tokens.push(encoded[0]);
@@ -984,6 +992,20 @@ mod tests {
         assert!(Qwen3_8.preset(Auto).is_none());
         assert_eq!(Qwen3Instruct2507.recommended_max_tokens(), Some(16_384));
         assert_eq!(GptOss.recommended_max_tokens(), None);
+    }
+
+    #[test]
+    fn harmony_stops_at_the_end_of_the_turn_not_of_a_message() {
+        let dir = Path::new("/Volumes/AmBa/huggingface/parity-configs/unsloth__gpt-oss-20b");
+        if !dir.join("tokenizer.json").exists() {
+            eprintln!("skipping: no gpt-oss tokenizer at {}", dir.display());
+            return;
+        }
+        let tokenizer = Tokenizer::from_model_dir(dir).unwrap();
+        let stops = collect_all_stop_tokens(dir, &tokenizer, Some(ChatTemplateType::GptOss));
+        let id = |name| tokenizer.inner().token_to_id(name).unwrap();
+        assert!(stops.contains(&id("<|return|>")));
+        assert!(!stops.contains(&id("<|end|>")));
     }
 
     #[test]

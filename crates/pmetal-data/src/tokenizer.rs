@@ -350,3 +350,42 @@ impl Tokenizer {
         ids
     }
 }
+
+/// Small in-memory tokenizers for tests, here and in crates that take a
+/// [`Tokenizer`].
+pub mod testing {
+    use super::Tokenizer;
+
+    /// A word-level tokenizer over `words` (text splits on whitespace; the
+    /// first word stands for unknown ones), with `markers` as added tokens,
+    /// `(content, special)`, numbered after the words. Decoding joins tokens
+    /// with spaces.
+    pub fn word_level(words: &[&str], markers: &[(&str, bool)]) -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (i, w) in words.iter().enumerate() {
+            vocab.insert((*w).to_string(), (i as u32).into());
+        }
+        let added: Vec<serde_json::Value> = markers
+            .iter()
+            .enumerate()
+            .map(|(i, (content, special))| {
+                let id = (words.len() + i) as u32;
+                vocab.insert((*content).to_string(), id.into());
+                serde_json::json!({
+                    "id": id, "content": content, "single_word": false, "lstrip": false,
+                    "rstrip": false, "normalized": false, "special": special
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": added,
+            "normalizer": null,
+            "pre_tokenizer": {"type": "WhitespaceSplit"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {"type": "WordLevel", "vocab": vocab, "unk_token": words[0]}
+        });
+        Tokenizer::from_bytes(json.to_string().as_bytes()).expect("a word-level tokenizer")
+    }
+}

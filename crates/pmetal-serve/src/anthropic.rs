@@ -12,7 +12,7 @@
 //! out of scope.
 
 use crate::error::ServeError;
-use crate::routes::{AppState, resolve_stop_sequences};
+use crate::routes::{AppState, resolve_stop_sequences, split_reply};
 use crate::types::try_parse_tool_calls;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
@@ -27,7 +27,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine::{SamplingParams, TokenEvent};
-use crate::sse::IncrementalDecoder;
+use crate::sse::{ChannelDecoder, ChannelDelta};
 use crate::types::ChatMessage;
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -207,10 +207,16 @@ impl MessagesRequest {
 // Response types
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Block inside an assistant response — `text` or `tool_use`.
+/// Block inside an assistant response — `thinking`, `text` or `tool_use`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseContentBlock {
+    /// The model's reasoning, ahead of its answer. A local model's thinking
+    /// is not signed, so `signature` is empty.
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
     Text {
         text: String,
     },
@@ -313,6 +319,7 @@ enum MessageEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DeltaBlock {
+    ThinkingDelta { thinking: String },
     TextDelta { text: String },
 }
 
@@ -387,9 +394,9 @@ pub async fn messages(
         let sse = anthropic_sse_stream(
             rx,
             tokenizer,
+            &prompt.input_ids,
             request_id,
             model_id,
-            prompt_tokens,
             tools_requested,
             metrics_handle,
             permit,
@@ -404,14 +411,11 @@ pub async fn messages(
     let (tokens, _logprobs, finish_reason, metrics) =
         state.engine.generate_prompt(&prompt, params).await?;
     state.metrics.record(&metrics);
-    let text = if tools_requested {
-        state.engine.decode_with_special_tokens(&tokens)?
-    } else {
-        state.engine.decode(&tokens)?
-    };
+    let reply = split_reply(&state.engine, &prompt.input_ids, &tokens, tools_requested)?;
+    let text = reply.content;
     let output_tokens = tokens.len();
 
-    let (content, stop_reason) = if tools_requested {
+    let (content, stop_reason): (Vec<ResponseContentBlock>, String) = if tools_requested {
         match try_parse_tool_calls(&text) {
             Some(calls) => {
                 let blocks = calls
@@ -432,6 +436,16 @@ pub async fn messages(
             to_stop_reason(&finish_reason),
         )
     };
+    // The reasoning, when there was any, comes first, as a thinking block.
+    let content = reply
+        .reasoning
+        .map(|thinking| ResponseContentBlock::Thinking {
+            thinking,
+            signature: String::new(),
+        })
+        .into_iter()
+        .chain(content)
+        .collect();
 
     Ok(Json(MessagesResponse {
         id: request_id,
@@ -457,13 +471,15 @@ pub async fn messages(
 ///
 /// Events emitted in order:
 ///   1. `message_start` with an empty-content skeleton message.
-///   2. `content_block_start` (text block at index 0).
-///   3. One `content_block_delta` per newly decoded UTF-8 text prefix.
-///   4. `content_block_stop`.
-///   5. `message_delta` carrying the final stop_reason + output_tokens.
-///   6. `message_stop`.
+///   2. For a model that reasons first, a `thinking` block:
+///      `content_block_start`, one `thinking_delta` per newly decoded
+///      UTF-8 prefix of the reasoning, `content_block_stop`.
+///   3. A `text` block the same way, with `text_delta`s of the answer (an
+///      empty one when the model gave none).
+///   4. `message_delta` carrying the final stop_reason + output_tokens.
+///   5. `message_stop`.
 ///
-/// Tool-call detection runs on the full accumulated text at Done — when a
+/// Tool-call detection runs on the full accumulated answer at Done — when a
 /// tool call parses, the stop_reason becomes `tool_use`. For Phase 1 we do
 /// not stream tool_use blocks incrementally; the text deltas already
 /// carry the raw JSON, and tool-aware clients can parse it from the final
@@ -472,16 +488,17 @@ pub async fn messages(
 fn anthropic_sse_stream(
     rx: tokio::sync::mpsc::Receiver<TokenEvent>,
     tokenizer: Arc<pmetal_data::Tokenizer>,
+    prompt: &[u32],
     request_id: String,
     model_id: String,
-    prompt_tokens: usize,
     tools_requested: bool,
     state: Arc<AppState>,
     _permit: OwnedSemaphorePermit,
     holdback_tokens: usize,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
-    // Opening events — pre-built so the first token arrival doesn't pay the
-    // cost of serialising three SSE frames in a row.
+    let prompt_tokens = prompt.len();
+    // Opening event — pre-built so the first token arrival doesn't pay the
+    // cost of serialising it.
     let opening_message_start = MessageEvent::MessageStart {
         message: MessagesResponse {
             id: request_id.clone(),
@@ -497,21 +514,15 @@ fn anthropic_sse_stream(
             },
         },
     };
-    let opening_block_start = MessageEvent::ContentBlockStart {
-        index: 0,
-        content_block: ResponseContentBlock::Text {
-            text: String::new(),
-        },
-    };
+    let openings = stream::iter(vec![Ok::<Event, Infallible>(encode_event(
+        &opening_message_start,
+    ))]);
 
-    let openings = stream::iter(vec![
-        Ok::<Event, Infallible>(encode_event(&opening_message_start)),
-        Ok(encode_event(&opening_block_start)),
-    ]);
-
-    // Shared UTF-8 boundary buffering — see crate::sse::IncrementalDecoder.
-    // Anthropic stream doesn't surface OpenAI logprobs, aux is `()`.
-    let mut decoder: IncrementalDecoder<()> = IncrementalDecoder::new(tokenizer);
+    // Shared UTF-8 boundary buffering, one decoder per channel — see
+    // crate::sse::ChannelDecoder. Anthropic stream doesn't surface OpenAI
+    // logprobs, aux is `()`.
+    let mut decoder: ChannelDecoder<()> = ChannelDecoder::new(tokenizer, prompt);
+    let mut blocks = BlockStream::default();
     let mut pending_tokens: VecDeque<u32> = VecDeque::new();
 
     let mapped = ReceiverStream::new(rx).flat_map(move |event| {
@@ -526,14 +537,7 @@ fn anthropic_sse_stream(
                     let Some(next_tok) = pending_tokens.pop_front() else {
                         break;
                     };
-                    let new_text = decoder.push(next_tok);
-                    if !new_text.is_empty() {
-                        let delta = MessageEvent::ContentBlockDelta {
-                            index: 0,
-                            delta: DeltaBlock::TextDelta { text: new_text },
-                        };
-                        events.push(Ok(encode_event(&delta)));
-                    }
+                    blocks.emit(decoder.push(next_tok), &mut events);
                 }
             }
             TokenEvent::Done {
@@ -555,29 +559,14 @@ fn anthropic_sse_stream(
                 }
 
                 while let Some(next_tok) = pending_tokens.pop_front() {
-                    let new_text = decoder.push(next_tok);
-                    if !new_text.is_empty() {
-                        let delta = MessageEvent::ContentBlockDelta {
-                            index: 0,
-                            delta: DeltaBlock::TextDelta { text: new_text },
-                        };
-                        events.push(Ok(encode_event(&delta)));
-                    }
+                    blocks.emit(decoder.push(next_tok), &mut events);
                 }
-
-                let remaining = decoder.flush();
-                if !remaining.is_empty() {
-                    let delta = MessageEvent::ContentBlockDelta {
-                        index: 0,
-                        delta: DeltaBlock::TextDelta { text: remaining },
-                    };
-                    events.push(Ok(encode_event(&delta)));
-                }
+                blocks.emit(decoder.flush_aux(), &mut events);
                 state.metrics.record(&metrics);
 
                 let output_tokens = decoder.token_count();
                 let stop_reason = if tools_requested {
-                    if try_parse_tool_calls(&decoder.decoded_text_with_special_tokens()).is_some() {
+                    if try_parse_tool_calls(&decoder.answer_with_special_tokens()).is_some() {
                         "tool_use".to_string()
                     } else {
                         to_stop_reason(&finish_reason)
@@ -586,9 +575,7 @@ fn anthropic_sse_stream(
                     to_stop_reason(&finish_reason)
                 };
 
-                events.push(Ok(encode_event(&MessageEvent::ContentBlockStop {
-                    index: 0,
-                })));
+                blocks.finish(&mut events);
                 events.push(Ok(encode_event(&MessageEvent::MessageDelta {
                     delta: MessageDeltaPayload {
                         stop_reason: Some(stop_reason),
@@ -617,6 +604,90 @@ fn anthropic_sse_stream(
     });
 
     openings.chain(mapped)
+}
+
+/// The content block a stream has open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum OpenBlock {
+    #[default]
+    None,
+    Thinking,
+    Text,
+}
+
+/// Opens, fills and closes a stream's content blocks: a `thinking` block
+/// while the model reasons, then a `text` block for its answer.
+#[derive(Debug, Default)]
+struct BlockStream {
+    open: OpenBlock,
+    index: usize,
+}
+
+impl BlockStream {
+    /// Emit `delta`'s reasoning and answer into their blocks.
+    fn emit(&mut self, delta: ChannelDelta<()>, events: &mut Vec<Result<Event, Infallible>>) {
+        events.extend(self.events(delta).iter().map(|e| Ok(encode_event(e))));
+    }
+
+    /// Close the open block, opening an empty text block first when the
+    /// stream produced no answer, so every reply carries one.
+    fn finish(&mut self, events: &mut Vec<Result<Event, Infallible>>) {
+        events.extend(self.closing().iter().map(|e| Ok(encode_event(e))));
+    }
+
+    fn events(&mut self, delta: ChannelDelta<()>) -> Vec<MessageEvent> {
+        let mut events = Vec::new();
+        if !delta.reasoning.is_empty() {
+            self.switch(OpenBlock::Thinking, &mut events);
+            events.push(MessageEvent::ContentBlockDelta {
+                index: self.index,
+                delta: DeltaBlock::ThinkingDelta {
+                    thinking: delta.reasoning,
+                },
+            });
+        }
+        if !delta.content.is_empty() {
+            self.switch(OpenBlock::Text, &mut events);
+            events.push(MessageEvent::ContentBlockDelta {
+                index: self.index,
+                delta: DeltaBlock::TextDelta {
+                    text: delta.content,
+                },
+            });
+        }
+        events
+    }
+
+    fn closing(&mut self) -> Vec<MessageEvent> {
+        let mut events = Vec::new();
+        self.switch(OpenBlock::Text, &mut events);
+        events.push(MessageEvent::ContentBlockStop { index: self.index });
+        events
+    }
+
+    fn switch(&mut self, to: OpenBlock, events: &mut Vec<MessageEvent>) {
+        if self.open == to {
+            return;
+        }
+        if self.open != OpenBlock::None {
+            events.push(MessageEvent::ContentBlockStop { index: self.index });
+            self.index += 1;
+        }
+        let content_block = match to {
+            OpenBlock::Thinking => ResponseContentBlock::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+            _ => ResponseContentBlock::Text {
+                text: String::new(),
+            },
+        };
+        events.push(MessageEvent::ContentBlockStart {
+            index: self.index,
+            content_block,
+        });
+        self.open = to;
+    }
 }
 
 fn encode_event(ev: &MessageEvent) -> Event {
@@ -714,5 +785,60 @@ mod tests {
         let json = serde_json::to_string(&block).unwrap();
         assert!(json.contains(r#""type":"text""#));
         assert!(json.contains(r#""text":"hello""#));
+    }
+
+    #[test]
+    fn reasoning_streams_as_a_thinking_block_ahead_of_the_text() {
+        let delta = |reasoning: &str, content: &str| ChannelDelta {
+            reasoning: reasoning.into(),
+            content: content.into(),
+            aux: Vec::new(),
+        };
+        let mut blocks = BlockStream::default();
+        let mut events = Vec::new();
+        for d in [delta("plan", ""), delta(" more", ""), delta("", "Paris")] {
+            events.extend(blocks.events(d));
+        }
+        events.extend(blocks.closing());
+        let events: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
+        let shape: Vec<(String, u64)> = events
+            .iter()
+            .map(|e| {
+                let kind = e["content_block"]["type"]
+                    .as_str()
+                    .or(e["delta"]["type"].as_str())
+                    .unwrap_or(e["type"].as_str().unwrap());
+                (kind.to_string(), e["index"].as_u64().unwrap())
+            })
+            .collect();
+        let expect = |s: &[(&str, u64)]| -> Vec<(String, u64)> {
+            s.iter().map(|(k, i)| (k.to_string(), *i)).collect()
+        };
+        assert_eq!(
+            shape,
+            expect(&[
+                ("thinking", 0),
+                ("thinking_delta", 0),
+                ("thinking_delta", 0),
+                ("content_block_stop", 0),
+                ("text", 1),
+                ("text_delta", 1),
+                ("content_block_stop", 1),
+            ])
+        );
+        assert_eq!(events[1]["delta"]["thinking"], "plan");
+        assert_eq!(events[5]["delta"]["text"], "Paris");
+
+        // No reasoning and no answer: one empty text block, as before.
+        let shape: Vec<serde_json::Value> = BlockStream::default()
+            .closing()
+            .iter()
+            .map(|e| serde_json::to_value(e).unwrap())
+            .collect();
+        assert_eq!(shape[0]["content_block"]["type"], "text");
+        assert_eq!(shape[1]["type"], "content_block_stop");
     }
 }

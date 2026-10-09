@@ -628,12 +628,17 @@ pub struct ChatChunkChoice {
 }
 
 /// Delta content in a streaming chunk.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// The model's reasoning, streamed apart from `content` as other
+    /// OpenAI-compatible servers stream it: a thinking model's deltas carry
+    /// this first, then `content` with the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Tool calls attached to the closing chunk when the model's output parses
     /// as a function call. Mid-stream token deltas leave this `None`.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -175,6 +175,20 @@ For multi-turn conversations, send an assistant turn's thinking back as
 head of `content` is split out the same way. `/v1/messages` maps
 `"thinking": {"type": "disabled"}` (or `"enabled"`) to `enable_thinking`.
 
+### Reasoning in replies
+
+A model that reasons before it answers gets its reasoning returned apart from
+the answer, and `content` holds the answer only. Chat completions put it in
+`message.reasoning_content`, and when streaming in `delta.reasoning_content`
+chunks ahead of the `delta.content` ones, as other OpenAI-compatible servers
+do. `/v1/messages` answers with a `thinking` block ahead of the `text` block
+(streamed as `thinking_delta`s); its `signature` is empty, since a local
+model's thinking is not signed. Qwen3-family `<think>…</think>` (including a
+block the chat template opens itself), DeepSeek-R1, Phi-4-reasoning,
+Magistral's `[THINK]`, Gemma 4's thought channel and gpt-oss's `analysis`
+channel are recognised; the markers themselves appear in neither field.
+Logprobs cover the answer's tokens.
+
 :::note
 The prebuilt release binary and the Homebrew formula both ship this command. If you build PMetal
 yourself, `serve` is opt-in: `cargo install pmetal --features serve`.

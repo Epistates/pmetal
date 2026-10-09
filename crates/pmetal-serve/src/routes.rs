@@ -2,13 +2,14 @@
 
 use crate::engine::{InferenceEngine, PreparedPrompt, RequestMetrics, SamplingParams, TokenEvent};
 use crate::error::ServeError;
-use crate::sse::IncrementalDecoder;
+use crate::sse::{ChannelDecoder, ChannelDelta, IncrementalDecoder};
 use crate::types::*;
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json};
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
+use pmetal_data::stream_format::{Route, SplitOutput};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -313,6 +314,7 @@ pub async fn chat_completions(
         let sse_stream = chat_sse_stream(
             rx,
             tokenizer,
+            &prompt.input_ids,
             request_id,
             model_id,
             created,
@@ -334,11 +336,8 @@ pub async fn chat_completions(
     state.metrics.record(&metrics);
 
     let completion_tokens = tokens.len();
-    let text = if tools_requested {
-        state.engine.decode_with_special_tokens(&tokens)?
-    } else {
-        state.engine.decode(&tokens)?
-    };
+    let reply = split_reply(&state.engine, &prompt.input_ids, &tokens, tools_requested)?;
+    let text = reply.content;
 
     // Best-effort tool-call detection: only attempted when the caller declared
     // `tools` in the request. Falls back to plain content otherwise.
@@ -354,11 +353,14 @@ pub async fn chat_completions(
     // Convert engine logprob entries to the wire shape. Per-token byte
     // decode uses the tokenizer so clients can reconstruct exact bytes
     // even when a token lands mid-codepoint.
+    // `content` is the answer, so its logprobs are the answer tokens'.
     let logprobs = logprob_entries.map(|entries| {
         let tokenizer = state.engine.tokenizer_arc();
         let content = entries
             .into_iter()
-            .map(|e| {
+            .zip(&reply.routes)
+            .filter(|(_, route)| **route == Route::Answer)
+            .map(|(e, _)| {
                 let token_str = tokenizer.decode(&[e.token]).unwrap_or_default();
                 let top = e
                     .top_logprobs
@@ -392,7 +394,7 @@ pub async fn chat_completions(
                 content,
                 tool_calls,
                 parts: None,
-                reasoning_content: None,
+                reasoning_content: reply.reasoning,
             },
             finish_reason: Some(reason),
             logprobs,
@@ -600,14 +602,18 @@ fn delta_logprobs_from_aux(
 ///
 /// Emits:
 /// 1. An opening event with `role: "assistant"` and no content.
-/// 2. One event per token (decoded to text, with UTF-8 boundary buffering).
+/// 2. One event per token that adds text (decoded with UTF-8 boundary
+///    buffering): the model's reasoning as `delta.reasoning_content`, its
+///    answer as `delta.content`, the markers between them in neither.
 /// 3. A closing event with `finish_reason` and empty delta.
 /// 4. A `[DONE]` sentinel (only on success — not emitted after errors).
 ///
 /// Metrics are recorded to `state.metrics` when the `Done` event arrives.
+#[allow(clippy::too_many_arguments)]
 fn chat_sse_stream(
     rx: tokio::sync::mpsc::Receiver<TokenEvent>,
     tokenizer: Arc<pmetal_data::Tokenizer>,
+    prompt: &[u32],
     request_id: String,
     model_id: String,
     created: i64,
@@ -616,8 +622,7 @@ fn chat_sse_stream(
     _permit: OwnedSemaphorePermit,
     holdback_tokens: usize,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
-    // Pre-build the opening event once.
-    let opening = {
+    let chunk_event = move |delta: ChatDelta, finish_reason: Option<String>| {
         let chunk = ChatCompletionChunk {
             id: request_id.clone(),
             object: "chat.completion.chunk".to_string(),
@@ -625,32 +630,65 @@ fn chat_sse_stream(
             model: model_id.clone(),
             choices: vec![ChatChunkChoice {
                 index: 0,
-                delta: ChatDelta {
-                    role: Some("assistant".to_string()),
-                    content: None,
-                    tool_calls: None,
-                    logprobs: None,
-                },
-                finish_reason: None,
+                delta,
+                finish_reason,
             }],
         };
-        Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+        Ok::<Event, Infallible>(
+            Event::default().data(serde_json::to_string(&chunk).unwrap_or_default()),
+        )
     };
 
+    // Pre-build the opening event once.
+    let opening = chunk_event(
+        ChatDelta {
+            role: Some("assistant".to_string()),
+            ..ChatDelta::default()
+        },
+        None,
+    );
+
     // BPE boundaries can split multi-byte codepoints across tokens — the
-    // decoder buffers the full sequence and exposes only the confirmed
+    // decoder buffers each channel's sequence and exposes only the confirmed
     // prefix, so clients never see half-codepoint byte sequences.
     //
     // The aux payload is the per-token logprob (None when caller didn't
     // opt in). On boundary-flush, drained aux entries align 1:1 with the
-    // tokens that contributed to the new text — we attach them to the
-    // outgoing ChatDelta as `logprobs.content`.
-    let mut decoder: IncrementalDecoder<Option<crate::engine::TokenLogprobEntry>> =
-        IncrementalDecoder::new(Arc::clone(&tokenizer));
+    // answer tokens that contributed to the new text — we attach them to
+    // the outgoing ChatDelta as `logprobs.content`.
+    let mut decoder: ChannelDecoder<Option<crate::engine::TokenLogprobEntry>> =
+        ChannelDecoder::new(Arc::clone(&tokenizer), prompt);
+
+    // One chunk for new reasoning, one for new answer text.
+    let tokenizer_for_aux = Arc::clone(&tokenizer);
+    let channel_events = {
+        let chunk_event = chunk_event.clone();
+        move |delta: ChannelDelta<Option<crate::engine::TokenLogprobEntry>>,
+              events: &mut Vec<Result<Event, Infallible>>| {
+            if !delta.reasoning.is_empty() {
+                events.push(chunk_event(
+                    ChatDelta {
+                        reasoning_content: Some(delta.reasoning),
+                        ..ChatDelta::default()
+                    },
+                    None,
+                ));
+            }
+            if !delta.content.is_empty() {
+                events.push(chunk_event(
+                    ChatDelta {
+                        content: Some(delta.content),
+                        logprobs: delta_logprobs_from_aux(&tokenizer_for_aux, delta.aux),
+                        ..ChatDelta::default()
+                    },
+                    None,
+                ));
+            }
+        }
+    };
 
     // Prepend the opening event to the token-event stream.
     let token_stream = ReceiverStream::new(rx);
-    let tokenizer_for_aux = Arc::clone(&tokenizer);
     let mut pending_tokens: VecDeque<(u32, Option<crate::engine::TokenLogprobEntry>)> =
         VecDeque::new();
 
@@ -665,28 +703,7 @@ fn chat_sse_stream(
                     let Some((next_id, next_logprob)) = pending_tokens.pop_front() else {
                         break;
                     };
-                    let (new_text, drained_aux) = decoder.push_with_aux(next_id, next_logprob);
-                    if !new_text.is_empty() {
-                        let logprobs = delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux);
-                        let chunk = ChatCompletionChunk {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model_id.clone(),
-                            choices: vec![ChatChunkChoice {
-                                index: 0,
-                                delta: ChatDelta {
-                                    role: None,
-                                    content: Some(new_text),
-                                    tool_calls: None,
-                                    logprobs,
-                                },
-                                finish_reason: None,
-                            }],
-                        };
-                        events.push(Ok(Event::default()
-                            .data(serde_json::to_string(&chunk).unwrap_or_default())));
-                    }
+                    channel_events(decoder.push_with_aux(next_id, next_logprob), &mut events);
                 }
             }
             TokenEvent::Done {
@@ -708,58 +725,16 @@ fn chat_sse_stream(
                 }
 
                 while let Some((next_id, next_logprob)) = pending_tokens.pop_front() {
-                    let (new_text, drained_aux) = decoder.push_with_aux(next_id, next_logprob);
-                    if !new_text.is_empty() {
-                        let logprobs = delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux);
-                        let chunk = ChatCompletionChunk {
-                            id: request_id.clone(),
-                            object: "chat.completion.chunk".to_string(),
-                            created,
-                            model: model_id.clone(),
-                            choices: vec![ChatChunkChoice {
-                                index: 0,
-                                delta: ChatDelta {
-                                    role: None,
-                                    content: Some(new_text),
-                                    tool_calls: None,
-                                    logprobs,
-                                },
-                                finish_reason: None,
-                            }],
-                        };
-                        events.push(Ok(Event::default()
-                            .data(serde_json::to_string(&chunk).unwrap_or_default())));
-                    }
+                    channel_events(decoder.push_with_aux(next_id, next_logprob), &mut events);
                 }
-
-                let (remaining, drained_aux) = decoder.flush_aux();
-                if !remaining.is_empty() {
-                    let chunk = ChatCompletionChunk {
-                        id: request_id.clone(),
-                        object: "chat.completion.chunk".to_string(),
-                        created,
-                        model: model_id.clone(),
-                        choices: vec![ChatChunkChoice {
-                            index: 0,
-                            delta: ChatDelta {
-                                role: None,
-                                content: Some(remaining),
-                                tool_calls: None,
-                                logprobs: delta_logprobs_from_aux(&tokenizer_for_aux, drained_aux),
-                            },
-                            finish_reason: None,
-                        }],
-                    };
-                    events.push(Ok(Event::default()
-                        .data(serde_json::to_string(&chunk).unwrap_or_default())));
-                }
+                channel_events(decoder.flush_aux(), &mut events);
 
                 // Record request metrics now that generation is complete.
                 state.metrics.record(&metrics);
 
-                // Best-effort tool-call detection on the accumulated response.
+                // Best-effort tool-call detection on the accumulated answer.
                 let (tool_calls, reason) = if tools_requested {
-                    let decoded = decoder.decoded_text_with_special_tokens();
+                    let decoded = decoder.answer_with_special_tokens();
                     match try_parse_tool_calls(&decoded) {
                         Some(calls) => (Some(calls), "tool_calls".to_string()),
                         None => (None, finish_reason),
@@ -771,24 +746,13 @@ fn chat_sse_stream(
                 // Closing chunk: empty delta, finish_reason set. When a tool
                 // call was detected, attach structured tool_calls so tool-aware
                 // clients can use the parsed form without re-parsing content.
-                let closing = ChatCompletionChunk {
-                    id: request_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: model_id.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatDelta {
-                            role: None,
-                            content: None,
-                            tool_calls,
-                            logprobs: None,
-                        },
-                        finish_reason: Some(reason),
-                    }],
-                };
-                events.push(Ok(Event::default()
-                    .data(serde_json::to_string(&closing).unwrap_or_default())));
+                events.push(chunk_event(
+                    ChatDelta {
+                        tool_calls,
+                        ..ChatDelta::default()
+                    },
+                    Some(reason),
+                ));
                 // OpenAI streaming sentinel — only on successful completion.
                 events.push(Ok(Event::default().data("[DONE]")));
             }
@@ -806,7 +770,7 @@ fn chat_sse_stream(
     });
 
     // Prepend the role announcement before the first token.
-    stream::once(async move { Ok::<Event, Infallible>(opening) }).chain(mapped)
+    stream::once(async move { opening }).chain(mapped)
 }
 
 /// Convert an mpsc token stream into an SSE event stream for text completions.
@@ -1081,6 +1045,39 @@ pub async fn embeddings(
 // ────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ────────────────────────────────────────────────────────────────────────────
+
+/// A finished chat reply, its reasoning apart from its answer.
+pub(crate) struct ChatReply {
+    /// The reasoning, trimmed; `None` when the model gave none.
+    pub(crate) reasoning: Option<String>,
+    /// The answer, leading whitespace dropped, with special tokens kept when
+    /// asked for (tool-call parsing reads them).
+    pub(crate) content: String,
+    /// Where each generated token went.
+    pub(crate) routes: Vec<Route>,
+}
+
+/// Split `tokens`, generated after `prompt`, into reasoning and answer
+/// (see [`pmetal_data::stream_format::ReasoningSplitter`]).
+pub(crate) fn split_reply(
+    engine: &InferenceEngine,
+    prompt: &[u32],
+    tokens: &[u32],
+    special_tokens: bool,
+) -> Result<ChatReply, ServeError> {
+    let tokenizer = engine.tokenizer_arc();
+    let split = SplitOutput::split(&tokenizer, prompt, tokens);
+    let content = if special_tokens {
+        engine.decode_with_special_tokens(&split.answer)?
+    } else {
+        engine.decode(&split.answer)?
+    };
+    Ok(ChatReply {
+        reasoning: split.reasoning_text(&tokenizer),
+        content: content.trim_start().to_string(),
+        routes: split.routes,
+    })
+}
 
 /// Resolve stop strings to a mix of fast-path token IDs and raw text sequences.
 ///
