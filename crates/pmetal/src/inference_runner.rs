@@ -98,9 +98,10 @@ pub struct InferenceRunnerConfig {
     pub chat_template_kwargs: ChatTemplateKwargs,
     /// Optional tool/function definitions for tool-calling models.
     pub tools: Option<Vec<ToolDefinition>>,
-    /// Images to show a Qwen3.5-family vision model, in order. Each gets a
-    /// placeholder ahead of the prompt text, where the chat template would
-    /// put an image item that precedes the text.
+    /// Images to show a Qwen3.5-family vision model, in order. In chat mode
+    /// each is an image item of the prompt's message, ahead of its text, for
+    /// the chat template to place (as `pmetal serve` does with a request's
+    /// image parts); without a template its placeholder precedes the text.
     pub images: Vec<PathBuf>,
     /// Videos to show a Qwen3.5-family vision model, in order, after the
     /// images and before the prompt text.
@@ -292,16 +293,6 @@ impl InferenceRunner {
         let images = std::mem::take(&mut config.images);
         let videos = std::mem::take(&mut config.videos);
         let has_media = !images.is_empty() || !videos.is_empty();
-        if has_media {
-            // The images' and then the videos' placeholders ahead of the
-            // text: what the chat template renders for media items before a
-            // text item, and the processor's input otherwise.
-            config.prompt = format!(
-                "{}{}",
-                pmetal_data::qwen_vl_processing::media_placeholders(images.len(), videos.len()),
-                config.prompt
-            );
-        }
         let model_path = &config.model_path;
         if config.qwen_mtp && config.mtp_assistant_path.is_some() {
             return Err(Exception::custom(
@@ -420,7 +411,7 @@ impl InferenceRunner {
                 &model_path.to_string_lossy(),
             );
 
-            let messages = build_chat_messages(
+            let mut messages = build_chat_messages(
                 config.chat_messages.as_ref(),
                 config.system_message.as_deref(),
                 &config.prompt,
@@ -429,16 +420,27 @@ impl InferenceRunner {
             detected
                 .check_thinking_controls(&template_kwargs)
                 .map_err(Exception::custom)?;
-            let formatted = expand_media(
+            let rendered = if has_media {
+                // The media are items of the prompt's message, rendered by
+                // the model's own template, as the server renders a
+                // request's media parts: the hardcoded fallback formatter
+                // would drop them.
+                attach_media(&mut messages, &config.prompt, images.len(), videos.len());
+                detected.render_inference_jinja_with_kwargs(
+                    &messages,
+                    config.tools.as_deref(),
+                    &template_kwargs,
+                )
+            } else {
                 detected
                     .apply_inference_with_kwargs(
                         &messages,
                         config.tools.as_deref(),
                         &template_kwargs,
                     )
-                    .map_err(Exception::custom)?
-                    .text,
-            )?;
+                    .map(|formatted| formatted.text)
+            };
+            let formatted = expand_media(rendered.map_err(Exception::custom)?)?;
 
             let ids = tokenizer
                 .encode_with_special_tokens(&formatted)
@@ -449,6 +451,13 @@ impl InferenceRunner {
                 detected.thinks_with(&template_kwargs),
             )
         } else {
+            // Without a template, the images' and then the videos'
+            // placeholders precede the text, as the processor takes them.
+            let prompt = format!(
+                "{}{}",
+                pmetal_data::qwen_vl_processing::media_placeholders(images.len(), videos.len()),
+                config.prompt
+            );
             let prompt_text = if config.chat_messages.is_some()
                 || config
                     .system_message
@@ -458,10 +467,10 @@ impl InferenceRunner {
                 build_plain_conversation_prompt(
                     config.chat_messages.as_ref(),
                     config.system_message.as_deref(),
-                    &config.prompt,
+                    &prompt,
                 )
             } else {
-                config.prompt.clone()
+                prompt
             };
             let ids = tokenizer
                 .encode(&expand_media(prompt_text)?)
@@ -2214,6 +2223,29 @@ fn build_chat_messages(
     messages
 }
 
+/// Make `images` images and then `videos` videos items of the prompt's
+/// message, ahead of its text: the content `[{"type": "image"}, ...,
+/// {"type": "text", ...}]` a client sends `pmetal serve` and the reference
+/// processor's chat template takes. The prompt's message is the last one
+/// [`build_chat_messages`] built; without a prompt the media are a user
+/// message of their own.
+fn attach_media(messages: &mut Vec<Message>, prompt: &str, images: usize, videos: usize) {
+    use pmetal_data::chat_templates::ContentPart;
+
+    let mut parts: Vec<ContentPart> = std::iter::repeat_n(ContentPart::Image, images)
+        .chain(std::iter::repeat_n(ContentPart::Video, videos))
+        .collect();
+    if prompt.is_empty() {
+        messages.push(Message::with_parts("user", parts));
+        return;
+    }
+    parts.push(ContentPart::Text(prompt.to_owned()));
+    let last = messages
+        .last_mut()
+        .expect("build_chat_messages ends with the prompt's message");
+    *last = Message::with_parts("user", parts);
+}
+
 fn build_plain_conversation_prompt(
     history: Option<&Vec<Message>>,
     system_message: Option<&str>,
@@ -2610,6 +2642,57 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "write fizzbuzz");
+    }
+
+    /// The images and videos are items of the prompt's message, so the
+    /// model's template places and labels them as transformers'
+    /// `apply_chat_template` does: `add_vision_id` numbers each one, which a
+    /// placeholder pasted into the text never got.
+    #[test]
+    fn media_are_items_of_the_prompt_message_for_the_template_to_place() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pmetal-data/tests/fixtures/chat_template_kwargs_reference.json");
+        let reference: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        let source = &reference["templates"]["qwen3_8"]["source"];
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            serde_json::json!({ "chat_template": source }).to_string(),
+        )
+        .unwrap();
+        let template = pmetal_data::chat_templates::detect_chat_template(dir.path(), "qwen");
+
+        let mut messages = build_chat_messages(None, Some("Be brief."), "Compare them.");
+        attach_media(&mut messages, "Compare them.", 2, 1);
+        let mut kwargs = ChatTemplateKwargs::new();
+        kwargs.set("add_vision_id", true);
+        let text = template
+            .render_inference_jinja_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
+        // transformers 5.19, `apply_chat_template(..., add_vision_id=True)`
+        // on `[{"type": "image"}, {"type": "image"}, {"type": "video"},
+        // {"type": "text", "text": "Compare them."}]`.
+        assert_eq!(
+            text,
+            "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully \
+             through the task, validate key assumptions, consider plausible alternatives, and \
+             prioritize correctness, consistency, and clarity in the final answer.\n\nBe \
+             brief.<|im_end|>\n<|im_start|>user\nPicture 1: \
+             <|vision_start|><|image_pad|><|vision_end|>Picture 2: \
+             <|vision_start|><|image_pad|><|vision_end|>Video 1: \
+             <|vision_start|><|video_pad|><|vision_end|>Compare them.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n"
+        );
+
+        // Media without a prompt are a user message of their own.
+        let mut messages = build_chat_messages(Some(&vec![Message::user("hi")]), None, "");
+        attach_media(&mut messages, "", 1, 0);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[1].parts.as_deref(),
+            Some(&[pmetal_data::chat_templates::ContentPart::Image][..])
+        );
     }
 
     #[test]
