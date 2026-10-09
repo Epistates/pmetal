@@ -994,13 +994,15 @@ mod tests {
         assert_eq!(GptOss.recommended_max_tokens(), None);
     }
 
+    /// Needs a gpt-oss snapshot (its tokenizer and generation config are
+    /// enough): `PMETAL_GPT_OSS_DIR=<snapshot> cargo test -p pmetal-data`.
     #[test]
     fn harmony_stops_at_the_end_of_the_turn_not_of_a_message() {
-        let dir = Path::new("/Volumes/AmBa/huggingface/parity-configs/unsloth__gpt-oss-20b");
-        if !dir.join("tokenizer.json").exists() {
-            eprintln!("skipping: no gpt-oss tokenizer at {}", dir.display());
+        let Some(dir) = std::env::var_os("PMETAL_GPT_OSS_DIR").map(std::path::PathBuf::from) else {
+            eprintln!("PMETAL_GPT_OSS_DIR is not set; skipping");
             return;
-        }
+        };
+        let dir = dir.as_path();
         let tokenizer = Tokenizer::from_model_dir(dir).unwrap();
         let stops = collect_all_stop_tokens(dir, &tokenizer, Some(ChatTemplateType::GptOss));
         let id = |name| tokenizer.inner().token_to_id(name).unwrap();
