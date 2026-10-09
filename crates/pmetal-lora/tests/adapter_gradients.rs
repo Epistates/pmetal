@@ -35,7 +35,8 @@ const SCORED_TAIL: i32 = 4;
 /// Length of the central difference's step, taken along a whole adapter
 /// tensor (rank 4 by a few dozen features, entries O(0.05), so a norm near
 /// 0.5): a few percent of it, large against f32 rounding of the loss and
-/// small enough that the loss stays close to quadratic over it.
+/// small enough that Richardson extrapolation over `H`, `H / 2` and `H / 4`
+/// leaves an error of order `H⁴`.
 const H: f32 = 1e-2;
 
 /// Architectures beyond the shared cases: the Qwen 3.5 MoE layer (router,
@@ -106,11 +107,13 @@ fn lora_config() -> LoraConfig {
 }
 
 /// Give both factors of every adapter a nonzero value, so each has a
-/// gradient (`B` starts at zero, which zeroes `A`'s).
+/// gradient (`B` starts at zero, which zeroes `A`'s). Drawn in name order, so
+/// every run gets the same values.
 fn randomize_adapters(model: &mut AdaptedModel) {
     random::seed(7);
-    let params: HashMap<Rc<str>, Array> = model
-        .lora_parameters()
+    let mut adapters: Vec<_> = model.lora_parameters().into_iter().collect();
+    adapters.sort_by(|a, b| a.0.cmp(&b.0));
+    let params: HashMap<Rc<str>, Array> = adapters
         .into_iter()
         .map(|(name, p)| {
             let r = random::uniform_range(-0.05, 0.05, p.shape(), Dtype::Float32);
@@ -203,7 +206,9 @@ fn check_architecture(name: &str, config_json: &str) -> Vec<String> {
     // whole tensor's signal goes into one difference, well clear of f32
     // rounding.
     let base = model.lora_parameters();
-    let rounding = 16.0 * f32::EPSILON * loss.abs().max(1.0) / H;
+    // The smaller pair weighs the quarter step's difference by 4/3, whose
+    // rounding is four times the full step's.
+    let rounding = 128.0 * f32::EPSILON * loss.abs().max(1.0) / H;
     let mut problems = Vec::new();
     for key in &names {
         let g = grads[key].as_dtype(Dtype::Float32.as_i32());
@@ -222,8 +227,21 @@ fn check_architecture(name: &str, config_json: &str) -> Vec<String> {
             drain(name);
             loss
         };
-        let fd = (nudged(H) - nudged(-H)) / (2.0 * H);
+        let mut central = |h: f32| (nudged(h) - nudged(-h)) / (2.0 * h);
+        let steps = [central(H), central(H / 2.0), central(H / 4.0)];
         model.set_lora_parameters(&base);
+        // Richardson over each pair of steps cancels the central difference's
+        // `h²` error. A step that crosses a kink in the loss (an MoE router
+        // changing its top-k) spoils the pairs it is in, while a missing
+        // gradient term shows at every step, so the gradient is wrong only
+        // when both pairs disagree with it. Report the closer one.
+        let fd = [
+            (4.0 * steps[1] - steps[0]) / 3.0,
+            (4.0 * steps[2] - steps[1]) / 3.0,
+        ]
+        .into_iter()
+        .min_by(|a, b| (a - norm).abs().total_cmp(&(b - norm).abs()))
+        .unwrap();
         if (fd - norm).abs() > 2e-2 * norm + rounding {
             problems.push(format!(
                 "{name}: {key} autograd |g| {norm} vs finite difference along g {fd}"
