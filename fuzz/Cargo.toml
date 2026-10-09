@@ -16,7 +16,7 @@ libfuzzer-sys = "0.4"
 pmetal-gguf = { path = "../crates/pmetal-gguf" }
 
 [target.'cfg(fuzzing)'.dependencies]
-arbitrary = { version = "1.4", features = ["derive"] }
+arbitrary = { version = "1.5", features = ["derive"] }
 
 [[bin]]
 name = "gguf_reader"

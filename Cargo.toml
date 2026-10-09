@@ -77,7 +77,7 @@ tower = "0.5"
 tower-http = "0.7"
 
 # MCP server (pmetal-mcp)
-turbomcp = "3.5.0"
+turbomcp = "3.6.0"
 
 # Peer discovery and networking (pmetal-distributed)
 libp2p = "0.57"
@@ -159,7 +159,9 @@ half = { version = "2", features = ["zerocopy"] }
 num-traits = "0.2"
 ndarray = { version = "0.17", features = ["rayon"] }
 rayon = "1"
-rand = "0.10"
+# Floors at or past RUSTSEC-2026-0097 (rand), RUSTSEC-2026-0186 (memmap2) and
+# RUSTSEC-2026-0009 (time), so a library consumer can't resolve below them.
+rand = "0.10.3"
 rand_distr = "0.6"
 ordered-float = "5"
 ahash = "0.8"
@@ -168,15 +170,15 @@ indicatif = "0.18"
 humansize = "2"
 dirs = "7"
 walkdir = "2"
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 chrono = "0.4.45"
-time = "0.3"
+time = "0.3.55"
 image = "0.25.10"
 flate2 = "1"
-libc = "0.2.189"
+libc = "0.2.190"
 parking_lot = "0.12.5"
 regex = "1.13"
-uuid = "1.26"
+uuid = "1.27"
 
 # Proc-macro authoring (pmetal-core-derive)
 proc-macro2 = "1.0"
@@ -184,7 +186,7 @@ quote = "1.0"
 syn = "3.0"
 
 # Native build helpers
-cc = "1.5"
+cc = "1.6"
 cmake = "0.1"
 
 # Python bindings
