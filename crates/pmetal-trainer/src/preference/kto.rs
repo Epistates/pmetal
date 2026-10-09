@@ -15,7 +15,7 @@
 //! out of the gradient. It is the reference point the prospect-theory value
 //! is measured from: without it, KTO only pushes rewards up or down.
 
-use pmetal_bridge::compat::{Array, Exception, nn, ops};
+use pmetal_bridge::compat::{Array, nn, ops};
 use pmetal_core::{TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 

@@ -82,6 +82,9 @@ pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Arra
     }
 }
 
+/// A loaded checkpoint: its parameters by name, and its metadata.
+pub type LoadedCheckpoint = (HashMap<Rc<str>, Array>, CheckpointMetadata);
+
 /// Training state metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMetadata {
@@ -347,19 +350,17 @@ impl CheckpointManager {
     }
 
     /// Load a checkpoint from a directory.
-    pub fn load_checkpoint<P: AsRef<Path>>(
-        checkpoint_path: P,
-    ) -> Result<(HashMap<Rc<str>, Array>, CheckpointMetadata)> {
+    pub fn load_checkpoint<P: AsRef<Path>>(checkpoint_path: P) -> Result<LoadedCheckpoint> {
         let checkpoint_path = checkpoint_path.as_ref();
 
         // Load weights
         let weights_path = checkpoint_path.join("lora_weights.safetensors");
         let params =
             inline_array::load_safetensors_shard(path_as_str(&weights_path)?).ok_or_else(|| {
-                SftError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to load weights from {}", weights_path.display()),
-                ))
+                SftError::Io(std::io::Error::other(format!(
+                    "Failed to load weights from {}",
+                    weights_path.display()
+                )))
             })?;
 
         // Convert HashMap<String, Array> to HashMap<Rc<str>, Array>
@@ -398,7 +399,7 @@ impl CheckpointManager {
     }
 
     /// Load the latest checkpoint.
-    pub fn load_latest(&self) -> Result<Option<(HashMap<Rc<str>, Array>, CheckpointMetadata)>> {
+    pub fn load_latest(&self) -> Result<Option<LoadedCheckpoint>> {
         let latest_path = self.checkpoint_dir.join("latest");
         if !latest_path.exists() {
             return Ok(None);
@@ -428,7 +429,7 @@ impl CheckpointManager {
     }
 
     /// Load the best checkpoint.
-    pub fn load_best(&self) -> Result<Option<(HashMap<Rc<str>, Array>, CheckpointMetadata)>> {
+    pub fn load_best(&self) -> Result<Option<LoadedCheckpoint>> {
         let best_path = self.checkpoint_dir.join("best");
         if best_path.exists() {
             Self::load_checkpoint(&best_path).map(Some)

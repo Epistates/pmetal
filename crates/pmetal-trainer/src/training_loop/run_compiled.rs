@@ -110,7 +110,7 @@ impl TrainingLoop {
         state.1.set_learning_rate(self.get_learning_rate());
 
         // Run ONE uncompiled training step
-        let mut warmup_loss = if use_cce {
+        let warmup_loss = if use_cce {
             jit_training_step_cce(&mut state, (&warmup_batch.input_ids, &warmup_batch.labels))?
         } else {
             jit_training_step_inner(
@@ -134,10 +134,7 @@ impl TrainingLoop {
         );
 
         // Update stats for warmup step - use checked arithmetic
-        let warmup_tokens = warmup_batch
-            .batch_size
-            .checked_mul(warmup_batch.seq_len)
-            .unwrap_or(usize::MAX);
+        let warmup_tokens = warmup_batch.batch_size.saturating_mul(warmup_batch.seq_len);
         self.step = 1;
         self.total_tokens = warmup_tokens;
         self.running_loss = warmup_loss_val as f64;
@@ -147,12 +144,8 @@ impl TrainingLoop {
         // =========================================================================
         // After warmup, optimizer state is stable (no more lazy initialization).
         //
-        // NOTE: mlx-rs compile_with_state has fundamental issues with large state counts:
-        // - LLMs have 10M+ trainable parameters, each with optimizer state (momentum, velocity)
-        // - compile_with_state's state tracking fails with integer underflow on such large counts
-        // - See: mlx-rs/src/transforms/compile/compile_with_state.rs:418
-        //
-        // Workaround: Use deferred evaluation (batch evals at logging boundaries)
+        // NOTE: the step is not compiled (see the `training_loop` module note).
+        // Instead, defer evaluation (batch evals at logging boundaries).
         // This achieves ~80% of full JIT performance by minimizing GPU-CPU syncs.
 
         tracing::info!(
@@ -212,10 +205,7 @@ impl TrainingLoop {
                     .try_next_batch()
                     .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
-                let batch_tokens = batch
-                    .batch_size
-                    .checked_mul(batch.seq_len)
-                    .unwrap_or(usize::MAX);
+                let batch_tokens = batch.batch_size.saturating_mul(batch.seq_len);
 
                 // Apply learning rate schedule before each step
                 let scheduled_lr = self.get_learning_rate();
@@ -225,7 +215,7 @@ impl TrainingLoop {
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
                 // MLX's lazy evaluation automatically fuses operations when not evaluated
                 let max_grad_norm = self.config.training.max_grad_norm as f32;
-                let mut loss = if use_cce {
+                let loss = if use_cce {
                     jit_training_step_cce_clipped(
                         &mut state,
                         (&batch.input_ids, &batch.labels),

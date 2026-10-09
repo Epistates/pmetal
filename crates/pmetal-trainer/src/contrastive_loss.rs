@@ -9,7 +9,7 @@
 //! All losses operate on L2-normalised embeddings `[batch, dim]`.
 //! Normalisation should be applied by the caller (use `pool::normalize_embeddings`).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, indexing::IndexOp, module::Module, ops};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
 // ---------------------------------------------------------------------------
 // Public loss functions

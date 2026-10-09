@@ -259,7 +259,7 @@ impl DiffusionGemmaTrainer {
     ) -> Result<DiffusionGemmaStepStats, Exception> {
         let t: f32 = self.rng.random_range(self.config.min_noise_level..=1.0);
         let keep_prob = 1.0 - t;
-        let (mut x_t, mut mask) = uniform_categorical_noise(canvas_x0, keep_prob, self.vocab, None);
+        let (x_t, mask) = uniform_categorical_noise(canvas_x0, keep_prob, self.vocab, None);
         // Realise the corruption before it feeds the differentiable forward.
         x_t.eval();
         mask.eval();
@@ -322,7 +322,7 @@ impl DiffusionGemmaTrainer {
                 }
             }
         };
-        let (mut loss, grads) = value_and_grad_explicit(loss_fn, &param_arrays, &[])?;
+        let (loss, grads) = value_and_grad_explicit(loss_fn, &param_arrays, &[])?;
         if let Some(e) = failure {
             return Err(e);
         }
@@ -335,7 +335,7 @@ impl DiffusionGemmaTrainer {
             for g in &grads {
                 norm_sq = norm_sq.add(&g.multiply(g).sum(None));
             }
-            let mut norm = ops::sqrt(&norm_sq);
+            let norm = ops::sqrt(&norm_sq);
             norm.eval();
             let total = norm.item_f32();
             let max_norm = self.config.max_grad_norm;
@@ -493,7 +493,7 @@ mod tests {
     #[serial]
     fn denoising_loss_uniform_is_ln_vocab() {
         let targets = Array::from_slice(&[0i32, 1, 2, 3], &[1, 4]);
-        let logits = Array::from_slice(&vec![0.0f32; 4 * 4], &[1, 4, 4]); // uniform over V=4
+        let logits = Array::from_slice(&[0.0f32; 4 * 4], &[1, 4, 4]); // uniform over V=4
         let loss = diffusion_denoising_loss(&logits, &targets, None, -100);
         let expected = (4.0f32).ln();
         assert!(

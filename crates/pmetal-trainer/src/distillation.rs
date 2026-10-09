@@ -184,10 +184,7 @@ impl DistillationTrainer {
         O: Optimizer,
     {
         let start_time = std::time::Instant::now();
-        let batch_tokens = batch
-            .batch_size
-            .checked_mul(batch.seq_len)
-            .unwrap_or(usize::MAX);
+        let batch_tokens = batch.batch_size.saturating_mul(batch.seq_len);
 
         // 1. Teacher Forward Pass (No Grad)
         // We run this outside the autodiff scope to save memory/compute
@@ -205,6 +202,7 @@ impl DistillationTrainer {
         )
     }
 
+    #[expect(clippy::too_many_arguments, reason = "the inputs of one training step")]
     fn train_step_with_teacher_logits<S, O>(
         &mut self,
         student: &mut S,
@@ -251,7 +249,7 @@ impl DistillationTrainer {
                     student,
                     (&batch.input_ids, &batch.labels, teacher_logits, &weights),
                 )
-                .map_err(|e| pmetal_mlx::error::MlxError::from(e))
+                .map_err(pmetal_mlx::error::MlxError::from)
             });
             result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
         } else {
@@ -523,10 +521,7 @@ impl DistillationTrainer {
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
             {
                 let step_start = std::time::Instant::now();
-                let batch_tokens = batch
-                    .batch_size
-                    .checked_mul(batch.seq_len)
-                    .unwrap_or(usize::MAX);
+                let batch_tokens = batch.batch_size.saturating_mul(batch.seq_len);
                 let teacher_logits = self.load_teacher_logits_from_cache(cache, &batch)?;
                 let stats = self.train_step_with_teacher_logits(
                     student,
@@ -667,12 +662,6 @@ impl DistillationTrainer {
             let student_logits = student
                 .forward(&batch.input_ids, None)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
-
-            let labels_opt = if batch.labels.size() > 0 {
-                Some(&batch.labels)
-            } else {
-                None
-            };
 
             let weights = Self::distillation_weights(&batch);
             let output = self.compute_distillation_output(

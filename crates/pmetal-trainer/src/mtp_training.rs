@@ -10,8 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use pmetal_bridge::compat::{
-    Array, Exception, FlattenedModuleParam, Module, ModuleParameters, ModuleParametersExt, Param,
-    nn, ops,
+    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
     optimizers::{AdamW, AdamWBuilder, Optimizer},
 };
 use pmetal_core::{LearningRateScheduler, LrSchedulerType};
@@ -20,7 +19,7 @@ use pmetal_mlx::{
     speculative::SpecCapture,
 };
 use pmetal_models::architectures::{
-    DFlashDraftConfig, DFlashDraftModel, Gemma4AssistantConfig, Gemma4AssistantForCausalLM,
+    DFlashDraftModel, Gemma4AssistantConfig, Gemma4AssistantForCausalLM,
     Gemma4AssistantGenerationConfig, Gemma4AssistantSharedKvStates, Gemma4Config,
     Gemma4ForCausalLM, Qwen3ForCausalLM, Qwen3NextConfig, Qwen3NextForCausalLM,
     Qwen3NextMtpForCausalLM,
@@ -333,7 +332,7 @@ where
             )?;
             Ok(out.loss)
         },
-        |dir, model, optimizer, meta| save_dflash_draft_checkpoint(dir, model, optimizer, meta),
+        save_dflash_draft_checkpoint,
     )
 }
 
@@ -667,7 +666,7 @@ pub fn batch_from_tokens(tokens: &[Vec<u32>]) -> Result<Array, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_models::architectures::DFlashExtras;
+    use pmetal_models::architectures::{DFlashDraftConfig, DFlashExtras};
 
     fn tiny_qwen_config() -> Qwen3NextConfig {
         Qwen3NextConfig {

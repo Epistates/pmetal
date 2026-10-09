@@ -86,6 +86,10 @@ fn lion_steps_by_the_sign_of_the_interpolated_momentum() {
 }
 
 /// Adafactor's update for a `rows × cols` matrix, in f64, from the paper.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the paper's update, spelled out over scalars"
+)]
 fn adafactor_matrix_reference(
     p: &mut [f64],
     row: &mut [f64],

@@ -28,27 +28,6 @@
 //!     .build();
 //! ```
 
-// Crate-level lint configuration
-#![allow(missing_docs)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::redundant_closure)]
-#![allow(clippy::manual_saturating_arithmetic)]
-#![allow(clippy::unnecessary_unwrap)]
-#![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::useless_vec)]
-#![allow(clippy::io_other_error)]
-#![allow(clippy::map_clone)]
-#![allow(clippy::borrow_deref_ref)]
-#![allow(clippy::useless_conversion)]
-#![allow(clippy::derivable_impls)]
-#![allow(ambiguous_glob_reexports)]
-
 pub mod orchestrator;
 
 pub mod adaptive_lr;

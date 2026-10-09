@@ -6,10 +6,6 @@
 //! - Optional Metal FlashAttention for forward pass
 //! - Checkpoint saving/loading
 
-#![allow(unused_variables)]
-#![allow(clippy::clone_on_copy)]
-#![allow(clippy::manual_range_contains)]
-
 use pmetal_bridge::compat::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
@@ -187,7 +183,7 @@ fn test_training_loop_gradient_accumulation() {
 
     // Second step - should apply accumulated gradients
     let batch2 = dataloader.next_batch().unwrap();
-    let stats2 = training_loop
+    let _stats2 = training_loop
         .train_step(&mut model, &batch2, &mut optimizer)
         .unwrap();
     // After gradient accumulation is complete, grad_norm should be Some
@@ -332,7 +328,7 @@ fn test_learning_rate_schedules() {
                 learning_rate: 1e-4,
                 warmup_steps: 10,
                 max_steps: Some(100),
-                lr_scheduler: scheduler.clone(),
+                lr_scheduler: scheduler,
                 ..Default::default()
             },
             use_metal_flash_attention: false,
@@ -557,7 +553,7 @@ fn test_evaluation_metrics() {
     assert!(metrics.accuracy.is_some(), "Accuracy should be computed");
     let acc = metrics.accuracy.unwrap();
     assert!(
-        acc >= 0.0 && acc <= 100.0,
+        (0.0..=100.0).contains(&acc),
         "Accuracy should be 0-100%, got {}",
         acc
     );

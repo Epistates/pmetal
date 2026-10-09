@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn test_parameter_grouping() {
-        let param_names = vec![
+        let param_names = [
             "model.embed_tokens.weight",
             "model.layers.0.self_attn.q_proj.lora_A.weight",
             "model.layers.0.self_attn.q_proj.lora_B.weight",
@@ -306,8 +306,7 @@ mod tests {
             "lm_head.weight",
         ];
 
-        let groups =
-            create_parameter_groups(param_names.iter().map(|s| *s), 2e-4, Some(5e-5), 0.01);
+        let groups = create_parameter_groups(param_names.iter().copied(), 2e-4, Some(5e-5), 0.01);
 
         assert_eq!(groups.len(), 2);
 
@@ -330,13 +329,13 @@ mod tests {
 
     #[test]
     fn test_no_embedding_lr() {
-        let param_names = vec![
+        let param_names = [
             "model.embed_tokens.weight",
             "model.layers.0.self_attn.q_proj.weight",
         ];
 
         // Without separate embedding LR
-        let groups = create_parameter_groups(param_names.iter().map(|s| *s), 2e-4, None, 0.0);
+        let groups = create_parameter_groups(param_names.iter().copied(), 2e-4, None, 0.0);
 
         // Both groups should have the same LR
         for group in &groups {

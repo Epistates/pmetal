@@ -146,7 +146,7 @@ impl TrainingLoop {
             .ok_or_else(|| {
                 SftError::Mlx(Exception::custom("No packed batches available for warmup"))
             })?
-            .map_err(|e| SftError::Mlx(e))?;
+            .map_err(SftError::Mlx)?;
 
         let warmup_tokens = warmup_batch.total_tokens;
 
@@ -163,7 +163,7 @@ impl TrainingLoop {
 
         // Execute warmup step - this initializes optimizer momentum/velocity buffers
         let max_grad_norm = self.config.training.max_grad_norm as f32;
-        let mut warmup_loss = if use_cce {
+        let warmup_loss = if use_cce {
             jit_training_step_packed_cce(&mut state, &warmup_batch, max_grad_norm)?
         } else {
             jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?
@@ -214,7 +214,7 @@ impl TrainingLoop {
                 // Prefetch next packed batch before executing the current training step.
                 prefetched_batch_result = packed_dataloader.next_batch();
 
-                let packed_batch = batch_result.map_err(|e| SftError::Mlx(e))?;
+                let packed_batch = batch_result.map_err(SftError::Mlx)?;
 
                 let batch_tokens = packed_batch.total_tokens;
 
@@ -223,14 +223,14 @@ impl TrainingLoop {
                 state.1.set_learning_rate(scheduled_lr);
 
                 // Execute packed training step (forward + backward + optimizer update)
-                let mut loss = if use_cce {
+                let loss = if use_cce {
                     jit_training_step_packed_cce(&mut state, &packed_batch, max_grad_norm)?
                 } else {
                     jit_training_step_packed(&mut state, &packed_batch, max_grad_norm)?
                 };
 
                 // Evaluate each step immediately to prevent computation graph
-                // accumulation. Without mx.compile (unavailable in mlx-rs), each
+                // accumulation. The step is not compiled, so each
                 // step builds a NEW graph (~10 GB for a 0.6B model). Deferring
                 // evaluation across 10 steps means 10 graphs (~100 GB) in memory.
                 loss.eval();

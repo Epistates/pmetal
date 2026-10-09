@@ -1,7 +1,7 @@
-//! MLX-Metal fused optimizer with zero-copy bridging.
+//! MLX-Metal fused optimizer.
 //!
 //! This module provides an optimizer that uses custom Metal kernels for maximum
-//! throughput, while integrating seamlessly with mlx-rs's training infrastructure.
+//! throughput on parameters held as MLX arrays.
 //!
 //! # Architecture
 //!
@@ -9,25 +9,14 @@
 //! MLX Arrays (unified memory)
 //!        │
 //!        ▼
-//! mlx_sys::mlx_array_data_float32() → raw pointer
-//!        │
-//!        ▼
-//! metal_buffer_from_ptr() → MetalBufferView (zero-copy)
+//! as_slice::<f32>() → copied into flat Metal buffers (params, grads)
 //!        │
 //!        ▼
 //! Fused Metal Kernel (processes all params in single dispatch)
 //!        │
 //!        ▼
-//! mlx_array_set() to update existing MLX arrays
+//! Array::from_f32_slice() → new parameter arrays, assigned back by name
 //! ```
-//!
-//! # Key Innovation: mlx_array_set bridging
-//!
-//! The critical insight is using `mlx_array_set()` (from mlx-c) to update
-//! existing MLX arrays with Metal kernel results. This preserves:
-//! - Array identity (same array reference)
-//! - MLX computational graph connectivity
-//! - Proper gradient flow during backpropagation
 //!
 //! # Performance
 //!
@@ -49,10 +38,6 @@ use pmetal_bridge::compat::{
 };
 use thiserror::Error;
 
-// Note: metal_buffer_from_ptr and MetalBufferView are available for future
-// zero-copy optimization, but current implementation uses copy for simplicity.
-#[allow(unused_imports)]
-use pmetal_metal::bridge::{MetalBufferView, metal_buffer_from_ptr};
 use pmetal_metal::buffer::{BufferUsage, MetalBuffer};
 use pmetal_metal::context::MetalContext;
 use pmetal_metal::error::MetalError;
@@ -87,9 +72,10 @@ pub type MlxMetalOptimizerResult<T> = std::result::Result<T, MlxMetalOptimizerEr
 /// - `Constant`: Fixed learning rate
 /// - `CosineDecay`: Cosine annealing from init_lr to 0
 /// - `CosineDecayWithWarmup`: Linear warmup followed by cosine decay
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum LrSchedule {
     /// Constant learning rate.
+    #[default]
     Constant,
     /// Cosine decay: lr * 0.5 * (1 + cos(π * step / total_steps))
     CosineDecay {
@@ -105,12 +91,6 @@ pub enum LrSchedule {
         /// Initial learning rate during warmup start (default: 0.0).
         warmup_init: f32,
     },
-}
-
-impl Default for LrSchedule {
-    fn default() -> Self {
-        Self::Constant
-    }
 }
 
 impl LrSchedule {
@@ -496,7 +476,7 @@ impl MlxMetalOptimizer {
         let mut offset = 0;
 
         for name in &self.layout.names {
-            let mut arr = params[name].clone();
+            let arr = params[name].clone();
             arr.eval();
 
             let size = arr.size();
@@ -548,15 +528,15 @@ impl MlxMetalOptimizer {
                 grad_keys.len()
             );
             // Show first few keys from each
-            let mut param_names: Vec<_> = self.layout.names.iter().take(3).collect();
-            let mut grad_names: Vec<_> = grads.keys().take(3).collect();
+            let param_names: Vec<_> = self.layout.names.iter().take(3).collect();
+            let grad_names: Vec<_> = grads.keys().take(3).collect();
             tracing::info!("First param keys: {:?}", param_names);
             tracing::info!("First grad keys: {:?}", grad_names);
         });
 
         for (i, name) in self.layout.names.iter().enumerate() {
             if let Some(grad) = grads.get(name) {
-                let mut grad = grad.clone();
+                let grad = grad.clone();
                 grad.eval();
 
                 // Debug: verify eval worked and check data
@@ -686,7 +666,7 @@ impl MlxMetalOptimizer {
             let m0 = self.m_buffer.as_slice()[0];
             let v0 = self.v_buffer.as_slice()[0];
 
-            // Manual AdamW calculation for verification (NO bias correction - matching mlx-rs)
+            // Manual AdamW calculation for verification (no bias correction, as in the kernel)
             let new_m0 = adamw_config.beta1 * m0 + (1.0 - adamw_config.beta1) * g0;
             let new_v0 = adamw_config.beta2 * v0 + (1.0 - adamw_config.beta2) * g0 * g0;
             // NO bias correction - use m and v directly
@@ -748,15 +728,7 @@ impl MlxMetalOptimizer {
 /// This is the main entry point for training integration. It:
 /// 1. Extracts trainable parameters from the model
 /// 2. Runs the fused Metal AdamW kernel (single GPU dispatch for ALL parameters)
-/// 3. Uses `mlx_array_set` to bridge results back to MLX arrays
-///
-/// # SOTA Implementation: Metal Kernel + mlx_array_set Bridge
-///
-/// The key innovation is using `mlx_array_set` (from mlx-c) to update existing
-/// MLX arrays with Metal kernel results. This:
-/// - Preserves array identity (same reference)
-/// - Maintains MLX computational graph
-/// - Enables FUSED Metal computation to bypass mlx-rs limitations
+/// 3. Writes the results back into the model's parameter arrays
 ///
 /// # Performance
 ///
@@ -772,15 +744,7 @@ impl MlxMetalOptimizer {
 /// optimizer.update_model(&mut model, &gradients)?;
 /// ```
 impl MlxMetalOptimizer {
-    /// Update model parameters using FUSED Metal kernel with mlx_array_set bridging.
-    ///
-    /// This is the SOTA implementation that:
-    /// 1. Copies params/grads to flat Metal buffers
-    /// 2. Runs fused Metal AdamW kernel (single dispatch)
-    /// 3. Uses `mlx_array_set` to update existing MLX arrays in-place
-    ///
-    /// The `mlx_array_set` function preserves array identity while updating data,
-    /// which is critical for maintaining MLX's computational graph connectivity.
+    /// Update model parameters in one vectorized step.
     ///
     /// **SOTA VECTORIZED UPDATE** - Delegates to update_vectorized for maximum throughput.
     ///
@@ -1047,7 +1011,7 @@ impl MlxMetalOptimizer {
             ) {
                 // Debug: Log first param details
                 if debug_idx == 0 && self.step <= 3 {
-                    let mut grad_debug = grad.clone();
+                    let grad_debug = grad.clone();
                     grad_debug.eval();
                     (*m).eval();
                     (*v).eval();
@@ -1070,9 +1034,9 @@ impl MlxMetalOptimizer {
                 // Compute new m and v using MLX ops ON THE ACTUAL GRADIENT
                 // m/v are MLX Arrays from state - no from_slice needed!
                 // Use references to m/v to avoid move (we need to assign back to them)
-                let mut new_m = beta1_arr.multiply(&*m).add(&one_minus_b1.multiply(grad));
+                let new_m = beta1_arr.multiply(&*m).add(&one_minus_b1.multiply(grad));
                 let grad_sq = grad.multiply(grad);
-                let mut new_v = beta2_arr
+                let new_v = beta2_arr
                     .multiply(&*v)
                     .add(&one_minus_b2.multiply(&grad_sq));
 
@@ -1083,7 +1047,7 @@ impl MlxMetalOptimizer {
                 // KEY: Use the actual param (**param) in the computation!
                 // This maintains the MLX computational graph connection.
                 let decayed_param = (**param).multiply(&one_minus_lr_wd);
-                let mut new_param = decayed_param.subtract(&lr_arr.multiply(&update));
+                let new_param = decayed_param.subtract(&lr_arr.multiply(&update));
 
                 // Debug: Log first param after update (before move)
                 if debug_idx == 0 && self.step <= 3 {
@@ -1137,9 +1101,9 @@ impl MlxMetalOptimizer {
     /// Catches numerical issues early before they propagate through training.
     fn validate_gradients(&self, flat_grads: &Array) -> std::result::Result<(), Exception> {
         // Build lazy check (single eval for both NaN and Inf)
-        let mut has_nan = ops::any(&ops::is_nan(flat_grads), None, false);
-        let mut has_inf = ops::any(&ops::is_inf(flat_grads), None, false);
-        let mut has_bad = ops::logical_or(&has_nan, &has_inf);
+        let has_nan = ops::any(&ops::is_nan(flat_grads), None, false);
+        let has_inf = ops::any(&ops::is_inf(flat_grads), None, false);
+        let has_bad = ops::logical_or(&has_nan, &has_inf);
 
         // Eval the check
         has_bad.eval();

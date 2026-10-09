@@ -12,7 +12,7 @@
 //!
 //! This is the technique used by DeepSeek V3/R1.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
 /// Selective log softmax: compute log probabilities only at target indices.
 ///
@@ -173,6 +173,7 @@ pub fn efficient_entropy(logits: &Array) -> Result<Array, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::nn;
 
     #[test]
     fn test_selective_matches_full_log_softmax() {

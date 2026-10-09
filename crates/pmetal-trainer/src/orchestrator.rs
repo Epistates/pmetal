@@ -1899,7 +1899,7 @@ pub fn format_param_count(count: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// Full training config loaded from YAML.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FullTrainingConfig {
     #[serde(default)]
     pub model: ModelConfig,
@@ -1909,17 +1909,6 @@ pub struct FullTrainingConfig {
     pub training: TrainingConfig,
     #[serde(default)]
     pub dataset: DatasetConfig,
-}
-
-impl Default for FullTrainingConfig {
-    fn default() -> Self {
-        Self {
-            model: ModelConfig::default(),
-            lora: LoraConfig::default(),
-            training: TrainingConfig::default(),
-            dataset: DatasetConfig::default(),
-        }
-    }
 }
 
 #[cfg(test)]

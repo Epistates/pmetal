@@ -12,7 +12,6 @@
 
 use pmetal_bridge::compat::{
     Array, Exception,
-    indexing::IndexOp,
     module::{Module, ModuleParameters},
     nn, ops,
     optimizers::Optimizer,
@@ -76,6 +75,10 @@ pub enum GrpoError {
 
 /// Result type for GRPO operations.
 pub type GrpoResult<T> = std::result::Result<T, GrpoError>;
+
+/// A batch flattened from completion groups: prompt ids, completion ids and
+/// advantage, one entry per completion.
+pub type PreparedBatch = (Vec<Vec<u32>>, Vec<Vec<u32>>, Vec<f64>);
 
 /// How the per-token clipped surrogate losses are aggregated into one loss.
 ///
@@ -453,9 +456,7 @@ fn load_images(image_paths: &[std::path::PathBuf], max_size: usize) -> GrpoResul
         let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
 
         // Delegate normalization to the existing processor (rescale + CLIP stats).
-        let arr = processor
-            .process_image(resized)
-            .map_err(|e| GrpoError::Mlx(e))?;
+        let arr = processor.process_image(resized).map_err(GrpoError::Mlx)?;
 
         images.push(arr);
     }
@@ -938,36 +939,22 @@ impl GrpoTrainer {
     }
 
     /// Prepare a training batch from completion groups.
-    pub fn prepare_batch(
-        &mut self,
-        groups: &[CompletionGroup],
-    ) -> GrpoResult<(
-        Vec<Vec<u32>>,
-        Vec<Vec<u32>>,
-        Vec<f64>,
-        Vec<Vec<f32>>,
-        Option<Vec<Vec<Array>>>,
-    )> {
+    pub fn prepare_batch(&mut self, groups: &[CompletionGroup]) -> GrpoResult<PreparedBatch> {
         let mut all_prompts = Vec::new();
         let mut all_completions = Vec::new();
         let mut all_rewards = Vec::new();
-        let mut all_masks = Vec::new();
 
         for group in groups {
             for completion in &group.completion_ids {
                 all_prompts.push(group.prompt_ids.clone());
                 all_completions.push(completion.clone());
-
-                let mut mask = vec![0.0f32; group.prompt_ids.len()];
-                mask.extend(vec![1.0f32; completion.len()]);
-                all_masks.push(mask);
             }
             all_rewards.extend(&group.rewards);
         }
 
         let advantages = self.compute_advantages(&all_rewards, groups.len())?;
 
-        Ok((all_prompts, all_completions, advantages, all_masks, None))
+        Ok((all_prompts, all_completions, advantages))
     }
 
     /// Train on one generation batch of completion groups.
@@ -997,8 +984,7 @@ impl GrpoTrainer {
         O: Optimizer,
     {
         let start_time = Instant::now();
-        let (all_prompts, all_completions, advantages, _all_masks, _) =
-            self.prepare_batch(groups)?;
+        let (all_prompts, all_completions, advantages) = self.prepare_batch(groups)?;
 
         // Collect raw rewards for logging before they're normalized into advantages
         let raw_rewards: Vec<f64> = groups
@@ -1081,7 +1067,7 @@ impl GrpoTrainer {
         let old_logits = policy_model
             .forward_with_images(&input_ids, None, pixel_values.as_ref())
             .map_err(|e| Exception::custom(e.to_string()))?;
-        let (mut old_per_token_logps, mut completion_mask) =
+        let (old_per_token_logps, completion_mask) =
             self.compute_per_token_logps(&old_logits, &labels, temperature)?;
         // Eval to materialize — these must NOT be part of the grad graph
         old_per_token_logps.eval();
@@ -1093,7 +1079,7 @@ impl GrpoTrainer {
         let ref_per_token_logps = if self.config.beta > 0.0 {
             if let Some(ref mut ref_m) = ref_model {
                 let ref_logits = ref_m.forward(input_ids.clone())?;
-                let (mut ref_logps, _) =
+                let (ref_logps, _) =
                     self.compute_per_token_logps(&ref_logits, &labels, temperature)?;
                 ref_logps.eval();
                 Some(ref_logps)
@@ -1332,6 +1318,10 @@ impl GrpoTrainer {
     }
 
     /// Run full GRPO training loop.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public API: the models, data and optimizer"
+    )]
     pub fn run<M, R, O, F>(
         &mut self,
         policy_model: &mut M,
@@ -1565,6 +1555,10 @@ impl GrpoTrainer {
     ///
     /// Same as [`run`], plus [`GrpoError::Reward`] if the background scorer
     /// thread terminates unexpectedly.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public API: the models, data and optimizer"
+    )]
     pub fn run_async<M, R, O, F>(
         &mut self,
         policy_model: &mut M,

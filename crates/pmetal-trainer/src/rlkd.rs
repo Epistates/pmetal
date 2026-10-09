@@ -34,9 +34,7 @@
 //! - The distillation loss uses the SAME student logits computed inside the closure,
 //!   so both objectives share one forward pass per step.
 
-use pmetal_bridge::compat::{
-    Array, Exception, eval_params, indexing::IndexOp, nn, ops, optimizers::Optimizer,
-};
+use pmetal_bridge::compat::{Array, Exception, eval_params, nn, ops, optimizers::Optimizer};
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -424,11 +422,8 @@ impl RlkdTrainer {
         T: TeacherModel,
         O: Optimizer,
     {
-        let start_time = Instant::now();
-
         // --- 1. Build batch tensors from completion groups ---
-        let (all_prompts, all_completions, advantages, _all_masks, _) =
-            self.grpo_trainer.prepare_batch(groups)?;
+        let (all_prompts, all_completions, advantages) = self.grpo_trainer.prepare_batch(groups)?;
 
         let raw_rewards: Vec<f64> = groups
             .iter()
@@ -481,18 +476,18 @@ impl RlkdTrainer {
         let old_logits = policy
             .forward(&input_ids, None)
             .map_err(|e| GrpoError::Mlx(Exception::custom(e.to_string())))?;
-        let (mut old_per_token_logps, mut completion_mask) = self
-            .grpo_trainer
-            .compute_per_token_logps(&old_logits, &labels, temperature)?;
+        let (old_per_token_logps, completion_mask) =
+            self.grpo_trainer
+                .compute_per_token_logps(&old_logits, &labels, temperature)?;
         old_per_token_logps.eval();
         completion_mask.eval();
 
         // --- 3. Compute teacher logits (frozen, outside gradient tape) ---
         // We materialize these before entering value_and_grad so they become
         // constants in the backward pass — no teacher gradients are computed.
-        let mut teacher_logits = teacher
+        let teacher_logits = teacher
             .forward_teacher(&input_ids)
-            .map_err(|e| GrpoError::Mlx(e))?;
+            .map_err(GrpoError::Mlx)?;
         teacher_logits.eval();
 
         let distill_temp = self.config.distill_temperature;
@@ -571,7 +566,6 @@ impl RlkdTrainer {
         optimizer.update(policy, grads)?;
         eval_params(policy.parameters())?;
 
-        let mut total_loss_arr = total_loss_arr;
         let total_loss =
             crate::step_check::check_step(self.step + 1, total_loss_arr.item::<f32>())?;
 
@@ -622,6 +616,10 @@ impl RlkdTrainer {
     /// * `reward_fn` - Combined reward function.
     /// * `optimizer` - Optimizer for the student.
     /// * `set_optimizer_lr` - Closure that updates the optimizer learning rate.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public API: the models, data and optimizer"
+    )]
     pub fn run<M, T, O, F>(
         &mut self,
         policy_model: &mut M,

@@ -34,7 +34,7 @@
 //! ).unwrap();
 //! ```
 
-use pmetal_bridge::compat::{Array, indexing::IndexOp, ops};
+use pmetal_bridge::compat::{Array, ops};
 use pmetal_bridge::inline_array;
 use pmetal_data::Tokenizer;
 use std::path::Path;
@@ -380,9 +380,9 @@ impl MLRewardModel {
                 let w = self.score_weight.as_ref().unwrap();
                 let w_t = w.transpose_axes(&[1, 0]);
                 // [1, vocab_size] × [vocab_size, 1] → [1, 1]
-                let mut score = ops::matmul(&last_token_vec, &w_t);
+                let score = ops::matmul(&last_token_vec, &w_t);
 
-                let mut score = if let Some(b) = &self.score_bias {
+                let score = if let Some(b) = &self.score_bias {
                     score.add(b)
                 } else {
                     score
@@ -397,7 +397,7 @@ impl MLRewardModel {
                 // logits as a heuristic scalar reward.
                 // Shape: [1, vocab_size] → scalar
                 let last_token_logits = logits.index((.., -1i32, ..));
-                let mut mean = last_token_logits.mean(None);
+                let mean = last_token_logits.mean(None);
                 mean.eval();
                 mean.item::<f32>() as f64
             }

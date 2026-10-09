@@ -38,7 +38,7 @@
 //! A full `pmetal train-draft` CLI command can be implemented on top of
 //! [`dflash_train_step`] without touching any other module.
 
-use pmetal_bridge::compat::{Array, Exception, Module, ops};
+use pmetal_bridge::compat::{Array, Exception, ops};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_models::architectures::dflash_draft::DFlashDraftModel;
 use pmetal_models::architectures::qwen3::Qwen3ForCausalLM;
@@ -156,19 +156,10 @@ pub fn dflash_train_step(
 
     // Draft forward: the mask-token embeddings go through the target's
     // embedding table (identical to inference), and the draft predicts
-    // the unmasked tokens for positions 1..block_size.
-    let block_ids = input_ids.slice(&[0, block_start_i32], &[batch, block_end_i32]);
-    let noise_embedding = target.embed_tokens(&block_ids.clone())?;
-    // Replace with the mask embedding — matches the inference pipeline,
-    // which also feeds `target.embed_tokens(block_input)` where
-    // `block_input` is mask-filled.
-    let noise_embedding = {
-        // re-derive using the masked block (all mask tokens):
-        let masked_block = mask_tok.clone();
-        target.embed_tokens(&masked_block)?
-    };
-    // `block_ids` is kept alive for labels below.
-    let _ = noise_embedding.dim(0);
+    // the unmasked tokens for positions 1..block_size. This matches the
+    // inference pipeline, which also feeds `target.embed_tokens(block_input)`
+    // where `block_input` is mask-filled.
+    let noise_embedding = target.embed_tokens(&mask_tok)?;
 
     let draft_hidden = draft.forward(&noise_embedding, &target_hidden_block, None)?;
     // Drop the seed position — the runtime always overwrites it with the

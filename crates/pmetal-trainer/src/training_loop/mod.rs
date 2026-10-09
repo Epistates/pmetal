@@ -3,7 +3,7 @@
 //! This module provides a unified training loop that:
 //! - Connects DataLoader → Model → Optimizer
 //! - Supports gradient accumulation
-//! - Uses mlx-rs autodiff for gradient computation
+//! - Uses the bridge's `value_and_grad` for gradient computation
 //! - Optionally uses Metal FlashAttention for efficient forward pass
 //! - Provides progress tracking and callbacks
 //!
@@ -21,18 +21,10 @@
 //!
 //! ## Note on JIT Compilation
 //!
-//! mlx-rs provides `compile_with_state` for JIT compilation, but it has known
-//! limitations with complex models + optimizers:
-//!
-//! 1. **State tracking overhead**: `compile_with_state` expects the compiled function
-//!    to return all mutable state as additional outputs. For LLMs with 10M+ parameters,
-//!    this creates a mismatch between expected and actual output counts.
-//!
-//! 2. **State count stability**: Even after warmup, the `Updatable::updatable_states_len()`
-//!    can return counts that don't match what the compiled graph actually produces.
-//!
-//! 3. **Architectural difference**: Python's `mx.compile(fn, inputs=state, outputs=state)`
-//!    explicitly tracks state containers, while mlx-rs tries to infer state automatically.
+//! The training step is not wrapped in `mx.compile`. Python's
+//! `mx.compile(fn, inputs=state, outputs=state)` tracks the model and optimizer
+//! state explicitly; the bridge has no equivalent stateful compile for a whole
+//! training step, so the loop relies on lazy evaluation instead.
 //!
 //! ## Performance Comparison (Qwen3-0.6B, batch=4, seq=512)
 //!
@@ -41,8 +33,8 @@
 //! | pmetal (fused) | ~1700-1800 tok/s | Deferred eval + warmup |
 //! | pmetal (basic) | ~500-600 tok/s | Per-step evaluation |
 //!
-//! The fused training path (`--fused` flag) uses deferred evaluation. Full graph fusion
-//! is limited by mlx-rs's `compile_with_state` with complex models.
+//! The fused training path (`--fused` flag) uses deferred evaluation; the step
+//! itself is not compiled (see above).
 //!
 //! ## Using the Optimized Training Path
 //!
@@ -54,29 +46,26 @@
 //! Note: Fused training requires `gradient_accumulation_steps=1`.
 
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception,
-    indexing::{IndexOp, argmax_axis},
-    losses::CrossEntropy,
-    module::{FlattenedModuleParam, ModuleParameters},
+    Array, Exception,
+    indexing::argmax_axis,
+    module::FlattenedModuleParam,
     nn,
-    optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable},
+    optimizers::{Optimizer, Updatable},
     transforms,
 };
 // The Rust bridge does not currently expose a working compile-with-state path
 // for training. Callers that request JIT dispatch are routed back to the fused
 // eager path with an explicit warning instead of silently pretending that
 // compilation happened.
-use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
+use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_data::{
-    DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
-    TrainingBatch, TrainingDataset, compute_pack_seq_len,
+    DataLoader, DataLoaderConfig, PackedDataLoader, PackerConfig, TrainingBatch, TrainingDataset,
+    compute_pack_seq_len,
 };
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::{init_training_context, with_training_mode};
 
-use crate::mlx_metal_optimizer::{
-    MlxMetalOptimizer, MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available,
-};
+use crate::mlx_metal_optimizer::{MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available};
 use crate::step_check::{check_grad_norm, check_step};
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
@@ -981,7 +970,7 @@ impl TrainingLoop {
 
     /// Perform a single training step.
     ///
-    /// This computes gradients using mlx-rs autodiff and handles gradient accumulation.
+    /// This computes gradients with the bridge's autodiff and handles gradient accumulation.
     /// Supports both text-only and multimodal (VLM) batches with pixel_values.
     pub fn train_step<M, O>(
         &mut self,
@@ -996,10 +985,7 @@ impl TrainingLoop {
         let start_time = std::time::Instant::now();
 
         // Track tokens - use checked arithmetic to prevent overflow
-        let batch_tokens = batch
-            .batch_size
-            .checked_mul(batch.seq_len)
-            .unwrap_or(usize::MAX);
+        let batch_tokens = batch.batch_size.saturating_mul(batch.seq_len);
 
         if self.step <= 1 {
             tracing::debug!(
@@ -1020,13 +1006,11 @@ impl TrainingLoop {
         };
 
         // Evaluate loss for this micro-batch
-        // NOTE: Without mx.compile JIT fusion, we need to
-        // evaluate each step. mlx-rs doesn't expose mx.compile, so deferring
+        // NOTE: The step is not compiled (see the module note), so deferring
         // evaluation just builds up a massive computation graph.
         if self.step <= 1 {
             tracing::debug!(step = self.step, "train_step: evaluating loss...");
         }
-        let mut loss = loss;
         loss.eval();
         let micro_batch_loss = check_step(self.step + 1, loss.item::<f32>())?;
         if self.step <= 3 {
@@ -1084,7 +1068,7 @@ impl TrainingLoop {
                 }
                 // NOTE: Do NOT clear the buffer cache here. MLX's cache holds
                 // freed buffers for reuse — clearing it forces fresh allocations
-                // that inflate RSS. Without mx.compile (unavailable in mlx-rs),
+                // that inflate RSS. The step is not compiled, so
                 // every step allocates new buffers; the cache is what prevents
                 // unbounded RSS growth by recycling them. MLX's built-in
                 // backpressure (memory_limit) handles OOM prevention.
@@ -1098,7 +1082,6 @@ impl TrainingLoop {
                 // Always compute grad_norm when clipping is enabled (tests expect this).
                 // The lazy Array is evaluated here — syncs GPU->CPU.
                 if let Some(norm_arr) = lazy_norm {
-                    let mut norm_arr = norm_arr;
                     norm_arr.eval();
                     Some(check_grad_norm(self.step + 1, norm_arr.item::<f32>())?)
                 } else {
@@ -1210,7 +1193,7 @@ impl TrainingLoop {
             let (loss, grads) = if self.metal_fa_available {
                 let result = with_training_mode(|| {
                     loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
-                        .map_err(|e| pmetal_mlx::error::MlxError::from(e))
+                        .map_err(pmetal_mlx::error::MlxError::from)
                 });
                 result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
             } else {
@@ -1238,7 +1221,7 @@ impl TrainingLoop {
             let (loss, grads) = if self.metal_fa_available {
                 let result = with_training_mode(|| {
                     loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
-                        .map_err(|e| pmetal_mlx::error::MlxError::from(e))
+                        .map_err(pmetal_mlx::error::MlxError::from)
                 });
                 result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
             } else {
@@ -1281,7 +1264,7 @@ impl TrainingLoop {
         let (loss, grads) = if self.metal_fa_available {
             let result = with_training_mode(|| {
                 loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
-                    .map_err(|e| pmetal_mlx::error::MlxError::from(e))
+                    .map_err(pmetal_mlx::error::MlxError::from)
             });
             result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
         } else {
@@ -1318,7 +1301,7 @@ impl TrainingLoop {
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
             // Compute loss
-            let mut loss = Self::compute_loss(&logits, &batch.labels)?;
+            let loss = Self::compute_loss(&logits, &batch.labels)?;
             loss.eval();
             total_loss += loss.item::<f32>() as f64;
 
@@ -1375,21 +1358,21 @@ impl TrainingLoop {
 
         // Get predictions (argmax over vocab dimension)
         let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-        let mut predictions = argmax_axis(&flat_logits, -1, false);
+        let predictions = argmax_axis(&flat_logits, -1, false);
         predictions.eval();
 
-        let mut flat_labels = shift_labels.reshape(&[-1]);
+        let flat_labels = shift_labels.reshape(&[-1]);
         flat_labels.eval();
 
         // Create mask for valid tokens (label != -100)
         let ignore_index = Array::from_int(-100);
-        let mut valid_mask = flat_labels.ne(&ignore_index);
+        let valid_mask = flat_labels.ne(&ignore_index);
         valid_mask.eval();
 
         // Count valid tokens (cast bool→f32 before sum — bridge item_f32
         // doesn't handle bool dtype correctly)
         let valid_mask_f32 = valid_mask.as_type::<f32>();
-        let mut total_valid = valid_mask_f32.sum(None);
+        let total_valid = valid_mask_f32.sum(None);
         total_valid.eval();
         let total_tokens = total_valid.item_f32() as u64;
 
@@ -1400,7 +1383,7 @@ impl TrainingLoop {
         // Compare predictions with labels (both i32 from the bridge dataloader)
         let correct = predictions.eq(&flat_labels).as_type::<f32>();
         let valid_correct = correct.multiply(&valid_mask_f32);
-        let mut correct_sum = valid_correct.sum(None);
+        let correct_sum = valid_correct.sum(None);
         correct_sum.eval();
         let correct_count = correct_sum.item_f32() as u64;
 

@@ -7,7 +7,7 @@ impl TrainingLoop {
     /// This method uses custom Metal kernels that process all parameters in a single
     /// GPU dispatch, eliminating per-parameter synchronization overhead.
     ///
-    /// Expected performance gain: ~40% compared to standard mlx-rs optimizer.
+    /// Expected performance gain: ~40% compared to the standard op-by-op optimizer.
     ///
     /// **Requirements:**
     /// - Apple Silicon with Metal support
@@ -255,10 +255,7 @@ impl TrainingLoop {
     {
         let start_time = std::time::Instant::now();
 
-        let batch_tokens = batch
-            .batch_size
-            .checked_mul(batch.seq_len)
-            .unwrap_or(usize::MAX);
+        let batch_tokens = batch.batch_size.saturating_mul(batch.seq_len);
 
         // PROFILING: Track time for each phase
         let t0 = std::time::Instant::now();
@@ -298,7 +295,7 @@ impl TrainingLoop {
                 // This does the actual computation and batched eval of params/state
                 metal_optimizer
                     .update_model_fused(model, &accumulated)
-                    .map_err(|e| SftError::Mlx(e))?;
+                    .map_err(SftError::Mlx)?;
 
                 let t4 = std::time::Instant::now();
                 let opt_elapsed = t4.duration_since(t3).as_micros();
@@ -310,22 +307,19 @@ impl TrainingLoop {
                 }
                 let _ = pmetal_bridge::compat::transforms::eval(to_eval);
 
-                let mut loss = loss;
                 let loss_val = check_step(self.step + 1, loss.item_f32())?;
                 let norm = lazy_norm
-                    .map(|mut n| check_grad_norm(self.step + 1, n.item_f32()))
+                    .map(|n| check_grad_norm(self.step + 1, n.item_f32()))
                     .transpose()?;
 
                 (loss_val, norm, clip_elapsed, opt_elapsed)
             } else {
                 // No gradients accumulated - just eval loss
-                let mut loss = loss;
                 loss.eval();
                 (check_step(self.step + 1, loss.item::<f32>())?, None, 0, 0)
             }
         } else {
             // Gradient accumulation not complete - just eval loss
-            let mut loss = loss;
             loss.eval();
             (check_step(self.step + 1, loss.item::<f32>())?, None, 0, 0)
         };

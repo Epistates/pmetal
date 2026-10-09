@@ -1,6 +1,7 @@
 use super::*;
-use pmetal_core::{LoraConfig, StepMetrics, TrainingCallback, TrainingConfig};
-use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
+use pmetal_bridge::compat::module::ModuleParameters;
+use pmetal_core::{LoraConfig, LrSchedulerType, StepMetrics, TrainingCallback, TrainingConfig};
+use pmetal_data::{DataLoaderConfig, PackedTrainingBatch, Sample, TrainingDataset};
 use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::dispatcher::DynamicModel;
@@ -136,8 +137,10 @@ fn test_learning_rate_warmup() {
 
 #[test]
 fn test_take_log_interval_metrics_uses_actual_logged_steps() {
-    let mut config = TrainingLoopConfig::default();
-    config.log_every = 10;
+    let config = TrainingLoopConfig {
+        log_every: 10,
+        ..Default::default()
+    };
     let mut training_loop = TrainingLoop::new(config);
 
     training_loop.step = 1;
@@ -653,17 +656,10 @@ fn test_jit_training_step_with_warmup() {
     // ========================================
     // PHASE 5: Use non-compiled path
     // ========================================
-    // NOTE: compile_with_state has a known limitation in mlx-rs where it doesn't
-    // correctly handle state count changes. Even with warmup to stabilize state,
-    // the internal state tracking in compile_with_state.rs:413 fails with
-    // "attempt to subtract with overflow" because:
-    // 1. The inner closure captures state count at creation time
-    // 2. During MLX tracing, the function may see different state
-    // 3. The compiled graph expects N outputs but current state has M > N
-    //
-    // For now, we use the non-compiled jit_training_step which correctly handles
-    // state and benefits from MLX's lazy evaluation and graph fusion.
-    println!("Using non-compiled training step (mlx-rs compile_with_state limitation)");
+    // The training step is not compiled (see the `training_loop` module note);
+    // the plain jit_training_step handles state and relies on MLX's lazy
+    // evaluation.
+    println!("Using non-compiled training step");
 
     let mut losses = vec![warmup_loss_val, warmup2_loss_val];
     for i in 0..3 {
@@ -844,9 +840,7 @@ fn test_batch_token_overflow_protection() {
     assert!(result.is_none(), "Should detect potential overflow");
 
     // With our protected version, it returns MAX
-    let protected = large_batch_size
-        .checked_mul(large_seq_len)
-        .unwrap_or(usize::MAX);
+    let protected = large_batch_size.saturating_mul(large_seq_len);
     assert_eq!(protected, usize::MAX, "Should return MAX on overflow");
 }
 
@@ -897,7 +891,7 @@ fn max_abs_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter()
         .map(|(k, x)| {
-            let mut d = x.subtract(&b[k]).abs().max(None);
+            let d = x.subtract(&b[k]).abs().max(None);
             d.eval();
             pmetal_bridge::check_last_error().unwrap();
             d.item_f32()

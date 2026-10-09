@@ -118,11 +118,11 @@ impl DistributedGradientSync {
         for (name, _shape, count) in &self.param_layout {
             if let Some(arr) = grads.get(name.as_str()) {
                 // Evaluate the gradient array to materialized f32 values
-                let mut arr_eval = arr.clone();
+                let arr_eval = arr.clone();
                 arr_eval
                     .try_eval()
                     .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
-                let mut arr_f32 = arr_eval.as_dtype(Dtype::Float32.as_i32());
+                let arr_f32 = arr_eval.as_dtype(Dtype::Float32.as_i32());
                 arr_f32
                     .try_eval()
                     .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
@@ -262,8 +262,10 @@ pub async fn create_distributed_context(
 
     if config.auto_discover {
         // Zero-config mDNS discovery
-        let mut auto_config = pmetal_distributed::AutoDiscoveryConfig::default();
-        auto_config.gradient_port = config.gradient_port;
+        let auto_config = pmetal_distributed::AutoDiscoveryConfig {
+            gradient_port: config.gradient_port,
+            ..Default::default()
+        };
 
         let backend = pmetal_distributed::AutoDiscoveryBackend::with_config(auto_config)
             .await

@@ -276,7 +276,7 @@ pub(crate) fn eval_training_state<M: ModuleParameters, O: Updatable>(
     all_arrays.extend(model_params.values());
 
     // Optimizer states (momentum, velocity buffers)
-    all_arrays.extend(state.1.updatable_states().into_iter());
+    all_arrays.extend(state.1.updatable_states());
 
     if !all_arrays.is_empty() {
         transforms::eval(all_arrays)?;
