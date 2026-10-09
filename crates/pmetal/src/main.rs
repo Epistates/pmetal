@@ -1134,8 +1134,8 @@ fn usable_metallib(path: &Path) -> bool {
     }
 }
 
-/// Search order: `PMETAL_METALLIB_PATH` → colocated → build dir → cache →
-/// Homebrew → embedded → download → error.
+/// Search order: `PMETAL_METALLIB_PATH` → colocated → cache → Homebrew →
+/// embedded → download → error.
 fn ensure_metallib() {
     // 0. Operator override. The GUI honours the same variable.
     if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH").filter(|p| !p.is_empty()) {
@@ -1162,40 +1162,6 @@ fn ensure_metallib() {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             search_paths.push(dir.join(metallib_name));
-        }
-    }
-
-    // 1b. Search build directories (for local development)
-    if let Ok(cwd) = std::env::current_dir() {
-        // Search in common build output locations relative to workspace root
-        let build_patterns = [
-            "target/release/build",
-            "target/debug/build",
-            "target/aarch64-apple-darwin/release/build",
-            "target/aarch64-apple-darwin/debug/build",
-        ];
-
-        for pattern in build_patterns {
-            let build_dir = cwd.join(pattern);
-            if build_dir.exists() {
-                // Look for mlx-sys build output specifically
-                if let Ok(entries) = std::fs::read_dir(build_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir()
-                            && path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .is_some_and(|s| s.contains("pmetal-mlx-sys"))
-                        {
-                            let metallib_candidate = path.join("out/build/lib").join(metallib_name);
-                            if metallib_candidate.is_file() {
-                                search_paths.push(metallib_candidate);
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
