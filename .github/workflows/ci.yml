@@ -80,6 +80,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # One version per dependency (`just check-workspace-deps`): reads
+      # manifests only, like the deny checks.
+      - name: Workspace dependencies
+        run: scripts/check-workspace-deps.sh
+
       - uses: EmbarkStudios/cargo-deny-action@v2
 
       # The GUI is a separate workspace; same deny.toml, found by walking up.

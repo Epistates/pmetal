@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check lint lint-all-features lint-min-features test test-release check-gui lint-gui check-version check-lockfile deny
+preflight: fmt-check check-workspace-deps lint lint-all-features lint-min-features test test-release check-gui lint-gui check-version check-lockfile deny
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -219,9 +219,19 @@ bump new_version:
 update:
     cargo update
 
-# Show deps behind latest (including semver-breaking)
-outdated:
-    cargo update --verbose 2>&1 | grep -E "Unchanged|Locking" || echo "All deps are latest"
+# Report everything behind upstream: crates in all three cargo workspaces
+# (majors included), bun and the GUI's JS, the MLX pin, the Rust toolchain,
+# the maturin floor, GitHub Actions, and duplicate crate versions. Read-only.
+deps-check:
+    scripts/deps-check.sh
+
+alias outdated := deps-check
+
+# One version per dependency: members inherit every dependency from the root
+# [workspace.dependencies], and the GUI and fuzz workspaces repeat the root's
+# requirement for every crate they share with it (CI: deny job).
+check-workspace-deps:
+    scripts/check-workspace-deps.sh
 
 # ─── Utilities ──────────────────────────────────────────────────────
 
