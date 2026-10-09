@@ -24,7 +24,7 @@ use pmetal_mlx::kernels::{
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
-use pmetal_mlx::moe::{MoEConfig, MoELayer};
+use pmetal_mlx::moe::Expert;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -710,24 +710,26 @@ impl DeepSeekMoEGate {
     }
 }
 
+/// DeepSeek's routed experts, under the `experts` key a checkpoint uses.
+/// Routing is [`DeepSeekMoEGate`]'s, so this holds the experts and nothing
+/// else.
+#[derive(Debug)]
+pub struct DeepSeekExperts {
+    pub experts: Vec<Expert>,
+}
+impl_module_params!(DeepSeekExperts; experts);
+
 #[derive(Debug)]
 pub struct DeepSeekMoE {
     pub config: DeepSeekConfig,
     pub gate: DeepSeekMoEGate,
-    pub moe: MoELayer,
+    pub moe: DeepSeekExperts,
     pub shared_experts: Option<DeepSeekMLP>,
     pub stacked_gate_proj: Option<Array>,
     pub stacked_up_proj: Option<Array>,
     pub stacked_down_proj: Option<Array>,
     pub stacked_weight_signature: Option<Vec<usize>>,
 }
-/// `MoELayer` carries its own `router`, but `DeepSeekMoE` never asks it to
-/// route — every path goes through `self.gate`, which implements DeepSeek's
-/// sigmoid/softmax scoring and group-limited selection. Publishing that unused
-/// router as a parameter leaves a tensor no checkpoint can fill, sitting at
-/// random init inside an otherwise fully-loaded model.
-const UNUSED_MOE_ROUTER: &str = "router";
-
 // Mirrors `parameters()`: the gate and the shared expert merge into the parent
 // path rather than nesting, which is the layout `deepseek_param_name` maps a
 // checkpoint onto.
@@ -744,9 +746,7 @@ impl VisitLinears for DeepSeekMoE {
 impl ModuleParameters for DeepSeekMoE {
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut map = self.gate.parameters();
-        let mut moe = self.moe.parameters();
-        moe.remove(UNUSED_MOE_ROUTER);
-        map.extend(moe);
+        map.extend(self.moe.parameters());
         if let Some(ref s) = self.shared_experts {
             map.extend(s.parameters());
         }
@@ -754,9 +754,7 @@ impl ModuleParameters for DeepSeekMoE {
     }
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut map = self.gate.trainable_parameters();
-        let mut moe = self.moe.trainable_parameters();
-        moe.remove(UNUSED_MOE_ROUTER);
-        map.extend(moe);
+        map.extend(self.moe.trainable_parameters());
         if let Some(ref s) = self.shared_experts {
             map.extend(s.trainable_parameters());
         }
@@ -772,9 +770,7 @@ impl ModuleParameters for DeepSeekMoE {
     }
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut map = self.gate.parameters_mut();
-        let mut moe = self.moe.parameters_mut();
-        moe.remove(UNUSED_MOE_ROUTER);
-        map.extend(moe);
+        map.extend(self.moe.parameters_mut());
         if let Some(ref mut s) = self.shared_experts {
             map.extend(s.parameters_mut());
         }
@@ -817,13 +813,9 @@ impl ModuleParameters for DeepSeekMoE {
 }
 impl DeepSeekMoE {
     pub fn new(config: &DeepSeekConfig) -> Result<Self> {
-        let moe_config = MoEConfig::new(
-            config.hidden_size,
-            config.moe_intermediate_size,
-            config.n_routed_experts.unwrap_or(8) as usize,
-        )
-        .with_num_experts_per_tok(config.num_experts_per_tok as usize)
-        .with_aux_loss(false, 0.0);
+        let experts = (0..config.n_routed_experts.unwrap_or(8))
+            .map(|_| Expert::new(config.hidden_size, config.moe_intermediate_size))
+            .collect();
         let shared_experts = if let Some(n_shared) = config.n_shared_experts {
             Some(DeepSeekMLP::new(
                 config.hidden_size,
@@ -835,7 +827,7 @@ impl DeepSeekMoE {
         Ok(Self {
             config: config.clone(),
             gate: DeepSeekMoEGate::new(config)?,
-            moe: MoELayer::new(moe_config),
+            moe: DeepSeekExperts { experts },
             shared_experts,
             stacked_gate_proj: None,
             stacked_up_proj: None,
@@ -928,12 +920,25 @@ impl DeepSeekMoE {
         Ok(result.squeeze_axes(&[1]))
     }
 
+    /// Every expert over every token, each weighted by the gate's weight for
+    /// it where the gate picked it and zero elsewhere: the routed sum written
+    /// out densely, from primitives.
     #[cfg(test)]
     fn forward_reference(&mut self, x: &Array) -> Result<Array> {
-        let (expert_indices, expert_weights) = self.gate.forward(x)?;
-        let moe_out = self
-            .moe
-            .forward_with_routing(x, &expert_indices, &expert_weights)?;
+        let shape = x.shape().to_vec();
+        let hidden = shape[shape.len() - 1];
+        let flat = x.reshape(&[-1, hidden]);
+        let (expert_indices, expert_weights) = self.gate.forward(&flat)?;
+        let mut routed =
+            pmetal_bridge::compat::ops::zeros_dtype(&[flat.dim(0), hidden], flat.dtype());
+        for (e, expert) in self.moe.experts.iter().enumerate() {
+            let picked = expert_indices
+                .equal(&Array::from_int(e as i32))
+                .as_dtype(expert_weights.dtype().as_i32());
+            let weight = picked.multiply(&expert_weights).sum_axis(-1, true);
+            routed = routed.add(&expert.forward(&flat).multiply(&weight));
+        }
+        let moe_out = routed.reshape(&shape);
         if let Some(ref mut shared) = self.shared_experts {
             Ok(moe_out.add(&shared.forward(x)?))
         } else {

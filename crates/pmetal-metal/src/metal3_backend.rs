@@ -21,8 +21,8 @@
 //!   as `MetalBuffer<u16>` (same 2-byte layout, Metal does not distinguish them)
 //!   and passed directly to [`FusedMoeExpert::forward_single_expert`].
 //!
-//! - **`fused_lora_forward`**, **`fused_cross_entropy`**, **`fused_distill_loss`**,
-//!   and **`fused_adamw_step`**: wired using [`DynBufRef`] (for the sampler-trait
+//! - **`fused_lora_forward`**, **`fused_cross_entropy`** and
+//!   **`fused_adamw_step`**: wired using [`DynBufRef`] (for the sampler-trait
 //!   mismatch) and param-info extraction from the `AdamWDescriptor` (for AdamW).
 
 use std::sync::Arc;
@@ -45,7 +45,6 @@ use crate::{
         fused_cross_entropy::{
             FusedCrossEntropy, FusedCrossEntropyConfig, FusedCrossEntropyOutput,
         },
-        fused_distill::{DistillLossType, FusedDistill, FusedDistillConfig, FusedDistillOutput},
         fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput},
         fused_moe::{ExpertWeightBuffers, FusedMoeExpert},
         fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput},
@@ -512,29 +511,5 @@ impl KernelBackend for Metal3Backend {
         kernel.forward_single_expert(desc.input, &weights, &output, &intermediate)?;
 
         Ok(output)
-    }
-
-    // ---- Distillation -------------------------------------------------------
-
-    /// Fused distillation loss via [`FusedDistill::forward`].
-    ///
-    /// [`FusedDistill::forward`] is generic over `impl buffer::AsMetalBuffer`.
-    /// [`DynBufRef`] implements `buffer::AsMetalBuffer` by delegating to
-    /// `as_metal_buffer()`, so we wrap the `&dyn` references and pass them
-    /// directly to the generic method.
-    fn fused_distill_loss(
-        &self,
-        ctx: &Arc<MetalContext>,
-        config: &FusedDistillConfig,
-        teacher_logits: &dyn AsMetalBuffer,
-        student_logits: &dyn AsMetalBuffer,
-        loss_type: DistillLossType,
-    ) -> Result<FusedDistillOutput> {
-        let kernel = FusedDistill::new(ctx.clone(), config.clone())?;
-        kernel.forward(
-            &DynBufRef(teacher_logits),
-            &DynBufRef(student_logits),
-            loss_type,
-        )
     }
 }

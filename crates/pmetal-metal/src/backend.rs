@@ -32,7 +32,6 @@ use crate::{
     kernels::{
         flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
         fused_cross_entropy::{FusedCrossEntropyConfig, FusedCrossEntropyOutput},
-        fused_distill::{DistillLossType, FusedDistillConfig, FusedDistillOutput},
         fused_lora::{FusedLoraConfig, FusedLoraOutput},
         fused_moe::FusedMoeExpertConfig,
         fused_norm_lora::{FusedNormLoraConfig, FusedNormLoraOutput},
@@ -83,9 +82,6 @@ pub struct BackendCaps {
     /// Whether this backend provides fused MoE kernels.
     pub has_moe: bool,
 
-    /// Whether this backend provides fused distillation loss.
-    pub has_distill: bool,
-
     /// Whether this backend provides fused norm+LoRA.
     pub has_norm_lora: bool,
 
@@ -125,7 +121,6 @@ impl BackendCaps {
             has_cross_entropy: true,
             has_rope: true,
             has_moe: true,
-            has_distill: true,
             has_norm_lora: true,
             has_lora: true,
             has_dw_gemm: true,
@@ -151,7 +146,6 @@ impl BackendCaps {
     /// - `has_adamw`: `MppFusedAdamW` via `fused_adamw_step_standalone`
     /// - `has_cross_entropy`: `MppFusedCrossEntropy`
     /// - `has_rope`: `MppFusedRoPE`
-    /// - `has_distill`: `MppFusedDistill`
     /// - `has_norm_lora`: `MppFusedNormLora`
     /// - `has_lora`: `MppFusedLora` (inference mode)
     /// - `has_dw_gemm`: `MppDwGemm`
@@ -181,8 +175,6 @@ impl BackendCaps {
             has_rope: true,
             // Fallback: quantized u32 weights in descriptor, MPP needs fp16.
             has_moe: false,
-            // Wired: MppFusedDistill.
-            has_distill: true,
             // Wired: MppFusedNormLora.
             has_norm_lora: true,
             // Wired: MppFusedLora (inference mode).
@@ -631,16 +623,4 @@ pub trait KernelBackend: Send + Sync {
         ctx: &Arc<MetalContext>,
         desc: &MoeExpertDescriptor<'_>,
     ) -> Result<MetalBuffer<f32>>;
-
-    // ---- Distillation -------------------------------------------------------
-
-    /// Fused distillation loss forward pass (KL, reverse-KL, JS, or soft-CE).
-    fn fused_distill_loss(
-        &self,
-        ctx: &Arc<MetalContext>,
-        config: &FusedDistillConfig,
-        teacher_logits: &dyn AsMetalBuffer,
-        student_logits: &dyn AsMetalBuffer,
-        loss_type: DistillLossType,
-    ) -> Result<FusedDistillOutput>;
 }

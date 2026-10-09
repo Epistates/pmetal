@@ -47,13 +47,12 @@
 use std::collections::HashMap;
 
 use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use pmetal_core::LoraConfig;
-use pmetal_mlx::kernels::fast_lora::create_lora_params;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope, rope_with_periods},
@@ -74,7 +73,10 @@ pub struct LoraDelta {
 
 impl LoraDelta {
     fn new(in_features: i32, out_features: i32, rank: i32, alpha: f32) -> Result<Self, Exception> {
-        let (a, b) = create_lora_params(in_features, out_features, rank)?;
+        // `A` uniform in ±sqrt(3 / in) (Kaiming), `B` zero.
+        let bound = (3.0_f32 / in_features as f32).sqrt();
+        let a = random::uniform_range(-bound, bound, &[rank, in_features], Dtype::Float32);
+        let b = ops::zeros(&[out_features, rank], Dtype::Float32);
         Ok(Self {
             a,
             b,

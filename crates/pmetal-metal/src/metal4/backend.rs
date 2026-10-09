@@ -22,7 +22,6 @@ use crate::{
     kernels::{
         flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
         fused_cross_entropy::{FusedCrossEntropyConfig, FusedCrossEntropyOutput},
-        fused_distill::{DistillLossType, FusedDistillConfig, FusedDistillOutput},
         fused_lora::{FusedLoraConfig, FusedLoraOutput},
         fused_norm_lora::{FusedNormLoraConfig, FusedNormLoraOutput},
         fused_rope::FusedRoPEConfig,
@@ -32,7 +31,6 @@ use crate::{
         mpp_dw_gemm::{MppDwGemm, MppDwGemmConfig},
         mpp_flash_attention::{MppFlashAttentionBackward, MppFlashAttentionConfig as MppFAConfig},
         mpp_fused_cross_entropy::{MppFusedCrossEntropy, MppFusedCrossEntropyConfig},
-        mpp_fused_distill::{MppDistillLossType, MppFusedDistill, MppFusedDistillConfig},
         mpp_fused_lora::{MppFusedLora, MppFusedLoraConfig},
         mpp_fused_moe::{MppFusedMoEQuant, MppFusedMoEQuantConfig, MppGroupedGemmTileCount},
         mpp_fused_norm_lora::{MppFusedNormLora, MppFusedNormLoraConfig},
@@ -746,63 +744,5 @@ impl KernelBackend for Metal4Backend {
         )?;
 
         Ok(output)
-    }
-
-    // ---- Distillation -------------------------------------------------------
-
-    fn fused_distill_loss(
-        &self,
-        ctx: &Arc<MetalContext>,
-        config: &FusedDistillConfig,
-        teacher_logits: &dyn AsMetalBuffer,
-        student_logits: &dyn AsMetalBuffer,
-        loss_type: DistillLossType,
-    ) -> Result<FusedDistillOutput> {
-        let mpp_loss_type = match loss_type {
-            DistillLossType::KlDivergence => MppDistillLossType::ForwardKL,
-            DistillLossType::ReverseKlDivergence => MppDistillLossType::ReverseKL,
-            DistillLossType::JensenShannon => MppDistillLossType::JensenShannon,
-            DistillLossType::SoftCrossEntropy => MppDistillLossType::SoftCrossEntropy,
-        };
-        let mpp_config = MppFusedDistillConfig {
-            num_tokens: config.num_tokens,
-            vocab_size: config.vocab_size,
-            temperature: config.temperature,
-            alpha: config.alpha,
-            ignore_index: config.ignore_index,
-            loss_type: mpp_loss_type,
-            use_fp16: config.use_fp16,
-        };
-        let dispatcher = MppFusedDistill::new(self.ctx.clone(), mpp_config);
-
-        if !dispatcher.is_available() {
-            return self.fallback.fused_distill_loss(
-                ctx,
-                config,
-                teacher_logits,
-                student_logits,
-                loss_type,
-            );
-        }
-
-        let losses = MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
-        let teacher_lse =
-            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
-        let student_lse =
-            MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
-
-        dispatcher.execute(
-            teacher_logits,
-            student_logits,
-            &losses,
-            &teacher_lse,
-            &student_lse,
-        )?;
-
-        Ok(FusedDistillOutput {
-            losses,
-            teacher_lse,
-            student_lse,
-        })
     }
 }

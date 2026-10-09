@@ -12,7 +12,6 @@ pub mod dw_gemm;
 pub mod flash_attention;
 pub mod fp8_training;
 pub mod fused_cross_entropy;
-pub mod fused_distill;
 pub mod fused_lora;
 pub mod fused_merge;
 pub mod fused_moe;
@@ -34,7 +33,6 @@ pub mod mpp_dw_gemm;
 #[cfg(has_metal4)]
 pub mod mpp_fused_cross_entropy;
 #[cfg(has_metal4)]
-pub mod mpp_fused_distill;
 #[cfg(has_metal4)]
 pub mod mpp_fused_lora;
 #[cfg(has_metal4)]
@@ -68,10 +66,6 @@ pub use fused_cross_entropy::{
     FusedLinearCrossEntropy,
     FusedLinearCrossEntropyConfig,
     FusedLinearCrossEntropyOutput,
-};
-pub use fused_distill::{
-    DistillLossType, FusedDistill, FusedDistillConfig, FusedDistillOutput, FusedHiddenAlign,
-    HiddenAlignConfig, HiddenAlignLossType,
 };
 pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_merge::{
