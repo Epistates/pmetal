@@ -435,11 +435,11 @@ fn every_architecture_hands_over_its_lm_head() {
         let hidden = config_int(&case, "hidden_size").expect("hidden_size");
 
         let adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
-        let head = TrainableModel::lm_head_weight(&adapted)
+        let head = TrainableModel::lm_head(&adapted)
             .unwrap_or_else(|| panic!("{}: no LM head, so CCE falls back", case.name));
 
         assert_eq!(
-            head.shape(),
+            head.weight.shape(),
             &[vocab, hidden],
             "{}: LM head is not [vocab, hidden]",
             case.name

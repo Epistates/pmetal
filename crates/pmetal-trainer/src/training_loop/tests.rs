@@ -1182,3 +1182,55 @@ fn a_failed_step_stops_the_packed_run() {
     };
     assert!(err.contains("step 2"), "{err}");
 }
+
+/// A step with cut cross-entropy moves an adapter on the LM head exactly as a
+/// step with the full logits does. The step used to read the head's weight
+/// before differentiating, so the adapter on it was a constant to autograd:
+/// its update was zero, and the loss left its contribution out.
+#[test]
+fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
+    use pmetal_bridge::compat::optimizers::Sgd;
+
+    let build = || {
+        let config = LlamaConfig {
+            tie_word_embeddings: false,
+            ..small_config()
+        };
+        let lora = LoraConfig {
+            target_modules: vec!["q_proj".to_string(), "lm_head".to_string()],
+            ..small_lora_config()
+        };
+        pmetal_bridge::compat::random::seed(5);
+        let base = DynamicModel::from_config(&serde_json::to_string(&config).unwrap()).unwrap();
+        (AdaptedModel::attach(base, lora).unwrap(), Sgd::new(1.0))
+    };
+    let input_ids = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4, 5, 6], &[1, 6]);
+    let labels = input_ids.clone();
+
+    let mut full = build();
+    let mut cut = build();
+    let before = full.0.lora_parameters();
+    jit_training_step_inner(&mut full, (&input_ids, &labels), None).unwrap();
+    jit_training_step_cce(&mut cut, (&input_ids, &labels), None).unwrap();
+    pmetal_bridge::check_last_error().expect("a bridge op threw");
+
+    let (full, cut) = (full.0.lora_parameters(), cut.0.lora_parameters());
+    for name in ["lm_head.lora_b", "layers.0.self_attn.q_proj.lora_b"] {
+        let key = full
+            .keys()
+            .find(|k| k.ends_with(name) || k.as_ref() == name)
+            .unwrap_or_else(|| panic!("no {name} among {:?}", full.keys()))
+            .clone();
+        let moved = full[&key]
+            .subtract(&before[&key])
+            .abs()
+            .max(None)
+            .item_f32();
+        let diff = cut[&key].subtract(&full[&key]).abs().max(None).item_f32();
+        assert!(moved > 0.0, "{key}: the full-logits step did not move it");
+        assert!(
+            diff <= 1e-4 * moved,
+            "{key}: the CCE step moved it differently (off by {diff}, update {moved})"
+        );
+    }
+}

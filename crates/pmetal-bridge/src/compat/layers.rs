@@ -495,6 +495,28 @@ impl Linear {
         }
     }
 
+    /// The dense `[out, in]` weight `W` for which [`forward`](Self::forward)
+    /// computes `x·Wᵀ + b`: unpacked, with an attached adapter folded in.
+    ///
+    /// For a caller that multiplies by the whole matrix in its own way, cut
+    /// cross-entropy over an LM head for one. Folding is exact, gradients
+    /// included: `x·(W + s·B·A)ᵀ` is the same function of `A` and `B` as the
+    /// adapter's own two small matmuls. `None` while the adapter applies
+    /// dropout, which acts on the input and no single weight reproduces.
+    pub fn effective_weight(&self) -> Option<Array> {
+        let dense = self.dense_weight();
+        match self.adapter.as_deref() {
+            Some(adapter) if !adapter.merged => {
+                if adapter.training && adapter.dropout > 0.0 {
+                    None
+                } else {
+                    Some(adapter.merged_weight(&dense))
+                }
+            }
+            _ => Some(dense),
+        }
+    }
+
     /// Undo [`quantize`](Self::quantize), leaving the unpacked weight (with
     /// the rounding packing introduced).
     pub fn dequantize(&mut self) {

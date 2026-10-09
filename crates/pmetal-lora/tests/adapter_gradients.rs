@@ -262,3 +262,96 @@ fn one_architecture() {
     let problems = check_architecture(name, config_json);
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// Loss and adapter gradients of one step, keyed by parameter path, with the
+/// loss built by `loss` from the model inside the differentiated function.
+fn step_with(
+    model: &mut AdaptedModel,
+    names: &[Rc<str>],
+    ids: &Array,
+    loss: impl Fn(&mut AdaptedModel, &Array) -> Array,
+) -> (f32, HashMap<Rc<str>, Array>) {
+    let live = model.lora_parameters();
+    let params: Vec<Array> = names.iter().map(|n| live[n].clone()).collect();
+    let (value, grads) = value_and_grad(
+        |arrays| {
+            let restored: HashMap<Rc<str>, Array> =
+                names.iter().cloned().zip(arrays.iter().cloned()).collect();
+            model.set_lora_parameters(&restored);
+            loss(model, ids)
+        },
+        &params,
+        &[],
+    );
+    model.set_lora_parameters(&live);
+    (value.item_f32(), names.iter().cloned().zip(grads).collect())
+}
+
+/// Cut cross-entropy computes the loss the model's own logits give, and the
+/// same gradient for every adapter, the LM head's included.
+///
+/// The trainer used to read the head's weight once, before the step, and
+/// hand that to the loss: an adapter on `lm_head` (every projection is
+/// adapted when `target_modules` is empty) was then a constant to autograd
+/// and trained on nothing, and its update was missing from the loss too. The
+/// head also left out the logit transforms some architectures apply after it
+/// (Gemma's softcap, Cohere's and Granite's scales), so CCE trained those on a
+/// different objective.
+#[test]
+fn cut_cross_entropy_trains_what_the_forward_computes() {
+    let mut problems = Vec::new();
+    let mut checked = 0;
+    for (name, config_json) in all_cases() {
+        random::seed(3);
+        let base = DynamicModel::from_config(config_json).expect("build");
+        let mut model = AdaptedModel::attach(base, lora_config()).expect("attach");
+        randomize_adapters(&mut model);
+        if pmetal_lora::TrainableModel::lm_head(&model).is_none() {
+            problems.push(format!("{name}: no LM head for cut cross-entropy"));
+            continue;
+        }
+        let ids = input_ids(vocab_of(config_json));
+        let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
+        names.sort();
+
+        let (want, want_grads) = step_with(&mut model, &names, &ids, |model, ids| {
+            let logits = model.forward(ids, None).unwrap();
+            pmetal_bridge::training::causal_lm_loss(&logits, ids, -100)
+        });
+        let (got, got_grads) = step_with(&mut model, &names, &ids, |model, ids| {
+            let hidden = model.forward_hidden(ids, None).unwrap();
+            let head = pmetal_lora::TrainableModel::lm_head(model).unwrap();
+            let seq = hidden.dim(1);
+            let hidden = hidden.slice(&[0, 0, 0], &[1, seq - 1, hidden.dim(2)]);
+            let targets = ids.slice(&[0, 1], &[1, seq]).reshape(&[-1]);
+            head.cut_cross_entropy(&hidden, &targets, -100).unwrap()
+        });
+        drain(name);
+        checked += 1;
+
+        let loss_gap = (got - want).abs();
+        if loss_gap.is_nan() || loss_gap > 1e-4 * want.abs().max(1.0) {
+            problems.push(format!("{name}: CCE loss {got} vs the logits' {want}"));
+            continue;
+        }
+        for key in &names {
+            let scale = want_grads[key].abs().max(None).item_f32();
+            let diff = got_grads[key]
+                .subtract(&want_grads[key])
+                .abs()
+                .max(None)
+                .item_f32();
+            if diff.is_nan() || diff > 1e-3 * scale.max(1e-6) {
+                problems.push(format!(
+                    "{name}: {key} gradient off by {diff} (scale {scale})"
+                ));
+            }
+        }
+    }
+    assert!(checked >= 19, "only {checked} architectures were exercised");
+    assert!(
+        problems.is_empty(),
+        "cut cross-entropy disagrees with the forward:\n  {}",
+        problems.join("\n  ")
+    );
+}

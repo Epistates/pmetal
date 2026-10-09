@@ -11,8 +11,8 @@ use crate::loader::{
 use crate::traits::{CausalLMModel, ModelConfig};
 use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
 use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
-    ModuleParametersExt, nn, transforms,
+    Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
+    ModuleParametersExt, nn, ops, transforms,
 };
 use pmetal_mlx::kv_cache::{
     CacheMode, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache,
@@ -668,6 +668,49 @@ macro_rules! simple_load_moe {
         model.init_post_load_fast_paths()?;
         Ok(model)
     }};
+}
+
+/// An LM head in the form cut cross-entropy computes a loss from: the logits
+/// of hidden states `h` are `softcap(logit_scale · (h·Wᵀ + b))`, never
+/// materialised. See [`DynamicModel::lm_head`].
+#[derive(Debug, Clone)]
+pub struct LmHead {
+    /// `[vocab, hidden]`, dense, with any adapter on the head folded in.
+    pub weight: Array,
+    /// `[vocab]`, when the head has a bias.
+    pub bias: Option<Array>,
+    /// Multiplies the logits: Cohere's `logit_scale`, Granite's
+    /// `1 / logits_scaling`, 1 elsewhere.
+    pub logit_scale: f32,
+    /// `cap · tanh(logits / cap)` after the scale, for Gemma 2 and Gemma 4.
+    pub softcap: Option<f32>,
+}
+
+impl LmHead {
+    /// Mean cross-entropy of `targets` (`[n]`, `ignore_index` skipped) under
+    /// the logits of `hidden` (`[n, hidden]`, or any leading shape that
+    /// flattens to it), computed a vocabulary chunk at a time.
+    pub fn cut_cross_entropy(
+        &self,
+        hidden: &Array,
+        targets: &Array,
+        ignore_index: i32,
+    ) -> Result<Array, Exception> {
+        use pmetal_mlx::kernels::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
+
+        let width = hidden.dim(-1);
+        let flat = hidden.reshape(&[-1, width]);
+        let mut config = CutCrossEntropyConfig::new()
+            .with_ignore_index(ignore_index)
+            .with_logit_scale(self.logit_scale);
+        if let Some(cap) = self.softcap {
+            config = config.with_softcap(cap);
+        }
+        CutCrossEntropy::new(config)
+            .forward(&flat, &self.weight, targets, self.bias.as_ref())
+            .map(|output| output.loss)
+            .map_err(|e| Exception::custom(e.to_string()))
+    }
 }
 
 /// A model whose architecture is dispatched at runtime.
@@ -1698,23 +1741,81 @@ impl DynamicModel {
         }
     }
 
-    /// The matrix that projects hidden states onto the vocabulary.
+    /// The untied LM head, when this architecture has one.
+    fn lm_head_layer(&self) -> Option<&nn::Linear> {
+        match self {
+            Self::Llama(m) => m.lm_head.as_ref(),
+            Self::Llama4(m) => Some(&m.lm_head),
+            Self::Qwen2(m) => m.lm_head.as_ref(),
+            Self::Qwen3(m) => m.lm_head.as_ref(),
+            Self::Qwen3MoE(m) => m.lm_head.as_ref(),
+            Self::Qwen3Next(m) => m.lm_head.as_ref(),
+            Self::Qwen4Exp(m) => m.lm_head.as_ref(),
+            Self::Mistral(m) => m.lm_head.as_ref(),
+            Self::Phi(m) | Self::Phi4(m) => m.lm_head.as_ref(),
+            Self::DeepSeek(m) => Some(&m.lm_head),
+            Self::Cohere(m) => m.lm_head.as_ref(),
+            Self::Granite(m) => m.lm_head.as_ref(),
+            Self::GptOss(m) => Some(&m.lm_head),
+            Self::NemotronH(m) => m.lm_head.as_ref(),
+            Self::Mllama(m) => Some(&m.lm_head),
+            Self::Gemma(_)
+            | Self::Gemma4(_)
+            | Self::Bert(_)
+            | Self::DiffusionGemma(_)
+            | Self::Flux(_) => None,
+        }
+    }
+
+    /// The LM head as cut cross-entropy computes the loss from it: the
+    /// logits of `hidden`, what [`forward_hidden`](Self::forward_hidden)
+    /// returns, are `softcap(logit_scale · (hidden·Wᵀ + b))`.
     ///
-    /// Cut cross-entropy needs it so the loss can be computed without ever
-    /// materialising `[batch, seq, vocab]` logits, which for a 150k-token
-    /// vocabulary is most of the step's peak memory.
+    /// The weight is the one [`Linear::forward`](nn::Linear::forward) would
+    /// multiply by, adapter folded in, so a loss built on it trains an adapter
+    /// on the head as the forward pass would; take it inside the function
+    /// being differentiated, where the adapter's parameters are the traced
+    /// ones. A model that ties its embeddings uses the embedding matrix.
     ///
-    /// Read out of the flattened parameter tree rather than matched per
-    /// architecture: every one of them spells the field `lm_head`, and a model
-    /// that ties its embeddings has no separate head at all, so the embedding
-    /// *is* the matrix, read the other way round. Matching would add an arm per
-    /// architecture to restate that.
+    /// `None` when the logits are not of that form, or when no single weight
+    /// reproduces the head (an adapter on it applying dropout).
+    pub fn lm_head(&self) -> Option<LmHead> {
+        let (logit_scale, softcap) = match self {
+            // `logits * logit_scale`.
+            Self::Cohere(m) => (m.config.logit_scale, None),
+            // `logits / logits_scaling`.
+            Self::Granite(m) => (m.config.logits_scaling.recip(), None),
+            // `cap · tanh(logits / cap)`.
+            Self::Gemma(m) => (1.0, m.model.config.final_logit_softcapping),
+            Self::Gemma4(m) => (1.0, m.config.final_logit_softcapping),
+            Self::Bert(_) | Self::DiffusionGemma(_) | Self::Flux(_) => return None,
+            _ => (1.0, None),
+        };
+        let (weight, bias) = match self.lm_head_layer() {
+            Some(linear) => (linear.effective_weight()?, linear.bias.value.clone()),
+            None => {
+                let params = self.flatten_params();
+                let tied = params.get("model.embed_tokens.weight")?;
+                let tied = if tied.dtype() == Dtype::Uint8 {
+                    ops::from_fp8(tied, Dtype::Bfloat16).ok()?
+                } else {
+                    tied.clone()
+                };
+                (tied, None)
+            }
+        };
+        Some(LmHead {
+            weight,
+            bias,
+            logit_scale,
+            softcap: softcap.filter(|cap| *cap != 0.0),
+        })
+    }
+
+    /// The matrix that projects hidden states onto the vocabulary,
+    /// `[vocab, hidden]` and dense. See [`lm_head`](Self::lm_head).
     pub fn lm_head_weight(&self) -> Option<Array> {
-        let params = self.flatten_params();
-        ["lm_head.weight", "model.embed_tokens.weight"]
-            .iter()
-            .find_map(|key| params.get(*key))
-            .cloned()
+        self.lm_head().map(|head| head.weight)
     }
 
     /// Set the NEFTune noise scale on the token embedding, or clear it.

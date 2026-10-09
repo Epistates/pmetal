@@ -441,8 +441,8 @@ impl crate::TrainableModel for AdaptedModel {
         )
     }
 
-    fn lm_head_weight(&self) -> Option<Array> {
-        self.model.lm_head_weight()
+    fn lm_head(&self) -> Option<pmetal_models::dispatcher::LmHead> {
+        self.model.lm_head()
     }
 
     /// Forward with NEFTune noise on the embedding output.

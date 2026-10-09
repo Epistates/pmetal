@@ -370,8 +370,8 @@ impl TrainableModel for DynamicLoraModel {
         )
     }
 
-    fn lm_head_weight(&self) -> Option<Array> {
-        TrainableModel::lm_head_weight(&self.inner)
+    fn lm_head(&self) -> Option<pmetal_models::dispatcher::LmHead> {
+        TrainableModel::lm_head(&self.inner)
     }
 }
 
@@ -508,7 +508,7 @@ mod tests {
             .expect("forward_hidden succeeds");
         assert_eq!(hidden.shape(), &[1, 4, 32]);
 
-        let head = TrainableModel::lm_head_weight(&model).expect("lm_head is available");
-        assert_eq!(head.shape(), &[128, 32]);
+        let head = TrainableModel::lm_head(&model).expect("lm_head is available");
+        assert_eq!(head.weight.shape(), &[128, 32]);
     }
 }

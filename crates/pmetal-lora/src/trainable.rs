@@ -292,14 +292,17 @@ pub trait TrainableModel: ModuleParameters {
         None
     }
 
-    /// Return the LM head weight matrix [vocab_size, hidden_dim].
+    /// The LM head as cut cross-entropy computes the loss from it, with any
+    /// adapter on the head folded in and the architecture's logit scale and
+    /// softcap; see [`pmetal_models::dispatcher::DynamicModel::lm_head`].
     ///
-    /// For models with a separate `lm_head` linear layer this returns that weight.
-    /// For models with tied embeddings it returns the embedding weight (which serves
-    /// as the LM head when transposed).
+    /// Call it inside the function being differentiated, after the trainer
+    /// has put the traced adapter parameters in place: a head taken before
+    /// that is a constant to autograd, and an adapter on it trains on nothing.
     ///
-    /// Returns `None` if the model does not expose its LM head (triggers CCE fallback).
-    fn lm_head_weight(&self) -> Option<Array> {
+    /// Returns `None` if the model does not expose its LM head in that form
+    /// (triggers CCE fallback).
+    fn lm_head(&self) -> Option<pmetal_models::dispatcher::LmHead> {
         None
     }
 }

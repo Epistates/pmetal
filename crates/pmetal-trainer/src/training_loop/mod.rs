@@ -178,7 +178,7 @@ pub struct TrainingLoopConfig {
     /// hidden states without materializing the full logits tensor.  This reduces memory
     /// by up to 37x for large vocabularies (e.g., 150K tokens in Qwen3.5).
     ///
-    /// Requires the model to implement `forward_hidden()` and `lm_head_weight()`.
+    /// Requires the model to implement `forward_hidden()` and `lm_head()`.
     /// Falls back to standard cross-entropy silently when the model does not support it.
     pub use_cut_cross_entropy: bool,
 
@@ -1153,30 +1153,20 @@ impl TrainingLoop {
         batch: &TrainingBatch,
     ) -> Result<(Array, FlattenedModuleParam)> {
         let neftune_alpha = self.config.neftune_noise_alpha;
-        // Fetch the LM head weight once — serves as capability probe and avoids
-        // a second call to lm_head_weight() inside the gradient closure.
-        let lm_weight_cached = if self.config.use_cut_cross_entropy && neftune_alpha.is_none() {
-            model.lm_head_weight()
-        } else {
-            None
-        };
-        let use_cce = lm_weight_cached.is_some();
+        // A probe only: the head the loss uses is read inside the closure,
+        // where an adapter on it is the traced parameter.
+        let use_cce = self.config.use_cut_cross_entropy
+            && neftune_alpha.is_none()
+            && model.lm_head().is_some();
 
         if use_cce {
-            let cached_weight = lm_weight_cached.expect("checked above");
             // CCE path: forward hidden states, then compute loss without logits.
             let loss_fn = |model: &mut M,
                            (input_ids, labels): (&Array, &Array)|
              -> std::result::Result<Array, Exception> {
                 let hidden_opt = model.forward_hidden(input_ids, None);
                 match hidden_opt {
-                    Some(Ok(hidden_states)) => {
-                        let seq_len = hidden_states.dim(1);
-                        let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
-                        let shift_labels = labels.index((.., 1..));
-                        let flat_labels = shift_labels.reshape(&[-1]);
-                        compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
-                    }
+                    Some(Ok(hidden_states)) => compute_cce_loss(model, &hidden_states, labels),
                     _ => {
                         // CCE unavailable at runtime — fall back to standard CE.
                         let logits = model

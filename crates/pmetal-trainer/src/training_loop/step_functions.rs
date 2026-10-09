@@ -139,31 +139,36 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     Ok(loss)
 }
 
-/// Shared helper: compute CCE loss from hidden states + lm_head weight.
+/// Shared helper: the CCE loss of the next token at every position.
 ///
-/// Both the standard and packed CCE steps call this after obtaining hidden states.
-/// `hidden_states` must already be shifted/reshaped as appropriate.
-/// `labels` must already be shifted and flattened to [n_tokens].
-pub(crate) fn compute_cce_loss(
+/// Every CCE step calls this, inside the function `value_and_grad`
+/// differentiates, with the hidden states it just computed. The head is read
+/// here too, not before the step: an adapter on the LM head is in place as a
+/// traced parameter only inside that function, and a head read outside it is
+/// a constant, which trained that adapter on nothing.
+///
+/// `hidden_states` is `[batch, seq, hidden]`; `labels` is `[batch, seq]`,
+/// unshifted. Errors when the model has no head CCE can use, which the
+/// caller has already ruled out by asking [`TrainableModel::lm_head`].
+pub(crate) fn compute_cce_loss<M: TrainableModel>(
+    model: &M,
     hidden_states: &Array,
-    lm_head_weight: &Array,
     labels: &Array,
 ) -> std::result::Result<Array, Exception> {
-    use pmetal_mlx::kernels::cut_cross_entropy::cut_cross_entropy_loss;
-
-    // Flatten hidden states to [n_tokens, hidden_dim]
-    let hidden_dim = hidden_states.dim(-1);
-    let n_tokens = hidden_states.size() as i32 / hidden_dim;
-    let flat_hidden = hidden_states.reshape(&[n_tokens, hidden_dim]);
-
-    cut_cross_entropy_loss(&flat_hidden, lm_head_weight, labels, -100)
-        .map_err(|e| Exception::custom(e.to_string()))
+    let head = model
+        .lm_head()
+        .ok_or_else(|| Exception::custom("cut cross-entropy: the model has no LM head to use"))?;
+    // Shift: hidden[:-1] predicts labels[1:].
+    let seq_len = hidden_states.dim(1);
+    let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
+    let shift_labels = labels.index((.., 1..)).reshape(&[-1]);
+    head.cut_cross_entropy(&shift_hidden, &shift_labels, -100)
 }
 
 /// Training step using Cut Cross-Entropy (avoids materializing the full logits tensor).
 ///
 /// Falls back to standard cross-entropy when the model does not implement
-/// `forward_hidden()` / `lm_head_weight()`, ensuring backward compatibility.
+/// `forward_hidden()` / `lm_head()`, ensuring backward compatibility.
 pub(crate) fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     (input_ids, labels): (&Array, &Array),
@@ -181,11 +186,9 @@ pub(crate) fn jit_training_step_cce_clipped<M: TrainableModel, O: Optimizer>(
 ) -> std::result::Result<Array, Exception> {
     let (model, optimizer) = state;
 
-    let lm_weight_cached = model.lm_head_weight();
-    let has_cce_support = lm_weight_cached.is_some();
+    let has_cce_support = model.lm_head().is_some();
 
     if has_cce_support && neftune_alpha.is_none() {
-        let cached_weight = lm_weight_cached.expect("checked above");
         // CCE path: compute loss from hidden states without full logits.
         let loss_fn = |model: &mut M,
                        (input_ids, labels): (&Array, &Array)|
@@ -193,16 +196,7 @@ pub(crate) fn jit_training_step_cce_clipped<M: TrainableModel, O: Optimizer>(
             let hidden_opt = model.forward_hidden(input_ids, None);
 
             match hidden_opt {
-                Some(Ok(hidden_states)) => {
-                    let seq_len = hidden_states.dim(1);
-
-                    // Shift: hidden[:-1] predicts labels[1:]
-                    let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
-                    let shift_labels = labels.index((.., 1..));
-                    let flat_labels = shift_labels.reshape(&[-1]);
-
-                    compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
-                }
+                Some(Ok(hidden_states)) => compute_cce_loss(model, &hidden_states, labels),
                 _ => {
                     // Unexpected failure in hidden forward — fall through to standard CE.
                     let logits = model
@@ -254,14 +248,10 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
         None
     };
 
-    // Fetch the LM head weight once — serves as capability probe and provides
-    // the cached weight to capture into the closure (avoids a second call inside
-    // the gradient graph).
-    let lm_weight_cached = model.lm_head_weight();
-    let has_cce_support = lm_weight_cached.is_some();
+    // A probe only: the head the loss uses is read inside the closure.
+    let has_cce_support = model.lm_head().is_some();
 
     if has_cce_support {
-        let cached_weight = lm_weight_cached.expect("checked above");
         let loss_fn = |model: &mut M,
                        (input_ids, labels): (&Array, &Array)|
          -> std::result::Result<Array, Exception> {
@@ -272,14 +262,7 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
             );
 
             match hidden_opt {
-                Some(Ok(hidden_states)) => {
-                    let seq_len = hidden_states.dim(1);
-                    let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
-                    let shift_labels = labels.index((.., 1..));
-                    let flat_labels = shift_labels.reshape(&[-1]);
-
-                    compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
-                }
+                Some(Ok(hidden_states)) => compute_cce_loss(model, &hidden_states, labels),
                 _ => {
                     // Fall back to standard cross-entropy
                     let logits = model
