@@ -17,8 +17,6 @@
 //! A decision model (a Clef release) is served by its own router instead, with
 //! `POST /v1/systemone`, `GET /v1/models` and `GET /health`; see [`decision`].
 
-#![allow(clippy::too_many_arguments)]
-
 pub mod anthropic;
 pub mod continuous_batch;
 pub mod continuous_driver;

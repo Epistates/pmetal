@@ -44,8 +44,6 @@
 //! - [HC Paper](https://arxiv.org/abs/2409.19606): "Hyper-Connections"
 
 #![warn(missing_docs)]
-#![warn(clippy::all)]
-#![allow(clippy::too_many_arguments)]
 
 pub mod config;
 pub mod layer;

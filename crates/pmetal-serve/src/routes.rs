@@ -780,6 +780,10 @@ fn chat_sse_stream(
 /// `CompletionLogprobs` payload with 4-parallel-array shape aligned to
 /// the substring boundaries of the current delta. [DONE] is only emitted
 /// on successful completion — not after errors.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream owns all per-request state"
+)]
 fn completion_sse_stream(
     rx: tokio::sync::mpsc::Receiver<TokenEvent>,
     tokenizer: Arc<pmetal_data::Tokenizer>,

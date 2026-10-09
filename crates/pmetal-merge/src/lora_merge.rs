@@ -336,6 +336,10 @@ fn bytes_to_f64_1d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
 ///
 /// Both tensors must be 1-D and have the same length.  The addition is done in
 /// f64 before downcasting back to the base dtype.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bytes, shape, dtype and name of each operand"
+)]
 fn merge_and_write_bias(
     base_bytes: &[u8],
     base_shape: &[usize],
@@ -904,6 +908,10 @@ fn write_merged_rows(
 // ---------------------------------------------------------------------------
 
 /// Merge a single-file base model with the adapter and write the output.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private helper threading the merge settings"
+)]
 fn merge_single_file(
     base: &MappedFile,
     adapter: &MappedFile,
@@ -1057,6 +1065,10 @@ impl ShardIndex {
 // Sharded merge
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private helper threading the merge settings"
+)]
 fn merge_sharded(
     base_dir: &Path,
     index: &ShardIndex,
