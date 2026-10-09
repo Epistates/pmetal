@@ -351,10 +351,9 @@ pub fn cases() -> Vec<ArchCase> {
             // block differently (`feed_forward` against `moe`) and disagree
             // about the router's key, so neither could load a real checkpoint
             // and the two could not agree. There is one forward pass now, so
-            // the question no longer arises. What a real Llama 4 checkpoint
-            // needs is a loader that splits `Llama4TextExperts`' fused 3-D
-            // `gate_up_proj` / `down_proj` into per-expert 2-D Linears, and
-            // that is a loader gap rather than a divergence.
+            // the question no longer arises. `llama4::sanitize_checkpoint`
+            // splits a real checkpoint's fused `gate_up_proj` / `down_proj`
+            // into the per-expert Linears this forward uses.
             known_divergence: None,
             stages: true,
         },
