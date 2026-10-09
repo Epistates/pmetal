@@ -70,7 +70,7 @@ to export DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 | Granite | Yes | Yes | Dense and hybrid variants. |
 | NemotronH | Yes | Yes | Hybrid architecture support. |
 | GPT-OSS | Yes | Yes | MoE variants. |
-| DiffusionGemma | Yes | Yes | Block-diffusion; trained via `pmetal train-diffusion` (add `--qlora`). |
+| DiffusionGemma | Yes | Yes | Block-diffusion; trained via `pmetal train-diffusion` (add `--quantization nf4` for QLoRA). |
 
 ## Diffusion Models
 
