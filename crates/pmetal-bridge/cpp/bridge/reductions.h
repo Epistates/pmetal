@@ -14,7 +14,7 @@ extern "C" {
 void mlx_inline_argmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
 void mlx_inline_argmin(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
 void mlx_inline_logsumexp(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
-void mlx_inline_categorical(mlx_inline_array* dst, const mlx_inline_array* logits);
+void mlx_inline_categorical(mlx_inline_array* dst, const mlx_inline_array* logits, int axis);
 
 // ── Element-wise absolute value ──────────────────────────────────────────
 void mlx_inline_abs(mlx_inline_array* dst, const mlx_inline_array* a);

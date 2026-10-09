@@ -283,7 +283,7 @@ pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
         let lse = logits_2d.logsumexp(-1, true);
         let log_probs = logits_2d.subtract(&lse);
         let scaled = log_probs.multiply(&inv_temp);
-        scaled.categorical()
+        scaled.categorical(-1)
     }
 }
 
@@ -308,7 +308,7 @@ pub fn sample_token_with_params(logits_2d: &InlineArray, params: &SamplingParams
         logits_2d.subtract(&lse).multiply(&inv_temp)
     };
     if !params.has_filters() {
-        return log_probs.categorical();
+        return log_probs.categorical(-1);
     }
     // Pre-construct the negative-infinity sentinel once per call. Filters
     // splat it into masked positions; sample_token is called per step so
@@ -325,7 +325,7 @@ pub fn sample_token_with_params(logits_2d: &InlineArray, params: &SamplingParams
     if params.min_p > 0.0 && params.min_p < 1.0 {
         filtered = apply_min_p(&filtered, params.min_p, &neg_inf);
     }
-    filtered.categorical()
+    filtered.categorical(-1)
 }
 
 /// Sample a single token id from `[B, vocab]` logits.

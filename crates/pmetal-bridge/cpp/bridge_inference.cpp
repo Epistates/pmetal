@@ -255,9 +255,9 @@ void mlx_inline_logsumexp(mlx_inline_array* dst, const mlx_inline_array* a, int 
         new (dst->buf) array(mlx::core::logsumexp(as_arr(a), axis, keepdims)));
 }
 
-void mlx_inline_categorical(mlx_inline_array* dst, const mlx_inline_array* logits) {
+void mlx_inline_categorical(mlx_inline_array* dst, const mlx_inline_array* logits, int axis) {
     BRIDGE_TRY_DST("categorical", dst,
-        new (dst->buf) array(mlx::core::random::categorical(as_arr(logits))));
+        new (dst->buf) array(mlx::core::random::categorical(as_arr(logits), axis)));
 }
 
 // mlx_inline_gdn_metal_step lives in bridge_native.cpp (uses get_gdn_kernel)

@@ -63,11 +63,13 @@ impl InlineArray {
         }
     }
 
+    /// Draw one class index per row from the unnormalized log-probabilities
+    /// along `axis`, which the result no longer has.
     #[inline]
-    pub fn categorical(&self) -> Self {
+    pub fn categorical(&self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_categorical(dst.as_mut_ptr(), &self.raw);
+            mlx_inline_categorical(dst.as_mut_ptr(), &self.raw, axis);
             Self {
                 raw: dst.assume_init(),
             }

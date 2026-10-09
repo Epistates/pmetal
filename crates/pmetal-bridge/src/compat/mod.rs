@@ -429,11 +429,10 @@ pub mod random {
 
     /// Sample from a categorical distribution.
     ///
-    /// `logits`: unnormalized log-probabilities of shape `[..., num_classes]`.
-    /// Returns integer indices of shape `[...]` (the last axis is reduced).
-    pub fn categorical(logits: &Array, _axis: i32) -> Array {
-        // InlineArray::categorical() uses the built-in MLX sampling
-        logits.categorical()
+    /// `logits`: unnormalized log-probabilities with the classes on `axis`.
+    /// Returns integer indices with `axis` removed.
+    pub fn categorical(logits: &Array, axis: i32) -> Array {
+        logits.categorical(axis)
     }
 }
 

@@ -574,7 +574,7 @@ unsafe extern "C" {
         axis: i32,
         keepdims: bool,
     );
-    pub(super) fn mlx_inline_categorical(dst: *mut RawBuf, logits: *const RawBuf);
+    pub(super) fn mlx_inline_categorical(dst: *mut RawBuf, logits: *const RawBuf, axis: i32);
 
     // ── Element-wise math ──
     pub(super) fn mlx_inline_abs(dst: *mut RawBuf, a: *const RawBuf);
