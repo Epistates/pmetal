@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { modelsStore } from '$lib/stores.svelte';
-  import { getModelInfo, getModelFit, searchHubModels, getTrendingModels } from '$lib/api';
-  import type { CachedModel, ModelInfo, ModelFitInfo, HubSearchResult } from '$lib/api';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { getModelInfo, getModelFit, searchHubModels, getTrendingModels } from '#lib/api.js';
+  import type { CachedModel, ModelInfo, ModelFitInfo, HubSearchResult } from '#lib/api.js';
 
   // Cached models
   let models = $derived(modelsStore.models);

@@ -1,9 +1,9 @@
 <script lang="ts">
   import '../app.css';
   import { onMount, onDestroy } from 'svelte';
-  import { page } from '$app/stores';
-  import { initializeStores, cleanupStores, configStore } from '$lib/stores.svelte';
-  import UpdateChecker from '$lib/components/UpdateChecker.svelte';
+  import { page } from '$app/state';
+  import { initializeStores, cleanupStores, configStore } from '#lib/stores.svelte.js';
+  import UpdateChecker from '#lib/components/UpdateChecker.svelte';
 
   let { children } = $props();
 
@@ -169,7 +169,7 @@
       try {
         await initializeStores();
         // Pull version from backend if available
-        const { getSystemInfo } = await import('$lib/api');
+        const { getSystemInfo } = await import('#lib/api.js');
         try {
           const info = await getSystemInfo();
           appVersion = info.version;
@@ -193,7 +193,7 @@
   });
 
   function isActive(path: string): boolean {
-    const pathname = $page.url.pathname;
+    const pathname = page.url.pathname;
     if (path === '/') return pathname === '/';
     return pathname.startsWith(path);
   }

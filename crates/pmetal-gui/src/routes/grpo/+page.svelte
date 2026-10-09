@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { modelsStore, grpoStore } from '$lib/stores.svelte';
-  import type { GrpoSpec, GrpoRun, OptimizerName, GrpoLossType } from '$lib/api';
-  import { GRPO_LOSS_TYPES, OPTIMIZERS, OPTIMIZER_HINT } from '$lib/api';
-  import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
+  import { modelsStore, grpoStore } from '#lib/stores.svelte.js';
+  import type { GrpoSpec, GrpoRun, OptimizerName, GrpoLossType } from '#lib/api.js';
+  import { GRPO_LOSS_TYPES, OPTIMIZERS, OPTIMIZER_HINT } from '#lib/api.js';
+  import { formatEta, runProgress, getStatusBadgeClass } from '#lib/utils.js';
 
   // Form state
   let selectedModel = $state('');

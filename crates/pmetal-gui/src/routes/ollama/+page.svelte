@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modelsStore } from '$lib/stores.svelte';
-  import { exportModelfile } from '$lib/api';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { exportModelfile } from '#lib/api.js';
 
   const templates = ['auto', 'llama3', 'qwen3', 'gemma', 'mistral', 'phi3', 'deep-seek'];
 

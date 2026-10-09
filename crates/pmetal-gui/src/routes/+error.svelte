@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
 
-  let status = $derived($page.status);
-  let message = $derived($page.error?.message ?? 'An unexpected error occurred.');
+  let status = $derived(page.status);
+  let message = $derived(page.error?.message ?? 'An unexpected error occurred.');
 </script>
 
 <div class="flex items-center justify-center min-h-screen bg-surface-50 dark:bg-surface-900 p-6">

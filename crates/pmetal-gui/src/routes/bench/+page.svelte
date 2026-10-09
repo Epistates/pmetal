@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { modelsStore, benchStore } from '$lib/stores.svelte';
+  import { modelsStore, benchStore } from '#lib/stores.svelte.js';
 
   const presets = [
     'dense-qwen3',

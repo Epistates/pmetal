@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { modelsStore, distillationStore } from '$lib/stores.svelte';
-  import type { DistillSpec, DistillationRun, OptimizerName } from '$lib/api';
-  import { OPTIMIZERS, OPTIMIZER_HINT } from '$lib/api';
-  import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
+  import { modelsStore, distillationStore } from '#lib/stores.svelte.js';
+  import type { DistillSpec, DistillationRun, OptimizerName } from '#lib/api.js';
+  import { OPTIMIZERS, OPTIMIZER_HINT } from '#lib/api.js';
+  import { formatEta, runProgress, getStatusBadgeClass } from '#lib/utils.js';
 
   const lossTypes = [
     { value: 'kl_divergence', label: 'KL Divergence', description: 'Standard KL(teacher || student) loss' },

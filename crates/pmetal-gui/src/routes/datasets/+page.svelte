@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { datasetsStore } from '$lib/stores.svelte';
-  import { downloadDataset } from '$lib/api';
-  import type { DatasetSearchResult } from '$lib/api';
-  import { formatBytes } from '$lib/utils';
+  import { datasetsStore } from '#lib/stores.svelte.js';
+  import { downloadDataset } from '#lib/api.js';
+  import type { DatasetSearchResult } from '#lib/api.js';
+  import { formatBytes } from '#lib/utils.js';
 
   // Local state for UI
   let hubQuery = $state('');

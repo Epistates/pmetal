@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { pretrainStore } from '$lib/stores.svelte';
-  import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
+  import { pretrainStore } from '#lib/stores.svelte.js';
+  import { formatEta, runProgress, getStatusBadgeClass } from '#lib/utils.js';
 
   const architectures = [
     'llama',

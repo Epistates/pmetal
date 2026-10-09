@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modelsStore } from '$lib/stores.svelte';
-  import { startDflash } from '$lib/api';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { startDflash } from '#lib/api.js';
 
   let target = $state('');
   let draft = $state('');

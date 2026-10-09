@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modelsStore } from '$lib/stores.svelte';
-  import { quantizeModel, fuseLora } from '$lib/api';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { quantizeModel, fuseLora } from '#lib/api.js';
 
   const quantMethods = [
     { value: 'dynamic', label: 'Dynamic', description: 'PMetal dynamic quantization — best quality/speed tradeoff' },

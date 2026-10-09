@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { dashboardStore, modelsStore, trainingStore, grpoStore, deviceStore } from '$lib/stores.svelte';
-  import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
+  import { dashboardStore, modelsStore, trainingStore, grpoStore, deviceStore } from '#lib/stores.svelte.js';
+  import { formatEta, runProgress, getStatusBadgeClass } from '#lib/utils.js';
 
   let stats = $derived(dashboardStore.stats);
   let recentModels = $derived(modelsStore.models.slice(0, 5));

@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modelsStore } from '$lib/stores.svelte';
-  import { startRlkd, type RlkdConfig } from '$lib/api';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { startRlkd, type RlkdConfig } from '#lib/api.js';
 
   // Form state
   let model = $state('');

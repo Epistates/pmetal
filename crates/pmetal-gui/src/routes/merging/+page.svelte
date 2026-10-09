@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { modelsStore } from '$lib/stores.svelte';
-  import { getMergeStrategies, mergeModels } from '$lib/api';
-  import type { MergeStrategy, MergeSpec } from '$lib/api';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { getMergeStrategies, mergeModels } from '#lib/api.js';
+  import type { MergeStrategy, MergeSpec } from '#lib/api.js';
 
   let models = $derived(modelsStore.models);
   let strategies = $state<MergeStrategy[]>([]);

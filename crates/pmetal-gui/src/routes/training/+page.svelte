@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { page } from '$app/stores';
-  import { modelsStore, trainingStore } from '$lib/stores.svelte';
-  import type { TrainSpec, TrainingRun, CachedDatasetInfo, TrainedAdapter, OptimizerName } from '$lib/api';
-  import { OPTIMIZERS, OPTIMIZER_HINT, fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns, getModelDefaults } from '$lib/api';
-  import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
+  import { page } from '$app/state';
+  import { modelsStore, trainingStore } from '#lib/stores.svelte.js';
+  import type { TrainSpec, TrainingRun, CachedDatasetInfo, TrainedAdapter, OptimizerName } from '#lib/api.js';
+  import { OPTIMIZERS, OPTIMIZER_HINT, fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns, getModelDefaults } from '#lib/api.js';
+  import { formatEta, runProgress, getStatusBadgeClass } from '#lib/utils.js';
 
   let cachedDatasets = $state<CachedDatasetInfo[]>([]);
   let datasetColumns = $state<string[]>([]);
@@ -222,7 +222,7 @@
 
   onMount(async () => {
     // Deep-link: pre-select model from query param
-    const modelParam = $page.url.searchParams.get('model');
+    const modelParam = page.url.searchParams.get('model');
     if (modelParam) selectedModel = modelParam;
 
     // Load cached datasets for the dropdown

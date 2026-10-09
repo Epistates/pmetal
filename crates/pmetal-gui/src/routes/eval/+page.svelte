@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { modelsStore, evalStore } from '$lib/stores.svelte';
+  import { modelsStore, evalStore } from '#lib/stores.svelte.js';
 
   // Form state
   let selectedModel = $state('');

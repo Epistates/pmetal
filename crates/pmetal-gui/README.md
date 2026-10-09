@@ -70,9 +70,7 @@ pmetal-gui/
 │   ├── tauri.bundle.conf.json # Release-only: CLI sidecar + metallib resource
 │   └── Cargo.toml          # Rust dependencies (uses pmetal with "full" features)
 ├── package.json            # Frontend dependencies
-├── svelte.config.js        # Svelte configuration
-├── vite.config.ts          # Vite configuration
-└── tailwind.config.ts      # TailwindCSS theme
+└── vite.config.js          # Vite and SvelteKit configuration (adapter, preprocess)
 ```
 
 The Rust backend imports `pmetal` with `features = ["full"]` and exposes training, inference, and

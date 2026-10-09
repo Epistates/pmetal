@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
-  import { page } from '$app/stores';
-  import { modelsStore } from '$lib/stores.svelte';
-  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError, listTrainedAdapters, getModelDefaults } from '$lib/api';
-  import type { TrainedAdapter, ModelDefaults, InferenceMetrics } from '$lib/api';
-  import { renderMarkdown } from '$lib/utils';
+  import { page } from '$app/state';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError, listTrainedAdapters, getModelDefaults } from '#lib/api.js';
+  import type { TrainedAdapter, ModelDefaults, InferenceMetrics } from '#lib/api.js';
+  import { renderMarkdown } from '#lib/utils.js';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
   const DEFAULT_MAX_TOKENS = 1024;
@@ -100,7 +100,7 @@
 
   onMount(() => {
     // Deep-link: pre-select model from query param
-    const modelParam = $page.url.searchParams.get('model');
+    const modelParam = page.url.searchParams.get('model');
     if (modelParam) selectedModel = modelParam;
 
     // Load trained adapters for the dropdown

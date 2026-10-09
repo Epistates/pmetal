@@ -6,7 +6,7 @@
     benchStore,
     evalStore,
     serveStore,
-  } from '$lib/stores.svelte';
+  } from '#lib/stores.svelte.js';
 
   /**
    * Unified job row. Every specialized store produces its own run shape; we

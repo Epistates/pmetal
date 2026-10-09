@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { modelsStore } from '$lib/stores.svelte';
+  import { modelsStore } from '#lib/stores.svelte.js';
   import {
     OPTIMIZERS,
     OPTIMIZER_HINT,
     startPreference,
     type OptimizerName,
     type PreferenceSpec,
-  } from '$lib/api';
+  } from '#lib/api.js';
 
   type Loss = NonNullable<PreferenceSpec['loss']>;
 

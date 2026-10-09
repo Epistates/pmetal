@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { configStore, modelsStore, deviceStore } from '$lib/stores.svelte';
-  import { getSystemInfo } from '$lib/api';
-  import type { SystemInfo, AppConfig } from '$lib/api';
+  import { configStore, modelsStore, deviceStore } from '#lib/stores.svelte.js';
+  import { getSystemInfo } from '#lib/api.js';
+  import type { SystemInfo, AppConfig } from '#lib/api.js';
   import { check, type Update } from '@tauri-apps/plugin-updater';
   import { relaunch } from '@tauri-apps/plugin-process';
 

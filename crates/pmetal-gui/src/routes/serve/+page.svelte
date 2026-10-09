@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { modelsStore, serveStore } from '$lib/stores.svelte';
+  import { modelsStore, serveStore } from '#lib/stores.svelte.js';
 
   const kvPresets = [
     { value: 'auto', label: 'Auto' },
@@ -64,7 +64,7 @@
 
     isStarting = true;
     try {
-      const spec: import('$lib/api').ServeSpec = {
+      const spec: import('#lib/api.js').ServeSpec = {
         model: selectedModel,
         host,
         port,

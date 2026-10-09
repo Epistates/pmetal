@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { modelsStore } from '$lib/stores.svelte';
-  import { startEmbedTrain, type EmbedTrainConfig } from '$lib/api';
+  import { modelsStore } from '#lib/stores.svelte.js';
+  import { startEmbedTrain, type EmbedTrainConfig } from '#lib/api.js';
 
   const lossOptions = [
     { value: 'info_nce', label: 'InfoNCE', description: 'Contrastive loss with in-batch negatives — best general-purpose choice' },
