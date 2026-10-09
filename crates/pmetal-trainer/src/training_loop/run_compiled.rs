@@ -68,6 +68,8 @@ impl TrainingLoop {
             self.config.training.batch_size,
         );
 
+        let use_cce = self.cut_cross_entropy_applies(&model, false);
+
         // Create state tuple that owns both model and optimizer
         // This allows the step function to mutate both in a single function
         let mut state = (model, optimizer);
@@ -108,12 +110,8 @@ impl TrainingLoop {
         state.1.set_learning_rate(self.get_learning_rate());
 
         // Run ONE uncompiled training step
-        let mut warmup_loss = if self.config.use_cut_cross_entropy {
-            jit_training_step_cce(
-                &mut state,
-                (&warmup_batch.input_ids, &warmup_batch.labels),
-                self.config.neftune_noise_alpha,
-            )?
+        let mut warmup_loss = if use_cce {
+            jit_training_step_cce(&mut state, (&warmup_batch.input_ids, &warmup_batch.labels))?
         } else {
             jit_training_step_inner(
                 &mut state,
@@ -227,11 +225,10 @@ impl TrainingLoop {
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
                 // MLX's lazy evaluation automatically fuses operations when not evaluated
                 let max_grad_norm = self.config.training.max_grad_norm as f32;
-                let mut loss = if self.config.use_cut_cross_entropy {
+                let mut loss = if use_cce {
                     jit_training_step_cce_clipped(
                         &mut state,
                         (&batch.input_ids, &batch.labels),
-                        self.config.neftune_noise_alpha,
                         max_grad_norm,
                     )?
                 } else {

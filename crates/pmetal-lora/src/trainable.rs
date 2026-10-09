@@ -268,7 +268,11 @@ pub trait TrainableModel: ModuleParameters {
     ///
     /// # Returns
     /// `Some(Ok(hidden_states))` of shape [batch, seq_len, hidden_dim] when the model
-    /// supports this path, or `None` when it does not (triggers standard CE fallback).
+    /// supports this path, or `None` when it does not. A model that answers
+    /// [`lm_head`](Self::lm_head) must have this, and
+    /// [`forward_hidden_with_positions`](Self::forward_hidden_with_positions) for
+    /// packed batches: the trainer decides on cut cross-entropy from the head,
+    /// and a missing forward then fails the step rather than switching losses.
     fn forward_hidden(
         &mut self,
         input_ids: &Array,
@@ -300,8 +304,8 @@ pub trait TrainableModel: ModuleParameters {
     /// has put the traced adapter parameters in place: a head taken before
     /// that is a constant to autograd, and an adapter on it trains on nothing.
     ///
-    /// Returns `None` if the model does not expose its LM head in that form
-    /// (triggers CCE fallback).
+    /// Returns `None` if the model does not expose its LM head in that form;
+    /// the trainer then says so once and computes the loss from the logits.
     fn lm_head(&self) -> Option<pmetal_models::dispatcher::LmHead> {
         None
     }

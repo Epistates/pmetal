@@ -142,19 +142,28 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
 /// Shared helper: the CCE loss of the next token at every position.
 ///
 /// Every CCE step calls this, inside the function `value_and_grad`
-/// differentiates, with the hidden states it just computed. The head is read
-/// here too, not before the step: an adapter on the LM head is in place as a
-/// traced parameter only inside that function, and a head read outside it is
-/// a constant, which trained that adapter on nothing.
+/// differentiates, with what the model's hidden-state forward returned. The
+/// head is read here too, not before the step: an adapter on the LM head is
+/// in place as a traced parameter only inside that function, and a head read
+/// outside it is a constant, which trained that adapter on nothing.
 ///
-/// `hidden_states` is `[batch, seq, hidden]`; `labels` is `[batch, seq]`,
-/// unshifted. Errors when the model has no head CCE can use, which the
-/// caller has already ruled out by asking [`TrainableModel::lm_head`].
+/// `hidden` is `[batch, seq, hidden]`; `labels` is `[batch, seq]`, unshifted.
+/// A model that has no hidden-state forward, or no head CCE can use, is an
+/// error rather than a quiet switch to the full logits: the caller decided on
+/// CCE by asking the model ([`TrainingLoop::cut_cross_entropy_applies`]), so
+/// either is a model that answered wrongly.
+///
+/// [`TrainingLoop::cut_cross_entropy_applies`]: super::TrainingLoop::cut_cross_entropy_applies
 pub(crate) fn compute_cce_loss<M: TrainableModel>(
     model: &M,
-    hidden_states: &Array,
+    hidden: Option<std::result::Result<Array, pmetal_lora::LoraError>>,
     labels: &Array,
 ) -> std::result::Result<Array, Exception> {
+    let hidden_states = hidden
+        .ok_or_else(|| {
+            Exception::custom("cut cross-entropy: the model has no hidden-state forward")
+        })?
+        .map_err(|e| Exception::custom(e.to_string()))?;
     let head = model
         .lm_head()
         .ok_or_else(|| Exception::custom("cut cross-entropy: the model has no LM head to use"))?;
@@ -167,66 +176,49 @@ pub(crate) fn compute_cce_loss<M: TrainableModel>(
 
 /// Training step using Cut Cross-Entropy (avoids materializing the full logits tensor).
 ///
-/// Falls back to standard cross-entropy when the model does not implement
-/// `forward_hidden()` / `lm_head()`, ensuring backward compatibility.
+/// Only for a model [`TrainingLoop::cut_cross_entropy_applies`] said yes to;
+/// see [`compute_cce_loss`].
+///
+/// [`TrainingLoop::cut_cross_entropy_applies`]: super::TrainingLoop::cut_cross_entropy_applies
 pub(crate) fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     (input_ids, labels): (&Array, &Array),
-    neftune_alpha: Option<f32>,
 ) -> std::result::Result<Array, Exception> {
-    jit_training_step_cce_clipped(state, (input_ids, labels), neftune_alpha, 0.0)
+    jit_training_step_cce_clipped(state, (input_ids, labels), 0.0)
 }
 
 /// CCE training step with optional gradient clipping.
 pub(crate) fn jit_training_step_cce_clipped<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     (input_ids, labels): (&Array, &Array),
-    neftune_alpha: Option<f32>,
     max_grad_norm: f32,
 ) -> std::result::Result<Array, Exception> {
     let (model, optimizer) = state;
 
-    let has_cce_support = model.lm_head().is_some();
+    let loss_fn = |model: &mut M,
+                   (input_ids, labels): (&Array, &Array)|
+     -> std::result::Result<Array, Exception> {
+        let hidden = model.forward_hidden(input_ids, None);
+        compute_cce_loss(model, hidden, labels)
+    };
 
-    if has_cce_support && neftune_alpha.is_none() {
-        // CCE path: compute loss from hidden states without full logits.
-        let loss_fn = |model: &mut M,
-                       (input_ids, labels): (&Array, &Array)|
-         -> std::result::Result<Array, Exception> {
-            let hidden_opt = model.forward_hidden(input_ids, None);
-
-            match hidden_opt {
-                Some(Ok(hidden_states)) => compute_cce_loss(model, &hidden_states, labels),
-                _ => {
-                    // Unexpected failure in hidden forward — fall through to standard CE.
-                    let logits = model
-                        .forward(input_ids, None)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                    Ok(pmetal_bridge::training::causal_lm_loss(
-                        &logits, labels, -100,
-                    ))
-                }
-            }
-        };
-
-        let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-        let (loss, mut grads) = loss_and_grad_fn(model, (input_ids, labels))?;
-        if max_grad_norm > 0.0 {
-            clip_grads(&mut grads, max_grad_norm);
-        }
-        optimizer.update(model, grads)?;
-        Ok(loss)
-    } else {
-        // NEFTune active or model doesn't support CCE — use standard path.
-        jit_training_step_inner_clipped(state, (input_ids, labels), neftune_alpha, max_grad_norm)
+    let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+    let (loss, mut grads) = loss_and_grad_fn(model, (input_ids, labels))?;
+    if max_grad_norm > 0.0 {
+        clip_grads(&mut grads, max_grad_norm);
     }
+    optimizer.update(model, grads)?;
+    Ok(loss)
 }
 
 /// Packed-sequence training step using Cut Cross-Entropy.
 ///
 /// Mirrors `jit_training_step_packed` but feeds hidden states through CCE
-/// to avoid materializing the full logits tensor.  Falls back to standard
-/// cross-entropy when the model does not implement `forward_hidden_with_positions()`.
+/// to avoid materializing the full logits tensor, with the same positions and
+/// block-diagonal mask. Only for a model
+/// [`TrainingLoop::cut_cross_entropy_applies`] said yes to.
+///
+/// [`TrainingLoop::cut_cross_entropy_applies`]: super::TrainingLoop::cut_cross_entropy_applies
 pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     packed_batch: &PackedTrainingBatch,
@@ -248,46 +240,23 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
         None
     };
 
-    // A probe only: the head the loss uses is read inside the closure.
-    let has_cce_support = model.lm_head().is_some();
+    let loss_fn = |model: &mut M,
+                   (input_ids, labels): (&Array, &Array)|
+     -> std::result::Result<Array, Exception> {
+        let hidden =
+            model.forward_hidden_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids);
+        compute_cce_loss(model, hidden, labels)
+    };
 
-    if has_cce_support {
-        let loss_fn = |model: &mut M,
-                       (input_ids, labels): (&Array, &Array)|
-         -> std::result::Result<Array, Exception> {
-            let hidden_opt = model.forward_hidden_with_positions(
-                input_ids,
-                attn_mask_4d.as_ref(),
-                &position_ids,
-            );
+    let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+    let (loss, mut grads) = loss_and_grad_fn(model, (&input_ids_2d, &labels_2d))?;
 
-            match hidden_opt {
-                Some(Ok(hidden_states)) => compute_cce_loss(model, &hidden_states, labels),
-                _ => {
-                    // Fall back to standard cross-entropy
-                    let logits = model
-                        .forward_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                    Ok(pmetal_bridge::training::causal_lm_loss(
-                        &logits, labels, -100,
-                    ))
-                }
-            }
-        };
-
-        let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-        let (loss, mut grads) = loss_and_grad_fn(model, (&input_ids_2d, &labels_2d))?;
-
-        if max_grad_norm > 0.0 {
-            clip_grads(&mut grads, max_grad_norm);
-        }
-
-        optimizer.update(model, grads)?;
-        Ok(loss)
-    } else {
-        // Model doesn't support CCE — use standard packed step.
-        jit_training_step_packed(state, packed_batch, max_grad_norm)
+    if max_grad_norm > 0.0 {
+        clip_grads(&mut grads, max_grad_norm);
     }
+
+    optimizer.update(model, grads)?;
+    Ok(loss)
 }
 
 /// Evaluate all accumulated losses plus model params and optimizer states.

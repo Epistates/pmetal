@@ -320,51 +320,18 @@ fn cut_cross_entropy_trains_what_the_forward_computes() {
     let mut problems = Vec::new();
     let mut checked = 0;
     for (name, config_json) in all_cases() {
-        random::seed(3);
-        let base = DynamicModel::from_config(config_json).expect("build");
-        let mut model = AdaptedModel::attach(base, lora_config()).expect("attach");
-        randomize_adapters(&mut model);
-        if pmetal_lora::TrainableModel::lm_head(&model).is_none() {
-            problems.push(format!("{name}: no LM head for cut cross-entropy"));
+        let Some(mut model) = cce_model(name, config_json, &mut problems) else {
             continue;
-        }
+        };
         let ids = input_ids(vocab_of(config_json));
-        let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
-        names.sort();
-
-        let (want, want_grads) = step_with(&mut model, &names, &ids, |model, ids| {
-            let logits = model.forward(ids, None).unwrap();
-            pmetal_bridge::training::causal_lm_loss(&logits, ids, -100)
-        });
-        let (got, got_grads) = step_with(&mut model, &names, &ids, |model, ids| {
-            let hidden = model.forward_hidden(ids, None).unwrap();
-            let head = pmetal_lora::TrainableModel::lm_head(model).unwrap();
-            let seq = hidden.dim(1);
-            let hidden = hidden.slice(&[0, 0, 0], &[1, seq - 1, hidden.dim(2)]);
-            let targets = ids.slice(&[0, 1], &[1, seq]).reshape(&[-1]);
-            head.cut_cross_entropy(&hidden, &targets, -100).unwrap()
-        });
-        drain(name);
+        problems.extend(cce_against_logits(
+            name,
+            &mut model,
+            &ids,
+            |model, ids| model.forward(ids, None).unwrap(),
+            |model, ids| model.forward_hidden(ids, None).unwrap(),
+        ));
         checked += 1;
-
-        let loss_gap = (got - want).abs();
-        if loss_gap.is_nan() || loss_gap > 1e-4 * want.abs().max(1.0) {
-            problems.push(format!("{name}: CCE loss {got} vs the logits' {want}"));
-            continue;
-        }
-        for key in &names {
-            let scale = want_grads[key].abs().max(None).item_f32();
-            let diff = got_grads[key]
-                .subtract(&want_grads[key])
-                .abs()
-                .max(None)
-                .item_f32();
-            if diff.is_nan() || diff > 1e-3 * scale.max(1e-6) {
-                problems.push(format!(
-                    "{name}: {key} gradient off by {diff} (scale {scale})"
-                ));
-            }
-        }
     }
     assert!(checked >= 19, "only {checked} architectures were exercised");
     assert!(
@@ -372,4 +339,130 @@ fn cut_cross_entropy_trains_what_the_forward_computes() {
         "cut cross-entropy disagrees with the forward:\n  {}",
         problems.join("\n  ")
     );
+}
+
+/// The same on a packed batch, through the hidden-state forward with
+/// positions, on every architecture that takes packed positions.
+///
+/// The trainer used to fall back to the full logits for every packed batch
+/// without saying so: the adapted model had no hidden-state forward with
+/// positions. The positions here restart at each sequence and step by two, so
+/// a hidden-state forward that dropped them would not match: plain RoPE
+/// absorbs a uniform shift, but not a stretch.
+#[test]
+fn cut_cross_entropy_trains_what_the_forward_computes_on_a_packed_batch() {
+    use pmetal_lora::TrainableModel;
+
+    // Two sequences of 12 in one row of 24.
+    let boundary = SEQ_LEN / 2;
+    let segment = |i: i32| i32::from(i >= boundary);
+    let start = |i: i32| segment(i) * boundary;
+    let positions: Vec<i32> = (0..SEQ_LEN).map(|i| 2 * (i - start(i))).collect();
+    let positions = Array::from_slice(&positions, &[SEQ_LEN]);
+    let mask: Vec<f32> = (0..SEQ_LEN * SEQ_LEN)
+        .map(|k| {
+            let (q, kv) = (k / SEQ_LEN, k % SEQ_LEN);
+            if segment(q) == segment(kv) && kv <= q {
+                0.0
+            } else {
+                f32::NEG_INFINITY
+            }
+        })
+        .collect();
+    let mask = Array::from_f32_slice(&mask, &[1, 1, SEQ_LEN, SEQ_LEN]);
+
+    let mut problems = Vec::new();
+    let mut checked = 0;
+    for (name, config_json) in all_cases() {
+        let Some(mut model) = cce_model(name, config_json, &mut problems) else {
+            continue;
+        };
+        if !model.supports_packed_positions() {
+            continue;
+        }
+        let ids = input_ids(vocab_of(config_json));
+        problems.extend(cce_against_logits(
+            name,
+            &mut model,
+            &ids,
+            |model, ids| {
+                TrainableModel::forward_with_positions(model, ids, Some(&mask), &positions).unwrap()
+            },
+            |model, ids| {
+                TrainableModel::forward_hidden_with_positions(model, ids, Some(&mask), &positions)
+                    .expect("the adapted model has a hidden-state forward with positions")
+                    .unwrap()
+            },
+        ));
+        checked += 1;
+    }
+    assert!(
+        checked >= 14,
+        "only {checked} architectures took packed positions"
+    );
+    assert!(
+        problems.is_empty(),
+        "cut cross-entropy disagrees with the forward on a packed batch:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+/// An adapted model with every adapter nonzero, or `None` (and a problem)
+/// when it has no head cut cross-entropy can use.
+fn cce_model(name: &str, config_json: &str, problems: &mut Vec<String>) -> Option<AdaptedModel> {
+    random::seed(3);
+    let base = DynamicModel::from_config(config_json).expect("build");
+    let mut model = AdaptedModel::attach(base, lora_config()).expect("attach");
+    randomize_adapters(&mut model);
+    if pmetal_lora::TrainableModel::lm_head(&model).is_none() {
+        problems.push(format!("{name}: no LM head for cut cross-entropy"));
+        return None;
+    }
+    Some(model)
+}
+
+/// Problems with cut cross-entropy over `hidden`'s output against the causal
+/// loss of `logits`' output: the loss, and every adapter's gradient.
+fn cce_against_logits(
+    name: &str,
+    model: &mut AdaptedModel,
+    ids: &Array,
+    logits: impl Fn(&mut AdaptedModel, &Array) -> Array,
+    hidden: impl Fn(&mut AdaptedModel, &Array) -> Array,
+) -> Vec<String> {
+    let mut names: Vec<Rc<str>> = model.lora_parameters().into_keys().collect();
+    names.sort();
+
+    let (want, want_grads) = step_with(model, &names, ids, |model, ids| {
+        pmetal_bridge::training::causal_lm_loss(&logits(model, ids), ids, -100)
+    });
+    let (got, got_grads) = step_with(model, &names, ids, |model, ids| {
+        let hidden = hidden(model, ids);
+        let head = pmetal_lora::TrainableModel::lm_head(model).unwrap();
+        let seq = hidden.dim(1);
+        let hidden = hidden.slice(&[0, 0, 0], &[1, seq - 1, hidden.dim(2)]);
+        let targets = ids.slice(&[0, 1], &[1, seq]).reshape(&[-1]);
+        head.cut_cross_entropy(&hidden, &targets, -100).unwrap()
+    });
+    drain(name);
+
+    let loss_gap = (got - want).abs();
+    if loss_gap.is_nan() || loss_gap > 1e-4 * want.abs().max(1.0) {
+        return vec![format!("{name}: CCE loss {got} vs the logits' {want}")];
+    }
+    let mut problems = Vec::new();
+    for key in &names {
+        let scale = want_grads[key].abs().max(None).item_f32();
+        let diff = got_grads[key]
+            .subtract(&want_grads[key])
+            .abs()
+            .max(None)
+            .item_f32();
+        if diff.is_nan() || diff > 1e-3 * scale.max(1e-6) {
+            problems.push(format!(
+                "{name}: {key} gradient off by {diff} (scale {scale})"
+            ));
+        }
+    }
+    problems
 }

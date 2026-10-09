@@ -1591,6 +1591,52 @@ impl DynamicModel {
         }
     }
 
+    /// [`forward_hidden`] with one rotary position per token, `[seq_len]`:
+    /// the trunk [`forward_with_positions`] runs before its LM head, which is
+    /// what cut cross-entropy needs from a packed batch.
+    ///
+    /// `None` is [`forward_hidden`]. With positions, the architectures are
+    /// those of [`supports_packed_positions`], and any other errors as
+    /// [`forward_with_positions`] does.
+    ///
+    /// [`forward_hidden`]: Self::forward_hidden
+    /// [`forward_with_positions`]: Self::forward_with_positions
+    /// [`supports_packed_positions`]: Self::supports_packed_positions
+    pub fn forward_hidden_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let Some(p) = positions else {
+            return self.forward_hidden(input_ids, mask);
+        };
+        let p = Some(p);
+        match self {
+            Self::Llama(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Llama4(m) => m.model.forward(input_ids, mask, p),
+            Self::Qwen2(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Qwen3(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Qwen3MoE(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Qwen3Next(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Gemma(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Gemma4(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Mistral(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Phi(m) | Self::Phi4(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::DeepSeek(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Cohere(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Granite(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::GptOss(m) => m.model.forward_with_positions(input_ids, mask, p),
+            Self::Mllama(m) => m
+                .language_model
+                .forward_with_positions(input_ids, None, mask, p),
+            other => Err(Exception::custom(format!(
+                "forward_hidden_with_positions is not implemented for {other:?}; \
+                 check supports_packed_positions() before calling"
+            ))),
+        }
+    }
+
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,

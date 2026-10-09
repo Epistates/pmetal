@@ -115,11 +115,20 @@ impl TrainingLoop {
             );
         }
 
+        if self.config.neftune_noise_alpha.is_some() {
+            tracing::warn!(
+                "NEFTune is set, but the packed path adds no embedding noise; pass \
+                 --no-sequence-packing to train with it"
+            );
+        }
+
         self.apply_gradient_checkpointing(&mut model, "Packed");
 
         // Each packed batch is one optimizer step: this path does not
         // accumulate gradients.
         let computed_total_steps = self.plan_schedule(stats.num_batches, 1);
+
+        let use_cce = self.cut_cross_entropy_applies(&model, true);
 
         // Create state tuple for training
         let mut state = (model, optimizer);
@@ -154,7 +163,7 @@ impl TrainingLoop {
 
         // Execute warmup step - this initializes optimizer momentum/velocity buffers
         let max_grad_norm = self.config.training.max_grad_norm as f32;
-        let mut warmup_loss = if self.config.use_cut_cross_entropy {
+        let mut warmup_loss = if use_cce {
             jit_training_step_packed_cce(&mut state, &warmup_batch, max_grad_norm)?
         } else {
             jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?
@@ -214,7 +223,7 @@ impl TrainingLoop {
                 state.1.set_learning_rate(scheduled_lr);
 
                 // Execute packed training step (forward + backward + optimizer update)
-                let mut loss = if self.config.use_cut_cross_entropy {
+                let mut loss = if use_cce {
                     jit_training_step_packed_cce(&mut state, &packed_batch, max_grad_norm)?
                 } else {
                     jit_training_step_packed(&mut state, &packed_batch, max_grad_norm)?

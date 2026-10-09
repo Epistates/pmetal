@@ -143,6 +143,11 @@ where
         let model_ptr: *mut M = model as *mut M;
         let loss_fn_ptr: *mut F = &mut loss_fn as *mut F;
         let keys_snap: Vec<Rc<str>> = keys.clone();
+        // The loss function's error, handed back once autograd returns: the
+        // callback has to produce an array, and a NaN in its place would
+        // reach the caller as a loss with the reason gone.
+        let mut failure: Option<super::Exception> = None;
+        let failure_ptr: *mut Option<super::Exception> = &mut failure;
 
         let flat_loss = move |all_arrays: &[Array]| -> Array {
             let model_mut = unsafe { &mut *model_ptr };
@@ -162,13 +167,19 @@ where
                 .expect("value_and_grad callback called more than once");
             match loss_fn_mut(model_mut, inp) {
                 Ok(loss) => loss,
-                Err(_) => Array::from_f32(f32::NAN),
+                Err(e) => {
+                    unsafe { *failure_ptr = Some(e) };
+                    Array::from_f32(f32::NAN)
+                }
             }
         };
 
         // 3. Run bridge autograd (no extra "input" arrays — all captured).
         let (loss, grad_arrays) =
             crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
+        if let Some(e) = failure {
+            return Err(e);
+        }
 
         // 4. Re-key gradients into FlattenedModuleParam.
         let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays).collect();
@@ -213,6 +224,9 @@ where
         // synchronous call to crate::inline_array::value_and_grad.
         let loss_fn_ptr: *mut F = &mut loss_fn as *mut F;
         let keys_snap: Vec<Rc<str>> = keys.clone();
+        // As in `value_and_grad`: the loss function's error, returned after.
+        let mut failure: Option<super::Exception> = None;
+        let failure_ptr: *mut Option<super::Exception> = &mut failure;
 
         let flat_loss = move |all_arrays: &[super::Array]| -> super::Array {
             let loss_fn_mut = unsafe { &mut *loss_fn_ptr };
@@ -235,13 +249,19 @@ where
                         .next()
                         .unwrap_or_else(|| super::Array::from_f32(0.0))
                 }
-                Err(_) => super::Array::from_f32(f32::NAN),
+                Err(e) => {
+                    unsafe { *failure_ptr = Some(e) };
+                    super::Array::from_f32(f32::NAN)
+                }
             }
         };
 
         // Bridge autograd: gradients w.r.t. param_arrays.
         let (loss_val, grad_arrays) =
             crate::inline_array::value_and_grad(flat_loss, &param_arrays, &[]);
+        if let Some(e) = failure {
+            return Err(e);
+        }
 
         // Re-key gradients.
         let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays).collect();

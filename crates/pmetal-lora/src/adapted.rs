@@ -441,6 +441,22 @@ impl crate::TrainableModel for AdaptedModel {
         )
     }
 
+    /// The same for a packed batch, through the trunk
+    /// [`forward_with_positions`](crate::TrainableModel::forward_with_positions)
+    /// runs, so cut cross-entropy covers packed training too.
+    fn forward_hidden_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(
+            self.model
+                .forward_hidden_with_positions(input_ids, mask, Some(position_ids))
+                .map_err(LoraError::Mlx),
+        )
+    }
+
     fn lm_head(&self) -> Option<pmetal_models::dispatcher::LmHead> {
         self.model.lm_head()
     }

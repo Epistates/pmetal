@@ -1211,7 +1211,7 @@ fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
     let mut cut = build();
     let before = full.0.lora_parameters();
     jit_training_step_inner(&mut full, (&input_ids, &labels), None).unwrap();
-    jit_training_step_cce(&mut cut, (&input_ids, &labels), None).unwrap();
+    jit_training_step_cce(&mut cut, (&input_ids, &labels)).unwrap();
     pmetal_bridge::check_last_error().expect("a bridge op threw");
 
     let (full, cut) = (full.0.lora_parameters(), cut.0.lora_parameters());
@@ -1233,4 +1233,123 @@ fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
             "{key}: the CCE step moved it differently (off by {diff}, update {moved})"
         );
     }
+}
+
+/// Two sequences of four, packed into one row with restarting positions.
+fn two_sequence_packed_batch() -> PackedTrainingBatch {
+    let tokens = [1_i32, 2, 3, 4, 5, 6, 7, 8];
+    let labels = [2_i32, 3, 4, -100, 6, 7, 8, -100];
+    let positions = [0_i32, 1, 2, 3, 0, 1, 2, 3];
+    let cu_seqlens_raw = vec![0_i32, 4, 8];
+    PackedTrainingBatch {
+        input_ids: Array::from_i32_slice_shaped(&tokens, &[8]),
+        position_ids: Array::from_i32_slice_shaped(&positions, &[8]),
+        cu_seqlens: Array::from_i32_slice_shaped(&cu_seqlens_raw, &[3]),
+        cu_seqlens_raw,
+        labels: Array::from_i32_slice_shaped(&labels, &[8]),
+        total_tokens: 8,
+        num_sequences: 2,
+        max_seqlen: 4,
+    }
+}
+
+/// A packed step with cut cross-entropy takes the step the packed step with
+/// the full logits takes. It used to *be* that step: the adapted model had
+/// no hidden-state forward with positions, so every packed batch quietly
+/// fell back to the full logits.
+#[test]
+fn a_packed_cut_cross_entropy_step_matches_the_full_logits_step() {
+    use pmetal_bridge::compat::optimizers::Sgd;
+
+    let build = || {
+        pmetal_bridge::compat::random::seed(9);
+        let mut model = small_model();
+        // Nonzero `B`, so every adapter has a gradient.
+        let params = model
+            .lora_parameters()
+            .into_iter()
+            .map(|(k, v)| (k, v.add(&Array::from_f32(0.01))))
+            .collect();
+        model.set_lora_parameters(&params);
+        (model, Sgd::new(1.0))
+    };
+    let batch = two_sequence_packed_batch();
+    let mut full = build();
+    let mut cut = build();
+    assert!(
+        full.0
+            .forward_hidden_with_positions(
+                &batch.input_ids.reshape(&[1, 8]),
+                None,
+                &batch.position_ids
+            )
+            .is_some_and(|h| h.is_ok())
+    );
+
+    let want = jit_training_step_packed(&mut full, &batch, 0.0).unwrap();
+    let got = jit_training_step_packed_cce(&mut cut, &batch, 0.0).unwrap();
+    pmetal_bridge::check_last_error().expect("a bridge op threw");
+    let (want, got) = (want.item_f32(), got.item_f32());
+    assert!(
+        (want - got).abs() <= 1e-5 * want.abs(),
+        "loss {got} vs the full logits' {want}"
+    );
+    let (full, cut) = (full.0.lora_parameters(), cut.0.lora_parameters());
+    for (key, value) in &full {
+        let diff = cut[key].subtract(value).abs().max(None).item_f32();
+        assert!(
+            diff <= 1e-5,
+            "{key}: the CCE step moved it differently by {diff}"
+        );
+    }
+}
+
+/// The training paths ask one place whether cut cross-entropy applies, and
+/// it says no, once, when it can't, rather than each path quietly taking the
+/// full logits.
+#[test]
+fn cut_cross_entropy_says_when_it_does_not_apply() {
+    let model = small_model();
+    let config = |neftune| TrainingLoopConfig {
+        use_cut_cross_entropy: true,
+        neftune_noise_alpha: neftune,
+        ..short_run_config()
+    };
+
+    let plain = TrainingLoop::new(config(None));
+    assert!(plain.cut_cross_entropy_applies(&model, false));
+    assert!(!plain.cce_unavailable_reported.get());
+
+    // NEFTune noises the full-logits forward, so the unpacked paths give
+    // CCE up and say so; the packed path noises nothing either way.
+    let noised = TrainingLoop::new(config(Some(5.0)));
+    assert!(!noised.cut_cross_entropy_applies(&model, false));
+    assert!(noised.cce_unavailable_reported.get());
+    assert!(TrainingLoop::new(config(Some(5.0))).cut_cross_entropy_applies(&model, true));
+
+    // Not asked for: nothing to say.
+    let off = TrainingLoop::new(TrainingLoopConfig {
+        use_cut_cross_entropy: false,
+        ..config(Some(5.0))
+    });
+    assert!(!off.cut_cross_entropy_applies(&model, false));
+    assert!(!off.cce_unavailable_reported.get());
+}
+
+/// A model that has an LM head but no hidden-state forward fails the CCE
+/// step instead of training on the full logits behind its back.
+#[test]
+fn a_cut_cross_entropy_step_without_hidden_states_fails() {
+    use pmetal_bridge::compat::optimizers::Sgd;
+
+    // `Breaking` delegates everything but the hidden-state forwards, which
+    // it leaves at the trait's "not implemented".
+    let mut state = (Breaking::new(usize::MAX, Fault::NanLoss), Sgd::new(1.0));
+    let ids = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]);
+    let err = jit_training_step_cce(&mut state, (&ids, &ids)).expect_err("no fallback");
+    assert!(err.to_string().contains("hidden-state forward"), "{err}");
+    let err = jit_training_step_packed_cce(&mut state, &two_sequence_packed_batch(), 0.0)
+        .expect_err("no fallback");
+    assert!(err.to_string().contains("hidden-state forward"), "{err}");
+    let _ = pmetal_bridge::check_last_error();
 }

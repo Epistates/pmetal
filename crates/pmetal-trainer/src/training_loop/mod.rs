@@ -178,8 +178,10 @@ pub struct TrainingLoopConfig {
     /// hidden states without materializing the full logits tensor.  This reduces memory
     /// by up to 37x for large vocabularies (e.g., 150K tokens in Qwen3.5).
     ///
-    /// Requires the model to implement `forward_hidden()` and `lm_head()`.
-    /// Falls back to standard cross-entropy silently when the model does not support it.
+    /// Covers packed and unpacked text batches. When it can't apply (NEFTune
+    /// on an unpacked path, image batches, a model with no usable LM head) the
+    /// run warns once and computes the loss from the full logits; see
+    /// [`TrainingLoop::cut_cross_entropy_applies`].
     pub use_cut_cross_entropy: bool,
 
     /// Override the maximum sequence length used for sequence packing.
@@ -315,6 +317,9 @@ pub struct TrainingLoop {
     pub(crate) schedule_total_steps: Option<usize>,
     /// Micro-batches (calls that advance `step`) per optimizer step.
     pub(crate) micro_steps_per_update: usize,
+    /// Set once the run has said why cut cross-entropy is not in effect, so
+    /// the reason is given once rather than every step.
+    pub(crate) cce_unavailable_reported: std::cell::Cell<bool>,
 }
 
 impl TrainingLoop {
@@ -359,6 +364,7 @@ impl TrainingLoop {
             distributed: None,
             schedule_total_steps: None,
             micro_steps_per_update: 1,
+            cce_unavailable_reported: std::cell::Cell::new(false),
         }
     }
 
@@ -1141,41 +1147,63 @@ impl TrainingLoop {
         })
     }
 
+    /// Whether a step's loss goes through cut cross-entropy: asked for, and
+    /// possible for this model and configuration.
+    ///
+    /// When it was asked for and is not possible, the run says why, once, and
+    /// computes the loss from the full logits; the run is not refused, since
+    /// CCE changes memory and not the loss. Every training path decides here,
+    /// so none of them falls back without saying so. `packed` is for the
+    /// packed path, which applies no NEFTune noise either way.
+    pub(crate) fn cut_cross_entropy_applies<M: TrainableModel>(
+        &self,
+        model: &M,
+        packed: bool,
+    ) -> bool {
+        if !self.config.use_cut_cross_entropy {
+            return false;
+        }
+        let reason = if self.config.neftune_noise_alpha.is_some() && !packed {
+            "NEFTune adds its noise in the full-logits forward"
+        } else if model.lm_head().is_none() {
+            "the model has no LM head in the form it computes from (or an adapter on the \
+             head applies dropout, which no single weight reproduces)"
+        } else {
+            return true;
+        };
+        self.cut_cross_entropy_unavailable(reason);
+        false
+    }
+
+    /// Say, once per run, that `--cut-cross-entropy` is not in effect and why.
+    pub(crate) fn cut_cross_entropy_unavailable(&self, reason: &str) {
+        if !self.cce_unavailable_reported.replace(true) {
+            tracing::warn!(
+                "Cut cross-entropy was requested, but {reason}; this run computes the loss \
+                 from the full logits"
+            );
+        }
+    }
+
     /// Compute loss and gradients for text-only training.
     ///
-    /// When `use_cut_cross_entropy` is set and the model supports it, computes the
-    /// loss directly from hidden states (CCE path) without materialising the full
-    /// [batch, seq, vocab] logits tensor.  Falls back to standard cross-entropy
-    /// when NEFTune is active or the model does not implement the CCE methods.
+    /// When [`cut_cross_entropy_applies`](Self::cut_cross_entropy_applies),
+    /// computes the loss directly from hidden states without materialising
+    /// the full `[batch, seq, vocab]` logits.
     pub(crate) fn compute_text_loss_and_grads<M: TrainableModel>(
         &self,
         model: &mut M,
         batch: &TrainingBatch,
     ) -> Result<(Array, FlattenedModuleParam)> {
         let neftune_alpha = self.config.neftune_noise_alpha;
-        // A probe only: the head the loss uses is read inside the closure,
-        // where an adapter on it is the traced parameter.
-        let use_cce = self.config.use_cut_cross_entropy
-            && neftune_alpha.is_none()
-            && model.lm_head().is_some();
 
-        if use_cce {
+        if self.cut_cross_entropy_applies(model, false) {
             // CCE path: forward hidden states, then compute loss without logits.
             let loss_fn = |model: &mut M,
                            (input_ids, labels): (&Array, &Array)|
              -> std::result::Result<Array, Exception> {
-                let hidden_opt = model.forward_hidden(input_ids, None);
-                match hidden_opt {
-                    Some(Ok(hidden_states)) => compute_cce_loss(model, &hidden_states, labels),
-                    _ => {
-                        // CCE unavailable at runtime — fall back to standard CE.
-                        let logits = model
-                            .forward(input_ids, None)
-                            .map_err(|e| Exception::custom(e.to_string()))?;
-                        Self::compute_loss(&logits, labels)
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    }
-                }
+                let hidden = model.forward_hidden(input_ids, None);
+                compute_cce_loss(model, hidden, labels)
             };
 
             let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
@@ -1227,6 +1255,11 @@ impl TrainingLoop {
         batch: &TrainingBatch,
         pixel_values: &Array,
     ) -> Result<(Array, FlattenedModuleParam)> {
+        if self.config.use_cut_cross_entropy {
+            self.cut_cross_entropy_unavailable(
+                "image batches go through the vision forward, which returns logits",
+            );
+        }
         // Clone pixel_values to move into closure
         let pixels = pixel_values.clone();
 
