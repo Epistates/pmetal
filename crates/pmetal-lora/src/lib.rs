@@ -23,17 +23,6 @@
 //! let model = DynamicLoraModel::from_pretrained("/path/to/model", lora_config)?;
 //! ```
 
-// Crate-level lint configuration for ML/LoRA code patterns
-#![allow(missing_docs)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::useless_conversion)]
-#![allow(clippy::redundant_closure)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::type_complexity)]
-
 pub mod adapted;
 mod dynamic;
 mod lora;

@@ -1,7 +1,14 @@
 //! Tiny random configs for every architecture the dispatcher builds, and a
 //! staged checkpoint for each, shared by the integration tests that hold the
 //! training path against the inference path.
-#![allow(dead_code)]
+
+// Each test binary compiles its own copy of this module and uses a subset of
+// it, so `dead_code` fires per binary. `expect` would go unfulfilled in
+// `base_parity`, which uses every item.
+#![allow(
+    dead_code,
+    reason = "shared by several test binaries, each using a subset"
+)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
