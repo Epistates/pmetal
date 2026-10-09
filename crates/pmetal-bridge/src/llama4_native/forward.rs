@@ -40,9 +40,9 @@ pub fn forward_step(
     // offset = number of tokens already in the cache (all layers share same sequence position).
     let offset = cache.rope_offset;
     let end = offset + s;
-    // We build the chunk mask eagerly only for prefill (T > 1). For decode (T=1)
-    // we skip the mask and use pure causal (the single query token attends to all
-    // positions in its chunk, which degenerates to a simple causal window).
+    // We build the chunk mask eagerly only for prefill (T > 1). A decoded
+    // token (T=1) needs no mask: the attention reads the keys from the start
+    // of its chunk (`attn_forward`'s `kv_start`).
     let chunk_mask: Option<InlineArray> = if s > 1 {
         // Bool mask shape [s, offset + s]. We start key positions at zero
         // because the native path never trims the cache front (the reference
@@ -66,6 +66,7 @@ pub fn forward_step(
             &mut cache.kv_caches[li],
             cache.rope_offset,
             chunk_mask.as_ref(),
+            chunk_size,
         );
 
         // Residual add

@@ -66,6 +66,7 @@ fn make_additive_mask(bool_mask: &InlineArray, dtype: i32) -> InlineArray {
 // Attention layer forward
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn attn_forward(
     lw: &LayerWeights,
     normed: &InlineArray,
@@ -74,11 +75,23 @@ pub(super) fn attn_forward(
     cache: &mut KvLayerCache,
     rope_offset: i32,
     chunk_mask: Option<&InlineArray>, // prefill only — [s, offset+s]
+    chunk_size: i32,
 ) -> InlineArray {
     let n_heads = lw.n_heads;
     let n_kv_heads = lw.n_kv_heads;
     let head_dim = lw.head_dim;
     let scale = lw.attn_scale;
+
+    // A single decoded token on a chunked (RoPE) layer attends to the keys of
+    // its own chunk only, `[p - p % chunk, p]`, as transformers'
+    // `create_chunked_causal_mask` and the reference implementation's
+    // `block_pos == 0` mask define it. The cache keeps every position, so
+    // the chunk is where the keys read start.
+    let kv_start = if lw.use_rope && s == 1 && chunk_size > 0 {
+        (rope_offset / chunk_size) * chunk_size
+    } else {
+        0
+    };
 
     // Fused-decode fast path: T=1 on the bf16 path. One compiled kernel
     // covers both layer flavours (RoPE/NoPE) via static flags captured in
@@ -169,6 +182,7 @@ pub(super) fn attn_forward(
                     lw.floor_scale,
                     lw.layer_attn_scale,
                     lw.norm_eps,
+                    kv_start,
                 );
             cache.keys = Some(new_cache_keys);
             cache.values = Some(new_cache_vals);
@@ -278,6 +292,27 @@ pub(super) fn attn_forward(
             crate::error::check_last_error()
                 .expect("Llama 4 TurboQuant masked prefill SDPA failed");
             output
+        } else if kv_start > 0 {
+            // A decode past the first chunk on a chunked layer reads only its
+            // chunk, which the fused kernels can't restrict to: dequantize and
+            // attend over that slice.
+            tq_cache
+                .append(&keys, &values)
+                .expect("Llama 4 TurboQuant chunked decode append failed");
+            let all_keys = tq_cache
+                .dequantize_keys()
+                .expect("Llama 4 TurboQuant chunked decode failed to dequantize keys");
+            let all_values = tq_cache
+                .dequantize_values()
+                .expect("Llama 4 TurboQuant chunked decode failed to dequantize values");
+            cache.offset = next;
+            let chunk =
+                |a: &InlineArray| a.slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, head_dim]);
+            let output =
+                queries.sdpa_with_mask(&chunk(&all_keys), &chunk(&all_values), scale, None);
+            crate::error::check_last_error()
+                .expect("Llama 4 TurboQuant chunked decode SDPA failed");
+            output
         } else {
             let out = crate::turboquant_dispatch::turboquant_attention_step(
                 tq_cache, &queries, &keys, &values, scale, prev, "LLAMA4",
@@ -358,23 +393,23 @@ pub(super) fn attn_forward(
         let qk = cache.quantized_keys.as_ref().unwrap();
         let cached_kp = qk
             .packed
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, packed_dim]);
         let cached_ks = qk
             .scales
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, scales_dim]);
         let cached_kb = qk
             .biases
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, scales_dim]);
         let qv = cache.quantized_values.as_ref().unwrap();
         let cached_vp = qv
             .packed
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, packed_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, packed_dim]);
         let cached_vs = qv
             .scales
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, scales_dim]);
         let cached_vb = qv
             .biases
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, scales_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, scales_dim]);
 
         if lw.use_rope {
             if let Some(mask_int) = chunk_mask {
@@ -466,21 +501,18 @@ pub(super) fn attn_forward(
             .keys
             .as_ref()
             .unwrap()
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, head_dim]);
         let valid_values = cache
             .values
             .as_ref()
             .unwrap()
-            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+            .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, head_dim]);
 
         // SDPA
         if lw.use_rope {
             // Local (chunked) layer:
-            // - For decode (s=1): use causal SDPA (the single query naturally attends
-            //   to all cached positions; the chunk constraint is handled by not storing
-            //   tokens outside the current chunk — or in this simpler native path, by
-            //   letting the model see a slightly wider window which matches the reference
-            //   behavior for cached keys).
+            // - For decode (s=1): the keys read start at the token's chunk
+            //   (`kv_start`), so every one of them is visible.
             // - For prefill (s>1): apply the chunk mask.
             if let Some(mask_int) = chunk_mask {
                 // Build [s, next] additive mask and reshape to [1, 1, s, next] for SDPA.

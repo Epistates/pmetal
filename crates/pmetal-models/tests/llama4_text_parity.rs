@@ -250,3 +250,19 @@ fn dynamic_llama4_moe_matches_transformers() {
 fn native_llama4_moe_matches_transformers() {
     check_native("moe");
 }
+
+/// `attention_chunk_size` 6 on the 20-token prompt: the RoPE layers attend
+/// within chunks `0..6, 6..12, …` (transformers' chunked causal mask), the
+/// NoPE layer to the whole prefix. The prefill of 7 already crosses a chunk
+/// boundary, and the decode steps run through three more.
+#[test]
+#[serial]
+fn dynamic_llama4_chunked_attention_matches_transformers() {
+    check_dynamic("chunked");
+}
+
+#[test]
+#[serial]
+fn native_llama4_chunked_attention_matches_transformers() {
+    check_native("chunked");
+}

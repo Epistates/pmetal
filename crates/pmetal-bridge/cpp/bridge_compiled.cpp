@@ -749,7 +749,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     bool temp_tuning,
     int floor_scale,
     float temp_attn_scale,
-    float qk_norm_eps
+    float qk_norm_eps,
+    int kv_start
 ) {
     struct Entry {
         int batch;
@@ -921,9 +922,13 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                         auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
                         auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
 
+                        // Slots `kv_start..offset + S`: the whole cache on a
+                        // NoPE layer, the current chunk on a chunked one.
                         auto next_offset = add(kv_offset_arr, array(S));
                         auto positions = reshape(arange(L, int32), {1, 1, 1, L});
-                        auto valid_mask = less(positions, reshape(next_offset, {1, 1, 1, 1}));
+                        auto valid_mask = logical_and(
+                            less(positions, reshape(next_offset, {1, 1, 1, 1})),
+                            greater_equal(positions, reshape(ins[15], {1, 1, 1, 1})));
 
                         auto output = fast::scaled_dot_product_attention(
                             queries, updated_keys, updated_vals, SCALE, "", valid_mask);
@@ -956,6 +961,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
             array(rope_offset),
             optional_input(rope_freqs),
             optional_input(rope_gain),
+            array(kv_start),
         });
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);

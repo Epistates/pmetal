@@ -264,7 +264,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     bool temp_tuning,
     int floor_scale,
     float temp_attn_scale,
-    float qk_norm_eps);
+    float qk_norm_eps,
+    int kv_start);                              // first cache slot attention reads
 
 // Fixed-shape compiled dense MoE decode block (shapeless=false).
 // Replays the routed-expert + shared-expert graph for T=1 decode.

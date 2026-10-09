@@ -453,6 +453,8 @@ pub struct Llama4Attention {
     pub scale: f32,
     /// Interleaved RoPE (Llama 3 bands on Scout); unused on NoPE layers.
     pub rotary: RotaryEmbedding,
+    /// RoPE layers attend within chunks of this many positions.
+    pub attention_chunk_size: i32,
     pub attn_temperature_tuning: bool,
     pub floor_scale: f32,
     pub attn_scale: f32,
@@ -526,6 +528,7 @@ impl Llama4Attention {
                 1.0,
                 true,
             )?,
+            attention_chunk_size: config.attention_chunk_size,
             attn_temperature_tuning: config.attn_temperature_tuning,
             floor_scale: config.floor_scale as f32,
             attn_scale: config.attn_scale,
@@ -536,6 +539,46 @@ impl Llama4Attention {
             q_norm,
             k_norm,
         })
+    }
+
+    /// The additive `[L, K]` mask (0 / -inf, f32) that keeps each query within
+    /// its chunk of `attention_chunk_size` positions; `causal` adds `k <= q`,
+    /// for when no caller's mask carries it. Keys sit at `0..kv_len` with a
+    /// cache, and at the queries' own positions without one. `None` when every
+    /// position is in chunk 0, where the chunk changes nothing.
+    fn chunk_mask(
+        &self,
+        positions: RopePositions<'_>,
+        seq_len: i32,
+        kv_len: Option<i32>,
+        causal: bool,
+    ) -> Option<Array> {
+        let chunk = self.attention_chunk_size;
+        let f32_dtype = Dtype::Float32.as_i32();
+        let q = match positions {
+            RopePositions::Offset(offset) => {
+                if offset + seq_len <= chunk {
+                    return None;
+                }
+                ops::arange_from(offset, offset + seq_len).as_dtype(f32_dtype)
+            }
+            RopePositions::Explicit(ids) => ids.as_dtype(f32_dtype),
+        };
+        let k = match kv_len {
+            Some(n) => ops::arange_from(0, n).as_dtype(f32_dtype),
+            None => q.clone(),
+        };
+        let (q, k) = (q.reshape(&[-1, 1]), k.reshape(&[1, -1]));
+        let size = Array::from_f32(chunk as f32);
+        let mut keep = ops::equal(&ops::floor(&q.divide(&size)), &ops::floor(&k.divide(&size)));
+        if causal {
+            keep = ops::logical_and(&keep, &ops::less_equal(&k, &q));
+        }
+        Some(ops::r#where(
+            &keep,
+            &Array::from_f32(0.0),
+            &Array::from_f32(f32::NEG_INFINITY),
+        ))
     }
 
     /// Forward pass without a cache; see [`Self::forward_with_cache`].
@@ -615,11 +658,30 @@ impl Llama4Attention {
             q = q.multiply(&scales).as_dtype(x.dtype().as_i32());
         }
 
+        let cached = cache.is_some();
         let (k, v) = match cache {
             Some((cache, layer)) => cache.update_and_fetch(layer, &k, &v)?,
             None => (k, v),
         };
 
+        // RoPE layers attend within their chunk of `attention_chunk_size`
+        // positions (transformers' `create_chunked_causal_mask`, the
+        // reference's `block_pos == 0`).
+        let chunk_mask = if self.uses_rope {
+            self.chunk_mask(
+                rope_positions,
+                seq_len,
+                cached.then(|| k.dim(2)),
+                mask.is_none(),
+            )
+        } else {
+            None
+        };
+        let mask = match (mask, &chunk_mask) {
+            (Some(m), Some(c)) => Some(m.add(c)),
+            (Some(m), None) => Some(m.clone()),
+            (None, c) => c.clone(),
+        };
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
             .with_mask_type(if mask.is_some() {
@@ -627,7 +689,7 @@ impl Llama4Attention {
             } else {
                 AttentionMaskType::Causal
             });
-        let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?
+        let output = fused_sdpa(&q, &k, &v, &attn_config, mask.as_ref())?
             .transpose_axes(&[0, 2, 1, 3])
             .reshape(&[batch, seq_len, -1]);
         Module::forward(&mut self.o_proj, &output)

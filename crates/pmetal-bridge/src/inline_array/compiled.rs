@@ -291,6 +291,7 @@ impl InlineArray {
         floor_scale: i32,
         temp_attn_scale: f32,
         qk_norm_eps: f32,
+        kv_start: i32,
     ) -> (Self, Self, Self) {
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let mut cache_keys = MaybeUninit::<RawBuf>::uninit();
@@ -328,6 +329,7 @@ impl InlineArray {
                 floor_scale,
                 temp_attn_scale,
                 qk_norm_eps,
+                kv_start,
             );
             (
                 Self {
