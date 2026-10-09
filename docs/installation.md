@@ -8,7 +8,7 @@ Install PMetal from prebuilt binaries, crates.io, or build from source.
 - **Xcode Command Line Tools**: `xcode-select --install`
 
 For building from source:
-- **Rust 1.86+**: Install via [rustup](https://rustup.rs/)
+- **Rust 1.95+**: Install via [rustup](https://rustup.rs/)
 - **Metal Toolchain**: Required for compiling Metal GPU shaders
 - **CMake**: Required for building MLX native dependencies
 
