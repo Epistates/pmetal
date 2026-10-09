@@ -83,6 +83,8 @@ void mlx_inline_compiled_attn_layer_fixed(
     int rope_dims,
     float rope_base,
     float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain,     // null: attention factor 1
     float q_norm_eps,
     float k_norm_eps,
     bool gated);
@@ -215,7 +217,10 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
     int n_kv,
     int head_dim,
     float scale,
-    float rope_base);
+    float rope_base,
+    float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain);    // null: attention factor 1
 
 // Fixed-shape compiled Llama 4 iRoPE attention decode layer (shapeless=false).
 // One kernel covers both layer flavours via captured static flags:
@@ -248,6 +253,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     float scale,
     float rope_base,
     float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain,     // null: attention factor 1
     bool use_rope,
     bool use_qk_norm,
     bool has_biases,

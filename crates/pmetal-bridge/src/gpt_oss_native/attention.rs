@@ -24,17 +24,19 @@ pub(super) fn attn_forward(
     // four biases present. Mirrors the qwen3_native pattern — alloc/grow
     // first so the compiled kernel sees a writable cache buffer, then
     // call `compiled_gptoss_attn_layer_fixed` which fuses Q/K/V proj +
-    // bias adds + RoPE + cache write + SDPA + o_proj + bias into one
-    // mx.compile graph. Sliding-window layers, turboquant cache, and
-    // zero-overhead-quantized cache stay on the per-op paths below, and so
-    // does a scaled RoPE (YaRN, which every release ships): the compiled
-    // graph rotates by a scalar base it has no equivalent for.
-    let scalar_rope = lw.attn_rotary.scalar().filter(|&(_, scale)| scale == 1.0);
+    // bias adds + RoPE (YaRN's period table and attention factor) + cache
+    // write + SDPA + o_proj + bias into one mx.compile graph. Sliding-window
+    // layers, turboquant cache, and zero-overhead-quantized cache stay on
+    // the per-op paths below.
+    let rope_kernel = lw
+        .attn_rotary
+        .fixed_kernel(rope_offset as i64 + s as i64)
+        .filter(|_| crate::decode::compiled_decode_enabled());
     if s == 1
         && !lw.attn_is_sliding
         && cache.turboquant.is_none()
         && cache.quant_config.is_none()
-        && let Some((rope_base, _)) = scalar_rope
+        && let Some(rope_kernel) = rope_kernel
     {
         if let (Some(qb), Some(kb), Some(vb), Some(ob)) = (
             lw.attn_q_b.as_ref(),
@@ -74,7 +76,7 @@ pub(super) fn attn_forward(
                     n_kv_heads,
                     head_dim,
                     scale,
-                    rope_base,
+                    rope_kernel,
                 );
             cache.keys = Some(new_cache_keys);
             cache.values = Some(new_cache_vals);

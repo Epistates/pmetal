@@ -263,6 +263,8 @@ unsafe extern "C" {
         rope_dims: i32,
         rope_base: f32,
         rope_scale: f32,
+        rope_freqs: *const RawBuf,
+        rope_gain: *const RawBuf,
         q_norm_eps: f32,
         k_norm_eps: f32,
         gated: bool,
@@ -305,6 +307,9 @@ unsafe extern "C" {
         head_dim: i32,
         scale: f32,
         rope_base: f32,
+        rope_scale: f32,
+        rope_freqs: *const RawBuf,
+        rope_gain: *const RawBuf,
     );
 
     pub(super) fn mlx_inline_compiled_llama4_attn_layer_fixed(
@@ -330,6 +335,8 @@ unsafe extern "C" {
         scale: f32,
         rope_base: f32,
         rope_scale: f32,
+        rope_freqs: *const RawBuf,
+        rope_gain: *const RawBuf,
         use_rope: bool,
         use_qk_norm: bool,
         has_biases: bool,

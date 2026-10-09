@@ -158,13 +158,24 @@ pub(super) fn attn_forward_with_tree_ctx(
         dtype,
     );
 
-    // The compiled layer rotates by `(base, scale)`, which a scaled rotary
-    // embedding (YaRN) has no equivalent for.
+    // The compiled layer rotates as the per-op path below does: from
+    // `(base, scale)`, or from a scaled rotary embedding's period table and
+    // attention factor (YaRN).
+    let rope_kernel = match &lw.attn_scaled_rope {
+        Some(scaled) => scaled.fixed_kernel(rope_offset as i64 + s as i64),
+        None => Some(crate::rope::RopeKernel {
+            base: lw.attn_rope_base,
+            scale: lw.attn_rope_scale,
+            periods: None,
+            gain: None,
+        }),
+    }
+    .filter(|_| crate::decode::compiled_decode_enabled());
     if s == 1
         && mrope.is_none()
-        && lw.attn_scaled_rope.is_none()
         && cache.turboquant.is_none()
         && cache.quant_config.is_none()
+        && let Some(rope_kernel) = rope_kernel
     {
         if let (
             Some(LayerWeight::Dense(q_w)),
@@ -192,8 +203,7 @@ pub(super) fn attn_forward_with_tree_ctx(
                 head_dim,
                 scale,
                 lw.attn_rope_dims,
-                lw.attn_rope_base,
-                lw.attn_rope_scale,
+                rope_kernel,
                 lw.attn_q_norm_eps,
                 lw.attn_k_norm_eps,
                 lw.attn_gated,

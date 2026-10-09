@@ -12,6 +12,11 @@ use super::RawBuf;
 use super::ffi::*;
 use crate::native_weight::LayerWeight;
 
+/// An optional array as the nullable pointer the C ABI takes.
+fn raw_or_null(a: Option<&InlineArray>) -> *const RawBuf {
+    a.map_or(std::ptr::null(), |a| &a.raw)
+}
+
 impl InlineArray {
     // ── Compiled fixed-shape sub-layers ─────────────────────────────────────
 
@@ -98,6 +103,9 @@ impl InlineArray {
 
     /// Fixed-shape compiled attention decode layer (shapeless=false).
     /// Traces per cache-capacity bucket on first T=1 call, then replays.
+    ///
+    /// `rope` rotates exactly as [`crate::rope::RotaryEmbedding::apply`]
+    /// does, scaled frequencies and attention factor included.
     #[allow(clippy::too_many_arguments)]
     pub fn compiled_attn_layer_fixed(
         normed: &Self,
@@ -116,8 +124,7 @@ impl InlineArray {
         head_dim: i32,
         scale: f32,
         rope_dims: i32,
-        rope_base: f32,
-        rope_scale: f32,
+        rope: crate::rope::RopeKernel<'_>,
         q_norm_eps: f32,
         k_norm_eps: f32,
         gated: bool,
@@ -146,8 +153,10 @@ impl InlineArray {
                 head_dim,
                 scale,
                 rope_dims,
-                rope_base,
-                rope_scale,
+                rope.base,
+                rope.scale,
+                raw_or_null(rope.periods),
+                raw_or_null(rope.gain),
                 q_norm_eps,
                 k_norm_eps,
                 gated,
@@ -169,9 +178,10 @@ impl InlineArray {
     /// Fixed-shape compiled GPT-OSS attention decode layer.
     ///
     /// Mirrors [`Self::compiled_attn_layer_fixed`] but tuned for GPT-OSS:
-    /// q/k/v/o biases, no q/k norm, full attention only. Sliding-window
-    /// layers stay on the per-op path because their cache rotation would
-    /// require a different cache layout to express in a compiled graph.
+    /// q/k/v/o biases, no q/k norm, full attention only, YaRN through
+    /// `rope`. Sliding-window layers stay on the per-op path because their
+    /// cache rotation would require a different cache layout to express in a
+    /// compiled graph.
     #[allow(clippy::too_many_arguments)]
     pub fn compiled_gptoss_attn_layer_fixed(
         normed: &Self,
@@ -191,7 +201,7 @@ impl InlineArray {
         n_kv: i32,
         head_dim: i32,
         scale: f32,
-        rope_base: f32,
+        rope: crate::rope::RopeKernel<'_>,
     ) -> (Self, Self, Self) {
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let mut cache_keys = MaybeUninit::<RawBuf>::uninit();
@@ -218,7 +228,10 @@ impl InlineArray {
                 n_kv,
                 head_dim,
                 scale,
-                rope_base,
+                rope.base,
+                rope.scale,
+                raw_or_null(rope.periods),
+                raw_or_null(rope.gain),
             );
             (
                 Self {
@@ -238,7 +251,8 @@ impl InlineArray {
     ///
     /// One kernel covers both layer flavours via static flags captured into
     /// the compiled closure (each combo gets its own trace):
-    ///   * `use_rope`    — traditional=true RoPE on Q/K (vs NoPE).
+    ///   * `use_rope`    — traditional=true RoPE on Q/K (vs NoPE), rotated by
+    ///     `rope` (Llama 3 bands included).
     ///   * `use_qk_norm` — weight-less RMS norm (eps=1e-6) on Q and K.
     ///   * `has_biases`  — gate q/k/v/o bias adds. When false, the four
     ///     `*_b` slots may be any same-dtype dummy array.
@@ -263,8 +277,7 @@ impl InlineArray {
         n_kv: i32,
         head_dim: i32,
         scale: f32,
-        rope_base: f32,
-        rope_scale: f32,
+        rope: crate::rope::RopeKernel<'_>,
         use_rope: bool,
         use_qk_norm: bool,
         has_biases: bool,
@@ -297,8 +310,10 @@ impl InlineArray {
                 n_kv,
                 head_dim,
                 scale,
-                rope_base,
-                rope_scale,
+                rope.base,
+                rope.scale,
+                raw_or_null(rope.periods),
+                raw_or_null(rope.gain),
                 use_rope,
                 use_qk_norm,
                 has_biases,

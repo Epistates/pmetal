@@ -30,6 +30,39 @@ static CompiledFn* make_compiled_fixed(CompiledFn fn) {
     return new CompiledFn(mlx::core::compile(std::move(fn), /*shapeless=*/false));
 }
 
+// The rotation `RotaryEmbedding::apply` (src/rope.rs) performs, for a compiled
+// decode graph: `fast::rope` from the kernel's `(base, scale)`, or from the
+// period table when there is one (YaRN, Llama 3 bands, LongRoPE), then the
+// attention factor on the rotated channels in f32. `freqs` and `gain` are
+// graph inputs, so a LongRoPE table switch replays the same trace.
+static array compiled_rope(
+    const array& x,
+    int dims,
+    bool traditional,
+    float base,
+    float scale,
+    const array& offset,
+    bool has_freqs,
+    const array& freqs,
+    bool has_gain,
+    const array& gain
+) {
+    auto rotated = has_freqs
+        ? fast::rope(x, dims, traditional, std::nullopt, 1.0f, offset,
+                     std::optional<array>(freqs))
+        : fast::rope(x, dims, traditional, std::optional<float>(base), scale, offset);
+    if (has_gain) {
+        rotated = astype(multiply(astype(rotated, float32), gain), x.dtype());
+    }
+    return rotated;
+}
+
+// A compiled graph takes every input positionally, so an absent optional
+// array still needs a slot.
+static array optional_input(const mlx_inline_array* a) {
+    return a != nullptr ? as_arr(a) : array(0.0f);
+}
+
 extern "C" {
 
 void mlx_inline_fused_swiglu(mlx_inline_array* dst,
@@ -273,6 +306,8 @@ void mlx_inline_compiled_attn_layer_fixed(
     int rope_dims,
     float rope_base,
     float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain,     // null: attention factor 1
     float q_norm_eps,
     float k_norm_eps,
     bool gated
@@ -285,6 +320,8 @@ void mlx_inline_compiled_attn_layer_fixed(
         int head_dim;
         int rope_dims;
         int gated;
+        int has_freqs;
+        int has_gain;
         // The trace bakes these in too, so two models that share a geometry
         // but not a RoPE base or norm epsilon must not share an entry.
         float scale, rope_base, rope_scale, q_norm_eps, k_norm_eps;
@@ -295,6 +332,8 @@ void mlx_inline_compiled_attn_layer_fixed(
     try {
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
+        int has_freqs = rope_freqs != nullptr ? 1 : 0;
+        int has_gain = rope_gain != nullptr ? 1 : 0;
 
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
@@ -305,6 +344,8 @@ void mlx_inline_compiled_attn_layer_fixed(
                 && entry.head_dim == head_dim
                 && entry.rope_dims == rope_dims
                 && entry.gated == static_cast<int>(gated)
+                && entry.has_freqs == has_freqs
+                && entry.has_gain == has_gain
                 && entry.scale == scale
                 && entry.rope_base == rope_base
                 && entry.rope_scale == rope_scale
@@ -327,6 +368,8 @@ void mlx_inline_compiled_attn_layer_fixed(
             float RSCALE = rope_scale;
             float QEPS = q_norm_eps;
             float KEPS = k_norm_eps;
+            bool HAS_FREQS = has_freqs == 1;
+            bool HAS_GAIN = has_gain == 1;
 
             entries->push_back(Entry{
                 batch,
@@ -336,13 +379,16 @@ void mlx_inline_compiled_attn_layer_fixed(
                 head_dim,
                 rope_dims,
                 static_cast<int>(gated),
+                has_freqs,
+                has_gain,
                 scale,
                 rope_base,
                 rope_scale,
                 q_norm_eps,
                 k_norm_eps,
                 *make_compiled_fixed(
-                    [NH, NKV, HD, RD, L, GATED, SCALE, RBASE, RSCALE, QEPS, KEPS]
+                    [NH, NKV, HD, RD, L, GATED, SCALE, RBASE, RSCALE, QEPS, KEPS,
+                     HAS_FREQS, HAS_GAIN]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
 
@@ -357,6 +403,8 @@ void mlx_inline_compiled_attn_layer_fixed(
                         auto& cache_vals = ins[8];
                         auto& kv_offset_arr = ins[9];
                         auto& rope_offset_arr = ins[10];
+                        auto& rope_freqs_arr = ins[11];
+                        auto& rope_gain_arr = ins[12];
 
                         int B = normed.shape(0);
                         int S = normed.shape(1);
@@ -384,8 +432,12 @@ void mlx_inline_compiled_attn_layer_fixed(
                         keys = transpose(keys, {0, 2, 1, 3});
                         values = transpose(values, {0, 2, 1, 3});
 
-                        queries = fast::rope(queries, RD, false, RBASE, RSCALE, rope_offset_arr);
-                        keys = fast::rope(keys, RD, false, RBASE, RSCALE, rope_offset_arr);
+                        queries = compiled_rope(queries, RD, false, RBASE, RSCALE,
+                                                rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                HAS_GAIN, rope_gain_arr);
+                        keys = compiled_rope(keys, RD, false, RBASE, RSCALE,
+                                             rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                             HAS_GAIN, rope_gain_arr);
 
                         auto kv_indices = broadcast_to(
                             reshape(kv_offset_arr, {1, 1, 1, 1}),
@@ -423,6 +475,8 @@ void mlx_inline_compiled_attn_layer_fixed(
             as_arr(cache_vals_in),
             array(kv_offset),
             array(rope_offset),
+            optional_input(rope_freqs),
+            optional_input(rope_gain),
         });
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);
@@ -472,7 +526,10 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
     int n_kv,
     int head_dim,
     float scale,
-    float rope_base
+    float rope_base,
+    float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain      // null: attention factor 1
 ) {
     struct Entry {
         int batch;
@@ -481,6 +538,10 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
         int n_kv;
         int head_dim;
         int dtype;
+        int has_freqs;
+        int has_gain;
+        // Baked into the trace, so they key it too.
+        float scale, rope_base, rope_scale;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -489,6 +550,8 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(normed).dtype().val());
+        int has_freqs = rope_freqs != nullptr ? 1 : 0;
+        int has_gain = rope_gain != nullptr ? 1 : 0;
 
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
@@ -497,7 +560,12 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
                 && entry.n_heads == n_heads
                 && entry.n_kv == n_kv
                 && entry.head_dim == head_dim
-                && entry.dtype == dtype) {
+                && entry.dtype == dtype
+                && entry.has_freqs == has_freqs
+                && entry.has_gain == has_gain
+                && entry.scale == scale
+                && entry.rope_base == rope_base
+                && entry.rope_scale == rope_scale) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -510,6 +578,9 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
             int L = cache_len;
             float SCALE = scale;
             float RBASE = rope_base;
+            float RSCALE = rope_scale;
+            bool HAS_FREQS = has_freqs == 1;
+            bool HAS_GAIN = has_gain == 1;
 
             entries->push_back(Entry{
                 batch,
@@ -518,8 +589,13 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
                 n_kv,
                 head_dim,
                 dtype,
+                has_freqs,
+                has_gain,
+                scale,
+                rope_base,
+                rope_scale,
                 *make_compiled_fixed(
-                    [NH, NKV, HD, L, SCALE, RBASE]
+                    [NH, NKV, HD, L, SCALE, RBASE, RSCALE, HAS_FREQS, HAS_GAIN]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
 
@@ -536,6 +612,8 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
                         auto& cache_vals = ins[10];
                         auto& kv_offset_arr = ins[11];
                         auto& rope_offset_arr = ins[12];
+                        auto& rope_freqs_arr = ins[13];
+                        auto& rope_gain_arr = ins[14];
 
                         int B = normed.shape(0);
                         int S = normed.shape(1);
@@ -552,14 +630,14 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
                         keys = transpose(keys, {0, 2, 1, 3});
                         values = transpose(values, {0, 2, 1, 3});
 
-                        // Full RoPE over the head, traditional=false (matches
-                        // the per-op path: `q.rope(head_dim, false, ...)`).
-                        queries = fast::rope(queries, HD, false,
-                                             std::optional<float>(RBASE), 1.0f,
-                                             rope_offset_arr);
-                        keys = fast::rope(keys, HD, false,
-                                          std::optional<float>(RBASE), 1.0f,
-                                          rope_offset_arr);
+                        // Full RoPE over the head, split-half, as the per-op
+                        // path's `RotaryEmbedding::apply` rotates it.
+                        queries = compiled_rope(queries, HD, false, RBASE, RSCALE,
+                                                rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                HAS_GAIN, rope_gain_arr);
+                        keys = compiled_rope(keys, HD, false, RBASE, RSCALE,
+                                             rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                             HAS_GAIN, rope_gain_arr);
 
                         auto kv_indices = broadcast_to(
                             reshape(kv_offset_arr, {1, 1, 1, 1}),
@@ -597,6 +675,8 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
             as_arr(cache_vals_in),
             array(kv_offset),
             array(rope_offset),
+            optional_input(rope_freqs),
+            optional_input(rope_gain),
         });
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);
@@ -651,6 +731,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     float scale,
     float rope_base,
     float rope_scale,
+    const mlx_inline_array* rope_freqs,    // null: rotate from (base, scale)
+    const mlx_inline_array* rope_gain,     // null: attention factor 1
     bool use_rope,
     bool use_qk_norm,
     bool has_biases,
@@ -669,6 +751,11 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
         int has_biases;
         int temp_tuning;
         int dtype;
+        int has_freqs;
+        int has_gain;
+        // Baked into the trace, so they key it too.
+        float scale, rope_base, rope_scale, temp_attn_scale;
+        int floor_scale;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -677,6 +764,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(normed).dtype().val());
+        int has_freqs = rope_freqs != nullptr ? 1 : 0;
+        int has_gain = rope_gain != nullptr ? 1 : 0;
 
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
@@ -689,7 +778,14 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                 && entry.use_qk_norm == static_cast<int>(use_qk_norm)
                 && entry.has_biases == static_cast<int>(has_biases)
                 && entry.temp_tuning == static_cast<int>(temp_tuning)
-                && entry.dtype == dtype) {
+                && entry.dtype == dtype
+                && entry.has_freqs == has_freqs
+                && entry.has_gain == has_gain
+                && entry.scale == scale
+                && entry.rope_base == rope_base
+                && entry.rope_scale == rope_scale
+                && entry.temp_attn_scale == temp_attn_scale
+                && entry.floor_scale == floor_scale) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -709,6 +805,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
             bool TTUNE = temp_tuning;
             int FLOOR = floor_scale;
             float TSCALE = temp_attn_scale;
+            bool HAS_FREQS = has_freqs == 1;
+            bool HAS_GAIN = has_gain == 1;
 
             entries->push_back(Entry{
                 batch,
@@ -721,9 +819,16 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                 static_cast<int>(has_biases),
                 static_cast<int>(temp_tuning),
                 dtype,
+                has_freqs,
+                has_gain,
+                scale,
+                rope_base,
+                rope_scale,
+                temp_attn_scale,
+                floor_scale,
                 *make_compiled_fixed(
                     [NH, NKV, HD, L, SCALE, RBASE, RSCALE,
-                     UROPE, UQKN, HBIAS, TTUNE, FLOOR, TSCALE]
+                     UROPE, UQKN, HBIAS, TTUNE, FLOOR, TSCALE, HAS_FREQS, HAS_GAIN]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
 
@@ -740,6 +845,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                         auto& cache_vals = ins[10];
                         auto& kv_offset_arr = ins[11];
                         auto& rope_offset_arr = ins[12];
+                        auto& rope_freqs_arr = ins[13];
+                        auto& rope_gain_arr = ins[14];
 
                         int B = normed.shape(0);
                         int S = normed.shape(1);
@@ -763,12 +870,12 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
 
                         if (UROPE) {
                             // Llama 4 uses traditional=true RoPE.
-                            queries = fast::rope(queries, HD, true,
-                                                 std::optional<float>(RBASE), RSCALE,
-                                                 rope_offset_arr);
-                            keys = fast::rope(keys, HD, true,
-                                              std::optional<float>(RBASE), RSCALE,
-                                              rope_offset_arr);
+                            queries = compiled_rope(queries, HD, true, RBASE, RSCALE,
+                                                    rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                    HAS_GAIN, rope_gain_arr);
+                            keys = compiled_rope(keys, HD, true, RBASE, RSCALE,
+                                                 rope_offset_arr, HAS_FREQS, rope_freqs_arr,
+                                                 HAS_GAIN, rope_gain_arr);
                         }
 
                         if (UQKN) {
@@ -833,6 +940,8 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
             as_arr(cache_vals_in),
             array(kv_offset),
             array(rope_offset),
+            optional_input(rope_freqs),
+            optional_input(rope_gain),
         });
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);

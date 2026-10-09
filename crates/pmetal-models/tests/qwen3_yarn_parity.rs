@@ -169,24 +169,53 @@ fn native_qwen3_yarn_matches_transformers() {
     );
     assert_eq!(argmax_last_axis(&logits), argmax_last_axis(&want));
 
-    let mut cache = NativeCache::new_empty(&weights);
-    let (_, prefill) = forward_step_hidden(&weights, &rows(&ids, 0, PREFILL), &mut cache);
-    drain_bridge("native cached prefill");
+    // Every decode step runs the compiled single-token graph, which takes
+    // YaRN's period table and attention factor; the per-op path it replaces
+    // must give the same logits.
+    let decode = |compiled: bool| {
+        pmetal_bridge::decode::set_compiled_decode(compiled);
+        let mut cache = NativeCache::new_empty(&weights);
+        let (_, prefill) = forward_step_hidden(&weights, &rows(&ids, 0, PREFILL), &mut cache);
+        drain_bridge("native cached prefill");
+        let mut steps = vec![prefill];
+        for pos in PREFILL..t {
+            let (_, step) = forward_step_hidden(&weights, &rows(&ids, pos, pos + 1), &mut cache);
+            drain_bridge("native decode step");
+            steps.push(step);
+        }
+        pmetal_bridge::decode::set_compiled_decode(true);
+        steps
+    };
+    let compiled = decode(true);
+    let per_op = decode(false);
+
     let mut reports = vec![ParityReport::compute(
         "prefill_logits",
-        &prefill,
+        &compiled[0],
         &rows(&want, 0, PREFILL),
         TOL,
     )];
-    for pos in PREFILL..t {
-        let (_, step) = forward_step_hidden(&weights, &rows(&ids, pos, pos + 1), &mut cache);
-        drain_bridge("native decode step");
+    let mut graph_vs_ops = 0f32;
+    for (i, pos) in (PREFILL..t).enumerate() {
+        let (step, op_step) = (&compiled[i + 1], &per_op[i + 1]);
+        graph_vs_ops = graph_vs_ops.max(max_abs_diff(step, op_step));
         reports.push(ParityReport::compute(
             &format!("step_{pos}"),
-            &step,
+            step,
             &rows(&want, pos, pos + 1),
             TOL,
         ));
     }
     assert_all_pass("native cached decode", &reports);
+    println!("compiled decode vs per-op decode: max |diff| {graph_vs_ops:e}");
+    assert!(
+        graph_vs_ops <= 1e-5,
+        "the compiled decode graph drifted from the per-op path by {graph_vs_ops:e}"
+    );
+}
+
+fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+    let d = a.subtract(b).abs();
+    let d = (0..d.ndim()).fold(d, |d, _| d.max_axis(-1, false));
+    d.item_f32()
 }

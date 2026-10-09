@@ -1,7 +1,31 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::InlineArray;
+
+static COMPILED_DECODE: OnceLock<AtomicBool> = OnceLock::new();
+
+fn compiled_decode_flag() -> &'static AtomicBool {
+    COMPILED_DECODE.get_or_init(|| {
+        AtomicBool::new(std::env::var_os("PMETAL_DISABLE_COMPILED_DECODE").is_none())
+    })
+}
+
+/// Whether the native engines take their compiled single-token attention
+/// graphs: on unless `PMETAL_DISABLE_COMPILED_DECODE` is set or
+/// [`set_compiled_decode`] turned them off. Off, every step runs the per-op
+/// path the graph replaces, which is how the parity tests and decode
+/// benchmarks compare the two.
+pub fn compiled_decode_enabled() -> bool {
+    compiled_decode_flag().load(Ordering::Relaxed)
+}
+
+/// Turn the compiled single-token attention graphs on or off, process-wide.
+/// See [`compiled_decode_enabled`].
+pub fn set_compiled_decode(enabled: bool) {
+    compiled_decode_flag().store(enabled, Ordering::Relaxed);
+}
 
 fn trace_decode_graph_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

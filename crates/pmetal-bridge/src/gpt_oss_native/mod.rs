@@ -256,9 +256,10 @@ mod tests {
         let config: GptOssConfig = serde_json::from_value(released.clone()).unwrap();
         let rotary = config.rotary().unwrap();
         assert_eq!(rotary.rotary(), &want);
+        let kernel = rotary.fixed_kernel(1).expect("YaRN is static");
         assert!(
-            rotary.scalar().is_none(),
-            "the compiled scalar-base path must step aside"
+            kernel.periods.is_some() && kernel.gain.is_some(),
+            "the compiled decode graph must rotate by YaRN's table and gain"
         );
 
         let mut bare = config.clone();

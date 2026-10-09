@@ -239,8 +239,8 @@ mod tests {
     /// Llama 4 Scout ships `rope_type: "llama3"` (factor 16, low and high
     /// band factors both 1). The native engine ran it as plain RoPE; it now
     /// rotates with transformers' bands (the shared fixture's
-    /// `llama4_scout` case), interleaved, and so leaves the scalar-base
-    /// compiled decode graph.
+    /// `llama4_scout` case), interleaved, and hands the compiled decode
+    /// graph the bands' period table.
     #[test]
     fn scout_rotates_with_the_llama3_bands() {
         let config: Llama4Config = serde_json::from_value(serde_json::json!({
@@ -256,6 +256,8 @@ mod tests {
         let rotary = config.rotary().unwrap();
         assert!(rotary.traditional());
         assert!(rotary.scalar().is_none());
+        let kernel = rotary.fixed_kernel(1).expect("the bands are static");
+        assert!(kernel.periods.is_some() && kernel.gain.is_none());
         let reference: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/rope_scaling_reference.json"
         ))

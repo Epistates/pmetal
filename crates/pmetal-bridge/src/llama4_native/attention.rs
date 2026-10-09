@@ -86,19 +86,25 @@ pub(super) fn attn_forward(
     // Each flag combo gets its own compile trace. Quantized/turboquant
     // caches and prefill (S>1) stay on the per-op paths below.
     let dtype_for_dummy = normed.dtype_raw();
-    // The compiled graph rotates by a scalar `(base, scale)`; a RoPE layer
-    // whose rotation needs a period table (Scout's Llama 3 bands) takes the
-    // per-op path. NoPE layers never rotate, so any rotation will do there.
-    let scalar_rope = match lw.rotary.scalar() {
-        Some(pair) => Some(pair),
-        None if !lw.use_rope => Some((lw.rotary.rotary().theta as f32, 1.0)),
-        None => None,
-    };
+    // The compiled graph rotates as the per-op path does, Scout's Llama 3
+    // bands included. NoPE layers never rotate, so any rotation will do
+    // there; the plain one keeps their trace free of a period table.
+    let rope_kernel = if lw.use_rope {
+        lw.rotary.fixed_kernel(rope_offset as i64 + s as i64)
+    } else {
+        Some(crate::rope::RopeKernel {
+            base: lw.rotary.rotary().theta as f32,
+            scale: 1.0,
+            periods: None,
+            gain: None,
+        })
+    }
+    .filter(|_| crate::decode::compiled_decode_enabled());
     if s == 1
         && chunk_mask.is_none()
         && cache.turboquant.is_none()
         && cache.quant_config.is_none()
-        && let Some((rope_base, rope_scale)) = scalar_rope
+        && let Some(rope_kernel) = rope_kernel
     {
         // Biases are all-or-none in real Llama 4 configs (audited at load
         // time). Disallow the mixed case to keep the compiled graph simple
@@ -155,8 +161,7 @@ pub(super) fn attn_forward(
                     n_kv_heads,
                     head_dim,
                     scale,
-                    rope_base,
-                    rope_scale,
+                    rope_kernel,
                     lw.use_rope,
                     lw.attn_qk_norm,
                     has_biases,

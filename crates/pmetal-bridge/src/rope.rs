@@ -654,6 +654,26 @@ fn llama3_inverse_frequencies(l: &Llama3, pos_freqs: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+/// The arguments [`RotaryEmbedding::apply`] hands MLX's fused `fast::rope`
+/// for one forward, and the gain it applies afterwards.
+///
+/// A compiled graph that rotates with these rotates exactly as `apply` does:
+/// `fast::rope(x, dims, traditional, base, scale, offset)` when `periods` is
+/// `None`, `fast::rope(x, dims, traditional, None, 1.0, offset, periods)`
+/// otherwise, then `(rotated as f32 × gain) as x.dtype` when `gain` is set.
+#[derive(Debug, Clone, Copy)]
+pub struct RopeKernel<'a> {
+    /// The kernel's `base`; unused with a period table.
+    pub base: f32,
+    /// The kernel's position scale; unused with a period table.
+    pub scale: f32,
+    /// The `[dims / 2]` period table (`fast::rope`'s `freqs`).
+    pub periods: Option<&'a Array>,
+    /// The attention factor, `[head_dim]` (1 past the rotated channels) or a
+    /// scalar when every channel rotates; `None` when it is 1.
+    pub gain: Option<&'a Array>,
+}
+
 /// A [`Rotary`] ready to rotate `[B, heads, L, head_dim]` queries and keys.
 ///
 /// Contiguous positions run the fused kernel: from `(base, scale)` for plain,
@@ -671,6 +691,8 @@ pub struct RotaryEmbedding {
     periods: Option<Array>,
     /// LongRoPE's table past the pretraining length.
     long_periods: Option<Array>,
+    /// The attention factor over a `head_dim`-wide head; `None` when it is 1.
+    gain: Option<Array>,
 }
 
 impl std::fmt::Debug for RotaryEmbedding {
@@ -701,11 +723,13 @@ impl RotaryEmbedding {
             }
             _ => (Some(table(0)), None),
         };
+        let gain = gain_over(&rotary, rotary.head_dim);
         Self {
             rotary,
             traditional,
             periods,
             long_periods,
+            gain,
         }
     }
 
@@ -761,26 +785,45 @@ impl RotaryEmbedding {
         self.rotary.inverse_frequencies(reach)
     }
 
+    /// The fused-kernel arguments for a forward reaching `reach` positions
+    /// (`offset + L`), as [`apply`](Self::apply) uses them.
+    pub fn kernel(&self, reach: i64) -> RopeKernel<'_> {
+        let scale = match self.rotary.scaling {
+            RopeScaling::Linear { factor } => (1.0 / factor) as f32,
+            _ => 1.0,
+        };
+        RopeKernel {
+            base: self.rotary.base_at(reach),
+            scale,
+            periods: self.table_for(reach),
+            gain: self.gain.as_ref(),
+        }
+    }
+
+    /// [`kernel`](Self::kernel), when a compiled graph can hold its scalars
+    /// fixed from one step to the next. Dynamic NTK past
+    /// `max_position_embeddings` raises its base every step, which would
+    /// trace a new graph per token, so it has none. LongRoPE's switch is a
+    /// different table of the same shape and needs no new trace.
+    pub fn fixed_kernel(&self, reach: i64) -> Option<RopeKernel<'_>> {
+        match self.rotary.scaling {
+            RopeScaling::Dynamic {
+                max_position_embeddings,
+                ..
+            } if reach as f64 > max_position_embeddings => None,
+            _ => Some(self.kernel(reach)),
+        }
+    }
+
     /// Rotate `x` (`[B, heads, L, head_dim]`) at positions
     /// `offset..offset + L`.
     pub fn apply(&self, x: &Array, offset: i32) -> Array {
         let reach = offset as i64 + x.dim(x.ndim() - 2) as i64;
         let dims = self.rotary.dims;
-        let rotated = match self.table_for(reach) {
+        let kernel = self.kernel(reach);
+        let rotated = match kernel.periods {
             Some(periods) => x.rope_with_freqs(dims, self.traditional, 1.0, offset, periods),
-            None => {
-                let scale = match self.rotary.scaling {
-                    RopeScaling::Linear { factor } => (1.0 / factor) as f32,
-                    _ => 1.0,
-                };
-                x.rope(
-                    dims,
-                    self.traditional,
-                    self.rotary.base_at(reach),
-                    scale,
-                    offset,
-                )
-            }
+            None => x.rope(dims, self.traditional, kernel.base, kernel.scale, offset),
         };
         self.with_gain(rotated, x)
     }
@@ -836,24 +879,40 @@ impl RotaryEmbedding {
 
     /// The attention factor on the rotated channels of a fused-kernel result.
     fn with_gain(&self, rotated: Array, x: &Array) -> Array {
-        let gain = self.rotary.attention_factor();
-        if gain == 1.0 {
-            return rotated;
-        }
         let head_dim = x.dim(x.ndim() - 1);
-        let gain = if self.rotary.dims >= head_dim {
-            Array::from_f32(gain)
+        let other;
+        let gain = if head_dim == self.rotary.head_dim {
+            self.gain.as_ref()
         } else {
-            let channels: Vec<f32> = (0..head_dim)
-                .map(|c| if c < self.rotary.dims { gain } else { 1.0 })
-                .collect();
-            Array::from_f32_slice(&channels, &[head_dim])
+            other = gain_over(&self.rotary, head_dim);
+            other.as_ref()
+        };
+        let Some(gain) = gain else {
+            return rotated;
         };
         rotated
             .as_dtype(Dtype::Float32.as_i32())
-            .multiply(&gain)
+            .multiply(gain)
             .as_dtype(x.dtype().as_i32())
     }
+}
+
+/// The attention factor over a `head_dim`-wide head: a scalar when every
+/// channel rotates, else the factor on the rotated channels and 1 past them;
+/// `None` when the factor is 1.
+fn gain_over(rotary: &Rotary, head_dim: i32) -> Option<Array> {
+    let gain = rotary.attention_factor();
+    if gain == 1.0 {
+        return None;
+    }
+    Some(if rotary.dims >= head_dim {
+        Array::from_f32(gain)
+    } else {
+        let channels: Vec<f32> = (0..head_dim)
+            .map(|c| if c < rotary.dims { gain } else { 1.0 })
+            .collect();
+        Array::from_f32_slice(&channels, &[head_dim])
+    })
 }
 
 /// Rotate the first `dims` channels of `x` (`[B, heads, L, head_dim]`) by

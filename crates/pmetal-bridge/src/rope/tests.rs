@@ -234,3 +234,54 @@ fn reach_dependent_scalings_switch_at_their_threshold() {
     assert_eq!(dynamic.base_at(16), 10_000.0);
     assert!(dynamic.base_at(17) > 10_000.0);
 }
+
+/// A compiled decode graph holds the kernel's scalars fixed, so only dynamic
+/// NTK past its threshold, whose base moves every token, has no fixed
+/// kernel. LongRoPE swaps tables of one shape instead.
+#[test]
+fn fixed_kernels_exist_wherever_a_compiled_graph_can_replay() {
+    let dynamic = RotaryEmbedding::new(
+        rotary(
+            json!({"max_position_embeddings": 16, "rope_scaling": {"rope_type": "dynamic", "factor": 2.0}}),
+            8,
+        )
+        .unwrap(),
+        false,
+    );
+    let inside = dynamic.fixed_kernel(16).expect("the trained base");
+    assert_eq!((inside.base, inside.scale), (10_000.0, 1.0));
+    assert!(inside.periods.is_none() && inside.gain.is_none());
+    assert!(dynamic.fixed_kernel(17).is_none());
+
+    let long = RotaryEmbedding::new(
+        rotary(
+            json!({"max_position_embeddings": 64,
+                   "rope_scaling": {"rope_type": "longrope", "original_max_position_embeddings": 16,
+                                    "short_factor": vec![1.0; 4], "long_factor": [1.0, 2.0, 4.0, 8.0]}}),
+            8,
+        )
+        .unwrap(),
+        false,
+    );
+    let (short, past) = (
+        long.fixed_kernel(16).unwrap(),
+        long.fixed_kernel(17).unwrap(),
+    );
+    let (short, past) = (short.periods.unwrap(), past.periods.unwrap());
+    assert_eq!(short.shape(), past.shape());
+    assert!(max_diff(short, past) > 0.0);
+    assert!(long.fixed_kernel(17).unwrap().gain.is_some());
+
+    let linear = RotaryEmbedding::new(
+        rotary(
+            json!({"rope_scaling": {"rope_type": "linear", "factor": 4.0}}),
+            8,
+        )
+        .unwrap(),
+        false,
+    );
+    let k = linear.fixed_kernel(100).unwrap();
+    assert_eq!((k.base, k.scale), (10_000.0, 0.25));
+    assert!(k.periods.is_none());
+    crate::check_last_error().unwrap();
+}
