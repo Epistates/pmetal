@@ -278,14 +278,22 @@ pub fn fused_sdpa(
     });
     let custom_mask = coerced_mask.as_ref().or(custom_mask);
 
-    if let Some(output) =
-        try_selected_attention_backend(queries, keys, values, config, custom_mask)?
-    {
-        return Ok(output);
-    }
+    // The Metal FlashAttention backends copy Q/K/V into Metal buffers and
+    // build their output from one, so autograd sees that output as a
+    // constant: Q, K and V (and every projection and adapter feeding them)
+    // would train on zero. MLX's SDPA has a VJP, so attention a gradient will
+    // flow through always takes it.
+    if !needs_gradient(queries, keys, values) {
+        if let Some(output) =
+            try_selected_attention_backend(queries, keys, values, config, custom_mask)?
+        {
+            return Ok(output);
+        }
 
-    if let Some(output) = try_metal_flash_attention(queries, keys, values, config, custom_mask)? {
-        return Ok(output);
+        if let Some(output) = try_metal_flash_attention(queries, keys, values, config, custom_mask)?
+        {
+            return Ok(output);
+        }
     }
 
     // Apply logit softcapping if configured (Gemma2 style)
@@ -295,6 +303,14 @@ pub fn fused_sdpa(
     }
 
     fast_fused_sdpa(queries, keys, values, config, custom_mask)
+}
+
+/// Whether autograd is tracing any of the attention inputs, so the output must
+/// stay in MLX's graph. A frozen model's forward (a distillation teacher, a
+/// reference policy) is not traced even inside `value_and_grad` and keeps the
+/// Metal kernels.
+pub(crate) fn needs_gradient(queries: &Array, keys: &Array, values: &Array) -> bool {
+    queries.is_tracer() || keys.is_tracer() || values.is_tracer()
 }
 
 fn try_selected_attention_backend(
@@ -1932,5 +1948,138 @@ mod tests {
         let config = FusedAttentionConfig::new(4, 2, 64);
         assert!(!config.is_asymmetric());
         assert_eq!(config.effective_value_head_dim(), 64);
+    }
+
+    #[test]
+    fn test_needs_gradient_follows_the_trace() {
+        use pmetal_bridge::compat::nn::value_and_grad_explicit;
+
+        let param = random_tensor(&[1, 2, 4, 64]);
+        let frozen = random_tensor(&[1, 2, 4, 64]);
+        assert!(!needs_gradient(&param, &frozen, &frozen));
+
+        let mut seen = Vec::new();
+        let _ = value_and_grad_explicit(
+            |a: &[Array]| {
+                let q = a[0].multiply(&Array::from_f32(2.0));
+                seen.push(needs_gradient(&q, &frozen, &frozen));
+                seen.push(needs_gradient(&frozen, &frozen, &frozen));
+                q.sum_all()
+            },
+            std::slice::from_ref(&param),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(seen, [true, false]);
+        assert!(!needs_gradient(&param, &frozen, &frozen));
+    }
+
+    /// Plain causal attention in f32 from primitives with known VJPs.
+    fn reference_causal_attention(q: &Array, k: &Array, v: &Array, scale: f32) -> Array {
+        let repeats = q.dim(1) / k.dim(1);
+        let k = expand_kv_heads(k, repeats).unwrap();
+        let v = expand_kv_heads(v, repeats).unwrap();
+        let scores = q
+            .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
+            .multiply(&Array::from_f32(scale))
+            .add(&create_causal_mask(q.dim(2), k.dim(2)).unwrap());
+        scores.softmax(-1).matmul(&v)
+    }
+
+    /// A forward that is being differentiated must keep its attention in
+    /// MLX's graph even when the backend cache says a Metal kernel is fastest
+    /// for the shape. The Metal kernels build their output from a Metal
+    /// buffer, so taking one here would hand autograd a constant and give
+    /// Q/K/V (and every adapter feeding them) a zero gradient.
+    #[test]
+    #[serial_test::serial]
+    fn test_attention_under_autograd_keeps_its_gradient() {
+        use pmetal_bridge::compat::nn::value_and_grad_explicit;
+
+        clear_cached_attention_backends();
+        let (heads, kv_heads, head_dim, len) = (4, 2, 128, 2048);
+        random::seed(3);
+        let q = random::uniform_range(-1.0, 1.0, &[1, heads, len, head_dim], Dtype::Float32);
+        let k = random::uniform_range(-1.0, 1.0, &[1, kv_heads, len, head_dim], Dtype::Float32);
+        let v = random::uniform_range(-1.0, 1.0, &[1, kv_heads, len, head_dim], Dtype::Float32);
+        let config = FusedAttentionConfig::new(heads, kv_heads, head_dim);
+
+        // Pin the Metal kernel for this shape, as a benchmark that favoured
+        // it would have.
+        let ctx = MetalContext::global().unwrap();
+        let key = benchmarkable_attention_dispatch_key(&q, &k, &v, &config, None, ctx.properties())
+            .expect("the shape is one the Metal kernels serve");
+        cache_attention_backend(key, AttentionBackendChoice::MetalFlash);
+
+        // Only the last few query rows enter the loss, so it stays O(1) and a
+        // finite difference resolves it in f32.
+        let rows = 4;
+        let mut w = vec![0.0_f32; (heads * len * head_dim) as usize];
+        for h in 0..heads {
+            for r in (len - rows)..len {
+                for c in 0..head_dim {
+                    let i = ((h * len + r) * head_dim + c) as usize;
+                    w[i] = ((i * 31 % 97) as f32 / 97.0) - 0.5;
+                }
+            }
+        }
+        let w = Array::from_f32_slice(&w, &[1, heads, len, head_dim]);
+        let scale = config.scale;
+
+        let grads = |f: &dyn Fn(&[Array]) -> Array| {
+            let (loss, g) = value_and_grad_explicit(
+                |a: &[Array]| f(a).multiply(&w).sum_all(),
+                &[q.clone(), k.clone(), v.clone()],
+                &[],
+            )
+            .unwrap();
+            loss.eval();
+            g.iter().for_each(|x| {
+                x.eval();
+            });
+            pmetal_bridge::check_last_error().unwrap();
+            g
+        };
+        let fused = grads(&|a| fused_sdpa(&a[0], &a[1], &a[2], &config, None).unwrap());
+        let reference = grads(&|a| reference_causal_attention(&a[0], &a[1], &a[2], scale));
+        clear_cached_attention_backends();
+
+        for (name, (got, want)) in ["dq", "dk", "dv"].iter().zip(fused.iter().zip(&reference)) {
+            let scale = max_abs(want).unwrap();
+            let diff = max_abs_diff(got, want).unwrap();
+            assert!(scale > 0.0, "{name}: reference gradient is zero");
+            assert!(
+                diff <= 1e-3 * scale,
+                "{name}: fused attention gradient is off by {diff} (scale {scale})"
+            );
+        }
+
+        // Finite differences of the attention itself at the largest entries.
+        let loss_at = |which: usize, idx: usize, delta: f32| {
+            let mut inputs = [q.clone(), k.clone(), v.clone()];
+            let n = inputs[which].size();
+            let mut data = inputs[which].to_f32_vec(n).unwrap();
+            data[idx] += delta;
+            inputs[which] = Array::from_f32_slice(&data, inputs[which].shape());
+            reference_causal_attention(&inputs[0], &inputs[1], &inputs[2], scale)
+                .multiply(&w)
+                .sum_all()
+                .item_f32()
+        };
+        for (which, grad) in fused.iter().enumerate() {
+            let n = grad.size();
+            let data = grad.clone().to_f32_vec(n).unwrap();
+            let (idx, &want) = data
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                .unwrap();
+            let h = 1e-2_f32;
+            let fd = (loss_at(which, idx, h) - loss_at(which, idx, -h)) / (2.0 * h);
+            assert!(
+                (fd - want).abs() <= 1e-2 * want.abs() + 1e-4,
+                "input {which}[{idx}]: autograd {want} vs finite difference {fd}"
+            );
+        }
     }
 }

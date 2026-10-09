@@ -7,8 +7,7 @@ use std::collections::HashMap;
 use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, random};
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
-    get_training_context,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, get_training_context,
     rope::{RopePositions, RopeScaling, apply_rope, apply_rope_scaled, rope, rope_with_periods},
 };
 use pmetal_mlx::kv_cache::KVCache;
@@ -171,7 +170,7 @@ pub struct LlamaAttention {
     /// scaling. When set it supersedes `effective_base`/`rope_scale`, neither of
     /// which can express the three-band rescale.
     pub rope_periods: Option<Array>,
-    /// Layer ID for training cache (set during model construction).
+    /// Layer index (set during model construction).
     pub layer_id: usize,
 
     /// Query projection.
@@ -192,7 +191,7 @@ impl LlamaAttention {
     ///
     /// # Arguments
     /// * `config` - Model configuration
-    /// * `layer_id` - Layer index (used for training cache)
+    /// * `layer_id` - Layer index
     pub fn new(config: &LlamaConfig, layer_id: usize) -> Result<Self, Exception> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_kv_heads();
@@ -375,16 +374,9 @@ impl LlamaAttention {
             (keys, values)
         };
 
-        // Use differentiable attention for training (O(n) backward pass via Metal FlashAttention)
-        // or fused SDPA for inference
-        let output = if is_training && mask.is_none() {
-            // Training mode: use Metal FlashAttention with proper backward pass
-            differentiable_attention(self.layer_id, &queries, &keys, &values, &attn_config)
-                .map_err(|e| Exception::custom(e.to_string()))?
-        } else {
-            // Inference mode: use fused SDPA (faster for single token generation)
-            fused_sdpa(&queries, &keys, &values, &attn_config, mask)?
-        };
+        // Differentiable when a gradient flows through Q/K/V (MLX SDPA); the
+        // Metal kernels are reserved for forwards nobody differentiates.
+        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
@@ -464,7 +456,7 @@ impl LlamaDecoderLayer {
     ///
     /// # Arguments
     /// * `config` - Model configuration
-    /// * `layer_id` - Layer index (used for training cache)
+    /// * `layer_id` - Layer index
     pub fn new(config: &LlamaConfig, layer_id: usize) -> Result<Self, Exception> {
         let self_attn = LlamaAttention::new(config, layer_id)?;
 

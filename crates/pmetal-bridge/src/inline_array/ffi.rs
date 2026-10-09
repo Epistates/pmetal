@@ -1333,6 +1333,9 @@ unsafe extern "C" {
         grads_out: *mut *mut RawBuf,
     );
 
+    /// True when the array is part of a graph a function transform is tracing.
+    pub(super) fn mlx_inline_is_tracer(a: *const RawBuf) -> bool;
+
     // ── Gradient checkpointing ──
     // Wraps `forward_fn` with mlx::core::checkpoint() so that activations
     // are discarded after the forward pass and recomputed during backward.

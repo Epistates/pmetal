@@ -82,6 +82,24 @@ where
     (loss, grads)
 }
 
+impl InlineArray {
+    /// Whether this array is being traced by a function transform, i.e. a
+    /// gradient is going to flow through it.
+    ///
+    /// Inside [`value_and_grad`] the differentiated inputs are tracers, and so
+    /// is every array computed from them (also when a [`checkpoint_apply`]
+    /// block is recomputed during the backward pass). An array built only from
+    /// constants, such as a frozen teacher's activations, is not.
+    ///
+    /// A kernel that produces its output outside MLX's graph (a Metal buffer
+    /// copied back, a value read to the host and rebuilt) has no gradient, so
+    /// it must not take a tracer as input: autograd would treat its output as
+    /// a constant and everything upstream of it would silently train on zero.
+    pub fn is_tracer(&self) -> bool {
+        unsafe { mlx_inline_is_tracer(&self.raw) }
+    }
+}
+
 // ── Gradient checkpointing ───────────────────────────────────────────────
 
 /// Capacity of the output buffer handed to the checkpointed callback.

@@ -38,8 +38,7 @@ use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
 use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
-    get_training_context, rope::apply_rope,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, get_training_context, rope::apply_rope,
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};

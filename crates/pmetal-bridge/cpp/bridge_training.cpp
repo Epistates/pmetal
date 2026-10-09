@@ -718,6 +718,12 @@ void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input,
 // shared_ptr whose deleter hands it back to Rust once MLX drops the last copy
 // of the closure.  Capturing by reference here reliably faults during backward.
 
+bool mlx_inline_is_tracer(const mlx_inline_array* a) {
+    // vjp/jvp mark the primals they differentiate as tracers, and every array
+    // computed from a tracer is one too, for as long as the trace is open.
+    return as_arr(a).is_tracer();
+}
+
 typedef void (*mlx_rust_checkpoint_fn)(
     const mlx_inline_array* const* all_arrays,
     int n_total,

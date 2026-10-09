@@ -1,7 +1,7 @@
 //! Shared utilities for Metal kernel integration.
 //!
 //! This module provides common functions for converting between MLX arrays
-//! and Metal buffers, used by training_attention and differentiable_attention.
+//! and Metal buffers.
 
 use crate::{array_ext::ArrayDtypeExt, bridge::MlxMetalBridge, error::MlxError};
 use half::f16;

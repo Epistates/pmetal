@@ -31,6 +31,11 @@ void mlx_inline_value_and_grad(
     mlx_inline_array** grads_out
 );
 
+// True when `a` is being traced by a function transform: it is (or was
+// computed from) an input that value_and_grad / vjp / jvp differentiates,
+// including inside a checkpoint's recomputation during the backward pass.
+bool mlx_inline_is_tracer(const mlx_inline_array* a);
+
 // ── Gradient checkpointing ───────────────────────────────────────────────
 // Callback type for the checkpointed inner function.
 // Writes output arrays into outputs_out[0..*n_outputs_out-1].
