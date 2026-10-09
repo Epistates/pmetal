@@ -183,11 +183,15 @@ fn test_training_loop_gradient_accumulation() {
 
     // Second step - should apply accumulated gradients
     let batch2 = dataloader.next_batch().unwrap();
-    let _stats2 = training_loop
+    let stats2 = training_loop
         .train_step(&mut model, &batch2, &mut optimizer)
         .unwrap();
-    // After gradient accumulation is complete, grad_norm should be Some
-    // (assuming max_grad_norm > 0, which triggers gradient clipping computation)
+    // The accumulated gradients are applied here, and the default
+    // max_grad_norm > 0 makes the step compute their norm.
+    assert!(
+        stats2.grad_norm.is_some(),
+        "Second step should apply the accumulated gradients"
+    );
 
     assert_eq!(training_loop.current_step(), 2);
 }
