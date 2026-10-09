@@ -713,6 +713,11 @@ pub fn try_gdn_metal_kernel(
     if mask.is_some() {
         return Ok(None);
     }
+    // It is a custom kernel with no VJP: under a gradient trace it fails, and
+    // the step with it. The ops path differentiates.
+    if super::utils::any_traced(&[q, k, v, g, beta, state]) {
+        return Ok(None);
+    }
     let dk = q.dim(3) as usize;
     if dk % 32 != 0 || dk > 256 || dk == 0 {
         return Ok(None);
@@ -815,6 +820,9 @@ fn gated_delta_dispatch(
     training: bool,
     chunk_size_override: Option<i32>,
 ) -> Result<(Array, Array), Exception> {
+    // A caller differentiating through a cached forward passes `training =
+    // false`; the traced inputs say otherwise, and they decide.
+    let training = training || super::utils::any_traced(&[q, k, v, g, beta, state]);
     if !training {
         // For inference: try fused Metal kernel first (single dispatch per layer)
         if let Some(result) = try_gdn_metal_kernel(q, k, v, g, beta, state, mask)? {
@@ -1559,5 +1567,58 @@ mod tests {
             1e-3,
             "Forced chunk state mismatch",
         );
+    }
+
+    /// Differentiating through the recurrence with `training = false`, the
+    /// flag a cached forward passes, gives the gradient the ops path gives.
+    /// The inference dispatch would otherwise take the fused Metal kernel (Dk
+    /// 32, no mask) or the chunked path, neither of which autograd can go
+    /// through: the custom kernel has no VJP, so the step failed.
+    #[test]
+    #[serial]
+    fn a_traced_recurrence_takes_the_differentiable_path() {
+        use pmetal_bridge::compat::nn::value_and_grad_explicit;
+
+        let (b, hk, dk, hv, dv) = (1, 2, 32, 4, 16);
+        let a_log = Array::from_f32_slice(&[0.5f32, 1.0, 1.5, 2.0], &[hv]);
+        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[hv]);
+        for (t, chunk) in [(6, None), (48, Some(16))] {
+            random::seed(9);
+            let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
+            let k = random::normal(&[b, t, hk, dk], Dtype::Float32).multiply(&Array::from_f32(0.2));
+            let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
+            let a = random::normal(&[b, t, hv], Dtype::Float32);
+            let b_in = random::normal(&[b, t, hv], Dtype::Float32);
+
+            let grad_of = |training: bool| {
+                let (_, grads) = value_and_grad_explicit(
+                    |x: &[Array]| {
+                        let (y, _) = gated_delta_update_with_chunk_size_override(
+                            &x[0], &x[1], &x[2], &a, &b_in, &a_log, &dt_bias, None, None, training,
+                            chunk,
+                        )
+                        .unwrap();
+                        y.square().sum_all()
+                    },
+                    &[q.clone(), k.clone(), v.clone()],
+                    &[],
+                )
+                .unwrap();
+                pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
+                grads
+            };
+            let want = grad_of(true);
+            let got = grad_of(false);
+            for (g, w) in got.iter().zip(&want) {
+                let scale: f32 = w.abs().max(None).item();
+                assert!(scale > 0.0, "T={t}: the ops path's gradient is zero");
+                assert_close(
+                    g,
+                    w,
+                    1e-4 * scale,
+                    &format!("T={t}: gradient through the inference dispatch"),
+                );
+            }
+        }
     }
 }

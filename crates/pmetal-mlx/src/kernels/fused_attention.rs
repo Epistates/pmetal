@@ -306,11 +306,9 @@ pub fn fused_sdpa(
 }
 
 /// Whether autograd is tracing any of the attention inputs, so the output must
-/// stay in MLX's graph. A frozen model's forward (a distillation teacher, a
-/// reference policy) is not traced even inside `value_and_grad` and keeps the
-/// Metal kernels.
+/// stay in MLX's graph. See [`any_traced`](super::utils::any_traced).
 pub(crate) fn needs_gradient(queries: &Array, keys: &Array, values: &Array) -> bool {
-    queries.is_tracer() || keys.is_tracer() || values.is_tracer()
+    super::utils::any_traced(&[queries, keys, values])
 }
 
 fn try_selected_attention_backend(

@@ -1121,7 +1121,9 @@ impl Gemma4Experts {
         top_weights: &Array,
     ) -> Result<Array, Exception> {
         if self.quant.is_some() {
-            return if self.dequant_backward {
+            // A traced input takes the exact path whatever the flag says.
+            let traced = pmetal_mlx::kernels::any_traced(&[hidden_flat, top_weights]);
+            return if self.dequant_backward || traced {
                 self.forward_quantized_dequant(hidden_flat, top_indices, top_weights)
             } else {
                 self.forward_quantized(hidden_flat, top_indices, top_weights)
