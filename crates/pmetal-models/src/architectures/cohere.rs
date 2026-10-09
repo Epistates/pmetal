@@ -9,9 +9,7 @@
 //! - **Command R**: 35B parameters
 //! - **Command R+**: 104B parameters
 //! - **Command A**: 111B parameters (2025)
-use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn, random,
-};
+use pmetal_bridge::compat::{Array, Exception, Module, nn};
 use pmetal_bridge::impl_module_params;
 
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
@@ -24,7 +22,7 @@ use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
-use crate::decoder_layer::{AttentionModule, MlpModule, NormModule};
+use crate::decoder_layer::{AttentionModule, MlpModule};
 use crate::traits::ModelConfig;
 
 /// Cohere model configuration.
@@ -714,7 +712,7 @@ impl CohereForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ModuleParameters;
+    use pmetal_bridge::compat::ModuleParametersExt;
     use serial_test::serial;
 
     #[test]
@@ -751,18 +749,20 @@ mod tests {
     #[test]
     #[serial]
     fn test_cohere_model_instantiation() {
-        let mut config = CohereConfig::default();
-        config.hidden_size = 64;
-        config.intermediate_size = 256;
-        config.num_hidden_layers = 2;
-        config.num_attention_heads = 4;
-        config.num_key_value_heads = 2;
-        config.head_dim = 16;
-        config.vocab_size = 1000;
+        let config = CohereConfig {
+            hidden_size: 64,
+            intermediate_size: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 16,
+            vocab_size: 1000,
+            ..Default::default()
+        };
 
         let model = CohereForCausalLM::new(config).unwrap();
 
         let params = model.flatten_params();
-        assert!(params.len() > 0);
+        assert!(!params.is_empty());
     }
 }

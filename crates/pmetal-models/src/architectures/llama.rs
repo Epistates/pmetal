@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, random};
+use pmetal_bridge::compat::{Array, Exception, Module, nn};
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{

@@ -334,7 +334,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             _ => None,
         };
         if let Some(window) = cache_window
-            && (window as usize) < block_size + 1
+            && window < block_size + 1
         {
             return Err(Exception::custom(format!(
                 "DFlashDecoder: target cache window ({window}) must be larger than \

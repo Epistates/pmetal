@@ -2,9 +2,7 @@
 //!
 //! Provides functionality to load model weights from safetensor files,
 //! with support for HuggingFace model formats and weight name mapping.
-use pmetal_bridge::compat::{
-    Array, Exception, ModuleParameters, ModuleParametersExt, Param, nn, transforms,
-};
+use pmetal_bridge::compat::{Array, ModuleParameters, ModuleParametersExt, nn};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -13,15 +11,12 @@ use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::clip::CLIPTextModel;
 use crate::architectures::flux::FluxDiT;
 use crate::architectures::gemma::GemmaForCausalLM;
-use crate::architectures::llama::{LlamaConfig, LlamaForCausalLM};
+use crate::architectures::llama::LlamaForCausalLM;
 use crate::architectures::mistral::MistralForCausalLM;
-use crate::architectures::mllama::MllamaForConditionalGeneration;
 use crate::architectures::nemotron_h::{
     NemotronHForCausalLM, load_nemotron_weights as load_nemotron,
 };
 use crate::architectures::phi::{PhiConfig, PhiForCausalLM};
-use crate::architectures::qwen2::Qwen2ForCausalLM;
-use crate::architectures::qwen3::Qwen3ForCausalLM;
 use crate::architectures::qwen3_next::{
     Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions, sanitize_weights,
 };
@@ -1252,7 +1247,7 @@ pub(crate) fn validate_shard_path(
     })?;
     // First check: shard is directly inside model_dir (non-symlinked case)
     if canonical_shard.starts_with(&canonical_dir) {
-        // Return original path to preserve .safetensors extension for mlx-rs
+        // Return the original path, so the `.safetensors` extension is kept
         return Ok(shard_path);
     }
     // Second check: HF cache layout — shard symlinks to ../../blobs/ within

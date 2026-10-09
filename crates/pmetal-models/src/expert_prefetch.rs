@@ -30,8 +30,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 
-use pmetal_bridge::compat::indexing::IndexOp;
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, indexing, nn};
+use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_metal::expert_buffer::{AlignedBuffer, ExpertBufferPool};
 
 use crate::expert_io::ExpertOffloadContext;
@@ -625,9 +624,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use pmetal_bridge::compat::builder::Builder;
     use pmetal_bridge::compat::nn;
-    use pmetal_mlx::Module;
     use serial_test::serial;
 
     use crate::architectures::qwen3_next::Qwen3NextConfig;
@@ -677,10 +674,12 @@ mod tests {
     #[test]
     #[serial]
     fn test_predict_topk_matches_qwen3next_gate_projection() {
-        let mut config = Qwen3NextConfig::default();
-        config.hidden_size = 8;
-        config.num_experts = 6;
-        config.num_experts_per_tok = 2;
+        let config = Qwen3NextConfig {
+            hidden_size: 8,
+            num_experts: 6,
+            num_experts_per_tok: 2,
+            ..Default::default()
+        };
 
         let mut gate = nn::LinearBuilder::new(config.hidden_size, config.num_experts)
             .bias(false)

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use pmetal_bridge::compat::{
-    Array, Exception, Module,
+    Array, Exception,
     ops::{concatenate_axis, select_axis},
 };
 use pmetal_mlx::{kv_cache::KVCache, speculative::SpecCapture};

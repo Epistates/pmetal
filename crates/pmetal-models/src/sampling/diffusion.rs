@@ -5,7 +5,7 @@
 
 use pmetal_bridge::compat::ops::argmin_axis;
 use pmetal_bridge::compat::{Array, Dtype, ops};
-use pmetal_core::{PMetalError, Result};
+use pmetal_core::Result;
 
 /// Flow-Matching scheduler for models like Flux.1 and Wan.
 #[derive(Debug, Clone)]

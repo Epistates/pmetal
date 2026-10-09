@@ -34,7 +34,7 @@
 //!
 //! For a well-matched draft (high acceptance rate), each step returns 2–N+1
 //! tokens at roughly the cost of one full forward pass (the verify pass dominates).
-use pmetal_bridge::compat::{Array, Exception, indexing, ops};
+use pmetal_bridge::compat::{Array, Exception};
 
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 
@@ -406,7 +406,7 @@ fn build_verify_input(input_ids: &Array, draft_tokens: &[u32]) -> Result<Array, 
 ///
 /// `hidden`: `[batch, seq_len, hidden_dim]` → `[batch, 1, hidden_dim]`
 fn last_token_hidden(hidden: &Array) -> Result<Array, Exception> {
-    let seq_len = hidden.dim(1) as i32;
+    let seq_len = hidden.dim(1);
     Ok(pmetal_bridge::compat::ops::slice_axis(
         hidden,
         1,
@@ -419,7 +419,7 @@ fn last_token_hidden(hidden: &Array) -> Result<Array, Exception> {
 /// `[1, seq_len, vocab_size]` — returns the argmax at the *last* position.
 fn argmax_last(logits: &Array) -> Result<u32, Exception> {
     // logits: [batch=1, seq_len, vocab_size]
-    let seq_len = logits.dim(1) as i32;
+    let seq_len = logits.dim(1);
     let row = pmetal_bridge::compat::ops::slice_axis(logits, 1, seq_len - 1, seq_len)
         .squeeze_axes(&[0, 1]);
     argmax_1d(&row)
@@ -475,17 +475,21 @@ mod tests {
 
     #[test]
     fn stats_tokens_per_step() {
-        let mut stats = SpeculativeStats::default();
-        stats.total_tokens = 15;
-        stats.num_steps = 5;
+        let stats = SpeculativeStats {
+            total_tokens: 15,
+            num_steps: 5,
+            ..Default::default()
+        };
         assert!((stats.tokens_per_step() - 3.0).abs() < 1e-6);
     }
 
     #[test]
     fn stats_acceptance_rate_full() {
-        let mut stats = SpeculativeStats::default();
-        stats.total_draft_proposed = 100;
-        stats.total_draft_accepted = 75;
+        let stats = SpeculativeStats {
+            total_draft_proposed: 100,
+            total_draft_accepted: 75,
+            ..Default::default()
+        };
         assert!((stats.acceptance_rate() - 0.75).abs() < 1e-6);
     }
 

@@ -30,14 +30,14 @@
 //! 3. **Early Exit Masking**: Skip computation for finished sequences
 //! 4. **Async Pipelining**: Overlap sampling with next forward pass
 //! 5. **Speculative Decoding**: Layer-split draft/verify for 2-4x generation speedup
-use pmetal_bridge::compat::{Array, Exception, indexing, ops};
+use pmetal_bridge::compat::{Array, Exception, ops};
 
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_mlx::prefix_cache::PrefixCachedGenerator;
 
 use crate::sampling::compiled_sampler::CompiledSampler;
 
-use crate::generation::{GenerationConfig, GenerationOutput};
+use crate::generation::GenerationConfig;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Speculative RL generation statistics

@@ -14,16 +14,11 @@
 //!
 //! Reference: https://arxiv.org/abs/2504.03624
 
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, Param, indexing, nn, ops,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn};
 use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, rope},
-};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use serde::{Deserialize, Serialize};
 
@@ -262,7 +257,7 @@ fn segsum(x: &Array) -> Result<Array, Exception> {
 
     // Repeat x along new axis: [B, H, L] -> [B, H, L, L]
     let x_expanded = pmetal_bridge::compat::ops::expand_dims(x, -1);
-    let x_repeated = pmetal_bridge::compat::ops::tile(&x_expanded, &[1, 1, 1, l as i32]);
+    let x_repeated = pmetal_bridge::compat::ops::tile(&x_expanded, &[1, 1, 1, l]);
 
     // Create lower triangular mask (shifted by -1)
     let x_tril = pmetal_bridge::compat::ops::tril(&x_repeated, -1);
@@ -291,6 +286,10 @@ fn segsum(x: &Array) -> Result<Array, Exception> {
 ///
 /// # Returns
 /// (output [B, 1, H, D], new_state [B, H, D, N])
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the SSM recurrence's inputs, one per tensor"
+)]
 pub fn ssm_update_single(
     x: &Array,       // [B, 1, H, D]
     a_log: &Array,   // [H]
@@ -399,6 +398,10 @@ pub fn ssm_update_single(
 ///
 /// # Returns
 /// (output [B, L, H, D], new_state [B, H, D, N])
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the SSM recurrence's inputs, one per tensor"
+)]
 pub fn ssm_attention(
     x: &Array,             // [B, L, H, D] - input
     a_log: &Array,         // [H] - log state transition
@@ -463,8 +466,7 @@ pub fn ssm_attention(
 
     // Compute new state for caching
     // decay_last: [B, H, 1, L] -> [B, L, H, 1]
-    let decay_last =
-        pmetal_bridge::compat::ops::slice_axis(&decay, 2, (seq_len as i32) - 1, seq_len as i32);
+    let decay_last = pmetal_bridge::compat::ops::slice_axis(&decay, 2, seq_len - 1, seq_len);
     let decay_last = decay_last.transpose_axes(&[0, 3, 1, 2]);
 
     // B_expanded: [B, G, N, L] -> repeat to [B, H, N, L] -> [B, H, L, N]
@@ -489,12 +491,8 @@ pub fn ssm_attention(
             pmetal_bridge::compat::ops::exp(&pmetal_bridge::compat::ops::cumsum(&dt_a, -2));
 
         // exp_dta_last: [B, 1, H] -> [B, H, 1, 1]
-        let exp_dta_last = pmetal_bridge::compat::ops::slice_axis(
-            &exp_dta_cumsum,
-            1,
-            (seq_len as i32) - 1,
-            seq_len as i32,
-        );
+        let exp_dta_last =
+            pmetal_bridge::compat::ops::slice_axis(&exp_dta_cumsum, 1, seq_len - 1, seq_len);
         let exp_dta_last = exp_dta_last.transpose_axes(&[0, 2, 1]);
         let exp_dta_last = pmetal_bridge::compat::ops::expand_dims(&exp_dta_last, -1);
 
@@ -686,7 +684,7 @@ impl MoERouter {
             // Zero out non-selected groups (keep top topk_group groups)
             let k = self.n_group - self.topk_group;
             let group_idx = pmetal_bridge::compat::ops::argpartition_axis(&group_scores, k - 1, -2);
-            let group_idx = pmetal_bridge::compat::ops::slice_axis(&group_idx, 1, 0, k as i32);
+            let group_idx = pmetal_bridge::compat::ops::slice_axis(&group_idx, 1, 0, k);
 
             // Zero out bottom groups using put_along_axis
             let zeros = Array::from_f32(0.0);
@@ -711,7 +709,7 @@ impl MoERouter {
         // Indices carry no gradient, and MLX refuses to differentiate a gather
         // with respect to them.
         let inds = pmetal_bridge::compat::ops::stop_gradient(
-            &pmetal_bridge::compat::ops::slice_last_to(&inds, self.top_k as i32),
+            &pmetal_bridge::compat::ops::slice_last_to(&inds, self.top_k),
         );
 
         // Get original scores for selected experts (not bias-corrected)
@@ -749,6 +747,7 @@ impl_module_params!(MoELayer; router, experts, shared_expert);
 
 impl MoELayer {
     /// Create a new MoE layer.
+    #[expect(clippy::too_many_arguments, reason = "one argument per config field")]
     pub fn new(
         hidden_size: i32,
         intermediate_size: i32,
@@ -1649,7 +1648,7 @@ impl NemotronHMixer {
             // No cache: use CAUSAL PADDING for full sequence
             // Pad (kernel_size - 1) zeros on the left of the sequence
             // This matches reference: mx.pad(conv_input, [(0, 0), (kernel_size - 1, 0), (0, 0)])
-            let pad_amount = (conv_kernel - 1) as i32;
+            let pad_amount = conv_kernel - 1;
             let padded_input = pmetal_bridge::compat::ops::pad(
                 conv_input,
                 &[(0i32, 0i32), (pad_amount, 0), (0, 0)],
@@ -2437,6 +2436,7 @@ fn load_moe_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::ops;
 
     fn small_config() -> NemotronHConfig {
         NemotronHConfig {

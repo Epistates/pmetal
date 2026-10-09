@@ -7,8 +7,7 @@
 //! - SwitchGLU-style expert MLP with gather_mm
 
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, VisitLinears,
-    indexing, nn, ops, random,
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn,
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
@@ -660,6 +659,10 @@ impl Qwen3MoEBlock {
 /// optimizer and parameter loading. The derive macro cannot handle enums, so
 /// we implement the trait manually, delegating to the inner variant.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per layer, never moved; boxing would add an indirection to every forward"
+)]
 pub enum Qwen3MoEFeedForward {
     /// Dense MLP.
     Dense(Qwen3MoEDenseMLP),
@@ -1160,10 +1163,11 @@ mod tests {
 
     #[test]
     fn test_use_moe_at() {
-        let mut config = Qwen3MoEConfig::default();
-
         // With sparse_step=2, only odd layers (0-indexed layer 1, 3, 5...) should be MoE
-        config.decoder_sparse_step = 2;
+        let mut config = Qwen3MoEConfig {
+            decoder_sparse_step: 2,
+            ..Default::default()
+        };
         assert!(!config.use_moe_at(0)); // Layer 1: 0+1=1, 1%2=1 != 0
         assert!(config.use_moe_at(1)); // Layer 2: 1+1=2, 2%2=0
         assert!(!config.use_moe_at(2)); // Layer 3: 2+1=3, 3%2=1 != 0

@@ -2,7 +2,7 @@
 //!
 //! Coordinates CLIP/T5 text encoders, Flux DiT, and VAE for end-to-end
 //! high-quality image generation on Apple Silicon.
-use pmetal_bridge::compat::{Array, ModuleParametersExt, ops, random};
+use pmetal_bridge::compat::{Array, ModuleParametersExt};
 
 use pmetal_core::Result;
 use serde_json::Value;
@@ -103,6 +103,10 @@ impl FluxPipeline {
     /// * `num_steps` - Number of denoising steps.
     /// * `guidance` - Guidance scale for Flux.
     /// * `seed` - Optional random seed.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public API: one argument per setting"
+    )]
     pub fn generate(
         &mut self,
         clip_input: &Array,
@@ -133,7 +137,7 @@ impl FluxPipeline {
 
         let mut latents = {
             if let Some(s) = seed {
-                pmetal_bridge::compat::random::seed(s as u64);
+                pmetal_bridge::compat::random::seed(s);
             }
             pmetal_bridge::compat::random::normal(
                 &[batch_size, latents_seq as i32, 64],
@@ -150,7 +154,7 @@ impl FluxPipeline {
         );
 
         // Image IDs: grid indices for positional encoding
-        let mut image_ids_vec = Vec::with_capacity(latents_seq as usize);
+        let mut image_ids_vec = Vec::with_capacity(latents_seq);
         for h in 0..latents_h {
             for w in 0..latents_w {
                 image_ids_vec.push([0.0f32, h as f32, w as f32]);
@@ -158,20 +162,18 @@ impl FluxPipeline {
         }
         let image_ids_flat: Vec<f32> = image_ids_vec.into_iter().flatten().collect();
         let image_ids_base = Array::from_f32_slice(&image_ids_flat, &[1, latents_seq as i32, 3]);
-        let image_ids =
-            pmetal_bridge::compat::ops::repeat_axis(image_ids_base, batch_size as i32, 0);
+        let image_ids = pmetal_bridge::compat::ops::repeat_axis(image_ids_base, batch_size, 0);
 
         // 4. Denoising loop
         let scheduler = FlowMatchScheduler::new_flux(num_steps, 1.0, Some(3.0))?;
         let guidance_arr = Array::from_f32(guidance).expand_dims(0);
-        let guidance_arr =
-            pmetal_bridge::compat::ops::repeat_axis(guidance_arr, batch_size as i32, 0);
+        let guidance_arr = pmetal_bridge::compat::ops::repeat_axis(guidance_arr, batch_size, 0);
 
         // Scheduler timesteps are already in descending order (high noise → low noise)
         let timesteps = scheduler.timesteps.as_slice::<f32>().to_vec();
         for timestep in timesteps.iter() {
             let t = Array::from_f32(*timestep).expand_dims(0);
-            let t_repeated = pmetal_bridge::compat::ops::repeat_axis(t, batch_size as i32, 0);
+            let t_repeated = pmetal_bridge::compat::ops::repeat_axis(t, batch_size, 0);
 
             let model_output = self
                 .dit

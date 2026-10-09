@@ -17,17 +17,14 @@
 //! - Uses pmetal_bridge::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
-use pmetal_bridge::compat::indexing::{IndexOp, argmax};
+use pmetal_bridge::compat::indexing::argmax;
 use pmetal_bridge::compat::ops::exp;
 use pmetal_bridge::compat::ops::{
-    argmax_axis, argmin_axis, argpartition_axis, argsort_axis, async_eval, concatenate_axis,
-    logsumexp_axis, logsumexp_axis_keepdims, put_along_axis, select_axis, softmax_axis,
-    take_along_axis, take_axis, which, zeros_like,
+    argmax_axis, argpartition_axis, argsort_axis, async_eval, logsumexp_axis_keepdims,
+    put_along_axis, select_axis, take_along_axis, which, zeros_like,
 };
 use pmetal_bridge::compat::random::categorical;
-use pmetal_bridge::compat::{
-    Array, Device, Dtype, Exception, Stream, indexing, ops, random, transforms,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Stream};
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
@@ -987,7 +984,7 @@ impl Sampler {
         logits_2d: &Array,
         vocab_size: usize,
     ) -> Result<Array, Exception> {
-        let k = (self.config.top_k as usize).min(vocab_size);
+        let k = self.config.top_k.min(vocab_size);
 
         // argpartition on -logits gives indices that partition around k-th largest
         let neg_logits = logits_2d.negative();
@@ -1321,7 +1318,6 @@ pub fn apply_repetition_penalty(
 /// - Uses argpartition to find the k-th largest element efficiently
 /// - Uses put_along_axis to mask out tokens below top-k
 /// - All operations stay on GPU - no CPU round-trip
-#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn top_k_filter(logits: &Array, k: usize) -> Result<Array, Exception> {
     let vocab_size = logits.dim(-1) as usize;
     let k = k.min(vocab_size);
@@ -1363,7 +1359,6 @@ fn top_k_filter(logits: &Array, k: usize) -> Result<Array, Exception> {
 /// - Computes cumulative sum
 /// - Keeps tokens with cumsum > (1 - top_p) threshold
 /// - All operations stay on GPU - no CPU round-trip
-#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
     let vocab_size = logits.dim(-1) as usize;
 
@@ -1427,7 +1422,6 @@ fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
 /// min-p scales the threshold based on the model's confidence (top token probability).
 /// This helps maintain coherence at high temperatures while allowing creativity.
 /// Recommended values: 0.05-0.1
-#[allow(dead_code)] // MLX sampling implementation, superseded by Metal fused sampler
 fn min_p_filter(logits: &Array, min_p: f32) -> Result<Array, Exception> {
     let vocab_size = logits.dim(-1) as usize;
 
@@ -2064,11 +2058,11 @@ fn build_decode_metrics(step_ns: &[u128]) -> Option<pmetal_bridge::decode::Decod
 ///
 /// This function uses a custom Metal kernel that fuses all sampling operations
 /// into a single GPU kernel launch, providing significant speedups especially
-/// on battery power where CPU throttling impacts the standard mlx-rs path.
+/// on battery power where CPU throttling impacts the op-by-op MLX path.
 ///
 /// # Performance Benefits
 ///
-/// - **Single kernel launch** vs 10+ separate launches with mlx-rs
+/// - **Single kernel launch** vs 10+ separate launches op by op
 /// - **Minimal CPU overhead** - critical for battery mode
 /// - **Zero-copy** from MLX arrays via unified memory
 ///
@@ -2932,8 +2926,8 @@ mod tests {
             let seq_len = chunk_input.dim(1);
             seen_chunks.push(seq_len);
 
-            let last_token = select_axis(&select_axis(chunk_input, 0, 0), (seq_len - 1) as i32, 0)
-                .item::<i32>() as usize;
+            let last_token =
+                select_axis(&select_axis(chunk_input, 0, 0), seq_len - 1, 0).item::<i32>() as usize;
             let vocab = 64usize;
             let mut data = vec![-1000.0f32; seq_len as usize * vocab];
             data[((seq_len as usize - 1) * vocab) + (last_token % vocab)] = 10.0;

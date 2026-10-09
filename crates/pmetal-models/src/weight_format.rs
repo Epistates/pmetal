@@ -16,7 +16,7 @@
 //! let weights = WeightLoader::load_gguf("./model.gguf");
 //! ```
 
-use pmetal_bridge::compat::{Array, Dtype, Exception};
+use pmetal_bridge::compat::{Array, Dtype};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

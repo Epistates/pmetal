@@ -1,44 +1,9 @@
-//! JIT-compiled sampling for high-performance token generation.
+//! Top-k / top-p / min-p filtered sampling on the GPU.
 //!
-//! This module provides sampling functions that are JIT-compiled by MLX,
-//! implementing the same paradigm as Python's `@partial(mx.compile, inputs=state, outputs=state)`.
-//!
-//! # Design Philosophy
-//!
-//! Fast sampling comes from compiling the sampler with proper random state
-//! tracking:
-//!
-//! ```python
-//! @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
-//! def categorical_sampling(logits, temp):
-//!     return mx.random.categorical(logits * (1 / temp))
-//! ```
-//!
-//! This Rust implementation mirrors that pattern using `compile_with_state` and the
-//! `Updatable` trait, ensuring:
-//!
-//! 1. **Proper random state tracking** - Random state is passed as input/output, not frozen
-//! 2. **Operation fusion** - Multiple ops compile into single Metal kernels
-//! 3. **Cached compilation** - Functions compile once and are reused via `OnceLock`
-//! 4. **Zero CPU overhead** - All sampling happens on GPU without round-trips
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                      CompiledSampler                            │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  SamplerState (Updatable)                                       │
-//! │  ├── RandomState (Updatable) ─── random key array              │
-//! │  └── neg_inf: Array ─────────── constant for masking           │
-//! ├─────────────────────────────────────────────────────────────────┤
-//! │  Cached Compiled Functions (OnceLock)                           │
-//! │  ├── compiled_categorical                                       │
-//! │  ├── compiled_top_k                                             │
-//! │  ├── compiled_top_p                                             │
-//! │  └── compiled_min_p                                             │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
+//! The filters and the categorical draw run as MLX ops on the bridge, with no
+//! host round-trip until the sampled token is read. Despite the module name,
+//! nothing here is passed to `mx.compile`: the ops run one by one, and the
+//! random key is MLX's global key ([`SamplerState::with_seed`] seeds it).
 //!
 //! # Usage
 //!
@@ -53,19 +18,20 @@
 //! let token2 = sampler.sample(&logits);  // Different random key used
 //! ```
 
-use pmetal_bridge::compat::indexing::{IndexOp, put_along_axis, take_along_axis};
+use pmetal_bridge::compat::indexing::{put_along_axis, take_along_axis};
 use pmetal_bridge::compat::ops::{
     argmax_axis, argpartition_axis, argsort_axis, cumsum, exp, logsumexp_axis_keepdims, slice_axis,
     slice_last_from, which, zeros_like,
 };
 use pmetal_bridge::compat::random::categorical;
-use pmetal_bridge::compat::{Array, Exception, indexing, ops};
+use pmetal_bridge::compat::{Array, Exception};
 
 // ============================================================================
-// SamplerState - Composite state for compiled sampling
+// SamplerState - sampler random state
 // ============================================================================
 
-/// Stub for `mlx_rs::random::RandomState` — bridge uses a global random seed.
+/// Random state of a sampler. The bridge draws from MLX's global key, so this
+/// holds only the seed; [`Self::with_seed`] applies it to the global key.
 #[derive(Debug, Clone)]
 pub struct RandomState {
     seed: u64,
@@ -94,23 +60,14 @@ impl RandomState {
     }
 }
 
-/// Stub for `mlx_rs::transforms::compile::Updatable`.
+/// State arrays a sampler exposes for evaluation. [`SamplerState`] has none.
 pub trait Updatable {
     fn updatable_states_len(&self) -> usize;
     fn updatable_states(&self) -> impl IntoIterator<Item = &Array>;
     fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array>;
 }
 
-/// Composite state for compiled sampling operations.
-///
-/// This struct holds all mutable state needed during sampling:
-/// - `random_state`: PRNG state that advances with each sample
-///
-/// It implements `Updatable` to work with `compile_with_state`, which is
-/// the Rust equivalent of Python's:
-/// ```python
-/// @partial(mx.compile, inputs=state, outputs=state)
-/// ```
+/// Mutable state of a sampler: its random state.
 #[derive(Debug, Clone)]
 pub struct SamplerState {
     /// Random number generator state
@@ -268,21 +225,9 @@ fn apply_min_p_2d(
 // CompiledSampler - Main Interface
 // ============================================================================
 
-/// A JIT-compiled sampler.
+/// A temperature / top-k / top-p / min-p sampler running as MLX ops.
 ///
-/// This sampler properly tracks random state across compiled function calls,
-/// implementing the same paradigm as Python's:
-/// ```python
-/// @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
-/// def sample(logits): ...
-/// ```
-///
-/// # Performance
-///
-/// By using MLX's JIT compilation with proper state tracking:
-/// - Operations are fused into single Metal kernels
-/// - Random state updates are correctly propagated
-/// - CPU overhead is minimized (no per-token Python/Rust overhead)
+/// Successive calls draw fresh samples from MLX's global random key.
 ///
 /// # Example
 ///
@@ -524,14 +469,12 @@ impl std::fmt::Debug for CompiledSampler {
 }
 
 // ============================================================================
-// Utility Functions for State-Aware Compilation
+// Utility Functions
 // ============================================================================
 
-/// Sample from a probability distribution using explicit key management.
+/// Sample from a probability distribution.
 ///
-/// This function demonstrates the pattern for achieving Python's
-/// `@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)`
-/// behavior in Rust: explicitly manage the random key as a function parameter.
+/// `_key` is ignored: the draw uses MLX's global key.
 ///
 /// # Example
 ///

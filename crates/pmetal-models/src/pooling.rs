@@ -1,6 +1,6 @@
 //! Pooling strategies for converting sequence representations to fixed-size embeddings.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_bridge::compat::{Array, Exception};
 /// Pooling modes for sentence embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PoolingMode {

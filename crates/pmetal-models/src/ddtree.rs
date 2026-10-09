@@ -18,7 +18,6 @@
 //! Python/NumPy marshalling overhead. See the module tests for a
 //! determinism check against hand-computed small-tree cases.
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use pmetal_bridge::compat::{Array, Dtype, ops};

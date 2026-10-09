@@ -3,7 +3,7 @@
 //! Implementation of T5 (Text-to-Text Transfer Transformer) encoder.
 //! Based on the architecture from Google and used in Flux.1 (T5-XXL).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, Param, fast, nn, ops};
+use pmetal_bridge::compat::{Array, Dtype, Exception, nn};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 

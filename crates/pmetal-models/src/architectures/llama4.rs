@@ -10,10 +10,7 @@
 //! Variants:
 //! - **Llama 4 Scout**: 109B total params (16 experts), 17B active, 10M context
 //! - **Llama 4 Maverick**: 402B total params (128 experts), 17B active, 1M context
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, fast, indexing, nn,
-    ops, random,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, nn, ops};
 use pmetal_bridge::impl_module_params;
 
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
@@ -308,7 +305,7 @@ impl Llama4Router {
         // softmax. The previous softmax-then-renormalize collapsed the top-1
         // weight to exactly 1.0 (softmax over a single selected logit is 1),
         // throwing away the router signal entirely.
-        let neg_k = -(self.top_k as i32);
+        let neg_k = -self.top_k;
         let part_indices = ops::argpartition_axis(&router_logits, neg_k, -1);
         // Slice the last top_k entries: [total_tokens, top_k]. A selection
         // carries no gradient, and MLX refuses to differentiate a gather with
@@ -1032,7 +1029,7 @@ impl Llama4TextConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::ModuleParameters;
+    use pmetal_bridge::compat::ModuleParametersExt;
     use serial_test::serial;
 
     #[test]
@@ -1085,12 +1082,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_llama4_moe_matches_naive_reference() {
-        let mut config = Llama4TextConfig::default();
-        config.hidden_size = 32;
-        config.intermediate_size = 64;
-        config.intermediate_size_mlp = 64;
-        config.num_local_experts = 4;
-        config.num_experts_per_tok = 2;
+        let config = Llama4TextConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            intermediate_size_mlp: 64,
+            num_local_experts: 4,
+            num_experts_per_tok: 2,
+            ..Default::default()
+        };
 
         let mut moe = Llama4MoE::new(&config).unwrap();
         let x = pmetal_bridge::compat::random::normal(
@@ -1185,12 +1184,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_llama4_moe_accepts_float16_inputs() {
-        let mut config = Llama4TextConfig::default();
-        config.hidden_size = 16;
-        config.intermediate_size = 32;
-        config.intermediate_size_mlp = 32;
-        config.num_local_experts = 2;
-        config.num_experts_per_tok = 1;
+        let config = Llama4TextConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            intermediate_size_mlp: 32,
+            num_local_experts: 2,
+            num_experts_per_tok: 1,
+            ..Default::default()
+        };
 
         let mut moe = Llama4MoE::new(&config).unwrap();
         let x = pmetal_bridge::compat::random::normal(
@@ -1212,20 +1213,22 @@ mod tests {
     #[test]
     #[serial]
     fn test_llama4_model_instantiation() {
-        let mut config = Llama4TextConfig::default();
-        config.hidden_size = 64;
-        config.intermediate_size = 256;
-        config.intermediate_size_mlp = 256;
-        config.num_hidden_layers = 2;
-        config.num_attention_heads = 4;
-        config.num_key_value_heads = 2;
-        config.head_dim = 16;
-        config.num_local_experts = 4;
-        config.vocab_size = 1000;
+        let config = Llama4TextConfig {
+            hidden_size: 64,
+            intermediate_size: 256,
+            intermediate_size_mlp: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 16,
+            num_local_experts: 4,
+            vocab_size: 1000,
+            ..Default::default()
+        };
 
         let model = Llama4ForCausalLM::new(config).unwrap();
 
         let params = model.flatten_params();
-        assert!(params.len() > 0);
+        assert!(!params.is_empty());
     }
 }

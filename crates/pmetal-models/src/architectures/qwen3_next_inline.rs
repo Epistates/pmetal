@@ -1,21 +1,18 @@
-//! InlineArray-based Qwen3.5 decode forward — zero mlx-c handle overhead.
+//! InlineArray-based Qwen3.5 decode forward.
 //!
 //! Every op on the hot path uses `InlineArray` (stack-allocated mlx::core::array,
-//! direct C++ bridge). This eliminates the 6.8x build overhead from mlx-c handle
-//! management (mlx_array_new/free/set per op), matching Python's nanobind path.
+//! direct C++ bridge), so no op allocates a heap handle.
 //!
-//! Weights are converted from `pmetal_bridge::compat::Array` → `InlineArray` once at first decode
-//! call (cold path). All subsequent decode calls use InlineArray exclusively.
+//! Weights are gathered into per-layer `InlineArray` structs once at the first
+//! decode call (cold path). All subsequent decode calls use them directly.
 
 use pmetal_bridge::InlineArray;
 use pmetal_bridge::compat::{Array, Dtype, Exception};
 
 use super::qwen3_next::Qwen3NextForCausalLM;
-use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
+use pmetal_mlx::kv_cache::{KVCache, MambaCache};
 
 // Interop helpers — COLD PATH ONLY (weight init, cache bootstrap).
-// These go through the raw void* pointer (shared_ptr copy, ~10ns).
-// The hot-path decode uses ONLY InlineArray — zero mlx-rs.
 
 /// Convert a bridge Array (= InlineArray) to InlineArray — identity since they're the same type.
 pub fn ia_from_array(arr: &Array) -> InlineArray {
@@ -154,7 +151,7 @@ impl std::fmt::Debug for InlineModelWeights {
 }
 
 // ============================================================================
-// InlineArray-native cache — zero mlx-rs on hot path
+// InlineArray-native cache
 // ============================================================================
 
 /// GDN layer cache state (conv + SSM) stored as InlineArray.
@@ -182,7 +179,7 @@ pub struct InlineCache {
 }
 
 impl InlineCache {
-    /// Bootstrap from existing mlx-rs caches (called once after prefill).
+    /// Bootstrap from the prefill's `KVCache` / `MambaCache` (called once after prefill).
     pub fn from_caches(
         kv_cache: &KVCache,
         mamba_cache: &MambaCache,
@@ -425,7 +422,7 @@ impl InlineModelWeights {
 
 /// Run one decode step (T=1) using InlineArray exclusively.
 ///
-/// ZERO mlx-rs on the hot path. Returns logits as InlineArray.
+/// Returns logits as InlineArray.
 /// The caller converts to Array once for sampling.
 pub fn inline_decode_step_pure(
     weights: &InlineModelWeights,
@@ -626,7 +623,7 @@ fn inline_gdn_forward_pure(
         .matmul(lw.gdn_out_w.as_ref().unwrap())
 }
 
-/// Pure InlineArray attention forward — zero mlx-rs.
+/// Pure InlineArray attention forward.
 fn inline_attn_forward_pure(
     lw: &InlineLayerWeights,
     normed: &InlineArray,

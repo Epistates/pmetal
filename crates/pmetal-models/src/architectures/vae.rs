@@ -2,11 +2,10 @@
 //!
 //! Implementation of Flux.1 and SDXL compatible VAEs optimized for Apple Silicon.
 //! This implementation uses NHWC format for consistency with MLX standards.
-use pmetal_bridge::compat::{Array, Exception, ModuleParameters, fast, nn, ops, random};
+use pmetal_bridge::compat::{Array, Exception, nn};
 use pmetal_bridge::impl_module_params;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// VAE configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]

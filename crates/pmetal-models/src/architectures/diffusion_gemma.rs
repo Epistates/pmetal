@@ -39,7 +39,7 @@
 //! transformers oracle. The discrete-diffusion generation engine (block loop,
 //! entropy-bound sampler, stopping) is built in a later phase.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn, ops};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::rope::RopePositions;
 use serde::{Deserialize, Serialize};

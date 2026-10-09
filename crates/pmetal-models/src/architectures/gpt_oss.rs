@@ -21,9 +21,7 @@
 //! - Configurable reasoning effort (low/medium/high)
 //! - Tool use optimization
 //! - Apache 2.0 license
-use pmetal_bridge::compat::{
-    Array, Exception, ModuleParameters, ModuleParametersExt, Param, indexing, nn, ops, random,
-};
+use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
 
 use crate::checkpointing::checkpointed_layer;

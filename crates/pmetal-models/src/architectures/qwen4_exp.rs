@@ -1655,7 +1655,7 @@ impl Qwen4ExpModel {
         }
         let mut h = embedded.tile(&[1, 1, self.hc_count]);
         let layout = self.layout;
-        let decode = input_ids.dim(input_ids.ndim() as i32 - 1) == 1;
+        let decode = input_ids.dim(input_ids.ndim() - 1) == 1;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let (next, moe_input) = layer.forward(
                 &h,

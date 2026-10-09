@@ -11,14 +11,11 @@
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
-use pmetal_bridge::compat::indexing::IndexOp;
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
-    Param, VisitLinears, indexing, nn, ops, random,
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn, ops,
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
-use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
@@ -26,8 +23,6 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::Expert;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::rc::Rc;
 
 /// Result type for DeepSeek operations.
 pub type Result<T, E = Exception> = std::result::Result<T, E>;
@@ -327,11 +322,11 @@ impl DeepSeekAttention {
         let q = q
             .reshape(&[batch, seq_len, self.n_heads, q_head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
-        let q_parts = ops::split_sections(&q, &[self.config.qk_nope_head_dim as i32], -1);
+        let q_parts = ops::split_sections(&q, &[self.config.qk_nope_head_dim], -1);
         let q_nope = &q_parts[0];
         let q_pe = &q_parts[1];
         let compressed_kv = self.kv_a_proj_with_mqa.forward(x);
-        let kv_parts = ops::split_sections(&compressed_kv, &[self.config.kv_lora_rank as i32], -1);
+        let kv_parts = ops::split_sections(&compressed_kv, &[self.config.kv_lora_rank], -1);
         let compressed_latent = &kv_parts[0];
         let k_pe = &kv_parts[1]
             .reshape(&[batch, seq_len, 1, self.config.qk_rope_head_dim])
@@ -342,7 +337,7 @@ impl DeepSeekAttention {
         let kv = kv
             .reshape(&[batch, seq_len, self.n_heads, kv_dim])
             .transpose_axes(&[0, 2, 1, 3]);
-        let kv_split = ops::split_sections(&kv, &[self.config.qk_nope_head_dim as i32], -1);
+        let kv_split = ops::split_sections(&kv, &[self.config.qk_nope_head_dim], -1);
         let k_nope = &kv_split[0];
         let values = &kv_split[1];
         // DeepSeek MLA rotates `q_pe` / `k_pe` interleaved (traditional),
@@ -1008,6 +1003,10 @@ impl DeepSeekMoE {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per layer, never moved; boxing would add an indirection to every forward"
+)]
 pub enum DeepSeekMLPType {
     Dense(DeepSeekMLP),
     MoE(DeepSeekMoE),
@@ -1440,7 +1439,7 @@ impl DeepSeek {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::module::Param;
+
     use serial_test::serial;
 
     fn tiny_deepseek_moe_config() -> DeepSeekConfig {

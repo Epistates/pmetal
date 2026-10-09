@@ -3,12 +3,9 @@
 //! Implementation of Flux.1 DiT (Diffusion Transformer) optimized for Apple Silicon.
 //! Based on the architecture from Black Forest Labs and DiffSynth-Studio.
 
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, ModuleParameters, ModuleParametersExt, fast, nn, ops, random,
-};
+use pmetal_bridge::compat::{Array, Exception, nn, ops};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// Flux model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -740,6 +737,10 @@ impl FluxDiT {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the reference transformer's forward inputs"
+    )]
     pub fn forward(
         &mut self,
         hidden_states: &Array,
@@ -805,6 +806,7 @@ impl FluxDiT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::Dtype;
 
     #[test]
     #[ignore] // Flux DiT RoPE embedding concat shape mismatch at tiny dims — needs arch-specific fix

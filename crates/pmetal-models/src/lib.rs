@@ -33,18 +33,6 @@
 //! [`CausalLMModel`]: traits::CausalLMModel
 //! [`DynamicModel`]: dispatcher::DynamicModel
 
-// Crate-level lint configuration
-#![allow(missing_docs)]
-#![allow(unused_imports)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::type_complexity)]
-#![allow(clippy::large_enum_variant)]
-#![allow(clippy::len_zero)]
-#![allow(ambiguous_glob_reexports)]
-
 #[cfg(feature = "ane")]
 mod ane_worker;
 pub mod architectures;

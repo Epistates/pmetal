@@ -6,9 +6,7 @@
 //! - GeGLU instead of SwiGLU (uses GELU instead of SiLU)
 //! - Embedding scaling by sqrt(hidden_size)
 //! - Gemma2: Attention logit softcapping, sliding window, extra normalization
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn};
 use pmetal_bridge::impl_module_params;
 
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};

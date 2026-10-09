@@ -2,11 +2,11 @@
 //!
 //! This module provides a fused Metal sampling kernel that executes all
 //! sampling operations in a single GPU kernel launch, eliminating the
-//! CPU overhead of multiple mlx-rs operations.
+//! CPU overhead of running the sampling ops one by one.
 //!
 //! # Performance Benefits
 //!
-//! - **Single kernel launch** vs 10+ separate launches with mlx-rs path
+//! - **Single kernel launch** vs 10+ separate launches op by op
 //! - **Minimal CPU overhead** - critical for battery mode performance
 //! - **Zero-copy** from MLX arrays via unified memory
 //!
@@ -33,7 +33,7 @@ use std::sync::Arc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandBuffer;
-use pmetal_bridge::compat::{Array, Dtype};
+use pmetal_bridge::compat::Array;
 use pmetal_metal::{FusedSampler, MetalContext, MetalError, bridge::metal_buffer_from_ptr};
 
 /// Error type for MetalSampler operations.
@@ -67,7 +67,7 @@ struct PendingDispatch {
 
 /// High-performance Metal sampler using fused kernel.
 ///
-/// This sampler bypasses the mlx-rs sampling path to execute all sampling
+/// This sampler bypasses the op-by-op MLX sampling path to execute all sampling
 /// operations in a single Metal kernel, providing significant speedups
 /// especially on battery power where CPU is throttled.
 pub struct MetalSampler {

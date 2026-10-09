@@ -18,10 +18,8 @@
 use crate::decoder_layer::{
     AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
 };
-use pmetal_bridge::compat::nn::{Embedding, Linear, RmsNorm};
-use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random,
-};
+use pmetal_bridge::compat::nn::{Embedding, Linear};
+use pmetal_bridge::compat::{Array, Exception, Module, Param, nn};
 use pmetal_bridge::impl_module_params;
 
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
@@ -528,14 +526,10 @@ impl PhiMLP {
         let activated = match self.activation {
             PhiActivation::SwiGLU => {
                 // Split into gate and up projections
-                let gate = pmetal_bridge::compat::ops::slice_last_to(
-                    &hidden,
-                    self.intermediate_size as i32,
-                );
-                let up = pmetal_bridge::compat::ops::slice_last_from(
-                    &hidden,
-                    self.intermediate_size as i32,
-                );
+                let gate =
+                    pmetal_bridge::compat::ops::slice_last_to(&hidden, self.intermediate_size);
+                let up =
+                    pmetal_bridge::compat::ops::slice_last_from(&hidden, self.intermediate_size);
                 // SwiGLU: silu(gate) * up
                 let gate_activated = pmetal_bridge::compat::ops::sigmoid(&gate).multiply(&gate);
                 gate_activated.multiply(&up)

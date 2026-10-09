@@ -46,9 +46,7 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random,
-};
+use pmetal_bridge::compat::{Array, Exception, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
@@ -2003,6 +2001,7 @@ pub use crate::architectures::utils::LoadReport;
 #[cfg(test)]
 mod moe_tests {
     use super::*;
+    use pmetal_bridge::compat::{Dtype, ModuleParametersExt, random};
     use serial_test::serial;
 
     const VOCAB: i32 = 64;

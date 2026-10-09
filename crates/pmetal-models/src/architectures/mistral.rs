@@ -5,7 +5,7 @@
 //! Key differences from Llama:
 //! - Sliding Window Attention (SWA) for efficient long-context handling
 //! - Different default configurations
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, random};
+use pmetal_bridge::compat::{Array, Exception, Module, nn};
 use pmetal_bridge::impl_module_params;
 
 use std::collections::HashMap;
@@ -851,8 +851,10 @@ mod tests {
 
     #[test]
     fn test_mistral_config_with_sliding_window() {
-        let mut config = MistralConfig::default();
-        config.sliding_window = Some(4096);
+        let config = MistralConfig {
+            sliding_window: Some(4096),
+            ..Default::default()
+        };
         assert_eq!(config.sliding_window, Some(4096));
     }
 

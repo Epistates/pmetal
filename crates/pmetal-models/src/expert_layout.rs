@@ -168,6 +168,7 @@ pub struct ExpertPackLayout {
 
 impl ExpertPackLayout {
     /// Compute layout from model config parameters.
+    #[expect(clippy::too_many_arguments, reason = "one argument per config field")]
     pub fn new(
         model_name: String,
         num_layers: usize,

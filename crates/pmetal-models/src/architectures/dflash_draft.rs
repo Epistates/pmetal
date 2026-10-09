@@ -30,14 +30,11 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
-};
+use pmetal_bridge::compat::{Array, Exception, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_mlx::kv_cache::KVCache;
 
 // ----------------------------------------------------------------------------

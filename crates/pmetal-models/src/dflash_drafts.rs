@@ -24,6 +24,10 @@ use crate::dflash_decoder::DFlashDraftQuant;
 
 /// A DFlash draft model of either generation.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per loaded drafter; the size difference is irrelevant next to its weights"
+)]
 pub enum DFlashDraft {
     /// `DFlashDraftModel`: per-position argmax.
     V1(DFlashDraftModel),

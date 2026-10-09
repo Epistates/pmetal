@@ -32,7 +32,10 @@ pub struct WeightCache {
     /// when they are finished.
     references: HashMap<usize, usize>,
     /// Total number of layers in the model.
-    #[allow(dead_code)] // Kept for capacity planning and future eviction policy improvements
+    #[expect(
+        dead_code,
+        reason = "read by the eviction policy once the cache is wired in"
+    )]
     num_layers: usize,
     /// Cache statistics.
     stats: CacheStats,

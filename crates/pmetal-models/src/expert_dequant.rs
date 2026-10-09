@@ -212,7 +212,7 @@ fn validate_alignment(byte_len: usize, elem_size: usize, name: &'static str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expert_layout::{ExpertPackLayout, PackedBits};
+    use crate::expert_layout::PackedBits;
 
     /// Build a synthetic raw expert buffer filled with recognisable byte patterns.
     ///

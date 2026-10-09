@@ -8,9 +8,7 @@
 //! - No bias in attention projections
 //! - Per-layer sliding window configuration via `layer_types`
 
-use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, random,
-};
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn};
 use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
@@ -1294,7 +1292,7 @@ mod tests {
                 .hidden_states
                 .get(&idx)
                 .unwrap_or_else(|| panic!("layer {idx} not captured"));
-            assert_eq!(h.shape(), &[1, 4, hidden_size as i32]);
+            assert_eq!(h.shape(), &[1, 4, hidden_size]);
         }
     }
 

@@ -11,9 +11,7 @@ use std::{
     path::Path,
 };
 
-use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, transforms,
-};
+use pmetal_bridge::compat::{Array, Exception, Module, ModuleParametersExt, nn, ops, transforms};
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::qwen3_native::family::canonical_checkpoint_key;
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};

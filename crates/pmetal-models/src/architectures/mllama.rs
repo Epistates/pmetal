@@ -30,16 +30,11 @@
 //! checkpoint (`(448/14)² + 1 = 1025` pads to 1032), and it is plainly not the
 //! intent, so [`aspect_ratio_attention_mask`] builds the mask additively and
 //! leaves nothing masked when there is no padding.
-use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random,
-};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn, ops, random};
 use pmetal_bridge::impl_module_params;
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, get_training_context, rope::apply_rope,
-};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 

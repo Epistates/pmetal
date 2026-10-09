@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use pmetal_bridge::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn, ops};
+use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kv_cache::KVCache;
 

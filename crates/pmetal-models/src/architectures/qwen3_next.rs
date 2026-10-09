@@ -14,7 +14,7 @@ use pmetal_bridge::compat::ops::{
 };
 use pmetal_bridge::compat::{
     Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param,
-    VisitLinears, fast, nn, ops, random,
+    VisitLinears, nn, ops,
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_bridge::qwen3_native::family::gdn_qk_rms_norm_eps;
@@ -40,7 +40,7 @@ use pmetal_mlx::{
         AttentionMaskType, FusedAttentionConfig,
         fused_moe::moe_combine_mlx,
         fused_sdpa,
-        gated_delta::{self, gated_delta_update},
+        gated_delta::gated_delta_update,
         rope::{RopePositions, rope_embedding},
     },
 };
@@ -1510,6 +1510,10 @@ impl Qwen3NextGatedDeltaNet {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the projections one forward pass splits into"
+    )]
     fn finish_forward_from_conv_out(
         &mut self,
         conv_out: &Array,
@@ -1576,6 +1580,10 @@ impl Qwen3NextGatedDeltaNet {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the projections one forward pass splits into"
+    )]
     fn finish_forward_from_conv_out_profiled(
         &mut self,
         conv_out: &Array,
@@ -1613,7 +1621,6 @@ impl Qwen3NextGatedDeltaNet {
         ]);
         // Q/K normalization: use fast::rms_norm (1 fused Metal op) instead of
         // l2norm_last_dim (5 separate ops). Matches the reference exactly.
-        // Pass ones weight since mlx-rs binding requires a weight array.
         // Q/K normalization: fast::rms_norm (1 fused Metal op) with pre-baked
         // scale factors. inv_scale = 1/sqrt(dk).
         // q gets inv_scale² (because rms_norm divides by sqrt(mean) not sqrt(sum)),
@@ -3140,6 +3147,10 @@ fn load_missing_experts_into_aligned_buffers(
 // ============================================================================
 
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per layer, never moved; boxing would add an indirection to every forward"
+)]
 pub enum Qwen3NextFeedForward {
     Dense(Qwen3NextMLP),
     MoE(Qwen3NextSparseMoeBlock),
@@ -3366,6 +3377,10 @@ impl Qwen3NextDecoderLayer {
     /// (every 4th, see `Qwen3NextConfig::is_linear_layer`) run the plain
     /// [`forward`] path — their KV cache rollback is just `KVCache::rollback`
     /// and needs no extra per-token state.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the layer forward's inputs plus the capture"
+    )]
     pub fn forward_with_capture(
         &mut self,
         x: &Array,
@@ -3867,7 +3882,9 @@ impl Qwen3NextForCausalLM {
                 {
                     Some(slot) => slot,
                     None => {
-                        tracing::debug!("[INLINE] Bootstrapping InlineCache from mlx-rs caches");
+                        tracing::debug!(
+                            "[INLINE] Bootstrapping InlineCache from the prefill caches"
+                        );
                         self.inline_caches.push((
                             mb.sequence_key(),
                             super::qwen3_next_inline::InlineCache::from_caches(
@@ -3967,8 +3984,8 @@ impl Qwen3NextForCausalLM {
     ///
     /// This path intentionally bypasses the InlineArray decode closure used
     /// by [`forward_with_cache`] for `T = 1`: verify always runs with
-    /// `T > 1` (multiple draft tokens), so the standard mlx-rs path is the
-    /// correct target.
+    /// `T > 1` (multiple draft tokens), so the standard layer-by-layer
+    /// forward is the correct target.
     pub fn forward_with_capture(
         &mut self,
         input_ids: &Array,

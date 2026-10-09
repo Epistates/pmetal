@@ -1314,7 +1314,7 @@ impl GraniteForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::{ModuleParameters, random};
+    use pmetal_bridge::compat::random;
     use serial_test::serial;
 
     fn hybrid_config() -> GraniteConfig {
@@ -1679,19 +1679,21 @@ mod tests {
     #[test]
     #[serial]
     fn test_granite_model_instantiation() {
-        let mut config = GraniteConfig::default();
-        config.hidden_size = 64;
-        config.intermediate_size = 256;
-        config.num_hidden_layers = 2;
-        config.num_attention_heads = 4;
-        config.num_key_value_heads = 2;
-        config.head_dim = Some(16);
-        config.vocab_size = 1000;
-        config.tie_word_embeddings = true;
+        let config = GraniteConfig {
+            hidden_size: 64,
+            intermediate_size: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: Some(16),
+            vocab_size: 1000,
+            tie_word_embeddings: true,
+            ..Default::default()
+        };
 
         let model = GraniteForCausalLM::new(config).unwrap();
 
         let params = model.flatten_params();
-        assert!(params.len() > 0);
+        assert!(!params.is_empty());
     }
 }

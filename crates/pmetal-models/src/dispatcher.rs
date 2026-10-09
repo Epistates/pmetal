@@ -6,13 +6,12 @@
 use crate::architectures::*;
 use crate::loader::{
     Qwen3NextLoadOptions, assign_weights, load_bert_weights, load_generic_weights,
-    load_nemotron_weights, load_qwen3_next_weights_with_options, load_weights,
+    load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
-    ModuleParametersExt, nn, ops, transforms,
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops,
 };
 use pmetal_mlx::kv_cache::{
     CacheMode, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache,
@@ -711,6 +710,10 @@ impl LmHead {
 }
 
 /// A model whose architecture is dispatched at runtime.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per loaded model; the size difference is irrelevant next to its weights"
+)]
 pub enum DynamicModel {
     Llama(LlamaForCausalLM),
     Llama4(Llama4ForCausalLM),

@@ -11,8 +11,7 @@ use std::{
 };
 
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
-    transforms,
+    Array, Dtype, Exception, ModuleParametersExt, Param, nn, ops, transforms,
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::rope::RopePositions;
