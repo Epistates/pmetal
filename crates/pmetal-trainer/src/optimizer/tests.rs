@@ -269,3 +269,57 @@ fn plain_adamw_trains_embeddings_at_the_rate_it_was_given() {
     opt.set_lr(0.0);
     assert_eq!(opt.lr(), 0.0);
 }
+
+/// One weight, for driving [`Optimizer::update`] through a model.
+struct OneWeight {
+    w: pmetal_bridge::compat::Param<Array>,
+}
+pmetal_bridge::impl_module_params!(OneWeight; w);
+
+fn one_weight() -> OneWeight {
+    OneWeight {
+        w: pmetal_bridge::compat::Param::new(arr(&[1.0, 1.0], &[2])),
+    }
+}
+
+/// A [3] gradient for the [2] weight: no update rule's arithmetic broadcasts.
+fn misfit_gradient() -> FlattenedModuleParam {
+    [(key("w"), arr(&[1.0, 1.0, 1.0], &[3]))].into()
+}
+
+#[test]
+fn an_update_that_fails_on_the_gpu_stops_the_step_and_names_the_parameter() {
+    // The failed op hands back a zero placeholder, so the update used to
+    // finish, leave the weight where it was, and return Ok.
+    let kinds = [
+        OptimizerType::AdamW,
+        OptimizerType::Sgd,
+        OptimizerType::Lion,
+        OptimizerType::Adafactor,
+    ];
+    for kind in kinds {
+        let mut opt = TrainOptimizer::new(kind, 0.1, 0.0);
+        let err = opt
+            .update(&mut one_weight(), misfit_gradient())
+            .expect_err("a gradient that doesn't fit its weight must fail the update");
+        assert!(err.what().contains("`w`"), "{kind:?}: {}", err.what());
+        // The failure was reported; nothing is left pending for the next kind.
+        let _ = pmetal_bridge::check_unobserved_error();
+    }
+}
+
+#[test]
+fn the_plain_adamw_update_reports_a_failed_parameter_too() {
+    let mut model = one_weight();
+    let mut opt = AdamWBuilder::new(0.1).weight_decay(0.0).build().unwrap();
+    assert!(opt.update(&mut model, misfit_gradient()).is_err());
+    let _ = pmetal_bridge::check_unobserved_error();
+
+    // A gradient that fits still trains.
+    let mut model = one_weight();
+    let mut opt = AdamWBuilder::new(0.1).weight_decay(0.0).build().unwrap();
+    let grads: FlattenedModuleParam = [(key("w"), arr(&[1.0, -1.0], &[2]))].into();
+    opt.update(&mut model, grads).unwrap();
+    assert_close(&values(&model.w), &[0.9, 1.1], 1e-5);
+    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+}

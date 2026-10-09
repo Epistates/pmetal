@@ -28,8 +28,8 @@ use std::rc::Rc;
 
 use pmetal_bridge::compat::{
     Array, Exception, FlattenedModuleParam,
-    module::{ModuleParameters, ModuleParametersExt},
-    optimizers::{AdamW, AdamWBuilder, Optimizer, State, Updatable},
+    module::ModuleParameters,
+    optimizers::{AdamW, AdamWBuilder, Optimizer, State, Updatable, apply_updates},
 };
 use pmetal_core::{OptimizerType, TrainingConfig};
 
@@ -288,23 +288,8 @@ impl Optimizer for Adafactor {
         gradients: FlattenedModuleParam,
     ) -> Result<()> {
         self.advance_step();
-        apply_to_model(self, model, gradients)
+        apply_updates(self, model, gradients)
     }
-}
-
-/// Run `update_single` over every parameter that has a gradient.
-fn apply_to_model<O: Optimizer, M: ModuleParameters>(
-    optimizer: &mut O,
-    model: &mut M,
-    gradients: FlattenedModuleParam,
-) -> Result<()> {
-    let mut flat = model.flatten_params_mut();
-    for (key, grad) in &gradients {
-        if let Some(arr) = flat.get_mut(key.as_ref()) {
-            optimizer.update_single(key, grad, arr)?;
-        }
-    }
-    Ok(())
 }
 
 /// One optimizer of the kind an [`OptimizerType`] names.
@@ -425,7 +410,7 @@ impl Optimizer for TrainOptimizer {
         gradients: FlattenedModuleParam,
     ) -> Result<()> {
         self.advance_step();
-        apply_to_model(self, model, gradients)
+        apply_updates(self, model, gradients)
     }
 }
 
@@ -617,7 +602,7 @@ impl Optimizer for ParamGroupOptimizer {
         for group in self.groups_mut() {
             group.advance_step();
         }
-        apply_to_model(self, model, gradients)
+        apply_updates(self, model, gradients)
     }
 }
 

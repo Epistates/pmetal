@@ -21,18 +21,40 @@ pub trait Optimizer {
         model: &mut M,
         gradients: FlattenedModuleParam,
     ) -> Result<(), Exception> {
-        // Flatten the nested parameter tree so that dotted keys from
-        // value_and_grad (e.g. "layers.0.self_attn.q_proj.lora_a") can
-        // be matched directly.  The old code looked up flat keys against
-        // the nested root map, where they could never be found.
-        let mut flat = model.flatten_params_mut();
-        for (key, grad) in &gradients {
-            if let Some(arr) = flat.get_mut(key.as_ref()) {
-                let _ = self.update_single(key, grad, arr);
-            }
-        }
-        Ok(())
+        apply_updates(self, model, gradients)
     }
+}
+
+/// Run [`Optimizer::update_single`] over every parameter that has a
+/// gradient, stopping at the first update that fails.
+///
+/// A bridge op that throws hands back a scalar-zero placeholder instead of
+/// unwinding, so a gradient that doesn't fit its parameter used to leave the
+/// parameter where it was while the step still reported a loss. The bridge's
+/// first unobserved error is read before the updates (a failure in the
+/// forward or backward pass is reported as that) and after each parameter,
+/// so an update failure names the parameter it broke.
+pub fn apply_updates<O: Optimizer + ?Sized, M: ModuleParameters>(
+    optimizer: &mut O,
+    model: &mut M,
+    gradients: FlattenedModuleParam,
+) -> Result<(), Exception> {
+    crate::error::check_unobserved_error().map_err(|e| {
+        Exception::custom(format!(
+            "a bridge op failed before the optimizer update: {e}"
+        ))
+    })?;
+    // Gradient keys are dotted paths ("layers.0.self_attn.q_proj.lora_a"),
+    // so they're matched against the flattened parameter tree.
+    let mut flat = model.flatten_params_mut();
+    for (key, grad) in &gradients {
+        if let Some(arr) = flat.get_mut(key.as_ref()) {
+            optimizer.update_single(key, grad, arr)?;
+            crate::error::check_unobserved_error()
+                .map_err(|e| Exception::custom(format!("optimizer update of `{key}`: {e}")))?;
+        }
+    }
+    Ok(())
 }
 
 /// Updatable: exposes state arrays for eval/checkpointing.
@@ -144,13 +166,7 @@ impl Optimizer for AdamW {
     ) -> Result<(), Exception> {
         // Advance the step counter ONCE per training step, not per parameter.
         self.inner.advance_step();
-        let mut flat = model.flatten_params_mut();
-        for (key, grad) in &gradients {
-            if let Some(arr) = flat.get_mut(key.as_ref()) {
-                let _ = self.update_single(key, grad, arr);
-            }
-        }
-        Ok(())
+        apply_updates(self, model, gradients)
     }
 }
 
