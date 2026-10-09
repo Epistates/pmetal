@@ -221,6 +221,10 @@ impl Distiller {
     }
 
     /// Compute loss with hidden state alignment.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "public API: the inputs of one loss step"
+    )]
     pub fn compute_loss_with_hidden(
         &self,
         teacher_logits: &Array,
@@ -387,7 +391,7 @@ fn compute_hard_loss(logits: &Array, labels: &Array, ignore_index: i32) -> Resul
     // gather lookup; their contribution is zeroed by `valid_mask` afterwards.
     // Negative labels (e.g. -100) would otherwise crash gather.
     let zero_i = Array::from_i32(0);
-    let upper = Array::from_i32((vocab_size - 1) as i32);
+    let upper = Array::from_i32(vocab_size - 1);
     let labels_clamped = ops::minimum(&ops::maximum(&labels_flat, &zero_i), &upper)
         .as_dtype(Dtype::Int32.as_i32())
         .reshape(&[-1, 1]);

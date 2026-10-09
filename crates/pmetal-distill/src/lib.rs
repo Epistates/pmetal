@@ -40,14 +40,6 @@
 //! // Use `distiller.compute_loss(...)` inside your own training loop.
 //! ```
 
-// Crate-level lint configuration for ML/GPU code patterns
-#![allow(missing_docs)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::type_complexity)]
-
 mod config;
 mod distill;
 mod error;

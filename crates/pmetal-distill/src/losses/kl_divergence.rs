@@ -220,14 +220,8 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 10.0)
             .collect();
 
-        let teacher = Array::from_f32_slice(
-            &teacher_data,
-            &[batch_size as i32, seq_len as i32, vocab_size as i32],
-        );
-        let student = Array::from_f32_slice(
-            &student_data,
-            &[batch_size as i32, seq_len as i32, vocab_size as i32],
-        );
+        let teacher = Array::from_f32_slice(&teacher_data, &[batch_size, seq_len, vocab_size]);
+        let student = Array::from_f32_slice(&student_data, &[batch_size, seq_len, vocab_size]);
 
         let loss = KlDivergenceLoss::new();
         let result = loss.compute(&teacher, &student, 2.0).unwrap();

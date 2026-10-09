@@ -306,7 +306,7 @@ pub fn align_vocab_with_k(
     // first k indices correspond to the k largest teacher logit positions.
     // O(V) vs O(V log V) for argsort — significant win at vocab size ~150k.
     let neg_teacher = teacher_logits.negative();
-    let partitioned_indices = ops::argpartition_axis(&neg_teacher, k as i32, -1);
+    let partitioned_indices = ops::argpartition_axis(&neg_teacher, k, -1);
 
     // Slice first k positions along the last axis.
     //
