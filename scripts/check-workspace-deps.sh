@@ -5,7 +5,8 @@
 #    [workspace.dependencies]: `dep = { workspace = true, ... }` or
 #    `dep.workspace = true`. A member that names a version, path or git source
 #    itself fails.
-# 2. The GUI (crates/pmetal-gui/src-tauri) and fuzz workspaces can't inherit
+# 2. Every [workspace.dependencies] entry is inherited by some member.
+# 3. The GUI (crates/pmetal-gui/src-tauri) and fuzz workspaces can't inherit
 #    from the root, so every crate they share with it must carry the same
 #    requirement string as the root's entry.
 #
@@ -70,6 +71,18 @@ root_reqs=$(awk '
     }
 ' Cargo.toml)
 
+# An entry no member inherits is a version nobody gets reminded to bump.
+while IFS=$'\t' read -r name _; do
+    used=0
+    for manifest in $members; do
+        if grep -qE "^${name}( *=|\.workspace)" "$manifest"; then
+            used=1
+            break
+        fi
+    done
+    ((used)) || fail "Cargo.toml: [workspace.dependencies] $name: no member uses it"
+done <<<"$root_reqs"
+
 for manifest in crates/pmetal-gui/src-tauri/Cargo.toml fuzz/Cargo.toml; do
     while IFS=$'\t' read -r sec name rest; do
         [[ $rest =~ path\ *= ]] && continue
@@ -84,7 +97,7 @@ for manifest in crates/pmetal-gui/src-tauri/Cargo.toml fuzz/Cargo.toml; do
 done
 
 if ((errors > 0)); then
-    echo "FAIL: $errors dependency declaration(s) bypass the root [workspace.dependencies]"
+    echo "FAIL: $errors dependency declaration(s) out of line with the root [workspace.dependencies]"
     exit 1
 fi
 echo "Every dependency comes from the root [workspace.dependencies]"

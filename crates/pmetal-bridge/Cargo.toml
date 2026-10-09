@@ -25,7 +25,6 @@ tq-ablation = []
 [dependencies]
 half = { workspace = true }
 memmap2 = { workspace = true }
-libc = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -5194,7 +5194,6 @@ dependencies = [
  "cc",
  "cmake",
  "half",
- "libc",
  "memmap2",
  "rand 0.10.3",
  "safetensors",
@@ -5212,7 +5211,6 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -5256,11 +5254,7 @@ version = "0.6.0"
 dependencies = [
  "bitcode",
  "criterion",
- "half",
- "indicatif",
  "pmetal-bridge",
- "pmetal-core",
- "pmetal-mlx",
  "safetensors",
  "serde",
  "serde-saphyr",
@@ -5269,7 +5263,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]
@@ -5279,7 +5272,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitcode",
- "bytes",
  "dirs 7.0.0",
  "futures",
  "half",
@@ -5289,7 +5281,6 @@ dependencies = [
  "parking_lot",
  "petgraph",
  "pmetal-bridge",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "sha3",
@@ -5322,14 +5313,12 @@ dependencies = [
  "base64 0.23.1",
  "dirs 7.0.0",
  "hf-hub",
- "indicatif",
  "pmetal-core",
  "pmetal-gguf",
  "reqwest",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
  "walkdir",
@@ -5340,14 +5329,11 @@ name = "pmetal-lora"
 version = "0.6.0"
 dependencies = [
  "criterion",
- "half",
  "pmetal-bridge",
  "pmetal-core",
- "pmetal-gguf",
  "pmetal-metal",
  "pmetal-mlx",
  "pmetal-models",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
@@ -5379,12 +5365,9 @@ dependencies = [
  "criterion",
  "half",
  "hf-hub",
- "indicatif",
  "memmap2",
  "ndarray",
  "pmetal-bridge",
- "pmetal-core",
- "pmetal-mlx",
  "rand 0.10.3",
  "regex",
  "safetensors",
@@ -5401,14 +5384,12 @@ dependencies = [
 name = "pmetal-metal"
 version = "0.6.0"
 dependencies = [
- "block2",
  "cc",
  "criterion",
  "dirs 7.0.0",
  "dispatch2",
  "half",
  "memmap2",
- "num-traits",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
@@ -5419,7 +5400,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.21",
  "tracing",
  "zerocopy",
 ]
@@ -5445,7 +5425,6 @@ version = "0.6.0"
 dependencies = [
  "dirs 7.0.0",
  "half",
- "num-traits",
  "pmetal-bridge",
  "pmetal-core",
  "pmetal-metal",
@@ -5456,7 +5435,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
- "zerocopy",
 ]
 
 [[package]]
@@ -5515,12 +5493,10 @@ dependencies = [
  "futures",
  "image",
  "pmetal-bridge",
- "pmetal-core",
  "pmetal-data",
  "pmetal-metal",
  "pmetal-mlx",
  "pmetal-models",
- "rand 0.10.3",
  "serde",
  "serde_json",
  "tempfile",
@@ -5528,7 +5504,6 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
- "tower",
  "tower-http 0.7.1",
  "tracing",
  "uuid",
@@ -5577,15 +5552,11 @@ dependencies = [
  "criterion",
  "half",
  "hf-hub",
- "num-traits",
  "pmetal-bridge",
- "pmetal-core",
- "pmetal-mlx",
  "safetensors",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tracing",
  "zerocopy",
 ]
 

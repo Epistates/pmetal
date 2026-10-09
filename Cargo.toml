@@ -69,11 +69,9 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 futures = "0.3.34"
 async-trait = "0.1"
-bytes = "1.12"
 
 # HTTP server (pmetal-serve)
 axum = "0.8"
-tower = "0.5"
 tower-http = "0.7"
 
 # MCP server (pmetal-mcp)
@@ -152,12 +150,10 @@ objc2-metal = { version = "0.3", features = [
     "MTLResidencySet", "MTLAllocation",
 ] }
 dispatch2 = "0.3"
-block2 = "0.6"
 
 # Utilities
 zerocopy = { version = "0.8", features = ["derive"] }
 half = { version = "2", features = ["zerocopy"] }
-num-traits = "0.2"
 ndarray = { version = "0.17", features = ["rayon"] }
 rayon = "1"
 # Floors at or past RUSTSEC-2026-0097 (rand) and RUSTSEC-2026-0186 (memmap2),

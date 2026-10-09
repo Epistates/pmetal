@@ -35,7 +35,6 @@ anyhow = { workspace = true }
 
 # Async utilities
 futures = { workspace = true }
-bytes = { workspace = true }
 async-trait = { workspace = true }
 zerocopy = { workspace = true }
 
@@ -60,7 +59,6 @@ petgraph = { workspace = true }
 # Utilities
 dirs = { workspace = true }
 sha3 = { workspace = true }
-rand = { workspace = true }
 parking_lot = { workspace = true }
 half = { workspace = true }
 ordered-float = { workspace = true }

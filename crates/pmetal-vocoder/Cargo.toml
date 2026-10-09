@@ -10,16 +10,12 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-pmetal-core = { workspace = true }
-pmetal-mlx = { workspace = true }
 pmetal-bridge = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 safetensors = { workspace = true }
 hf-hub = { workspace = true, features = ["blocking"] }
-tracing = { workspace = true }
-num-traits = { workspace = true }
 half = { workspace = true }
 zerocopy = { workspace = true }
 

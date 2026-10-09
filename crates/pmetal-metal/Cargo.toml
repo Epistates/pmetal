@@ -23,15 +23,10 @@ objc2 = { workspace = true }
 objc2-foundation = { workspace = true }
 objc2-metal = { workspace = true }
 dispatch2 = { workspace = true }
-block2 = { workspace = true }
 
 # Numeric types
 half = { workspace = true }
 zerocopy = { workspace = true }
-num-traits = { workspace = true }
-
-# Error handling
-thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
