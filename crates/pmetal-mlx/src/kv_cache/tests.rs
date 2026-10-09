@@ -1424,8 +1424,10 @@ fn test_gdn_rollback_matches_never_went_there() {
     .unwrap();
 
     // Rollback path: advance through the full verify batch, then rewind
-    let mut entry = MambaCacheEntry::default();
-    entry.ssm_state = Some(initial_state.clone());
+    let mut entry = MambaCacheEntry {
+        ssm_state: Some(initial_state.clone()),
+        ..Default::default()
+    };
     let snapshot = entry.snapshot();
 
     // Simulate verify advancing through all K tokens

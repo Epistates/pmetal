@@ -32,7 +32,6 @@
 //! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
 //!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
-use crate::array_ext::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, Exception, linalg, ops};
 
 /// Default chunk size for the chunkwise parallel GDN algorithm.
@@ -328,44 +327,32 @@ pub fn gated_delta_ops(
         let v_h = v.dim(2) as usize;
         let v_d = v.dim(3) as usize;
         let q_t = q
-            .slice(
-                &[0, t_idx, 0, 0],
-                &[b as i32, ti1 as i32, q_h as i32, q_d as i32],
-            )
+            .slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, q_h as i32, q_d as i32])
             .squeeze(1);
         let k_t = k
-            .slice(
-                &[0, t_idx, 0, 0],
-                &[b as i32, ti1 as i32, q_h as i32, q_d as i32],
-            )
+            .slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, q_h as i32, q_d as i32])
             .squeeze(1);
         let v_t = v
-            .slice(
-                &[0, t_idx, 0, 0],
-                &[b as i32, ti1 as i32, v_h as i32, v_d as i32],
-            )
+            .slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, v_h as i32, v_d as i32])
             .squeeze(1);
 
         let g_t = if g.ndim() == 3 {
             let g_h = g.dim(2) as usize;
-            g.slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, g_h as i32])
+            g.slice(&[0, t_idx, 0], &[b, ti1 as i32, g_h as i32])
                 .squeeze(1)
         } else {
             let g_h = g.dim(2) as usize;
             let g_d = g.dim(3) as usize;
-            g.slice(
-                &[0, t_idx, 0, 0],
-                &[b as i32, ti1 as i32, g_h as i32, g_d as i32],
-            )
-            .squeeze(1)
+            g.slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, g_h as i32, g_d as i32])
+                .squeeze(1)
         };
 
         let beta_h = beta.dim(2) as usize;
         let beta_t = beta
-            .slice(&[0, t_idx, 0], &[b as i32, ti1 as i32, beta_h as i32])
+            .slice(&[0, t_idx, 0], &[b, ti1 as i32, beta_h as i32])
             .squeeze(1);
 
-        let mask_t = mask.map(|m| m.slice(&[0, t_idx], &[b as i32, ti1 as i32]).squeeze(1));
+        let mask_t = mask.map(|m| m.slice(&[0, t_idx], &[b, ti1 as i32]).squeeze(1));
 
         let (y, new_state) =
             gated_delta_step_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, mask_t.as_ref())?;
@@ -1277,9 +1264,7 @@ mod tests {
 
         // Mask: first 100 tokens valid, last 28 masked
         let mut mask_data = vec![1.0f32; t as usize];
-        for i in 100..t as usize {
-            mask_data[i] = 0.0;
-        }
+        mask_data[100..].fill(0.0);
         let mask = Array::from_f32_slice(&mask_data, &[b, t]);
 
         let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());

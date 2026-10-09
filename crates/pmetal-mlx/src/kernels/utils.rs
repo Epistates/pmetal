@@ -3,7 +3,7 @@
 //! This module provides common functions for converting between MLX arrays
 //! and Metal buffers.
 
-use crate::{array_ext::ArrayDtypeExt, bridge::MlxMetalBridge, error::MlxError};
+use crate::{bridge::MlxMetalBridge, error::MlxError};
 use half::f16;
 use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_metal::{

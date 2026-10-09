@@ -13,8 +13,7 @@
 
 use std::{sync::OnceLock, time::Instant};
 
-use crate::ArrayDtypeExt;
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
+use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 use pmetal_metal::{
     FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, KernelDispatch,
     MetalContext, MppFlashAttention, MppFlashAttentionConfig,
@@ -1152,6 +1151,7 @@ fn create_chunk_causal_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::random;
 
     fn random_tensor(shape: &[i32]) -> Array {
         random::normal(shape, Dtype::Float32)

@@ -65,7 +65,6 @@ impl ArrayExt for Array {
     }
 
     fn element_size(&self) -> usize {
-        use ArrayDtypeExt;
         match self.dtype() {
             Dtype::Bool | Dtype::Int8 | Dtype::Uint8 => 1,
             Dtype::Int16 | Dtype::Uint16 | Dtype::Float16 | Dtype::Bfloat16 => 2,

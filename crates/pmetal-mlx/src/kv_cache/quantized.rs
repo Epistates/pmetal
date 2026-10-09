@@ -2,8 +2,6 @@
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
-use crate::array_ext::ArrayDtypeExt;
-
 /// Quantized representation of cached K/V tensors.
 #[derive(Debug, Clone)]
 struct QuantizedTensor {

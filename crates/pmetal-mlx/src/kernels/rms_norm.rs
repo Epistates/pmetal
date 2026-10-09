@@ -2,7 +2,7 @@
 //!
 //! Wraps the pmetal-bridge RmsNorm implementation.
 
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_bridge::compat::Array;
 
 /// Apply RMS normalization to a tensor (functional version).
 ///

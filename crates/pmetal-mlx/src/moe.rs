@@ -6,15 +6,10 @@
 //! is the expert itself: a bias-free SwiGLU MLP whose weights a checkpoint
 //! fills.
 
-#![allow(missing_docs)]
-
-use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, ops};
 use pmetal_bridge::impl_module_params;
 
-/// Minimal linear layer: weight [out, in], no bias.
-///
-/// Replaces `nn::Linear` — keeps `pmetal-mlx` free of mlx-rs module machinery.
+/// Minimal linear layer: weight [out, in], no bias, zero-initialised.
 #[derive(Debug, Clone)]
 pub struct Linear {
     /// Weight matrix, shape `[out_features, in_features]`.
@@ -39,13 +34,17 @@ impl Linear {
 /// Single expert MLP (SwiGLU).
 #[derive(Debug)]
 pub struct Expert {
+    /// Gate projection, `[intermediate, hidden]`.
     pub w1: Linear,
+    /// Up projection, `[intermediate, hidden]`.
     pub w3: Linear,
+    /// Down projection, `[hidden, intermediate]`.
     pub w2: Linear,
 }
 impl_module_params!(Expert; w1, w3, w2);
 
 impl Expert {
+    /// Create a zero-initialised expert; a checkpoint fills the weights.
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Self {
         Self {
             w1: Linear::new(hidden_size, intermediate_size),
@@ -54,6 +53,7 @@ impl Expert {
         }
     }
 
+    /// `w2(silu(w1(x)) * w3(x))`.
     pub fn forward(&self, x: &Array) -> Array {
         let gate = self.w1.forward(x);
         // SwiGLU: silu(gate) * up

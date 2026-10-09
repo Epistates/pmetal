@@ -451,9 +451,7 @@ impl SpeculativeDecoder {
         let mut rejection_idx = None;
 
         // Rejection sampling
-        for i in 0..k {
-            let token = tokens[i];
-
+        for (i, &token) in tokens.iter().enumerate().take(k) {
             // Get probability of this token under both models
             let p_draft = draft_probs
                 .slice(&[i as i32, token], &[i as i32 + 1, token + 1])
@@ -553,7 +551,7 @@ impl SpeculativeDecoder {
             .collect();
         let mut accepted_tokens = Vec::new();
 
-        for i in 0..k {
+        for (i, &token) in tokens.iter().enumerate().take(k) {
             let target_row = target_logits
                 .slice(&[i as i32, 0], &[i as i32 + 1, target_logits.dim(1)])
                 .squeeze(0);
@@ -561,8 +559,8 @@ impl SpeculativeDecoder {
             best_idx.eval();
             let best_token = best_idx.item::<u32>() as i32;
 
-            if tokens[i] == best_token {
-                accepted_tokens.push(tokens[i]);
+            if token == best_token {
+                accepted_tokens.push(token);
             } else {
                 // Rejected: return the target argmax token as the correction token,
                 // expressed as log-prob logits (one-hot in log space).
@@ -879,11 +877,11 @@ mod tests {
     fn test_estimate_optimal_k() {
         // 7B target, 350M draft (20x ratio) -> K ≈ sqrt(20) ≈ 4-5
         let k = estimate_optimal_k(350_000_000, 7_000_000_000);
-        assert!(k >= 3 && k <= 6);
+        assert!((3..=6).contains(&k));
 
         // 70B target, 1B draft (70x ratio) -> K ≈ sqrt(70) ≈ 8
         let k = estimate_optimal_k(1_000_000_000, 70_000_000_000);
-        assert!(k >= 6 && k <= 10);
+        assert!((6..=10).contains(&k));
     }
 
     #[test]
@@ -912,18 +910,22 @@ mod tests {
 
     #[test]
     fn test_stats_acceptance_rate() {
-        let mut stats = SpeculativeStats::default();
-        stats.total_draft_tokens = 100;
-        stats.total_accepted = 75;
+        let stats = SpeculativeStats {
+            total_draft_tokens: 100,
+            total_accepted: 75,
+            ..Default::default()
+        };
 
         assert!((stats.acceptance_rate() - 0.75).abs() < 0.01);
     }
 
     #[test]
     fn test_stats_tokens_per_iteration() {
-        let mut stats = SpeculativeStats::default();
-        stats.total_tokens = 30;
-        stats.num_iterations = 10;
+        let stats = SpeculativeStats {
+            total_tokens: 30,
+            num_iterations: 10,
+            ..Default::default()
+        };
 
         assert!((stats.tokens_per_iteration() - 3.0).abs() < 0.01);
     }

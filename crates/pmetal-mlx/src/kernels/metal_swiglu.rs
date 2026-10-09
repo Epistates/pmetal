@@ -37,9 +37,7 @@
 //! let output = mlp.forward(&input, &gate_weight, &up_weight, &down_weight)?;
 //! ```
 
-use pmetal_bridge::compat::{Array, Dtype, random};
-
-use crate::error::MlxError;
+use pmetal_bridge::compat::Array;
 
 use super::utils::Result;
 
@@ -403,6 +401,7 @@ pub fn fused_swiglu_lora_forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::{Dtype, random};
 
     #[test]
     fn test_fused_swiglu_config() {

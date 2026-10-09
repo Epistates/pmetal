@@ -4,7 +4,6 @@ use std::sync::{Arc, Weak};
 
 use pmetal_bridge::compat::{Array, Exception, ops};
 
-use crate::array_ext::ArrayDtypeExt;
 use crate::kernels::gated_delta_state_advance;
 
 /// Cache for Mamba-2 SSM state during autoregressive generation.
@@ -240,8 +239,8 @@ impl MambaCacheEntry {
     ) -> Result<Array, Exception> {
         let pad_len = (kernel_size - 1) as usize;
         let shape = input.shape();
-        let batch = shape[0] as i32;
-        let conv_dim = shape[2] as i32;
+        let batch = shape[0];
+        let conv_dim = shape[2];
 
         // Get or initialize conv state with matching dtype
         let conv_state = if let Some(ref state) = self.conv_state {

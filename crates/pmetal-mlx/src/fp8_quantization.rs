@@ -27,8 +27,7 @@
 //! Runtime inference quantization is wired through the shared model loader and
 //! uses MLX native E4M3 FP8 encode/decode through `pmetal-bridge`.
 
-use crate::ArrayDtypeExt;
-use pmetal_bridge::compat::{Array, Dtype, Exception, random};
+use pmetal_bridge::compat::{Array, Dtype, Exception};
 use serde::{Deserialize, Serialize};
 
 #[inline]
@@ -44,21 +43,16 @@ fn from_fp8(x: &Array, dtype: Dtype) -> Result<Array, Exception> {
 /// FP8 format type.
 ///
 /// MLX currently supports E4M3 format natively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fp8Format {
     /// E4M3 format: 4-bit exponent, 3-bit mantissa.
     /// Range: ~±240, Best for weights.
+    #[default]
     E4M3,
     /// E5M2 format: 5-bit exponent, 2-bit mantissa.
     /// Range: ~±57344, Best for activations.
     /// Note: Currently uses E4M3 internally as MLX only supports E4M3.
     E5M2,
-}
-
-impl Default for Fp8Format {
-    fn default() -> Self {
-        Self::E4M3
-    }
 }
 
 impl Fp8Format {
@@ -319,6 +313,7 @@ pub fn calculate_fp8_savings(original_size_bytes: usize, dtype_bits: usize) -> (
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::random;
 
     #[test]
     fn test_fp8_format() {

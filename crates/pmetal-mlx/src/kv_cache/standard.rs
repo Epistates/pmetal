@@ -2,7 +2,6 @@
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
 
-use crate::array_ext::ArrayDtypeExt;
 use crate::kernels::FusedAttentionConfig;
 
 use super::{

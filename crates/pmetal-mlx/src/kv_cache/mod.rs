@@ -84,9 +84,10 @@ pub struct KVCacheConfig {
 }
 
 /// KV cache mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheMode {
     /// Standard cache - stores all past tokens.
+    #[default]
     Standard,
     /// Sliding window cache with fixed size.
     SlidingWindow {
@@ -126,12 +127,6 @@ pub enum CacheMode {
         /// TurboQuant K/V configuration.
         config: TurboQuantConfig,
     },
-}
-
-impl Default for CacheMode {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 impl CacheMode {
@@ -466,10 +461,10 @@ impl KVCacheConfig {
         match self.mode {
             CacheMode::Quantized { bits, group_size } => {
                 let el_per_int = 32 / bits as usize;
-                let k_packed = (key_dim + el_per_int - 1) / el_per_int;
-                let v_packed = (value_dim + el_per_int - 1) / el_per_int;
-                let k_groups = (key_dim + group_size - 1) / group_size;
-                let v_groups = (value_dim + group_size - 1) / group_size;
+                let k_packed = key_dim.div_ceil(el_per_int);
+                let v_packed = value_dim.div_ceil(el_per_int);
+                let k_groups = key_dim.div_ceil(group_size);
+                let v_groups = value_dim.div_ceil(group_size);
                 // packed u32 data + f16 scale + f16 bias per group
                 let k_per_token_bytes = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
                 let v_per_token_bytes = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
@@ -482,10 +477,10 @@ impl KVCacheConfig {
             } => {
                 let k_el = 32 / key_bits as usize;
                 let v_el = 32 / value_bits as usize;
-                let k_packed = (key_dim + k_el - 1) / k_el;
-                let v_packed = (value_dim + v_el - 1) / v_el;
-                let k_groups = (key_dim + group_size - 1) / group_size;
-                let v_groups = (value_dim + group_size - 1) / group_size;
+                let k_packed = key_dim.div_ceil(k_el);
+                let v_packed = value_dim.div_ceil(v_el);
+                let k_groups = key_dim.div_ceil(group_size);
+                let v_groups = value_dim.div_ceil(group_size);
                 let k_per_token = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
                 let v_per_token = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
                 (k_per_token + v_per_token) * self.max_seq_len * self.num_layers

@@ -15,7 +15,6 @@
 
 #![allow(unsafe_code)]
 
-use crate::array_ext::ArrayDtypeExt;
 use half::f16;
 use pmetal_bridge::compat::{Array, Dtype};
 use pmetal_metal::{
@@ -195,7 +194,7 @@ impl MlxMetalBridge {
             ));
         }
 
-        unsafe { metal_buffer_from_ptr(ctx, ptr as *mut u32, array.size()) }
+        unsafe { metal_buffer_from_ptr(ctx, ptr, array.size()) }
     }
 
     /// Copy MLX array data to a new f32 Metal buffer, converting dtype if needed.

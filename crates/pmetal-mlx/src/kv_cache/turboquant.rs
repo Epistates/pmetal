@@ -17,7 +17,6 @@ use pmetal_metal::{MetalContext, TurboQuantTransform};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tracing::debug;
 
-use crate::array_ext::ArrayDtypeExt;
 use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 
 /// Deterministic seed used for TurboQuant rotations and QJL projections.
@@ -2429,8 +2428,8 @@ fn encode_key_component_rows(
         }
     };
 
-    for row_idx in 0..num_rows {
-        if norms[row_idx] <= ZERO_EPSILON {
+    for (row_idx, &norm) in norms.iter().enumerate() {
+        if norm <= ZERO_EPSILON {
             let start = row_idx * core.dim;
             let end = start + core.dim;
             qjl_signs[start..end].fill(0);
@@ -2467,8 +2466,8 @@ fn encode_value_component_rows(
     }
 
     let mut indices = quantize_mse_rows(core, &normalized, value_bits);
-    for row_idx in 0..num_rows {
-        if norms[row_idx] <= ZERO_EPSILON {
+    for (row_idx, &norm) in norms.iter().enumerate() {
+        if norm <= ZERO_EPSILON {
             let start = row_idx * core.dim;
             let end = start + core.dim;
             indices[start..end].fill(0);
@@ -2627,8 +2626,7 @@ fn decode_key_component_rows_raw(
         // Codebook lookup scaled by per-row slot_scale, then inverse-rotated.
         let codebook = core.codebook(mse_bits);
         let mut decoded_rot = vec![0.0f32; total_rows * core.dim];
-        for row_idx in 0..total_rows {
-            let s = slot_scale[row_idx];
+        for (row_idx, &s) in slot_scale.iter().enumerate().take(total_rows) {
             let start = row_idx * core.dim;
             let end = start + core.dim;
             for i in start..end {
@@ -2647,8 +2645,7 @@ fn decode_key_component_rows_raw(
             .map(|value| if *value == 0 { -1.0 } else { 1.0 })
             .collect();
         let qjl = core.inverse_project_rows(&qjl_signs);
-        for row_idx in 0..total_rows {
-            let residual_norm = residual_norms[row_idx];
+        for (row_idx, &residual_norm) in residual_norms.iter().enumerate().take(total_rows) {
             if residual_norm <= ZERO_EPSILON {
                 continue;
             }
@@ -2664,10 +2661,9 @@ fn decode_key_component_rows_raw(
         }
     }
 
-    for row_idx in 0..total_rows {
+    for (row_idx, &norm) in norms.iter().enumerate() {
         let start = row_idx * core.dim;
         let end = start + core.dim;
-        let norm = norms[row_idx];
         if norm <= ZERO_EPSILON {
             reconstructed[start..end].fill(0.0);
             continue;
@@ -2686,12 +2682,10 @@ fn decode_value_component_rows_raw(
     norms: &[f32],
     value_bits: u8,
 ) -> Vec<f32> {
-    let total_rows = norms.len();
     let mut reconstructed = reconstruct_mse_rows(core, indices, value_bits);
-    for row_idx in 0..total_rows {
+    for (row_idx, &norm) in norms.iter().enumerate() {
         let start = row_idx * core.dim;
         let end = start + core.dim;
-        let norm = norms[row_idx];
         if norm <= ZERO_EPSILON {
             reconstructed[start..end].fill(0.0);
             continue;

@@ -5,7 +5,7 @@
 //! and adding synchronization barriers (4x eval() + waitUntilCompleted) made the
 //! Metal path 5-20x slower than the MLX ops it replaced.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, random};
+use pmetal_bridge::compat::{Array, Exception};
 
 /// MoE combine: weighted expert sum + sigmoid-gated shared expert.
 ///
@@ -51,6 +51,7 @@ pub fn moe_combine_mlx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::compat::{Dtype, random};
     use serial_test::serial;
 
     #[test]
