@@ -16,7 +16,7 @@ pmetal-bridge = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 indicatif = { workspace = true }

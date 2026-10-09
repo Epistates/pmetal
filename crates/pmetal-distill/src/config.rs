@@ -420,7 +420,7 @@ impl DistillConfig {
 
     /// Parse configuration from a YAML string.
     pub fn from_yaml(yaml: &str) -> crate::Result<Self> {
-        Ok(serde_yaml::from_str(yaml)?)
+        Ok(serde_saphyr::from_str(yaml)?)
     }
 
     /// Validate the configuration.

@@ -153,15 +153,18 @@ pub async fn search_models_with_tag(
     let client = build_client(token)?;
 
     let tag = pipeline_tag.unwrap_or("text-generation");
-    let url = format!(
-        "https://huggingface.co/api/models?search={}&filter={}&sort=downloads&direction=-1&limit={}&full=true",
-        urlencoding::encode(query),
-        urlencoding::encode(tag),
-        limit.min(50)
-    );
+    let limit = limit.min(50).to_string();
 
     let response = client
-        .get(&url)
+        .get("https://huggingface.co/api/models")
+        .query(&[
+            ("search", query),
+            ("filter", tag),
+            ("sort", "downloads"),
+            ("direction", "-1"),
+            ("limit", &limit),
+            ("full", "true"),
+        ])
         .send()
         .await
         .map_err(|e| pmetal_core::PMetalError::Hub(format!("Search request failed: {e}")))?;

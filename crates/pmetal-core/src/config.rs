@@ -542,17 +542,17 @@ mod tests {
         use super::{OptimizerType, TrainingConfig};
         for kind in OptimizerType::ALL {
             assert_eq!(kind.as_str().parse::<OptimizerType>(), Ok(kind));
-            let yaml = serde_yaml::to_string(&kind).unwrap();
+            let yaml = serde_saphyr::to_string(&kind).unwrap();
             assert_eq!(yaml.trim(), kind.as_str());
-            let back: OptimizerType = serde_yaml::from_str(&yaml).unwrap();
+            let back: OptimizerType = serde_saphyr::from_str(&yaml).unwrap();
             assert_eq!(back, kind);
         }
         assert_eq!("AdamW".parse::<OptimizerType>(), Ok(OptimizerType::AdamW));
         assert_eq!("adam_w".parse::<OptimizerType>(), Ok(OptimizerType::AdamW));
         assert!("adam".parse::<OptimizerType>().is_err());
-        let config: TrainingConfig = serde_yaml::from_str("optimizer: adam_w").unwrap();
+        let config: TrainingConfig = serde_saphyr::from_str("optimizer: adam_w").unwrap();
         assert_eq!(config.optimizer, OptimizerType::AdamW);
-        let config: TrainingConfig = serde_yaml::from_str("optimizer: lion").unwrap();
+        let config: TrainingConfig = serde_saphyr::from_str("optimizer: lion").unwrap();
         assert_eq!(config.optimizer, OptimizerType::Lion);
     }
 }

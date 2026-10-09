@@ -4171,7 +4171,7 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
         },
     };
 
-    let yaml = serde_yaml::to_string(&config)?;
+    let yaml = serde_saphyr::to_string(&config)?;
     std::fs::write(output, yaml)?;
 
     println!("Sample configuration written to: {}", output);

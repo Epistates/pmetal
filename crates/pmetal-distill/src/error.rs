@@ -65,7 +65,7 @@ pub enum DistillError {
 
     /// YAML parsing error.
     #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] serde_saphyr::Error),
 
     /// Bitcode serialization error.
     #[error("Bitcode error: {0}")]

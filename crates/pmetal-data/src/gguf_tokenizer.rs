@@ -20,7 +20,6 @@
 //! mechanics (round-trip encode/decode + special-token handling) on synthetic
 //! vocabularies.
 
-use ahash::AHashMap;
 use pmetal_core::{PMetalError, Result};
 use pmetal_gguf::tokenizer::GgufTokenizerData;
 use tokenizers::{
@@ -29,7 +28,10 @@ use tokenizers::{
         byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DecoderSequence,
         strip::Strip,
     },
-    models::{bpe::BpeBuilder, unigram::Unigram},
+    models::{
+        bpe::{BpeBuilder, Vocab},
+        unigram::Unigram,
+    },
     normalizers::{Prepend, Replace, Sequence as NormalizerSequence},
     pre_tokenizers::{
         byte_level::ByteLevel,
@@ -66,7 +68,7 @@ fn token_string(data: &GgufTokenizerData, id: Option<u32>) -> Option<String> {
 }
 
 fn build_bpe(data: &GgufTokenizerData) -> Result<HfTokenizer> {
-    let vocab: AHashMap<String, u32> = data
+    let vocab: Vocab = data
         .tokens
         .iter()
         .enumerate()

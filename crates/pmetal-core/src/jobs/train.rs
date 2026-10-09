@@ -659,8 +659,8 @@ mod tests {
             dataset: "d".into(),
             ..Default::default()
         };
-        let yaml = serde_yaml::to_string(&spec).expect("serialize");
-        let back: TrainSpec = serde_yaml::from_str(&yaml).expect("deserialize");
+        let yaml = serde_saphyr::to_string(&spec).expect("serialize");
+        let back: TrainSpec = serde_saphyr::from_str(&yaml).expect("deserialize");
         assert_eq!(back.model, spec.model);
         assert_eq!(back.dataset, spec.dataset);
         assert_eq!(back.learning_rate, spec.learning_rate);

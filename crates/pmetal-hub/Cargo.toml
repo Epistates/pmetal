@@ -21,8 +21,7 @@ dirs = { workspace = true }
 walkdir = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-reqwest = { workspace = true }
-urlencoding = { workspace = true }
+reqwest = { workspace = true, features = ["query"] }
 
 [dev-dependencies]
 base64 = { workspace = true }

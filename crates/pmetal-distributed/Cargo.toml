@@ -60,7 +60,6 @@ petgraph = { workspace = true }
 # Utilities
 dirs = { workspace = true }
 sha3 = { workspace = true }
-bs58 = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
 half = { workspace = true }

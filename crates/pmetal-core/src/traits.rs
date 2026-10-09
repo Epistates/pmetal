@@ -140,7 +140,7 @@ pub trait ConfigLoader: Sized + serde::de::DeserializeOwned {
 
     /// Load configuration from a YAML string.
     fn from_yaml(yaml: &str) -> Result<Self> {
-        serde_yaml::from_str(yaml).map_err(|e| crate::PMetalError::Config(e.to_string()))
+        serde_saphyr::from_str(yaml).map_err(|e| crate::PMetalError::Config(e.to_string()))
     }
 
     /// Load configuration from a JSON file.

@@ -393,7 +393,7 @@ pub async fn run_training(
     let has_config_file = config.config_path.is_some();
     let mut full_config = if let Some(ref path) = config.config_path {
         let content = std::fs::read_to_string(path)?;
-        serde_yaml::from_str(&content)?
+        serde_saphyr::from_str(&content)?
     } else {
         FullTrainingConfig::default()
     };

@@ -583,7 +583,7 @@ impl MergeConfig {
 
     /// Parse configuration from a YAML string.
     pub fn from_yaml(yaml: &str) -> crate::Result<Self> {
-        Ok(serde_yaml::from_str(yaml)?)
+        Ok(serde_saphyr::from_str(yaml)?)
     }
 
     /// Returns `true` when the config uses slice-based execution.
@@ -881,7 +881,7 @@ weight:
     filter: "mlp"
   - value: 0.5
 "#;
-        let params: MergeParameters = serde_yaml::from_str(yaml).unwrap();
+        let params: MergeParameters = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(
             params.resolve_weight("model.layers.0.self_attn.q_proj.weight"),
             0.8
@@ -897,7 +897,7 @@ weight:
     #[test]
     fn test_scalar_weight_yaml() {
         let yaml = "weight: 0.42";
-        let params: MergeParameters = serde_yaml::from_str(yaml).unwrap();
+        let params: MergeParameters = serde_saphyr::from_str(yaml).unwrap();
         assert_eq!(params.weight(), 0.42);
         assert_eq!(params.resolve_weight("some.tensor.name"), 0.42);
     }

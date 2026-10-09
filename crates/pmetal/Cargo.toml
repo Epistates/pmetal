@@ -57,7 +57,7 @@ full = [
 cli = [
     "core", "gguf", "metal", "hub", "mlx", "models", "data",
     "dep:clap", "dep:tokio", "dep:tracing-subscriber",
-    "dep:serde", "dep:serde_yaml", "dep:indicatif", "dep:anyhow",
+    "dep:serde", "dep:serde-saphyr", "dep:indicatif", "dep:anyhow",
     "dep:safetensors", "dep:dirs", "dep:chrono",
     "dep:parquet", "dep:arrow-array", "dep:arrow-json",
     "dep:rand", "dep:regex", "dep:tempfile", "dep:tokenizers",
@@ -103,7 +103,7 @@ clap = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-serde_yaml = { workspace = true, optional = true }
+serde-saphyr = { workspace = true, optional = true }
 indicatif = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
