@@ -720,11 +720,6 @@ pub struct Gemma4Experts {
     /// cache below). Populated by [`Gemma4Experts::quantize`]; kept outside the
     /// module-parameter tree.
     quant: Option<Gemma4ExpertsQuant>,
-    /// When `quant` is set, selects the backward-compatible dequantize-to-dense
-    /// forward (exact gradients for QLoRA training) instead of the fused
-    /// `gather_qmm` (fast, memory-efficient, but no input-activation vjp).
-    /// Enable via [`Gemma4Experts::set_dequant_backward`] for training.
-    dequant_backward: bool,
     /// Cached pre-transposed, materialised-contiguous expert weights:
     /// `gate_up_t [E, H, 2·I]` and `down_t [E, I, H]`. The per-token dispatch
     /// matmul then reads a contiguous gathered operand instead of transposing
@@ -758,19 +753,10 @@ impl Gemma4Experts {
             moe_intermediate_size,
             hidden_size,
             quant: None,
-            dequant_backward: false,
             gate_up_t: None,
             down_t: None,
             transposed_sig: None,
         })
-    }
-
-    /// Select the exact (dequantize-to-dense) QLoRA backward path for the
-    /// quantized experts instead of the fused `gather_qmm` inference path. Set
-    /// this before training a quantized model — `gather_qmm` has no
-    /// input-activation vjp, so backprop through it NaNs.
-    pub fn set_dequant_backward(&mut self, enabled: bool) {
-        self.dequant_backward = enabled;
     }
 
     /// Quantize the fused expert weights to `bits`-bit affine (group size
@@ -820,6 +806,11 @@ impl Gemma4Experts {
     /// numerically equivalent to the dense [`Self::forward`] within quantization
     /// tolerance. `x [N, H] -> [N, 1, 1, H]`, gathered per `top_indices
     /// [N, top_k]` to `[N, top_k, 1, ·]`, then weighted-summed over `top_k`.
+    ///
+    /// Training (QLoRA) runs through this too: MLX's `GatherQMM::vjp` gives
+    /// the gradient with respect to `x`, which is all the frozen experts pass
+    /// back to the adapters below them, so the packed weights are never
+    /// unpacked. See `packed_experts_backpropagate_to_the_tokens`.
     fn forward_quantized(
         &self,
         hidden_flat: &Array,
@@ -869,67 +860,6 @@ impl Gemma4Experts {
 
         let weighted = down.multiply(&top_weights.reshape(&[n, top_k, 1]));
         Ok(weighted.sum_axis(1, false)) // [N, H]
-    }
-
-    /// Exact QLoRA-training expert dispatch: dequantize the frozen experts to
-    /// f32 (stop-gradient — the base is not trained) and run the differentiable
-    /// dense per-slot gather + matmul. Numerically equivalent to
-    /// [`Self::forward_quantized`], but backprops correctly to the input
-    /// activation (and thence to lower-layer LoRA), which `gather_qmm` cannot.
-    /// The persistent 4-bit storage is retained; only a transient f32 copy of
-    /// the layer's experts is materialised per forward.
-    fn forward_quantized_dequant(
-        &self,
-        hidden_flat: &Array,
-        top_indices: &Array,
-        top_weights: &Array,
-    ) -> Result<Array, Exception> {
-        let q = self
-            .quant
-            .as_ref()
-            .expect("forward_quantized_dequant: quant present");
-        // Dequantize to the fused dense layout, frozen (base is not trained).
-        let gate_up_w = ops::stop_gradient(&q.gate_up.0.dequantize(
-            &q.gate_up.1,
-            &q.gate_up.2,
-            q.group_size,
-            q.bits,
-        )); // [E, 2I, H]
-        let down_w = ops::stop_gradient(&q.down.0.dequantize(
-            &q.down.1,
-            &q.down.2,
-            q.group_size,
-            q.bits,
-        )); // [E, H, I]
-
-        let n = hidden_flat.dim(0);
-        let h = self.hidden_size;
-        let i = self.moe_intermediate_size;
-        let k = top_indices.dim(1);
-
-        let mut out = ops::zeros_dtype(&[n, h], hidden_flat.dtype());
-        for slot in 0..k {
-            let slot_experts = ops::slice_axis(top_indices, -1, slot, slot + 1).reshape(&[n]);
-            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1); // [N, 1]
-
-            let gate_up_e = gate_up_w
-                .take_axis(&slot_experts, 0)
-                .transpose_axes(&[0, 2, 1]); // [N, H, 2I]
-            let x_b = hidden_flat.reshape(&[n, 1, h]);
-            let gate_up = ops::matmul(&x_b, &gate_up_e).squeeze_axes(&[1]); // [N, 2I]
-            let gate = ops::slice_axis(&gate_up, -1, 0, i);
-            let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
-            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, I]
-
-            let down_e = down_w
-                .take_axis(&slot_experts, 0)
-                .transpose_axes(&[0, 2, 1]); // [N, I, H]
-            let act_b = activated.reshape(&[n, 1, i]);
-            let down = ops::matmul(&act_b, &down_e).squeeze_axes(&[1]); // [N, H]
-
-            out = out.add(&down.multiply(&slot_weights));
-        }
-        Ok(out)
     }
 
     /// Signature of the current fused-weight handles, used to invalidate the
@@ -983,13 +913,7 @@ impl Gemma4Experts {
         top_weights: &Array,
     ) -> Result<Array, Exception> {
         if self.quant.is_some() {
-            // A traced input takes the exact path whatever the flag says.
-            let traced = pmetal_mlx::kernels::any_traced(&[hidden_flat, top_weights]);
-            return if self.dequant_backward || traced {
-                self.forward_quantized_dequant(hidden_flat, top_indices, top_weights)
-            } else {
-                self.forward_quantized(hidden_flat, top_indices, top_weights)
-            };
+            return self.forward_quantized(hidden_flat, top_indices, top_weights);
         }
         self.ensure_transposed()?;
         let gate_up_t = self.gate_up_t.as_ref().expect("transposed cache built");
@@ -2266,6 +2190,102 @@ mod moe_tests {
             d < 0.2 * scale,
             "8-bit quantized experts diverged: diff={d}, scale={scale}"
         );
+    }
+
+    /// Packed experts with their dense twin: the same layer with the packed
+    /// weights unpacked, so the two compute the same function.
+    fn packed_and_unpacked_experts(
+        e: i32,
+        i: i32,
+        h: i32,
+        group: i32,
+        bits: i32,
+        dtype: Dtype,
+    ) -> (Gemma4Experts, Gemma4Experts) {
+        let rand = |shape: &[i32]| {
+            random::uniform_range(-0.3, 0.3, shape, Dtype::Float32).as_dtype(dtype.as_i32())
+        };
+        let mut packed = Gemma4Experts::new(e, i, h).unwrap();
+        packed.gate_up_proj = Param::new(rand(&[e, 2 * i, h]));
+        packed.down_proj = Param::new(rand(&[e, h, i]));
+        packed.quantize(group, bits).unwrap();
+        let q = packed.quant.as_ref().unwrap();
+        let mut dense = Gemma4Experts::new(e, i, h).unwrap();
+        dense.gate_up_proj = Param::new(q.gate_up.0.dequantize(
+            &q.gate_up.1,
+            &q.gate_up.2,
+            group,
+            bits,
+        ));
+        dense.down_proj = Param::new(q.down.0.dequantize(&q.down.1, &q.down.2, group, bits));
+        (packed, dense)
+    }
+
+    /// The gradient with respect to the tokens through packed experts, which
+    /// QLoRA training takes to reach every adapter below an MoE layer.
+    ///
+    /// MLX's `GatherQMM::vjp` has the gradient with respect to `x` (a
+    /// `gather_qmm` against the transposed packed weight; the MLX version this
+    /// workspace pins, 0.32.3). It refuses only the indices and the packed
+    /// weight, and the router's indices never enter the trace. So the fused
+    /// kernel trains: its gradient matches the unpacked layer's, and a
+    /// central difference of the loss along it.
+    #[test]
+    #[serial]
+    fn packed_experts_backpropagate_to_the_tokens() {
+        use pmetal_bridge::inline_array::value_and_grad;
+        random::seed(21);
+        let (h, i, e, k, n) = (64, 32, NUM_EXPERTS, TOP_K, 6);
+        let (packed, mut dense) = packed_and_unpacked_experts(e, i, h, 32, 4, Dtype::Float32);
+        let mut router = Gemma4Router::new(h, e, k, 1e-6).unwrap();
+        let x = random::uniform_range(-1.0, 1.0, &[n, h], Dtype::Float32);
+        let (idx, w) = router.route(&x).unwrap();
+        let probe = random::uniform_range(-1.0, 1.0, &[n, h], Dtype::Float32);
+        let loss = |y: Array| y.multiply(&probe).sum_all();
+
+        let (_, fused) = value_and_grad(
+            |a| loss(packed.forward_quantized(&a[0], &idx, &w).unwrap()),
+            std::slice::from_ref(&x),
+            &[],
+        );
+        let (_, unpacked) = value_and_grad(
+            |a| loss(dense.forward(&a[0], &idx, &w).unwrap()),
+            std::slice::from_ref(&x),
+            &[],
+        );
+        pmetal_bridge::check_last_error().expect("a bridge op threw");
+        let g = &fused[0];
+        let scale = g.abs().max(None).item_f32();
+        let diff = g.subtract(&unpacked[0]).abs().max(None).item_f32();
+        assert!(
+            scale > 0.0,
+            "the packed experts gave the tokens no gradient"
+        );
+        assert!(
+            diff <= 1e-4 * scale,
+            "gather_qmm's gradient is off the unpacked layer's by {diff} (scale {scale})"
+        );
+
+        // Along the gradient's own direction the loss changes at |g|.
+        // Richardson over (H, H/2) and (H/2, H/4), failing only if both
+        // disagree: the experts are linear in the tokens for fixed routing,
+        // so neither should.
+        let norm = g.square().sum_all().sqrt().item_f32();
+        let u = g.divide(&Array::from_f32(norm));
+        let at = |step: f32| {
+            let moved = x.add(&u.multiply(&Array::from_f32(step)));
+            loss(packed.forward_quantized(&moved, &idx, &w).unwrap()).item_f32()
+        };
+        let d = |step: f32| (at(step) - at(-step)) / (2.0 * step);
+        let h0 = 1e-2;
+        let r1 = (4.0 * d(h0 / 2.0) - d(h0)) / 3.0;
+        let r2 = (4.0 * d(h0 / 4.0) - d(h0 / 2.0)) / 3.0;
+        let off = |r: f32| (r - norm).abs() > 1e-2 * norm;
+        assert!(
+            !(off(r1) && off(r2)),
+            "|g| {norm} vs the loss's slope along g {r1}, {r2}"
+        );
+        pmetal_bridge::check_last_error().expect("a bridge op threw");
     }
 
     /// The MoE block is built only when `enable_moe_block` is set, and is
