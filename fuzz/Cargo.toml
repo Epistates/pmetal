@@ -7,6 +7,10 @@ edition = "2021"
 [package.metadata]
 cargo-fuzz = true
 
+# Its own workspace root, like crates/pmetal-gui/src-tauri: see the comment
+# there for why the root manifest's `exclude` alone is not enough.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 pmetal-gguf = { path = "../crates/pmetal-gguf" }

@@ -117,19 +117,19 @@ regex = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
-flate2 = { version = "1", optional = true }
+flate2 = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 # Dashboard dependencies (optional, behind "dashboard" feature)
-ratatui = { version = "0.30", optional = true }
-crossterm = { version = "0.29", features = ["event-stream"], optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, features = ["event-stream"], optional = true }
 futures = { workspace = true, optional = true }
-tokio-util = { version = "0.7", features = ["rt"], optional = true }
+tokio-util = { workspace = true, features = ["rt"], optional = true }
 
 [build-dependencies]
-flate2 = "1"
+flate2 = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

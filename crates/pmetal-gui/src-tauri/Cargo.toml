@@ -7,6 +7,13 @@ license = "MIT OR Apache-2.0"
 # Ships as the PMetal.app bundle, never to crates.io.
 publish = false
 
+# Its own workspace root. The root manifest's `exclude` keeps it out of that
+# workspace, but cargo only honours an `exclude` from the first workspace it
+# finds walking up, so a checkout nested inside another cargo workspace (a git
+# worktree under the main checkout, say) failed with "believes it's in a
+# workspace when it's not". Declaring the root here ends the search.
+[workspace]
+
 [lib]
 name = "pmetal_gui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

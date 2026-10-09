@@ -11,7 +11,7 @@ categories.workspace = true
 
 [dependencies]
 pmetal-core = { workspace = true }
-byteorder = "1.5"
+byteorder = { workspace = true }
 half = { workspace = true }
 serde_json = { workspace = true }
 zerocopy = { workspace = true }

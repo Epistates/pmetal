@@ -47,8 +47,8 @@ parquet = { workspace = true }
 image = { workspace = true }
 
 # TensorBoard event files
-prost = "0.14"
-crc = "3.4"
+prost = { workspace = true }
+crc = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }

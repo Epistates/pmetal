@@ -22,15 +22,15 @@ tracing = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 tokenizers = { workspace = true }
-ahash = "0.8"
+ahash = { workspace = true }
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 # `time` is already pulled in transitively by minijinja-contrib; depending
 # on it directly lets us format "now" for the Llama 3 `strftime_now` shim.
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { workspace = true, features = ["formatting", "macros"] }
 memmap2 = { workspace = true }
 rand = { workspace = true }
-rayon = "1"
+rayon = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
 
