@@ -694,7 +694,7 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `distributed` | Yes | `pmetal-distributed` | Distributed training and the `cluster` subcommand |
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
-| `native-only` | No | `pmetal-bridge` | Bridge-only build with no mlx-rs/mlx-sys |
+| `native-only` | No | `pmetal-bridge` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
 | `lora-metal-fused` | No | — | ~2x LoRA training speedup via fused Metal kernels |
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |

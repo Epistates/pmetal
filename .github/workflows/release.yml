@@ -72,7 +72,7 @@ jobs:
 
       - name: Stage metallib
         run: |
-          # Search both old (pmetal-mlx-sys) and new (pmetal-bridge) crate names
+          # Find the metallib in any crate's build output (pmetal-bridge builds it)
           MLX_METALLIB=$(find target/aarch64-apple-darwin/release/build/ -name "mlx.metallib" -path "*/out/build/lib/*" | head -1)
           if [ -z "$MLX_METALLIB" ]; then
             # Also check the user cache (build.rs caches metallib here)

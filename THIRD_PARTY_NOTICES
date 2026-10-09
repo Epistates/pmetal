@@ -10,7 +10,7 @@ respective licenses.
 -------------------
 
 PMetal embeds a compiled MLX Metal library (mlx.metallib) via the
-pmetal-mlx-sys crate. MLX is Apple's open-source machine learning framework.
+pmetal-bridge crate. MLX is Apple's open-source machine learning framework.
 
     Copyright (c) 2023 Apple Inc.
 
