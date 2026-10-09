@@ -97,7 +97,7 @@ impl ResolutionDiscriminator {
 
         // Convolutional layers: process spectrogram as 1D signal over time
         // with channels = frequency bins
-        let channels = vec![
+        let channels = [
             (n_freq, 32),
             (32, 128),
             (128, 512),

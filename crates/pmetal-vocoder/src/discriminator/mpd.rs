@@ -76,7 +76,7 @@ impl PeriodDiscriminator {
     pub fn new(period: i32) -> Result<Self> {
         // Channel progression: period -> 32 -> 128 -> 512 -> 1024 -> 1024
         // First layer takes `period` channels since we reshape [B, 1, T] -> [B, period, T/period]
-        let channels = vec![
+        let channels = [
             (period, 32),
             (32, 128),
             (128, 512),

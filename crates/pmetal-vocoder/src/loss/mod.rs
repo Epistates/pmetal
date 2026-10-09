@@ -182,6 +182,10 @@ impl Default for GeneratorLossConfig {
 }
 
 /// Compute combined generator loss.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "public API: real and fake outputs of each discriminator"
+)]
 pub fn generator_loss(
     real_audio: &Array,
     fake_audio: &Array,
