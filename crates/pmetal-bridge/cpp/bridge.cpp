@@ -38,6 +38,14 @@ namespace {
     thread_local int32_t g_bridge_error_code = 0;
     thread_local std::string g_bridge_error_message;
 
+    // The first error since Rust last observed one. The slot above is the
+    // most recent op's, and every successful op clears it, so a computation
+    // that carries on past a failed op (building on its placeholder) shows
+    // nothing there by its end. This one stays until Rust reads or clears
+    // an error, which is what a check at the end of a training step needs.
+    thread_local int32_t g_bridge_unobserved_code = 0;
+    thread_local std::string g_bridge_unobserved_message;
+
     // Process-wide toggle for stderr emission when an exception is caught
     // inside a BRIDGE_TRY_{DST,VOID} wrapper. Writing to stderr on every
     // failure makes the *first* exception visible to the user even when
@@ -80,6 +88,15 @@ void pmetal_bridge_set_last_error(const char* op, const char* what) noexcept {
         g_bridge_error_message.clear();
     }
 
+    if (g_bridge_unobserved_code == 0) {
+        g_bridge_unobserved_code = g_bridge_error_code;
+        try {
+            g_bridge_unobserved_message = g_bridge_error_message;
+        } catch (...) {
+            g_bridge_unobserved_message.clear();
+        }
+    }
+
     if (bridge_error_log_flag().load(std::memory_order_relaxed)) {
         // fprintf is signal-safe enough for this use and avoids pulling in
         // iostream on the bridge's hot path. Single call to keep the line
@@ -105,8 +122,20 @@ const char* pmetal_bridge_last_error_message(void) {
     return g_bridge_error_message.c_str();
 }
 
+// Called when Rust observes (or deliberately discards) an error, so it
+// clears the unobserved one too.
 void pmetal_bridge_clear_error(void) {
     pmetal_bridge_clear_error_internal();
+    g_bridge_unobserved_code = 0;
+    g_bridge_unobserved_message.clear();
+}
+
+int32_t pmetal_bridge_unobserved_error_code(void) {
+    return g_bridge_unobserved_code;
+}
+
+const char* pmetal_bridge_unobserved_error_message(void) {
+    return g_bridge_unobserved_message.c_str();
 }
 
 void pmetal_bridge_set_error_log_mode(int32_t enabled) {

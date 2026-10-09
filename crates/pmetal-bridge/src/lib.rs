@@ -13,8 +13,8 @@ pub use inline_array::{InlineArray, QuantizedMode};
 
 pub mod error;
 pub use error::{
-    BridgeError, BridgeResult, check_last_error, clear_last_error, error_log_mode,
-    set_error_log_mode,
+    BridgeError, BridgeResult, check_last_error, check_unobserved_error, clear_last_error,
+    error_log_mode, set_error_log_mode,
 };
 
 pub mod dtype;

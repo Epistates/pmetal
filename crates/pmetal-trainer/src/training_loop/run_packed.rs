@@ -160,7 +160,7 @@ impl TrainingLoop {
             jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?
         };
         warmup_loss.eval();
-        let warmup_loss_val: f32 = warmup_loss.item();
+        let warmup_loss_val = check_step(1, warmup_loss.item_f32())?;
 
         // Record optimizer state count AFTER warmup (states now initialized)
         let state_count_after = state.updatable_states_len();
@@ -225,6 +225,7 @@ impl TrainingLoop {
                 // step builds a NEW graph (~10 GB for a 0.6B model). Deferring
                 // evaluation across 10 steps means 10 graphs (~100 GB) in memory.
                 loss.eval();
+                check_step(self.step + 1, loss.item_f32())?;
                 eval_training_state(&[], &state)?;
 
                 accumulated_losses.push(loss);

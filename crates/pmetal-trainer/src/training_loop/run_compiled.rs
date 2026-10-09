@@ -122,7 +122,7 @@ impl TrainingLoop {
             )?
         };
         warmup_loss.eval();
-        let warmup_loss_val = warmup_loss.item_f32();
+        let warmup_loss_val = check_step(1, warmup_loss.item_f32())?;
 
         // Record state count AFTER warmup (optimizer states now initialized)
         let state_count_after = state.updatable_states_len();
@@ -246,6 +246,7 @@ impl TrainingLoop {
                 // accumulation. Without mx.compile, each step builds a new graph
                 // (~10 GB for a 0.6B model). Deferring across steps causes OOM.
                 loss.eval();
+                check_step(self.step + 1, loss.item_f32())?;
                 eval_training_state(&[], &state)?;
 
                 accumulated_losses.push(loss);

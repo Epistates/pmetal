@@ -37,6 +37,8 @@ unsafe extern "C" {
     fn pmetal_bridge_last_error_code() -> i32;
     fn pmetal_bridge_last_error_message() -> *const std::os::raw::c_char;
     fn pmetal_bridge_clear_error();
+    fn pmetal_bridge_unobserved_error_code() -> i32;
+    fn pmetal_bridge_unobserved_error_message() -> *const std::os::raw::c_char;
     fn pmetal_bridge_set_error_log_mode(enabled: i32);
     fn pmetal_bridge_get_error_log_mode() -> i32;
 }
@@ -88,6 +90,39 @@ pub fn check_last_error() -> BridgeResult<()> {
             return Ok(());
         }
         let raw = pmetal_bridge_last_error_message();
+        let msg = if raw.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(raw).to_string_lossy().into_owned()
+        };
+        pmetal_bridge_clear_error();
+        match code {
+            2 => Err(BridgeError::Unknown(msg)),
+            _ => Err(BridgeError::CxxException(msg)),
+        }
+    }
+}
+
+/// Reports the first error a bridge op recorded on this thread since one was
+/// last observed, and clears it.
+///
+/// [`check_last_error`] reports the most recent op only: every op that
+/// succeeds clears its slot. MLX builds its graph lazily, so a computation
+/// carries on past an op that threw, on the placeholder the bridge put in its
+/// place, and by the time it is checked the slot is clean again. A training
+/// step is such a computation: one op failing inside `value_and_grad` leaves
+/// a step that finishes, reports a loss, and moved nothing. Call this at the
+/// end of one instead; any error [`check_last_error`] has already reported,
+/// or [`clear_last_error`] discarded, doesn't count.
+pub fn check_unobserved_error() -> BridgeResult<()> {
+    // SAFETY: as in `check_last_error`: a thread-local read, and the message
+    // is copied before `pmetal_bridge_clear_error` invalidates it.
+    unsafe {
+        let code = pmetal_bridge_unobserved_error_code();
+        if code == 0 {
+            return Ok(());
+        }
+        let raw = pmetal_bridge_unobserved_error_message();
         let msg = if raw.is_null() {
             String::new()
         } else {
@@ -181,6 +216,29 @@ mod tests {
 
         // Slot must have been cleared by check_last_error.
         assert_eq!(check_last_error(), Ok(()));
+    }
+
+    /// An op that threw and was followed by ops that succeeded leaves the
+    /// last-op slot clean, and the unobserved one holding the failure.
+    #[test]
+    fn an_error_followed_by_successful_ops_stays_unobserved() {
+        use crate::InlineArray;
+
+        clear_last_error();
+        let two_elem = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
+        let _ = two_elem.item_f32();
+        let later = two_elem.add(&two_elem);
+        let _ = later.sum_all();
+
+        assert_eq!(check_last_error(), Ok(()), "a later op cleared the slot");
+        let err = check_unobserved_error().expect_err("the failure is still there");
+        assert!(err.to_string().contains("item_f32"), "{err}");
+        assert_eq!(check_unobserved_error(), Ok(()), "reading it cleared it");
+
+        // An error the caller observed doesn't count again.
+        let _ = two_elem.item_f32();
+        assert!(check_last_error().is_err());
+        assert_eq!(check_unobserved_error(), Ok(()));
     }
 
     /// Calls that are not ops (memory queries, syncs, scalar constructors) run

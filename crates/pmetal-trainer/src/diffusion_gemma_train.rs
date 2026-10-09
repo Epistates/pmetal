@@ -289,7 +289,7 @@ impl DiffusionGemmaTrainer {
         let (mut loss, grads) = value_and_grad_explicit(loss_fn, &param_arrays, &[])?;
         // Model borrow released here; loss/grads reference the traced leaves.
         loss.eval();
-        let loss_val = loss.item_f32();
+        let loss_val = crate::step_check::check_step(self.step as usize + 1, loss.item_f32())?;
 
         // Global-norm gradient clipping.
         let (grads, grad_norm) = if self.config.max_grad_norm > 0.0 {

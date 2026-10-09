@@ -341,7 +341,8 @@ impl EmbeddingTrainer {
                     .map_err(EmbeddingTrainerError::Mlx)?;
                 eval_params(model.trainable_parameters()).map_err(EmbeddingTrainerError::Mlx)?;
 
-                let loss_val: f32 = loss.item();
+                let loss_val = crate::step_check::check_step(self.step + 1, loss.item())
+                    .map_err(EmbeddingTrainerError::Mlx)?;
                 epoch_loss += loss_val as f64;
                 self.step += 1;
 
@@ -456,7 +457,8 @@ impl EmbeddingTrainer {
                     .map_err(EmbeddingTrainerError::Mlx)?;
                 eval_params(model.trainable_parameters()).map_err(EmbeddingTrainerError::Mlx)?;
 
-                let loss_val: f32 = loss.item();
+                let loss_val = crate::step_check::check_step(self.step + 1, loss.item())
+                    .map_err(EmbeddingTrainerError::Mlx)?;
                 epoch_loss += loss_val as f64;
                 self.step += 1;
 

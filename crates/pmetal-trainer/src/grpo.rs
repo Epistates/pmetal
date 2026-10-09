@@ -1172,8 +1172,10 @@ impl GrpoTrainer {
             transforms::eval([&loss, &parts.policy, &parts.kl, &parts.clip_fraction])?;
             let params = policy_model.lora_parameters();
             transforms::eval(params.values())?;
-            pmetal_bridge::check_last_error().map_err(|e| Exception::custom(e.to_string()))?;
-            losses.push(loss.item_f32());
+            losses.push(crate::step_check::check_step(
+                self.step + 1,
+                loss.item_f32(),
+            )?);
             policy_losses.push(parts.policy.item_f32());
             kls.push(parts.kl.item_f32());
             clip_fractions.push(parts.clip_fraction.item_f32());

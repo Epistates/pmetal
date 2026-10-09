@@ -311,21 +311,23 @@ impl TrainingLoop {
                 let _ = pmetal_bridge::compat::transforms::eval(to_eval);
 
                 let mut loss = loss;
-                let loss_val = loss.item_f32();
-                let norm = lazy_norm.map(|mut n| n.item_f32());
+                let loss_val = check_step(self.step + 1, loss.item_f32())?;
+                let norm = lazy_norm
+                    .map(|mut n| check_grad_norm(self.step + 1, n.item_f32()))
+                    .transpose()?;
 
                 (loss_val, norm, clip_elapsed, opt_elapsed)
             } else {
                 // No gradients accumulated - just eval loss
                 let mut loss = loss;
                 loss.eval();
-                (loss.item::<f32>(), None, 0, 0)
+                (check_step(self.step + 1, loss.item::<f32>())?, None, 0, 0)
             }
         } else {
             // Gradient accumulation not complete - just eval loss
             let mut loss = loss;
             loss.eval();
-            (loss.item::<f32>(), None, 0, 0)
+            (check_step(self.step + 1, loss.item::<f32>())?, None, 0, 0)
         };
 
         // Update stats

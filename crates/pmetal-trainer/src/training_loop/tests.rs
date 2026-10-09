@@ -1028,3 +1028,157 @@ fn an_epoch_based_run_decays_to_the_end_and_max_steps_counts_optimizer_steps() {
     assert_eq!(training_loop.optimizer_steps_taken(), 3);
     assert_eq!(training_loop.current_step(), 6);
 }
+
+/// How [`Breaking`] goes wrong on its chosen step.
+#[derive(Clone, Copy)]
+enum Fault {
+    /// The loss comes out NaN, as an overflow would leave it.
+    NanLoss,
+    /// A bridge op throws inside the gradient trace. The bridge records it and
+    /// hands back an empty array, and nothing unwinds.
+    BridgeError,
+}
+
+/// The small model, broken on the `on`-th forward pass.
+struct Breaking {
+    inner: AdaptedModel,
+    forwards: usize,
+    on: usize,
+    fault: Fault,
+}
+
+impl Breaking {
+    fn new(on: usize, fault: Fault) -> Self {
+        Self {
+            inner: small_model(),
+            forwards: 0,
+            on,
+            fault,
+        }
+    }
+}
+
+impl ModuleParameters for Breaking {
+    fn num_parameters(&self) -> usize {
+        self.inner.num_parameters()
+    }
+    fn parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+        self.inner.parameters()
+    }
+    fn parameters_mut(&mut self) -> pmetal_bridge::compat::ModuleParamMut<'_> {
+        self.inner.parameters_mut()
+    }
+    fn trainable_parameters(&self) -> pmetal_bridge::compat::ModuleParamRef<'_> {
+        self.inner.trainable_parameters()
+    }
+}
+
+impl TrainableModel for Breaking {
+    fn forward(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> std::result::Result<Array, pmetal_lora::LoraError> {
+        self.forwards += 1;
+        let logits = TrainableModel::forward(&mut self.inner, input_ids, mask)?;
+        if self.forwards != self.on {
+            return Ok(logits);
+        }
+        Ok(match self.fault {
+            Fault::NanLoss => logits.multiply(&Array::from_f32(f32::NAN)),
+            Fault::BridgeError => {
+                // Inner dimensions that don't match: MLX throws.
+                let bad = pmetal_bridge::compat::ops::matmul(&logits, &Array::ones_f32(&[3, 5]));
+                logits.add(&bad.sum(None))
+            }
+        })
+    }
+    fn num_trainable_params(&self) -> usize {
+        self.inner.num_trainable_params()
+    }
+    fn lora_parameters(&self) -> std::collections::HashMap<std::rc::Rc<str>, Array> {
+        self.inner.lora_parameters()
+    }
+    fn set_lora_parameters(&mut self, params: &std::collections::HashMap<std::rc::Rc<str>, Array>) {
+        self.inner.set_lora_parameters(params)
+    }
+    fn save_lora_weights(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<(), pmetal_lora::LoraError> {
+        self.inner.save_lora_weights(path)
+    }
+    fn load_lora_weights(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::result::Result<(), pmetal_lora::LoraError> {
+        self.inner.load_lora_weights(path)
+    }
+}
+
+fn short_run_config() -> TrainingLoopConfig {
+    TrainingLoopConfig {
+        training: TrainingConfig {
+            learning_rate: 1e-4,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            num_epochs: 1,
+            max_steps: Some(6),
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len: 16,
+            shuffle: false,
+            pad_token_id: 0,
+            ..Default::default()
+        },
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        use_jit_compilation: false,
+        use_cut_cross_entropy: false,
+        ..Default::default()
+    }
+}
+
+/// A step that fails inside the gradient trace stops the run there, naming
+/// the step, whether it shows as a NaN loss or as an op that threw. The run
+/// used to log `loss=NaN`, carry on to the end, and save an adapter no step
+/// had moved.
+#[test]
+fn a_failed_step_stops_the_run_and_names_the_step() {
+    for (fault, expect) in [
+        (Fault::NanLoss, "loss of NaN"),
+        (Fault::BridgeError, "matmul"),
+    ] {
+        let mut model = Breaking::new(3, fault);
+        let mut training_loop = TrainingLoop::new(short_run_config());
+        let err = training_loop
+            .run(&mut model, create_dummy_dataset(8, 12), None, None)
+            .expect_err("the run should stop at the broken step");
+        let message = err.to_string();
+        assert!(message.contains("step 3"), "{message}");
+        assert!(message.contains(expect), "{message}");
+        assert_eq!(
+            training_loop.current_step(),
+            2,
+            "steps after the failure ran"
+        );
+        pmetal_bridge::check_last_error().expect("the failure was drained");
+    }
+}
+
+/// The packed loop checks the same way.
+#[test]
+fn a_failed_step_stops_the_packed_run() {
+    let mut training_loop = TrainingLoop::new(short_run_config());
+    let model = Breaking::new(2, Fault::NanLoss);
+    let err = match training_loop.run_packed(model, create_dummy_dataset(8, 12), None, None) {
+        Ok(_) => panic!("the run should stop at the broken step"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("step 2"), "{err}");
+}

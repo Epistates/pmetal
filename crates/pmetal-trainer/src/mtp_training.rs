@@ -384,7 +384,7 @@ where
         pmetal_bridge::compat::eval_params(model.trainable_parameters())?;
 
         loss.eval();
-        let loss_value = loss.item::<f32>();
+        let loss_value = crate::step_check::check_step(step + 1, loss.item::<f32>())?;
         losses.push(loss_value);
 
         if config.log_every > 0 && (step + 1) % config.log_every == 0 {

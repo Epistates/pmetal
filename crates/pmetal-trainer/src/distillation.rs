@@ -261,7 +261,7 @@ impl DistillationTrainer {
             )?
         };
 
-        let loss_val = loss.item_f32();
+        let loss_val = crate::step_check::check_step(self.loop_state.step + 1, loss.item_f32())?;
         optimizer.update(student, grads)?;
 
         let step_time_ms = start_time.elapsed().as_millis() as u64;

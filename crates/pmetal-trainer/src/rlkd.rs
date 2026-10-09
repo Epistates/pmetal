@@ -572,7 +572,8 @@ impl RlkdTrainer {
         eval_params(policy.parameters())?;
 
         let mut total_loss_arr = total_loss_arr;
-        let total_loss = total_loss_arr.item::<f32>();
+        let total_loss =
+            crate::step_check::check_step(self.step + 1, total_loss_arr.item::<f32>())?;
 
         // NOTE: These are proportional approximations, not actual component values.
         // Actual decomposition would require separate forward passes or returning

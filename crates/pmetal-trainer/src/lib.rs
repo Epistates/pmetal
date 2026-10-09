@@ -72,6 +72,7 @@ pub mod reward_model;
 pub mod rlkd;
 pub mod scheduler;
 pub mod sft;
+pub mod step_check;
 pub mod tensorboard;
 pub mod training_loop;
 

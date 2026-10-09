@@ -77,6 +77,7 @@ use pmetal_mlx::kernels::{init_training_context, with_training_mode};
 use crate::mlx_metal_optimizer::{
     MlxMetalOptimizer, MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available,
 };
+use crate::step_check::{check_grad_norm, check_step};
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
 mod run_compiled;
@@ -1021,7 +1022,7 @@ impl TrainingLoop {
         }
         let mut loss = loss;
         loss.eval();
-        let micro_batch_loss = loss.item::<f32>();
+        let micro_batch_loss = check_step(self.step + 1, loss.item::<f32>())?;
         if self.step <= 3 {
             let active = pmetal_mlx::memory::get_active_memory();
             let cache = pmetal_mlx::memory::get_cache_memory();
@@ -1093,7 +1094,7 @@ impl TrainingLoop {
                 if let Some(norm_arr) = lazy_norm {
                     let mut norm_arr = norm_arr;
                     norm_arr.eval();
-                    Some(norm_arr.item::<f32>())
+                    Some(check_grad_norm(self.step + 1, norm_arr.item::<f32>())?)
                 } else {
                     None
                 }

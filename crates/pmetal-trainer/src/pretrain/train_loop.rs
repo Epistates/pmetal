@@ -220,6 +220,8 @@ where
             config.z_loss_coef,
             config.max_grad_norm,
         )?;
+        crate::step_check::check_step(step + 1, loss)
+            .map_err(|e| PretrainError::Autograd(e.to_string()))?;
         losses.push(loss);
 
         // Logging
