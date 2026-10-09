@@ -298,9 +298,11 @@ unsafe extern "C" {
         k_b: *const RawBuf,
         v_b: *const RawBuf,
         o_b: *const RawBuf,
+        sinks: *const RawBuf,
         cache_keys_in: *const RawBuf,
         cache_vals_in: *const RawBuf,
-        kv_offset: i32,
+        kv_write: i32,
+        kv_valid: i32,
         rope_offset: i32,
         n_heads: i32,
         n_kv: i32,
@@ -525,6 +527,16 @@ unsafe extern "C" {
         v: *const RawBuf,
         scale: f32,
         mask: *const RawBuf,
+    );
+    pub(super) fn mlx_inline_sdpa_sinks(
+        dst: *mut RawBuf,
+        q: *const RawBuf,
+        k: *const RawBuf,
+        v: *const RawBuf,
+        scale: f32,
+        mask_mode: *const std::ffi::c_char,
+        mask: *const RawBuf,
+        sinks: *const RawBuf,
     );
     pub(super) fn mlx_inline_eval_2(a: *mut RawBuf, b: *mut RawBuf);
     pub(super) fn mlx_inline_quantized_matmul(

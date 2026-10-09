@@ -53,13 +53,11 @@ pub enum NativeArch {
 impl NativeArch {
     pub fn supports_turboquant(self) -> bool {
         // qwen3_native owns the most-tested TurboQuant integration (incl. the
-        // hot/cold split). gpt_oss_native and llama4_native got the same path
-        // wired through the shared dispatch helper; deepseek's MLA layout is
-        // structurally different and remains a follow-up.
-        matches!(
-            self,
-            Self::Qwen3 | Self::Qwen3_5 | Self::GptOss | Self::Llama4
-        )
+        // hot/cold split). llama4_native got the same path wired through the
+        // shared dispatch helper; deepseek's MLA layout is structurally
+        // different and remains a follow-up. gpt-oss's attention sinks have
+        // no place in TurboQuant's attention kernels.
+        matches!(self, Self::Qwen3 | Self::Qwen3_5 | Self::Llama4)
     }
 
     pub fn label(self) -> &'static str {
@@ -174,7 +172,8 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
                 num_kv_heads: config.num_key_value_heads as usize,
                 head_dim: config.head_dim as usize,
                 value_head_dim: config.head_dim as usize,
-                supports_turboquant: true,
+                // Attention sinks: TurboQuant's kernels have no sink term.
+                supports_turboquant: false,
             }
         }
         NativeArch::Gemma4 => {
@@ -374,7 +373,9 @@ mod tests {
         );
         let info = load_native_bridge_info(&dir).unwrap().unwrap();
         assert_eq!(info.arch, NativeArch::GptOss);
-        assert!(info.supports_turboquant);
+        // Its attention sinks have no place in TurboQuant's kernels.
+        assert!(!info.supports_turboquant);
+        assert!(!NativeArch::GptOss.supports_turboquant());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -542,7 +543,6 @@ pub fn run_native_inference_ext(
             input_ids,
             max_tokens,
             params,
-            turboquant,
             quant_config,
             &mut on_token,
         ),
@@ -1576,7 +1576,6 @@ fn run_gpt_oss(
     input_ids: &[u32],
     max_tokens: usize,
     params: pmetal_bridge::decode::SamplingParams,
-    turboquant: Option<TurboQuantConfig>,
     quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<NativeGenerationOutput, String> {
@@ -1599,31 +1598,12 @@ fn run_gpt_oss(
             )
         },
         gpt_oss_native::load_model,
-        move |weights, _| build_gpt_oss_cache(weights, turboquant, quant_config),
+        // Affine quant on full-attention layers only — sliding layers stay
+        // in the model dtype.
+        move |weights, _| gpt_oss_native::NativeCache::new_with_quant(weights, quant_config),
         gpt_oss_native::prefill_first_token,
         |weights, _config, cache, first_tok, remaining, params, on_token| {
             gpt_oss_native::generate(weights, cache, first_tok, remaining, params, on_token)
         },
     )
-}
-
-fn build_gpt_oss_cache(
-    weights: &pmetal_bridge::gpt_oss_native::NativeWeights,
-    turboquant: Option<TurboQuantConfig>,
-    quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
-) -> pmetal_bridge::gpt_oss_native::NativeCache {
-    use pmetal_bridge::gpt_oss_native;
-    let mut cache = match turboquant {
-        Some(cfg) => gpt_oss_native::NativeCache::new_with_turboquant(weights, Some(cfg)),
-        None => gpt_oss_native::NativeCache::new_empty(weights),
-    };
-    // Affine quant on full-attention layers only — sliding layers stay bf16.
-    if let Some(qcfg) = quant_config {
-        for kv in &mut cache.kv_caches {
-            if !kv.is_sliding {
-                kv.quant_config = Some(qcfg);
-            }
-        }
-    }
-    cache
 }

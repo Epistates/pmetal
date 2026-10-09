@@ -191,9 +191,10 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
 // Mirrors `mlx_inline_compiled_attn_layer_fixed` but adapted for GPT-OSS:
 //   * q/k/v/o biases (Qwen3 has none).
 //   * No q/k norm (Qwen3 hardcodes both).
-//   * Full attention only — sliding-window layers stay on the per-op path
-//     because they rotate the cache buffer in place, which would force a
-//     different cache layout to express in a compiled graph.
+//   * Per-head attention sinks (`sinks [n_heads]`) in the softmax.
+//   * Full and sliding-window layers: the new key goes to slot `kv_write`
+//     and attention reads the first `kv_valid` slots (a sliding layer's
+//     cache is a ring of `window` slots).
 // Traces per (batch, cache_len, n_heads, n_kv, head_dim) on first call,
 // then replays.
 void mlx_inline_compiled_gptoss_attn_layer_fixed(
@@ -209,9 +210,11 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
     const mlx_inline_array* k_b,
     const mlx_inline_array* v_b,
     const mlx_inline_array* o_b,
+    const mlx_inline_array* sinks,
     const mlx_inline_array* cache_keys_in,
     const mlx_inline_array* cache_vals_in,
-    int kv_offset,
+    int kv_write,
+    int kv_valid,
     int rope_offset,
     int n_heads,
     int n_kv,

@@ -1,13 +1,20 @@
 //! Per-layer + full-model weight bundles and safetensors loading.
 //!
-//! Sanitization mirrors Python's `Model.sanitize()`:
-//!   * fused `gate_up_proj` (and its `_blocks` / `_scales` MXFP4 variants)
-//!     → split into `gate_proj` / `up_proj`
-//!   * fused `gate_up_proj_bias` → split into `gate_proj.bias` + `up_proj.bias`
-//!   * `down_proj_blocks` → `down_proj.weight` (flattened)
-//!   * `down_proj_bias`   → `down_proj.bias`
+//! Two dense expert layouts load:
+//!
+//! * transformers' own (a bf16 release): `mlp.experts.gate_up_proj
+//!   [E, H, 2I]`, applied as `x @ W`, with gate and up **interleaved** on the
+//!   last axis (`[..., ::2]` / `[..., 1::2]`), its `gate_up_proj_bias [E, 2I]`
+//!   interleaved the same way, and `down_proj [E, I, H]` / `down_proj_bias`;
+//! * the stacked per-projection layout MLX conversions ship:
+//!   `mlp.experts.{gate,up}_proj.weight [E, I, H]`,
+//!   `mlp.experts.down_proj.weight [E, H, I]`, each with its `.bias`.
+//!
+//! Packed checkpoints (the release's MXFP4 `*_blocks` / `*_scales`, or an MLX
+//! quantization) are refused by name: the expert kernels here are dense.
 
 use crate::InlineArray;
+use crate::native_weight::LayerWeight;
 
 use super::{AttentionLayerType, GptOssConfig};
 
@@ -28,6 +35,9 @@ pub(super) struct LayerWeights {
     pub(super) attn_v_b: Option<InlineArray>, // [n_kv_heads * head_dim]
     pub(super) attn_o_w: InlineArray, // [n_heads * head_dim, hidden]
     pub(super) attn_o_b: Option<InlineArray>, // [hidden]
+    /// Per-head attention sink logits, `[n_heads]`, in the model dtype: one
+    /// more logit in each softmax row that attends to nothing.
+    pub(super) attn_sinks: InlineArray,
 
     // Attention dims
     pub(super) attn_n_heads: i32,
@@ -39,23 +49,22 @@ pub(super) struct LayerWeights {
     pub(super) attn_is_sliding: bool,
     pub(super) attn_sliding_window: i32,
 
-    // MoE: router + stacked expert projections
-    // Router: [hidden, num_experts] (NO transpose — direct matmul hidden @ router_w)
+    // MoE
+    /// Router `[hidden, num_experts]` and its bias `[num_experts]`.
     pub(super) moe_router_w: InlineArray,
-    // Stacked expert weights — shape [num_experts, hidden_size, intermediate_size]
-    // pre-transposed to [num_experts, intermediate_size, hidden_size] for batched gather_mm
-    // but actually stored as [num_experts, hidden, intermediate] with matmul handling transpose
-    pub(super) moe_gate_w: InlineArray, // [num_experts, hidden, intermediate]
-    pub(super) moe_gate_b: InlineArray, // [num_experts, intermediate]
-    pub(super) moe_up_w: InlineArray,   // [num_experts, hidden, intermediate]
-    pub(super) moe_up_b: InlineArray,   // [num_experts, intermediate]
-    pub(super) moe_down_w: InlineArray, // [num_experts, intermediate, hidden]
-    pub(super) moe_down_b: InlineArray, // [num_experts, hidden]
+    pub(super) moe_router_b: InlineArray,
+    /// Experts stacked `[E, in, out]` for `gather_mm`.
+    pub(super) moe_gate_w: LayerWeight, // [E, hidden, intermediate]
+    pub(super) moe_up_w: LayerWeight,   // [E, hidden, intermediate]
+    pub(super) moe_down_w: LayerWeight, // [E, intermediate, hidden]
+    pub(super) moe_gate_b: InlineArray, // [E, intermediate]
+    pub(super) moe_up_b: InlineArray,   // [E, intermediate]
+    pub(super) moe_down_b: InlineArray, // [E, hidden]
 
     pub(super) moe_num_experts: i32,
     pub(super) moe_top_k: i32,
 
-    // SwiGLU parameters
+    // GLU parameters
     pub(super) swiglu_alpha: f32,
     pub(super) swiglu_limit: f32,
 }
@@ -84,115 +93,86 @@ impl std::fmt::Debug for NativeWeights {
     }
 }
 
+/// One layer's experts in the `[E, in, out]` layout `gather_mm` takes, with
+/// their biases.
+struct Experts {
+    gate_w: InlineArray,
+    up_w: InlineArray,
+    down_w: InlineArray,
+    gate_b: InlineArray,
+    up_b: InlineArray,
+    down_b: InlineArray,
+}
+
+/// The even (`0`) or odd (`1`) entries of `x`'s last axis: transformers'
+/// `x[..., ::2]` / `x[..., 1::2]`.
+fn interleaved(x: &InlineArray, which: i32) -> InlineArray {
+    let mut shape: Vec<i32> = (0..x.ndim()).map(|i| x.dim(i)).collect();
+    let last = shape.pop().expect("an expert tensor has axes");
+    let pairs: Vec<i32> = shape.iter().copied().chain([last / 2, 2]).collect();
+    let mut start = vec![0; pairs.len()];
+    let mut stop = pairs.clone();
+    *start.last_mut().unwrap() = which;
+    *stop.last_mut().unwrap() = which + 1;
+    x.reshape(&pairs).slice(&start, &stop).squeeze(-1)
+}
+
+/// Read one layer's experts from either dense layout (see the module docs).
+fn load_experts(
+    raw: &std::collections::HashMap<String, InlineArray>,
+    exp: &str,
+) -> Result<Experts, String> {
+    let get = |key: &str| {
+        raw.get(key)
+            .cloned()
+            .ok_or_else(|| format!("missing weight key: {key}"))
+    };
+    let swap = |x: InlineArray| x.transpose_axes(&[0, 2, 1]);
+    if let Some(gate_up) = raw.get(&format!("{exp}.gate_up_proj")) {
+        // [E, H, 2I], gate and up interleaved on the last axis.
+        let gate_up_b = get(&format!("{exp}.gate_up_proj_bias"))?;
+        return Ok(Experts {
+            gate_w: interleaved(gate_up, 0),
+            up_w: interleaved(gate_up, 1),
+            down_w: get(&format!("{exp}.down_proj"))?,
+            gate_b: interleaved(&gate_up_b, 0),
+            up_b: interleaved(&gate_up_b, 1),
+            down_b: get(&format!("{exp}.down_proj_bias"))?,
+        });
+    }
+    // Stacked `[E, out, in]`.
+    Ok(Experts {
+        gate_w: swap(get(&format!("{exp}.gate_proj.weight"))?),
+        up_w: swap(get(&format!("{exp}.up_proj.weight"))?),
+        down_w: swap(get(&format!("{exp}.down_proj.weight"))?),
+        gate_b: get(&format!("{exp}.gate_proj.bias"))?,
+        up_b: get(&format!("{exp}.up_proj.bias"))?,
+        down_b: get(&format!("{exp}.down_proj.bias"))?,
+    })
+}
+
 /// Load GPT-OSS model weights from a directory containing safetensors shards.
-///
-/// ## Sanitization applied
-///
-/// The checkpoint stores MoE expert weights in a `gate_up_proj` / `down_proj`
-/// format (two projections fused) with optional MXFP4 quantization suffixes
-/// (`_blocks`, `_scales`).  We split and rename:
-///
-///   `*.gate_up_proj_blocks`  → gate and up weight blocks (split along expert dim)
-///   `*.gate_up_proj_bias`    → split into `gate_proj.bias` + `up_proj.bias`
-///   `*.down_proj_blocks`     → down weight blocks
-///   `*.down_proj_bias`       → `down_proj.bias`
-///
-/// After sanitization all expert weights are stacked into tensors of shape
-/// `[num_experts, ...]` for efficient batched gather_mm during inference.
 pub fn load_model(
     model_dir: &std::path::Path,
     config: &GptOssConfig,
 ) -> Result<NativeWeights, String> {
-    // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
     let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
     let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
 
-    // ── Step 3: Sanitization — mirror Python's Model.sanitize() ────────────
-    //
-    // The checkpoint may store weights in one of two states:
-    //   (a) Already-sanitized: gate_proj.weight / up_proj.weight present.
-    //   (b) Fused gate_up_proj: must be split; may have _blocks/_scales quantization
-    //       suffixes for MXFP4 weights.
-    //
-    // We detect state by checking for any "gate_proj.weight" key; if absent we
-    // perform the full sanitization pass.
-
-    let already_sanitized = raw.keys().any(|k| k.ends_with("gate_proj.weight"));
-
-    if !already_sanitized {
-        let original_keys: Vec<String> = raw.keys().cloned().collect();
-        let mut new_entries: Vec<(String, InlineArray)> = Vec::new();
-
-        for k in &original_keys {
-            if k.contains("gate_up_proj") && !k.contains("bias") {
-                // Could be: gate_up_proj_blocks, gate_up_proj_scales, gate_up_proj.weight
-                // Handle quantized (_blocks, _scales) and dense (.weight) variants.
-
-                if let Some(v) = raw.remove(k) {
-                    let (base_key, array, suffix) = if k.contains("_blocks") {
-                        // MXFP4 blocks — flatten the last two dims: view as uint32, flatten(-2)
-                        // Python: v.view(mx.uint32).flatten(-2)
-                        // For now we pass through as-is; quantized_matmul handles _blocks/_scales.
-                        let flat = flatten_mxfp4_blocks(&v);
-                        let bk = k.replace("_blocks", ".weight");
-                        (bk, flat, ".weight")
-                    } else if k.contains("_scales") {
-                        let scaled = v.clone();
-                        let bk = k.replace("_scales", ".scales");
-                        (bk, scaled, ".scales")
-                    } else {
-                        (k.clone(), v, ".weight")
-                    };
-
-                    // Split the fused gate_up tensor along the expert/output dim at index 1:
-                    //   gate: even rows (::2), up: odd rows (1::2) along the second-to-last axis.
-                    // For stacked expert weights shape [num_experts, out*2, hidden] or flat [out*2, hidden].
-                    // We split the gate_up into two halves.
-                    let (gate_arr, up_arr) = split_gate_up(&array, suffix);
-
-                    // Produce two keys by replacing gate_up_proj with gate_proj / up_proj
-                    let gate_key = base_key.replace("gate_up_proj", "gate_proj");
-                    let up_key = base_key.replace("gate_up_proj", "up_proj");
-
-                    new_entries.push((gate_key, gate_arr));
-                    new_entries.push((up_key, up_arr));
-                }
-            } else if k.contains("gate_up_proj_bias") {
-                if let Some(v) = raw.remove(k) {
-                    let (gate_b, up_b) = split_gate_up_bias(&v);
-                    new_entries.push((k.replace("gate_up_proj_bias", "gate_proj.bias"), gate_b));
-                    new_entries.push((k.replace("gate_up_proj_bias", "up_proj.bias"), up_b));
-                }
-            } else if k.contains("down_proj") && !k.contains("bias") {
-                if let Some(v) = raw.remove(k) {
-                    let (final_key, final_v) = if k.contains("_blocks") {
-                        let flat = flatten_mxfp4_blocks(&v);
-                        (k.replace("_blocks", ".weight"), flat)
-                    } else if k.contains("_scales") {
-                        (k.replace("_scales", ".scales"), v)
-                    } else {
-                        (k.clone(), v)
-                    };
-                    new_entries.push((final_key, final_v));
-                }
-            } else if k.contains("down_proj_bias") {
-                if let Some(v) = raw.remove(k) {
-                    new_entries.push((k.replace("down_proj_bias", "down_proj.bias"), v));
-                }
-            }
-        }
-
-        for (k, v) in new_entries {
-            raw.insert(k, v);
-        }
+    if let Some(packed) = raw
+        .keys()
+        .find(|k| k.ends_with("_blocks") || k.ends_with("_scales") || k.ends_with(".scales"))
+    {
+        return Err(format!(
+            "gpt_oss: `{packed}` is a packed (MXFP4 or MLX-quantized) tensor, which the \
+             native gpt-oss engine does not run; use a dense (bf16 / f16 / f32) checkpoint"
+        ));
     }
 
     // Drop lm_head when embeddings are tied.
     if config.tie_word_embeddings {
         raw.remove("lm_head.weight");
     }
-
-    // ── Step 4: Build per-layer weight structs ──────────────────────────────
 
     let get = |key: &str| -> Result<InlineArray, String> {
         raw.get(key).cloned().ok_or_else(|| {
@@ -234,75 +214,32 @@ pub fn load_model(
         let layer_type = config.layer_type(li);
         let is_sliding = layer_type == AttentionLayerType::SlidingAttention;
 
-        // Layer norms
-        let input_ln_w = get(&format!("{p}.input_layernorm.weight"))?;
-        let post_ln_w = get(&format!("{p}.post_attention_layernorm.weight"))?;
-
-        // Attention projections — stored as [out, in], pre-transpose to [in, out]
-        let attn_q_w = get(&format!("{sa}.q_proj.weight"))?.t();
-        let attn_k_w = get(&format!("{sa}.k_proj.weight"))?.t();
-        let attn_v_w = get(&format!("{sa}.v_proj.weight"))?.t();
-        let attn_o_w = get(&format!("{sa}.o_proj.weight"))?.t();
-
-        // Optional attention biases
-        let attn_q_b = if use_bias {
-            get_opt(&format!("{sa}.q_proj.bias"))
-        } else {
-            None
+        let bias = |name: &str| {
+            if use_bias {
+                get_opt(&format!("{sa}.{name}.bias"))
+            } else {
+                None
+            }
         };
-        let attn_k_b = if use_bias {
-            get_opt(&format!("{sa}.k_proj.bias"))
-        } else {
-            None
-        };
-        let attn_v_b = if use_bias {
-            get_opt(&format!("{sa}.v_proj.bias"))
-        } else {
-            None
-        };
-        let attn_o_b = if use_bias {
-            get_opt(&format!("{sa}.o_proj.bias"))
-        } else {
-            None
-        };
-
-        // MoE router — stored as [num_experts, hidden]; pre-transpose to [hidden, num_experts]
-        let moe_router_w = get(&format!("{mlp}.router.weight"))?.t();
-
-        // Expert projections.  These are stacked tensors of shape
-        //   gate_proj / up_proj:  [num_experts, intermediate, hidden] (stored [num_experts, out, in])
-        //   down_proj:            [num_experts, hidden, intermediate]
-        // We pre-transpose gate/up to [num_experts, hidden, intermediate] so that
-        // batched gather_mm(hidden[tok], stacked_w[expert_idx]) works correctly.
-        // NOTE: The stacked weights arrive from the checkpoint as
-        //   [num_experts, out_features, in_features] (PyTorch convention).
-        // InlineArray.t() on 3-D does a full transpose of the last two dims — this
-        // matches what we want: [num_experts, in, out] after transposing.
-        let moe_gate_w = get(&format!("{mlp}.experts.gate_proj.weight"))?.t();
-        let moe_up_w = get(&format!("{mlp}.experts.up_proj.weight"))?.t();
-        // down_proj: [num_experts, hidden, intermediate] — transpose to [num_experts, intermediate, hidden]
-        // to match gather_mm(clamped, down_w) → clamped: [T, inter], down_w: [inter, hidden]
-        let moe_down_w = get(&format!("{mlp}.experts.down_proj.weight"))?.t();
-
-        // Expert biases — [num_experts, out_features]; accessed by index during routing
-        let moe_gate_b = get(&format!("{mlp}.experts.gate_proj.bias"))?;
-        let moe_up_b = get(&format!("{mlp}.experts.up_proj.bias"))?;
-        let moe_down_b = get(&format!("{mlp}.experts.down_proj.bias"))?;
+        let experts = load_experts(&raw, &format!("{mlp}.experts"))?;
 
         layers.push(LayerWeights {
-            input_ln_w,
+            input_ln_w: get(&format!("{p}.input_layernorm.weight"))?,
             input_ln_eps: config.rms_norm_eps,
-            post_ln_w,
+            post_ln_w: get(&format!("{p}.post_attention_layernorm.weight"))?,
             post_ln_eps: config.rms_norm_eps,
 
-            attn_q_w,
-            attn_q_b,
-            attn_k_w,
-            attn_k_b,
-            attn_v_w,
-            attn_v_b,
-            attn_o_w,
-            attn_o_b,
+            // Stored [out, in]; pre-transposed to [in, out].
+            attn_q_w: get(&format!("{sa}.q_proj.weight"))?.t(),
+            attn_q_b: bias("q_proj"),
+            attn_k_w: get(&format!("{sa}.k_proj.weight"))?.t(),
+            attn_k_b: bias("k_proj"),
+            attn_v_w: get(&format!("{sa}.v_proj.weight"))?.t(),
+            attn_v_b: bias("v_proj"),
+            attn_o_w: get(&format!("{sa}.o_proj.weight"))?.t(),
+            attn_o_b: bias("o_proj"),
+            // MLX's SDPA takes sinks only in the output dtype.
+            attn_sinks: get(&format!("{sa}.sinks"))?.as_dtype(model_dtype),
 
             attn_n_heads: n_heads,
             attn_n_kv_heads: n_kv_heads,
@@ -312,13 +249,15 @@ pub fn load_model(
             attn_is_sliding: is_sliding,
             attn_sliding_window: config.sliding_window,
 
-            moe_router_w,
-            moe_gate_w,
-            moe_gate_b,
-            moe_up_w,
-            moe_up_b,
-            moe_down_w,
-            moe_down_b,
+            // Router stored [E, hidden]; pre-transposed to [hidden, E].
+            moe_router_w: get(&format!("{mlp}.router.weight"))?.t(),
+            moe_router_b: get(&format!("{mlp}.router.bias"))?,
+            moe_gate_w: LayerWeight::Dense(experts.gate_w),
+            moe_up_w: LayerWeight::Dense(experts.up_w),
+            moe_down_w: LayerWeight::Dense(experts.down_w),
+            moe_gate_b: experts.gate_b,
+            moe_up_b: experts.up_b,
+            moe_down_b: experts.down_b,
             moe_num_experts: n_experts,
             moe_top_k: top_k,
 
@@ -335,7 +274,8 @@ pub fn load_model(
         }
     }
 
-    // ── Step 5: copy_fresh — force all weights into fresh Metal buffers ─────
+    // Force every weight into a fresh, contiguous Metal buffer (the expert
+    // splits above are strided views of the fused tensors).
     let zero = InlineArray::scalar_with_dtype(0.0, model_dtype);
     let copy_fresh = |w: &InlineArray| -> InlineArray {
         let mut fresh = w.add(&zero);
@@ -361,14 +301,17 @@ pub fn load_model(
         lw.attn_k_b = copy_fresh_opt(lw.attn_k_b.take());
         lw.attn_v_b = copy_fresh_opt(lw.attn_v_b.take());
         lw.attn_o_b = copy_fresh_opt(lw.attn_o_b.take());
+        lw.attn_sinks = copy_fresh(&lw.attn_sinks);
         lw.moe_router_w = copy_fresh(&lw.moe_router_w);
-        lw.moe_gate_w = copy_fresh(&lw.moe_gate_w);
+        lw.moe_router_b = copy_fresh(&lw.moe_router_b);
+        lw.moe_gate_w = lw.moe_gate_w.copy_fresh(&zero);
+        lw.moe_up_w = lw.moe_up_w.copy_fresh(&zero);
+        lw.moe_down_w = lw.moe_down_w.copy_fresh(&zero);
         lw.moe_gate_b = copy_fresh(&lw.moe_gate_b);
-        lw.moe_up_w = copy_fresh(&lw.moe_up_w);
         lw.moe_up_b = copy_fresh(&lw.moe_up_b);
-        lw.moe_down_w = copy_fresh(&lw.moe_down_w);
         lw.moe_down_b = copy_fresh(&lw.moe_down_b);
     }
+    crate::check_last_error().map_err(|e| format!("gpt_oss: loading the weights failed: {e}"))?;
 
     eprintln!("[GPT-OSS] load_model: all weights force-copied into fresh Metal buffers");
 
@@ -381,109 +324,4 @@ pub fn load_model(
         layers,
         model_dtype,
     })
-}
-
-// ── MXFP4 / weight sanitization helpers ──────────────────────────────────────
-
-/// Flatten the last two dims of an MXFP4 `_blocks` tensor, as Python does:
-///   `v.view(mx.uint32).flatten(-2)`
-///
-/// In the InlineArray bridge there is no direct view-as-uint32 op, so we
-/// reinterpret by reshaping the last dimension (which packs bytes into uint32
-/// words).  The bridge's `reshape` accepts -1 to infer a dimension.
-///
-/// If the shape cannot be inferred (unexpected layout), return the tensor
-/// unchanged and let the downstream matmul fail with a useful shape error.
-fn flatten_mxfp4_blocks(v: &InlineArray) -> InlineArray {
-    // Shape is typically [num_experts, out_features//2, in_features, 2] for MXFP4
-    // or [out_features//2, in_features, 2] for dense expert.
-    // After flattening last two dims: [num_experts, out_features//2, in_features*2]
-    // or [out_features//2, in_features*2].
-    // Use reshape with -1 on the last dim to let MLX compute the product.
-    let ndim = v.ndim();
-    if ndim < 2 {
-        return v.clone();
-    }
-    let mut new_shape: Vec<i32> = (0..ndim - 2).map(|i| v.dim(i)).collect();
-    new_shape.push(-1); // flatten last two dims
-    v.reshape(&new_shape)
-}
-
-/// Split a fused gate_up weight along the second-to-last dim.
-///
-/// For dense weights: shape `[num_experts, out*2, hidden]` →
-///   gate: `[num_experts, out, hidden]` (first half)
-///   up:   `[num_experts, out, hidden]` (second half)
-///
-/// For `.scales` or `.weight` the same slice indices apply to whatever dim
-/// encodes the fused projection.
-///
-/// Returns (gate, up).
-fn split_gate_up(v: &InlineArray, suffix: &str) -> (InlineArray, InlineArray) {
-    let ndim = v.ndim();
-    // The fused dim is the second-to-last (-2 from end, i.e. ndim-2 in 0-indexed).
-    // For 2-D: dim 0. For 3-D expert tensor: dim 1.
-    if ndim < 2 {
-        // Scalar or 1-D — shouldn't happen; return copies.
-        return (v.clone(), v.clone());
-    }
-
-    let split_dim = ndim - 2; // second-to-last axis
-    let fused_size = v.dim(split_dim);
-    let half = fused_size / 2;
-
-    // Build start/stop index arrays for slice on split_dim.
-    // All other dims are taken in full: start=0, stop=dim(i).
-    let start_gate = vec![0i32; ndim as usize];
-    let mut stop_gate = (0..ndim).map(|i| v.dim(i)).collect::<Vec<_>>();
-    let mut start_up = vec![0i32; ndim as usize];
-    let stop_up = stop_gate.clone();
-
-    // gate: [0..half] along split_dim
-    stop_gate[split_dim as usize] = half;
-    // up: [half..fused_size] along split_dim
-    start_up[split_dim as usize] = half;
-
-    if suffix == ".scales" {
-        // For scales the fused axis may be the last dim — use the same logic
-        // but fall back to a split on axis -1 when ndim == 1.
-        let axis = if ndim == 1 { 0i32 } else { split_dim };
-        let sg = vec![0i32; ndim as usize];
-        let mut eg = (0..ndim).map(|i| v.dim(i)).collect::<Vec<_>>();
-        let mut su = sg.clone();
-        let eu = eg.clone();
-        let half_s = eg[axis as usize] / 2;
-        eg[axis as usize] = half_s;
-        su[axis as usize] = half_s;
-        let gate = v.slice(&sg, &eg);
-        let up = v.slice(&su, &eu);
-        return (gate, up);
-    }
-
-    let gate = v.slice(&start_gate, &stop_gate);
-    let up = v.slice(&start_up, &stop_up);
-    (gate, up)
-}
-
-/// Split a fused gate_up BIAS along the last axis.
-///
-/// Shape `[num_experts, out*2]` → gate `[num_experts, out]`, up `[num_experts, out]`.
-/// Shape `[out*2]` → gate `[out]`, up `[out]`.
-fn split_gate_up_bias(v: &InlineArray) -> (InlineArray, InlineArray) {
-    let ndim = v.ndim();
-    let last = ndim - 1;
-    let total = v.dim(last);
-    let half = total / 2;
-
-    let sg = vec![0i32; ndim as usize];
-    let mut eg = (0..ndim).map(|i| v.dim(i)).collect::<Vec<_>>();
-    let mut su = sg.clone();
-    let eu = eg.clone();
-
-    eg[last as usize] = half;
-    su[last as usize] = half;
-
-    let gate = v.slice(&sg, &eg);
-    let up = v.slice(&su, &eu);
-    (gate, up)
 }

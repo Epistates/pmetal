@@ -178,10 +178,11 @@ impl InlineArray {
     /// Fixed-shape compiled GPT-OSS attention decode layer.
     ///
     /// Mirrors [`Self::compiled_attn_layer_fixed`] but tuned for GPT-OSS:
-    /// q/k/v/o biases, no q/k norm, full attention only, YaRN through
-    /// `rope`. Sliding-window layers stay on the per-op path because their
-    /// cache rotation would require a different cache layout to express in a
-    /// compiled graph.
+    /// q/k/v/o biases, no q/k norm, per-head attention `sinks`, YaRN through
+    /// `rope`. The new key and value go to cache slot `kv_write` and
+    /// attention reads the first `kv_valid` slots, which serves a
+    /// full-attention cache (`offset`, `offset + 1`) and a sliding ring
+    /// (`offset % window`, `min(offset + 1, window)`) alike.
     #[allow(clippy::too_many_arguments)]
     pub fn compiled_gptoss_attn_layer_fixed(
         normed: &Self,
@@ -193,9 +194,11 @@ impl InlineArray {
         k_b: &Self,
         v_b: &Self,
         o_b: &Self,
+        sinks: &Self,
         cache_keys_in: &Self,
         cache_vals_in: &Self,
-        kv_offset: i32,
+        kv_write: i32,
+        kv_valid: i32,
         rope_offset: i32,
         n_heads: i32,
         n_kv: i32,
@@ -220,9 +223,11 @@ impl InlineArray {
                 &k_b.raw,
                 &v_b.raw,
                 &o_b.raw,
+                &sinks.raw,
                 &cache_keys_in.raw,
                 &cache_vals_in.raw,
-                kv_offset,
+                kv_write,
+                kv_valid,
                 rope_offset,
                 n_heads,
                 n_kv,

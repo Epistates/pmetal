@@ -158,6 +158,39 @@ impl InlineArray {
         }
     }
 
+    /// SDPA with per-head attention sinks: `sinks` (`[n_heads]`) joins each
+    /// row's softmax as one more logit whose value is zero, as
+    /// `mx.fast.scaled_dot_product_attention(..., sinks=sinks)` and
+    /// transformers' gpt-oss attention compute it. `mask_mode` is `""` or
+    /// `"causal"`; `mask` is an additive or boolean array mask.
+    pub fn sdpa_with_sinks(
+        &self,
+        k: &Self,
+        v: &Self,
+        scale: f32,
+        mask_mode: &str,
+        mask: Option<&Self>,
+        sinks: &Self,
+    ) -> Self {
+        let mode = std::ffi::CString::new(mask_mode).unwrap();
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_sdpa_sinks(
+                dst.as_mut_ptr(),
+                &self.raw,
+                &k.raw,
+                &v.raw,
+                scale,
+                mode.as_ptr(),
+                mask.map_or(std::ptr::null(), |m| &m.raw),
+                &sinks.raw,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
     pub fn split(&self, indices: &[i32], axis: i32) -> Vec<Self> {
         let n = indices.len() + 1;
         let mut bufs: Vec<MaybeUninit<RawBuf>> = (0..n).map(|_| MaybeUninit::uninit()).collect();

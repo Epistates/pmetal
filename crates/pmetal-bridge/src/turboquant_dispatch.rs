@@ -1,6 +1,6 @@
 //! Shared TurboQuant attention dispatch for the bridge native paths.
 //!
-//! Every native architecture (`qwen3_native`, `gpt_oss_native`,
+//! Every native architecture with a TurboQuant cache (`qwen3_native`,
 //! `llama4_native`, …) needs the same decode-time decision tree once it has
 //! a `QuantizedKvCache`:
 //!
@@ -31,7 +31,7 @@ use crate::turboquant::QuantizedKvCache;
 /// Returns the layer output `[B, H, S, D_v]`. `prev` is the cache offset
 /// **before** the new chunk is appended, used to pick the prefill fallback
 /// path. `trace_label` is a short upper-case identifier (e.g. `"QWEN"`,
-/// `"GPT_OSS"`) prefixed to trace messages emitted via the
+/// `"LLAMA4"`) prefixed to trace messages emitted via the
 /// `PMETAL_TRACE_TURBOQUANT` env var.
 pub fn turboquant_attention_step(
     tq_cache: &mut QuantizedKvCache,

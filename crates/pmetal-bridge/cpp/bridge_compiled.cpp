@@ -502,8 +502,12 @@ void mlx_inline_compiled_attn_layer_fixed(
 //   * q/k/v/o biases (always present in real models — caller asserts).
 //   * No q/k norm.
 //   * Traditional=false RoPE over the full head_dim.
-// Sliding-window layers stay on the per-op path; their cache rotation
-// would need a different cache layout to express in a compiled graph.
+//   * Per-head attention sinks in the softmax.
+// Full and sliding-window layers alike: the new key is written at slot
+// `kv_write` and attention reads the first `kv_valid` slots, so a full
+// layer passes (offset, offset + 1) and a sliding ring (offset % window,
+// min(offset + 1, window)). Order within the cache never matters, since keys
+// are rotated before they are stored.
 // ----------------------------------------------------------------------------
 void mlx_inline_compiled_gptoss_attn_layer_fixed(
     mlx_inline_array* dst_out,
@@ -518,9 +522,11 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
     const mlx_inline_array* k_b,
     const mlx_inline_array* v_b,
     const mlx_inline_array* o_b,
+    const mlx_inline_array* sinks,
     const mlx_inline_array* cache_keys_in,
     const mlx_inline_array* cache_vals_in,
-    int kv_offset,
+    int kv_write,
+    int kv_valid,
     int rope_offset,
     int n_heads,
     int n_kv,
@@ -610,10 +616,12 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
                         auto& o_b = ins[8];
                         auto& cache_keys = ins[9];
                         auto& cache_vals = ins[10];
-                        auto& kv_offset_arr = ins[11];
+                        auto& kv_write_arr = ins[11];
                         auto& rope_offset_arr = ins[12];
                         auto& rope_freqs_arr = ins[13];
                         auto& rope_gain_arr = ins[14];
+                        auto& sinks_arr = ins[15];
+                        auto& kv_valid_arr = ins[16];
 
                         int B = normed.shape(0);
                         int S = normed.shape(1);
@@ -640,17 +648,17 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
                                              HAS_GAIN, rope_gain_arr);
 
                         auto kv_indices = broadcast_to(
-                            reshape(kv_offset_arr, {1, 1, 1, 1}),
+                            reshape(kv_write_arr, {1, 1, 1, 1}),
                             {B, NKV, S, HD});
                         auto updated_keys = put_along_axis(cache_keys, kv_indices, keys, 2);
                         auto updated_vals = put_along_axis(cache_vals, kv_indices, values, 2);
 
-                        auto next_offset = add(kv_offset_arr, array(S));
                         auto positions = reshape(arange(L, int32), {1, 1, 1, L});
-                        auto valid_mask = less(positions, reshape(next_offset, {1, 1, 1, 1}));
+                        auto valid_mask = less(positions, reshape(kv_valid_arr, {1, 1, 1, 1}));
 
                         auto output = fast::scaled_dot_product_attention(
-                            queries, updated_keys, updated_vals, SCALE, "", valid_mask);
+                            queries, updated_keys, updated_vals, SCALE, "", valid_mask,
+                            std::optional<array>(sinks_arr));
                         output = transpose(output, {0, 2, 1, 3});
                         output = reshape(output, {B, S, NH * HD});
 
@@ -673,10 +681,12 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
             as_arr(o_b),
             as_arr(cache_keys_in),
             as_arr(cache_vals_in),
-            array(kv_offset),
+            array(kv_write),
             array(rope_offset),
             optional_input(rope_freqs),
             optional_input(rope_gain),
+            as_arr(sinks),
+            array(kv_valid),
         });
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);

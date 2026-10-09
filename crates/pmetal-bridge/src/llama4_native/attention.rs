@@ -407,6 +407,7 @@ pub(super) fn attn_forward(
                     n_kv_heads,
                     group_size,
                     bits,
+                    None,
                 )
             }
         } else {
@@ -421,6 +422,7 @@ pub(super) fn attn_forward(
                 n_kv_heads,
                 group_size,
                 bits,
+                None,
             )
         }
     } else {

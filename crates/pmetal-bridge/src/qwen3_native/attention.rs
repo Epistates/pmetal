@@ -723,6 +723,7 @@ pub(super) fn attn_forward_with_tree_ctx(
                     n_kv_heads,
                     group_size,
                     bits,
+                    None,
                 )
             }
         }

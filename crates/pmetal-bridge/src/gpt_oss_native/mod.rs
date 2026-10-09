@@ -2,22 +2,29 @@
 //!
 //! GPT-OSS is OpenAI's first Apache-2.0 open-weight model (Aug 2025).  Available
 //! in 20B and 120B variants, it uses:
-//!   - Mixture of Experts (MoE) with top-k sigmoid routing and per-expert bias
-//!   - Alternating sliding window (128 tok) and full-context attention patterns
-//!   - GPT-OSS SwiGLU: `x_glu * sigmoid(α * x_glu) * (x_linear + 1)` with clamping
+//!   - Mixture of Experts (MoE): a biased router, softmax over the top-k
+//!     logits, per-expert biases
+//!   - Alternating banded sliding-window (128 tok) and full-context attention
+//!   - Learned per-head attention sinks in every softmax
+//!   - GPT-OSS GLU: `gate * sigmoid(α * gate) * (up + 1)` with clamping, gate
+//!     and up interleaved in the fused `gate_up_proj`
 //!   - Grouped Multi-Query Attention (GQA), bias on q/k/v/o projections
-//!   - Standard full-head RoPE (head_dim = 64)
+//!   - Full-head YaRN RoPE (head_dim = 64, `truncate: false`)
 //!   - No Q/K norm (unlike Qwen3.5)
+//!
+//! It computes what transformers' `GptOssForCausalLM` and the reference
+//! implementation compute; `pmetal-models`' `gpt_oss_native_parity` test
+//! checks it against transformers.
 //!
 //! Every op on the hot path uses [`InlineArray`] (stack-allocated `mlx::core::array`,
 //! direct C++ bridge). This eliminates ALL per-op heap allocation, matching
 //! Python/nanobind's direct C++ binding performance.
 //!
 //! The stack is split across focused submodules:
-//!   * [`weights`] — layer weight struct, safetensors loading, MXFP4 sanitization
-//!   * [`cache`] — per-layer KV caches (sliding / full / quantized-full)
-//!   * [`attention`] — attention forward step (three cache paths)
-//!   * [`moe`] — sigmoid-routed MoE + clamped SwiGLU activation
+//!   * [`weights`] — layer weight struct, safetensors loading (dense layouts)
+//!   * [`cache`] — per-layer KV caches (sliding ring / full / quantized-full)
+//!   * [`attention`] — attention forward step with sinks (three cache paths)
+//!   * [`moe`] — biased top-k router + clamped GLU experts
 //!   * [`forward`] — full-model forward + prefill/prime/generate wrappers
 
 use serde::Deserialize;

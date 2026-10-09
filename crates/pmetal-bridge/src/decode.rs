@@ -395,6 +395,8 @@ pub fn try_sdpa_causal_like_mlx(
 /// - `q_keys` / `q_values`: `(packed, scales, biases)` where packed is uint32
 /// - For GQA (`n_q_heads > n_kv_heads`): queries are reshaped and quantized
 ///   tuples are broadcast, matching upstream behavior exactly.
+/// - `sinks`: per-head attention sink logits `[n_q_heads]` (gpt-oss), or
+///   `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn quantized_sdpa(
     queries: &InlineArray,
@@ -406,6 +408,7 @@ pub fn quantized_sdpa(
     n_kv_heads: i32,
     group_size: i32,
     bits: i32,
+    sinks: Option<&InlineArray>,
 ) -> InlineArray {
     let b = queries.dim(0);
     let l = queries.dim(2);
@@ -469,8 +472,33 @@ pub fn quantized_sdpa(
         scores
     };
 
-    // Softmax with precise=true
-    let weights = scores.softmax_precise(-1);
+    // Softmax with precise=true. Attention sinks (`[n_q_heads]`) join each
+    // row as one more logit and are dropped again, as MLX's fused SDPA
+    // computes them.
+    let weights = match sinks {
+        Some(sinks) => {
+            let mut sink_shape = scores.shape().to_vec();
+            let n = sink_shape.len();
+            sink_shape[n - 1] = 1;
+            let head_shape: Vec<i32> = if n_repeats > 1 {
+                vec![1, n_kv_heads, n_repeats, 1, 1]
+            } else {
+                vec![1, n_q_heads, 1, 1]
+            };
+            let sink_col = sinks
+                .as_dtype(scores.dtype_raw())
+                .reshape(&head_shape)
+                .broadcast_to(&sink_shape);
+            let kv_len = scores.dim(-1);
+            crate::compat::ops::slice_axis(
+                &scores.concatenate_2(&sink_col, -1).softmax_precise(-1),
+                -1,
+                0,
+                kv_len,
+            )
+        }
+        None => scores.softmax_precise(-1),
+    };
 
     // Value aggregation: weights @ V via quantized_matmul (fused dequant)
     let out = weights.quantized_matmul(

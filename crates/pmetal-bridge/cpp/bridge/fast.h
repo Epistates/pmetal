@@ -36,6 +36,13 @@ void mlx_inline_sdpa_with_mask(mlx_inline_array* dst,
     const mlx_inline_array* q, const mlx_inline_array* k,
     const mlx_inline_array* v, float scale,
     const mlx_inline_array* mask);
+// SDPA with per-head attention sinks (`sinks [n_heads]`, one extra logit in
+// each row's softmax that contributes no value). `mask_mode` is "" or
+// "causal"; `mask` (nullable) is an additive or boolean array mask.
+void mlx_inline_sdpa_sinks(mlx_inline_array* dst,
+    const mlx_inline_array* q, const mlx_inline_array* k,
+    const mlx_inline_array* v, float scale, const char* mask_mode,
+    const mlx_inline_array* mask, const mlx_inline_array* sinks);
 
 // ── Split ────────────────────────────────────────────────────────────────
 void mlx_inline_split(const mlx_inline_array* input, const int* indices, int num_indices,
