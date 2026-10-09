@@ -350,13 +350,17 @@ impl Llama4Router {
         // throwing away the router signal entirely.
         let neg_k = -(self.top_k as i32);
         let part_indices = ops::argpartition_axis(&router_logits, neg_k, -1);
-        // Slice the last top_k entries: [total_tokens, top_k]
-        let expert_indices = ops::slice_axis_from(&part_indices, -1, neg_k);
+        // Slice the last top_k entries: [total_tokens, top_k]. A selection
+        // carries no gradient, and MLX refuses to differentiate a gather with
+        // respect to its indices.
+        let expert_indices = ops::stop_gradient(&ops::slice_axis_from(&part_indices, -1, neg_k));
 
         // Gate weight = sigmoid of the selected RAW logits (per expert,
-        // independent — no cross-expert normalisation).
+        // independent — no cross-expert normalisation), in f32 and then back
+        // to the activations' dtype, as `Llama4TextMoe` computes it.
         let selected_logits = router_logits.take_along_axis(&expert_indices, -1);
-        let expert_weights = ops::sigmoid(&selected_logits);
+        let expert_weights =
+            ops::sigmoid(&selected_logits.as_type::<f32>()).as_dtype(x.dtype().as_i32());
 
         Ok((expert_indices, expert_weights, router_logits))
     }
@@ -478,31 +482,27 @@ impl Llama4MoE {
         // Shared expert output (always applied to all tokens)
         let shared_out = self.shared_expert.forward(&flat_x)?;
 
-        // Eval routing tensors to CPU for index extraction.
-        // The routing tensors are small relative to expert MLP compute, and
-        // per-expert dispatch avoids running every expert over every token.
+        // Which expert each token goes to is read on the host, so that each
+        // expert runs over its own tokens only. The gate values stay in the
+        // graph: the loss reaches the router, and every adapter upstream of
+        // it, through them, as it does in `Llama4TextMoe`.
         let expert_indices = expert_indices.as_type::<i32>();
         expert_indices.eval();
-        let expert_weights = expert_weights;
-        expert_weights.eval();
 
         let top_k = self.config.num_experts_per_tok as usize;
         let n_tokens = total_tokens as usize;
-        let expert_ids: Vec<i32> = expert_indices
-            .as_slice::<u32>()
-            .iter()
-            .map(|&x| x as i32)
-            .collect();
-        let routing_weights: Vec<f32> = expert_weights.as_type::<f32>().as_slice().to_vec();
+        let expert_ids: Vec<i32> = expert_indices.as_slice::<i32>().to_vec();
+        let flat_weights = expert_weights.reshape(&[-1]);
 
-        let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
+        // Per expert: the tokens routed to it, and where each one's gate
+        // value sits in `flat_weights`.
+        let mut expert_assignments: Vec<Vec<(i32, i32)>> = vec![Vec::new(); self.experts.len()];
         for token_idx in 0..n_tokens {
             for slot in 0..top_k {
                 let flat_idx = token_idx * top_k + slot;
                 let expert_id = expert_ids[flat_idx] as usize;
-                let weight = routing_weights[flat_idx];
                 if expert_id < self.experts.len() {
-                    expert_assignments[expert_id].push((token_idx, weight));
+                    expert_assignments[expert_id].push((token_idx as i32, flat_idx as i32));
                 }
             }
         }
@@ -514,11 +514,14 @@ impl Llama4MoE {
                 continue;
             }
 
-            let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
-            let weights: Vec<f32> = assignments.iter().map(|&(_, weight)| weight).collect();
+            let count = assignments.len() as i32;
+            let token_indices: Vec<i32> = assignments.iter().map(|&(token, _)| token).collect();
+            let gate_slots: Vec<i32> = assignments.iter().map(|&(_, slot)| slot).collect();
 
-            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
-            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
+            let idx_array = Array::from_slice(&token_indices, &[count]);
+            let weight_array = flat_weights
+                .take_axis(&Array::from_slice(&gate_slots, &[count]), 0)
+                .reshape(&[count, 1]);
 
             // Llama4 scales the expert *input* by the sigmoid gate
             // (`experts(x * scores)`), not the output. The expert MLP is
@@ -527,7 +530,7 @@ impl Llama4MoE {
             let expert_input = flat_x.take_axis(&idx_array, 0).multiply(&weight_array);
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
 
-            let updates = expert_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
+            let updates = expert_out.reshape(&[count, 1, hidden_size]);
             combined_out = pmetal_bridge::compat::indexing::scatter_add_single(
                 &combined_out,
                 &idx_array,
