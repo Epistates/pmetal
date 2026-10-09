@@ -21,11 +21,17 @@
 //! - Configurable reasoning effort (low/medium/high)
 //! - Tool use optimization
 //! - Apache 2.0 license
-use pmetal_bridge::compat::{Array, Exception, ModuleParameters, Param, indexing, nn, ops, random};
+use pmetal_bridge::compat::{
+    Array, Exception, ModuleParameters, ModuleParametersExt, Param, indexing, nn, ops, random,
+};
 use pmetal_bridge::impl_module_params;
 
 use crate::checkpointing::checkpointed_layer;
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
+use pmetal_bridge::gpt_oss_native::GptOssExperts;
+
+/// gpt-oss's GLU slope, `gate · σ(1.702 · gate)`.
+const SWIGLU_ALPHA: f32 = 1.702;
 use pmetal_bridge::rope::{RopeConfig, RotaryEmbedding};
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig,
@@ -562,7 +568,7 @@ impl GptOssMLP {
 /// deviations against. The clamps bound the two *inputs* (asymmetrically), not
 /// the product — this keeps activations in range for MXFP4 inference.
 fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
-    const ALPHA: f32 = 1.702;
+    const ALPHA: f32 = SWIGLU_ALPHA;
     let lim = Array::from_f32(limit);
     let neg_lim = Array::from_f32(-limit);
     // gate: clamp the upper bound only (min stays unbounded).
@@ -667,6 +673,10 @@ pub struct GptOssMoE {
     stacked_down_bias: Option<Array>,
     /// Signature of the current expert weight/bias handles.
     stacked_signature: Option<Vec<usize>>,
+    /// The experts as a checkpoint ships them fused (the release's MXFP4,
+    /// kept packed, or transformers' dense `gate_up_proj`), frozen, in place
+    /// of `experts`. See [`GptOssMoE::set_fused_experts`].
+    fused: Option<GptOssExperts>,
 }
 impl_module_params!(GptOssMoE; gate, experts);
 
@@ -702,7 +712,30 @@ impl GptOssMoE {
             stacked_up_bias: None,
             stacked_down_bias: None,
             stacked_signature: None,
+            fused: None,
         })
+    }
+
+    /// Run the experts a checkpoint ships fused, the way both engines read
+    /// them ([`GptOssExperts::from_checkpoint`]), in place of the per-expert
+    /// `Linear`s, which are dropped. The release's MXFP4 experts stay packed.
+    /// They are frozen (not parameters), and a loss's gradient passes through
+    /// them to everything below.
+    pub fn set_fused_experts(&mut self, experts: GptOssExperts) {
+        self.experts.clear();
+        self.stacked_gate_proj = None;
+        self.stacked_up_proj = None;
+        self.stacked_down_proj = None;
+        self.stacked_gate_bias = None;
+        self.stacked_up_bias = None;
+        self.stacked_down_bias = None;
+        self.stacked_signature = None;
+        self.fused = Some(experts);
+    }
+
+    /// The fused experts, when [`Self::set_fused_experts`] installed them.
+    pub fn fused_experts(&self) -> Option<&GptOssExperts> {
+        self.fused.as_ref()
     }
 
     fn current_signature(&self) -> Vec<usize> {
@@ -856,6 +889,9 @@ impl GptOssMoE {
 
     /// Eagerly build or refresh the stacked expert cache.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        if self.fused.is_some() {
+            return Ok(());
+        }
         self.ensure_stacked()
     }
 
@@ -1013,7 +1049,29 @@ impl GptOssMoE {
     /// Forward pass through MoE.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let _ = self.router_aux_loss_coef;
+        if self.fused.is_some() {
+            return self.forward_fused(x);
+        }
         self.forward_stacked(x)
+    }
+
+    /// The router here, the experts through [`GptOssExperts::forward`].
+    fn forward_fused(&mut self, x: &Array) -> Result<Array, Exception> {
+        let shape = x.shape().to_vec();
+        let hidden_size = shape[shape.len() - 1];
+        let hidden_flat = x.reshape(&[-1, hidden_size]);
+        let (_, _, top_indices, weights) = self.route_topk(&hidden_flat)?;
+        let fused = self.fused.as_ref().expect("fused experts");
+        let out = fused.forward(
+            &hidden_flat,
+            &top_indices,
+            &weights.as_dtype(hidden_flat.dtype().as_i32()),
+            SWIGLU_ALPHA,
+            self.swiglu_limit,
+        );
+        pmetal_bridge::check_last_error()
+            .map_err(|e| Exception::custom(format!("gpt_oss: fused experts: {e}")))?;
+        Ok(out.reshape(&shape))
     }
 }
 
@@ -1286,6 +1344,54 @@ impl GptOssForCausalLM {
     /// Eagerly build stacked expert caches for all MoE layers.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         self.model.init_stacked_moe()
+    }
+
+    /// Load a checkpoint whose experts are fused as transformers and the
+    /// release store them (`mlp.experts.gate_up_proj[_blocks]`), returning
+    /// `false`, with nothing loaded, when the experts are per-expert `Linear`s.
+    ///
+    /// The experts go to [`GptOssMoE::set_fused_experts`], read the way the
+    /// native engine reads them (the release's MXFP4 stays packed); the
+    /// router's `mlp.router.*` loads into `mlp.gate`, everything else by
+    /// name. A tensor nothing reads is an error naming it.
+    pub fn load_fused_checkpoint(
+        &mut self,
+        model_dir: &std::path::Path,
+    ) -> Result<bool, Exception> {
+        use pmetal_bridge::native_loader::{discover_safetensors_shards, load_shards_into_map};
+        let shards = discover_safetensors_shards(model_dir).map_err(Exception::custom)?;
+        let mut raw = load_shards_into_map(&shards, model_dir).map_err(Exception::custom)?;
+        if !raw.keys().any(|k| k.contains(".mlp.experts.gate_up_proj")) {
+            return Ok(false);
+        }
+        let zero = Array::from_f32(0.0);
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let prefix = format!("model.layers.{i}.mlp.experts");
+            let experts = GptOssExperts::from_checkpoint(&raw, &prefix)
+                .map_err(Exception::custom)?
+                .copy_fresh(&zero);
+            raw.retain(|k, _| !k.starts_with(&format!("{prefix}.")));
+            layer.mlp.set_fused_experts(experts);
+        }
+        if self.model.config.tie_word_embeddings {
+            raw.remove("lm_head.weight");
+        }
+        let mut params = self.flatten_params_mut();
+        let mut unread = Vec::new();
+        for (key, value) in raw {
+            let key = key.replace(".mlp.router.", ".mlp.gate.");
+            match params.get_mut(key.as_str()) {
+                Some(param) => **param = value,
+                None => unread.push(key),
+            }
+        }
+        if !unread.is_empty() {
+            unread.sort();
+            return Err(Exception::custom(format!(
+                "gpt_oss: checkpoint tensors nothing reads: {unread:?}"
+            )));
+        }
+        Ok(true)
     }
 
     /// Get the configuration.

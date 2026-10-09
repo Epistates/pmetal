@@ -1,22 +1,13 @@
 //! Per-layer + full-model weight bundles and safetensors loading.
 //!
-//! Two dense expert layouts load:
-//!
-//! * transformers' own (a bf16 release): `mlp.experts.gate_up_proj
-//!   [E, H, 2I]`, applied as `x @ W`, with gate and up **interleaved** on the
-//!   last axis (`[..., ::2]` / `[..., 1::2]`), its `gate_up_proj_bias [E, 2I]`
-//!   interleaved the same way, and `down_proj [E, I, H]` / `down_proj_bias`;
-//! * the stacked per-projection layout MLX conversions ship:
-//!   `mlp.experts.{gate,up}_proj.weight [E, I, H]`,
-//!   `mlp.experts.down_proj.weight [E, H, I]`, each with its `.bias`.
-//!
-//! Packed checkpoints (the release's MXFP4 `*_blocks` / `*_scales`, or an MLX
-//! quantization) are refused by name: the expert kernels here are dense.
+//! The experts load from the release's MXFP4 (kept packed), transformers'
+//! dense layout or the stacked layout MLX conversions ship; see
+//! [`GptOssExperts`]. An MLX-quantized checkpoint (`*.scales` beside every
+//! projection) is refused by name.
 
 use crate::InlineArray;
-use crate::native_weight::LayerWeight;
 
-use super::{AttentionLayerType, GptOssConfig};
+use super::{AttentionLayerType, GptOssConfig, GptOssExperts};
 
 /// GPT-OSS layer weights — attention + MoE.
 pub(super) struct LayerWeights {
@@ -53,15 +44,8 @@ pub(super) struct LayerWeights {
     /// Router `[hidden, num_experts]` and its bias `[num_experts]`.
     pub(super) moe_router_w: InlineArray,
     pub(super) moe_router_b: InlineArray,
-    /// Experts stacked `[E, in, out]` for `gather_mm`.
-    pub(super) moe_gate_w: LayerWeight, // [E, hidden, intermediate]
-    pub(super) moe_up_w: LayerWeight,   // [E, hidden, intermediate]
-    pub(super) moe_down_w: LayerWeight, // [E, intermediate, hidden]
-    pub(super) moe_gate_b: InlineArray, // [E, intermediate]
-    pub(super) moe_up_b: InlineArray,   // [E, intermediate]
-    pub(super) moe_down_b: InlineArray, // [E, hidden]
-
-    pub(super) moe_num_experts: i32,
+    /// The routed experts, packed or dense.
+    pub(super) moe_experts: GptOssExperts,
     pub(super) moe_top_k: i32,
 
     // GLU parameters
@@ -83,6 +67,13 @@ pub struct NativeWeights {
     pub model_dtype: i32,
 }
 
+impl NativeWeights {
+    /// Whether the routed experts are held packed (the release's MXFP4).
+    pub fn experts_packed(&self) -> bool {
+        self.layers.iter().all(|lw| lw.moe_experts.is_packed())
+    }
+}
+
 impl std::fmt::Debug for NativeWeights {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeWeights")
@@ -93,64 +84,6 @@ impl std::fmt::Debug for NativeWeights {
     }
 }
 
-/// One layer's experts in the `[E, in, out]` layout `gather_mm` takes, with
-/// their biases.
-struct Experts {
-    gate_w: InlineArray,
-    up_w: InlineArray,
-    down_w: InlineArray,
-    gate_b: InlineArray,
-    up_b: InlineArray,
-    down_b: InlineArray,
-}
-
-/// The even (`0`) or odd (`1`) entries of `x`'s last axis: transformers'
-/// `x[..., ::2]` / `x[..., 1::2]`.
-fn interleaved(x: &InlineArray, which: i32) -> InlineArray {
-    let mut shape: Vec<i32> = (0..x.ndim()).map(|i| x.dim(i)).collect();
-    let last = shape.pop().expect("an expert tensor has axes");
-    let pairs: Vec<i32> = shape.iter().copied().chain([last / 2, 2]).collect();
-    let mut start = vec![0; pairs.len()];
-    let mut stop = pairs.clone();
-    *start.last_mut().unwrap() = which;
-    *stop.last_mut().unwrap() = which + 1;
-    x.reshape(&pairs).slice(&start, &stop).squeeze(-1)
-}
-
-/// Read one layer's experts from either dense layout (see the module docs).
-fn load_experts(
-    raw: &std::collections::HashMap<String, InlineArray>,
-    exp: &str,
-) -> Result<Experts, String> {
-    let get = |key: &str| {
-        raw.get(key)
-            .cloned()
-            .ok_or_else(|| format!("missing weight key: {key}"))
-    };
-    let swap = |x: InlineArray| x.transpose_axes(&[0, 2, 1]);
-    if let Some(gate_up) = raw.get(&format!("{exp}.gate_up_proj")) {
-        // [E, H, 2I], gate and up interleaved on the last axis.
-        let gate_up_b = get(&format!("{exp}.gate_up_proj_bias"))?;
-        return Ok(Experts {
-            gate_w: interleaved(gate_up, 0),
-            up_w: interleaved(gate_up, 1),
-            down_w: get(&format!("{exp}.down_proj"))?,
-            gate_b: interleaved(&gate_up_b, 0),
-            up_b: interleaved(&gate_up_b, 1),
-            down_b: get(&format!("{exp}.down_proj_bias"))?,
-        });
-    }
-    // Stacked `[E, out, in]`.
-    Ok(Experts {
-        gate_w: swap(get(&format!("{exp}.gate_proj.weight"))?),
-        up_w: swap(get(&format!("{exp}.up_proj.weight"))?),
-        down_w: swap(get(&format!("{exp}.down_proj.weight"))?),
-        gate_b: get(&format!("{exp}.gate_proj.bias"))?,
-        up_b: get(&format!("{exp}.up_proj.bias"))?,
-        down_b: get(&format!("{exp}.down_proj.bias"))?,
-    })
-}
-
 /// Load GPT-OSS model weights from a directory containing safetensors shards.
 pub fn load_model(
     model_dir: &std::path::Path,
@@ -159,13 +92,10 @@ pub fn load_model(
     let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
     let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
 
-    if let Some(packed) = raw
-        .keys()
-        .find(|k| k.ends_with("_blocks") || k.ends_with("_scales") || k.ends_with(".scales"))
-    {
+    if let Some(packed) = raw.keys().find(|k| k.ends_with(".scales")) {
         return Err(format!(
-            "gpt_oss: `{packed}` is a packed (MXFP4 or MLX-quantized) tensor, which the \
-             native gpt-oss engine does not run; use a dense (bf16 / f16 / f32) checkpoint"
+            "gpt_oss: `{packed}` belongs to an MLX quantization, which the native gpt-oss \
+             engine does not read; use the release (MXFP4 experts) or a dense checkpoint"
         ));
     }
 
@@ -221,7 +151,7 @@ pub fn load_model(
                 None
             }
         };
-        let experts = load_experts(&raw, &format!("{mlp}.experts"))?;
+        let experts = GptOssExperts::from_checkpoint(&raw, &format!("{mlp}.experts"))?;
 
         layers.push(LayerWeights {
             input_ln_w: get(&format!("{p}.input_layernorm.weight"))?,
@@ -252,13 +182,7 @@ pub fn load_model(
             // Router stored [E, hidden]; pre-transposed to [hidden, E].
             moe_router_w: get(&format!("{mlp}.router.weight"))?.t(),
             moe_router_b: get(&format!("{mlp}.router.bias"))?,
-            moe_gate_w: LayerWeight::Dense(experts.gate_w),
-            moe_up_w: LayerWeight::Dense(experts.up_w),
-            moe_down_w: LayerWeight::Dense(experts.down_w),
-            moe_gate_b: experts.gate_b,
-            moe_up_b: experts.up_b,
-            moe_down_b: experts.down_b,
-            moe_num_experts: n_experts,
+            moe_experts: experts,
             moe_top_k: top_k,
 
             swiglu_alpha: config.swiglu_alpha,
@@ -304,12 +228,7 @@ pub fn load_model(
         lw.attn_sinks = copy_fresh(&lw.attn_sinks);
         lw.moe_router_w = copy_fresh(&lw.moe_router_w);
         lw.moe_router_b = copy_fresh(&lw.moe_router_b);
-        lw.moe_gate_w = lw.moe_gate_w.copy_fresh(&zero);
-        lw.moe_up_w = lw.moe_up_w.copy_fresh(&zero);
-        lw.moe_down_w = lw.moe_down_w.copy_fresh(&zero);
-        lw.moe_gate_b = copy_fresh(&lw.moe_gate_b);
-        lw.moe_up_b = copy_fresh(&lw.moe_up_b);
-        lw.moe_down_b = copy_fresh(&lw.moe_down_b);
+        lw.moe_experts = lw.moe_experts.copy_fresh(&zero);
     }
     crate::check_last_error().map_err(|e| format!("gpt_oss: loading the weights failed: {e}"))?;
 

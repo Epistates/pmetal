@@ -1134,13 +1134,22 @@ impl DynamicModel {
             ModelArchitecture::Flux => Err(Exception::custom(
                 "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
             )),
-            ModelArchitecture::GptOss => simple_load_moe!(
-                GptOssConfig,
-                GptOssForCausalLM::new,
-                &config_content,
-                model_dir,
-                GptOss
-            ),
+            ModelArchitecture::GptOss => {
+                let config: GptOssConfig = json5::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = GptOssForCausalLM::new(config)?;
+                // The release (MXFP4) and transformers' own layout ship the
+                // experts fused; a per-expert `Linear` checkpoint takes the
+                // generic loader.
+                if !model.load_fused_checkpoint(model_dir)? {
+                    load_generic_weights(&mut model, model_dir)
+                        .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                }
+                eval_module_parameters_batched(&model)?;
+                let mut model = Self::GptOss(model);
+                model.init_post_load_fast_paths()?;
+                Ok(model)
+            }
             ModelArchitecture::Gemma4 => {
                 let effective = unwrap_text_config(&config_content)?;
                 let config: crate::architectures::gemma4::Gemma4Config =

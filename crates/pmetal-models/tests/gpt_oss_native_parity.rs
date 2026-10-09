@@ -47,10 +47,12 @@ impl Fixture {
     }
 }
 
-fn checkpoint(weights_file: &str) -> Fixture {
+/// The `<model>_config.json` / `<model>_reference.safetensors` fixture with
+/// `weights_file` as its checkpoint.
+fn checkpoint(model: &str, weights_file: &str) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(
-        fixture_path("gpt_oss_native_config.json"),
+        fixture_path(&format!("{model}_config.json")),
         dir.path().join("config.json"),
     )
     .expect("copy config");
@@ -63,7 +65,7 @@ fn checkpoint(weights_file: &str) -> Fixture {
     Fixture {
         _dir: dir,
         weights,
-        reference: load_shard(&fixture_path("gpt_oss_native_reference.safetensors")),
+        reference: load_shard(&fixture_path(&format!("{model}_reference.safetensors"))),
     }
 }
 
@@ -121,8 +123,8 @@ fn run_chunks(fx: &Fixture, chunks: &[i32], compiled: bool) -> Vec<(i32, InlineA
     out
 }
 
-fn check_layout(weights_file: &str) {
-    let fx = checkpoint(weights_file);
+fn check_layout(model: &str, weights_file: &str) {
+    let fx = checkpoint(model, weights_file);
     let want = fx.tensor("logits");
     let t = want.dim(1);
 
@@ -181,36 +183,172 @@ fn check_layout(weights_file: &str) {
 #[test]
 #[serial]
 fn native_gpt_oss_matches_transformers_from_the_transformers_layout() {
-    check_layout("gpt_oss_native_weights.safetensors");
+    check_layout("gpt_oss_native", "gpt_oss_native_weights.safetensors");
 }
 
 #[test]
 #[serial]
 fn native_gpt_oss_matches_transformers_from_the_stacked_layout() {
-    check_layout("gpt_oss_native_stacked_weights.safetensors");
+    check_layout(
+        "gpt_oss_native",
+        "gpt_oss_native_stacked_weights.safetensors",
+    );
 }
 
-/// The release ships MXFP4 experts, which the dense expert kernels cannot
-/// run: loading one is refused by name, not decoded as noise.
+/// The release's layout: experts as MXFP4 `*_blocks` / `*_scales` (random
+/// here, hidden and intermediate 64), everything else dense. They stay
+/// packed and run through `gather_qmm`; transformers dequantizes them
+/// (`convert_moe_packed_tensors`) for its reference.
 #[test]
 #[serial]
-fn native_gpt_oss_refuses_packed_experts_by_name() {
+fn native_gpt_oss_runs_the_release_mxfp4_experts_packed() {
+    check_layout("gpt_oss_mxfp4", "gpt_oss_mxfp4_weights.safetensors");
+    let fx = checkpoint("gpt_oss_mxfp4", "gpt_oss_mxfp4_weights.safetensors");
+    assert!(
+        fx.weights.experts_packed(),
+        "the MXFP4 experts were unpacked at load"
+    );
+}
+
+/// The `DynamicModel` path (training, LoRA, `serve`) on the same checkpoint
+/// directory: its loader reads the fused experts the native engine reads,
+/// packed when the checkpoint is, and the model must match transformers on
+/// an uncached forward and a cached decode across the window.
+fn check_dynamic(model: &str, weights_file: &str) {
+    use pmetal_models::DynamicModel;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::copy(
+        fixture_path(&format!("{model}_config.json")),
+        dir.path().join("config.json"),
+    )
+    .expect("copy config");
+    std::fs::copy(
+        fixture_path(weights_file),
+        dir.path().join("model.safetensors"),
+    )
+    .expect("copy weights");
+    let reference = load_shard(&fixture_path(&format!("{model}_reference.safetensors")));
+    let ids = ref_tensor(&reference, "input_ids").clone();
+    let want = ref_tensor(&reference, "logits").clone();
+    let t = ids.dim(1);
+
+    let mut dynamic = DynamicModel::load(dir.path()).expect("checkpoint loads");
+    drain_bridge("dynamic load");
+    let logits = dynamic.forward(&ids, None).expect("forward");
+    drain_bridge("dynamic forward");
+    assert_all_pass(
+        &format!("{weights_file}: dynamic forward"),
+        &[ParityReport::compute_with_per_position(
+            "logits", &logits, &want, TOL,
+        )],
+    );
+
+    let mut cache = dynamic.create_cache(t as usize + 1);
+    let mut reports = Vec::new();
+    let mut start = 0;
+    for len in std::iter::once(3).chain(std::iter::repeat_n(1, (t - 3) as usize)) {
+        let step = dynamic
+            .forward_with_cache(&rows(&ids, start, start + len), None, Some(&mut cache))
+            .expect("cached step");
+        drain_bridge("dynamic cached step");
+        reports.push(ParityReport::compute(
+            &format!("pos_{start}"),
+            &step,
+            &rows(&want, start, start + len),
+            TOL,
+        ));
+        start += len;
+    }
+    assert_all_pass(&format!("{weights_file}: dynamic cached decode"), &reports);
+}
+
+#[test]
+#[serial]
+fn dynamic_gpt_oss_matches_transformers_from_the_transformers_layout() {
+    check_dynamic("gpt_oss_native", "gpt_oss_native_weights.safetensors");
+}
+
+#[test]
+#[serial]
+fn dynamic_gpt_oss_runs_the_release_mxfp4_experts_packed() {
+    check_dynamic("gpt_oss_mxfp4", "gpt_oss_mxfp4_weights.safetensors");
+}
+
+/// A loss differentiated through the packed experts (`gather_qmm`) has to
+/// reach everything below them, as training adapters there needs: the input
+/// gradient is finite, non-zero, and the one the same experts give unpacked.
+#[test]
+#[serial]
+fn packed_experts_pass_the_gradient_to_their_input() {
+    use pmetal_models::DynamicModel;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::copy(
+        fixture_path("gpt_oss_mxfp4_config.json"),
+        dir.path().join("config.json"),
+    )
+    .expect("copy config");
+    std::fs::copy(
+        fixture_path("gpt_oss_mxfp4_weights.safetensors"),
+        dir.path().join("model.safetensors"),
+    )
+    .expect("copy weights");
+    let mut dynamic = DynamicModel::load(dir.path()).expect("checkpoint loads");
+    let DynamicModel::GptOss(model) = &mut dynamic else {
+        panic!("a gpt-oss checkpoint loads as GptOss");
+    };
+    let moe = &mut model.model.layers[0].mlp;
+    let packed = moe.fused_experts().expect("fused experts").clone();
+    assert!(packed.is_packed());
+    let x = pmetal_bridge::compat::random::normal(&[5, 64], pmetal_bridge::compat::Dtype::Float32);
+
+    let grad_of = |moe: &mut pmetal_models::architectures::gpt_oss::GptOssMoE| {
+        pmetal_bridge::clear_last_error();
+        let (loss, grads) = pmetal_bridge::compat::nn::value_and_grad_explicit(
+            |arrays: &[Array]| moe.forward(&arrays[0]).unwrap().square().sum(None),
+            std::slice::from_ref(&x),
+            &[],
+        )
+        .unwrap();
+        drain_bridge("value_and_grad");
+        assert!(loss.item::<f32>().is_finite());
+        grads[0].eval();
+        drain_bridge("gradient");
+        grads[0].clone()
+    };
+    let through_packed = grad_of(moe);
+    moe.set_fused_experts(packed.unpacked(pmetal_bridge::compat::Dtype::Float32.as_i32()));
+    let through_dense = grad_of(moe);
+
+    let dx = through_packed.as_slice::<f32>();
+    assert!(dx.iter().all(|g| g.is_finite()), "finite input gradient");
+    assert!(dx.iter().any(|g| *g != 0.0), "non-zero input gradient");
+    let diff = max_abs_diff(&through_packed, &through_dense);
+    assert!(
+        diff <= 1e-5,
+        "packed and dense experts' gradients differ by {diff:e}"
+    );
+}
+
+/// An MLX quantization packs every projection, which this engine doesn't
+/// read: loading one is refused by name, not decoded as noise.
+#[test]
+#[serial]
+fn native_gpt_oss_refuses_an_mlx_quantization_by_name() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::copy(
         fixture_path("gpt_oss_native_config.json"),
         dir.path().join("config.json"),
     )
     .expect("copy config");
-    let blocks = InlineArray::zeros(
-        &[4, 96, 1, 16],
-        pmetal_bridge::compat::Dtype::Uint8.as_i32(),
-    );
+    let scales = InlineArray::zeros(&[64, 1], pmetal_bridge::compat::Dtype::Float32.as_i32());
     InlineArray::save_safetensors(
         dir.path().join("model.safetensors").to_str().unwrap(),
-        &[("model.layers.0.mlp.experts.gate_up_proj_blocks", &blocks)],
+        &[("model.layers.0.self_attn.q_proj.scales", &scales)],
     );
     let config = load_config(dir.path()).expect("config parses");
-    let err = load_model(dir.path(), &config).expect_err("packed experts are refused");
-    assert!(err.contains("gate_up_proj_blocks"), "{err}");
+    let err = load_model(dir.path(), &config).expect_err("MLX-quantized weights are refused");
+    assert!(err.contains("q_proj.scales"), "{err}");
     drain_bridge("refusal");
 }

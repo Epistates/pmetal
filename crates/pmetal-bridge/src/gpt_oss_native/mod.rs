@@ -31,12 +31,15 @@ use serde::Deserialize;
 
 mod attention;
 mod cache;
+mod experts;
 mod forward;
 mod moe;
 mod weights;
 
 pub use cache::{KvLayerCache, NativeCache};
+pub use experts::{GptOssExperts, glu};
 pub use forward::{benchmark_trial, forward_step, generate, prefill_first_token};
+pub use moe::route;
 pub use weights::{NativeWeights, load_model};
 
 // ============================================================================
