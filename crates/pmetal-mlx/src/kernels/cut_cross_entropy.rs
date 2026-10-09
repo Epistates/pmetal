@@ -1,648 +1,398 @@
-//! Cut Cross Entropy (CCE) - Memory-efficient cross-entropy for long contexts.
+//! Cut cross-entropy: the cross-entropy of an LM head's logits without ever
+//! holding all of them, forward or backward.
 //!
-//! This implements Apple ML's Cut Cross Entropy technique that enables up to
-//! 13x longer context training by never materializing the full logits tensor.
+//! Wijmans et al., "Cut Your Losses in Large-Vocabulary Language Models"
+//! (arXiv 2411.09009), with the reference implementation at
+//! <https://github.com/apple/ml-cross-entropy>. The loss of a token is
+//! `logsumexp(logits) - logits[target]`, and both terms can be had without the
+//! `[tokens, vocab]` logits: build a vocabulary chunk's logits, reduce them to
+//! the chunk's `logsumexp` and the target logit if the chunk holds it, drop
+//! them, and combine the chunks' `[tokens]` results.
 //!
-//! # Key Innovation
+//! Autograd would undo that: differentiating the chunked forward keeps every
+//! chunk's intermediates for the backward pass, which is all the logits
+//! again, in f32. So each chunk runs under [`checkpoint_apply`], which keeps
+//! only its inputs and its `[tokens]` outputs and rebuilds the chunk during
+//! the backward pass, as the reference implementation's backward kernel
+//! does. The head is split rather than sliced, and the target logit read out
+//! of its chunk rather than gathered from the head, so the head's gradient
+//! comes back as one concatenation instead of a full-size array per chunk.
 //!
-//! Standard cross-entropy computes:
-//! ```text
-//! loss = logsumexp(logits) - logits[target]
-//! ```
+//! # Precision
 //!
-//! For vocab=150K, seq=4096, batch=4, the logits tensor is **2.4GB** in fp16!
-//!
-//! CCE avoids this by computing the loss in chunks:
-//! 1. Compute target logit directly: `hidden @ W[target]`
-//! 2. Compute logsumexp in chunks using online algorithm
-//! 3. Never materialize more than chunk_size logits at a time
-//!
-//! # Memory Savings
-//!
-//! | Sequence Length | Standard CE | Cut CE |
-//! |-----------------|-------------|--------|
-//! | 2K tokens | 600MB | 8MB |
-//! | 8K tokens | 2.4GB | 8MB |
-//! | 32K tokens | 9.6GB | 8MB |
-//!
-//! Peak memory is O(chunk_size) instead of O(seq * vocab).
-//!
-//! # References
-//!
-//! - Apple ML: https://github.com/apple/ml-cross-entropy
+//! As in the reference implementation: each chunk's logits come out of the
+//! matmul in the model's dtype (the GEMM accumulates in f32 and rounds once,
+//! which is exactly the logits the model's own head produces), and
+//! everything after that (scale, softcap, max, exp, sum, the log) runs in
+//! f32. The target logit is read out of the same chunk, so the two terms of
+//! the loss see the same logits.
 
-use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops};
+use pmetal_bridge::inline_array::checkpoint_apply;
 
-/// Configuration for Cut Cross Entropy.
+/// Configuration for [`CutCrossEntropy`].
 #[derive(Debug, Clone)]
 pub struct CutCrossEntropyConfig {
-    /// Vocabulary chunk size for computing logsumexp.
-    /// Larger = faster but more memory. Default: 4096.
+    /// Vocabulary rows per chunk. The transient memory of a chunk is
+    /// `tokens × vocab_chunk_size` f32 values, forward and backward.
     pub vocab_chunk_size: usize,
-
-    /// Token chunk size for parallel processing.
-    /// Default: 1024 tokens at a time.
-    pub token_chunk_size: usize,
-
-    /// Index to ignore in loss computation (e.g., -100 for padding).
+    /// Target id excluded from the loss.
     pub ignore_index: i32,
-
-    /// Label smoothing factor (0.0 to disable).
-    pub label_smoothing: f32,
-
-    /// Logit softcapping for Gemma2 (0.0 to disable).
+    /// `cap · tanh(logits / cap)` after the scale (Gemma 2, Gemma 4); 0
+    /// disables it.
     pub softcap: f32,
-
-    /// Logit scaling for Cohere (1.0 to disable).
+    /// Multiplies the logits (Cohere, Granite); 1 disables it.
     pub logit_scale: f32,
-
-    /// Whether to compute gradient (requires more memory).
-    pub compute_grad: bool,
-
-    /// Use online softmax for better numerical stability.
-    pub use_online_softmax: bool,
 }
 
 impl Default for CutCrossEntropyConfig {
     fn default() -> Self {
         Self {
             vocab_chunk_size: 4096,
-            token_chunk_size: 1024,
             ignore_index: -100,
-            label_smoothing: 0.0,
             softcap: 0.0,
             logit_scale: 1.0,
-            compute_grad: true,
-            use_online_softmax: true,
         }
     }
 }
 
 impl CutCrossEntropyConfig {
-    /// Create a new configuration.
+    /// The default configuration.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set vocabulary chunk size.
+    /// Set the vocabulary chunk size.
     pub fn with_vocab_chunk_size(mut self, size: usize) -> Self {
         self.vocab_chunk_size = size;
         self
     }
 
-    /// Set token chunk size.
-    pub fn with_token_chunk_size(mut self, size: usize) -> Self {
-        self.token_chunk_size = size;
-        self
-    }
-
-    /// Set ignore index.
+    /// Set the ignored target id.
     pub fn with_ignore_index(mut self, index: i32) -> Self {
         self.ignore_index = index;
         self
     }
 
-    /// Enable Gemma2 softcapping.
+    /// Enable logit softcapping.
     pub fn with_softcap(mut self, softcap: f32) -> Self {
         self.softcap = softcap;
         self
     }
 
-    /// Enable Cohere logit scaling.
+    /// Scale the logits.
     pub fn with_logit_scale(mut self, scale: f32) -> Self {
         self.logit_scale = scale;
         self
     }
-
-    /// Set label smoothing.
-    pub fn with_label_smoothing(mut self, smoothing: f32) -> Self {
-        self.label_smoothing = smoothing;
-        self
-    }
 }
 
-/// Output from Cut Cross Entropy forward pass.
-#[derive(Debug)]
-pub struct CutCrossEntropyOutput {
-    /// Mean loss over valid tokens.
-    pub loss: Array,
-
-    /// Number of valid (non-ignored) tokens.
-    pub n_valid: usize,
-
-    /// Per-token losses (optional, for debugging).
-    pub per_token_loss: Option<Array>,
-
-    /// Cached values for backward pass.
-    cached_logsumexp: Option<Array>,
-}
-
-impl CutCrossEntropyOutput {
-    /// Get the loss value.
-    pub fn loss_value(&self) -> Result<f32, Exception> {
-        let loss_eval = self.loss.clone();
-        loss_eval.eval();
-        Ok(loss_eval.item_f32())
-    }
-}
-
-/// Cut Cross Entropy loss computation.
-///
-/// Computes cross-entropy loss directly from hidden states without ever
-/// materializing the full logits tensor. This enables training with up to
-/// 13x longer context on memory-limited hardware.
+/// Cut cross-entropy over an LM head. See the [module docs](self).
 pub struct CutCrossEntropy {
     config: CutCrossEntropyConfig,
 }
 
 impl CutCrossEntropy {
-    /// Create a new Cut Cross Entropy instance.
+    /// A loss with the given configuration.
     pub fn new(config: CutCrossEntropyConfig) -> Self {
         Self { config }
     }
 
-    /// Create with default configuration.
-    pub fn default_config() -> Self {
-        Self::new(CutCrossEntropyConfig::default())
-    }
-
-    /// Compute loss directly from hidden states.
+    /// Mean cross-entropy over the targets that are not `ignore_index`, as an
+    /// f32 scalar.
     ///
-    /// This is the key optimization: we never materialize the full logits tensor.
-    ///
-    /// # Arguments
-    ///
-    /// * `hidden_states` - Hidden states [batch * seq, hidden_dim]
-    /// * `lm_head_weight` - LM head weights [vocab_size, hidden_dim]
-    /// * `targets` - Target token indices [batch * seq]
-    /// * `lm_head_bias` - Optional LM head bias [vocab_size]
-    ///
-    /// # Returns
-    ///
-    /// Loss value and optional cached data for backward pass.
+    /// * `hidden` - `[tokens, hidden]`
+    /// * `weight` - the head, `[vocab, hidden]`
+    /// * `targets` - `[tokens]`
+    /// * `bias` - `[vocab]`, when the head has one
     pub fn forward(
         &self,
-        hidden_states: &Array,
-        lm_head_weight: &Array,
+        hidden: &Array,
+        weight: &Array,
         targets: &Array,
-        lm_head_bias: Option<&Array>,
-    ) -> Result<CutCrossEntropyOutput, Exception> {
-        let hidden_shape = hidden_states.shape();
-        let _n_tokens = hidden_shape[0] as usize;
-        let hidden_dim = hidden_shape[1] as usize;
-
-        let weight_shape = lm_head_weight.shape();
-        let vocab_size = weight_shape[0] as usize;
-
-        // Validate dimensions
-        if weight_shape[1] as usize != hidden_dim {
+        bias: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        if hidden.ndim() != 2 || weight.ndim() != 2 || hidden.dim(1) != weight.dim(1) {
             return Err(Exception::custom(format!(
-                "Hidden dim mismatch: hidden={}, weight={}",
-                hidden_dim, weight_shape[1]
+                "cut cross-entropy: hidden {:?} and head {:?} don't multiply",
+                hidden.shape(),
+                weight.shape()
             )));
         }
+        // Labels must never enter the trace: MLX ≥ 0.32 refuses a gather's
+        // gradient with respect to its indices.
+        let targets = targets.as_dtype(Dtype::Int32.as_i32()).stop_gradient();
+        let valid = targets
+            .not_equal(&Array::from_i32(self.config.ignore_index))
+            .as_dtype(Dtype::Float32.as_i32());
+        let transform = Transform {
+            scale: self.config.logit_scale,
+            softcap: self.config.softcap,
+        };
 
-        // Step 1: Compute target logits directly (only for target tokens)
-        let target_logits =
-            self.compute_target_logits(hidden_states, lm_head_weight, targets, lm_head_bias);
+        let (lse, target) = self.chunked(hidden, weight, bias, &targets, transform)?;
 
-        // Step 2: Compute logsumexp in chunks
-        let logsumexp =
-            self.compute_chunked_logsumexp(hidden_states, lm_head_weight, lm_head_bias, vocab_size);
+        let per_token = lse.subtract(&target).multiply(&valid);
+        let count = valid.sum_all().maximum(&Array::from_f32(1.0));
+        Ok(per_token.sum_all().divide(&count))
+    }
 
-        // Step 3: Compute per-token loss
-        // loss[i] = logsumexp[i] - target_logits[i]
-        let per_token_loss = logsumexp.subtract(&target_logits);
-
-        // Step 4: Apply ignore index masking
-        let (masked_loss, n_valid) = self.apply_mask(&per_token_loss, targets);
-
-        // Step 5: Compute mean loss
-        let safe_n_valid = n_valid.max(1);
-        let n_valid_arr = Array::from_i32(safe_n_valid as i32).as_dtype(Dtype::Float32.as_i32());
-        let loss = masked_loss.sum_all().divide(&n_valid_arr);
-
-        // Cache for backward if needed
-        let cached_lse = self.config.compute_grad.then_some(logsumexp);
-
-        Ok(CutCrossEntropyOutput {
-            loss,
-            n_valid,
-            per_token_loss: if self.config.compute_grad {
-                Some(per_token_loss)
+    /// Each token's `logsumexp` and target logit, both `[tokens]` in f32, a
+    /// chunk of the vocabulary at a time and each chunk rebuilt for its
+    /// backward pass.
+    ///
+    /// The target logit is read out of the chunk that holds it, as the
+    /// reference implementation's forward kernel does, rather than gathered
+    /// from the head: a gather's gradient is a scatter into a zeroed copy of
+    /// the whole head, a second full-size array beside the one the chunks
+    /// already produce.
+    fn chunked(
+        &self,
+        hidden: &Array,
+        weight: &Array,
+        bias: Option<&Array>,
+        targets: &Array,
+        transform: Transform,
+    ) -> Result<(Array, Array), Exception> {
+        let vocab = weight.dim(0);
+        let chunk = self.config.vocab_chunk_size.clamp(1, i32::MAX as usize) as i32;
+        let bounds: Vec<i32> = (1..)
+            .map(|i| i * chunk)
+            .take_while(|&b| b < vocab)
+            .collect();
+        let split = |a: &Array| -> Vec<Array> {
+            if bounds.is_empty() {
+                vec![a.clone()]
             } else {
-                None
-            },
-            cached_logsumexp: cached_lse,
-        })
-    }
-
-    /// Compute target logits by direct indexing.
-    fn compute_target_logits(
-        &self,
-        hidden_states: &Array,
-        lm_head_weight: &Array,
-        targets: &Array,
-        lm_head_bias: Option<&Array>,
-    ) -> Array {
-        // Clamp targets to valid indices before gather.
-        let zero = Array::from_i32(0_i32);
-        let targets_i32 = targets.as_dtype(Dtype::Int32.as_i32());
-        let safe_targets = targets_i32.maximum(&zero);
-
-        // Gather target embeddings: W[safe_targets, :] -> [n_tokens, hidden_dim]
-        let target_weights = lm_head_weight.take_axis(&safe_targets, 0);
-
-        // Compute dot product: sum(hidden * target_weights, axis=-1)
-        let product = hidden_states.multiply(&target_weights);
-        let mut target_logits = product.sum_axis(-1, false);
-
-        // Add bias if present
-        if let Some(bias) = lm_head_bias {
-            let target_bias = bias.take_axis(&safe_targets, 0);
-            target_logits = target_logits.add(&target_bias);
-        }
-
-        // Apply logit transforms
-        self.apply_logit_transforms(target_logits)
-    }
-
-    /// Compute logsumexp in chunks using online algorithm.
-    fn compute_chunked_logsumexp(
-        &self,
-        hidden_states: &Array,
-        lm_head_weight: &Array,
-        lm_head_bias: Option<&Array>,
-        vocab_size: usize,
-    ) -> Array {
-        let n_tokens = hidden_states.dim(0);
-        let hidden_dim = lm_head_weight.dim(1);
-        let chunk_size = self.config.vocab_chunk_size;
-        let n_chunks = (vocab_size + chunk_size - 1) / chunk_size;
-
-        // Initialize online logsumexp accumulators
-        let neg_inf_arr = Array::from_f32(f32::NEG_INFINITY);
-        let mut running_max = neg_inf_arr.broadcast_to(&[n_tokens]);
-        let zero_arr = Array::from_f32(0.0);
-        let mut running_sum = zero_arr.broadcast_to(&[n_tokens]);
-
-        for chunk_idx in 0..n_chunks {
-            let start = chunk_idx * chunk_size;
-            let end = ((chunk_idx + 1) * chunk_size).min(vocab_size);
-
-            // Get weight chunk: W[start:end, :]
-            let weight_chunk = lm_head_weight.slice(&[start as i32, 0], &[end as i32, hidden_dim]);
-
-            // Compute chunk logits: hidden @ W_chunk.T
-            let weight_t = weight_chunk.t();
-            let mut chunk_logits = hidden_states.matmul(&weight_t);
-
-            // Add bias if present
-            if let Some(bias) = lm_head_bias {
-                let bias_chunk = bias.slice(&[start as i32], &[end as i32]);
-                chunk_logits = chunk_logits.add(&bias_chunk);
+                a.split(&bounds, 0)
             }
+        };
+        let weights = split(weight);
+        let biases = bias.map(split);
 
-            // Apply logit transforms to chunk
-            chunk_logits = self.apply_logit_transforms(chunk_logits);
+        // The running logsumexp and target logit are threaded through the
+        // chunks in order, and so are the hidden states: each chunk passes
+        // them on as `h + 0·lse`, which is `h` exactly, but makes the next
+        // chunk's matmul wait for this chunk's forward and this chunk's
+        // backward wait for the next one's. Without that the chunks are
+        // independent, and MLX schedules them side by side, which peaked
+        // above the full logits' memory. Chained, a 4,212-token Qwen3-0.6B
+        // step peaks at 1.5 GB against the full bf16 logits' 2.6 GB.
+        let n = hidden.dim(0);
+        let f32_ = Dtype::Float32.as_i32();
+        let mut lse = Array::from_f32(f32::NEG_INFINITY).broadcast_to(&[n]);
+        let mut target = ops::zeros(&[n], Dtype::Float32);
+        let mut h = hidden.clone();
+        let mut start = 0;
+        for (i, w) in weights.into_iter().enumerate() {
+            let len = w.dim(0);
+            // Where each target sits in this chunk, and whether it does at
+            // all. Constants, so captured rather than passed: the closure's
+            // inputs are what the checkpoint differentiates.
+            let local = targets.subtract(&Array::from_i32(start));
+            let inside = local
+                .greater_equal(&Array::from_i32(0))
+                .logical_and(&local.less(&Array::from_i32(len)))
+                .as_dtype(f32_);
+            let local = local
+                .maximum(&Array::from_i32(0))
+                .minimum(&Array::from_i32(len - 1))
+                .expand_dims(-1);
+            start += len;
 
-            // Online logsumexp update
-            let chunk_max = chunk_logits.max_axis(-1, false);
-            let new_max = running_max.maximum(&chunk_max);
-
-            // Update running_sum: s_new = s * exp(m - m_new) + sum(exp(chunk - m_new))
-            let max_diff = running_max.subtract(&new_max);
-            let scaled_sum = running_sum.multiply(&max_diff.exp());
-
-            let new_max_expanded = new_max.reshape(&[-1, 1]);
-            let chunk_shifted = chunk_logits.subtract(&new_max_expanded);
-            let chunk_exp = chunk_shifted.exp();
-            let chunk_sum = chunk_exp.sum_axis(-1, false);
-
-            running_sum = scaled_sum.add(&chunk_sum);
-            running_max = new_max;
-
-            // Evaluate to avoid building huge lazy graph
-            running_sum.eval();
-            running_max.eval();
+            let mut inputs = vec![h, w, lse, target];
+            if let Some(biases) = &biases {
+                inputs.push(biases[i].clone());
+            }
+            let out = checkpoint_apply(&inputs, move |a| {
+                let mut z = a[0].matmul(&a[1].t());
+                if let Some(b) = a.get(4) {
+                    z = z.add(&b.as_dtype(z.dtype().as_i32()));
+                }
+                let z = transform.apply(z);
+                let picked = z.take_along_axis(&local, -1).squeeze_axes(&[-1]);
+                let lse = a[2].logaddexp(&z.logsumexp(-1, false));
+                let h = a[0].add(
+                    &lse.expand_dims(-1)
+                        .multiply(&Array::from_f32(0.0))
+                        .as_dtype(a[0].dtype().as_i32()),
+                );
+                vec![lse, a[3].add(&picked.multiply(&inside)), h]
+            });
+            pmetal_bridge::check_last_error()
+                .map_err(|e| Exception::custom(format!("cut cross-entropy chunk {i}: {e}")))?;
+            [lse, target, h] = out.try_into().map_err(|_| {
+                Exception::custom("cut cross-entropy: a chunk returned the wrong outputs")
+            })?;
         }
-
-        // Final logsumexp = m + log(s)
-        let log_sum = running_sum.log();
-        running_max.add(&log_sum)
-    }
-
-    /// Apply logit transformations (softcapping, scaling).
-    fn apply_logit_transforms(&self, logits: Array) -> Array {
-        let mut result = logits;
-
-        // Apply scaling (Cohere)
-        if self.config.logit_scale != 1.0 {
-            let scale = Array::from_f32(self.config.logit_scale);
-            result = result.multiply(&scale);
-        }
-
-        // Apply softcapping (Gemma2): softcap * tanh(logits / softcap)
-        if self.config.softcap > 0.0 {
-            let softcap = Array::from_f32(self.config.softcap);
-            let scaled = result.divide(&softcap);
-            let tanh_scaled = ops::tanh(&scaled);
-            result = tanh_scaled.multiply(&softcap);
-        }
-
-        result
-    }
-
-    /// Apply ignore index masking.
-    fn apply_mask(&self, loss: &Array, targets: &Array) -> (Array, usize) {
-        let ignore_arr = Array::from_i32(self.config.ignore_index);
-        let targets_i32 = targets.as_dtype(Dtype::Int32.as_i32());
-        let valid_mask = targets_i32.not_equal(&ignore_arr);
-        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32.as_i32());
-
-        // Count valid tokens
-        let n_valid_arr = valid_mask_f32.sum_all();
-        let n_valid_eval = n_valid_arr.clone();
-        n_valid_eval.eval();
-        let n_valid = n_valid_eval.item_f32() as usize;
-
-        // Zero out ignored positions
-        let masked_loss = loss.multiply(&valid_mask_f32);
-
-        (masked_loss, n_valid)
-    }
-
-    /// Compute backward pass (gradient of loss w.r.t. hidden states).
-    pub fn backward(
-        &self,
-        hidden_states: &Array,
-        lm_head_weight: &Array,
-        targets: &Array,
-        output: &CutCrossEntropyOutput,
-        grad_loss: &Array,
-    ) -> Result<Array, Exception> {
-        let n_tokens = hidden_states.dim(0);
-        let hidden_dim = hidden_states.dim(1);
-        let vocab_size = lm_head_weight.dim(0) as usize;
-        let chunk_size = self.config.vocab_chunk_size;
-        let n_chunks = (vocab_size + chunk_size - 1) / chunk_size;
-
-        // Get cached logsumexp
-        let logsumexp = output
-            .cached_logsumexp
-            .as_ref()
-            .ok_or_else(|| Exception::custom("No cached logsumexp for backward"))?;
-
-        // Initialize gradient accumulator
-        let zero = Array::from_f32(0.0);
-        let mut grad_hidden = zero.broadcast_to(&[n_tokens, hidden_dim]);
-
-        // Expand grad_loss and logsumexp for broadcasting
-        let grad_expanded = grad_loss.reshape(&[-1, 1]);
-        let lse_expanded = logsumexp.reshape(&[-1, 1]);
-
-        let targets_i32 = targets.as_dtype(Dtype::Int32.as_i32());
-
-        for chunk_idx in 0..n_chunks {
-            let start = chunk_idx * chunk_size;
-            let end = ((chunk_idx + 1) * chunk_size).min(vocab_size);
-            let chunk_len = end - start;
-
-            // Get weight chunk
-            let weight_chunk = lm_head_weight.slice(&[start as i32, 0], &[end as i32, hidden_dim]);
-
-            // Compute chunk logits
-            let weight_t = weight_chunk.t();
-            let chunk_logits = hidden_states.matmul(&weight_t);
-
-            // Compute softmax for this chunk: softmax_chunk = exp(logits - logsumexp)
-            let shifted = chunk_logits.subtract(&lse_expanded);
-            let softmax_chunk = shifted.exp();
-
-            // Subtract 1 at target positions if target is in this chunk
-            let start_arr = Array::from_i32(start as i32);
-            let end_arr = Array::from_i32(end as i32);
-            let in_chunk = targets_i32
-                .greater_equal(&start_arr)
-                .multiply(&targets_i32.less(&end_arr));
-
-            // Local targets (clamped)
-            let local_targets = targets_i32.subtract(&start_arr);
-            let zero_i = Array::from_i32(0);
-            let max_idx = Array::from_i32((chunk_len - 1) as i32);
-            let local_targets_clipped = local_targets.maximum(&zero_i).minimum(&max_idx);
-
-            // Create one-hot for targets in this chunk
-            let in_chunk_f32 = in_chunk.as_dtype(Dtype::Float32.as_i32());
-            let identity = Array::eye(chunk_len as i32, Dtype::Float32.as_i32());
-            let one_hot = identity.take_axis(&local_targets_clipped, 0);
-            let masked_one_hot = one_hot.multiply(&in_chunk_f32.reshape(&[-1, 1]));
-
-            // Gradient: (softmax - one_hot) * grad_loss
-            let grad_chunk = softmax_chunk.subtract(&masked_one_hot);
-            let grad_chunk_scaled = grad_chunk.multiply(&grad_expanded);
-
-            // Accumulate: grad_hidden += grad_chunk @ weight_chunk
-            let chunk_contrib = grad_chunk_scaled.matmul(&weight_chunk);
-            grad_hidden = grad_hidden.add(&chunk_contrib);
-
-            // Evaluate to avoid huge graph
-            grad_hidden.eval();
-        }
-
-        // Apply ignore mask
-        let ignore_arr = Array::from_i32(self.config.ignore_index);
-        let valid_mask = targets_i32.not_equal(&ignore_arr);
-        let valid_mask_f32 = valid_mask
-            .as_dtype(Dtype::Float32.as_i32())
-            .reshape(&[-1, 1]);
-
-        // Scale by 1/n_valid
-        let safe_n_valid = output.n_valid.max(1);
-        let n_valid = Array::from_i32(safe_n_valid as i32).as_dtype(Dtype::Float32.as_i32());
-        let grad_hidden = grad_hidden.multiply(&valid_mask_f32);
-        Ok(grad_hidden.divide(&n_valid))
+        Ok((lse, target))
     }
 }
 
-/// Convenience function for computing Cut Cross Entropy loss.
-///
-/// This is the main entry point for memory-efficient cross-entropy.
-///
-/// # Arguments
-///
-/// * `hidden_states` - Hidden states [batch * seq, hidden_dim]
-/// * `lm_head_weight` - LM head weights [vocab_size, hidden_dim]
-/// * `targets` - Target token indices [batch * seq]
-/// * `ignore_index` - Index to ignore (typically -100)
-///
-/// # Returns
-///
-/// Scalar loss value.
-pub fn cut_cross_entropy_loss(
-    hidden_states: &Array,
-    lm_head_weight: &Array,
-    targets: &Array,
-    ignore_index: i32,
-) -> Result<Array, Exception> {
-    let config = CutCrossEntropyConfig::new().with_ignore_index(ignore_index);
-    let cce = CutCrossEntropy::new(config);
-    let output = cce.forward(hidden_states, lm_head_weight, targets, None)?;
-    Ok(output.loss)
-}
-
-/// Convenience function for Gemma2 with softcapping.
-pub fn cut_cross_entropy_loss_gemma(
-    hidden_states: &Array,
-    lm_head_weight: &Array,
-    targets: &Array,
-    ignore_index: i32,
+/// The logit transforms after the head, applied in f32.
+#[derive(Debug, Clone, Copy)]
+struct Transform {
+    scale: f32,
     softcap: f32,
-) -> Result<Array, Exception> {
-    let config = CutCrossEntropyConfig::new()
-        .with_ignore_index(ignore_index)
-        .with_softcap(softcap);
-    let cce = CutCrossEntropy::new(config);
-    let output = cce.forward(hidden_states, lm_head_weight, targets, None)?;
-    Ok(output.loss)
+}
+
+impl Transform {
+    fn apply(self, logits: Array) -> Array {
+        let mut z = logits.as_dtype(Dtype::Float32.as_i32());
+        if self.scale != 1.0 {
+            z = z.multiply(&Array::from_f32(self.scale));
+        }
+        if self.softcap > 0.0 {
+            let cap = Array::from_f32(self.softcap);
+            z = ops::tanh(&z.divide(&cap)).multiply(&cap);
+        }
+        z
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Array;
+    use pmetal_bridge::inline_array::value_and_grad;
 
-    #[test]
-    fn test_config_default() {
-        let config = CutCrossEntropyConfig::default();
-        assert_eq!(config.vocab_chunk_size, 4096);
-        assert_eq!(config.ignore_index, -100);
-        assert_eq!(config.softcap, 0.0);
+    fn drain() {
+        if let Err(e) = pmetal_bridge::check_last_error() {
+            panic!("a bridge op threw: {e}");
+        }
     }
 
-    #[test]
-    fn test_config_builder() {
-        let config = CutCrossEntropyConfig::new()
-            .with_vocab_chunk_size(8192)
-            .with_ignore_index(-1)
-            .with_softcap(30.0);
-
-        assert_eq!(config.vocab_chunk_size, 8192);
-        assert_eq!(config.ignore_index, -1);
-        assert_eq!(config.softcap, 30.0);
+    /// The loss, and its gradients with respect to the hidden states and the
+    /// head, by the full logits in f32.
+    fn full(
+        hidden: &Array,
+        weight: &Array,
+        targets: &Array,
+        transform: Transform,
+    ) -> (f32, Vec<Array>) {
+        let (loss, grads) = value_and_grad(
+            |a| {
+                let z = transform.apply(a[0].matmul(&a[1].t()));
+                pmetal_bridge::training::cross_entropy_loss(&z, targets, -100)
+            },
+            &[hidden.clone(), weight.clone()],
+            &[],
+        );
+        drain();
+        (loss.item_f32(), grads)
     }
 
-    #[test]
-    fn test_cut_cross_entropy_basic() {
-        let n_tokens: i32 = 4;
-        let hidden_dim: i32 = 8;
-        let vocab_size: i32 = 16;
-
-        let hidden_data: Vec<f32> = (0..(n_tokens * hidden_dim) as usize)
-            .map(|i| ((i * 7 + 3) % 10) as f32 / 10.0)
-            .collect();
-        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
-
-        let weight_data: Vec<f32> = (0..(vocab_size * hidden_dim) as usize)
-            .map(|i| ((i * 11 + 5) % 10) as f32 / 10.0 - 0.5)
-            .collect();
-        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
-
-        let targets = Array::from_i32_slice(&[0i32, 5, 10, 15]).reshape(&[4]);
-
-        let config = CutCrossEntropyConfig::new().with_vocab_chunk_size(4);
+    fn chunked(
+        config: CutCrossEntropyConfig,
+        hidden: &Array,
+        weight: &Array,
+        targets: &Array,
+    ) -> (f32, Vec<Array>) {
         let cce = CutCrossEntropy::new(config);
-
-        let output = cce.forward(&hidden, &weight, &targets, None).unwrap();
-        let loss_eval = output.loss.clone();
-        loss_eval.eval();
-
-        let loss_value = loss_eval.item_f32();
-        assert!(loss_value.is_finite());
-        assert!(loss_value > 0.0);
+        let (loss, grads) = value_and_grad(
+            |a| cce.forward(&a[0], &a[1], targets, None).unwrap(),
+            &[hidden.clone(), weight.clone()],
+            &[],
+        );
+        drain();
+        (loss.item_f32(), grads)
     }
 
-    #[test]
-    fn test_cut_cross_entropy_ignore_index() {
-        let n_tokens: i32 = 4;
-        let hidden_dim: i32 = 8;
-        let vocab_size: i32 = 16;
-
-        let hidden_data: Vec<f32> = vec![0.5; (n_tokens * hidden_dim) as usize];
-        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
-
-        let weight_data: Vec<f32> = vec![0.1; (vocab_size * hidden_dim) as usize];
-        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
-
-        let targets = Array::from_i32_slice(&[0i32, -100, 5, -100]).reshape(&[4]);
-
-        let config = CutCrossEntropyConfig::new()
-            .with_ignore_index(-100)
-            .with_vocab_chunk_size(4);
-        let cce = CutCrossEntropy::new(config);
-
-        let output = cce.forward(&hidden, &weight, &targets, None).unwrap();
-
-        assert_eq!(output.n_valid, 2);
+    fn max_abs(a: &Array) -> f32 {
+        a.abs().max(None).item_f32()
     }
 
+    /// The loss and both gradients match the full logits', over a vocabulary
+    /// that doesn't divide into the chunks, with repeated and ignored targets
+    /// and a softcap.
     #[test]
-    fn test_cut_cross_entropy_softcap() {
-        let n_tokens: i32 = 2;
-        let hidden_dim: i32 = 4;
-        let vocab_size: i32 = 8;
+    fn matches_the_full_logits_loss_and_gradients() {
+        pmetal_bridge::compat::random::seed(11);
+        let (n, h, v) = (9, 16, 70);
+        let hidden = pmetal_bridge::compat::random::normal(&[n, h], Dtype::Float32);
+        let weight = pmetal_bridge::compat::random::normal(&[v, h], Dtype::Float32)
+            .multiply(&Array::from_f32(0.5));
+        let targets = Array::from_i32_slice(&[3, 3, 69, -100, 0, 41, 3, -100, 64]);
 
-        let hidden_data: Vec<f32> = vec![10.0; (n_tokens * hidden_dim) as usize];
-        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
+        for softcap in [0.0, 5.0] {
+            let transform = Transform {
+                scale: 1.0,
+                softcap,
+            };
+            let (want, want_grads) = full(&hidden, &weight, &targets, transform);
+            let config = CutCrossEntropyConfig::new()
+                .with_vocab_chunk_size(16)
+                .with_softcap(softcap);
+            let (got, got_grads) = chunked(config, &hidden, &weight, &targets);
 
-        let weight_data: Vec<f32> = vec![1.0; (vocab_size * hidden_dim) as usize];
-        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
+            assert!(
+                (got - want).abs() < 1e-5 * want.abs().max(1.0),
+                "softcap {softcap}: loss {got} vs {want}"
+            );
+            for (name, g, w) in [
+                ("hidden", &got_grads[0], &want_grads[0]),
+                ("head", &got_grads[1], &want_grads[1]),
+            ] {
+                let diff = max_abs(&g.subtract(w));
+                let scale = max_abs(w);
+                assert!(
+                    diff <= 1e-5 * scale,
+                    "softcap {softcap}: {name} gradient off by {diff} (scale {scale})"
+                );
+            }
+        }
+    }
 
-        let targets = Array::from_i32_slice(&[0i32, 1]).reshape(&[2]);
+    /// On a bf16 head the loss is the bf16 logits' loss taken in f32: the
+    /// logsumexp and the target logit lose nothing beyond the head's own
+    /// rounding. Reducing a chunk's logits in bf16 instead is off by 6e-3
+    /// here.
+    #[test]
+    fn a_bf16_head_is_reduced_in_f32() {
+        pmetal_bridge::compat::random::seed(13);
+        let (n, h, v) = (16, 64, 1000);
+        let bf16 = Dtype::Bfloat16.as_i32();
+        let hidden = pmetal_bridge::compat::random::normal(&[n, h], Dtype::Float32)
+            .multiply(&Array::from_f32(2.0))
+            .as_dtype(bf16);
+        let weight = pmetal_bridge::compat::random::normal(&[v, h], Dtype::Float32)
+            .multiply(&Array::from_f32(0.5))
+            .as_dtype(bf16);
+        let ids: Vec<i32> = (0..n).map(|i| (i * 61) % v).collect();
+        let targets = Array::from_i32_slice(&ids);
 
-        let config_no_cap = CutCrossEntropyConfig::new().with_vocab_chunk_size(4);
-        let cce_no_cap = CutCrossEntropy::new(config_no_cap);
-        let output_no_cap = cce_no_cap
+        let want = pmetal_bridge::training::cross_entropy_loss(
+            &hidden.matmul(&weight.t()).as_dtype(Dtype::Float32.as_i32()),
+            &targets,
+            -100,
+        )
+        .item_f32();
+        let got = CutCrossEntropy::new(CutCrossEntropyConfig::new().with_vocab_chunk_size(128))
             .forward(&hidden, &weight, &targets, None)
-            .unwrap();
-        let loss_eval_no_cap = output_no_cap.loss.clone();
-        loss_eval_no_cap.eval();
-
-        let config_cap = CutCrossEntropyConfig::new()
-            .with_softcap(30.0)
-            .with_vocab_chunk_size(4);
-        let cce_cap = CutCrossEntropy::new(config_cap);
-        let output_cap = cce_cap.forward(&hidden, &weight, &targets, None).unwrap();
-        let loss_eval_cap = output_cap.loss.clone();
-        loss_eval_cap.eval();
-
-        assert!(loss_eval_no_cap.item_f32().is_finite());
-        assert!(loss_eval_cap.item_f32().is_finite());
+            .unwrap()
+            .item_f32();
+        drain();
+        assert!(
+            (got - want).abs() <= 1e-5 * want.abs(),
+            "loss {got} vs the bf16 logits' f32 loss {want}"
+        );
     }
 
+    /// Ignored targets contribute neither loss nor gradient, and a batch of
+    /// nothing but ignored targets is a zero loss rather than a NaN.
     #[test]
-    fn test_convenience_function() {
-        let n_tokens: i32 = 4;
-        let hidden_dim: i32 = 8;
-        let vocab_size: i32 = 16;
+    fn ignored_targets_count_for_nothing() {
+        pmetal_bridge::compat::random::seed(5);
+        let hidden = pmetal_bridge::compat::random::normal(&[4, 8], Dtype::Float32);
+        let weight = pmetal_bridge::compat::random::normal(&[16, 8], Dtype::Float32);
+        let config = || CutCrossEntropyConfig::new().with_vocab_chunk_size(4);
 
-        let hidden_data: Vec<f32> = (0..(n_tokens * hidden_dim) as usize)
-            .map(|i| (i as f32) / 32.0)
-            .collect();
-        let hidden = Array::from_f32_slice(&hidden_data, &[n_tokens, hidden_dim]);
+        let some = Array::from_i32_slice(&[0, -100, 5, -100]);
+        let (_, grads) = chunked(config(), &hidden, &weight, &some);
+        let ignored_rows = grads[0].take_axis(&Array::from_i32_slice(&[1, 3]), 0);
+        assert_eq!(max_abs(&ignored_rows), 0.0);
 
-        let weight_data: Vec<f32> = (0..(vocab_size * hidden_dim) as usize)
-            .map(|i| (i as f32) / 128.0 - 0.5)
-            .collect();
-        let weight = Array::from_f32_slice(&weight_data, &[vocab_size, hidden_dim]);
-
-        let targets = Array::from_i32_slice(&[0i32, 5, 10, 15]).reshape(&[4]);
-
-        let loss = cut_cross_entropy_loss(&hidden, &weight, &targets, -100).unwrap();
-        let loss_eval = loss.clone();
-        loss_eval.eval();
-
-        assert!(loss_eval.item_f32().is_finite());
+        let none = Array::from_i32_slice(&[-100, -100, -100, -100]);
+        let (loss, _) = chunked(config(), &hidden, &weight, &none);
+        assert_eq!(loss, 0.0);
     }
 }

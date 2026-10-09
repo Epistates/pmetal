@@ -706,10 +706,7 @@ impl LmHead {
         if let Some(cap) = self.softcap {
             config = config.with_softcap(cap);
         }
-        CutCrossEntropy::new(config)
-            .forward(&flat, &self.weight, targets, self.bias.as_ref())
-            .map(|output| output.loss)
-            .map_err(|e| Exception::custom(e.to_string()))
+        CutCrossEntropy::new(config).forward(&flat, &self.weight, targets, self.bias.as_ref())
     }
 }
 
