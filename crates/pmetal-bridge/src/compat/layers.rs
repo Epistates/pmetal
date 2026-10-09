@@ -495,6 +495,24 @@ impl Linear {
         }
     }
 
+    /// The weight as stored, for a fast path that multiplies by it itself
+    /// (concatenated with its neighbours', flattened for decode, handed to a
+    /// fused kernel) instead of calling [`forward`](Self::forward).
+    ///
+    /// `Some` only when that computes what `forward` does and stays in
+    /// autograd's view: no adapter that isn't merged into the weight (a fast
+    /// path would skip it), the weight not packed (it would be read as its
+    /// packed words), and the weight not being differentiated (a fast path
+    /// caches what it builds from it). An FP8 weight comes back as stored, for
+    /// the caller to dequantize. Every fast path asks this, rather than
+    /// checking the layer's fields itself, so a new way for a layer to compute
+    /// something other than `x·Wᵀ + b` has one place to be declared.
+    pub fn plain_weight(&self) -> Option<&Array> {
+        let adapted = self.adapter.as_ref().is_some_and(|a| !a.merged);
+        let plain = !adapted && self.quant.is_none() && !self.weight.value.is_tracer();
+        plain.then_some(&self.weight.value)
+    }
+
     /// The dense `[out, in]` weight `W` for which [`forward`](Self::forward)
     /// computes `x·Wᵀ + b`: unpacked, with an attached adapter folded in.
     ///

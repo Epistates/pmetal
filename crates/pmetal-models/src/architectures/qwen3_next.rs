@@ -1277,7 +1277,7 @@ impl Qwen3NextGatedDeltaNet {
             &self.out_proj,
         ]
         .iter()
-        .all(|linear| linear.adapter.is_none() && linear.quant.is_none())
+        .all(|linear| linear.plain_weight().is_some())
     }
 
     fn should_use_flattened_decode_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
@@ -2299,7 +2299,7 @@ impl Qwen3NextSparseMoeBlock {
             &self.shared_expert_gate,
         ]
         .iter()
-        .all(|linear| linear.adapter.is_none() && linear.quant.is_none());
+        .all(|linear| linear.plain_weight().is_some());
         if !plain {
             let shared_y = self.shared_expert.forward(&x_flat)?;
             let shared_gate_logit = self
@@ -3738,6 +3738,10 @@ pub struct Qwen3NextForCausalLM {
     /// doesn't update. Keeping a single one made every sequence after the
     /// first decode against the first one's state.
     pub inline_caches: Vec<(SequenceKey, super::qwen3_next_inline::InlineCache)>,
+    /// The projection weights `inline_weights` was built from, by identity.
+    /// The engine multiplies by copies of them, so a change to any (a merge,
+    /// a reload) rebuilds it.
+    pub inline_built_from: Option<Vec<usize>>,
 }
 impl_module_params!(Qwen3NextForCausalLM; model, lm_head);
 
@@ -3767,7 +3771,25 @@ impl Qwen3NextForCausalLM {
             config,
             inline_weights: None,
             inline_caches: Vec::new(),
+            inline_built_from: None,
         })
+    }
+
+    /// Every projection's stored weight, by identity, when each is plain
+    /// ([`nn::Linear::plain_weight`]); `None` when any is not. The InlineArray
+    /// decode engine multiplies by the weights directly, so an adapter or a
+    /// packed weight on any projection keeps a model off it: it would decode
+    /// as the base model, or read packed words as weights.
+    fn plain_projection_ids(&mut self) -> Option<Vec<usize>> {
+        let mut ids = Some(Vec::new());
+        self.visit_linears_mut(
+            "",
+            &mut |_, linear| match (linear.plain_weight(), ids.as_mut()) {
+                (Some(weight), Some(list)) => list.push(weight.id()),
+                _ => ids = None,
+            },
+        );
+        ids
     }
 
     pub fn requires_expert_offloading(&self) -> bool {
@@ -3801,10 +3823,20 @@ impl Qwen3NextForCausalLM {
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
         // Decode (T=1): use InlineArray path for zero-overhead graph build
-        if mask.is_none() && input_ids.dim(1) == 1 && kv_cache.is_some() && mamba_cache.is_some() {
-            // Build the InlineArray weights on the first decode step, once:
-            // a model that can't take that path decodes on the standard one
-            // from then on.
+        let plain = (mask.is_none()
+            && input_ids.dim(1) == 1
+            && kv_cache.is_some()
+            && mamba_cache.is_some())
+        .then(|| self.plain_projection_ids())
+        .flatten();
+        if let Some(projections) = plain {
+            // Build the InlineArray weights on the first decode step, and
+            // again only if the projections' weights change: a model that
+            // can't take that path decodes on the standard one from then on.
+            if self.inline_built_from.as_ref() != Some(&projections) {
+                self.inline_weights = None;
+                self.inline_built_from = Some(projections);
+            }
             if self.inline_weights.is_none() {
                 let built = super::qwen3_next_inline::InlineModelWeights::from_model(self)
                     .map_err(|e| e.to_string());
