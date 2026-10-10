@@ -27,7 +27,7 @@
 use std::path::Path;
 
 use crate::accelerate;
-use crate::ane::lm::sample;
+use crate::ane::lm::{sample, sampling_rng};
 use crate::error::{MetalError, Result};
 
 // ============================================================================
@@ -97,6 +97,8 @@ pub struct Qwen3NextInferenceConfig {
     pub max_tokens: usize,
     /// EOS token ID for early stopping.
     pub eos_token_id: Option<u32>,
+    /// Seed of the sampling RNG (`None` seeds it from the OS).
+    pub seed: Option<u64>,
 }
 
 /// Activation on the gated-delta-net output gate.
@@ -545,7 +547,13 @@ impl Qwen3NextInferenceEngine {
 
         // Process last prompt token to get first generation logits
         let logits = self.decode_step(*input_ids.last().unwrap(), &mut state)?;
-        let next = sample(&logits, self.config.temperature, self.config.top_k);
+        let mut rng = sampling_rng(self.config.seed);
+        let next = sample(
+            &logits,
+            self.config.temperature,
+            self.config.top_k,
+            &mut rng,
+        );
 
         let mut sequence = input_ids.to_vec();
 
@@ -566,7 +574,12 @@ impl Qwen3NextInferenceEngine {
             }
 
             let logits_vec = self.decode_step(*sequence.last().unwrap(), &mut state)?;
-            let next_tok = sample(&logits_vec, self.config.temperature, self.config.top_k);
+            let next_tok = sample(
+                &logits_vec,
+                self.config.temperature,
+                self.config.top_k,
+                &mut rng,
+            );
 
             if let Some(eos) = self.config.eos_token_id {
                 if next_tok == eos {
@@ -1448,6 +1461,7 @@ mod tests {
             top_k: 0,
             max_tokens: 16,
             eos_token_id: None,
+            seed: None,
         }
     }
 

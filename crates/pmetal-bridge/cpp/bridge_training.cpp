@@ -32,6 +32,11 @@ void mlx_inline_random_seed(uint64_t seed) {
     mlx::core::random::seed(seed);
 }
 
+void mlx_inline_random_key(mlx_inline_array* dst, uint64_t seed) {
+    BRIDGE_TRY_DST("random_key", dst,
+        new (dst->buf) array(mlx::core::random::key(seed)));
+}
+
 void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype) {
     BRIDGE_TRY_DST("random_randint", dst,
         new (dst->buf) array(mlx::core::random::randint(

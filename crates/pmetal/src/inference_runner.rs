@@ -1018,6 +1018,7 @@ impl InferenceGenState {
                 repetition_penalty: self.gen_config.repetition_penalty,
                 frequency_penalty: self.gen_config.frequency_penalty,
                 presence_penalty: self.gen_config.presence_penalty,
+                seed: self.gen_config.seed,
             };
             let on_native_token =
                 |token| forward_native_token(&stop_tokens, &mut on_token_guarded, token);

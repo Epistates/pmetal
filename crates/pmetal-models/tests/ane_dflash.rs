@@ -83,6 +83,7 @@ fn dflash_keeps_greedy_output_on_the_ane() {
         temperature: 0.0,
         top_k: 0,
         stop: vec![151645],
+        seed: None,
     };
     let mut per_pass = Vec::new();
     for (name, prompt) in PROMPTS {

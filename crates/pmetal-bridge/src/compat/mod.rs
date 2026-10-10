@@ -369,7 +369,8 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
 
 // ── random sub-module ─────────────────────────────────────────────────────────
 
-/// Random sampling on the global MLX key.
+/// Random sampling. Draws take the thread's global MLX key ([`random::seed`]
+/// seeds it) unless given a key ([`random::key`]).
 pub mod random {
     use super::{Array, Dtype};
 
@@ -409,9 +410,15 @@ pub mod random {
     /// Sample from a categorical distribution.
     ///
     /// `logits`: unnormalized log-probabilities with the classes on `axis`.
-    /// Returns integer indices with `axis` removed.
-    pub fn categorical(logits: &Array, axis: i32) -> Array {
-        logits.categorical(axis)
+    /// Returns integer indices with `axis` removed. With a `key` the draw is
+    /// a function of it alone; without one it takes the thread's global key.
+    pub fn categorical(logits: &Array, axis: i32, key: Option<&Array>) -> Array {
+        logits.categorical(axis, key)
+    }
+
+    /// The PRNG key for `seed`, for the `key` argument of the samplers.
+    pub fn key(seed: u64) -> Array {
+        Array::random_key(seed)
     }
 }
 

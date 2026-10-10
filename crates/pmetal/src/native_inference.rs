@@ -601,12 +601,12 @@ pub fn run_native_multimodal_inference_ext(
         turboquant,
         quant_config,
         &mut on_token,
-        move |weights, cache, ids, temperature| {
+        move |weights, cache, ids, params| {
             pmetal_bridge::decode::prefill_first_token(
                 weights,
                 cache,
                 ids,
-                temperature,
+                params,
                 |weights, prompt, cache| {
                     let text = qwen3_native::embed_tokens(weights, prompt);
                     let embeddings = encoded
@@ -1175,7 +1175,12 @@ fn run_bridge_inference<Config, Weights, Cache>(
     describe_config: impl Fn(&Config) -> String,
     load_model: impl Fn(&Path, &Config) -> Result<Weights, String>,
     build_cache: impl Fn(&Weights, &Config) -> Cache,
-    prefill_first_token: impl Fn(&Weights, &mut Cache, &[u32], f32) -> u32,
+    prefill_first_token: impl Fn(
+        &Weights,
+        &mut Cache,
+        &[u32],
+        &pmetal_bridge::decode::SamplingParams,
+    ) -> u32,
     generate: impl Fn(
         &Weights,
         &Config,
@@ -1200,9 +1205,8 @@ fn run_bridge_inference<Config, Weights, Cache>(
         "Model loaded",
     );
 
-    let temperature = params.temperature;
     let mut cache = build_cache(&weights, &config);
-    let first_tok = prefill_first_token(&weights, &mut cache, input_ids, temperature);
+    let first_tok = prefill_first_token(&weights, &mut cache, input_ids, &params);
 
     Ok(finish_with_bridge_generate(
         input_ids,
@@ -1267,7 +1271,7 @@ fn run_qwen3(
         &pmetal_bridge::qwen3_native::NativeWeights,
         &mut pmetal_bridge::qwen3_native::NativeCache,
         &[u32],
-        f32,
+        &pmetal_bridge::decode::SamplingParams,
     ) -> u32,
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::qwen3_native;

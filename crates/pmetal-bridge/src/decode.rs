@@ -120,6 +120,10 @@ pub struct SamplingParams {
     pub repetition_penalty: f32,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
+    /// Seed of the sampled draws: with one, the `n`-th sampled token is
+    /// drawn with [`draw_key`]`(seed, n)`, so the same seed, prompt and
+    /// model give the same tokens. `None` draws from the thread's MLX key.
+    pub seed: Option<u64>,
 }
 
 impl SamplingParams {
@@ -132,7 +136,13 @@ impl SamplingParams {
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            seed: None,
         }
+    }
+
+    /// The key for the `draw`-th sampled token, if these params are seeded.
+    pub fn draw_key(&self, draw: u64) -> Option<InlineArray> {
+        self.seed.map(|seed| draw_key(seed, draw))
     }
 
     /// Whether any penalty is active (requires token counting).
@@ -150,7 +160,7 @@ impl SamplingParams {
 
 /// Apply the top-k filter: mask all logits except the `k` highest to
 /// negative infinity. Uses `argpartition_axis` (O(n)) instead of a full
-/// sort. Mirrors `pmetal-models::sampling::compiled_sampler::apply_top_k_2d`,
+/// sort. Mirrors the top-k filter of `pmetal_models::generation::Sampler`,
 /// kept here so the bridge can do native-path filtered sampling without
 /// taking a dependency on `pmetal-models`.
 fn apply_top_k(logits_2d: &InlineArray, k: usize, neg_inf: &InlineArray) -> InlineArray {
@@ -168,7 +178,7 @@ fn apply_top_k(logits_2d: &InlineArray, k: usize, neg_inf: &InlineArray) -> Inli
 
 /// Apply the top-p (nucleus) filter: keep the smallest set of tokens
 /// whose cumulative probability exceeds `p`. Mirrors
-/// `compiled_sampler::apply_top_p_2d`.
+/// `pmetal_models::generation::Sampler`'s.
 fn apply_top_p(logits_2d: &InlineArray, p: f32, neg_inf: &InlineArray) -> InlineArray {
     use crate::compat::ops::{
         argsort_axis, cumsum, exp, put_along_axis, take_along_axis, which, zeros_like,
@@ -197,7 +207,7 @@ fn apply_top_p(logits_2d: &InlineArray, p: f32, neg_inf: &InlineArray) -> Inline
 
 /// Apply the min-p filter: drop tokens whose probability is less than
 /// `min_p * top_token_probability`. Mirrors
-/// `compiled_sampler::apply_min_p_2d`.
+/// `pmetal_models::generation::Sampler`'s.
 fn apply_min_p(logits_2d: &InlineArray, min_p: f32, neg_inf: &InlineArray) -> InlineArray {
     use crate::compat::ops::{
         argsort_axis, put_along_axis, slice_axis, take_along_axis, which, zeros_like,
@@ -271,44 +281,45 @@ impl PenaltyBuffer {
     }
 }
 
-/// Shared temperature sampling helper for bridge-backed decode paths.
+/// The MLX PRNG key for draw `draw` of a generation seeded with `seed`.
+///
+/// It is the key for the `draw`-th output of a SplitMix64 sequence started
+/// at `seed` (Steele, Lea and Flood, *Fast Splittable Pseudorandom Number
+/// Generators*, OOPSLA 2014), so every sampled token has its own key and no
+/// key state is threaded through the decode loop: a seeded generation picks
+/// the same tokens whichever thread runs it and whatever else draws random
+/// numbers meanwhile, which the thread's shared MLX key cannot promise.
+pub fn draw_key(seed: u64, draw: u64) -> InlineArray {
+    let mut z = seed.wrapping_add(draw.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    InlineArray::random_key(z ^ (z >> 31))
+}
+
+/// Sample a token from `[B, vocab]` logits through the pipeline in
+/// `params`: temperature, then top-k, top-p and min-p, then a categorical
+/// draw with the key for `draw` (the token's index in the generated text)
+/// when `params` has a seed. At `temperature == 0` it is argmax.
 ///
 /// The inverse-temperature scalar is cast to the logits dtype before the
 /// multiply so bf16/f16 decode graphs do not get silently promoted to f32.
-pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    if temperature <= 0.0 {
-        logits_2d.argmax(-1)
-    } else {
-        let inv_temp = scalar_f32_like(1.0 / temperature, logits_2d);
-        let lse = logits_2d.logsumexp(-1, true);
-        let log_probs = logits_2d.subtract(&lse);
-        let scaled = log_probs.multiply(&inv_temp);
-        scaled.categorical(-1)
-    }
-}
-
-/// Sample a token from `[B, vocab]` logits using the full filter
-/// pipeline in `params`: temperature → top-k → top-p → min-p →
-/// categorical. At `temperature == 0` the call collapses to argmax and
-/// every filter is a no-op. Otherwise the filter chain matches the reference
-/// per-step sampling pipeline. Use [`sample_token`] when only
-/// temperature matters.
 ///
 /// IMPORTANT: penalty (`repetition_penalty` / `frequency_penalty` /
 /// `presence_penalty`) handling lives in [`PenaltyBuffer::apply`] which
 /// must run BEFORE this call — penalties operate on raw logits, not
 /// log-probs, and depend on per-token counts the sampler does not track.
-pub fn sample_token_with_params(logits_2d: &InlineArray, params: &SamplingParams) -> InlineArray {
+pub fn sample_token(logits_2d: &InlineArray, params: &SamplingParams, draw: u64) -> InlineArray {
     if params.temperature <= 0.0 {
         return logits_2d.argmax(-1);
     }
+    let key = params.draw_key(draw);
     let log_probs = {
         let inv_temp = scalar_f32_like(1.0 / params.temperature, logits_2d);
         let lse = logits_2d.logsumexp(-1, true);
         logits_2d.subtract(&lse).multiply(&inv_temp)
     };
     if !params.has_filters() {
-        return log_probs.categorical(-1);
+        return log_probs.categorical(-1, key.as_ref());
     }
     // Pre-construct the negative-infinity sentinel once per call. Filters
     // splat it into masked positions; sample_token is called per step so
@@ -325,28 +336,23 @@ pub fn sample_token_with_params(logits_2d: &InlineArray, params: &SamplingParams
     if params.min_p > 0.0 && params.min_p < 1.0 {
         filtered = apply_min_p(&filtered, params.min_p, &neg_inf);
     }
-    filtered.categorical(-1)
+    filtered.categorical(-1, key.as_ref())
 }
 
-/// Sample a single token id from `[B, vocab]` logits.
-pub fn sample_token_id(logits_2d: &InlineArray, temperature: f32) -> u32 {
-    let tok_arr = sample_token(logits_2d, temperature);
-    tok_arr.eval();
-    tok_arr.item_u32()
-}
-
-/// Run prompt prefill and return the first sampled token.
+/// Run prompt prefill and return the first sampled token (draw 0).
 pub fn prefill_first_token<Weights, Cache>(
     weights: &Weights,
     cache: &mut Cache,
     input_ids: &[u32],
-    temperature: f32,
+    params: &SamplingParams,
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
 ) -> u32 {
     let prompt = prompt_tokens_to_input(input_ids);
     let logits = forward_step(weights, &prompt, cache);
     let last_logits = last_token_logits(&logits);
-    sample_token_id(&last_logits, temperature)
+    let token = sample_token(&last_logits, params, 0);
+    token.eval();
+    token.item_u32()
 }
 
 /// Cache-aware causal attention.
@@ -878,7 +884,7 @@ pub fn prime_generation<Weights, Cache>(
     weights: &Weights,
     cache: &mut Cache,
     first_token: u32,
-    temperature: f32,
+    params: &SamplingParams,
     reset_peak_memory: bool,
     log_session: bool,
     mut prepare_cache: impl FnMut(&mut Cache),
@@ -890,7 +896,8 @@ pub fn prime_generation<Weights, Cache>(
     let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
     let logits = forward_step(weights, &input_token, cache);
     let logits_2d = logits.squeeze(1);
-    let current_y = sample_token(&logits_2d, temperature);
+    // Draw 1: the prompt's own last position drew token 0.
+    let current_y = sample_token(&logits_2d, params, 1);
     current_y.async_eval_ref();
     current_y
 }
@@ -957,26 +964,16 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
 
             // Apply penalties before sampling (zero-cost when disabled or no
             // tokens seen yet; reuses pre-allocated buffer otherwise).
-            // Route through the full filter pipeline only when any
-            // filter is actually active — params.has_filters() is
-            // false on the common greedy / temperature-only path so
-            // we use the leaner sample_token and skip the
-            // scalar_f32_like neg-inf construction inside
-            // sample_token_with_params.
-            let needs_filters = params.has_filters();
+            // `current_y`, primed as draw 1, is token `step + 1`; this
+            // samples token `step + 2`.
+            let draw = step as u64 + 2;
             let next_y = if use_penalties && !token_counts.is_empty() {
                 let buf = penalty_buf
                     .get_or_insert_with(|| PenaltyBuffer::new(next_logits_2d.dim(-1) as usize));
                 let penalized = buf.apply(&next_logits_2d, &token_counts, &params);
-                if needs_filters {
-                    sample_token_with_params(&penalized, &params)
-                } else {
-                    sample_token(&penalized, params.temperature)
-                }
-            } else if needs_filters {
-                sample_token_with_params(&next_logits_2d, &params)
+                sample_token(&penalized, &params, draw)
             } else {
-                sample_token(&next_logits_2d, params.temperature)
+                sample_token(&next_logits_2d, &params, draw)
             };
 
             trace_decode_graph(tag, step, &next_logits_2d, &next_y);

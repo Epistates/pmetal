@@ -1638,9 +1638,9 @@ pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
-    temperature: f32,
+    params: &crate::decode::SamplingParams,
 ) -> u32 {
-    crate::decode::prefill_first_token(weights, cache, input_ids, temperature, forward_step)
+    crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
 }
 
 pub fn generate(
@@ -1660,7 +1660,7 @@ pub fn generate(
         weights,
         cache,
         first_token,
-        params.temperature,
+        &params,
         true,
         true,
         move |cache| {

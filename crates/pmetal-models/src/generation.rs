@@ -697,16 +697,16 @@ pub struct Sampler {
     /// Cached inverse temperature for categorical sampling (1.0 / temp)
     /// None if temp == 1.0 (no scaling needed)
     inv_temp: Option<Array>,
+    /// How many tokens this sampler has drawn: with a seed, draw `n` uses
+    /// [`pmetal_bridge::decode::draw_key`]`(seed, n)`.
+    draws: std::cell::Cell<u64>,
 }
 
 impl Sampler {
-    /// Create a new sampler.
+    /// Create a new sampler. A seeded config draws every token with its own
+    /// key derived from the seed, so the sampler's tokens don't depend on
+    /// the thread it runs on or on any other random draw.
     pub fn new(config: GenerationConfig) -> Self {
-        // Seed MLX random state if a seed was provided
-        if let Some(seed) = config.seed {
-            pmetal_bridge::inline_array::random_seed(seed);
-        }
-
         // Pre-allocate cached scalar arrays (avoids allocation per token)
         let neg_inf = Array::from_f32(f32::NEG_INFINITY);
 
@@ -724,7 +724,17 @@ impl Sampler {
             token_counts: HashMap::new(),
             neg_inf,
             inv_temp,
+            draws: std::cell::Cell::new(0),
         }
+    }
+
+    /// The key for the next sampled draw (`None` when unseeded), counting it.
+    fn next_key(&self) -> Option<Array> {
+        let draw = self.draws.get();
+        self.draws.set(draw + 1);
+        self.config
+            .seed
+            .map(|seed| pmetal_bridge::decode::draw_key(seed, draw))
     }
 
     /// Sample the next token from logits.
@@ -786,7 +796,11 @@ impl Sampler {
 
         // Sample from the distribution using GPU-native categorical
         // categorical(logprobs * (1/temp))
-        let token = gpu_categorical_sample(&log_probs, self.config.temperature)?;
+        let token = gpu_categorical_sample(
+            &log_probs,
+            self.config.temperature,
+            self.next_key().as_ref(),
+        )?;
         self.update_counts(token);
         Ok(token)
     }
@@ -834,13 +848,14 @@ impl Sampler {
 
         // Sample from the distribution using GPU-native categorical
         // Use cached inv_temp to avoid allocation per token
+        let key = self.next_key();
         let token = if let Some(ref inv_temp) = self.inv_temp {
             // Scale by cached inverse temperature
             let scaled = log_probs.multiply(inv_temp);
-            categorical(&scaled, -1)
+            categorical(&scaled, -1, key.as_ref())
         } else {
             // No temperature scaling needed (temp == 1.0)
-            categorical(&log_probs, -1)
+            categorical(&log_probs, -1, key.as_ref())
         };
         Ok((token, log_probs))
     }
@@ -1205,7 +1220,7 @@ pub fn sampling_log_probs_with_counts(
 
 /// Sample from a normalized log-probability distribution.
 pub fn sample_from_log_probs(log_probs: &Array) -> Result<u32, Exception> {
-    Ok(categorical(log_probs, -1).item::<u32>())
+    Ok(categorical(log_probs, -1, None).item::<u32>())
 }
 
 /// Return `exp(log_probs[token])`, validating the token against the vocabulary.
@@ -1515,7 +1530,11 @@ pub fn apply_frequency_presence_penalty(
 /// Uses pmetal_bridge::compat::random::categorical for efficient GPU sampling.
 /// This is ~10x faster than CPU sampling for large vocabularies.
 /// Note: item() internally calls eval(), so no explicit eval() needed.
-fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Exception> {
+fn gpu_categorical_sample(
+    log_probs: &Array,
+    temperature: f32,
+    key: Option<&Array>,
+) -> Result<u32, Exception> {
     // Multiply log_probs by inverse temperature
     // categorical_sampling(logits, temp) -> mx.random.categorical(logits * (1 / temp))
     let scaled = if temperature != 1.0 && temperature > 0.0 {
@@ -1526,7 +1545,7 @@ fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Ex
     };
 
     // Sample using GPU-native categorical (axis=-1 by default)
-    let sampled = categorical(&scaled, -1);
+    let sampled = categorical(&scaled, -1, key);
 
     // Extract the scalar token ID (item() calls eval() internally)
     Ok(sampled.item::<u32>())
@@ -2342,15 +2361,9 @@ where
     })
 }
 
-/// High-performance generation using JIT-compiled sampling.
-///
-/// This function uses MLX's JIT compilation (like Python's `@mx.compile`)
-/// to fuse sampling operations into optimized Metal kernels.
-///
-/// # Performance Benefits
-///
-/// - **JIT-compiled sampling** - operations fused into a single kernel
-/// - **Async pipelining** - next forward pass scheduled while extracting current token
+/// Generation with the next forward pass scheduled while the current token
+/// is read back (`--backend compiled`). Sampling is [`Sampler::sample_array`]
+/// as MLX ops; nothing here goes through `mx.compile`.
 ///
 /// # Limitations
 ///
@@ -2374,8 +2387,6 @@ pub fn generate_cached_compiled<F>(
 where
     F: FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
 {
-    use crate::sampling::CompiledSampler;
-
     // Set wired memory limit for optimal GPU memory management
     // This prevents page faults and matches Python's wired_limit context manager
     let _wired_guard = WiredLimitGuard::new();
@@ -2383,11 +2394,6 @@ where
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
     let prompt_len = input_ids.len();
 
-    // Create compiled sampler with config parameters
-    let mut compiled_sampler =
-        CompiledSampler::new(config.temperature, config.top_k, config.top_p, config.min_p)?;
-
-    // Create a standard sampler for stop token checking
     let sampler = Sampler::new(config.clone());
 
     let mut current_y = {
@@ -2398,7 +2404,7 @@ where
             })?;
         let last_idx = logits.dim(1) - 1;
         let current_logits = select_axis(&logits, last_idx, 1);
-        compiled_sampler.sample(&current_logits)?
+        sampler.sample_array(&current_logits)?.0
     };
 
     // async_eval OUTSIDE stream context (enables pipelining!)
@@ -2417,7 +2423,7 @@ where
                     .reshape(&[1, 1]);
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = select_axis(&next_output, 0, 1);
-                compiled_sampler.sample(&next_logits)?
+                sampler.sample_array(&next_logits)?.0
             };
             // async_eval OUTSIDE stream context
             async_eval([&y]);
@@ -2553,6 +2559,7 @@ where
         temperature: gen_config.temperature,
         top_k: gen_config.top_k,
         stop: gen_config.stop_tokens.clone(),
+        seed: gen_config.seed,
     };
     let request = crate::ane_worker::AneRequest {
         model_path: model_path.to_path_buf(),
@@ -2713,6 +2720,7 @@ pub fn hybrid_cpu_inference_config(
         top_k: 0,
         max_tokens: 0,
         eos_token_id: None,
+        seed: None,
     })
 }
 
@@ -2734,6 +2742,7 @@ fn build_hybrid_cpu_inference_config(
     config.top_k = gen_config.top_k;
     config.max_tokens = gen_config.max_new_tokens;
     config.eos_token_id = gen_config.stop_tokens.first().copied();
+    config.seed = gen_config.seed;
     Ok(config)
 }
 
@@ -3090,7 +3099,7 @@ mod tests {
         pmetal_bridge::compat::random::seed(42);
 
         // Temperature = 1.0 (no scaling)
-        let token = gpu_categorical_sample(&log_probs, 1.0).unwrap();
+        let token = gpu_categorical_sample(&log_probs, 1.0, None).unwrap();
 
         // Should almost always sample token 0 due to dominant probability
         assert_eq!(token, 0);

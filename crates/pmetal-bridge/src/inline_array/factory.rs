@@ -195,6 +195,17 @@ impl InlineArray {
 
     // ── Random samplers ──────────────────────────────────────────────────
 
+    /// The MLX PRNG key for `seed` (`mlx.random.key`): two `uint32` words.
+    pub fn random_key(seed: u64) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_random_key(dst.as_mut_ptr(), seed);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
     pub fn random_normal(shape: &[i32], dtype: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {

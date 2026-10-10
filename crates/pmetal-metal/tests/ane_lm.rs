@@ -50,6 +50,7 @@ fn greedy_generation_matches_the_reference() {
                 temperature: 0.0,
                 top_k: 0,
                 stop: Vec::new(),
+                seed: None,
             };
             let (got, stats) = lm
                 .generate(prompt, &opts, &mut NoDraft, |_| true)
@@ -98,6 +99,7 @@ fn speculation_keeps_greedy_output() {
         temperature: 0.0,
         top_k: 0,
         stop: Vec::new(),
+        seed: None,
     };
     let (plain, plain_stats) = lm
         .generate(&prompt, &settings, &mut NoDraft, |_| true)
@@ -152,6 +154,7 @@ fn qwen3_4b_throughput() {
         temperature: 0.0,
         top_k: 0,
         stop: Vec::new(),
+        seed: None,
     };
     let (plain, p) = lm
         .generate(&prompt, &settings, &mut NoDraft, |_| true)
@@ -201,6 +204,7 @@ fn qwen3_4b_answers_a_chat_prompt() {
         temperature: 0.0,
         top_k: 0,
         stop: Vec::new(),
+        seed: None,
     };
     for weights in [WeightFormat::Int8, WeightFormat::Fp16] {
         let opts = AneLmOptions {

@@ -1285,7 +1285,7 @@ impl DiffusionGemmaForBlockDiffusion {
 
                 // Multinomial proposal: categorical over processed logits is
                 // equivalent to multinomial over softmax(processed).
-                let denoiser = pmetal_bridge::compat::random::categorical(&processed, -1)
+                let denoiser = pmetal_bridge::compat::random::categorical(&processed, -1, None)
                     .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
 
                 let (accepted, mask) =

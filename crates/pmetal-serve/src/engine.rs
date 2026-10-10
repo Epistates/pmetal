@@ -217,12 +217,6 @@ fn build_generation_config_from_parts(
     if let Some(pp) = params.presence_penalty {
         config = config.with_presence_penalty(pp);
     }
-    if !do_sample {
-        if let Some(seed) = params.seed {
-            config = config.with_seed(seed);
-        }
-    }
-
     config
 }
 

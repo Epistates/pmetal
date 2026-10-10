@@ -11,9 +11,9 @@ pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
-    temperature: f32,
+    params: &crate::decode::SamplingParams,
 ) -> u32 {
-    crate::decode::prefill_first_token(weights, cache, input_ids, temperature, forward_step)
+    crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
 }
 
 // ============================================================================
@@ -57,7 +57,7 @@ fn prime_generation_impl(
     cache: &mut NativeCache,
     first_token: u32,
     reserve_decode_inputs: usize,
-    temperature: f32,
+    params: &crate::decode::SamplingParams,
     reset_peak_memory: bool,
     log_session: bool,
 ) -> InlineArray {
@@ -68,7 +68,7 @@ fn prime_generation_impl(
         weights,
         cache,
         first_token,
-        temperature,
+        params,
         reset_peak_memory,
         log_session,
         |cache| prepare_generation_cache(cache, reserve_decode_inputs, weights.model_dtype),
@@ -114,7 +114,7 @@ pub fn prime_generation_preserve_peak(
         cache,
         first_token,
         reserve_decode_inputs,
-        temperature,
+        &crate::decode::SamplingParams::new(temperature),
         false,
         true,
     )
@@ -132,7 +132,7 @@ pub fn prime_generation_preserve_peak_silent(
         cache,
         first_token,
         reserve_decode_inputs,
-        temperature,
+        &crate::decode::SamplingParams::new(temperature),
         false,
         false,
     )
@@ -176,7 +176,12 @@ pub fn benchmark_trial(
     let mut cache = NativeCache::new_with_turboquant(weights, turboquant);
 
     let prompt_tic = std::time::Instant::now();
-    let first_tok = prefill_first_token(weights, &mut cache, prompt_ids, 0.0);
+    let first_tok = prefill_first_token(
+        weights,
+        &mut cache,
+        prompt_ids,
+        &crate::decode::SamplingParams::new(0.0),
+    );
     let current_y = prime_generation_preserve_peak_silent(
         weights,
         &mut cache,
@@ -242,15 +247,8 @@ pub fn generate(
     params: crate::decode::SamplingParams,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    let current_y = prime_generation_impl(
-        weights,
-        cache,
-        first_token,
-        max_tokens,
-        params.temperature,
-        true,
-        true,
-    );
+    let current_y =
+        prime_generation_impl(weights, cache, first_token, max_tokens, &params, true, true);
     generate_from_primed_sample_impl(
         weights, cache, current_y, max_tokens, params, true, on_token,
     )
@@ -269,7 +267,7 @@ pub fn generate_preserve_peak(
         cache,
         first_token,
         max_tokens,
-        temperature,
+        &crate::decode::SamplingParams::new(temperature),
         false,
         true,
     );

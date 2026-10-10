@@ -65,11 +65,16 @@ impl InlineArray {
 
     /// Draw one class index per row from the unnormalized log-probabilities
     /// along `axis`, which the result no longer has.
+    ///
+    /// `key` is an MLX PRNG key ([`Self::random_key`]); the same key and
+    /// logits always draw the same indices. Without one the draw takes the
+    /// calling thread's default key, which every unkeyed draw advances.
     #[inline]
-    pub fn categorical(&self, axis: i32) -> Self {
+    pub fn categorical(&self, axis: i32, key: Option<&Self>) -> Self {
+        let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_categorical(dst.as_mut_ptr(), &self.raw, axis);
+            mlx_inline_categorical(dst.as_mut_ptr(), &self.raw, axis, key);
             Self {
                 raw: dst.assume_init(),
             }

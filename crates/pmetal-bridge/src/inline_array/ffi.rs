@@ -574,7 +574,12 @@ unsafe extern "C" {
         axis: i32,
         keepdims: bool,
     );
-    pub(super) fn mlx_inline_categorical(dst: *mut RawBuf, logits: *const RawBuf, axis: i32);
+    pub(super) fn mlx_inline_categorical(
+        dst: *mut RawBuf,
+        logits: *const RawBuf,
+        axis: i32,
+        key: *const RawBuf,
+    );
 
     // ── Element-wise math ──
     pub(super) fn mlx_inline_abs(dst: *mut RawBuf, a: *const RawBuf);
@@ -1158,6 +1163,7 @@ unsafe extern "C" {
         ndim: i32,
     );
     pub(super) fn mlx_inline_random_seed(seed: u64);
+    pub(super) fn mlx_inline_random_key(dst: *mut RawBuf, seed: u64);
     pub(super) fn mlx_inline_random_randint(
         dst: *mut RawBuf,
         low: i32,

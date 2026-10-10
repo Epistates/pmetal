@@ -35,9 +35,7 @@ use pmetal_bridge::compat::{Array, Exception, ops};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_mlx::prefix_cache::PrefixCachedGenerator;
 
-use crate::sampling::compiled_sampler::CompiledSampler;
-
-use crate::generation::GenerationConfig;
+use crate::generation::{GenerationConfig, Sampler};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Speculative RL generation statistics
@@ -212,7 +210,8 @@ impl BatchedRlConfig {
             presence_penalty: 0.0,
             stop_tokens: self.stop_tokens.clone(),
             seed: self.seed,
-            do_sample: true,
+            // Temperature 0 is greedy, not an unscaled draw.
+            do_sample: self.temperature > 0.0,
             prefill_step_size: 2048,
         }
     }
@@ -223,8 +222,8 @@ impl BatchedRlConfig {
 /// This generator efficiently produces multiple completions from the same prompt
 /// using batched forward passes and parallel sampling.
 ///
-/// H10: Uses `CompiledSampler` for proper top-k/top-p/min-p filtering instead
-/// of temperature-only sampling.
+/// Samples through [`Sampler`], with the config's temperature, top-k, top-p,
+/// min-p and seed.
 pub struct BatchedRlGenerator {
     /// Configuration.
     config: BatchedRlConfig,
@@ -232,8 +231,8 @@ pub struct BatchedRlGenerator {
     prefix_cache: Option<PrefixCachedGenerator>,
     /// KV cache config for creating new caches.
     kv_config: KVCacheConfig,
-    /// Compiled sampler with full filter chain (temperature, top-k, top-p, min-p).
-    sampler: CompiledSampler,
+    /// Sampler with the full filter chain (temperature, top-k, top-p, min-p).
+    sampler: Sampler,
     /// Statistics from the most recent `generate_speculative` call.
     last_speculative_stats: Option<SpeculativeRlStats>,
 }
@@ -247,19 +246,7 @@ impl BatchedRlGenerator {
             None
         };
 
-        let sampler = if let Some(seed) = config.seed {
-            CompiledSampler::with_seed(
-                config.temperature,
-                config.top_k,
-                config.top_p,
-                config.min_p,
-                seed,
-            )
-            .expect("Failed to create seeded sampler")
-        } else {
-            CompiledSampler::new(config.temperature, config.top_k, config.top_p, config.min_p)
-                .expect("Failed to create sampler")
-        };
+        let sampler = Sampler::new(config.to_generation_config());
 
         Self {
             config,
@@ -750,14 +737,10 @@ impl BatchedRlGenerator {
         self.last_speculative_stats.as_ref()
     }
 
-    /// Sample a token from logits using the compiled sampler.
-    ///
-    /// H10: Delegates to `CompiledSampler` which applies the full filter chain
-    /// (temperature scaling, top-k, top-p, min-p) before sampling. The previous
-    /// implementation only applied temperature, ignoring top-k/top-p/min-p
-    /// from the config.
+    /// Sample a token from logits through the full filter chain
+    /// (temperature, top-k, top-p, min-p).
     fn sample(&mut self, logits: &Array) -> RlGenResult<u32> {
-        self.sampler.sample_token(logits)
+        Ok(self.sampler.sample_array(logits)?.0.item::<u32>())
     }
 
     /// Check if a token is a stop token.

@@ -107,9 +107,9 @@ pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
-    temperature: f32,
+    params: &crate::decode::SamplingParams,
 ) -> u32 {
-    crate::decode::prefill_first_token(weights, cache, input_ids, temperature, forward_step)
+    crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
 }
 
 fn prepare_generation_cache(cache: &mut NativeCache) {
@@ -121,7 +121,7 @@ fn prime_generation_impl(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     first_token: u32,
-    temperature: f32,
+    params: &crate::decode::SamplingParams,
     reset_peak_memory: bool,
     log_session: bool,
 ) -> InlineArray {
@@ -131,7 +131,7 @@ fn prime_generation_impl(
         weights,
         cache,
         first_token,
-        temperature,
+        params,
         reset_peak_memory,
         log_session,
         prepare_generation_cache,
@@ -171,8 +171,20 @@ pub fn benchmark_trial(
     let mut cache = NativeCache::new_empty(weights);
 
     let prompt_tic = std::time::Instant::now();
-    let first_tok = prefill_first_token(weights, &mut cache, prompt_ids, 0.0);
-    let current_y = prime_generation_impl(weights, &mut cache, first_tok, 0.0, false, false);
+    let first_tok = prefill_first_token(
+        weights,
+        &mut cache,
+        prompt_ids,
+        &crate::decode::SamplingParams::new(0.0),
+    );
+    let current_y = prime_generation_impl(
+        weights,
+        &mut cache,
+        first_tok,
+        &crate::decode::SamplingParams::new(0.0),
+        false,
+        false,
+    );
     let prompt_secs = prompt_tic.elapsed().as_secs_f64();
 
     let generation_secs = if generation_tokens > 1 {
@@ -219,8 +231,7 @@ pub fn generate(
     params: crate::decode::SamplingParams,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    let current_y =
-        prime_generation_impl(weights, cache, first_token, params.temperature, true, true);
+    let current_y = prime_generation_impl(weights, cache, first_token, &params, true, true);
     generate_from_primed_sample_impl(
         weights, cache, current_y, max_tokens, params, true, on_token,
     )

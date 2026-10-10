@@ -637,6 +637,74 @@ mod tests {
         }
     }
 
+    /// Uniform logits over a 1000-token vocabulary, so every token is a
+    /// random draw.
+    struct UniformForward;
+
+    impl SlotForward for UniformForward {
+        fn forward(
+            &mut self,
+            tokens: &[u32],
+            cache: &mut KVCache,
+            _recurrent: Option<&mut MambaCache>,
+        ) -> Result<Array, Exception> {
+            let (num_heads, head_dim) = {
+                let cfg = cache.config();
+                (cfg.num_kv_heads as i32, cfg.head_dim as i32)
+            };
+            let s = tokens.len() as i32;
+            let kv = Array::zeros_f32(&[1, num_heads, s, head_dim]);
+            cache.update_and_fetch(0, &kv, &kv)?;
+            cache.update_and_fetch(1, &kv, &kv)?;
+            Ok(Array::zeros_f32(&[1, s, 1000]))
+        }
+    }
+
+    fn sampling(seed: Option<u64>) -> Sampler {
+        let mut config = pmetal_models::generation::GenerationConfig::sampling(64, 1.0);
+        config.seed = seed;
+        Sampler::new(config)
+    }
+
+    /// Eight decode steps of `seeded` (seed 5), with `others` admitted
+    /// beside it; returns the seeded slot's tokens.
+    fn seeded_slot_tokens(others: &[Option<u64>]) -> Vec<u32> {
+        let mut state = ContinuousEngineState::new(1 + others.len(), make_config());
+        let seeded = SlotId(0);
+        state.admit(seeded, sampling(Some(5))).unwrap();
+        let other_ids: Vec<SlotId> = (1..=others.len() as u64).map(SlotId).collect();
+        for (&id, &seed) in other_ids.iter().zip(others) {
+            state.admit(id, sampling(seed)).unwrap();
+        }
+        let history: Vec<u32> = vec![];
+        let mut tokens = Vec::new();
+        for _ in 0..8 {
+            let mut slots = vec![(seeded, 1u32, history.as_slice())];
+            slots.extend(other_ids.iter().map(|&id| (id, 1u32, history.as_slice())));
+            let outs = drive_decode_step(&mut UniformForward, &mut state, &slots).unwrap();
+            tokens.push(outs.iter().find(|o| o.slot == seeded).unwrap().token);
+        }
+        tokens
+    }
+
+    #[test]
+    fn a_seeded_slot_draws_the_same_tokens_whatever_shares_the_batch() {
+        // Seeding used to reset the model thread's one MLX key at admission,
+        // so every other slot's draw shifted the seeded slot's stream.
+        let alone = seeded_slot_tokens(&[]);
+        assert_eq!(
+            alone,
+            seeded_slot_tokens(&[]),
+            "the same seed drew twice differently"
+        );
+        assert_eq!(
+            alone,
+            seeded_slot_tokens(&[None, Some(9)]),
+            "an unseeded and a differently seeded slot moved the seeded slot's tokens"
+        );
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    }
+
     #[test]
     fn decode_step_routes_per_slot_logits_correctly() {
         let mut state = ContinuousEngineState::new(3, make_config());
