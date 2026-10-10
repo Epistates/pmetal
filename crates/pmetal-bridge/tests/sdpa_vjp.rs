@@ -14,7 +14,7 @@
 
 use pmetal_bridge::InlineArray;
 use pmetal_bridge::dtype::F32;
-use pmetal_bridge::inline_array::{random_seed, value_and_grad};
+use pmetal_bridge::inline_array::{checkpoint_apply, random_seed, value_and_grad};
 
 const HEADS: i32 = 2;
 const HEAD_DIM: i32 = 64;
@@ -88,6 +88,33 @@ fn fused_attention_gradient_matches_unfused_on_full_kernel() {
 fn fused_attention_gradient_matches_unfused_on_short_queries() {
     for len in [1, 4, 8] {
         assert_fused_matches_unfused(len, false);
+    }
+}
+
+/// A checkpointed layer rebuilds its forward inside the backward pass, so
+/// the short-query attention it holds is built twice under the trace.
+#[test]
+fn short_query_attention_trains_under_checkpoint() {
+    random_seed(7);
+    let shape = [1, HEADS, 4, HEAD_DIM];
+    let q = InlineArray::random_normal(&shape, F32);
+    let k = InlineArray::random_normal(&shape, F32);
+    let v = InlineArray::random_normal(&shape, F32);
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let (loss, grads) = value_and_grad(
+        |a| {
+            let out = checkpoint_apply(&[a[0].clone(), a[1].clone(), a[2].clone()], move |x| {
+                vec![x[0].sdpa(&x[1], &x[2], scale, "causal")]
+            });
+            out[0].sum_all()
+        },
+        &[q, k, v],
+        &[],
+    );
+    assert!(loss.item_f32().is_finite());
+    pmetal_bridge::check_last_error().expect("checkpointed short-query attention");
+    for g in &grads {
+        assert!(g.abs().max(None).item_f32().is_finite());
     }
 }
 

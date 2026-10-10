@@ -4,7 +4,6 @@
 
 #include "bridge.h"
 #include "mlx/mlx.h"
-#include "mlx/transforms_impl.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -66,6 +65,23 @@ static inline void bridge_placeholder(mlx_inline_array* dst) noexcept {
     }
 }
 
+// How many autograd traces the bridge has open on this thread
+// (`value_and_grad`, and `checkpoint`'s forward). MLX keeps the same count
+// (`detail::in_grad_tracing`), but its counter is a thread-local that
+// libmlx.dylib doesn't export, so a shared-MLX build can't link against it.
+// `inline`, not `static`: one counter for every translation unit.
+inline int& pmetal_bridge_grad_depth() noexcept {
+    thread_local int depth = 0;
+    return depth;
+}
+
+struct BridgeGradScope {
+    BridgeGradScope() noexcept { ++pmetal_bridge_grad_depth(); }
+    ~BridgeGradScope() { --pmetal_bridge_grad_depth(); }
+    BridgeGradScope(const BridgeGradScope&) = delete;
+    BridgeGradScope& operator=(const BridgeGradScope&) = delete;
+};
+
 // `fast::scaled_dot_product_attention`, as every bridge entry point runs it.
 //
 // Under autograd with no array mask, MLX (since #4563) runs a fused forward
@@ -82,7 +98,7 @@ static inline array bridge_sdpa(const array& q, const array& k, const array& v, 
                                 const std::optional<array>& mask,
                                 const std::optional<array>& sinks) {
     namespace mx = mlx::core;
-    if (!mask && mx::detail::in_grad_tracing() && (sinks || q.shape(2) <= 8)) {
+    if (!mask && pmetal_bridge_grad_depth() > 0 && (sinks || q.shape(2) <= 8)) {
         const int q_len = q.shape(2);
         const int k_len = k.shape(2);
         // MLX's causal mask: query i sees keys up to i + (k_len - q_len).

@@ -494,6 +494,10 @@ void mlx_inline_value_and_grad(
     // mlx::core::value_and_grad returns a function that produces
     // pair<vector<array>, vector<array>> = (values, grads).
     try {
+        // The forward and the backward graph are both built inside this call
+        // (a checkpoint's recomputed forward included), so attention built in
+        // either sees the trace (see `bridge_sdpa`).
+        BridgeGradScope grad_scope;
         auto vg_fn = mlx::core::value_and_grad(
             std::function<std::vector<array>(std::vector<array>)>(cpp_forward),
             argnums);
@@ -778,7 +782,12 @@ void mlx_inline_checkpoint(
         // the slots the callback reports are read back and destroyed.
         std::vector<mlx_inline_array> out_bufs(n_outputs_max);
         int n_out = 0;
-        forward_fn(ptrs.data(), (int)ptrs.size(), out_bufs.data(), &n_out, ctx_guard.get());
+        {
+            // A checkpointed forward exists to be differentiated; its
+            // recomputation runs inside the backward pass.
+            BridgeGradScope grad_scope;
+            forward_fn(ptrs.data(), (int)ptrs.size(), out_bufs.data(), &n_out, ctx_guard.get());
+        }
         if (n_out > n_outputs_max) {
             n_out = n_outputs_max;
         }
