@@ -102,12 +102,17 @@ grep -rhoE 'uses: *[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+' .github/work
     printf '%-40s %-10s newest major: %s%s\n' "$action" "$ref" "${newest:-?}" "$flag"
 done
 
-section "duplicate crate versions (distinct versions per crate name)"
+# Counted in what macOS actually builds (all features), not in Cargo.lock:
+# the lockfile also lists every optional dependency and every other
+# platform's, none of which is compiled here.
+section "duplicate crate versions (distinct versions per crate name, macOS build graph)"
 for dir in "${CARGO_DIRS[@]}"; do
-    awk '/^name = /{ n = $3 } /^version = /{ print n, $3 }' "$dir/Cargo.lock" | sort -u |
+    cargo tree --manifest-path "$dir/Cargo.toml" --duplicates --all-features \
+        --target aarch64-apple-darwin -e normal,build,dev --prefix none 2>/dev/null |
+        awk '/^[A-Za-z0-9_-]+ v[0-9]/ { print $1, $2 }' | sort -u |
         awk -v d="$dir" '{ c[$1]++ } END {
             for (k in c) if (c[k] > 1) { crates++; extra += c[k] - 1 }
             printf "-- %s: %d crates with more than one version (%d extra versions)\n", d, crates, extra
         }'
 done
-echo "   list them with: cargo tree --duplicates [--manifest-path DIR/Cargo.toml]"
+echo "   list them with: cargo tree --duplicates --target aarch64-apple-darwin [--manifest-path DIR/Cargo.toml]"
