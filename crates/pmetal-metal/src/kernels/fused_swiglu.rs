@@ -744,6 +744,15 @@ struct FusedSwiGLUParams {
     lora_scale: f32,
 }
 
+// `FusedSwiGLUParams` in `metal/fused_swiglu.metal`.
+crate::msl_layout::msl_layout!(FusedSwiGLUParams, size = 20, {
+    batch_size: 0,
+    hidden_size: 4,
+    intermediate_size: 8,
+    lora_rank: 12,
+    lora_scale: 16,
+});
+
 fn resolve_swiglu_tuned_config(
     ctx: &Arc<MetalContext>,
     config: &FusedSwiGLUConfig,

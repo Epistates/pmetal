@@ -60,6 +60,17 @@ struct QuantGemmParams {
     num_tiles_n: u32,
 }
 
+// `QuantGemmParams` in `metal4/mpp_quantized.metal`.
+crate::msl_layout::msl_layout!(QuantGemmParams, size = 28, {
+    m: 0,
+    n: 4,
+    k: 8,
+    group_size: 12,
+    bits: 16,
+    num_tiles_m: 20,
+    num_tiles_n: 24,
+});
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchGeometry {
     bm: usize,

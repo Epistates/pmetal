@@ -105,6 +105,17 @@ pub struct SamplingParams {
     _padding: [u8; 3],
 }
 
+// `SamplingParams` in `metal/fused_sampler.metal`.
+crate::msl_layout::msl_layout!(SamplingParams, size = 28, {
+    vocab_size: 0,
+    temperature: 4,
+    top_p: 8,
+    min_p: 12,
+    top_k: 16,
+    random_seed: 20,
+    do_sample: 24,
+});
+
 impl Default for SamplingParams {
     fn default() -> Self {
         Self {
@@ -615,12 +626,6 @@ impl std::fmt::Debug for FusedSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_sampling_params_size() {
-        // Ensure the struct is properly aligned for Metal
-        assert_eq!(std::mem::size_of::<SamplingParams>(), 28);
-    }
 
     #[test]
     fn test_fused_sampler_creation() {

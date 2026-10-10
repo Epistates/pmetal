@@ -672,6 +672,16 @@ struct CrossEntropyParams {
     block_size: u32,
 }
 
+// `CrossEntropyParams` in `metal/fused_cross_entropy.metal`.
+crate::msl_layout::msl_layout!(CrossEntropyParams, size = 24, {
+    num_tokens: 0,
+    vocab_size: 4,
+    label_smoothing: 8,
+    softcap: 12,
+    ignore_index: 16,
+    block_size: 20,
+});
+
 impl std::fmt::Debug for FusedCrossEntropy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FusedCrossEntropy")
@@ -1136,6 +1146,16 @@ struct FusedLinearCEParams {
     ignore_index: i32,
     label_smoothing: f32,
 }
+
+// `FusedLinearCEParams` in `metal/fused_cross_entropy.metal`.
+crate::msl_layout::msl_layout!(FusedLinearCEParams, size = 24, {
+    num_tokens: 0,
+    hidden_size: 4,
+    vocab_size: 8,
+    chunk_size: 12,
+    ignore_index: 16,
+    label_smoothing: 20,
+});
 
 fn resolve_fused_linear_ce_tuned_config(
     ctx: &Arc<MetalContext>,

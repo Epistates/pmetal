@@ -5,7 +5,6 @@
 //! and efficient training operations.
 
 pub mod batch_encoder;
-pub mod batched_lora;
 pub mod dequant;
 pub mod dispatch;
 pub mod dw_gemm;
@@ -49,7 +48,6 @@ pub mod mpp_fused_training;
 pub mod mpp_grouped_gemm;
 
 // Re-export main types
-pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
 pub use dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
 pub use flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,

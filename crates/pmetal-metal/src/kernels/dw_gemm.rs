@@ -34,6 +34,15 @@ struct DwGemmParams {
     beta: f32,
 }
 
+// `DwGemmParams` in `metal/dw_gemm.metal`.
+crate::msl_layout::msl_layout!(DwGemmParams, size = 20, {
+    m: 0,
+    n: 4,
+    k: 8,
+    alpha: 12,
+    beta: 16,
+});
+
 /// Tile dimensions — must match `dw_gemm.metal` constants.
 const BM: usize = 64;
 const BN: usize = 64;

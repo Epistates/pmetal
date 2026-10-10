@@ -91,6 +91,15 @@ struct FusedSwiGLUParams {
     lora_scale: f32,
 }
 
+// `FusedSwiGLUParams` in `metal4/mpp_fused_swiglu.metal`.
+crate::msl_layout::msl_layout!(FusedSwiGLUParams, size = 20, {
+    batch_size: 0,
+    hidden_size: 4,
+    intermediate_size: 8,
+    lora_rank: 12,
+    lora_scale: 16,
+});
+
 #[derive(Debug, Clone, Copy)]
 struct DispatchGeometry {
     /// Threadgroups in the intermediate (x) dimension.
@@ -364,6 +373,13 @@ struct FusedMLPParams {
     hidden_size: u32,
     intermediate_size: u32,
 }
+
+// `FusedMLPParams` in `metal4/mpp_fused_swiglu.metal`.
+crate::msl_layout::msl_layout!(FusedMLPParams, size = 12, {
+    batch_size: 0,
+    hidden_size: 4,
+    intermediate_size: 8,
+});
 
 /// MPP Fused MLP dispatcher.
 ///

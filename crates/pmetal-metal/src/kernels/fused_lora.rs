@@ -170,12 +170,11 @@ impl FusedLoraConfig {
 
 /// Parameters passed to the Metal kernel.
 ///
-/// Layout must exactly match the `FusedLoraParams` struct in `fused_lora.metal`.
-/// Fields are appended to the end — adding new fields here without matching the
-/// shader will silently produce wrong results, so keep both in sync.
+/// The layout of the `FusedLoraParams` struct in `fused_lora.metal`, pinned
+/// below. Built only from a [`FusedLoraConfig`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct FusedLoraParams {
+pub(crate) struct FusedLoraParams {
     batch_size: u32,
     in_features: u32,
     out_features: u32,
@@ -186,6 +185,17 @@ struct FusedLoraParams {
     /// LoRA+ gradient scale for dB. Applied at write time in the backward kernel.
     lr_scale_b: f32,
 }
+
+// `FusedLoraParams` in `metal/fused_lora.metal`.
+crate::msl_layout::msl_layout!(FusedLoraParams, size = 28, {
+    batch_size: 0,
+    in_features: 4,
+    out_features: 8,
+    rank: 12,
+    scale: 16,
+    lr_scale_a: 20,
+    lr_scale_b: 24,
+});
 
 impl From<&FusedLoraConfig> for FusedLoraParams {
     fn from(config: &FusedLoraConfig) -> Self {

@@ -787,6 +787,23 @@ struct FlashAttentionParams {
     softcap: f32,
 }
 
+// `FlashAttentionParams` in `metal/flash_attention.metal`.
+crate::msl_layout::msl_layout!(FlashAttentionParams, size = 52, {
+    batch_size: 0,
+    num_heads: 4,
+    num_kv_heads: 8,
+    query_seq_len: 12,
+    kv_seq_len: 16,
+    head_dim: 20,
+    scale: 24,
+    block_q: 28,
+    block_k: 32,
+    gqa_ratio: 36,
+    is_causal: 40,
+    sliding_window: 44,
+    softcap: 48,
+});
+
 impl std::fmt::Debug for FlashAttention {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlashAttention")
@@ -1164,6 +1181,21 @@ struct FlashAttentionVarlenParams {
     softcap: f32,
     sliding_window: u32,
 }
+
+// `FlashAttentionVarlenParams` in `metal/flash_attention.metal`.
+crate::msl_layout::msl_layout!(FlashAttentionVarlenParams, size = 44, {
+    total_tokens: 0,
+    num_heads: 4,
+    num_kv_heads: 8,
+    head_dim: 12,
+    num_seqs: 16,
+    scale: 20,
+    gqa_ratio: 24,
+    max_seqlen: 28,
+    is_causal: 32,
+    softcap: 36,
+    sliding_window: 40,
+});
 
 impl std::fmt::Debug for FlashAttentionVarlen {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

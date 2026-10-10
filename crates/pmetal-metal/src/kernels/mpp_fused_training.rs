@@ -89,6 +89,16 @@ struct MppAdamWConfigMetal {
     step: u32,
 }
 
+// `MppAdamWConfig` in `metal4/mpp_fused_training.metal`.
+crate::msl_layout::msl_layout!(MppAdamWConfigMetal, size = 24, {
+    learning_rate: 0,
+    beta1: 4,
+    beta2: 8,
+    epsilon: 12,
+    weight_decay: 16,
+    step: 20,
+});
+
 /// Must match `MppParamInfo` in mpp_fused_training.metal.
 #[repr(C)]
 pub struct MppParamInfo {
@@ -101,6 +111,14 @@ pub struct MppParamInfo {
     /// Offset into the flat Adam second-moment (`v`) buffer for this parameter.
     pub v_offset: u32,
 }
+
+// `MppParamInfo` in `metal4/mpp_fused_training.metal`.
+crate::msl_layout::msl_layout!(MppParamInfo, size = 16, {
+    offset: 0,
+    size: 4,
+    m_offset: 8,
+    v_offset: 12,
+});
 
 // =============================================================================
 // AdamW dispatcher

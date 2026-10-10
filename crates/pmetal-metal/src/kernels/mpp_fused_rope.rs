@@ -112,6 +112,16 @@ struct MppRoPEParamsMetal {
     scale: f32,
 }
 
+// `MppRoPEParams` in `metal4/mpp_fused_rope.metal`.
+crate::msl_layout::msl_layout!(MppRoPEParamsMetal, size = 24, {
+    batch_size: 0,
+    num_heads: 4,
+    seq_len: 8,
+    head_dim: 12,
+    base: 16,
+    scale: 20,
+});
+
 impl MppRoPEParamsMetal {
     fn from_config(config: &MppFusedRoPEConfig) -> Self {
         Self {

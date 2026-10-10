@@ -122,6 +122,17 @@ struct FusedLoraParams {
     lr_scale_b: f32,
 }
 
+// `FusedLoraParams` in `metal4/mpp_fused_lora.metal`.
+crate::msl_layout::msl_layout!(FusedLoraParams, size = 28, {
+    batch_size: 0,
+    in_features: 4,
+    out_features: 8,
+    rank: 12,
+    scale: 16,
+    lr_scale_a: 20,
+    lr_scale_b: 24,
+});
+
 #[derive(Debug, Clone, Copy)]
 struct DispatchGeometry {
     num_batch_tiles: usize,

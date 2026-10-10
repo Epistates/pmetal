@@ -382,6 +382,16 @@ struct FusedNormLoraParams {
     lora_scale: f32,
 }
 
+// `FusedNormLoraParams` in `metal/fused_norm_lora.metal`.
+crate::msl_layout::msl_layout!(FusedNormLoraParams, size = 24, {
+    batch_size: 0,
+    hidden_size: 4,
+    out_features: 8,
+    lora_rank: 12,
+    eps: 16,
+    lora_scale: 20,
+});
+
 fn resolve_norm_lora_tuned_config(
     ctx: &Arc<MetalContext>,
     config: &FusedNormLoraConfig,

@@ -75,6 +75,7 @@ pub mod kernels;
 pub mod metal3_backend;
 #[cfg(has_metal4)]
 pub mod metal4;
+pub(crate) mod msl_layout;
 pub mod neon_convert;
 pub mod pipeline;
 pub mod tuna;
@@ -84,7 +85,6 @@ pub use buffer::{BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use dispatch::KernelDispatch;
 pub use error::{MetalError, Result};
-pub use kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
 pub use kernels::flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
     FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
@@ -124,7 +124,6 @@ pub mod prelude {
     pub use crate::buffer::{BufferUsage, MetalBuffer};
     pub use crate::context::MetalContext;
     pub use crate::error::{MetalError, Result};
-    pub use crate::kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
     pub use crate::kernels::flash_attention::{
         FlashAttention, FlashAttentionConfig, FlashAttentionVarlen, FlashAttentionVarlenConfig,
     };

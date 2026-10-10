@@ -51,6 +51,8 @@ use crate::context::{DeviceProperties, DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
 use crate::kernels::flash_attention::{FlashAttention, FlashAttentionConfig};
 use crate::kernels::fused_cross_entropy::{FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig};
+use crate::kernels::fused_lora::{FusedLoraConfig, FusedLoraParams};
+use crate::kernels::fused_merge::{MergeConfig, TensorInfo};
 use crate::kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig};
 use crate::kernels::fused_swiglu::{FusedMLP, FusedSwiGLUConfig};
 use crate::kernels::mpp_gemm::{MppGemm, MppGemmConfig, MppGemmKernelVariant};
@@ -313,6 +315,25 @@ impl FlashAttentionTuneRequest {
             if self.is_training { "train" } else { "infer" }
         )
     }
+}
+
+/// The `fused_lora_forward` params a LoRA tuning run sends: the kernel's own
+/// struct, with no LoRA+ scaling.
+fn lora_bench_params(
+    batch_size: usize,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+) -> FusedLoraParams {
+    FusedLoraParams::from(&FusedLoraConfig {
+        batch_size,
+        in_features,
+        out_features,
+        rank,
+        scale: 1.0,
+        lr_scale_a: None,
+        lr_scale_b: None,
+    })
 }
 
 fn device_tier_key(tier: DeviceTier) -> &'static str {
@@ -1582,25 +1603,9 @@ impl Tuner {
                 reason: "xa buffer".into(),
             })?;
 
-        // Create params buffer
-        #[expect(dead_code, reason = "read by the kernel through the params buffer")]
-        struct FusedLoraParams {
-            batch_size: u32,
-            in_features: u32,
-            out_features: u32,
-            rank: u32,
-            scale: f32,
-        }
-        let params = FusedLoraParams {
-            batch_size: batch_size as u32,
-            in_features: in_features as u32,
-            out_features: out_features as u32,
-            rank: rank as u32,
-            scale: 1.0,
-        };
-
+        let params = lora_bench_params(batch_size, in_features, out_features, rank);
         let params_size = std::mem::size_of::<FusedLoraParams>();
-        let params_ptr = NonNull::new(&params as *const _ as *mut c_void).unwrap();
+        let params_ptr = NonNull::from(&params).cast::<c_void>();
 
         let buf_params = unsafe {
             device.newBufferWithBytes_length_options(
@@ -1912,29 +1917,14 @@ impl Tuner {
         )?;
 
         // Create config buffer
-        #[repr(C)]
-        struct MergeConfigParams {
-            num_tensors: u32,
-            total_elements: u32,
-            epsilon: f32,
-            _pad: u32,
-        }
-        let params = MergeConfigParams {
+        let params = MergeConfig {
             num_tensors: 1,
             total_elements: num_elements as u32,
             epsilon: 1e-8,
             _pad: 0,
         };
 
-        // Tensor info
-        #[repr(C)]
-        struct TensorInfoParams {
-            offset: u32,
-            size: u32,
-            density: f32,
-            threshold: f32,
-        }
-        let tensor_info = TensorInfoParams {
+        let tensor_info = TensorInfo {
             offset: 0,
             size: num_elements as u32,
             density: 0.5,
@@ -1974,15 +1964,15 @@ impl Tuner {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_merge_kernel<P, T>(
+    fn dispatch_merge_kernel(
         &self,
         context: &MetalContext,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
         config: MergeTunedConfig,
         input: &ProtocolObject<dyn MTLBuffer>,
         output: &ProtocolObject<dyn MTLBuffer>,
-        params: &P,
-        tensor_info: &T,
+        params: &MergeConfig,
+        tensor_info: &TensorInfo,
         num_elements: usize,
     ) -> Result<()> {
         let queue = context.command_queue();
@@ -2000,10 +1990,10 @@ impl Tuner {
             encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
 
             let tensor_info_ptr = NonNull::from(tensor_info).cast();
-            encoder.setBytes_length_atIndex(tensor_info_ptr, std::mem::size_of::<T>(), 2);
+            encoder.setBytes_length_atIndex(tensor_info_ptr, std::mem::size_of::<TensorInfo>(), 2);
 
             let params_ptr = NonNull::from(params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of::<P>(), 3);
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of::<MergeConfig>(), 3);
         }
 
         // Calculate grid based on tuned config
@@ -2981,6 +2971,22 @@ mod tests {
     use super::*;
     use crate::context::{AppleGPUFamily, MemoryBandwidthSource};
     use std::sync::Arc;
+
+    #[test]
+    fn the_lora_tuning_run_sends_the_whole_shader_params_struct() {
+        // `FusedLoraParams` in fused_lora.metal: four uints, then scale,
+        // lr_scale_a and lr_scale_b as floats, 28 bytes. The tuner used to
+        // send a 20-byte struct of its own without the two LoRA+ scales.
+        let params = lora_bench_params(8, 64, 32, 4);
+        assert_eq!(std::mem::size_of_val(&params), 28);
+        // SAFETY: `FusedLoraParams` is a `#[repr(C)]` struct of seven 4-byte
+        // scalars, so it is 7 initialized `u32`-sized words.
+        let words: &[u32] =
+            unsafe { std::slice::from_raw_parts(NonNull::from(&params).cast().as_ptr(), 7) };
+        assert_eq!(&words[..4], &[8, 64, 32, 4]);
+        let floats: Vec<f32> = words[4..].iter().map(|w| f32::from_bits(*w)).collect();
+        assert_eq!(floats, [1.0, 1.0, 1.0], "scale, lr_scale_a, lr_scale_b");
+    }
 
     fn test_device_properties(
         name: &str,

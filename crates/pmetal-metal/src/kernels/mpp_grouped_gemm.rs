@@ -85,6 +85,18 @@ struct GroupedGemmParams {
     fuse_mul: u32,
 }
 
+// `GroupedGemmParams` in `metal4/mpp_grouped_gemm.metal`.
+crate::msl_layout::msl_layout!(GroupedGemmParams, size = 32, {
+    total_tokens: 0,
+    num_experts: 4,
+    hidden_size: 8,
+    intermediate: 12,
+    topk: 16,
+    permute_x: 20,
+    permute_y: 24,
+    fuse_mul: 28,
+});
+
 /// Total threadgroup count for the dispatch.
 ///
 /// This must be pre-computed from expert_offsets on the CPU before dispatch since the

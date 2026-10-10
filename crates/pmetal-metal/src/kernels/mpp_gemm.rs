@@ -128,6 +128,17 @@ struct MppGemmParams {
     num_tiles_n: u32,
 }
 
+// `MppGemmParams` in `metal4/mpp_gemm.metal`.
+crate::msl_layout::msl_layout!(MppGemmParams, size = 28, {
+    m: 0,
+    n: 4,
+    k: 8,
+    alpha: 12,
+    beta: 16,
+    num_tiles_m: 20,
+    num_tiles_n: 24,
+});
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchGeometry {
     bm: usize,

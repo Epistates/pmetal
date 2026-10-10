@@ -213,6 +213,16 @@ pub struct AdamWConfig {
     pub step: u32,
 }
 
+// `AdamWConfig` in `metal/fused_training.metal`.
+crate::msl_layout::msl_layout!(AdamWConfig, size = 24, {
+    learning_rate: 0,
+    beta1: 4,
+    beta2: 8,
+    epsilon: 12,
+    weight_decay: 16,
+    step: 20,
+});
+
 impl Default for AdamWConfig {
     fn default() -> Self {
         Self {
@@ -239,6 +249,14 @@ pub struct ParamInfo {
     /// Offset into second moment buffer.
     pub v_offset: u32,
 }
+
+// `ParamInfo` in `metal/fused_training.metal`.
+crate::msl_layout::msl_layout!(ParamInfo, size = 16, {
+    offset: 0,
+    size: 4,
+    m_offset: 8,
+    v_offset: 12,
+});
 
 // =============================================================================
 // Fused AdamW Optimizer

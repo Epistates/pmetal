@@ -88,6 +88,23 @@ struct FlashAttentionParams {
     softcap: f32,
 }
 
+// `FlashAttentionParams` in `metal4/mpp_flash_attention.metal`.
+crate::msl_layout::msl_layout!(FlashAttentionParams, size = 52, {
+    batch_size: 0,
+    num_heads: 4,
+    num_kv_heads: 8,
+    query_seq_len: 12,
+    kv_seq_len: 16,
+    head_dim: 20,
+    scale: 24,
+    block_q: 28,
+    block_k: 32,
+    gqa_ratio: 36,
+    is_causal: 40,
+    sliding_window: 44,
+    softcap: 48,
+});
+
 fn validate_config(config: &MppFlashAttentionConfig) -> Result<()> {
     if config.batch_size == 0
         || config.num_heads == 0

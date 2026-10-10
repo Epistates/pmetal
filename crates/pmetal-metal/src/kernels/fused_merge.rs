@@ -59,6 +59,14 @@ pub struct TensorInfo {
     pub threshold: f32,
 }
 
+// `TensorInfo` in `metal/fused_merge.metal`.
+crate::msl_layout::msl_layout!(TensorInfo, size = 16, {
+    offset: 0,
+    size: 4,
+    density: 8,
+    threshold: 12,
+});
+
 /// Configuration for merge operations.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -73,6 +81,14 @@ pub struct MergeConfig {
     pub _pad: u32,
 }
 
+// `MergeConfig` in `metal/fused_merge.metal`.
+crate::msl_layout::msl_layout!(MergeConfig, size = 16, {
+    num_tensors: 0,
+    total_elements: 4,
+    epsilon: 8,
+    _pad: 12,
+});
+
 /// Configuration for TIES merge operations.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -86,6 +102,14 @@ pub struct TiesConfig {
     /// Epsilon for numerical stability.
     pub epsilon: f32,
 }
+
+// `TiesConfig` in `metal/fused_merge.metal`.
+crate::msl_layout::msl_layout!(TiesConfig, size = 16, {
+    num_models: 0,
+    elements_per_model: 4,
+    lambda: 8,
+    epsilon: 12,
+});
 
 /// Maximum number of models supported by fused TIES kernel.
 /// Limited by threadgroup memory for sparse_task_vectors array in Metal shader.

@@ -31,6 +31,11 @@ struct TurboQuantTransformParams {
     dim: u32,
 }
 
+// `TurboQuantTransformParams` in `metal/turboquant.metal`.
+crate::msl_layout::msl_layout!(TurboQuantTransformParams, size = 4, {
+    dim: 0,
+});
+
 /// Fixed dense transform applied to a batch of row vectors.
 ///
 /// The stored matrix is row-major `[dim, dim]`. Applying it to a batch of

@@ -79,12 +79,25 @@ struct MppMoEParamsMetal {
     intermediate_dim: u32,
 }
 
+// `MppMoEParams` in `metal4/mpp_fused_moe.metal`.
+crate::msl_layout::msl_layout!(MppMoEParamsMetal, size = 12, {
+    batch_size: 0,
+    hidden_dim: 4,
+    intermediate_dim: 8,
+});
+
 /// Must match `MppMoEScatterParams` in mpp_fused_moe.metal.
 #[repr(C)]
 struct MppMoEScatterParamsMetal {
     num_tokens: u32,
     hidden_dim: u32,
 }
+
+// `MppMoEScatterParams` in `metal4/mpp_fused_moe.metal`.
+crate::msl_layout::msl_layout!(MppMoEScatterParamsMetal, size = 8, {
+    num_tokens: 0,
+    hidden_dim: 4,
+});
 
 // =============================================================================
 // MoE Expert Forward Dispatcher
@@ -394,6 +407,15 @@ struct MppMoEQuantParamsMetal {
     bits: u32,
 }
 
+// `MppMoEQuantParams` in `metal4/mpp_fused_moe.metal`.
+crate::msl_layout::msl_layout!(MppMoEQuantParamsMetal, size = 20, {
+    batch_size: 0,
+    hidden_dim: 4,
+    intermediate_dim: 8,
+    group_size: 12,
+    bits: 16,
+});
+
 /// MPP Fused MoE expert forward dispatcher for quantized (4-bit) weights.
 ///
 /// Accepts packed `u32` gate/up/down weights and fp16 scales/biases as carried
@@ -613,6 +635,14 @@ struct TileCountParams {
     block_n: u32,
 }
 
+// `TileCountParams` in `metal4/mpp_fused_moe.metal`.
+crate::msl_layout::msl_layout!(TileCountParams, size = 16, {
+    num_experts: 0,
+    intermediate: 4,
+    block_m: 8,
+    block_n: 12,
+});
+
 /// Computes the grouped GEMM tile count from `expert_offsets` entirely on GPU.
 ///
 /// Eliminates the CPU round-trip in `Metal4Backend::grouped_gemm`: instead of
@@ -787,12 +817,5 @@ mod tests {
         let tiles_b = cfg.batch_size.div_ceil(32);
         assert_eq!(tiles_h, 64);
         assert_eq!(tiles_b, 1);
-    }
-
-    // TileCountParams layout test
-    #[test]
-    fn test_tile_count_params_size() {
-        // Must be 4 × u32 = 16 bytes to match Metal struct.
-        assert_eq!(std::mem::size_of::<TileCountParams>(), 16);
     }
 }

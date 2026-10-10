@@ -759,6 +759,16 @@ struct RoPEParams {
     scale: f32,
 }
 
+// `RoPEParams` in `metal/fused_rope.metal`.
+crate::msl_layout::msl_layout!(RoPEParams, size = 24, {
+    batch_size: 0,
+    num_heads: 4,
+    seq_len: 8,
+    head_dim: 12,
+    base: 16,
+    scale: 20,
+});
+
 impl std::fmt::Debug for FusedRoPE {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FusedRoPE")

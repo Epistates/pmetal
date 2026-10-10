@@ -681,6 +681,15 @@ struct MoeRoutingParams {
     renormalize: u32,
 }
 
+// `MoeRoutingParams` in `metal/moe_routing.metal`.
+crate::msl_layout::msl_layout!(MoeRoutingParams, size = 20, {
+    num_tokens: 0,
+    num_experts: 4,
+    topk: 8,
+    use_sigmoid: 12,
+    renormalize: 16,
+});
+
 /// Parameters passed to grouped GEMM kernel.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -694,6 +703,18 @@ struct GroupedGemmParams {
     permute_y: u32,
     fuse_mul: u32,
 }
+
+// `GroupedGemmParams` in `metal/grouped_gemm.metal`.
+crate::msl_layout::msl_layout!(GroupedGemmParams, size = 32, {
+    total_tokens: 0,
+    num_experts: 4,
+    hidden_size: 8,
+    intermediate: 12,
+    topk: 16,
+    permute_x: 20,
+    permute_y: 24,
+    fuse_mul: 28,
+});
 
 impl std::fmt::Debug for MoeKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
