@@ -27,14 +27,13 @@
 
 #![allow(unsafe_code)]
 
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use pmetal_bridge::compat::{
     Array, Dtype, Exception,
     module::{FlattenedModuleParam, ModuleParameters, ModuleParametersExt},
-    ops, transforms,
+    transforms,
 };
 use thiserror::Error;
 
@@ -165,118 +164,43 @@ impl Default for MlxMetalOptimizerConfig {
     }
 }
 
-/// Tracks the layout of flattened parameters.
-#[derive(Debug)]
+/// Where each parameter sits in the flat buffers.
+#[derive(Debug, Default)]
 struct ParameterLayout {
-    /// Parameter names in order (sorted for determinism).
+    /// Parameter names, sorted, in buffer order.
     names: Vec<Rc<str>>,
-    /// Sizes of each parameter.
+    /// Element count of each parameter.
     sizes: Vec<usize>,
-    /// Shapes of each parameter.
-    shapes: Vec<Vec<i32>>,
-    /// Total number of elements.
+    /// Sum of `sizes`.
     total_elements: usize,
-    /// Cumulative split indices for split_sections (excludes 0 and total).
-    /// E.g., for sizes [100, 200, 300], split_indices = [100, 300]
-    /// Note: Uses i32 as required by MLX split_sections API (max ~2.1B elements).
-    split_indices: Vec<i32>,
 }
 
 impl ParameterLayout {
-    /// Maximum supported total elements (i32::MAX - 1 for safety margin).
-    const MAX_TOTAL_ELEMENTS: usize = (i32::MAX - 1) as usize;
-
-    /// Create a new parameter layout from flattened parameters.
-    /// Returns None if the total elements exceed i32::MAX (MLX API limitation).
-    fn try_from_params(params: &FlattenedModuleParam) -> Option<Self> {
-        if params.is_empty() {
-            return Some(Self {
-                names: vec![],
-                sizes: vec![],
-                shapes: vec![],
-                total_elements: 0,
-                split_indices: vec![],
-            });
-        }
-
-        // Sort keys for deterministic ordering
+    fn from_params(params: &FlattenedModuleParam) -> MlxMetalOptimizerResult<Self> {
         let mut names: Vec<_> = params.keys().cloned().collect();
         names.sort();
-
         let sizes: Vec<usize> = names.iter().map(|k| params[k].size()).collect();
-        let shapes: Vec<Vec<i32>> = names.iter().map(|k| params[k].shape().to_vec()).collect();
         let total_elements: usize = sizes.iter().sum();
-
-        // Check for overflow - MLX split_sections uses i32 indices
-        if total_elements > Self::MAX_TOTAL_ELEMENTS {
-            tracing::error!(
-                "Model has {} total elements, exceeds MLX i32 limit of {}. \
-                 Use a smaller model or enable gradient checkpointing.",
-                total_elements,
-                Self::MAX_TOTAL_ELEMENTS
-            );
-            return None;
+        // The kernel's ParamInfo offsets are u32.
+        if u32::try_from(total_elements).is_err() {
+            return Err(MlxMetalOptimizerError::Mlx(Exception::custom(format!(
+                "{total_elements} trainable elements exceed the fused AdamW kernel's u32 offsets"
+            ))));
         }
-
-        // Compute cumulative split indices with overflow checking
-        let mut split_indices = Vec::with_capacity(sizes.len().saturating_sub(1));
-        let mut cumsum: i64 = 0; // Use i64 for intermediate calculation
-        for (i, &size) in sizes.iter().enumerate() {
-            cumsum += size as i64;
-            if i < sizes.len() - 1 {
-                // Safe to cast since we already checked total_elements fits in i32
-                split_indices.push(cumsum as i32);
-            }
-        }
-
-        Some(Self {
+        Ok(Self {
             names,
             sizes,
-            shapes,
             total_elements,
-            split_indices,
         })
     }
-
-    /// Legacy method - panics on overflow. Prefer try_from_params.
-    fn from_params(params: &FlattenedModuleParam) -> Self {
-        Self::try_from_params(params).expect("Model too large for vectorized optimizer")
-    }
 }
 
-/// Pre-computed scalar arrays for optimizer efficiency.
-/// These are created once and reused every step to avoid allocation overhead.
-struct CachedScalars {
-    beta1: Array,
-    beta2: Array,
-    epsilon: Array,
-    one_minus_beta1: Array,
-    one_minus_beta2: Array,
-}
-
-impl CachedScalars {
-    fn new(beta1: f32, beta2: f32, epsilon: f32) -> Self {
-        Self {
-            beta1: Array::from_f32(beta1),
-            beta2: Array::from_f32(beta2),
-            epsilon: Array::from_f32(epsilon),
-            one_minus_beta1: Array::from_f32(1.0 - beta1),
-            one_minus_beta2: Array::from_f32(1.0 - beta2),
-        }
-    }
-}
-
-/// MLX-Metal fused optimizer using custom Metal kernels.
+/// AdamW over every trainable parameter in one Metal dispatch.
 ///
-/// This optimizer implements AdamW using fused Metal kernels that process
-/// all parameters in a single dispatch, eliminating per-parameter overhead.
-///
-/// # Features
-///
-/// - **Learning rate scheduling**: Supports constant, cosine decay, and warmup
-/// - **Pre-computed scalars**: Caches beta1, beta2, eps arrays to avoid allocation
-/// - **MLX-native state**: Stores m/v as MLX Arrays for graph connectivity
-/// - **Batched eval**: Single eval() call for all updated arrays
+/// The parameters and gradients are copied into flat f32 Metal buffers,
+/// `fused_adamw` updates the parameters and both moments in place, and the
+/// parameters are read back as new arrays. Like MLX's `optimizers.AdamW`
+/// default, the update has no bias correction.
 pub struct MlxMetalOptimizer {
     /// Metal context.
     ctx: Arc<MetalContext>,
@@ -300,16 +224,6 @@ pub struct MlxMetalOptimizer {
     step: u32,
     /// Whether the optimizer has been initialized with parameter shapes.
     initialized: bool,
-    /// MLX-native optimizer state: (m, v) per parameter.
-    /// Stored as MLX Arrays to maintain computational graph connectivity.
-    state: HashMap<Rc<str>, (Array, Array)>,
-    /// Pre-computed scalar arrays (cached for efficiency).
-    cached_scalars: CachedScalars,
-    /// Vectorized optimizer state: flat m array [total_elements]
-    /// Used for SOTA vectorized updates (single op chain instead of per-param)
-    flat_m: Option<Array>,
-    /// Vectorized optimizer state: flat v array [total_elements]
-    flat_v: Option<Array>,
 }
 
 impl MlxMetalOptimizer {
@@ -338,9 +252,6 @@ impl MlxMetalOptimizer {
 
         let adamw = FusedAdamW::new(ctx.clone(), &[1]);
 
-        // Pre-compute scalar arrays (SOTA optimization)
-        let cached_scalars = CachedScalars::new(config.beta1, config.beta2, config.epsilon);
-
         Ok(Self {
             ctx,
             adamw,
@@ -349,20 +260,10 @@ impl MlxMetalOptimizer {
             v_buffer,
             flat_params,
             flat_grads,
-            layout: ParameterLayout {
-                names: vec![],
-                sizes: vec![],
-                shapes: vec![],
-                total_elements: 0,
-                split_indices: vec![],
-            },
+            layout: ParameterLayout::default(),
             config,
             step: 0,
             initialized: false,
-            state: HashMap::new(),
-            cached_scalars,
-            flat_m: None,
-            flat_v: None,
         })
     }
 
@@ -400,7 +301,7 @@ impl MlxMetalOptimizer {
         params: &FlattenedModuleParam,
     ) -> MlxMetalOptimizerResult<()> {
         // Build parameter layout
-        self.layout = ParameterLayout::from_params(params);
+        self.layout = ParameterLayout::from_params(params)?;
 
         // Validate all parameters are f32 and contiguous
         for name in &self.layout.names {
@@ -426,15 +327,6 @@ impl MlxMetalOptimizer {
 
         // Create fused AdamW with correct sizes
         self.adamw = FusedAdamW::new(self.ctx.clone(), &self.layout.sizes);
-
-        // Initialize MLX-native optimizer state (m=0, v=0 for each parameter)
-        self.state.clear();
-        for (idx, name) in self.layout.names.iter().enumerate() {
-            let shape = &self.layout.shapes[idx];
-            let m = ops::zeros_dtype(shape, Dtype::Float32);
-            let v = ops::zeros_dtype(shape, Dtype::Float32);
-            self.state.insert(name.clone(), (m, v));
-        }
 
         self.initialized = true;
 
@@ -467,116 +359,51 @@ impl MlxMetalOptimizer {
         self.layout.total_elements
     }
 
-    /// Copy parameters from MLX arrays to flat Metal buffer.
+    /// Copy `arrays` into `dst` in layout order, one evaluation for all of
+    /// them; a name with no array is zero-filled. Each array must have the
+    /// element count the layout recorded for its name.
+    fn copy_to_flat(
+        layout: &ParameterLayout,
+        dst: &mut MetalBuffer<f32>,
+        arrays: &FlattenedModuleParam,
+        what: &str,
+    ) -> MlxMetalOptimizerResult<()> {
+        transforms::eval(layout.names.iter().filter_map(|n| arrays.get(n)))?;
+        let flat = dst.as_mut_slice();
+        let mut offset = 0;
+        for (name, &size) in layout.names.iter().zip(&layout.sizes) {
+            let dst = &mut flat[offset..offset + size];
+            match arrays.get(name) {
+                Some(arr) => {
+                    if arr.dtype_raw() != Dtype::Float32.as_i32() {
+                        return Err(MlxMetalOptimizerError::UnsupportedDtype {
+                            name: format!("{what} {name}"),
+                        });
+                    }
+                    if arr.size() != size {
+                        return Err(MlxMetalOptimizerError::Mlx(Exception::custom(format!(
+                            "{what} `{name}` has {} elements, its parameter {size}",
+                            arr.size()
+                        ))));
+                    }
+                    dst.copy_from_slice(arr.as_slice::<f32>());
+                }
+                None => dst.fill(0.0),
+            }
+            offset += size;
+        }
+        Ok(())
+    }
+
     fn copy_params_to_flat(
         &mut self,
         params: &FlattenedModuleParam,
     ) -> MlxMetalOptimizerResult<()> {
-        let flat_slice = self.flat_params.as_mut_slice();
-        let mut offset = 0;
-
-        for name in &self.layout.names {
-            let arr = params[name].clone();
-            arr.eval();
-
-            let size = arr.size();
-            let src_data = arr.as_slice::<f32>();
-
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    src_data.as_ptr(),
-                    flat_slice.as_mut_ptr().add(offset),
-                    size,
-                );
-            }
-
-            offset += size;
-        }
-
-        Ok(())
+        Self::copy_to_flat(&self.layout, &mut self.flat_params, params, "parameter")
     }
 
-    /// Copy gradients from MLX arrays to flat Metal buffer.
     fn copy_grads_to_flat(&mut self, grads: &FlattenedModuleParam) -> MlxMetalOptimizerResult<()> {
-        let flat_slice = self.flat_grads.as_mut_slice();
-        let mut offset = 0;
-
-        // Debug: Check for key mismatches on first call
-        static DEBUG_ONCE: std::sync::Once = std::sync::Once::new();
-        DEBUG_ONCE.call_once(|| {
-            let param_keys: std::collections::HashSet<_> = self.layout.names.iter().collect();
-            let grad_keys: std::collections::HashSet<_> = grads.keys().collect();
-            let missing_grads: Vec<_> = param_keys.difference(&grad_keys).collect();
-            let extra_grads: Vec<_> = grad_keys.difference(&param_keys).collect();
-            if !missing_grads.is_empty() {
-                tracing::warn!(
-                    "Missing gradients for {} params: {:?}",
-                    missing_grads.len(),
-                    &missing_grads[..missing_grads.len().min(5)]
-                );
-            }
-            if !extra_grads.is_empty() {
-                tracing::warn!(
-                    "Extra gradients for {} params: {:?}",
-                    extra_grads.len(),
-                    &extra_grads[..extra_grads.len().min(5)]
-                );
-            }
-            tracing::info!(
-                "Total param keys: {}, grad keys: {}",
-                param_keys.len(),
-                grad_keys.len()
-            );
-            // Show first few keys from each
-            let param_names: Vec<_> = self.layout.names.iter().take(3).collect();
-            let grad_names: Vec<_> = grads.keys().take(3).collect();
-            tracing::info!("First param keys: {:?}", param_names);
-            tracing::info!("First grad keys: {:?}", grad_names);
-        });
-
-        for (i, name) in self.layout.names.iter().enumerate() {
-            if let Some(grad) = grads.get(name) {
-                let grad = grad.clone();
-                grad.eval();
-
-                // Debug: verify eval worked and check data
-                if i == 0 && self.step <= 3 {
-                    let slice = grad.as_slice::<f32>();
-                    let max = slice.iter().cloned().fold(0.0f32, f32::max);
-                    let min = slice.iter().cloned().fold(0.0f32, f32::min);
-                    tracing::info!("First param name: '{}'", name);
-                    tracing::info!(
-                        "as_slice - len={}, max={:.6}, min={:.6}, first4={:?}",
-                        slice.len(),
-                        max,
-                        min,
-                        &slice[..4.min(slice.len())]
-                    );
-                }
-
-                let size = grad.size();
-                let src_data = grad.as_slice::<f32>();
-
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src_data.as_ptr(),
-                        flat_slice.as_mut_ptr().add(offset),
-                        size,
-                    );
-                }
-
-                offset += size;
-            } else {
-                // No gradient for this parameter - zero it out
-                let size = self.layout.sizes[i];
-                for i in 0..size {
-                    flat_slice[offset + i] = 0.0;
-                }
-                offset += size;
-            }
-        }
-
-        Ok(())
+        Self::copy_to_flat(&self.layout, &mut self.flat_grads, grads, "gradient")
     }
 
     /// Copy updated parameters back to MLX arrays.
@@ -606,10 +433,11 @@ impl MlxMetalOptimizer {
         Ok(())
     }
 
-    /// Execute a fused optimizer step using Metal.
+    /// One AdamW step over every parameter in one Metal dispatch.
     ///
-    /// This is the core optimization - all parameters are processed in a single
-    /// Metal dispatch, eliminating per-parameter overhead.
+    /// The parameters and gradients are copied into flat Metal buffers, the
+    /// fused kernel updates the parameters and both moments in place, and
+    /// the parameters come back as new arrays under the same names.
     pub fn fused_step(
         &mut self,
         params: &mut FlattenedModuleParam,
@@ -618,8 +446,6 @@ impl MlxMetalOptimizer {
         if !self.initialized {
             self.initialize_from_params(params)?;
         }
-
-        // Verify parameter count matches
         if params.len() != self.layout.names.len() {
             return Err(MlxMetalOptimizerError::ParamCountMismatch {
                 expected: self.layout.names.len(),
@@ -627,70 +453,21 @@ impl MlxMetalOptimizer {
             });
         }
 
-        // Copy params and grads to flat buffers
         self.copy_params_to_flat(params)?;
         self.copy_grads_to_flat(grads)?;
+        if self.config.validate_numerics {
+            self.validate_gradients()?;
+        }
 
-        // Increment step
         self.step += 1;
-
-        // Create AdamW config with scheduled learning rate
-        let scheduled_lr = self
-            .config
-            .lr_schedule
-            .get_lr_multiplier(self.step, self.config.learning_rate);
         let adamw_config = AdamWConfig {
-            learning_rate: scheduled_lr,
+            learning_rate: self.current_lr(),
             beta1: self.config.beta1,
             beta2: self.config.beta2,
             epsilon: self.config.epsilon,
             weight_decay: self.config.weight_decay,
             step: self.step,
         };
-
-        // Debug: Log config on first few steps
-        if self.step <= 3 {
-            tracing::info!(
-                "Metal AdamW config - step={}, lr={:.6}, beta1={}, beta2={}, eps={}, wd={}",
-                self.step,
-                adamw_config.learning_rate,
-                adamw_config.beta1,
-                adamw_config.beta2,
-                adamw_config.epsilon,
-                adamw_config.weight_decay
-            );
-
-            // Detailed trace for first param element
-            let p0 = self.flat_params.as_slice()[0];
-            let g0 = self.flat_grads.as_slice()[0];
-            let m0 = self.m_buffer.as_slice()[0];
-            let v0 = self.v_buffer.as_slice()[0];
-
-            // Manual AdamW calculation for verification (no bias correction, as in the kernel)
-            let new_m0 = adamw_config.beta1 * m0 + (1.0 - adamw_config.beta1) * g0;
-            let new_v0 = adamw_config.beta2 * v0 + (1.0 - adamw_config.beta2) * g0 * g0;
-            // NO bias correction - use m and v directly
-            let update = new_m0 / (new_v0.sqrt() + adamw_config.epsilon);
-            let expected_p0 = p0 * (1.0 - adamw_config.learning_rate * adamw_config.weight_decay)
-                - adamw_config.learning_rate * update;
-
-            tracing::info!(
-                "TRACE[0]: p={:.8}, g={:.8e}, m={:.8e}, v={:.8e}",
-                p0,
-                g0,
-                m0,
-                v0
-            );
-            tracing::info!(
-                "TRACE[0]: new_m={:.8e}, new_v={:.8e}, update={:.8e}",
-                new_m0,
-                new_v0,
-                update
-            );
-            tracing::info!("TRACE[0]: expected_new_p={:.8}", expected_p0);
-        }
-
-        // Execute fused update
         let mut batch = BatchedCommandBuffer::new(self.ctx.clone())?;
         self.adamw.queue_update(
             &mut batch,
@@ -703,446 +480,90 @@ impl MlxMetalOptimizer {
         )?;
         batch.execute()?;
 
-        // Debug: Log values after update on first few steps
-        if self.step <= 3 {
-            let actual_p0 = self.flat_params.as_slice()[0];
-            let actual_m0 = self.m_buffer.as_slice()[0];
-            let actual_v0 = self.v_buffer.as_slice()[0];
-            tracing::info!(
-                "TRACE[0] ACTUAL: p={:.8}, m={:.8e}, v={:.8e}",
-                actual_p0,
-                actual_m0,
-                actual_v0
-            );
-        }
-
-        // Copy updated params back to MLX arrays
         self.copy_flat_to_params(params)?;
-
         Ok(())
     }
-}
 
-/// Update model parameters using fused Metal optimization.
-///
-/// This is the main entry point for training integration. It:
-/// 1. Extracts trainable parameters from the model
-/// 2. Runs the fused Metal AdamW kernel (single GPU dispatch for ALL parameters)
-/// 3. Writes the results back into the model's parameter arrays
-///
-/// # Performance
-///
-/// By fusing all parameter updates into a single Metal dispatch, we eliminate:
-/// - Per-parameter command buffer creation overhead
-/// - Per-parameter GPU-CPU synchronization
-/// - Multiple kernel launches
-///
-/// # Usage
-///
-/// ```ignore
-/// let mut optimizer = MlxMetalOptimizerBuilder::new(2e-4).build()?;
-/// optimizer.update_model(&mut model, &gradients)?;
-/// ```
-impl MlxMetalOptimizer {
-    /// Update model parameters in one vectorized step.
+    /// Update a model's parameters with one [`Self::fused_step`].
     ///
-    /// **SOTA VECTORIZED UPDATE** - Delegates to update_vectorized for maximum throughput.
-    ///
-    /// This method now uses the vectorized optimizer which:
-    /// - Reduces ~1600 MLX operation calls to ~10
-    /// - Uses concatenate/split for lazy O(1) operations
-    /// - Performs single vectorized AdamW on all 10M parameters at once
+    /// Every parameter the optimizer was initialized with must still be in
+    /// the model. A parameter without a gradient is left where it is (its
+    /// gradient is taken as zero); a step with no gradients at all is an
+    /// error, since it means the backward pass never ran.
     pub fn update_model_fused<M: ModuleParameters>(
         &mut self,
         model: &mut M,
         gradients: &FlattenedModuleParam,
     ) -> std::result::Result<(), Exception> {
-        // Delegate to SOTA vectorized implementation
-        self.update_vectorized(model, gradients)
-    }
-
-    /// **SOTA VECTORIZED UPDATE** - Maximum throughput via single operation chain.
-    ///
-    /// Instead of 392 separate per-parameter operation chains, this method:
-    /// 1. Concatenates all params/grads into single flat arrays (lazy O(1))
-    /// 2. Performs ONE vectorized AdamW update on 10M elements (4 MLX ops)
-    /// 3. Splits back into individual arrays (lazy O(1))
-    /// 4. Single batched eval at the end
-    ///
-    /// This reduces ~1600 MLX operation calls to ~10, dramatically improving throughput.
-    pub fn update_vectorized<M: ModuleParameters>(
-        &mut self,
-        model: &mut M,
-        gradients: &FlattenedModuleParam,
-    ) -> std::result::Result<(), Exception> {
-        // Initialize layout if needed
+        let mut params: FlattenedModuleParam = model.flatten_params();
         if !self.initialized {
-            let params: FlattenedModuleParam = model.flatten_params();
             self.initialize_from_params(&params)
                 .map_err(|e| Exception::custom(e.to_string()))?;
         }
 
-        // Get mutable model parameters
-        let mut model_params = model.flatten_params_mut();
-
-        self.step += 1;
-
-        // Get scheduled learning rate
-        let scheduled_lr = self
-            .config
-            .lr_schedule
-            .get_lr_multiplier(self.step, self.config.learning_rate);
-
-        // Collect params and grads in layout order, flattening each to 1D
-        // Track missing params/grads for validation
-        let mut missing_params: Vec<&str> = Vec::new();
-        let mut missing_grads: Vec<&str> = Vec::new();
-
-        let param_arrays: Vec<Array> = self
+        let missing_params: Vec<&str> = self
             .layout
             .names
             .iter()
-            .map(|name| match model_params.get(&**name) {
-                Some(p) => (*p).reshape(&[-1]),
-                None => {
-                    missing_params.push(name);
-                    ops::zeros_dtype(&[0], Dtype::Float32)
-                }
-            })
+            .filter(|n| !params.contains_key(*n))
+            .map(|n| &**n)
             .collect();
-
-        let grad_arrays: Vec<Array> = self
-            .layout
-            .names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| {
-                match gradients.get(name) {
-                    Some(g) => g.reshape(&[-1]),
-                    None => {
-                        missing_grads.push(name);
-                        // Use zeros with correct size from layout
-                        ops::zeros_dtype(&[self.layout.sizes[i] as i32], Dtype::Float32)
-                    }
-                }
-            })
-            .collect();
-
-        // Warn about missing gradients (indicates broken backprop)
-        if !missing_grads.is_empty() {
-            // If ALL gradients are missing, this is a critical error
-            if missing_grads.len() == self.layout.names.len() {
-                return Err(Exception::custom(
-                    "MlxMetalOptimizer: All gradients are missing. \
-                     This indicates backward pass was not called or gradients were lost.",
-                ));
-            }
-            tracing::warn!(
-                "MlxMetalOptimizer: {} gradient(s) missing (using zeros): {:?}",
-                missing_grads.len(),
-                if missing_grads.len() <= 5 {
-                    missing_grads.clone()
-                } else {
-                    missing_grads[..5].to_vec()
-                }
-            );
-        }
-
-        // Missing params after initialization is a critical error - fail fast
         if !missing_params.is_empty() {
             return Err(Exception::custom(format!(
-                "MlxMetalOptimizer: {} parameter(s) missing from model after initialization: {:?}. \
-                 This indicates the model structure changed. Re-initialize the optimizer.",
-                missing_params.len(),
-                missing_params
+                "MlxMetalOptimizer: {} parameter(s) missing from the model since initialization: \
+                 {missing_params:?}. The model structure changed; re-initialize the optimizer.",
+                missing_params.len()
             )));
         }
-
-        // LAZY CONCATENATE: O(1) - just builds computation graph
-        let param_refs: Vec<&Array> = param_arrays.iter().collect();
-        let grad_refs: Vec<&Array> = grad_arrays.iter().collect();
-
-        let flat_params = ops::concatenate_axis(&param_refs, 0);
-        let flat_grads = ops::concatenate_axis(&grad_refs, 0);
-
-        // Optional NaN/Inf validation for debugging numerical issues
-        if self.config.validate_numerics {
-            self.validate_gradients(&flat_grads)?;
-        }
-
-        // Initialize flat_m/flat_v on first step
-        if self.flat_m.is_none() {
-            self.flat_m = Some(ops::zeros_dtype(
-                &[self.layout.total_elements as i32],
-                Dtype::Float32,
-            ));
-            self.flat_v = Some(ops::zeros_dtype(
-                &[self.layout.total_elements as i32],
-                Dtype::Float32,
+        let missing_grads: Vec<&str> = self
+            .layout
+            .names
+            .iter()
+            .filter(|n| !gradients.contains_key(*n))
+            .map(|n| &**n)
+            .collect();
+        if missing_grads.len() == self.layout.names.len() && !missing_grads.is_empty() {
+            return Err(Exception::custom(
+                "MlxMetalOptimizer: every gradient is missing; the backward pass was not run \
+                 or its gradients were lost",
             ));
         }
-
-        let flat_m = self.flat_m.as_ref().ok_or_else(|| {
-            Exception::custom("Optimizer momentum state (flat_m) not initialized")
-        })?;
-        let flat_v = self.flat_v.as_ref().ok_or_else(|| {
-            Exception::custom("Optimizer velocity state (flat_v) not initialized")
-        })?;
-
-        // SINGLE VECTORIZED ADAMW UPDATE (4 MLX ops instead of 392 × 4)
-        let beta1 = &self.cached_scalars.beta1;
-        let beta2 = &self.cached_scalars.beta2;
-        let eps = &self.cached_scalars.epsilon;
-        let one_minus_b1 = &self.cached_scalars.one_minus_beta1;
-        let one_minus_b2 = &self.cached_scalars.one_minus_beta2;
-        let lr = Array::from_f32(scheduled_lr);
-        let one_minus_lr_wd = Array::from_f32(1.0 - scheduled_lr * self.config.weight_decay);
-
-        // m = beta1 * m + (1-beta1) * grad
-        let new_flat_m = beta1
-            .multiply(flat_m)
-            .add(&one_minus_b1.multiply(&flat_grads));
-
-        // v = beta2 * v + (1-beta2) * grad²
-        let grad_sq = flat_grads.multiply(&flat_grads);
-        let new_flat_v = beta2.multiply(flat_v).add(&one_minus_b2.multiply(&grad_sq));
-
-        // update = m / (sqrt(v) + eps)
-        let denom = new_flat_v.sqrt().add(eps);
-        let update = new_flat_m.divide(&denom);
-
-        // new_params = params * (1 - lr*wd) - lr * update
-        let new_flat_params = flat_params
-            .multiply(&one_minus_lr_wd)
-            .subtract(&lr.multiply(&update));
-
-        // LAZY SPLIT: O(1) - just builds computation graph
-        let new_param_arrays = ops::split_sections(&new_flat_params, &self.layout.split_indices, 0);
-
-        // Reshape and assign back to model (still lazy)
-        for (i, name) in self.layout.names.iter().enumerate() {
-            if let Some(param) = model_params.get_mut(&**name) {
-                let shape = &self.layout.shapes[i];
-                **param = new_param_arrays[i].reshape(shape);
-            }
-        }
-
-        // Update optimizer state
-        self.flat_m = Some(new_flat_m);
-        self.flat_v = Some(new_flat_v);
-
-        // SINGLE BATCHED EVAL for everything
-        {
-            let mut to_eval: Vec<&Array> = Vec::with_capacity(self.layout.names.len() + 2);
-            for name in &self.layout.names {
-                if let Some(param) = model_params.get(&**name) {
-                    to_eval.push(*param);
-                }
-            }
-            to_eval.push(self.flat_m.as_ref().unwrap());
-            to_eval.push(self.flat_v.as_ref().unwrap());
-            transforms::eval(to_eval)?;
-        }
-
-        Ok(())
-    }
-
-    /// Update model parameters using pure MLX AdamW with MLX-native state.
-    ///
-    /// # Optimized SOTA Implementation
-    ///
-    /// This implementation correctly trains by:
-    /// 1. Using actual gradient arrays from the backward pass (maintaining MLX graph)
-    /// 2. Computing m, v updates using MLX ops on actual gradients
-    /// 3. Using actual param references in the update computation
-    /// 4. Storing m/v state as MLX Arrays (eliminates from_slice/copy_from_slice overhead)
-    /// 5. Batching eval() calls for efficiency
-    ///
-    /// Key insight: We MUST use the actual param and gradient arrays in MLX
-    /// computations. Creating new arrays via `Array::from_slice()` for parameters
-    /// breaks training because MLX loses track of the computational graph.
-    /// However, m/v state CAN be MLX Arrays since they're optimizer state,
-    /// not part of the forward pass graph.
-    pub fn update_model<M: ModuleParameters>(
-        &mut self,
-        model: &mut M,
-        gradients: &FlattenedModuleParam,
-    ) -> std::result::Result<(), Exception> {
-        // Initialize layout if needed
-        if !self.initialized {
-            let params: FlattenedModuleParam = model.flatten_params();
-            self.initialize_from_params(&params)
-                .map_err(|e| Exception::custom(e.to_string()))?;
-        }
-
-        // Get mutable model parameters ONCE at the start
-        let mut model_params = model.flatten_params_mut();
-
-        self.step += 1;
-
-        // SOTA: Apply learning rate schedule
-        let scheduled_lr = self
-            .config
-            .lr_schedule
-            .get_lr_multiplier(self.step, self.config.learning_rate);
-        let wd = self.config.weight_decay;
-
-        // SOTA: Use cached scalar arrays for beta1, beta2, epsilon
-        // Only create lr_arr and weight_decay_factor each step (LR may change)
-        let lr_arr = Array::from_f32(scheduled_lr);
-        let one_minus_lr_wd = Array::from_f32(1.0 - scheduled_lr * wd);
-
-        // Reference cached scalars (no allocation)
-        let beta1_arr = &self.cached_scalars.beta1;
-        let beta2_arr = &self.cached_scalars.beta2;
-        let eps_arr = &self.cached_scalars.epsilon;
-        let one_minus_b1 = &self.cached_scalars.one_minus_beta1;
-        let one_minus_b2 = &self.cached_scalars.one_minus_beta2;
-
-        // Collect arrays to eval at the end (batched for efficiency)
-        let mut arrays_to_eval: Vec<&Array> = Vec::with_capacity(self.layout.names.len() * 3);
-
-        let mut debug_idx = 0;
-        for name in self.layout.names.clone() {
-            if let (Some(param), Some(grad), Some((m, v))) = (
-                model_params.get_mut(name.as_ref()),
-                gradients.get(name.as_ref()),
-                self.state.get_mut(name.as_ref()),
-            ) {
-                // Debug: Log first param details
-                if debug_idx == 0 && self.step <= 3 {
-                    let grad_debug = grad.clone();
-                    grad_debug.eval();
-                    (*m).eval();
-                    (*v).eval();
-                    (**param).eval();
-                    let g_val = grad_debug.as_slice::<f32>()[0];
-                    let m_val = m.as_slice::<f32>()[0];
-                    let v_val = v.as_slice::<f32>()[0];
-                    let p_val = (**param).as_slice::<f32>()[0];
-                    tracing::info!(
-                        "MLX BEFORE[0]: step={}, lr={:.6}, p={:.8}, g={:.8e}, m={:.8e}, v={:.8e}",
-                        self.step,
-                        scheduled_lr,
-                        p_val,
-                        g_val,
-                        m_val,
-                        v_val
-                    );
-                }
-
-                // Compute new m and v using MLX ops ON THE ACTUAL GRADIENT
-                // m/v are MLX Arrays from state - no from_slice needed!
-                // Use references to m/v to avoid move (we need to assign back to them)
-                let new_m = beta1_arr.multiply(&*m).add(&one_minus_b1.multiply(grad));
-                let grad_sq = grad.multiply(grad);
-                let new_v = beta2_arr
-                    .multiply(&*v)
-                    .add(&one_minus_b2.multiply(&grad_sq));
-
-                // Compute update using MLX ops
-                let denom = new_v.sqrt().add(eps_arr);
-                let update = new_m.divide(&denom);
-
-                // KEY: Use the actual param (**param) in the computation!
-                // This maintains the MLX computational graph connection.
-                let decayed_param = (**param).multiply(&one_minus_lr_wd);
-                let new_param = decayed_param.subtract(&lr_arr.multiply(&update));
-
-                // Debug: Log first param after update (before move)
-                if debug_idx == 0 && self.step <= 3 {
-                    new_m.eval();
-                    new_v.eval();
-                    new_param.eval();
-                    let m_new = new_m.as_slice::<f32>()[0];
-                    let v_new = new_v.as_slice::<f32>()[0];
-                    let p_new = new_param.as_slice::<f32>()[0];
-                    tracing::info!(
-                        "MLX AFTER[0]: p={:.8}, m={:.8e}, v={:.8e}",
-                        p_new,
-                        m_new,
-                        v_new
-                    );
-                }
-
-                // Update parameter in place
-                **param = new_param;
-
-                // Update m/v state (these are MLX Arrays, no copy needed)
-                *m = new_m;
-                *v = new_v;
-
-                debug_idx += 1;
-            }
-        }
-
-        // Batched eval: evaluate all updated parameters and state at once
-        // This allows MLX to optimize the computation graph
-        for name in &self.layout.names {
-            if let Some(param) = model_params.get(name.as_ref()) {
-                arrays_to_eval.push(*param);
-            }
-            if let Some((m, v)) = self.state.get(name.as_ref()) {
-                arrays_to_eval.push(m);
-                arrays_to_eval.push(v);
-            }
-        }
-
-        // Single eval call for all arrays
-        // Pass Vec directly since Vec<&Array> implements IntoIterator<Item = &Array>
-        transforms::eval(arrays_to_eval)?;
-
-        Ok(())
-    }
-
-    /// Validate gradients for NaN/Inf values.
-    ///
-    /// This is an optional debug feature (enabled via `validate_numerics` config).
-    /// Catches numerical issues early before they propagate through training.
-    fn validate_gradients(&self, flat_grads: &Array) -> std::result::Result<(), Exception> {
-        // Build lazy check (single eval for both NaN and Inf)
-        let has_nan = ops::any(&ops::is_nan(flat_grads), None, false);
-        let has_inf = ops::any(&ops::is_inf(flat_grads), None, false);
-        let has_bad = ops::logical_or(&has_nan, &has_inf);
-
-        // Eval the check
-        has_bad.eval();
-
-        // Extract result (scalar bool)
-        let bad_values = ops::item_bool(&has_bad);
-
-        if bad_values {
-            // Determine which type of bad value
-            has_nan.eval();
-            has_inf.eval();
-            let nan_present = ops::item_bool(&has_nan);
-            let inf_present = ops::item_bool(&has_inf);
-
-            let issue = match (nan_present, inf_present) {
-                (true, true) => "NaN and Inf values",
-                (true, false) => "NaN values",
-                (false, true) => "Inf values",
-                _ => "bad values",
-            };
-
-            tracing::error!(
-                "MlxMetalOptimizer: Gradients contain {} at step {}. \
-                 This indicates numerical instability. Consider: \
-                 (1) reducing learning rate, \
-                 (2) enabling gradient clipping, \
-                 (3) checking for loss explosion in forward pass",
-                issue,
-                self.step
+        if !missing_grads.is_empty() {
+            tracing::warn!(
+                "MlxMetalOptimizer: {} gradient(s) missing, taken as zero: {:?}",
+                missing_grads.len(),
+                &missing_grads[..missing_grads.len().min(5)]
             );
-
-            // Return error to stop training early
-            return Err(Exception::custom(format!(
-                "Gradient validation failed: {} detected at step {}",
-                issue, self.step
-            )));
         }
 
+        self.fused_step(&mut params, gradients)
+            .map_err(|e| Exception::custom(e.to_string()))?;
+
+        let mut model_params = model.flatten_params_mut();
+        for name in &self.layout.names {
+            if let (Some(param), Some(updated)) = (model_params.get_mut(&**name), params.get(name))
+            {
+                **param = updated.clone();
+            }
+        }
         Ok(())
+    }
+
+    /// Fail the step if a gradient is NaN or infinite (`validate_numerics`).
+    fn validate_gradients(&self) -> MlxMetalOptimizerResult<()> {
+        let grads = &self.flat_grads.as_slice()[..self.layout.total_elements];
+        let nan = grads.iter().any(|g| g.is_nan());
+        let inf = grads.iter().any(|g| g.is_infinite());
+        let issue = match (nan, inf) {
+            (false, false) => return Ok(()),
+            (true, true) => "NaN and Inf values",
+            (true, false) => "NaN values",
+            (false, true) => "Inf values",
+        };
+        Err(MlxMetalOptimizerError::Mlx(Exception::custom(format!(
+            "Gradient validation failed: {issue} detected at step {}",
+            self.step + 1
+        ))))
     }
 }
 
@@ -1234,6 +655,112 @@ pub fn is_mlx_metal_optimizer_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    struct Weights {
+        params: Vec<Array>,
+    }
+    pmetal_bridge::impl_module_params!(Weights; params);
+
+    #[test]
+    fn the_model_update_runs_the_metal_kernel() {
+        // `update_model_fused` used to run an AdamW of MLX ops and leave the
+        // kernel's moment buffers untouched.
+        let (lr, b1, b2, eps, wd) = (0.1f32, 0.9f32, 0.999f32, 1e-8f32, 0.01f32);
+        let mut model = Weights {
+            params: vec![
+                Array::from_f32_slice(&[1.0, 2.0], &[2]),
+                Array::from_f32_slice(&[3.0, -1.0, 0.5], &[3]),
+            ],
+        };
+        let gs = [vec![0.5f32, -0.25], vec![1.0, 2.0, -4.0]];
+        let grads: FlattenedModuleParam = [
+            (Rc::from("params.0"), Array::from_f32_slice(&gs[0], &[2])),
+            (Rc::from("params.1"), Array::from_f32_slice(&gs[1], &[3])),
+        ]
+        .into();
+
+        let mut opt = MlxMetalOptimizerBuilder::new(lr)
+            .weight_decay(wd)
+            .build()
+            .unwrap();
+        // AdamW by hand over both weights in name order, without bias
+        // correction, as the kernel computes it.
+        let g = gs.concat();
+        let mut p = vec![1.0f32, 2.0, 3.0, -1.0, 0.5];
+        let mut m = vec![0.0f32; 5];
+        let mut v = vec![0.0f32; 5];
+        for _ in 0..2 {
+            opt.update_model_fused(&mut model, &grads).unwrap();
+            for (((p, m), v), g) in p.iter_mut().zip(&mut m).zip(&mut v).zip(&g) {
+                *m = b1 * *m + (1.0 - b1) * g;
+                *v = b2 * *v + (1.0 - b2) * g * g;
+                *p = *p * (1.0 - lr * wd) - lr * *m / (v.sqrt() + eps);
+            }
+        }
+        let got: Vec<f32> = model
+            .params
+            .iter()
+            .flat_map(|a| a.as_slice::<f32>().to_vec())
+            .collect();
+        for (a, b) in got.iter().zip(&p) {
+            assert!((a - b).abs() < 1e-5, "weights {got:?}, by hand {p:?}");
+        }
+        // The kernel's own first moments.
+        for (a, b) in opt.m_buffer.as_slice()[..5].iter().zip(&m) {
+            assert!((a - b).abs() < 1e-6, "m buffer {a} vs {b}");
+        }
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    #[test]
+    fn a_gradient_of_the_wrong_size_fails_the_step() {
+        let mut model = Weights {
+            params: vec![Array::from_f32_slice(&[1.0, 2.0], &[2])],
+        };
+        let grads: FlattenedModuleParam = [(
+            Rc::from("params.0"),
+            Array::from_f32_slice(&[1.0, 1.0, 1.0], &[3]),
+        )]
+        .into();
+        let mut opt = MlxMetalOptimizerBuilder::new(0.1).build().unwrap();
+        let err = opt.update_model_fused(&mut model, &grads).unwrap_err();
+        assert!(err.what().contains("params.0"), "{}", err.what());
+    }
+
+    /// AdamW over LoRA-sized parameters (392 adapters of 16 x 1600 f32,
+    /// about 10M elements). Measures speed: run through the GPU queue.
+    #[test]
+    #[ignore = "benchmark; run through gpuq"]
+    fn bench_fused_adamw_over_lora_sized_params() {
+        pmetal_bridge::compat::random::seed(1);
+        let mut model = Weights {
+            params: (0..392)
+                .map(|_| pmetal_bridge::compat::random::normal(&[16, 1600], Dtype::Float32))
+                .collect(),
+        };
+        let grads: FlattenedModuleParam = model
+            .flatten_params()
+            .into_iter()
+            .map(|(k, p)| (k, p.multiply(&Array::from_f32(1e-3))))
+            .collect();
+        transforms::eval(model.params.iter().chain(grads.values())).unwrap();
+        let mut opt = MlxMetalOptimizerBuilder::new(1e-4).build().unwrap();
+        for _ in 0..3 {
+            opt.update_model_fused(&mut model, &grads).unwrap();
+        }
+        let steps = 30;
+        let t = std::time::Instant::now();
+        for _ in 0..steps {
+            opt.update_model_fused(&mut model, &grads).unwrap();
+        }
+        transforms::eval(model.params.iter()).unwrap();
+        println!(
+            "fused AdamW over {} elements: {:.2} ms/step",
+            opt.total_elements(),
+            t.elapsed().as_secs_f64() * 1e3 / steps as f64
+        );
+    }
 
     #[test]
     fn test_config_default() {
@@ -1294,84 +821,6 @@ mod tests {
 
         let values: Vec<f32> = updated.as_slice().to_vec();
         assert!(values[0] < 1.0, "Weight should decrease, got {}", values[0]);
-    }
-
-    /// Compare pure MLX vs fused Metal optimizer outputs.
-    /// Both should produce the same parameter updates given the same inputs.
-    #[test]
-    fn test_mlx_vs_fused_equivalence() {
-        // Create two identical optimizers
-        let mut opt_mlx = MlxMetalOptimizerBuilder::new(0.1)
-            .weight_decay(0.01)
-            .build()
-            .unwrap();
-
-        let mut opt_fused = MlxMetalOptimizerBuilder::new(0.1)
-            .weight_decay(0.01)
-            .build()
-            .unwrap();
-
-        // Create identical initial parameters
-        let p0 = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
-        let g0 = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[4]);
-
-        // Initialize both with same layout
-        let mut params_mlx: FlattenedModuleParam = HashMap::new();
-        params_mlx.insert(Rc::from("weight"), p0.clone());
-
-        let mut params_fused: FlattenedModuleParam = HashMap::new();
-        params_fused.insert(Rc::from("weight"), p0.clone());
-
-        // Initialize layouts
-        opt_mlx.initialize_from_params(&params_mlx).unwrap();
-        opt_fused.initialize_from_params(&params_fused).unwrap();
-
-        // Create gradients
-        let grads: FlattenedModuleParam = {
-            let mut g = HashMap::new();
-            g.insert(Rc::from("weight"), g0.clone());
-            g
-        };
-
-        // Now run fused_step on both (which uses Metal kernel)
-        opt_fused.fused_step(&mut params_fused, &grads).unwrap();
-
-        // Get fused result
-        let fused_result: Vec<f32> = params_fused
-            .get(&Rc::from("weight"))
-            .unwrap()
-            .as_slice()
-            .to_vec();
-
-        // Manual AdamW calculation for verification
-        // Step 1: m = 0.9 * 0 + 0.1 * g = 0.1 * g
-        // v = 0.999 * 0 + 0.001 * g^2 = 0.001 * g^2
-        // update = m / (sqrt(v) + eps)
-        // p_new = p * (1 - lr * wd) - lr * update
-        let lr = 0.1f32;
-        let beta1 = 0.9f32;
-        let beta2 = 0.999f32;
-        let eps = 1e-8f32;
-        let wd = 0.01f32;
-
-        let g_val = 0.1f32;
-        let m_new = (1.0 - beta1) * g_val; // 0.01
-        let v_new = (1.0 - beta2) * g_val * g_val; // 0.00001
-        let update = m_new / (v_new.sqrt() + eps); // 0.01 / (0.00316 + 1e-8) ≈ 3.16
-        let p_new = 1.0 * (1.0 - lr * wd) - lr * update; // 0.999 - 0.316 ≈ 0.683
-
-        println!("Expected first element: {:.6}", p_new);
-        println!("Fused result: {:?}", fused_result);
-        println!(
-            "Manual calc: m={:.6}, v={:.6}, update={:.6}",
-            m_new, v_new, update
-        );
-
-        // Verify fused result is reasonable
-        assert!(
-            fused_result[0] < 1.0,
-            "Param should decrease with positive gradient"
-        );
     }
 
     #[test]
