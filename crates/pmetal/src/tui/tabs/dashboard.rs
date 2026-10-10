@@ -272,7 +272,7 @@ impl DashboardTab {
                     .title("Loss")
                     .style(THEME.chart_axis)
                     .bounds([y_min, y_max])
-                    .labels::<Vec<Line>>(vec![
+                    .labels::<Vec<Line<'_>>>(vec![
                         format!("{:.3}", y_min).into(),
                         format!("{:.3}", (y_min + y_max) / 2.0).into(),
                         format!("{:.3}", y_max).into(),
@@ -290,7 +290,7 @@ impl DashboardTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let items: Vec<ListItem> = if let Some(last) = self.samples.last() {
+        let items: Vec<ListItem<'_>> = if let Some(last) = self.samples.last() {
             let loss_trend = if self.samples.len() >= 10 {
                 let recent_avg: f64 = self.samples[self.samples.len() - 5..]
                     .iter()

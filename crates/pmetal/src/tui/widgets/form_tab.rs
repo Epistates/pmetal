@@ -259,7 +259,7 @@ impl FormTabState {
             .unwrap_or(10);
 
         let mut current_section: Option<&str> = None;
-        let mut items: Vec<ListItem> = Vec::new();
+        let mut items: Vec<ListItem<'_>> = Vec::new();
 
         for (i, field) in self.fields.iter().enumerate() {
             if !visible(field) {
@@ -348,7 +348,7 @@ impl JobLog {
 
         let visible = inner.height as usize;
         let start = self.lines.len().saturating_sub(visible);
-        let rendered: Vec<Line> = self.lines[start..]
+        let rendered: Vec<Line<'_>> = self.lines[start..]
             .iter()
             .map(|l| Line::from(Span::styled(format!("  {l}"), THEME.text)))
             .collect();

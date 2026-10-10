@@ -612,7 +612,7 @@ fn render_confirm(area: Rect, buf: &mut Buffer, title: &str, lines: &[String], s
     .areas(inner);
 
     // Message lines
-    let msg_lines: Vec<Line> = lines
+    let msg_lines: Vec<Line<'_>> = lines
         .iter()
         .map(|l| Line::from(Span::styled(l.as_str(), THEME.text)))
         .collect();
@@ -721,7 +721,7 @@ fn render_model_picker(
     }
 
     let header = Row::new(vec!["Model ID", "Details"]).style(THEME.table_header);
-    let rows: Vec<Row> = filtered
+    let rows: Vec<Row<'_>> = filtered
         .iter()
         .enumerate()
         .map(|(i, entry)| {
@@ -786,7 +786,7 @@ fn render_tab_picker(area: Rect, buf: &mut Buffer, list_state: &mut ListState, s
         return;
     }
 
-    let items: Vec<ListItem> = filtered
+    let items: Vec<ListItem<'_>> = filtered
         .iter()
         .map(|tab| {
             ListItem::new(Line::from(vec![
@@ -850,7 +850,7 @@ fn render_dataset_picker(
         return;
     }
 
-    let items: Vec<ListItem> = filtered
+    let items: Vec<ListItem<'_>> = filtered
         .iter()
         .map(|ds| {
             ListItem::new(Line::from(vec![
@@ -960,7 +960,7 @@ fn render_hf_search(
     .style(THEME.table_header)
     .height(1);
 
-    let rows: Vec<Row> = entries
+    let rows: Vec<Row<'_>> = entries
         .iter()
         .enumerate()
         .map(|(i, entry)| {
@@ -1057,7 +1057,7 @@ fn render_help(area: Rect, buf: &mut Buffer, tab: Tab) {
         ("F2", "Toggle mouse capture (text select/copy)"),
         ("Esc", "Close modal / cancel edit"),
     ];
-    let mut lines: Vec<Line> = Vec::new();
+    let mut lines: Vec<Line<'_>> = Vec::new();
     lines.push(Line::from(Span::styled(" Global", THEME.kv_key)));
     for (key, desc) in &global_lines {
         lines.push(Line::from(vec![
@@ -1071,7 +1071,7 @@ fn render_help(area: Rect, buf: &mut Buffer, tab: Tab) {
 
     // ── Tab-specific bindings ──────────────────────────────────────────
     let tab_bindings: &[(&str, &str)] = tab_help(tab);
-    let mut tab_lines: Vec<Line> = Vec::new();
+    let mut tab_lines: Vec<Line<'_>> = Vec::new();
     tab_lines.push(Line::from(Span::styled(
         format!(" {tab} tab"),
         THEME.kv_key,

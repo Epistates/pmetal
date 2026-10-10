@@ -75,3 +75,23 @@ opt-level = 3
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+# This crate is outside the root workspace, so it can't inherit
+# [workspace.lints]; these mirror them.
+[lints.rust]
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unit_bindings = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"

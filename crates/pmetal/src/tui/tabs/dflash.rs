@@ -205,7 +205,7 @@ impl DflashTab {
             _ => None,
         };
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
         match &self.status {
             DflashStatus::Idle => {
                 lines.push(status_line(StatusTone::Idle, "Idle", None));

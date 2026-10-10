@@ -19,7 +19,7 @@ where
     impl<'de> Visitor<'de> for StringOrVec {
         type Value = Option<Vec<String>>;
 
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("a string or array of strings or null")
         }
 

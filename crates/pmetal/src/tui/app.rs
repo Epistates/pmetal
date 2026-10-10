@@ -3181,7 +3181,7 @@ impl App {
 
 impl App {
     /// Draw the full UI to a frame.
-    fn draw(&mut self, frame: &mut ratatui::Frame) {
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         let buf = frame.buffer_mut();
 

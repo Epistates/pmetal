@@ -48,6 +48,14 @@ harness = false
 # `unsafe_code = "deny"` still applies to every other crate.
 [lints.rust]
 unsafe_code = "allow"
+# The rest mirrors [workspace.lints.rust].
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+rust_2018_idioms = { level = "warn", priority = -1 }
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unit_bindings = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
 
 [lints.clippy]
 collapsible_if = "allow"

@@ -466,7 +466,7 @@ impl ModelsTab {
             .style(THEME.table_header)
             .height(1);
 
-        let rows: Vec<Row> = filtered
+        let rows: Vec<Row<'_>> = filtered
             .iter()
             .enumerate()
             .map(|(i, model)| {

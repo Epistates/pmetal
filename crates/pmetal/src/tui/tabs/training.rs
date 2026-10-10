@@ -573,7 +573,7 @@ impl TrainingTab {
             .render_list(form_area, buf, "Configuration", |_| true);
 
         if footer_lines > 0 {
-            let mut lines: Vec<Line> = Vec::new();
+            let mut lines: Vec<Line<'_>> = Vec::new();
             if let Some(ref info) = self.dataset_info {
                 lines.push(Line::from(Span::styled(
                     format!("  {info}"),

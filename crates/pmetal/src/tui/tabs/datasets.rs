@@ -420,7 +420,7 @@ impl DatasetsTab {
             .style(THEME.table_header)
             .height(1);
 
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'_>> = self
             .datasets
             .iter()
             .enumerate()

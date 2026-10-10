@@ -215,7 +215,7 @@ impl RlkdTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
         match &self.status {
             RlkdStatus::Idle => {
                 lines.push(status_line(StatusTone::Idle, "Idle", None));

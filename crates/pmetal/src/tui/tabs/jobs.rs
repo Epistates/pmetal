@@ -273,7 +273,7 @@ impl JobsTab {
             .style(THEME.table_header)
             .height(1);
 
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'_>> = self
             .jobs
             .iter()
             .enumerate()
@@ -400,7 +400,7 @@ impl JobsTab {
                 .style(THEME.text_muted)
                 .render(log_inner, buf);
         } else {
-            let lines: Vec<Line> = job
+            let lines: Vec<Line<'_>> = job
                 .log_lines
                 .iter()
                 .map(|l| Line::from(Span::styled(l.as_str(), THEME.text_dim)))

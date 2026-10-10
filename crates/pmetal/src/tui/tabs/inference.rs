@@ -1108,7 +1108,7 @@ impl InferenceTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
 
         // Model display — truncate to fit sidebar
         let model_label = self.model_id.as_deref().unwrap_or("(none)");

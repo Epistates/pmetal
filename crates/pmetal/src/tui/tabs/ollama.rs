@@ -267,7 +267,7 @@ impl OllamaTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
         lines.push(Line::from(""));
 
         for (i, field) in self.fields.iter().enumerate() {
@@ -318,7 +318,7 @@ impl OllamaTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
         match &self.status {
             OllamaStatus::Idle => {
                 lines.push(status_line(StatusTone::Idle, "Idle", None));

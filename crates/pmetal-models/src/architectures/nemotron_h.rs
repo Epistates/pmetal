@@ -1638,11 +1638,8 @@ impl NemotronHMixer {
             // Output is [B, padded_len, conv_dim], truncate to [B, seq_len, conv_dim]
             let out_len = conv_out.dim(1);
 
-            let conv_out = pmetal_bridge::compat::ops::slice_axis_from(
-                &conv_out,
-                1,
-                (out_len - seq_len) as i32,
-            );
+            let conv_out =
+                pmetal_bridge::compat::ops::slice_axis_from(&conv_out, 1, out_len - seq_len);
             nn::silu(&conv_out)
         } else {
             // No cache: use CAUSAL PADDING for full sequence

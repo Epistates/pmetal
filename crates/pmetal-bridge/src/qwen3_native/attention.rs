@@ -138,7 +138,7 @@ pub(super) fn attn_forward_with_tree_ctx(
     rope_offset: i32,
     dtype: i32,
     qjl_matrix: Option<&InlineArray>,
-    tree_ctx: Option<TreeVerifyInputs>,
+    tree_ctx: Option<TreeVerifyInputs<'_>>,
     mrope: Option<&MropeTables>,
 ) -> InlineArray {
     let n_heads = lw.attn_n_heads;

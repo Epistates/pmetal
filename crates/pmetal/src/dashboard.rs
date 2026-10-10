@@ -149,7 +149,7 @@ pub mod app {
             Ok(())
         }
 
-        fn draw(&self, f: &mut ratatui::Frame) {
+        fn draw(&self, f: &mut ratatui::Frame<'_>) {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -198,7 +198,7 @@ pub mod app {
             f.render_widget(status_widget, chunks[2]);
         }
 
-        fn draw_loss_chart(&self, f: &mut ratatui::Frame, area: Rect) {
+        fn draw_loss_chart(&self, f: &mut ratatui::Frame<'_>, area: Rect) {
             if self.loss_data.is_empty() {
                 let placeholder = Paragraph::new("No data yet")
                     .block(Block::default().title(" Loss ").borders(Borders::ALL));
@@ -240,7 +240,7 @@ pub mod app {
                         .title("Loss")
                         .style(Style::default().fg(Color::Gray))
                         .bounds([min_loss * 0.95, max_loss * 1.05])
-                        .labels::<Vec<Line>>(vec![
+                        .labels::<Vec<Line<'_>>>(vec![
                             format!("{:.2}", min_loss).into(),
                             format!("{:.2}", (min_loss + max_loss) / 2.0).into(),
                             format!("{:.2}", max_loss).into(),
@@ -249,14 +249,14 @@ pub mod app {
             f.render_widget(chart, area);
         }
 
-        fn draw_stats_panel(&self, f: &mut ratatui::Frame, area: Rect) {
+        fn draw_stats_panel(&self, f: &mut ratatui::Frame<'_>, area: Rect) {
             let stats_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(area);
 
             // Current stats
-            let stats: Vec<ListItem> = if let Some(last) = self.samples.last() {
+            let stats: Vec<ListItem<'_>> = if let Some(last) = self.samples.last() {
                 vec![
                     ListItem::new(format!("Step:      {}", last.step)),
                     ListItem::new(format!("Loss:      {:.4}", last.loss)),
@@ -276,7 +276,7 @@ pub mod app {
             f.render_widget(stats_list, stats_chunks[0]);
 
             // Timing breakdown
-            let timing: Vec<ListItem> = if let Some(last) = self.samples.last() {
+            let timing: Vec<ListItem<'_>> = if let Some(last) = self.samples.last() {
                 let total = last.total_ms.max(0.001);
                 vec![
                     ListItem::new(format!(

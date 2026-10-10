@@ -471,7 +471,7 @@ impl BenchTab {
             Cell::from("Peak GB").style(THEME.table_header),
         ]);
 
-        let rows: Vec<Row> = self
+        let rows: Vec<Row<'_>> = self
             .trials
             .iter()
             .map(|t| {

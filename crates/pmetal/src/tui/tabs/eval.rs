@@ -214,7 +214,7 @@ impl EvalTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line<'_>> = Vec::new();
 
         let (tone, label, detail): (StatusTone, &str, Option<String>) = match &self.status {
             EvalStatus::Idle => (StatusTone::Idle, "Idle", None),

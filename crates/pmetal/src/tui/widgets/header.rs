@@ -31,7 +31,7 @@ impl Widget for Header<'_> {
         logo.render(logo_area, buf);
 
         // Tab bar
-        let tab_titles: Vec<Line> = self
+        let tab_titles: Vec<Line<'_>> = self
             .tabs
             .iter()
             .map(|t| {
