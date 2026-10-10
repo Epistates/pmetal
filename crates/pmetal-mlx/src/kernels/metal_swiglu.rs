@@ -1,7 +1,7 @@
 //! Metal-accelerated SwiGLU MLP operations.
 //!
 //! This module provides optimized SwiGLU/GEGLU MLP operations with:
-//! - JIT-compiled MLX operations (default, ~15-20% faster than separate ops)
+//! - MLX operations (default)
 //! - Fused LoRA support for efficient fine-tuning
 //! - Optional full Metal kernel for maximum throughput
 //!

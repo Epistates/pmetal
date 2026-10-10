@@ -568,58 +568,63 @@ impl_module_params!(Qwen3NextRMSNormGated; weight);
 /// type the native engine uses too, so the two read `output_gate_type` alike.
 pub use pmetal_bridge::qwen3_native::family::GdnGateActivation as GateActivation;
 
-/// Compiled _precise_swiglu: `(silu(gate.f32()) * norm_out.f32()).as(dtype)`.
-///
-/// Equivalent to a `@partial(mx.compile, shapeless=True)` `_precise_swiglu(h, gate, x)`.
-/// Fuses 6 element-wise ops (2 casts, sigmoid, 2 multiplies, cast) into 1 Metal dispatch.
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread ran the Rust body of the compiled swiglu.
+    static SWIGLU_TRACES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `(silu(gate.f32()) * norm_out.f32()).as(norm_out.dtype)`, the reference's
+/// `_precise_swiglu`, which it compiles with `mx.compile(shapeless=True)`.
+fn precise_swiglu(norm_out: &Array, gate: &Array) -> Array {
+    let gate_f32 = nn::silu(&gate.cast(pmetal_bridge::compat::Dtype::Float32));
+    let norm_f32 = norm_out.cast(pmetal_bridge::compat::Dtype::Float32);
+    gate_f32.multiply(&norm_f32).as_dtype(norm_out.dtype_raw())
+}
+
+/// [`precise_swiglu`] traced once per thread through `mlx::core::compile`
+/// (shapeless, so decode and prefill share the trace; a new input dtype or
+/// rank retraces), which fuses its casts, sigmoid and multiplies into one
+/// kernel. The closure captures nothing, so the trace has no hidden inputs.
+/// Falls back to the op-by-op version if MLX refuses to compile it. The
+/// result is cast to `out_dtype` (the layer input's) when the norm promoted.
 fn compiled_precise_swiglu(
     norm_out: &Array,
     gate: &Array,
     out_dtype: pmetal_bridge::compat::Dtype,
 ) -> Result<Array, Exception> {
     thread_local! {
-        static COMPILED: std::cell::RefCell<Option<pmetal_bridge::compat::compile::Closure>> =
+        // Never dropped: a compiled function destroyed during process
+        // teardown can outlive libmlx (see `pmetal_bridge::compile`).
+        static COMPILED: std::cell::RefCell<Option<std::mem::ManuallyDrop<pmetal_bridge::CompiledFn>>> =
             const { std::cell::RefCell::new(None) };
     }
-
-    // Initialize the compiled closure on first call
-    COMPILED.with(|cell| {
+    let out = COMPILED.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            let closure = pmetal_bridge::compat::compile::Closure::new(|inputs: &[Array]| {
-                let norm_out = &inputs[0];
-                let gate = &inputs[1];
-                let gate_f32 = nn::silu(&gate.cast(pmetal_bridge::compat::Dtype::Float32));
-                let norm_f32 = norm_out.cast(pmetal_bridge::compat::Dtype::Float32);
-                let result = gate_f32.multiply(&norm_f32);
-                vec![result.as_dtype(norm_out.dtype_raw())]
-            });
-            *slot = pmetal_bridge::compat::compile::compile(closure, true).ok();
-        }
-    });
-
-    // Try the compiled path; fall back to uncompiled if unavailable
-    let result = COMPILED.with(|cell| -> Option<Result<Array, Exception>> {
-        let slot = cell.borrow();
-        slot.as_ref().map(|compiled_fn| {
-            let outputs = compiled_fn.apply(&[norm_out.clone(), gate.clone()])?;
-            let result = outputs.into_iter().next().unwrap();
-            Ok(if result.dtype() != out_dtype {
-                result.as_dtype(out_dtype.as_i32())
-            } else {
-                result
+            *slot = pmetal_bridge::CompiledFn::new(1, true, |inputs: &[Array]| {
+                #[cfg(test)]
+                SWIGLU_TRACES.with(|n| n.set(n.get() + 1));
+                vec![precise_swiglu(&inputs[0], &inputs[1])]
             })
-        })
-    });
-
-    if let Some(r) = result {
-        r
+            .ok()
+            .map(std::mem::ManuallyDrop::new);
+        }
+        match slot.as_mut() {
+            Some(compiled) => compiled
+                .call(&[norm_out, gate])
+                .map_err(|e| Exception::custom(e.to_string()))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Exception::custom("compiled precise_swiglu returned nothing")),
+            None => Ok(precise_swiglu(norm_out, gate)),
+        }
+    })?;
+    Ok(if out.dtype() != out_dtype {
+        out.as_dtype(out_dtype.as_i32())
     } else {
-        // Fallback: uncompiled
-        let gate_f32 = nn::silu(&gate.cast(pmetal_bridge::compat::Dtype::Float32));
-        let norm_f32 = norm_out.cast(pmetal_bridge::compat::Dtype::Float32);
-        Ok(gate_f32.multiply(&norm_f32).as_dtype(out_dtype.as_i32()))
-    }
+        out
+    })
 }
 
 impl Qwen3NextRMSNormGated {
@@ -635,7 +640,7 @@ impl Qwen3NextRMSNormGated {
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         let normed = pmetal_bridge::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps);
         match (gate, self.gate_activation) {
-            // Compiled _precise_swiglu (shapeless mx.compile).
+            // `_precise_swiglu` through mlx::core::compile (shapeless).
             // Fuses silu(gate.f32()) * norm.f32() → cast_back into 1 Metal dispatch
             // instead of 6 separate dispatches (2 casts + silu(2 ops) + mul + cast).
             (Some(g), GateActivation::Silu) => compiled_precise_swiglu(&normed, g, x.dtype()),
@@ -1294,11 +1299,7 @@ impl Qwen3NextGatedDeltaNet {
             && self.projections_are_plain()
     }
 
-    /// Decode forward (T=1) — compiled via mx.compile for fused GPU evaluation.
-    ///
-    /// MLX traces the function on the first call and replays the cached trace on
-    /// subsequent calls. This fuses intermediate ops, dramatically reducing
-    /// Metal kernel dispatch count during eval (from ~30 kernels to ~5 per layer).
+    /// Decode forward (T=1), op by op apart from the gated norm's compiled swiglu.
     fn forward_cached_decode(
         &mut self,
         inputs: &Array,
@@ -1322,7 +1323,7 @@ impl Qwen3NextGatedDeltaNet {
 
         // Direct decode: uses Metal GDN kernel (1 dispatch for recurrence) +
         // individually dispatched ops for projections/conv/norm.
-        // No per-layer mx.compile — relies on MLX global compile for element-wise fusion.
+        // Not compiled: MLX dispatches these ops one by one.
         let b_dim = inputs.dim(0);
         let s = 1i32;
 
@@ -4253,6 +4254,40 @@ pub fn sanitize_weights(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn the_gated_norm_swiglu_is_traced_once_and_replayed() {
+        // The compile wrapper this used to go through returned the closure
+        // unchanged, so its body ran op by op on every call.
+        std::thread::spawn(|| {
+            for seq in [1, 7, 33] {
+                let shape = [1, seq, 64];
+                let norm = pmetal_bridge::compat::random::normal(&shape, Dtype::Bfloat16);
+                let gate = pmetal_bridge::compat::random::normal(&shape, Dtype::Bfloat16);
+                let got = compiled_precise_swiglu(&norm, &gate, Dtype::Bfloat16).unwrap();
+                let want = precise_swiglu(&norm, &gate);
+                assert_eq!(got.dtype(), Dtype::Bfloat16);
+                let diff = got
+                    .as_dtype(Dtype::Float32.as_i32())
+                    .subtract(&want.as_dtype(Dtype::Float32.as_i32()))
+                    .abs()
+                    .max(None)
+                    .item_f32();
+                assert!(
+                    diff <= 1e-2,
+                    "seq {seq}: compiled and op-by-op differ by {diff}"
+                );
+            }
+            assert_eq!(
+                SWIGLU_TRACES.with(|n| n.get()),
+                1,
+                "three sequence lengths share one shapeless trace"
+            );
+            pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        })
+        .join()
+        .unwrap();
+    }
 
     fn tiny_config() -> Qwen3NextConfig {
         Qwen3NextConfig {

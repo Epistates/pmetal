@@ -773,7 +773,7 @@ pub(crate) async fn run_inference(
                 .state
                 .run_with(|fwd, cache| generate_cached_metal(fwd, &input_ids, gen_config, cache))?
         } else if compiled {
-            tracing::info!("Using JIT-compiled sampling");
+            tracing::info!("Using async-pipelined sampling");
             runner.state.run_with(|fwd, cache| {
                 generate_cached_compiled(fwd, &input_ids, gen_config, cache)
             })?

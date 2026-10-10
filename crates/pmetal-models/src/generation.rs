@@ -180,10 +180,9 @@ fn token_input_array(tokens: &[u32]) -> Array {
     )
 }
 
-/// Clear both compiled graph state and the general MLX allocation cache.
+/// Release the Metal buffers MLX's allocator holds for reuse.
 #[inline]
 pub fn clear_generation_caches() {
-    pmetal_bridge::compat::transforms::compile::clear_cache();
     pmetal_mlx::memory::clear_cache();
 }
 

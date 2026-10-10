@@ -248,7 +248,7 @@ pub enum InferenceBackend {
     Auto,
     /// Default streaming MLX path (the current no-flag behavior).
     Standard,
-    /// JIT-compiled sampling (mlx.compile).
+    /// Filtered sampling with the next forward scheduled before the token is read.
     Compiled,
     /// Fused Metal sampling kernel.
     MetalSampler,
@@ -288,7 +288,7 @@ impl InferenceBackend {
         match self {
             Self::Auto => "pick best for this device + model",
             Self::Standard => "streaming MLX path (token-by-token)",
-            Self::Compiled => "JIT-compiled sampling (mlx.compile)",
+            Self::Compiled => "async-pipelined MLX sampling",
             Self::MetalSampler => "fused Metal sampling kernel",
             Self::Ane => "Apple Neural Engine (experimental)",
             Self::Minimal => "minimal async loop (debug only)",

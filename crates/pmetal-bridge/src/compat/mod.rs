@@ -711,50 +711,6 @@ pub mod ops_ext {
     }
 }
 
-// ── compile placeholder ──────────────────────────────────────────────────────
-//
-// `compile` does NOT call MLX's compiler: it returns the closure unchanged, so
-// the closure runs op by op. Fused graphs live in C++ (`inline_array::compiled`)
-// and are reached through their own bridge entry points.
-pub mod compile {
-    use super::Array;
-
-    /// Clear the compile cache (wraps `pmetal_bridge::inline_array::clear_cache`).
-    pub fn clear_cache() {
-        crate::inline_array::clear_cache();
-    }
-
-    /// A boxed, type-erased array function.
-    pub struct Closure {
-        #[allow(clippy::type_complexity)]
-        f: Box<dyn Fn(&[Array]) -> Vec<Array>>,
-    }
-
-    impl std::fmt::Debug for Closure {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "Closure")
-        }
-    }
-
-    impl Closure {
-        pub fn new(f: impl Fn(&[Array]) -> Vec<Array> + 'static) -> Self {
-            Self { f: Box::new(f) }
-        }
-        pub fn call(&self, args: &[Array]) -> Vec<Array> {
-            (self.f)(args)
-        }
-        /// [`Self::call`], wrapped in `Ok`.
-        pub fn apply(&self, args: &[Array]) -> Result<Vec<Array>, super::Exception> {
-            Ok((self.f)(args))
-        }
-    }
-
-    /// Returns `f` unchanged; see the module note.
-    pub fn compile(f: Closure, _shapeless: bool) -> Result<Closure, super::Exception> {
-        Ok(f)
-    }
-}
-
 // ── losses ───────────────────────────────────────────────────────────────────
 pub mod losses {
     use super::{Array, Exception};
@@ -866,13 +822,6 @@ pub mod transforms {
 
     pub fn eval<'a>(arrays: impl IntoIterator<Item = &'a Array>) -> Result<(), Exception> {
         super::eval(arrays)
-    }
-
-    pub mod compile {
-        /// Clear the MLX compilation cache.
-        pub fn clear_cache() {
-            crate::inline_array::clear_cache();
-        }
     }
 
     /// Set the Metal wired memory limit.
