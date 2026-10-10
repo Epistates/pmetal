@@ -1564,46 +1564,49 @@ impl App {
         }
     }
 
+    /// Whether `job_id` is the training, distillation or GRPO job the
+    /// dashboard is showing.
+    fn is_active_training_job(&self, job_id: &str) -> bool {
+        self.active_training_job.as_deref() == Some(job_id)
+    }
+
     /// Handle a message from a background process.
     fn handle_app_msg(&mut self, msg: AppMsg) {
         match msg {
-            AppMsg::JobStarted {
-                job_id: _,
-                job_type,
-            } => match job_type {
-                JobType::Train => {
-                    self.training.set_status_running(0, 0, 0, 0);
-                    self.dashboard.job_phase = Some("Starting training job...".to_string());
+            // The dashboard and the training tabs show the one job in
+            // `active_training_job`; another job's progress (an earlier run
+            // still finishing, a concurrent pretrain) must not land there.
+            // A pretrain job's own tab is set running when it is spawned.
+            AppMsg::JobStarted { job_id, job_type } => {
+                if !self.is_active_training_job(&job_id) {
+                    return;
                 }
-                JobType::Distill => {
-                    self.distillation.status = TrainingStatus::Running {
-                        step: 0,
-                        epoch: 0,
-                        total_epochs: 0,
-                        total_steps: 0,
-                    };
+                match job_type {
+                    JobType::Train => {
+                        self.training.set_status_running(0, 0, 0, 0);
+                        self.dashboard.job_phase = Some("Starting training job...".to_string());
+                    }
+                    JobType::Distill => {
+                        self.distillation.status = TrainingStatus::Running {
+                            step: 0,
+                            epoch: 0,
+                            total_epochs: 0,
+                            total_steps: 0,
+                        };
+                    }
+                    JobType::Grpo => {
+                        self.grpo.status = TrainingStatus::Running {
+                            step: 0,
+                            epoch: 0,
+                            total_epochs: 0,
+                            total_steps: 0,
+                        };
+                    }
+                    _ => {}
                 }
-                JobType::Grpo => {
-                    self.grpo.status = TrainingStatus::Running {
-                        step: 0,
-                        epoch: 0,
-                        total_epochs: 0,
-                        total_steps: 0,
-                    };
-                }
-                JobType::Pretrain => {
-                    self.pretrain.status = TrainingStatus::Running {
-                        step: 0,
-                        epoch: 0,
-                        total_epochs: 0,
-                        total_steps: 0,
-                    };
-                    self.dashboard.job_phase = Some("Starting pretrain job...".to_string());
-                }
-                _ => {}
-            },
+            }
             AppMsg::JobMetrics {
-                job_id: _,
+                job_id,
                 step,
                 epoch,
                 total_epochs,
@@ -1618,7 +1621,19 @@ impl App {
                 adam_ms,
                 total_ms,
             } => {
-                // Update dashboard with metrics
+                let running = TrainingStatus::Running {
+                    step,
+                    epoch,
+                    total_epochs,
+                    total_steps,
+                };
+                if self.active_pretrain_job.as_deref() == Some(job_id.as_str()) {
+                    self.pretrain.status = running;
+                    return;
+                }
+                if !self.is_active_training_job(&job_id) {
+                    return;
+                }
                 self.dashboard.push_sample(MetricSample {
                     step,
                     epoch,
@@ -1636,23 +1651,18 @@ impl App {
                 });
 
                 // Update status on the tab that owns the active job
-                let running = TrainingStatus::Running {
-                    step,
-                    epoch,
-                    total_epochs,
-                    total_steps,
-                };
                 match self.active_job_type {
                     Some(JobType::Distill) => self.distillation.status = running,
                     Some(JobType::Grpo) => self.grpo.status = running,
-                    Some(JobType::Pretrain) => self.pretrain.status = running,
                     _ => self
                         .training
                         .set_status_running(step, epoch, total_epochs, total_steps),
                 }
             }
-            AppMsg::JobPhase { job_id: _, phase } => {
-                self.dashboard.job_phase = Some(phase);
+            AppMsg::JobPhase { job_id, phase } => {
+                if self.is_active_training_job(&job_id) {
+                    self.dashboard.job_phase = Some(phase);
+                }
             }
             AppMsg::JobOutput { job_id, line } => {
                 // Route to jobs tab live log
@@ -3352,4 +3362,92 @@ fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metrics(job_id: &str, step: usize, loss: f64) -> AppMsg {
+        AppMsg::JobMetrics {
+            job_id: job_id.into(),
+            step,
+            epoch: 0,
+            total_epochs: 1,
+            total_steps: 100,
+            loss,
+            lr: 1e-4,
+            tok_sec: 0.0,
+            ane_fwd_ms: 0.0,
+            ane_bwd_ms: 0.0,
+            rmsnorm_ms: 0.0,
+            cblas_ms: 0.0,
+            adam_ms: 0.0,
+            total_ms: 0.0,
+        }
+    }
+
+    fn running_step(status: &TrainingStatus) -> Option<usize> {
+        match status {
+            TrainingStatus::Running { step, .. } => Some(*step),
+            _ => None,
+        }
+    }
+
+    /// The dashboard is showing a training run (`job-2`) while an earlier
+    /// distillation run (`job-1`) and a pretrain run (`job-3`) still report.
+    fn app_with_jobs() -> App {
+        let mut app = App::new(None);
+        app.active_training_job = Some("job-2".into());
+        app.active_job_type = Some(JobType::Train);
+        app.active_pretrain_job = Some("job-3".into());
+        app
+    }
+
+    #[test]
+    fn another_jobs_metrics_stay_off_the_dashboard() {
+        let mut app = app_with_jobs();
+        app.handle_app_msg(metrics("job-1", 40, 9.0));
+        assert!(
+            app.dashboard.samples.is_empty(),
+            "job-1's sample was charted"
+        );
+        assert_eq!(running_step(&app.training.status), None);
+
+        app.handle_app_msg(metrics("job-3", 7, 3.0));
+        assert!(
+            app.dashboard.samples.is_empty(),
+            "the pretrain sample was charted"
+        );
+        assert_eq!(running_step(&app.pretrain.status), Some(7));
+        assert_eq!(running_step(&app.training.status), None);
+
+        app.handle_app_msg(metrics("job-2", 5, 1.5));
+        assert_eq!(app.dashboard.samples.len(), 1);
+        assert_eq!(app.dashboard.samples[0].loss, 1.5);
+        assert_eq!(running_step(&app.training.status), Some(5));
+    }
+
+    #[test]
+    fn another_jobs_phase_and_start_leave_the_dashboard_alone() {
+        let mut app = app_with_jobs();
+        app.handle_app_msg(AppMsg::JobPhase {
+            job_id: "job-3".into(),
+            phase: "Tokenizing...".into(),
+        });
+        assert_eq!(app.dashboard.job_phase, None);
+
+        app.handle_app_msg(AppMsg::JobStarted {
+            job_id: "job-1".into(),
+            job_type: JobType::Distill,
+        });
+        assert_eq!(running_step(&app.distillation.status), None);
+        assert_eq!(app.dashboard.job_phase, None);
+
+        app.handle_app_msg(AppMsg::JobPhase {
+            job_id: "job-2".into(),
+            phase: "Loading model...".into(),
+        });
+        assert_eq!(app.dashboard.job_phase.as_deref(), Some("Loading model..."));
+    }
 }

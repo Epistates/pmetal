@@ -37,14 +37,9 @@ pub enum AppMsg {
     /// this one.
     Job(pmetal_core::JobEvent),
     /// A background job has started.
-    JobStarted {
-        #[expect(dead_code, reason = "the TUI does not route job state by id yet")]
-        job_id: String,
-        job_type: JobType,
-    },
+    JobStarted { job_id: String, job_type: JobType },
     /// Real-time metrics from a running training job.
     JobMetrics {
-        #[expect(dead_code, reason = "the TUI does not route job state by id yet")]
         job_id: String,
         step: usize,
         epoch: usize,
@@ -61,11 +56,7 @@ pub enum AppMsg {
         total_ms: f64,
     },
     /// Status phase update from a running job (e.g. "Loading model...", "Tokenizing...").
-    JobPhase {
-        #[expect(dead_code, reason = "the TUI does not route job state by id yet")]
-        job_id: String,
-        phase: String,
-    },
+    JobPhase { job_id: String, phase: String },
     /// A line of stdout/stderr from a running job.
     JobOutput { job_id: String, line: String },
     /// A background job has finished.
