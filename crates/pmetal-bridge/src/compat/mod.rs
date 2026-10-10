@@ -278,27 +278,6 @@ pub type ModuleParamMut<'a> =
 /// Owned, flattened parameter map (used by optimizers and `value_and_grad`).
 pub type FlattenedModuleParam = std::collections::HashMap<std::rc::Rc<str>, Array>;
 
-// ── Stream placeholder ───────────────────────────────────────────────────────
-
-/// A placeholder for an MLX stream: every bridge op runs on the default
-/// stream, so this carries no state.
-///
-/// `pmetal_models::generation` still threads one through its decode loop;
-/// nothing else uses it.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Stream;
-
-impl Stream {
-    /// The CPU stream (the same placeholder).
-    pub fn cpu() -> Self {
-        Self
-    }
-    /// The GPU stream (the same placeholder).
-    pub fn gpu() -> Self {
-        Self
-    }
-}
-
 // ── Module traits ─────────────────────────────────────────────────────────────
 
 /// Forward-pass trait for neural-network modules.

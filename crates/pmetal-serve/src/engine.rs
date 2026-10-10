@@ -1865,12 +1865,11 @@ impl InferenceEngine {
     {
         use pmetal_bridge::compat::ops::async_eval;
         use pmetal_models::generation::{
-            StreamContext, WiredLimitGuard, clear_generation_caches, create_generation_stream,
-            run_cached_prefill_chunks_at, token_logprobs,
+            WiredLimitGuard, clear_generation_caches, run_cached_prefill_chunks_at, token_logprobs,
+            use_generation_stream,
         };
 
         let _wired_guard = WiredLimitGuard::new();
-        let stream = create_generation_stream();
 
         let mut all_tokens: Vec<u32> = input_ids.to_vec();
         let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -1923,7 +1922,7 @@ impl InferenceEngine {
         // === Prefill (chunked, on possibly shortened suffix) ===
         //
         // `run_cached_prefill_chunks_at` calls `forward` once per chunk; each
-        // call wraps the forward in a fresh `StreamContext` so chunked
+        // call makes the generation stream the default first, so chunked
         // prefill also runs on the generation stream. Chunks shrink as the
         // cache deepens (counting a restored prefix), so none runs past the
         // GPU watchdog near the end of a long context. The final chunk's
@@ -1938,12 +1937,12 @@ impl InferenceEngine {
                 prefix_hit_len,
                 prefill_step_size,
                 |chunk| {
-                    let _ctx = StreamContext::new(&stream);
+                    use_generation_stream();
                     model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
                 },
             ),
             Some(media) => {
-                let _ctx = StreamContext::new(&stream);
+                use_generation_stream();
                 Self::prefill_media(model, media, cache, mamba_cache.as_mut())
             }
         }
@@ -1978,7 +1977,7 @@ impl InferenceEngine {
             // 1. Schedule NEXT forward BEFORE extracting current token.
             let next = if i + 1 < max_tokens {
                 let pair = {
-                    let _ctx = StreamContext::new(&stream);
+                    use_generation_stream();
                     let next_input = current_y
                         .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
                         .reshape(&[1, -1]);

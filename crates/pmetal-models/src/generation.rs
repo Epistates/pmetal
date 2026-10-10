@@ -24,7 +24,7 @@ use pmetal_bridge::compat::ops::{
     put_along_axis, select_axis, take_along_axis, which, zeros_like,
 };
 use pmetal_bridge::compat::random::categorical;
-use pmetal_bridge::compat::{Array, Dtype, Exception, Stream};
+use pmetal_bridge::compat::{Array, Dtype, Exception};
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
@@ -158,36 +158,18 @@ impl Drop for WiredLimitGuard {
     }
 }
 
-/// A RAII guard that activates the MLX generation stream for the duration of its lifetime.
+/// Make this thread's generation stream the default stream for the MLX ops
+/// that follow, creating it on the thread's first call.
 ///
-/// In the bridge, we use the built-in new_generation_stream / set_generation_stream
-/// bridge functions which set the underlying C++ stream correctly.
-pub struct StreamContext {
-    _marker: std::marker::PhantomData<()>,
-}
-
-impl StreamContext {
-    /// Create a new stream context, activating the generation stream.
-    pub fn new(_stream: &Stream) -> Self {
-        pmetal_bridge::inline_array::set_generation_stream();
-        StreamContext {
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl Drop for StreamContext {
-    fn drop(&mut self) {
-        // Bridge does not expose restoring previous stream; set_generation_stream
-        // is idempotent — the generation stream remains active.
-    }
-}
-
-/// Create a new generation stream (no-op in bridge — streams are managed internally).
+/// The bridge keeps one generation stream per thread (an MLX stream works
+/// only on the thread that made it), so there is no stream value to hold.
+/// The stream stays the default after the call returns, async evaluations
+/// included; [`pmetal_bridge::inline_array::reset_default_stream`] restores
+/// MLX's own.
 #[inline]
-pub fn create_generation_stream() -> Stream {
+pub fn use_generation_stream() {
     pmetal_bridge::inline_array::new_generation_stream();
-    Stream
+    pmetal_bridge::inline_array::set_generation_stream();
 }
 
 /// Build a `[1, seq_len]` Int32 token array from token IDs.
@@ -1779,11 +1761,7 @@ where
     // Set wired memory limit for optimal GPU memory management
     // This prevents page faults and matches Python's wired_limit context manager
     let _wired_guard = WiredLimitGuard::new();
-
-    // Create stream once (like Python's module-level generation_stream)
-    // CRITICAL: Stream context must wrap ONLY forward passes, NOT async_eval!
     // This is what enables true async pipelining.
-    let generation_stream = create_generation_stream();
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
     let sampler = Sampler::new(config.clone());
@@ -1799,7 +1777,7 @@ where
     let (mut current_y, mut current_logprobs) = {
         let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-                let _stream_ctx = StreamContext::new(&generation_stream);
+                use_generation_stream();
                 forward_fn(chunk_input, cache)
             })?;
         let current_logits = extract_logits(&logits);
@@ -1821,7 +1799,7 @@ where
         let next_pair = if n + 1 < config.max_new_tokens {
             // Forward pass INSIDE stream context
             let (y, lp) = {
-                let _stream_ctx = StreamContext::new(&generation_stream);
+                use_generation_stream();
                 // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
                 let next_input = current_y
                     .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
@@ -1909,7 +1887,6 @@ where
     C: FnMut(u32) -> bool,
 {
     let _wired_guard = WiredLimitGuard::new();
-    let generation_stream = create_generation_stream();
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
     let sampler = Sampler::new(config.clone());
@@ -1928,7 +1905,7 @@ where
     let (mut current_y, mut current_logprobs) = {
         let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-                let _stream_ctx = StreamContext::new(&generation_stream);
+                use_generation_stream();
                 forward_fn(chunk_input, cache)
             })?;
         let current_logits = extract_logits(&logits);
@@ -1942,7 +1919,7 @@ where
         let step_start = std::time::Instant::now();
         let next_pair = if n + 1 < config.max_new_tokens {
             let (y, lp) = {
-                let _stream_ctx = StreamContext::new(&generation_stream);
+                use_generation_stream();
                 let next_input = current_y
                     .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())
                     .reshape(&[1, -1]);
@@ -2096,10 +2073,6 @@ where
     // Set wired memory limit for optimal GPU memory management
     let _wired_guard = WiredLimitGuard::new();
 
-    // Create stream once (like Python's module-level generation_stream)
-    // CRITICAL: Stream context must wrap ONLY forward passes, NOT async operations!
-    let generation_stream = create_generation_stream();
-
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
     let prompt_len = input_ids.len();
 
@@ -2108,7 +2081,7 @@ where
 
     // Get vocab size from the final prefill chunk output.
     let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-        let _stream_ctx = StreamContext::new(&generation_stream);
+        use_generation_stream();
         forward_fn(chunk_input, cache)
     })?;
     let vocab_size = logits.dim(-1) as usize;
@@ -2221,7 +2194,7 @@ where
         // Forward pass for next token (INSIDE stream context)
         let token_input = Array::from_slice(&[token as i32], &[1, 1]);
         let next_output = {
-            let _stream_ctx = StreamContext::new(&generation_stream);
+            use_generation_stream();
             forward_fn(&token_input, cache)
         }?;
         let next_logits = extract_logits(&next_output)?;
@@ -2279,13 +2252,10 @@ where
 
     let _wired_guard = WiredLimitGuard::new();
 
-    // Create stream once (like Python's module-level generation_stream)
-    let generation_stream = create_generation_stream();
-
     // Helper to do forward pass INSIDE stream context (like Python's _step)
     let mut step = |input: &Array, cache: &mut KVCache| -> Result<Array, Exception> {
         // Stream context ONLY around forward pass (like Python's `with mx.stream(generation_stream):`)
-        let _stream_ctx = StreamContext::new(&generation_stream);
+        use_generation_stream();
         let out = forward_fn(input, cache)?;
         let logits = select_axis(&out, -1, 1);
         Ok(argmax_axis(&logits, -1))
@@ -2411,10 +2381,6 @@ where
     // This prevents page faults and matches Python's wired_limit context manager
     let _wired_guard = WiredLimitGuard::new();
 
-    // Create stream once (like Python's module-level generation_stream)
-    // CRITICAL: Stream context must wrap ONLY forward passes, NOT async_eval!
-    let generation_stream = create_generation_stream();
-
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
     let prompt_len = input_ids.len();
 
@@ -2428,7 +2394,7 @@ where
     let mut current_y = {
         let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-                let _stream_ctx = StreamContext::new(&generation_stream);
+                use_generation_stream();
                 forward_fn(chunk_input, cache)
             })?;
         let last_idx = logits.dim(1) - 1;
@@ -2445,7 +2411,7 @@ where
         // 1. Schedule NEXT forward pass (stream context inside, async_eval outside)
         let next_y = if n + 1 < config.max_new_tokens {
             let y = {
-                let _stream_ctx = StreamContext::new(&generation_stream);
+                use_generation_stream();
                 // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
                 let next_input = current_y
                     .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32())

@@ -17,7 +17,7 @@
 //! # Today's batched-decode strategy
 //!
 //! The driver runs forward **once per slot** inside a single
-//! `StreamContext`, schedules `async_eval` on the batch of returned
+//! generation stream, schedules `async_eval` on the batch of returned
 //! logit tensors, and only then samples. This gives us back-to-back
 //! kernel dispatches on the GPU stream without per-slot host syncs.
 //! It is *not* yet a single fused batched matmul — that's a future
@@ -376,7 +376,7 @@ pub struct SlotStepOutput {
 /// 5. Calls [`Sampler::update_counts`] per slot so frequency penalty
 ///    state advances with the slot's own token stream.
 ///
-/// All forwards run on the caller's current `StreamContext`.
+/// All forwards run on the caller's current default stream.
 pub fn drive_decode_step<F: SlotForward>(
     forward: &mut F,
     state: &mut ContinuousEngineState,
