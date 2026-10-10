@@ -67,7 +67,6 @@ pub mod sampling;
 pub mod shard;
 pub mod speculative;
 pub mod traits;
-pub mod weight_cache;
 pub mod weight_format;
 
 // Re-exports for convenience
