@@ -380,6 +380,16 @@ pub mod random {
     pub fn uniform(shape: &[i32], dtype: Dtype) -> Array {
         Array::random_uniform(shape, dtype.as_i32())
     }
+    /// Standard normal draws. With a `key` the draw is a function of it
+    /// alone; without one it takes the thread's global key.
+    pub fn normal_keyed(shape: &[i32], dtype: Dtype, key: Option<&Array>) -> Array {
+        Array::random_normal_keyed(shape, dtype.as_i32(), key)
+    }
+    /// Uniform draws in `[0, 1)`. With a `key` the draw is a function of it
+    /// alone; without one it takes the thread's global key.
+    pub fn uniform_keyed(shape: &[i32], dtype: Dtype, key: Option<&Array>) -> Array {
+        Array::random_uniform_keyed(shape, dtype.as_i32(), key)
+    }
     pub fn seed(s: u64) {
         crate::inline_array::random_seed(s);
     }

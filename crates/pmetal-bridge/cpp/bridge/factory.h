@@ -43,8 +43,11 @@ void mlx_inline_from_i32_slice(mlx_inline_array* dst, const int32_t* data, int l
 int mlx_inline_to_f32_slice(mlx_inline_array* a, float* out, size_t n);
 
 // ── Random samplers ──────────────────────────────────────────────────────
-void mlx_inline_random_normal(mlx_inline_array* dst, const int* shape, int ndim, int dtype);
-void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim, int dtype);
+// `key` may be null: the draw then takes the thread's global key.
+void mlx_inline_random_normal(mlx_inline_array* dst, const int* shape, int ndim, int dtype,
+                              const mlx_inline_array* key);
+void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim, int dtype,
+                               const mlx_inline_array* key);
 void mlx_inline_random_bernoulli(mlx_inline_array* dst, const mlx_inline_array* p, const int* shape, int ndim);
 void mlx_inline_random_seed(uint64_t seed);
 void mlx_inline_random_key(mlx_inline_array* dst, uint64_t seed);

@@ -30,6 +30,7 @@ use std::rc::Rc;
 
 use pmetal_bridge::compat::nn::value_and_grad_explicit;
 use pmetal_bridge::compat::{Array, Dtype, Exception, eval, ops, random};
+use pmetal_bridge::decode::{draw_bits, draw_key};
 use pmetal_bridge::optimizer::{AdamW, ParamClass};
 use pmetal_bridge::training::per_token_cross_entropy_loss;
 use pmetal_lora::{AdaptedModel, PackedBase, QLoraConfig, QLoraScheme, quantize_base};
@@ -45,21 +46,24 @@ use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 /// `(x_t, corrupted_mask)` where `x_t` is `[B, S]` int32 and `corrupted_mask`
 /// is `[B, S]` f32 (1.0 at replaced positions, 0.0 where the original was kept).
 ///
-/// The bridge RNG is process-global and stateless; seed the trajectory with
-/// [`pmetal_bridge::compat::random::seed`] before calling (the `seed` argument
-/// is accepted for call-site clarity and forward compatibility).
+/// With a `seed` the corruption is a function of it alone: the keep draws take
+/// the key [`draw_key`]`(seed, 0)` and the replacement tokens
+/// [`draw_key`]`(seed, 1)`, so the same seed corrupts the same way whatever
+/// else draws on the thread, and the thread's key is left alone. Without one
+/// both draws take the thread's key.
 pub fn uniform_categorical_noise(
     x0: &Array,
     keep_prob: f32,
     vocab: i32,
     seed: Option<u64>,
 ) -> (Array, Array) {
-    let _ = seed; // bridge RNG is seeded globally via random::seed
     let shape = x0.shape();
-    let uniform = random::uniform_range(0.0_f32, 1.0_f32, shape, Dtype::Float32);
+    let keep_key = seed.map(|seed| draw_key(seed, 0));
+    let token_key = seed.map(|seed| draw_key(seed, 1));
+    let uniform = random::uniform_keyed(shape, Dtype::Float32, keep_key.as_ref());
     // keep where u < keep_prob; corrupt otherwise.
     let keep_bool = uniform.lt(&Array::from_f32(keep_prob));
-    let random_tokens = random::randint(0, vocab, shape, Dtype::Int32, None);
+    let random_tokens = random::randint(0, vocab, shape, Dtype::Int32, token_key.as_ref());
     let x0_i32 = x0.as_dtype(Dtype::Int32.as_i32());
     let x_t = ops::r#where(&keep_bool, &x0_i32, &random_tokens);
     let corrupted_mask = Array::from_f32(1.0).subtract(&keep_bool.as_type::<f32>());
@@ -149,7 +153,8 @@ pub struct DiffusionGemmaTrainConfig {
     pub corrupted_only: bool,
     /// Global gradient-norm clip threshold (0.0 disables clipping).
     pub max_grad_norm: f32,
-    /// Seed for the per-step noise-level sampler.
+    /// Seed of every step's noise: the noise level and the corruption of
+    /// step `n` are functions of this seed and `n` alone.
     pub seed: u64,
 }
 
@@ -208,8 +213,8 @@ pub fn quantize_diffusion_gemma_base(
 
 /// DiffusionGemma block-diffusion LoRA trainer.
 ///
-/// Owns the AdamW optimizer (its moments keyed by adapter parameter name)
-/// and the noise-level RNG. Call [`Self::train_step`] with a clean canvas to run the
+/// Owns the AdamW optimizer (its moments keyed by adapter parameter name).
+/// Call [`Self::train_step`] with a clean canvas to run the
 /// full stochastic objective (sample `t`, corrupt, denoise, update), or
 /// [`Self::train_on_batch`] with a caller-supplied corruption for a
 /// deterministic step (reproducible runs, curriculum, overfit checks).
@@ -224,14 +229,11 @@ pub struct DiffusionGemmaTrainer {
     optimizer: AdamW,
     /// Completed optimiser steps.
     step: u64,
-    /// Noise-level sampler.
-    rng: StdRng,
 }
 
 impl DiffusionGemmaTrainer {
     /// Create a trainer for a model whose vocabulary size is `vocab`.
     pub fn new(config: DiffusionGemmaTrainConfig, vocab: i32) -> Self {
-        let rng = StdRng::seed_from_u64(config.seed);
         let optimizer = AdamW::new(config.learning_rate, config.weight_decay)
             .with_betas(config.beta1, config.beta2)
             .with_eps(config.eps)
@@ -241,7 +243,6 @@ impl DiffusionGemmaTrainer {
             vocab,
             optimizer,
             step: 0,
-            rng,
         }
     }
 
@@ -250,18 +251,33 @@ impl DiffusionGemmaTrainer {
         self.step
     }
 
+    /// The noisy canvas and corruption mask the next step trains on: a noise
+    /// level `t ~ U(min, 1]` and a uniform-categorical corruption of
+    /// `canvas_x0` at it.
+    ///
+    /// Both are functions of the config's seed and the step alone, through
+    /// the step's seed [`draw_bits`]`(seed, step)`, as every seeded sampler's
+    /// draws are: the same seed trains on the same noise at every step
+    /// whatever else draws random numbers meanwhile, and a run resumed at a
+    /// step draws what the uninterrupted run did there.
+    fn step_noise(&self, canvas_x0: &Array) -> (Array, Array) {
+        let step_seed = draw_bits(self.config.seed, self.step);
+        let t: f32 =
+            StdRng::seed_from_u64(step_seed).random_range(self.config.min_noise_level..=1.0);
+        uniform_categorical_noise(canvas_x0, 1.0 - t, self.vocab, Some(step_seed))
+    }
+
     /// Full stochastic training step: sample a noise level `t ~ U(min, 1]`,
     /// corrupt `canvas_x0` with the uniform-categorical kernel, denoise it
     /// conditioned on `context_ids`, and take one AdamW step on the adapters.
+    /// The noise is the step's own ([`Self::step_noise`]).
     pub fn train_step(
         &mut self,
         model: &mut AdaptedModel,
         context_ids: &Array,
         canvas_x0: &Array,
     ) -> Result<DiffusionGemmaStepStats, Exception> {
-        let t: f32 = self.rng.random_range(self.config.min_noise_level..=1.0);
-        let keep_prob = 1.0 - t;
-        let (x_t, mask) = uniform_categorical_noise(canvas_x0, keep_prob, self.vocab, None);
+        let (x_t, mask) = self.step_noise(canvas_x0);
         // Realise the corruption before it feeds the differentiable forward.
         x_t.eval();
         mask.eval();
@@ -418,6 +434,84 @@ mod tests {
             (96.0..160.0).contains(&corrupted),
             "keep_prob=0.5 corrupted {corrupted}/256, expected ~128"
         );
+    }
+
+    fn ints(a: &Array) -> Vec<i32> {
+        let a = a.as_type::<i32>();
+        a.eval();
+        a.as_slice::<i32>().to_vec()
+    }
+
+    /// A seeded corruption is a function of its seed alone: other draws on
+    /// the thread don't change it, and it neither reseeds nor advances the
+    /// thread's key.
+    #[test]
+    #[serial]
+    fn a_seeded_corruption_is_independent_of_the_thread_key() {
+        let vocab = 1000;
+        let x0 = Array::from_slice(&vec![3i32; 4 * 64], &[4, 64]);
+        let corrupt = |seed| {
+            let (x_t, mask) = uniform_categorical_noise(&x0, 0.5, vocab, Some(seed));
+            (ints(&x_t), ints(&mask))
+        };
+        let thread_draw = || ints(&random::randint(0, 1 << 30, &[8], Dtype::Int32, None));
+
+        random::seed(1);
+        let a = corrupt(42);
+        let after_a = thread_draw();
+        random::seed(99);
+        let _ = thread_draw();
+        assert_eq!(a, corrupt(42), "the same seed corrupted differently");
+
+        // The thread's key went on from where it was, untouched.
+        random::seed(1);
+        assert_eq!(
+            thread_draw(),
+            after_a,
+            "the corruption moved the thread's key"
+        );
+
+        let b = corrupt(43);
+        assert_ne!(a.0, b.0, "another seed drew the same tokens");
+        assert_ne!(a.1, b.1, "another seed kept the same positions");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// Each step's noise is a function of the config's seed and the step:
+    /// two trainers with one seed draw the same noise at every step, whatever
+    /// else draws in between, and different steps and seeds draw differently.
+    #[test]
+    #[serial]
+    fn each_step_draws_its_own_noise_from_the_seed() {
+        let vocab = 1000;
+        let x0 = Array::from_slice(&vec![3i32; 64], &[1, 64]);
+        let noise = |trainer: &DiffusionGemmaTrainer| {
+            let (x_t, mask) = trainer.step_noise(&x0);
+            (ints(&x_t), ints(&mask))
+        };
+        let config = DiffusionGemmaTrainConfig {
+            seed: 7,
+            ..Default::default()
+        };
+        let mut a = DiffusionGemmaTrainer::new(config.clone(), vocab);
+        let mut b = DiffusionGemmaTrainer::new(config.clone(), vocab);
+
+        random::seed(1);
+        let a0 = noise(&a);
+        a.step = 1;
+        let a1 = noise(&a);
+        random::seed(99);
+        let _ = ints(&random::randint(0, vocab, &[8], Dtype::Int32, None));
+        b.step = 1;
+        assert_eq!(noise(&b), a1, "step 1 drew different noise");
+        b.step = 0;
+        assert_eq!(noise(&b), a0, "step 0 drew different noise");
+        assert_ne!(a0, a1, "steps 0 and 1 drew the same noise");
+
+        let other =
+            DiffusionGemmaTrainer::new(DiffusionGemmaTrainConfig { seed: 8, ..config }, vocab);
+        assert_ne!(noise(&other), a0, "seeds 7 and 8 drew the same noise");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]

@@ -1150,12 +1150,14 @@ unsafe extern "C" {
         shape: *const i32,
         ndim: i32,
         dtype: i32,
+        key: *const RawBuf,
     );
     pub(super) fn mlx_inline_random_uniform(
         dst: *mut RawBuf,
         shape: *const i32,
         ndim: i32,
         dtype: i32,
+        key: *const RawBuf,
     );
     pub(super) fn mlx_inline_random_bernoulli(
         dst: *mut RawBuf,

@@ -10,16 +10,20 @@ extern "C" {
 
 // ── Training ops: random ─────────────────────────────────────────────────────
 
-void mlx_inline_random_normal(mlx_inline_array* dst, const int* shape, int ndim, int dtype) {
+void mlx_inline_random_normal(mlx_inline_array* dst, const int* shape, int ndim, int dtype,
+                              const mlx_inline_array* key) {
     BRIDGE_TRY_DST("random_normal", dst,
         new (dst->buf) array(mlx::core::random::normal(
-        {shape, shape + ndim}, dtype_from_int(dtype))));
+        {shape, shape + ndim}, dtype_from_int(dtype),
+        key ? std::optional<array>(as_arr(key)) : std::nullopt)));
 }
 
-void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim, int dtype) {
+void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim, int dtype,
+                               const mlx_inline_array* key) {
     BRIDGE_TRY_DST("random_uniform", dst,
         new (dst->buf) array(mlx::core::random::uniform(
-        {shape, shape + ndim}, dtype_from_int(dtype))));
+        {shape, shape + ndim}, dtype_from_int(dtype),
+        key ? std::optional<array>(as_arr(key)) : std::nullopt)));
 }
 
 void mlx_inline_random_bernoulli(mlx_inline_array* dst, const mlx_inline_array* p, const int* shape, int ndim) {

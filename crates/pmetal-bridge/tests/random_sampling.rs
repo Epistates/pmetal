@@ -60,6 +60,41 @@ fn a_keyed_draw_depends_on_the_key_and_nothing_else() {
     check_unobserved_error().expect("no bridge op failed");
 }
 
+/// Keyed uniform and normal draws are functions of their key alone, and
+/// leave the thread's key where it was.
+#[test]
+fn keyed_uniform_and_normal_draws_depend_on_the_key_alone() {
+    use pmetal_bridge::compat::Dtype;
+    let floats = |a: Array| a.as_slice::<f32>().to_vec();
+    for draw in [random::uniform_keyed, random::normal_keyed] {
+        let key = random::key(7);
+        random::seed(1);
+        let first = floats(draw(&[256], Dtype::Float32, Some(&key)));
+        let thread_after_first = floats(random::uniform(&[8], Dtype::Float32));
+        random::seed(99);
+        let _ = floats(random::uniform(&[8], Dtype::Float32));
+        let again = floats(draw(&[256], Dtype::Float32, Some(&key)));
+        assert_eq!(first, again, "the same key drew different values");
+
+        // The keyed draw did not move the thread's key.
+        random::seed(1);
+        assert_eq!(
+            floats(random::uniform(&[8], Dtype::Float32)),
+            thread_after_first,
+            "a keyed draw moved the thread's key"
+        );
+
+        let other = floats(draw(&[256], Dtype::Float32, Some(&random::key(8))));
+        assert_ne!(first, other, "two keys drew the same values");
+        // Without a key the draw takes the thread's key.
+        random::seed(5);
+        let unkeyed = floats(draw(&[256], Dtype::Float32, None));
+        random::seed(5);
+        assert_eq!(unkeyed, floats(draw(&[256], Dtype::Float32, None)));
+    }
+    check_unobserved_error().expect("no bridge op failed");
+}
+
 #[test]
 fn a_seeded_decode_draw_is_the_same_on_any_thread() {
     let params = SamplingParams {

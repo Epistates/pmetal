@@ -206,21 +206,50 @@ impl InlineArray {
         }
     }
 
+    /// Sample from N(0,1) with the calling thread's default key.
     pub fn random_normal(shape: &[i32], dtype: i32) -> Self {
+        Self::random_normal_keyed(shape, dtype, None)
+    }
+
+    /// Sample from N(0,1). With a `key` ([`Self::random_key`]) the draw is a
+    /// function of it alone; without one it takes the calling thread's
+    /// default key, which every unkeyed draw advances.
+    pub fn random_normal_keyed(shape: &[i32], dtype: i32, key: Option<&Self>) -> Self {
+        let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_random_normal(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
+            mlx_inline_random_normal(
+                dst.as_mut_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype,
+                key,
+            );
             Self {
                 raw: dst.assume_init(),
             }
         }
     }
 
-    /// Sample from U(0,1) with given shape and dtype.
+    /// Sample from U(0,1) with the calling thread's default key.
     pub fn random_uniform(shape: &[i32], dtype: i32) -> Self {
+        Self::random_uniform_keyed(shape, dtype, None)
+    }
+
+    /// Sample from U(0,1). With a `key` ([`Self::random_key`]) the draw is a
+    /// function of it alone; without one it takes the calling thread's
+    /// default key, which every unkeyed draw advances.
+    pub fn random_uniform_keyed(shape: &[i32], dtype: i32, key: Option<&Self>) -> Self {
+        let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_random_uniform(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
+            mlx_inline_random_uniform(
+                dst.as_mut_ptr(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype,
+                key,
+            );
             Self {
                 raw: dst.assume_init(),
             }
