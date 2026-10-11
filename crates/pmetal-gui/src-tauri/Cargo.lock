@@ -6113,7 +6113,6 @@ dependencies = [
  "rand 0.10.3",
  "ratatui",
  "regex",
- "reqwest",
  "safetensors",
  "serde",
  "serde-saphyr",
@@ -6140,6 +6139,8 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
 ]
 
 [[package]]

@@ -190,43 +190,20 @@ pub fn run() {
 // startup init tasks.
 // ---------------------------------------------------------------------------
 
-/// Point the MLX backend at an `mlx.metallib`.
+/// Point the MLX backend at the `mlx.metallib` built with the MLX this app
+/// links.
 ///
-/// MLX cannot load a single Metal kernel without it. The bundled app carries one
-/// as a Tauri resource; a source checkout has one next to the built executable or
-/// in the shared cache that `pmetal-bridge`'s build script writes. Without this,
-/// the only thing that ever populated that cache was building PMetal from source
-/// on the same machine, so a GUI installed from the .dmg alone had no metallib
-/// at all.
-///
-/// Handing the path to `set_metallib_path` is what MLX honours (upstream API
-/// since MLX v0.32). `PMETAL_METALLIB_PATH` is still read here as an operator
-/// override, but MLX itself no longer looks at it — before v0.32 that env var
-/// was serviced by a patch to MLX's own `load_default_library`, which this crate
-/// no longer carries. The `pmetal` CLI processes this app spawns run their own
-/// search, so the path isn't exported to them.
+/// MLX cannot load a single Metal kernel without it. The bundled app carries
+/// one as a Tauri resource; a build from a source checkout uses the one its
+/// build produced. The search is `pmetal_bridge::metallib::locate`'s, as the
+/// CLI's: `PMETAL_METALLIB_PATH`, the per-version metallib cache, the build's
+/// own file, then the bundle resource and a copy next to the executable. The
+/// `pmetal` CLI processes this app spawns run their own search.
 fn ensure_metallib(app: &tauri::AppHandle) {
+    use pmetal_bridge::metallib;
     use tauri::path::BaseDirectory;
 
-    // Operator override. The CLI honours the same variable the same way.
-    if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH")
-        && !explicit.is_empty()
-    {
-        let explicit = std::path::PathBuf::from(explicit);
-        match pmetal_bridge::inline_array::validate_metallib(&explicit) {
-            Ok(()) => {
-                pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
-                return;
-            }
-            Err(e) => tracing::warn!(
-                path = %explicit.display(),
-                "PMETAL_METALLIB_PATH is unusable ({e}); searching the default locations"
-            ),
-        }
-    }
-
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-
     if let Ok(path) = app.path().resolve("mlx.metallib", BaseDirectory::Resource) {
         candidates.push(path);
     }
@@ -235,30 +212,23 @@ fn ensure_metallib(app: &tauri::AppHandle) {
     {
         candidates.push(dir.join("mlx.metallib"));
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(std::path::PathBuf::from(home).join(".cache/pmetal/lib/mlx.metallib"));
-    }
 
-    // A candidate that is there but fails the header check would make MLX
-    // abort on its first allocation, so it is skipped with a warning.
-    let usable = |p: &std::path::PathBuf| match pmetal_bridge::inline_array::validate_metallib(p) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            tracing::warn!(path = %p.display(), "skipping unusable mlx.metallib: {e}");
-            false
-        }
-    };
-    match candidates.into_iter().find(|p| usable(p)) {
-        Some(path) => {
-            tracing::info!(path = %path.display(), "Found mlx.metallib");
-            pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
+    // A file that is there but fails the header check would make MLX fail
+    // its first allocation, so it is skipped with a warning.
+    let found = metallib::locate(metallib::BUILT_SHA256, &candidates, |path, e| {
+        tracing::warn!(path = %path.display(), "skipping unusable mlx.metallib: {e}");
+    });
+    match found {
+        Some(located) => {
+            tracing::info!(path = %located.path.display(), "Found mlx.metallib");
+            pmetal_bridge::inline_array::set_metallib_path(&located.path.to_string_lossy());
         }
         None => {
             tracing::error!(
                 "mlx.metallib not found — MLX kernels will fail to load. \
-                 Install the pmetal CLI (it carries an embedded copy and extracts \
-                 it to ~/.cache/pmetal/lib/) or set PMETAL_METALLIB_PATH."
+                 Reinstall PMetal, or set PMETAL_METALLIB_PATH to the mlx.metallib \
+                 built with MLX {}.",
+                metallib::MLX_REVISION
             );
         }
     }

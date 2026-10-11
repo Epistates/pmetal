@@ -1,5 +1,9 @@
 use cmake::Config;
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// The MLX revision this crate builds against, tag or commit.
 ///
@@ -66,9 +70,23 @@ fn emit_mlx_rpath(path: &str) {
 /// own artifacts — it does not propagate to downstream bins. Rewriting the
 /// dylib's own install name is the one setting that every dependent binary
 /// inherits.
+///
+/// A dylib that already carries the name is left alone. The build script
+/// watches the library it links (see `emit_link_inputs_rerun`), so rewriting
+/// it on every run would make every build rerun this script.
 #[cfg(target_os = "macos")]
 fn set_dylib_install_name(dylib: &std::path::Path) {
     if !dylib.exists() {
+        return;
+    }
+    let current = Command::new("otool")
+        .arg("-D")
+        .arg(dylib)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    if current.is_some_and(|text| text.lines().nth(1) == Some(&*dylib.display().to_string())) {
         return;
     }
     let status = Command::new("install_name_tool")
@@ -333,16 +351,17 @@ fn run_cmake_build() -> PathBuf {
     {
         config.define("CMAKE_BUILD_TYPE", "Release");
         config.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", "ON");
-        // Release normally builds MLX as a dylib: `libmlx.a` is ~200 MB, and a
-        // release `cargo test` links ~96 test binaries, so a static MLX there
-        // is not viable.
+        // A shipped binary has to run on a machine that has never seen this
+        // build tree, so release links MLX statically by default
+        // (`mlx_static_requested`): the artifact carries MLX inside it, with
+        // no dylib to locate, no install name, no rpath, nothing to bundle.
+        // Dead-stripping at link time keeps it near the size of the dynamic
+        // build.
         //
-        // A *distributed* binary is the opposite case — one binary, and it has
-        // to run on a machine that has never seen this build tree. Set
-        // PMETAL_MLX_STATIC=1 for those (see .github/workflows/release.yml) and
-        // the artifact carries MLX inside it: no dylib to locate, no install
-        // name, no rpath, nothing to bundle. Dead-stripping at link time keeps
-        // the result near the size of the dynamic build.
+        // This repository's own release builds opt out (PMETAL_MLX_STATIC=0
+        // in .cargo/config.toml): `libmlx.a` is ~200 MB, and a release
+        // `cargo test` links ~96 test binaries. Its release jobs set
+        // PMETAL_MLX_STATIC=1 back for the artifacts they ship.
     }
     // Always explicit, both ways: CMake caches it in the build tree, so
     // leaving it unset for a static build meant a directory that last built
@@ -356,15 +375,21 @@ fn run_cmake_build() -> PathBuf {
     config.build()
 }
 
-/// Whether to link MLX statically even in release. See the call site.
+/// Whether to link MLX statically in release. See the call site.
 ///
-/// Debug already builds static unconditionally, so this only steers release.
+/// Static unless `PMETAL_MLX_STATIC` says otherwise. A build with no say in
+/// the matter is a `cargo install pmetal` or a crate depending on this one,
+/// and a shared MLX there is a dylib whose install name points into a build
+/// directory that `cargo install` deletes. This repository's
+/// `.cargo/config.toml` sets `PMETAL_MLX_STATIC=0` for its own release
+/// builds, where ~96 test binaries each linking a static MLX would not be
+/// viable. Debug builds static unconditionally, so this only steers release.
 fn mlx_static_requested() -> bool {
-    env::var("PMETAL_MLX_STATIC").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    env::var("PMETAL_MLX_STATIC").map_or(true, |v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-/// Whether this build produces `libmlx.dylib` (else `libmlx.a`): release,
-/// unless PMETAL_MLX_STATIC asks for static.
+/// Whether this build produces `libmlx.dylib` (else `libmlx.a`): only a
+/// release build with PMETAL_MLX_STATIC=0.
 fn mlx_builds_shared() -> bool {
     !cfg!(debug_assertions) && !mlx_static_requested()
 }
@@ -380,6 +405,101 @@ fn mlx_lib_names() -> (&'static str, &'static str) {
     } else {
         ("libmlx.a", mlx_dylib_name())
     }
+}
+
+// ── What the link depends on ──────────────────────────────────────────────
+
+/// Rerun this script when the MLX it linked against changes or disappears.
+///
+/// That MLX can live in a prefix slot shared by many build directories, and
+/// Cargo only reruns a build script for the files it names. Deleting or
+/// repopulating the slot while this script's output stayed cached left later
+/// builds linking against files that were gone or replaced, and the test
+/// binaries they produced computed on placeholder arrays. A watched file that
+/// changes or goes missing makes Cargo rerun the script, which rebuilds or
+/// reuses the slot as it finds it.
+fn emit_link_inputs_rerun(lib_dir: &Path, slot: Option<&Path>) {
+    let (wanted, _) = mlx_lib_names();
+    let mut watched = vec![lib_dir.join(wanted), lib_dir.join("mlx.metallib")];
+    if let Some(slot) = slot {
+        watched.push(slot.join(".mlx-version"));
+    }
+    for path in watched.into_iter().filter(|p| p.exists()) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+/// SHA-256 of `bytes`, lower-case hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Publish the `mlx.metallib` built with the MLX this crate links: its path
+/// and SHA-256, to this crate (`PMETAL_BRIDGE_MLX_METALLIB{,_SHA256}`, read by
+/// `pmetal_bridge::metallib`) and to dependents
+/// (`DEP_PMETAL_BRIDGE_MLX_METALLIB{,_SHA256}`).
+///
+/// Nothing is written outside OUT_DIR. Cargo asks build scripts not to, and a
+/// sandboxed build (Homebrew's) can't. This script used to copy the file to an
+/// unversioned `~/.cache/pmetal/lib/mlx.metallib`, which every build of every
+/// MLX version overwrote for every installed binary. Binaries built here find
+/// the file at this path while it exists; an application that outlives its
+/// build tree carries its own copy (the CLI embeds one, the GUI bundles one)
+/// and caches it by MLX revision and content hash at run time.
+fn publish_metallib(lib_dir: &Path) -> Option<PathBuf> {
+    if !cfg!(feature = "metal") {
+        return None;
+    }
+    let metallib = lib_dir.join("mlx.metallib");
+    let bytes = std::fs::read(&metallib).ok()?;
+    let sha256 = sha256_hex(&bytes);
+    emit_bridge_metadata("mlx_metallib", metallib.display().to_string());
+    emit_bridge_metadata("mlx_metallib_sha256", &sha256);
+    println!(
+        "cargo:rustc-env=PMETAL_BRIDGE_MLX_METALLIB={}",
+        metallib.display()
+    );
+    println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_METALLIB_SHA256={sha256}");
+    Some(metallib)
+}
+
+/// Write `pmetal_metallib_config.h` for the bridge's C++, naming the metallib
+/// [`publish_metallib`] found (empty when there is none). Returns the
+/// directory to put on the include path.
+fn write_metallib_config(metallib: Option<&Path>) -> PathBuf {
+    let dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("generated");
+    std::fs::create_dir_all(&dir).expect("Failed to create OUT_DIR/generated");
+    let path = metallib
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let mut literal = String::with_capacity(path.len() + 2);
+    for byte in path.bytes() {
+        match byte {
+            b'"' | b'\\' => {
+                literal.push('\\');
+                literal.push(byte as char);
+            }
+            0x20..=0x7e => literal.push(byte as char),
+            // Octal escapes keep any other byte (UTF-8 included) exact.
+            _ => literal.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    let header = format!(
+        "// Generated by pmetal-bridge's build.rs.\n\
+         #pragma once\n\n\
+         // The mlx.metallib built with the MLX this bridge links, or \"\".\n\
+         #define PMETAL_BUILT_METALLIB \"{literal}\"\n"
+    );
+    let file = dir.join("pmetal_metallib_config.h");
+    // Unchanged contents keep their mtime, so the C++ doesn't rebuild for nothing.
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(header.as_str()) {
+        std::fs::write(&file, header).expect("Failed to write pmetal_metallib_config.h");
+    }
+    dir
 }
 
 // ── Main build ────────────────────────────────────────────────────────────
@@ -507,6 +627,11 @@ fn build_and_link() {
     println!("cargo:rustc-env=PMETAL_BRIDGE_MLX_GIT_TAG={BUNDLED_MLX_GIT_TAG}");
     emit_bridge_metadata("mlx_lib_dir", mlx_lib_dir.display().to_string());
 
+    emit_link_inputs_rerun(&mlx_lib_dir_built, mlx_prefix.as_deref());
+
+    // ── mlx.metallib ──
+    let built_metallib = publish_metallib(&mlx_lib_dir_built);
+
     // ── Compile bridge C++ sources via cc::Build ──
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
@@ -540,6 +665,8 @@ fn build_and_link() {
     build
         // MLX C++ headers (mlx/mlx.h)
         .include(&mlx_include)
+        // pmetal_metallib_config.h, written by `write_metallib_config`
+        .include(write_metallib_config(built_metallib.as_deref()))
         // bridge.h / bridge_internal.h live alongside the source files
         .include(manifest_dir.join("cpp"))
         .flag("-w") // suppress warnings from MLX internals
@@ -582,49 +709,6 @@ fn build_and_link() {
             println!(
                 "cargo:warning=clang_rt NOT FOUND — ___isPlatformVersionAtLeast may be missing"
             );
-        }
-    }
-
-    // ── Cache mlx.metallib ──
-    #[cfg(feature = "metal")]
-    {
-        // Either the freshly built tree or the reused cache has it at <lib>/mlx.metallib
-        let metallib = mlx_lib_dir_built.join("mlx.metallib");
-        if metallib.exists() {
-            emit_bridge_metadata("mlx_metallib", metallib.display().to_string());
-            // For this crate's own tests: with PMETAL_MLX_PREFIX (CI) the file
-            // lives in the prefix, not under OUT_DIR.
-            println!(
-                "cargo:rustc-env=PMETAL_BRIDGE_MLX_METALLIB={}",
-                metallib.display()
-            );
-            if let Ok(home) = env::var("HOME") {
-                let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
-                let dest = cache_dir.join("mlx.metallib");
-                let should_copy = if dest.exists() {
-                    dest.metadata()
-                        .and_then(|d| {
-                            metallib.metadata().map(|s| {
-                                s.modified()
-                                    .ok()
-                                    .zip(d.modified().ok())
-                                    .is_some_and(|(src_t, dst_t)| src_t > dst_t)
-                            })
-                        })
-                        .unwrap_or(false)
-                } else {
-                    true
-                };
-                if should_copy {
-                    let _ = std::fs::create_dir_all(&cache_dir);
-                    match std::fs::copy(&metallib, &dest) {
-                        Ok(_) => {
-                            println!("cargo:warning=Cached mlx.metallib to {}", dest.display())
-                        }
-                        Err(e) => println!("cargo:warning=Failed to cache mlx.metallib: {}", e),
-                    }
-                }
-            }
         }
     }
 

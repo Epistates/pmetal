@@ -40,10 +40,28 @@ pub fn metal_start_capture(path: &str) -> bool {
 /// Point MLX at a specific `mlx.metallib` (upstream `set_metallib_path`,
 /// MLX >= 0.32). Lazy: MLX consults the stored path when the Metal device
 /// first loads its kernel library, so call this before the first GPU op.
-/// Replaces the pre-0.32 source patch that read PMETAL_METALLIB_PATH.
+///
+/// The bridge already points MLX at the metallib its own build produced
+/// (see [`crate::metallib`]); an application that ships its own copy calls
+/// this to use that one instead.
 pub fn set_metallib_path(path: &str) {
     let c_path = std::ffi::CString::new(path).unwrap();
     unsafe { mlx_inline_set_metallib_path(c_path.as_ptr()) }
+}
+
+/// The `mlx.metallib` MLX loads (or loaded) its kernels from, as last given to
+/// [`set_metallib_path`] or chosen by the bridge at load. `None` when MLX is
+/// left to its own search (next to the binary, then the path compiled into
+/// libmlx).
+pub fn metallib_path() -> Option<std::path::PathBuf> {
+    // SAFETY: returns a pointer into MLX's stored std::string, copied here
+    // before anything can set it again.
+    let raw = unsafe { mlx_inline_get_metallib_path() };
+    if raw.is_null() {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path.into_owned()))
 }
 
 /// Build MLX's Metal device now, loading the metallib given to

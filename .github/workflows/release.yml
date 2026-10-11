@@ -70,16 +70,24 @@ jobs:
           fi
           echo "OK: no libmlx dependency."
 
+      # Ship the metallib the binary itself loads, checked against the one it
+      # embeds, so the tarball's copy is the same MLX build as the binary.
+      # Running `info` also proves the binary starts and loads its kernels.
       - name: Stage metallib
         run: |
-          # Find the metallib in any crate's build output (pmetal-bridge builds it)
-          MLX_METALLIB=$(find target/aarch64-apple-darwin/release/build/ -name "mlx.metallib" -path "*/out/build/lib/*" | head -1)
-          if [ -z "$MLX_METALLIB" ]; then
-            # Also check the user cache (build.rs caches metallib here)
-            MLX_METALLIB="$HOME/.cache/pmetal/lib/mlx.metallib"
+          set -euo pipefail
+          BIN=target/aarch64-apple-darwin/release/pmetal
+          INFO=$(env -u PMETAL_METALLIB_PATH "$BIN" info --json)
+          echo "$INFO" | jq .mlx
+          MLX_METALLIB=$(jq -r '.mlx.metallib // empty' <<<"$INFO")
+          EXPECTED=$(jq -r '.mlx.metallib_sha256 // empty' <<<"$INFO")
+          if [ -z "$MLX_METALLIB" ] || [ -z "$EXPECTED" ] || [ ! -f "$MLX_METALLIB" ]; then
+            echo "ERROR: the CLI reports no mlx.metallib"
+            exit 1
           fi
-          if [ ! -f "$MLX_METALLIB" ]; then
-            echo "ERROR: mlx.metallib not found in build output or cache"
+          ACTUAL=$(shasum -a 256 "$MLX_METALLIB" | cut -d' ' -f1)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: $MLX_METALLIB ($ACTUAL) is not the mlx.metallib the CLI embeds ($EXPECTED)"
             exit 1
           fi
           cp "$MLX_METALLIB" "target/aarch64-apple-darwin/release/mlx.metallib"

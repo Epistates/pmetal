@@ -59,7 +59,7 @@ cli = [
     "dep:safetensors", "dep:dirs", "dep:chrono",
     "dep:parquet", "dep:arrow-array", "dep:arrow-json",
     "dep:rand", "dep:regex", "dep:tempfile", "dep:tokenizers",
-    "dep:walkdir", "dep:flate2", "dep:libc", "dep:reqwest", "dep:sha2",
+    "dep:walkdir", "dep:flate2", "dep:libc", "dep:sha2",
 ]
 
 # Dashboard: TUI (adds ratatui/crossterm on top of cli)
@@ -117,7 +117,6 @@ tokenizers = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 # Dashboard dependencies (optional, behind "dashboard" feature)
@@ -128,6 +127,7 @@ tokio-util = { workspace = true, features = ["rt"], optional = true }
 
 [build-dependencies]
 flate2 = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

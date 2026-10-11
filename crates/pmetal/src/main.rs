@@ -1068,289 +1068,89 @@ pub enum OllamaTemplate {
     DeepSeek,
 }
 
-/// Gzip-compressed `mlx.metallib` bytes (baked in at compile time by build.rs).
-/// ~31MB compressed in the binary, ~102MB decompressed on disk.
+/// The gzip-compressed `mlx.metallib` built with the MLX this binary links,
+/// embedded by build.rs. Empty when the build had none.
 #[cfg(target_os = "macos")]
 static MLX_METALLIB_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mlx.metallib.gz"));
 
-/// Extract the embedded `mlx.metallib` to `~/.cache/pmetal/lib/mlx.metallib`,
-/// decompressing the gzip'd blob on first run. Skips if a valid metallib is
-/// already there; a wrong, empty or truncated one is replaced.
-/// Returns the path if extraction succeeded.
+/// SHA-256 of the embedded metallib, uncompressed.
+const EMBEDDED_METALLIB_SHA256: Option<&str> = option_env!("PMETAL_EMBEDDED_METALLIB_SHA256");
+
+/// Write the embedded metallib into the metallib cache and return its path:
+/// the user's (`~/.cache/pmetal/lib`), or one under the temporary directory
+/// when that can't be written.
 #[cfg(target_os = "macos")]
-fn extract_embedded_metallib() -> Option<PathBuf> {
+fn extract_embedded_metallib(sha256: &str) -> Option<PathBuf> {
     use flate2::read::GzDecoder;
+    use pmetal_bridge::metallib::Cache;
     use std::io::Read;
 
     if MLX_METALLIB_GZ.is_empty() {
         return None;
     }
-    let home = std::env::var("HOME").ok()?;
-    let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
-    let dest = cache_dir.join("mlx.metallib");
-
-    // Skip if already present and whole. A corrupt copy is overwritten below
-    // rather than returned, or it would reach MLX and abort the process.
-    if pmetal_bridge::inline_array::validate_metallib(&dest).is_ok() {
-        return Some(dest);
-    }
-
-    std::fs::create_dir_all(&cache_dir).ok()?;
-    let tmp = dest.with_extension("metallib.tmp");
-
-    let mut decoder = GzDecoder::new(MLX_METALLIB_GZ);
-    let mut decompressed = Vec::new();
-    if decoder.read_to_end(&mut decompressed).is_err() {
+    let mut bytes = Vec::new();
+    if let Err(e) = GzDecoder::new(MLX_METALLIB_GZ).read_to_end(&mut bytes) {
+        tracing::warn!("the embedded mlx.metallib does not decompress: {e}");
         return None;
     }
-
-    std::fs::write(&tmp, &decompressed).ok()?;
-    std::fs::rename(&tmp, &dest).ok()?;
-    tracing::info!("Extracted embedded mlx.metallib to {}", dest.display());
-    Some(dest)
-}
-
-/// Discover `mlx.metallib` and hand it to MLX via the upstream
-/// `set_metallib_path` API (MLX >= 0.32) so the backend can find it
-/// regardless of where the binary is installed.
-///
-/// Whether `path` holds a whole Metal library. A file that is there but fails
-/// the check (wrong, empty or truncated) is reported, so the search moves past
-/// it rather than handing MLX a library it can't load.
-fn usable_metallib(path: &Path) -> bool {
-    match pmetal_bridge::inline_array::validate_metallib(path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), "skipping unusable mlx.metallib: {e}");
-            false
-        }
-    }
-}
-
-/// Search order: `PMETAL_METALLIB_PATH` → colocated → cache → Homebrew →
-/// embedded → download → error.
-fn ensure_metallib() {
-    // 0. Operator override. The GUI honours the same variable.
-    if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH").filter(|p| !p.is_empty()) {
-        let explicit = PathBuf::from(explicit);
-        match pmetal_bridge::inline_array::validate_metallib(&explicit) {
-            Ok(()) => {
-                pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
-                return;
+    let caches = Cache::user()
+        .into_iter()
+        .chain([Cache::at(std::env::temp_dir().join("pmetal-metallib"))]);
+    for cache in caches {
+        match cache.install(&bytes, sha256) {
+            Ok(path) => {
+                tracing::info!("Extracted the embedded mlx.metallib to {}", path.display());
+                return Some(path);
             }
             Err(e) => tracing::warn!(
-                path = %explicit.display(),
-                "PMETAL_METALLIB_PATH is unusable ({e}); searching the default locations"
+                dir = %cache.dir().display(),
+                "could not write the embedded mlx.metallib: {e}"
             ),
         }
     }
+    None
+}
 
-    let metallib_name = "mlx.metallib";
-    let cache_dir = std::env::var("HOME")
+#[cfg(not(target_os = "macos"))]
+fn extract_embedded_metallib(_sha256: &str) -> Option<PathBuf> {
+    None
+}
+
+/// Point MLX at the `mlx.metallib` built with the MLX this binary links,
+/// before anything builds its Metal device.
+///
+/// In order (`pmetal_bridge::metallib::locate`): `PMETAL_METALLIB_PATH`; the
+/// metallib cache's entry for the embedded copy; the file the build produced,
+/// while it exists; an `mlx.metallib` next to the executable, as the release
+/// tarball ships it. Failing those, the embedded copy is written into the
+/// cache. Each binary's copy is keyed by MLX revision and content hash, so
+/// installed pmetal versions don't overwrite each other's.
+fn ensure_metallib() {
+    use pmetal_bridge::metallib;
+
+    let colocated: Vec<PathBuf> = std::env::current_exe()
         .ok()
-        .map(|h| PathBuf::from(h).join(".cache/pmetal/lib"));
-    let mut search_paths: Vec<PathBuf> = Vec::new();
+        .and_then(|exe| exe.parent().map(|dir| dir.join("mlx.metallib")))
+        .into_iter()
+        .collect();
+    let sha256 = EMBEDDED_METALLIB_SHA256.or(metallib::BUILT_SHA256);
+    let found = metallib::locate(sha256, &colocated, |path, e| {
+        tracing::warn!(path = %path.display(), "skipping unusable mlx.metallib: {e}");
+    })
+    .map(|located| located.path)
+    .or_else(|| EMBEDDED_METALLIB_SHA256.and_then(extract_embedded_metallib));
 
-    // 1. Colocated with binary
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            search_paths.push(dir.join(metallib_name));
+    match found {
+        Some(path) => {
+            tracing::debug!(path = %path.display(), "Using mlx.metallib");
+            pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
         }
-    }
-
-    // 2. User cache ($HOME/.cache/pmetal/lib/) — matches C++ fallback path
-    if let Some(ref cache) = cache_dir {
-        search_paths.push(cache.join(metallib_name));
-    }
-    // 3. Homebrew Apple Silicon
-    search_paths.push("/opt/homebrew/lib/mlx.metallib".into());
-    // 4. Homebrew Intel / standard
-    search_paths.push("/usr/local/lib/mlx.metallib".into());
-
-    if let Some(path) = search_paths.iter().find(|p| usable_metallib(p)) {
-        // Since MLX v0.32 the override is upstream API (set_metallib_path),
-        // replacing the pre-0.32 source patch that read an env var.
-        #[cfg(any(feature = "models", feature = "native-only"))]
-        pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
-        tracing::debug!(path = %path.display(), "Found mlx.metallib");
-
-        // Auto-cache: if found colocated with binary, copy to cache dir for resilience
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                if path.as_path() == dir.join(metallib_name) {
-                    if let Some(ref cache) = cache_dir {
-                        let dest = cache.join(metallib_name);
-                        if !dest.exists() {
-                            let _ = std::fs::create_dir_all(cache);
-                            if std::fs::copy(path, &dest).is_ok() {
-                                tracing::debug!("Cached metallib to {}", dest.display());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    // Try extracting the embedded metallib (baked in at compile time)
-    if let Some(path) = extract_embedded_metallib() {
-        #[cfg(any(feature = "models", feature = "native-only"))]
-        pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
-        tracing::debug!(path = %path.display(), "Using embedded mlx.metallib");
-        return;
-    }
-
-    // Not found locally — try to auto-download from GitHub releases
-    if let Some(ref cache) = cache_dir {
-        let dest = cache.join(metallib_name);
-        if download_metallib(&dest) {
-            #[cfg(any(feature = "models", feature = "native-only"))]
-            pmetal_bridge::inline_array::set_metallib_path(&dest.to_string_lossy());
-            return;
-        }
-    }
-
-    // Download failed or no HOME — print actionable instructions
-    let locations = search_paths
-        .iter()
-        .map(|p| format!("  - {}", p.display()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    eprintln!(
-        "\n\x1b[1;33mwarning:\x1b[0m mlx.metallib not found — Metal GPU acceleration will fail.\n\n\
-         Searched:\n{locations}\n\n\
-         To fix this, do ONE of the following:\n\
-         \x1b[1m  1. Rebuild from source:\x1b[0m  cargo install pmetal  (auto-caches metallib)\n\
-         \x1b[1m  2. Download manually:\x1b[0m\n\
-             curl -fSL -o ~/.cache/pmetal/lib/mlx.metallib \\\n\
-               https://github.com/epistates/pmetal/releases/download/v{version}/mlx.metallib\n\
-         \x1b[1m  3. Homebrew:\x1b[0m             brew install epistates/tap/pmetal\n\n\
-         The metallib ships with every pmetal release and is built during compilation.\n\
-         See: https://github.com/epistates/pmetal#installation\n",
-        version = env!("CARGO_PKG_VERSION"),
-    );
-}
-
-/// SHA-256 of the released `mlx.metallib` artifact.
-///
-/// Empty string in dev builds.  Set to the hex digest of the artifact for
-/// official releases so every download is cryptographically verified before
-/// being committed to the cache.
-const METALLIB_SHA256: &str = match option_env!("PMETAL_METALLIB_SHA256") {
-    Some(s) => s,
-    None => "",
-};
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
-}
-
-/// Download `mlx.metallib` from the matching GitHub release.
-///
-/// Uses `reqwest` (no subprocess) and verifies the SHA-256 of the downloaded
-/// bytes when `METALLIB_SHA256` is non-empty.  Writes to a temp file first,
-/// then atomically renames into place so a failed download never leaves a
-/// corrupted cache entry.
-///
-/// Returns `true` if the download succeeded and the file is verified.
-fn download_metallib(dest: &std::path::Path) -> bool {
-    let version = env!("CARGO_PKG_VERSION");
-    let url =
-        format!("https://github.com/epistates/pmetal/releases/download/v{version}/mlx.metallib");
-
-    eprintln!(
-        "\x1b[1;36minfo:\x1b[0m mlx.metallib not found locally. \
-         Downloading from GitHub releases (one-time setup)..."
-    );
-
-    if let Some(parent) = dest.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    // Use a temp file so a partial download never leaves a broken metallib.
-    let tmp = dest.with_extension("metallib.tmp");
-
-    // Build a single-threaded tokio runtime for the blocking download
-    // (this function is called before the main async runtime is started).
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("\x1b[1;33mwarning:\x1b[0m Failed to create download runtime: {e}");
-            return false;
-        }
-    };
-
-    let bytes: Vec<u8> = match rt.block_on(async {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("pmetal/", env!("CARGO_PKG_VERSION")))
-            .build()?;
-        let response = client
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        Ok::<_, reqwest::Error>(response.to_vec())
-    }) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!(
-                "\x1b[1;33mwarning:\x1b[0m Download failed (offline or release v{version} \
-                 not published yet): {e}\n"
-            );
-            return false;
-        }
-    };
-
-    // Verify SHA-256 when a reference digest is compiled in.
-    if !METALLIB_SHA256.is_empty() {
-        use sha2::Digest as _;
-        let digest = sha2::Sha256::digest(&bytes);
-        let hex = lower_hex(digest.as_ref());
-        if hex != METALLIB_SHA256 {
-            eprintln!(
-                "\x1b[1;31merror:\x1b[0m SHA-256 mismatch for mlx.metallib\n\
-                 expected: {METALLIB_SHA256}\n\
-                 got:      {hex}\n\
-                 The downloaded file has been discarded."
-            );
-            return false;
-        }
-    }
-
-    // Write to temp file, then atomically rename into place.
-    if let Err(e) = std::fs::write(&tmp, &bytes) {
-        eprintln!("\x1b[1;33mwarning:\x1b[0m Failed to write temp metallib: {e}");
-        return false;
-    }
-    // Catches a bad file even when no SHA-256 was compiled in.
-    if let Err(e) = pmetal_bridge::inline_array::validate_metallib(&tmp) {
-        eprintln!("\x1b[1;33mwarning:\x1b[0m Downloaded mlx.metallib is unusable: {e}");
-        let _ = std::fs::remove_file(&tmp);
-        return false;
-    }
-
-    if std::fs::rename(&tmp, dest).is_ok() {
-        eprintln!(
-            "\x1b[1;32minfo:\x1b[0m Cached mlx.metallib to {}\n",
-            dest.display()
-        );
-        true
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-        false
+        None => eprintln!(
+            "\x1b[1;33mwarning:\x1b[0m no mlx.metallib for this build's MLX ({revision}) was \
+             found, and none is embedded in this binary.\n\
+             Set PMETAL_METALLIB_PATH to the mlx.metallib built with it, or reinstall pmetal.",
+            revision = metallib::MLX_REVISION,
+        ),
     }
 }
 

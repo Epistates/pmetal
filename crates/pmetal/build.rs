@@ -1,20 +1,19 @@
 //! Build script for pmetal.
 //!
-//! Locates `mlx.metallib` produced by the bridge build, compresses it with gzip,
-//! and writes it to OUT_DIR so it can be embedded into the binary via
-//! `include_bytes!`. At runtime the binary decompresses it on first use.
-//!
-//! Raw metallib is ~102MB; gzip-compressed is ~31MB — keeps the binary lean
-//! while ensuring `cargo install pmetal` is fully self-contained.
+//! Embeds the `mlx.metallib` built with the MLX this binary links, gzip
+//! compressed, so an installed `pmetal` carries its own kernels (~31 MB of
+//! ~102 MB). On first use the binary writes it to the per-version metallib
+//! cache (`pmetal_bridge::metallib::Cache`). Its SHA-256 is compiled in as
+//! `PMETAL_EMBEDDED_METALLIB_SHA256`, which names the cache entry and checks
+//! the bytes written there.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_LIB_DIR");
     println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_METALLIB");
     println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MIN_MACOS");
-    println!("cargo:rerun-if-env-changed=HOME");
 
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "macos" {
         return;
@@ -26,30 +25,32 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let dest = out_dir.join("mlx.metallib.gz");
 
-    // If we already have the compressed blob (incremental rebuild), skip.
-    if dest.is_file() {
-        emit(&dest);
-        return;
+    // Only the bridge's own metallib, the one built with the MLX this links.
+    // This used to fall back to scanning sibling build directories and to an
+    // unversioned copy in ~/.cache, either of which could hold another MLX
+    // revision's kernels.
+    let metallib = env::var("DEP_PMETAL_BRIDGE_MLX_METALLIB")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file());
+    match metallib {
+        Some(src) => {
+            // Re-embed when the file changes, as when the MLX prefix slot it
+            // lives in is rebuilt.
+            println!("cargo:rerun-if-changed={}", src.display());
+            let sha256 = compress_metallib(&src, &dest);
+            println!("cargo:rustc-env=PMETAL_EMBEDDED_METALLIB_SHA256={sha256}");
+        }
+        None => {
+            // An empty blob keeps `include_bytes!` compiling; at run time the
+            // binary then looks for a metallib instead of extracting one.
+            std::fs::write(&dest, b"").unwrap();
+            println!(
+                "cargo:warning=pmetal-bridge published no mlx.metallib (built without the \
+                 `metal` feature?), so none is embedded. The binary will look for one at run time."
+            );
+        }
     }
-
-    if let Some(src) = find_metallib() {
-        compress_metallib(&src, &dest);
-        emit(&dest);
-    } else {
-        // Write an empty file so `include_bytes!` compiles even without the metallib.
-        // The runtime check (`MLX_METALLIB_GZ.is_empty()`) handles this gracefully.
-        std::fs::write(&dest, b"").unwrap();
-        emit(&dest);
-        println!(
-            "cargo:warning=mlx.metallib not found at build time — \
-             embedded metallib will not be available. \
-             The binary will fall back to runtime discovery/download."
-        );
-    }
-}
-
-fn emit(path: &std::path::Path) {
-    println!("cargo:rustc-env=MLX_METALLIB_EMBED_PATH={}", path.display());
 }
 
 /// Stamp the binary with the macOS floor the bridge was built against, so it
@@ -82,11 +83,17 @@ fn emit_runtime_rpath() {
     }
 }
 
-fn compress_metallib(src: &std::path::Path, dest: &std::path::Path) {
+/// Gzip `src` into `dest` and return the SHA-256 of the uncompressed bytes.
+fn compress_metallib(src: &Path, dest: &Path) -> String {
+    use sha2::Digest as _;
     use std::io::Write;
 
     let raw = std::fs::read(src)
         .unwrap_or_else(|e| panic!("Failed to read mlx.metallib from {}: {e}", src.display()));
+    let sha256: String = sha2::Sha256::digest(&raw)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
 
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(&raw).expect("gzip compression failed");
@@ -98,67 +105,7 @@ fn compress_metallib(src: &std::path::Path, dest: &std::path::Path) {
             dest.display()
         )
     });
-
-    let raw_mb = raw.len() as f64 / 1_048_576.0;
-    let gz_mb = compressed.len() as f64 / 1_048_576.0;
-    println!(
-        "cargo:warning=Compressed mlx.metallib: {raw_mb:.1}MB → {gz_mb:.1}MB ({:.0}% reduction)",
-        (1.0 - gz_mb / raw_mb) * 100.0
-    );
-}
-
-/// Search for mlx.metallib in order:
-/// 1. `pmetal-bridge` build-script metadata
-/// 2. Sibling pmetal-bridge build output directories (same target/profile/build/)
-/// 3. ~/.cache/pmetal/lib/ (cached by the bridge build.rs)
-fn find_metallib() -> Option<PathBuf> {
-    if let Ok(path) = env::var("DEP_PMETAL_BRIDGE_MLX_METALLIB") {
-        let candidate = PathBuf::from(path);
-        if candidate.is_file() {
-            println!(
-                "cargo:warning=Found mlx.metallib from pmetal-bridge metadata: {}",
-                candidate.display()
-            );
-            return Some(candidate);
-        }
-    }
-
-    let out_dir = PathBuf::from(env::var("OUT_DIR").ok()?);
-
-    // OUT_DIR is typically: target/<profile>/build/<crate>-<hash>/out
-    // We want:              target/<profile>/build/pmetal-bridge-<hash>/out/build/lib/mlx.metallib
-    if let Some(build_dir) = out_dir.parent().and_then(|p| p.parent()) {
-        if let Ok(entries) = std::fs::read_dir(build_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("pmetal-bridge-") && entry.path().is_dir() {
-                    let candidate = entry.path().join("out/build/lib/mlx.metallib");
-                    if candidate.is_file() {
-                        println!(
-                            "cargo:warning=Found mlx.metallib in build dir: {}",
-                            candidate.display()
-                        );
-                        return Some(candidate);
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: check the cache directory
-    if let Ok(home) = env::var("HOME") {
-        let cached = PathBuf::from(home).join(".cache/pmetal/lib/mlx.metallib");
-        if cached.is_file() {
-            println!(
-                "cargo:warning=Found mlx.metallib in cache: {}",
-                cached.display()
-            );
-            return Some(cached);
-        }
-    }
-
-    None
+    sha256
 }
 
 enum MlxLinkage {

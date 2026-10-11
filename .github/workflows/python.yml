@@ -28,8 +28,12 @@ jobs:
       - name: Install maturin
         run: pip install "maturin>=1.15,<2.0"
 
+      # A wheel runs far from this build tree, so MLX is linked into the
+      # extension module (.cargo/config.toml otherwise links it shared here).
       - name: Build wheel
         working-directory: crates/pmetal-py
+        env:
+          PMETAL_MLX_STATIC: '1'
         run: maturin build --release --strip
 
       - name: Install wheel and run tests

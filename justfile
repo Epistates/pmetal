@@ -99,12 +99,16 @@ stage-gui-sidecar: build-cli
     TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
     mkdir -p "$SIDECAR_DIR"
     cp target/release/pmetal "$SIDECAR_DIR/pmetal-$TRIPLE"
-    METALLIB=$(find target/release/build -name mlx.metallib -path '*/out/build/lib/*' | head -1)
-    if [[ -z "$METALLIB" ]]; then
-        METALLIB="$HOME/.cache/pmetal/lib/mlx.metallib"
+    # The metallib the CLI itself loads, checked against the one it embeds.
+    INFO=$(env -u PMETAL_METALLIB_PATH target/release/pmetal info --json)
+    METALLIB=$(jq -r '.mlx.metallib // empty' <<<"$INFO")
+    EXPECTED=$(jq -r '.mlx.metallib_sha256 // empty' <<<"$INFO")
+    if [[ -z "$METALLIB" || -z "$EXPECTED" || ! -f "$METALLIB" ]]; then
+        echo "FAIL: the CLI reports no mlx.metallib"
+        exit 1
     fi
-    if [[ ! -f "$METALLIB" ]]; then
-        echo "FAIL: mlx.metallib not found in the build output or the cache"
+    if [[ $(shasum -a 256 "$METALLIB" | cut -d' ' -f1) != "$EXPECTED" ]]; then
+        echo "FAIL: $METALLIB is not the mlx.metallib the CLI embeds ($EXPECTED)"
         exit 1
     fi
     cp "$METALLIB" "$SIDECAR_DIR/mlx.metallib"
