@@ -290,10 +290,16 @@ impl PenaltyBuffer {
 /// the same tokens whichever thread runs it and whatever else draws random
 /// numbers meanwhile, which the thread's shared MLX key cannot promise.
 pub fn draw_key(seed: u64, draw: u64) -> InlineArray {
+    InlineArray::random_key(draw_bits(seed, draw))
+}
+
+/// The `draw`-th output of the SplitMix64 sequence started at `seed`: the
+/// bits [`draw_key`] makes its key from, for a draw taken on the host.
+pub fn draw_bits(seed: u64, draw: u64) -> u64 {
     let mut z = seed.wrapping_add(draw.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    InlineArray::random_key(z ^ (z >> 31))
+    z ^ (z >> 31)
 }
 
 /// Sample a token from `[B, vocab]` logits through the pipeline in

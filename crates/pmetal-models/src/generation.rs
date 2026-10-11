@@ -1218,9 +1218,65 @@ pub fn sampling_log_probs_with_counts(
     logits_to_log_probs(&log_probs)
 }
 
-/// Sample from a normalized log-probability distribution.
-pub fn sample_from_log_probs(log_probs: &Array) -> Result<u32, Exception> {
-    Ok(categorical(log_probs, -1, None).item::<u32>())
+/// The random draws of one speculative generation: the tokens it samples
+/// (drafts, corrections, bonus tokens) and the uniforms its acceptance tests
+/// compare against.
+///
+/// Seeded, the `n`-th draw of either kind comes from
+/// [`pmetal_bridge::decode::draw_key`]`(seed, n)` (or its bits, for a
+/// uniform), as the plain sampler's tokens do: no random state is shared
+/// with the thread or with another generation, so a seeded speculative
+/// decode picks the same tokens whichever thread runs it and whatever else
+/// draws meanwhile. Unseeded, tokens take the thread's MLX key and uniforms
+/// a SplitMix64 stream started from the clock.
+#[derive(Debug)]
+pub struct SpeculativeDraws {
+    seed: Option<u64>,
+    /// The seed, or the clock when unseeded: where the uniforms come from.
+    uniform_seed: u64,
+    next: u64,
+}
+
+impl SpeculativeDraws {
+    /// The draws of a generation with this seed (`None`: unseeded).
+    pub fn new(seed: Option<u64>) -> Self {
+        let uniform_seed = seed.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x1234_5678_9abc_def0, |d| d.as_nanos() as u64)
+        });
+        Self {
+            seed,
+            uniform_seed,
+            next: 0,
+        }
+    }
+
+    fn advance(&mut self) -> u64 {
+        let draw = self.next;
+        self.next += 1;
+        draw
+    }
+
+    /// Sample a token from normalized log-probabilities.
+    pub fn sample(&mut self, log_probs: &Array) -> Result<u32, Exception> {
+        let draw = self.advance();
+        let key = self
+            .seed
+            .map(|seed| pmetal_bridge::decode::draw_key(seed, draw));
+        let token = categorical(log_probs, -1, key.as_ref());
+        token.eval();
+        pmetal_bridge::check_last_error()
+            .map_err(|e| Exception::custom(format!("speculative sample: {e}")))?;
+        Ok(token.item::<u32>())
+    }
+
+    /// A uniform in `[0, 1)`, with 24 random bits.
+    pub fn uniform(&mut self) -> f32 {
+        let draw = self.advance();
+        let bits = pmetal_bridge::decode::draw_bits(self.uniform_seed, draw);
+        (bits >> 40) as f32 / (1u64 << 24) as f32
+    }
 }
 
 /// Return `exp(log_probs[token])`, validating the token against the vocabulary.

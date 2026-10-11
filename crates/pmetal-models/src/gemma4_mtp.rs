@@ -13,7 +13,7 @@ use crate::{
         Gemma4AssistantForCausalLM, Gemma4AssistantSharedKvStates, Gemma4Config, Gemma4ForCausalLM,
     },
     generation::{
-        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, sample_from_log_probs,
+        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
         sampling_log_probs_with_counts, token_probability_from_log_probs,
     },
 };
@@ -333,10 +333,7 @@ fn generate_gemma4_mtp_sampling_streaming<F>(
 where
     F: FnMut(u32) -> bool,
 {
-    if let Some(seed) = gen_config.seed {
-        pmetal_bridge::inline_array::random_seed(seed);
-        seed_acceptance_rng(seed);
-    }
+    let mut draws = SpeculativeDraws::new(gen_config.seed);
 
     validate_gemma4_mtp_pair(target, assistant)?;
     let kv_sources = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)?;
@@ -383,7 +380,7 @@ where
                 &draft_counts,
                 &gen_config,
             )?;
-            let draft_token = sample_from_log_probs(&log_probs)?;
+            let draft_token = draws.sample(&log_probs)?;
             draft_tokens.push(draft_token);
             draft_log_probs.push(log_probs);
             draft_history.push(draft_token);
@@ -402,7 +399,7 @@ where
                 &generated_counts,
                 &gen_config,
             )?;
-            let token = sample_from_log_probs(&log_probs)?;
+            let token = draws.sample(&log_probs)?;
             let continue_stream = emit_token(
                 token,
                 &mut token_ids,
@@ -446,14 +443,14 @@ where
                 0.0
             };
 
-            if rand_uniform() < accept_prob {
+            if draws.uniform() < accept_prob {
                 accepted += 1;
                 verify_history.push(token);
                 increment_count(&mut verify_counts, token);
             } else {
                 let correction_log_probs =
                     correction_log_probs(&target_log_probs, draft_log_probs_row)?;
-                correction = Some(sample_from_log_probs(&correction_log_probs)?);
+                correction = Some(draws.sample(&correction_log_probs)?);
                 break;
             }
         }
@@ -471,7 +468,7 @@ where
                     &verify_counts,
                     &gen_config,
                 )?;
-                let bonus = sample_from_log_probs(&log_probs)?;
+                let bonus = draws.sample(&log_probs)?;
                 planned.push(bonus);
                 Some(bonus)
             } else {
@@ -622,47 +619,6 @@ fn select_last_sequence(values: &Array) -> Array {
 fn select_last_logits(logits: &Array) -> Array {
     let seq_len = logits.dim(1);
     select_axis(logits, seq_len - 1, 1)
-}
-
-fn seed_acceptance_rng(seed: u64) {
-    ACCEPTANCE_RNG_STATE.with(|state| {
-        state.set(if seed == 0 {
-            0xdead_beef_cafe_1234
-        } else {
-            seed
-        });
-    });
-}
-
-fn rand_uniform() -> f32 {
-    ACCEPTANCE_RNG_STATE.with(|state| {
-        let mut x = state.get();
-        if x == 0 {
-            x = seed_from_time();
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        state.set(x);
-        (x >> 40) as f32 / (1u64 << 24) as f32
-    })
-}
-
-fn seed_from_time() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    if seed == 0 {
-        0xdead_beef_cafe_1234
-    } else {
-        seed
-    }
-}
-
-thread_local! {
-    static ACCEPTANCE_RNG_STATE: std::cell::Cell<u64> = std::cell::Cell::new(seed_from_time());
 }
 
 #[cfg(test)]

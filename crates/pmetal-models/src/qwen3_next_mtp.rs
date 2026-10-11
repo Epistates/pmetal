@@ -11,7 +11,7 @@ use pmetal_mlx::{
 use crate::{
     architectures::{Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM},
     generation::{
-        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, sample_from_log_probs,
+        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
         sampling_log_probs_with_counts, token_probability_from_log_probs,
     },
 };
@@ -110,10 +110,7 @@ where
             speculative_metrics: None,
         });
     }
-    if let Some(seed) = gen_config.seed {
-        pmetal_bridge::inline_array::random_seed(seed);
-        seed_acceptance_rng(seed);
-    }
+    let mut draws = SpeculativeDraws::new(gen_config.seed);
 
     validate_qwen3_next_mtp_pair(target, mtp)?;
     target_cache.reset();
@@ -164,7 +161,7 @@ where
                     &draft_counts,
                     &gen_config,
                 )?;
-                let token = sample_from_log_probs(&log_probs)?;
+                let token = draws.sample(&log_probs)?;
                 draft_log_probs.push(log_probs);
                 token
             } else {
@@ -203,6 +200,7 @@ where
                 &token_ids,
                 &generated_counts,
                 &gen_config,
+                &mut draws,
             )?
         } else {
             accept_greedy_draft(&draft_tokens, &prev_target_logits, &verify_logits)
@@ -228,7 +226,7 @@ where
                         &verify_counts,
                         &gen_config,
                     )?;
-                    sample_from_log_probs(&log_probs)?
+                    draws.sample(&log_probs)?
                 } else {
                     greedy_token(&row)
                 };
@@ -368,10 +366,7 @@ where
             speculative_metrics: None,
         });
     }
-    if let Some(seed) = gen_config.seed {
-        pmetal_bridge::inline_array::random_seed(seed);
-        seed_acceptance_rng(seed);
-    }
+    let mut draws = SpeculativeDraws::new(gen_config.seed);
 
     validate_qwen3_next_mtp_pair(target, mtp)?;
     let mut mtp_state = rebuild_qwen_mtp_state(
@@ -409,7 +404,7 @@ where
                     &draft_counts,
                     &gen_config,
                 )?;
-                let token = sample_from_log_probs(&log_probs)?;
+                let token = draws.sample(&log_probs)?;
                 draft_log_probs.push(log_probs);
                 token
             } else {
@@ -445,6 +440,7 @@ where
                 &token_ids,
                 &generated_counts,
                 &gen_config,
+                &mut draws,
             )?
         } else {
             accept_greedy_draft(&draft_tokens, &mtp_state.prev_target_logits, &verify_logits)
@@ -470,7 +466,7 @@ where
                         &verify_counts,
                         &gen_config,
                     )?;
-                    sample_from_log_probs(&log_probs)?
+                    draws.sample(&log_probs)?
                 } else {
                     greedy_token(&row)
                 };
@@ -626,6 +622,7 @@ fn accept_sampled_draft(
     token_ids: &[u32],
     generated_counts: &HashMap<u32, usize>,
     gen_config: &GenerationConfig,
+    draws: &mut SpeculativeDraws,
 ) -> Result<(usize, Option<u32>), Exception> {
     let mut accepted = 0usize;
     let mut verify_history = token_ids.to_vec();
@@ -649,17 +646,14 @@ fn accept_sampled_draft(
             0.0
         };
 
-        if rand_uniform() < accept_prob {
+        if draws.uniform() < accept_prob {
             accepted += 1;
             verify_history.push(token);
             increment_count(&mut verify_counts, token);
         } else {
             let correction_log_probs =
                 correction_log_probs(&target_log_probs, draft_log_probs_row)?;
-            return Ok((
-                accepted,
-                Some(sample_from_log_probs(&correction_log_probs)?),
-            ));
+            return Ok((accepted, Some(draws.sample(&correction_log_probs)?)));
         }
     }
 
@@ -795,43 +789,6 @@ fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {
     *token_counts.entry(token).or_insert(0) += 1;
 }
 
-thread_local! {
-    static ACCEPTANCE_RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-fn seed_acceptance_rng(seed: u64) {
-    ACCEPTANCE_RNG_STATE.with(|state| {
-        state.set(if seed == 0 {
-            0xdead_beef_cafe_1234
-        } else {
-            seed
-        });
-    });
-}
-
-fn rand_uniform() -> f32 {
-    ACCEPTANCE_RNG_STATE.with(|state| {
-        let mut x = state.get();
-        if x == 0 {
-            x = seed_from_time();
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        state.set(x);
-        (x >> 40) as f32 / (1u64 << 24) as f32
-    })
-}
-
-fn seed_from_time() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0x1234_5678_9abc_def0);
-    nanos ^ 0xa5a5_5a5a_dead_beef
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -882,5 +839,85 @@ mod tests {
 
         validate_qwen3_next_mtp_pair(&target, &mtp).unwrap();
         assert_eq!(mtp.create_cache(16).config().num_layers, 2);
+    }
+
+    /// The tokens of a sampled MTP decode on a tiny random target and
+    /// predictor. With `disturb`, every emitted token also draws from the
+    /// thread's MLX key, as another stream sharing the thread would.
+    fn sampled_mtp_tokens(seed: Option<u64>, disturb: bool) -> Vec<u32> {
+        use pmetal_bridge::compat::{Dtype, random};
+        use pmetal_mlx::kv_cache::KVCacheConfig;
+
+        let config = crate::architectures::Qwen3NextConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            head_dim: Some(8),
+            partial_rotary_factor: 0.5,
+            vocab_size: 64,
+            num_experts: 0,
+            mtp_num_hidden_layers: Some(1),
+            ..Default::default()
+        };
+        random::seed(5);
+        let mut target = Qwen3NextForCausalLM::new(config.clone()).unwrap();
+        let mut mtp = Qwen3NextMtpForCausalLM::new(config.clone()).unwrap();
+        let mut target_cache = KVCache::new(KVCacheConfig::new(2, 128, 1, 8));
+        let mut mamba = MambaCache::new(2);
+        let mut mtp_cache = mtp.create_cache(128);
+        let gen_config = GenerationConfig {
+            max_new_tokens: 32,
+            temperature: 1.0,
+            do_sample: true,
+            seed,
+            ..Default::default()
+        };
+        let out = generate_qwen3_next_mtp_streaming(
+            &mut target,
+            &mut mtp,
+            &[1, 2, 3, 4],
+            gen_config,
+            &mut target_cache,
+            &mut mamba,
+            &mut mtp_cache,
+            Qwen3NextMtpConfig {
+                num_draft_tokens: 3,
+            },
+            |_| {
+                if disturb {
+                    random::uniform(&[8], Dtype::Float32).eval();
+                }
+                true
+            },
+        )
+        .expect("generate");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        out.token_ids
+    }
+
+    /// A seed fixes the tokens of a sampled MTP decode, drafts, acceptance
+    /// tests, corrections and bonus tokens alike, whatever else draws from
+    /// the thread's key meanwhile and whichever thread runs it.
+    #[test]
+    #[serial_test::serial]
+    fn a_seeded_mtp_decode_draws_the_same_tokens_whatever_else_draws() {
+        let first = sampled_mtp_tokens(Some(7), false);
+        assert_eq!(first.len(), 4 + 32);
+        assert_eq!(
+            sampled_mtp_tokens(Some(7), true),
+            first,
+            "draws on the thread's key moved the seeded tokens"
+        );
+        let elsewhere = std::thread::spawn(|| sampled_mtp_tokens(Some(7), true))
+            .join()
+            .expect("thread");
+        assert_eq!(elsewhere, first, "another thread drew other tokens");
+        assert_ne!(
+            sampled_mtp_tokens(Some(8), false),
+            first,
+            "the seed is unused"
+        );
     }
 }

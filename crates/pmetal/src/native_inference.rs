@@ -14,7 +14,7 @@ use pmetal_models::{
     Qwen3NextMtpConfig,
     architectures::Qwen3NextMtpForCausalLM,
     generation::{
-        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, sample_from_log_probs,
+        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
         sampling_log_probs_with_counts, token_probability_from_log_probs,
     },
 };
@@ -661,10 +661,7 @@ pub fn run_qwen3_native_mtp_inference_ext(
 
     ensure_native_bridge_metal_available()?;
 
-    if let Some(seed) = gen_config.seed {
-        pmetal_bridge::inline_array::random_seed(seed);
-        seed_acceptance_rng(seed);
-    }
+    let mut draws = SpeculativeDraws::new(gen_config.seed);
 
     let config = qwen3_native::load_config(model_path)?;
     tracing::debug!(
@@ -727,7 +724,8 @@ pub fn run_qwen3_native_mtp_inference_ext(
                     &gen_config,
                 )
                 .map_err(|e| format!("native Qwen MTP draft sampling: {e}"))?;
-                let token = sample_from_log_probs(&log_probs)
+                let token = draws
+                    .sample(&log_probs)
                     .map_err(|e| format!("native Qwen MTP draft sample: {e}"))?;
                 draft_log_probs.push(log_probs);
                 token
@@ -761,6 +759,7 @@ pub fn run_qwen3_native_mtp_inference_ext(
                 &token_ids,
                 &generated_counts,
                 &gen_config,
+                &mut draws,
             )?
         } else {
             accept_greedy_draft(&draft_tokens, &prev_target_logits, &verify_logits)
@@ -787,7 +786,8 @@ pub fn run_qwen3_native_mtp_inference_ext(
                         &gen_config,
                     )
                     .map_err(|e| format!("native Qwen MTP bonus sampling: {e}"))?;
-                    sample_from_log_probs(&log_probs)
+                    draws
+                        .sample(&log_probs)
                         .map_err(|e| format!("native Qwen MTP bonus sample: {e}"))?
                 } else {
                     greedy_token(&row)
@@ -981,6 +981,7 @@ fn accept_sampled_draft(
     token_ids: &[u32],
     generated_counts: &HashMap<u32, usize>,
     gen_config: &GenerationConfig,
+    draws: &mut SpeculativeDraws,
 ) -> Result<(usize, Option<u32>), String> {
     let mut accepted = 0usize;
     let mut verify_history = token_ids.to_vec();
@@ -1007,7 +1008,7 @@ fn accept_sampled_draft(
             0.0
         };
 
-        if rand_uniform() < accept_prob {
+        if draws.uniform() < accept_prob {
             accepted += 1;
             verify_history.push(token);
             increment_count(&mut verify_counts, token);
@@ -1017,7 +1018,8 @@ fn accept_sampled_draft(
             return Ok((
                 accepted,
                 Some(
-                    sample_from_log_probs(&correction_log_probs)
+                    draws
+                        .sample(&correction_log_probs)
                         .map_err(|e| format!("native Qwen MTP correction sample: {e}"))?,
                 ),
             ));
@@ -1083,43 +1085,6 @@ fn greedy_token(logits: &Array) -> u32 {
 
 fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {
     *token_counts.entry(token).or_insert(0) += 1;
-}
-
-thread_local! {
-    static ACCEPTANCE_RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-fn seed_acceptance_rng(seed: u64) {
-    ACCEPTANCE_RNG_STATE.with(|state| {
-        state.set(if seed == 0 {
-            0xdead_beef_cafe_1234
-        } else {
-            seed
-        });
-    });
-}
-
-fn rand_uniform() -> f32 {
-    ACCEPTANCE_RNG_STATE.with(|state| {
-        let mut x = state.get();
-        if x == 0 {
-            x = seed_from_time();
-        }
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        state.set(x);
-        (x >> 40) as f32 / (1u64 << 24) as f32
-    })
-}
-
-fn seed_from_time() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
-        .unwrap_or(0x1234_5678_9abc_def0);
-    nanos ^ 0xa5a5_5a5a_dead_beef
 }
 
 // ============================================================================
