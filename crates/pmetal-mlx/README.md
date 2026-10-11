@@ -11,7 +11,7 @@ This crate provides the bridge between PMetal and Apple's MLX framework, along w
 - **Gradient Checkpointing**: Memory-efficient training for large models
 - **KV Cache**: Efficient key-value caching for inference
 - **Mixture of Experts**: MoE layer implementations
-- **Speculative Decoding**: Faster inference with draft models
+- **Speculative Decoding State**: The hidden states a draft model reads and the recurrent-layer inputs a rollback replays
 
 ## Usage
 
@@ -33,7 +33,7 @@ fn setup() {
 | `gradient_checkpoint` | Gradient-checkpointing config (the mechanism lives in `pmetal-bridge`) |
 | `kv_cache` | Key-value cache for efficient inference |
 | `moe` | Mixture of Experts support |
-| `speculative` | Speculative decoding utilities |
+| `speculative` | `SpecCapture`, the state a target's forward pass records for speculative decoding |
 
 ## License
 

@@ -8,7 +8,7 @@
 //! - Memory management utilities for Apple Silicon
 //! - KV caching for efficient inference
 //! - Mixture of Experts (MoE) for sparse models
-//! - Speculative decoding for faster inference
+//! - The state a target model records for speculative decoding
 
 #![warn(missing_docs)]
 
