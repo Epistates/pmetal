@@ -42,7 +42,7 @@ fn pretrain_smoke_loss_decreases() {
     // Deterministic synthetic batch — the loop sees the same tokens every
     // step, so loss must decrease as the model memorises them.
     let fixed_batch =
-        random::randint(0, vocab, &[batch, seq], Dtype::Int32).expect("random tokens");
+        random::randint(0, vocab, &[batch, seq], Dtype::Int32, None).expect("random tokens");
     let batch_iter = std::iter::repeat_with(move || fixed_batch.clone());
 
     let config = PretrainConfig {

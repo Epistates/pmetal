@@ -244,7 +244,18 @@ impl InlineArray {
     }
 
     /// Random integers in [low, high) with given shape and dtype.
-    pub fn random_randint(low: i32, high: i32, shape: &[i32], dtype: i32) -> Self {
+    ///
+    /// `key` is an MLX PRNG key ([`Self::random_key`]); the same key always
+    /// draws the same integers. Without one the draw takes the calling
+    /// thread's default key, which every unkeyed draw advances.
+    pub fn random_randint(
+        low: i32,
+        high: i32,
+        shape: &[i32],
+        dtype: i32,
+        key: Option<&Self>,
+    ) -> Self {
+        let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_random_randint(
@@ -254,6 +265,7 @@ impl InlineArray {
                 shape.as_ptr(),
                 shape.len() as i32,
                 dtype,
+                key,
             );
             Self {
                 raw: dst.assume_init(),

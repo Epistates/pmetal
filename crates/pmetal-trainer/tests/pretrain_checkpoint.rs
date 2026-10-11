@@ -44,7 +44,7 @@ fn checkpoint_resume_preserves_optimizer_state() {
 
     // -- Phase A: train 10 steps --
     let mut model_a = GptOssForCausalLM::new(tiny_config()).unwrap();
-    let fixed_batch = random::randint(0, vocab, &[2, 8], Dtype::Int32).expect("rand");
+    let fixed_batch = random::randint(0, vocab, &[2, 8], Dtype::Int32, None).expect("rand");
     let batch_iter = std::iter::repeat_with({
         let b = fixed_batch.clone();
         move || b.clone()

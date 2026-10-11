@@ -54,7 +54,7 @@ fn gemma4_pretrain_smoke_with_small_model_features() {
     let mut model = Gemma4ForCausalLM::new(tiny_gemma4_config()).expect("gemma4 model init");
 
     let fixed_batch =
-        random::randint(0, vocab, &[batch, seq], Dtype::Int32).expect("random tokens");
+        random::randint(0, vocab, &[batch, seq], Dtype::Int32, None).expect("random tokens");
     let batch_iter = std::iter::repeat_with({
         let b = fixed_batch.clone();
         move || b.clone()

@@ -1238,31 +1238,38 @@ impl DiffusionGemmaForBlockDiffusion {
     /// then append the argmax canvas. Stops at `max_new_tokens` or when the
     /// canvas contains an EOS token.
     ///
-    /// The trajectory is stochastic (multinomial + uniform renoise), seeded via
-    /// `seed`; the per-step *transforms* are the parity-verified deterministic
-    /// functions above.
+    /// The trajectory is stochastic (multinomial + uniform renoise). The
+    /// `n`-th random draw of a generation (a fresh canvas, a proposal, a
+    /// renoise) takes the key [`pmetal_bridge::decode::draw_key`]`(seed, n)`,
+    /// as every sampler's draws do, so a seed picks the same tokens whatever
+    /// else draws on the thread, and the thread's own key is left alone. The
+    /// per-step *transforms* are the parity-verified deterministic functions
+    /// above.
     pub fn generate(
         &mut self,
         input_ids: &Array,
         config: &DiffusionGemmaGenerationConfig,
         seed: u64,
     ) -> Result<Array, Exception> {
-        pmetal_bridge::compat::random::seed(seed);
+        use pmetal_bridge::compat::{Dtype, random};
+
         let canvas = self.canvas_length;
         let vocab = self.vocab_size;
         let max_new_canvases = (config.max_new_tokens + canvas - 1) / canvas;
+        let mut draws = 0u64;
+        let mut next_key = || {
+            draws += 1;
+            pmetal_bridge::decode::draw_key(seed, draws - 1)
+        };
+        let uniform_canvas =
+            |key: &Array| random::randint(0, vocab, &[1, canvas], Dtype::Int32, Some(key));
 
         let mut sequence = input_ids.clone();
         for _block in 0..max_new_canvases {
             let (_enc_hidden, kvs_full) = self.encoder.forward(&sequence)?;
             let kvs = self.truncate_sliding_kvs(kvs_full);
 
-            let mut current = pmetal_bridge::compat::random::randint(
-                0,
-                vocab,
-                &[1, canvas],
-                pmetal_bridge::compat::Dtype::Int32,
-            );
+            let mut current = uniform_canvas(&next_key());
             let mut argmax_canvas = current.clone();
             let mut sc_logits: Option<Array> = None;
             let mut stopper = StableConfidentStopper::new(
@@ -1285,19 +1292,14 @@ impl DiffusionGemmaForBlockDiffusion {
 
                 // Multinomial proposal: categorical over processed logits is
                 // equivalent to multinomial over softmax(processed).
-                let denoiser = pmetal_bridge::compat::random::categorical(&processed, -1, None)
-                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+                let denoiser = random::categorical(&processed, -1, Some(&next_key()))
+                    .as_dtype(Dtype::Int32.as_i32());
 
                 let (accepted, mask) =
                     entropy_bound_accept(&processed, &current, &denoiser, config.entropy_bound);
                 // Renoise: rejected positions get fresh uniform tokens.
                 let renoise_mask = ops::logical_not(&mask);
-                let random_canvas = pmetal_bridge::compat::random::randint(
-                    0,
-                    vocab,
-                    &[1, canvas],
-                    pmetal_bridge::compat::Dtype::Int32,
-                );
+                let random_canvas = uniform_canvas(&next_key());
                 current = ops::where_fn(&renoise_mask, &random_canvas, &accepted);
 
                 let stop = stopper.should_stop(&argmax_canvas, &processed);
@@ -2234,5 +2236,46 @@ mod tests {
             va, vb,
             "generation must be deterministic under a fixed seed"
         );
+    }
+
+    /// A seed is a function of itself alone: other draws on the thread
+    /// between two generations don't change what a seed generates, and a
+    /// generation neither reseeds nor advances the thread's key.
+    #[test]
+    #[serial]
+    fn a_seeded_generation_is_independent_of_the_thread_key() {
+        use pmetal_bridge::compat::{Dtype, random};
+
+        let cfg = tiny_config();
+        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg.clone()).unwrap();
+        let prompt = Array::from_slice(&[1i32, 2, 3, 4, 5], &[1, 5]);
+        let gen_cfg = DiffusionGemmaGenerationConfig {
+            max_new_tokens: 2 * cfg.canvas_length,
+            max_denoising_steps: 4,
+            eos_token_ids: vec![],
+            ..Default::default()
+        };
+        let tokens = |a: Array| {
+            let a = a.as_type::<i32>();
+            a.eval();
+            a.as_slice::<i32>().to_vec()
+        };
+        let thread_draw = || tokens(random::randint(0, 1 << 30, &[8], Dtype::Int32, None));
+
+        random::seed(1);
+        let a = tokens(model.generate(&prompt, &gen_cfg, 42).unwrap());
+        let after_a = thread_draw();
+        random::seed(99);
+        let _ = thread_draw();
+        let b = tokens(model.generate(&prompt, &gen_cfg, 42).unwrap());
+        assert_eq!(a, b, "the same seed generated different tokens");
+
+        // The thread's key went on from where it was, untouched.
+        random::seed(1);
+        assert_eq!(thread_draw(), after_a, "generate moved the thread's key");
+
+        let c = tokens(model.generate(&prompt, &gen_cfg, 43).unwrap());
+        assert_ne!(a, c, "another seed generated the same tokens");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 }

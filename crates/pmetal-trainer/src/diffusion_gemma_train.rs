@@ -59,7 +59,7 @@ pub fn uniform_categorical_noise(
     let uniform = random::uniform_range(0.0_f32, 1.0_f32, shape, Dtype::Float32);
     // keep where u < keep_prob; corrupt otherwise.
     let keep_bool = uniform.lt(&Array::from_f32(keep_prob));
-    let random_tokens = random::randint(0, vocab, shape, Dtype::Int32);
+    let random_tokens = random::randint(0, vocab, shape, Dtype::Int32, None);
     let x0_i32 = x0.as_dtype(Dtype::Int32.as_i32());
     let x_t = ops::r#where(&keep_bool, &x0_i32, &random_tokens);
     let corrupted_mask = Array::from_f32(1.0).subtract(&keep_bool.as_type::<f32>());
@@ -391,7 +391,7 @@ mod tests {
     fn noise_rate_matches_keep_prob() {
         random::seed(7);
         let vocab = 32;
-        let x0 = random::randint(0, vocab, &[4, 64], Dtype::Int32);
+        let x0 = random::randint(0, vocab, &[4, 64], Dtype::Int32, None);
 
         // keep_prob = 1.0 -> nothing corrupted, x_t == x0.
         let (x_t, mask) = uniform_categorical_noise(&x0, 1.0, vocab, None);

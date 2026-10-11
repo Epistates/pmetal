@@ -383,8 +383,10 @@ pub mod random {
     pub fn seed(s: u64) {
         crate::inline_array::random_seed(s);
     }
-    pub fn randint(low: i32, high: i32, shape: &[i32], dtype: Dtype) -> Array {
-        Array::random_randint(low, high, shape, dtype.as_i32())
+    /// Integers drawn uniformly from `[low, high)`. With a `key` the draw is
+    /// a function of it alone; without one it takes the thread's global key.
+    pub fn randint(low: i32, high: i32, shape: &[i32], dtype: Dtype, key: Option<&Array>) -> Array {
+        Array::random_randint(low, high, shape, dtype.as_i32(), key)
     }
     pub fn bernoulli(p: &Array, shape: &[i32]) -> Array {
         Array::random_bernoulli(p, shape)

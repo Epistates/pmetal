@@ -1172,6 +1172,7 @@ unsafe extern "C" {
         shape: *const i32,
         ndim: i32,
         dtype: i32,
+        key: *const RawBuf,
     );
 
     // ── Training ops: math ──

@@ -48,7 +48,9 @@ void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim
 void mlx_inline_random_bernoulli(mlx_inline_array* dst, const mlx_inline_array* p, const int* shape, int ndim);
 void mlx_inline_random_seed(uint64_t seed);
 void mlx_inline_random_key(mlx_inline_array* dst, uint64_t seed);
-void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype);
+// `key` may be null: the draw then takes the thread's global key.
+void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype,
+                               const mlx_inline_array* key);
 
 #ifdef __cplusplus
 }

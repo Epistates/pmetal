@@ -37,10 +37,12 @@ void mlx_inline_random_key(mlx_inline_array* dst, uint64_t seed) {
         new (dst->buf) array(mlx::core::random::key(seed)));
 }
 
-void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype) {
+void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype,
+                               const mlx_inline_array* key) {
     BRIDGE_TRY_DST("random_randint", dst,
         new (dst->buf) array(mlx::core::random::randint(
-        low, high, {shape, shape + ndim}, dtype_from_int(dtype))));
+        low, high, {shape, shape + ndim}, dtype_from_int(dtype),
+        key ? std::optional<array>(as_arr(key)) : std::nullopt)));
 }
 
 // ── Training ops: math ───────────────────────────────────────────────────────
