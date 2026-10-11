@@ -794,7 +794,7 @@ pub struct Llama4TextModel {
     pub layers: Vec<Llama4DecoderLayer>,
     pub norm: nn::RmsNorm,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(Llama4TextModel; embed_tokens, layers, norm);

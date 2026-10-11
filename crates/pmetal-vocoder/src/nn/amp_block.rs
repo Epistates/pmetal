@@ -82,7 +82,7 @@ impl AMPBlock {
 
     /// Create an AMP block with BigVGAN v2 configuration.
     ///
-    /// Default: kernel_size=3, dilations=[[1,3,5], [1,3,5], [1,3,5]]
+    /// Default: kernel_size=3, `dilations=[[1,3,5], [1,3,5], [1,3,5]]`
     pub fn bigvgan_v2(channels: i32) -> Result<Self> {
         Self::new(
             channels,

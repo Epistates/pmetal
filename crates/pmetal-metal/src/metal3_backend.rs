@@ -22,7 +22,7 @@
 //!   and passed directly to [`FusedMoeExpert::forward_single_expert`].
 //!
 //! - **`fused_lora_forward`**, **`fused_cross_entropy`** and
-//!   **`fused_adamw_step`**: wired using [`DynBufRef`] (for the sampler-trait
+//!   **`fused_adamw_step`**: wired using `DynBufRef` (for the sampler-trait
 //!   mismatch) and param-info extraction from the `AdamWDescriptor` (for AdamW).
 
 use std::sync::Arc;
@@ -104,7 +104,7 @@ impl AsMetalBuffer for DynBufRef<'_> {
 /// Metal 3 kernel backend.
 ///
 /// A thin delegation layer over the existing Metal 3 kernel structs.
-/// Implements [`KernelBackend`] so that [`KernelDispatch`] can route
+/// Implements [`KernelBackend`] so that [`KernelDispatch`](crate::KernelDispatch) can route
 /// operations here without knowing the concrete kernel types.
 ///
 /// Backends are `Send + Sync` — each method constructs lightweight kernel
@@ -339,7 +339,7 @@ impl KernelBackend for Metal3Backend {
     ///
     /// [`FusedLora::forward`] is generic over `B: fused_sampler::AsMetalBuffer`.
     /// The trait provides `&dyn buffer::AsMetalBuffer`. We bridge the gap with
-    /// [`DynBufRef`], which implements `fused_sampler::AsMetalBuffer` by
+    /// `DynBufRef`, which implements `fused_sampler::AsMetalBuffer` by
     /// delegating `metal_buffer()` to `buffer::AsMetalBuffer::as_metal_buffer()`.
     fn fused_lora_forward(
         &self,
@@ -399,7 +399,7 @@ impl KernelBackend for Metal3Backend {
     /// for callers (e.g. [`Metal4Backend`] dispatch glue) that need a
     /// self-contained call without an externally owned batch.
     ///
-    /// [`Metal4Backend`]: crate::metal4::backend::Metal4Backend
+    /// [`Metal4Backend`]: crate::metal4::Metal4Backend
     fn fused_adamw_step_standalone(
         &self,
         _ctx: &Arc<MetalContext>,
@@ -410,11 +410,11 @@ impl KernelBackend for Metal3Backend {
         batch.execute()
     }
 
-    /// Fused cross-entropy via [`FusedCrossEntropy::forward_dyn`].
+    /// Fused cross-entropy via `FusedCrossEntropy::forward_dyn`.
     ///
     /// The trait provides `logits: &dyn AsMetalBuffer` to support both f32
     /// and f16 logits without an extra type parameter. [`FusedCrossEntropy`]
-    /// exposes [`forward_dyn`] which accepts the same type-erased buffer.
+    /// exposes `forward_dyn` which accepts the same type-erased buffer.
     fn fused_cross_entropy(
         &self,
         ctx: &Arc<MetalContext>,

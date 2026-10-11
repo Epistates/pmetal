@@ -8,7 +8,7 @@ use pmetal_bridge::compat::Array;
 ///
 /// # Arguments
 /// * `x` - Input tensor of shape [..., hidden_size]
-/// * `weight` - Optional scale parameter of shape [hidden_size]
+/// * `weight` - Optional scale parameter of shape `[hidden_size]`
 /// * `eps` - Epsilon for numerical stability
 ///
 /// # Returns

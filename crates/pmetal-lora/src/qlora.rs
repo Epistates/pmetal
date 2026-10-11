@@ -57,7 +57,7 @@ pub const NF4_CODEBOOK: [f32; 16] = [
     1.0,
 ];
 
-/// How a QLoRA base weight is stored. See the [module docs](self) for the
+/// How a QLoRA base weight is stored. See the module docs for the
 /// measurements behind each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QLoraScheme {
@@ -184,7 +184,7 @@ fn kept_because(path: &str, output: Option<&str>) -> Option<&'static str> {
 ///
 /// Projections already packed (a checkpoint saved quantized) are left as
 /// they are, as are the output layer, MoE routers and routed experts
-/// ([`kept_because`]) and any projection whose input width doesn't divide
+/// (`kept_because`) and any projection whose input width doesn't divide
 /// into the scheme's groups.
 pub fn quantize_base(
     model: &mut DynamicModel,

@@ -15,21 +15,21 @@
 //!
 //! | Feature | Crate | Default | Notes |
 //! |---------|-------|---------|-------|
-//! | `core` | [`pmetal-core`] | yes | Foundation types, configs, traits |
-//! | `gguf` | [`pmetal-gguf`] | yes | GGUF format support |
-//! | `metal` | [`pmetal-metal`] | yes | Metal GPU kernels |
-//! | `hub` | [`pmetal-hub`] | yes | HuggingFace Hub integration + model resolution |
-//! | `mlx` | [`pmetal-mlx`] | yes | MLX backend |
-//! | `models` | [`pmetal-models`] | yes | LLM architectures |
-//! | `lora` | [`pmetal-lora`] | no | LoRA/QLoRA training |
-//! | `trainer` | [`pmetal-trainer`] | no | Training loops (enables `data` + `distill`) |
-//! | `ane` | [`pmetal-metal`] | yes | Apple Neural Engine integration |
-//! | `data` | [`pmetal-data`] | yes | Dataset loading |
-//! | `distill` | [`pmetal-distill`] | yes* | Knowledge distillation (*enabled transitively via `trainer`) |
-//! | `merge` | [`pmetal-merge`] | no | Model merging strategies |
-//! | `vocoder` | [`pmetal-vocoder`] | no | BigVGAN neural vocoder |
-//! | `distributed` | [`pmetal-distributed`] | no | Distributed training |
-//! | `mhc` | [`pmetal-mhc`] | no | Manifold-Constrained Hyper-Connections |
+//! | `core` | `pmetal-core` | yes | Foundation types, configs, traits |
+//! | `gguf` | `pmetal-gguf` | yes | GGUF format support |
+//! | `metal` | `pmetal-metal` | yes | Metal GPU kernels |
+//! | `hub` | `pmetal-hub` | yes | HuggingFace Hub integration + model resolution |
+//! | `mlx` | `pmetal-mlx` | yes | MLX backend |
+//! | `models` | `pmetal-models` | yes | LLM architectures |
+//! | `lora` | `pmetal-lora` | no | LoRA/QLoRA training |
+//! | `trainer` | `pmetal-trainer` | no | Training loops (enables `data` + `distill`) |
+//! | `ane` | `pmetal-metal` | yes | Apple Neural Engine integration |
+//! | `data` | `pmetal-data` | yes | Dataset loading |
+//! | `distill` | `pmetal-distill` | yes* | Knowledge distillation (*enabled transitively via `trainer`) |
+//! | `merge` | `pmetal-merge` | no | Model merging strategies |
+//! | `vocoder` | `pmetal-vocoder` | no | BigVGAN neural vocoder |
+//! | `distributed` | `pmetal-distributed` | no | Distributed training |
+//! | `mhc` | `pmetal-mhc` | no | Manifold-Constrained Hyper-Connections |
 //! | `full` | (all) | no | All features |
 //!
 //! ## Direct SDK Usage

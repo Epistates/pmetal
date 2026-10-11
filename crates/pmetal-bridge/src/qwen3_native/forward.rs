@@ -490,7 +490,7 @@ pub fn compact_tree_cache(
 }
 
 /// Rollback the target KV state by `n` positions. Mirrors
-/// [`pmetal_mlx::kv_cache::KVCache::rollback`] but operates on the native
+/// `pmetal_mlx::kv_cache::KVCache::rollback` but operates on the native
 /// cache — decrements `rope_offset` on the cache and on each KV layer,
 /// leaving the underlying buffer intact. Subsequent writes refill the
 /// rejected slots.

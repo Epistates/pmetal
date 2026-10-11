@@ -338,7 +338,7 @@ impl TensorInfo {
     /// Get the number of elements in the tensor.
     ///
     /// # Panics
-    /// Panics if the calculation would overflow. Prefer [`n_elements_checked`]
+    /// Panics if the calculation would overflow. Prefer `n_elements_checked`
     /// when processing untrusted input (e.g., GGUF files from external sources).
     pub fn n_elements(&self) -> usize {
         self.n_elements_checked()
@@ -358,7 +358,7 @@ impl TensorInfo {
     /// Get the byte size of the tensor data.
     ///
     /// # Panics
-    /// Panics if the calculation would overflow. Prefer [`byte_size_checked`]
+    /// Panics if the calculation would overflow. Prefer `byte_size_checked`
     /// when processing untrusted input (e.g., GGUF files from external sources).
     pub fn byte_size(&self) -> usize {
         self.byte_size_checked()

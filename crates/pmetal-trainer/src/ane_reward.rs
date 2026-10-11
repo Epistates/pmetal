@@ -89,7 +89,7 @@ impl PendingRewards {
     /// Non-blocking check: returns `Some(result)` if scores are already ready,
     /// or `None` if the worker is still computing.
     ///
-    /// Useful for polling in time-sensitive loops; prefer [`collect`] when
+    /// Useful for polling in time-sensitive loops; prefer `collect` when
     /// you are ready to synchronize.
     pub fn try_collect(&self) -> Option<GrpoResult<Vec<f64>>> {
         match self.rx.try_recv() {
@@ -109,7 +109,7 @@ impl PendingRewards {
 /// Asynchronous wrapper around any [`RewardFunction`].
 ///
 /// Spawns a single background thread that processes scoring requests from a
-/// channel.  The caller submits a batch via [`score_async`] and receives a
+/// channel.  The caller submits a batch via `score_async` and receives a
 /// [`PendingRewards`] handle that can be collected later, after the GPU has
 /// made progress on the next training step.
 ///
@@ -123,7 +123,7 @@ impl PendingRewards {
 ///
 /// The request channel is bounded to one slot (`SyncSender` with capacity 1).
 /// If the caller submits a second request before the first has been collected,
-/// [`score_async`] will block until the worker is ready.  This prevents
+/// `score_async` will block until the worker is ready.  This prevents
 /// unbounded queue growth when scoring is slower than generation.
 ///
 /// # Shutdown
@@ -294,7 +294,7 @@ impl<'a> PipelinedGrpoSession<'a> {
     ///
     /// Returns the rewards from the **previous** step (or `None` if this is
     /// the first step).  The current step's scores are submitted in the
-    /// background and can be collected by calling [`end_step`].
+    /// background and can be collected by calling `end_step`.
     ///
     /// # Errors
     ///

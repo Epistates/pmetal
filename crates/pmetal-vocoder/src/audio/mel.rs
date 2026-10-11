@@ -171,7 +171,7 @@ pub fn mel_filterbank(config: &MelConfig) -> Result<Array> {
 /// Compute mel spectrogram from audio.
 ///
 /// # Arguments
-/// * `audio` - Audio signal [samples] or [batch, samples]
+/// * `audio` - Audio signal `[samples]` or `[batch, samples]`
 /// * `config` - Mel configuration
 /// * `stft_config` - STFT configuration
 ///

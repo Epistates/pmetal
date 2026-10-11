@@ -501,11 +501,11 @@ fn format_tool_calls_mistral(tool_calls: &[ToolCall]) -> String {
 pub enum ChatTemplateType {
     /// ChatML format: <|im_start|>role\ncontent<|im_end|>
     ChatMl,
-    /// Llama-2 format: [INST] <<SYS>>...message...[/INST]
+    /// Llama-2 format: `[INST] <<SYS>>...message...[/INST]`
     Llama2,
     /// Llama-3 format: <|start_header_id|>role<|end_header_id|>content<|eot_id|>
     Llama3,
-    /// Mistral format: [INST] message [/INST]
+    /// Mistral format: `[INST] message [/INST]`
     Mistral,
     /// Gemma format: <start_of_turn>role\ncontent<end_of_turn>
     Gemma,

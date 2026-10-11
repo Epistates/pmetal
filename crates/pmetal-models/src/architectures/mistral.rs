@@ -474,7 +474,7 @@ pub struct MistralModel {
     /// Final layer norm.
     pub norm: nn::RmsNorm,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(MistralModel; embed_tokens, layers, norm);
@@ -533,7 +533,7 @@ impl MistralModel {
 
     /// Forward pass with optional hidden-state capture for DFlash
     /// speculative decoding. When `capture` is `None` this is the same
-    /// path as [`forward_with_cache`].
+    /// path as `forward_with_cache`.
     pub fn forward_with_capture(
         &mut self,
         input_ids: &Array,

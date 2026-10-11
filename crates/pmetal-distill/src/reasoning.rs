@@ -85,8 +85,8 @@ impl RationaleLoss {
     /// # Arguments
     ///
     /// * `reasoning_weight` - Weight for reasoning tokens
-    /// * `start_marker` - Start of reasoning region (e.g., "<thinking>")
-    /// * `end_marker` - End of reasoning region (e.g., "</thinking>")
+    /// * `start_marker` - Start of reasoning region (e.g., `<thinking>`)
+    /// * `end_marker` - End of reasoning region (e.g., `</thinking>`)
     pub fn with_markers(reasoning_weight: f32, start_marker: &str, end_marker: &str) -> Self {
         Self {
             reasoning_weight,
@@ -222,8 +222,8 @@ impl DistillLoss for RationaleLoss {
 ///
 /// # Arguments
 /// * `tokens` - Tokenized sequence `[batch, seq]`
-/// * `start_token` - Token ID for the start of reasoning (e.g., "<think>")
-/// * `end_token` - Token ID for the end of reasoning (e.g., "</think>")
+/// * `start_token` - Token ID for the start of reasoning (e.g., `<think>`)
+/// * `end_token` - Token ID for the end of reasoning (e.g., `</think>`)
 pub fn generate_reasoning_mask(tokens: &Array, start_token: u32, end_token: u32) -> Result<Array> {
     let start_arr = Array::from_i32(start_token as i32);
     let end_arr = Array::from_i32(end_token as i32);

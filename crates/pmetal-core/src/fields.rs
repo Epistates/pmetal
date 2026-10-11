@@ -4,7 +4,7 @@
 //! Specs in [`crate::jobs`] derive [`JobFields`] via the `#[derive(JobSpec)]`
 //! macro in `pmetal-core-derive`, exposing per-field metadata that:
 //!
-//! - The TUI uses to materialise [`crate::FormField`]-equivalent widgets.
+//! - The TUI uses to materialise `crate::FormField`-equivalent widgets.
 //! - The CLI uses for help text and `default_value` reconciliation.
 //! - The GUI uses to auto-build (or hand-build against) Svelte forms.
 //! - The MCP server uses to construct argv for subprocess fallback.

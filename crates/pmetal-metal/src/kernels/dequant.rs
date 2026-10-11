@@ -5,7 +5,7 @@
 //! Thin wrappers around [`dispatch_linear_kernel`] — each entry point just
 //! names the Metal function to bind and forwards the input / output
 //! buffers. Any failure to allocate a command buffer or encoder now
-//! propagates as [`MetalError`] instead of panicking via `None.unwrap()`.
+//! propagates as `MetalError` instead of panicking via `None.unwrap()`.
 
 use crate::context::MetalContext;
 use crate::error::Result;

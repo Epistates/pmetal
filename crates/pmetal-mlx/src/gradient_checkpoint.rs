@@ -1,7 +1,7 @@
 //! Gradient checkpointing configuration.
 //!
 //! The mechanism lives in
-//! [`pmetal_bridge::compat::checkpointed`](pmetal_bridge::compat::checkpointed),
+//! [`pmetal_bridge::compat::checkpointed`],
 //! which runs a module's forward under `mlx::core::checkpoint`.
 //!
 //! This module used to carry an implementation built on a different idea: call

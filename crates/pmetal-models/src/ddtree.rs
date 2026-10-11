@@ -92,7 +92,7 @@ pub struct TreeBuildResult {
     /// `child_maps[i]` maps token_id → child index for node `i`. Used
     /// by the acceptance walk to follow the verified path in O(1).
     pub child_maps: Vec<BTreeMap<i32, usize>>,
-    /// `[N+1, N+1]` boolean matrix (CPU): visibility[i][j] = 1 iff
+    /// `[N+1, N+1]` boolean matrix (CPU): `visibility[i][j]` = 1 iff
     /// node j is an ancestor of node i (inclusive). Used to build the
     /// tree attention mask during compile.
     pub visibility: Vec<Vec<bool>>,

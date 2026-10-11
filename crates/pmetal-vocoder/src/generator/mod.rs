@@ -255,7 +255,7 @@ impl BigVGAN {
     /// * `mel` - Mel spectrogram [n_mels, frames] or [batch, n_mels, frames]
     ///
     /// # Returns
-    /// Audio samples [samples] or [batch, samples]
+    /// Audio samples `[samples]` or `[batch, samples]`
     pub fn generate(&self, mel: &Array) -> Result<Array> {
         let (mel, was_2d) = if mel.ndim() == 2 {
             (mel.reshape(&[1, mel.dim(0), mel.dim(1)]), true)

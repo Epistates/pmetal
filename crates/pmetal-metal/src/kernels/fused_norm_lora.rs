@@ -186,7 +186,7 @@ impl FusedNormLora {
     /// # Arguments
     ///
     /// * `input` - Input tensor [batch_size, hidden_size]
-    /// * `gamma` - RMSNorm weight [hidden_size]
+    /// * `gamma` - RMSNorm weight `[hidden_size]`
     /// * `weight` - Base weight [out_features, hidden_size]
     /// * `lora_a` - LoRA A matrix [lora_rank, hidden_size]
     /// * `lora_b` - LoRA B matrix [out_features, lora_rank]

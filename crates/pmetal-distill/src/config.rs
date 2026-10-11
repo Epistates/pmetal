@@ -80,10 +80,10 @@ pub struct LossConfig {
     #[serde(default)]
     pub outcome_supervised: bool,
 
-    /// Start marker for explicit reasoning (e.g., "<think>").
+    /// Start marker for explicit reasoning (e.g., `<think>`).
     pub start_marker: Option<String>,
 
-    /// End marker for explicit reasoning (e.g., "</think>").
+    /// End marker for explicit reasoning (e.g., `</think>`).
     pub end_marker: Option<String>,
 
     /// Hidden state distillation configuration.

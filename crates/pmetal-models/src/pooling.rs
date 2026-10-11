@@ -7,7 +7,7 @@ pub enum PoolingMode {
     /// Mean of all non-padding tokens.
     #[default]
     Mean,
-    /// First token ([CLS] for BERT, <s> for RoBERTa).
+    /// First token (`[CLS]` for BERT, `<s>` for RoBERTa).
     Cls,
     /// Element-wise max across sequence dimension.
     Max,

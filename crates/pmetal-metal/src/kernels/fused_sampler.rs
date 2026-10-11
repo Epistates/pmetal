@@ -252,7 +252,7 @@ impl FusedSampler {
     /// This is the fastest path for deterministic decoding.
     ///
     /// # Arguments
-    /// * `logits` - Logits buffer of shape [vocab_size] as f32.
+    /// * `logits` - Logits buffer of shape `[vocab_size]` as f32.
     ///
     /// # Returns
     /// The token ID with the highest logit value.
@@ -333,7 +333,7 @@ impl FusedSampler {
     /// Perform temperature sampling with filtering.
     ///
     /// # Arguments
-    /// * `logits` - Logits buffer of shape [vocab_size] as f32.
+    /// * `logits` - Logits buffer of shape `[vocab_size]` as f32.
     /// * `temperature` - Sampling temperature (higher = more random).
     /// * `top_k` - Top-K filtering (0 = disabled).
     /// * `top_p` - Top-P nucleus sampling threshold.
@@ -451,7 +451,7 @@ impl FusedSampler {
     /// Call `read_result()` after the command buffer completes to get the token.
     ///
     /// # Arguments
-    /// * `logits` - Logits buffer of shape [vocab_size] as f32.
+    /// * `logits` - Logits buffer of shape `[vocab_size]` as f32.
     ///
     /// # Returns
     /// A command buffer handle for synchronization.

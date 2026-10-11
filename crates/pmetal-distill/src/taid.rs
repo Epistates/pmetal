@@ -301,7 +301,7 @@ impl TaidDistiller {
     /// * `base_alpha` - Base alpha from temporal schedule
     ///
     /// # Returns
-    /// Per-sample alpha values [batch]
+    /// Per-sample alpha values `[batch]`
     pub fn compute_difficulty_alpha(
         &self,
         teacher_probs: &Array,
@@ -367,7 +367,7 @@ impl TaidDistiller {
     /// # Arguments
     /// * `teacher_probs` - Teacher softmax probs [batch, seq, vocab]
     /// * `student_probs` - Student softmax probs [batch, seq, vocab]
-    /// * `alpha` - Interpolation factor [batch] or scalar
+    /// * `alpha` - Interpolation factor `[batch]` or scalar
     ///
     /// # Returns
     /// Interpolated distribution [batch, seq, vocab]

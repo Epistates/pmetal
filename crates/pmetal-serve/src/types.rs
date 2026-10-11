@@ -1001,7 +1001,7 @@ pub struct EmbeddingsResponse {
     pub usage: EmbeddingsUsage,
 }
 
-/// Parse the wire `pooling` field into a [`PoolingMode`] with sensible
+/// Parse the wire `pooling` field into a `PoolingMode` with sensible
 /// defaults. Unknown modes yield `None` so the handler can 400 rather than
 /// silently applying a fallback.
 pub fn parse_pooling_mode(s: Option<&str>) -> Option<pmetal_models::pooling::PoolingMode> {

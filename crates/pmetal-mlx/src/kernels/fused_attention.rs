@@ -909,7 +909,7 @@ fn manual_sdpa_with_softcapping(
 /// ```
 ///
 /// `sinks` is a 1-D `[n_heads]` array. GQA K/V are expanded internally, exactly
-/// like [`manual_sdpa_with_softcapping`]. Logit softcapping is intentionally
+/// like `manual_sdpa_with_softcapping`. Logit softcapping is intentionally
 /// unsupported here — GPT-OSS uses sinks, not softcap.
 pub fn sink_sdpa(
     queries: &Array,

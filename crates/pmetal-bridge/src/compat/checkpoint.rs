@@ -8,7 +8,7 @@
 //! longer scales with the number of layers.
 //!
 //! [`checkpointed`] is the module-level form of
-//! [`checkpoint_apply_unchecked`](crate::inline_array::checkpoint_apply_unchecked),
+//! [`checkpoint_apply_unchecked`],
 //! and it exists because the raw primitive has a trap: `checkpoint` is a
 //! `custom_vjp`, and a `custom_vjp` differentiates only with respect to the
 //! arrays handed to it. A weight the closure merely captures is a constant to

@@ -9,14 +9,14 @@
 //! MoE routing uses the `noaux_tc` group-aware top-k method with sigmoid
 //! scoring and auxiliary-loss-free load balancing (e_score_correction_bias).
 //!
-//! Every op on the hot path uses [`InlineArray`] — no per-op heap allocation.
+//! Every op on the hot path uses [`InlineArray`](crate::InlineArray) — no per-op heap allocation.
 //!
 //! The stack is split across focused submodules:
-//!   * [`weights`] — layer weight struct, safetensors loading, FP8 dequant, expert stacking
-//!   * [`cache`] — MLA latent + k_pe cache (bf16 + affine-quantized variants)
-//!   * [`attention`] — MLA forward (decode absorbs embed_q; prefill expands K/V)
-//!   * [`moe`] — dense SwiGLU MLP + group-aware noaux_tc top-k MoE
-//!   * [`forward`] — full-model forward + prefill/prime/generate wrappers
+//!   * `weights` — layer weight struct, safetensors loading, FP8 dequant, expert stacking
+//!   * `cache` — MLA latent + k_pe cache (bf16 + affine-quantized variants)
+//!   * `attention` — MLA forward (decode absorbs embed_q; prefill expands K/V)
+//!   * `moe` — dense SwiGLU MLP + group-aware noaux_tc top-k MoE
+//!   * `forward` — full-model forward + prefill/prime/generate wrappers
 
 use serde::Deserialize;
 

@@ -73,7 +73,7 @@ pub struct MllamaVisionConfig {
     pub intermediate_layers_indices: Vec<i32>,
     /// `hidden_size · (1 + intermediate_layers_indices.len())`. Kept as a field
     /// because the reference config carries it and the text-side projector reads
-    /// it; [`MllamaVisionConfig::validate`] checks the two agree.
+    /// it; `MllamaVisionConfig::validate` checks the two agree.
     pub vision_output_dim: i32,
     /// Number of tile arrangements the checkpoint's embedding tables were built
     /// for. `None` means the default rule (every `(w, h)` with `w·h ≤

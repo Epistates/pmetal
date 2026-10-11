@@ -73,7 +73,7 @@ pub trait MergeMethod: Send + Sync {
     ) -> Result<Array>;
 
     /// Name-aware merge entry. The default implementation forwards to
-    /// [`merge`], discarding the name; methods that need per-tensor side
+    /// `merge`, discarding the name; methods that need per-tensor side
     /// data (Fisher information, RegMean Gram matrices) override this to
     /// look up that state.
     fn merge_named(

@@ -8,14 +8,14 @@
 //!
 //! # Design
 //!
-//! The pool maintains a fixed-size array of [`AllocatorSlot`]s.  Each slot
+//! The pool maintains a fixed-size array of `AllocatorSlot`s.  Each slot
 //! transitions through the following states:
 //!
 //! ```text
 //! Idle ──► InFlight { event, value } ──► Idle (after GPU signals event)
 //! ```
 //!
-//! [`CommandAllocatorPool::acquire`] scans for an `Idle` slot.  If none is
+//! `CommandAllocatorPool::acquire` scans for an `Idle` slot.  If none is
 //! available it polls all `InFlight` slots, resets any whose `MTLSharedEvent`
 //! has been signalled by the GPU, then waits in a short spin-sleep loop until
 //! one becomes free.

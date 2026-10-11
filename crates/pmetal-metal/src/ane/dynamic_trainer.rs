@@ -252,7 +252,7 @@ impl DynamicAneTrainerConfig {
     /// The training kernels are Llama-shaped: SiLU-gated FFN, no per-head q/k
     /// norm, plain RoPE, logits from the embedding matrix. That rules out
     /// Qwen3 (per-head q/k norm, which the loader never reads) as well as the
-    /// hybrid, MoE and scaled-RoPE models; see [`super::checkpoint`].
+    /// hybrid, MoE and scaled-RoPE models; see `super::checkpoint`.
     pub fn is_ane_trainable(config_json: &serde_json::Value) -> std::result::Result<(), String> {
         super::checkpoint::check_model_type(config_json, &["llama", "mistral"], "training")?;
         super::checkpoint::check_shared_limits(config_json, "training")

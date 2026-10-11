@@ -12,7 +12,7 @@
 //! - `-` = MLP layer (rarely used standalone)
 //! - `E` = MoE layer
 //!
-//! Reference: https://arxiv.org/abs/2504.03624
+//! Reference: <https://arxiv.org/abs/2504.03624>
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn};
 use pmetal_bridge::impl_module_params;
@@ -157,7 +157,7 @@ impl QuantizedLinear {
 /// This matches the reference MambaRMSNormGated implementation.
 #[derive(Debug, Clone)]
 pub struct MambaRMSNormGated {
-    /// Learnable scale weights [hidden_size].
+    /// Learnable scale weights `[hidden_size]`.
     pub weight: Array,
     /// Epsilon for numerical stability.
     pub eps: f32,
@@ -275,12 +275,12 @@ fn segsum(x: &Array) -> Result<Array, Exception> {
 ///
 /// # Arguments
 /// * `x` - Input tensor [B, 1, H, D]
-/// * `a_log` - Log of state transition matrix [H]
+/// * `a_log` - Log of state transition matrix `[H]`
 /// * `b` - Input mixing [B, 1, G, N]
 /// * `c` - Output mixing [B, 1, G, N]
-/// * `d` - Skip connection weights [H]
+/// * `d` - Skip connection weights `[H]`
 /// * `dt` - Time deltas [B, 1, H]
-/// * `dt_bias` - Time delta bias [H]
+/// * `dt_bias` - Time delta bias `[H]`
 /// * `state` - Previous SSM state [B, H, D, N]
 /// * `time_step_min` - lower bound for dt (no upper bound; see `compute_dt`)
 ///
@@ -387,12 +387,12 @@ pub fn ssm_update_single(
 ///
 /// # Arguments
 /// * `x` - Input tensor [B, L, H, D]
-/// * `a_log` - Log of state transition matrix [H]
+/// * `a_log` - Log of state transition matrix `[H]`
 /// * `b` - Input mixing [B, L, G, N]
 /// * `c` - Output mixing [B, L, G, N]
-/// * `d` - Skip connection weights [H]
+/// * `d` - Skip connection weights `[H]`
 /// * `dt` - Time deltas [B, L, H]
-/// * `dt_bias` - Time delta bias [H]
+/// * `dt_bias` - Time delta bias `[H]`
 /// * `state` - Optional previous SSM state [B, H, D, N]
 /// * `time_step_min` - lower bound for dt (no upper bound; see `compute_dt`)
 ///
@@ -613,7 +613,7 @@ impl Expert {
 #[derive(Debug)]
 pub struct MoERouter {
     pub gate: nn::Linear,
-    /// Score correction bias for expert selection (shape: [num_experts])
+    /// Score correction bias for expert selection (shape: `[num_experts]`)
     pub e_score_correction_bias: Array,
     pub num_experts: i32,
     pub top_k: i32,
@@ -1049,10 +1049,10 @@ pub struct NemotronHConfig {
     /// Time step limits [min, max] - legacy field, prefer time_step_min/max.
     #[serde(default = "default_time_step_limit")]
     pub time_step_limit: (f32, f32),
-    /// Minimum time step value (overrides time_step_limit[0] if set).
+    /// Minimum time step value (overrides `time_step_limit[0]` if set).
     #[serde(default)]
     pub time_step_min: Option<f32>,
-    /// Maximum time step value (overrides time_step_limit[1] if set).
+    /// Maximum time step value (overrides `time_step_limit[1]` if set).
     #[serde(default)]
     pub time_step_max: Option<f32>,
 
@@ -1246,11 +1246,11 @@ pub struct NemotronHMixer {
     pub out_proj_input_scale: Option<Array>,
 
     // SSM parameters (Mamba-2 specific)
-    /// Log of state transition matrix [num_heads]
+    /// Log of state transition matrix `[num_heads]`
     pub a_log: Option<Array>,
-    /// Skip connection weights [num_heads]
+    /// Skip connection weights `[num_heads]`
     pub d: Option<Array>,
-    /// Time step bias [num_heads]
+    /// Time step bias `[num_heads]`
     pub dt_bias: Option<Array>,
     /// Internal gated RMS norm (not a standard nn module, handled separately)
     pub gated_norm: Option<MambaRMSNormGated>,

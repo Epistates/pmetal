@@ -98,7 +98,7 @@ pub struct MppGemmConfig {
 }
 
 impl MppGemmConfig {
-    /// Create a new MPP GEMM config for C = A[M,K] @ B[N,K]^T.
+    /// Create a new MPP GEMM config for C = `A[M,K]` @ `B[N,K]^T`.
     pub fn new(m: usize, n: usize, k: usize) -> Self {
         Self {
             m,

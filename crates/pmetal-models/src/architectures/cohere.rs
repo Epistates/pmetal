@@ -464,7 +464,7 @@ pub struct CohereModel {
     pub layers: Vec<CohereDecoderLayer>,
     pub norm: nn::LayerNorm,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(CohereModel; embed_tokens, layers, norm);

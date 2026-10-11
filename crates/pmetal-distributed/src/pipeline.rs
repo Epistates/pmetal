@@ -1,6 +1,6 @@
 //! Pipeline-parallel inference runtime.
 //!
-//! Coordinates multiple [`PipelineShard`] instances across a cluster,
+//! Coordinates multiple `PipelineShard` instances across a cluster,
 //! routing activations between stages via [`ActivationMessage`].
 //!
 //! The API node (rank 0, first shard) drives generation: it embeds tokens,

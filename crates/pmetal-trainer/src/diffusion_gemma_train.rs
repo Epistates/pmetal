@@ -270,7 +270,7 @@ impl DiffusionGemmaTrainer {
     /// Full stochastic training step: sample a noise level `t ~ U(min, 1]`,
     /// corrupt `canvas_x0` with the uniform-categorical kernel, denoise it
     /// conditioned on `context_ids`, and take one AdamW step on the adapters.
-    /// The noise is the step's own ([`Self::step_noise`]).
+    /// The noise is the step's own (`Self::step_noise`).
     pub fn train_step(
         &mut self,
         model: &mut AdaptedModel,

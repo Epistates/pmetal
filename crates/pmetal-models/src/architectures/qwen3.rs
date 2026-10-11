@@ -669,7 +669,7 @@ pub struct Qwen3Model {
     pub layers: Vec<Qwen3Layer>,
     pub norm: nn::RmsNorm,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(Qwen3Model; embed_tokens, layers, norm);
@@ -792,12 +792,12 @@ impl Qwen3Model {
     /// Forward pass with optional hidden-state capture for speculative
     /// decoding.
     ///
-    /// Runs the same inner loop as [`forward`] but, for each layer index
+    /// Runs the same inner loop as `forward` but, for each layer index
     /// requested by `capture`, clones the post-layer hidden state into
     /// `capture.hidden_states`. The `capture.gdn_inputs` map is never
     /// populated here because Qwen3 has no linear-attention layers.
     ///
-    /// Passing `capture = None` reproduces [`forward`] exactly — this
+    /// Passing `capture = None` reproduces `forward` exactly — this
     /// method intentionally does not duplicate the hot path.
     pub fn forward_with_capture(
         &mut self,
@@ -978,7 +978,7 @@ impl Qwen3ForCausalLM {
     ///
     /// `capture` is populated with hidden states at every layer index in
     /// `capture.requested_hidden_layers`. The returned logits are the same
-    /// shape (`[B, T, V]`) as [`forward_with_cache`].
+    /// shape (`[B, T, V]`) as `forward_with_cache`.
     pub fn forward_with_capture(
         &mut self,
         input_ids: &Array,

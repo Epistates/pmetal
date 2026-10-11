@@ -668,7 +668,7 @@ impl ExpertBufferPool {
     ///
     /// # Deadlock warning
     ///
-    /// Do not hold any lock that is also taken inside [`release`] while calling
+    /// Do not hold any lock that is also taken inside `release` while calling
     /// this method.
     pub fn acquire_blocking(&self) -> AlignedBuffer {
         let mut guard = self.inner.available.lock();

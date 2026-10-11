@@ -88,7 +88,7 @@ fn sanitize_non_finite(src: &str) -> String {
 }
 
 /// Parse a `config.json` into a `serde_json::Value`, tolerating the non-finite
-/// literals described on [`sanitize_non_finite`].
+/// literals described on `sanitize_non_finite`.
 ///
 /// Strict parsing is tried first so a well-formed config never pays for the
 /// rewrite, and so a genuinely malformed one still reports its original error.

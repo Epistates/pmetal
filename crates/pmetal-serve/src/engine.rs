@@ -2405,7 +2405,7 @@ impl InferenceEngine {
     /// The channel will receive:
     /// - Zero or more `TokenEvent::Token(id)` — one per generated token.
     /// - Exactly one `TokenEvent::Done { .. }` on success.
-    /// - Exactly one `TokenEvent::Error(msg)` if generation fails (no [DONE]).
+    /// - Exactly one `TokenEvent::Error(msg)` if generation fails (no `[DONE]`).
     pub fn generate_streaming(
         &self,
         input_ids: &[u32],

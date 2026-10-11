@@ -32,7 +32,7 @@
 //! primitive. It is deliberately *not* a full training loop: wiring up
 //! dataset streaming, optimization, LR scheduling, checkpointing, and
 //! distributed data parallel is covered by pmetal's existing trainer
-//! infrastructure in [`crate::diffusion`] (block diffusion in general) and
+//! infrastructure in `crate::diffusion` (block diffusion in general) and
 //! [`crate::orchestrator`] (training orchestration).
 //!
 //! A full `pmetal train-draft` CLI command can be implemented on top of

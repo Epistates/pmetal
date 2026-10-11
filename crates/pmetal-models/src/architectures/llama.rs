@@ -484,7 +484,7 @@ pub struct LlamaModel {
     /// Final layer norm.
     pub norm: nn::RmsNorm,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(LlamaModel; embed_tokens, layers, norm);
@@ -558,7 +558,7 @@ impl LlamaModel {
 
     /// Forward pass with optional hidden-state capture for DFlash
     /// speculative decoding. `capture = None` is identical to
-    /// [`forward_with_cache`]; otherwise the post-layer hidden state is
+    /// `forward_with_cache`; otherwise the post-layer hidden state is
     /// cloned into `capture` for every layer index the caller requested.
     pub fn forward_with_capture(
         &mut self,
@@ -730,7 +730,7 @@ impl LlamaForCausalLM {
     /// Fused batched decode forward.
     ///
     /// Runs one `[N_active, 1]` forward across every active slot,
-    /// reusing the shared [`FusedBatchKVCache`] for all layers. Shape
+    /// reusing the shared `FusedBatchKVCache` for all layers. Shape
     /// contract matches [`crate::dispatcher::DynamicModel::forward_batched`].
     pub fn forward_batched_impl(
         &mut self,

@@ -1182,7 +1182,7 @@ pub struct DeepSeekModel {
     pub layers: Vec<DeepSeekDecoderLayer>,
     pub norm: nn::RmsNorm,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(DeepSeekModel; embed_tokens, layers, norm);

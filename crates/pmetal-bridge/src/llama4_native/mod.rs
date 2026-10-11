@@ -1,6 +1,6 @@
 //! Standalone Llama 4 inference engine, independent of pmetal-models.
 //!
-//! Every op on the hot path uses [`InlineArray`] (stack-allocated `mlx::core::array`,
+//! Every op on the hot path uses [`InlineArray`](crate::InlineArray) (stack-allocated `mlx::core::array`,
 //! direct C++ bridge). This eliminates ALL per-op heap allocation, matching
 //! Python/nanobind's direct C++ binding performance.
 //!
@@ -20,11 +20,11 @@
 //!   `down_proj` already store them (the former split into gate and up).
 //!
 //! The stack is split across focused submodules:
-//!   * [`weights`] — layer weight struct, safetensors loading, expert sanitization
-//!   * [`cache`] — per-layer KV caches (bf16 + zero-overhead-quantized)
-//!   * [`attention`] — iRoPE attention + chunk mask + temperature tuning
-//!   * [`moe`] — dense SwiGLU MLP + top-1 SwitchGLU with shared expert
-//!   * [`forward`] — full-model forward + prefill/prime/generate wrappers
+//!   * `weights` — layer weight struct, safetensors loading, expert sanitization
+//!   * `cache` — per-layer KV caches (bf16 + zero-overhead-quantized)
+//!   * `attention` — iRoPE attention + chunk mask + temperature tuning
+//!   * `moe` — dense SwiGLU MLP + top-1 SwitchGLU with shared expert
+//!   * `forward` — full-model forward + prefill/prime/generate wrappers
 
 use serde::Deserialize;
 

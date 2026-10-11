@@ -131,16 +131,16 @@ pub struct MoeRouting {
     /// TopK expert IDs [num_tokens, topk].
     pub topk_ids: MetalBuffer<u32>,
 
-    /// Token counts per expert [num_experts].
+    /// Token counts per expert `[num_experts]`.
     pub token_counts: MetalBuffer<u32>,
 
     /// Cumulative offsets per expert [num_experts + 1].
     pub expert_offsets: MetalBuffer<u32>,
 
-    /// Gather indices: sorted -> original [total_tokens].
+    /// Gather indices: sorted -> original `[total_tokens]`.
     pub gather_indices: MetalBuffer<u32>,
 
-    /// Scatter indices: original -> sorted [total_tokens].
+    /// Scatter indices: original -> sorted `[total_tokens]`.
     pub scatter_indices: MetalBuffer<u32>,
 }
 

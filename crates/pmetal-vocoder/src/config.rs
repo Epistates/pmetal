@@ -10,7 +10,7 @@ pub struct BigVGANConfig {
     pub num_mels: i32,
 
     /// Upsampling rates for each stage.
-    /// Product should equal hop_size (e.g., [4,4,2,2,2,2] = 256).
+    /// Product should equal hop_size (e.g., `[4,4,2,2,2,2]` = 256).
     #[serde(default = "default_upsample_rates")]
     pub upsample_rates: Vec<i32>,
 

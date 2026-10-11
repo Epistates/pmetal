@@ -239,7 +239,7 @@ impl TrainingState {
 /// Rich per-step metrics for dashboard and callback consumption.
 ///
 /// Carries timing breakdown, throughput, and learning rate alongside loss.
-/// Used by [`TrainingCallback::on_step_end_with_metrics`] to feed real-time
+/// Used by `TrainingCallback::on_step_end_with_metrics` to feed real-time
 /// dashboards and JSONL loggers with complete training telemetry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StepMetrics {

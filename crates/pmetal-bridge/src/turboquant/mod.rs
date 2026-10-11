@@ -9,8 +9,8 @@
 //!
 //! Pack/encode/decode/score MUST agree on these axis orders. This contract is
 //! mirrored in `cpp/bridge/turboquant.h`'s top-of-file comment; keep both in
-//! sync. The [`tests::layout_invariants`] tests pin the derived dimensions
-//! (e.g. [`bits::packed_qjl_words`]) so a silent off-by-one in one of the
+//! sync. The `tests::layout_invariants` tests pin the derived dimensions
+//! (e.g. `bits::packed_qjl_words`) so a silent off-by-one in one of the
 //! helpers will fail CI rather than corrupt cache reads.
 //!
 //! Live cache layouts (read by score kernels):
@@ -55,17 +55,17 @@
 //!
 //! # Module layout (post-Phase 0 split)
 //!
-//! - [`config`] — public config types ([`TurboQuantConfig`], [`TurboQuantTensorConfig`]).
-//! - [`core`] — [`TurboQuantCore`] (shared rotation matrices + codebooks).
-//! - [`state`] — [`TurboQuantState`] (per-tensor runtime tables).
-//! - [`bits`] — [`PackedBits`] bit-packing primitive used by the host stores.
-//! - [`math`] — pure math helpers (Beta codebook, FWHT, Rademacher signs).
-//! - [`gpu_keystore`] — GPU-resident `Gpu*KeyStore` / `Gpu*ValueStore`.
-//! - [`host_keystore`] — host-side [`QuantizedKeyStore`] / [`QuantizedValueStore`].
-//! - [`encode`] — CPU encode/decode primitives + outlier helpers.
-//! - [`dispatch`] — GPU quantise/dequantise kernel glue.
-//! - [`cache`] — [`QuantizedKvCache`] state machine (impl of public API).
-//! - [`tests`] — round-trip + layout-invariant tests (`#[cfg(test)]`).
+//! - `config` — public config types ([`TurboQuantConfig`], [`TurboQuantTensorConfig`]).
+//! - `core` — [`TurboQuantCore`] (shared rotation matrices + codebooks).
+//! - `state` — [`TurboQuantState`] (per-tensor runtime tables).
+//! - `bits` — [`PackedBits`] bit-packing primitive used by the host stores.
+//! - `math` — pure math helpers (Beta codebook, FWHT, Rademacher signs).
+//! - `gpu_keystore` — GPU-resident `Gpu*KeyStore` / `Gpu*ValueStore`.
+//! - `host_keystore` — host-side [`QuantizedKeyStore`] / [`QuantizedValueStore`].
+//! - `encode` — CPU encode/decode primitives + outlier helpers.
+//! - `dispatch` — GPU quantise/dequantise kernel glue.
+//! - `cache` — [`QuantizedKvCache`] state machine (impl of public API).
+//! - `tests` — round-trip + layout-invariant tests (`#[cfg(test)]`).
 //!
 //! # What is NOT in this module
 //!

@@ -96,7 +96,7 @@ pub struct QuantCacheConfig {
     pub group_size: i32,
     /// Mixed-bit mode (TurboQuant v2). When set, `bits` is ignored and the
     /// outlier/regular split is used instead. Channel permutation must be
-    /// applied to projection weights at load time via [`apply_outlier_permutation`].
+    /// applied to projection weights at load time via `apply_outlier_permutation`.
     pub mixed_bit: Option<MixedBitConfig>,
     /// QJL residual correction for keys at Q2-Q3.
     ///

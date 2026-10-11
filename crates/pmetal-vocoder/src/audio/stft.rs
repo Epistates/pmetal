@@ -48,7 +48,7 @@ impl Default for StftConfig {
 /// * `size` - Window size
 ///
 /// # Returns
-/// Hann window as [size] array
+/// Hann window as `[size]` array
 pub fn hann_window(size: i32) -> Result<Array> {
     // hann[n] = 0.5 * (1 - cos(2*pi*n / (N-1)))
     let n = Array::arange(size, 10); // float32 arange [0..size)
@@ -64,7 +64,7 @@ pub fn hann_window(size: i32) -> Result<Array> {
 /// Compute Short-Time Fourier Transform.
 ///
 /// # Arguments
-/// * `signal` - Input audio signal [samples] or [batch, samples]
+/// * `signal` - Input audio signal `[samples]` or `[batch, samples]`
 /// * `config` - STFT configuration
 ///
 /// # Returns
@@ -146,7 +146,7 @@ pub fn stft(signal: &Array, config: &StftConfig) -> Result<Array> {
 /// * `config` - STFT configuration
 ///
 /// # Returns
-/// Reconstructed audio signal [batch, samples] or [samples]
+/// Reconstructed audio signal `[batch, samples]` or `[samples]`
 pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
     let win_length = config.win_length.unwrap_or(config.n_fft);
 

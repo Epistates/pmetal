@@ -302,7 +302,7 @@ pub struct TurboQuantConfig {
     /// (default) keeps the 2-tier behaviour. When `Some`, hot evictions go
     /// to a warm store at the warm-tier precision, and warm slots migrate
     /// to the cold store (sized at `keys`/`values` precision) once the
-    /// warm window overflows. See [`TurboQuantWarmTier`].
+    /// warm window overflows. See `TurboQuantWarmTier`.
     pub warm_tier: Option<TurboQuantWarmTier>,
 }
 
@@ -386,7 +386,7 @@ impl TurboQuantConfig {
     }
 
     /// Phase H: enable the warm tier between hot fp16 and cold compressed.
-    /// See [`TurboQuantWarmTier`] for the eviction semantics.
+    /// See `TurboQuantWarmTier` for the eviction semantics.
     pub const fn with_warm_tier(mut self, warm: Option<TurboQuantWarmTier>) -> Self {
         self.warm_tier = warm;
         self

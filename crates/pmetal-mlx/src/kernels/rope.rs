@@ -135,7 +135,7 @@ pub fn apply_rope(
 ///
 /// # Arguments
 /// * `x` - Input tensor of shape [batch, heads, seq_len, head_dim]
-/// * `position_ids` - Position indices of shape [seq_len]
+/// * `position_ids` - Position indices of shape `[seq_len]`
 /// * `dims` - Number of dimensions to apply RoPE to (usually head_dim)
 /// * `traditional` - If true, use traditional (interleaved) RoPE
 /// * `base` - Base frequency for the embeddings (default 10000.0)

@@ -16,16 +16,16 @@
 //! implementation compute; `pmetal-models`' `gpt_oss_native_parity` test
 //! checks it against transformers.
 //!
-//! Every op on the hot path uses [`InlineArray`] (stack-allocated `mlx::core::array`,
+//! Every op on the hot path uses [`InlineArray`](crate::InlineArray) (stack-allocated `mlx::core::array`,
 //! direct C++ bridge). This eliminates ALL per-op heap allocation, matching
 //! Python/nanobind's direct C++ binding performance.
 //!
 //! The stack is split across focused submodules:
-//!   * [`weights`] — layer weight struct, safetensors loading (dense layouts)
-//!   * [`cache`] — per-layer KV caches (sliding ring / full / quantized-full)
-//!   * [`attention`] — attention forward step with sinks (three cache paths)
-//!   * [`moe`] — biased top-k router + clamped GLU experts
-//!   * [`forward`] — full-model forward + prefill/prime/generate wrappers
+//!   * `weights` — layer weight struct, safetensors loading (dense layouts)
+//!   * `cache` — per-layer KV caches (sliding ring / full / quantized-full)
+//!   * `attention` — attention forward step with sinks (three cache paths)
+//!   * `moe` — biased top-k router + clamped GLU experts
+//!   * `forward` — full-model forward + prefill/prime/generate wrappers
 
 use serde::Deserialize;
 

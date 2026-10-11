@@ -60,7 +60,7 @@ use crate::{
 /// - `moe_routing`: routing kernel is Metal 3 only; no MPP variant exists yet.
 ///
 /// Previously falling back: `fused_adamw_step` now routes through
-/// [`fused_adamw_step_standalone`] which dispatches `MppFusedAdamW` directly.
+/// `fused_adamw_step_standalone` which dispatches `MppFusedAdamW` directly.
 /// Quantized GEMM is now wired to `MppQuantizedGemm`.
 pub struct Metal4Backend {
     ctx: Arc<MetalContext>,
@@ -118,7 +118,7 @@ impl KernelBackend for Metal4Backend {
     // ---- Routing hints ------------------------------------------------------
 
     /// Override the default `should_handle_gemm` to add the problem-size
-    /// heuristic from [`DeviceProperties::should_consider_mpp_gemm`].
+    /// heuristic from `DeviceProperties::should_consider_mpp_gemm`.
     fn should_handle_gemm(&self, m: usize, n: usize, k: usize) -> bool {
         let caps = self.caps();
         if m < caps.gemm_min_m || (caps.gemm_k_alignment > 1 && k % caps.gemm_k_alignment != 0) {

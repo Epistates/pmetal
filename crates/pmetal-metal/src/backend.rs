@@ -1,15 +1,15 @@
 //! Trait-based kernel dispatch abstraction.
 //!
 //! This module defines [`KernelBackend`] — the single interface that all kernel
-//! dispatch paths implement. [`Metal3Backend`] (Task 2) delegates to the existing
-//! Metal 3 kernel structs. [`Metal4Backend`] (Tasks 6+) uses MPP / NAX paths on
+//! dispatch paths implement. [`Metal3Backend`](crate::metal3_backend::Metal3Backend) (Task 2) delegates to the existing
+//! Metal 3 kernel structs. [`Metal4Backend`](crate::metal4::Metal4Backend) (Tasks 6+) uses MPP / NAX paths on
 //! M5+ hardware.
 //!
 //! # Design
 //!
 //! Each operation family is represented by an input descriptor struct that bundles
 //! the parameters the kernel needs. These descriptors mirror the existing config
-//! structs so that `Metal3Backend` can delegate without translation overhead.
+//! structs so that [`Metal3Backend`](crate::metal3_backend::Metal3Backend) can delegate without translation overhead.
 //!
 //! All methods take `&self` — backends are wrapped in `Arc<dyn KernelBackend>` and
 //! shared freely across threads.
@@ -48,7 +48,7 @@ use crate::{
 
 /// Static capability descriptor for a kernel backend.
 ///
-/// Queried once at startup by [`KernelDispatch`](crate::kernels::dispatch::KernelDispatch)
+/// Queried once at startup by [`KernelDispatch`](crate::KernelDispatch)
 /// to decide which operations to route to which backend.
 #[derive(Debug, Clone)]
 pub struct BackendCaps {
@@ -138,7 +138,7 @@ impl BackendCaps {
     /// # Wired MPP operations
     ///
     /// The following flags are `true` because the corresponding trait methods
-    /// in [`Metal4Backend`] now dispatch through MPP kernel structs:
+    /// in [`Metal4Backend`](crate::metal4::Metal4Backend) now dispatch through MPP kernel structs:
     ///
     /// - `has_gemm`: `MppGemm` (large prefill / training shapes)
     /// - `has_quantized_gemm`: `MppQuantizedGemm` via `fused_adamw_step_standalone`
@@ -193,7 +193,7 @@ impl BackendCaps {
 // Input descriptor types
 // ============================================================================
 
-/// Descriptor for a standard GEMM: D = alpha * A[M,K] @ B[N,K]^T + beta * C
+/// Descriptor for a standard GEMM: D = alpha * `A[M,K]` @ `B[N,K]^T` + beta * C
 #[derive(Debug, Clone)]
 pub struct GemmDescriptor {
     /// Output rows.
@@ -227,7 +227,7 @@ impl GemmDescriptor {
     }
 }
 
-/// Descriptor for a quantized GEMM: Y[M,N] = X[M,K] @ W_q[N,K]^T
+/// Descriptor for a quantized GEMM: `Y[M,N]` = `X[M,K]` @ `W_q[N,K]^T`
 #[derive(Debug, Clone)]
 pub struct QuantizedGemmDescriptor {
     /// Output rows.
@@ -255,7 +255,7 @@ impl QuantizedGemmDescriptor {
     }
 }
 
-/// Descriptor for a grouped GEMM: Y[M,N] = X[M,K] @ W[E,N,K]^T, dispatched per expert.
+/// Descriptor for a grouped GEMM: `Y[M,N]` = `X[M,K]` @ `W[E,N,K]^T`, dispatched per expert.
 ///
 /// Used by MoE models to route `total_tokens` token activations through `num_experts`
 /// independent weight matrices. `expert_offsets[e]..expert_offsets[e+1]` gives the
@@ -307,7 +307,7 @@ impl GroupedGemmDescriptor {
 
 /// Descriptor for the AdamW optimizer step.
 ///
-/// Mirrors [`FusedAdamW::queue_update`] parameters.
+/// Mirrors `FusedAdamW::queue_update` parameters.
 #[derive(Debug)]
 pub struct AdamWDescriptor<'a> {
     /// Flattened parameter buffer.
@@ -327,7 +327,7 @@ pub struct AdamWDescriptor<'a> {
 
 /// Descriptor for fused MoE expert forward.
 ///
-/// Mirrors [`FusedMoeExpert`] invocation parameters.
+/// Mirrors `FusedMoeExpert` invocation parameters.
 #[derive(Debug)]
 pub struct MoeExpertDescriptor<'a> {
     /// Per-expert configuration (dims, group size, bit width).
@@ -362,8 +362,8 @@ pub struct MoeExpertDescriptor<'a> {
 
 /// Trait-based kernel dispatch interface.
 ///
-/// Both [`Metal3Backend`] and [`Metal4Backend`] implement this trait, allowing
-/// [`KernelDispatch`] to route each operation to the appropriate backend without
+/// Both [`Metal3Backend`](crate::metal3_backend::Metal3Backend) and [`Metal4Backend`](crate::metal4::Metal4Backend) implement this trait, allowing
+/// [`KernelDispatch`](crate::KernelDispatch) to route each operation to the appropriate backend without
 /// runtime cost beyond the initial routing decision.
 ///
 /// # Thread safety
@@ -373,7 +373,7 @@ pub struct MoeExpertDescriptor<'a> {
 ///
 /// # Routing
 ///
-/// Before calling any GEMM method, callers should invoke [`should_handle_gemm`] to
+/// Before calling any GEMM method, callers should invoke `should_handle_gemm` to
 /// confirm the backend can efficiently handle the shape. If it returns `false`, the
 /// caller should fall back to the other backend.
 pub trait KernelBackend: Send + Sync {
@@ -429,7 +429,7 @@ pub trait KernelBackend: Send + Sync {
 
     /// Encode a weight-gradient GEMM into an existing batched command buffer.
     ///
-    /// C = alpha * A[M,K] @ B[N,K]^T + beta * C (read-modify-write).
+    /// C = alpha * `A[M,K]` @ `B[N,K]^T` + beta * C (read-modify-write).
     /// Used for the backward pass dW computation across all layers.
     #[expect(
         clippy::too_many_arguments,
@@ -448,7 +448,7 @@ pub trait KernelBackend: Send + Sync {
         beta: f32,
     ) -> Result<()>;
 
-    /// Grouped GEMM forward: Y = X[M,K] @ W[E,N,K]^T, one sub-GEMM per expert.
+    /// Grouped GEMM forward: Y = `X[M,K]` @ `W[E,N,K]^T`, one sub-GEMM per expert.
     ///
     /// Tokens are pre-sorted by expert assignment. `expert_offsets[e]..expert_offsets[e+1]`
     /// gives the contiguous slice of tokens routed to expert `e`. `gather_indices` and
@@ -594,7 +594,7 @@ pub trait KernelBackend: Send + Sync {
     /// Metal 3 callers should prefer [`fused_adamw_step`] for batching efficiency.
     ///
     /// [`fused_adamw_step`]: KernelBackend::fused_adamw_step
-    /// [`Metal4Backend`]: crate::metal4::backend::Metal4Backend
+    /// [`Metal4Backend`]: crate::metal4::Metal4Backend
     fn fused_adamw_step_standalone(
         &self,
         ctx: &Arc<MetalContext>,

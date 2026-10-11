@@ -224,7 +224,7 @@ enum LoadedModel {
 /// `runner.gen.generate_streaming()`.
 pub struct InferenceRunner {
     /// Tokenizer for encoding/decoding. Public for split-borrow access
-    /// during streaming (borrow this before calling [`generate_streaming`]).
+    /// during streaming (borrow this before calling `generate_streaming`).
     pub tokenizer: Tokenizer,
     /// Generation state. Public for split-borrow access.
     pub state: InferenceGenState,

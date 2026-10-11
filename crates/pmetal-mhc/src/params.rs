@@ -25,10 +25,10 @@ pub struct MhcParams {
     pub alpha_res: f32,
 
     // === Static Biases (b) ===
-    /// Static bias for H^pre mapping. Shape: [n]
+    /// Static bias for H^pre mapping. Shape: `[n]`
     pub b_pre: Array1<f32>,
 
-    /// Static bias for H^post mapping. Shape: [n]
+    /// Static bias for H^post mapping. Shape: `[n]`
     pub b_post: Array1<f32>,
 
     /// Static bias for H^res mapping. Shape: [n, n]
@@ -45,7 +45,7 @@ pub struct MhcParams {
     pub phi_res: Array2<f32>,
 
     // === RMSNorm Weight (absorbed into φ) ===
-    /// RMSNorm weight for input normalization. Shape: [nC]
+    /// RMSNorm weight for input normalization. Shape: `[nC]`
     pub rmsnorm_weight: Array1<f32>,
 }
 
@@ -268,10 +268,10 @@ pub struct MhcGradients {
     /// Gradient for alpha_res.
     pub d_alpha_res: f32,
 
-    /// Gradient for b_pre. Shape: [n]
+    /// Gradient for b_pre. Shape: `[n]`
     pub d_b_pre: Array1<f32>,
 
-    /// Gradient for b_post. Shape: [n]
+    /// Gradient for b_post. Shape: `[n]`
     pub d_b_post: Array1<f32>,
 
     /// Gradient for b_res. Shape: [n, n]
@@ -286,7 +286,7 @@ pub struct MhcGradients {
     /// Gradient for phi_res. Shape: [nC, n²]
     pub d_phi_res: Array2<f32>,
 
-    /// Gradient for rmsnorm_weight. Shape: [nC]
+    /// Gradient for rmsnorm_weight. Shape: `[nC]`
     pub d_rmsnorm_weight: Array1<f32>,
 }
 

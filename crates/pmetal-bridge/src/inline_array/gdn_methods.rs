@@ -53,7 +53,7 @@ impl InlineArray {
 
     /// GDN state-only advance for speculative-decoding rollback replay.
     ///
-    /// Same contract as [`gdn_metal_step`] but skips the query / output
+    /// Same contract as `gdn_metal_step` but skips the query / output
     /// projection — only the post-replay state is returned. Used when the
     /// caller has accepted a prefix of a drafted block and wants to
     /// reconstruct the recurrent state at the accepted position without

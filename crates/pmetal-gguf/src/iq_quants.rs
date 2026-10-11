@@ -1440,7 +1440,7 @@ pub fn dequantize_iq3s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Dequantize IQ2_S bytes to f32 values.
 ///
 /// IQ2_S uses a 1024-entry lookup table (iq2s_grid) where each entry encodes 8 values.
-/// The grid index is 10 bits: qs[i] | ((qh << shift) & 0x300).
+/// The grid index is 10 bits: `qs[i] | ((qh << shift) & 0x300)`.
 pub fn dequantize_iq2s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
     let n_blocks = n_elements.div_ceil(BlockIq2S::BLOCK_SIZE);

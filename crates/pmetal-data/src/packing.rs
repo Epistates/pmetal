@@ -62,7 +62,7 @@ pub struct PackedBatch {
     /// Position IDs (reset for each sequence).
     pub position_ids: Vec<u32>,
     /// Cumulative sequence lengths for attention (length: num_sequences + 1).
-    /// cu_seqlens[0] = 0, cu_seqlens[i+1] = cu_seqlens[i] + seq_lengths[i]
+    /// `cu_seqlens[0] = 0`, `cu_seqlens[i+1] = cu_seqlens[i] + seq_lengths[i]`
     pub cu_seqlens: Vec<u32>,
     /// Individual sequence lengths.
     pub seq_lengths: Vec<u32>,
@@ -121,7 +121,7 @@ impl PackedBatch {
 
     /// Build a block diagonal attention mask, returning as an MLX Array.
     ///
-    /// This is more efficient than building Vec<f32> and then converting,
+    /// This is more efficient than building `Vec<f32>` and then converting,
     /// as it avoids an intermediate allocation.
     pub fn build_attention_mask_array(&self) -> std::result::Result<Array, Exception> {
         let n = self.total_tokens() as i32;
@@ -173,15 +173,15 @@ impl PackedBatch {
 
     /// Mask label positions that would predict across sequence boundaries.
     ///
-    /// For causal LM with shifted labels (logits[i] predicts labels[i+1]),
+    /// For causal LM with shifted labels (`logits[i]` predicts `labels[i+1]`),
     /// we need to mask the FIRST token of each sequence after the first one.
     /// This prevents the last token of sequence N from being penalized for
     /// not predicting the first token of sequence N+1.
     ///
-    /// Example: For packed sequences [A, B, C | D, E] with labels [A, B, C, D, E],
-    /// after shift_labels = labels[1:] we get [B, C, D, E].
-    /// logits[2] (from C) would predict D, but C is the end of seq1,
-    /// so we must set labels[3] = -100 to ignore this cross-boundary prediction.
+    /// Example: For packed sequences `[A, B, C | D, E]` with labels `[A, B, C, D, E]`,
+    /// after `shift_labels = labels[1:]` we get `[B, C, D, E]`.
+    /// `logits[2]` (from C) would predict D, but C is the end of seq1,
+    /// so we must set `labels[3] = -100` to ignore this cross-boundary prediction.
     pub fn mask_label_boundaries(&mut self, ignore_index: i64) {
         if let Some(ref mut labels) = self.labels {
             // Mask the first token of each sequence (except the first sequence)
@@ -603,18 +603,18 @@ use pmetal_bridge::compat::{Array, Exception};
 ///
 /// This is the bridge between the packing infrastructure and the training loop.
 /// Unlike regular TrainingBatch which has shape [batch_size, seq_len],
-/// PackedTrainingBatch has shape [total_tokens] with variable-length sequences.
+/// PackedTrainingBatch has shape `[total_tokens]` with variable-length sequences.
 #[derive(Debug)]
 pub struct PackedTrainingBatch {
-    /// Packed input token IDs [total_tokens].
+    /// Packed input token IDs `[total_tokens]`.
     pub input_ids: Array,
-    /// Position IDs reset per sequence [total_tokens].
+    /// Position IDs reset per sequence `[total_tokens]`.
     pub position_ids: Array,
     /// Cumulative sequence lengths [num_sequences + 1].
     pub cu_seqlens: Array,
     /// Cumulative sequence lengths as a CPU-side Vec for mask construction.
     pub cu_seqlens_raw: Vec<i32>,
-    /// Packed labels for loss computation [total_tokens].
+    /// Packed labels for loss computation `[total_tokens]`.
     pub labels: Array,
     /// Total number of tokens.
     pub total_tokens: usize,

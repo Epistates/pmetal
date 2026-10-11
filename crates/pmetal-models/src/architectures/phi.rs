@@ -633,7 +633,7 @@ pub struct PhiModel {
     pub norm: PhiRMSNorm,
     pub config: PhiConfig,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(PhiModel; embed_tokens, layers, norm);
@@ -687,7 +687,7 @@ impl PhiModel {
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
-    /// speculative decoding. Identical to [`forward_with_cache`] when
+    /// speculative decoding. Identical to `forward_with_cache` when
     /// `capture` is `None`.
     pub fn forward_with_capture(
         &mut self,

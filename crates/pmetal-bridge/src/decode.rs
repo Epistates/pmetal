@@ -327,7 +327,7 @@ pub fn draw_bits(seed: u64, draw: u64) -> u64 {
 /// multiply so bf16/f16 decode graphs do not get silently promoted to f32.
 ///
 /// IMPORTANT: penalty (`repetition_penalty` / `frequency_penalty` /
-/// `presence_penalty`) handling lives in [`PenaltyBuffer::apply`] which
+/// `presence_penalty`) handling lives in `PenaltyBuffer::apply` which
 /// must run BEFORE this call — penalties operate on raw logits, not
 /// log-probs, and depend on per-token counts the sampler does not track.
 pub fn sample_token(logits_2d: &InlineArray, params: &SamplingParams, draw: u64) -> InlineArray {

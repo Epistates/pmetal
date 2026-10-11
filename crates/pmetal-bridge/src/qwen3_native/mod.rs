@@ -7,18 +7,18 @@
 //!   - **Qwen3.5 MoE** (same type fields but `num_experts > 0`): like Qwen3.5 dense but
 //!     MLP replaced with routed expert dispatch (SwitchGLU) plus a shared expert.
 //!
-//! Every op on the hot path uses [`InlineArray`] (stack-allocated `mlx::core::array`,
+//! Every op on the hot path uses [`InlineArray`](crate::InlineArray) (stack-allocated `mlx::core::array`,
 //! direct C++ bridge). This eliminates ALL per-op heap allocation, matching
 //! Python/nanobind's direct C++ binding performance.
 //!
 //! The stack is split across focused submodules:
-//!   * [`weights`] — layer + model weight bundles + Hadamard/QJL/outlier preconditioning
-//!   * [`cache`] — GDN state + KV caches (bf16 / affine-quantized / TurboQuant)
-//!   * [`load`] — safetensors loading + sanitization + expert stacking
-//!   * [`attention`] — per-position RoPE + attn_forward + tree-verify variant
-//!   * [`mlp_moe`] — dense SwiGLU + SwitchGLU MoE + GDN step
-//!   * [`forward`] — forward_step + capture + tree-verify + compact/rollback
-//!   * [`speculative`] — rewinding GDN layers to a verified block's accepted prefix
+//!   * `weights` — layer + model weight bundles + Hadamard/QJL/outlier preconditioning
+//!   * `cache` — GDN state + KV caches (bf16 / affine-quantized / TurboQuant)
+//!   * `load` — safetensors loading + sanitization + expert stacking
+//!   * `attention` — per-position RoPE + attn_forward + tree-verify variant
+//!   * `mlp_moe` — dense SwiGLU + SwitchGLU MoE + GDN step
+//!   * `forward` — forward_step + capture + tree-verify + compact/rollback
+//!   * `speculative` — rewinding GDN layers to a verified block's accepted prefix
 //!   * [`generate`] — prefill/prime/generate loops + benchmarks
 
 use serde::Deserialize;

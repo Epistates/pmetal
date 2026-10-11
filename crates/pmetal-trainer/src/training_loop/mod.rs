@@ -170,7 +170,7 @@ pub struct TrainingLoopConfig {
     /// Covers packed and unpacked text batches. When it can't apply (NEFTune
     /// on an unpacked path, image batches, a model with no usable LM head) the
     /// run warns once and computes the loss from the full logits; see
-    /// [`TrainingLoop::cut_cross_entropy_applies`].
+    /// `TrainingLoop::cut_cross_entropy_applies`.
     pub use_cut_cross_entropy: bool,
 
     /// Override the maximum sequence length used for sequence packing.

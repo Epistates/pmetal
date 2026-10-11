@@ -195,7 +195,7 @@ impl FusedRoPE {
     /// # Arguments
     ///
     /// * `x` - Input tensor [batch, heads, seq_len, head_dim] (modified in-place)
-    /// * `position_ids` - Position indices [seq_len]
+    /// * `position_ids` - Position indices `[seq_len]`
     pub fn apply_with_positions(
         &self,
         x: &MetalBuffer<f32>,

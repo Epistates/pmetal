@@ -1,10 +1,10 @@
-//! `#[derive(JobSpec)]` — derives [`pmetal_core::JobFields`] for a spec struct.
+//! `#[derive(JobSpec)]` — derives `pmetal_core::JobFields` for a spec struct.
 //!
 //! See `pmetal_core::jobs::*` for usage examples.
 //!
 //! ## Spec-level attributes (`#[spec(...)]` on the struct)
 //!
-//! - `kind = "Train"` — required; the [`pmetal_core::JobKind`] variant.
+//! - `kind = "Train"` — required; the `pmetal_core::JobKind` variant.
 //! - `subcommand = "train"` — required; the CLI subcommand string.
 //!
 //! ## Field-level attributes (`#[job(...)]` on each field)
@@ -18,7 +18,7 @@
 //!   For complex constants, use `default_const = path::TO::CONST` (verbatim path
 //!   reference with no display value — descriptor `DefaultValue::None`).
 //! - `kind = "model_picker" | "dataset_picker" | "path" | "read_only" | "enum"`
-//!   — overrides type-inferred [`pmetal_core::FieldKind`].
+//!   — overrides type-inferred `pmetal_core::FieldKind`.
 //! - `enum_options = ["none", "nf4", "fp4"]` — required when `kind = "enum"`.
 //! - `min = 0.0`, `max = 1.0` — bounds for `Number`/`Integer` kinds
 //!   (defaults: numeric type's full range).

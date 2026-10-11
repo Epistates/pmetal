@@ -39,7 +39,7 @@ pub trait TrainableModel: ModuleParameters {
     /// # Arguments
     /// * `input_ids` - Token IDs [batch, seq_len]
     /// * `mask` - Optional attention mask
-    /// * `position_ids` - Position indices [seq_len]
+    /// * `position_ids` - Position indices `[seq_len]`
     ///
     /// # Returns
     /// Logits [batch, seq_len, vocab_size]

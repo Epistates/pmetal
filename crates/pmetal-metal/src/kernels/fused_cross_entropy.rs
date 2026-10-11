@@ -5,7 +5,7 @@
 //! This module provides GPU-accelerated cross-entropy loss computation
 //! using a fused forward/backward pattern:
 //!
-//! - Forward: CE(x, y) = logsumexp(x) - x[y]
+//! - Forward: CE(x, y) = logsumexp(x) - `x[y]`
 //! - Backward: dL/dx = softmax(x) - one_hot(y)
 //!
 //! Key optimizations:
@@ -112,10 +112,10 @@ impl FusedCrossEntropyConfig {
 /// Output from fused cross-entropy forward pass.
 #[derive(Debug)]
 pub struct FusedCrossEntropyOutput {
-    /// Per-token losses [num_tokens].
+    /// Per-token losses `[num_tokens]`.
     pub losses: MetalBuffer<f32>,
 
-    /// Cached logsumexp for backward [num_tokens].
+    /// Cached logsumexp for backward `[num_tokens]`.
     pub logsumexp: MetalBuffer<f32>,
 }
 
@@ -165,7 +165,7 @@ impl FusedCrossEntropy {
     /// # Arguments
     ///
     /// * `logits` - Logits tensor [num_tokens, vocab_size]
-    /// * `targets` - Target indices [num_tokens]
+    /// * `targets` - Target indices `[num_tokens]`
     ///
     /// # Returns
     ///
@@ -281,9 +281,9 @@ impl FusedCrossEntropy {
     /// # Arguments
     ///
     /// * `logits` - Logits tensor [num_tokens, vocab_size] - will be overwritten with gradients
-    /// * `targets` - Target indices [num_tokens]
-    /// * `logsumexp` - Cached logsumexp from forward [num_tokens]
-    /// * `grad_loss` - Upstream gradient [num_tokens]
+    /// * `targets` - Target indices `[num_tokens]`
+    /// * `logsumexp` - Cached logsumexp from forward `[num_tokens]`
+    /// * `grad_loss` - Upstream gradient `[num_tokens]`
     pub fn backward(
         &self,
         logits: &mut MetalBuffer<f32>,
@@ -789,10 +789,10 @@ impl FusedLinearCrossEntropyConfig {
 /// Output from fused linear + cross-entropy forward pass.
 #[derive(Debug)]
 pub struct FusedLinearCrossEntropyOutput {
-    /// Per-token losses [num_tokens].
+    /// Per-token losses `[num_tokens]`.
     pub losses: MetalBuffer<f32>,
 
-    /// Cached logsumexp for backward [num_tokens].
+    /// Cached logsumexp for backward `[num_tokens]`.
     pub logsumexp: MetalBuffer<f32>,
 }
 
@@ -886,7 +886,7 @@ impl FusedLinearCrossEntropy {
     ///
     /// * `hidden_states` - Hidden states tensor [num_tokens, hidden_size]
     /// * `lm_head_weight` - LM head weight matrix [vocab_size, hidden_size]
-    /// * `targets` - Target token indices [num_tokens]
+    /// * `targets` - Target token indices `[num_tokens]`
     ///
     /// # Returns
     ///

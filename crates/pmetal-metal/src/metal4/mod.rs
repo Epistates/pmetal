@@ -5,7 +5,7 @@
 //!
 //! # Structure
 //!
-//! - [`backend`] — [`Metal4Backend`] implementing [`KernelBackend`]. Currently
+//! - `backend` — [`Metal4Backend`] implementing `KernelBackend`. Currently
 //!   delegates all operations to [`Metal3Backend`]; Tasks 11–18 replace calls
 //!   with MPP kernel dispatch.
 //!

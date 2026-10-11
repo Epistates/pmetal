@@ -741,7 +741,7 @@ impl Sampler {
     /// Only the final token extraction requires CPU sync.
     ///
     /// # Arguments
-    /// * `logits` - Logits for the next token [vocab_size]
+    /// * `logits` - Logits for the next token `[vocab_size]`
     /// * `generated_tokens` - Previously generated tokens (for repetition penalty)
     ///
     /// # Returns

@@ -68,6 +68,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --exclude pmetal-py --profile ci -- -D warnings
 
+      # Broken or private intra-doc links and stray HTML in doc comments.
+      - name: Docs
+        run: cargo doc --workspace --exclude pmetal-py --no-deps --profile ci
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # Single-threaded to avoid Metal/GPU conflicts.
       - name: Run tests
         run: cargo test --workspace --exclude pmetal-py --profile ci -- --test-threads=1

@@ -32,7 +32,7 @@
 //! This module provides:
 //! - [`FusedAdamW`]: All-parameter optimizer update in one dispatch
 //! - [`FusedGradientClipping`]: Global norm + scaling in two dispatches
-//! - [`FusedCrossEntropy`]: Loss + backward fused
+//! - `FusedCrossEntropy`: Loss + backward fused
 //! - [`BatchedCommandBuffer`]: Helper for batched execution
 //!
 //! # Performance Target
@@ -721,7 +721,7 @@ impl FusedCrossEntropyTraining {
     /// # Arguments
     /// * `batch` - Command buffer to queue into
     /// * `logits` - Model outputs [N, vocab_size]
-    /// * `labels` - Target labels [N]
+    /// * `labels` - Target labels `[N]`
     /// * `grad_logits` - Output gradients [N, vocab_size]
     /// * `loss` - Scalar loss (atomically accumulated)
     /// * `n` - Number of positions (batch * seq after shift)

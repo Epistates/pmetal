@@ -591,7 +591,7 @@ pub struct Qwen2Model {
     /// Final layer norm.
     pub norm: nn::RmsNorm,
     /// Recompute each layer's activations during the backward pass instead of
-    /// holding them. Training only; see [`crate::checkpointing`].
+    /// holding them. Training only; see `crate::checkpointing`.
     pub grad_checkpoint: bool,
 }
 impl_module_params!(Qwen2Model; embed_tokens, layers, norm);
@@ -657,7 +657,7 @@ impl Qwen2Model {
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
-    /// speculative decoding. Matches [`forward_with_cache`] exactly when
+    /// speculative decoding. Matches `forward_with_cache` exactly when
     /// `capture` is `None`.
     pub fn forward_with_capture(
         &mut self,

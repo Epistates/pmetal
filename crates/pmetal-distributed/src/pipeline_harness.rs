@@ -1,8 +1,8 @@
 //! Pipeline-parallel inference harness.
 //!
-//! Wires together [`auto::AutoDiscoveryBackend`] (for topology + identity) +
-//! [`transport::TcpTransport`] (for fabric-aware ring connections) +
-//! [`pipeline::PipelineStageRuntime`] (for activation send/recv) into a
+//! Wires together `auto::AutoDiscoveryBackend` (for topology + identity) +
+//! `transport::TcpTransport` (for fabric-aware ring connections) +
+//! `pipeline::PipelineStageRuntime` (for activation send/recv) into a
 //! single high-level handle that callers can drive a model through.
 //!
 //! Topology of TCP connections in pipeline mode:

@@ -9,7 +9,7 @@
 //! All dequant kernels use the qdot technique (pre-scaled activations) from MLX's
 //! `quantized.h`, eliminating per-nibble shifts from the inner loop for 30-40%
 //! compute reduction. Thread-private registers replace threadgroup shared memory
-//! to avoid the x_shared[4096] overflow bug and reduce barrier overhead.
+//! to avoid the `x_shared[4096]` overflow bug and reduce barrier overhead.
 
 use std::ptr::NonNull;
 use std::sync::Arc;

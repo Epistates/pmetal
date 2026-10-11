@@ -3,7 +3,7 @@
 //!
 //! LoRA reparameterises a frozen linear map: `y = x·Wᵀ + b` becomes
 //! `y = x·Wᵀ + b + s·((x·Aᵀ)·Bᵀ)`. That is the same shape as the optional bias
-//! `Linear` already carries, so [`LoraAdapter`] hangs off [`Linear`] the way a
+//! `Linear` already carries, so [`LoraAdapter`] hangs off [`Linear`](super::Linear) the way a
 //! bias does, and an architecture never has to mention LoRA to be trainable
 //! with it.
 //!

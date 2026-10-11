@@ -268,12 +268,16 @@ pub fn dequantize_q2k(block: &BlockQ2K, output: &mut [f32; QK_K]) {
 ///
 /// Scale encoding: 12 bytes encode 16 signed 6-bit values (bias 32, range -32..31).
 /// The reconstruction uses a u32-mask approach identical to the GGML reference:
-///   aux[0..3] = little-endian u32 from scales[0..12] (3 values)
-///   tmp = aux[2]  (the third u32 holds the upper-2-bit extensions)
-///   aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4)
-///   aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4)
-///   aux[0] = ( aux[0]       & KMASK2) | (((tmp     ) & KMASK1) << 4)
-///   aux[1] = ( aux[1]       & KMASK2) | (((tmp >> 2) & KMASK1) << 4)
+///
+/// ```text
+/// aux[0..3] = little-endian u32 from scales[0..12] (3 values)
+/// tmp = aux[2]  (the third u32 holds the upper-2-bit extensions)
+/// aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4)
+/// aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4)
+/// aux[0] = ( aux[0]       & KMASK2) | (((tmp     ) & KMASK1) << 4)
+/// aux[1] = ( aux[1]       & KMASK2) | (((tmp >> 2) & KMASK1) << 4)
+/// ```
+///
 /// The 16 bytes of aux[0..4] then hold the 16 unsigned 6-bit scale values; subtract 32 for
 /// the signed result.
 ///
@@ -472,10 +476,13 @@ pub fn dequantize_q5k(block: &BlockQ5K, output: &mut [f32; QK_K]) {
 ///
 /// Layout: 256 elements split into two 128-element chunks, each processed with a single
 /// `for l in 0..32` loop that writes 4 output positions simultaneously:
-///   - ys[l]      uses ql[l]      (low nibble) | (qh[l] bits 0-1) << 4  -> scale sc[l/16]
-///   - ys[l+32]   uses ql[l+32]   (low nibble) | (qh[l] bits 2-3) << 4  -> scale sc[l/16 + 2]
-///   - ys[l+64]   uses ql[l]      (high nibble) | (qh[l] bits 4-5) << 4 -> scale sc[l/16 + 4]
-///   - ys[l+96]   uses ql[l+32]   (high nibble) | (qh[l] bits 6-7) << 4 -> scale sc[l/16 + 6]
+///
+/// ```text
+/// ys[l]      uses ql[l]      (low nibble)  | (qh[l] bits 0-1) << 4 -> scale sc[l/16]
+/// ys[l+32]   uses ql[l+32]   (low nibble)  | (qh[l] bits 2-3) << 4 -> scale sc[l/16 + 2]
+/// ys[l+64]   uses ql[l]      (high nibble) | (qh[l] bits 4-5) << 4 -> scale sc[l/16 + 4]
+/// ys[l+96]   uses ql[l+32]   (high nibble) | (qh[l] bits 6-7) << 4 -> scale sc[l/16 + 6]
+/// ```
 ///
 /// Reference: GGML `dequantize_row_q6_K`.
 pub fn dequantize_q6k(block: &BlockQ6K, output: &mut [f32; QK_K]) {

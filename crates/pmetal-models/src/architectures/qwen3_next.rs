@@ -3376,7 +3376,7 @@ impl Qwen3NextDecoderLayer {
     /// Speculative-verify forward: records GDN verify inputs into
     /// `capture` for every linear-attention layer. Full-attention layers
     /// (every 4th, see `Qwen3NextConfig::is_linear_layer`) run the plain
-    /// [`forward`] path — their KV cache rollback is just `KVCache::rollback`
+    /// `forward` path — their KV cache rollback is just `KVCache::rollback`
     /// and needs no extra per-token state.
     #[expect(
         clippy::too_many_arguments,
@@ -3542,7 +3542,7 @@ impl Qwen3NextModel {
     /// Forward pass with optional hidden-state capture for speculative
     /// decoding.
     ///
-    /// Behaves identically to [`forward_with_cache`] when `capture` is
+    /// Behaves identically to `forward_with_cache` when `capture` is
     /// `None`. When a capture buffer is supplied, the post-layer hidden
     /// state is cloned into `capture.hidden_states` for every layer index in
     /// `capture.requested_hidden_layers`, without otherwise perturbing the
@@ -3984,7 +3984,7 @@ impl Qwen3NextForCausalLM {
     /// step for the hybrid-attention Qwen3.5 stack.
     ///
     /// This path intentionally bypasses the InlineArray decode closure used
-    /// by [`forward_with_cache`] for `T = 1`: verify always runs with
+    /// by `forward_with_cache` for `T = 1`: verify always runs with
     /// `T > 1` (multiple draft tokens), so the standard layer-by-layer
     /// forward is the correct target.
     pub fn forward_with_capture(

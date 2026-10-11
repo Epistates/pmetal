@@ -90,7 +90,7 @@ impl TrainingCallback for LoggingCallback {
 /// Checkpoint callback for saving training state.
 ///
 /// **Note**: This callback provides logging only. Actual checkpoint saving
-/// is handled by [`CheckpointManager`] in the training loop. This callback
+/// is handled by `CheckpointManager` in the training loop. This callback
 /// can be used to add custom behavior around checkpoint events.
 pub struct CheckpointCallback {
     save_every: usize,

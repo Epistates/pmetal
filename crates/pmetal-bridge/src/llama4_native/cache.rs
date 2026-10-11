@@ -11,7 +11,7 @@ use super::weights::NativeWeights;
 ///
 /// iRoPE invariant: this cache stores the *full* KV history regardless of
 /// `lw.use_rope`. Chunked attention is enforced as a *mask* during prefill
-/// (see [`super::attention::build_chunk_mask`]), not as a cache eviction
+/// (see `super::attention::build_chunk_mask`), not as a cache eviction
 /// policy — so global (NoPE) layers still see every prior token, which is
 /// the intended Llama 4 behaviour.
 #[derive(Clone)]

@@ -21,7 +21,7 @@
 //!   into `num_patches / pooling_kernel²` soft tokens, then a `√hidden` scaling
 //!   computed in fp32.
 //!
-//! The RMSNorms are exactly [`Gemma4RmsNorm`] / [`rms_norm_noscale`] (plain-`w`,
+//! The RMSNorms are exactly [`Gemma4RmsNorm`] / `rms_norm_noscale` (plain-`w`,
 //! eps-inside-sqrt), so those verified helpers are reused directly.
 //!
 //! # Scope

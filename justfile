@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check check-workspace-deps lint lint-all-features lint-min-features test test-release check-gui lint-gui check-version check-lockfile deny
+preflight: fmt-check check-workspace-deps lint lint-all-features lint-min-features doc-check test test-release check-gui lint-gui check-version check-lockfile deny
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -51,6 +51,11 @@ lint-all-features:
 lint-min-features:
     cargo clippy -p pmetal --all-targets --no-default-features --features cli -- -D warnings
     cargo clippy -p pmetal-trainer --all-targets -- -D warnings
+
+# Rustdoc with warnings as errors: an intra-doc link that doesn't resolve or
+# points at a private item, or prose rustdoc reads as HTML (CI: check job)
+doc-check:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude pmetal-py --no-deps
 
 # ─── Building ───────────────────────────────────────────────────────
 

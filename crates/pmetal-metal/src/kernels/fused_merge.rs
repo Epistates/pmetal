@@ -420,8 +420,8 @@ impl FusedMergeMetal {
     /// # Arguments
     /// * `batch` - Command buffer to queue into
     /// * `tensors` - Stacked input tensors [num_models, total_elements]
-    /// * `weights` - Weight per model [num_models]
-    /// * `consensus` - Output consensus signs [total_elements]
+    /// * `weights` - Weight per model `[num_models]`
+    /// * `consensus` - Output consensus signs `[total_elements]`
     /// * `num_models` - Number of models being merged
     /// * `total_elements` - Elements per model
     pub fn queue_sign_consensus(
@@ -609,10 +609,10 @@ impl FusedMergeMetal {
     /// # Arguments
     /// * `batch` - Command buffer to queue into
     /// * `tensors` - Stacked fine-tuned models [num_models, elements]
-    /// * `base` - Base model [elements]
-    /// * `weights` - Per-model weights [num_models]
-    /// * `thresholds` - Pre-computed magnitude thresholds [num_models]
-    /// * `output` - Output buffer [elements]
+    /// * `base` - Base model `[elements]`
+    /// * `weights` - Per-model weights `[num_models]`
+    /// * `thresholds` - Pre-computed magnitude thresholds `[num_models]`
+    /// * `output` - Output buffer `[elements]`
     /// * `config` - TIES configuration
     #[allow(clippy::too_many_arguments)]
     pub fn queue_fused_ties_merge(
@@ -675,8 +675,8 @@ impl FusedMergeMetal {
     /// # Arguments
     /// * `batch` - Command buffer to queue into
     /// * `tensors` - Stacked models [num_models, elements]
-    /// * `weights` - Per-model weights [num_models]
-    /// * `output` - Output buffer [elements]
+    /// * `weights` - Per-model weights `[num_models]`
+    /// * `output` - Output buffer `[elements]`
     /// * `num_models` - Number of models
     /// * `total_elements` - Elements per model
     pub fn queue_linear_merge(
@@ -741,9 +741,9 @@ impl FusedMergeMetal {
     ///
     /// # Arguments
     /// * `batch` - Command buffer to queue into
-    /// * `tensor_a` - First tensor [elements]
-    /// * `tensor_b` - Second tensor [elements]
-    /// * `output` - Output buffer [elements]
+    /// * `tensor_a` - First tensor `[elements]`
+    /// * `tensor_b` - Second tensor `[elements]`
+    /// * `output` - Output buffer `[elements]`
     /// * `t` - Interpolation factor (0.0 = a, 1.0 = b)
     /// * `omega` - Pre-computed angle between vectors
     /// * `sin_omega` - Pre-computed sin(omega)
@@ -818,8 +818,8 @@ impl FusedMergeMetal {
     ///
     /// # Arguments
     /// * `batch` - Command buffer to queue into
-    /// * `input` - Input tensor [elements]
-    /// * `output` - Output buffer [elements]
+    /// * `input` - Input tensor `[elements]`
+    /// * `output` - Output buffer `[elements]`
     /// * `density` - Fraction of elements to keep (0.0-1.0)
     /// * `total_elements` - Number of elements
     /// * `seed` - Random seed for reproducibility
@@ -887,8 +887,8 @@ impl FusedMergeMetal {
     ///
     /// # Arguments
     /// * `batch` - Command buffer to queue into
-    /// * `tensor_a` - First tensor [elements]
-    /// * `tensor_b` - Second tensor [elements]
+    /// * `tensor_a` - First tensor `[elements]`
+    /// * `tensor_b` - Second tensor `[elements]`
     /// * `partial_results` - Output for partial sums [3 * num_threadgroups]
     /// * `total_elements` - Number of elements
     pub fn queue_slerp_dot_norm(

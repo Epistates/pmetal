@@ -38,7 +38,7 @@ use crate::types::ChatMessage;
 ///
 /// Anthropic's spec allows `content` to be either `"text"` or `[{type, ...}]`.
 /// We accept both. Text blocks are joined; image blocks go to the model as
-/// images (see [`AnthropicMessage::to_chat_message`]); tool_use and
+/// images (see `AnthropicMessage::to_chat_message`); tool_use and
 /// tool_result blocks are accepted and contribute nothing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]

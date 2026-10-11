@@ -7,7 +7,7 @@
 //! in Rust by hand is brittle — upstream Gemma 4 alone uses ~200 lines of
 //! Jinja with macros, namespaces, and nested control flow.
 //!
-//! This module wraps [`minijinja`] + [`minijinja-contrib`] to execute those
+//! This module wraps [`minijinja`] + `minijinja-contrib` to execute those
 //! templates directly. The result is a bit-exact match against
 //! `transformers.AutoTokenizer.apply_chat_template(...)` for every model in
 //! the parity audit suite.

@@ -70,7 +70,7 @@ pub struct TensorBatch {
     /// Names of tensors in this batch.
     pub names: Vec<String>,
 
-    /// Loaded tensors from each model [model_idx][tensor_idx].
+    /// Loaded tensors from each model `[model_idx][tensor_idx]`.
     pub tensors: Vec<Vec<Array>>,
 
     /// Base tensors (if using task arithmetic methods).

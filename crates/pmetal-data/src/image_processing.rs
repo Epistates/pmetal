@@ -352,7 +352,7 @@ pub struct MllamaImageProcessorConfig {
     /// Whether to scale raw `[0, 255]` samples by [`Self::rescale_factor`].
     pub do_rescale: bool,
     /// Pixel scale, `1/255`. `f64` for the reason spelled out on
-    /// [`PixelNormalizer`]: the reference rescales in f64, so an f32 factor is
+    /// `PixelNormalizer`: the reference rescales in f64, so an f32 factor is
     /// already rounded before the multiply and lands a ULP off.
     pub rescale_factor: f64,
     /// Whether to apply mean/std normalisation after rescaling.

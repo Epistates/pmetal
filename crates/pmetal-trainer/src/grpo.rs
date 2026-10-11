@@ -254,7 +254,7 @@ pub struct GrpoConfig {
     /// KV cache quantization bits for the generation (rollout) phase.
     ///
     /// When `Some(bits)`, the KV cache used during `generate_completions` is
-    /// configured with [`CacheMode::Quantized`] at the requested bit width
+    /// configured with `CacheMode::Quantized` at the requested bit width
     /// (valid values: 2, 4, 8).  A group size of 64 is used, which is
     /// compatible with all standard head dimensions.
     ///
@@ -1528,7 +1528,7 @@ impl GrpoTrainer {
 
     /// Run GRPO training with pipelined (asynchronous) reward scoring.
     ///
-    /// Identical to [`run`] but wraps `reward_fn` in an [`AsyncRewardModel`]
+    /// Identical to `run` but wraps `reward_fn` in an `AsyncRewardModel`
     /// so reward scoring for step N overlaps with GPU training for step N+1.
     ///
     /// # Pipeline
@@ -1546,14 +1546,14 @@ impl GrpoTrainer {
     ///
     /// # Arguments
     ///
-    /// Identical to [`run`] except `reward_fn` is taken by value as
+    /// Identical to `run` except `reward_fn` is taken by value as
     /// `Box<dyn RewardFunction>` to allow ownership transfer to the
     /// background thread.  Pass `Box::new(combined_reward)` when wrapping a
     /// `CombinedReward` (which implements `RewardFunction`).
     ///
     /// # Errors
     ///
-    /// Same as [`run`], plus [`GrpoError::Reward`] if the background scorer
+    /// Same as `run`, plus [`GrpoError::Reward`] if the background scorer
     /// thread terminates unexpectedly.
     #[expect(
         clippy::too_many_arguments,
@@ -1911,7 +1911,7 @@ pub trait RewardFunction: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// Reward function that checks for proper XML tags (e.g., <thought> and <answer>).
+/// Reward function that checks for proper XML tags (e.g., `<thought>` and `<answer>`).
 pub struct XmlFormatReward {
     pub tags: Vec<(String, String)>,
 }

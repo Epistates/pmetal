@@ -444,9 +444,9 @@ impl BatchedRlGenerator {
     ///
     /// ## Returns
     ///
-    /// `BatchedGenerationOutput` with the same structure as [`generate`].
+    /// `BatchedGenerationOutput` with the same structure as `generate`.
     /// Token IDs include the prompt followed by the generated completion.
-    /// Statistics are available via [`speculative_rl_stats`] after this call.
+    /// Statistics are available via `speculative_rl_stats` after this call.
     pub fn generate_speculative<D, V>(
         &mut self,
         mut draft_fn: D,
