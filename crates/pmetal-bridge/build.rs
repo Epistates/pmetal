@@ -651,6 +651,7 @@ fn build_and_link() {
         "bridge_compiled.cpp",
         "bridge_native.cpp",
         "bridge_training.cpp",
+        "bridge_cce.cpp",
         "bridge_gdn.cpp",
         "bridge_distributed.cpp",
     ];

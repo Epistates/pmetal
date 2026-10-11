@@ -1365,6 +1365,25 @@ bridge_extern! {
     /// True when the array is part of a graph a function transform is tracing.
     pub(super) fn mlx_inline_is_tracer(a: *const RawBuf) -> bool;
 
+    // ── Cut cross-entropy, fused ──
+    // 0 on success, 1 when the fused kernels can't take the inputs (`reason`
+    // set, outputs placeholders), 2 on an exception (error channel set).
+    pub(super) fn mlx_inline_cce_fused(
+        dst_lse: *mut RawBuf,
+        dst_target: *mut RawBuf,
+        hidden: *const RawBuf,
+        weight: *const RawBuf,
+        targets: *const RawBuf,
+        bias: *const RawBuf,
+        logit_scale: f32,
+        softcap: f32,
+        filter_eps: f32,
+        vocab_chunk: i32,
+        want_dx: bool,
+        want_dw: bool,
+        reason: *mut *const std::ffi::c_char,
+    ) -> i32;
+
     // ── Gradient checkpointing ──
     // Wraps `forward_fn` with mlx::core::checkpoint() so that activations
     // are discarded after the forward pass and recomputed during backward.

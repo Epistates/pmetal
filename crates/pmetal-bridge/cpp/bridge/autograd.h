@@ -69,6 +69,28 @@ void mlx_inline_checkpoint(
     int* n_outputs_written
 );
 
+// ── Cut cross-entropy, fused (bridge_cce.cpp) ────────────────────────────
+// Each token's logsumexp over the vocabulary and its target logit, both [n]
+// f32, of the logits softcap(logit_scale * (hidden · weightᵀ + bias)), from
+// hidden [n, k] and weight [v, k] without the [n, v] logits. A custom VJP:
+// gradients reach hidden, weight and bias (`bias` may be NULL). A target
+// outside [0, v) has a target logit of zero. The backward leaves out each
+// 8-token group's 64-row vocabulary tiles where its softmax stays under
+// `filter_eps` (0 leaves out nothing) and holds one `vocab_chunk`-column chunk
+// of logit gradients at a time. `want_dx` /
+// `want_dw` say which gradients autograd will ask for; they only shape the
+// backward's memory schedule.
+//
+// Returns 0 on success; 1 when the fused kernels can't take these inputs
+// (`*reason` says why, outputs are placeholders); 2 on an exception (in the
+// error channel).
+int mlx_inline_cce_fused(mlx_inline_array* dst_lse, mlx_inline_array* dst_target,
+                         const mlx_inline_array* hidden, const mlx_inline_array* weight,
+                         const mlx_inline_array* targets, const mlx_inline_array* bias,
+                         float logit_scale, float softcap, float filter_eps,
+                         int vocab_chunk, bool want_dx, bool want_dw,
+                         const char** reason);
+
 #ifdef __cplusplus
 }
 #endif

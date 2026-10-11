@@ -157,7 +157,10 @@ pub struct TrainArgs {
     #[arg(long = "seed", default_value = "42")]
     pub seed: u64,
 
-    /// Use Cut Cross-Entropy for memory-efficient loss computation.
+    /// Use cut cross-entropy: the loss from fused Metal kernels that never
+    /// hold the logits, with the backward's gradient filtering set to keep
+    /// the gradient as precise as the full logits' (the library's
+    /// `CutCrossEntropyConfig::filter_eps` trades precision for speed).
     #[arg(long = "cut-cross-entropy")]
     pub cut_cross_entropy: bool,
 

@@ -639,7 +639,7 @@ Multiple distillation methods and loss functions:
 | `--warmup-steps` | 100 | Learning rate warmup steps |
 | `--weight-decay` | 0.01 | AdamW weight decay coefficient |
 | `--no-sequence-packing` | false | Disable sequence packing |
-| `--cut-cross-entropy` | false | Memory-efficient loss (avoids full logit materialization) |
+| `--cut-cross-entropy` | false | Loss from fused Metal kernels that never hold the logits; gradient as precise as the full logits' |
 | `--text-column` | — | Custom JSONL column name for training text |
 | `--text-columns` | — | Multi-column concat (comma-separated, e.g. `thinking,solution`) |
 | `--prompt-column` | — | Column for prompt (enables SFT loss masking) |

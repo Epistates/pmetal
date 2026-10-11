@@ -25,6 +25,9 @@ pub use safetensors::{load_safetensors_shard, random_seed};
 mod autograd;
 pub use autograd::{checkpoint_apply, checkpoint_apply_unchecked, value_and_grad};
 
+mod cce;
+pub use cce::{FusedCceOutput, FusedCceParams, cut_cross_entropy_fused};
+
 mod compiled;
 mod eval;
 mod factory;

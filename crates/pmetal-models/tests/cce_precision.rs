@@ -9,7 +9,10 @@
 //!
 //! `PMETAL_CCE_CHECKPOINT=/path/to/Qwen3-0.6B cargo test -p pmetal-models
 //! --test cce_precision -- --ignored --nocapture`, several paths separated by
-//! `:` to sweep.
+//! `:` to sweep. `PMETAL_CCE_TOKENS` sets the batch's length (the text is
+//! repeated to fill it), `PMETAL_CCE_TEXT` names a file to read the text
+//! from instead of the built-in one, and `PMETAL_CCE_PROFILE_VARIANTS`
+//! (`;`-separated) limits the memory and time measurements to some variants.
 
 use std::time::Instant;
 
@@ -17,6 +20,7 @@ use pmetal_bridge::compat::{Array, Dtype, ops};
 use pmetal_bridge::inline_array::{
     clear_cache, get_active_memory, get_peak_memory, reset_peak_memory, value_and_grad,
 };
+use pmetal_mlx::kernels::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
 use pmetal_models::dispatcher::{DynamicModel, LmHead};
 
 const TEST_NAME: &str = "cut_cross_entropy_precision_on_a_real_checkpoint";
@@ -61,11 +65,12 @@ fn logits(head: &LmHead, h: &Array, w: &Array) -> Array {
     z
 }
 
-const VARIANTS: [&str; 4] = [
+const VARIANTS: [&str; 5] = [
     "f32 reference",
     "full logits",
     "full logits, f32 softmax",
     "cut cross-entropy",
+    "cut cross-entropy, chunked",
 ];
 
 /// The loss of `variant`, from the hidden states and the head weight.
@@ -79,6 +84,15 @@ fn loss(variant: &str, head: &LmHead, targets: &Array, h: &Array, w: &Array) -> 
             let mut head = head.clone();
             head.weight = w.clone();
             head.cut_cross_entropy(h, targets, -100).expect("cce")
+        }
+        "cut cross-entropy, chunked" => {
+            let mut config = CutCrossEntropyConfig::new().with_logit_scale(head.logit_scale);
+            if let Some(cap) = head.softcap {
+                config = config.with_softcap(cap);
+            }
+            CutCrossEntropy::new(config)
+                .forward_chunked(h, w, targets, head.bias.as_ref())
+                .expect("chunked cce")
         }
         other => panic!("no variant {other}"),
     }
@@ -123,14 +137,28 @@ fn rel(got: &Array, want: &Array) -> f32 {
     d.divide(&n).item_f32()
 }
 
-/// Copies of the text in the batch, `PMETAL_CCE_REPEAT` (default 1): the
+/// Tokens in the batch, `PMETAL_CCE_TOKENS` (default: the text once). The
 /// logits' share of memory grows with the token count, so a long batch is
 /// where the loss's memory shows.
-fn repeats() -> usize {
-    std::env::var("PMETAL_CCE_REPEAT")
+fn token_count() -> Option<usize> {
+    std::env::var("PMETAL_CCE_TOKENS")
         .ok()
         .and_then(|r| r.parse().ok())
-        .unwrap_or(1)
+}
+
+/// Whether to measure `variant`'s memory and time: all of them, or those
+/// `PMETAL_CCE_PROFILE_VARIANTS` lists (separated by `;`).
+fn profiled(variant: &str) -> bool {
+    std::env::var("PMETAL_CCE_PROFILE_VARIANTS")
+        .map_or(true, |list| list.split(';').any(|v| v.trim() == variant))
+}
+
+/// The batch's text: the file `PMETAL_CCE_TEXT` names, or the built-in one.
+fn text() -> String {
+    match std::env::var("PMETAL_CCE_TEXT") {
+        Ok(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}")),
+        Err(_) => TEXT.to_string(),
+    }
 }
 
 struct Batch {
@@ -142,12 +170,15 @@ struct Batch {
 fn batch(dir: &str) -> Batch {
     let mut model = DynamicModel::load(dir).expect("load");
     let tokenizer = pmetal_data::Tokenizer::from_model_dir(dir).expect("tokenizer");
-    let ids: Vec<i32> = tokenizer
-        .encode(&TEXT.repeat(repeats()))
+    let once: Vec<i32> = tokenizer
+        .encode(&text())
         .expect("encode")
         .into_iter()
         .map(|t| t as i32)
         .collect();
+    // One more than the batch: the targets are the ids shifted by one.
+    let len = token_count().map_or(once.len(), |n| n + 1);
+    let ids: Vec<i32> = once.iter().copied().cycle().take(len).collect();
     let n = ids.len() as i32;
     let input = Array::from_i32_slice_shaped(&ids, &[1, n]);
     let hidden = model.forward_hidden(&input, None).expect("hidden");
@@ -175,14 +206,15 @@ fn profile(dir: &str, variant: &str, wrt_head: bool) {
     reset_peak_memory();
     drop(step(variant, &b.head, &b.targets, &b.hidden, wrt_head));
     let peak = get_peak_memory().saturating_sub(base);
-    let mut times = Vec::new();
-    for _ in 0..5 {
+    // The fastest of seven steps: on a machine doing other work, the other
+    // work only ever adds time.
+    let mut fastest = f64::INFINITY;
+    for _ in 0..7 {
         let start = Instant::now();
         drop(step(variant, &b.head, &b.targets, &b.hidden, wrt_head));
-        times.push(start.elapsed().as_secs_f64() * 1e3);
+        fastest = fastest.min(start.elapsed().as_secs_f64() * 1e3);
     }
-    times.sort_by(f64::total_cmp);
-    println!("PROFILE {:.0} {:.1}", peak as f64 / 1e6, times[2]);
+    println!("PROFILE {:.0} {:.1}", peak as f64 / 1e6, fastest);
 }
 
 #[test]
@@ -214,13 +246,17 @@ fn cut_cross_entropy_precision_on_a_real_checkpoint() {
             ];
             drop(grads);
             let mut line = format!(
-                "  {variant:<26} loss {:.6} |Δ| {:.1e}  ∂h {:.1e}  ∂W {:.1e}",
+                "  {variant:<26} loss {:.6} |Δ| {:.2e}  ∂h {:.2e}  ∂W {:.2e}",
                 got.item_f32(),
                 error[0],
                 error[1],
                 error[2],
             );
             errors.push(error);
+            if !profiled(variant) {
+                println!("{line}");
+                continue;
+            }
             for wrt in ["hidden", "head"] {
                 let out = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", TEST_NAME, "--ignored", "--nocapture"])
