@@ -18,7 +18,8 @@ use pmetal_models::{
     architectures::Qwen3NextMtpForCausalLM,
     generation::{
         GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
-        correction_log_probs, sampling_log_probs_with_counts, token_probability_from_log_probs,
+        correction_log_probs, count_token, sampling_log_probs_with_counts,
+        token_probability_from_log_probs,
     },
 };
 
@@ -737,7 +738,7 @@ pub fn run_qwen3_native_mtp_inference_ext(
             };
             draft_tokens.push(draft_token);
             draft_history.push(draft_token);
-            increment_count(&mut draft_counts, draft_token);
+            count_token(&mut draft_counts, draft_token);
 
             let (next_hidden, next_logits) =
                 mtp_step(mtp, draft_token, &draft_hidden, mtp_cache, draft_idx + 1)?;
@@ -780,7 +781,7 @@ pub fn run_qwen3_native_mtp_inference_ext(
                     let mut verify_counts = generated_counts.clone();
                     for &token in &draft_tokens {
                         verify_history.push(token);
-                        increment_count(&mut verify_counts, token);
+                        count_token(&mut verify_counts, token);
                     }
                     let log_probs = sampling_log_probs_with_counts(
                         &row,
@@ -825,7 +826,7 @@ pub fn run_qwen3_native_mtp_inference_ext(
                 &mut on_token,
             );
             emitted_planned_count += 1;
-            increment_count(&mut generated_counts, token);
+            count_token(&mut generated_counts, token);
             if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
                 break;
             }
@@ -1014,7 +1015,7 @@ fn accept_sampled_draft(
         if draws.uniform() < accept_prob {
             accepted += 1;
             verify_history.push(token);
-            increment_count(&mut verify_counts, token);
+            count_token(&mut verify_counts, token);
         } else {
             let correction_log_probs = correction_log_probs(&target_log_probs, draft_log_probs_row)
                 .map_err(|e| e.to_string())?;
@@ -1049,10 +1050,6 @@ where
         *stopped_by_token = true;
     }
     on_token(token)
-}
-
-fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {
-    *token_counts.entry(token).or_insert(0) += 1;
 }
 
 // ============================================================================

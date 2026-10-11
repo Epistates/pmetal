@@ -17,7 +17,8 @@ use crate::{
     },
     generation::{
         GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
-        correction_log_probs, sampling_log_probs_with_counts, token_probability_from_log_probs,
+        correction_log_probs, count_token, sampling_log_probs_with_counts,
+        token_probability_from_log_probs,
     },
 };
 
@@ -387,7 +388,7 @@ where
             draft_tokens.push(draft_token);
             draft_log_probs.push(log_probs);
             draft_history.push(draft_token);
-            increment_count(&mut draft_counts, draft_token);
+            count_token(&mut draft_counts, draft_token);
             draft_hidden = projected_hidden;
             draft_input_token = draft_token;
             if gen_config.stop_tokens.contains(&draft_token) {
@@ -411,7 +412,7 @@ where
                 &gen_config,
                 &mut on_token,
             )?;
-            increment_count(&mut generated_counts, token);
+            count_token(&mut generated_counts, token);
             if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
                 break;
             }
@@ -449,7 +450,7 @@ where
             if draws.uniform() < accept_prob {
                 accepted += 1;
                 verify_history.push(token);
-                increment_count(&mut verify_counts, token);
+                count_token(&mut verify_counts, token);
             } else {
                 let correction_log_probs =
                     correction_log_probs(&target_log_probs, draft_log_probs_row)?;
@@ -502,7 +503,7 @@ where
                 &mut on_token,
             )?;
             emitted_planned_count += 1;
-            increment_count(&mut generated_counts, token);
+            count_token(&mut generated_counts, token);
             if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
                 break;
             }
@@ -583,10 +584,6 @@ fn embed_target_token(target: &Gemma4ForCausalLM, token: u32) -> Array {
         .embed_tokens
         .forward(&input)
         .multiply(&Array::from_f32(target.model.embed_scale))
-}
-
-fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {
-    *token_counts.entry(token).or_insert(0) += 1;
 }
 
 #[cfg(test)]

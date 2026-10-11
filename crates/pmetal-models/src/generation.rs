@@ -889,7 +889,7 @@ impl Sampler {
 
     /// Update token frequency counts for frequency penalty.
     pub fn update_counts(&mut self, token: u32) {
-        *self.token_counts.entry(token).or_insert(0) += 1;
+        count_token(&mut self.token_counts, token);
     }
 
     /// Reset token counts (call between generations).
@@ -1154,6 +1154,12 @@ pub fn token_logprobs(
     }
 
     Ok((chosen, top))
+}
+
+/// Count one more occurrence of `token`, in the counts the frequency and
+/// presence penalties read ([`sampling_log_probs_with_counts`]).
+pub fn count_token(token_counts: &mut HashMap<u32, usize>, token: u32) {
+    *token_counts.entry(token).or_insert(0) += 1;
 }
 
 /// Build the exact sampling distribution used by [`Sampler`] for a given
