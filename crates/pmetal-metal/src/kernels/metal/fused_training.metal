@@ -52,6 +52,7 @@ struct ParamInfo {
     uint size;              // Number of elements in this parameter
     uint m_offset;          // Offset into first moment buffer
     uint v_offset;          // Offset into second moment buffer
+    uint group;             // Index of this parameter's AdamWScalars
 };
 
 // =============================================================================
@@ -71,6 +72,9 @@ struct ParamInfo {
 /// - m: First moment estimates [total_elements]
 /// - v: Second moment estimates [total_elements]
 /// - param_info: Metadata for each parameter [num_params]
+/// - groups: One step's scalars per parameter group; a parameter reads
+///   groups[param_info.group], so groups train at their own learning rate
+///   and weight decay, as torch.optim's param_groups do
 ///
 /// The update is torch.optim.AdamW's, in its order: decoupled weight decay on
 /// the old parameter, then the bias-corrected Adam step.
@@ -87,7 +91,7 @@ kernel void fused_adamw_update(
     device float* m [[buffer(2)]],              // First moments (in-place update)
     device float* v [[buffer(3)]],              // Second moments (in-place update)
     device const ParamInfo* param_info [[buffer(4)]],  // Parameter metadata
-    constant AdamWScalars& s [[buffer(5)]],
+    constant AdamWScalars* groups [[buffer(5)]],       // Scalars per group
     constant uint& num_params [[buffer(6)]],
     uint2 tid [[thread_position_in_grid]],
     uint2 tgid [[threadgroup_position_in_grid]]
@@ -107,6 +111,7 @@ kernel void fused_adamw_update(
     const uint p_idx = info.offset + elem_idx;
     const uint m_idx = info.m_offset + elem_idx;
     const uint v_idx = info.v_offset + elem_idx;
+    const AdamWScalars s = groups[info.group];
 
     const float g = grads[p_idx];
     const float p = params[p_idx] * s.decay;

@@ -17,7 +17,7 @@ use crate::{
     },
     buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},
     context::MetalContext,
-    error::Result,
+    error::{MetalError, Result},
     kernels::fused_moe::ExpertBits,
     kernels::{
         flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
@@ -553,9 +553,16 @@ impl KernelBackend for Metal4Backend {
             use_fp16: false,
         };
 
-        // Convert ParamInfo → MppParamInfo. Both are #[repr(C)] with the same
-        // four u32 fields (offset, size, m_offset, v_offset), so the mapping
-        // is a direct field copy with no data loss.
+        // The MPP kernel has one set of scalars for every parameter.
+        if let Some(p) = param_infos.iter().find(|p| p.group != 0) {
+            return Err(MetalError::InvalidConfig(format!(
+                "AdamWDescriptor carries one parameter group, but the parameter at \
+                 offset {} is in group {}",
+                p.offset, p.group
+            )));
+        }
+        // Convert ParamInfo → MppParamInfo: offset, size and moment offsets,
+        // into a buffer laid out as the MPP kernel reads it.
         let mpp_param_infos: Vec<MppParamInfo> = param_infos
             .iter()
             .map(|p| MppParamInfo {
@@ -573,13 +580,15 @@ impl KernelBackend for Metal4Backend {
             return self.fallback.fused_adamw_step_standalone(_ctx, desc);
         }
 
+        let mpp_info_buf =
+            MetalBuffer::from_slice(&self.ctx, &mpp_param_infos, BufferUsage::Shared)?;
         dispatcher.execute(
             desc.params,
             desc.grads,
             desc.m,
             desc.v,
             &mpp_param_infos,
-            desc.param_info,
+            &mpp_info_buf,
             &desc.config,
         )
     }

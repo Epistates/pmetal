@@ -388,7 +388,7 @@ impl KernelBackend for Metal3Backend {
             desc.m,
             desc.v,
             desc.param_info,
-            &desc.config,
+            &[desc.config.scalars()?],
         )
     }
 

@@ -70,7 +70,19 @@ pub struct MppGradClipConfig {
 // =============================================================================
 
 /// Must match `MppParamInfo` in mpp_fused_training.metal.
+///
+/// Not [`crate::kernels::ParamInfo`]: that one also names a parameter
+/// group, so a buffer of one is not a buffer of the other.
 #[repr(C)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::KnownLayout,
+    zerocopy::Immutable,
+)]
 pub struct MppParamInfo {
     /// Offset into the flat param/grad buffer at which this parameter starts.
     pub offset: u32,

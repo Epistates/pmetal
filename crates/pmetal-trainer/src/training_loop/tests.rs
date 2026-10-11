@@ -1347,3 +1347,127 @@ fn a_cut_cross_entropy_step_without_hidden_states_fails() {
     assert!(err.to_string().contains("hidden-state forward"), "{err}");
     pmetal_bridge::clear_last_error();
 }
+
+/// The fused Metal AdamW loop and the standard loop train the same adapters
+/// from the same config: LoRA+ on the B matrices, the embedding learning
+/// rate on the LM head's adapter (an embedding parameter by name), weight
+/// decay on the rest, and the frozen base left alone by both.
+#[test]
+fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
+    use pmetal_bridge::compat::{ModuleParametersExt, random};
+    use std::collections::HashMap;
+
+    let config = || {
+        let mut config = epoch_based_config();
+        config.training.learning_rate = 2e-3;
+        config.training.weight_decay = 0.1;
+        config.training.max_grad_norm = 1.0;
+        config.training.gradient_accumulation_steps = 1;
+        config.training.num_epochs = 1;
+        config.training.max_steps = Some(4);
+        config.embedding_lr = Some(5e-4);
+        config.loraplus_lr_ratio = Some(16.0);
+        config
+    };
+    let lora = LoraConfig {
+        target_modules: ["q_proj", "v_proj", "lm_head"].map(String::from).to_vec(),
+        ..small_lora_config()
+    };
+    let build = || {
+        random::seed(29);
+        let untied = LlamaConfig {
+            tie_word_embeddings: false,
+            ..small_config()
+        };
+        let base = DynamicModel::from_config(&serde_json::to_string(&untied).unwrap())
+            .expect("llama builds");
+        AdaptedModel::attach(base, lora.clone()).expect("attach adapters")
+    };
+    let snapshot = |model: &AdaptedModel, trainable: bool| -> HashMap<String, Vec<f32>> {
+        let params = if trainable {
+            model.flatten_trainable_params()
+        } else {
+            model.flatten_params()
+        };
+        params
+            .iter()
+            .map(|(k, v)| {
+                let v = v.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+                v.eval();
+                (k.to_string(), v.as_slice::<f32>().to_vec())
+            })
+            .collect()
+    };
+    let largest_difference = |a: &HashMap<String, Vec<f32>>, b: &HashMap<String, Vec<f32>>| {
+        let mut worst = 0.0f64;
+        for (name, a) in a {
+            for (&x, &y) in a.iter().zip(&b[name]) {
+                let d = (x as f64 - y as f64).abs();
+                worst = if d.is_nan() {
+                    f64::INFINITY
+                } else {
+                    worst.max(d)
+                };
+            }
+        }
+        worst
+    };
+
+    let start = build();
+    let init = snapshot(&start, false);
+    let trainable: usize = start
+        .flatten_trainable_params()
+        .values()
+        .map(|a| a.size())
+        .sum();
+    assert!(
+        start
+            .flatten_trainable_params()
+            .keys()
+            .any(|k| k.contains("lm_head.lora_")),
+        "the LM head is adapted"
+    );
+
+    let mut standard = build();
+    TrainingLoop::new(config())
+        .run(&mut standard, create_dummy_dataset(4, 12), None, None)
+        .expect("standard loop");
+    let mut fused = build();
+    TrainingLoop::new(config())
+        .run_metal_fused(&mut fused, create_dummy_dataset(4, 12), None, None)
+        .expect("fused loop");
+
+    let (a, b) = (snapshot(&standard, true), snapshot(&fused, true));
+    let moved = largest_difference(&a, &snapshot(&start, true));
+    assert!(moved > 1e-3, "the adapters barely trained ({moved:.2e})");
+    let diff = largest_difference(&a, &b);
+    assert!(
+        diff < 1e-5,
+        "the fused loop's adapters are {diff:.3e} off the standard loop's"
+    );
+    // Neither loop touched the frozen base.
+    for (name, model) in [("standard", &standard), ("fused", &fused)] {
+        let after = snapshot(model, false);
+        let base: HashMap<String, Vec<f32>> = init
+            .iter()
+            .filter(|(k, _)| !a.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(
+            largest_difference(&base, &after),
+            0.0,
+            "the {name} loop moved a frozen weight"
+        );
+    }
+    let mut optimizer = TrainingLoop::new(config())
+        .build_metal_fused_optimizer()
+        .expect("fused");
+    optimizer.initialize(&start).expect("initialize");
+    assert_eq!(
+        optimizer.total_elements(),
+        trainable,
+        "the fused optimizer holds state for the trainable parameters only"
+    );
+    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    println!("fused vs standard loop over 4 steps: {diff:.2e} (adapters moved {moved:.2e})");
+}

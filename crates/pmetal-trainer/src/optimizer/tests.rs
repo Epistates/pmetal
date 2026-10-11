@@ -225,7 +225,7 @@ fn every_group_follows_the_scheduled_rate_at_its_ratio() {
     opt.set_learning_rate(0.02);
     assert_eq!(opt.learning_rates(), (0.02, 0.01));
     assert_eq!(opt.kind(), OptimizerType::Lion);
-    for g in opt.groups_mut() {
+    for g in opt.optimizers_mut() {
         g.advance_step();
     }
 

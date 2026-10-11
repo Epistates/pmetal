@@ -272,6 +272,22 @@ pub struct AdamWScalars {
     pub epsilon: f32,
 }
 
+impl AdamWScalars {
+    /// Scalars that leave a parameter and both its moments exactly as they
+    /// are: `p·1 − 0·(…)`, `m + 0·(g − m)`, `1·v + 0·g²`. A parameter without
+    /// a gradient this step takes them, as `torch.optim` skips a parameter
+    /// whose `.grad` is `None`.
+    pub const UNCHANGED: Self = Self {
+        decay: 1.0,
+        one_minus_beta1: 0.0,
+        beta2: 1.0,
+        one_minus_beta2: 0.0,
+        step_size: 0.0,
+        bias_correction2_sqrt: 1.0,
+        epsilon: 1.0,
+    };
+}
+
 // `AdamWScalars` in `metal/fused_training.metal` and
 // `metal4/mpp_fused_training.metal`.
 crate::msl_layout::msl_layout!(AdamWScalars, size = 28, {
@@ -309,14 +325,18 @@ pub struct ParamInfo {
     pub m_offset: u32,
     /// Offset into second moment buffer.
     pub v_offset: u32,
+    /// Which of the step's [`AdamWScalars`] this parameter is updated with
+    /// (its parameter group); see [`FusedAdamW::queue_update`].
+    pub group: u32,
 }
 
 // `ParamInfo` in `metal/fused_training.metal`.
-crate::msl_layout::msl_layout!(ParamInfo, size = 16, {
+crate::msl_layout::msl_layout!(ParamInfo, size = 20, {
     offset: 0,
     size: 4,
     m_offset: 8,
     v_offset: 12,
+    group: 16,
 });
 
 // =============================================================================
@@ -365,7 +385,7 @@ impl FusedAdamW {
         }
     }
 
-    /// Build parameter info metadata from sizes.
+    /// Build parameter info metadata from sizes, every parameter in group 0.
     pub fn build_param_info(param_sizes: &[usize]) -> Vec<ParamInfo> {
         let mut offset = 0u32;
         param_sizes
@@ -376,6 +396,7 @@ impl FusedAdamW {
                     size: size as u32,
                     m_offset: offset,
                     v_offset: offset,
+                    group: 0,
                 };
                 offset += size as u32;
                 info
@@ -383,7 +404,17 @@ impl FusedAdamW {
             .collect()
     }
 
+    /// The most groups one dispatch takes: their scalars go to the kernel
+    /// with `setBytes`, which carries at most 4 KiB.
+    pub const MAX_GROUPS: usize = 4096 / std::mem::size_of::<AdamWScalars>();
+
     /// Queue an AdamW update into a batched command buffer.
+    ///
+    /// Parameter `i` is updated with `groups[param_info[i].group]`: one set
+    /// of scalars per parameter group, so each group trains at its own
+    /// learning rate and weight decay. Fails if a parameter names a group
+    /// past the end of `groups`, or if there are more than
+    /// [`Self::MAX_GROUPS`].
     ///
     /// This does NOT execute immediately - call `batch.execute()` after
     /// queueing all operations.
@@ -396,9 +427,34 @@ impl FusedAdamW {
         m: &MetalBuffer<f32>,
         v: &MetalBuffer<f32>,
         param_info: &MetalBuffer<ParamInfo>,
-        config: &AdamWConfig,
+        groups: &[AdamWScalars],
     ) -> Result<()> {
-        let scalars = config.scalars()?;
+        if groups.is_empty() || groups.len() > Self::MAX_GROUPS {
+            return Err(crate::error::MetalError::InvalidConfig(format!(
+                "fused AdamW takes 1 to {} parameter groups, got {}",
+                Self::MAX_GROUPS,
+                groups.len()
+            )));
+        }
+        let infos = param_info.as_slice();
+        if infos.len() < self.num_params {
+            return Err(crate::error::MetalError::InvalidConfig(format!(
+                "fused AdamW over {} parameters given metadata for {}",
+                self.num_params,
+                infos.len()
+            )));
+        }
+        if let Some(info) = infos[..self.num_params]
+            .iter()
+            .find(|info| info.group as usize >= groups.len())
+        {
+            return Err(crate::error::MetalError::InvalidConfig(format!(
+                "a parameter at offset {} is in group {}, but the step has {} groups",
+                info.offset,
+                info.group,
+                groups.len()
+            )));
+        }
         let function_name = "fused_adamw_update";
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
@@ -416,8 +472,8 @@ impl FusedAdamW {
             encoder.setBuffer_offset_atIndex(Some(v.metal_buffer()), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(param_info.metal_buffer()), 0, 4);
 
-            let scalars_ptr = NonNull::from(&scalars).cast();
-            encoder.setBytes_length_atIndex(scalars_ptr, std::mem::size_of::<AdamWScalars>(), 5);
+            let groups_ptr = NonNull::from(groups).cast();
+            encoder.setBytes_length_atIndex(groups_ptr, std::mem::size_of_val(groups), 5);
 
             let num_params = self.num_params as u32;
             let num_params_ptr = NonNull::from(&num_params).cast();
@@ -454,10 +510,10 @@ impl FusedAdamW {
         m: &MetalBuffer<f32>,
         v: &MetalBuffer<f32>,
         param_info: &MetalBuffer<ParamInfo>,
-        config: &AdamWConfig,
+        groups: &[AdamWScalars],
     ) -> Result<()> {
         let mut batch = BatchedCommandBuffer::new(self.ctx.clone())?;
-        self.queue_update(&mut batch, params, grads, m, v, param_info, config)?;
+        self.queue_update(&mut batch, params, grads, m, v, param_info, groups)?;
         batch.execute()
     }
 
@@ -817,12 +873,14 @@ mod tests {
         let v = MetalBuffer::zeros(&ctx, total_elements, BufferUsage::Shared)
             .expect("Failed to create v buffer");
 
-        // Build param info
-        let param_info_vec = FusedAdamW::build_param_info(&param_sizes);
+        // One parameter per group: the second at its own rate without
+        // decay, the third left as it is.
+        let mut param_info_vec = FusedAdamW::build_param_info(&param_sizes);
+        param_info_vec[1].group = 1;
+        param_info_vec[2].group = 2;
         let param_info = MetalBuffer::from_slice(&ctx, &param_info_vec, BufferUsage::Shared)
             .expect("Failed to create param_info buffer");
 
-        // Execute AdamW update
         let config = AdamWConfig {
             learning_rate: 0.001,
             beta1: 0.9,
@@ -831,20 +889,47 @@ mod tests {
             weight_decay: 0.01,
             step: 1,
         };
+        let second = AdamWConfig {
+            learning_rate: 0.004,
+            weight_decay: 0.0,
+            ..config
+        };
+        let groups = [
+            config.scalars().unwrap(),
+            second.scalars().unwrap(),
+            AdamWScalars::UNCHANGED,
+        ];
 
         adamw
-            .execute_update(&params, &grads, &m, &v, &param_info, &config)
+            .execute_update(&params, &grads, &m, &v, &param_info, &groups)
             .expect("AdamW update failed");
 
         // The first bias-corrected step moves each weight by lr·sign(g),
         // after its decay: 1·(1 − 0.001·0.01) − 0.001.
-        let want = (1.0 - 0.001 * 0.01) - 0.001;
-        for (i, &p) in params.as_slice().iter().enumerate() {
-            assert!((p - want).abs() < 1e-6, "param {i}: {p}, want {want}");
+        let (p_out, m_out) = (params.as_slice(), m.as_slice());
+        let wants = [
+            ((1.0 - 0.001 * 0.01) - 0.001, 0.01),
+            (1.0 - 0.004, 0.01),
+            (1.0, 0.0),
+        ];
+        let mut offset = 0;
+        for (&size, &(want_p, want_m)) in param_sizes.iter().zip(&wants) {
+            for i in offset..offset + size {
+                let (p, m) = (p_out[i], m_out[i]);
+                assert!((p - want_p).abs() < 1e-6, "param {i}: {p}, want {want_p}");
+                assert!((m - want_m).abs() < 1e-8, "m {i}: {m}, want {want_m}");
+            }
+            offset += size;
         }
-        for (i, &m) in m.as_slice().iter().enumerate() {
-            assert!((m - 0.01).abs() < 1e-8, "m {i}: {m}");
-        }
+        let untouched = total_elements - param_sizes[2];
+        assert!(v.as_slice()[untouched..].iter().all(|&v| v == 0.0));
+
+        // A group past the end of the step's scalars is refused.
+        assert!(
+            adamw
+                .execute_update(&params, &grads, &m, &v, &param_info, &groups[..2])
+                .is_err()
+        );
     }
 
     #[test]
@@ -885,10 +970,12 @@ mod tests {
         let param_info = MetalBuffer::from_slice(&ctx, &param_info_vec, BufferUsage::Shared)
             .expect("Failed to create param_info buffer");
 
-        let config = AdamWConfig {
+        let config = [AdamWConfig {
             learning_rate: 0.001,
             ..Default::default()
-        };
+        }
+        .scalars()
+        .unwrap()];
 
         // Warmup
         adamw

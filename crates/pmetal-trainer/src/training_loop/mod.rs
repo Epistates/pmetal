@@ -413,27 +413,50 @@ impl TrainingLoop {
         }
     }
 
-    /// The optimizer every loop variant trains with: the kind
-    /// `training.optimizer` names, at the configured learning rate and weight
-    /// decay, with the embedding and LoRA+ groups when they are set.
-    pub fn build_optimizer(&self) -> crate::ParamGroupOptimizer {
+    /// The parameter groups every loop variant trains: the configured weight
+    /// decay, and the embedding and LoRA+ rates when they are set.
+    pub fn parameter_groups(&self) -> crate::ParameterGroupConfig {
         let training = &self.config.training;
         let base_lr = training.learning_rate as f32;
-        let mut builder = crate::ParamGroupOptimizerBuilder::new(training.optimizer, base_lr)
-            .with_weight_decay(training.weight_decay as f32);
+        let mut groups = crate::ParameterGroupConfig::new(training.weight_decay as f32);
         if let Some(emb_lr) = self.config.embedding_lr {
-            builder = builder.with_embedding_lr(emb_lr);
+            groups = groups.with_embedding_lr(emb_lr, base_lr);
             tracing::info!("Using separate embedding LR: {emb_lr:.2e} (base: {base_lr:.2e})");
         }
         if let Some(ratio) = self.config.loraplus_lr_ratio {
-            builder = builder.with_loraplus_lr_ratio(ratio);
+            groups = groups.with_loraplus_lr_ratio(ratio);
         }
+        groups
+    }
+
+    /// The optimizer the standard, packed and compiled loops train with: the
+    /// kind `training.optimizer` names, at the configured learning rate, over
+    /// [`Self::parameter_groups`].
+    pub fn build_optimizer(&self) -> crate::ParamGroupOptimizer {
+        let training = &self.config.training;
+        let base_lr = training.learning_rate as f32;
         tracing::info!(
             "Optimizer: {:?}, lr={base_lr:.2e}, weight_decay={}",
             training.optimizer,
             training.weight_decay
         );
-        builder.build()
+        crate::ParamGroupOptimizer::new(training.optimizer, base_lr, self.parameter_groups())
+    }
+
+    /// The Metal fused AdamW [`Self::run_metal_fused`] trains with: the same
+    /// learning rate and [`Self::parameter_groups`] as
+    /// [`Self::build_optimizer`]'s AdamW, so it updates every parameter as
+    /// the standard loop does.
+    pub fn build_metal_fused_optimizer(
+        &self,
+    ) -> std::result::Result<
+        crate::mlx_metal_optimizer::MlxMetalOptimizer,
+        crate::mlx_metal_optimizer::MlxMetalOptimizerError,
+    > {
+        let base_lr = self.config.training.learning_rate as f32;
+        MlxMetalOptimizerBuilder::new(base_lr)
+            .param_groups(self.parameter_groups())
+            .build()
     }
 
     /// Run the standard loop while retaining ownership of the model.

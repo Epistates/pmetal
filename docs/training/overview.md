@@ -45,8 +45,15 @@ Every training command takes `--optimizer` (and YAML configs take `training.opti
 | `sgd` | Heavy-ball momentum 0.9, L2 weight decay |
 | `lion` | Sign of an interpolated momentum, betas (0.9, 0.99). Use a learning rate 3-10x smaller and a weight decay 3-10x larger than for AdamW (Chen et al., arXiv 2302.06675) |
 | `adafactor` | Factored second moments, update clipping at RMS 1, decay 1 - t^-0.8, no first moment, learning rate from the schedule (Shazeer and Stern, arXiv 1804.04235). Usually run around 1e-3 |
-| Metal Fused AdamW | The same AdamW update in one Metal dispatch, used for `adamw` unless `--no-metal-fused-optimizer` |
+| Metal Fused AdamW | The same AdamW update, over the same parameter groups, in one Metal dispatch, used for `adamw` unless `--no-metal-fused-optimizer` |
 | LoRA+ | Differentiated LR for A and B matrices, with any optimizer |
+
+Every optimizer, fused or not, trains the same parameter groups. Biases and
+normalization weights train without weight decay (the split
+`transformers`' `Trainer` makes), `--embedding-lr` sets the rate of the
+embedding and output-projection parameters, and LoRA+ trains each B matrix
+at `loraplus_lr_ratio` times its A matrix's rate. The scheduler moves every
+group's rate together, keeping the ratios.
 
 ### LR Schedules
 `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd`

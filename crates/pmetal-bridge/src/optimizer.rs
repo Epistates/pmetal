@@ -7,17 +7,19 @@
 //!
 //! # Parameter groups
 //!
-//! [`AdamW`] supports differential learning rates via [`ParamClass`]:
+//! [`AdamW`] trains each [`ParamClass`] at the rate [`GroupRates`] gives it,
+//! a multiple of the base learning rate the scheduler sets:
 //!
-//! | Class       | Learning rate          | Weight decay |
-//! |-------------|------------------------|--------------|
-//! | `Regular`   | `base_lr`              | `weight_decay` |
-//! | `NoDecay`   | `base_lr`              | 0.0          |
-//! | `Embedding` | `embedding_lr`         | `weight_decay` |
-//! | `LoraB`     | `base_lr * loraplus_ratio` | `weight_decay` |
+//! | Class       | Learning rate               | Weight decay   |
+//! |-------------|-----------------------------|----------------|
+//! | `Regular`   | `base_lr`                   | `weight_decay` |
+//! | `NoDecay`   | `base_lr`                   | 0.0            |
+//! | `Embedding` | `base_lr * embedding_ratio` | `weight_decay` |
+//! | `LoraB`     | `base_lr * loraplus_ratio`  | `weight_decay` |
 //!
-//! LoRA+ (Hayou et al., 2024) sets `loraplus_ratio` to scale up LoRA B
-//! matrices relative to LoRA A matrices, improving fine-tuning stability.
+//! LoRA+ (Hayou, Ghosh and Yu, ICML 2024) trains each LoRA B matrix at
+//! `loraplus_ratio` times its A matrix's rate. Which parameters skip weight
+//! decay is [`excluded_from_weight_decay`].
 
 use crate::InlineArray;
 use std::collections::HashMap;
@@ -27,10 +29,96 @@ use std::collections::HashMap;
 /// The `String`-keyed counterpart of `compat::FlattenedModuleParam`.
 pub type ParamSet = HashMap<String, InlineArray>;
 
+/// Whether the parameter called `name` trains without weight decay: biases
+/// and the weights of normalization layers.
+///
+/// This is the split `transformers`' `Trainer.get_decay_parameter_names`
+/// makes. On the lower-cased dotted name it leaves out anything containing
+/// `bias`, `layernorm` or `rmsnorm` and anything under a module named `norm`
+/// or `*_norm`; it also leaves out every parameter of an `nn.LayerNorm`,
+/// which it finds by type. With only the name to go on, a path component
+/// that contains `norm` (`norm1`, `hnorm`, `norm_q_a`) or is GPT-2's `ln_*`
+/// stands in for that type check, so every normalization weight is left
+/// out whatever its module is called.
+pub fn excluded_from_weight_decay(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("bias")
+        || name
+            .split('.')
+            .any(|part| part.contains("norm") || part == "ln" || part.starts_with("ln_"))
+}
+
+/// The learning rate and weight decay of each [`ParamClass`], the rates as
+/// multiples of the base learning rate.
+///
+/// The scheduler moves the base rate and every class keeps its ratio to it,
+/// as a PyTorch scheduler scales each parameter group's initial rate by the
+/// same factor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroupRates {
+    /// Weight decay of every class but [`ParamClass::NoDecay`].
+    pub weight_decay: f32,
+    /// The embedding learning rate over the base rate.
+    pub embedding_ratio: f32,
+    /// The LoRA B learning rate over the base rate (LoRA+); `None` trains
+    /// LoRA B matrices at the base rate.
+    pub loraplus_ratio: Option<f32>,
+}
+
+impl GroupRates {
+    /// Every class at the base rate, decayed by `weight_decay` unless it is
+    /// [`ParamClass::NoDecay`].
+    pub fn new(weight_decay: f32) -> Self {
+        Self {
+            weight_decay,
+            embedding_ratio: 1.0,
+            loraplus_ratio: None,
+        }
+    }
+
+    /// Train embeddings at `embedding_lr` while the base rate is `base_lr`,
+    /// and at the same multiple of it as it moves. With a base rate of 0
+    /// there is no multiple, and embeddings train at the base rate.
+    pub fn with_embedding_lr(mut self, embedding_lr: f32, base_lr: f32) -> Self {
+        self.embedding_ratio = if base_lr > 0.0 {
+            embedding_lr / base_lr
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// Train LoRA B matrices at `ratio` times the base rate (LoRA+).
+    pub fn with_loraplus_ratio(mut self, ratio: f32) -> Self {
+        self.loraplus_ratio = Some(ratio);
+        self
+    }
+
+    /// The learning rate of `class` while the base rate is `base_lr`.
+    #[inline]
+    pub fn learning_rate(&self, class: ParamClass, base_lr: f32) -> f32 {
+        match class {
+            ParamClass::Regular | ParamClass::NoDecay => base_lr,
+            ParamClass::Embedding => base_lr * self.embedding_ratio,
+            ParamClass::LoraB => base_lr * self.loraplus_ratio.unwrap_or(1.0),
+        }
+    }
+
+    /// The weight decay of `class`.
+    #[inline]
+    pub fn weight_decay(&self, class: ParamClass) -> f32 {
+        match class {
+            ParamClass::NoDecay => 0.0,
+            _ => self.weight_decay,
+        }
+    }
+}
+
 /// Parameter classification for differential learning rates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamClass {
-    /// Bias, norm, or scale parameter — weight decay suppressed.
+    /// A bias or a normalization weight: no weight decay
+    /// ([`excluded_from_weight_decay`]).
     NoDecay,
     /// Embedding or output projection weights — separate (usually lower) LR.
     Embedding,
@@ -62,9 +150,7 @@ pub struct AdamState {
 /// ```
 pub struct AdamW {
     base_lr: f32,
-    embedding_lr: f32,
-    loraplus_ratio: f32,
-    weight_decay: f32,
+    rates: GroupRates,
     beta1: f32,
     beta2: f32,
     eps: f32,
@@ -78,9 +164,7 @@ impl std::fmt::Debug for AdamW {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdamW")
             .field("base_lr", &self.base_lr)
-            .field("embedding_lr", &self.embedding_lr)
-            .field("loraplus_ratio", &self.loraplus_ratio)
-            .field("weight_decay", &self.weight_decay)
+            .field("rates", &self.rates)
             .field("beta1", &self.beta1)
             .field("beta2", &self.beta2)
             .field("eps", &self.eps)
@@ -94,14 +178,13 @@ impl AdamW {
     /// Create a new AdamW optimizer with the default betas (0.9, 0.999) and
     /// eps 1e-8.
     ///
-    /// `base_lr` is the learning rate for `Regular` and `NoDecay` params.
-    /// `weight_decay` is applied to all classes except `NoDecay`.
+    /// Every class trains at `base_lr` until [`Self::with_embedding_lr`] or
+    /// [`Self::with_loraplus_ratio`] says otherwise. `weight_decay` is
+    /// applied to all classes except `NoDecay`.
     pub fn new(base_lr: f32, weight_decay: f32) -> Self {
         Self {
             base_lr,
-            embedding_lr: 5e-5,
-            loraplus_ratio: 1.0,
-            weight_decay,
+            rates: GroupRates::new(weight_decay),
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
@@ -124,10 +207,11 @@ impl AdamW {
         self
     }
 
-    /// Override the learning rate applied to `Embedding`-class parameters
-    /// (default: 5e-5).
+    /// Train `Embedding`-class parameters at `lr` now, and at the same
+    /// multiple of the base rate as [`Self::set_lr`] moves it. Without this
+    /// they train at the base rate, as every class does.
     pub fn with_embedding_lr(mut self, lr: f32) -> Self {
-        self.embedding_lr = lr;
+        self.rates = self.rates.with_embedding_lr(lr, self.base_lr);
         self
     }
 
@@ -135,9 +219,9 @@ impl AdamW {
     ///
     /// The effective LR for LoRA B matrices is `base_lr * loraplus_ratio`.
     /// Hayou et al. recommend values in the range 4–16 for most setups.
-    /// Default is 1.0 (no scaling).
+    /// Without it, LoRA B matrices train at the base rate.
     pub fn with_loraplus_ratio(mut self, ratio: f32) -> Self {
-        self.loraplus_ratio = ratio;
+        self.rates = self.rates.with_loraplus_ratio(ratio);
         self
     }
 
@@ -150,8 +234,8 @@ impl AdamW {
         self
     }
 
-    /// Update `base_lr` for LR scheduling. Embedding and LoraB rates are
-    /// derived from `base_lr`, so they update automatically.
+    /// Update `base_lr` for LR scheduling. The embedding and LoRA B rates
+    /// are multiples of it ([`GroupRates`]), so they move with it.
     pub fn set_lr(&mut self, lr: f32) {
         self.base_lr = lr;
     }
@@ -183,21 +267,13 @@ impl AdamW {
     /// Return the effective learning rate for a given [`ParamClass`].
     #[inline]
     fn lr_for(&self, class: ParamClass) -> f32 {
-        match class {
-            ParamClass::NoDecay => self.base_lr,
-            ParamClass::Embedding => self.embedding_lr,
-            ParamClass::LoraB => self.base_lr * self.loraplus_ratio,
-            ParamClass::Regular => self.base_lr,
-        }
+        self.rates.learning_rate(class, self.base_lr)
     }
 
     /// Return the effective weight decay for a given [`ParamClass`].
     #[inline]
     fn wd_for(&self, class: ParamClass) -> f32 {
-        match class {
-            ParamClass::NoDecay => 0.0,
-            _ => self.weight_decay,
-        }
+        self.rates.weight_decay(class)
     }
 
     /// Apply one AdamW step: advance the step counter, then
@@ -329,13 +405,14 @@ impl AdamWStepScalars {
 
 /// Classifier that only separates out the parameters weight decay must skip.
 ///
-/// Bias, norm and scale parameters are [`ParamClass::NoDecay`]; everything
-/// else, embeddings and LoRA B matrices included, is [`ParamClass::Regular`]
-/// and trains at the base learning rate. This is what an optimizer without
-/// parameter groups should do: a separate embedding or LoRA+ rate is a group
-/// the caller configures, not something the optimizer infers from a name.
+/// Biases and normalization weights ([`excluded_from_weight_decay`]) are
+/// [`ParamClass::NoDecay`]; everything else, embeddings and LoRA B matrices
+/// included, is [`ParamClass::Regular`] and trains at the base learning
+/// rate. This is what an optimizer without parameter groups should do: a
+/// separate embedding or LoRA+ rate is a group the caller configures, not
+/// something the optimizer infers from a name.
 pub fn decay_only_classifier(name: &str) -> ParamClass {
-    if name.contains("bias") || name.contains("norm") || name.contains("scale") {
+    if excluded_from_weight_decay(name) {
         ParamClass::NoDecay
     } else {
         ParamClass::Regular
@@ -345,12 +422,13 @@ pub fn decay_only_classifier(name: &str) -> ParamClass {
 /// Default parameter classifier based on common naming conventions.
 ///
 /// Rules (first match wins):
-/// 1. Name contains `"bias"`, `"norm"`, or `"scale"` → [`ParamClass::NoDecay`]
+/// 1. A bias or normalization weight ([`excluded_from_weight_decay`]) →
+///    [`ParamClass::NoDecay`]
 /// 2. Name contains `"embed"` or `"lm_head"` → [`ParamClass::Embedding`]
 /// 3. Name contains `"lora_b"` → [`ParamClass::LoraB`]
 /// 4. All other names → [`ParamClass::Regular`]
 pub fn default_classifier(name: &str) -> ParamClass {
-    if name.contains("bias") || name.contains("norm") || name.contains("scale") {
+    if excluded_from_weight_decay(name) {
         ParamClass::NoDecay
     } else if name.contains("embed") || name.contains("lm_head") {
         ParamClass::Embedding
@@ -403,6 +481,68 @@ mod tests {
         assert!((opt.lr_for(ParamClass::NoDecay) - 1e-4).abs() < 1e-9);
         assert!((opt.lr_for(ParamClass::Embedding) - 5e-5).abs() < 1e-9);
         assert!((opt.lr_for(ParamClass::LoraB) - 16.0 * 1e-4).abs() < 1e-9);
+    }
+
+    /// Biases and normalization weights skip weight decay, as
+    /// `Trainer.get_decay_parameter_names` decides; everything else decays.
+    #[test]
+    fn biases_and_normalization_weights_skip_weight_decay() {
+        for name in [
+            // The name patterns `get_decay_parameter_names` matches.
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "transformer.h.0.mlp.rmsnorm.weight",
+            "model.norm.weight",
+            "norm.weight",
+            "model.layers.0.self_attn.q_norm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
+            "encoder.layer.0.attention.output.LayerNorm.weight",
+            "model.decoder.layers.0.final_layer_norm.weight",
+            // `nn.LayerNorm` modules it finds by type.
+            "transformer.h.0.ln_1.weight",
+            "transformer.ln_f.bias",
+            "transformer.ln_f.weight",
+            "vision_model.encoder.layers.0.layer_norm1.weight",
+            // Normalization layers named neither way.
+            "model.layers.3.enorm.weight",
+            "model.layers.3.hnorm.weight",
+            "model.layers.0.self_attn.kv_a_layernorm.weight",
+            "model.layers.0.mixer.norm_q_a.weight",
+        ] {
+            assert!(excluded_from_weight_decay(name), "{name} should not decay");
+            assert_eq!(decay_only_classifier(name), ParamClass::NoDecay, "{name}");
+        }
+        for name in [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.lora_a",
+            "model.layers.0.self_attn.q_proj.lora_b",
+            "model.layers.0.self_attn.q_proj.lora_magnitude",
+            "model.layers.0.mlp.down_proj.weight",
+            // A learned scalar is a weight like any other.
+            "model.layers.0.layer_scalar",
+            "model.layers.0.self_attn.per_dim_scale",
+            "transformer.wte.weight",
+            "transformer.h.0.attn.c_attn.weight",
+        ] {
+            assert!(!excluded_from_weight_decay(name), "{name} should decay");
+            assert_eq!(decay_only_classifier(name), ParamClass::Regular, "{name}");
+        }
+    }
+
+    /// The embedding rate is a multiple of the base rate, so the scheduler
+    /// moves it as it moves every other class's.
+    #[test]
+    fn the_embedding_rate_follows_the_base_rate() {
+        let mut opt = AdamW::new(2e-4, 0.0).with_embedding_lr(5e-5);
+        assert!((opt.lr_for(ParamClass::Embedding) - 5e-5).abs() < 1e-12);
+        opt.set_lr(1e-4);
+        assert!((opt.lr_for(ParamClass::Embedding) - 2.5e-5).abs() < 1e-12);
+        // Without an embedding rate, embeddings train at the base rate.
+        let opt = AdamW::new(3e-4, 0.0);
+        assert_eq!(opt.lr_for(ParamClass::Embedding), 3e-4);
     }
 
     #[test]

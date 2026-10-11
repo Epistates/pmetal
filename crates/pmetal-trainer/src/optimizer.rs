@@ -2,11 +2,12 @@
 //! groups every training loop wraps them in.
 //!
 //! [`TrainOptimizer`] is one optimizer of the kind a [`OptimizerType`] names.
-//! [`ParamGroupOptimizer`] holds one per parameter group: embeddings at their
-//! own learning rate, LoRA B matrices at the LoRA+ rate, and bias, norm and
-//! scale parameters without weight decay. Every group follows the learning
-//! rate the scheduler sets through [`ParamGroupOptimizer::set_learning_rate`],
-//! keeping its ratio to the base rate.
+//! [`ParamGroupOptimizer`] holds one per parameter group
+//! ([`ParameterGroupConfig`]): embeddings at their own learning rate, LoRA B
+//! matrices at the LoRA+ rate, and biases and normalization weights without
+//! weight decay. Every group follows the learning rate the scheduler sets
+//! through [`ParamGroupOptimizer::set_learning_rate`], keeping its ratio to
+//! the base rate.
 //!
 //! Each update rule follows the paper that introduced it, with that paper's
 //! default hyperparameters, and computes what its reference implementation
@@ -34,7 +35,7 @@ use pmetal_bridge::compat::{
 };
 use pmetal_core::{OptimizerType, TrainingConfig};
 
-use crate::ParameterGroupConfig;
+use crate::{ParamClass, ParameterGroupConfig};
 
 type Result<T> = std::result::Result<T, Exception>;
 
@@ -451,65 +452,66 @@ impl Updatable for TrainOptimizer {
     }
 }
 
-/// Which group a parameter trains in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ParamClass {
-    /// Base learning rate, full weight decay: LoRA A, projections.
-    Regular,
-    /// The embedding learning rate, full weight decay.
-    Embedding,
-    /// Base learning rate, no weight decay: bias, norm, scale.
-    NoDecay,
-    /// The LoRA+ learning rate (`base * ratio`, Hayou et al., ICML 2024).
-    LoraB,
-}
-
 /// An optimizer per parameter group, all of one [`OptimizerType`].
 ///
-/// Bias, norm and scale parameters train without weight decay, embeddings at
-/// their own learning rate, and with LoRA+ the LoRA B matrices at
-/// `base_lr * ratio`. [`Self::set_learning_rate`] moves every group's rate
-/// with the base rate, keeping the ratios.
+/// The groups are a [`ParameterGroupConfig`]'s: biases and normalization
+/// weights train without weight decay, embeddings at their own learning
+/// rate, and with LoRA+ the LoRA B matrices at `base_lr * ratio`.
+/// [`Self::set_learning_rate`] moves every group's rate with the base rate,
+/// keeping the ratios.
 #[derive(Debug)]
 pub struct ParamGroupOptimizer {
     regular: TrainOptimizer,
     lora_b: Option<TrainOptimizer>,
     embedding: TrainOptimizer,
     no_decay: TrainOptimizer,
-    base_lr: f32,
-    embedding_ratio: f32,
-    loraplus_ratio: Option<f32>,
-    config: ParameterGroupConfig,
+    groups: ParameterGroupConfig,
     param_cache: HashMap<Rc<str>, ParamClass>,
 }
 
 impl ParamGroupOptimizer {
+    /// `kind` optimizers over `groups`, at base learning rate `base_lr`.
+    pub fn new(kind: OptimizerType, base_lr: f32, groups: ParameterGroupConfig) -> Self {
+        let make = |class| {
+            TrainOptimizer::new(
+                kind,
+                groups.learning_rate(class, base_lr),
+                groups.weight_decay(class),
+            )
+        };
+        let lora_b = groups.rates.loraplus_ratio.map(|ratio| {
+            tracing::info!(
+                "LoRA+ enabled: A matrices lr={:.2e}, B matrices lr={:.2e} (ratio={ratio})",
+                base_lr,
+                groups.learning_rate(ParamClass::LoraB, base_lr),
+            );
+            make(ParamClass::LoraB)
+        });
+        Self {
+            regular: make(ParamClass::Regular),
+            lora_b,
+            embedding: make(ParamClass::Embedding),
+            no_decay: make(ParamClass::NoDecay),
+            groups,
+            param_cache: HashMap::new(),
+        }
+    }
+
     /// Which kind of optimizer every group runs.
     pub fn kind(&self) -> OptimizerType {
         self.regular.kind()
+    }
+
+    /// The groups the parameters train in.
+    pub fn parameter_groups(&self) -> &ParameterGroupConfig {
+        &self.groups
     }
 
     fn classify_param(&mut self, name: &Rc<str>) -> ParamClass {
         if let Some(&class) = self.param_cache.get(name) {
             return class;
         }
-        let name_lower = name.to_lowercase();
-        let class = if self.config.is_no_decay(name) {
-            ParamClass::NoDecay
-        } else if self
-            .config
-            .embedding_patterns
-            .iter()
-            .any(|pattern| name_lower.contains(&pattern.to_lowercase()))
-        {
-            ParamClass::Embedding
-        } else if self.lora_b.is_some()
-            && (name_lower.contains("lora_b") || name_lower.contains("lorab"))
-        {
-            ParamClass::LoraB
-        } else {
-            ParamClass::Regular
-        };
+        let class = self.groups.classify(name);
         self.param_cache.insert(name.clone(), class);
         class
     }
@@ -523,13 +525,13 @@ impl ParamGroupOptimizer {
         }
     }
 
-    fn groups(&self) -> impl Iterator<Item = &TrainOptimizer> {
+    fn optimizers(&self) -> impl Iterator<Item = &TrainOptimizer> {
         [&self.regular, &self.embedding, &self.no_decay]
             .into_iter()
             .chain(self.lora_b.as_ref())
     }
 
-    fn groups_mut(&mut self) -> impl Iterator<Item = &mut TrainOptimizer> {
+    fn optimizers_mut(&mut self) -> impl Iterator<Item = &mut TrainOptimizer> {
         [&mut self.regular, &mut self.embedding, &mut self.no_decay]
             .into_iter()
             .chain(self.lora_b.as_mut())
@@ -540,15 +542,15 @@ impl ParamGroupOptimizer {
         (self.regular.lr(), self.embedding.lr())
     }
 
-    /// Set the base learning rate. The embedding and LoRA B groups keep their
-    /// ratio to it; the no-decay group runs at it.
+    /// Set the base learning rate. Every group runs at its multiple of it.
     pub fn set_learning_rate(&mut self, base_lr: f32) {
-        self.base_lr = base_lr;
-        self.regular.set_lr(base_lr);
-        self.no_decay.set_lr(base_lr);
-        self.embedding.set_lr(base_lr * self.embedding_ratio);
-        if let (Some(b), Some(ratio)) = (self.lora_b.as_mut(), self.loraplus_ratio) {
-            b.set_lr(base_lr * ratio);
+        let rates = self.groups.rates;
+        let rate = |class| rates.learning_rate(class, base_lr);
+        self.regular.set_lr(rate(ParamClass::Regular));
+        self.no_decay.set_lr(rate(ParamClass::NoDecay));
+        self.embedding.set_lr(rate(ParamClass::Embedding));
+        if let Some(b) = self.lora_b.as_mut() {
+            b.set_lr(rate(ParamClass::LoraB));
         }
     }
 
@@ -600,7 +602,7 @@ impl Optimizer for ParamGroupOptimizer {
     ) -> Result<()> {
         // Every group advances together so bias corrections and Adafactor's
         // decay see the same step whichever parameters a group holds.
-        for group in self.groups_mut() {
+        for group in self.optimizers_mut() {
             group.advance_step();
         }
         apply_updates(self, model, gradients)
@@ -609,13 +611,15 @@ impl Optimizer for ParamGroupOptimizer {
 
 impl Updatable for ParamGroupOptimizer {
     fn updatable_states_len(&self) -> usize {
-        self.groups().map(|g| g.updatable_states_len()).sum()
+        self.optimizers().map(|g| g.updatable_states_len()).sum()
     }
     fn updatable_states(&self) -> Vec<&Array> {
-        self.groups().flat_map(|g| g.updatable_states()).collect()
+        self.optimizers()
+            .flat_map(|g| g.updatable_states())
+            .collect()
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
-        self.groups_mut()
+        self.optimizers_mut()
             .flat_map(|g| g.updatable_states_mut())
             .collect()
     }
@@ -626,10 +630,7 @@ impl Updatable for ParamGroupOptimizer {
 pub struct ParamGroupOptimizerBuilder {
     kind: OptimizerType,
     base_lr: f32,
-    embedding_lr: Option<f32>,
-    weight_decay: f32,
-    embedding_patterns: Vec<String>,
-    loraplus_lr_ratio: Option<f32>,
+    groups: ParameterGroupConfig,
 }
 
 impl ParamGroupOptimizerBuilder {
@@ -639,10 +640,7 @@ impl ParamGroupOptimizerBuilder {
         Self {
             kind,
             base_lr,
-            embedding_lr: None,
-            weight_decay: 0.01,
-            embedding_patterns: ParameterGroupConfig::default().embedding_patterns,
-            loraplus_lr_ratio: None,
+            groups: ParameterGroupConfig::new(0.01),
         }
     }
 
@@ -659,61 +657,31 @@ impl ParamGroupOptimizerBuilder {
 
     /// Train embedding parameters at `lr`, scaled with the base rate.
     pub fn with_embedding_lr(mut self, lr: f32) -> Self {
-        self.embedding_lr = Some(lr);
+        self.groups = self.groups.with_embedding_lr(lr, self.base_lr);
         self
     }
 
     /// Weight decay for every group but the no-decay one.
     pub fn with_weight_decay(mut self, wd: f32) -> Self {
-        self.weight_decay = wd;
+        self.groups.rates.weight_decay = wd;
         self
     }
 
     /// Count names containing `pattern` as embedding parameters.
     pub fn add_embedding_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.embedding_patterns.push(pattern.into());
+        self.groups = self.groups.add_embedding_pattern(pattern);
         self
     }
 
     /// Train LoRA B matrices at `base_lr * ratio` (LoRA+; the paper suggests 16).
     pub fn with_loraplus_lr_ratio(mut self, ratio: f32) -> Self {
-        self.loraplus_lr_ratio = Some(ratio);
+        self.groups = self.groups.with_loraplus_lr_ratio(ratio);
         self
     }
 
     /// Build the groups.
     pub fn build(self) -> ParamGroupOptimizer {
-        let base_lr = self.base_lr;
-        let embedding_ratio = match self.embedding_lr {
-            Some(lr) if base_lr > 0.0 => lr / base_lr,
-            _ => 1.0,
-        };
-        let make = |lr: f32, wd: f32| TrainOptimizer::new(self.kind, lr, wd);
-        let lora_b = self.loraplus_lr_ratio.map(|ratio| {
-            tracing::info!(
-                "LoRA+ enabled: A matrices lr={:.2e}, B matrices lr={:.2e} (ratio={ratio})",
-                base_lr,
-                base_lr * ratio,
-            );
-            make(base_lr * ratio, self.weight_decay)
-        });
-        ParamGroupOptimizer {
-            regular: make(base_lr, self.weight_decay),
-            lora_b,
-            embedding: make(base_lr * embedding_ratio, self.weight_decay),
-            no_decay: make(base_lr, 0.0),
-            base_lr,
-            embedding_ratio,
-            loraplus_ratio: self.loraplus_lr_ratio,
-            config: ParameterGroupConfig {
-                base_lr: base_lr as f64,
-                embedding_lr: self.embedding_lr.map(f64::from),
-                weight_decay: self.weight_decay as f64,
-                embedding_patterns: self.embedding_patterns,
-                ..Default::default()
-            },
-            param_cache: HashMap::new(),
-        }
+        ParamGroupOptimizer::new(self.kind, self.base_lr, self.groups)
     }
 }
 

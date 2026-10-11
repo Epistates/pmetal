@@ -68,7 +68,8 @@ pub trait Updatable {
 /// [`crate::optimizer::AdamW::step_single`]).
 ///
 /// Every parameter trains at the one learning rate [`AdamW::set_lr`] sets;
-/// bias, norm and scale parameters skip weight decay. Separate embedding or
+/// biases and normalization weights skip weight decay
+/// ([`crate::optimizer::excluded_from_weight_decay`]). Separate embedding or
 /// LoRA+ rates are parameter groups, which the trainer builds from several
 /// of these.
 pub struct AdamW {

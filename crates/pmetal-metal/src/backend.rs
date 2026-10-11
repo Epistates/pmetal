@@ -318,9 +318,10 @@ pub struct AdamWDescriptor<'a> {
     pub m: &'a MetalBuffer<f32>,
     /// Second moment buffer.
     pub v: &'a MetalBuffer<f32>,
-    /// Per-parameter metadata (offset, size, moment offsets).
+    /// Per-parameter metadata (offset, size, moment offsets), every
+    /// parameter in group 0.
     pub param_info: &'a MetalBuffer<ParamInfo>,
-    /// Optimizer hyperparameters.
+    /// Optimizer hyperparameters, for every parameter.
     pub config: AdamWConfig,
 }
 

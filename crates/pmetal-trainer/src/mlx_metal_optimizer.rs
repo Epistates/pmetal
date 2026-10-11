@@ -40,7 +40,11 @@ use thiserror::Error;
 use pmetal_metal::buffer::{BufferUsage, MetalBuffer};
 use pmetal_metal::context::MetalContext;
 use pmetal_metal::error::MetalError;
-use pmetal_metal::kernels::{AdamWConfig, BatchedCommandBuffer, FusedAdamW, ParamInfo};
+use pmetal_metal::kernels::{
+    AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, ParamInfo,
+};
+
+use crate::{ParamClass, ParameterGroupConfig};
 
 /// Error type for MLX-Metal optimizer operations.
 #[derive(Error, Debug)]
@@ -140,8 +144,9 @@ pub struct MlxMetalOptimizerConfig {
     pub beta2: f32,
     /// Numerical stability constant.
     pub epsilon: f32,
-    /// Decoupled weight decay.
-    pub weight_decay: f32,
+    /// The parameter groups: each group's learning rate (a multiple of
+    /// `learning_rate`) and decoupled weight decay.
+    pub param_groups: ParameterGroupConfig,
     /// Learning rate schedule.
     pub lr_schedule: LrSchedule,
     /// Enable gradient/parameter validation (NaN/Inf detection).
@@ -157,11 +162,33 @@ impl Default for MlxMetalOptimizerConfig {
             beta1: 0.9,
             beta2: 0.999,
             epsilon: 1e-8,
-            weight_decay: 0.01,
+            param_groups: ParameterGroupConfig::new(0.01),
             lr_schedule: LrSchedule::Constant,
             validate_numerics: false, // Disabled by default for production perf
         }
     }
+}
+
+/// The groups in the order their scalars go to the kernel, which a
+/// parameter's `ParamInfo::group` indexes.
+const GROUPS: [ParamClass; 4] = [
+    ParamClass::Regular,
+    ParamClass::Embedding,
+    ParamClass::NoDecay,
+    ParamClass::LoraB,
+];
+
+/// The kernel group of a parameter with no gradient this step: it takes
+/// [`AdamWScalars::UNCHANGED`], so neither it nor its moments move, as the
+/// standard loop leaves a parameter without a gradient alone.
+const UNCHANGED_GROUP: u32 = GROUPS.len() as u32;
+
+/// The kernel group `class` trains in.
+fn group_index(class: ParamClass) -> u32 {
+    GROUPS
+        .iter()
+        .position(|&g| g == class)
+        .expect("every class has a group") as u32
 }
 
 /// Where each parameter sits in the flat buffers.
@@ -171,14 +198,23 @@ struct ParameterLayout {
     names: Vec<Rc<str>>,
     /// Element count of each parameter.
     sizes: Vec<usize>,
+    /// The kernel group of each parameter ([`group_index`]).
+    groups: Vec<u32>,
     /// Sum of `sizes`.
     total_elements: usize,
 }
 
 impl ParameterLayout {
-    fn from_params(params: &FlattenedModuleParam) -> MlxMetalOptimizerResult<Self> {
+    fn from_params(
+        params: &FlattenedModuleParam,
+        param_groups: &ParameterGroupConfig,
+    ) -> MlxMetalOptimizerResult<Self> {
         let mut names: Vec<_> = params.keys().cloned().collect();
         names.sort();
+        let groups = names
+            .iter()
+            .map(|name| group_index(param_groups.classify(name)))
+            .collect();
         let sizes: Vec<usize> = names.iter().map(|k| params[k].size()).collect();
         let total_elements: usize = sizes.iter().sum();
         // The kernel's ParamInfo offsets are u32.
@@ -190,6 +226,7 @@ impl ParameterLayout {
         Ok(Self {
             names,
             sizes,
+            groups,
             total_elements,
         })
     }
@@ -200,8 +237,10 @@ impl ParameterLayout {
 /// The parameters and gradients are copied into flat f32 Metal buffers,
 /// `fused_adamw` updates the parameters and both moments in place, and the
 /// parameters are read back as new arrays. The update is `torch.optim.AdamW`'s,
-/// bias correction and decoupled weight decay included, as on every other
-/// training path.
+/// bias correction and decoupled weight decay included, over the same
+/// parameter groups ([`ParameterGroupConfig`]) as every other training path:
+/// each group's learning rate and weight decay go to the kernel as their own
+/// scalars.
 pub struct MlxMetalOptimizer {
     /// Metal context.
     ctx: Arc<MetalContext>,
@@ -247,6 +286,7 @@ impl MlxMetalOptimizer {
                 size: 1,
                 m_offset: 0,
                 v_offset: 0,
+                group: 0,
             }],
             BufferUsage::Shared,
         )?;
@@ -287,12 +327,14 @@ impl MlxMetalOptimizer {
             .get_lr_multiplier(self.step, self.config.learning_rate)
     }
 
-    /// Initialize the optimizer with model parameters.
+    /// Initialize the optimizer with the model's trainable parameters.
     ///
     /// This must be called once before the first `update()` call.
     /// It allocates optimizer state buffers sized to match the parameters.
+    /// A frozen parameter (an adapted model's base) is not the optimizer's,
+    /// as the standard loop's optimizer never sees it.
     pub fn initialize<M: ModuleParameters>(&mut self, model: &M) -> MlxMetalOptimizerResult<()> {
-        let params: FlattenedModuleParam = model.flatten_params();
+        let params: FlattenedModuleParam = model.flatten_trainable_params();
         self.initialize_from_params(&params)
     }
 
@@ -302,7 +344,7 @@ impl MlxMetalOptimizer {
         params: &FlattenedModuleParam,
     ) -> MlxMetalOptimizerResult<()> {
         // Build parameter layout
-        self.layout = ParameterLayout::from_params(params)?;
+        self.layout = ParameterLayout::from_params(params, &self.config.param_groups)?;
 
         // Validate all parameters are f32 and contiguous
         for name in &self.layout.names {
@@ -322,7 +364,7 @@ impl MlxMetalOptimizer {
         self.m_buffer = MetalBuffer::zeros(&self.ctx, total, BufferUsage::Shared)?;
         self.v_buffer = MetalBuffer::zeros(&self.ctx, total, BufferUsage::Shared)?;
 
-        // Build param info
+        // Build param info; each parameter's group is set per step.
         let param_info_vec = FusedAdamW::build_param_info(&self.layout.sizes);
         self.param_info = MetalBuffer::from_slice(&self.ctx, &param_info_vec, BufferUsage::Shared)?;
 
@@ -331,10 +373,25 @@ impl MlxMetalOptimizer {
 
         self.initialized = true;
 
+        let base_lr = self.config.learning_rate;
+        let in_group = |class| {
+            let g = group_index(class);
+            self.layout.groups.iter().filter(|&&p| p == g).count()
+        };
         tracing::info!(
-            "MlxMetalOptimizer initialized: {} params, {} total elements",
+            "MlxMetalOptimizer initialized: {} params, {} total elements; groups: {}",
             self.layout.names.len(),
-            total
+            total,
+            GROUPS
+                .iter()
+                .map(|&class| format!(
+                    "{class:?} {} (lr={:.2e}, wd={})",
+                    in_group(class),
+                    self.config.param_groups.learning_rate(class, base_lr),
+                    self.config.param_groups.weight_decay(class),
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
         Ok(())
@@ -434,11 +491,36 @@ impl MlxMetalOptimizer {
         Ok(())
     }
 
+    /// The scalars of this step for each kernel group: [`GROUPS`] at their
+    /// learning rate and weight decay, then [`UNCHANGED_GROUP`].
+    fn group_scalars(&self) -> MlxMetalOptimizerResult<Vec<AdamWScalars>> {
+        let base_lr = self.current_lr();
+        let groups = &self.config.param_groups;
+        let mut scalars = GROUPS
+            .iter()
+            .map(|&class| {
+                AdamWConfig {
+                    learning_rate: groups.learning_rate(class, base_lr),
+                    beta1: self.config.beta1,
+                    beta2: self.config.beta2,
+                    epsilon: self.config.epsilon,
+                    weight_decay: groups.weight_decay(class),
+                    step: self.step,
+                }
+                .scalars()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        scalars.push(AdamWScalars::UNCHANGED);
+        Ok(scalars)
+    }
+
     /// One AdamW step over every parameter in one Metal dispatch.
     ///
     /// The parameters and gradients are copied into flat Metal buffers, the
-    /// fused kernel updates the parameters and both moments in place, and
-    /// the parameters come back as new arrays under the same names.
+    /// fused kernel updates the parameters and both moments in place, each at
+    /// its group's learning rate and weight decay, and the parameters come
+    /// back as new arrays under the same names. A parameter `grads` has no
+    /// entry for is left as it is, moments included.
     pub fn fused_step(
         &mut self,
         params: &mut FlattenedModuleParam,
@@ -460,15 +542,24 @@ impl MlxMetalOptimizer {
             self.validate_gradients()?;
         }
 
+        // Each parameter's group this step: its own, or none without a
+        // gradient.
+        for ((info, name), &group) in self
+            .param_info
+            .as_mut_slice()
+            .iter_mut()
+            .zip(&self.layout.names)
+            .zip(&self.layout.groups)
+        {
+            info.group = if grads.contains_key(name) {
+                group
+            } else {
+                UNCHANGED_GROUP
+            };
+        }
+
         self.step += 1;
-        let adamw_config = AdamWConfig {
-            learning_rate: self.current_lr(),
-            beta1: self.config.beta1,
-            beta2: self.config.beta2,
-            epsilon: self.config.epsilon,
-            weight_decay: self.config.weight_decay,
-            step: self.step,
-        };
+        let scalars = self.group_scalars()?;
         let mut batch = BatchedCommandBuffer::new(self.ctx.clone())?;
         self.adamw.queue_update(
             &mut batch,
@@ -477,7 +568,7 @@ impl MlxMetalOptimizer {
             &self.m_buffer,
             &self.v_buffer,
             &self.param_info,
-            &adamw_config,
+            &scalars,
         )?;
         batch.execute()?;
 
@@ -485,18 +576,19 @@ impl MlxMetalOptimizer {
         Ok(())
     }
 
-    /// Update a model's parameters with one [`Self::fused_step`].
+    /// Update a model's trainable parameters with one [`Self::fused_step`].
     ///
-    /// Every parameter the optimizer was initialized with must still be in
-    /// the model. A parameter without a gradient is left where it is (its
-    /// gradient is taken as zero); a step with no gradients at all is an
-    /// error, since it means the backward pass never ran.
+    /// Every parameter the optimizer was initialized with must still be
+    /// trainable in the model. A parameter without a gradient is left where
+    /// it is, its moments too, as the standard loop leaves it; a step with no
+    /// gradients at all is an error, since it means the backward pass never
+    /// ran.
     pub fn update_model_fused<M: ModuleParameters>(
         &mut self,
         model: &mut M,
         gradients: &FlattenedModuleParam,
     ) -> std::result::Result<(), Exception> {
-        let mut params: FlattenedModuleParam = model.flatten_params();
+        let mut params: FlattenedModuleParam = model.flatten_trainable_params();
         if !self.initialized {
             self.initialize_from_params(&params)
                 .map_err(|e| Exception::custom(e.to_string()))?;
@@ -531,7 +623,7 @@ impl MlxMetalOptimizer {
         }
         if !missing_grads.is_empty() {
             tracing::warn!(
-                "MlxMetalOptimizer: {} gradient(s) missing, taken as zero: {:?}",
+                "MlxMetalOptimizer: {} gradient(s) missing, those parameters not updated: {:?}",
                 missing_grads.len(),
                 &missing_grads[..missing_grads.len().min(5)]
             );
@@ -603,9 +695,16 @@ impl MlxMetalOptimizerBuilder {
         self
     }
 
-    /// Set weight decay.
+    /// Set the weight decay of every group but the no-decay one.
     pub fn weight_decay(mut self, weight_decay: f32) -> Self {
-        self.config.weight_decay = weight_decay;
+        self.config.param_groups.rates.weight_decay = weight_decay;
+        self
+    }
+
+    /// Train over `groups`: their learning rates, weight decay and which
+    /// parameters each holds, replacing any [`Self::weight_decay`].
+    pub fn param_groups(mut self, groups: ParameterGroupConfig) -> Self {
+        self.config.param_groups = groups;
         self
     }
 
