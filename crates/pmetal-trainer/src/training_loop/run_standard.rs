@@ -86,18 +86,8 @@ impl TrainingLoop {
                 optimizer.set_learning_rate(scheduled_lr);
 
                 // Training step
-                let mut stats = self.train_step(model, &batch, &mut optimizer)?;
-
-                // Distributed: sync loss across nodes so all agree on LR decisions
-                #[cfg(feature = "distributed")]
-                if let Some(ref dist) = self.distributed {
-                    let synced = tokio::runtime::Handle::current()
-                        .block_on(async { dist.sync_loss(stats.loss).await })?;
-                    stats.loss = synced;
-                    // Note: do NOT update running_loss here — train_step already
-                    // applied EMA. We only override stats.loss so that all nodes
-                    // agree on the value fed to the adaptive LR controller.
-                }
+                let stats = self.train_step(model, &batch, &mut optimizer)?;
+                let stats = self.sync_step_loss(stats)?;
 
                 // Adaptive LR + snapshot/rollback/checkpoint-on-stop.
                 // See `TrainingLoop::post_step_adaptive_with_checkpoint` in mod.rs

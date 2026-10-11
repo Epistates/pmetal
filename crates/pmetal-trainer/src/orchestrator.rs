@@ -38,6 +38,16 @@ fn take_distributed_sync(_: &mut DistributedSyncOption) -> DistributedSyncOption
     None
 }
 
+#[cfg(feature = "distributed")]
+fn attach_distributed_sync(training_loop: &mut TrainingLoop, sync: DistributedSyncOption) {
+    if let Some(sync) = sync {
+        training_loop.set_distributed(sync);
+    }
+}
+
+#[cfg(not(feature = "distributed"))]
+fn attach_distributed_sync(_: &mut TrainingLoop, _: DistributedSyncOption) {}
+
 // ---------------------------------------------------------------------------
 // Configuration types
 // ---------------------------------------------------------------------------
@@ -730,7 +740,40 @@ pub async fn run_training(
         ..Default::default()
     };
 
-    let mut training_loop_config = TrainingLoopConfig {
+    #[cfg(feature = "distributed")]
+    let mut distributed_sync: DistributedSyncOption = if let Some(ref distributed_config) =
+        config.dispatch.distributed
+    {
+        let ctx = crate::distributed_bridge::create_distributed_context(distributed_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize distributed training: {e}"))?;
+        tracing::info!(
+            "Distributed training initialized: rank={}/{}",
+            ctx.rank(),
+            ctx.world_size()
+        );
+        let sync = crate::distributed_bridge::DistributedGradientSync::new(ctx, distributed_config);
+        if config.dispatch.sequence_packing {
+            tracing::warn!(
+                "Sequence packing is disabled for distributed training; using sharded dataloaders instead"
+            );
+            config.dispatch.sequence_packing = false;
+        }
+        if config.dispatch.jit_compilation {
+            tracing::warn!(
+                "Compiled/fused-owned dispatch is disabled for distributed training; using distributed-aware loops"
+            );
+            config.dispatch.jit_compilation = false;
+        }
+        Some(sync)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "distributed"))]
+    let mut distributed_sync: DistributedSyncOption = None;
+
+    let training_loop_config = TrainingLoopConfig {
         training: full_config.training.clone(),
         dataloader: dataloader_config.clone(),
         use_metal_flash_attention: config.dispatch.flash_attention,
@@ -758,41 +801,6 @@ pub async fn run_training(
         #[cfg(feature = "distributed")]
         distributed: config.dispatch.distributed.clone(),
     };
-
-    #[cfg(feature = "distributed")]
-    let mut distributed_sync: DistributedSyncOption = if let Some(ref distributed_config) =
-        config.dispatch.distributed
-    {
-        let ctx = crate::distributed_bridge::create_distributed_context(distributed_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to initialize distributed training: {e}"))?;
-        tracing::info!(
-            "Distributed training initialized: rank={}/{}",
-            ctx.rank(),
-            ctx.world_size()
-        );
-        let sync = crate::distributed_bridge::DistributedGradientSync::new(ctx, distributed_config);
-        if config.dispatch.sequence_packing {
-            tracing::warn!(
-                "Sequence packing is disabled for distributed training; using sharded dataloaders instead"
-            );
-            config.dispatch.sequence_packing = false;
-            training_loop_config.use_sequence_packing = false;
-        }
-        if config.dispatch.jit_compilation {
-            tracing::warn!(
-                "Compiled/fused-owned dispatch is disabled for distributed training; using distributed-aware loops"
-            );
-            config.dispatch.jit_compilation = false;
-            training_loop_config.use_jit_compilation = false;
-        }
-        Some(sync)
-    } else {
-        None
-    };
-
-    #[cfg(not(feature = "distributed"))]
-    let mut distributed_sync: DistributedSyncOption = None;
 
     // -----------------------------------------------------------------------
     // Phase 9: Load model + run training
@@ -1029,10 +1037,7 @@ fn run_lora_path(
     }
 
     let mut training_loop = TrainingLoop::new(training_loop_config);
-    #[cfg(feature = "distributed")]
-    if let Some(sync) = distributed_sync {
-        training_loop.set_distributed(sync);
-    }
+    attach_distributed_sync(&mut training_loop, distributed_sync);
 
     if let Some(cb) = metrics_callback.take() {
         training_loop.add_callback(cb);

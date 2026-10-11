@@ -136,15 +136,8 @@ impl TrainingLoop {
                 metal_optimizer.set_learning_rate(self.get_scheduled_lr());
 
                 // Training step with Metal optimizer
-                let mut stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
-
-                // Distributed: sync loss across nodes so all agree on LR decisions
-                #[cfg(feature = "distributed")]
-                if let Some(ref dist) = self.distributed {
-                    let synced = tokio::runtime::Handle::current()
-                        .block_on(async { dist.sync_loss(stats.loss).await })?;
-                    stats.loss = synced;
-                }
+                let stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
+                let stats = self.sync_step_loss(stats)?;
 
                 // Adaptive LR + snapshot/rollback/checkpoint-on-stop.
                 // See `TrainingLoop::post_step_adaptive_with_checkpoint` in mod.rs

@@ -505,6 +505,25 @@ impl TrainingLoop {
         self.distributed = Some(sync);
     }
 
+    /// Agree on a step's loss across nodes, so every node feeds the adaptive
+    /// LR controller the same value. Only `loss` changes: `train_step` has
+    /// already folded the local loss into the running average.
+    #[cfg(feature = "distributed")]
+    pub(crate) fn sync_step_loss(&self, stats: StepStats) -> Result<StepStats> {
+        let Some(dist) = &self.distributed else {
+            return Ok(stats);
+        };
+        let loss = tokio::runtime::Handle::current()
+            .block_on(async { dist.sync_loss(stats.loss).await })?;
+        Ok(StepStats { loss, ..stats })
+    }
+
+    /// A single machine's loss is already agreed on.
+    #[cfg(not(feature = "distributed"))]
+    pub(crate) fn sync_step_loss(&self, stats: StepStats) -> Result<StepStats> {
+        Ok(stats)
+    }
+
     /// Set the directory where best-loss snapshots are persisted to disk.
     ///
     /// When set, every call to `snapshot_best_weights` also writes

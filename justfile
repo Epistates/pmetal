@@ -43,11 +43,14 @@ lint:
 lint-all-features:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Clippy on the smallest CLI build (`cli` alone: no trainer, LoRA or ANE).
-# Nothing else compiles the paths those features gate off, so unused-code
-# warnings there went unseen.
+# Clippy on the smallest CLI build (`cli` alone: no trainer, LoRA or ANE), and
+# on pmetal-trainer built alone, without the `distributed` feature the
+# workspace build turns on for it (as the Python bindings build it). Nothing
+# else compiles the paths those features gate off, so unused-code warnings
+# there went unseen.
 lint-min-features:
     cargo clippy -p pmetal --all-targets --no-default-features --features cli -- -D warnings
+    cargo clippy -p pmetal-trainer --all-targets -- -D warnings
 
 # ─── Building ───────────────────────────────────────────────────────
 
