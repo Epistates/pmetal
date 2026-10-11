@@ -64,7 +64,8 @@ pub trait Updatable {
     fn updatable_states_mut(&mut self) -> Vec<&mut Array>;
 }
 
-/// AdamW optimizer.
+/// AdamW optimizer, updating as `torch.optim.AdamW` does (see
+/// [`crate::optimizer::AdamW::step_single`]).
 ///
 /// Every parameter trains at the one learning rate [`AdamW::set_lr`] sets;
 /// bias, norm and scale parameters skip weight decay. Separate embedding or

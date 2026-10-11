@@ -77,7 +77,7 @@ pub use fused_swiglu::{
     FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
 };
 pub use fused_training::{
-    AdamWConfig, BatchedCommandBuffer, FusedAdamW, FusedCrossEntropyTraining,
+    AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, FusedCrossEntropyTraining,
     FusedGradientClipping, ParamInfo,
 };
 pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};

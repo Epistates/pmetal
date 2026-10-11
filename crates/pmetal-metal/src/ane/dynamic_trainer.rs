@@ -39,7 +39,7 @@ use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
 use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM};
-use crate::kernels::fused_training::BatchedCommandBuffer;
+use crate::kernels::fused_training::{AdamWConfig, BatchedCommandBuffer};
 
 /// Configuration for the dynamic ANE trainer.
 ///
@@ -73,6 +73,9 @@ pub struct DynamicAneTrainerConfig {
     pub adam_beta2: f32,
     /// Adam epsilon.
     pub adam_eps: f32,
+    /// Decoupled weight decay for the projection and embedding weights
+    /// (RMSNorm weights are not decayed).
+    pub weight_decay: f32,
     /// Gradient clipping norm.
     pub gradient_clip_norm: f32,
     /// Number of gradient accumulation steps per batch.
@@ -113,6 +116,7 @@ impl Default for DynamicAneTrainerConfig {
             adam_beta1: 0.9,
             adam_beta2: 0.999,
             adam_eps: 1e-8,
+            weight_decay: 0.0,
             gradient_clip_norm: 1.0,
             accum_steps: 10,
             warmup_steps: 100,
@@ -315,7 +319,7 @@ struct LayerAdamState {
 ///
 /// Weight gradient fields (wq..w3) are `MetalBuffer<f32>` with `Shared` storage,
 /// enabling zero-copy access from both the Metal GPU (dW GEMM accumulation) and
-/// CPU (scale_inplace, sum_of_squares, adam_update via `.as_mut_slice()`).
+/// CPU (scale_inplace, sum_of_squares, adamw_update via `.as_mut_slice()`).
 ///
 /// RMSNorm gradient fields remain `Vec<f32>` because they are tiny (dim elements)
 /// and only written on CPU.
@@ -2360,14 +2364,29 @@ impl DynamicAneTrainer {
             accelerate::scale_inplace(&mut self.rms_final_grad, clip_scale);
         }
 
-        // Adam update (timed)
+        // AdamW update (timed), as torch.optim.AdamW computes it. The
+        // projection and embedding weights decay; RMSNorm weights do not.
         let adam_start = std::time::Instant::now();
         self.adam_t += 1;
         let t = self.adam_t;
         let lr = self.get_lr(t, max_steps);
-        let b1 = self.config.adam_beta1;
-        let b2 = self.config.adam_beta2;
-        let eps = self.config.adam_eps;
+        // Embedding uses a separate LR if configured (prevents divergence
+        // from sparse token updates and magnitude drift through many layers)
+        let embed_lr = self.config.embedding_lr.unwrap_or(lr);
+        let scalars = |learning_rate: f32, weight_decay: f32| {
+            AdamWConfig {
+                learning_rate,
+                beta1: self.config.adam_beta1,
+                beta2: self.config.adam_beta2,
+                epsilon: self.config.adam_eps,
+                weight_decay,
+                step: u32::try_from(t).unwrap_or(u32::MAX),
+            }
+            .scalars()
+        };
+        let weights = scalars(lr, self.config.weight_decay)?;
+        let norms = scalars(lr, 0.0)?;
+        let embedding = scalars(embed_lr, self.config.weight_decay)?;
 
         for l in 0..self.config.n_layers {
             let lw = &mut self.layer_weights[l];
@@ -2376,74 +2395,54 @@ impl DynamicAneTrainer {
 
             // Weight gradient fields are MetalBuffer — access via as_slice()
             macro_rules! adam_weight {
-                ($w:ident, $g:ident, $a:ident) => {
-                    accelerate::adam_update(
+                ($w:ident) => {
+                    accelerate::adamw_update(
                         &mut lw.$w,
-                        lg.$g.as_slice(),
-                        &mut la.$a.m,
-                        &mut la.$a.v,
-                        t,
-                        lr,
-                        b1,
-                        b2,
-                        eps,
+                        lg.$w.as_slice(),
+                        &mut la.$w.m,
+                        &mut la.$w.v,
+                        &weights,
                     );
                 };
             }
             // RMSNorm gradient fields are Vec<f32>
             macro_rules! adam_norm {
-                ($w:ident, $g:ident, $a:ident) => {
-                    accelerate::adam_update(
+                ($w:ident) => {
+                    accelerate::adamw_update(
                         &mut lw.$w,
-                        &lg.$g,
-                        &mut la.$a.m,
-                        &mut la.$a.v,
-                        t,
-                        lr,
-                        b1,
-                        b2,
-                        eps,
+                        &lg.$w,
+                        &mut la.$w.m,
+                        &mut la.$w.v,
+                        &norms,
                     );
                 };
             }
 
-            adam_weight!(wq, wq, wq);
-            adam_weight!(wk, wk, wk);
-            adam_weight!(wv, wv, wv);
-            adam_weight!(wo, wo, wo);
-            adam_weight!(w1, w1, w1);
-            adam_weight!(w2, w2, w2);
-            adam_weight!(w3, w3, w3);
-            adam_norm!(rms_att, rms_att, rms_att);
-            adam_norm!(rms_ffn, rms_ffn, rms_ffn);
+            adam_weight!(wq);
+            adam_weight!(wk);
+            adam_weight!(wv);
+            adam_weight!(wo);
+            adam_weight!(w1);
+            adam_weight!(w2);
+            adam_weight!(w3);
+            adam_norm!(rms_att);
+            adam_norm!(rms_ffn);
         }
 
-        // Embedding uses a separate LR if configured (prevents divergence
-        // from sparse token updates and magnitude drift through many layers)
-        let embed_lr = self.config.embedding_lr.unwrap_or(lr);
-
-        accelerate::adam_update(
+        accelerate::adamw_update(
             &mut self.embed_weights,
             &self.embed_grad,
             &mut self.embed_adam.m,
             &mut self.embed_adam.v,
-            t,
-            embed_lr,
-            b1,
-            b2,
-            eps,
+            &embedding,
         );
 
-        accelerate::adam_update(
+        accelerate::adamw_update(
             &mut self.rms_final,
             &self.rms_final_grad,
             &mut self.rms_final_adam.m,
             &mut self.rms_final_adam.v,
-            t,
-            lr,
-            b1,
-            b2,
-            eps,
+            &norms,
         );
 
         self.last_timings.adam_us = adam_start.elapsed().as_micros() as u64;

@@ -30,6 +30,7 @@ use std::rc::Rc;
 
 use pmetal_bridge::compat::nn::value_and_grad_explicit;
 use pmetal_bridge::compat::{Array, Dtype, Exception, eval, ops, random};
+use pmetal_bridge::optimizer::{AdamW, ParamClass};
 use pmetal_bridge::training::per_token_cross_entropy_loss;
 use pmetal_lora::{AdaptedModel, PackedBase, QLoraConfig, QLoraScheme, quantize_base};
 #[cfg(doc)]
@@ -207,8 +208,8 @@ pub fn quantize_diffusion_gemma_base(
 
 /// DiffusionGemma block-diffusion LoRA trainer.
 ///
-/// Owns the AdamW moment buffers (keyed by adapter parameter name) and the
-/// noise-level RNG. Call [`Self::train_step`] with a clean canvas to run the
+/// Owns the AdamW optimizer (its moments keyed by adapter parameter name)
+/// and the noise-level RNG. Call [`Self::train_step`] with a clean canvas to run the
 /// full stochastic objective (sample `t`, corrupt, denoise, update), or
 /// [`Self::train_on_batch`] with a caller-supplied corruption for a
 /// deterministic step (reproducible runs, curriculum, overfit checks).
@@ -219,11 +220,9 @@ pub fn quantize_diffusion_gemma_base(
 pub struct DiffusionGemmaTrainer {
     config: DiffusionGemmaTrainConfig,
     vocab: i32,
-    /// AdamW first moments, keyed by adapter parameter name.
-    m: HashMap<Rc<str>, Array>,
-    /// AdamW second moments, keyed by adapter parameter name.
-    v: HashMap<Rc<str>, Array>,
-    /// Completed optimiser steps (drives bias correction).
+    /// AdamW over the adapters, every one decayed alike.
+    optimizer: AdamW,
+    /// Completed optimiser steps.
     step: u64,
     /// Noise-level sampler.
     rng: StdRng,
@@ -233,11 +232,14 @@ impl DiffusionGemmaTrainer {
     /// Create a trainer for a model whose vocabulary size is `vocab`.
     pub fn new(config: DiffusionGemmaTrainConfig, vocab: i32) -> Self {
         let rng = StdRng::seed_from_u64(config.seed);
+        let optimizer = AdamW::new(config.learning_rate, config.weight_decay)
+            .with_betas(config.beta1, config.beta2)
+            .with_eps(config.eps)
+            .with_classifier(|_| ParamClass::Regular);
         Self {
             config,
             vocab,
-            m: HashMap::new(),
-            v: HashMap::new(),
+            optimizer,
             step: 0,
             rng,
         }
@@ -352,82 +354,25 @@ impl DiffusionGemmaTrainer {
 
         // AdamW update on the adapter arrays, then write the new values back.
         self.step += 1;
-        let new_params = self.adamw_step(&keys, &param_arrays, &grads)?;
+        self.optimizer.advance_step();
+        let mut new_params = param_arrays;
+        for ((key, param), grad) in keys.iter().zip(&mut new_params).zip(&grads) {
+            self.optimizer.step_single(key, grad, param);
+        }
+        // Evaluate the whole update in one pass so the graph does not grow
+        // across steps.
+        let moments = keys
+            .iter()
+            .filter_map(|k| self.optimizer.states.get(k.as_ref()))
+            .flat_map(|s| [&s.m, &s.v]);
+        eval(new_params.iter().chain(moments))?;
         model.set_lora_parameters(&keys.iter().cloned().zip(new_params).collect());
-        eval(model.lora_parameters().values())?;
 
         Ok(DiffusionGemmaStepStats {
             step: self.step,
             loss: loss_val,
             grad_norm,
         })
-    }
-
-    /// One decoupled-weight-decay AdamW update. Reads/writes the per-key moment
-    /// buffers and returns the new parameter values (already evaluated).
-    fn adamw_step(
-        &mut self,
-        keys: &[Rc<str>],
-        params: &[Array],
-        grads: &[Array],
-    ) -> Result<Vec<Array>, Exception> {
-        let (lr, b1, b2, eps, wd) = (
-            self.config.learning_rate,
-            self.config.beta1,
-            self.config.beta2,
-            self.config.eps,
-            self.config.weight_decay,
-        );
-        let t = self.step as f32;
-        let bc1 = 1.0 - b1.powf(t);
-        let bc2 = 1.0 - b2.powf(t);
-        let sc = |x: f32| Array::from_f32(x);
-        let zeros_like = |a: &Array| a.multiply(&sc(0.0));
-
-        let mut new_params = Vec::with_capacity(keys.len());
-        let mut new_m = Vec::with_capacity(keys.len());
-        let mut new_v = Vec::with_capacity(keys.len());
-        for i in 0..keys.len() {
-            let g = &grads[i];
-            let m_prev = self
-                .m
-                .get(&keys[i])
-                .cloned()
-                .unwrap_or_else(|| zeros_like(g));
-            let v_prev = self
-                .v
-                .get(&keys[i])
-                .cloned()
-                .unwrap_or_else(|| zeros_like(g));
-
-            let m_new = m_prev.multiply(&sc(b1)).add(&g.multiply(&sc(1.0 - b1)));
-            let v_new = v_prev
-                .multiply(&sc(b2))
-                .add(&g.multiply(g).multiply(&sc(1.0 - b2)));
-
-            let m_hat = m_new.divide(&sc(bc1));
-            let v_hat = v_new.divide(&sc(bc2));
-            let denom = ops::sqrt(&v_hat).add(&sc(eps));
-            let update = m_hat.divide(&denom);
-
-            // Decoupled weight decay: p ← p·(1 − lr·wd) − lr·update.
-            let new_p = params[i]
-                .multiply(&sc(1.0 - lr * wd))
-                .subtract(&update.multiply(&sc(lr)));
-
-            new_params.push(new_p);
-            new_m.push(m_new);
-            new_v.push(v_new);
-        }
-
-        // Evaluate the whole update in one pass so the graph does not grow
-        // across steps, then persist the moments.
-        eval(new_params.iter().chain(new_m.iter()).chain(new_v.iter()))?;
-        for (k, (m, v)) in keys.iter().zip(new_m.into_iter().zip(new_v)) {
-            self.m.insert(k.clone(), m);
-            self.v.insert(k.clone(), v);
-        }
-        Ok(new_params)
     }
 }
 

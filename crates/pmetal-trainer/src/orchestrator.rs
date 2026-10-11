@@ -1442,6 +1442,7 @@ async fn attempt_ane_training(
             .training
             .embedding_learning_rate
             .map(|v| v as f32),
+        weight_decay: full_config.training.weight_decay as f32,
         ..Default::default()
     };
 

@@ -9,14 +9,15 @@
 //! keeping its ratio to the base rate.
 //!
 //! Each update rule follows the paper that introduced it, with that paper's
-//! default hyperparameters:
+//! default hyperparameters, and computes what its reference implementation
+//! does (`tests/optimizer_parity.rs` holds each to it, step by step):
 //!
-//! | Kind | Rule | Defaults |
-//! |------|------|----------|
-//! | AdamW | Loshchilov & Hutter, *Decoupled Weight Decay Regularization* (arXiv 1711.05101) | β = (0.9, 0.999), ε = 1e-8 |
-//! | SGD | heavy-ball momentum, Sutskever et al., *On the importance of initialization and momentum in deep learning* (ICML 2013); L2 weight decay added to the gradient | momentum 0.9 |
-//! | Lion | Chen et al., *Symbolic Discovery of Optimization Algorithms* (arXiv 2302.06675) | β = (0.9, 0.99), decoupled weight decay |
-//! | Adafactor | Shazeer & Stern, *Adafactor: Adaptive Learning Rates with Sublinear Memory Cost* (arXiv 1804.04235) | ε₁ = 1e-30, update clip d = 1, β̂₂ₜ = 1 − t^-0.8, no first moment, external learning rate |
+//! | Kind | Rule | Defaults | Reference |
+//! |------|------|----------|-----------|
+//! | AdamW | Loshchilov & Hutter, *Decoupled Weight Decay Regularization* (arXiv 1711.05101), bias-corrected | β = (0.9, 0.999), ε = 1e-8 | `torch.optim.AdamW` |
+//! | SGD | heavy-ball momentum, Sutskever et al., *On the importance of initialization and momentum in deep learning* (ICML 2013); L2 weight decay added to the gradient | momentum 0.9 | `torch.optim.SGD` |
+//! | Lion | Chen et al., *Symbolic Discovery of Optimization Algorithms* (arXiv 2302.06675) | β = (0.9, 0.99), decoupled weight decay | the authors' PyTorch implementation |
+//! | Adafactor | Shazeer & Stern, *Adafactor: Adaptive Learning Rates with Sublinear Memory Cost* (arXiv 1804.04235) | ε₁ = 1e-30, update clip d = 1, β̂₂ₜ = 1 − t^-0.8, no first moment, external learning rate | `transformers` `Adafactor(relative_step=False, scale_parameter=False)` |
 //!
 //! The learning rate and weight decay are the caller's. They are not
 //! interchangeable between kinds: the Lion paper recommends a learning rate

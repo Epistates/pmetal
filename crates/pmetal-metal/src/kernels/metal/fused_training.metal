@@ -33,14 +33,17 @@ constant uint XENT_TG_SIZE = 128;
 // AdamW Optimizer Structures
 // =============================================================================
 
-/// AdamW hyperparameters (shared across all parameters)
-struct AdamWConfig {
-    float learning_rate;    // Current learning rate (after scheduling)
-    float beta1;            // First moment decay (default 0.9)
-    float beta2;            // Second moment decay (default 0.999)
-    float epsilon;          // Numerical stability (default 1e-8)
-    float weight_decay;     // L2 regularization (default 0.01)
-    uint step;              // Current optimization step (for bias correction)
+/// One AdamW step's scalars, computed on the host as torch.optim.AdamW
+/// computes them (in f64, each rounded to f32 once). `AdamWScalars` in
+/// fused_training.rs.
+struct AdamWScalars {
+    float decay;                  // 1 - lr * weight_decay
+    float one_minus_beta1;        // 1 - beta1
+    float beta2;
+    float one_minus_beta2;        // 1 - beta2
+    float step_size;              // lr / (1 - beta1^t)
+    float bias_correction2_sqrt;  // sqrt(1 - beta2^t)
+    float epsilon;
 };
 
 /// Parameter metadata for batched processing
@@ -69,13 +72,12 @@ struct ParamInfo {
 /// - v: Second moment estimates [total_elements]
 /// - param_info: Metadata for each parameter [num_params]
 ///
-/// The kernel computes (MLX's AdamW default, without bias correction):
-///   m = beta1 * m + (1 - beta1) * grad
-///   v = beta2 * v + (1 - beta2) * grad^2
-///   param = param * (1 - lr * weight_decay) - lr * m / (sqrt(v) + eps)
-///
-/// Note: Unlike PyTorch's AdamW, MLX's does not use bias correction by default.
-/// This matches the original decoupled weight decay paper's formulation.
+/// The update is torch.optim.AdamW's, in its order: decoupled weight decay on
+/// the old parameter, then the bias-corrected Adam step.
+///   p = p * (1 - lr * wd)
+///   m = m + (1 - beta1) * (g - m)
+///   v = beta2 * v + (1 - beta2) * g^2
+///   p = p - lr / (1 - beta1^t) * m / (sqrt(v) / sqrt(1 - beta2^t) + eps)
 ///
 /// Grid: [ceil(max_param_size / WARP_SIZE), num_params, 1]
 /// Threadgroup: [WARP_SIZE, 1, 1]
@@ -85,7 +87,7 @@ kernel void fused_adamw_update(
     device float* m [[buffer(2)]],              // First moments (in-place update)
     device float* v [[buffer(3)]],              // Second moments (in-place update)
     device const ParamInfo* param_info [[buffer(4)]],  // Parameter metadata
-    constant AdamWConfig& config [[buffer(5)]],
+    constant AdamWScalars& s [[buffer(5)]],
     constant uint& num_params [[buffer(6)]],
     uint2 tid [[thread_position_in_grid]],
     uint2 tgid [[threadgroup_position_in_grid]]
@@ -106,170 +108,13 @@ kernel void fused_adamw_update(
     const uint m_idx = info.m_offset + elem_idx;
     const uint v_idx = info.v_offset + elem_idx;
 
-    // Load values
-    float param_val = params[p_idx];
-    float grad_val = grads[p_idx];
-    float m_val = m[m_idx];
-    float v_val = v[v_idx];
+    const float g = grads[p_idx];
+    const float p = params[p_idx] * s.decay;
+    const float m_val = m[m_idx] + s.one_minus_beta1 * (g - m[m_idx]);
+    const float v_val = s.beta2 * v[v_idx] + s.one_minus_beta2 * g * g;
+    const float denom = sqrt(v_val) / s.bias_correction2_sqrt + s.epsilon;
 
-    // AdamW update (MLX's default - NO bias correction)
-    // m = beta1 * m + (1 - beta1) * grad
-    m_val = config.beta1 * m_val + (1.0f - config.beta1) * grad_val;
-
-    // v = beta2 * v + (1 - beta2) * grad^2
-    v_val = config.beta2 * v_val + (1.0f - config.beta2) * grad_val * grad_val;
-
-    // AdamW decoupled weight decay + Adam update (NO bias correction)
-    // param = param * (1 - lr * weight_decay) - lr * m / (sqrt(v) + eps)
-    float update = m_val / (sqrt(v_val) + config.epsilon);
-    param_val = param_val * (1.0f - config.learning_rate * config.weight_decay)
-                - config.learning_rate * update;
-
-    // Write back
-    params[p_idx] = param_val;
-    m[m_idx] = m_val;
-    v[v_idx] = v_val;
-}
-
-/// Bias-corrected AdamW update (PyTorch-compatible).
-///
-/// Adds Adam bias correction factors:
-///   m_hat = m / (1 - beta1^step)
-///   v_hat = v / (1 - beta2^step)
-///   param = param * (1 - lr * weight_decay) - lr * m_hat / (sqrt(v_hat) + eps)
-///
-/// The `step` field in AdamWConfig must be set to the current optimization step (1-indexed).
-/// Grid/Threadgroup layout identical to fused_adamw_update.
-kernel void fused_adamw_update_bias_corrected(
-    device float* params [[buffer(0)]],
-    device const float* grads [[buffer(1)]],
-    device float* m [[buffer(2)]],
-    device float* v [[buffer(3)]],
-    device const ParamInfo* param_info [[buffer(4)]],
-    constant AdamWConfig& config [[buffer(5)]],
-    constant uint& num_params [[buffer(6)]],
-    uint2 tid [[thread_position_in_grid]],
-    uint2 tgid [[threadgroup_position_in_grid]]
-) {
-    const uint param_idx = tgid.y;
-    if (param_idx >= num_params) return;
-
-    const ParamInfo info = param_info[param_idx];
-    const uint elem_idx = tid.x;
-    if (elem_idx >= info.size) return;
-
-    const uint p_idx = info.offset + elem_idx;
-    const uint m_idx = info.m_offset + elem_idx;
-    const uint v_idx = info.v_offset + elem_idx;
-
-    float param_val = params[p_idx];
-    float grad_val  = grads[p_idx];
-    float m_val     = m[m_idx];
-    float v_val     = v[v_idx];
-
-    // Update biased first and second moment estimates
-    m_val = config.beta1 * m_val + (1.0f - config.beta1) * grad_val;
-    v_val = config.beta2 * v_val + (1.0f - config.beta2) * grad_val * grad_val;
-
-    // Bias correction (LOW-M1 fix)
-    float step_f    = float(config.step);
-    float m_hat     = m_val / (1.0f - pow(config.beta1, step_f));
-    float v_hat     = v_val / (1.0f - pow(config.beta2, step_f));
-
-    // AdamW decoupled weight decay + bias-corrected Adam update
-    float update  = m_hat / (sqrt(v_hat) + config.epsilon);
-    param_val = param_val * (1.0f - config.learning_rate * config.weight_decay)
-                - config.learning_rate * update;
-
-    params[p_idx] = param_val;
-    m[m_idx]      = m_val;
-    v[v_idx]      = v_val;
-}
-
-/// Half-precision bias-corrected AdamW update.
-kernel void fused_adamw_update_bias_corrected_f16(
-    device half* params [[buffer(0)]],
-    device const half* grads [[buffer(1)]],
-    device float* m [[buffer(2)]],
-    device float* v [[buffer(3)]],
-    device const ParamInfo* param_info [[buffer(4)]],
-    constant AdamWConfig& config [[buffer(5)]],
-    constant uint& num_params [[buffer(6)]],
-    uint2 tid [[thread_position_in_grid]],
-    uint2 tgid [[threadgroup_position_in_grid]]
-) {
-    const uint param_idx = tgid.y;
-    if (param_idx >= num_params) return;
-
-    const ParamInfo info = param_info[param_idx];
-    const uint elem_idx = tid.x;
-    if (elem_idx >= info.size) return;
-
-    const uint p_idx = info.offset + elem_idx;
-    const uint m_idx = info.m_offset + elem_idx;
-    const uint v_idx = info.v_offset + elem_idx;
-
-    float param_val = float(params[p_idx]);
-    float grad_val  = float(grads[p_idx]);
-    float m_val     = m[m_idx];
-    float v_val     = v[v_idx];
-
-    m_val = config.beta1 * m_val + (1.0f - config.beta1) * grad_val;
-    v_val = config.beta2 * v_val + (1.0f - config.beta2) * grad_val * grad_val;
-
-    float step_f = float(config.step);
-    float m_hat  = m_val / (1.0f - pow(config.beta1, step_f));
-    float v_hat  = v_val / (1.0f - pow(config.beta2, step_f));
-
-    float update  = m_hat / (sqrt(v_hat) + config.epsilon);
-    param_val = param_val * (1.0f - config.learning_rate * config.weight_decay)
-                - config.learning_rate * update;
-
-    params[p_idx] = half(param_val);
-    m[m_idx]      = m_val;
-    v[v_idx]      = v_val;
-}
-
-/// Half-precision version for memory efficiency (no bias correction)
-kernel void fused_adamw_update_f16(
-    device half* params [[buffer(0)]],
-    device const half* grads [[buffer(1)]],
-    device float* m [[buffer(2)]],              // Keep moments in fp32
-    device float* v [[buffer(3)]],
-    device const ParamInfo* param_info [[buffer(4)]],
-    constant AdamWConfig& config [[buffer(5)]],
-    constant uint& num_params [[buffer(6)]],
-    uint2 tid [[thread_position_in_grid]],
-    uint2 tgid [[threadgroup_position_in_grid]]
-) {
-    const uint param_idx = tgid.y;
-    if (param_idx >= num_params) return;
-
-    const ParamInfo info = param_info[param_idx];
-    const uint elem_idx = tid.x;
-    if (elem_idx >= info.size) return;
-
-    const uint p_idx = info.offset + elem_idx;
-    const uint m_idx = info.m_offset + elem_idx;
-    const uint v_idx = info.v_offset + elem_idx;
-
-    // Load and convert to fp32 for computation
-    float param_val = float(params[p_idx]);
-    float grad_val = float(grads[p_idx]);
-    float m_val = m[m_idx];
-    float v_val = v[v_idx];
-
-    // AdamW update (MLX's default - NO bias correction)
-    m_val = config.beta1 * m_val + (1.0f - config.beta1) * grad_val;
-    v_val = config.beta2 * v_val + (1.0f - config.beta2) * grad_val * grad_val;
-
-    // NO bias correction - MLX's default
-    float update = m_val / (sqrt(v_val) + config.epsilon);
-    param_val = param_val * (1.0f - config.learning_rate * config.weight_decay)
-                - config.learning_rate * update;
-
-    // Write back (convert param to fp16)
-    params[p_idx] = half(param_val);
+    params[p_idx] = p - s.step_size * (m_val / denom);
     m[m_idx] = m_val;
     v[v_idx] = v_val;
 }

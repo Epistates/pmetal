@@ -140,7 +140,7 @@ pub struct MlxMetalOptimizerConfig {
     pub beta2: f32,
     /// Numerical stability constant.
     pub epsilon: f32,
-    /// L2 regularization (weight decay).
+    /// Decoupled weight decay.
     pub weight_decay: f32,
     /// Learning rate schedule.
     pub lr_schedule: LrSchedule,
@@ -199,8 +199,9 @@ impl ParameterLayout {
 ///
 /// The parameters and gradients are copied into flat f32 Metal buffers,
 /// `fused_adamw` updates the parameters and both moments in place, and the
-/// parameters are read back as new arrays. Like MLX's `optimizers.AdamW`
-/// default, the update has no bias correction.
+/// parameters are read back as new arrays. The update is `torch.optim.AdamW`'s,
+/// bias correction and decoupled weight decay included, as on every other
+/// training path.
 pub struct MlxMetalOptimizer {
     /// Metal context.
     ctx: Arc<MetalContext>,
@@ -684,18 +685,19 @@ mod tests {
             .weight_decay(wd)
             .build()
             .unwrap();
-        // AdamW by hand over both weights in name order, without bias
-        // correction, as the kernel computes it.
+        // AdamW by hand over both weights in name order, with bias
+        // correction, as torch.optim.AdamW computes it.
         let g = gs.concat();
         let mut p = vec![1.0f32, 2.0, 3.0, -1.0, 0.5];
         let mut m = vec![0.0f32; 5];
         let mut v = vec![0.0f32; 5];
-        for _ in 0..2 {
+        for t in 1..=2 {
             opt.update_model_fused(&mut model, &grads).unwrap();
+            let (bc1, bc2) = (1.0 - b1.powi(t), 1.0 - b2.powi(t));
             for (((p, m), v), g) in p.iter_mut().zip(&mut m).zip(&mut v).zip(&g) {
                 *m = b1 * *m + (1.0 - b1) * g;
                 *v = b2 * *v + (1.0 - b2) * g * g;
-                *p = *p * (1.0 - lr * wd) - lr * *m / (v.sqrt() + eps);
+                *p = *p * (1.0 - lr * wd) - lr / bc1 * *m / (v.sqrt() / bc2.sqrt() + eps);
             }
         }
         let got: Vec<f32> = model

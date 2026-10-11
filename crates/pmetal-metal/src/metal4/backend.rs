@@ -551,7 +551,6 @@ impl KernelBackend for Metal4Backend {
             num_params,
             max_param_elements,
             use_fp16: false,
-            step: desc.config.step,
         };
 
         // Convert ParamInfo → MppParamInfo. Both are #[repr(C)] with the same
@@ -581,11 +580,7 @@ impl KernelBackend for Metal4Backend {
             desc.v,
             &mpp_param_infos,
             desc.param_info,
-            desc.config.learning_rate,
-            desc.config.beta1,
-            desc.config.beta2,
-            desc.config.epsilon,
-            desc.config.weight_decay,
+            &desc.config,
         )
     }
 

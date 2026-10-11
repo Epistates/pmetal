@@ -709,91 +709,30 @@ pub fn softmax_inplace(data: &mut [f32], dim: usize, seq: usize) {
     }
 }
 
-/// Adam optimizer update.
+/// One AdamW step over a parameter on the CPU, as `torch.optim.AdamW`
+/// computes it (see [`AdamWScalars`] for the update).
 ///
-/// Updates weights `w` using gradient `g` with moment estimates `m` and `v`.
-/// `t` is the 1-based step count for bias correction.
-#[allow(clippy::too_many_arguments)]
-pub fn adam_update(
+/// [`AdamWScalars`]: crate::kernels::AdamWScalars
+pub fn adamw_update(
     w: &mut [f32],
     g: &[f32],
     m: &mut [f32],
     v: &mut [f32],
-    t: usize,
-    lr: f32,
-    b1: f32,
-    b2: f32,
-    eps: f32,
+    s: &crate::kernels::AdamWScalars,
 ) {
     let n = w.len();
-    debug_assert_eq!(n, g.len());
-    debug_assert_eq!(n, m.len());
-    debug_assert_eq!(n, v.len());
-
-    let bc1 = 1.0 - b1.powi(t as i32);
-    let bc2 = 1.0 - b2.powi(t as i32);
+    assert_eq!(n, g.len(), "gradient length");
+    assert_eq!(n, m.len(), "first moment length");
+    assert_eq!(n, v.len(), "second moment length");
 
     for i in 0..n {
-        m[i] = b1 * m[i] + (1.0 - b1) * g[i];
-        v[i] = b2 * v[i] + (1.0 - b2) * g[i] * g[i];
-        let mh = m[i] / bc1;
-        let vh = v[i] / bc2;
-        w[i] -= lr * mh / (vh.sqrt() + eps);
-    }
-}
-
-/// Fused single-pass AdamW update with weight decay and gradient scaling.
-///
-/// Traverses each element exactly once: read param, grad, m, v; write param, m, v.
-/// Memory traffic: ~28 bytes/element (7 x f32). LLVM auto-vectorizes to NEON FMA.
-///
-/// `grad_scale` is a combined scaling factor applied inline to each gradient,
-/// avoiding a separate `scale_inplace` pass. Typically set to
-/// `clip_ratio / (accum_steps * loss_scale)`.
-///
-/// `t` is the Adam step counter and must be >= 1 (step 0 is undefined — bias
-/// correction would divide by zero). `weight_decay` is applied directly to the
-/// parameter and is NOT scaled by `grad_scale`.
-#[allow(clippy::too_many_arguments)]
-pub fn adam_update_fused(
-    w: &mut [f32],
-    g: &[f32],
-    m: &mut [f32],
-    v: &mut [f32],
-    t: usize,
-    lr: f32,
-    b1: f32,
-    b2: f32,
-    eps: f32,
-    weight_decay: f32,
-    grad_scale: f32,
-) {
-    debug_assert!(t >= 1, "Adam step t must be >= 1");
-
-    let n = w.len();
-    debug_assert_eq!(n, g.len());
-    debug_assert_eq!(n, m.len());
-    debug_assert_eq!(n, v.len());
-
-    if n == 0 {
-        return;
-    }
-
-    let bc1_inv = 1.0 / (1.0 - b1.powi(t as i32));
-    let bc2_inv = 1.0 / (1.0 - b2.powi(t as i32));
-    let one_minus_b1 = 1.0 - b1;
-    let one_minus_b2 = 1.0 - b2;
-
-    for i in 0..n {
-        let gi = g[i] * grad_scale;
-        let mi = b1 * m[i] + one_minus_b1 * gi;
-        let vi = b2 * v[i] + one_minus_b2 * gi * gi;
+        let gi = g[i];
+        let mi = m[i] + s.one_minus_beta1 * (gi - m[i]);
+        let vi = s.beta2 * v[i] + s.one_minus_beta2 * gi * gi;
         m[i] = mi;
         v[i] = vi;
-        let m_hat = mi * bc1_inv;
-        let v_hat = vi * bc2_inv;
-        let update = m_hat / (v_hat.sqrt() + eps);
-        w[i] -= lr * (update + weight_decay * w[i]);
+        let denom = vi.sqrt() / s.bias_correction2_sqrt + s.epsilon;
+        w[i] = w[i] * s.decay - s.step_size * (mi / denom);
     }
 }
 
@@ -1059,18 +998,27 @@ mod tests {
     }
 
     #[test]
-    fn test_adam_update() {
+    fn adamw_first_step_moves_each_weight_by_the_learning_rate() {
+        // m̂/√v̂ = g/|g| on the first step, so each weight moves by lr after
+        // its decay: p·(1 − lr·λ) − lr·sign(g).
         let mut w = vec![1.0f32, 2.0, 3.0];
-        let g = vec![0.1, 0.2, 0.3];
+        let g = vec![0.1, -0.2, 0.3];
         let mut m = vec![0.0f32; 3];
         let mut v = vec![0.0f32; 3];
-
-        adam_update(&mut w, &g, &mut m, &mut v, 1, 0.001, 0.9, 0.999, 1e-8);
-
-        // After 1 step, weights should have decreased
-        assert!(w[0] < 1.0);
-        assert!(w[1] < 2.0);
-        assert!(w[2] < 3.0);
+        let config = crate::kernels::AdamWConfig {
+            learning_rate: 0.001,
+            weight_decay: 0.1,
+            step: 1,
+            ..Default::default()
+        };
+        adamw_update(&mut w, &g, &mut m, &mut v, &config.scalars().unwrap());
+        let decay = 1.0 - 0.001 * 0.1;
+        for (got, want) in w
+            .iter()
+            .zip([decay - 0.001, 2.0 * decay + 0.001, 3.0 * decay - 0.001])
+        {
+            assert!((got - want).abs() < 1e-6, "{w:?}");
+        }
     }
 
     #[test]

@@ -6,13 +6,12 @@
 // - Single dispatch processes all parameters (2D grid: elem × param)
 // - Metal 4 command buffer lifecycle for amortized kernel launch overhead
 //
-// Math mirrors Metal 3 fused_training.metal exactly:
-//   m = beta1 * m + (1 - beta1) * g
+// Math mirrors Metal 3 fused_training.metal exactly, which is
+// torch.optim.AdamW's update in its order:
+//   p = p * (1 - lr * wd)
+//   m = m + (1 - beta1) * (g - m)
 //   v = beta2 * v + (1 - beta2) * g^2
-//   [with bias correction:]
-//   m_hat = m / (1 - beta1^t)
-//   v_hat = v / (1 - beta2^t)
-//   p = p - lr * (m_hat / (sqrt(v_hat) + eps) + wd * p)
+//   p = p - lr / (1 - beta1^t) * m / (sqrt(v) / sqrt(1 - beta2^t) + eps)
 //
 // MPP Guide Section 2.3.4 (Postfix Fusion): simd_sum() reductions inline
 // without threadgroup memory round-trips.
@@ -29,13 +28,16 @@ using namespace metal;
 // Shared structures (must match Rust repr(C))
 // =============================================================================
 
-struct MppAdamWConfig {
-    float learning_rate;
-    float beta1;
+/// One AdamW step's scalars, computed on the host (`AdamWScalars` in
+/// fused_training.rs).
+struct AdamWScalars {
+    float decay;                  // 1 - lr * weight_decay
+    float one_minus_beta1;        // 1 - beta1
     float beta2;
+    float one_minus_beta2;        // 1 - beta2
+    float step_size;              // lr / (1 - beta1^t)
+    float bias_correction2_sqrt;  // sqrt(1 - beta2^t)
     float epsilon;
-    float weight_decay;
-    uint  step;           // 0 = no bias correction (MLX's default)
 };
 
 struct MppParamInfo {
@@ -45,15 +47,25 @@ struct MppParamInfo {
     uint v_offset;   // element offset into second-moment buffer
 };
 
+/// One element's AdamW update; `p` and `g` are already f32.
+inline float adamw_element(
+    float p, float g, device float* m, device float* v, uint m_idx, uint v_idx,
+    constant AdamWScalars& s
+) {
+    const float m_val = m[m_idx] + s.one_minus_beta1 * (g - m[m_idx]);
+    const float v_val = s.beta2 * v[v_idx] + s.one_minus_beta2 * g * g;
+    const float denom = sqrt(v_val) / s.bias_correction2_sqrt + s.epsilon;
+    m[m_idx] = m_val;
+    v[v_idx] = v_val;
+    return p * s.decay - s.step_size * (m_val / denom);
+}
+
 // =============================================================================
-// MPP Fused AdamW — bias-corrected (PyTorch-compatible)
+// MPP Fused AdamW
 // =============================================================================
 //
 // Grid: [ceil(max_param_size / 32), num_params, 1]
 // Threadgroup: [32, 1, 1]  — one SIMD group per threadgroup
-//
-// Each SIMD lane handles one element. simd_sum() provides the per-lane
-// reduction without threadgroup memory, following MPP Section 2.3.1.
 
 kernel void mpp_fused_adamw_f32(
     device float*                params     [[buffer(0)]],
@@ -61,7 +73,7 @@ kernel void mpp_fused_adamw_f32(
     device float*                m          [[buffer(2)]],
     device float*                v          [[buffer(3)]],
     device const MppParamInfo*   param_info [[buffer(4)]],
-    constant MppAdamWConfig&     config     [[buffer(5)]],
+    constant AdamWScalars&       s          [[buffer(5)]],
     constant uint&               num_params [[buffer(6)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]]
@@ -76,35 +88,9 @@ kernel void mpp_fused_adamw_f32(
     if (elem_base >= info.size) return;
 
     const uint p_idx = info.offset + elem_base;
-    const uint m_idx = info.m_offset + elem_base;
-    const uint v_idx = info.v_offset + elem_base;
-
-    float p_val = params[p_idx];
-    float g_val = grads[p_idx];
-    float m_val = m[m_idx];
-    float v_val = v[v_idx];
-
-    m_val = config.beta1 * m_val + (1.0f - config.beta1) * g_val;
-    v_val = config.beta2 * v_val + (1.0f - config.beta2) * g_val * g_val;
-
-    float update;
-    if (config.step > 0u) {
-        // Bias-corrected (PyTorch-compatible)
-        float step_f = float(config.step);
-        float m_hat  = m_val / (1.0f - metal::fast::exp(step_f * metal::fast::log(config.beta1)));
-        float v_hat  = v_val / (1.0f - metal::fast::exp(step_f * metal::fast::log(config.beta2)));
-        update = m_hat / (metal::fast::sqrt(v_hat) + config.epsilon);
-    } else {
-        // No bias correction (MLX's default)
-        update = m_val / (metal::fast::sqrt(v_val) + config.epsilon);
-    }
-
-    p_val = p_val * (1.0f - config.learning_rate * config.weight_decay)
-          - config.learning_rate * update;
-
-    params[p_idx] = p_val;
-    m[m_idx]      = m_val;
-    v[v_idx]      = v_val;
+    params[p_idx] = adamw_element(
+        params[p_idx], grads[p_idx], m, v,
+        info.m_offset + elem_base, info.v_offset + elem_base, s);
 }
 
 // Half-precision params, fp32 moments.
@@ -114,7 +100,7 @@ kernel void mpp_fused_adamw_f16(
     device float*                m          [[buffer(2)]],
     device float*                v          [[buffer(3)]],
     device const MppParamInfo*   param_info [[buffer(4)]],
-    constant MppAdamWConfig&     config     [[buffer(5)]],
+    constant AdamWScalars&       s          [[buffer(5)]],
     constant uint&               num_params [[buffer(6)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint  lane [[thread_index_in_simdgroup]]
@@ -127,33 +113,9 @@ kernel void mpp_fused_adamw_f16(
     if (elem_base >= info.size) return;
 
     const uint p_idx = info.offset + elem_base;
-    const uint m_idx = info.m_offset + elem_base;
-    const uint v_idx = info.v_offset + elem_base;
-
-    float p_val = float(params[p_idx]);
-    float g_val = float(grads[p_idx]);
-    float m_val = m[m_idx];
-    float v_val = v[v_idx];
-
-    m_val = config.beta1 * m_val + (1.0f - config.beta1) * g_val;
-    v_val = config.beta2 * v_val + (1.0f - config.beta2) * g_val * g_val;
-
-    float update;
-    if (config.step > 0u) {
-        float step_f = float(config.step);
-        float m_hat  = m_val / (1.0f - metal::fast::exp(step_f * metal::fast::log(config.beta1)));
-        float v_hat  = v_val / (1.0f - metal::fast::exp(step_f * metal::fast::log(config.beta2)));
-        update = m_hat / (metal::fast::sqrt(v_hat) + config.epsilon);
-    } else {
-        update = m_val / (metal::fast::sqrt(v_val) + config.epsilon);
-    }
-
-    p_val = p_val * (1.0f - config.learning_rate * config.weight_decay)
-          - config.learning_rate * update;
-
-    params[p_idx] = half(p_val);
-    m[m_idx]      = m_val;
-    v[v_idx]      = v_val;
+    params[p_idx] = half(adamw_element(
+        float(params[p_idx]), float(grads[p_idx]), m, v,
+        info.m_offset + elem_base, info.v_offset + elem_base, s));
 }
 
 // =============================================================================

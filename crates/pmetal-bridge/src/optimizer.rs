@@ -1,4 +1,4 @@
-//! AdamW optimizer for InlineArray parameters.
+//! AdamW optimizer for InlineArray parameters, matching `torch.optim.AdamW`.
 //!
 //! Operates purely on [`InlineArray`] values. All arithmetic builds MLX
 //! lazy computation graph nodes; no `eval()` is called here. The caller
@@ -200,84 +200,18 @@ impl AdamW {
         }
     }
 
-    /// Apply one AdamW step.
-    ///
-    /// Updates every parameter in `params` that also has a corresponding
-    /// entry in `grads`. Parameters without gradients are left untouched.
-    ///
-    /// The update is:
-    /// ```text
-    /// m  = β₁·m + (1−β₁)·g
-    /// v  = β₂·v + (1−β₂)·g²
-    /// m̂  = m / (1 − β₁ᵗ)
-    /// v̂  = v / (1 − β₂ᵗ)
-    /// p  = p − lr · m̂/(√v̂ + ε)  −  wd·lr·p
-    /// ```
+    /// Apply one AdamW step: advance the step counter, then
+    /// [`Self::step_single`] every parameter in `params` that has a gradient
+    /// in `grads`. Parameters without gradients are left untouched.
     ///
     /// No `eval()` calls are made. The caller is responsible for materialising
     /// the updated parameter tensors (and optionally the moment arrays) at the
     /// appropriate point in the training loop.
     pub fn step(&mut self, params: &mut ParamSet, grads: &ParamSet) {
-        self.step_count_inner += 1;
-        let t = self.step_count_inner as f32;
-
-        // Bias-correction denominators (scalar InlineArrays).
-        let bc1 = InlineArray::from_f32(1.0 - self.beta1.powf(t));
-        let bc2 = InlineArray::from_f32(1.0 - self.beta2.powf(t));
-
-        // Pre-box scalar constants shared across all parameters.
-        let b1 = InlineArray::from_f32(self.beta1);
-        let one_minus_b1 = InlineArray::from_f32(1.0 - self.beta1);
-        let b2 = InlineArray::from_f32(self.beta2);
-        let one_minus_b2 = InlineArray::from_f32(1.0 - self.beta2);
-        let eps_arr = InlineArray::from_f32(self.eps);
-
+        self.advance_step();
         for (name, param) in params.iter_mut() {
-            let grad = match grads.get(name) {
-                Some(g) => g,
-                None => continue,
-            };
-
-            let class = (self.classifier)(name);
-            let lr = self.lr_for(class);
-            let wd = self.wd_for(class);
-
-            // Lazily initialise moment arrays to zeros on first encounter.
-            let state = self.states.entry(name.clone()).or_insert_with(|| {
-                let shape = param.shape().to_vec();
-                let dtype = param.dtype_raw();
-                AdamState {
-                    m: InlineArray::zeros(&shape, dtype),
-                    v: InlineArray::zeros(&shape, dtype),
-                }
-            });
-
-            // m = β₁·m + (1−β₁)·g
-            state.m = state.m.multiply(&b1).add(&grad.multiply(&one_minus_b1));
-
-            // v = β₂·v + (1−β₂)·g²
-            state.v = state
-                .v
-                .multiply(&b2)
-                .add(&grad.square().multiply(&one_minus_b2));
-
-            // Bias-corrected estimates: m̂ = m/(1−β₁ᵗ), v̂ = v/(1−β₂ᵗ)
-            let m_hat = state.m.divide(&bc1);
-            let v_hat = state.v.divide(&bc2);
-
-            // Adaptive step: Δ = m̂ / (√v̂ + ε)
-            let adaptive_step = m_hat.divide(&v_hat.sqrt().add(&eps_arr));
-
-            // Parameter update: p = p − lr·Δ
-            let lr_arr = InlineArray::from_f32(lr);
-            *param = param.subtract(&adaptive_step.multiply(&lr_arr));
-
-            // Decoupled weight decay: p = p − wd·lr·p
-            // Applied separately from the adaptive step, as in Loshchilov &
-            // Hutter (2019). Skipped entirely when wd == 0 (e.g. NoDecay).
-            if wd > 0.0 {
-                let wd_lr_arr = InlineArray::from_f32(wd * lr);
-                *param = param.subtract(&param.clone().multiply(&wd_lr_arr));
+            if let Some(grad) = grads.get(name) {
+                self.step_single(name, grad, param);
             }
         }
     }
@@ -297,12 +231,26 @@ impl AdamW {
     /// parameters.  This method does *not* increment the step counter —
     /// doing so would corrupt the Adam bias-correction terms when multiple
     /// parameters are updated in one training step.
+    ///
+    /// The update is `torch.optim.AdamW`'s, in its order:
+    /// ```text
+    /// p = p·(1 − lr·λ)                      decoupled weight decay, on the old p
+    /// m = m + (1−β₁)·(g − m)
+    /// v = β₂·v + (1−β₂)·g²
+    /// p = p − lr/(1−β₁ᵗ) · m / (√v/√(1−β₂ᵗ) + ε)
+    /// ```
+    /// The step's scalars are computed in f64 and rounded once, and the
+    /// moments keep the parameter's dtype.
     pub fn step_single(&mut self, name: &str, gradient: &InlineArray, parameter: &mut InlineArray) {
-        let t = self.step_count_inner as f32;
-
         let class = (self.classifier)(name);
-        let lr = self.lr_for(class);
-        let wd = self.wd_for(class);
+        let s = AdamWStepScalars::new(
+            self.lr_for(class),
+            self.wd_for(class),
+            self.beta1,
+            self.beta2,
+            self.eps,
+            self.step_count_inner,
+        );
 
         let state = self.states.entry(name.to_string()).or_insert_with(|| {
             let shape = parameter.shape().to_vec();
@@ -313,30 +261,68 @@ impl AdamW {
             }
         });
 
-        let b1 = InlineArray::from_f32(self.beta1);
-        let one_minus_b1 = InlineArray::from_f32(1.0 - self.beta1);
-        let b2 = InlineArray::from_f32(self.beta2);
-        let one_minus_b2 = InlineArray::from_f32(1.0 - self.beta2);
-
-        state.m = state.m.multiply(&b1).add(&gradient.multiply(&one_minus_b1));
+        if s.decay != 1.0 {
+            *parameter = parameter.mul_scalar(s.decay);
+        }
+        state.m = state
+            .m
+            .add(&gradient.subtract(&state.m).mul_scalar(s.one_minus_beta1));
         state.v = state
             .v
-            .multiply(&b2)
-            .add(&gradient.square().multiply(&one_minus_b2));
+            .mul_scalar(s.beta2)
+            .add(&gradient.square().mul_scalar(s.one_minus_beta2));
+        let denom = state
+            .v
+            .sqrt()
+            .div_scalar(s.bias_correction2_sqrt)
+            .add_scalar(s.eps);
+        *parameter = parameter.subtract(&state.m.divide(&denom).mul_scalar(s.step_size));
+    }
+}
 
-        let bc1 = InlineArray::from_f32(1.0 - self.beta1.powf(t));
-        let bc2 = InlineArray::from_f32(1.0 - self.beta2.powf(t));
-        let m_hat = state.m.divide(&bc1);
-        let v_hat = state.v.divide(&bc2);
+/// The scalars of AdamW step `t`, computed as `torch.optim.AdamW` computes
+/// them: in f64, each rounded to f32 once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdamWStepScalars {
+    /// `1 − lr·λ`: the decoupled weight decay, applied before the update.
+    pub decay: f32,
+    /// `1 − β₁`, the weight the first moment moves toward the gradient by.
+    pub one_minus_beta1: f32,
+    /// `β₂`.
+    pub beta2: f32,
+    /// `1 − β₂`.
+    pub one_minus_beta2: f32,
+    /// `lr / (1 − β₁ᵗ)`.
+    pub step_size: f32,
+    /// `√(1 − β₂ᵗ)`.
+    pub bias_correction2_sqrt: f32,
+    /// `ε`, added after the second moment's bias correction.
+    pub eps: f32,
+}
 
-        let eps_arr = InlineArray::from_f32(self.eps);
-        let adaptive_step = m_hat.divide(&v_hat.sqrt().add(&eps_arr));
-        let lr_arr = InlineArray::from_f32(lr);
-        *parameter = parameter.subtract(&adaptive_step.multiply(&lr_arr));
-
-        if wd > 0.0 {
-            let wd_lr_arr = InlineArray::from_f32(wd * lr);
-            *parameter = parameter.subtract(&parameter.clone().multiply(&wd_lr_arr));
+impl AdamWStepScalars {
+    /// The scalars of 1-based step `t`.
+    ///
+    /// # Panics
+    /// If `t` is 0: Adam's bias correction is undefined before the first step.
+    pub fn new(lr: f32, weight_decay: f32, beta1: f32, beta2: f32, eps: f32, t: u64) -> Self {
+        assert!(t >= 1, "AdamW steps are 1-based; advance the step first");
+        let (lr, wd, b1, b2) = (
+            f64::from(lr),
+            f64::from(weight_decay),
+            f64::from(beta1),
+            f64::from(beta2),
+        );
+        // `powf` rather than `powi`: a step count past i32::MAX must not wrap.
+        let t = t as f64;
+        Self {
+            decay: (1.0 - lr * wd) as f32,
+            one_minus_beta1: (1.0 - b1) as f32,
+            beta2,
+            one_minus_beta2: (1.0 - b2) as f32,
+            step_size: (lr / (1.0 - b1.powf(t))) as f32,
+            bias_correction2_sqrt: (1.0 - b2.powf(t)).sqrt() as f32,
+            eps,
         }
     }
 }

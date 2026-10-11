@@ -27,7 +27,7 @@ use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
-    kernels::mpp_dispatch::encode_mpp_kernel,
+    kernels::{fused_training::AdamWConfig, mpp_dispatch::encode_mpp_kernel},
 };
 
 // =============================================================================
@@ -43,8 +43,6 @@ pub struct MppFusedAdamWConfig {
     pub max_param_elements: usize,
     /// Use fp16 params / fp32 moments (true) or all fp32 (false).
     pub use_fp16: bool,
-    /// Current optimizer step (0 = disable bias correction, MLX's default).
-    pub step: u32,
 }
 
 impl MppFusedAdamWConfig {
@@ -54,14 +52,7 @@ impl MppFusedAdamWConfig {
             num_params,
             max_param_elements,
             use_fp16: false,
-            step: 0,
         }
-    }
-
-    /// Enable bias-corrected AdamW (PyTorch-compatible).
-    pub fn with_bias_correction(mut self, step: u32) -> Self {
-        self.step = step;
-        self
     }
 }
 
@@ -77,27 +68,6 @@ pub struct MppGradClipConfig {
 // =============================================================================
 // Metal-side parameter blocks (must match Metal struct layout)
 // =============================================================================
-
-/// Must match `MppAdamWConfig` in mpp_fused_training.metal.
-#[repr(C)]
-struct MppAdamWConfigMetal {
-    learning_rate: f32,
-    beta1: f32,
-    beta2: f32,
-    epsilon: f32,
-    weight_decay: f32,
-    step: u32,
-}
-
-// `MppAdamWConfig` in `metal4/mpp_fused_training.metal`.
-crate::msl_layout::msl_layout!(MppAdamWConfigMetal, size = 24, {
-    learning_rate: 0,
-    beta1: 4,
-    beta2: 8,
-    epsilon: 12,
-    weight_decay: 16,
-    step: 20,
-});
 
 /// Must match `MppParamInfo` in mpp_fused_training.metal.
 #[repr(C)]
@@ -151,7 +121,7 @@ impl MppFusedAdamW {
     /// - `m`: first-moment buffer (fp32)
     /// - `v`: second-moment buffer (fp32)
     /// - `param_infos`: per-parameter metadata slice
-    /// - `lr`, `beta1`, `beta2`, `eps`, `wd`: optimizer hyperparameters
+    /// - `config`: this step's hyperparameters, applied as in [`AdamWConfig`]
     #[allow(clippy::too_many_arguments)]
     pub fn execute(
         &self,
@@ -161,25 +131,9 @@ impl MppFusedAdamW {
         v: &dyn AsMetalBuffer,
         param_infos: &[MppParamInfo],
         param_info_buf: &dyn AsMetalBuffer,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        wd: f32,
+        config: &AdamWConfig,
     ) -> Result<()> {
-        let cb = self.execute_async(
-            params,
-            grads,
-            m,
-            v,
-            param_infos,
-            param_info_buf,
-            lr,
-            beta1,
-            beta2,
-            eps,
-            wd,
-        )?;
+        let cb = self.execute_async(params, grads, m, v, param_infos, param_info_buf, config)?;
         cb.waitUntilCompleted();
         if let Some(error) = cb.error() {
             return Err(MetalError::ExecutionFailed(error.to_string()));
@@ -197,11 +151,7 @@ impl MppFusedAdamW {
         v: &dyn AsMetalBuffer,
         param_infos: &[MppParamInfo],
         param_info_buf: &dyn AsMetalBuffer,
-        lr: f32,
-        beta1: f32,
-        beta2: f32,
-        eps: f32,
-        wd: f32,
+        config: &AdamWConfig,
     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         if !self.is_available() {
             return Err(MetalError::ExecutionFailed(
@@ -223,14 +173,7 @@ impl MppFusedAdamW {
             "mpp_fused_adamw_f32"
         };
 
-        let metal_config = MppAdamWConfigMetal {
-            learning_rate: lr,
-            beta1,
-            beta2,
-            epsilon: eps,
-            weight_decay: wd,
-            step: self.config.step,
-        };
+        let scalars = config.scalars()?;
         let num_params = self.config.num_params as u32;
 
         // Grid: [ceil(max_param_elements / 32), num_params, 1]
@@ -259,8 +202,8 @@ impl MppFusedAdamW {
             encoder.setBuffer_offset_atIndex(Some(m_buf), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(info_buf), 0, 4);
-            let cfg_ptr = NonNull::from(&metal_config).cast();
-            encoder.setBytes_length_atIndex(cfg_ptr, std::mem::size_of_val(&metal_config), 5);
+            let scalars_ptr = NonNull::from(&scalars).cast();
+            encoder.setBytes_length_atIndex(scalars_ptr, std::mem::size_of_val(&scalars), 5);
             let np_ptr = NonNull::from(&num_params).cast();
             encoder.setBytes_length_atIndex(np_ptr, std::mem::size_of_val(&num_params), 6);
         })
@@ -353,13 +296,6 @@ mod tests {
         assert_eq!(cfg.num_params, 10);
         assert_eq!(cfg.max_param_elements, 4096);
         assert!(!cfg.use_fp16);
-        assert_eq!(cfg.step, 0);
-    }
-
-    #[test]
-    fn test_bias_correction_step() {
-        let cfg = MppFusedAdamWConfig::new(1, 512).with_bias_correction(42);
-        assert_eq!(cfg.step, 42);
     }
 
     #[test]

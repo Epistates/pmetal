@@ -195,9 +195,13 @@ impl Drop for BatchedCommandBuffer {
 // AdamW Configuration
 // =============================================================================
 
-/// AdamW optimizer hyperparameters.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+/// AdamW optimizer hyperparameters for one step.
+///
+/// Every AdamW in this crate (the Metal kernels and the CPU update in
+/// [`crate::accelerate`]) applies them as `torch.optim.AdamW` does: decoupled
+/// weight decay on the parameter before the update, and bias correction of
+/// both moments.
+#[derive(Debug, Clone, Copy)]
 pub struct AdamWConfig {
     /// Learning rate (after scheduling).
     pub learning_rate: f32,
@@ -207,20 +211,77 @@ pub struct AdamWConfig {
     pub beta2: f32,
     /// Numerical stability constant (default 1e-8).
     pub epsilon: f32,
-    /// L2 regularization strength (default 0.01).
+    /// Decoupled weight decay (default 0.01).
     pub weight_decay: f32,
-    /// Current optimization step (for bias correction).
+    /// This step's number, from 1 (drives the bias correction).
     pub step: u32,
 }
 
-// `AdamWConfig` in `metal/fused_training.metal`.
-crate::msl_layout::msl_layout!(AdamWConfig, size = 24, {
-    learning_rate: 0,
-    beta1: 4,
+impl AdamWConfig {
+    /// The per-step scalars the kernels read, computed as `torch.optim.AdamW`
+    /// computes them: in f64, each rounded to f32 once.
+    ///
+    /// Fails for step 0: the bias correction is undefined before the first
+    /// step.
+    pub fn scalars(&self) -> Result<AdamWScalars> {
+        if self.step == 0 {
+            return Err(crate::error::MetalError::InvalidConfig(
+                "AdamW steps are 1-based; step 0 has no bias correction".into(),
+            ));
+        }
+        let (lr, wd) = (f64::from(self.learning_rate), f64::from(self.weight_decay));
+        let (b1, b2) = (f64::from(self.beta1), f64::from(self.beta2));
+        let t = f64::from(self.step);
+        Ok(AdamWScalars {
+            decay: (1.0 - lr * wd) as f32,
+            one_minus_beta1: (1.0 - b1) as f32,
+            beta2: self.beta2,
+            one_minus_beta2: (1.0 - b2) as f32,
+            step_size: (lr / (1.0 - b1.powf(t))) as f32,
+            bias_correction2_sqrt: (1.0 - b2.powf(t)).sqrt() as f32,
+            epsilon: self.epsilon,
+        })
+    }
+}
+
+/// One AdamW step's scalars, as the kernels read them.
+///
+/// The update is, per element:
+/// ```text
+/// p = p·decay
+/// m = m + (1−β₁)·(g − m)
+/// v = β₂·v + (1−β₂)·g²
+/// p = p − step_size · m / (√v / bias_correction2_sqrt + ε)
+/// ```
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+pub struct AdamWScalars {
+    /// `1 − lr·λ`.
+    pub decay: f32,
+    /// `1 − β₁`.
+    pub one_minus_beta1: f32,
+    /// `β₂`.
+    pub beta2: f32,
+    /// `1 − β₂`.
+    pub one_minus_beta2: f32,
+    /// `lr / (1 − β₁ᵗ)`.
+    pub step_size: f32,
+    /// `√(1 − β₂ᵗ)`.
+    pub bias_correction2_sqrt: f32,
+    /// `ε`.
+    pub epsilon: f32,
+}
+
+// `AdamWScalars` in `metal/fused_training.metal` and
+// `metal4/mpp_fused_training.metal`.
+crate::msl_layout::msl_layout!(AdamWScalars, size = 28, {
+    decay: 0,
+    one_minus_beta1: 4,
     beta2: 8,
-    epsilon: 12,
-    weight_decay: 16,
-    step: 20,
+    one_minus_beta2: 12,
+    step_size: 16,
+    bias_correction2_sqrt: 20,
+    epsilon: 24,
 });
 
 impl Default for AdamWConfig {
@@ -337,6 +398,7 @@ impl FusedAdamW {
         param_info: &MetalBuffer<ParamInfo>,
         config: &AdamWConfig,
     ) -> Result<()> {
+        let scalars = config.scalars()?;
         let function_name = "fused_adamw_update";
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
@@ -354,8 +416,8 @@ impl FusedAdamW {
             encoder.setBuffer_offset_atIndex(Some(v.metal_buffer()), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(param_info.metal_buffer()), 0, 4);
 
-            let config_ptr = NonNull::from(config).cast();
-            encoder.setBytes_length_atIndex(config_ptr, std::mem::size_of::<AdamWConfig>(), 5);
+            let scalars_ptr = NonNull::from(&scalars).cast();
+            encoder.setBytes_length_atIndex(scalars_ptr, std::mem::size_of::<AdamWScalars>(), 5);
 
             let num_params = self.num_params as u32;
             let num_params_ptr = NonNull::from(&num_params).cast();
@@ -774,28 +836,24 @@ mod tests {
             .execute_update(&params, &grads, &m, &v, &param_info, &config)
             .expect("AdamW update failed");
 
-        // Verify params were updated
-        let updated_params = params.as_slice();
+        // The first bias-corrected step moves each weight by lr·sign(g),
+        // after its decay: 1·(1 − 0.001·0.01) − 0.001.
+        let want = (1.0 - 0.001 * 0.01) - 0.001;
+        for (i, &p) in params.as_slice().iter().enumerate() {
+            assert!((p - want).abs() < 1e-6, "param {i}: {p}, want {want}");
+        }
+        for (i, &m) in m.as_slice().iter().enumerate() {
+            assert!((m - 0.01).abs() < 1e-8, "m {i}: {m}");
+        }
+    }
 
-        // After one step with grad=0.1, lr=0.001:
-        // m = 0.1 * 0.1 = 0.01
-        // v = 0.001 * 0.01 = 0.00001
-        // m_hat = 0.01 / 0.1 = 0.1
-        // v_hat = 0.00001 / 0.001 = 0.01
-        // update = 0.1 / (sqrt(0.01) + 1e-8) = 0.1 / 0.1 = 1.0
-        // param = 1.0 * (1 - 0.001 * 0.01) - 0.001 * 1.0 = 0.99999 - 0.001 ≈ 0.999
-        //
-        // The exact value depends on bias correction, but params should be < 1.0
-        assert!(
-            updated_params[0] < 1.0,
-            "Params should decrease after AdamW update, got {}",
-            updated_params[0]
-        );
-        assert!(
-            updated_params[0] > 0.9,
-            "Params should not decrease too much, got {}",
-            updated_params[0]
-        );
+    #[test]
+    fn adamw_step_zero_is_refused() {
+        let config = AdamWConfig {
+            step: 0,
+            ..Default::default()
+        };
+        assert!(config.scalars().is_err());
     }
 
     #[test]
