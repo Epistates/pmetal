@@ -12,7 +12,7 @@ use crate::{
     architectures::{Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM},
     generation::{
         GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
-        sampling_log_probs_with_counts, token_probability_from_log_probs,
+        correction_log_probs, sampling_log_probs_with_counts, token_probability_from_log_probs,
     },
 };
 
@@ -748,22 +748,6 @@ where
         *stopped_by_token = true;
     }
     Ok(on_token(token))
-}
-
-fn correction_log_probs(
-    target_log_probs: &Array,
-    draft_log_probs: &Array,
-) -> Result<Array, Exception> {
-    let target_probs = target_log_probs.exp();
-    let draft_probs = draft_log_probs.exp();
-    let diff = target_probs.subtract(&draft_probs);
-    let clipped = diff.maximum(&Array::from_f32(0.0));
-    let total = clipped.sum_axis(-1, true);
-    let total_value = total.item::<f32>();
-    if !total_value.is_finite() || total_value <= 1e-20 {
-        return Ok(target_log_probs.clone());
-    }
-    Ok(clipped.divide(&total).log())
 }
 
 fn greedy_token(logits: &Array) -> u32 {

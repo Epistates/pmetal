@@ -15,7 +15,7 @@ use pmetal_models::{
     architectures::Qwen3NextMtpForCausalLM,
     generation::{
         GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
-        sampling_log_probs_with_counts, token_probability_from_log_probs,
+        correction_log_probs, sampling_log_probs_with_counts, token_probability_from_log_probs,
     },
 };
 
@@ -1013,8 +1013,8 @@ fn accept_sampled_draft(
             verify_history.push(token);
             increment_count(&mut verify_counts, token);
         } else {
-            let correction_log_probs =
-                correction_log_probs(&target_log_probs, draft_log_probs_row)?;
+            let correction_log_probs = correction_log_probs(&target_log_probs, draft_log_probs_row)
+                .map_err(|e| e.to_string())?;
             return Ok((
                 accepted,
                 Some(
@@ -1027,22 +1027,6 @@ fn accept_sampled_draft(
     }
 
     Ok((accepted, None))
-}
-
-fn correction_log_probs(
-    target_log_probs: &Array,
-    draft_log_probs: &Array,
-) -> Result<Array, String> {
-    let target_probs = target_log_probs.exp();
-    let draft_probs = draft_log_probs.exp();
-    let diff = target_probs.subtract(&draft_probs);
-    let clipped = diff.maximum(&Array::from_f32(0.0));
-    let total = clipped.sum_axis(-1, true);
-    let total_value = total.item::<f32>();
-    if !total_value.is_finite() || total_value <= 1e-20 {
-        return Ok(target_log_probs.clone());
-    }
-    Ok(clipped.divide(&total).log())
 }
 
 fn emit_token<F>(

@@ -1279,6 +1279,31 @@ impl SpeculativeDraws {
     }
 }
 
+/// The log-probabilities a speculative decoder samples its correction token
+/// from after rejecting a draft token: the residual `norm(max(0, p − q))` of
+/// the target's probabilities `p` over the draft's `q` (Leviathan et al.,
+/// arXiv 2211.17192, section 2.3; Chen et al., arXiv 2302.01318). With the
+/// acceptance test `min(1, p/q)` before it, every token comes out distributed
+/// as the target alone would sample it. A residual with no mass (the draft
+/// agreeing with the target) leaves the target's distribution.
+pub fn correction_log_probs(
+    target_log_probs: &Array,
+    draft_log_probs: &Array,
+) -> Result<Array, Exception> {
+    let residual = target_log_probs
+        .exp()
+        .subtract(&draft_log_probs.exp())
+        .maximum(&Array::from_f32(0.0));
+    let total = residual.sum_axis(-1, true);
+    let total_value = total.item::<f32>();
+    pmetal_bridge::check_last_error()
+        .map_err(|e| Exception::custom(format!("speculative correction distribution: {e}")))?;
+    if !total_value.is_finite() || total_value <= 1e-20 {
+        return Ok(target_log_probs.clone());
+    }
+    Ok(residual.divide(&total).log())
+}
+
 /// Return `exp(log_probs[token])`, validating the token against the vocabulary.
 pub fn token_probability_from_log_probs(log_probs: &Array, token: u32) -> Result<f32, Exception> {
     let vocab_size = log_probs.dim(-1);
@@ -2430,6 +2455,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The correction distribution is the clipped, renormalized residual of
+    /// the target over the draft, and the target when there is none.
+    #[test]
+    fn the_correction_samples_the_residual_of_target_over_draft() {
+        let log = |p: &[f32]| {
+            Array::from_slice(
+                &p.iter().map(|p| p.ln()).collect::<Vec<_>>(),
+                &[1, p.len() as i32],
+            )
+        };
+        let probs = |a: Array| {
+            let a = a.exp();
+            a.eval();
+            a.as_slice::<f32>().to_vec()
+        };
+        let target = [0.5f32, 0.3, 0.2];
+        // Residual (0.3, 0, 0.1) over 0.4.
+        let got = probs(correction_log_probs(&log(&target), &log(&[0.2, 0.6, 0.1])).unwrap());
+        for (g, w) in got.iter().zip([0.75f32, 0.0, 0.25]) {
+            assert!((g - w).abs() < 1e-6, "{got:?}");
+        }
+        // A draft equal to the target leaves no residual: the target.
+        let got = probs(correction_log_probs(&log(&target), &log(&target)).unwrap());
+        for (g, w) in got.iter().zip(target) {
+            assert!((g - w).abs() < 1e-6, "{got:?}");
+        }
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    }
 
     #[test]
     fn token_logprobs_chosen_matches_log_softmax() {
