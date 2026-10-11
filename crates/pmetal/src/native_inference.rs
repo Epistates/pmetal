@@ -673,15 +673,15 @@ fn run_bridge_inference<Config, Weights, Cache>(
         &Weights,
         &mut Cache,
         &[u32],
-        &pmetal_bridge::decode::SamplingParams,
-    ) -> u32,
+        pmetal_bridge::decode::SamplingParams,
+    ) -> (u32, pmetal_bridge::decode::DecodeSampler),
     generate: impl Fn(
         &Weights,
         &Config,
         &mut Cache,
         u32,
         usize,
-        pmetal_bridge::decode::SamplingParams,
+        pmetal_bridge::decode::DecodeSampler,
         &mut dyn FnMut(u32) -> bool,
     ) -> (Vec<u32>, Option<pmetal_bridge::decode::DecodeMetrics>),
 ) -> Result<NativeGenerationOutput, String> {
@@ -700,7 +700,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
     );
 
     let mut cache = build_cache(&weights, &config);
-    let first_tok = prefill_first_token(&weights, &mut cache, input_ids, &params);
+    let (first_tok, sampler) = prefill_first_token(&weights, &mut cache, input_ids, params);
 
     Ok(finish_with_bridge_generate(
         input_ids,
@@ -714,7 +714,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
                 &mut cache,
                 first_tok,
                 max_tokens.saturating_sub(1),
-                params,
+                sampler,
                 on_token,
             )
         },
@@ -765,8 +765,8 @@ fn run_qwen3(
         &pmetal_bridge::qwen3_native::NativeWeights,
         &mut pmetal_bridge::qwen3_native::NativeCache,
         &[u32],
-        &pmetal_bridge::decode::SamplingParams,
-    ) -> u32,
+        pmetal_bridge::decode::SamplingParams,
+    ) -> (u32, pmetal_bridge::decode::DecodeSampler),
 ) -> Result<NativeGenerationOutput, String> {
     use pmetal_bridge::qwen3_native;
 
@@ -815,8 +815,8 @@ fn run_qwen3(
         },
         |weights, _| build_qwen3_cache_with_quant(weights, turboquant, quant_config),
         prefill_first_token,
-        |weights, _config, cache, first_tok, remaining, params, on_token| {
-            qwen3_native::generate(weights, cache, first_tok, remaining, params, on_token)
+        |weights, _config, cache, first_tok, remaining, sampler, on_token| {
+            qwen3_native::generate(weights, cache, first_tok, remaining, sampler, on_token)
         },
     )
 }
@@ -873,9 +873,9 @@ fn run_gemma4(
         gemma4_native::load_model,
         gemma4_native::build_cache,
         gemma4_native::prefill_first_token,
-        |weights, config, cache, first_tok, remaining, params, on_token| {
+        |weights, config, cache, first_tok, remaining, sampler, on_token| {
             gemma4_native::generate(
-                weights, config, cache, first_tok, remaining, params, on_token,
+                weights, config, cache, first_tok, remaining, sampler, on_token,
             )
         },
     )
@@ -997,8 +997,8 @@ fn run_llama4(
         llama4_native::load_model,
         move |weights, _| build_llama4_cache(weights, turboquant, quant_config),
         llama4_native::prefill_first_token,
-        |weights, _config, cache, first_tok, remaining, params, on_token| {
-            llama4_native::generate(weights, cache, first_tok, remaining, params, on_token)
+        |weights, _config, cache, first_tok, remaining, sampler, on_token| {
+            llama4_native::generate(weights, cache, first_tok, remaining, sampler, on_token)
         },
     )
 }
@@ -1059,8 +1059,8 @@ fn run_deepseek(
             )
         },
         deepseek_native::prefill_first_token,
-        |weights, _config, cache, first_tok, remaining, params, on_token| {
-            deepseek_native::generate(weights, cache, first_tok, remaining, params, on_token)
+        |weights, _config, cache, first_tok, remaining, sampler, on_token| {
+            deepseek_native::generate(weights, cache, first_tok, remaining, sampler, on_token)
         },
     )
 }
@@ -1100,8 +1100,8 @@ fn run_gpt_oss(
         // in the model dtype.
         move |weights, _| gpt_oss_native::NativeCache::new_with_quant(weights, quant_config),
         gpt_oss_native::prefill_first_token,
-        |weights, _config, cache, first_tok, remaining, params, on_token| {
-            gpt_oss_native::generate(weights, cache, first_tok, remaining, params, on_token)
+        |weights, _config, cache, first_tok, remaining, sampler, on_token| {
+            gpt_oss_native::generate(weights, cache, first_tok, remaining, sampler, on_token)
         },
     )
 }

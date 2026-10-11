@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -250,50 +249,187 @@ fn apply_min_p(logits_2d: &InlineArray, min_p: f32, neg_inf: &InlineArray) -> In
     take_along_axis(&selected, &inverse_indices, -1)
 }
 
-/// Reusable buffer for penalty application.
-///
-/// Pre-allocates a vocab-sized vec once and tracks dirty indices so each step
-/// only zeros the positions that were previously set, instead of re-allocating
-/// and zeroing the entire ~1 MB buffer every decode step.
-struct PenaltyBuffer {
-    vec: Vec<f32>,
-    dirty: Vec<usize>,
+/// The repetition penalty applied to the logits of tokens already in the
+/// sequence: a positive logit is divided by `penalty`, a negative one
+/// multiplied by it, so a penalty above 1 makes every repeat less likely
+/// (CTRL, Keskar et al., arXiv 1909.05858; transformers'
+/// `RepetitionPenaltyLogitsProcessor`).
+pub fn repetition_penalized(logits: &InlineArray, penalty: f32) -> InlineArray {
+    let penalty = scalar_f32_like(penalty, logits);
+    let zero = scalar_f32_like(0.0, logits);
+    logits
+        .less(&zero)
+        .where_cond(&logits.multiply(&penalty), &logits.divide(&penalty))
 }
 
-impl PenaltyBuffer {
-    fn new(vocab_size: usize) -> Self {
+/// The repetition, frequency and presence penalties of one generation, with
+/// the token history they read kept on the GPU.
+///
+/// The repetition penalty covers every token in the sequence, prompt
+/// included, as transformers' `RepetitionPenaltyLogitsProcessor` does for a
+/// decoder-only model; the frequency and presence penalties (OpenAI's
+/// `logit -= frequency * count + presence * (count > 0)`) count the
+/// generated tokens only. Repetition is applied first, as the samplers of
+/// `pmetal-models` do.
+///
+/// [`record`](Self::record) folds a sampled token in without reading it
+/// back, so a pipelined decode loop keeps its next step queued behind the
+/// sample and every step still sees every token before it.
+pub struct DecodePenalties {
+    repetition: f32,
+    frequency: f32,
+    presence: f32,
+    /// The prompt, until the first logits give the vocabulary size.
+    prompt: Vec<u32>,
+    /// Tokens recorded before the first logits.
+    pending: Vec<InlineArray>,
+    history: Option<PenaltyHistory>,
+}
+
+/// The token history the penalties read, as `[1, vocab]` masks.
+struct PenaltyHistory {
+    /// `0..vocab`, int32.
+    ids: InlineArray,
+    /// Tokens in the prompt or generated: the repetition penalty's set.
+    seen: InlineArray,
+    /// How often each token was generated, f32.
+    counts: InlineArray,
+}
+
+impl DecodePenalties {
+    /// The penalties of a generation from `prompt`, or `None` when none is
+    /// active (a repetition penalty of 1, frequency and presence 0).
+    pub fn new(repetition: f32, frequency: f32, presence: f32, prompt: &[u32]) -> Option<Self> {
+        (repetition != 1.0 || frequency != 0.0 || presence != 0.0).then(|| Self {
+            repetition,
+            frequency,
+            presence,
+            prompt: prompt.to_vec(),
+            pending: Vec::new(),
+            history: None,
+        })
+    }
+
+    fn history(&mut self, vocab: i32) -> &mut PenaltyHistory {
+        if self.history.is_none() {
+            // Tokens past the logits' vocabulary have no logit to penalize.
+            let mut prompt_mask = vec![0.0f32; vocab.max(0) as usize];
+            for &token in &self.prompt {
+                if let Some(slot) = prompt_mask.get_mut(token as usize) {
+                    *slot = 1.0;
+                }
+            }
+            self.prompt = Vec::new();
+            let zero = InlineArray::from_f32(0.0);
+            self.history = Some(PenaltyHistory {
+                ids: InlineArray::arange(vocab, crate::compat::Dtype::Int32.as_i32())
+                    .reshape(&[1, vocab]),
+                seen: InlineArray::from_f32_slice(&prompt_mask, &[1, vocab]).greater(&zero),
+                counts: InlineArray::zeros(&[1, vocab], crate::compat::Dtype::Float32.as_i32()),
+            });
+            for token in std::mem::take(&mut self.pending) {
+                self.history.as_mut().unwrap().record(&token);
+            }
+        }
+        self.history.as_mut().unwrap()
+    }
+
+    /// `[1, vocab]` logits with the penalties applied, in f32.
+    pub fn apply(&mut self, logits_2d: &InlineArray) -> InlineArray {
+        let (repetition, frequency, presence) = (self.repetition, self.frequency, self.presence);
+        let logits = logits_2d.as_dtype(crate::compat::Dtype::Float32.as_i32());
+        let history = self.history(logits.dim(-1));
+        let mut out = logits;
+        if repetition != 1.0 {
+            out = history
+                .seen
+                .where_cond(&repetition_penalized(&out, repetition), &out);
+        }
+        if frequency != 0.0 || presence != 0.0 {
+            let generated = history.counts.greater(&InlineArray::from_f32(0.0));
+            let penalty = history
+                .counts
+                .multiply(&InlineArray::from_f32(frequency))
+                .add(
+                    &generated
+                        .as_dtype(crate::compat::Dtype::Float32.as_i32())
+                        .multiply(&InlineArray::from_f32(presence)),
+                );
+            out = out.subtract(&penalty);
+        }
+        out
+    }
+
+    /// Add a generated token (a one-element array, read lazily) to the
+    /// history.
+    pub fn record(&mut self, token: &InlineArray) {
+        match self.history.as_mut() {
+            Some(history) => history.record(token),
+            None => self.pending.push(token.clone()),
+        }
+    }
+}
+
+impl PenaltyHistory {
+    fn record(&mut self, token: &InlineArray) {
+        let token = token
+            .reshape(&[1, 1])
+            .as_dtype(crate::compat::Dtype::Int32.as_i32());
+        let hit = self.ids.equal(&token);
+        self.seen = self.seen.logical_or(&hit);
+        self.counts = self
+            .counts
+            .add(&hit.as_dtype(crate::compat::Dtype::Float32.as_i32()));
+    }
+}
+
+/// The sampler of one native generation: its [`SamplingParams`], its
+/// penalties over the prompt and every token drawn so far, and the index of
+/// its next draw.
+///
+/// Every token of the generation comes from [`sample`](Self::sample): the
+/// prompt's last position (draw 0), the primed step (draw 1), and each step
+/// of the decode loop after them, so each is penalized for all the tokens
+/// before it.
+pub struct DecodeSampler {
+    params: SamplingParams,
+    penalties: Option<DecodePenalties>,
+    draws: u64,
+}
+
+impl DecodeSampler {
+    /// The sampler of a generation continuing `prompt`.
+    pub fn new(params: SamplingParams, prompt: &[u32]) -> Self {
+        let penalties = DecodePenalties::new(
+            params.repetition_penalty,
+            params.frequency_penalty,
+            params.presence_penalty,
+            prompt,
+        );
         Self {
-            vec: vec![0.0f32; vocab_size],
-            dirty: Vec::with_capacity(256),
+            params,
+            penalties,
+            draws: 0,
         }
     }
 
-    /// Apply penalties and return penalized logits. Reuses the internal buffer.
-    fn apply(
-        &mut self,
-        logits_2d: &InlineArray,
-        token_counts: &HashMap<u32, usize>,
-        params: &SamplingParams,
-    ) -> InlineArray {
-        // Clear only previously-dirty positions (O(unique_tokens) not O(vocab))
-        for &idx in &self.dirty {
-            self.vec[idx] = 0.0;
-        }
-        self.dirty.clear();
+    pub fn params(&self) -> &SamplingParams {
+        &self.params
+    }
 
-        let vocab_size = self.vec.len();
-        for (&token, &count) in token_counts {
-            let idx = token as usize;
-            if idx >= vocab_size {
-                continue;
+    /// Sample the next token from `[1, vocab]` logits ([`sample_token`]
+    /// after the penalties), without reading it back.
+    pub fn sample(&mut self, logits_2d: &InlineArray) -> InlineArray {
+        let draw = self.draws;
+        self.draws += 1;
+        match self.penalties.as_mut() {
+            Some(penalties) => {
+                let token = sample_token(&penalties.apply(logits_2d), &self.params, draw);
+                penalties.record(&token);
+                token
             }
-            // Frequency + presence (subtractive): logit -= freq*count + pres*(count>0)
-            self.vec[idx] = params.frequency_penalty * count as f32 + params.presence_penalty;
-            self.dirty.push(idx);
+            None => sample_token(logits_2d, &self.params, draw),
         }
-
-        let pen_arr = InlineArray::from_slice(&self.vec, &[1, vocab_size as i32]);
-        logits_2d.subtract(&pen_arr)
     }
 }
 
@@ -326,10 +462,9 @@ pub fn draw_bits(seed: u64, draw: u64) -> u64 {
 /// The inverse-temperature scalar is cast to the logits dtype before the
 /// multiply so bf16/f16 decode graphs do not get silently promoted to f32.
 ///
-/// IMPORTANT: penalty (`repetition_penalty` / `frequency_penalty` /
-/// `presence_penalty`) handling lives in `PenaltyBuffer::apply` which
-/// must run BEFORE this call — penalties operate on raw logits, not
-/// log-probs, and depend on per-token counts the sampler does not track.
+/// The penalties (`repetition_penalty`, `frequency_penalty`,
+/// `presence_penalty`) are not applied here: they act on the raw logits and
+/// read the token history, which [`DecodeSampler`] keeps.
 pub fn sample_token(logits_2d: &InlineArray, params: &SamplingParams, draw: u64) -> InlineArray {
     if params.temperature <= 0.0 {
         return logits_2d.argmax(-1);
@@ -361,20 +496,23 @@ pub fn sample_token(logits_2d: &InlineArray, params: &SamplingParams, draw: u64)
     filtered.categorical(-1, key.as_ref())
 }
 
-/// Run prompt prefill and return the first sampled token (draw 0).
+/// Run prompt prefill and return the first sampled token (draw 0) with the
+/// generation's sampler, which [`prime_generation`] and
+/// [`generate_from_primed_sample`] continue.
 pub fn prefill_first_token<Weights, Cache>(
     weights: &Weights,
     cache: &mut Cache,
     input_ids: &[u32],
-    params: &SamplingParams,
+    params: SamplingParams,
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
-) -> u32 {
+) -> (u32, DecodeSampler) {
+    let mut sampler = DecodeSampler::new(params, input_ids);
     let prompt = prompt_tokens_to_input(input_ids);
     let logits = forward_step(weights, &prompt, cache);
     let last_logits = last_token_logits(&logits);
-    let token = sample_token(&last_logits, params, 0);
+    let token = sampler.sample(&last_logits);
     token.eval();
-    token.item_u32()
+    (token.item_u32(), sampler)
 }
 
 /// Cache-aware causal attention.
@@ -906,7 +1044,7 @@ pub fn prime_generation<Weights, Cache>(
     weights: &Weights,
     cache: &mut Cache,
     first_token: u32,
-    params: &SamplingParams,
+    sampler: &mut DecodeSampler,
     reset_peak_memory: bool,
     log_session: bool,
     mut prepare_cache: impl FnMut(&mut Cache),
@@ -918,64 +1056,27 @@ pub fn prime_generation<Weights, Cache>(
     let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
     let logits = forward_step(weights, &input_token, cache);
     let logits_2d = logits.squeeze(1);
-    // Draw 1: the prompt's own last position drew token 0.
-    let current_y = sample_token(&logits_2d, params, 1);
+    let current_y = sampler.sample(&logits_2d);
     current_y.async_eval_ref();
     current_y
 }
 
-/// Continue generation from an already-primed async sample.
+/// Continue generation from an already-primed async sample, drawing every
+/// token with `sampler` (the one that drew `current_y`).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_from_primed_sample<Weights, Cache>(
     tag: &str,
     weights: &Weights,
     cache: &mut Cache,
-    current_y: InlineArray,
-    max_tokens: usize,
-    temperature: f32,
-    log_stats: bool,
-    on_token: impl FnMut(u32) -> bool,
-    forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
-) -> (Vec<u32>, Option<DecodeMetrics>) {
-    generate_from_primed_sample_with_params(
-        tag,
-        weights,
-        cache,
-        current_y,
-        max_tokens,
-        SamplingParams::new(temperature),
-        log_stats,
-        on_token,
-        forward_step,
-    )
-}
-
-/// Continue generation with full sampling parameter control.
-///
-/// Like [`generate_from_primed_sample`] but accepts [`SamplingParams`] for
-/// repetition, frequency, and presence penalties.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_from_primed_sample_with_params<Weights, Cache>(
-    tag: &str,
-    weights: &Weights,
-    cache: &mut Cache,
     mut current_y: InlineArray,
     max_tokens: usize,
-    params: SamplingParams,
+    mut sampler: DecodeSampler,
     log_stats: bool,
     mut on_token: impl FnMut(u32) -> bool,
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
 ) -> (Vec<u32>, Option<DecodeMetrics>) {
     let mut tokens = Vec::with_capacity(max_tokens);
     let mut step_times: Vec<f64> = Vec::new();
-    let use_penalties = params.has_penalties();
-    let mut token_counts: HashMap<u32, usize> = if use_penalties {
-        HashMap::new()
-    } else {
-        HashMap::with_capacity(0)
-    };
-    // Lazily initialised on first step that needs it (once vocab_size is known).
-    let mut penalty_buf: Option<PenaltyBuffer> = None;
 
     for step in 0..max_tokens {
         let next_y = if step + 1 < max_tokens {
@@ -983,20 +1084,9 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
             let next_input = current_y.reshape(&[1, 1]);
             let next_logits = forward_step(weights, &next_input, cache);
             let next_logits_2d = next_logits.squeeze(1);
-
-            // Apply penalties before sampling (zero-cost when disabled or no
-            // tokens seen yet; reuses pre-allocated buffer otherwise).
-            // `current_y`, primed as draw 1, is token `step + 1`; this
-            // samples token `step + 2`.
-            let draw = step as u64 + 2;
-            let next_y = if use_penalties && !token_counts.is_empty() {
-                let buf = penalty_buf
-                    .get_or_insert_with(|| PenaltyBuffer::new(next_logits_2d.dim(-1) as usize));
-                let penalized = buf.apply(&next_logits_2d, &token_counts, &params);
-                sample_token(&penalized, &params, draw)
-            } else {
-                sample_token(&next_logits_2d, &params, draw)
-            };
+            // Queued behind `current_y` without reading it back: the
+            // sampler's penalties take it in on the GPU.
+            let next_y = sampler.sample(&next_logits_2d);
 
             trace_decode_graph(tag, step, &next_logits_2d, &next_y);
             next_y.async_eval_ref();
@@ -1012,9 +1102,6 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
         let token_val = current_y.item_u32();
 
         tokens.push(token_val);
-        if use_penalties {
-            *token_counts.entry(token_val).or_insert(0) += 1;
-        }
         if !on_token(token_val) {
             break;
         }
@@ -1144,6 +1231,84 @@ mod tests {
         assert_eq!(greedy_token(&logits), 2);
         let flat = InlineArray::from_f32_slice(&[9.0, -1.0, 3.0], &[3]);
         assert_eq!(greedy_token(&flat), 0);
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    fn values(array: &InlineArray) -> Vec<f32> {
+        let mut array = array.reshape(&[-1]);
+        let n = array.size();
+        array.to_f32_vec(n).unwrap()
+    }
+
+    fn token(id: u32) -> InlineArray {
+        InlineArray::from_slice(&[id], &[1])
+    }
+
+    /// Repetition over the prompt and the generated tokens, then frequency
+    /// and presence over the generated ones, worked out by hand:
+    ///
+    /// | token | logit | in prompt | generated | penalized                  |
+    /// |-------|-------|-----------|-----------|----------------------------|
+    /// | 0     |  2.0  |           |           |  2.0                       |
+    /// | 1     | -1.0  | yes       |           | -1.0 * 2 = -2.0            |
+    /// | 2     |  0.5  |           | twice     |  0.5 / 2 - (2 * 0.5 + 0.25) = -1.0 |
+    /// | 3     | -3.0  |           |           | -3.0                       |
+    /// | 4     |  4.0  | twice     | once      |  4.0 / 2 - (0.5 + 0.25) = 1.25 |
+    /// | 5     |  1.0  |           |           |  1.0                       |
+    ///
+    /// Token 99 of the prompt is past the vocabulary and penalizes nothing.
+    #[test]
+    fn penalties_match_hand_computed_logits() {
+        let logits = InlineArray::from_f32_slice(&[2.0, -1.0, 0.5, -3.0, 4.0, 1.0], &[1, 6]);
+        let mut penalties = DecodePenalties::new(2.0, 0.5, 0.25, &[1, 4, 4, 99]).unwrap();
+        // Recorded before the first logits fix the vocabulary.
+        penalties.record(&token(2));
+        assert_eq!(
+            values(&penalties.apply(&logits)),
+            [2.0, -2.0, 0.25 - 0.75, -3.0, 2.0, 1.0]
+        );
+        penalties.record(&token(4));
+        penalties.record(&token(2));
+        let penalized = penalties.apply(&logits);
+        assert_eq!(
+            penalized.dtype_raw(),
+            crate::compat::Dtype::Float32.as_i32()
+        );
+        assert_eq!(values(&penalized), [2.0, -2.0, -1.0, -3.0, 1.25, 1.0]);
+
+        // bf16 logits come out penalized in f32.
+        let bf16 = logits.as_dtype(crate::compat::Dtype::Bfloat16.as_i32());
+        assert_eq!(
+            values(&penalties.apply(&bf16)),
+            [2.0, -2.0, -1.0, -3.0, 1.25, 1.0]
+        );
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    #[test]
+    fn no_penalty_means_no_penalties() {
+        assert!(DecodePenalties::new(1.0, 0.0, 0.0, &[1, 2, 3]).is_none());
+        assert!(DecodePenalties::new(1.0, 0.0, 0.1, &[]).is_some());
+    }
+
+    /// A greedy sampler takes every token it draws into the penalties
+    /// before the next draw, without the host reading the token first.
+    #[test]
+    fn the_sampler_penalizes_the_tokens_it_drew() {
+        let logits = InlineArray::from_f32_slice(&[3.0, 2.9, 0.0], &[1, 3]);
+        let params = SamplingParams {
+            repetition_penalty: 1.1,
+            ..SamplingParams::new(0.0)
+        };
+        let mut sampler = DecodeSampler::new(params, &[0]);
+        // The prompt's token 0: 3.0 / 1.1 < 2.9.
+        let first = sampler.sample(&logits);
+        // Both seen: 3.0 / 1.1 > 2.9 / 1.1.
+        let second = sampler.sample(&logits);
+        assert_eq!((first.item_u32(), second.item_u32()), (1, 0));
+
+        let mut plain = DecodeSampler::new(SamplingParams::new(0.0), &[0]);
+        assert_eq!(plain.sample(&logits).item_u32(), 0);
         crate::check_unobserved_error().expect("no bridge op failed");
     }
 }

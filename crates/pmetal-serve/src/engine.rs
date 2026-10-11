@@ -1958,8 +1958,11 @@ impl InferenceEngine {
         }
 
         let mut current_last = Self::extract_last_logits(&prefill_logits)?;
+        // The penalties take each sampled token in on the GPU, so the
+        // look-ahead step below is penalized for the token it runs on.
+        let mut penalties = sampler.decode_penalties(&all_tokens);
         let (mut current_y, _filtered) = sampler
-            .sample_array_with_penalties(&current_last, &all_tokens)
+            .sample_array_penalized(&current_last, penalties.as_mut())
             .map_err(ServeError::Model)?;
         // Schedule the first-token pair async so the GPU starts working
         // before we enter the loop.
@@ -1986,7 +1989,7 @@ impl InferenceEngine {
                     .map_err(ServeError::Model)?;
                     let next_last = Self::extract_last_logits(&next_full)?;
                     let (ny, _) = sampler
-                        .sample_array_with_penalties(&next_last, &all_tokens)
+                        .sample_array_penalized(&next_last, penalties.as_mut())
                         .map_err(ServeError::Model)?;
                     (ny, next_last)
                 };
@@ -2018,10 +2021,7 @@ impl InferenceEngine {
                 break;
             }
 
-            // 5. Update frequency-penalty history.
-            sampler.update_counts(token);
-
-            // 6. Optional logprobs: compute from RAW last-position logits
+            // 5. Optional logprobs: compute from RAW last-position logits
             //    (the sampler's filtered log-probs aren't suitable for
             //    OpenAI-style reporting). Cheap when top_n is small.
             let logprob_entry = match logprobs_top_n {
@@ -2043,14 +2043,14 @@ impl InferenceEngine {
             generated.push(token);
             all_tokens.push(token);
 
-            // 7. Accumulate logprob for non-streaming return value. We
+            // 6. Accumulate logprob for non-streaming return value. We
             //    clone so the owned value can still be handed to the
             //    streaming callback below.
             if let (Some(entry), Some(out)) = (logprob_entry.as_ref(), logprobs_out.as_mut()) {
                 out.push(entry.clone());
             }
 
-            // 8. Emit to caller (moves logprob entry into TokenEvent for
+            // 7. Emit to caller (moves logprob entry into TokenEvent for
             //    streaming; ignored by non-streaming).
             match on_token(token, logprob_entry) {
                 StepOutcome::Continue => {}
@@ -2060,7 +2060,7 @@ impl InferenceEngine {
                 }
             }
 
-            // 9. Stop-sequence detection on decoded text (multi-token
+            // 8. Stop-sequence detection on decoded text (multi-token
             //    suffix match via tokenizer).
             if let Some(n_strip) =
                 detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences)
@@ -2070,12 +2070,12 @@ impl InferenceEngine {
                 break;
             }
 
-            // 10. Periodic allocation-cache sweep.
+            // 9. Periodic allocation-cache sweep.
             if i > 0 && i % 256 == 0 {
                 clear_generation_caches();
             }
 
-            // 11. Swap current ← next.
+            // 10. Swap current ← next.
             if let Some((ny, nl)) = next {
                 current_y = ny;
                 current_last = nl;

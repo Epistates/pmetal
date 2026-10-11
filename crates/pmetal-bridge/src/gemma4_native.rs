@@ -1638,8 +1638,8 @@ pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
-    params: &crate::decode::SamplingParams,
-) -> u32 {
+    params: crate::decode::SamplingParams,
+) -> (u32, crate::decode::DecodeSampler) {
     crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
 }
 
@@ -1649,7 +1649,7 @@ pub fn generate(
     cache: &mut NativeCache,
     first_token: u32,
     max_tokens: usize,
-    params: crate::decode::SamplingParams,
+    mut sampler: crate::decode::DecodeSampler,
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let model_dtype = weights.model_dtype;
@@ -1660,7 +1660,7 @@ pub fn generate(
         weights,
         cache,
         first_token,
-        &params,
+        &mut sampler,
         true,
         true,
         move |cache| {
@@ -1673,13 +1673,13 @@ pub fn generate(
         },
         forward_step,
     );
-    crate::decode::generate_from_primed_sample_with_params(
+    crate::decode::generate_from_primed_sample(
         "NATIVE-GEMMA4",
         weights,
         cache,
         current_y,
         max_tokens,
-        params,
+        sampler,
         true,
         on_token,
         forward_step,

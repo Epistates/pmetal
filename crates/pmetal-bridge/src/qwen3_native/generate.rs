@@ -1,18 +1,21 @@
 //! Prefill / prime / generate loops and benchmark trials.
 
 use crate::InlineArray;
+use crate::decode::{DecodeSampler, SamplingParams};
 use crate::inline_array as bridge;
 
 use super::cache::NativeCache;
 use super::forward::forward_step;
 use super::weights::NativeWeights;
 
+/// Run prompt prefill and return the first sampled token and the
+/// generation's sampler, which [`generate`] continues.
 pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
-    params: &crate::decode::SamplingParams,
-) -> u32 {
+    params: SamplingParams,
+) -> (u32, DecodeSampler) {
     crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
 }
 
@@ -20,13 +23,6 @@ pub fn prefill_first_token(
 // Generation loop
 // ============================================================================
 
-/// Run the full generation loop with async GPU pipelining.
-///
-/// `first_token` is the token at the end of the prompt (already prefilled into
-/// `cache`). Each call to `on_token` receives the sampled token ID and returns
-/// `false` to stop early (e.g. on EOS).
-///
-/// Returns all generated token IDs (not including `first_token`).
 fn prepare_generation_cache(cache: &mut NativeCache, reserve_decode_inputs: i32, model_dtype: i32) {
     let trace_qwen35 = std::env::var_os("PMETAL_TRACE_QWEN35").is_some();
     if trace_qwen35 {
@@ -57,7 +53,7 @@ fn prime_generation_impl(
     cache: &mut NativeCache,
     first_token: u32,
     reserve_decode_inputs: usize,
-    params: &crate::decode::SamplingParams,
+    sampler: &mut DecodeSampler,
     reset_peak_memory: bool,
     log_session: bool,
 ) -> InlineArray {
@@ -68,7 +64,7 @@ fn prime_generation_impl(
         weights,
         cache,
         first_token,
-        params,
+        sampler,
         reset_peak_memory,
         log_session,
         |cache| prepare_generation_cache(cache, reserve_decode_inputs, weights.model_dtype),
@@ -81,83 +77,20 @@ fn generate_from_primed_sample_impl(
     cache: &mut NativeCache,
     current_y: InlineArray,
     max_tokens: usize,
-    params: crate::decode::SamplingParams,
+    sampler: DecodeSampler,
     log_stats: bool,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    crate::decode::generate_from_primed_sample_with_params(
+    crate::decode::generate_from_primed_sample(
         "NATIVE",
         weights,
         cache,
         current_y,
         max_tokens,
-        params,
+        sampler,
         log_stats,
         on_token,
         forward_step,
-    )
-}
-
-/// Prime the canonical decode loop without resetting peak memory.
-///
-/// This is used by `infer --benchmark` so the timing path shares the
-/// same bridge decode implementation as live inference.
-pub fn prime_generation_preserve_peak(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
-    first_token: u32,
-    reserve_decode_inputs: usize,
-    temperature: f32,
-) -> InlineArray {
-    prime_generation_impl(
-        weights,
-        cache,
-        first_token,
-        reserve_decode_inputs,
-        &crate::decode::SamplingParams::new(temperature),
-        false,
-        true,
-    )
-}
-
-pub fn prime_generation_preserve_peak_silent(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
-    first_token: u32,
-    reserve_decode_inputs: usize,
-    temperature: f32,
-) -> InlineArray {
-    prime_generation_impl(
-        weights,
-        cache,
-        first_token,
-        reserve_decode_inputs,
-        &crate::decode::SamplingParams::new(temperature),
-        false,
-        false,
-    )
-}
-
-/// Continue generation from an already-primed async sample.
-///
-/// `current_y` must come from [`prime_generation_preserve_peak`] or the
-/// equivalent internal priming path.
-pub fn generate_from_primed_sample(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
-    current_y: InlineArray,
-    max_tokens: usize,
-    temperature: f32,
-    on_token: impl FnMut(u32) -> bool,
-) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    generate_from_primed_sample_impl(
-        weights,
-        cache,
-        current_y,
-        max_tokens,
-        crate::decode::SamplingParams::new(temperature),
-        true,
-        on_token,
     )
 }
 
@@ -176,29 +109,28 @@ pub fn benchmark_trial(
     let mut cache = NativeCache::new_with_turboquant(weights, turboquant);
 
     let prompt_tic = std::time::Instant::now();
-    let first_tok = prefill_first_token(
-        weights,
-        &mut cache,
-        prompt_ids,
-        &crate::decode::SamplingParams::new(0.0),
-    );
-    let current_y = prime_generation_preserve_peak_silent(
+    let (first_tok, mut sampler) =
+        prefill_first_token(weights, &mut cache, prompt_ids, SamplingParams::new(0.0));
+    let current_y = prime_generation_impl(
         weights,
         &mut cache,
         first_tok,
         generation_tokens.saturating_sub(1),
-        0.0,
+        &mut sampler,
+        false,
+        false,
     );
     let prompt_secs = prompt_tic.elapsed().as_secs_f64();
 
     let generation_secs = if generation_tokens > 1 {
         let generation_tic = std::time::Instant::now();
-        let generated_tail = generate_from_primed_sample_silent(
+        let (generated_tail, _) = generate_from_primed_sample_impl(
             weights,
             &mut cache,
             current_y,
             generation_tokens - 1,
-            0.0,
+            sampler,
+            false,
             |_| true,
         );
         debug_assert_eq!(generated_tail.len(), generation_tokens - 1);
@@ -219,47 +151,20 @@ pub fn benchmark_trial(
     trial
 }
 
-pub fn generate_from_primed_sample_silent(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
-    current_y: InlineArray,
-    max_tokens: usize,
-    temperature: f32,
-    on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
-    generate_from_primed_sample_impl(
-        weights,
-        cache,
-        current_y,
-        max_tokens,
-        crate::decode::SamplingParams::new(temperature),
-        false,
-        on_token,
-    )
-    .0
-}
-
+/// Run the full generation loop with async GPU pipelining.
+///
+/// `first_token` is the token [`prefill_first_token`] sampled (the prompt is
+/// already prefilled into `cache`) and `sampler` the one it returned. Each
+/// call to `on_token` receives the sampled token ID and returns `false` to
+/// stop early (e.g. on EOS).
+///
+/// Returns all generated token IDs (not including `first_token`).
 pub fn generate(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     first_token: u32,
     max_tokens: usize,
-    params: crate::decode::SamplingParams,
-    on_token: impl FnMut(u32) -> bool,
-) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    let current_y =
-        prime_generation_impl(weights, cache, first_token, max_tokens, &params, true, true);
-    generate_from_primed_sample_impl(
-        weights, cache, current_y, max_tokens, params, true, on_token,
-    )
-}
-
-pub fn generate_preserve_peak(
-    weights: &NativeWeights,
-    cache: &mut NativeCache,
-    first_token: u32,
-    max_tokens: usize,
-    temperature: f32,
+    mut sampler: DecodeSampler,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(
@@ -267,17 +172,11 @@ pub fn generate_preserve_peak(
         cache,
         first_token,
         max_tokens,
-        &crate::decode::SamplingParams::new(temperature),
-        false,
+        &mut sampler,
+        true,
         true,
     );
     generate_from_primed_sample_impl(
-        weights,
-        cache,
-        current_y,
-        max_tokens,
-        crate::decode::SamplingParams::new(temperature),
-        true,
-        on_token,
+        weights, cache, current_y, max_tokens, sampler, true, on_token,
     )
 }

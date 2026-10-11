@@ -76,12 +76,12 @@ fn native(seed: Option<u64>, disturb: bool) -> Vec<u32> {
         ..SamplingParams::new(1.0)
     };
     let mut cache = NativeCache::new_empty(&weights);
-    let first =
-        pmetal_bridge::qwen3_native::prefill_first_token(&weights, &mut cache, &PROMPT, &params);
+    let (first, sampler) =
+        pmetal_bridge::qwen3_native::prefill_first_token(&weights, &mut cache, &PROMPT, params);
     if disturb {
         draw_unseeded();
     }
-    let (rest, _) = generate(&weights, &mut cache, first, NEW_TOKENS - 1, params, |_| {
+    let (rest, _) = generate(&weights, &mut cache, first, NEW_TOKENS - 1, sampler, |_| {
         if disturb {
             draw_unseeded();
         }

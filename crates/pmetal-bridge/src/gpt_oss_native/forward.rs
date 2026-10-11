@@ -76,13 +76,14 @@ pub fn forward_step(
 // Generation loop
 // ============================================================================
 
-/// Run prompt prefill and return the first sampled token.
+/// Run prompt prefill and return the first sampled token and the
+/// generation's sampler.
 pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
-    params: &crate::decode::SamplingParams,
-) -> u32 {
+    params: crate::decode::SamplingParams,
+) -> (u32, crate::decode::DecodeSampler) {
     crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
 }
 
@@ -95,7 +96,7 @@ fn prime_generation_impl(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     first_token: u32,
-    params: &crate::decode::SamplingParams,
+    sampler: &mut crate::decode::DecodeSampler,
     reset_peak_memory: bool,
     log_session: bool,
 ) -> InlineArray {
@@ -105,7 +106,7 @@ fn prime_generation_impl(
         weights,
         cache,
         first_token,
-        params,
+        sampler,
         reset_peak_memory,
         log_session,
         prepare_generation_cache,
@@ -118,17 +119,17 @@ fn generate_from_primed_sample_impl(
     cache: &mut NativeCache,
     current_y: InlineArray,
     max_tokens: usize,
-    params: crate::decode::SamplingParams,
+    sampler: crate::decode::DecodeSampler,
     log_stats: bool,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    crate::decode::generate_from_primed_sample_with_params(
+    crate::decode::generate_from_primed_sample(
         "GPT-OSS",
         weights,
         cache,
         current_y,
         max_tokens,
-        params,
+        sampler,
         log_stats,
         on_token,
         forward_step,
@@ -145,20 +146,14 @@ pub fn benchmark_trial(
     let mut cache = NativeCache::new_empty(weights);
 
     let prompt_tic = std::time::Instant::now();
-    let first_tok = prefill_first_token(
+    let (first_tok, mut sampler) = prefill_first_token(
         weights,
         &mut cache,
         prompt_ids,
-        &crate::decode::SamplingParams::new(0.0),
+        crate::decode::SamplingParams::new(0.0),
     );
-    let current_y = prime_generation_impl(
-        weights,
-        &mut cache,
-        first_tok,
-        &crate::decode::SamplingParams::new(0.0),
-        false,
-        false,
-    );
+    let current_y =
+        prime_generation_impl(weights, &mut cache, first_tok, &mut sampler, false, false);
     let prompt_secs = prompt_tic.elapsed().as_secs_f64();
 
     let generation_secs = if generation_tokens > 1 {
@@ -168,7 +163,7 @@ pub fn benchmark_trial(
             &mut cache,
             current_y,
             generation_tokens - 1,
-            crate::decode::SamplingParams::new(0.0),
+            sampler,
             false,
             |_| true,
         );
@@ -202,11 +197,11 @@ pub fn generate(
     cache: &mut NativeCache,
     first_token: u32,
     max_tokens: usize,
-    params: crate::decode::SamplingParams,
+    mut sampler: crate::decode::DecodeSampler,
     on_token: impl FnMut(u32) -> bool,
 ) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
-    let current_y = prime_generation_impl(weights, cache, first_token, &params, true, true);
+    let current_y = prime_generation_impl(weights, cache, first_token, &mut sampler, true, true);
     generate_from_primed_sample_impl(
-        weights, cache, current_y, max_tokens, params, true, on_token,
+        weights, cache, current_y, max_tokens, sampler, true, on_token,
     )
 }

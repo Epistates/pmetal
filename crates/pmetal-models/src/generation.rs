@@ -24,7 +24,9 @@ use pmetal_bridge::compat::ops::{
 };
 use pmetal_bridge::compat::random::categorical;
 use pmetal_bridge::compat::{Array, Dtype, Exception};
-use pmetal_bridge::decode::{greedy_token, last_token_logits, prompt_tokens_to_input};
+use pmetal_bridge::decode::{
+    DecodePenalties, greedy_token, last_token_logits, prompt_tokens_to_input, repetition_penalized,
+};
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
@@ -816,8 +818,8 @@ impl Sampler {
     /// 3. Only call `.item()` on the token AFTER scheduling the next computation
     ///
     /// NOTE: Penalties (repetition, frequency, presence) are NOT applied in this
-    /// method to avoid GPU→CPU sync for token history tracking. Use `sample()`
-    /// for penalty support, or apply penalties on logits before calling this.
+    /// method; [`sample_array_penalized`](Self::sample_array_penalized)
+    /// applies them without a GPU→CPU sync.
     ///
     /// # Returns
     /// `(token_array, log_probs)` - both stay as Arrays for lazy evaluation
@@ -885,6 +887,35 @@ impl Sampler {
             )?;
         }
         self.sample_array(&penalised)
+    }
+
+    /// The penalties of a pipelined generation from `prompt`, kept on the
+    /// GPU, or `None` when this sampler's config has none. Pass them to
+    /// [`sample_array_penalized`](Self::sample_array_penalized) for every
+    /// token of the generation.
+    pub fn decode_penalties(&self, prompt: &[u32]) -> Option<DecodePenalties> {
+        DecodePenalties::new(
+            self.config.repetition_penalty,
+            self.config.frequency_penalty,
+            self.config.presence_penalty,
+            prompt,
+        )
+    }
+
+    /// [`sample_array`](Self::sample_array) after `penalties`, which take
+    /// the sampled token in without reading it back, so the next step,
+    /// queued before this token reaches the host, is penalized for it.
+    pub fn sample_array_penalized(
+        &self,
+        logits: &Array,
+        penalties: Option<&mut DecodePenalties>,
+    ) -> Result<(Array, Array), Exception> {
+        let Some(penalties) = penalties else {
+            return self.sample_array(logits);
+        };
+        let (token, log_probs) = self.sample_array(&penalties.apply(logits))?;
+        penalties.record(&token);
+        Ok((token, log_probs))
     }
 
     /// Update token frequency counts for frequency penalty.
@@ -1319,16 +1350,13 @@ pub fn token_probability_from_log_probs(log_probs: &Array, token: u32) -> Result
     Ok(log_prob.item::<f32>().exp())
 }
 
-/// GPU-native repetition penalty.
-///
-/// For positive logits: divide by penalty (reduces probability)
-/// For negative logits: multiply by penalty (reduces probability)
-///
-/// All operations stay on GPU - no CPU round-trip.
-/// GPU-native repetition penalty.
+/// GPU-native repetition penalty over the tokens in `generated_tokens` (the
+/// prompt and the output so far): positive logits are divided by the
+/// penalty, negative ones multiplied by it
+/// ([`pmetal_bridge::decode::repetition_penalized`]).
 ///
 /// `logits` can be 1-D `[vocab]` or 2-D `[1, vocab]`. Returns an array of the
-/// same shape with the penalty applied in-place on the GPU (no host sync).
+/// same shape with the penalty applied on the GPU (no host sync).
 pub fn apply_repetition_penalty(
     logits: &Array,
     generated_tokens: &[u32],
@@ -1358,16 +1386,7 @@ pub fn apply_repetition_penalty(
     // Get logits at token positions: logits[:, tokens]
     let selected_logits = take_along_axis(&logits_2d, &token_indices, -1);
 
-    // Apply penalty: divide positive, multiply negative
-    let zero = Array::from_f32(0.0);
-    let penalty_arr = Array::from_f32(penalty);
-    let inv_penalty = Array::from_f32(1.0 / penalty);
-
-    // selected < 0 ? selected * penalty : selected / penalty
-    let is_negative = selected_logits.less(&zero);
-    let penalized_positive = selected_logits.multiply(&inv_penalty);
-    let penalized_negative = selected_logits.multiply(&penalty_arr);
-    let penalized = which(&is_negative, &penalized_negative, &penalized_positive);
+    let penalized = repetition_penalized(&selected_logits, penalty);
 
     // Put the penalized values back: logits[:, tokens] = penalized
     let result = put_along_axis(&logits_2d, &token_indices, &penalized, -1);
@@ -1820,8 +1839,8 @@ where
 /// scheduling the next one. This mimics Python's async_eval behavior where
 /// `MAX_ACTIVE_TASKS=10` causes blocking, ensuring perfect GPU pipelining.
 ///
-/// NOTE: Penalties are disabled in async mode to avoid token history tracking
-/// which would require sync. Use `generate_cached()` if penalties are needed.
+/// The repetition, frequency and presence penalties are applied on the GPU
+/// ([`DecodePenalties`]), so they cost the pipeline no sync.
 ///
 /// # Arguments
 /// * `forward_fn` - Function that takes (input_ids, cache) and returns logits
@@ -1847,6 +1866,7 @@ where
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
     let sampler = Sampler::new(config.clone());
+    let mut penalties = sampler.decode_penalties(input_ids);
     let prompt_len = input_ids.len();
 
     // The prefill's last-position logits, [1, vocab].
@@ -1857,7 +1877,7 @@ where
                 forward_fn(chunk_input, cache)
             })?;
         let current_logits = last_token_logits(&logits);
-        sampler.sample_array(&current_logits)?
+        sampler.sample_array_penalized(&current_logits, penalties.as_mut())?
     };
 
     // async_eval OUTSIDE stream context (critical for pipelining!)
@@ -1882,7 +1902,7 @@ where
                     .reshape(&[1, -1]);
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = select_axis(&next_output, 0, 1);
-                sampler.sample_array(&next_logits)?
+                sampler.sample_array_penalized(&next_logits, penalties.as_mut())?
             };
             // async_eval OUTSIDE stream context (enables pipelining)
             async_eval([&y, &lp]);
@@ -1966,6 +1986,7 @@ where
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
     let sampler = Sampler::new(config.clone());
+    let mut penalties = sampler.decode_penalties(input_ids);
     let prompt_len = input_ids.len();
 
     // Per-step decode latencies in nanoseconds. The first step (n=0) is
@@ -1980,7 +2001,7 @@ where
                 forward_fn(chunk_input, cache)
             })?;
         let current_logits = last_token_logits(&logits);
-        sampler.sample_array(&current_logits)?
+        sampler.sample_array_penalized(&current_logits, penalties.as_mut())?
     };
     async_eval([&current_y, &current_logprobs]);
 
@@ -1996,7 +2017,7 @@ where
                     .reshape(&[1, -1]);
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = select_axis(&next_output, 0, 1);
-                sampler.sample_array(&next_logits)?
+                sampler.sample_array_penalized(&next_logits, penalties.as_mut())?
             };
             async_eval([&y, &lp]);
             Some((y, lp))

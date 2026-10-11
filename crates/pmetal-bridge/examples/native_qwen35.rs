@@ -116,7 +116,11 @@ fn main() {
         &mut cache,
         first_tok_id,
         max_tokens,
-        pmetal_bridge::decode::SamplingParams::new(temperature),
+        // No penalties or seed: the prefill's own argmax needs no history.
+        pmetal_bridge::decode::DecodeSampler::new(
+            pmetal_bridge::decode::SamplingParams::new(temperature),
+            &[],
+        ),
         |_tok| true,
     );
     let elapsed = t0.elapsed().as_secs_f64();
