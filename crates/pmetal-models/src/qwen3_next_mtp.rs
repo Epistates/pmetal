@@ -3,6 +3,9 @@
 use std::collections::HashMap;
 
 use pmetal_bridge::compat::{Array, Exception, ops::select_axis};
+use pmetal_bridge::decode::{
+    greedy_token, last_token_hidden, last_token_logits, prompt_tokens_to_input,
+};
 use pmetal_mlx::{
     kv_cache::{GdnVerifyInputs, KVCache, MambaCache, MambaSnapshot},
     speculative::SpecCapture,
@@ -117,7 +120,7 @@ where
     target_mamba_cache.reset();
     mtp_cache.reset();
 
-    let prompt = token_array(input_ids);
+    let prompt = prompt_tokens_to_input(input_ids);
     let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
     let (target_hidden, target_logits) = target.forward_hidden_with_capture(
         &prompt,
@@ -126,12 +129,12 @@ where
         Some(target_mamba_cache),
         &mut capture,
     )?;
-    let mut prev_target_logits = select_last_logits(&target_logits);
+    let mut prev_target_logits = last_token_logits(&target_logits);
 
     let (mtp_hidden, mtp_logits) =
         mtp.forward_logits(&prompt, &target_hidden, None, Some(mtp_cache), 0)?;
-    let mut last_mtp_hidden = select_last_sequence(&mtp_hidden);
-    let mut prev_mtp_logits = select_last_logits(&mtp_logits);
+    let mut last_mtp_hidden = last_token_hidden(&mtp_hidden);
+    let mut prev_mtp_logits = last_token_logits(&mtp_logits);
 
     let mut token_ids = input_ids.to_vec();
     let mut generated_counts = HashMap::new();
@@ -182,7 +185,7 @@ where
 
         let mamba_snapshot = target_mamba_cache.snapshot();
         capture.clear();
-        let verify_input = token_array(&draft_tokens);
+        let verify_input = prompt_tokens_to_input(&draft_tokens);
         let (verify_hidden, verify_logits) = target.forward_hidden_with_capture(
             &verify_input,
             None,
@@ -423,7 +426,7 @@ where
             }
         }
 
-        let verify_input = token_array(&draft_tokens);
+        let verify_input = prompt_tokens_to_input(&draft_tokens);
         let (_verify_hidden, verify_logits) = target.forward_hidden_for_mtp(
             &verify_input,
             None,
@@ -557,21 +560,21 @@ fn rebuild_qwen_mtp_state<T: Qwen3NextMtpTarget>(
     target_mamba_cache.reset();
     mtp_cache.reset();
 
-    let input = token_array(committed_tokens);
+    let input = prompt_tokens_to_input(committed_tokens);
     let (target_hidden, target_logits) = target.forward_hidden_for_mtp(
         &input,
         None,
         Some(target_cache),
         Some(target_mamba_cache),
     )?;
-    let prev_target_logits = select_last_logits(&target_logits);
+    let prev_target_logits = last_token_logits(&target_logits);
 
     let (mtp_hidden, mtp_logits) =
         mtp.forward_logits(&input, &target_hidden, None, Some(mtp_cache), 0)?;
     Ok(QwenMtpState {
         prev_target_logits,
-        last_mtp_hidden: select_last_sequence(&mtp_hidden),
-        prev_mtp_logits: select_last_logits(&mtp_logits),
+        last_mtp_hidden: last_token_hidden(&mtp_hidden),
+        prev_mtp_logits: last_token_logits(&mtp_logits),
     })
 }
 
@@ -708,9 +711,9 @@ fn mtp_step(
     mtp_cache: &mut KVCache,
     step_idx: usize,
 ) -> Result<(Array, Array), Exception> {
-    let input = token_array(&[token]);
+    let input = prompt_tokens_to_input(&[token]);
     let (hidden, logits) = mtp.forward_logits(&input, hidden, None, Some(mtp_cache), step_idx)?;
-    Ok((select_last_sequence(&hidden), select_last_logits(&logits)))
+    Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
 }
 
 fn target_step(
@@ -719,7 +722,7 @@ fn target_step(
     target_cache: &mut KVCache,
     target_mamba_cache: &mut MambaCache,
 ) -> Result<(Array, Array), Exception> {
-    let input = token_array(&[token]);
+    let input = prompt_tokens_to_input(&[token]);
     let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
     let (hidden, logits) = target.forward_hidden_with_capture(
         &input,
@@ -728,7 +731,7 @@ fn target_step(
         Some(target_mamba_cache),
         &mut capture,
     )?;
-    Ok((select_last_sequence(&hidden), select_last_logits(&logits)))
+    Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
 }
 
 fn emit_token<F>(
@@ -748,25 +751,6 @@ where
         *stopped_by_token = true;
     }
     Ok(on_token(token))
-}
-
-fn greedy_token(logits: &Array) -> u32 {
-    logits.argmax(-1).item::<u32>()
-}
-
-fn token_array(tokens: &[u32]) -> Array {
-    let data: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
-    Array::from_i32_slice(&data).reshape(&[1, data.len() as i32])
-}
-
-fn select_last_sequence(values: &Array) -> Array {
-    let seq_len = values.dim(1);
-    select_axis(values, seq_len - 1, 1).reshape(&[1, 1, -1])
-}
-
-fn select_last_logits(logits: &Array) -> Array {
-    let seq_len = logits.dim(1);
-    select_axis(logits, seq_len - 1, 1)
 }
 
 fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {

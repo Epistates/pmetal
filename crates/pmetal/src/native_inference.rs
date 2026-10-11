@@ -8,6 +8,9 @@
 use std::{collections::HashMap, path::Path};
 
 use pmetal_bridge::compat::{Array, ops::select_axis};
+use pmetal_bridge::decode::{
+    greedy_token, last_token_hidden, last_token_logits, prompt_tokens_to_input,
+};
 use pmetal_bridge::turboquant::TurboQuantConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::{
@@ -684,16 +687,16 @@ pub fn run_qwen3_native_mtp_inference_ext(
     let mut target_cache = qwen3_native::NativeCache::new_empty(&weights);
     mtp_cache.reset();
 
-    let prompt = token_array(input_ids);
+    let prompt = prompt_tokens_to_input(input_ids);
     let (target_hidden, target_logits) =
         qwen3_native::forward_step_hidden(&weights, &prompt, &mut target_cache);
-    let mut prev_target_logits = select_last_logits(&target_logits);
+    let mut prev_target_logits = last_token_logits(&target_logits);
 
     let (mtp_hidden, mtp_logits) = mtp
         .forward_logits(&prompt, &target_hidden, None, Some(mtp_cache), 0)
         .map_err(|e| format!("native Qwen MTP prompt forward: {e}"))?;
-    let mut last_mtp_hidden = select_last_sequence(&mtp_hidden);
-    let mut prev_mtp_logits = select_last_logits(&mtp_logits);
+    let mut last_mtp_hidden = last_token_hidden(&mtp_hidden);
+    let mut prev_mtp_logits = last_token_logits(&mtp_logits);
 
     let mut token_ids = input_ids.to_vec();
     let mut generated_counts = HashMap::new();
@@ -746,7 +749,7 @@ pub fn run_qwen3_native_mtp_inference_ext(
         }
 
         let target_snapshot = target_cache.fork();
-        let verify_input = token_array(&draft_tokens);
+        let verify_input = prompt_tokens_to_input(&draft_tokens);
         let (verify_hidden, verify_logits) =
             qwen3_native::forward_step_hidden(&weights, &verify_input, &mut target_cache);
 
@@ -841,7 +844,7 @@ pub fn run_qwen3_native_mtp_inference_ext(
         if emitted_draft_count < draft_tokens.len() {
             target_cache = target_snapshot;
             for &token in &draft_tokens[..emitted_draft_count] {
-                let input = token_array(&[token]);
+                let input = prompt_tokens_to_input(&[token]);
                 let _ = qwen3_native::forward_step_hidden(&weights, &input, &mut target_cache);
             }
         }
@@ -904,9 +907,9 @@ fn target_step_native(
     cache: &mut pmetal_bridge::qwen3_native::NativeCache,
     token: u32,
 ) -> (Array, Array) {
-    let input = token_array(&[token]);
+    let input = prompt_tokens_to_input(&[token]);
     let (hidden, logits) = pmetal_bridge::qwen3_native::forward_step_hidden(weights, &input, cache);
-    (select_last_sequence(&hidden), select_last_logits(&logits))
+    (last_token_hidden(&hidden), last_token_logits(&logits))
 }
 
 fn mtp_step(
@@ -916,11 +919,11 @@ fn mtp_step(
     mtp_cache: &mut KVCache,
     step_idx: usize,
 ) -> Result<(Array, Array), String> {
-    let input = token_array(&[token]);
+    let input = prompt_tokens_to_input(&[token]);
     let (hidden, logits) = mtp
         .forward_logits(&input, hidden, None, Some(mtp_cache), step_idx)
         .map_err(|e| format!("native Qwen MTP step: {e}"))?;
-    Ok((select_last_sequence(&hidden), select_last_logits(&logits)))
+    Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
 }
 
 fn replay_mtp_with_target_hidden(
@@ -1046,25 +1049,6 @@ where
         *stopped_by_token = true;
     }
     on_token(token)
-}
-
-fn token_array(tokens: &[u32]) -> Array {
-    let data: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
-    Array::from_i32_slice(&data).reshape(&[1, data.len() as i32])
-}
-
-fn select_last_sequence(values: &Array) -> Array {
-    let seq_len = values.dim(1);
-    select_axis(values, seq_len - 1, 1).reshape(&[1, 1, -1])
-}
-
-fn select_last_logits(logits: &Array) -> Array {
-    let seq_len = logits.dim(1);
-    select_axis(logits, seq_len - 1, 1)
-}
-
-fn greedy_token(logits: &Array) -> u32 {
-    logits.argmax(-1).item::<u32>()
 }
 
 fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {

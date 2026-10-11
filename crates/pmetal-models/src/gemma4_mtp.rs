@@ -6,6 +6,9 @@ use pmetal_bridge::compat::{
     Array, Exception,
     ops::{concatenate_axis, select_axis},
 };
+use pmetal_bridge::decode::{
+    greedy_token, last_token_hidden, last_token_logits, prompt_tokens_to_input,
+};
 use pmetal_mlx::{kv_cache::KVCache, speculative::SpecCapture};
 
 use crate::{
@@ -159,12 +162,12 @@ where
     let kv_sources = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)?;
     cache.reset();
 
-    let prompt = token_array(input_ids);
+    let prompt = prompt_tokens_to_input(input_ids);
     let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
     let (hidden, logits) =
         target.forward_hidden_with_capture(&prompt, None, Some(cache), &mut capture)?;
-    let mut last_hidden = select_last_sequence(&hidden);
-    let mut prev_logits = select_last_logits(&logits);
+    let mut last_hidden = last_token_hidden(&hidden);
+    let mut prev_logits = last_token_logits(&logits);
 
     let mut token_ids = input_ids.to_vec();
     let mut num_generated = 0usize;
@@ -217,7 +220,7 @@ where
             continue;
         }
 
-        let verify_input = token_array(&draft_tokens);
+        let verify_input = prompt_tokens_to_input(&draft_tokens);
         let verify_logits = target.forward_with_cache(&verify_input, None, Some(cache))?;
         let mut matched = 0usize;
         while matched < draft_tokens.len() {
@@ -339,12 +342,12 @@ where
     let kv_sources = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)?;
     cache.reset();
 
-    let prompt = token_array(input_ids);
+    let prompt = prompt_tokens_to_input(input_ids);
     let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
     let (hidden, logits) =
         target.forward_hidden_with_capture(&prompt, None, Some(cache), &mut capture)?;
-    let mut last_hidden = select_last_sequence(&hidden);
-    let mut prev_logits = select_last_logits(&logits);
+    let mut last_hidden = last_token_hidden(&hidden);
+    let mut prev_logits = last_token_logits(&logits);
 
     let mut token_ids = input_ids.to_vec();
     let mut generated_counts = HashMap::new();
@@ -418,7 +421,7 @@ where
             continue;
         }
 
-        let verify_input = token_array(&draft_tokens);
+        let verify_input = prompt_tokens_to_input(&draft_tokens);
         let verify_logits = target.forward_with_cache(&verify_input, None, Some(cache))?;
         let mut accepted = 0usize;
         let mut correction = None;
@@ -566,15 +569,15 @@ fn target_step(
     token: u32,
     cache: &mut KVCache,
 ) -> Result<(Array, Array), Exception> {
-    let input = token_array(&[token]);
+    let input = prompt_tokens_to_input(&[token]);
     let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
     let (hidden, logits) =
         target.forward_hidden_with_capture(&input, None, Some(cache), &mut capture)?;
-    Ok((select_last_sequence(&hidden), select_last_logits(&logits)))
+    Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
 }
 
 fn embed_target_token(target: &Gemma4ForCausalLM, token: u32) -> Array {
-    let input = token_array(&[token]);
+    let input = prompt_tokens_to_input(&[token]);
     target
         .model
         .embed_tokens
@@ -584,25 +587,6 @@ fn embed_target_token(target: &Gemma4ForCausalLM, token: u32) -> Array {
 
 fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {
     *token_counts.entry(token).or_insert(0) += 1;
-}
-
-fn greedy_token(logits: &Array) -> u32 {
-    logits.argmax(-1).item::<u32>()
-}
-
-fn token_array(tokens: &[u32]) -> Array {
-    let data: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
-    Array::from_i32_slice(&data).reshape(&[1, data.len() as i32])
-}
-
-fn select_last_sequence(values: &Array) -> Array {
-    let seq_len = values.dim(1);
-    select_axis(values, seq_len - 1, 1).reshape(&[1, 1, -1])
-}
-
-fn select_last_logits(logits: &Array) -> Array {
-    let seq_len = logits.dim(1);
-    select_axis(logits, seq_len - 1, 1)
 }
 
 #[cfg(test)]

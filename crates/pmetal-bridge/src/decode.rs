@@ -66,14 +66,15 @@ pub struct DecodeMetrics {
     pub measured_steps: usize,
 }
 
-/// Convert token ids to the native `[1, T]` int32 prompt input expected by
-/// bridge-backed forward passes.
+/// Convert token ids (a prompt, or tokens to feed or verify) to the `[1, T]`
+/// int32 input bridge-backed forward passes take.
 pub fn prompt_tokens_to_input(input_ids: &[u32]) -> InlineArray {
     let ids_i32: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
     InlineArray::from_i32_slice_shaped(&ids_i32, &[1, ids_i32.len() as i32])
 }
 
-/// Extract the last sequence-position logits from a `[B, T, vocab]` tensor.
+/// Extract the last sequence-position logits from a `[B, T, vocab]` tensor:
+/// `[B, vocab]`.
 pub fn last_token_logits(logits: &InlineArray) -> InlineArray {
     let b = logits.dim(0);
     let t = logits.dim(1);
@@ -81,6 +82,21 @@ pub fn last_token_logits(logits: &InlineArray) -> InlineArray {
     logits
         .slice(&[0, t - 1, 0], &[b, t, vocab])
         .reshape(&[b, vocab])
+}
+
+/// The last sequence position of a `[B, T, D]` tensor (hidden states),
+/// keeping the sequence axis: `[B, 1, D]`.
+pub fn last_token_hidden(values: &InlineArray) -> InlineArray {
+    let b = values.dim(0);
+    let t = values.dim(1);
+    let d = values.dim(2);
+    values.slice(&[0, t - 1, 0], &[b, t, d])
+}
+
+/// The greedy token of `[1, vocab]` (or `[vocab]`) logits, read back to the
+/// host.
+pub fn greedy_token(logits: &InlineArray) -> u32 {
+    logits.argmax(-1).item::<u32>()
 }
 
 /// Create an f32 scalar cast to a specific MLX dtype.
@@ -1077,5 +1093,57 @@ mod tests {
         let third = last.slice(&[0, 2], &[1, 3]).reshape(&[1]).item_f32();
         assert_eq!(first, 4.0);
         assert_eq!(third, 6.0);
+    }
+
+    #[test]
+    fn last_token_hidden_keeps_the_sequence_axis() {
+        let hidden = InlineArray::from_f32_slice(
+            &[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
+            &[2, 3, 2],
+        );
+        let last = last_token_hidden(&hidden);
+        assert_eq!(last.shape(), &[2, 1, 2]);
+        let mut last = last.reshape(&[4]);
+        assert_eq!(last.to_f32_vec(4).unwrap(), [5.0, 6.0, 11.0, 12.0]);
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// The slices are the gathers they replace, element for element.
+    #[test]
+    fn last_position_slices_equal_the_gather_of_the_last_index() {
+        use crate::compat::ops::select_axis;
+        let x = crate::compat::random::normal_keyed(
+            &[1, 5, 7],
+            crate::compat::Dtype::Float32,
+            Some(&draw_key(3, 0)),
+        );
+        let values = |a: InlineArray| {
+            let mut a = a.reshape(&[-1]);
+            let n = a.size();
+            a.to_f32_vec(n).unwrap()
+        };
+        assert_eq!(
+            values(last_token_logits(&x)),
+            values(select_axis(&x, 4, 1)),
+            "last_token_logits"
+        );
+        assert_eq!(last_token_hidden(&x).shape(), &[1, 1, 7]);
+        assert_eq!(
+            values(last_token_hidden(&x)),
+            values(select_axis(&x, 4, 1).reshape(&[1, 1, -1])),
+            "last_token_hidden"
+        );
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    #[test]
+    fn greedy_token_is_the_argmax_of_the_last_axis() {
+        let logits = InlineArray::from_f32_slice(&[0.5, -1.0, 3.0, 2.0], &[1, 4]);
+        assert_eq!(greedy_token(&logits), 2);
+        let flat = InlineArray::from_f32_slice(&[9.0, -1.0, 3.0], &[3]);
+        assert_eq!(greedy_token(&flat), 0);
+        crate::check_unobserved_error().expect("no bridge op failed");
     }
 }

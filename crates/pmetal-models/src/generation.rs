@@ -17,7 +17,6 @@
 //! - Uses pmetal_bridge::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
-use pmetal_bridge::compat::indexing::argmax;
 use pmetal_bridge::compat::ops::exp;
 use pmetal_bridge::compat::ops::{
     argmax_axis, argpartition_axis, argsort_axis, async_eval, logsumexp_axis_keepdims,
@@ -25,6 +24,7 @@ use pmetal_bridge::compat::ops::{
 };
 use pmetal_bridge::compat::random::categorical;
 use pmetal_bridge::compat::{Array, Dtype, Exception};
+use pmetal_bridge::decode::{greedy_token, last_token_logits, prompt_tokens_to_input};
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
@@ -172,14 +172,6 @@ pub fn use_generation_stream() {
     pmetal_bridge::inline_array::set_generation_stream();
 }
 
-/// Build a `[1, seq_len]` Int32 token array from token IDs.
-fn token_input_array(tokens: &[u32]) -> Array {
-    Array::from_slice(
-        &tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-        &[1, tokens.len() as i32],
-    )
-}
-
 /// Release the Metal buffers MLX's allocator holds for reuse.
 #[inline]
 pub fn clear_generation_caches() {
@@ -247,7 +239,7 @@ where
     F: FnMut(&Array) -> Result<Array, Exception>,
 {
     if input_ids.is_empty() || prefill_step_size == 0 {
-        return forward(&token_input_array(input_ids));
+        return forward(&prompt_tokens_to_input(input_ids));
     }
 
     let mut last_logits = None;
@@ -255,7 +247,7 @@ where
     while start < input_ids.len() {
         let len = prefill_chunk_len(prefill_step_size, depth + start);
         let end = (start + len).min(input_ids.len());
-        let chunk_input = token_input_array(&input_ids[start..end]);
+        let chunk_input = prompt_tokens_to_input(&input_ids[start..end]);
         let logits = forward(&chunk_input)?;
         if end < input_ids.len() {
             logits.eval();
@@ -782,7 +774,7 @@ impl Sampler {
 
         // Greedy decoding - GPU-native argmax (no log-softmax needed)
         if !self.config.do_sample {
-            let token = greedy_sample(&logits)?;
+            let token = greedy_token(&logits);
             self.update_counts(token);
             return Ok(token);
         }
@@ -1055,13 +1047,6 @@ impl Sampler {
 
         Ok(take_along_axis(&selected_logits, &inverse_indices, -1))
     }
-}
-
-/// Greedy sampling - returns the token with highest probability.
-/// Note: item() internally calls eval(), so no explicit eval() needed.
-fn greedy_sample(logits: &Array) -> Result<u32, Exception> {
-    let token_id = argmax(logits);
-    Ok(token_id.item::<u32>())
 }
 
 /// Greedy sampling returning Array for async pipelining.
@@ -1654,20 +1639,14 @@ where
     let prompt_len = input_ids.len();
 
     for _ in 0..config.max_new_tokens {
-        // Create input array
-        let input = Array::from_slice(
-            &all_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-            &[1, all_tokens.len() as i32],
-        );
+        let input = prompt_tokens_to_input(&all_tokens);
 
         // Get logits from model
         let logits = forward_fn(&input)?;
         logits.eval();
 
-        // Extract logits for the last position [vocab_size]
-        let last_idx = logits.dim(1) - 1;
-        let last_logits = select_axis(&logits, last_idx, 1);
-        // next squeeze removed - select_axis already reduces dim
+        // Logits for the last position, [1, vocab]
+        let last_logits = last_token_logits(&logits);
 
         // Sample next token
         let next_token = sampler.sample(&last_logits, &all_tokens)?;
@@ -1740,9 +1719,7 @@ where
     logits.eval();
 
     // Get logits for the last position and sample first new token
-    let last_idx = logits.dim(1) - 1;
-    let last_logits = select_axis(&logits, last_idx, 1);
-    // next squeeze removed - select_axis already reduces dim
+    let last_logits = last_token_logits(&logits);
 
     let mut next_token = sampler.sample(&last_logits, &all_tokens)?;
 
@@ -1866,20 +1843,14 @@ where
     let sampler = Sampler::new(config.clone());
     let prompt_len = input_ids.len();
 
-    // Helper to get last logits from output - keeps 2D [1, vocab] format
-    // Avoiding squeeze reduces reshape operations in sampling pipeline
-    let extract_logits = |logits: &Array| -> Array {
-        let last_idx = logits.dim(1) - 1;
-        select_axis(logits, last_idx, 1) // Returns [1, vocab]
-    };
-
+    // The prefill's last-position logits, [1, vocab].
     let (mut current_y, mut current_logprobs) = {
         let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 use_generation_stream();
                 forward_fn(chunk_input, cache)
             })?;
-        let current_logits = extract_logits(&logits);
+        let current_logits = last_token_logits(&logits);
         sampler.sample_array(&current_logits)?
     };
 
@@ -1996,18 +1967,13 @@ where
     // tokens-per-second number. See `build_decode_metrics` below.
     let mut step_ns: Vec<u128> = Vec::with_capacity(config.max_new_tokens);
 
-    let extract_logits = |logits: &Array| -> Array {
-        let last_idx = logits.dim(1) - 1;
-        select_axis(logits, last_idx, 1)
-    };
-
     let (mut current_y, mut current_logprobs) = {
         let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 use_generation_stream();
                 forward_fn(chunk_input, cache)
             })?;
-        let current_logits = extract_logits(&logits);
+        let current_logits = last_token_logits(&logits);
         sampler.sample_array(&current_logits)?
     };
     async_eval([&current_y, &current_logprobs]);
@@ -2594,7 +2560,7 @@ mod tests {
         assert_eq!(logits.dim(1), 1);
 
         let last_logits = select_axis(&logits, 0, 0);
-        let token = greedy_sample(&last_logits).unwrap();
+        let token = greedy_token(&last_logits);
         assert_eq!(token as usize, 55);
     }
 
@@ -2648,13 +2614,13 @@ mod tests {
     }
 
     #[test]
-    fn test_greedy_sample() {
+    fn test_greedy_token() {
         // Create logits where token 5 has highest value
         let mut logits_vec = vec![-10.0f32; 100];
         logits_vec[5] = 10.0;
         let logits = Array::from_slice(&logits_vec, &[100]);
 
-        let token = greedy_sample(&logits).unwrap();
+        let token = greedy_token(&logits);
         assert_eq!(token, 5);
     }
 
