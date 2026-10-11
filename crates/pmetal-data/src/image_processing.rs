@@ -377,7 +377,8 @@ impl Default for MllamaImageProcessorConfig {
             // `preprocessor_config.json`, which also pins `size` 560x560,
             // `max_image_tiles` 4, `resample` 2 and `rescale_factor` 1/255 —
             // every default here. Note transformers' *class* default is
-            // IMAGENET 0.5/0.5, so a dumper that omits these silently diverges.
+            // IMAGENET 0.5/0.5, so a reference built on the class defaults
+            // silently diverges.
             #[allow(clippy::excessive_precision)]
             image_mean: [0.48145466, 0.4578275, 0.40821073],
             #[allow(clippy::excessive_precision)]

@@ -1,9 +1,14 @@
 //! A Qwen3.5-family vision checkpoint against transformers on a real image
-//! prompt. Opt-in: needs the checkpoint and a reference dumped by
-//! `.strategy/parity/dump_qwen3_5_vision_real_reference.py`.
+//! prompt. Opt-in: needs the checkpoint and a reference directory from
+//! transformers 5.19 `Qwen3_5ForConditionalGeneration` + `AutoProcessor` (f32,
+//! CPU) on one chat turn, "Describe this image in one short sentence.", with
+//! an image. The directory holds `image.png` and `reference.safetensors` with
+//! `input_ids`, `pixel_values` and `image_grid_thw` (the processor's),
+//! `image_features` (the vision tower's merged output), `prompt_logits` (at
+//! the last prompt position) and `generated` (the greedy continuation ids).
 //!
 //! ```text
-//! PMETAL_QWEN3_5_VL_DIR=<snapshot> PMETAL_QWEN3_5_VL_REFERENCE=<dump dir> \
+//! PMETAL_QWEN3_5_VL_DIR=<snapshot> PMETAL_QWEN3_5_VL_REFERENCE=<reference dir> \
 //!     cargo test -p pmetal-models --test qwen3_5_vision_real_weights -- --nocapture
 //! ```
 //!

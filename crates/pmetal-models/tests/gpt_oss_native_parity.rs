@@ -1,8 +1,8 @@
 //! The native gpt-oss engine (`pmetal_bridge::gpt_oss_native`) against the
 //! authoritative Hugging Face `transformers` `GptOssForCausalLM`.
 //!
-//! The fixture (`.strategy/parity/dump_gpt_oss_native_reference.py`) is a
-//! whole two-layer checkpoint with what the release carries: per-head
+//! The fixture (transformers 5.19, torch 2.14.1, seed 5) is a whole
+//! two-layer checkpoint with what the release carries: per-head
 //! attention sinks seeded non-zero, YaRN with `truncate: false`, a sliding
 //! window of 4 on layer 0 beside full attention on layer 1, the biased top-k
 //! router with its softmax over the chosen logits, and the clamped GLU on

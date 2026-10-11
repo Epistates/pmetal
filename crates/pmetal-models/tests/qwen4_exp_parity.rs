@@ -1,8 +1,8 @@
 //! Numerical parity for the Qwen4-Exp (Qwen3.8-Flash-Next) text tower against
 //! the HuggingFace `transformers` `Qwen4ExpForCausalLM` oracle.
 //!
-//! The fixture is a tiny fp32 model with every feature switched on (dumped by
-//! `.strategy/parity/dump_qwen4_exp_reference.py`): GDN with the sigmoid
+//! The fixture is a tiny fp32 model with every feature switched on
+//! (transformers 5.19, torch 2.14.1, seed 11): GDN with the sigmoid
 //! output gate, gated attention with a QSA indexer whose budget is small enough
 //! to drop blocks from position 5 on, three hyper-connection streams, PLE
 //! n-gram embeddings on two layers with EOS tokens inside the prompt, and an

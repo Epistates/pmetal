@@ -1,10 +1,11 @@
 //! Numerical-parity test for the Rust DeepSeek MLA attention block.
 //!
-//! Replays a reference dumped from the authoritative HuggingFace `transformers`
-//! `DeepseekV3Attention` (`.strategy/parity/dump_deepseek_attn_reference.py`),
+//! Replays a reference from HuggingFace `transformers` 5.10.0.dev0
+//! `DeepseekV3Attention` (torch 2.12, seed 21, 6 tokens under a causal mask),
 //! whose explicit `kv_b_proj` formulation matches pmetal's `DeepSeekAttention`.
 //! The v3 module is the oracle rather than v2 because v2 drops YARN's `mscale²`
-//! softmax term entirely — see the dumper for the full reasoning.
+//! softmax term entirely (v3 folds it into the softmax scale when
+//! `mscale_all_dim` is set) and ignores `rope_interleave`.
 //!
 //! With `rope_type: "default"` there is no YARN frequency correction and no
 //! mscale, so this fixture isolates the one thing that is wrong regardless of

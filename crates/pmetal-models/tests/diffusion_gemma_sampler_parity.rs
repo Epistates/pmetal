@@ -4,10 +4,9 @@
 //! proposal plus uniform renoising), but every transform the Rust port must
 //! reproduce exactly is a pure function of the logits: the linear temperature
 //! schedule, the Categorical token entropy, and the entropy-bound acceptance
-//! mask. The dumper
-//! (`.strategy/parity/dump_diffusion_gemma_reference.py --mode sampler`) runs
-//! each on fixed seeded inputs from the transformers oracle; this test diffs
-//! the Rust implementations against those references.
+//! mask. The reference runs each through the transformers 5.10.0.dev0 oracle
+//! on fixed inputs (seed 42); this test diffs the Rust implementations
+//! against those references.
 
 mod common;
 
@@ -20,7 +19,7 @@ use pmetal_models::architectures::diffusion_gemma::{
     categorical_entropy, entropy_bound_accept, linear_temperature,
 };
 
-// Matches the dumper's `dump_sampler` constants.
+// The constants the reference was generated with (also in its `.meta.json`).
 const T_MIN: f32 = 0.4;
 const T_MAX: f32 = 0.8;
 const MAX_STEPS: i32 = 48;

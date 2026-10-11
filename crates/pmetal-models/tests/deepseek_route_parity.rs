@@ -1,8 +1,7 @@
 //! Numerical-parity test for DeepSeek-V3 group-limited expert routing.
 //!
-//! Replays a reference dumped from the authoritative HuggingFace `transformers`
-//! `DeepseekV3MoE::route_tokens_to_experts`
-//! (`.strategy/parity/dump_deepseek_route_reference.py`) with `n_group=4`,
+//! Replays a reference from HuggingFace `transformers` 5.10.0.dev0
+//! `DeepseekV3MoE::route_tokens_to_experts` (torch 2.12, seed 33) with `n_group=4`,
 //! `topk_group=2`, so the group-masking branch is exercised. The reference is a
 //! DENSE `[N, num_experts]` weight vector (top-k weights scattered to their
 //! expert columns), which is invariant to top-k ordering — the two
@@ -25,7 +24,7 @@ use pmetal_models::moe_routing::noaux_tc_topk;
 
 #[test]
 fn deepseek_group_routing_synthetic_parity() {
-    // Matches the dumper meta.
+    // Matches the fixture's `.meta.json`.
     const N_TOKENS: i32 = 5;
     const NUM_EXPERTS: i32 = 16;
     const TOP_K: i32 = 4;

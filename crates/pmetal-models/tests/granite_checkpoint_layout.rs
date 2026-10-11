@@ -1,8 +1,8 @@
 //! Released Granite checkpoints against the model their config builds, by
 //! tensor name and shape, without downloading a weight.
 //!
-//! The synthetic parity fixtures are written under the key names the dumper
-//! believes checkpoints use. This holds that belief against the real thing:
+//! The synthetic parity fixtures are written under the key names their
+//! generator believes checkpoints use. This holds that belief against the real thing:
 //! for every checkpoint directory, the config builds a model through the
 //! production path, and a zero tensor for every entry of the checkpoint's
 //! safetensors headers is handed to the same all-or-nothing assignment
@@ -19,7 +19,7 @@
 //! `{"dtype", "shape"}` across every shard) and run:
 //!
 //! ```bash
-//! PMETAL_GRANITE_HEADERS=/Volumes/AmBa/tmp/granite-headers \
+//! PMETAL_GRANITE_HEADERS=<dir of checkpoint headers> \
 //!     cargo test -p pmetal-models --test granite_checkpoint_layout -- --ignored --nocapture
 //! ```
 //!

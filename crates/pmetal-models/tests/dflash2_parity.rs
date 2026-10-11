@@ -1,6 +1,6 @@
 //! DFlash 2 draft parity against the reference implementation's PyTorch
-//! `DFlash2DraftModel` (z-lab/dflash), dumped by
-//! `.strategy/parity/dump_dflash2_reference.py` on a tiny random config.
+//! `DFlash2DraftModel` (z-lab/dflash `dflash/model.py` at 07ebd93, on
+//! transformers 5.19 and torch 2.14.1) on a tiny random config.
 //!
 //! The draft drafts five blocks in a row against a context that grows by the
 //! prompt, then by each step's accepted tokens, the way speculative decoding

@@ -1,9 +1,8 @@
 //! Numerical-parity test for the Rust Llama 4 attention block.
 //!
 //! Isolates `Llama4Attention` (no MoE, so no expert-splitting needed) and
-//! replays a reference dumped from the authoritative HuggingFace
-//! `transformers` `Llama4TextAttention`
-//! (`.strategy/parity/dump_llama4_attn_reference.py`). It pins the interacting
+//! replays a reference from HuggingFace `transformers` 5.10.0.dev0
+//! `Llama4TextAttention` (torch 2.12, seed 11). It pins the interacting
 //! iRoPE fixes:
 //!
 //!   * traditional (interleaved) RoPE — transformers rotates via
@@ -67,7 +66,7 @@ fn llama4_attention_synthetic_parity() {
         attn.v_proj.weight = Param::new(ref_tensor(&shard, &format!("{tag}.v_proj")).clone());
         attn.o_proj.weight = Param::new(ref_tensor(&shard, &format!("{tag}.o_proj")).clone());
 
-        // Sanity-check the iRoPE layer mapping that the dumper reported.
+        // Sanity-check the iRoPE layer mapping that the reference reported.
         let expects_rope = layer_idx == 0;
         assert_eq!(
             attn.uses_rope, expects_rope,

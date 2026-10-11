@@ -1,9 +1,8 @@
 //! Encoding parity for Clef decision records.
 //!
 //! The oracle is the release's own `encode_record` and `render`
-//! (`joint_schema_model.py`) with the release tokenizer, dumped by
-//! `.strategy/parity/dump_clef_encoding_reference.py` into
-//! `clef_encoding_reference.json`.
+//! (`joint_schema_model.py`, shipped with the Clef checkpoints) with the
+//! release tokenizer; its outputs are in `clef_encoding_reference.json`.
 //!
 //! * `render` cases need no tokenizer and always run: key order, Python float
 //!   repr (300 random bit patterns among them), and string escaping.

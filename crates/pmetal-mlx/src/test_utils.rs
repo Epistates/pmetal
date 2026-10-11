@@ -18,8 +18,8 @@ use pmetal_bridge::compat::{Array, ops};
 
 /// Load a safetensors shard into a name→tensor map.
 ///
-/// The counterpart to the parity dumpers' `save_fixture`: every `*_parity`
-/// integration test loads a committed fixture this way. Panics rather than
+/// Every `*_parity` integration test loads its committed fixture (a
+/// name→tensor safetensors shard of reference values) this way. Panics rather than
 /// returning a `Result` — a missing or malformed fixture is a broken checkout,
 /// not a condition a test can meaningfully handle.
 pub fn load_shard(path: &Path) -> HashMap<String, Array> {

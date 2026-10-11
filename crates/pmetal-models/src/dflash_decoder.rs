@@ -605,7 +605,8 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
     /// specializations are mathematically equivalent but produce
     /// slightly different bf16 numerics due to different fused
     /// instruction orderings inside the steel attention kernel
-    /// (see `.strategy/mlx/.../steel_attention.h`). The K/V values
+    /// (see `mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h`
+    /// in ml-explore/mlx). The K/V values
     /// written to cache stay bit-exact (they come from RoPE +
     /// projection, both kernel-identical to the linear path), so
     /// the drift only affects which TOKEN the target picks at

@@ -3,7 +3,7 @@
 //! `tests/fixtures/rope_scaling_reference.json` holds, per case, the config a
 //! released model ships (or an edge case of the parser), the reach the init
 //! function was called with, and the inverse frequencies and attention factor
-//! transformers returned (`.strategy/parity/dump_rope_scaling_reference.py`).
+//! transformers 5.19 returned (the version is recorded in the fixture).
 //! The same config goes through [`Rotary::from_config`] here.
 
 use pmetal_bridge::rope::{RopeConfig, Rotary};

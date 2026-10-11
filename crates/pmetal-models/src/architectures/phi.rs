@@ -974,7 +974,7 @@ mod tests {
     use serial_test::serial;
 
     /// A LongRoPE Phi config: `head_dim` 32, full rotary, pretraining length
-    /// 128 stretched to 512, as the transformers dumper sets it up.
+    /// 128 stretched to 512, as the fixture's transformers config has it.
     fn longrope_config(short_factor: Vec<f32>, long_factor: Vec<f32>) -> PhiConfig {
         PhiConfig {
             hidden_size: 64,
@@ -997,12 +997,15 @@ mod tests {
     /// `long_factor`-scaled frequencies, and the attention factor
     /// `sqrt(1 + ln(512/128) / ln(128))` on the rotated channels, once.
     ///
-    /// The fixture rotates positions 0..6 with the long table (the dumper
+    /// The fixture rotates positions 0..6 with the long table (the reference
     /// asks for `seq_len = 129`), so the config here carries the fixture's
     /// `long_factor` as both tables; which table a reach picks is pinned
     /// below and in `pmetal_bridge::rope`.
     ///
-    /// Fixture: `.strategy/parity/dump_phi_surope_reference.py`.
+    /// Fixture: transformers 5.10.0.dev0 (torch 2.12), `Phi3Config` with
+    /// `head_dim` 32, rotating a fixed input; the mscale is folded into
+    /// `cos`/`sin` there and value-scaled here, which rotation's linearity
+    /// makes identical.
     #[test]
     #[serial]
     fn phi_longrope_matches_transformers_oracle() {

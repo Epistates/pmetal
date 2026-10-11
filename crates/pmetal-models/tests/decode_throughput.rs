@@ -2,12 +2,12 @@
 //! the one `pmetal infer` takes with an adapter, FP8 or an experts dir.
 //!
 //! Gated and ignored: it loads a checkpoint and measures speed, so run it
-//! through the machine's GPU queue.
+//! alone, with nothing else on the GPU.
 //!
 //! ```bash
 //! PMETAL_DECODE_MODEL=/path/to/checkpoint \
-//! PMETAL_DECODE_LOGITS=/tmp/logits.bin \
-//!     gpuq cargo test -p pmetal-models --test decode_throughput -- --ignored --nocapture
+//! PMETAL_DECODE_LOGITS=/path/to/logits.bin \
+//!     cargo test -p pmetal-models --test decode_throughput -- --ignored --nocapture
 //! ```
 //!
 //! It prints greedy decode tok/s over 128 tokens through
@@ -33,7 +33,7 @@ fn last_row_f32(logits: &Array) -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "needs a real checkpoint; set PMETAL_DECODE_MODEL and run through gpuq"]
+#[ignore = "needs a real checkpoint; set PMETAL_DECODE_MODEL and run it alone (it measures speed)"]
 fn decode_throughput_and_logits() {
     let dir = std::env::var("PMETAL_DECODE_MODEL").expect("set PMETAL_DECODE_MODEL");
     let mut model = DynamicModel::load(&dir).expect("checkpoint loads");

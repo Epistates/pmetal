@@ -3,11 +3,10 @@
 //! `pixel_values [B, N, 3·patch²]` + `image_position_ids [B, N, 2]` pair
 //! `Gemma4VisionModel::forward` consumes.
 //!
-//! The oracle is the authoritative HuggingFace `transformers`
-//! `Gemma4ImageProcessorPil`. `.strategy/parity/dump_gemma4_image_reference.py`
-//! runs it over four deterministic test patterns and commits both the raw uint8
-//! pixels and the processor's output, so no image codec sits between the two
-//! implementations.
+//! The oracle is HuggingFace `transformers` 5.10.0.dev0
+//! `Gemma4ImageProcessorPil`, run over four deterministic test patterns. The
+//! fixture holds both the raw uint8 pixels and the processor's output, so no
+//! image codec sits between the two implementations.
 //!
 //! **Everything is compared at atol 0**, resized cases included. That is
 //! possible because `pmetal_data::pillow_resample` reproduces Pillow's
@@ -39,7 +38,7 @@ const FIXTURE: &str = "gemma4_image_reference.safetensors";
 /// resampler, so nothing here is entitled to a tolerance.
 const EXACT: Tolerance = Tolerance::new(0.0, 0.0);
 
-/// Mirrors `PROC_ARGS` in `.strategy/parity/dump_gemma4_image_reference.py`.
+/// The processor arguments the reference was generated with.
 /// The tiny patch size keeps the fixture at ~600 KB while leaving every branch
 /// of the geometry reachable.
 fn fixture_config() -> Gemma4ImageProcessorConfig {
@@ -103,7 +102,7 @@ const CASES: [Case; 4] = [
     },
 ];
 
-/// Rebuild the exact `DynamicImage` the dumper fed `transformers` from the
+/// Rebuild the exact `DynamicImage` the reference fed `transformers` from the
 /// fixture's `[H, W, 3]` uint8 tensor.
 fn fixture_image(shard: &HashMap<String, Array>, key: &str) -> DynamicImage {
     let arr = ref_tensor(shard, key);

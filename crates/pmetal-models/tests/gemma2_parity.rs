@@ -1,8 +1,7 @@
 //! Numerical-parity test for the Rust Gemma 2 port.
 //!
-//! Loads a tiny 2-layer seeded fixture dumped from the authoritative
-//! HuggingFace `transformers` `Gemma2ForCausalLM`
-//! (`.strategy/parity/dump_gemma2_reference.py`) through the full
+//! Loads a tiny 2-layer fixture (seed 42) dumped from HuggingFace
+//! `transformers` 5.10.0.dev0 `Gemma2ForCausalLM` (torch 2.12) through the full
 //! `DynamicModel::load` dispatcher path — with a `config.json` whose
 //! `model_type` is `"gemma2"` but with NO `is_gemma2` flag — so the test
 //! validates the dispatcher auto-detection fix end to end: without it the

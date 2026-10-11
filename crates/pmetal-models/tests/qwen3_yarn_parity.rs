@@ -1,7 +1,7 @@
 //! Dense Qwen3 with YaRN against the authoritative Hugging Face
 //! `transformers` `Qwen3ForCausalLM`, on both of pmetal's engines.
 //!
-//! The fixture (`.strategy/parity/dump_qwen3_yarn_reference.py`) is a whole
+//! The fixture (transformers 5.19, torch 2.14.1, seed 11) is a whole
 //! checkpoint directory whose `config.json` carries YaRN the way the Qwen3 card
 //! documents it, a legacy `rope_scaling` block with `factor` 4, shrunk from
 //! `original_max_position_embeddings` 32768 to 64 so the 96-token prompt runs

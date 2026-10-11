@@ -4,8 +4,8 @@
 //! `DynamicModel` path (`architectures/qwen3_next.rs`) and the native bridge
 //! (`pmetal_bridge::qwen3_native`), which is what `pmetal infer` runs.
 //!
-//! Each fixture is a whole checkpoint directory, dumped by
-//! `.strategy/parity/dump_qwen3_5_reference.py`: the nested `config.json` Qwen
+//! Each fixture is a whole checkpoint directory from transformers 5.19 (torch
+//! 2.14.1, seed 7): the nested `config.json` Qwen
 //! ships, an fp32 `model.safetensors` under the released key names (vision
 //! tower and bundled `mtp.*` predictor included), and the reference
 //! activations. Both engines load it through their production loaders.

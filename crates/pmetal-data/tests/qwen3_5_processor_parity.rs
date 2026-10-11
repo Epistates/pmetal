@@ -3,9 +3,8 @@
 //! ([`pmetal_data::pillow_resample::resize_rgb8_torchvision`]).
 //!
 //! Oracle: Hugging Face transformers 5.19 on the torchvision backend, the one
-//! `AutoProcessor` picks when torchvision is installed. The fixture is dumped
-//! by `.strategy/parity/dump_qwen3_5_processor_reference.py` from synthetic
-//! images and covers:
+//! `AutoProcessor` picks when torchvision is installed (torch 2.14.1). The
+//! fixture is generated from synthetic images and covers:
 //!
 //! * torchvision's antialiased `uint8` resize over a grid of ratios, both
 //!   filters, compared byte for byte;

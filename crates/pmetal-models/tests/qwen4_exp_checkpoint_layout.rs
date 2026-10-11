@@ -14,11 +14,15 @@
 //! checked against the config the same way.
 //!
 //! The headers and configs are not committed (the configs carry the models'
-//! own licenses), so this is `#[ignore]`d and gated on a directory written by
-//! `.strategy/parity/dump_qwen4_exp_headers_reference.py`:
+//! own licenses), so this is `#[ignore]`d and gated on a directory with one
+//! subdirectory per repo, named as in [`VARIANTS`] (`/` replaced by `_`),
+//! each holding the release's `config.json` and a `tensors.json` mapping every
+//! tensor name to its `{"dtype", "shape"}` from the shard headers. Each
+//! header is two HTTP range requests (the 8-byte length, then the JSON), so
+//! the whole set is a few megabytes:
 //!
 //! ```bash
-//! PMETAL_QWEN4_EXP_HEADERS=/Volumes/AmBa/huggingface/qwen4-exp-headers \
+//! PMETAL_QWEN4_EXP_HEADERS=<dir of checkpoint headers> \
 //!     cargo test -p pmetal-models --test qwen4_exp_checkpoint_layout -- --ignored --nocapture
 //! ```
 
@@ -170,7 +174,7 @@ fn check_variant(dir: &Path) {
 #[serial]
 fn released_qwen4_exp_layouts_load_completely() {
     let root = std::env::var("PMETAL_QWEN4_EXP_HEADERS")
-        .expect("set PMETAL_QWEN4_EXP_HEADERS to the dumper's output directory");
+        .expect("set PMETAL_QWEN4_EXP_HEADERS (see the module docs)");
     for variant in VARIANTS {
         check_variant(&Path::new(&root).join(variant));
     }

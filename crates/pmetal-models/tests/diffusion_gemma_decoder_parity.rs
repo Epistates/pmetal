@@ -2,10 +2,9 @@
 //!
 //! The decoder refines a `canvas_length` block with bidirectional attention
 //! while reading the encoder's read-only K/V cache. To isolate the decoder
-//! forward from any encoder drift, the reference dumper
-//! (`.strategy/parity/dump_diffusion_gemma_reference.py --mode decoder`) runs
-//! the transformers-nightly oracle, captures the encoder's per-layer KV cache
-//! as fixtures, and feeds it straight into the oracle decoder. This test loads
+//! forward from any encoder drift, the reference runs the transformers
+//! 5.10.0.dev0 oracle (seed 42), captures the encoder's per-layer KV cache as
+//! fixtures, and feeds it straight into the oracle decoder. This test loads
 //! the *same* cache tensors into the Rust [`DiffusionGemmaDecoderModel`], so a
 //! mismatch is purely decoder logic — self-conditioning, the bidirectional
 //! `[encoder_kv | canvas]` attention, and the shared 7-norm MoE layer.
@@ -23,7 +22,7 @@ use pmetal_models::architectures::diffusion_gemma::{
     DiffusionGemmaDecoderModel, DiffusionGemmaTextConfig, load_diffusion_gemma_decoder_weights,
 };
 
-/// Synthetic config — mirrors `SYNTHETIC_ARGS` in the Python dumper (same as
+/// Synthetic config — the one the fixture was generated with (same as
 /// the encoder test). The forward derives canvas/enc lengths from the dumped
 /// tensors, so `canvas_length` here is irrelevant.
 fn synthetic_config() -> DiffusionGemmaTextConfig {

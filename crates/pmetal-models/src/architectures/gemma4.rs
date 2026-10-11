@@ -42,7 +42,8 @@
 //! logits, argmax tokens) match the Python reference to single-precision
 //! round-off (`max_abs_diff ≤ 1e-5` on the f32 synthetic config). The real
 //! 31B path runs under the same test when `PMETAL_GEMMA4_REFERENCE` points
-//! at a dump produced by `.strategy/parity/dump_gemma4_reference.py`.
+//! at taps of transformers' `Gemma4ForCausalLM` on that checkpoint (the
+//! layout is described in the test).
 
 use std::collections::HashMap;
 

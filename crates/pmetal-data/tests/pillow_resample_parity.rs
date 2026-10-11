@@ -5,8 +5,8 @@
 //! reimplement its filters rather than the other way round), so Pillow's output
 //! is what a released VLM's pixel input is *defined* as.
 //!
-//! `.strategy/parity/dump_pillow_resample_reference.py` commits the source
-//! images and `PIL.Image.resize` results for a grid chosen to break naive
+//! The fixture holds the source images and Pillow 12.3 `PIL.Image.resize`
+//! results for a grid chosen to break naive
 //! implementations: pure up- and downscale, mixed axes, single-axis resizes that
 //! exercise the skip-the-other-pass shortcut, >20x ratios where the stretched
 //! kernel spans many input pixels, and coprime sizes so no output centre ever
@@ -30,7 +30,7 @@ use pmetal_mlx::test_utils::to_f32_vec_eval;
 
 const FIXTURE: &str = "pillow_resample_reference.safetensors";
 
-/// Mirrors `CASES` in `.strategy/parity/dump_pillow_resample_reference.py`:
+/// The resize grid the fixture was generated from:
 /// `(source index, [(target height, target width), ...])`.
 const CASES: [(usize, &[(u32, u32)]); 3] = [
     (0, &[(24, 32), (96, 128), (17, 53), (48, 21), (9, 64)]),

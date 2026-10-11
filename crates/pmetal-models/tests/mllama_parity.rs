@@ -6,11 +6,11 @@
 //! non-functional skeleton that still produced plausible-looking tensors — so
 //! this fixture is the only thing that distinguishes "runs" from "correct".
 //!
-//! `.strategy/parity/dump_mllama_reference.py` builds a tiny seeded
-//! `MllamaForConditionalGeneration`, sets every scalar gate to 0.7 (the shipped
+//! The fixture is a tiny seeded `MllamaForConditionalGeneration` with every
+//! scalar gate set to 0.7 (the shipped
 //! inits of 0 and π/4 would leave `tanh(gate)` small enough to hide the entire
-//! gated global transformer and all of cross-attention), and commits the
-//! `state_dict` alongside three checkpoints:
+//! gated global transformer and all of cross-attention): its `state_dict`
+//! alongside three checkpoints:
 //!
 //! * `vision_out` — the tower's `[batch, images, tiles, patches, 7680-analogue]`
 //!   output, which catches the tile/position embeddings, the gated global
@@ -42,7 +42,7 @@ const WEIGHTS: &str = "mllama_weights.safetensors";
 /// to mean anything.
 const TOL: Tolerance = Tolerance::new(5e-6, 1e-6);
 
-/// Mirrors `VISION_ARGS` / `TEXT_ARGS` in the Python dumper.
+/// The vision and text configs the fixture was generated with.
 fn fixture_config() -> MllamaConfig {
     MllamaConfig {
         vision_config: MllamaVisionConfig {

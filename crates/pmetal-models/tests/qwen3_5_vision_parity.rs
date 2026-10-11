@@ -1,6 +1,6 @@
 //! Numerical parity for Qwen 3.5-family vision against Hugging Face
-//! transformers' `Qwen3_5ForConditionalGeneration`, on a tiny seeded model
-//! dumped by `.strategy/parity/dump_qwen3_5_vision_reference.py`.
+//! transformers 5.19 `Qwen3_5ForConditionalGeneration` (torch 2.14.1), on a
+//! tiny model seeded with 11.
 //!
 //! The text half is the `swish` profile of `qwen3_5_parity.rs`; the vision
 //! tower is shrunk but keeps every structural feature (two blocks, rotary

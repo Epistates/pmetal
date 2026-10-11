@@ -1,11 +1,11 @@
 //! Numerical-parity test for the Rust Cohere (Command-R) port.
 //!
-//! The oracle is the authoritative HuggingFace `transformers`
+//! The oracle is HuggingFace `transformers` 5.10.0.dev0 (torch 2.12)
 //! `CohereForCausalLM` — the implementation released Command-R weights are
-//! defined against. `.strategy/parity/dump_cohere_reference.py` builds a tiny
-//! 2-layer seeded model and commits its activations + weights; this test loads
-//! them through the *production* weight loader and diffs every tapped
-//! checkpoint, plus an argmax-exact check on the final logits.
+//! defined against — on a tiny 2-layer model seeded with 42. The fixture holds
+//! its activations + weights; this test loads them through the *production*
+//! weight loader and diffs every tapped checkpoint, plus an argmax-exact check
+//! on the final logits.
 //!
 //! This is the regression guard for three forward-pass fixes:
 //!   1. output `logit_scale` (0.0625) — applied via the LM head path,
@@ -27,7 +27,7 @@ use pmetal_mlx::test_utils::{
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::loader::load_generic_weights;
 
-/// Synthetic config — must mirror SYNTHETIC_ARGS in the Python dumper.
+/// Synthetic config — the one the fixture was generated with.
 /// `use_sliding_window` is omitted (defaults false) so the synthetic run is a
 /// plain global-causal forward.
 fn synthetic_config_json() -> &'static str {

@@ -1,8 +1,7 @@
 //! Numerical-parity test for DeepSeek MLA attention WITH YARN rope_scaling.
 //!
-//! Replays references dumped from the authoritative HuggingFace `transformers`
-//! `DeepseekV3Attention` (`.strategy/parity/dump_deepseek_yarn_reference.py`)
-//! for two cases:
+//! Replays references from HuggingFace `transformers` 5.10.0.dev0
+//! `DeepseekV3Attention` (torch 2.12, seed 41) for two cases:
 //!
 //!   * "scale" — `mscale = mscale_all_dim = 1.0`: the embedding mscale ratio
 //!     collapses to 1.0, leaving the YARN frequency blend and the

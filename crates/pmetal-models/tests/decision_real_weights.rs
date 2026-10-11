@@ -3,8 +3,8 @@
 //! `clef_flash_reference.json` holds five `/v1/systemone` requests (the model
 //! card's two examples, a French support message, an entailment pair, a
 //! multiple-choice question) answered by the release's own `load_release_model`
-//! and `systemone` in float32 on CPU, dumped by
-//! `.strategy/parity/dump_clef_real_weight_reference.py`.
+//! and `systemone` (from the release's `joint_schema_model.py`) in float32 on
+//! CPU.
 //!
 //! pmetal runs the backbone in bf16 on the GPU and the head in f32, so the two
 //! sides agree to bf16 noise, not bit for bit. The measured worst per-option
@@ -14,8 +14,7 @@
 //!
 //! `clef_flash_media_reference.json` holds three more, carrying media in the
 //! JSON form `decision::media` defines (base64 PNGs, a video as frames plus
-//! fps): one image, two images, and a six-frame clip, dumped by
-//! `.strategy/parity/dump_clef_media_reference.py`, which hands the reference
+//! fps): one image, two images, and a six-frame clip, with the reference given
 //! the same pixels. The vision tower also runs in bf16, and media move further:
 //! pmetal's worst is 9.2e-3, the reference's own bf16 run lands 1.23e-2 from
 //! its float32 one (both on the clip's `is_moving`), so the bound is 2e-2.

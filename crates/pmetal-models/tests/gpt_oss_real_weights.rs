@@ -1,24 +1,26 @@
 //! The released `openai/gpt-oss-20b` (MXFP4 experts) on both engines against
 //! transformers' greedy decode of a harmony-formatted prompt.
 //!
-//! The reference comes from `.strategy/parity/dump_gpt_oss_20b_reference.py`:
-//! transformers loads the release, dequantizes its MXFP4 experts to bf16 and
-//! decodes greedily on the CPU, recording the logits each token was picked
-//! from. Here both engines keep the experts packed and must pick the same
-//! tokens, on a cached decode from the prompt and on one uncached forward over
+//! The reference comes from transformers' `GptOssForCausalLM`: it loads the
+//! release, dequantizes its MXFP4 experts to bf16
+//! (`Mxfp4Config(dequantize=True)`) and decodes greedily on the CPU from a
+//! harmony-formatted user turn, saving `prompt_ids [P]`, `generated_ids [G]`
+//! and the f32 `logits [G, vocab]` each token was picked from. Here both
+//! engines keep the experts packed and must pick the same tokens, on a cached decode from the prompt and on one uncached forward over
 //! prompt and reply.
 //!
-//! bf16 moves the logits by itself, so the dumper's `--floor-of` also reruns
-//! transformers in fp32: given that (`PMETAL_GPT_OSS_REFERENCE_FP32`), each
-//! engine has to be about as close to fp32 as transformers in bf16 is.
+//! bf16 moves the logits by itself, so an optional second reference reruns
+//! the same rows in transformers fp32: given that
+//! (`PMETAL_GPT_OSS_REFERENCE_FP32`), each engine has to be about as close to
+//! fp32 as transformers in bf16 is.
 //!
 //! The checkpoint is 13 GB and not committed, so this is `#[ignore]`d and
-//! gated on the variables (run it through the GPU queue):
+//! gated on the variables (run it alone; it needs the GPU's memory):
 //!
 //! ```bash
 //! PMETAL_GPT_OSS_DIR=<snapshot dir> PMETAL_GPT_OSS_REFERENCE=<reference.safetensors> \
 //! PMETAL_GPT_OSS_REFERENCE_FP32=<reference_fp32.safetensors> \
-//!     gpuq cargo test -p pmetal-models --test gpt_oss_real_weights -- --ignored --nocapture
+//!     cargo test -p pmetal-models --test gpt_oss_real_weights -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;
@@ -33,7 +35,7 @@ struct Reference {
     generated: Vec<i32>,
     /// transformers in bf16, the format both engines run.
     logits: Array,
-    /// The same rows from transformers in fp32 (`--floor-of`), when given.
+    /// The same rows from transformers in fp32, when given.
     fp32: Option<Array>,
 }
 

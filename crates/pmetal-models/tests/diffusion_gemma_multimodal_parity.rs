@@ -2,10 +2,10 @@
 //! the text tower + Gemma 4 vision tower + vision→text projector + image-token
 //! merge ([`DiffusionGemmaEncoderModel::forward_multimodal`]).
 //!
-//! The oracle is the authoritative HuggingFace `transformers`
-//! `DiffusionGemmaEncoderModel`. `.strategy/parity/dump_diffusion_gemma_multimodal_reference.py`
-//! builds a tiny seeded model, runs the encoder over a prompt with image
-//! placeholders + one image, and commits the encoder hidden states.
+//! The oracle is HuggingFace `transformers` `DiffusionGemmaEncoderModel` (a
+//! nightly, `>= 5.8.0.dev0`, the first to ship it). The fixture is a tiny
+//! seeded model's weights and the encoder hidden states it gives over a prompt
+//! with image placeholders + one image.
 //!
 //! The `pooled_causal` fixture is the plain-causal path (no `mm_token_type_ids`)
 //! — end-to-end validation of the vision tower, projector, and masked-scatter

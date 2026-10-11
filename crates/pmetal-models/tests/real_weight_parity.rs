@@ -19,7 +19,7 @@
 //! only legitimate source of divergence is accumulation order.
 //!
 //! How much divergence that buys is not a constant, which is why nothing here
-//! is compared against a fixed tolerance. The dumper measures each model's
+//! is compared against a fixed tolerance. The reference records each model's
 //! **noise floor** by running the same `transformers` code twice, once in bf16
 //! and once in fp32. Those floors span two orders of magnitude: `1 - cos` is
 //! 5.6e-5 for Granite and 5.5e-3 for Gemma 3, whose residual stream reaches
@@ -48,17 +48,25 @@
 //! Checkpoints are *not* committed — they carry the upstream model licenses,
 //! and they are gigabytes. So this is `#[ignore]`d and gated on
 //! `PMETAL_REAL_WEIGHTS`, the same pattern as `real_config_parity` and the real
-//! Mllama test. Populate it with:
+//! Mllama test:
 //!
 //! ```bash
-//! HF_HOME=/Volumes/AmBa/huggingface .venv-parity/bin/python -u \
-//!     .strategy/parity/dump_real_weight_reference.py \
-//!     weight_models.txt /Volumes/AmBa/huggingface/parity-weights
-//! PMETAL_REAL_WEIGHTS=/Volumes/AmBa/huggingface/parity-weights \
+//! PMETAL_REAL_WEIGHTS=<dir> \
 //!     cargo test -p pmetal-models --test real_weight_parity -- --ignored --nocapture
 //! ```
 //!
-//! Everything lands on `/Volumes/AmBa`, never the boot volume.
+//! `<dir>/_references/` holds the `transformers` side, from
+//! `AutoModelForCausalLM` loaded in bf16 (not upcast) on the arithmetic token
+//! ids [`input_ids`] gives, 16 of them and, where the model fits, 640:
+//!
+//! * `<slug>.safetensors`: `input_ids`, `trunk` (post final norm, pre LM
+//!   head, the tap `DynamicModel::forward_hidden` returns) and `logits` (what
+//!   `DynamicModel::forward` returns) as f32, plus `input_ids_long`,
+//!   `trunk_long` and the floor's per-position `1 - cos` over the long run,
+//!   `floor_pos_cos_long`, when those were run;
+//! * `_manifest.json`: slug to [`RefMeta`], where `model_dir` is the local
+//!   checkpoint snapshot and `noise_floor` the same model rerun in fp32 against
+//!   its bf16 taps.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -74,7 +82,7 @@ use serde::Deserialize;
 
 /// How much further than bf16 itself pmetal is allowed to be.
 ///
-/// A fixed cosine threshold cannot work here. The dumper measures each model's
+/// A fixed cosine threshold cannot work here. The reference measures each model's
 /// *noise floor* by running the same `transformers` code twice, in bf16 and in
 /// fp32, and those floors span two orders of magnitude: `1 - cos` is 5.6e-5 for
 /// Granite and 5.5e-3 for Gemma 3, whose residual stream reaches ~9.6e3 where a
@@ -129,7 +137,7 @@ const UNMEASURED_FLOOR: NoiseFloor = NoiseFloor {
 /// past 5 at every position.
 const MAX_RANK: usize = 5;
 
-/// How far bf16 alone moves one tap, measured by the dumper.
+/// How far bf16 alone moves one tap, measured by the reference.
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct NoiseFloor {
     cosine: f32,
@@ -148,8 +156,7 @@ impl NoiseFloor {
     }
 }
 
-/// One entry of `_references/_manifest.json`, written by
-/// `dump_real_weight_reference.py`.
+/// One entry of `_references/_manifest.json` (see the module docs).
 #[derive(Debug, Deserialize)]
 struct RefMeta {
     arch: String,
@@ -157,7 +164,7 @@ struct RefMeta {
     model_dir: String,
     seq_len: usize,
     /// Second, longer run, present to cross a sliding-window boundary. `None`
-    /// when the dumper could not run it — NemotronH's naive SSM fallback
+    /// when the reference could not run it — NemotronH's naive SSM fallback
     /// materializes the whole scan and does not fit at 640 tokens.
     long_seq_len: Option<usize>,
     /// The window this checkpoint states, if any. Only used to report whether
@@ -206,7 +213,7 @@ struct Finding {
     detail: String,
 }
 
-/// The dumper's token ids, recomputed rather than read, so a mismatch between
+/// The reference's token ids, recomputed rather than read, so a mismatch between
 /// the two sides is itself a failure the fixture cannot paper over.
 fn input_ids(seq_len: usize, vocab_size: i32) -> Vec<i32> {
     (0..seq_len)
@@ -364,7 +371,7 @@ fn check_one_inner(slug: &str, meta: &RefMeta, refs_root: &Path) -> Outcome {
             .collect();
         if from_fixture != ids {
             out.details.push(format!(
-                "{key} drifted from the dumper: rust starts {:?}, fixture starts {:?}",
+                "{key} drifted from the reference: rust starts {:?}, fixture starts {:?}",
                 &ids[..ids.len().min(6)],
                 &from_fixture[..from_fixture.len().min(6)]
             ));
@@ -632,10 +639,10 @@ fn checkpoint_tensor_names(model_dir: &Path) -> Option<Vec<String>> {
     )
 }
 
-/// Read the manifest the dumper wrote, or explain what is missing.
+/// Read the reference manifest, or explain what is missing.
 fn load_manifest() -> (PathBuf, BTreeMap<String, RefMeta>) {
     let Ok(root) = std::env::var("PMETAL_REAL_WEIGHTS") else {
-        panic!("set PMETAL_REAL_WEIGHTS to a directory built by dump_real_weight_reference.py");
+        panic!("set PMETAL_REAL_WEIGHTS to a reference directory (see the module docs)");
     };
     let refs_root = PathBuf::from(root).join("_references");
     let manifest_path = refs_root.join("_manifest.json");

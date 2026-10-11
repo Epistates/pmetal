@@ -2,7 +2,7 @@
 //! `Llama4ForCausalLM`, on both of pmetal's engines, over a whole prompt and
 //! through the caches one token at a time.
 //!
-//! The fixture (`.strategy/parity/dump_llama4_text_reference.py`) is a whole
+//! The fixture (transformers 5.19, torch 2.14.1, seed 7) is a whole
 //! four-layer checkpoint: Llama 3 frequency bands shrunk so an 8-wide head's
 //! four frequencies land in all three bands, interleaved RoPE and the
 //! weightless QK-norm on layers 0-2, NoPE on layer 3 with attention

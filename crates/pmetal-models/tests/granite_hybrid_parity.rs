@@ -3,8 +3,8 @@
 //! (`GraniteMoeHybridForCausalLM`, `GraniteMoeForCausalLM`,
 //! `GraniteMoeSharedForCausalLM`).
 //!
-//! Each fixture is a whole checkpoint directory, dumped by
-//! `.strategy/parity/dump_granite_hybrid_reference.py`: a `config.json` and an
+//! Each fixture is a whole checkpoint directory from transformers 5.19 (torch
+//! 2.14.1, seed 11): a `config.json` and an
 //! fp32 `model.safetensors` under the key names IBM's checkpoints ship
 //! (`block_sparse_moe.input_linear.weight`, `router.layer.weight`,
 //! `mamba.A_log`, the conv as `[C, 1, K]`). The model is loaded through

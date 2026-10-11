@@ -1,11 +1,11 @@
 //! Numerical parity for the Clef joint schema head.
 //!
 //! The oracle is the release's own PyTorch `JointSchemaHead`
-//! (`joint_schema_model.py`), run by `.strategy/parity/dump_clef_head_reference.py`
-//! on a small seeded head: hidden 48, width 32, two routing layers, two decoder layers,
-//! four heads. The fixture's record has a choice, a proposition and a score
-//! question with spans of one to four tokens, and the scalars are set so each
-//! matters: `prior_logit_scale = 5.0` is above the `log(100)` clamp,
+//! (`joint_schema_model.py`, shipped with the Clef checkpoints), run under
+//! torch 2.14.1 on a small head seeded with 20261007: hidden 48, width 32, two
+//! routing layers, two decoder layers, four heads. The fixture's record has a
+//! choice, a proposition and a score question with spans of one to four
+//! tokens, and the scalars are set so each matters: `prior_logit_scale = 5.0` is above the `log(100)` clamp,
 //! `joint_logit_scale = 1.3`, `residual_gate = 0.4`.
 //!
 //! The head is checked in f32 against f32 torch, so the only allowed difference

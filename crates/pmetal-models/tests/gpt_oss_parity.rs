@@ -4,13 +4,12 @@
 //! Exercises the three forward-pass fixes together — attention **sinks**,
 //! **YARN** per-dim RoPE frequencies + embedding mscale, and the **biased
 //! router** (plus the clamped `(up + 1)·gate·σ(1.702·gate)` GLU) — end to end.
-//! The tiny 2-layer fixture is dumped by
-//! `.strategy/parity/dump_gpt_oss_reference.py` and loaded here through the
-//! production `load_generic_weights` path.
+//! The tiny 2-layer fixture (transformers 5.10.0.dev0, torch 2.12, seed 42)
+//! is loaded here through the production `load_generic_weights` path.
 //!
 //! GPT-OSS is the one architecture whose `transformers` weight layout is not
 //! pmetal's: experts ship fused, transposed, and with gate/up **interleaved**
-//! on the last axis, so the dumper de-interleaves and transposes them into
+//! on the last axis, so the fixture's weights are de-interleaved and transposed into
 //! per-expert `nn.Linear` tensors. Getting that wrong is not subtle — it moves
 //! the logits by O(1).
 //!
@@ -32,7 +31,8 @@ use serial_test::serial;
 use pmetal_models::architectures::gpt_oss::{GptOssConfig, GptOssForCausalLM};
 use pmetal_models::loader::load_generic_weights;
 
-/// Mirrors `SYNTHETIC_ARGS` in the Python dumper. Fields must stay in sync.
+/// The synthetic config the fixture was generated with. Fields must stay in
+/// sync with it.
 fn synthetic_config_json() -> &'static str {
     r#"{
         "model_type": "gpt_oss",

@@ -1,12 +1,10 @@
 //! Numerical-parity test for the Rust DiffusionGemma **encoder** port.
 //!
-//! The oracle is the authoritative HuggingFace `transformers`
-//! `DiffusionGemmaEncoderTextModel` (`transformers >= 5.8.0.dev0`), dumped by
-//! `.strategy/parity/dump_diffusion_gemma_reference.py`. That script builds a
-//! tiny seeded `DiffusionGemmaEncoderTextModel`, captures the scaled
-//! embeddings, every encoder-layer output, and the final-normed hidden state,
-//! and writes both those tensors and the raw HF weights into
-//! `tests/fixtures/`.
+//! The oracle is HuggingFace `transformers` 5.10.0.dev0
+//! `DiffusionGemmaEncoderTextModel` (it ships from 5.8.0.dev0). The fixture is
+//! a tiny `DiffusionGemmaEncoderTextModel` seeded with 42: its scaled
+//! embeddings, every encoder-layer output, the final-normed hidden state, and
+//! the raw HF weights, all in `tests/fixtures/`.
 //!
 //! This test loads the same weights into the Rust
 //! [`DiffusionGemmaEncoderModel`] and diffs each checkpoint. It exercises the
@@ -25,9 +23,9 @@ use pmetal_models::architectures::diffusion_gemma::{
     DiffusionGemmaEncoderModel, DiffusionGemmaTextConfig, load_diffusion_gemma_encoder_weights,
 };
 
-/// Synthetic config — mirrors `SYNTHETIC_ARGS` in the Python dumper. The RoPE
+/// Synthetic config — the one the fixture was generated with. The RoPE
 /// parameters are left `None` so [`DiffusionGemmaTextConfig::resolved_rope_parameters`]
-/// supplies the same defaults the dumper passes explicitly (full: 0.25 / θ1e6 /
+/// supplies the same defaults the reference config sets explicitly (full: 0.25 / θ1e6 /
 /// proportional; sliding: 1.0 / θ1e4 / default).
 fn synthetic_config() -> DiffusionGemmaTextConfig {
     DiffusionGemmaTextConfig {

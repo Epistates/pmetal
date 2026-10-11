@@ -4,11 +4,10 @@
 //!
 //! The oracle is the authoritative HuggingFace `transformers` implementation of
 //! `gemma4_vision` — the reference the released weights are defined against.
-//! `.strategy/parity/dump_gemma4_vision_reference.py` builds a tiny seeded
-//! `Gemma4VisionModel` (norms + ones-init `position_embedding_table` perturbed
-//! so parity isn't blind to them), runs a forward over a regular 4×4 patch
-//! grid, and commits the patch-embedder output, the encoder `last_hidden_state`,
-//! and the pooled soft-token features as a fixture.
+//! The fixture is a tiny seeded `Gemma4VisionModel` (norms + ones-init
+//! `position_embedding_table` perturbed so parity isn't blind to them), run
+//! over a regular 4×4 patch grid: its weights, the patch-embedder output, the
+//! encoder `last_hidden_state`, and the pooled soft-token features.
 //!
 //! This loads the same weights into the Rust tower and diffs each checkpoint,
 //! exercising the linear patch embed + 2-D position table, the multidimensional
@@ -25,7 +24,7 @@ use pmetal_models::architectures::gemma4_vision::{
     Gemma4VisionConfig, Gemma4VisionModel, load_gemma4_vision_weights,
 };
 
-/// Synthetic config — mirrors `SYNTHETIC_ARGS` in the Python dumper.
+/// Synthetic config — the one the fixture was generated with.
 fn synthetic_config() -> Gemma4VisionConfig {
     Gemma4VisionConfig {
         hidden_size: 32,

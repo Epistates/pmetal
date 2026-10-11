@@ -4,10 +4,10 @@
 //!
 //! 1. **Synthetic** (always) — loads a tiny 2-layer seeded fixture checked
 //!    into `tests/fixtures/` and compares every tapped checkpoint against
-//!    the reference tensors dumped from the authoritative HuggingFace
-//!    `transformers` `Gemma4ForCausalLM` by
-//!    `.strategy/parity/dump_gemma4_reference.py`. Catches architectural
-//!    bugs and weight-loader bugs under tight tolerances.
+//!    reference tensors from HuggingFace `transformers` 5.10.0.dev0
+//!    `Gemma4ForCausalLM` (torch 2.12, seed 42, 12 tokens; a dense and a
+//!    routed-experts variant). Catches architectural bugs and weight-loader
+//!    bugs under tight tolerances.
 //!
 //! The 2-layer geometry makes every Gemma-4 asymmetry visible: layer 0 is
 //! `sliding_attention` (head_dim 32, full rotary, θ1e4, its own `v_proj`) and
@@ -36,8 +36,8 @@ use pmetal_mlx::test_utils::{
 
 use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4ForCausalLM, load_gemma4_weights};
 
-/// Synthetic config that mirrors SYNTHETIC_ARGS in the Python dumper.
-/// Fields must stay in sync with `.strategy/parity/dump_gemma4_reference.py`.
+/// The synthetic config the fixture was generated with. Changing a field
+/// here without regenerating the fixture breaks the comparison.
 fn synthetic_config_json() -> &'static str {
     r#"{
         "model_type": "gemma4_text",
@@ -117,8 +117,8 @@ fn gemma4_31b_tolerances(tap_layers: &[i32]) -> Vec<(String, Tolerance)> {
     t
 }
 
-/// MoE synthetic config — mirrors MOE_SYNTHETIC_ARGS in the Python dumper
-/// (same geometry as the dense fixture with the routed-experts branch enabled).
+/// MoE synthetic config the fixture was generated with (same geometry as the
+/// dense fixture with the routed-experts branch enabled).
 fn moe_synthetic_config_json() -> &'static str {
     r#"{
         "model_type": "gemma4_text",
@@ -175,7 +175,7 @@ fn build_model(config_json: &str, weights_fixture: &str) -> Gemma4ForCausalLM {
     model
 }
 
-/// Read `input_ids` from a reference shard. The dumper saves them as int32
+/// Read `input_ids` from a reference shard. They are stored as int32
 /// `[1, T]`; we rematerialise as an Array with the same dtype.
 fn input_ids_from_shard(shard: &HashMap<String, Array>) -> Array {
     let stored = ref_tensor(shard, "input_ids");
@@ -468,10 +468,12 @@ fn run_synthetic_parity(
 
 /// Real 31B parity run, gated behind `PMETAL_GEMMA4_REFERENCE`.
 ///
-/// Set the env var to the path of a reference safetensors file produced by
-/// `.strategy/parity/dump_gemma4_reference.py --model <gemma-4-31B checkpoint>`.
-/// The sidecar `.meta.json` next to it is read for `model_id` (used to
-/// load the real weights) and `tap_layers`.
+/// Set the env var to a reference safetensors file of transformers'
+/// `Gemma4ForCausalLM` on a `gemma-4-31B` checkpoint (fp32, eager
+/// attention): `input_ids` (int32 `[1, T]`), `post_embed`, `layer_{i}_hidden`
+/// for each tapped layer, `final_hidden`, `logits` and `argmax_tokens`. The
+/// sidecar `<file>.meta.json` next to it gives `model_id` (a local checkpoint
+/// directory, used to load the real weights) and `tap_layers`.
 #[test]
 fn gemma4_31b_parity() {
     let ref_path = match std::env::var("PMETAL_GEMMA4_REFERENCE") {
@@ -479,8 +481,8 @@ fn gemma4_31b_parity() {
         Err(_) => {
             eprintln!(
                 "PMETAL_GEMMA4_REFERENCE not set — skipping gemma4_31b_parity. \
-                 To run: set it to a safetensors file dumped by \
-                 .strategy/parity/dump_gemma4_reference.py."
+                 To run: set it to transformers taps of a gemma-4-31B \
+                 checkpoint (layout in the test's docs)."
             );
             return;
         }
@@ -525,8 +527,8 @@ fn gemma4_31b_parity() {
     if !model_path.exists() {
         eprintln!(
             "Real-weights path {model_path:?} does not exist locally. \
-             Pass an absolute path to a local clone, or adjust the dumper \
-             to also store the resolved HF cache path. Skipping."
+             Set the sidecar's `model_id` to an absolute path to a local \
+             clone. Skipping."
         );
         return;
     }

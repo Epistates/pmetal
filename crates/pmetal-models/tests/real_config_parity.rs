@@ -2,7 +2,7 @@
 //! `config.json`.
 //!
 //! The synthetic parity fixtures prove the math, but they are generated from
-//! configs that pmetal and the dumper agree on by construction. Nothing in the
+//! configs that pmetal and the fixture generator agree on by construction. Nothing in the
 //! suite ever asked the cheaper question: *given the config file that actually
 //! ships with the checkpoint, does pmetal read it the way `transformers` does?*
 //!
@@ -31,22 +31,20 @@
 //! Llama, and friends are not permissive), and vendoring them into the tracked
 //! tree would violate the repo's permissive-only rule. So this is `#[ignore]`d
 //! and gated on `PMETAL_REAL_CONFIGS`, following the same pattern as the real
-//! Mllama checkpoint test. Populate it with:
+//! Mllama checkpoint test. The directory holds one config-only Hub snapshot
+//! per checkpoint, in `<org>__<name>/` (the repo id with `/` replaced by
+//! `__`), and a `_manifest.json` mapping each of those directory names to the
+//! [`ModelArchitecture`] it must be detected as, or `"Unsupported"` for one
+//! pmetal must decline:
 //!
 //! ```bash
-//! PYTHONPATH=.strategy/parity .venv-parity/bin/python \
-//!     .strategy/parity/download_configs.py \
-//!     arch_models.txt /Volumes/AmBa/huggingface/parity-configs
-//! PMETAL_REAL_CONFIGS=/Volumes/AmBa/huggingface/parity-configs \
+//! hf download <org>/<name> --include '*.json' --local-dir <dir>/<org>__<name>
+//! PMETAL_REAL_CONFIGS=<dir> \
 //!     cargo test -p pmetal-models --test real_config_parity -- --ignored --nocapture
 //! ```
 //!
-//! Model artifacts live on `/Volumes/AmBa`, not the boot volume — the config
-//! snapshots pull whole tokenizer files alongside the configs and run to
-//! hundreds of megabytes, which is enough to matter next to a Rust `target/`.
-//!
-//! Even so the download is JSON only, never weights, so the sweep covers a
-//! 30 GB checkpoint and a 700 GB one at the same price.
+//! The download is JSON only, never weights, so the sweep covers a 30 GB
+//! checkpoint and a 700 GB one at the same price.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -252,7 +250,7 @@ fn check_one(
 #[ignore = "requires PMETAL_REAL_CONFIGS; see the module docs"]
 fn released_configs_parse_the_way_the_checkpoint_states() {
     let Ok(root) = std::env::var("PMETAL_REAL_CONFIGS") else {
-        panic!("set PMETAL_REAL_CONFIGS to a directory built by download_configs.py");
+        panic!("set PMETAL_REAL_CONFIGS to a directory of config snapshots (see the module docs)");
     };
     let root = PathBuf::from(root);
     let manifest_path = root.join("_manifest.json");

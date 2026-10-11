@@ -1,10 +1,9 @@
 //! Numerical-parity test for [`MllamaImageProcessor`] — Llama 3.2 Vision's
 //! tiled preprocessing.
 //!
-//! The oracle is the authoritative HuggingFace `transformers`
-//! `MllamaImageProcessorPil`. `.strategy/parity/dump_mllama_image_reference.py`
-//! commits the raw uint8 pixels beside the processor's output, so no image codec
-//! sits between the two implementations.
+//! The oracle is HuggingFace `transformers` 5.10.0.dev0
+//! `MllamaImageProcessorPil`. The fixture holds the raw uint8 pixels beside the
+//! processor's output, so no image codec sits between the two implementations.
 //!
 //! **Why this is compared at atol 0.** Mllama's geometry is not a preprocessing
 //! nicety: the chosen tile arrangement comes back as `aspect_ratio_ids`, and the
@@ -38,7 +37,7 @@ const FIXTURE: &str = "mllama_image_reference.safetensors";
 /// Exact. Tiling is integer geometry over a bit-exact resampler.
 const EXACT: Tolerance = Tolerance::new(0.0, 0.0);
 
-/// Mirrors `PROC_ARGS` in `.strategy/parity/dump_mllama_image_reference.py`.
+/// The processor arguments the reference was generated with.
 /// The tile size is shrunk from 560 to keep the fixture small; the geometry is
 /// scale-free and `pillow_resample_parity.rs` pins the resampler at real sizes.
 fn fixture_config() -> MllamaImageProcessorConfig {
@@ -49,7 +48,7 @@ fn fixture_config() -> MllamaImageProcessorConfig {
     }
 }
 
-/// Mirrors `BATCH` in the dumper: per sample, the `(height, width)` of each
+/// The batch the reference was generated from: per sample, the `(height, width)` of each
 /// image, and the tile count the reference chose for it.
 const BATCH: [&[((u32, u32), usize)]; 3] = [
     &[((28, 28), 1), ((100, 50), 2)],

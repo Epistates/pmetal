@@ -9,7 +9,8 @@
 //! `enable_thinking`, gpt-oss's `model_identity`, and tool schemas (which go
 //! through `tojson`). Each case must render byte for byte, and a case the
 //! template refused (an unsupported `reasoning_effort`) must be refused here
-//! too. Regenerate with `.strategy/parity/dump_chat_template_kwargs_reference.py`.
+//! too. The renders come from transformers 5.19 with `strftime_now` frozen at
+//! the fixture's `frozen_date`; both are recorded in the fixture.
 #![allow(unsafe_code)]
 
 use pmetal_data::chat_templates::{
