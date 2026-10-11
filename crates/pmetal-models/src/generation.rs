@@ -1266,7 +1266,7 @@ impl SpeculativeDraws {
             .map(|seed| pmetal_bridge::decode::draw_key(seed, draw));
         let token = categorical(log_probs, -1, key.as_ref());
         token.eval();
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("speculative sample: {e}")))?;
         Ok(token.item::<u32>())
     }
@@ -1296,7 +1296,7 @@ pub fn correction_log_probs(
         .maximum(&Array::from_f32(0.0));
     let total = residual.sum_axis(-1, true);
     let total_value = total.item::<f32>();
-    pmetal_bridge::check_last_error()
+    pmetal_bridge::check_unobserved_error()
         .map_err(|e| Exception::custom(format!("speculative correction distribution: {e}")))?;
     if !total_value.is_finite() || total_value <= 1e-20 {
         return Ok(target_log_probs.clone());
