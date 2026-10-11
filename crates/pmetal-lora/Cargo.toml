@@ -9,14 +9,8 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[features]
-default = []
-# Enable fused Metal kernels for accelerated training on Apple Silicon
-metal-fused = ["pmetal-metal"]
-
 [dependencies]
 pmetal-core = { workspace = true }
-pmetal-metal = { workspace = true, optional = true }
 pmetal-bridge = { workspace = true }
 pmetal-mlx = { workspace = true }
 pmetal-models = { workspace = true }

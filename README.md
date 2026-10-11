@@ -498,7 +498,7 @@ Custom Metal shaders provide significant speedups:
 
 - **FlashAttention**: O(n) memory attention with fused softmax, tier-aware block sizes
 - **Fused GDN**: Gated Delta Network recurrence kernel (ported from FLA Triton) — single-pass state update with SIMD reductions
-- **Fused LoRA**: Combined forward pass for adapter layers (~2x speedup with `lora-metal-fused` feature)
+- **Fused LoRA**: Combined forward pass for adapter layers
 - **Fused Cross-Entropy**: Chunked vocabulary loss computation
 - **Fused Linear Cross-Entropy**: Skips logits materialization entirely
 - **Fused RoPE**: Rotary position embeddings in-kernel
@@ -695,7 +695,6 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
 | `native-only` | No | `pmetal-bridge` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
-| `lora-metal-fused` | No | — | ~2x LoRA training speedup via fused Metal kernels |
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | No | `pmetal-serve` | OpenAI- and Anthropic-compatible inference server |

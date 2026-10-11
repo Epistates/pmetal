@@ -27,7 +27,6 @@ Entries marked `Yes*` are not listed in `default` but arrive through one of thos
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
 | `native-only` | **No** | `pmetal-bridge` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
-| `lora-metal-fused` | **No** | — | ~2× LoRA training speedup via fused Metal kernels |
 | `vocoder` | **No** | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | **No** | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | **No** | `pmetal-serve` | OpenAI-compatible inference server (`pmetal serve`) |

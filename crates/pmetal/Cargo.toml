@@ -35,8 +35,6 @@ models = ["dep:pmetal-models", "dep:pmetal-bridge", "core", "gguf", "metal", "ml
 # Native-only: inference through pmetal-bridge alone, without pmetal-mlx or pmetal-models
 native-only = ["dep:pmetal-bridge", "core", "metal"]
 lora = ["dep:pmetal-lora", "core", "gguf", "metal", "mlx", "models"]
-# Opt-in: enables fused Metal kernels for ~2x LoRA training speedup (requires Float16 inputs)
-lora-metal-fused = ["lora", "pmetal-lora/metal-fused"]
 data = ["dep:pmetal-data", "core", "mlx"]
 trainer = ["dep:pmetal-trainer", "core", "mlx", "metal", "lora", "models", "data", "distill"]
 distill = ["dep:pmetal-distill", "core", "mlx", "metal"]

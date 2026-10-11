@@ -26,7 +26,6 @@
 //! | `ane` | [`pmetal-metal`] | yes | Apple Neural Engine integration |
 //! | `data` | [`pmetal-data`] | yes | Dataset loading |
 //! | `distill` | [`pmetal-distill`] | yes* | Knowledge distillation (*enabled transitively via `trainer`) |
-//! | `lora-metal-fused` | [`pmetal-lora`] | no | ~2x LoRA training speedup via fused Metal kernels |
 //! | `merge` | [`pmetal-merge`] | no | Model merging strategies |
 //! | `vocoder` | [`pmetal-vocoder`] | no | BigVGAN neural vocoder |
 //! | `distributed` | [`pmetal-distributed`] | no | Distributed training |

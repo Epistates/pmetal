@@ -6,10 +6,6 @@
 //! - QLoRA: the same, over a base packed to NF4, NVFP4 or 8-bit integers
 //!   ([`quantize_base`])
 //!
-//! # Feature Flags
-//!
-//! - `metal-fused`: Enable Metal fused kernels for accelerated training
-//!
 //! # Architecture-Agnostic Training
 //!
 //! Use [`DynamicLoraModel`] to automatically detect and load the correct

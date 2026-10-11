@@ -104,7 +104,6 @@ rest come in transitively.
 | `mhc` | `pmetal-mhc` | no | Manifold-Constrained Hyper-Connections |
 | `serve` | `pmetal-serve` | no | OpenAI-compatible inference server (`pmetal serve`) |
 | `mcp` | `pmetal-mcp` | no | MCP server for Claude Desktop (`pmetal mcp`) |
-| `lora-metal-fused` | — | no | Fused Metal kernels for ~2x LoRA speedup |
 | `full` | sub-crates | no | Every sub-crate feature (not `cli`, `serve` or `mcp`) |
 
 `serve` and `mcp` stay opt-in so library consumers don't inherit axum and rmcp. The prebuilt
