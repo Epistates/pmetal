@@ -88,7 +88,9 @@ pub struct LoraConfig {
     #[serde(default)]
     pub dropout: f32,
 
-    /// Target modules to apply LoRA to.
+    /// Projections to adapt, by name (`q_proj`, `gate_proj`, ...). Empty
+    /// adapts every linear layer except the output layer (the LM head), as
+    /// PEFT's `all-linear` does; name `lm_head` to adapt the head.
     #[serde(default = "default_target_modules")]
     pub target_modules: Vec<String>,
 

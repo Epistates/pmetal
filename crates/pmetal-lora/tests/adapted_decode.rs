@@ -18,9 +18,8 @@ mod common;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use common::cases;
+use common::{cases, every_projection_lora};
 use pmetal_bridge::compat::{Array, Dtype, random};
-use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, QLoraConfig, quantize_base};
 use pmetal_models::dispatcher::DynamicModel;
 
@@ -65,13 +64,7 @@ fn worst_disagreement(
     if packed {
         quantize_base(&mut base, &QLoraConfig::default()).expect("pack");
     }
-    let lora = LoraConfig {
-        r: 4,
-        alpha: 8.0,
-        dropout: 0.0,
-        target_modules: Vec::new(),
-        ..Default::default()
-    };
+    let lora = every_projection_lora(&mut base);
     let mut model = AdaptedModel::attach(base, lora).expect("attach");
     let nudged: HashMap<Rc<str>, Array> = model
         .lora_parameters()

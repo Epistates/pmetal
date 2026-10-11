@@ -622,6 +622,30 @@ pub fn checkpoint_key(param_path: &str, is_moe_layer: impl Fn(&str) -> bool) -> 
     format!("{prefix}shared_experts.{tail}")
 }
 
+/// The name of every projection in `model`, the LM head's included.
+///
+/// As `target_modules` this adapts all of them; an empty list leaves the
+/// output layer out.
+pub fn every_projection(model: &mut DynamicModel) -> Vec<String> {
+    use pmetal_bridge::compat::VisitLinears;
+    let mut names = std::collections::BTreeSet::new();
+    model.visit_linears_mut("", &mut |path, _| {
+        names.insert(path.rsplit('.').next().unwrap_or(path).to_string());
+    });
+    names.into_iter().collect()
+}
+
+/// A rank-4 adapter on every projection of `model`, the LM head's included.
+pub fn every_projection_lora(model: &mut DynamicModel) -> LoraConfig {
+    LoraConfig {
+        r: 4,
+        alpha: 8.0,
+        dropout: 0.0,
+        target_modules: every_projection(model),
+        ..Default::default()
+    }
+}
+
 /// Deterministic token ids inside the configured vocab.
 pub fn input_ids(vocab_size: i32) -> Array {
     let ids: Vec<i32> = (0..SEQ_LEN).map(|i| (i * 7 + 3) % vocab_size).collect();
@@ -634,21 +658,14 @@ pub fn input_ids(vocab_size: i32) -> Array {
 /// An architecture that multiplies by a projection's weight directly, rather
 /// than through `Linear::forward`, never sees the adapter on it.
 pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
-    // Every projection, as the QLoRA paper adapts them.
-    let lora = LoraConfig {
-        r: 4,
-        alpha: 8.0,
-        dropout: 0.0,
-        target_modules: Vec::new(),
-        ..Default::default()
-    };
     let mut silent = Vec::new();
     for case in cases() {
         let Ok(mut base) = DynamicModel::from_config(case.config_json) else {
             continue;
         };
         prepare(&mut base);
-        let mut model = AdaptedModel::attach(base, lora.clone()).expect("attach");
+        let lora = every_projection_lora(&mut base);
+        let mut model = AdaptedModel::attach(base, lora).expect("attach");
         let ids = input_ids(config_int(&case, "vocab_size").expect("vocab"));
         let Ok(Ok(before)) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.forward(&ids, None)))

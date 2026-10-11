@@ -1819,6 +1819,25 @@ impl DynamicModel {
         }
     }
 
+    /// Where the projection onto the vocabulary sits in the walk
+    /// [`VisitLinears`](pmetal_bridge::compat::VisitLinears) makes, when it is
+    /// a layer of its own; `None` when the model ties it to the token
+    /// embedding or has none.
+    ///
+    /// Found by identity rather than by name, so it holds whatever the layer
+    /// is called. This is the layer an empty LoRA `target_modules` leaves
+    /// out, as the model's output embedding is in PEFT's `all-linear`.
+    pub fn output_projection_path(&mut self) -> Option<String> {
+        let head: *const nn::Linear = self.lm_head_layer()?;
+        let mut found = None;
+        pmetal_bridge::compat::VisitLinears::visit_linears_mut(self, "", &mut |path, linear| {
+            if std::ptr::eq(linear, head) {
+                found = Some(path.to_string());
+            }
+        });
+        found
+    }
+
     /// The LM head as cut cross-entropy computes the loss from it: the
     /// logits of `hidden`, what [`forward_hidden`](Self::forward_hidden)
     /// returns, are `softcap(logit_scale · (hidden·Wᵀ + b))`.

@@ -20,10 +20,9 @@ mod common;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use common::{SEQ_LEN, cases, input_ids};
+use common::{SEQ_LEN, cases, every_projection_lora, input_ids};
 use pmetal_bridge::compat::{Array, Dtype, random};
 use pmetal_bridge::inline_array::value_and_grad;
-use pmetal_core::LoraConfig;
 use pmetal_lora::AdaptedModel;
 use pmetal_mlx::kernels::with_training_mode;
 use pmetal_models::dispatcher::DynamicModel;
@@ -92,17 +91,6 @@ fn vocab_of(config_json: &str) -> i32 {
 fn drain(case: &str) {
     if let Err(e) = pmetal_bridge::check_last_error() {
         panic!("{case}: a bridge op threw: {e}");
-    }
-}
-
-/// Every projection, as the QLoRA paper adapts them.
-fn lora_config() -> LoraConfig {
-    LoraConfig {
-        r: 4,
-        alpha: 8.0,
-        dropout: 0.0,
-        target_modules: Vec::new(),
-        ..Default::default()
     }
 }
 
@@ -183,10 +171,11 @@ fn gradients(
 /// Problems with one architecture's adapter gradients, empty when it is right.
 fn check_architecture(name: &str, config_json: &str) -> Vec<String> {
     random::seed(3);
-    let Ok(base) = DynamicModel::from_config(config_json) else {
+    let Ok(mut base) = DynamicModel::from_config(config_json) else {
         return vec![format!("{name}: does not build")];
     };
-    let mut model = AdaptedModel::attach(base, lora_config()).expect("attach");
+    let lora = every_projection_lora(&mut base);
+    let mut model = AdaptedModel::attach(base, lora).expect("attach");
     randomize_adapters(&mut model);
     let vocab = vocab_of(config_json);
     let ids = input_ids(vocab);
@@ -309,8 +298,8 @@ fn step_with(
 /// same gradient for every adapter, the LM head's included.
 ///
 /// The trainer used to read the head's weight once, before the step, and
-/// hand that to the loss: an adapter on `lm_head` (every projection is
-/// adapted when `target_modules` is empty) was then a constant to autograd
+/// hand that to the loss: an adapter on `lm_head` (these tests name every
+/// projection, the head's included) was then a constant to autograd
 /// and trained on nothing, and its update was missing from the loss too. The
 /// head also left out the logit transforms some architectures apply after it
 /// (Gemma's softcap, Cohere's and Granite's scales), so CCE trained those on a
@@ -411,8 +400,9 @@ fn cut_cross_entropy_trains_what_the_forward_computes_on_a_packed_batch() {
 /// when it has no head cut cross-entropy can use.
 fn cce_model(name: &str, config_json: &str, problems: &mut Vec<String>) -> Option<AdaptedModel> {
     random::seed(3);
-    let base = DynamicModel::from_config(config_json).expect("build");
-    let mut model = AdaptedModel::attach(base, lora_config()).expect("attach");
+    let mut base = DynamicModel::from_config(config_json).expect("build");
+    let lora = every_projection_lora(&mut base);
+    let mut model = AdaptedModel::attach(base, lora).expect("attach");
     randomize_adapters(&mut model);
     if pmetal_lora::TrainableModel::lm_head(&model).is_none() {
         problems.push(format!("{name}: no LM head for cut cross-entropy"));

@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
-use common::{ArchCase, SEQ_LEN, cases, config_int, input_ids, stage};
+use common::{ArchCase, SEQ_LEN, cases, config_int, every_projection, input_ids, stage};
 use pmetal_bridge::compat::{Array, ModuleParametersExt};
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel};
@@ -599,6 +599,104 @@ fn an_unmatched_target_is_an_error() {
         ..lora_config()
     };
     assert!(AdaptedModel::attach(base, config).is_err());
+}
+
+/// An empty `target_modules` adapts every projection but the output layer,
+/// as PEFT's `all-linear` does, on every architecture: an untied LM head is
+/// left out, and a model that ties its head to the embedding loses nothing.
+/// Naming the head adapts it.
+#[test]
+fn empty_targets_adapt_every_projection_but_the_output_layer() {
+    let (mut untied, mut tied) = (0, 0);
+    for case in cases() {
+        let build = || DynamicModel::from_config(case.config_json);
+        let Ok(mut base) = build() else {
+            continue;
+        };
+        let head = base.output_projection_path();
+        let every = LoraConfig {
+            target_modules: every_projection(&mut base),
+            ..lora_config()
+        };
+        let all = AdaptedModel::attach(base, every).expect("attach every projection");
+        let empty = LoraConfig {
+            target_modules: Vec::new(),
+            ..lora_config()
+        };
+        let default = AdaptedModel::attach(build().unwrap(), empty).expect("attach");
+
+        let mut want: Vec<&String> = all
+            .adapted_projections()
+            .iter()
+            .filter(|p| Some(p.as_str()) != head.as_deref())
+            .collect();
+        let mut got: Vec<&String> = default.adapted_projections().iter().collect();
+        want.sort();
+        got.sort();
+        assert_eq!(got, want, "{}: empty targets adapted", case.name);
+
+        match head {
+            Some(head) => {
+                untied += 1;
+                assert!(
+                    all.adapted_projections().contains(&head),
+                    "{}: naming the head did not adapt `{head}`",
+                    case.name
+                );
+                let only_head = LoraConfig {
+                    target_modules: vec![head.rsplit('.').next().unwrap().to_string()],
+                    ..lora_config()
+                };
+                let adapted = AdaptedModel::attach(build().unwrap(), only_head).expect("attach");
+                assert_eq!(adapted.adapted_projections(), [head], "{}", case.name);
+            }
+            None => {
+                tied += 1;
+                assert_eq!(got.len(), all.adapted_projections().len(), "{}", case.name);
+            }
+        }
+    }
+    assert!(
+        untied >= 10,
+        "only {untied} architectures have an untied head"
+    );
+    assert!(tied >= 1, "no architecture ties its head");
+}
+
+/// An adapter file with a tensor the model has no adapter for fails to load,
+/// rather than serving a model without it: an LM-head adapter trained when an
+/// empty `target_modules` still adapted the head is refused by a model that
+/// leaves it out.
+#[test]
+fn an_adapter_the_model_has_no_slot_for_fails_to_load() {
+    let case = cases()
+        .into_iter()
+        .find(|c| c.name == "llama")
+        .expect("llama case");
+    let mut base = DynamicModel::from_config(case.config_json).expect("build");
+    assert_eq!(base.output_projection_path().as_deref(), Some("lm_head"));
+    let every = LoraConfig {
+        target_modules: every_projection(&mut base),
+        ..lora_config()
+    };
+    let trained = AdaptedModel::attach(base, every).expect("attach");
+    let dir = std::env::temp_dir().join(format!("pmetal_adapter_slot_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let file = dir.join("adapter.safetensors");
+    trained.save_lora_weights(&file).expect("save");
+
+    let empty = LoraConfig {
+        target_modules: Vec::new(),
+        ..lora_config()
+    };
+    let base = DynamicModel::from_config(case.config_json).expect("build");
+    let mut model = AdaptedModel::attach(base, empty).expect("attach");
+    let err = model
+        .load_lora_weights(&file)
+        .expect_err("the head's adapter has no slot");
+    assert!(err.to_string().contains("lm_head.lora_"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
 }
 
 /// Only the adapters are trainable, across the whole model.

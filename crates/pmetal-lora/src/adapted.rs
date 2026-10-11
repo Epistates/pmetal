@@ -50,7 +50,9 @@ impl AdaptedModel {
     ///
     /// Every projection whose *name* — the last segment of its path — appears in
     /// `config.target_modules` gets one. An empty `target_modules` adapts every
-    /// projection, matching [`crate::effective_rank`].
+    /// projection except the output layer (the LM head), as PEFT's
+    /// `all-linear` does; name it (`lm_head`) to adapt it. MoE routers and
+    /// routed experts are never adapted.
     pub fn attach(mut model: DynamicModel, config: LoraConfig) -> Result<Self, LoraError> {
         let rank = config.r as i32;
         if rank <= 0 {
@@ -60,6 +62,11 @@ impl AdaptedModel {
         }
 
         let targets = &config.target_modules;
+        let output = if targets.is_empty() {
+            model.output_projection_path()
+        } else {
+            None
+        };
         let mut adapted = Vec::new();
         let mut failure: Option<Exception> = None;
 
@@ -69,7 +76,7 @@ impl AdaptedModel {
         let use_rslora = config.use_rslora;
 
         model.visit_linears_mut("", &mut |path, linear| {
-            if failure.is_some() || !is_targeted(path, targets) {
+            if failure.is_some() || !is_targeted(path, targets, output.as_deref()) {
                 return;
             }
             // Read the base weight before attaching: DoRA seeds its magnitude
@@ -219,8 +226,32 @@ impl AdaptedModel {
     }
 
     /// Read adapters back from a safetensors file.
+    ///
+    /// Fails if the file holds an adapter tensor this model has no slot for:
+    /// dropping it would serve a different model than the one trained.
     pub fn load_lora_weights(&mut self, path: impl AsRef<Path>) -> Result<(), LoraError> {
         let loaded = load_safetensors_map(path)?;
+        let ours = self.lora_parameters();
+        let mut unmatched: Vec<&str> = loaded
+            .keys()
+            .map(String::as_str)
+            .filter(|k| {
+                is_adapter_key(k)
+                    && !ours.contains_key(*k)
+                    && !ours.contains_key(adapter_key(k).as_str())
+            })
+            .collect();
+        if !unmatched.is_empty() {
+            unmatched.sort_unstable();
+            return Err(LoraError::InvalidState(format!(
+                "the adapter file holds {} tensor(s) for projections this model has no \
+                 adapter on ({:?}{}); name those projections in target_modules, which \
+                 when empty leaves out the LM head",
+                unmatched.len(),
+                &unmatched[..unmatched.len().min(4)],
+                if unmatched.len() > 4 { ", ..." } else { "" },
+            )));
+        }
         let keyed: HashMap<Rc<str>, Array> = loaded
             .into_iter()
             .map(|(k, v)| (Rc::from(k.as_str()), v))
@@ -261,13 +292,15 @@ impl AdaptedModel {
 ///
 /// Matches on the final path segment, which is the projection's name as a
 /// checkpoint and `target_modules` both spell it (`q_proj`, `gate_proj`).
-/// MoE routers and routed experts never do; see [`moe_role`].
-fn is_targeted(path: &str, targets: &[String]) -> bool {
+/// No targets means every projection but `output`, the model's output layer
+/// (see [`DynamicModel::output_projection_path`]). MoE routers and routed
+/// experts never do; see [`moe_role`].
+fn is_targeted(path: &str, targets: &[String], output: Option<&str>) -> bool {
     if moe_role(path).is_some() {
         return false;
     }
     if targets.is_empty() {
-        return true;
+        return output != Some(path);
     }
     let name = path.rsplit('.').next().unwrap_or(path);
     targets.iter().any(|t| t == name)
@@ -532,5 +565,32 @@ impl ModuleParameters for AdaptedModel {
         let mut out = pmetal_bridge::compat::ModuleParamRef::new();
         collect(&tree, "", &mut out);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_targeted;
+
+    /// The output layer is left out by identity, not by name: a model whose
+    /// head is `embed_out` loses that, and keeps an adapter on a projection
+    /// that happens to be called `lm_head` but is not its output.
+    #[test]
+    fn empty_targets_leave_out_the_output_layer_whatever_it_is_called() {
+        let none: &[String] = &[];
+        assert!(!is_targeted("embed_out", none, Some("embed_out")));
+        assert!(is_targeted("lm_head", none, Some("embed_out")));
+        assert!(is_targeted(
+            "model.layers.0.self_attn.q_proj",
+            none,
+            Some("embed_out")
+        ));
+        // A tied model has no output projection to leave out.
+        assert!(is_targeted("model.layers.0.mlp.down_proj", none, None));
+        // Routers stay out whatever the targets.
+        assert!(!is_targeted("model.layers.0.mlp.gate", none, None));
+        // Named, the output layer is adapted.
+        assert!(is_targeted("embed_out", &["embed_out".to_string()], None));
+        assert!(is_targeted("lm_head", &["lm_head".to_string()], None));
     }
 }
