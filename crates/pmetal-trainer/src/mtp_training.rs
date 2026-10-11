@@ -158,14 +158,18 @@ pub fn initialize_qwen3_next_mtp_from_target(
     }
 }
 
+/// The predictor's loss on `input_ids`: at each position `i` it reads the
+/// target's hidden state `h[i]` beside the embedding of the next token
+/// `x[i + 1]`, as it does when drafting, and learns the target's own choice
+/// for `x[i + 2]`.
 pub fn qwen3_next_mtp_loss(
     target: &mut Qwen3NextForCausalLM,
     mtp: &mut Qwen3NextMtpForCausalLM,
     input_ids: &Array,
 ) -> Result<Array, Exception> {
-    if input_ids.ndim() != 2 || input_ids.dim(1) < 2 {
+    if input_ids.ndim() != 2 || input_ids.dim(1) < 3 {
         return Err(Exception::custom(format!(
-            "qwen3_next_mtp_loss expects input_ids [B, T>=2], got {:?}",
+            "qwen3_next_mtp_loss expects input_ids [B, T>=3], got {:?}",
             input_ids.shape()
         )));
     }
@@ -176,9 +180,9 @@ pub fn qwen3_next_mtp_loss(
         target.forward_hidden_with_capture(input_ids, None, None, None, &mut capture)?;
     target_hidden.eval();
 
-    let input_tokens = input_ids.slice(&[0, 0], &[batch, seq - 1]);
-    let hidden = target_hidden.slice(&[0, 0, 0], &[batch, seq - 1, target_hidden.dim(2)]);
-    let teacher_logits = target_logits.slice(&[0, 0, 0], &[batch, seq - 1, target_logits.dim(2)]);
+    let input_tokens = input_ids.slice(&[0, 1], &[batch, seq - 1]);
+    let hidden = target_hidden.slice(&[0, 0, 0], &[batch, seq - 2, target_hidden.dim(2)]);
+    let teacher_logits = target_logits.slice(&[0, 1, 0], &[batch, seq - 1, target_logits.dim(2)]);
     let labels = ops::argmax_axis(&teacher_logits, -1);
 
     let layers = mtp.config.mtp_num_hidden_layers().max(1);
@@ -196,23 +200,28 @@ pub fn qwen3_next_mtp_loss(
         .divide(&Array::from_f32(layers as f32)))
 }
 
+/// The assistant's loss on `input_ids`: at each position `i` it reads the
+/// target's hidden state `h[i]` beside the scaled embedding of the next token
+/// `x[i + 1]`, attends to the target's cache up to `i` and runs at position
+/// `i + 1`, as it does when drafting, and learns `x[i + 2]`.
 pub fn gemma4_assistant_mtp_loss(
     target: &mut Gemma4ForCausalLM,
     assistant: &mut Gemma4AssistantForCausalLM,
     input_ids: &Array,
 ) -> Result<Array, Exception> {
     validate_gemma4_mtp_pair(target, assistant)?;
-    if input_ids.ndim() != 2 || input_ids.dim(1) < 2 {
+    if input_ids.ndim() != 2 || input_ids.dim(1) < 3 {
         return Err(Exception::custom(format!(
-            "gemma4_assistant_mtp_loss expects input_ids [B, T>=2], got {:?}",
+            "gemma4_assistant_mtp_loss expects input_ids [B, T>=3], got {:?}",
             input_ids.shape()
         )));
     }
     let batch = input_ids.dim(0);
     let seq = input_ids.dim(1);
     let mut total: Option<Array> = None;
+    let embed_scale = Array::from_f32(target.model.embed_scale);
 
-    for pos in 0..(seq - 1) {
+    for pos in 0..(seq - 2) {
         let prefix = input_ids.slice(&[0, 0], &[batch, pos + 1]);
         let mut cache = gemma4_target_cache(target, seq as usize);
         let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
@@ -220,12 +229,13 @@ pub fn gemma4_assistant_mtp_loss(
             target.forward_hidden_with_capture(&prefix, None, Some(&mut cache), &mut capture)?;
         hidden.eval();
         let last_hidden = hidden.slice(&[0, pos, 0], &[batch, pos + 1, hidden.dim(2)]);
-        let token = input_ids.slice(&[0, pos], &[batch, pos + 1]);
-        let token_embed = Module::forward(&mut target.model.embed_tokens, &token)?;
+        let token = input_ids.slice(&[0, pos + 1], &[batch, pos + 2]);
+        let token_embed =
+            Module::forward(&mut target.model.embed_tokens, &token)?.multiply(&embed_scale);
         let inputs_embeds = ops::concatenate_axis(&[&token_embed, &last_hidden], -1);
         let shared = gemma4_shared_states_for_assistant(target, assistant, &cache)?;
-        let (_, logits) = assistant.forward_logits(&inputs_embeds, &shared, pos)?;
-        let labels = input_ids.slice(&[0, pos + 1], &[batch, pos + 2]);
+        let (_, logits) = assistant.forward_logits(&inputs_embeds, &shared, pos + 1)?;
+        let labels = input_ids.slice(&[0, pos + 2], &[batch, pos + 3]);
         let vocab = assistant.config.text_config.vocab_size;
         let logits = logits.reshape(&[batch, 1, vocab]);
         let loss = pmetal_bridge::training::cross_entropy_loss(&logits, &labels, -100);
@@ -237,7 +247,7 @@ pub fn gemma4_assistant_mtp_loss(
 
     Ok(total
         .ok_or_else(|| Exception::custom("gemma4_assistant_mtp_loss produced no position losses"))?
-        .divide(&Array::from_f32((seq - 1) as f32)))
+        .divide(&Array::from_f32((seq - 2) as f32)))
 }
 
 pub fn run_qwen3_next_mtp_training<I>(
@@ -771,5 +781,131 @@ mod tests {
             pmetal_models::dflash_decoder::load_dflash_draft_from_dir(dir.path()).unwrap();
         assert_eq!(loaded.block_size(), 4);
         assert!(report.loaded > 0);
+    }
+
+    fn loss_value(loss: &Array) -> f32 {
+        loss.eval();
+        loss.item_f32()
+    }
+
+    /// The predictor learns on the pairing it drafts with: the target's state
+    /// at `i` beside the next token `x[i + 1]`, against the target's own
+    /// choice at `i + 1`, which is its choice for `x[i + 2]`.
+    #[test]
+    fn the_qwen_mtp_loss_pairs_each_state_with_the_next_token() {
+        pmetal_bridge::compat::random::seed(3);
+        let config = tiny_qwen_config();
+        let mut target = Qwen3NextForCausalLM::new(config.clone()).unwrap();
+        let mut mtp = Qwen3NextMtpForCausalLM::new(config).unwrap();
+        let ids = pmetal_bridge::decode::prompt_tokens_to_input(&[5, 9, 1, 33, 7, 12]);
+        let loss = loss_value(&qwen3_next_mtp_loss(&mut target, &mut mtp, &ids).unwrap());
+
+        let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
+        let (states, logits) = target
+            .forward_hidden_with_capture(&ids, None, None, None, &mut capture)
+            .unwrap();
+        let next = ops::slice_axis(&ids, 1, 1, 5);
+        let labels = ops::argmax_axis(&ops::slice_axis(&logits, 1, 1, 5), -1);
+        let (_, mtp_logits) = mtp
+            .forward_logits(&next, &ops::slice_axis(&states, 1, 0, 4), None, None, 0)
+            .unwrap();
+        let want = loss_value(&pmetal_bridge::training::cross_entropy_loss(
+            &mtp_logits,
+            &labels,
+            -100,
+        ));
+        assert!((loss - want).abs() < 1e-5, "loss {loss}, by hand {want}");
+    }
+
+    fn tiny_gemma_config(layer_types: &[&str], hidden: i32, shared: i32) -> Gemma4Config {
+        Gemma4Config {
+            model_type: "gemma4_text".to_string(),
+            vocab_size: 64,
+            hidden_size: hidden,
+            intermediate_size: 2 * hidden,
+            num_hidden_layers: layer_types.len() as i32,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 8,
+            global_head_dim: Some(8),
+            num_global_key_value_heads: Some(1),
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-6,
+            attention_k_eq_v: false,
+            tie_word_embeddings: true,
+            sliding_window: 16,
+            final_logit_softcapping: None,
+            layer_types: layer_types.iter().map(|t| t.to_string()).collect(),
+            rope_parameters: None,
+            _raw_rope_parameters: None,
+            hidden_size_per_layer_input: None,
+            vocab_size_per_layer_input: None,
+            hidden_activation: None,
+            num_kv_shared_layers: Some(shared),
+            use_double_wide_mlp: Some(false),
+            enable_moe_block: Some(false),
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
+        }
+    }
+
+    /// The assistant learns on the inputs it drafts from: the target's state
+    /// at `i` beside its scaled embedding of the next token `x[i + 1]`, the
+    /// target's cache up to `i`, position `i + 1`, against `x[i + 2]`.
+    #[test]
+    fn the_gemma4_assistant_loss_reads_the_scaled_next_token_at_its_position() {
+        pmetal_bridge::compat::random::seed(4);
+        let mut target = Gemma4ForCausalLM::new(tiny_gemma_config(
+            &["sliding_attention", "full_attention"],
+            32,
+            0,
+        ))
+        .unwrap();
+        let mut assistant = Gemma4AssistantForCausalLM::new(Gemma4AssistantConfig {
+            model_type: "gemma4_assistant".to_string(),
+            text_config: tiny_gemma_config(&["sliding_attention", "full_attention"], 16, 2),
+            backbone_hidden_size: 32,
+            use_ordered_embeddings: false,
+            num_centroids: 2048,
+            centroid_intermediate_top_k: 32,
+            tie_word_embeddings: true,
+        })
+        .unwrap();
+        let tokens = [5u32, 9, 1, 33, 7];
+        let ids = pmetal_bridge::decode::prompt_tokens_to_input(&tokens);
+        let loss =
+            loss_value(&gemma4_assistant_mtp_loss(&mut target, &mut assistant, &ids).unwrap());
+
+        let mut total = 0.0;
+        for i in 0..tokens.len() - 2 {
+            let mut cache = gemma4_target_cache(&target, tokens.len());
+            let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
+            let prefix = pmetal_bridge::decode::prompt_tokens_to_input(&tokens[..=i]);
+            let (states, _) = target
+                .forward_hidden_with_capture(&prefix, None, Some(&mut cache), &mut capture)
+                .unwrap();
+            let state = ops::slice_axis(&states, 1, i as i32, i as i32 + 1);
+            let next = pmetal_bridge::decode::prompt_tokens_to_input(&tokens[i + 1..i + 2]);
+            let embedding = Module::forward(&mut target.model.embed_tokens, &next)
+                .unwrap()
+                .multiply(&Array::from_f32(target.model.embed_scale));
+            let shared = gemma4_shared_states_for_assistant(&target, &assistant, &cache).unwrap();
+            let (_, logits) = assistant
+                .forward_logits(
+                    &ops::concatenate_axis(&[&embedding, &state], -1),
+                    &shared,
+                    i as i32 + 1,
+                )
+                .unwrap();
+            let label = pmetal_bridge::decode::prompt_tokens_to_input(&tokens[i + 2..i + 3]);
+            total += loss_value(&pmetal_bridge::training::cross_entropy_loss(
+                &logits.reshape(&[1, 1, 64]),
+                &label,
+                -100,
+            ));
+        }
+        let want = total / (tokens.len() - 2) as f32;
+        assert!((loss - want).abs() < 1e-5, "loss {loss}, by hand {want}");
     }
 }
