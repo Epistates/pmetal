@@ -145,6 +145,35 @@ const CASES: &[(&str, &str)] = &[
             "num_kv_shared_layers": 0
         }"#,
     ),
+    (
+        // Gemma 4 E2B/E4B: the last layers keep no cache of their own and
+        // attend to the last earlier layer of their type. Their queries still
+        // sit at the current position.
+        "gemma4 shared KV",
+        r#"{
+            "model_type": "gemma4_text",
+            "vocab_size": 64, "hidden_size": 32, "intermediate_size": 64,
+            "num_hidden_layers": 6, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 8,
+            "global_head_dim": 16, "num_global_key_value_heads": 1,
+            "max_position_embeddings": 4096, "rms_norm_eps": 1e-6,
+            "attention_k_eq_v": true, "tie_word_embeddings": true,
+            "sliding_window": 64, "final_logit_softcapping": 30.0,
+            "layer_types": [
+                "sliding_attention", "full_attention", "sliding_attention",
+                "full_attention", "sliding_attention", "full_attention"
+            ],
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional"
+                },
+                "sliding_attention": { "rope_theta": 10000.0, "rope_type": "default" }
+            },
+            "num_kv_shared_layers": 4
+        }"#,
+    ),
 ];
 
 fn ids(tokens: &[i32]) -> Array {

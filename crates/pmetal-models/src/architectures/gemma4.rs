@@ -1580,9 +1580,14 @@ impl Gemma4Model {
                 .map(|inputs| layer_per_input(inputs, i));
             let layer_input_ref = layer_input.as_ref();
             if let Some(shared_source) = layer.kv_shared_source_layer {
+                // A shared layer has no cache of its own to count positions
+                // in. Its source, an earlier layer, has already taken this
+                // call's tokens, so they start that many before its count.
                 let rope_positions = RopePositions::resolve(
                     positions,
-                    cache.as_ref().map_or(0, |c| c.rope_offset_for(i)),
+                    cache
+                        .as_ref()
+                        .map_or(0, |c| c.rope_offset_for(shared_source) - input_ids.dim(1)),
                 );
                 if let Some(cache_ref) = cache.as_ref() {
                     let (source_keys, source_values) = cache_ref.get(shared_source).ok_or_else(|| {
