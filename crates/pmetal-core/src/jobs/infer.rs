@@ -183,7 +183,7 @@ pub struct InferSpec {
         group = "Compute",
         argv = "--backend",
         kind = "enum",
-        enum_options = ["auto", "standard", "compiled", "metal-sampler", "ane", "minimal"],
+        enum_options = ["auto", "standard", "ane"],
         default = "auto"
     )]
     #[serde(default = "default_backend")]
@@ -449,13 +449,16 @@ mod tests {
 
     #[test]
     fn unknown_backend_is_rejected() {
-        // DFlash runs as `pmetal dflash`, not an `infer` backend.
-        let mut spec = InferSpec {
-            model: "m".into(),
-            prompt: "hi".into(),
-            backend: "dflash".into(),
-            ..Default::default()
-        };
-        assert!(spec.normalize().is_err());
+        // DFlash runs as `pmetal dflash`, not an `infer` backend, and the
+        // other three were generation paths that are gone.
+        for backend in ["dflash", "compiled", "metal-sampler", "minimal"] {
+            let mut spec = InferSpec {
+                model: "m".into(),
+                prompt: "hi".into(),
+                backend: backend.into(),
+                ..Default::default()
+            };
+            assert!(spec.normalize().is_err(), "{backend} was accepted");
+        }
     }
 }

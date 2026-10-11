@@ -1098,43 +1098,6 @@ impl InferenceGenState {
         Ok(output)
     }
 
-    /// Run a generation function with properly split borrows.
-    ///
-    /// Destructures self to provide a forward closure + cache reference
-    /// that don't conflict. The callback receives `(forward_fn, &mut cache)`
-    /// where `forward_fn: impl FnMut(&Array, &mut KVCache) -> Result<Array>`.
-    pub fn run_with<F, R>(&mut self, f: F) -> R
-    where
-        F: FnOnce(
-            &mut dyn FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
-            &mut KVCache,
-        ) -> R,
-    {
-        let Self {
-            ref mut model,
-            ref mut cache,
-            ref mut mamba_cache,
-            ..
-        } = *self;
-
-        let mut fwd = |input: &Array, kv: &mut KVCache| -> Result<Array, Exception> {
-            match model {
-                LoadedModel::Standard(m) => {
-                    m.forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
-                }
-                #[cfg(feature = "lora")]
-                LoadedModel::Lora(m) => m
-                    .forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
-                    .map_err(|e| Exception::custom(e.to_string())),
-                LoadedModel::NativeOnly => Err(Exception::custom(
-                    "run_with is not available in native mode",
-                )),
-            }
-        };
-
-        f(&mut fwd, cache)
-    }
-
     /// Run a callback with mutable access to the standard DynamicModel and its caches.
     ///
     /// This is useful for opt-in diagnostics that need model-specific APIs while

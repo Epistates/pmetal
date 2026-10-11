@@ -46,9 +46,6 @@ pmetal infer --model Qwen/Qwen3.5-0.8B --video frames/ --video-fps 2 \
 # Inference on the Apple Neural Engine
 pmetal infer --model Qwen/Qwen3-4B --backend ane --ane-max-seq-len 2048 --chat
 
-# JIT-compiled sampling
-pmetal infer --model Qwen/Qwen3-0.6B --backend compiled --chat
-
 # Gemma 4 MTP assistant (exact speculative decode)
 pmetal infer \
   --model google/gemma-4-31B-it \
@@ -109,7 +106,7 @@ pmetal infer \
 | `--presence-penalty` | `0.0` | Presence penalty |
 | `--chat` | `false` | Apply chat template |
 | `--fp8` | `false` | FP8 weights (~2× mem reduction) |
-| `--backend` | `auto` | Generation path: `auto`, `standard`, `compiled` (JIT-compiled sampling), `metal-sampler` (fused Metal sampling kernel), `ane` (Apple Neural Engine) or `minimal` (debug loop) |
+| `--backend` | `auto` | Generation path: `auto` (the GPU, or the ANE with `--ane`), `standard` (the GPU, whatever `--ane` says) or `ane` (Apple Neural Engine) |
 | `--profile-layers` | `false` | Run an opt-in per-layer forward profile for supported hybrid models |
 | `--profile-output` | — | Write the layer profile report as pretty JSON |
 | `--ane-max-seq-len` | `4096` | Largest context (prompt plus output) the ANE compiles a model for |

@@ -264,7 +264,7 @@ fn run_qwen3_next_layer_profile(
 ///
 /// Uses the shared `InferenceRunner` for model loading, tokenization, chat
 /// template, sampling config, and cache creation. CLI-specific features
-/// (ANE, metal sampler, compiled, benchmark) use the runner's prepared state.
+/// (ANE, benchmark) use the runner's prepared state.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_inference(
     model_id: &str,
@@ -322,20 +322,15 @@ pub(crate) async fn run_inference(
     let no_thinking = no_thinking || chat_template_kwargs.enable_thinking() == Some(false);
     let reasoning_effort = chat_template_kwargs.reasoning_effort().map(str::to_string);
     use pmetal_data::inference_config::InferenceBackend;
-    use pmetal_models::{
-        GenerationOutput, generate_cached_compiled, generate_cached_metal, generate_minimal_async,
-    };
+    use pmetal_models::GenerationOutput;
 
     // ── Resolve --backend into the generation path ────────────────────────
     //
-    // `auto` streams on the GPU, or runs on the ANE when `--ane` is set; any
-    // other variant pins its path and overrides `--ane`.
-    let (metal_sampler, compiled, minimal, ane) = match backend {
-        InferenceBackend::Auto => (false, false, false, ane),
-        InferenceBackend::Standard => (false, false, false, false),
-        InferenceBackend::Compiled => (false, true, false, false),
-        InferenceBackend::MetalSampler => (true, false, false, false),
-        InferenceBackend::Minimal => (false, false, true, false),
+    // `auto` streams on the GPU, or runs on the ANE when `--ane` is set;
+    // `standard` and `ane` pin their path and override `--ane`.
+    let ane = match backend {
+        InferenceBackend::Auto => ane,
+        InferenceBackend::Standard => false,
         InferenceBackend::Ane => {
             #[cfg(not(feature = "ane"))]
             {
@@ -345,7 +340,7 @@ pub(crate) async fn run_inference(
             }
             #[cfg(feature = "ane")]
             {
-                (false, false, false, true)
+                true
             }
         }
     };
@@ -368,9 +363,6 @@ pub(crate) async fn run_inference(
             (lora_path.is_some(), "--lora"),
             (fp8, "--fp8"),
             (experts_dir.is_some(), "--experts-dir"),
-            (metal_sampler, "--backend metal-sampler"),
-            (compiled, "--backend compiled"),
-            (minimal, "--backend minimal"),
             (ane, "--ane / --backend ane"),
         ];
         if let Some((_, flag)) = other.iter().find(|(set, _)| *set) {
@@ -406,15 +398,15 @@ pub(crate) async fn run_inference(
     let mtp_owns_generation = mtp || (draft_model.is_some() && !dflash_draft);
     // Only the ANE path reads `ane` from here on.
     #[cfg_attr(not(feature = "ane"), allow(unused_variables))]
-    let (metal_sampler, compiled, minimal, ane) = if mtp_owns_generation {
-        if metal_sampler || compiled || minimal || ane {
+    let ane = if mtp_owns_generation {
+        if ane {
             tracing::info!(
                 "MTP uses its own verifier/drafter generation backend; ignoring the requested non-MTP backend selector"
             );
         }
-        (false, false, false, false)
+        false
     } else {
-        (metal_sampler, compiled, minimal, ane)
+        ane
     };
 
     // Download model if needed (HuggingFace repo ID contains '/')
@@ -607,6 +599,7 @@ pub(crate) async fn run_inference(
 
     // Extract refs for generation dispatch (split borrow)
     let input_ids = runner.state.input_ids().to_vec();
+    #[cfg(feature = "ane")]
     let gen_config = runner.state.gen_config().clone();
 
     // ── Generation dispatch ────────────────────────────────────────────────
@@ -762,21 +755,6 @@ pub(crate) async fn run_inference(
             output
         } else if let Some(output) = cpu_hybrid_output {
             output
-        } else if minimal {
-            tracing::info!("Using minimal async generation (debugging)");
-            runner
-                .state
-                .run_with(|fwd, cache| generate_minimal_async(fwd, &input_ids, gen_config, cache))?
-        } else if metal_sampler {
-            tracing::info!("Using fused Metal sampling kernel");
-            runner
-                .state
-                .run_with(|fwd, cache| generate_cached_metal(fwd, &input_ids, gen_config, cache))?
-        } else if compiled {
-            tracing::info!("Using async-pipelined sampling");
-            runner.state.run_with(|fwd, cache| {
-                generate_cached_compiled(fwd, &input_ids, gen_config, cache)
-            })?
         } else {
             already_streamed = true;
             let tokenizer = &runner.tokenizer;

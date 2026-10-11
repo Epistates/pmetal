@@ -665,7 +665,7 @@ Multiple distillation methods and loss functions:
 | `--mtp-model` | bundled `mtp.*` | Optional external Qwen MTP checkpoint from `train-mtp` |
 | `--mtp-draft-tokens` | 3 | Qwen MTP draft tokens per verification step |
 | `--fp8` | false | Use FP8 weights (~2x mem reduction) |
-| `--backend` | auto | Generation path: `auto`, `standard`, `compiled`, `metal-sampler`, `ane` or `minimal` |
+| `--backend` | auto | Generation path: `auto` (the GPU, or the ANE with `--ane`), `standard` (the GPU) or `ane` |
 | `--ane-max-seq-len` | 4096 | Largest ANE context (prompt plus output) |
 | `--image` | — | Image file for a Qwen3.5-family vision model (repeatable) |
 | `--video` | — | Directory of a video's frames for a Qwen3.5-family vision model (repeatable) |

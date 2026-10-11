@@ -237,25 +237,18 @@ impl std::str::FromStr for SamplingMode {
 
 /// Execution backend used to run a forward/decode step.
 ///
-/// `Auto` asks the runner to pick the fastest backend that still produces
-/// correct output for the current device + model. Explicit variants let the
-/// user pin a path (for benchmarking, debugging, or when the heuristic is
-/// wrong). See `commands/infer.rs::resolve_backend` for the selection rules.
+/// `Auto` streams on the GPU, or runs on the ANE when `--ane` asks for it;
+/// the explicit variants pin a path for benchmarking or debugging. See
+/// `commands/infer.rs` in the CLI for the selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InferenceBackend {
-    /// Heuristic auto-select: best backend for current device + model.
+    /// GPU, or the ANE when `--ane` is set.
     #[default]
     Auto,
-    /// Default streaming MLX path (the current no-flag behavior).
+    /// The streaming GPU path, whatever `--ane` says.
     Standard,
-    /// Filtered sampling with the next forward scheduled before the token is read.
-    Compiled,
-    /// Fused Metal sampling kernel.
-    MetalSampler,
     /// Apple Neural Engine, same as `--ane` (requires the `ane` feature).
     Ane,
-    /// Minimal async generation (debug path).
-    Minimal,
 }
 
 impl InferenceBackend {
@@ -264,10 +257,7 @@ impl InferenceBackend {
         match self {
             Self::Auto => "auto",
             Self::Standard => "standard",
-            Self::Compiled => "compiled",
-            Self::MetalSampler => "metal-sampler",
             Self::Ane => "ane",
-            Self::Minimal => "minimal",
         }
     }
 
@@ -276,10 +266,7 @@ impl InferenceBackend {
         match self {
             Self::Auto => "Auto",
             Self::Standard => "Standard",
-            Self::Compiled => "Compiled",
-            Self::MetalSampler => "Metal",
             Self::Ane => "ANE",
-            Self::Minimal => "Minimal",
         }
     }
 
@@ -287,24 +274,14 @@ impl InferenceBackend {
     pub fn description(&self) -> &'static str {
         match self {
             Self::Auto => "pick best for this device + model",
-            Self::Standard => "streaming MLX path (token-by-token)",
-            Self::Compiled => "async-pipelined MLX sampling",
-            Self::MetalSampler => "fused Metal sampling kernel",
+            Self::Standard => "streaming GPU path (token-by-token)",
             Self::Ane => "Apple Neural Engine (experimental)",
-            Self::Minimal => "minimal async loop (debug only)",
         }
     }
 
     /// All variants in UI cycle order. Used by the TUI dropdown and the
     /// `--backend` clap value-parser.
-    pub const ALL: &'static [InferenceBackend] = &[
-        Self::Auto,
-        Self::Standard,
-        Self::Compiled,
-        Self::MetalSampler,
-        Self::Ane,
-        Self::Minimal,
-    ];
+    pub const ALL: &'static [InferenceBackend] = &[Self::Auto, Self::Standard, Self::Ane];
 }
 
 impl std::fmt::Display for InferenceBackend {
@@ -319,13 +296,9 @@ impl std::str::FromStr for InferenceBackend {
         match s {
             "auto" => Ok(Self::Auto),
             "standard" | "default" => Ok(Self::Standard),
-            "compiled" | "jit" => Ok(Self::Compiled),
-            "metal-sampler" | "metal_sampler" | "metal" => Ok(Self::MetalSampler),
             "ane" => Ok(Self::Ane),
-            "minimal" => Ok(Self::Minimal),
             _ => Err(format!(
-                "unknown backend '{s}': expected auto, standard, compiled, \
-                 metal-sampler, ane or minimal"
+                "unknown backend '{s}': expected auto, standard or ane"
             )),
         }
     }

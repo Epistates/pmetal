@@ -440,8 +440,7 @@ impl PmetalMcpServer {
             "Enable QJL residual correction for Q2-Q3 uniform KV cache (reduces accuracy loss at low bits)"
         )]
         kv_qjl: Option<bool>,
-        #[description("Inference backend: auto, standard, compiled, metal-sampler, ane, minimal")]
-        backend: Option<String>,
+        #[description("Inference backend: auto, standard, ane")] backend: Option<String>,
         #[description(
             "Draft model for exact speculative decoding: a Gemma 4 MTP assistant, or with ane a DFlash draft model"
         )]

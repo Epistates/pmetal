@@ -116,7 +116,10 @@ pub struct InferArgs {
     #[arg(long = "mode", default_value = "auto")]
     pub mode: pmetal_data::inference_config::SamplingMode,
 
-    /// Execution backend: auto | standard | compiled | metal-sampler | ane | minimal.
+    /// Execution backend: auto | standard | ane.
+    ///
+    /// `auto` runs on the GPU, or on the ANE with --ane; `standard` pins the
+    /// GPU and `ane` the ANE.
     #[arg(long = "backend", default_value = "auto")]
     pub backend: pmetal_data::inference_config::InferenceBackend,
 
