@@ -48,13 +48,9 @@ fn drain(what: &str) {
     pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{what}: {e}"));
 }
 
+/// Greedy decoding with no penalties: the bare argmax.
 fn greedy_config() -> GenerationConfig {
-    GenerationConfig {
-        max_new_tokens: NEW_TOKENS,
-        do_sample: false,
-        temperature: 0.0,
-        ..Default::default()
-    }
+    GenerationConfig::greedy(NEW_TOKENS)
 }
 
 /// Run `tokens` through `target` from an empty state.
@@ -741,4 +737,99 @@ impl<'v> MtpDrafter<Gemma4MtpVerifier<'v>> for CheckedGemmaHead<'_> {
         self.inner
             .commit(target, pending, seed, drafts, accepted, verify_hidden)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Penalties
+// ---------------------------------------------------------------------------
+
+/// Greedy decoding with the repetition, frequency and presence penalties on,
+/// as `GenerationConfig::default()` and model-card presets turn them on.
+fn penalized_config() -> GenerationConfig {
+    GenerationConfig {
+        repetition_penalty: 1.3,
+        frequency_penalty: 0.5,
+        presence_penalty: 1.5,
+        ..greedy_config()
+    }
+}
+
+/// Plain greedy decoding through the `Sampler`, which applies the penalties
+/// before its argmax, recomputed from scratch every step.
+fn plain_penalized<T: MtpTarget>(target: &mut T, prompt: &[u32], n: usize) -> Vec<u32> {
+    let mut sampler = pmetal_models::generation::Sampler::new(penalized_config());
+    let mut seq = prompt.to_vec();
+    for _ in 0..n {
+        let (_, logits) = from_scratch(target, &seq);
+        let token = sampler
+            .sample(&last_token_logits(&logits), &seq)
+            .expect("sample");
+        seq.push(token);
+    }
+    drain("plain penalized greedy");
+    seq
+}
+
+/// The penalties change what greedy decoding picks, and greedy MTP decoding
+/// picks what plain greedy decoding with the same penalties picks, on every
+/// target and head.
+#[test]
+#[serial]
+fn penalized_greedy_mtp_matches_penalized_plain_greedy() {
+    let config = penalized_config();
+    let ck = qwen_checkpoint();
+
+    let mut model = ck.dynamic();
+    let mut head = ck.mtp(&model);
+    let mut caches = QwenCaches::new(&model);
+    let want = plain_penalized(&mut caches.verifier(&mut model), &PROMPT, NEW_TOKENS);
+    let unpenalized = plain_greedy(&mut caches.verifier(&mut model), &PROMPT, NEW_TOKENS);
+    assert_ne!(
+        want, unpenalized,
+        "the penalties must change the greedy tokens"
+    );
+    let mut mtp_cache = head.create_cache(128);
+    for budget in [1, 3] {
+        let mut target = caches.verifier(&mut model);
+        let mut drafter = Qwen3NextMtpDrafter::new(&mut head, &mut mtp_cache);
+        let out =
+            generate_mtp_streaming(&mut target, &mut drafter, &PROMPT, &config, budget, |_| {
+                true
+            })
+            .expect("decode");
+        drain("decode");
+        let what = format!("dynamic Qwen, penalized, drafting {budget}");
+        assert_exact(&what, &out, &want);
+    }
+
+    let mut native = ck.native();
+    let want_native = plain_penalized(&mut native, &PROMPT, NEW_TOKENS);
+    let mut drafter = Qwen3NextMtpDrafter::new(&mut head, &mut mtp_cache);
+    let out = generate_mtp_streaming(&mut native, &mut drafter, &PROMPT, &config, 3, |_| true)
+        .expect("decode");
+    drain("native decode");
+    assert_exact("native Qwen, penalized", &out, &want_native);
+
+    let mut model = gemma_target();
+    let mut cache = gemma_cache(&model);
+    let mut assistant = gemma_assistant();
+    let want = plain_penalized(
+        &mut Gemma4MtpVerifier::new(&mut model, &mut cache),
+        &PROMPT,
+        NEW_TOKENS,
+    );
+    let out = pmetal_models::generate_gemma4_mtp_streaming(
+        &mut model,
+        &mut assistant,
+        &PROMPT,
+        config,
+        &mut cache,
+        pmetal_models::Gemma4MtpConfig {
+            num_assistant_tokens: 3,
+        },
+        |_| true,
+    )
+    .expect("decode");
+    drain("Gemma decode");
+    assert_exact("Gemma 4, penalized", &out, &want);
 }

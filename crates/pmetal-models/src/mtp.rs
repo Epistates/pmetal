@@ -163,7 +163,7 @@ where
                 draft_log_probs.push(log_probs);
                 token
             } else {
-                greedy_token(&logits)
+                greedy_choice(&logits, &history, &counts, gen_config)?
             };
             hidden = next_hidden;
             drafts.push(token);
@@ -189,7 +189,13 @@ where
                 &mut draws,
             )?
         } else {
-            accept_greedy(&drafts, &verify_logits)
+            accept_greedy(
+                &drafts,
+                &verify_logits,
+                &out.token_ids,
+                &out.counts,
+                gen_config,
+            )?
         };
         if !drafts.is_empty() {
             metrics.record_verify_step(drafts.len(), accepted);
@@ -274,22 +280,54 @@ fn pick(
         let log_probs = sampling_log_probs_with_counts(logits, history, counts, gen_config)?;
         draws.sample(&log_probs)
     } else {
-        Ok(greedy_token(logits))
+        greedy_choice(logits, history, counts, gen_config)
     }
+}
+
+/// The greedy token after the repetition, frequency and presence penalties,
+/// as plain greedy decoding picks it (the `Sampler` applies them before its
+/// argmax too).
+fn greedy_choice(
+    logits: &Array,
+    history: &[u32],
+    counts: &HashMap<u32, usize>,
+    gen_config: &GenerationConfig,
+) -> Result<u32, Exception> {
+    let penalized = gen_config.repetition_penalty != 1.0
+        || gen_config.frequency_penalty != 0.0
+        || gen_config.presence_penalty != 0.0;
+    if !penalized {
+        return Ok(greedy_token(logits));
+    }
+    let log_probs = sampling_log_probs_with_counts(logits, history, counts, gen_config)?;
+    Ok(greedy_token(&log_probs))
 }
 
 /// How many drafts the target's greedy choice agrees with, and its token at
 /// the first disagreement (or after the last draft). `verify_logits[j]` is
-/// the target's choice for draft `j`.
-fn accept_greedy(drafts: &[u32], verify_logits: &Array) -> (usize, u32) {
+/// the target's choice for draft `j`, over the history that ends with the
+/// drafts before it.
+fn accept_greedy(
+    drafts: &[u32],
+    verify_logits: &Array,
+    history: &[u32],
+    counts: &HashMap<u32, usize>,
+    gen_config: &GenerationConfig,
+) -> Result<(usize, u32), Exception> {
+    let mut history = history.to_vec();
+    let mut counts = counts.clone();
     for (j, &draft) in drafts.iter().enumerate() {
-        let target = greedy_token(&select_axis(verify_logits, j as i32, 1));
+        let row = select_axis(verify_logits, j as i32, 1);
+        let target = greedy_choice(&row, &history, &counts, gen_config)?;
         if target != draft {
-            return (j, target);
+            return Ok((j, target));
         }
+        history.push(draft);
+        count_token(&mut counts, draft);
     }
-    let bonus = greedy_token(&select_axis(verify_logits, drafts.len() as i32, 1));
-    (drafts.len(), bonus)
+    let row = select_axis(verify_logits, drafts.len() as i32, 1);
+    let bonus = greedy_choice(&row, &history, &counts, gen_config)?;
+    Ok((drafts.len(), bonus))
 }
 
 /// Rejection sampling: draft `j` is kept with probability
