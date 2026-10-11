@@ -1,0 +1,80 @@
+name: Dependencies
+
+# Watches the dependencies without changing them: a weekly report of
+# everything behind upstream (`just deps-check`) on the run's summary page,
+# and a daily check of the lockfiles against the RustSec advisory database
+# (deny.toml's reviewed ignores applied). Neither opens issues or pull
+# requests; a failed advisory run is the signal.
+on:
+  schedule:
+    - cron: '23 6 * * 1'   # deps-check, Mondays
+    - cron: '41 5 * * *'   # advisories, daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  deps-check:
+    name: Outdated dependencies
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '23 6 * * 1'
+    # macOS: the duplicate count reads the build graph this project builds
+    # (aarch64-apple-darwin, build scripts and proc macros included), and the
+    # justfile runs its recipes under zsh.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml's pinned toolchain, which `cargo` would otherwise
+      # install on first use.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `cargo upgrade` comes from cargo-edit.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-edit
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: crates/pmetal-gui/package.json
+
+      # `bun outdated` compares against the installed packages.
+      - name: Install GUI dependencies
+        working-directory: crates/pmetal-gui
+        run: bun install --frozen-lockfile
+
+      - name: Report
+        run: |
+          set -o pipefail
+          just deps-check 2>&1 | tee deps-report.txt
+          {
+            echo "## Dependencies behind upstream"
+            echo
+            echo '```text'
+            cat deps-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  advisories:
+    name: Security advisories
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '41 5 * * *'
+    # Reads manifests and lockfiles only, like the Deny job in ci.yml.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+
+      # The GUI is a separate workspace; same deny.toml, found by walking up.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
+          manifest-path: crates/pmetal-gui/src-tauri/Cargo.toml
