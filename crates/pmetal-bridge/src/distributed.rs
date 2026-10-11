@@ -15,7 +15,7 @@ use crate::InlineArray;
 use crate::error::{BridgeError, BridgeResult, check_last_error};
 use crate::inline_array::{RawBuf, from_raw_buf};
 
-unsafe extern "C" {
+bridge_extern! {
     fn mlx_inline_distributed_is_available() -> bool;
     fn mlx_inline_distributed_init(strict: bool) -> *mut c_void;
     fn mlx_inline_distributed_group_split(

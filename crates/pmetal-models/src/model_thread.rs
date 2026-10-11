@@ -248,7 +248,7 @@ mod tests {
         .join()
         .unwrap();
         let s = x.0.sum(None);
-        s.eval();
+        pmetal_bridge::expect_bridge_errors(|| s.eval());
         let err = pmetal_bridge::check_unobserved_error().expect_err("cross-thread eval must fail");
         assert!(err.to_string().contains("Stream"), "{err}");
     }

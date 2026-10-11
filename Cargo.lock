@@ -5194,6 +5194,7 @@ dependencies = [
  "cmake",
  "half",
  "memmap2",
+ "pmetal-bridge",
  "rand 0.10.3",
  "safetensors",
  "serde",

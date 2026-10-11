@@ -5,7 +5,7 @@
 
 use super::{QWeightRaw, RawBuf};
 
-unsafe extern "C" {
+bridge_extern! {
     pub(super) fn mlx_inline_destroy(a: *mut RawBuf);
     pub(super) fn mlx_inline_init_copy(dst: *mut RawBuf, src: *const RawBuf);
 

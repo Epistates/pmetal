@@ -80,7 +80,7 @@ type mlx_rust_compile_forward_fn = unsafe extern "C" fn(
 // Redeclared here so we don't need to widen the visibility of the
 // `extern "C"` block in `inline_array.rs`. Rust treats these as distinct
 // items; the linker resolves them to the same underlying C symbols.
-unsafe extern "C" {
+bridge_extern! {
     fn mlx_inline_compile_make(
         fn_ptr: mlx_rust_compile_forward_fn,
         ctx: *mut c_void,

@@ -170,6 +170,119 @@ pub fn error_log_mode() -> bool {
     unsafe { pmetal_bridge_get_error_log_mode() != 0 }
 }
 
+/// Runs `f` as code that expects a bridge op to fail.
+///
+/// Test builds turn on the `strict-errors` feature, under which a bridge op
+/// whose C++ side throws panics the calling thread at that op. A test that
+/// exercises an error path on purpose, or code that tries an op and handles
+/// its failure, runs that op inside this scope: errors raised in it stay in
+/// the error channel for [`check_last_error`] and [`check_unobserved_error`]
+/// to report, as they do in a build without the feature, and none of them
+/// panics, then or at a later op. Scopes nest. Without `strict-errors` this
+/// just calls `f`.
+pub fn expect_bridge_errors<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(feature = "strict-errors")]
+    let _expected = strict::Expected::enter();
+    f()
+}
+
+/// The `strict-errors` runtime: what each bridge entry point runs around its
+/// C call (see `bridge_extern!`).
+///
+/// The panic is raised on the Rust side, after the C call has returned, so
+/// it never unwinds through a C++ frame. A Rust callback that MLX calls from
+/// inside a bridge call (a traced loss, a compiled closure) runs in an
+/// `extern "C"` frame, where a panic would abort the process, so a nested
+/// call never panics: the outermost call reports its error when MLX returns.
+/// An error that Rust code drained before then (a callback that tried an op
+/// and fell back) is not reported.
+#[cfg(feature = "strict-errors")]
+pub(crate) mod strict {
+    use std::cell::Cell;
+
+    unsafe extern "C" {
+        fn pmetal_bridge_error_seq() -> u64;
+    }
+
+    thread_local! {
+        /// Bridge calls in progress on this thread (above one: a callback).
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+        /// Open `expect_bridge_errors` scopes.
+        static EXPECTED: Cell<u32> = const { Cell::new(0) };
+        /// The error count the last outermost call ended on.
+        static SEEN: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn error_seq() -> u64 {
+        // SAFETY: a thread-local read on the C side.
+        unsafe { pmetal_bridge_error_seq() }
+    }
+
+    /// One bridge call: [`Call::begin`] before the C call, [`Call::end`]
+    /// after it.
+    pub(crate) struct Call {
+        outermost: bool,
+    }
+
+    impl Call {
+        #[inline]
+        pub(crate) fn begin() -> Self {
+            let depth = DEPTH.get();
+            DEPTH.set(depth + 1);
+            Self {
+                outermost: depth == 0,
+            }
+        }
+
+        /// Panics if the call raised an error that nothing has observed.
+        #[inline]
+        #[track_caller]
+        pub(crate) fn end(self, op: &'static str) {
+            DEPTH.set(DEPTH.get() - 1);
+            if !self.outermost || std::thread::panicking() {
+                return;
+            }
+            let seq = error_seq();
+            if seq == SEEN.get() {
+                return;
+            }
+            SEEN.set(seq);
+            if EXPECTED.get() > 0 {
+                return;
+            }
+            // The first error since one was last observed, else the call's
+            // own; neither when a callback drained it.
+            let pending = super::check_unobserved_error().and_then(|()| super::check_last_error());
+            if let Err(err) = pending {
+                panic!(
+                    "bridge op `{op}` failed: {err}\n\
+                     (`strict-errors` fails a test at every bridge error; run an op that \
+                     is meant to fail inside `pmetal_bridge::expect_bridge_errors`)"
+                );
+            }
+        }
+    }
+
+    /// An open [`super::expect_bridge_errors`] scope.
+    pub(super) struct Expected(());
+
+    impl Expected {
+        pub(super) fn enter() -> Self {
+            EXPECTED.set(EXPECTED.get() + 1);
+            Self(())
+        }
+    }
+
+    impl Drop for Expected {
+        fn drop(&mut self) {
+            EXPECTED.set(EXPECTED.get() - 1);
+            // Whichever call raised them, errors from inside the scope were
+            // expected.
+            SEEN.set(error_seq());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,7 +314,7 @@ mod tests {
         let two_elem = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
         // The C++ side catches the std::runtime_error("item can only be called on a scalar.")
         // into the thread-local slot; Rust sees the 0.0f sentinel.
-        let v = two_elem.item_f32();
+        let v = expect_bridge_errors(|| two_elem.item_f32());
         assert_eq!(v, 0.0);
 
         let err = check_last_error().expect_err("item on non-scalar should surface an error");
@@ -226,7 +339,7 @@ mod tests {
 
         clear_last_error();
         let two_elem = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
-        let _ = two_elem.item_f32();
+        let _ = expect_bridge_errors(|| two_elem.item_f32());
         let later = two_elem.add(&two_elem);
         let _ = later.sum_all();
 
@@ -236,7 +349,7 @@ mod tests {
         assert_eq!(check_unobserved_error(), Ok(()), "reading it cleared it");
 
         // An error the caller observed doesn't count again.
-        let _ = two_elem.item_f32();
+        let _ = expect_bridge_errors(|| two_elem.item_f32());
         assert!(check_last_error().is_err());
         assert_eq!(check_unobserved_error(), Ok(()));
     }
@@ -251,7 +364,7 @@ mod tests {
 
         clear_last_error();
         let two_elem = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
-        let _ = two_elem.item_f32();
+        let _ = expect_bridge_errors(|| two_elem.item_f32());
 
         let _ = get_active_memory();
         synchronize();
@@ -263,5 +376,78 @@ mod tests {
             format!("{err:?}").contains("item_f32"),
             "wrong error: {err:?}"
         );
+    }
+
+    /// Under `strict-errors`, the op that throws panics, naming itself, and
+    /// leaves the channel clean.
+    #[cfg(feature = "strict-errors")]
+    #[test]
+    fn strict_mode_panics_at_the_op_that_throws() {
+        use crate::InlineArray;
+
+        let two_elem = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
+        let panic = std::panic::catch_unwind(|| two_elem.item_f32())
+            .expect_err("a throwing op must panic in a strict build");
+        let msg = panic
+            .downcast_ref::<String>()
+            .expect("a formatted panic message");
+        assert!(msg.contains("mlx_inline_item_f32"), "{msg}");
+        assert!(msg.contains("[item_f32]"), "{msg}");
+        assert_eq!(check_last_error(), Ok(()));
+        assert_eq!(check_unobserved_error(), Ok(()));
+    }
+
+    /// An op that throws inside a callback MLX runs (here a traced loss)
+    /// can't panic there, inside an `extern "C"` frame; the bridge call that
+    /// ran the callback panics once it returns.
+    #[cfg(feature = "strict-errors")]
+    #[test]
+    fn strict_mode_reports_an_error_from_a_callback_at_the_outer_call() {
+        use crate::InlineArray;
+        use crate::inline_array::value_and_grad;
+
+        let w = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
+        let bad = InlineArray::from_f32_slice(&[1.0, 2.0, 3.0], &[3]);
+        let panic = std::panic::catch_unwind(|| {
+            value_and_grad(
+                |p: &[InlineArray]| {
+                    // [2] x [3]: a shape error, raised while tracing.
+                    let _ = p[0].matmul(&bad);
+                    p[0].sum_all()
+                },
+                std::slice::from_ref(&w),
+                &[],
+            )
+        })
+        .expect_err("the traced op's error must fail the outer call");
+        let msg = panic.downcast_ref::<String>().expect("a panic message");
+        assert!(msg.contains("mlx_inline_value_and_grad"), "{msg}");
+        assert!(msg.contains("[matmul]"), "{msg}");
+    }
+
+    /// A callback that tries an op and handles its failure has observed the
+    /// error, so the outer call doesn't report it.
+    #[cfg(feature = "strict-errors")]
+    #[test]
+    fn strict_mode_ignores_an_error_a_callback_handled() {
+        use crate::InlineArray;
+        use crate::inline_array::value_and_grad;
+
+        let w = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
+        let bad = InlineArray::from_f32_slice(&[1.0, 2.0, 3.0], &[3]);
+        // No asserting inside the callback: a panic there aborts.
+        let handled = std::cell::Cell::new(false);
+        let (loss, mut grads) = value_and_grad(
+            |p: &[InlineArray]| {
+                let _ = p[0].matmul(&bad);
+                handled.set(check_last_error().is_err());
+                p[0].sum_all()
+            },
+            std::slice::from_ref(&w),
+            &[],
+        );
+        assert!(handled.get(), "the callback saw the matmul fail");
+        assert_eq!(loss.item_f32(), 3.0);
+        assert_eq!(grads[0].to_f32_vec(2), Some(vec![1.0, 1.0]));
     }
 }

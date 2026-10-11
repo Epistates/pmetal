@@ -71,7 +71,9 @@ mod tests {
     #[test]
     fn a_recorded_bridge_error_fails_the_step() {
         // Mismatched inner dimensions: the bridge records the exception.
-        let _ = ops::matmul(&Array::ones_f32(&[2, 3]), &Array::ones_f32(&[4, 5]));
+        let _ = pmetal_bridge::expect_bridge_errors(|| {
+            ops::matmul(&Array::ones_f32(&[2, 3]), &Array::ones_f32(&[4, 5]))
+        });
         let err = check_step(4, 0.5).unwrap_err().to_string();
         assert!(err.contains("step 4"), "{err}");
         assert!(err.contains("matmul"), "{err}");

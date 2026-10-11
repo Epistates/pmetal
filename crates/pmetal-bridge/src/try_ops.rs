@@ -25,9 +25,21 @@
 //! `std::runtime_error` from MLX. The list is deliberately narrow to keep
 //! the checked surface focused; other ops can adopt a `try_*` sibling
 //! later as their callers need them.
+//!
+//! A checked op hands its failure to the caller, so it runs as one that is
+//! allowed to fail ([`crate::expect_bridge_errors`]): a test build reports
+//! the error through the `Result` rather than panicking at the op.
 
-use crate::error::{BridgeResult, check_last_error};
+use crate::error::{BridgeResult, check_last_error, expect_bridge_errors};
 use crate::{InlineArray, QuantizedMode};
+
+/// Run one op and return its result, or the error it raised.
+fn checked<T>(op: impl FnOnce() -> T) -> BridgeResult<T> {
+    expect_bridge_errors(|| {
+        let out = op();
+        check_last_error().map(|()| out)
+    })
+}
 
 impl InlineArray {
     // ── Binary / reduction math ──────────────────────────────────────────
@@ -36,62 +48,46 @@ impl InlineArray {
     /// [`crate::BridgeError::CxxException`] instead of silently returning a
     /// zeros scalar.
     pub fn try_matmul(&self, other: &Self) -> BridgeResult<Self> {
-        let out = self.matmul(other);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.matmul(other))
     }
 
     /// Checked softmax. The `axis` argument is validated by MLX; an
     /// out-of-range value surfaces as `CxxException`.
     pub fn try_softmax(&self, axis: i32) -> BridgeResult<Self> {
-        let out = self.softmax(axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.softmax(axis))
     }
 
     /// Checked precise (fp32-internal) softmax.
     pub fn try_softmax_precise(&self, axis: i32) -> BridgeResult<Self> {
-        let out = self.softmax_precise(axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.softmax_precise(axis))
     }
 
     /// Checked reshape — the most common shape-fail site per the v0.5.0
     /// sampling + MoE test-abort findings.
     pub fn try_reshape(&self, shape: &[i32]) -> BridgeResult<Self> {
-        let out = self.reshape(shape);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.reshape(shape))
     }
 
     /// Checked native E4M3 FP8 quantization. MLX stores the result as `uint8`.
     pub fn try_to_fp8(&self) -> BridgeResult<Self> {
-        let out = self.to_fp8();
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.to_fp8())
     }
 
     /// Checked native E4M3 FP8 dequantization to the requested floating dtype.
     pub fn try_from_fp8(&self, dtype: i32) -> BridgeResult<Self> {
-        let out = self.from_fp8(dtype);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.from_fp8(dtype))
     }
 
     // ── Fast ops / attention ─────────────────────────────────────────────
 
     /// Checked fused RMS norm.
     pub fn try_rms_norm(&self, weight: Option<&Self>, eps: f32) -> BridgeResult<Self> {
-        let out = self.rms_norm(weight, eps);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.rms_norm(weight, eps))
     }
 
     /// Checked fused scaled-dot-product attention.
     pub fn try_sdpa(&self, k: &Self, v: &Self, scale: f32, mask_mode: &str) -> BridgeResult<Self> {
-        let out = self.sdpa(k, v, scale, mask_mode);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.sdpa(k, v, scale, mask_mode))
     }
 
     /// Checked fused SDPA with optional explicit mask array.
@@ -102,9 +98,7 @@ impl InlineArray {
         scale: f32,
         mask: Option<&Self>,
     ) -> BridgeResult<Self> {
-        let out = self.sdpa_with_mask(k, v, scale, mask);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.sdpa_with_mask(k, v, scale, mask))
     }
 
     // ── Gather / quantized paths ─────────────────────────────────────────
@@ -119,9 +113,7 @@ impl InlineArray {
         rhs_indices: Option<&Self>,
         sorted: bool,
     ) -> BridgeResult<Self> {
-        let out = self.gather_mm(other, lhs_indices, rhs_indices, sorted);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.gather_mm(other, lhs_indices, rhs_indices, sorted))
     }
 
     /// Checked dequantize (group-size + bits validated on the C++ side).
@@ -132,9 +124,7 @@ impl InlineArray {
         group_size: i32,
         bits: i32,
     ) -> BridgeResult<Self> {
-        let out = self.dequantize(scales, biases, group_size, bits);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.dequantize(scales, biases, group_size, bits))
     }
 
     /// Checked quantized matmul.
@@ -147,9 +137,7 @@ impl InlineArray {
         group_size: i32,
         bits: i32,
     ) -> BridgeResult<Self> {
-        let out = self.quantized_matmul(w, scales, biases, transpose, group_size, bits);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.quantized_matmul(w, scales, biases, transpose, group_size, bits))
     }
 
     /// Checked quantized matmul in a specific MLX quantization mode.
@@ -164,9 +152,7 @@ impl InlineArray {
         bits: i32,
         mode: QuantizedMode,
     ) -> BridgeResult<Self> {
-        let out = self.quantized_matmul_mode(w, scales, biases, transpose, group_size, bits, mode);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.quantized_matmul_mode(w, scales, biases, transpose, group_size, bits, mode))
     }
 
     /// Checked gather-quantized-matmul. The argument count mirrors the
@@ -185,19 +171,19 @@ impl InlineArray {
         bits: i32,
         sorted: bool,
     ) -> BridgeResult<Self> {
-        let out = self.gather_qmm(
-            w,
-            scales,
-            biases,
-            lhs_indices,
-            rhs_indices,
-            transpose,
-            group_size,
-            bits,
-            sorted,
-        );
-        check_last_error()?;
-        Ok(out)
+        checked(|| {
+            self.gather_qmm(
+                w,
+                scales,
+                biases,
+                lhs_indices,
+                rhs_indices,
+                transpose,
+                group_size,
+                bits,
+                sorted,
+            )
+        })
     }
 
     /// Checked gather-quantized-matmul in a specific MLX quantization mode.
@@ -215,20 +201,20 @@ impl InlineArray {
         sorted: bool,
         mode: QuantizedMode,
     ) -> BridgeResult<Self> {
-        let out = self.gather_qmm_mode(
-            w,
-            scales,
-            biases,
-            lhs_indices,
-            rhs_indices,
-            transpose,
-            group_size,
-            bits,
-            sorted,
-            mode,
-        );
-        check_last_error()?;
-        Ok(out)
+        checked(|| {
+            self.gather_qmm_mode(
+                w,
+                scales,
+                biases,
+                lhs_indices,
+                rhs_indices,
+                transpose,
+                group_size,
+                bits,
+                sorted,
+                mode,
+            )
+        })
     }
 
     /// Checked quantize in a non-affine MLX quantization mode.
@@ -238,18 +224,14 @@ impl InlineArray {
         bits: i32,
         mode: QuantizedMode,
     ) -> BridgeResult<(Self, Self)> {
-        let out = self.quantize_weights_mode(group_size, bits, mode);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.quantize_weights_mode(group_size, bits, mode))
     }
 
     // ── Composition / shuffle ops ────────────────────────────────────────
 
     /// Checked 2-way concatenate (most callers use the 2-arg form).
     pub fn try_concatenate_2(&self, other: &Self, axis: i32) -> BridgeResult<Self> {
-        let out = self.concatenate_2(other, axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.concatenate_2(other, axis))
     }
 
     /// Checked split — returns `Vec<Self>` of `indices.len() + 1` entries.
@@ -258,37 +240,27 @@ impl InlineArray {
     /// zero sentinel (see `bridge.cpp`), so dropping the returned `Vec`
     /// is safe even in the error path.
     pub fn try_split(&self, indices: &[i32], axis: i32) -> BridgeResult<Vec<Self>> {
-        let out = self.split(indices, axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.split(indices, axis))
     }
 
     /// Checked cross-entropy loss.
     pub fn try_cross_entropy(&self, targets: &Self, axis: i32) -> BridgeResult<Self> {
-        let out = self.cross_entropy(targets, axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.cross_entropy(targets, axis))
     }
 
     /// Checked sparse cross-entropy (integer-class targets).
     pub fn try_cross_entropy_sparse(&self, indices: &Self, axis: i32) -> BridgeResult<Self> {
-        let out = self.cross_entropy_sparse(indices, axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.cross_entropy_sparse(indices, axis))
     }
 
     /// Checked log-softmax along `axis`.
     pub fn try_log_softmax(&self, axis: i32) -> BridgeResult<Self> {
-        let out = self.log_softmax(axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.log_softmax(axis))
     }
 
     /// Checked clip — bounds may be `None` for one-sided clipping.
     pub fn try_clip(&self, lo: Option<&Self>, hi: Option<&Self>) -> BridgeResult<Self> {
-        let out = self.clip(lo, hi);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.clip(lo, hi))
     }
 
     /// Checked layer norm.
@@ -298,30 +270,22 @@ impl InlineArray {
         bias: Option<&Self>,
         eps: f32,
     ) -> BridgeResult<Self> {
-        let out = self.layer_norm(weight, bias, eps);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.layer_norm(weight, bias, eps))
     }
 
     /// Checked constant-pad. `pad_widths_flat` must have length `2 * ndim`.
     pub fn try_pad_constant(&self, pad_widths_flat: &[i32], fill_value: f32) -> BridgeResult<Self> {
-        let out = self.pad_constant(pad_widths_flat, fill_value);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.pad_constant(pad_widths_flat, fill_value))
     }
 
     /// Checked leaky-ReLU activation.
     pub fn try_leaky_relu(&self, neg_slope: f32) -> BridgeResult<Self> {
-        let out = self.leaky_relu(neg_slope);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.leaky_relu(neg_slope))
     }
 
     /// Checked addmm (`c + a @ b`).
     pub fn try_addmm(c: &Self, a: &Self, b: &Self) -> BridgeResult<Self> {
-        let out = Self::addmm(c, a, b);
-        check_last_error()?;
-        Ok(out)
+        checked(|| Self::addmm(c, a, b))
     }
 
     /// Checked 1-D convolution.
@@ -333,9 +297,7 @@ impl InlineArray {
         dilation: i32,
         groups: i32,
     ) -> BridgeResult<Self> {
-        let out = self.conv1d(weight, stride, padding, dilation, groups);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.conv1d(weight, stride, padding, dilation, groups))
     }
 
     /// Checked 2-D convolution (NHWC, MLX standard).
@@ -351,26 +313,22 @@ impl InlineArray {
         dil_w: i32,
         groups: i32,
     ) -> BridgeResult<Self> {
-        let out = self.conv2d(
-            weight, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups,
-        );
-        check_last_error()?;
-        Ok(out)
+        checked(|| {
+            self.conv2d(
+                weight, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups,
+            )
+        })
     }
 
     /// Checked tri-inverse (lower or upper triangular). `use_cpu=true` forces
     /// CPU dispatch (as the WY factorization uses it).
     pub fn try_tri_inv(&self, upper: bool, use_cpu: bool) -> BridgeResult<Self> {
-        let out = self.tri_inv(upper, use_cpu);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.tri_inv(upper, use_cpu))
     }
 
     /// Checked SVD — returns `(U, S, Vt)`.
     pub fn try_svd(&self) -> BridgeResult<(Self, Self, Self)> {
-        let out = self.svd();
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.svd())
     }
 
     // ── Shape ops ───────────────────────────────────────────────────────
@@ -378,23 +336,17 @@ impl InlineArray {
     /// Checked single-axis squeeze. Out-of-range axis surfaces as
     /// `BridgeError::CxxException`.
     pub fn try_squeeze(&self, axis: i32) -> BridgeResult<Self> {
-        let out = self.squeeze(axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.squeeze(axis))
     }
 
     /// Checked single-axis expand_dims.
     pub fn try_expand_dims(&self, axis: i32) -> BridgeResult<Self> {
-        let out = self.expand_dims(axis);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.expand_dims(axis))
     }
 
     /// Checked transpose. Permutation must contain each axis index exactly once.
     pub fn try_transpose_axes(&self, axes: &[i32]) -> BridgeResult<Self> {
-        let out = self.transpose_axes(axes);
-        check_last_error()?;
-        Ok(out)
+        checked(|| self.transpose_axes(axes))
     }
 }
 

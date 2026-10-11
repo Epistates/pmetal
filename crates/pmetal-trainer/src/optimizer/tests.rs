@@ -2,6 +2,7 @@
 
 use super::*;
 use pmetal_bridge::compat::optimizers::AdamWBuilder;
+use pmetal_bridge::expect_bridge_errors;
 
 fn arr(v: &[f32], shape: &[i32]) -> Array {
     Array::from_slice(v, shape)
@@ -299,8 +300,7 @@ fn an_update_that_fails_on_the_gpu_stops_the_step_and_names_the_parameter() {
     ];
     for kind in kinds {
         let mut opt = TrainOptimizer::new(kind, 0.1, 0.0);
-        let err = opt
-            .update(&mut one_weight(), misfit_gradient())
+        let err = expect_bridge_errors(|| opt.update(&mut one_weight(), misfit_gradient()))
             .expect_err("a gradient that doesn't fit its weight must fail the update");
         assert!(err.what().contains("`w`"), "{kind:?}: {}", err.what());
         // The failure was reported; nothing is left pending for the next kind.
@@ -312,7 +312,7 @@ fn an_update_that_fails_on_the_gpu_stops_the_step_and_names_the_parameter() {
 fn the_plain_adamw_update_reports_a_failed_parameter_too() {
     let mut model = one_weight();
     let mut opt = AdamWBuilder::new(0.1).weight_decay(0.0).build().unwrap();
-    assert!(opt.update(&mut model, misfit_gradient()).is_err());
+    assert!(expect_bridge_errors(|| opt.update(&mut model, misfit_gradient())).is_err());
     let _ = pmetal_bridge::check_unobserved_error();
 
     // A gradient that fits still trains.

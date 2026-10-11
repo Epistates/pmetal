@@ -20,6 +20,8 @@ half = { workspace = true }
 zerocopy = { workspace = true }
 
 [dev-dependencies]
+# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
+pmetal-bridge = { workspace = true, features = ["strict-errors"] }
 criterion = { workspace = true }
 
 [lints]

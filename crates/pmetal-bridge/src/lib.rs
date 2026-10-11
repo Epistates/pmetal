@@ -8,6 +8,9 @@
 //! `Dtype`, `Module`, `ModuleParameters`, optimizers, layers, etc.), so model
 //! code never touches the FFI directly.
 
+#[macro_use]
+mod bridge_extern;
+
 pub mod inline_array;
 pub use inline_array::{InlineArray, QuantizedMode};
 
@@ -16,7 +19,7 @@ pub mod metallib;
 pub mod error;
 pub use error::{
     BridgeError, BridgeResult, check_last_error, check_unobserved_error, clear_last_error,
-    error_log_mode, set_error_log_mode,
+    error_log_mode, expect_bridge_errors, set_error_log_mode,
 };
 
 pub mod dtype;

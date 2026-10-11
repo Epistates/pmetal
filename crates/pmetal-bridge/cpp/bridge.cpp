@@ -49,6 +49,13 @@ namespace {
     thread_local int32_t g_bridge_unobserved_code = 0;
     thread_local std::string g_bridge_unobserved_message;
 
+#ifdef PMETAL_BRIDGE_STRICT_ERRORS
+    // Counts the errors recorded on this thread. The Rust side of a strict
+    // (test) build compares it across each bridge call to tell an error that
+    // call raised from one still pending from an earlier, expected failure.
+    thread_local uint64_t g_bridge_error_seq = 0;
+#endif
+
     // Set while `mlx_inline_init_device` probes the Metal device, whose
     // failure is reported rather than fatal.
     thread_local bool g_probing_device = false;
@@ -131,6 +138,10 @@ void pmetal_bridge_set_last_error(const char* op, const char* what) noexcept {
         g_bridge_error_message.clear();
     }
 
+#ifdef PMETAL_BRIDGE_STRICT_ERRORS
+    ++g_bridge_error_seq;
+#endif
+
     if (g_bridge_unobserved_code == 0) {
         g_bridge_unobserved_code = g_bridge_error_code;
         try {
@@ -188,6 +199,12 @@ void pmetal_bridge_set_error_log_mode(int32_t enabled) {
 int32_t pmetal_bridge_get_error_log_mode(void) {
     return bridge_error_log_flag().load(std::memory_order_relaxed) ? 1 : 0;
 }
+
+#ifdef PMETAL_BRIDGE_STRICT_ERRORS
+uint64_t pmetal_bridge_error_seq(void) {
+    return g_bridge_error_seq;
+}
+#endif
 
 void mlx_inline_init_empty(mlx_inline_array* dst) {
     bridge_placeholder(dst);  // MLX array default = scalar 0

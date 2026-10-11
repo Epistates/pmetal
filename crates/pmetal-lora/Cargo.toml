@@ -19,6 +19,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Fail every test at the bridge op that throws (pmetal-bridge `strict-errors`).
+pmetal-bridge = { workspace = true, features = ["strict-errors"] }
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
 # Pull in pmetal-mlx's `test-utils` feature so `base_parity` can reach the

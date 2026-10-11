@@ -21,6 +21,13 @@ metal = []
 # perplexity with vs without the residual stage. Off by default — release
 # builds carry no ablation surface.
 tq-ablation = []
+# Tests only: a bridge op whose C++ side throws panics the calling thread at
+# that op, naming it, instead of handing back a placeholder array for the
+# caller to check. Every workspace crate turns it on through its
+# `[dev-dependencies]`, so it reaches test, bench and example builds and
+# never a library or binary build. Code that expects an op to fail runs it
+# inside `expect_bridge_errors`.
+strict-errors = []
 
 [dependencies]
 half = { workspace = true }
@@ -33,6 +40,10 @@ sha2 = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# This crate's own tests fail at the op that throws (`strict-errors`). No
+# version, so publishing drops it instead of resolving the crate against
+# itself on the registry.
+pmetal-bridge = { path = ".", features = ["strict-errors"] }
 
 [build-dependencies]
 cc = { workspace = true }

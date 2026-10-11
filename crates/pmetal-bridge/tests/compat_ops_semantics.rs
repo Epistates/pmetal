@@ -304,7 +304,7 @@ fn split_into_equal_sections() {
     assert_same(&read(&parts[2]), &[4.0, 5.0], "split");
 
     // 6 doesn't divide into 4 sections: MLX refuses rather than going uneven.
-    let parts = ops::split(&x, 4, 0);
+    let parts = pmetal_bridge::expect_bridge_errors(|| ops::split(&x, 4, 0));
     assert!(check_unobserved_error().is_err(), "uneven split must fail");
     assert!(parts.is_empty());
 }

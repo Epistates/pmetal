@@ -287,7 +287,7 @@ mod tests {
     fn eval_token_surfaces_pending_bridge_error() {
         let a = InlineArray::from_f32_slice(&[1.0; 6], &[2, 3]);
         let b = InlineArray::from_f32_slice(&[1.0; 20], &[4, 5]);
-        let sentinel = a.matmul(&b);
+        let sentinel = crate::expect_bridge_errors(|| a.matmul(&b));
 
         let err = sentinel
             .eval()

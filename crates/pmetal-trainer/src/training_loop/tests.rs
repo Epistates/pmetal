@@ -1150,9 +1150,10 @@ fn a_failed_step_stops_the_run_and_names_the_step() {
     ] {
         let mut model = Breaking::new(3, fault);
         let mut training_loop = TrainingLoop::new(short_run_config());
-        let err = training_loop
-            .run(&mut model, create_dummy_dataset(8, 12), None, None)
-            .expect_err("the run should stop at the broken step");
+        let err = pmetal_bridge::expect_bridge_errors(|| {
+            training_loop.run(&mut model, create_dummy_dataset(8, 12), None, None)
+        })
+        .expect_err("the run should stop at the broken step");
         let message = err.to_string();
         assert!(message.contains("step 3"), "{message}");
         assert!(message.contains(expect), "{message}");

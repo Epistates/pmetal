@@ -676,6 +676,12 @@ fn build_and_link() {
     #[cfg(target_os = "macos")]
     build.flag(format!("-mmacosx-version-min={deploy_target}"));
 
+    // The error counter `strict-errors` reads. Without the feature the bridge
+    // compiles exactly as it did before it existed.
+    if env::var_os("CARGO_FEATURE_STRICT_ERRORS").is_some() {
+        build.define("PMETAL_BRIDGE_STRICT_ERRORS", None);
+    }
+
     build.compile("pmetal_bridge");
     println!("cargo:rustc-link-lib=static=pmetal_bridge");
 

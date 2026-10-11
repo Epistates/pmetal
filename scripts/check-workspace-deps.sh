@@ -46,8 +46,14 @@ members=$(cargo metadata --no-deps --format-version 1 --locked |
 
 for manifest in $members; do
     rel=${manifest#"$PWD/"}
+    package=$(awk -F'"' '/^name *=/ { print $2; exit }' "$manifest")
     while IFS=$'\t' read -r sec name rest; do
-        if [[ $name == "<table>" ]]; then
+        if [[ $sec == "[dev-dependencies]" && $name == "$package" && $rest =~ ^\{\ *path\ *=\ *\"\.\" ]]; then
+            # A crate's tests turning on one of its own features. No version,
+            # so publishing strips it rather than asking the registry for the
+            # version being published.
+            continue
+        elif [[ $name == "<table>" ]]; then
             fail "$rel: $sec: write it as one line, \`dep = { workspace = true }\`"
         elif [[ $name == *.workspace && $rest == true* ]]; then
             continue
