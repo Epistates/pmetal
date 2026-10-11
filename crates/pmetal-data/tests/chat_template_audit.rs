@@ -8,17 +8,45 @@
 //! single-threaded (no other code runs concurrently) and the env var is
 //! read-only from the chat-template renderer, so the usage is sound.
 //!
-//! This test walks every subdirectory of `.strategy/parity/configs/`
+//! This test walks every subdirectory of `$PMETAL_CHAT_AUDIT_DIR` and, for
 #![allow(unsafe_code)]
-//! (pre-populated by `download_configs.py` + `dump_expected.py`) and, for
 //! each model, verifies that pmetal's chat-template stack matches the real
-//! upstream Jinja template. The reference values live in
-//! `<config_dir>/expected.json`, which the Python dumper produces via
-//! `transformers.AutoTokenizer.apply_chat_template(...)`.
+//! upstream Jinja template. Each subdirectory holds one model's tokenizer and
+//! config files as published on the Hugging Face Hub (`tokenizer.json`,
+//! `tokenizer_config.json`, `config.json`, `generation_config.json`, any
+//! `chat_template.jinja`; no weights) plus an `expected.json` rendered with
+//! `transformers.AutoTokenizer.apply_chat_template(...)` on
+//! [`CANONICAL_PROMPT`] with `add_generation_prompt=True`, the clock frozen at
+//! 2026-04-14, and the ids encoded with `add_special_tokens=False`:
 //!
-//! The test is skipped when the configs directory is absent — it's
-//! maintainer tooling, not part of the public repo. Set
-//! `PMETAL_CHAT_AUDIT_DIR` to override the location.
+//! ```json
+//! {
+//!   "model_id": "Qwen/Qwen3-0.6B",
+//!   "arch_tag": "Qwen",
+//!   "prompt_ids_default": [...],
+//!   "prompt_ids_thinking": [...],
+//!   "prompt_text_default": "...",
+//!   "prompt_text_thinking": "...",
+//!   "eos_token_id": [...],
+//!   "generation_config": { ... }
+//! }
+//! ```
+//!
+//! `arch_tag` is the [`ChatTemplateType`] name the model should be detected
+//! as. The `_default` render passes `enable_thinking=False` and the
+//! `_thinking` one `enable_thinking=True` (templates without the switch
+//! render the same text twice). `eos_token_id` is `generation_config.json`'s,
+//! falling back to the tokenizer's, always as a list, and `generation_config`
+//! is that file's sampling fields verbatim. The audit needs model downloads,
+//! so it is skipped when `PMETAL_CHAT_AUDIT_DIR` is unset:
+//!
+//! ```bash
+//! PMETAL_CHAT_AUDIT_DIR=<dir of model config dirs> \
+//!     cargo test -p pmetal-data --test chat_template_audit -- --nocapture
+//! ```
+//!
+//! `PMETAL_CHAT_AUDIT_VERBOSE=1` adds the rendered text and tokens of every
+//! mismatch to the report.
 //!
 //! Pass criteria per model (in priority order):
 //!   1. `detect_chat_template` returns a template with the arch_tag we
@@ -43,8 +71,7 @@ use pmetal_data::inference_config::{
 use pmetal_data::tokenizer::Tokenizer;
 use serde_json::Value;
 
-/// The prompt the Python dumper renders. Must stay in sync with
-/// `CANONICAL_PROMPT` in `dump_expected.py`.
+/// The single user turn every `expected.json` is rendered from.
 const CANONICAL_PROMPT: &str = "What is the capital of France?";
 
 /// Which `arch_tag` strings should be considered equivalent for the
@@ -67,22 +94,16 @@ fn template_matches(expected_tag: &str, detected: ChatTemplateType) -> bool {
     )
 }
 
+/// The configs directory, or `None` when the audit isn't configured. A path
+/// that is set but missing is a mistake, not a reason to skip quietly.
 fn audit_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("PMETAL_CHAT_AUDIT_DIR") {
-        let p = PathBuf::from(dir);
-        return p.exists().then_some(p);
-    }
-    // Walk up from the test crate to find `.strategy/parity/configs/`.
-    // crate dir: crates/pmetal-data → .. → .. → .strategy/parity/configs
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join(".strategy").join("parity").join("configs"));
-    match candidate {
-        Some(p) if p.exists() => Some(p),
-        _ => None,
-    }
+    let dir = PathBuf::from(std::env::var_os("PMETAL_CHAT_AUDIT_DIR")?);
+    assert!(
+        dir.is_dir(),
+        "PMETAL_CHAT_AUDIT_DIR={} is not a directory",
+        dir.display()
+    );
+    Some(dir)
 }
 
 #[derive(Debug)]
@@ -167,7 +188,7 @@ fn run_audit_on(dir: &Path) -> ModelReport {
         })
         .unwrap_or_default();
 
-    // Python's dumper produces ids with `add_special_tokens=False`, and
+    // The reference ids are encoded with `add_special_tokens=False`, and
     // pmetal's `Tokenizer::encode` does the same — both correctly parse
     // `<|begin_of_text|>` etc as real special tokens from the text.
     // Compare the raw sequences verbatim.
@@ -326,7 +347,7 @@ fn fmt_row(r: &ModelReport) -> String {
 #[allow(unsafe_code)]
 fn chat_template_audit() {
     // Freeze the clock that Llama 3 / gpt-oss chat templates see through
-    // `strftime_now`. The fixtures were dumped on 2026-04-14 and encode
+    // `strftime_now`. The references are rendered on 2026-04-14 and encode
     // `Today Date: 14 Apr 2026` (or the gpt-oss equivalent) directly into
     // the expected prompt ids. Without this override the test flips from
     // green to red every UTC midnight as the rendered `now()` moves past
@@ -342,8 +363,8 @@ fn chat_template_audit() {
 
     let Some(audit_root) = audit_dir() else {
         eprintln!(
-            "chat_template_audit: no configs directory found (set PMETAL_CHAT_AUDIT_DIR \
-             or populate .strategy/parity/configs/). Skipping."
+            "chat_template_audit: skipped; set PMETAL_CHAT_AUDIT_DIR to a directory of \
+             model config dirs, each with an expected.json (see the module docs)."
         );
         return;
     };
