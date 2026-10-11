@@ -51,7 +51,8 @@ Every training command takes `--optimizer` (and YAML configs take `training.opti
 Every optimizer, fused or not, trains the same parameter groups. Biases and
 normalization weights train without weight decay (the split
 `transformers`' `Trainer` makes), `--embedding-lr` sets the rate of the
-embedding and output-projection parameters, and LoRA+ trains each B matrix
+token embedding and the output head (and of an adapter on the head), and
+LoRA+ trains each B matrix
 at `loraplus_lr_ratio` times its A matrix's rate. The scheduler moves every
 group's rate together, keeping the ratios.
 

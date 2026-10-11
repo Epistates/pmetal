@@ -85,6 +85,18 @@ pub trait TrainableModel: ModuleParameters {
         false
     }
 
+    /// Where the model's output head sits among its parameters, when it is a
+    /// layer of its own; see
+    /// [`pmetal_models::dispatcher::DynamicModel::output_projection_path`].
+    ///
+    /// Found by identity, not by name, so the trainer's parameter groups
+    /// train the head (and an adapter on it) at the embedding rate whatever
+    /// the head is called. `None` when the model ties its head to the token
+    /// embedding, or doesn't say.
+    fn output_projection_path(&mut self) -> Option<String> {
+        None
+    }
+
     /// Perform forward pass for Vision-Language Models with image inputs.
     ///
     /// This is used for VLM training (e.g., Llama 3.2 Vision) where the model

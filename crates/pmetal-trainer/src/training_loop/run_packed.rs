@@ -11,7 +11,7 @@ impl TrainingLoop {
     /// Uses block-diagonal attention masks to prevent cross-sequence attention.
     pub fn run_packed<M>(
         &mut self,
-        model: M,
+        mut model: M,
         train_dataset: TrainingDataset,
         eval_dataset: Option<TrainingDataset>,
         checkpoint_manager: Option<&CheckpointManager>,
@@ -35,7 +35,7 @@ impl TrainingLoop {
         let num_epochs = self.config.training.num_epochs;
         let max_steps = self.config.training.max_steps;
 
-        let optimizer = self.build_optimizer();
+        let optimizer = self.build_optimizer(model.output_projection_path());
 
         tracing::info!("Starting packed training with sequence packing enabled");
 
@@ -93,8 +93,6 @@ impl TrainingLoop {
             );
             return self.run_standard_owned(model, train_dataset, eval_dataset, checkpoint_manager);
         }
-
-        let mut model = model;
 
         // Packing is on by default, so this is the common path. The
         // block-diagonal mask keeps one packed sequence from attending to

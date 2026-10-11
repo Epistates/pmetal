@@ -48,6 +48,44 @@ pub fn excluded_from_weight_decay(name: &str) -> bool {
             .any(|part| part.contains("norm") || part == "ln" || part.starts_with("ln_"))
 }
 
+/// What `transformers` names a model's token embedding and its output head,
+/// the modules its `get_input_embeddings` and `get_output_embeddings` return,
+/// and what GGUF calls the token embedding. The first two are PEFT's
+/// `EMBEDDING_LAYER_NAMES`.
+pub const EMBEDDING_MODULE_NAMES: &[&str] = &[
+    // Token embeddings.
+    "embed_tokens",    // Llama, Mistral, Qwen, Gemma, Phi-3, OPT
+    "wte",             // GPT-2, GPT-J
+    "word_embeddings", // BERT, BLOOM, Falcon
+    "embed_in",        // GPT-NeoX
+    "tok_embeddings",  // InternLM2
+    "token_embd",      // GGUF
+    // Output heads.
+    "lm_head",
+    "embed_out",    // GPT-NeoX
+    "output_layer", // ChatGLM
+];
+
+/// Whether the parameter called `name` sits under a module named one of
+/// `modules`: one of its dotted path components is, ignoring case.
+///
+/// Whole components, not substrings, so the `output` of BERT's
+/// `attention.output.dense` is not an output head and `embed` does not reach
+/// a vision tower's `patch_embed`.
+pub fn under_module<S: AsRef<str>>(name: &str, modules: &[S]) -> bool {
+    name.split('.').any(|part| {
+        modules
+            .iter()
+            .any(|module| part.eq_ignore_ascii_case(module.as_ref()))
+    })
+}
+
+/// Whether the parameter called `name` belongs to the token embedding or the
+/// output head, by the names in [`EMBEDDING_MODULE_NAMES`].
+pub fn is_embedding_parameter(name: &str) -> bool {
+    under_module(name, EMBEDDING_MODULE_NAMES)
+}
+
 /// The learning rate and weight decay of each [`ParamClass`], the rates as
 /// multiples of the base learning rate.
 ///
@@ -424,13 +462,14 @@ pub fn decay_only_classifier(name: &str) -> ParamClass {
 /// Rules (first match wins):
 /// 1. A bias or normalization weight ([`excluded_from_weight_decay`]) →
 ///    [`ParamClass::NoDecay`]
-/// 2. Name contains `"embed"` or `"lm_head"` → [`ParamClass::Embedding`]
+/// 2. The token embedding or the output head ([`is_embedding_parameter`]) →
+///    [`ParamClass::Embedding`]
 /// 3. Name contains `"lora_b"` → [`ParamClass::LoraB`]
 /// 4. All other names → [`ParamClass::Regular`]
 pub fn default_classifier(name: &str) -> ParamClass {
     if excluded_from_weight_decay(name) {
         ParamClass::NoDecay
-    } else if name.contains("embed") || name.contains("lm_head") {
+    } else if is_embedding_parameter(name) {
         ParamClass::Embedding
     } else if name.contains("lora_b") {
         ParamClass::LoraB
@@ -470,6 +509,56 @@ mod tests {
             default_classifier("layers.0.mlp.gate_proj.weight"),
             ParamClass::Regular
         );
+    }
+
+    /// The token embedding and the output head are embeddings, under the
+    /// names `transformers` gives them; nothing else is, however much of
+    /// one of those names it contains.
+    #[test]
+    fn only_the_token_embedding_and_output_head_are_embeddings() {
+        for name in [
+            // Llama
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "lm_head.lora_a",
+            // GPT-2
+            "transformer.wte.weight",
+            // GPT-NeoX
+            "gpt_neox.embed_in.weight",
+            "embed_out.weight",
+            "embed_out.lora_b",
+            // BERT
+            "bert.embeddings.word_embeddings.weight",
+            // GGUF, and a name in another case
+            "token_embd.weight",
+            "model.Embed_Tokens.weight",
+        ] {
+            assert!(is_embedding_parameter(name), "{name} is an embedding");
+            assert_eq!(default_classifier(name), ParamClass::Embedding, "{name}");
+        }
+        for name in [
+            // BERT: an attention or MLP output projection is not the head.
+            "bert.encoder.layer.0.attention.output.dense.weight",
+            "bert.encoder.layer.0.attention.output.dense.lora_a",
+            "bert.encoder.layer.0.output.dense.lora_b",
+            // GPT-2's position embedding is not the token embedding.
+            "transformer.wpe.weight",
+            "transformer.h.0.attn.c_attn.lora_a",
+            "transformer.h.0.mlp.c_proj.weight",
+            // GPT-NeoX
+            "gpt_neox.layers.0.attention.dense.weight",
+            "gpt_neox.layers.0.mlp.dense_4h_to_h.lora_a",
+            // Llama
+            "model.layers.0.self_attn.o_proj.lora_a",
+            "model.layers.0.mlp.down_proj.weight",
+            // Names that contain an embedding's name without being one.
+            "vision_tower.patch_embed.proj.weight",
+            "model.layers.0.output_proj.weight",
+            "output.weight",
+            "model.lm_head_norm_scale",
+        ] {
+            assert!(!is_embedding_parameter(name), "{name} is not an embedding");
+        }
     }
 
     #[test]

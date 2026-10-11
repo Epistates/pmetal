@@ -667,9 +667,10 @@ impl ParamGroupOptimizerBuilder {
         self
     }
 
-    /// Count names containing `pattern` as embedding parameters.
-    pub fn add_embedding_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.groups = self.groups.add_embedding_pattern(pattern);
+    /// Count parameters under a module named `module` as embedding
+    /// parameters.
+    pub fn add_embedding_module(mut self, module: impl Into<String>) -> Self {
+        self.groups = self.groups.add_embedding_module(module);
         self
     }
 

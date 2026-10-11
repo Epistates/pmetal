@@ -638,6 +638,17 @@ fn empty_targets_adapt_every_projection_but_the_output_layer() {
         match head {
             Some(head) => {
                 untied += 1;
+                // The trainer's parameter groups find the head's adapter
+                // under the path the model reports for the head.
+                let trainable = all.flatten_trainable_params();
+                for matrix in ["lora_a", "lora_b"] {
+                    let key = format!("{head}.{matrix}");
+                    assert!(
+                        trainable.contains_key(key.as_str()),
+                        "{}: no trainable `{key}`",
+                        case.name
+                    );
+                }
                 assert!(
                     all.adapted_projections().contains(&head),
                     "{}: naming the head did not adapt `{head}`",

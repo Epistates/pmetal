@@ -12,7 +12,7 @@ impl TrainingLoop {
     where
         M: TrainableModel,
     {
-        let mut optimizer = self.build_optimizer();
+        let mut optimizer = self.build_optimizer(model.output_projection_path());
 
         let max_steps = self.config.training.max_steps;
         let num_epochs = self.config.training.num_epochs;

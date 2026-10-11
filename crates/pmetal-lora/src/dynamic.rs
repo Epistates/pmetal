@@ -286,6 +286,10 @@ impl TrainableModel for DynamicLoraModel {
         TrainableModel::has_recurrent_layers(&self.inner)
     }
 
+    fn output_projection_path(&mut self) -> Option<String> {
+        TrainableModel::output_projection_path(&mut self.inner)
+    }
+
     fn forward_with_images(
         &mut self,
         input_ids: &Array,

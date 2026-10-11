@@ -334,7 +334,9 @@ impl DistillationTrainer {
         S: TrainableModel,
         T: TeacherModel,
     {
-        let mut optimizer = self.loop_state.build_optimizer();
+        let mut optimizer = self
+            .loop_state
+            .build_optimizer(student.output_projection_path());
 
         let num_epochs = self.loop_state.config.training.num_epochs;
         let checkpoint_every = self.loop_state.config.checkpoint_every;
@@ -482,7 +484,9 @@ impl DistillationTrainer {
     where
         S: TrainableModel,
     {
-        let mut optimizer = self.loop_state.build_optimizer();
+        let mut optimizer = self
+            .loop_state
+            .build_optimizer(student.output_projection_path());
 
         let num_epochs = self.loop_state.config.training.num_epochs;
         let checkpoint_every = self.loop_state.config.checkpoint_every;

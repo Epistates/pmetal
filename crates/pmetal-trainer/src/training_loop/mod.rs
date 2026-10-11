@@ -415,10 +415,18 @@ impl TrainingLoop {
 
     /// The parameter groups every loop variant trains: the configured weight
     /// decay, and the embedding and LoRA+ rates when they are set.
-    pub fn parameter_groups(&self) -> crate::ParameterGroupConfig {
+    ///
+    /// `output_projection` is where the model's output head sits
+    /// ([`pmetal_lora::TrainableModel::output_projection_path`]), so the head trains at
+    /// the embedding rate whatever it is called.
+    pub fn parameter_groups(
+        &self,
+        output_projection: Option<String>,
+    ) -> crate::ParameterGroupConfig {
         let training = &self.config.training;
         let base_lr = training.learning_rate as f32;
-        let mut groups = crate::ParameterGroupConfig::new(training.weight_decay as f32);
+        let mut groups = crate::ParameterGroupConfig::new(training.weight_decay as f32)
+            .with_output_projection(output_projection);
         if let Some(emb_lr) = self.config.embedding_lr {
             groups = groups.with_embedding_lr(emb_lr, base_lr);
             tracing::info!("Using separate embedding LR: {emb_lr:.2e} (base: {base_lr:.2e})");
@@ -432,7 +440,7 @@ impl TrainingLoop {
     /// The optimizer the standard, packed and compiled loops train with: the
     /// kind `training.optimizer` names, at the configured learning rate, over
     /// [`Self::parameter_groups`].
-    pub fn build_optimizer(&self) -> crate::ParamGroupOptimizer {
+    pub fn build_optimizer(&self, output_projection: Option<String>) -> crate::ParamGroupOptimizer {
         let training = &self.config.training;
         let base_lr = training.learning_rate as f32;
         tracing::info!(
@@ -440,7 +448,11 @@ impl TrainingLoop {
             training.optimizer,
             training.weight_decay
         );
-        crate::ParamGroupOptimizer::new(training.optimizer, base_lr, self.parameter_groups())
+        crate::ParamGroupOptimizer::new(
+            training.optimizer,
+            base_lr,
+            self.parameter_groups(output_projection),
+        )
     }
 
     /// The Metal fused AdamW [`Self::run_metal_fused`] trains with: the same
@@ -449,13 +461,14 @@ impl TrainingLoop {
     /// the standard loop does.
     pub fn build_metal_fused_optimizer(
         &self,
+        output_projection: Option<String>,
     ) -> std::result::Result<
         crate::mlx_metal_optimizer::MlxMetalOptimizer,
         crate::mlx_metal_optimizer::MlxMetalOptimizerError,
     > {
         let base_lr = self.config.training.learning_rate as f32;
         MlxMetalOptimizerBuilder::new(base_lr)
-            .param_groups(self.parameter_groups())
+            .param_groups(self.parameter_groups(output_projection))
             .build()
     }
 

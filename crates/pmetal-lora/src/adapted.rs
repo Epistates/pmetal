@@ -406,6 +406,10 @@ impl crate::TrainableModel for AdaptedModel {
         self.model.create_mamba_cache().is_some()
     }
 
+    fn output_projection_path(&mut self) -> Option<String> {
+        self.model.output_projection_path()
+    }
+
     /// `pixel_values` here means vision features already projected to the text
     /// hidden size, which is what the VLM adapter path computes once and
     /// reuses. Running the tower from raw pixels needs the processor's tile

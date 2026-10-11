@@ -10,14 +10,23 @@
 //! | Group | Parameters | Learning rate | Weight decay |
 //! |-------|------------|---------------|--------------|
 //! | [`ParamClass::NoDecay`] | biases and normalization weights ([`excluded_from_weight_decay`]) | base | 0 |
-//! | [`ParamClass::Embedding`] | names matching an embedding pattern | base × embedding ratio | configured |
+//! | [`ParamClass::Embedding`] | the token embedding and the output head, and adapters on them | base × embedding ratio | configured |
 //! | [`ParamClass::LoraB`] | LoRA B matrices, with LoRA+ | base × LoRA+ ratio | configured |
 //! | [`ParamClass::Regular`] | everything else | base | configured |
 //!
 //! The first matching row wins. The scheduler sets the base rate; the other
 //! groups keep their ratio to it.
+//!
+//! The output head is the layer the model reports as its head
+//! ([`Self::with_output_projection`](ParameterGroupConfig::with_output_projection),
+//! found by identity, as PEFT finds it), whatever it is called; failing
+//! that, an embedding is a parameter under a module named one of
+//! [`EMBEDDING_MODULE_NAMES`]. Names match on whole path components, so
+//! BERT's `attention.output.dense` is not an output head.
 
-pub use pmetal_bridge::optimizer::{GroupRates, ParamClass, excluded_from_weight_decay};
+pub use pmetal_bridge::optimizer::{
+    EMBEDDING_MODULE_NAMES, GroupRates, ParamClass, excluded_from_weight_decay,
+};
 
 /// The parameter groups of a training run.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,9 +34,13 @@ pub struct ParameterGroupConfig {
     /// Each group's learning rate (as a multiple of the base rate) and
     /// weight decay.
     pub rates: GroupRates,
-    /// A parameter whose lower-cased name contains one of these is an
-    /// embedding.
-    pub embedding_patterns: Vec<String>,
+    /// A parameter under a module with one of these names (a whole path
+    /// component, ignoring case) is an embedding.
+    pub embedding_modules: Vec<String>,
+    /// The path of the model's output head, when the model has one of its
+    /// own: its parameters, and its adapter's, are embeddings whatever the
+    /// head is called.
+    pub output_projection: Option<String>,
 }
 
 impl Default for ParameterGroupConfig {
@@ -42,17 +55,21 @@ impl ParameterGroupConfig {
     pub fn new(weight_decay: f32) -> Self {
         Self {
             rates: GroupRates::new(weight_decay),
-            embedding_patterns: [
-                "embed_tokens",
-                "lm_head",
-                "wte",        // GPT-2 style
-                "wpe",        // Position embeddings
-                "token_embd", // GGUF style
-                "output",     // Output projection
-            ]
-            .map(String::from)
-            .to_vec(),
+            embedding_modules: EMBEDDING_MODULE_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            output_projection: None,
         }
+    }
+
+    /// Count the layer at `path` (as
+    /// `DynamicModel::output_projection_path` reports it) as the output head:
+    /// its parameters and its adapter's train at the embedding rate. `None`
+    /// leaves the head to [`Self::embedding_modules`].
+    pub fn with_output_projection(mut self, path: Option<String>) -> Self {
+        self.output_projection = path;
+        self
     }
 
     /// Train embeddings at `embedding_lr` while the base rate is `base_lr`,
@@ -68,15 +85,26 @@ impl ParameterGroupConfig {
         self
     }
 
-    /// Count names containing `pattern` as embedding parameters.
-    pub fn add_embedding_pattern(mut self, pattern: impl Into<String>) -> Self {
-        self.embedding_patterns.push(pattern.into());
+    /// Count parameters under a module named `module` as embedding
+    /// parameters.
+    pub fn add_embedding_module(mut self, module: impl Into<String>) -> Self {
+        self.embedding_modules.push(module.into());
         self
     }
 
     /// Whether the parameter called `name` trains without weight decay.
     pub fn is_no_decay(&self, name: &str) -> bool {
         excluded_from_weight_decay(name)
+    }
+
+    /// Whether the parameter called `name` belongs to the token embedding or
+    /// the output head.
+    pub fn is_embedding(&self, name: &str) -> bool {
+        let in_head = self.output_projection.as_deref().is_some_and(|head| {
+            name.strip_prefix(head)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+        });
+        in_head || pmetal_bridge::optimizer::under_module(name, &self.embedding_modules)
     }
 
     /// The group the parameter called `name` trains in.
@@ -87,11 +115,7 @@ impl ParameterGroupConfig {
         let lower = name.to_lowercase();
         if self.is_no_decay(name) {
             ParamClass::NoDecay
-        } else if self
-            .embedding_patterns
-            .iter()
-            .any(|pattern| lower.contains(&pattern.to_lowercase()))
-        {
+        } else if self.is_embedding(name) {
             ParamClass::Embedding
         } else if self.rates.loraplus_ratio.is_some()
             && (lower.contains("lora_b") || lower.contains("lorab"))
@@ -165,12 +189,92 @@ mod tests {
     }
 
     #[test]
-    fn custom_embedding_patterns_count() {
-        let groups = ParameterGroupConfig::new(0.0).add_embedding_pattern("my_custom_embedding");
+    fn custom_embedding_modules_count() {
+        let groups = ParameterGroupConfig::new(0.0).add_embedding_module("my_custom_embedding");
         assert_eq!(
             groups.classify("my_custom_embedding.weight"),
             ParamClass::Embedding
         );
+        assert_eq!(
+            groups.classify("model.my_custom_embedding.lora_a"),
+            ParamClass::Embedding
+        );
+        // A whole module name, not a part of one.
+        assert_eq!(
+            groups.classify("not_my_custom_embedding.weight"),
+            ParamClass::Regular
+        );
         assert_eq!(groups.classify("regular_layer.weight"), ParamClass::Regular);
+    }
+
+    /// The token embedding and the output head, and adapters on them, train
+    /// at the embedding rate under the names BERT, Llama, GPT-2 and GPT-NeoX
+    /// give them; no other projection does, whatever its name contains.
+    #[test]
+    fn embeddings_are_the_token_embedding_and_the_head_by_module_name() {
+        let groups = ParameterGroupConfig::new(0.01).with_embedding_lr(5e-5, 2e-4);
+        for name in [
+            // Llama
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "lm_head.lora_a",
+            "lm_head.lora_b",
+            // GPT-2
+            "transformer.wte.weight",
+            // GPT-NeoX
+            "gpt_neox.embed_in.weight",
+            "embed_out.weight",
+            "embed_out.lora_a",
+            // BERT
+            "bert.embeddings.word_embeddings.weight",
+        ] {
+            assert_eq!(groups.classify(name), ParamClass::Embedding, "{name}");
+        }
+        for name in [
+            // BERT: the attention and MLP output projections.
+            "bert.encoder.layer.0.attention.output.dense.lora_a",
+            "bert.encoder.layer.0.attention.output.dense.weight",
+            "bert.encoder.layer.0.output.dense.lora_b",
+            "bert.encoder.layer.0.intermediate.dense.lora_a",
+            // Llama
+            "model.layers.0.self_attn.o_proj.lora_a",
+            "model.layers.0.mlp.down_proj.weight",
+            // GPT-2
+            "transformer.wpe.weight",
+            "transformer.h.0.attn.c_proj.lora_a",
+            // GPT-NeoX
+            "gpt_neox.layers.0.attention.dense.lora_a",
+            "gpt_neox.layers.0.mlp.dense_4h_to_h.weight",
+        ] {
+            assert_eq!(groups.classify(name), ParamClass::Regular, "{name}");
+        }
+        // Normalization weights skip weight decay before anything else.
+        assert_eq!(
+            groups.classify("bert.encoder.layer.0.attention.output.LayerNorm.weight"),
+            ParamClass::NoDecay
+        );
+    }
+
+    /// The head the model reports is the head, whatever it is called, and
+    /// only the parameters under it are: a head named `output`, as GGUF and
+    /// InternLM2 name it, does not take BERT's `attention.output` with it.
+    #[test]
+    fn the_reported_output_head_is_an_embedding_whatever_its_name() {
+        let groups =
+            ParameterGroupConfig::new(0.01).with_output_projection(Some("output".to_string()));
+        for name in ["output.weight", "output.lora_a", "output.lora_b"] {
+            assert_eq!(groups.classify(name), ParamClass::Embedding, "{name}");
+        }
+        for name in [
+            "output_proj.weight",
+            "outputs.weight",
+            "model.output.weight",
+            "encoder.layer.0.attention.output.dense.lora_a",
+        ] {
+            assert_eq!(groups.classify(name), ParamClass::Regular, "{name}");
+        }
+        // Without the model's word, `output` is no embedding.
+        let by_name = ParameterGroupConfig::new(0.01);
+        assert_eq!(by_name.classify("output.lora_a"), ParamClass::Regular);
     }
 }

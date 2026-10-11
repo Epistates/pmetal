@@ -57,7 +57,7 @@ impl TrainingLoop {
         let mut model = model;
         self.apply_gradient_checkpointing(&mut model, "Compiled");
 
-        let optimizer = self.build_optimizer();
+        let optimizer = self.build_optimizer(model.output_projection_path());
 
         let max_steps = self.config.training.max_steps;
         let num_epochs = self.config.training.num_epochs;

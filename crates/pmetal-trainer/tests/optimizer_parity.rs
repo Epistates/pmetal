@@ -390,9 +390,11 @@ fn fused_adamw_trains_the_parameter_groups_the_standard_loop_does() {
         })
         .collect();
 
-    let mut standard = training_loop.build_optimizer();
+    // `Grouped` has no output head of its own; `embed_tokens` is the
+    // embedding by name.
+    let mut standard = training_loop.build_optimizer(None);
     let mut fused = training_loop
-        .build_metal_fused_optimizer()
+        .build_metal_fused_optimizer(None)
         .expect("fused optimizer");
     // The fused path at the run's weight decay, without its embedding rate
     // and LoRA+ ratio: the update the default loop used to make.

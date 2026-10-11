@@ -43,7 +43,7 @@ impl TrainingLoop {
         // The same parameter groups as the standard loop: no-decay
         // parameters, the embedding rate and LoRA+ all reach the kernel.
         let mut metal_optimizer = self
-            .build_metal_fused_optimizer()
+            .build_metal_fused_optimizer(model.output_projection_path())
             .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
         // Initialize optimizer with model parameters

@@ -1350,7 +1350,7 @@ fn a_cut_cross_entropy_step_without_hidden_states_fails() {
 
 /// The fused Metal AdamW loop and the standard loop train the same adapters
 /// from the same config: LoRA+ on the B matrices, the embedding learning
-/// rate on the LM head's adapter (an embedding parameter by name), weight
+/// rate on the LM head's adapter (the head the model reports), weight
 /// decay on the rest, and the frozen base left alone by both.
 #[test]
 fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
@@ -1413,7 +1413,19 @@ fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
         worst
     };
 
-    let start = build();
+    let mut start = build();
+    // The head, as the model reports it, is the embedding group: its
+    // adapter and nothing else.
+    let head = start.output_projection_path();
+    assert_eq!(head.as_deref(), Some("lm_head"));
+    let groups = TrainingLoop::new(config()).parameter_groups(head.clone());
+    for name in start.flatten_trainable_params().keys() {
+        assert_eq!(
+            groups.classify(name) == crate::ParamClass::Embedding,
+            name.starts_with("lm_head."),
+            "{name}"
+        );
+    }
     let init = snapshot(&start, false);
     let trainable: usize = start
         .flatten_trainable_params()
@@ -1460,7 +1472,7 @@ fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
         );
     }
     let mut optimizer = TrainingLoop::new(config())
-        .build_metal_fused_optimizer()
+        .build_metal_fused_optimizer(head)
         .expect("fused");
     optimizer.initialize(&start).expect("initialize");
     assert_eq!(
