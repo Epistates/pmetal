@@ -33,6 +33,7 @@
 use pmetal_bridge::QuantizedMode;
 use pmetal_bridge::compat::{Linear, ModuleParameters, VisitLinears};
 use pmetal_bridge::native_weight::QuantParams;
+use pmetal_models::DynamicModel;
 
 use super::LoraError;
 
@@ -162,14 +163,18 @@ pub struct PackedBase {
 }
 
 /// Why the projection at `path` keeps its weight as loaded, if it does.
+/// `output` is where the model's output layer sits, if it has one of its own.
 ///
 /// The LM head stays in the compute dtype, as the paper's (and the reference
-/// implementation's) QLoRA leaves it. A MoE router stays, because its argmax
-/// picks the experts and is the one place four bits of noise change which
-/// computation runs, and routed experts stay as every per-architecture QLoRA
-/// model this replaced left them; see [`crate::adapted::moe_role`].
-fn kept_because(path: &str) -> Option<&'static str> {
-    if path.rsplit('.').next() == Some("lm_head") {
+/// implementation's) QLoRA leaves it. It is the layer at `output`, found by
+/// identity ([`DynamicModel::output_projection_path`]) as an empty LoRA
+/// `target_modules` finds it, whatever it is called. A MoE router stays,
+/// because its argmax picks the experts and is the one place four bits of
+/// noise change which computation runs, and routed experts stay as every
+/// per-architecture QLoRA model this replaced left them; see
+/// [`crate::adapted::moe_role`].
+fn kept_because(path: &str, output: Option<&str>) -> Option<&'static str> {
+    if output == Some(path) {
         return Some("the LM head stays in the compute dtype");
     }
     crate::adapted::moe_role(path)
@@ -178,10 +183,22 @@ fn kept_because(path: &str) -> Option<&'static str> {
 /// Pack every projection of `model` that QLoRA packs, as `config` says.
 ///
 /// Projections already packed (a checkpoint saved quantized) are left as
-/// they are, as are those [`kept_because`] names and any whose input width
-/// doesn't divide into the scheme's groups.
+/// they are, as are the output layer, MoE routers and routed experts
+/// ([`kept_because`]) and any projection whose input width doesn't divide
+/// into the scheme's groups.
 pub fn quantize_base(
+    model: &mut DynamicModel,
+    config: &QLoraConfig,
+) -> Result<PackedBase, LoraError> {
+    let output = model.output_projection_path();
+    pack_projections(model, output.as_deref(), config)
+}
+
+/// [`quantize_base`] over any tree of projections, the one at `output`
+/// being its output layer.
+fn pack_projections(
     model: &mut (impl VisitLinears + ?Sized),
+    output: Option<&str>,
     config: &QLoraConfig,
 ) -> Result<PackedBase, LoraError> {
     config.validate()?;
@@ -204,7 +221,7 @@ pub fn quantize_base(
                 .push((path.to_string(), "FP8 weights stay as loaded"));
             return;
         }
-        if let Some(reason) = kept_because(path) {
+        if let Some(reason) = kept_because(path, output) {
             report.kept.push((path.to_string(), reason));
             return;
         }
@@ -278,7 +295,7 @@ mod tests {
                 scheme,
                 ..Default::default()
             };
-            let report = quantize_base(&mut model, &config).expect("pack");
+            let report = pack_projections(&mut model, None, &config).expect("pack");
             pmetal_bridge::check_unobserved_error().expect("no bridge error");
             assert_eq!(report.packed, 1, "{scheme}");
             assert_eq!(report.dense_bytes, n * 4, "{scheme}: f32 dense");
@@ -299,7 +316,7 @@ mod tests {
             double_quant: true,
             ..Default::default()
         };
-        let report = quantize_base(&mut model, &config).expect("pack");
+        let report = pack_projections(&mut model, None, &config).expect("pack");
         let bits = report.packed_bytes as f64 * 8.0 / (512.0 * 256.0);
         // 4 + (8 + 2·16/64) / 64.
         assert!((bits - 4.133).abs() < 0.01, "{bits} bits per weight");
@@ -308,34 +325,65 @@ mod tests {
     /// The paths QLoRA leaves alone, and a width no group divides.
     #[test]
     fn heads_routers_experts_and_odd_widths_stay_as_loaded() {
-        assert!(kept_because("lm_head").is_some());
-        assert!(kept_because("model.layers.0.mlp.gate").is_some());
-        assert!(kept_because("model.layers.0.mlp.router").is_some());
-        assert!(kept_because("model.layers.0.mlp.experts.3.w1").is_some());
+        let kept = |path| kept_because(path, Some("lm_head"));
+        assert!(kept("lm_head").is_some());
+        assert!(kept("model.layers.0.mlp.gate").is_some());
+        assert!(kept("model.layers.0.mlp.router").is_some());
+        assert!(kept("model.layers.0.mlp.experts.3.w1").is_some());
         assert!(
-            kept_because("model.layers.0.mlp.weight").is_some(),
+            kept("model.layers.0.mlp.weight").is_some(),
             "DeepSeek's router"
         );
         assert!(
-            kept_because("model.layers.1.block_sparse_moe.router.layer").is_some(),
+            kept("model.layers.1.block_sparse_moe.router.layer").is_some(),
             "Granite 4's router"
         );
         assert!(
-            kept_because("model.layers.2.router.proj").is_some(),
+            kept("model.layers.2.router.proj").is_some(),
             "Gemma 4's router"
         );
         assert!(
-            kept_because("decoder.layers.0.router.proj").is_some(),
+            kept("decoder.layers.0.router.proj").is_some(),
             "DiffusionGemma's router"
         );
-        assert!(kept_because("model.layers.0.mlp.gate_proj").is_none());
-        assert!(kept_because("model.layers.0.self_attn.q_proj").is_none());
+        assert!(kept("model.layers.0.mlp.gate_proj").is_none());
+        assert!(kept("model.layers.0.self_attn.q_proj").is_none());
 
         let mut model = vec![layer(48)];
-        let report = quantize_base(&mut model, &QLoraConfig::default()).expect("pack");
+        let report = pack_projections(&mut model, None, &QLoraConfig::default()).expect("pack");
         assert_eq!(report.packed, 0);
         assert_eq!(report.kept.len(), 1);
         assert!(model[0].quant.is_none());
+    }
+
+    /// The output layer stays as loaded because it is the output layer, not
+    /// because of its name: a head called `embed_out` stays, and a
+    /// projection called `lm_head` that isn't the head is packed.
+    #[test]
+    fn the_output_layer_stays_whatever_it_is_called() {
+        struct Headed {
+            lm_head: Linear,
+            embed_out: Linear,
+        }
+        pmetal_bridge::impl_module_params!(Headed; lm_head, embed_out);
+
+        let mut model = Headed {
+            lm_head: layer(512),
+            embed_out: layer(512),
+        };
+        let report =
+            pack_projections(&mut model, Some("embed_out"), &QLoraConfig::default()).expect("pack");
+        assert_eq!(report.packed, 1);
+        assert_eq!(
+            report.kept,
+            [(
+                "embed_out".to_string(),
+                "the LM head stays in the compute dtype"
+            )]
+        );
+        assert!(model.embed_out.quant.is_none(), "the head was packed");
+        assert!(model.lm_head.quant.is_some(), "`lm_head` was kept by name");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]
@@ -344,7 +392,7 @@ mod tests {
             group_size: 48,
             ..Default::default()
         };
-        let err = quantize_base(&mut vec![layer(128)], &bad_group).unwrap_err();
+        let err = pack_projections(&mut vec![layer(128)], None, &bad_group).unwrap_err();
         assert!(err.to_string().contains("48"), "{err}");
 
         let dq_on_int8 = QLoraConfig {
@@ -375,7 +423,7 @@ mod tests {
                 scheme,
                 ..Default::default()
             };
-            quantize_base(&mut model, &config).expect("pack");
+            pack_projections(&mut model, None, &config).expect("pack");
             let diff = model[0]
                 .dense_weight()
                 .as_dtype(Dtype::Float32.as_i32())

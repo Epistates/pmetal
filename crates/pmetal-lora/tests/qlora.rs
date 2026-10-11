@@ -104,6 +104,7 @@ fn every_projection_is_packed_or_kept_for_a_reason() {
         };
         let mut total = 0;
         model.visit_linears_mut("", &mut |_, _| total += 1);
+        let head = model.output_projection_path();
         let report = quantize_base(&mut model, &QLoraConfig::default()).expect("pack");
         assert_eq!(
             report.packed + report.kept.len(),
@@ -112,13 +113,21 @@ fn every_projection_is_packed_or_kept_for_a_reason() {
             case.name
         );
         for (path, reason) in &report.kept {
-            let name = path.rsplit('.').next().unwrap_or(path);
-            let expected = match name {
-                "lm_head" => reason.contains("LM head"),
-                _ if path.contains(".experts.") => reason.contains("routed experts"),
-                _ => reason.contains("router") || reason.contains("divide"),
+            let expected = if Some(path) == head.as_ref() {
+                reason.contains("LM head")
+            } else if path.contains(".experts.") {
+                reason.contains("routed experts")
+            } else {
+                reason.contains("router") || reason.contains("divide")
             };
             assert!(expected, "{}: `{path}` kept: {reason}", case.name);
+        }
+        if let Some(head) = &head {
+            assert!(
+                report.kept.iter().any(|(path, _)| path == head),
+                "{}: the output layer `{head}` was packed",
+                case.name
+            );
         }
         assert!(
             report.packed_bytes * 3 < report.dense_bytes,
