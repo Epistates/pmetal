@@ -503,7 +503,9 @@ pub mod fast {
         x.rope_with_freqs(dims, traditional, scale, offset, freqs)
     }
 
-    /// Scaled dot-product attention with string mask mode (`"none"`, `"causal"`, …).
+    /// Scaled dot-product attention with a string mask mode: `""` for none or
+    /// `"causal"`. Any other mode throws; an explicit mask array goes through
+    /// [`scaled_dot_product_attention_masked`].
     pub fn scaled_dot_product_attention(
         q: &Array,
         k: &Array,

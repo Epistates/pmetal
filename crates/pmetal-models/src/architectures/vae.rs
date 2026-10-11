@@ -209,7 +209,7 @@ impl VAEAttentionBlock {
 
         let scale = 1.0 / (c as f32).sqrt();
         let attn_out =
-            pmetal_bridge::compat::fast::scaled_dot_product_attention(&q, &k, &v, scale, "none");
+            pmetal_bridge::compat::fast::scaled_dot_product_attention(&q, &k, &v, scale, "");
 
         let attn_out = attn_out.squeeze_axes(&[1]).reshape(&[b, h, w, c]);
         let out = self.proj_out.forward(&attn_out);

@@ -474,6 +474,10 @@ mod tests {
 
         assert!(out.is_ok(), "Pipeline failed: {:?}", out.err());
         let image = out.unwrap();
+        image.eval();
+        // A throwing bridge op hands back a placeholder of plausible shape, so
+        // the shape alone can't show the pipeline ran.
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
         assert_eq!(image.shape(), &[batch, 3, 64, 64]);
     }
 
