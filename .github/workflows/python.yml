@@ -14,6 +14,11 @@ jobs:
   build:
     name: Build Python wheel (macOS aarch64)
     runs-on: macos-latest
+    env:
+      # A wheel runs far from this build tree, so MLX is linked into the
+      # extension module (.cargo/config.toml otherwise links it shared here).
+      # Job-wide, so the metallib step and maturin build the same MLX.
+      PMETAL_MLX_STATIC: '1'
     steps:
       - uses: actions/checkout@v7
 
@@ -28,13 +33,37 @@ jobs:
       - name: Install maturin
         run: pip install "maturin>=1.15,<2.0"
 
-      # A wheel runs far from this build tree, so MLX is linked into the
-      # extension module (.cargo/config.toml otherwise links it shared here).
+      # MLX loads its Metal kernels from an mlx.metallib next to the binary
+      # that links it, here the extension module, and only the one built with
+      # that MLX holds the kernels it asks for. Build the extension's
+      # dependencies as maturin will, take the metallib path and SHA-256 the
+      # bridge's build script publishes, and put the file in the package,
+      # where the wheel carries it beside the module.
+      - name: Bundle the metallib built with the linked MLX
+        run: |
+          set -euo pipefail
+          meta=$(
+            cargo build --release -p pmetal-py --message-format=json \
+              | jq -r 'select(.reason == "build-script-executed")
+                  | select(.package_id | test("pmetal-bridge"))
+                  | .env | map({(.[0]): .[1]}) | add
+                  | "\(.PMETAL_BRIDGE_MLX_METALLIB) \(.PMETAL_BRIDGE_MLX_METALLIB_SHA256)"' \
+              | tail -n 1)
+          read -r path sha <<< "$meta"
+          if [ ! -f "$path" ]; then
+            echo "::error::the bridge's build published no metallib ($meta)"
+            exit 1
+          fi
+          dest=crates/pmetal-py/py_src/pmetal/mlx.metallib
+          cp "$path" "$dest"
+          echo "$sha  $dest" | shasum -a 256 -c -
+
       - name: Build wheel
         working-directory: crates/pmetal-py
-        env:
-          PMETAL_MLX_STATIC: '1'
         run: maturin build --release --strip
+
+      - name: Check the wheel carries the metallib
+        run: unzip -l target/wheels/*.whl | grep -q 'pmetal/mlx.metallib$'
 
       - name: Install wheel and run tests
         run: |
