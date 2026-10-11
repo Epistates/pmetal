@@ -1415,12 +1415,14 @@ async fn attempt_ane_training(
         n_layers,
         vocab_size,
         seq_len: max_seq_len,
-        // Full-parameter training needs much lower LR than LoRA.
-        // LoRA default (1e-4) is 10-100x too high for all-param updates.
-        // Cap at 2e-5 unless the user explicitly set a lower value.
+        // Full-parameter training wants about a tenth of LoRA's learning
+        // rate: TRL's reference is 2e-5 for full fine-tuning against 2e-4
+        // for LoRA, and published full SFT of models this size runs at 1e-5
+        // to 2e-5. A LoRA rate here would diverge, so the rate is capped at
+        // 2e-5 (the GUI's ANE default); a lower one is kept as given.
         learning_rate: {
             let user_lr = full_config.training.learning_rate as f32;
-            let max_full_param_lr = 5e-6;
+            let max_full_param_lr = 2e-5;
             if user_lr > max_full_param_lr {
                 tracing::info!(
                     user_lr = format!("{:.1e}", user_lr),
