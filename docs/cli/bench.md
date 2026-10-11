@@ -35,7 +35,7 @@ pmetal bench-ffi
 Run the structured kernel benchmark corpus for the current Apple Silicon tier and emit a JSON artifact. This corpus covers standard-Metal hot paths on M1-M4, includes fused-merge plus initial model-family coverage for Llama 4 MoE, Qwen3-MoE, Qwen3Next, and NemotronH hybrid layers, and adds MPP GEMM coverage on Apple10/M5 when NAX is available.
 
 ```bash
-pmetal bench-corpus --quick --output .strategy/bench_corpus.json
+pmetal bench-corpus --quick --output bench_corpus.json
 ```
 
 Use `--json` to print the report to stdout, or omit `--quick` for the standard corpus run.
@@ -76,21 +76,21 @@ pmetal bench-workload \
   --train-samples 4 \
   --train-steps 2 \
   --json \
-  --output .strategy/bench_workload_qwen3_0_6b.json
+  --output bench_workload_qwen3_0_6b.json
 ```
 
 ```bash
 pmetal bench-workload \
   --preset hybrid-qwen3next \
   --json \
-  --output .strategy/bench_workload_qwen3next_0_8b.json
+  --output bench_workload_qwen3next_0_8b.json
 ```
 
 ```bash
 pmetal bench-workload \
   --preset moe-nemotronh \
   --json \
-  --output .strategy/bench_workload_nemotronh_4b.json
+  --output bench_workload_nemotronh_4b.json
 ```
 
 ### bench-gdn

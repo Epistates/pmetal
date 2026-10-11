@@ -206,6 +206,6 @@ Replace hardcoded tier-based parameters with runtime optimization:
 - [x] Auto-select fp16 vs q8 KV cache for inference based on model/context fit instead of hardcoding q8 as the default on Apple7-Apple9
 - [ ] Expand first-run autotuning only where checked-in corpus data still shows meaningful upside beyond the now-covered hot paths
 - [x] Measure and persist approximate GPU unified-memory bandwidth via copy benchmark, with spec-table fallback when probing is unavailable
-- [x] Record local M4 Max benchmark-corpus reports in `.strategy/bench_corpus_m4_max_2026_03_23.json` and `.strategy/bench_corpus_m4_max_quick_2026_03_23.json`
+- [x] Record M4 Max benchmark-corpus reports (standard and `--quick` runs, 2026-03-23)
 - [ ] Run `pmetal bench-corpus` on representative M1/M2/M3/M4/M5 hardware and check in the reports that justify default choices
 - [ ] M5 Pro/Max/Ultra profiling once hardware is available

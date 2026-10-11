@@ -67,7 +67,7 @@ struct ChannelMetricsCallback {
     best_loss: Option<f64>,
 }
 
-// Phase 4's GUI agent will add a `TauriJobEventSink` once the Svelte frontend
+// A `TauriJobEventSink` comes in Phase 4, once the Svelte frontend
 // is migrated to consume `pmetal::core::JobEvent` directly. `Channel<T>` does
 // not implement `Deserialize`, so it can't be wrapped in `Option<>` for a
 // backwards-compatible Phase 2 hook — the migration is necessarily a single

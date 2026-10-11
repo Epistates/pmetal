@@ -82,7 +82,7 @@ pmetal infer \
   --prompt "write a fizzbuzz program in python" \
   --chat --no-thinking --temperature 0 \
   --profile-layers \
-  --profile-output .strategy/qwen35_layer_profile.json
+  --profile-output qwen35_layer_profile.json
 ```
 
 ## Parameters

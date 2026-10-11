@@ -92,8 +92,8 @@ impl TrainingTab {
     ///
     /// The CLI is authoritative for flag names and default values.  The
     /// reconciliation of inverted-toggle UX (spec `no_x` → TUI shows as
-    /// positive "X: Enabled/Disabled") is deferred to the CLI agent, which
-    /// controls the spec's flag conventions.
+    /// positive "X: Enabled/Disabled") is deferred to the CLI, which owns the
+    /// spec's flag conventions.
     fn default_fields() -> Vec<FormField> {
         let mut fields: Vec<FormField> = TrainSpec::field_descriptors()
             .iter()

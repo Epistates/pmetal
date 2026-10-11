@@ -729,9 +729,9 @@ mod tests {
     }
 
     /// AdamW over LoRA-sized parameters (392 adapters of 16 x 1600 f32,
-    /// about 10M elements). Measures speed: run through the GPU queue.
+    /// about 10M elements). Measures speed: run it alone.
     #[test]
-    #[ignore = "benchmark; run through gpuq"]
+    #[ignore = "benchmark; run it alone (it measures speed)"]
     fn bench_fused_adamw_over_lora_sized_params() {
         pmetal_bridge::compat::random::seed(1);
         let mut model = Weights {

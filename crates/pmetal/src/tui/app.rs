@@ -2036,8 +2036,8 @@ impl App {
                 // Phase 2 hook — substrate transport validation. Today the
                 // legacy `Job*` variants above still drive all UI; this arm is
                 // a no-op placeholder that proves the JobEvent stream is
-                // reaching `app.rs`. Phase 4's TUI agent will collapse the
-                // legacy variants and consume `event` directly.
+                // reaching `app.rs`. Phase 4 collapses the legacy variants
+                // and consumes `event` directly.
                 tracing::trace!(target: "tui::events", "JobEvent: {event:?}");
             }
         }

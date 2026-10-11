@@ -531,8 +531,8 @@ async fn run_direct_command(
 ///
 /// Phase 2: emits both the legacy `AppMsg::Job*` variants (via
 /// `ChannelMetricsCallback`) and the canonical `AppMsg::Job(JobEvent)` (via
-/// `MpscAppMsgSink` wrapped in `TrainingCallbackToSink`). Phase 4's TUI agent
-/// collapses to the canonical path only.
+/// `MpscAppMsgSink` wrapped in `TrainingCallbackToSink`). Phase 4 collapses
+/// to the canonical path only.
 fn direct_training_callbacks(
     job_id: &str,
     tx: mpsc::Sender<AppMsg>,

@@ -33,8 +33,8 @@ pub enum AppMsg {
     /// Successor to the per-event `Job*` variants below — added in Phase 2 of
     /// the surface-cohesion roll-out so the new substrate's transports can be
     /// validated end-to-end without breaking existing consumers. Phase 4
-    /// agents per surface (CLI/TUI/GUI/MCP) collapse the legacy variants into
-    /// this one.
+    /// collapses the legacy variants into this one on every surface
+    /// (CLI/TUI/GUI/MCP).
     Job(pmetal_core::JobEvent),
     /// A background job has started.
     JobStarted { job_id: String, job_type: JobType },
