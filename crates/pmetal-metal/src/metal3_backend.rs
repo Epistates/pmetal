@@ -22,14 +22,12 @@
 //!   and passed directly to [`FusedMoeExpert::forward_single_expert`].
 //!
 //! - **`fused_lora_forward`**, **`fused_cross_entropy`** and
-//!   **`fused_adamw_step`**: wired using `DynBufRef` (for the sampler-trait
-//!   mismatch) and param-info extraction from the `AdamWDescriptor` (for AdamW).
+//!   **`fused_adamw_step`**: wired directly, with param-info extraction from
+//!   the `AdamWDescriptor` for AdamW.
 
 use std::sync::Arc;
 
 use half::f16;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLBuffer;
 
 use crate::{
     backend::{
@@ -49,7 +47,6 @@ use crate::{
         fused_moe::{ExpertWeightBuffers, FusedMoeExpert},
         fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput},
         fused_rope::{FusedRoPE, FusedRoPEConfig},
-        fused_sampler::AsMetalBuffer as SamplerBuf,
         fused_swiglu::{
             FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
         },
@@ -58,44 +55,6 @@ use crate::{
         mpp_gemm::MppGemm,
     },
 };
-
-// ============================================================================
-// DynBufRef — bridges &dyn buffer::AsMetalBuffer to both AsMetalBuffer traits
-// ============================================================================
-
-/// Newtype wrapper that adapts a `&dyn buffer::AsMetalBuffer` reference into
-/// types implementing both `buffer::AsMetalBuffer` and
-/// `fused_sampler::AsMetalBuffer`.
-///
-/// The two traits are identically-shaped but distinct:
-/// - `buffer::AsMetalBuffer` uses `as_metal_buffer()`
-/// - `fused_sampler::AsMetalBuffer` uses `metal_buffer()`
-///
-/// Both return `&ProtocolObject<dyn MTLBuffer>`, so the adapter is
-/// zero-overhead — it simply re-names the call. Implementing both lets
-/// `DynBufRef` be passed to kernel methods regardless of which variant they
-/// expect.
-struct DynBufRef<'a>(&'a dyn AsMetalBuffer);
-
-impl SamplerBuf for DynBufRef<'_> {
-    fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        self.0.as_metal_buffer()
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-}
-
-impl AsMetalBuffer for DynBufRef<'_> {
-    fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        self.0.as_metal_buffer()
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-}
 
 // ============================================================================
 // Metal3Backend
@@ -336,11 +295,6 @@ impl KernelBackend for Metal3Backend {
     }
 
     /// Fused LoRA forward via [`FusedLora::forward`].
-    ///
-    /// [`FusedLora::forward`] is generic over `B: fused_sampler::AsMetalBuffer`.
-    /// The trait provides `&dyn buffer::AsMetalBuffer`. We bridge the gap with
-    /// `DynBufRef`, which implements `fused_sampler::AsMetalBuffer` by
-    /// delegating `metal_buffer()` to `buffer::AsMetalBuffer::as_metal_buffer()`.
     fn fused_lora_forward(
         &self,
         ctx: &Arc<MetalContext>,
@@ -351,12 +305,7 @@ impl KernelBackend for Metal3Backend {
         lora_b: &dyn AsMetalBuffer,
     ) -> Result<FusedLoraOutput> {
         let kernel = FusedLora::new(ctx.clone(), config.clone())?;
-        kernel.forward(
-            &DynBufRef(x),
-            &DynBufRef(weight),
-            &DynBufRef(lora_a),
-            &DynBufRef(lora_b),
-        )
+        kernel.forward(x, weight, lora_a, lora_b)
     }
 
     // ---- Training optimizers and losses -------------------------------------

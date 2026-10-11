@@ -81,7 +81,7 @@ pub mod pipeline;
 pub mod tuna;
 
 pub use bridge::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
-pub use buffer::{BufferUsage, MetalBuffer};
+pub use buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use dispatch::KernelDispatch;
 pub use error::{MetalError, Result};
@@ -108,7 +108,6 @@ pub use kernels::fused_moe::{
 };
 pub use kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use kernels::fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
-pub use kernels::fused_sampler::{AsMetalBuffer, FusedSampler, FusedSamplerConfig, SamplingParams};
 pub use kernels::fused_swiglu::{
     FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
 };
@@ -132,7 +131,6 @@ pub mod prelude {
         FusedLinearCrossEntropyConfig,
     };
     pub use crate::kernels::fused_lora::{FusedLora, FusedLoraConfig};
-    pub use crate::kernels::fused_sampler::{FusedSampler, FusedSamplerConfig};
     pub use crate::kernels::mpp_flash_attention::{MppFlashAttention, MppFlashAttentionConfig};
     pub use crate::pipeline::PipelineCache;
 }

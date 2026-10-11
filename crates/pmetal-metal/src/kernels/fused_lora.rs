@@ -36,10 +36,9 @@ use objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 
-use crate::buffer::{BufferUsage, MetalBuffer};
+use crate::buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
-use crate::kernels::fused_sampler::AsMetalBuffer;
 
 /// Configuration for fused LoRA operations.
 #[derive(Debug, Clone)]
@@ -249,7 +248,7 @@ impl FusedLora {
     /// Returns
     ///
     /// Output tensor and intermediate for backward.
-    pub fn forward<B: AsMetalBuffer>(
+    pub fn forward<B: AsMetalBuffer + ?Sized>(
         &self,
         x: &B,
         weight: &B,
@@ -299,7 +298,7 @@ impl FusedLora {
     /// Returns
     ///
     /// Tuple of (grad_a, grad_b).
-    pub fn backward_ab<B: AsMetalBuffer>(
+    pub fn backward_ab<B: AsMetalBuffer + ?Sized>(
         &self,
         grad_output: &B,
         x: &B,
@@ -343,7 +342,7 @@ impl FusedLora {
     /// Returns
     ///
     /// Input gradient [batch_size, in_features].
-    pub fn backward_x<B: AsMetalBuffer>(
+    pub fn backward_x<B: AsMetalBuffer + ?Sized>(
         &self,
         grad_output: &B,
         weight: &B,
@@ -367,7 +366,7 @@ impl FusedLora {
     }
 
     /// Validate input sizes for forward pass.
-    fn validate_forward_inputs<B: AsMetalBuffer>(
+    fn validate_forward_inputs<B: AsMetalBuffer + ?Sized>(
         &self,
         x: &B,
         weight: &B,
@@ -406,7 +405,7 @@ impl FusedLora {
     }
 
     /// Execute the forward kernel.
-    fn execute_forward<B: AsMetalBuffer>(
+    fn execute_forward<B: AsMetalBuffer + ?Sized>(
         &self,
         x: &B,
         weight: &B,
@@ -452,12 +451,12 @@ impl FusedLora {
 
         // Set buffers
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weight.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(lora_a.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(lora_b.metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weight.as_metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(lora_a.as_metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(lora_b.as_metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(output.as_metal_buffer()), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(intermediate.as_metal_buffer()), 0, 5);
 
             let params = FusedLoraParams::from(&self.config);
             let params_ptr = NonNull::from(&params).cast();
@@ -530,11 +529,11 @@ impl FusedLora {
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weight.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(lora_a.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(lora_b.metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weight.as_metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(lora_a.as_metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(lora_b.as_metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(output.as_metal_buffer()), 0, 4);
 
             let params = FusedLoraParams::from(&self.config);
             let params_ptr = NonNull::from(&params).cast();
@@ -566,7 +565,7 @@ impl FusedLora {
     }
 
     /// Execute the backward AB kernel.
-    fn execute_backward_ab<B: AsMetalBuffer>(
+    fn execute_backward_ab<B: AsMetalBuffer + ?Sized>(
         &self,
         grad_output: &B,
         x: &B,
@@ -603,12 +602,12 @@ impl FusedLora {
             encoder.setComputePipelineState(&pipeline);
 
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grad_output.metal_buffer()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(lora_b.metal_buffer()), 0, 3);
-                encoder.setBuffer_offset_atIndex(Some(grad_a.metal_buffer()), 0, 4);
-                encoder.setBuffer_offset_atIndex(Some(grad_b.metal_buffer()), 0, 5);
+                encoder.setBuffer_offset_atIndex(Some(grad_output.as_metal_buffer()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(intermediate.as_metal_buffer()), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(lora_b.as_metal_buffer()), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(grad_a.as_metal_buffer()), 0, 4);
+                encoder.setBuffer_offset_atIndex(Some(grad_b.as_metal_buffer()), 0, 5);
 
                 let params = FusedLoraParams::from(&self.config);
                 let params_ptr = NonNull::from(&params).cast();
@@ -704,10 +703,10 @@ impl FusedLora {
             encoder.setComputePipelineState(&pipeline);
 
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(grad_output.metal_buffer()), 0, 0);
-                encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 1);
-                encoder.setBuffer_offset_atIndex(Some(lora_b.metal_buffer()), 0, 2);
-                encoder.setBuffer_offset_atIndex(Some(grad_a.metal_buffer()), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(grad_output.as_metal_buffer()), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(lora_b.as_metal_buffer()), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(grad_a.as_metal_buffer()), 0, 3);
 
                 let params = FusedLoraParams::from(&self.config);
                 let params_ptr = NonNull::from(&params).cast();
@@ -744,7 +743,7 @@ impl FusedLora {
     }
 
     /// Execute the backward X kernel.
-    fn execute_backward_x<B: AsMetalBuffer>(
+    fn execute_backward_x<B: AsMetalBuffer + ?Sized>(
         &self,
         grad_output: &B,
         weight: &B,
@@ -778,11 +777,11 @@ impl FusedLora {
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grad_output.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weight.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(lora_a.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(lora_b.metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(grad_x.metal_buffer()), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(grad_output.as_metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(weight.as_metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(lora_a.as_metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(lora_b.as_metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(grad_x.as_metal_buffer()), 0, 4);
 
             let params = FusedLoraParams::from(&self.config);
             let params_ptr = NonNull::from(&params).cast();

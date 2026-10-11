@@ -135,7 +135,7 @@ pub mod prelude {
         BufferUsage, FlashAttention, FlashAttentionConfig, FlashAttentionVarlen,
         FlashAttentionVarlenConfig, FusedCrossEntropy, FusedCrossEntropyConfig,
         FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig, FusedLora, FusedLoraConfig,
-        FusedSampler, FusedSamplerConfig, MetalBuffer, MetalContext, MetalError, PipelineCache,
+        MetalBuffer, MetalContext, MetalError, PipelineCache,
     };
 
     // MLX prelude minus Dtype (use mlx::Dtype explicitly to avoid ambiguity with core::Dtype)

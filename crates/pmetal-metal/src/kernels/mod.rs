@@ -1,8 +1,8 @@
 //! GPU compute kernels for ML operations.
 //!
 //! This module contains optimized Metal kernels for machine learning operations,
-//! with a focus on transformer attention mechanisms, high-performance sampling,
-//! and efficient training operations.
+//! with a focus on transformer attention mechanisms and efficient training
+//! operations.
 
 pub mod batch_encoder;
 pub mod dequant;
@@ -16,7 +16,6 @@ pub mod fused_merge;
 pub mod fused_moe;
 pub mod fused_norm_lora;
 pub mod fused_rope;
-pub mod fused_sampler;
 pub mod fused_swiglu;
 pub mod fused_training;
 pub mod moe;
@@ -72,7 +71,6 @@ pub use fused_merge::{
 pub use fused_moe::{ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig};
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
-pub use fused_sampler::{FusedSampler, FusedSamplerConfig, SamplingParams};
 pub use fused_swiglu::{
     FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
 };

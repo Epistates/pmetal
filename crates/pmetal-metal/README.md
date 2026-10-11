@@ -12,7 +12,6 @@ This crate provides custom Metal shaders that accelerate LLM training and infere
 - **Fused LoRA**: Combined base + adapter forward pass (~2x speedup)
 - **Fused Cross-Entropy**: Chunked vocabulary loss (avoids logits materialization)
 - **Fused RoPE**: Rotary position embeddings computed in-kernel
-- **Fused Sampler**: JIT-compiled token sampling
 - **Fused SwiGLU**: MLP activation fusion
 - **Fused Norm+LoRA**: Combined layer norm and adapter application
 - **Fused GDN**: Gated Delta Network recurrence (Metal shader, 32-thread SIMD)
@@ -103,7 +102,6 @@ fn attend(
 | `fused_lora` | ~2x | Same | Combined base+adapter forward |
 | `fused_cross_entropy` | 1.3x | O(1) per chunk | Chunked loss computation |
 | `fused_rope` | 1.2x | Same | In-kernel position encoding |
-| `fused_sampler` | 1.4x | Same | JIT-compiled sampling |
 
 ## Requirements
 
