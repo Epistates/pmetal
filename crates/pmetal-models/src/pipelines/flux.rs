@@ -102,7 +102,9 @@ impl FluxPipeline {
     /// * `height` - Output image height.
     /// * `num_steps` - Number of denoising steps.
     /// * `guidance` - Guidance scale for Flux.
-    /// * `seed` - Optional random seed.
+    /// * `seed` - Seed of the initial noise. The same seed and inputs give
+    ///   the same image whatever else draws random numbers on the thread,
+    ///   and generating leaves the thread's random key alone.
     #[expect(
         clippy::too_many_arguments,
         reason = "public API: one argument per setting"
@@ -135,15 +137,7 @@ impl FluxPipeline {
         let latents_w = width / 16;
         let latents_seq = latents_h * latents_w;
 
-        let mut latents = {
-            if let Some(s) = seed {
-                pmetal_bridge::compat::random::seed(s);
-            }
-            pmetal_bridge::compat::random::normal(
-                &[batch_size, latents_seq as i32, 64],
-                pmetal_bridge::compat::Dtype::Float32,
-            )
-        };
+        let mut latents = initial_latents(&[batch_size, latents_seq as i32, 64], seed);
 
         // 3. Prepare IDs for RoPE
         // Text IDs are [B, text_seq, 3] - usually zeros or indices for Flux.
@@ -211,6 +205,22 @@ impl FluxPipeline {
 
         Ok(image)
     }
+}
+
+/// The noise a generation starts from, standard normal latents of `shape`.
+///
+/// With a `seed` they are drawn with the key
+/// [`draw_key`](pmetal_bridge::decode::draw_key)`(seed, 0)`, as a seeded
+/// sampler's first draw is, so a seed gives the same image whatever else
+/// draws random numbers on the thread, and the thread's own key is left
+/// alone. Without one they take the thread's key.
+fn initial_latents(shape: &[i32], seed: Option<u64>) -> Array {
+    let key = seed.map(|seed| pmetal_bridge::decode::draw_key(seed, 0));
+    pmetal_bridge::compat::random::normal_keyed(
+        shape,
+        pmetal_bridge::compat::Dtype::Float32,
+        key.as_ref(),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -465,6 +475,53 @@ mod tests {
         assert!(out.is_ok(), "Pipeline failed: {:?}", out.err());
         let image = out.unwrap();
         assert_eq!(image.shape(), &[batch, 3, 64, 64]);
+    }
+
+    /// A seeded generation's noise is a function of its seed alone: other
+    /// draws on the thread between two generations don't change it, and
+    /// drawing it neither reseeds nor advances the thread's key.
+    #[test]
+    #[serial_test::serial]
+    fn seeded_initial_noise_is_independent_of_the_thread_key() {
+        use pmetal_bridge::compat::{Dtype, random};
+
+        let shape = [1, 16, 64];
+        let floats = |a: Array| {
+            a.eval();
+            a.as_slice::<f32>().to_vec()
+        };
+        let thread_draw = || floats(random::uniform(&[8], Dtype::Float32));
+
+        random::seed(1);
+        let a = floats(initial_latents(&shape, Some(42)));
+        let after_a = thread_draw();
+        random::seed(99);
+        let _ = thread_draw();
+        assert_eq!(
+            a,
+            floats(initial_latents(&shape, Some(42))),
+            "the same seed drew different noise"
+        );
+
+        // The thread's key went on from where it was, untouched.
+        random::seed(1);
+        assert_eq!(
+            thread_draw(),
+            after_a,
+            "the seeded draw moved the thread's key"
+        );
+
+        assert_ne!(
+            a,
+            floats(initial_latents(&shape, Some(43))),
+            "another seed drew the same noise"
+        );
+        // Unseeded, the noise is the thread's.
+        random::seed(5);
+        let unseeded = floats(initial_latents(&shape, None));
+        random::seed(5);
+        assert_eq!(unseeded, floats(initial_latents(&shape, None)));
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[test]
