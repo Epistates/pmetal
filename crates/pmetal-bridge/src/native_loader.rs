@@ -16,7 +16,7 @@
 
 use crate::InlineArray;
 use crate::compat::Dtype;
-use crate::error::check_last_error;
+use crate::error::{check_last_error, check_unobserved_error};
 use crate::inline_array as bridge;
 use crate::native_weight::MlxQuantization;
 use std::collections::HashMap;
@@ -244,7 +244,7 @@ impl ModelOptWeight {
             } => fp8_e4m3_to_dtype(weight, f32_dtype)?.multiply(tensor_scale),
         };
         let dense = dense.as_dtype(dtype);
-        check_last_error().map_err(|e| format!("ModelOpt dequantize: {e}"))?;
+        check_unobserved_error().map_err(|e| format!("ModelOpt dequantize: {e}"))?;
         Ok(dense)
     }
 }
@@ -591,7 +591,7 @@ mod tests {
             .into_layer_weight();
 
         let mut got = projection.matmul_from(&InlineArray::from_f32_slice(&x, &[1, in_dim as i32]));
-        crate::check_last_error().expect("nvfp4 matmul");
+        crate::check_unobserved_error().expect("nvfp4 matmul");
         let got = got.to_f32_vec(out).expect("read product");
 
         for (r, got) in got.iter().enumerate() {

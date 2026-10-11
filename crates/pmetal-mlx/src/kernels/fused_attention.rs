@@ -1215,7 +1215,8 @@ mod tests {
         let mut out = fused_sdpa(&q, &k, &v, &config, Some(&mask)).expect("fused_sdpa runs");
         out.eval();
 
-        pmetal_bridge::check_last_error().expect("no bridge exception with an f32 mask on bf16");
+        pmetal_bridge::check_unobserved_error()
+            .expect("no bridge exception with an f32 mask on bf16");
         assert_eq!(out.shape(), &shape);
         let values = out.to_f32_vec(out.size()).expect("output readable");
         assert!(
@@ -1257,7 +1258,7 @@ mod tests {
         )
         .expect("fused_sdpa runs");
         bf16_out.eval();
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .expect("no bridge exception from a self-built sliding-window mask on bf16");
         assert_eq!(bf16_out.shape(), &shape);
 
@@ -2035,7 +2036,7 @@ mod tests {
             g.iter().for_each(|x| {
                 x.eval();
             });
-            pmetal_bridge::check_last_error().unwrap();
+            pmetal_bridge::check_unobserved_error().unwrap();
             g
         };
         let fused = grads(&|a| fused_sdpa(&a[0], &a[1], &a[2], &config, None).unwrap());

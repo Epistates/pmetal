@@ -61,7 +61,7 @@ fn describe(model: &Path, video: PathBuf) -> String {
     .expect("prepare");
     let prompt_len = runner.state.input_ids().len();
     let output = runner.state.generate_streaming(|_| true).expect("generate");
-    pmetal_bridge::check_last_error().expect("bridge error");
+    pmetal_bridge::check_unobserved_error().expect("bridge error");
     runner
         .tokenizer
         .decode(&output.token_ids[prompt_len..])

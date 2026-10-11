@@ -5,14 +5,15 @@
 //! Expected values are written out by hand from the NumPy / MLX definitions,
 //! never read back from another MLX op.
 
-use pmetal_bridge::check_last_error;
+use pmetal_bridge::check_unobserved_error;
 use pmetal_bridge::compat::ops::PadMode;
 use pmetal_bridge::compat::{Array, Dtype, ops};
 
-/// The op under test, checked for a bridge error before anything else runs
-/// (a later successful op clears the thread's error slot).
+/// The op under test, checked for a bridge error before anything else runs:
+/// any op since the last check, so one that threw while building `out`'s
+/// inputs counts too.
 fn checked(out: Array, what: &str) -> Array {
-    check_last_error().unwrap_or_else(|e| panic!("{what}: bridge error {e}"));
+    check_unobserved_error().unwrap_or_else(|e| panic!("{what}: bridge error {e}"));
     out
 }
 
@@ -21,7 +22,7 @@ fn read(a: &Array) -> Vec<f32> {
     a.eval();
     let n = a.size();
     let v = a.to_f32_vec(n).expect("to_f32_vec");
-    check_last_error().expect("readback");
+    check_unobserved_error().expect("readback");
     v
 }
 
@@ -298,13 +299,13 @@ fn tile_repeats_the_whole_array() {
 fn split_into_equal_sections() {
     let x = f32s(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
     let parts = ops::split(&x, 3, 0);
-    check_last_error().expect("split");
+    check_unobserved_error().expect("split");
     assert_eq!(parts.len(), 3);
     assert_same(&read(&parts[2]), &[4.0, 5.0], "split");
 
     // 6 doesn't divide into 4 sections: MLX refuses rather than going uneven.
     let parts = ops::split(&x, 4, 0);
-    assert!(check_last_error().is_err(), "uneven split must fail");
+    assert!(check_unobserved_error().is_err(), "uneven split must fail");
     assert!(parts.is_empty());
 }
 

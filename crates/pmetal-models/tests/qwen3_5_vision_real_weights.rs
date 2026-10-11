@@ -54,7 +54,7 @@ fn top_k(values: &[f32], k: usize) -> Vec<usize> {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_last_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn last_row(logits: &Array) -> Vec<f32> {

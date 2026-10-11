@@ -357,10 +357,10 @@ mod tests {
         let w = InlineArray::from_f32_slice(&values, &[rows, cols]);
 
         let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
-        crate::check_last_error().expect("nvfp4 quantize");
+        crate::check_unobserved_error().expect("nvfp4 quantize");
 
         let plain = packed.dequantize_two_level(&scales, None, None, 16, 4, QuantizedMode::Nvfp4);
-        crate::check_last_error().expect("dequantize without a global scale");
+        crate::check_unobserved_error().expect("dequantize without a global scale");
 
         // What ModelOpt would store as `weight_scale_2`.
         let weight_scale_2 = 0.37f32;
@@ -368,7 +368,7 @@ mod tests {
             InlineArray::from_f32_slice(&[weight_scale_2 * 448.0 * 6.0], &[1]).as_dtype(dtype::F32);
         let scaled =
             packed.dequantize_two_level(&scales, None, Some(&global), 16, 4, QuantizedMode::Nvfp4);
-        crate::check_last_error().expect("dequantize with a global scale");
+        crate::check_unobserved_error().expect("dequantize with a global scale");
 
         let n = (rows * cols) as usize;
         let mut plain = plain;

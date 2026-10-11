@@ -9,7 +9,7 @@ fn arr(v: &[f32], shape: &[i32]) -> Array {
 
 fn values(a: &Array) -> Vec<f32> {
     a.eval();
-    pmetal_bridge::check_last_error().expect("bridge op failed");
+    pmetal_bridge::check_unobserved_error().expect("bridge op failed");
     a.as_slice::<f32>().to_vec()
 }
 

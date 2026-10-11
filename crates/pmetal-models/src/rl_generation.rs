@@ -892,7 +892,7 @@ mod tests {
         };
         let mut generator = BatchedRlGenerator::new(config, create_test_kv_config());
         let out = generator.generate(counting_model, &[2, 3, 4]).unwrap();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
         for (seq, n) in out.token_ids.iter().zip(&out.num_generated) {
             // The first token comes from the last prompt position, every later
             // one from the token before it, and exactly max_new_tokens are made.
@@ -930,7 +930,7 @@ mod tests {
         let out = generator
             .generate_speculative(counting_model, counting_model, &[1, 2])
             .unwrap();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
         for seq in &out.token_ids {
             assert_eq!(&seq[..6], &[1, 2, 3, 4, 5, 6]);
             assert!(seq.windows(2).all(|w| w[1] == (w[0] + 1) % 16), "{seq:?}");

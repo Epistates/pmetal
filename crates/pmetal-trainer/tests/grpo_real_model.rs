@@ -94,7 +94,7 @@ fn run(loss_type: &str) {
                     &mut set_lr,
                 )
                 .unwrap();
-            pmetal_bridge::check_last_error().unwrap();
+            pmetal_bridge::check_unobserved_error().unwrap();
             println!(
                 "epoch {epoch} step {:2}: loss {:+.5} policy {:+.5} reward {:.4} clip {:.3} \
                  ({} updates, lr before {:.2e} after {:.2e})",

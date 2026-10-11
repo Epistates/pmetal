@@ -219,7 +219,7 @@ impl CutCrossEntropy {
                 );
                 vec![lse, a[3].add(&picked.multiply(&inside)), h]
             });
-            pmetal_bridge::check_last_error()
+            pmetal_bridge::check_unobserved_error()
                 .map_err(|e| Exception::custom(format!("cut cross-entropy chunk {i}: {e}")))?;
             [lse, target, h] = out.try_into().map_err(|_| {
                 Exception::custom("cut cross-entropy: a chunk returned the wrong outputs")
@@ -256,7 +256,7 @@ mod tests {
     use pmetal_bridge::inline_array::value_and_grad;
 
     fn drain() {
-        if let Err(e) = pmetal_bridge::check_last_error() {
+        if let Err(e) = pmetal_bridge::check_unobserved_error() {
             panic!("a bridge op threw: {e}");
         }
     }

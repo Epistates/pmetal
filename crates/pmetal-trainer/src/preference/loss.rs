@@ -243,13 +243,13 @@ mod tests {
 
     fn values(a: &Array) -> Vec<f32> {
         a.eval();
-        pmetal_bridge::check_last_error().expect("bridge error");
+        pmetal_bridge::check_unobserved_error().expect("bridge error");
         a.as_slice::<f32>().to_vec()
     }
 
     fn scalar(a: &Array) -> f32 {
         a.eval();
-        pmetal_bridge::check_last_error().expect("bridge error");
+        pmetal_bridge::check_unobserved_error().expect("bridge error");
         a.item_f32()
     }
 

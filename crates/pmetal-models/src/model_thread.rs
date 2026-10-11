@@ -221,7 +221,8 @@ mod tests {
                     .call(move |x: &mut Array| {
                         let s = x.sum(None);
                         s.eval();
-                        pmetal_bridge::check_last_error().map(|()| s.item_f32() + round as f32)
+                        pmetal_bridge::check_unobserved_error()
+                            .map(|()| s.item_f32() + round as f32)
                     })
                     .unwrap()
             })
@@ -248,7 +249,7 @@ mod tests {
         .unwrap();
         let s = x.0.sum(None);
         s.eval();
-        let err = pmetal_bridge::check_last_error().expect_err("cross-thread eval must fail");
+        let err = pmetal_bridge::check_unobserved_error().expect_err("cross-thread eval must fail");
         assert!(err.to_string().contains("Stream"), "{err}");
     }
 

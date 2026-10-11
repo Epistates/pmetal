@@ -217,7 +217,7 @@ mod tests {
         let labels = Array::from_slice(&[1.0f32, 1.0, 0.0], &[3]);
         let loss = cosent_loss(&a, &b, &labels, 0.01).unwrap();
         loss.eval();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
         let val = loss.item_f32();
         assert!((val - 200.0).abs() < 1e-3, "cosent loss: {val}");
     }
@@ -252,7 +252,7 @@ mod tests {
         let labels = Array::from_slice(labels, &[labels.len() as i32]);
         let loss = cosent_loss(&a, &b, &labels, 0.05).unwrap();
         loss.eval();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
         loss.item_f32()
     }
 

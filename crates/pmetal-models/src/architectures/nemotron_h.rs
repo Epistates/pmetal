@@ -2605,7 +2605,7 @@ mod tests {
             std::slice::from_ref(&b),
             &[],
         );
-        pmetal_bridge::check_last_error().expect("a bridge op threw");
+        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
         let want = xa
             .as_dtype(Dtype::Float32.as_i32())
             .sum_axis(0, true)

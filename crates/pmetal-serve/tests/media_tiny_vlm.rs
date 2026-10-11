@@ -201,7 +201,7 @@ fn greedy(max_tokens: usize) -> SamplingParams {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_last_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 /// Greedy decoding with no cache at all: at every step the whole sequence,

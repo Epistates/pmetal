@@ -210,6 +210,7 @@ pub fn recv_like(x: &InlineArray, from: i32, group: Option<&Group>) -> BridgeRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::check_unobserved_error;
 
     /// A process launched without a distributed configuration is a group of
     /// one, and every collective hands back its input.
@@ -233,6 +234,6 @@ mod tests {
                 "{name}"
             );
         }
-        check_last_error().expect("no bridge op failed");
+        check_unobserved_error().expect("no bridge op failed");
     }
 }

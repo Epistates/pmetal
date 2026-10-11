@@ -4516,12 +4516,12 @@ mod tests {
             &[],
         )
         .unwrap();
-        pmetal_bridge::check_last_error().expect("no bridge op failed under value_and_grad");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed under value_and_grad");
 
         assert!(loss.item::<f32>().is_finite());
         // Evaluate before reading: as_slice on a lazy array reads a null pointer.
         grads[0].eval();
-        pmetal_bridge::check_last_error().expect("the gradient evaluates");
+        pmetal_bridge::check_unobserved_error().expect("the gradient evaluates");
         let dx = grads[0].as_slice::<f32>();
         assert!(dx.iter().all(|g| g.is_finite()), "finite input gradient");
         assert!(dx.iter().any(|g| *g != 0.0), "non-zero input gradient");

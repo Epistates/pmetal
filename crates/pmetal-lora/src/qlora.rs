@@ -226,7 +226,7 @@ pub fn quantize_base(
                     pmetal_bridge::compat::NestedValue::Map(_) => None,
                 }
             }))?;
-            pmetal_bridge::check_last_error().map_err(|e| {
+            pmetal_bridge::check_unobserved_error().map_err(|e| {
                 pmetal_bridge::compat::Exception::custom(format!("packing {path}: {e}"))
             })
         });
@@ -279,7 +279,7 @@ mod tests {
                 ..Default::default()
             };
             let report = quantize_base(&mut model, &config).expect("pack");
-            pmetal_bridge::check_last_error().expect("no bridge error");
+            pmetal_bridge::check_unobserved_error().expect("no bridge error");
             assert_eq!(report.packed, 1, "{scheme}");
             assert_eq!(report.dense_bytes, n * 4, "{scheme}: f32 dense");
             // The 4-byte NVFP4 tensor scale rounds into the comparison.
@@ -383,7 +383,7 @@ mod tests {
                 .square()
                 .sum(None);
             diff.eval();
-            pmetal_bridge::check_last_error().expect("no bridge error");
+            pmetal_bridge::check_unobserved_error().expect("no bridge error");
             let relative = diff.item_f32().sqrt() / norm;
             assert!(relative < bound, "{scheme}: relative error {relative}");
         }

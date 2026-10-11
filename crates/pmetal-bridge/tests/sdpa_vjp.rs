@@ -56,7 +56,7 @@ fn loss_and_grads(len: i32, sinks: bool, fused: bool) -> (f32, Vec<InlineArray>)
         &[w, mask, sink_logits],
     );
     let loss = loss.item_f32();
-    pmetal_bridge::check_last_error().unwrap_or_else(|e| {
+    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| {
         panic!("attention gradient at length {len} (sinks: {sinks}, fused: {fused}): {e}")
     });
     (loss, grads)
@@ -112,7 +112,7 @@ fn short_query_attention_trains_under_checkpoint() {
         &[],
     );
     assert!(loss.item_f32().is_finite());
-    pmetal_bridge::check_last_error().expect("checkpointed short-query attention");
+    pmetal_bridge::check_unobserved_error().expect("checkpointed short-query attention");
     for g in &grads {
         assert!(g.abs().max(None).item_f32().is_finite());
     }

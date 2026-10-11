@@ -285,7 +285,8 @@ fn rank_of(row: &[f32], token: i32) -> usize {
 /// and plausibly scaled. Drain after every stage or the whole sweep can pass
 /// while attention computes nothing.
 fn drain(stage: &str) -> Result<(), String> {
-    pmetal_bridge::check_last_error().map_err(|e| format!("{stage} raised a bridge exception: {e}"))
+    pmetal_bridge::check_unobserved_error()
+        .map_err(|e| format!("{stage} raised a bridge exception: {e}"))
 }
 
 /// Everything one checkpoint contributes: the taps it produced, whatever went

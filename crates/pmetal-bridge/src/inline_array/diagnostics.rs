@@ -337,7 +337,7 @@ mod tests {
 
         // Would have aborted the test binary, not failed the assertion.
         let previous = set_wired_limit(max);
-        crate::check_last_error().expect("setting the reported maximum is legal");
+        crate::check_unobserved_error().expect("setting the reported maximum is legal");
         set_wired_limit(previous);
     }
 
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn an_oversized_request_is_clamped_not_fatal() {
         let previous = set_wired_limit(usize::MAX);
-        crate::check_last_error().expect("an oversized request is clamped");
+        crate::check_unobserved_error().expect("an oversized request is clamped");
         set_wired_limit(previous);
     }
 }

@@ -16,7 +16,7 @@ fn generate_on_this_thread(x: f32) -> f32 {
     out.eval();
     bridge::synchronize();
     bridge::reset_default_stream();
-    pmetal_bridge::check_last_error().expect("the generation stream works on this thread");
+    pmetal_bridge::check_unobserved_error().expect("the generation stream works on this thread");
     out.item_f32()
 }
 

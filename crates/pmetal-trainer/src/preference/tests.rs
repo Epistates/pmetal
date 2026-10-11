@@ -114,7 +114,7 @@ fn dpo_starts_at_ln2_and_learns_the_preference() {
     let history = trainer
         .train(&mut model, &data, &mut adamw(lr), set_lr)
         .unwrap();
-    pmetal_bridge::check_last_error().unwrap();
+    pmetal_bridge::check_unobserved_error().unwrap();
 
     assert_eq!(history.len(), 30);
     let first = &history[0];
@@ -153,7 +153,7 @@ fn reference_free_objectives_train() {
         let history = trainer
             .train(&mut model, &pairs(16), &mut adamw(lr), set_lr)
             .unwrap();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
         let (first, last) = (&history[0], history.last().unwrap());
         assert!(
             last.loss < first.loss,
@@ -210,7 +210,7 @@ fn kto_learns_desirable_from_undesirable() {
     let history = trainer
         .train(&mut model, &data, &mut adamw(lr), set_lr)
         .unwrap();
-    pmetal_bridge::check_last_error().unwrap();
+    pmetal_bridge::check_unobserved_error().unwrap();
     let (first, last) = (&history[0], history.last().unwrap());
     // At the start r = 0 and z = 0: every example's loss is 1 − σ(0) = 0.5.
     assert!(

@@ -142,6 +142,6 @@ fn released_granite_checkpoints_match_the_model_their_config_builds() {
             Err(e) => failures.push(format!("{slug} ({count} tensors): {e}")),
         }
     }
-    pmetal_bridge::check_last_error().expect("no bridge op failed");
+    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }

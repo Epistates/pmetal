@@ -1067,7 +1067,7 @@ impl GptOssMoE {
             SWIGLU_ALPHA,
             self.swiglu_limit,
         );
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("gpt_oss: fused experts: {e}")))?;
         Ok(out.reshape(&shape))
     }

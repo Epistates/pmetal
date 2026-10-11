@@ -964,7 +964,7 @@ mod tests {
             .collect();
         let w = InlineArray::from_f32_slice(&values, &[out, in_dim]);
         let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
-        crate::check_last_error().expect("nvfp4 quantize");
+        crate::check_unobserved_error().expect("nvfp4 quantize");
 
         let params = QuantParams::defaults_for(QuantizedMode::Nvfp4);
         let x_values: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 32.0) / 32.0).collect();
@@ -980,13 +980,13 @@ mod tests {
             params,
         );
         let mut got = scaled.matmul_from(&x);
-        crate::check_last_error().expect("scaled matmul");
+        crate::check_unobserved_error().expect("scaled matmul");
 
         let dense = packed
             .dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4)
             .multiply(&scale);
         let mut want = x.matmul(&dense.t());
-        crate::check_last_error().expect("reference matmul");
+        crate::check_unobserved_error().expect("reference matmul");
 
         let diff = max_abs_diff(&mut got, &mut want, out as usize);
         assert!(
@@ -1005,7 +1005,7 @@ mod tests {
             .collect();
         let w = InlineArray::from_f32_slice(&values, &[experts, out, in_dim]);
         let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
-        crate::check_last_error().expect("nvfp4 quantize");
+        crate::check_unobserved_error().expect("nvfp4 quantize");
 
         let params = QuantParams::defaults_for(QuantizedMode::Nvfp4);
         let per_expert = InlineArray::from_f32_slice(&[0.5, 3.0], &[experts]);
@@ -1025,7 +1025,7 @@ mod tests {
         // the wrong order is caught as well as a missing one.
         let routes = InlineArray::from_u32_slice(&[1, 0], &[2]);
         let mut got = stacked.gather_mm_from(&x, None, Some(&routes), false);
-        crate::check_last_error().expect("scaled gather matmul");
+        crate::check_unobserved_error().expect("scaled gather matmul");
 
         let dense = packed.dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4);
         // `[1, in, out]` and `[1, 1, in]`, so each product is `[1, 1, out]`.
@@ -1038,7 +1038,7 @@ mod tests {
             .matmul(&expert(0))
             .multiply(&InlineArray::from_f32_slice(&[0.5], &[]));
         let mut want = want_0.concatenate_2(&want_1, 0);
-        crate::check_last_error().expect("reference gather");
+        crate::check_unobserved_error().expect("reference gather");
 
         let diff = max_abs_diff(&mut got, &mut want, (2 * out) as usize);
         assert!(

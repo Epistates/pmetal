@@ -338,7 +338,7 @@ impl JointSchemaHead {
         }
         drop(params);
         self.eval().map_err(DecisionError::Model)?;
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| DecisionError::Model(Exception::custom(e.to_string())))?;
         Ok(())
     }
@@ -526,7 +526,7 @@ impl JointSchemaHead {
             offset += count as i32;
         }
         debug_assert_eq!(offset as usize, option_total);
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| DecisionError::Model(Exception::custom(e.to_string())))?;
         Ok(out)
     }

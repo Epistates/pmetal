@@ -538,7 +538,7 @@ mod tests {
             assert_eq!(y.dtype(), Dtype::Bfloat16, "{mode:?}");
             assert_eq!(packed.dense_weight().dtype(), Dtype::Bfloat16, "{mode:?}");
             let got = values(y.as_dtype(Dtype::Float32.as_i32()));
-            crate::check_last_error().expect("no bridge error");
+            crate::check_unobserved_error().expect("no bridge error");
             let err = want
                 .iter()
                 .zip(&got)
@@ -578,7 +578,7 @@ mod tests {
         layer.quantize_codebook(&NF4, 64, false).expect("pack");
         assert_eq!(layer.shape(), (4, 128));
         let back = values(layer.dense_weight());
-        crate::check_last_error().expect("no bridge error");
+        crate::check_unobserved_error().expect("no bridge error");
         for (group, (orig, got)) in dense.chunks(64).zip(back.chunks(64)).enumerate() {
             let absmax = orig.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             // bf16 absmax: 2^-8 relative.
@@ -643,7 +643,7 @@ mod tests {
                 .sqrt()
         };
         let (e1, e2) = (err(&single), err(&double));
-        crate::check_last_error().expect("no bridge error");
+        crate::check_unobserved_error().expect("no bridge error");
         assert!(e2 < e1 * 1.05 + 1e-6, "double quant error {e2} vs {e1}");
     }
 }

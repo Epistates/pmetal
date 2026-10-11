@@ -89,7 +89,7 @@ fn vocab_of(config_json: &str) -> i32 {
 }
 
 fn drain(case: &str) {
-    if let Err(e) = pmetal_bridge::check_last_error() {
+    if let Err(e) = pmetal_bridge::check_unobserved_error() {
         panic!("{case}: a bridge op threw: {e}");
     }
 }

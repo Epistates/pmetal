@@ -1526,7 +1526,7 @@ mod tests {
         let refs: Vec<&Array> = rows.iter().collect();
         let cached = pmetal_bridge::compat::ops::concatenate_axis(&refs, 1);
         let diff = cached.subtract(&full).abs().max(None).item::<f32>();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
         assert!(
             diff < 1e-4,
             "cached decode drifted from the full forward by {diff}"

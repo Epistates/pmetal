@@ -1764,7 +1764,7 @@ mod tests {
             &scores,
             InlineArray::fused_geglu_tanh,
         );
-        crate::check_last_error().expect("switch_glu");
+        crate::check_unobserved_error().expect("switch_glu");
         let got = got.to_f32_vec(hidden).expect("read output");
 
         let gelu = |v: f64| {

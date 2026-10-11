@@ -99,7 +99,7 @@ fn ints(a: &Array) -> Vec<i32> {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_last_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 /// Hidden states, logits and the selector's path at every step, drafted

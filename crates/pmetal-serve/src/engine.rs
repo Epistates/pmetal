@@ -1733,7 +1733,7 @@ impl InferenceEngine {
                     .states
                     .try_eval()
                     .map_err(|e| ServeError::Internal(format!("vision tower: {e}")))?;
-                pmetal_bridge::check_last_error()
+                pmetal_bridge::check_unobserved_error()
                     .map_err(|e| ServeError::Internal(format!("vision tower: {e}")))?;
                 let last_row = |array: &Option<Array>, axis: i32| {
                     array.as_ref().map(|a| slice_axis(a, axis, len - 1, len))

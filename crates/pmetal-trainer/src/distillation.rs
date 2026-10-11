@@ -866,7 +866,7 @@ mod tests {
         let stats = test_trainer()
             .train_step(&mut student, &mut teacher, &batch, &mut optimizer, 1)
             .unwrap();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
         assert!(stats.loss.is_finite(), "loss {}", stats.loss);
 
         let after = adapter_values(&student);

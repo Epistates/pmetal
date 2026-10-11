@@ -162,7 +162,7 @@ fn contiguous_and_explicit_positions_agree_for_every_scaling() {
                 let ids: Vec<i32> = (offset..offset + len).collect();
                 let explicit = emb.apply_at(&x, &Array::from_i32_slice(&ids));
                 let d = max_diff(&contiguous, &explicit);
-                crate::check_last_error().unwrap();
+                crate::check_unobserved_error().unwrap();
                 assert!(
                     d < 2e-5,
                     "{config} traditional={traditional} offset={offset}: |Δ| = {d:e}"
@@ -211,7 +211,7 @@ fn the_attention_factor_scales_only_the_rotated_channels() {
         ) < 1e-6
     );
     assert_eq!(max_diff(&tail(&scaled), &tail(&x)), 0.0);
-    crate::check_last_error().unwrap();
+    crate::check_unobserved_error().unwrap();
 }
 
 /// LongRoPE and dynamic NTK re-decide from each forward's reach.
@@ -283,5 +283,5 @@ fn fixed_kernels_exist_wherever_a_compiled_graph_can_replay() {
     let k = linear.fixed_kernel(100).unwrap();
     assert_eq!((k.base, k.scale), (10_000.0, 0.25));
     assert!(k.periods.is_none());
-    crate::check_last_error().unwrap();
+    crate::check_unobserved_error().unwrap();
 }

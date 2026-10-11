@@ -273,7 +273,7 @@ impl DecisionModel {
                 .as_dtype(Dtype::Float32.as_i32());
         flat.try_eval()
             .map_err(|e| DecisionError::Model(Exception::custom(e.to_string())))?;
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| DecisionError::Model(Exception::custom(e.to_string())))?;
         tracing::debug!(
             tokens = record.input_ids.len(),

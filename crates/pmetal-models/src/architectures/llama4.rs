@@ -997,7 +997,7 @@ pub fn sanitize_checkpoint(
             }
         }
     }
-    pmetal_bridge::check_last_error()
+    pmetal_bridge::check_unobserved_error()
         .map_err(|e| Exception::custom(format!("llama4: splitting the experts failed: {e}")))?;
     Ok(out)
 }

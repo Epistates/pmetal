@@ -1031,7 +1031,7 @@ mod tests {
         );
         let mut y_rust = rotary.apply(&x, 0);
         y_rust.eval().unwrap();
-        pmetal_bridge::check_last_error().expect("bridge");
+        pmetal_bridge::check_unobserved_error().expect("bridge");
 
         let got = y_rust.to_f32_vec(384).expect("rust vec");
         let mut y_ref_eval = y_ref;

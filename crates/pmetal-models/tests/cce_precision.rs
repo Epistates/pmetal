@@ -111,7 +111,7 @@ fn step(
     for g in &grads {
         g.eval();
     }
-    if let Err(e) = pmetal_bridge::check_last_error() {
+    if let Err(e) = pmetal_bridge::check_unobserved_error() {
         panic!("{variant}: a bridge op threw: {e}");
     }
     (value, grads)

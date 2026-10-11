@@ -307,7 +307,7 @@ fn run_native_synthetic_parity(
     let ref_shard = load_shard(&fixture_path(reference_fixture));
     let logits =
         gemma4_native::forward_step(&weights, &input_ids_from_shard(&ref_shard), &mut cache);
-    pmetal_bridge::check_last_error().expect("native forward");
+    pmetal_bridge::check_unobserved_error().expect("native forward");
 
     // ⚠️ Tighter than `synthetic_tolerances`, which the module port can
     // afford because it also checks every layer's hidden state. With only the

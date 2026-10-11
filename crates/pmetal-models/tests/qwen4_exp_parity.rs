@@ -120,7 +120,7 @@ fn cached_logits(model: &mut DynamicModel, input_ids: &Array) -> Array {
         let logits = model
             .forward_with_hybrid_cache(&chunk, None, Some(&mut kv), mamba.as_mut())
             .expect("cached forward");
-        pmetal_bridge::check_last_error().expect("no bridge error in the cached forward");
+        pmetal_bridge::check_unobserved_error().expect("no bridge error in the cached forward");
         outputs.push(logits);
     }
     let refs: Vec<&Array> = outputs.iter().collect();
@@ -150,7 +150,7 @@ fn qwen4_exp_matches_transformers_full_and_cached() {
         .model
         .forward_with_cache_and_capture(&input_ids, None, None, None, Some(&mut capture))
         .expect("uncached forward");
-    pmetal_bridge::check_last_error().expect("no bridge error in the uncached forward");
+    pmetal_bridge::check_unobserved_error().expect("no bridge error in the uncached forward");
     let logits = model.forward(&input_ids, None).expect("logits");
 
     let mut reports = vec![compare(
@@ -333,7 +333,7 @@ fn qwen4_exp_nvfp4_experts_run_packed() {
         );
         let logits = model.forward(&input_ids, None).expect("forward");
         let cached = cached_logits(&mut model, &input_ids);
-        pmetal_bridge::check_last_error().expect("no bridge error");
+        pmetal_bridge::check_unobserved_error().expect("no bridge error");
         runs.push((logits, cached));
     }
     // Observed 6.6e-7 both ways; swapping a gate and up projection moves the

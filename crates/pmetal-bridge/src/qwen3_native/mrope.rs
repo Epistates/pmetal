@@ -182,7 +182,7 @@ mod tests {
                 &ops::slice_axis(&got, 3, 8, head_dim),
                 &ops::slice_axis(&x, 3, 8, head_dim),
             );
-            crate::check_last_error().unwrap();
+            crate::check_unobserved_error().unwrap();
             assert!(d < 1e-5, "{config}: tables vs embedding {d}");
             assert_eq!(pass, 0.0);
         }

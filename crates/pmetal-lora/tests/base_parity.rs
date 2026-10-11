@@ -409,7 +409,7 @@ fn every_architecture_trains() {
         let losses: Vec<f32> = (0..8)
             .map(|_| common::train_step(&mut model, &mut optimizer, &ids))
             .collect();
-        let _ = pmetal_bridge::check_last_error();
+        pmetal_bridge::clear_last_error();
         if !losses.iter().all(|l| l.is_finite()) || losses[7] >= losses[0] {
             failures.push(format!("{}: {losses:?}", case.name));
         }

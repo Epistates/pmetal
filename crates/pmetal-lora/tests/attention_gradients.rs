@@ -90,7 +90,7 @@ fn adapted_qlora(config_json: &str) -> AdaptedModel {
 }
 
 fn drain() {
-    pmetal_bridge::check_last_error().expect("a bridge op threw");
+    pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
 }
 
 /// Give every adapter (B included, which starts at zero) a nonzero value, so

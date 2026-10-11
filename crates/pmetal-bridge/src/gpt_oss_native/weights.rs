@@ -230,7 +230,8 @@ pub fn load_model(
         lw.moe_router_b = copy_fresh(&lw.moe_router_b);
         lw.moe_experts = lw.moe_experts.copy_fresh(&zero);
     }
-    crate::check_last_error().map_err(|e| format!("gpt_oss: loading the weights failed: {e}"))?;
+    crate::check_unobserved_error()
+        .map_err(|e| format!("gpt_oss: loading the weights failed: {e}"))?;
 
     eprintln!("[GPT-OSS] load_model: all weights force-copied into fresh Metal buffers");
 

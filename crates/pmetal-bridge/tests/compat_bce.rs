@@ -2,7 +2,7 @@
 //! `nn.losses.binary_cross_entropy`: per-element BCE, independent of the
 //! other elements. Expected values are written out from the definition.
 
-use pmetal_bridge::check_last_error;
+use pmetal_bridge::check_unobserved_error;
 use pmetal_bridge::compat::Array;
 use pmetal_bridge::compat::losses::{BinaryCrossEntropyBuilder, LossReduction};
 
@@ -11,7 +11,7 @@ fn read(a: &Array) -> Vec<f32> {
     a.eval();
     let n = a.size();
     let v = a.to_f32_vec(n).expect("to_f32_vec");
-    check_last_error().expect("bridge error");
+    check_unobserved_error().expect("bridge error");
     v
 }
 

@@ -140,7 +140,7 @@ impl GptOssExperts {
                 down_bias: get("down_proj.bias")?,
             }
         };
-        crate::check_last_error()
+        crate::check_unobserved_error()
             .map_err(|e| format!("gpt_oss: reading the experts under {prefix} failed: {e}"))?;
         Ok(experts)
     }

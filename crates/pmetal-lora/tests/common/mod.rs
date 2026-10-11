@@ -670,7 +670,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
         let Ok(Ok(before)) =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| model.forward(&ids, None)))
         else {
-            let _ = pmetal_bridge::check_last_error();
+            pmetal_bridge::clear_last_error();
             silent.push(format!("{}: the model doesn't run", case.name));
             continue;
         };
@@ -688,7 +688,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
             )]);
             model.set_lora_parameters(&nudged);
             let after = model.forward(&ids, None).expect("forward");
-            pmetal_bridge::check_last_error().expect("no bridge error");
+            pmetal_bridge::check_unobserved_error().expect("no bridge error");
             let moved = max_abs_diff(&before, &after);
             // NaN compares unequal to everything, so a broken forward would
             // pass for one the adapter reached.

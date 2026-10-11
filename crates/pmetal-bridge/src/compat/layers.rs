@@ -391,7 +391,7 @@ impl Linear {
                 (w, s, None)
             }
         };
-        crate::check_last_error()
+        crate::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("Linear::quantize: {e}")))?;
         self.weight.value = weight;
         self.quant = Some(LinearQuant {
@@ -440,7 +440,7 @@ impl Linear {
         } else {
             (absmax.as_dtype(super::Dtype::Bfloat16.as_i32()), None)
         };
-        crate::check_last_error()
+        crate::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("Linear::quantize_codebook: {e}")))?;
         self.weight.value = packed;
         self.quant = Some(LinearQuant {

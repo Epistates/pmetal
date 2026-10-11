@@ -1250,7 +1250,7 @@ mod tests {
         let x_values: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 32.0) / 32.0).collect();
         let x = InlineArray::from_f32_slice(&x_values, &[1, in_dim]);
         let got = modelopt_weight(&raw, base, QuantizedMode::Mxfp8).matmul_from(&x);
-        crate::check_last_error().expect("mxfp8 matmul");
+        crate::check_unobserved_error().expect("mxfp8 matmul");
 
         let dense = fp8
             .from_fp8(Dtype::Float32.as_i32())
@@ -1273,7 +1273,7 @@ mod tests {
             .collect();
         let w = InlineArray::from_f32_slice(&values, &[out, in_dim]);
         let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
-        crate::check_last_error().expect("nvfp4 quantize");
+        crate::check_unobserved_error().expect("nvfp4 quantize");
 
         let base = "model.layers.0.mlp.down_proj";
         let mut raw = HashMap::from([
@@ -1301,7 +1301,7 @@ mod tests {
         let x_values: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 32.0) / 32.0).collect();
         let x = InlineArray::from_f32_slice(&x_values, &[1, in_dim]);
         let got = modelopt_weight(&raw, base, QuantizedMode::Nvfp4).matmul_from(&x);
-        crate::check_last_error().expect("nvfp4 matmul");
+        crate::check_unobserved_error().expect("nvfp4 matmul");
 
         let dense = packed
             .dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4)

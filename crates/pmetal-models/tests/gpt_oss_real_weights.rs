@@ -64,7 +64,7 @@ fn ids(tokens: &[i32]) -> Array {
 }
 
 fn drain_bridge(op: &str) {
-    pmetal_bridge::check_last_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 /// Max |diff| and the smallest per-row cosine of `[G, vocab]` logits.

@@ -969,7 +969,7 @@ impl Qwen3_5Vision {
                 .try_eval()
                 .map_err(|e| Exception::custom(format!("vision tower: {e}")))?;
         }
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("vision tower: {e}")))?;
         let encoded = EncodedMedia {
             image_features,

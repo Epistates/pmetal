@@ -55,7 +55,7 @@ fn a_packed_base_computes_what_its_unpacked_weights_compute() {
 
                 let a = packed.forward(&ids, None).expect("packed forward");
                 let b = unpacked.forward(&ids, None).expect("unpacked forward");
-                pmetal_bridge::check_last_error().map_err(|e| e.to_string())?;
+                pmetal_bridge::check_unobserved_error().map_err(|e| e.to_string())?;
                 Ok::<_, String>((a, b))
             });
             let (a, b) = match run {
@@ -65,7 +65,7 @@ fn a_packed_base_computes_what_its_unpacked_weights_compute() {
                     continue;
                 }
                 Err(_) => {
-                    let _ = pmetal_bridge::check_last_error();
+                    pmetal_bridge::clear_last_error();
                     failures.push(format!("{}/{scheme}: panicked", case.name));
                     continue;
                 }
@@ -178,7 +178,7 @@ fn every_architecture_trains_with_a_packed_base() {
             let losses: Vec<f32> = (0..12)
                 .map(|_| common::train_step(&mut model, &mut optimizer, &ids))
                 .collect();
-            pmetal_bridge::check_last_error().expect("no bridge error");
+            pmetal_bridge::check_unobserved_error().expect("no bridge error");
             let (first, last) = (losses[0], losses[losses.len() - 1]);
             if !losses.iter().all(|l| l.is_finite()) || last > first - 0.25 {
                 failures.push(format!("{}/{scheme}: {losses:?}", case.name));

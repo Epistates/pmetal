@@ -297,7 +297,7 @@ mod tests {
     fn values(mut a: Array, n: usize) -> Vec<f32> {
         a.eval();
         let out = a.to_f32_vec(n).expect("to_f32_vec");
-        crate::check_last_error().expect("bridge error");
+        crate::check_unobserved_error().expect("bridge error");
         out
     }
 

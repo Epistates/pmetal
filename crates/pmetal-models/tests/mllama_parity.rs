@@ -242,7 +242,7 @@ fn real_checkpoint_loads_and_runs() {
     // which is exactly what happened before the mask-dtype fix. Drain the
     // channel after every stage.
     fn assert_no_bridge_error(stage: &str) {
-        if let Err(e) = pmetal_bridge::check_last_error() {
+        if let Err(e) = pmetal_bridge::check_unobserved_error() {
             panic!("{stage} raised a bridge exception: {e}");
         }
     }

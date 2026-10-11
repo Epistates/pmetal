@@ -559,7 +559,7 @@ mod tests {
             }
             last = stats.loss;
         }
-        pmetal_bridge::check_last_error().expect("a bridge op threw");
+        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
         (first, last)
     }
 

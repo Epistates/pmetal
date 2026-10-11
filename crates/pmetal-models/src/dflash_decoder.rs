@@ -529,7 +529,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
                 &mut capture,
             )?;
             let token = sample_token_argmax(&slice_last_time_step(&logits)?)?;
-            pmetal_bridge::check_last_error()
+            pmetal_bridge::check_unobserved_error()
                 .map_err(|e| Exception::custom(format!("greedy decode: {e}")))?;
             output_tokens.push(token);
             metrics.acceptance_lengths.push(1);
@@ -562,7 +562,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         )?;
         let last = slice_last_time_step(&logits)?.as_dtype(Dtype::Float32.as_i32());
         let _ = last.eval();
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("top two: {e}")))?;
         let values = last.as_slice::<f32>();
         let mut best = [(0, f32::NEG_INFINITY); 2];
@@ -964,7 +964,7 @@ fn argmax_last_axis(logits: &Array) -> Result<Vec<i32>, Exception> {
 fn token_ids(ids: &Array) -> Result<Vec<i32>, Exception> {
     let ids = ids.as_dtype(Dtype::Int32.as_i32());
     let _ = ids.eval();
-    pmetal_bridge::check_last_error()
+    pmetal_bridge::check_unobserved_error()
         .map_err(|e| Exception::custom(format!("DFlash draft: {e}")))?;
     Ok(ids.as_slice::<i32>().to_vec())
 }

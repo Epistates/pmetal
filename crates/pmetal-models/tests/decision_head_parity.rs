@@ -93,7 +93,7 @@ fn joint_schema_head_matches_reference() {
             ref_tensor(&reference, "output_embedding"),
         )
         .expect("head forward");
-    pmetal_bridge::check_last_error().expect("no bridge op threw");
+    pmetal_bridge::check_unobserved_error().expect("no bridge op threw");
 
     let reports: Vec<ParityReport> = logits
         .iter()

@@ -241,7 +241,7 @@ impl DFlashDrafter {
         )?;
         self.pending.clear();
         let _ = tokens.eval();
-        pmetal_bridge::check_last_error()
+        pmetal_bridge::check_unobserved_error()
             .map_err(|e| Exception::custom(format!("DFlash draft: {e}")))?;
         Ok(tokens.as_slice::<u32>().to_vec())
     }

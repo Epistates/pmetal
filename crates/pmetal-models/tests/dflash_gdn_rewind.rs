@@ -47,7 +47,7 @@ fn checkpoint() -> Checkpoint {
 }
 
 fn drain(op: &str) {
-    pmetal_bridge::check_last_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+    pmetal_bridge::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
 }
 
 fn forward(target: &mut NativeQwen3Target, ids: &Array) -> Array {

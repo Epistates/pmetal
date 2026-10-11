@@ -2253,7 +2253,7 @@ mod moe_tests {
             std::slice::from_ref(&x),
             &[],
         );
-        pmetal_bridge::check_last_error().expect("a bridge op threw");
+        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
         let g = &fused[0];
         let scale = g.abs().max(None).item_f32();
         let diff = g.subtract(&unpacked[0]).abs().max(None).item_f32();
@@ -2285,7 +2285,7 @@ mod moe_tests {
             !(off(r1) && off(r2)),
             "|g| {norm} vs the loss's slope along g {r1}, {r2}"
         );
-        pmetal_bridge::check_last_error().expect("a bridge op threw");
+        pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
     }
 
     /// The MoE block is built only when `enable_moe_block` is set, and is

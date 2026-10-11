@@ -9,7 +9,7 @@
 //! the buffer. Every case here builds the expected values by hand from the
 //! row-major definition of the view, never by reading another MLX array.
 
-use pmetal_bridge::check_last_error;
+use pmetal_bridge::check_unobserved_error;
 use pmetal_bridge::compat::{Array, Dtype, nn};
 
 /// `[[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]` as f32.
@@ -32,7 +32,7 @@ fn assert_reads(view: &Array, want: &[f32], what: &str) {
         want,
         "to_f32_vec of {what}"
     );
-    check_last_error().expect("bridge error");
+    check_unobserved_error().expect("bridge error");
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn a_view_of_a_non_f32_array_reads_back_through_to_f32_vec() {
         t.to_f32_vec(12).expect("to_f32_vec"),
         vec![0., 4., 8., 1., 5., 9., 2., 6., 10., 3., 7., 11.]
     );
-    check_last_error().expect("bridge error");
+    check_unobserved_error().expect("bridge error");
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn reading_a_view_leaves_its_source_and_other_handles_intact() {
         sum_rows.to_f32_vec(4).expect("to_f32_vec"),
         vec![12., 15., 18., 21.]
     );
-    check_last_error().expect("bridge error");
+    check_unobserved_error().expect("bridge error");
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn an_empty_array_reads_back_as_an_empty_slice() {
     let empty = grid().slice(&[0, 0], &[0, 4]);
     assert_eq!(empty.size(), 0);
     assert!(empty.as_slice::<f32>().is_empty());
-    check_last_error().expect("bridge error");
+    check_unobserved_error().expect("bridge error");
 }
 
 #[test]

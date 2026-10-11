@@ -345,14 +345,17 @@ impl ContinuousPump {
             StepInstruction::Decode { slots } => slots.clone(),
         };
         // An error another job left behind on this thread is not this step's.
-        if let Err(stale) = pmetal_bridge::check_last_error() {
+        // The sticky slot, both here and after the step: the step is many
+        // ops, and one that threw early is cleared from the last-op slot by
+        // every op that succeeds after it.
+        if let Err(stale) = pmetal_bridge::check_unobserved_error() {
             tracing::debug!(
                 target: "pmetal_serve::continuous_pump",
                 "discarding an earlier bridge error: {stale}"
             );
         }
         let stepped = self.run_instruction(forward, instruction).and_then(|tick| {
-            pmetal_bridge::check_last_error()
+            pmetal_bridge::check_unobserved_error()
                 .map(|()| tick)
                 .map_err(|e| Exception::custom(e.to_string()))
         });

@@ -323,6 +323,7 @@ impl std::fmt::Debug for CompiledFn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::check_unobserved_error;
 
     /// Canary: compile a trivial 1-input, 1-output pass-through and
     /// verify it runs end-to-end twice. Proves the FFI + trampoline are
@@ -356,7 +357,7 @@ mod tests {
         assert!((v[1] - 21.0).abs() < 1e-5, "got {}", v[1]);
 
         // Error channel stays clean after two successful calls.
-        assert_eq!(check_last_error(), Ok(()));
+        assert_eq!(check_unobserved_error(), Ok(()));
     }
 
     #[test]

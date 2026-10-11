@@ -317,7 +317,7 @@ pub(crate) fn sequence_log_probs<M: TrainableModel>(
             length_normalized,
         )?);
         logps.eval();
-        pmetal_bridge::check_last_error().map_err(|e| Exception::custom(e.to_string()))?;
+        pmetal_bridge::check_unobserved_error().map_err(|e| Exception::custom(e.to_string()))?;
         out.extend_from_slice(logps.as_slice::<f32>());
     }
     Ok(out)
@@ -454,7 +454,8 @@ where
                     to_eval.push(kl);
                 }
                 transforms::eval(to_eval)?;
-                pmetal_bridge::check_last_error().map_err(|e| Exception::custom(e.to_string()))?;
+                pmetal_bridge::check_unobserved_error()
+                    .map_err(|e| Exception::custom(e.to_string()))?;
 
                 losses.push(loss.item_f32());
                 let c = floats(&out.chosen_rewards);
@@ -488,7 +489,8 @@ where
             grad_norm.eval();
             let params = model.lora_parameters();
             transforms::eval(params.values())?;
-            pmetal_bridge::check_last_error().map_err(|e| Exception::custom(e.to_string()))?;
+            pmetal_bridge::check_unobserved_error()
+                .map_err(|e| Exception::custom(e.to_string()))?;
             step += 1;
 
             let metrics = PreferenceStepMetrics {

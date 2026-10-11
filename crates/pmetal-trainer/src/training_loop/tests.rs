@@ -236,7 +236,7 @@ fn test_run_packed_does_not_pack_models_with_recurrent_layers() {
     training_loop
         .run_packed(hybrid, dataset(), None, None)
         .unwrap();
-    pmetal_bridge::check_last_error().unwrap();
+    pmetal_bridge::check_unobserved_error().unwrap();
     assert_eq!(
         training_loop.current_step(),
         6,
@@ -893,7 +893,7 @@ fn max_abs_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
         .map(|(k, x)| {
             let d = x.subtract(&b[k]).abs().max(None);
             d.eval();
-            pmetal_bridge::check_last_error().unwrap();
+            pmetal_bridge::check_unobserved_error().unwrap();
             d.item_f32()
         })
         .fold(0.0, f32::max)
@@ -1161,7 +1161,7 @@ fn a_failed_step_stops_the_run_and_names_the_step() {
             2,
             "steps after the failure ran"
         );
-        pmetal_bridge::check_last_error().expect("the failure was drained");
+        pmetal_bridge::check_unobserved_error().expect("the failure was drained");
     }
 }
 
@@ -1206,7 +1206,7 @@ fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
     let before = full.0.lora_parameters();
     jit_training_step_inner(&mut full, (&input_ids, &labels), None).unwrap();
     jit_training_step_cce(&mut cut, (&input_ids, &labels)).unwrap();
-    pmetal_bridge::check_last_error().expect("a bridge op threw");
+    pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
 
     let (full, cut) = (full.0.lora_parameters(), cut.0.lora_parameters());
     for name in ["lm_head.lora_b", "layers.0.self_attn.q_proj.lora_b"] {
@@ -1282,7 +1282,7 @@ fn a_packed_cut_cross_entropy_step_matches_the_full_logits_step() {
 
     let want = jit_training_step_packed(&mut full, &batch, 0.0).unwrap();
     let got = jit_training_step_packed_cce(&mut cut, &batch, 0.0).unwrap();
-    pmetal_bridge::check_last_error().expect("a bridge op threw");
+    pmetal_bridge::check_unobserved_error().expect("a bridge op threw");
     let (want, got) = (want.item_f32(), got.item_f32());
     assert!(
         (want - got).abs() <= 1e-5 * want.abs(),
@@ -1345,5 +1345,5 @@ fn a_cut_cross_entropy_step_without_hidden_states_fails() {
     let err = jit_training_step_packed_cce(&mut state, &two_sequence_packed_batch(), 0.0)
         .expect_err("no fallback");
     assert!(err.to_string().contains("hidden-state forward"), "{err}");
-    let _ = pmetal_bridge::check_last_error();
+    pmetal_bridge::clear_last_error();
 }

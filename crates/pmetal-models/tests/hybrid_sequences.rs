@@ -128,7 +128,7 @@ fn second_sequence_decodes_against_its_own_state() {
                 &format!("{name}: second sequence, step {step}"),
             );
         }
-        pmetal_bridge::check_last_error().expect("no bridge op failed");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 }
 
@@ -147,7 +147,7 @@ fn interleaved_sequences_keep_their_own_state() {
             a.assert_matches_recompute(&mut model, &format!("{name}: sequence a, step {step}"));
             b.assert_matches_recompute(&mut model, &format!("{name}: sequence b, step {step}"));
         }
-        pmetal_bridge::check_last_error().expect("no bridge op failed");
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 }
 

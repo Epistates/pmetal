@@ -258,7 +258,7 @@ mod tests {
         let (loss, rewards) = cfg.loss(&policy, &reference, &kl, &[true, true, false, false]);
         loss.eval();
         rewards.eval();
-        pmetal_bridge::check_last_error().unwrap();
+        pmetal_bridge::check_unobserved_error().unwrap();
 
         let r = [2.0f64, -1.0, 0.5, -3.0];
         let z = 0.4;
