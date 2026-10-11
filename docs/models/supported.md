@@ -40,6 +40,11 @@ LoRA-merged Qwen3Next targets. LoRA and packed expert offload are separate modes
 adapter first if you need both. MTP inference reports draft acceptance, average accepted
 draft tokens per verify step, and target bonus/correction token counts.
 
+Both MTP heads draft the tokens after the target's own next token: the head reads the
+target hidden state that predicted that token beside the token's embedding, as the heads
+are trained to. One target forward then checks the drafts and emits the accepted ones plus
+one token of the target's, so greedy output is the target's own greedy decode.
+
 Custom MTP and draft checkpoint creation is available from the CLI. Use `pmetal train-mtp`
 to export Gemma 4 assistant checkpoints or Qwen `mtp.*` predictor checkpoints, then load
 Qwen predictors with `pmetal infer --mtp --mtp-model ./qwen-mtp`. Use `pmetal train-draft`

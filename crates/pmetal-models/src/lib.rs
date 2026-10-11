@@ -57,6 +57,7 @@ pub mod loader;
 pub mod model_thread;
 pub mod moe;
 pub mod moe_routing;
+pub mod mtp;
 pub mod ollama;
 pub mod pipelines;
 pub mod pooling;

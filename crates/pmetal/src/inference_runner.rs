@@ -31,14 +31,12 @@ use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::{
     Gemma4MtpConfig, GenerationOutput, Qwen3NextMtpConfig, generate_cached_async_streaming,
-    generate_gemma4_mtp_streaming, generate_qwen3_next_mtp_streaming, validate_gemma4_mtp_pair,
-    validate_qwen3_next_mtp_pair,
+    generate_gemma4_mtp_streaming, generate_qwen3_native_mtp_streaming,
+    generate_qwen3_next_mtp_streaming, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair,
 };
 
 #[cfg(feature = "lora")]
 use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
-#[cfg(feature = "lora")]
-use pmetal_models::generate_qwen3_next_mtp_streaming_rebuild;
 
 /// A video given as a directory of its frames.
 #[derive(Clone, Debug)]
@@ -720,7 +718,7 @@ impl InferenceRunner {
             match &model {
                 LoadedModel::Standard(DynamicModel::Qwen3Next(target)) => {
                     let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, &target.config)?;
-                    validate_qwen3_next_mtp_pair(target, &mtp)?;
+                    validate_qwen3_next_mtp_pair(&target.config, &mtp)?;
                     if config.fp8 {
                         tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
                         mtp.quantize_fp8_weights()?;
@@ -750,7 +748,7 @@ impl InferenceRunner {
                 LoadedModel::Lora(lora) => match lora.model() {
                     DynamicModel::Qwen3Next(target) => {
                         let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, &target.config)?;
-                        validate_qwen3_next_mtp_pair(target, &mtp)?;
+                        validate_qwen3_next_mtp_pair(&target.config, &mtp)?;
                         if config.fp8 {
                             tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
                             mtp.quantize_fp8_weights()?;
@@ -777,6 +775,7 @@ impl InferenceRunner {
                 LoadedModel::NativeOnly => {
                     let target_config = load_qwen3_next_config_for_mtp(model_path)?;
                     let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, &target_config)?;
+                    validate_qwen3_next_mtp_pair(&target_config, &mtp)?;
                     if config.fp8 {
                         tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
                         mtp.quantize_fp8_weights()?;
@@ -969,7 +968,7 @@ impl InferenceGenState {
                 ))),
                 #[cfg(feature = "lora")]
                 LoadedModel::Lora(ref mut lora) => match lora.model_mut() {
-                    DynamicModel::Qwen3Next(target) => generate_qwen3_next_mtp_streaming_rebuild(
+                    DynamicModel::Qwen3Next(target) => generate_qwen3_next_mtp_streaming(
                         target,
                         mtp,
                         &self.input_ids,
@@ -986,7 +985,9 @@ impl InferenceGenState {
                     ))),
                 },
                 LoadedModel::NativeOnly => {
-                    crate::native_inference::run_qwen3_native_mtp_inference_ext(
+                    crate::native_inference::ensure_native_bridge_metal_available()
+                        .map_err(Exception::custom)?;
+                    generate_qwen3_native_mtp_streaming(
                         &self.model_path,
                         mtp,
                         mtp_cache,
@@ -995,7 +996,6 @@ impl InferenceGenState {
                         qwen_mtp_config,
                         on_token_guarded,
                     )
-                    .map_err(Exception::custom)
                 }
             }?;
             self.last_decode_metrics = output.decode_metrics;

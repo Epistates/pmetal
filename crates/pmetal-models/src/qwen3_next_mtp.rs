@@ -1,11 +1,17 @@
 //! Qwen3Next bundled MTP speculative decoding.
+//!
+//! The decode loop is [`crate::mtp`]'s. This module supplies the predictor as
+//! an [`MtpDrafter`] and the three targets it runs against: the dynamic model
+//! (adapted or not), and the native bridge engine `pmetal infer` uses.
 
-use std::collections::HashMap;
+use std::path::Path;
 
-use pmetal_bridge::compat::{Array, Exception, ops::select_axis};
-use pmetal_bridge::decode::{
-    greedy_token, last_token_hidden, last_token_logits, prompt_tokens_to_input,
+use pmetal_bridge::compat::{
+    Array, Exception,
+    ops::{concatenate_axis, slice_axis},
 };
+use pmetal_bridge::decode::{last_token_hidden, last_token_logits, prompt_tokens_to_input};
+use pmetal_bridge::qwen3_native::{self, NativeCache, NativeWeights};
 use pmetal_mlx::{
     kv_cache::{GdnVerifyInputs, KVCache, MambaCache, MambaSnapshot},
     speculative::SpecCapture,
@@ -13,11 +19,8 @@ use pmetal_mlx::{
 
 use crate::{
     architectures::{Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM},
-    generation::{
-        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
-        correction_log_probs, count_token, sampling_log_probs_with_counts,
-        token_probability_from_log_probs,
-    },
+    generation::{GenerationConfig, GenerationOutput},
+    mtp::{MtpDrafter, MtpTarget, generate_mtp_streaming},
 };
 
 #[derive(Debug, Clone)]
@@ -34,40 +37,11 @@ impl Default for Qwen3NextMtpConfig {
     }
 }
 
-pub trait Qwen3NextMtpTarget {
-    fn qwen3_next_config(&self) -> &Qwen3NextConfig;
-
-    fn forward_hidden_for_mtp(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        kv_cache: Option<&mut KVCache>,
-        mamba_cache: Option<&mut MambaCache>,
-    ) -> Result<(Array, Array), Exception>;
-}
-
-impl Qwen3NextMtpTarget for Qwen3NextForCausalLM {
-    fn qwen3_next_config(&self) -> &Qwen3NextConfig {
-        &self.config
-    }
-
-    fn forward_hidden_for_mtp(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        kv_cache: Option<&mut KVCache>,
-        mamba_cache: Option<&mut MambaCache>,
-    ) -> Result<(Array, Array), Exception> {
-        let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
-        self.forward_hidden_with_capture(input_ids, mask, kv_cache, mamba_cache, &mut capture)
-    }
-}
-
-pub fn validate_qwen3_next_mtp_pair<T: Qwen3NextMtpTarget + ?Sized>(
-    target: &T,
+/// Check that `mtp` can draft for a target with `target_config`.
+pub fn validate_qwen3_next_mtp_pair(
+    target_config: &Qwen3NextConfig,
     mtp: &Qwen3NextMtpForCausalLM,
 ) -> Result<(), Exception> {
-    let target_config = target.qwen3_next_config();
     if target_config.hidden_size != mtp.config.hidden_size {
         return Err(Exception::custom(format!(
             "Qwen MTP hidden_size ({}) must match target hidden_size ({})",
@@ -86,6 +60,7 @@ pub fn validate_qwen3_next_mtp_pair<T: Qwen3NextMtpTarget + ?Sized>(
     Ok(())
 }
 
+/// MTP decode of a dynamic Qwen3Next target (adapted or not).
 #[allow(clippy::too_many_arguments)]
 pub fn generate_qwen3_next_mtp_streaming<F>(
     target: &mut Qwen3NextForCausalLM,
@@ -96,662 +71,278 @@ pub fn generate_qwen3_next_mtp_streaming<F>(
     target_mamba_cache: &mut MambaCache,
     mtp_cache: &mut KVCache,
     mtp_config: Qwen3NextMtpConfig,
-    mut on_token: F,
+    on_token: F,
 ) -> Result<GenerationOutput, Exception>
 where
     F: FnMut(u32) -> bool,
 {
-    if input_ids.is_empty() {
-        return Err(Exception::custom("Qwen MTP requires a non-empty prompt"));
-    }
-    if gen_config.max_new_tokens == 0 {
-        return Ok(GenerationOutput {
-            token_ids: input_ids.to_vec(),
-            num_generated: 0,
-            stopped_by_token: false,
-            stopped_by_length: true,
-            decode_metrics: None,
-            speculative_metrics: None,
-        });
-    }
-    let mut draws = SpeculativeDraws::new(gen_config.seed);
-
-    validate_qwen3_next_mtp_pair(target, mtp)?;
-    target_cache.reset();
-    target_mamba_cache.reset();
-    mtp_cache.reset();
-
-    let prompt = prompt_tokens_to_input(input_ids);
-    let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
-    let (target_hidden, target_logits) = target.forward_hidden_with_capture(
-        &prompt,
-        None,
-        Some(target_cache),
-        Some(target_mamba_cache),
-        &mut capture,
-    )?;
-    let mut prev_target_logits = last_token_logits(&target_logits);
-
-    let (mtp_hidden, mtp_logits) =
-        mtp.forward_logits(&prompt, &target_hidden, None, Some(mtp_cache), 0)?;
-    let mut last_mtp_hidden = last_token_hidden(&mtp_hidden);
-    let mut prev_mtp_logits = last_token_logits(&mtp_logits);
-
-    let mut token_ids = input_ids.to_vec();
-    let mut generated_counts = HashMap::new();
-    let mut num_generated = 0usize;
-    let mut stopped_by_token = false;
-    let draft_budget = mtp_config.num_draft_tokens.max(1);
-    let mut speculative_metrics = SpeculativeDecodeMetrics::default();
-
-    while num_generated < gen_config.max_new_tokens {
-        let remaining = gen_config.max_new_tokens - num_generated;
-        let max_draft = draft_budget.min(remaining);
-        let base_mtp_hidden = last_mtp_hidden.clone();
-        let base_mtp_logits = prev_mtp_logits.clone();
-
-        let mut draft_tokens = Vec::with_capacity(max_draft);
-        let mut draft_log_probs = Vec::with_capacity(max_draft);
-        let mut draft_history = token_ids.clone();
-        let mut draft_counts = generated_counts.clone();
-        let mut draft_hidden = last_mtp_hidden.clone();
-        let mut draft_logits = prev_mtp_logits.clone();
-
-        for draft_idx in 0..max_draft {
-            let draft_token = if gen_config.do_sample {
-                let log_probs = sampling_log_probs_with_counts(
-                    &draft_logits,
-                    &draft_history,
-                    &draft_counts,
-                    &gen_config,
-                )?;
-                let token = draws.sample(&log_probs)?;
-                draft_log_probs.push(log_probs);
-                token
-            } else {
-                greedy_token(&draft_logits)
-            };
-            draft_tokens.push(draft_token);
-            draft_history.push(draft_token);
-            count_token(&mut draft_counts, draft_token);
-
-            let (next_hidden, next_logits) =
-                mtp_step(mtp, draft_token, &draft_hidden, mtp_cache, draft_idx + 1)?;
-            draft_hidden = next_hidden;
-            draft_logits = next_logits;
-            if gen_config.stop_tokens.contains(&draft_token) || draft_idx + 1 >= max_draft {
-                break;
-            }
-        }
-
-        let mamba_snapshot = target_mamba_cache.snapshot();
-        capture.clear();
-        let verify_input = prompt_tokens_to_input(&draft_tokens);
-        let (verify_hidden, verify_logits) = target.forward_hidden_with_capture(
-            &verify_input,
-            None,
-            Some(target_cache),
-            Some(target_mamba_cache),
-            &mut capture,
-        )?;
-
-        let (accepted, correction) = if gen_config.do_sample {
-            accept_sampled_draft(
-                &draft_tokens,
-                &draft_log_probs,
-                &prev_target_logits,
-                &verify_logits,
-                &token_ids,
-                &generated_counts,
-                &gen_config,
-                &mut draws,
-            )?
-        } else {
-            accept_greedy_draft(&draft_tokens, &prev_target_logits, &verify_logits)
-        };
-        record_speculative_verify(&mut speculative_metrics, draft_tokens.len(), accepted);
-
-        let all_accepted = accepted == draft_tokens.len();
-        let mut planned = Vec::with_capacity(draft_tokens.len() + 1);
-        planned.extend_from_slice(&draft_tokens[..accepted]);
-        let append_after_emit = if all_accepted {
-            if num_generated + planned.len() < gen_config.max_new_tokens {
-                let row = select_axis(&verify_logits, (draft_tokens.len() - 1) as i32, 1);
-                let bonus = if gen_config.do_sample {
-                    let mut verify_history = token_ids.clone();
-                    let mut verify_counts = generated_counts.clone();
-                    for &token in &draft_tokens {
-                        verify_history.push(token);
-                        count_token(&mut verify_counts, token);
-                    }
-                    let log_probs = sampling_log_probs_with_counts(
-                        &row,
-                        &verify_history,
-                        &verify_counts,
-                        &gen_config,
-                    )?;
-                    draws.sample(&log_probs)?
-                } else {
-                    greedy_token(&row)
-                };
-                planned.push(bonus);
-                Some(bonus)
-            } else {
-                None
-            }
-        } else {
-            let correction = correction.ok_or_else(|| {
-                Exception::custom("Qwen MTP rejected a draft without correction token")
-            })?;
-            planned.push(correction);
-            Some(correction)
-        };
-
-        let stop_pos = planned
-            .iter()
-            .position(|token| gen_config.stop_tokens.contains(token));
-        let planned_len = stop_pos.map(|idx| idx + 1).unwrap_or(planned.len());
-
-        let mut continue_stream = true;
-        let mut emitted_planned_count = 0usize;
-        for &token in &planned[..planned_len] {
-            continue_stream = emit_token(
-                token,
-                &mut token_ids,
-                &mut num_generated,
-                &mut stopped_by_token,
-                &gen_config,
-                &mut on_token,
-            )?;
-            emitted_planned_count += 1;
-            count_token(&mut generated_counts, token);
-            if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
-                break;
-            }
-        }
-        let emitted_draft_count = emitted_planned_count.min(accepted);
-        speculative_metrics.emitted_draft_tokens += emitted_draft_count;
-        if emitted_planned_count > emitted_draft_count {
-            if all_accepted {
-                speculative_metrics.bonus_tokens += 1;
-            } else {
-                speculative_metrics.correction_tokens += 1;
-            }
-        }
-
-        rollback_target_to_accepted(
-            target_cache,
-            target_mamba_cache,
-            &mamba_snapshot,
-            &mut capture,
-            draft_tokens.len(),
-            emitted_draft_count,
-        )?;
-
-        mtp_cache.rollback(draft_tokens.len());
-        let (mut next_mtp_hidden, mut next_mtp_logits) =
-            (base_mtp_hidden.clone(), base_mtp_logits.clone());
-        if emitted_draft_count > 0 {
-            (next_mtp_hidden, next_mtp_logits) = replay_mtp_with_target_hidden(
-                mtp,
-                mtp_cache,
-                &draft_tokens[..emitted_draft_count],
-                &verify_hidden,
-            )?;
-        }
-        last_mtp_hidden = next_mtp_hidden;
-        prev_mtp_logits = next_mtp_logits;
-
-        if !continue_stream
-            || stopped_by_token
-            || num_generated >= gen_config.max_new_tokens
-            || stop_pos.is_some()
-        {
-            break;
-        }
-
-        if let Some(token) = append_after_emit
-            && emitted_draft_count < planned_len
-        {
-            let (target_hidden, target_logits) =
-                target_step(target, token, target_cache, target_mamba_cache)?;
-            prev_target_logits = target_logits;
-            let (mtp_hidden, mtp_logits) = mtp_step(
-                mtp,
-                token,
-                &target_hidden,
-                mtp_cache,
-                emitted_draft_count + 1,
-            )?;
-            last_mtp_hidden = mtp_hidden;
-            prev_mtp_logits = mtp_logits;
-        } else if emitted_draft_count > 0 {
-            let last_idx = emitted_draft_count - 1;
-            prev_target_logits = select_axis(&verify_logits, last_idx as i32, 1);
-        }
-    }
-
-    Ok(GenerationOutput {
-        token_ids,
-        num_generated,
-        stopped_by_token,
-        stopped_by_length: num_generated >= gen_config.max_new_tokens && !stopped_by_token,
-        decode_metrics: None,
-        speculative_metrics: Some(speculative_metrics),
-    })
+    validate_qwen3_next_mtp_pair(&target.config, mtp)?;
+    let mut target = Qwen3NextMtpVerifier::new(target, target_cache, target_mamba_cache);
+    let mut drafter = Qwen3NextMtpDrafter::new(mtp, mtp_cache);
+    generate_mtp_streaming(
+        &mut target,
+        &mut drafter,
+        input_ids,
+        &gen_config,
+        mtp_config.num_draft_tokens,
+        on_token,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn generate_qwen3_next_mtp_streaming_rebuild<T, F>(
-    target: &mut T,
+/// The Qwen3Next MTP predictor as an [`MtpDrafter`]. It keeps its own KV
+/// cache, one entry per `(token, hidden state)` pair: entry `i` pairs
+/// `x[i + 1]` with the target's `h[i]`. A round's draft steps add entries
+/// built on the predictor's own hidden states; the round's commit puts the
+/// cache back as it was and adds the kept tokens with the target's.
+pub struct Qwen3NextMtpDrafter<'a> {
+    mtp: &'a mut Qwen3NextMtpForCausalLM,
+    cache: &'a mut KVCache,
+    before_round: Option<KVCache>,
+}
+
+impl<'a> Qwen3NextMtpDrafter<'a> {
+    pub fn new(mtp: &'a mut Qwen3NextMtpForCausalLM, cache: &'a mut KVCache) -> Self {
+        Self {
+            mtp,
+            cache,
+            before_round: None,
+        }
+    }
+
+    /// Run `tokens` paired with `hidden` (`[1, T, H]`) into the cache.
+    fn append(
+        &mut self,
+        tokens: &[u32],
+        hidden: &Array,
+        step: usize,
+    ) -> Result<(Array, Array), Exception> {
+        let input = prompt_tokens_to_input(tokens);
+        self.mtp
+            .forward_logits(&input, hidden, None, Some(self.cache), step)
+    }
+}
+
+impl<T: MtpTarget> MtpDrafter<T> for Qwen3NextMtpDrafter<'_> {
+    fn prefill(&mut self, _: &mut T, prompt: &[u32], hidden: &Array) -> Result<(), Exception> {
+        self.cache.reset();
+        let n = prompt.len();
+        if n > 1 {
+            let head = slice_axis(hidden, 1, 0, n as i32 - 1);
+            self.append(&prompt[1..], &head, 0)?;
+        }
+        Ok(())
+    }
+
+    fn step(
+        &mut self,
+        _: &mut T,
+        token: u32,
+        hidden: &Array,
+        step: usize,
+        _position: usize,
+    ) -> Result<(Array, Array), Exception> {
+        if step == 0 {
+            // A clone shares the cached arrays; appending makes new ones.
+            self.before_round = Some(self.cache.clone());
+        }
+        let (hidden, logits) = self.append(&[token], hidden, step)?;
+        Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
+    }
+
+    fn commit(
+        &mut self,
+        _: &mut T,
+        pending: u32,
+        seed: &Array,
+        drafts: &[u32],
+        accepted: usize,
+        verify_hidden: &Array,
+    ) -> Result<(), Exception> {
+        if let Some(before) = self.before_round.take() {
+            *self.cache = before;
+        }
+        // `pending` was predicted by `seed`, and kept draft `j` by the
+        // target's hidden state at the block's position `j`.
+        let mut tokens = Vec::with_capacity(accepted + 1);
+        tokens.push(pending);
+        tokens.extend_from_slice(&drafts[..accepted]);
+        let hidden = if accepted == 0 {
+            seed.clone()
+        } else {
+            concatenate_axis(
+                &[seed, &slice_axis(verify_hidden, 1, 0, accepted as i32)],
+                1,
+            )
+        };
+        self.append(&tokens, &hidden, 0)?;
+        Ok(())
+    }
+}
+
+/// A dynamic Qwen3Next model as an [`MtpTarget`]. Its attention layers roll
+/// back by their KV caches; its GDN layers are rewound from a snapshot taken
+/// before the verify, replaying the kept tokens' recorded inputs.
+pub struct Qwen3NextMtpVerifier<'a> {
+    model: &'a mut Qwen3NextForCausalLM,
+    cache: &'a mut KVCache,
+    mamba: &'a mut MambaCache,
+    capture: SpecCapture,
+    snapshot: Vec<MambaSnapshot>,
+    verified: usize,
+}
+
+impl<'a> Qwen3NextMtpVerifier<'a> {
+    pub fn new(
+        model: &'a mut Qwen3NextForCausalLM,
+        cache: &'a mut KVCache,
+        mamba: &'a mut MambaCache,
+    ) -> Self {
+        Self {
+            model,
+            cache,
+            mamba,
+            capture: SpecCapture::with_layers_and_embedding(Vec::new(), false),
+            snapshot: Vec::new(),
+            verified: 0,
+        }
+    }
+}
+
+impl MtpTarget for Qwen3NextMtpVerifier<'_> {
+    fn reset(&mut self) -> Result<(), Exception> {
+        self.cache.reset();
+        self.mamba.reset();
+        Ok(())
+    }
+
+    fn forward(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
+        self.capture.clear();
+        self.model.forward_hidden_with_capture(
+            &prompt_tokens_to_input(tokens),
+            None,
+            Some(self.cache),
+            Some(self.mamba),
+            &mut self.capture,
+        )
+    }
+
+    fn verify(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
+        self.snapshot = self.mamba.snapshot();
+        self.verified = tokens.len();
+        self.forward(tokens)
+    }
+
+    fn keep(&mut self, kept: usize) -> Result<(), Exception> {
+        let rejected = self.verified.saturating_sub(kept);
+        if rejected > 0 {
+            self.cache.rollback(rejected);
+            let per_layer: Vec<Option<GdnVerifyInputs>> = (0..self.mamba.num_layers())
+                .map(|layer| self.capture.gdn_inputs.remove(&layer))
+                .collect();
+            self.mamba
+                .rewind_from_snapshots(&self.snapshot, &per_layer, kept)?;
+        }
+        Ok(())
+    }
+}
+
+/// MTP decode of the native bridge Qwen engine, loaded from `model_dir`.
+pub fn generate_qwen3_native_mtp_streaming<F>(
+    model_dir: &Path,
     mtp: &mut Qwen3NextMtpForCausalLM,
+    mtp_cache: &mut KVCache,
     input_ids: &[u32],
     gen_config: GenerationConfig,
-    target_cache: &mut KVCache,
-    target_mamba_cache: &mut MambaCache,
-    mtp_cache: &mut KVCache,
     mtp_config: Qwen3NextMtpConfig,
-    mut on_token: F,
+    on_token: F,
 ) -> Result<GenerationOutput, Exception>
 where
-    T: Qwen3NextMtpTarget,
     F: FnMut(u32) -> bool,
 {
-    if input_ids.is_empty() {
-        return Err(Exception::custom("Qwen MTP requires a non-empty prompt"));
+    let mut target = NativeQwen3MtpVerifier::load(model_dir)?;
+    if mtp.config.hidden_size != target.hidden_size {
+        return Err(Exception::custom(format!(
+            "Qwen MTP hidden_size ({}) must match target hidden_size ({})",
+            mtp.config.hidden_size, target.hidden_size
+        )));
     }
-    if gen_config.max_new_tokens == 0 {
-        return Ok(GenerationOutput {
-            token_ids: input_ids.to_vec(),
-            num_generated: 0,
-            stopped_by_token: false,
-            stopped_by_length: true,
-            decode_metrics: None,
-            speculative_metrics: None,
-        });
-    }
-    let mut draws = SpeculativeDraws::new(gen_config.seed);
-
-    validate_qwen3_next_mtp_pair(target, mtp)?;
-    let mut mtp_state = rebuild_qwen_mtp_state(
-        target,
-        mtp,
+    let mut drafter = Qwen3NextMtpDrafter::new(mtp, mtp_cache);
+    generate_mtp_streaming(
+        &mut target,
+        &mut drafter,
         input_ids,
-        target_cache,
-        target_mamba_cache,
-        mtp_cache,
-    )?;
-
-    let mut token_ids = input_ids.to_vec();
-    let mut generated_counts = HashMap::new();
-    let mut num_generated = 0usize;
-    let mut stopped_by_token = false;
-    let draft_budget = mtp_config.num_draft_tokens.max(1);
-    let mut speculative_metrics = SpeculativeDecodeMetrics::default();
-
-    while num_generated < gen_config.max_new_tokens {
-        let remaining = gen_config.max_new_tokens - num_generated;
-        let max_draft = draft_budget.min(remaining);
-
-        let mut draft_tokens = Vec::with_capacity(max_draft);
-        let mut draft_log_probs = Vec::with_capacity(max_draft);
-        let mut draft_history = token_ids.clone();
-        let mut draft_counts = generated_counts.clone();
-        let mut draft_hidden = mtp_state.last_mtp_hidden.clone();
-        let mut draft_logits = mtp_state.prev_mtp_logits.clone();
-
-        for draft_idx in 0..max_draft {
-            let draft_token = if gen_config.do_sample {
-                let log_probs = sampling_log_probs_with_counts(
-                    &draft_logits,
-                    &draft_history,
-                    &draft_counts,
-                    &gen_config,
-                )?;
-                let token = draws.sample(&log_probs)?;
-                draft_log_probs.push(log_probs);
-                token
-            } else {
-                greedy_token(&draft_logits)
-            };
-            draft_tokens.push(draft_token);
-            draft_history.push(draft_token);
-            count_token(&mut draft_counts, draft_token);
-
-            let (next_hidden, next_logits) =
-                mtp_step(mtp, draft_token, &draft_hidden, mtp_cache, draft_idx + 1)?;
-            draft_hidden = next_hidden;
-            draft_logits = next_logits;
-            if gen_config.stop_tokens.contains(&draft_token) || draft_idx + 1 >= max_draft {
-                break;
-            }
-        }
-
-        let verify_input = prompt_tokens_to_input(&draft_tokens);
-        let (_verify_hidden, verify_logits) = target.forward_hidden_for_mtp(
-            &verify_input,
-            None,
-            Some(target_cache),
-            Some(target_mamba_cache),
-        )?;
-
-        let (accepted, correction) = if gen_config.do_sample {
-            accept_sampled_draft(
-                &draft_tokens,
-                &draft_log_probs,
-                &mtp_state.prev_target_logits,
-                &verify_logits,
-                &token_ids,
-                &generated_counts,
-                &gen_config,
-                &mut draws,
-            )?
-        } else {
-            accept_greedy_draft(&draft_tokens, &mtp_state.prev_target_logits, &verify_logits)
-        };
-        record_speculative_verify(&mut speculative_metrics, draft_tokens.len(), accepted);
-
-        let all_accepted = accepted == draft_tokens.len();
-        let mut planned = Vec::with_capacity(draft_tokens.len() + 1);
-        planned.extend_from_slice(&draft_tokens[..accepted]);
-        if all_accepted {
-            if num_generated + planned.len() < gen_config.max_new_tokens {
-                let row = select_axis(&verify_logits, (draft_tokens.len() - 1) as i32, 1);
-                let bonus = if gen_config.do_sample {
-                    let mut verify_history = token_ids.clone();
-                    let mut verify_counts = generated_counts.clone();
-                    for &token in &draft_tokens {
-                        verify_history.push(token);
-                        count_token(&mut verify_counts, token);
-                    }
-                    let log_probs = sampling_log_probs_with_counts(
-                        &row,
-                        &verify_history,
-                        &verify_counts,
-                        &gen_config,
-                    )?;
-                    draws.sample(&log_probs)?
-                } else {
-                    greedy_token(&row)
-                };
-                planned.push(bonus);
-            }
-        } else {
-            let correction = correction.ok_or_else(|| {
-                Exception::custom("Qwen MTP rejected a draft without correction token")
-            })?;
-            planned.push(correction);
-        }
-
-        let stop_pos = planned
-            .iter()
-            .position(|token| gen_config.stop_tokens.contains(token));
-        let planned_len = stop_pos.map(|idx| idx + 1).unwrap_or(planned.len());
-
-        let mut continue_stream = true;
-        let mut emitted_planned_count = 0usize;
-        for &token in &planned[..planned_len] {
-            continue_stream = emit_token(
-                token,
-                &mut token_ids,
-                &mut num_generated,
-                &mut stopped_by_token,
-                &gen_config,
-                &mut on_token,
-            )?;
-            emitted_planned_count += 1;
-            count_token(&mut generated_counts, token);
-            if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
-                break;
-            }
-        }
-        let emitted_draft_count = emitted_planned_count.min(accepted);
-        speculative_metrics.emitted_draft_tokens += emitted_draft_count;
-        if emitted_planned_count > emitted_draft_count {
-            if all_accepted {
-                speculative_metrics.bonus_tokens += 1;
-            } else {
-                speculative_metrics.correction_tokens += 1;
-            }
-        }
-
-        if !continue_stream
-            || stopped_by_token
-            || num_generated >= gen_config.max_new_tokens
-            || stop_pos.is_some()
-        {
-            break;
-        }
-
-        mtp_state = rebuild_qwen_mtp_state(
-            target,
-            mtp,
-            &token_ids,
-            target_cache,
-            target_mamba_cache,
-            mtp_cache,
-        )?;
-    }
-
-    Ok(GenerationOutput {
-        token_ids,
-        num_generated,
-        stopped_by_token,
-        stopped_by_length: num_generated >= gen_config.max_new_tokens && !stopped_by_token,
-        decode_metrics: None,
-        speculative_metrics: Some(speculative_metrics),
-    })
+        &gen_config,
+        mtp_config.num_draft_tokens,
+        on_token,
+    )
 }
 
-struct QwenMtpState {
-    prev_target_logits: Array,
-    last_mtp_hidden: Array,
-    prev_mtp_logits: Array,
+/// The native bridge Qwen engine as an [`MtpTarget`]. A verify forks the
+/// cache first, and a partial accept goes back to the fork and runs the kept
+/// tokens again.
+pub struct NativeQwen3MtpVerifier {
+    weights: NativeWeights,
+    cache: NativeCache,
+    before_verify: Option<NativeCache>,
+    verified: Vec<u32>,
+    hidden_size: i32,
 }
 
-fn rebuild_qwen_mtp_state<T: Qwen3NextMtpTarget>(
-    target: &mut T,
-    mtp: &mut Qwen3NextMtpForCausalLM,
-    committed_tokens: &[u32],
-    target_cache: &mut KVCache,
-    target_mamba_cache: &mut MambaCache,
-    mtp_cache: &mut KVCache,
-) -> Result<QwenMtpState, Exception> {
-    target_cache.reset();
-    target_mamba_cache.reset();
-    mtp_cache.reset();
-
-    let input = prompt_tokens_to_input(committed_tokens);
-    let (target_hidden, target_logits) = target.forward_hidden_for_mtp(
-        &input,
-        None,
-        Some(target_cache),
-        Some(target_mamba_cache),
-    )?;
-    let prev_target_logits = last_token_logits(&target_logits);
-
-    let (mtp_hidden, mtp_logits) =
-        mtp.forward_logits(&input, &target_hidden, None, Some(mtp_cache), 0)?;
-    Ok(QwenMtpState {
-        prev_target_logits,
-        last_mtp_hidden: last_token_hidden(&mtp_hidden),
-        prev_mtp_logits: last_token_logits(&mtp_logits),
-    })
-}
-
-fn accept_greedy_draft(
-    draft_tokens: &[u32],
-    prev_target_logits: &Array,
-    verify_logits: &Array,
-) -> (usize, Option<u32>) {
-    let mut matched = 0usize;
-    while matched < draft_tokens.len() {
-        let row = if matched == 0 {
-            prev_target_logits.clone()
-        } else {
-            select_axis(verify_logits, (matched - 1) as i32, 1)
-        };
-        if greedy_token(&row) != draft_tokens[matched] {
-            break;
-        }
-        matched += 1;
-    }
-
-    if matched == draft_tokens.len() {
-        (matched, None)
-    } else {
-        let row = if matched == 0 {
-            prev_target_logits.clone()
-        } else {
-            select_axis(verify_logits, (matched - 1) as i32, 1)
-        };
-        (matched, Some(greedy_token(&row)))
+impl NativeQwen3MtpVerifier {
+    /// Load a Qwen3 / Qwen3.5 checkpoint into the native engine.
+    pub fn load(model_dir: &Path) -> Result<Self, Exception> {
+        let config = qwen3_native::load_config(model_dir).map_err(Exception::custom)?;
+        let weights = qwen3_native::load_model(model_dir, &config).map_err(Exception::custom)?;
+        tracing::debug!(
+            layers = config.num_hidden_layers,
+            hidden = config.hidden_size,
+            "native Qwen MTP verifier loaded"
+        );
+        Ok(Self {
+            cache: NativeCache::new_empty(&weights),
+            weights,
+            before_verify: None,
+            verified: Vec::new(),
+            hidden_size: config.hidden_size,
+        })
     }
 }
 
-fn record_speculative_verify(
-    metrics: &mut SpeculativeDecodeMetrics,
-    drafted: usize,
-    accepted: usize,
-) {
-    metrics.record_verify_step(drafted, accepted);
-}
+impl MtpTarget for NativeQwen3MtpVerifier {
+    fn reset(&mut self) -> Result<(), Exception> {
+        self.cache = NativeCache::new_empty(&self.weights);
+        Ok(())
+    }
 
-#[allow(clippy::too_many_arguments)]
-fn accept_sampled_draft(
-    draft_tokens: &[u32],
-    draft_log_probs: &[Array],
-    prev_target_logits: &Array,
-    verify_logits: &Array,
-    token_ids: &[u32],
-    generated_counts: &HashMap<u32, usize>,
-    gen_config: &GenerationConfig,
-    draws: &mut SpeculativeDraws,
-) -> Result<(usize, Option<u32>), Exception> {
-    let mut accepted = 0usize;
-    let mut verify_history = token_ids.to_vec();
-    let mut verify_counts = generated_counts.clone();
+    fn forward(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
+        let input = prompt_tokens_to_input(tokens);
+        Ok(qwen3_native::forward_step_hidden(
+            &self.weights,
+            &input,
+            &mut self.cache,
+        ))
+    }
 
-    while accepted < draft_tokens.len() {
-        let row = if accepted == 0 {
-            prev_target_logits.clone()
-        } else {
-            select_axis(verify_logits, (accepted - 1) as i32, 1)
-        };
-        let target_log_probs =
-            sampling_log_probs_with_counts(&row, &verify_history, &verify_counts, gen_config)?;
-        let draft_log_probs_row = &draft_log_probs[accepted];
-        let token = draft_tokens[accepted];
-        let p_target = token_probability_from_log_probs(&target_log_probs, token)?;
-        let p_draft = token_probability_from_log_probs(draft_log_probs_row, token)?;
-        let accept_prob = if p_draft > 0.0 {
-            (p_target / p_draft).min(1.0)
-        } else {
-            0.0
-        };
+    fn verify(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
+        self.before_verify = Some(self.cache.fork());
+        self.verified = tokens.to_vec();
+        self.forward(tokens)
+    }
 
-        if draws.uniform() < accept_prob {
-            accepted += 1;
-            verify_history.push(token);
-            count_token(&mut verify_counts, token);
-        } else {
-            let correction_log_probs =
-                correction_log_probs(&target_log_probs, draft_log_probs_row)?;
-            return Ok((accepted, Some(draws.sample(&correction_log_probs)?)));
+    fn keep(&mut self, kept: usize) -> Result<(), Exception> {
+        if kept >= self.verified.len() {
+            return Ok(());
         }
-    }
-
-    Ok((accepted, None))
-}
-
-fn rollback_target_to_accepted(
-    target_cache: &mut KVCache,
-    target_mamba_cache: &mut MambaCache,
-    mamba_snapshot: &[MambaSnapshot],
-    capture: &mut SpecCapture,
-    draft_len: usize,
-    accepted: usize,
-) -> Result<(), Exception> {
-    let rollback = draft_len.saturating_sub(accepted);
-    if rollback > 0 {
-        target_cache.rollback(rollback);
-        let num_layers = target_mamba_cache.num_layers();
-        let mut per_layer: Vec<Option<GdnVerifyInputs>> = Vec::with_capacity(num_layers);
-        for layer_idx in 0..num_layers {
-            per_layer.push(capture.gdn_inputs.remove(&layer_idx));
+        self.cache = self
+            .before_verify
+            .take()
+            .ok_or_else(|| Exception::custom("native Qwen MTP: keep without a verify"))?;
+        let kept_tokens = std::mem::take(&mut self.verified);
+        if kept > 0 {
+            self.forward(&kept_tokens[..kept])?;
         }
-        target_mamba_cache.rewind_from_snapshots(mamba_snapshot, &per_layer, accepted)?;
+        Ok(())
     }
-    Ok(())
-}
-
-fn replay_mtp_with_target_hidden(
-    mtp: &mut Qwen3NextMtpForCausalLM,
-    mtp_cache: &mut KVCache,
-    tokens: &[u32],
-    target_hidden: &Array,
-) -> Result<(Array, Array), Exception> {
-    let mut last_hidden = None;
-    let mut last_logits = None;
-    for (idx, &token) in tokens.iter().enumerate() {
-        let hidden = select_axis(target_hidden, idx as i32, 1).reshape(&[1, 1, -1]);
-        let (h, logits) = mtp_step(mtp, token, &hidden, mtp_cache, idx)?;
-        last_hidden = Some(h);
-        last_logits = Some(logits);
-    }
-    Ok((
-        last_hidden.ok_or_else(|| Exception::custom("Qwen MTP replay received no tokens"))?,
-        last_logits.ok_or_else(|| Exception::custom("Qwen MTP replay received no tokens"))?,
-    ))
-}
-
-fn mtp_step(
-    mtp: &mut Qwen3NextMtpForCausalLM,
-    token: u32,
-    hidden: &Array,
-    mtp_cache: &mut KVCache,
-    step_idx: usize,
-) -> Result<(Array, Array), Exception> {
-    let input = prompt_tokens_to_input(&[token]);
-    let (hidden, logits) = mtp.forward_logits(&input, hidden, None, Some(mtp_cache), step_idx)?;
-    Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
-}
-
-fn target_step(
-    target: &mut Qwen3NextForCausalLM,
-    token: u32,
-    target_cache: &mut KVCache,
-    target_mamba_cache: &mut MambaCache,
-) -> Result<(Array, Array), Exception> {
-    let input = prompt_tokens_to_input(&[token]);
-    let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
-    let (hidden, logits) = target.forward_hidden_with_capture(
-        &input,
-        None,
-        Some(target_cache),
-        Some(target_mamba_cache),
-        &mut capture,
-    )?;
-    Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
-}
-
-fn emit_token<F>(
-    token: u32,
-    token_ids: &mut Vec<u32>,
-    num_generated: &mut usize,
-    stopped_by_token: &mut bool,
-    gen_config: &GenerationConfig,
-    on_token: &mut F,
-) -> Result<bool, Exception>
-where
-    F: FnMut(u32) -> bool,
-{
-    token_ids.push(token);
-    *num_generated += 1;
-    if gen_config.stop_tokens.contains(&token) {
-        *stopped_by_token = true;
-    }
-    Ok(on_token(token))
 }
 
 #[cfg(test)]
@@ -779,7 +370,7 @@ mod tests {
             crate::architectures::Qwen3NextForCausalLM::new(target_config.clone()).unwrap();
         target_config.hidden_size = 8;
         let mtp = crate::architectures::Qwen3NextMtpForCausalLM::new(target_config).unwrap();
-        assert!(validate_qwen3_next_mtp_pair(&target, &mtp).is_err());
+        assert!(validate_qwen3_next_mtp_pair(&target.config, &mtp).is_err());
     }
 
     #[test]
@@ -802,7 +393,7 @@ mod tests {
         let target = crate::architectures::Qwen3NextForCausalLM::new(config.clone()).unwrap();
         let mtp = crate::architectures::Qwen3NextMtpForCausalLM::new(config).unwrap();
 
-        validate_qwen3_next_mtp_pair(&target, &mtp).unwrap();
+        validate_qwen3_next_mtp_pair(&target.config, &mtp).unwrap();
         assert_eq!(mtp.create_cache(16).config().num_layers, 2);
     }
 

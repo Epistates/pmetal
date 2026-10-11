@@ -1,25 +1,20 @@
 //! Gemma 4 multi-token prediction decoding.
+//!
+//! The decode loop is [`crate::mtp`]'s. This module supplies the assistant as
+//! an [`MtpDrafter`] and the target as an [`MtpTarget`]. The assistant has no
+//! cache of its own: it attends to the target's KV cache, and every step of a
+//! round runs at the pending token's position.
 
-use std::collections::HashMap;
-
-use pmetal_bridge::compat::{
-    Array, Exception,
-    ops::{concatenate_axis, select_axis},
-};
-use pmetal_bridge::decode::{
-    greedy_token, last_token_hidden, last_token_logits, prompt_tokens_to_input,
-};
+use pmetal_bridge::compat::{Array, Exception, ops::concatenate_axis};
+use pmetal_bridge::decode::prompt_tokens_to_input;
 use pmetal_mlx::{kv_cache::KVCache, speculative::SpecCapture};
 
 use crate::{
     architectures::{
         Gemma4AssistantForCausalLM, Gemma4AssistantSharedKvStates, Gemma4Config, Gemma4ForCausalLM,
     },
-    generation::{
-        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
-        correction_log_probs, count_token, sampling_log_probs_with_counts,
-        token_probability_from_log_probs,
-    },
+    generation::{GenerationConfig, GenerationOutput},
+    mtp::{MtpDrafter, MtpTarget, generate_mtp_streaming},
 };
 
 #[derive(Debug, Clone)]
@@ -128,6 +123,7 @@ pub fn validate_gemma4_mtp_pair(
     Ok(())
 }
 
+/// MTP decode of a Gemma 4 target with its assistant.
 pub fn generate_gemma4_mtp_streaming<F>(
     target: &mut Gemma4ForCausalLM,
     assistant: &mut Gemma4AssistantForCausalLM,
@@ -135,446 +131,130 @@ pub fn generate_gemma4_mtp_streaming<F>(
     gen_config: GenerationConfig,
     cache: &mut KVCache,
     mtp_config: Gemma4MtpConfig,
-    mut on_token: F,
+    on_token: F,
 ) -> Result<GenerationOutput, Exception>
 where
     F: FnMut(u32) -> bool,
 {
-    if input_ids.is_empty() {
-        return Err(Exception::custom("Gemma 4 MTP requires a non-empty prompt"));
-    }
-    if gen_config.max_new_tokens == 0 {
-        return Ok(GenerationOutput {
-            token_ids: input_ids.to_vec(),
-            num_generated: 0,
-            stopped_by_token: false,
-            stopped_by_length: true,
-            decode_metrics: None,
-            speculative_metrics: None,
-        });
-    }
-    if gen_config.do_sample {
-        return generate_gemma4_mtp_sampling_streaming(
-            target, assistant, input_ids, gen_config, cache, mtp_config, on_token,
-        );
-    }
-
-    validate_gemma4_mtp_pair(target, assistant)?;
-    let kv_sources = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)?;
-    cache.reset();
-
-    let prompt = prompt_tokens_to_input(input_ids);
-    let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
-    let (hidden, logits) =
-        target.forward_hidden_with_capture(&prompt, None, Some(cache), &mut capture)?;
-    let mut last_hidden = last_token_hidden(&hidden);
-    let mut prev_logits = last_token_logits(&logits);
-
-    let mut token_ids = input_ids.to_vec();
-    let mut num_generated = 0usize;
-    let mut stopped_by_token = false;
-    let draft_budget = mtp_config.num_assistant_tokens.max(1);
-    let mut speculative_metrics = SpeculativeDecodeMetrics::default();
-
-    while num_generated < gen_config.max_new_tokens {
-        let remaining = gen_config.max_new_tokens - num_generated;
-        let max_draft = draft_budget.min(remaining);
-        // Gemma 4 assistants use a static target KV cache; HF documents the
-        // assistant position IDs as constant throughout a drafting round.
-        let position_id = token_ids.len().saturating_sub(1) as i32;
-        let shared_states = kv_sources.shared_states(cache)?;
-        let mut draft_tokens = Vec::with_capacity(max_draft);
-        let mut draft_hidden = last_hidden.clone();
-        let mut draft_input_token = *token_ids
-            .last()
-            .ok_or_else(|| Exception::custom("Gemma 4 MTP internal empty token state"))?;
-
-        for _ in 0..max_draft {
-            let token_embedding = embed_target_token(target, draft_input_token);
-            let inputs_embeds = concatenate_axis(&[&token_embedding, &draft_hidden], -1);
-            let (draft_token, projected_hidden) =
-                assistant.draft_greedy_token(&inputs_embeds, &shared_states, position_id)?;
-            draft_tokens.push(draft_token);
-            draft_hidden = projected_hidden;
-            draft_input_token = draft_token;
-            if gen_config.stop_tokens.contains(&draft_token) {
-                break;
-            }
-        }
-
-        if draft_tokens.is_empty() {
-            let token = greedy_token(&prev_logits);
-            emit_token(
-                token,
-                &mut token_ids,
-                &mut num_generated,
-                &mut stopped_by_token,
-                &gen_config,
-                &mut on_token,
-            )?;
-            if stopped_by_token || num_generated >= gen_config.max_new_tokens {
-                break;
-            }
-            let (hidden, logits) = target_step(target, token, cache)?;
-            last_hidden = hidden;
-            prev_logits = logits;
-            continue;
-        }
-
-        let verify_input = prompt_tokens_to_input(&draft_tokens);
-        let verify_logits = target.forward_with_cache(&verify_input, None, Some(cache))?;
-        let mut matched = 0usize;
-        while matched < draft_tokens.len() {
-            let row = if matched == 0 {
-                prev_logits.clone()
-            } else {
-                select_axis(&verify_logits, (matched - 1) as i32, 1)
-            };
-            if greedy_token(&row) != draft_tokens[matched] {
-                break;
-            }
-            matched += 1;
-        }
-        speculative_metrics.record_verify_step(draft_tokens.len(), matched);
-
-        let all_matched = matched == draft_tokens.len();
-        let mut planned = Vec::with_capacity(draft_tokens.len() + 1);
-        planned.extend_from_slice(&draft_tokens[..matched]);
-        let append_after_emit = if all_matched {
-            if num_generated + planned.len() < gen_config.max_new_tokens {
-                let bonus = greedy_token(&select_axis(
-                    &verify_logits,
-                    (draft_tokens.len() - 1) as i32,
-                    1,
-                ));
-                planned.push(bonus);
-                Some(bonus)
-            } else {
-                None
-            }
-        } else {
-            let correction_logits = if matched == 0 {
-                prev_logits.clone()
-            } else {
-                select_axis(&verify_logits, (matched - 1) as i32, 1)
-            };
-            let correction = greedy_token(&correction_logits);
-            planned.push(correction);
-            Some(correction)
-        };
-
-        let stop_pos = planned
-            .iter()
-            .position(|token| gen_config.stop_tokens.contains(token));
-        let planned_len = stop_pos.map(|idx| idx + 1).unwrap_or(planned.len());
-
-        let mut continue_stream = true;
-        let mut emitted_planned_count = 0usize;
-        for &token in &planned[..planned_len] {
-            continue_stream = emit_token(
-                token,
-                &mut token_ids,
-                &mut num_generated,
-                &mut stopped_by_token,
-                &gen_config,
-                &mut on_token,
-            )?;
-            emitted_planned_count += 1;
-            if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
-                break;
-            }
-        }
-        let emitted_draft_count = emitted_planned_count.min(matched);
-        speculative_metrics.emitted_draft_tokens += emitted_draft_count;
-        if emitted_planned_count > emitted_draft_count {
-            if all_matched {
-                speculative_metrics.bonus_tokens += 1;
-            } else {
-                speculative_metrics.correction_tokens += 1;
-            }
-        }
-        let rollback = draft_tokens.len().saturating_sub(emitted_draft_count);
-        if rollback > 0 {
-            cache.rollback(rollback);
-        }
-        if !continue_stream
-            || stopped_by_token
-            || num_generated >= gen_config.max_new_tokens
-            || stop_pos.is_some()
-        {
-            break;
-        }
-
-        if let Some(token) = append_after_emit {
-            let appended_is_draft = all_matched && planned.len() <= draft_tokens.len();
-            if !appended_is_draft {
-                let (hidden, logits) = target_step(target, token, cache)?;
-                last_hidden = hidden;
-                prev_logits = logits;
-            }
-        }
-    }
-
-    Ok(GenerationOutput {
-        token_ids,
-        num_generated,
-        stopped_by_token,
-        stopped_by_length: num_generated >= gen_config.max_new_tokens && !stopped_by_token,
-        decode_metrics: None,
-        speculative_metrics: Some(speculative_metrics),
-    })
+    let mut drafter = Gemma4MtpDrafter::new(target, assistant)?;
+    let mut target = Gemma4MtpVerifier::new(target, cache);
+    generate_mtp_streaming(
+        &mut target,
+        &mut drafter,
+        input_ids,
+        &gen_config,
+        mtp_config.num_assistant_tokens,
+        on_token,
+    )
 }
 
-fn generate_gemma4_mtp_sampling_streaming<F>(
-    target: &mut Gemma4ForCausalLM,
-    assistant: &mut Gemma4AssistantForCausalLM,
-    input_ids: &[u32],
-    gen_config: GenerationConfig,
-    cache: &mut KVCache,
-    mtp_config: Gemma4MtpConfig,
-    mut on_token: F,
-) -> Result<GenerationOutput, Exception>
-where
-    F: FnMut(u32) -> bool,
-{
-    let mut draws = SpeculativeDraws::new(gen_config.seed);
-
-    validate_gemma4_mtp_pair(target, assistant)?;
-    let kv_sources = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)?;
-    cache.reset();
-
-    let prompt = prompt_tokens_to_input(input_ids);
-    let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
-    let (hidden, logits) =
-        target.forward_hidden_with_capture(&prompt, None, Some(cache), &mut capture)?;
-    let mut last_hidden = last_token_hidden(&hidden);
-    let mut prev_logits = last_token_logits(&logits);
-
-    let mut token_ids = input_ids.to_vec();
-    let mut generated_counts = HashMap::new();
-    let mut num_generated = 0usize;
-    let mut stopped_by_token = false;
-    let draft_budget = mtp_config.num_assistant_tokens.max(1);
-    let mut speculative_metrics = SpeculativeDecodeMetrics::default();
-
-    while num_generated < gen_config.max_new_tokens {
-        let remaining = gen_config.max_new_tokens - num_generated;
-        let max_draft = draft_budget.min(remaining);
-        // Gemma 4 assistants use a static target KV cache; HF documents the
-        // assistant position IDs as constant throughout a drafting round.
-        let position_id = token_ids.len().saturating_sub(1) as i32;
-        let shared_states = kv_sources.shared_states(cache)?;
-        let mut draft_tokens = Vec::with_capacity(max_draft);
-        let mut draft_log_probs = Vec::with_capacity(max_draft);
-        let mut draft_history = token_ids.clone();
-        let mut draft_counts = generated_counts.clone();
-        let mut draft_hidden = last_hidden.clone();
-        let mut draft_input_token = *token_ids
-            .last()
-            .ok_or_else(|| Exception::custom("Gemma 4 MTP internal empty token state"))?;
-
-        for _ in 0..max_draft {
-            let token_embedding = embed_target_token(target, draft_input_token);
-            let inputs_embeds = concatenate_axis(&[&token_embedding, &draft_hidden], -1);
-            let (projected_hidden, logits) =
-                assistant.forward_logits(&inputs_embeds, &shared_states, position_id)?;
-            let log_probs = sampling_log_probs_with_counts(
-                &logits,
-                &draft_history,
-                &draft_counts,
-                &gen_config,
-            )?;
-            let draft_token = draws.sample(&log_probs)?;
-            draft_tokens.push(draft_token);
-            draft_log_probs.push(log_probs);
-            draft_history.push(draft_token);
-            count_token(&mut draft_counts, draft_token);
-            draft_hidden = projected_hidden;
-            draft_input_token = draft_token;
-            if gen_config.stop_tokens.contains(&draft_token) {
-                break;
-            }
-        }
-
-        if draft_tokens.is_empty() {
-            let log_probs = sampling_log_probs_with_counts(
-                &prev_logits,
-                &token_ids,
-                &generated_counts,
-                &gen_config,
-            )?;
-            let token = draws.sample(&log_probs)?;
-            let continue_stream = emit_token(
-                token,
-                &mut token_ids,
-                &mut num_generated,
-                &mut stopped_by_token,
-                &gen_config,
-                &mut on_token,
-            )?;
-            count_token(&mut generated_counts, token);
-            if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
-                break;
-            }
-            let (hidden, logits) = target_step(target, token, cache)?;
-            last_hidden = hidden;
-            prev_logits = logits;
-            continue;
-        }
-
-        let verify_input = prompt_tokens_to_input(&draft_tokens);
-        let verify_logits = target.forward_with_cache(&verify_input, None, Some(cache))?;
-        let mut accepted = 0usize;
-        let mut correction = None;
-        let mut verify_history = token_ids.clone();
-        let mut verify_counts = generated_counts.clone();
-
-        while accepted < draft_tokens.len() {
-            let row = if accepted == 0 {
-                prev_logits.clone()
-            } else {
-                select_axis(&verify_logits, (accepted - 1) as i32, 1)
-            };
-            let target_log_probs =
-                sampling_log_probs_with_counts(&row, &verify_history, &verify_counts, &gen_config)?;
-            let draft_log_probs_row = &draft_log_probs[accepted];
-            let token = draft_tokens[accepted];
-            let p_target = token_probability_from_log_probs(&target_log_probs, token)?;
-            let p_draft = token_probability_from_log_probs(draft_log_probs_row, token)?;
-            let accept_prob = if p_draft > 0.0 {
-                (p_target / p_draft).min(1.0)
-            } else {
-                0.0
-            };
-
-            if draws.uniform() < accept_prob {
-                accepted += 1;
-                verify_history.push(token);
-                count_token(&mut verify_counts, token);
-            } else {
-                let correction_log_probs =
-                    correction_log_probs(&target_log_probs, draft_log_probs_row)?;
-                correction = Some(draws.sample(&correction_log_probs)?);
-                break;
-            }
-        }
-        speculative_metrics.record_verify_step(draft_tokens.len(), accepted);
-
-        let all_accepted = accepted == draft_tokens.len();
-        let mut planned = Vec::with_capacity(draft_tokens.len() + 1);
-        planned.extend_from_slice(&draft_tokens[..accepted]);
-        let append_after_emit = if all_accepted {
-            if num_generated + planned.len() < gen_config.max_new_tokens {
-                let row = select_axis(&verify_logits, (draft_tokens.len() - 1) as i32, 1);
-                let log_probs = sampling_log_probs_with_counts(
-                    &row,
-                    &verify_history,
-                    &verify_counts,
-                    &gen_config,
-                )?;
-                let bonus = draws.sample(&log_probs)?;
-                planned.push(bonus);
-                Some(bonus)
-            } else {
-                None
-            }
-        } else {
-            let correction = correction.ok_or_else(|| {
-                Exception::custom("Gemma 4 MTP sampling rejected without correction token")
-            })?;
-            planned.push(correction);
-            Some(correction)
-        };
-
-        let stop_pos = planned
-            .iter()
-            .position(|token| gen_config.stop_tokens.contains(token));
-        let planned_len = stop_pos.map(|idx| idx + 1).unwrap_or(planned.len());
-
-        let mut continue_stream = true;
-        let mut emitted_planned_count = 0usize;
-        for &token in &planned[..planned_len] {
-            continue_stream = emit_token(
-                token,
-                &mut token_ids,
-                &mut num_generated,
-                &mut stopped_by_token,
-                &gen_config,
-                &mut on_token,
-            )?;
-            emitted_planned_count += 1;
-            count_token(&mut generated_counts, token);
-            if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
-                break;
-            }
-        }
-        let emitted_draft_count = emitted_planned_count.min(accepted);
-        speculative_metrics.emitted_draft_tokens += emitted_draft_count;
-        if emitted_planned_count > emitted_draft_count {
-            if all_accepted {
-                speculative_metrics.bonus_tokens += 1;
-            } else {
-                speculative_metrics.correction_tokens += 1;
-            }
-        }
-        let rollback = draft_tokens.len().saturating_sub(emitted_draft_count);
-        if rollback > 0 {
-            cache.rollback(rollback);
-        }
-        if !continue_stream
-            || stopped_by_token
-            || num_generated >= gen_config.max_new_tokens
-            || stop_pos.is_some()
-        {
-            break;
-        }
-
-        if let Some(token) = append_after_emit {
-            let (hidden, logits) = target_step(target, token, cache)?;
-            last_hidden = hidden;
-            prev_logits = logits;
-        }
-    }
-
-    Ok(GenerationOutput {
-        token_ids,
-        num_generated,
-        stopped_by_token,
-        stopped_by_length: num_generated >= gen_config.max_new_tokens && !stopped_by_token,
-        decode_metrics: None,
-        speculative_metrics: Some(speculative_metrics),
-    })
+/// A Gemma 4 model and its KV cache as an [`MtpTarget`].
+pub struct Gemma4MtpVerifier<'a> {
+    model: &'a mut Gemma4ForCausalLM,
+    cache: &'a mut KVCache,
+    verified: usize,
 }
 
-fn emit_token<F>(
-    token: u32,
-    token_ids: &mut Vec<u32>,
-    num_generated: &mut usize,
-    stopped_by_token: &mut bool,
-    gen_config: &GenerationConfig,
-    on_token: &mut F,
-) -> Result<bool, Exception>
-where
-    F: FnMut(u32) -> bool,
-{
-    token_ids.push(token);
-    *num_generated += 1;
-    if gen_config.stop_tokens.contains(&token) {
-        *stopped_by_token = true;
+impl<'a> Gemma4MtpVerifier<'a> {
+    pub fn new(model: &'a mut Gemma4ForCausalLM, cache: &'a mut KVCache) -> Self {
+        Self {
+            model,
+            cache,
+            verified: 0,
+        }
     }
-    Ok(on_token(token))
 }
 
-fn target_step(
-    target: &mut Gemma4ForCausalLM,
-    token: u32,
-    cache: &mut KVCache,
-) -> Result<(Array, Array), Exception> {
-    let input = prompt_tokens_to_input(&[token]);
-    let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
-    let (hidden, logits) =
-        target.forward_hidden_with_capture(&input, None, Some(cache), &mut capture)?;
-    Ok((last_token_hidden(&hidden), last_token_logits(&logits)))
+impl MtpTarget for Gemma4MtpVerifier<'_> {
+    fn reset(&mut self) -> Result<(), Exception> {
+        self.cache.reset();
+        Ok(())
+    }
+
+    fn forward(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
+        let mut capture = SpecCapture::with_layers_and_embedding(Vec::new(), false);
+        self.model.forward_hidden_with_capture(
+            &prompt_tokens_to_input(tokens),
+            None,
+            Some(self.cache),
+            &mut capture,
+        )
+    }
+
+    fn verify(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
+        self.verified = tokens.len();
+        self.forward(tokens)
+    }
+
+    fn keep(&mut self, kept: usize) -> Result<(), Exception> {
+        let rejected = self.verified.saturating_sub(kept);
+        if rejected > 0 {
+            self.cache.rollback(rejected);
+        }
+        Ok(())
+    }
+}
+
+/// A Gemma 4 assistant as an [`MtpDrafter`] of a [`Gemma4MtpVerifier`]. A
+/// step reads the target's scaled embedding of the newest token beside the
+/// hidden state that predicted it, and the target's KV cache, which holds
+/// every position before the pending token's.
+pub struct Gemma4MtpDrafter<'a> {
+    assistant: &'a mut Gemma4AssistantForCausalLM,
+    kv_sources: Gemma4MtpKvSources,
+}
+
+impl<'a> Gemma4MtpDrafter<'a> {
+    pub fn new(
+        target: &Gemma4ForCausalLM,
+        assistant: &'a mut Gemma4AssistantForCausalLM,
+    ) -> Result<Self, Exception> {
+        validate_gemma4_mtp_pair(target, assistant)?;
+        let kv_sources = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)?;
+        Ok(Self {
+            assistant,
+            kv_sources,
+        })
+    }
+}
+
+impl MtpDrafter<Gemma4MtpVerifier<'_>> for Gemma4MtpDrafter<'_> {
+    fn prefill(
+        &mut self,
+        _: &mut Gemma4MtpVerifier<'_>,
+        _: &[u32],
+        _: &Array,
+    ) -> Result<(), Exception> {
+        Ok(())
+    }
+
+    fn step(
+        &mut self,
+        target: &mut Gemma4MtpVerifier<'_>,
+        token: u32,
+        hidden: &Array,
+        _step: usize,
+        position: usize,
+    ) -> Result<(Array, Array), Exception> {
+        let shared_states = self.kv_sources.shared_states(target.cache)?;
+        let embedding = embed_target_token(target.model, token);
+        let inputs_embeds = concatenate_axis(&[&embedding, hidden], -1);
+        // `[1, 1, H]` for the next step, `[1, V]` logits.
+        self.assistant
+            .forward_logits(&inputs_embeds, &shared_states, position as i32)
+    }
+
+    fn commit(
+        &mut self,
+        _: &mut Gemma4MtpVerifier<'_>,
+        _: u32,
+        _: &Array,
+        _: &[u32],
+        _: usize,
+        _: &Array,
+    ) -> Result<(), Exception> {
+        Ok(())
+    }
 }
 
 fn embed_target_token(target: &Gemma4ForCausalLM, token: u32) -> Array {

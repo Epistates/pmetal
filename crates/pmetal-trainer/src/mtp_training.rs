@@ -249,7 +249,7 @@ pub fn run_qwen3_next_mtp_training<I>(
 where
     I: Iterator<Item = Array>,
 {
-    validate_qwen3_next_mtp_pair(target, mtp)?;
+    validate_qwen3_next_mtp_pair(&target.config, mtp)?;
     let mtp_config = mtp.config.clone();
     run_training_loop(
         mtp,
