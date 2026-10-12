@@ -8,7 +8,9 @@
 #![cfg(target_os = "macos")]
 
 use pmetal_metal::ane::extend::WeightFormat;
-use pmetal_metal::ane::lm::{AneLm, AneLmOptions, Drafter, GenerateOptions, NoDraft, PromptLookup};
+use pmetal_metal::ane::lm::{
+    AneLm, AneLmOptions, Drafter, GenerateOptions, Greedy, NoDraft, PromptLookup,
+};
 
 fn model_dir() -> Option<std::path::PathBuf> {
     let dir = std::env::var_os("PMETAL_TEST_QWEN3_0_6B")?;
@@ -47,13 +49,10 @@ fn greedy_generation_matches_the_reference() {
         for (prompt, want) in CASES {
             let opts = GenerateOptions {
                 max_new: want.len(),
-                temperature: 0.0,
-                top_k: 0,
                 stop: Vec::new(),
-                seed: None,
             };
             let (got, stats) = lm
-                .generate(prompt, &opts, &mut NoDraft, |_| true)
+                .generate(prompt, &opts, &mut Greedy, &mut NoDraft, |_| true)
                 .expect("generate");
             eprintln!(
                 "{weights:?}: {got:?} ({} tokens in {:.0} ms decode)",
@@ -96,17 +95,16 @@ fn speculation_keeps_greedy_output() {
     prompt.extend([750, 75698, 1445, 982, 257]);
     let settings = GenerateOptions {
         max_new: 40,
-        temperature: 0.0,
-        top_k: 0,
         stop: Vec::new(),
-        seed: None,
     };
     let (plain, plain_stats) = lm
-        .generate(&prompt, &settings, &mut NoDraft, |_| true)
+        .generate(&prompt, &settings, &mut Greedy, &mut NoDraft, |_| true)
         .unwrap();
     let mut lookup = PromptLookup::default();
     let drafter: &mut dyn Drafter = &mut lookup;
-    let (spec, stats) = lm.generate(&prompt, &settings, drafter, |_| true).unwrap();
+    let (spec, stats) = lm
+        .generate(&prompt, &settings, &mut Greedy, drafter, |_| true)
+        .unwrap();
     eprintln!(
         "plain: {} tokens in {} passes, {:.0} ms; lookup: {} passes, {}/{} guesses kept, {:.0} ms",
         plain.len(),
@@ -151,17 +149,14 @@ fn qwen3_4b_throughput() {
     prompt.extend([750, 75698, 1445, 982, 257]);
     let settings = GenerateOptions {
         max_new: 64,
-        temperature: 0.0,
-        top_k: 0,
         stop: Vec::new(),
-        seed: None,
     };
     let (plain, p) = lm
-        .generate(&prompt, &settings, &mut NoDraft, |_| true)
+        .generate(&prompt, &settings, &mut Greedy, &mut NoDraft, |_| true)
         .unwrap();
     let mut lookup = PromptLookup::default();
     let (spec, s) = lm
-        .generate(&prompt, &settings, &mut lookup, |_| true)
+        .generate(&prompt, &settings, &mut Greedy, &mut lookup, |_| true)
         .unwrap();
     for (name, st) in [("plain", &p), ("lookup", &s)] {
         eprintln!(
@@ -201,10 +196,7 @@ fn qwen3_4b_answers_a_chat_prompt() {
     let want = [39814, 0, 5692, 594, 264, 13027, 729, 429, 4675, 279, 3070];
     let settings = GenerateOptions {
         max_new: want.len(),
-        temperature: 0.0,
-        top_k: 0,
         stop: Vec::new(),
-        seed: None,
     };
     for weights in [WeightFormat::Int8, WeightFormat::Fp16] {
         let opts = AneLmOptions {
@@ -214,7 +206,7 @@ fn qwen3_4b_answers_a_chat_prompt() {
         };
         let mut lm = AneLm::load(std::path::Path::new(&dir), &opts).expect("load");
         let (got, _) = lm
-            .generate(&prompt, &settings, &mut NoDraft, |_| true)
+            .generate(&prompt, &settings, &mut Greedy, &mut NoDraft, |_| true)
             .expect("generate");
         assert_eq!(got, want, "{weights:?}");
     }

@@ -12,7 +12,7 @@ build = "build.rs"
 
 [features]
 default = ["ane"]
-ane = ["pmetal-core/ane", "dep:rand", "dep:safetensors", "dep:memmap2"]
+ane = ["pmetal-core/ane", "dep:safetensors", "dep:memmap2"]
 
 [dependencies]
 # Internal crates
@@ -37,9 +37,6 @@ serde_json = { workspace = true }
 
 # Directory resolution (for ~/.cache path)
 dirs = { workspace = true }
-
-# Sampling (optional, for ANE inference)
-rand = { workspace = true, optional = true }
 
 # SafeTensors loading (optional, for ANE inference)
 safetensors = { workspace = true, optional = true }

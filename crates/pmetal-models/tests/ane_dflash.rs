@@ -11,8 +11,9 @@ use std::path::PathBuf;
 
 use pmetal_bridge::QuantizedMode;
 use pmetal_bridge::native_weight::QuantParams;
-use pmetal_metal::ane::lm::{AneLm, AneLmOptions, GenerateOptions, NoDraft};
+use pmetal_metal::ane::lm::{AneLm, AneLmOptions, GenerateOptions, Greedy, NoDraft};
 use pmetal_models::dflash_drafter::DFlashDrafter;
+use pmetal_models::generation::{GenerationConfig, HostLogitsSampler};
 
 /// Chat prompts (thinking off).
 const PROMPTS: [(&str, &[u32]); 3] = [
@@ -80,15 +81,12 @@ fn dflash_keeps_greedy_output_on_the_ane() {
     let mut lm = AneLm::load(&target, &opts).expect("load target");
     let settings = GenerateOptions {
         max_new: 192,
-        temperature: 0.0,
-        top_k: 0,
         stop: vec![151645],
-        seed: None,
     };
     let mut per_pass = Vec::new();
     for (name, prompt) in PROMPTS {
         let (plain, p) = lm
-            .generate(prompt, &settings, &mut NoDraft, |_| true)
+            .generate(prompt, &settings, &mut Greedy, &mut NoDraft, |_| true)
             .expect("plain");
         eprintln!(
             "{name}: plain {:.1} tok/s",
@@ -96,7 +94,7 @@ fn dflash_keeps_greedy_output_on_the_ane() {
         );
         for (precision, drafter) in &mut drafters {
             let (spec, s) = lm
-                .generate(prompt, &settings, drafter, |_| true)
+                .generate(prompt, &settings, &mut Greedy, drafter, |_| true)
                 .expect("dflash");
             let tokens_per_pass = s.generated_tokens as f64 / (s.passes + 1) as f64;
             eprintln!(
@@ -124,4 +122,77 @@ fn dflash_keeps_greedy_output_on_the_ane() {
         per_pass[0],
         per_pass[1]
     );
+}
+
+/// Under the penalties, and sampling with a seed, DFlash still changes only
+/// the speed: the sampler decides each verified position in turn, penalized
+/// for the drafts before it, so the output is that of decoding one token at a
+/// time with the same sampler.
+#[test]
+#[ignore = "requires ANE hardware, PMETAL_TEST_QWEN3_4B and PMETAL_TEST_QWEN3_4B_DFLASH"]
+fn dflash_keeps_penalized_and_sampled_output_on_the_ane() {
+    let Some((target, draft)) = dirs() else {
+        eprintln!("PMETAL_TEST_QWEN3_4B / PMETAL_TEST_QWEN3_4B_DFLASH not set; skipping");
+        return;
+    };
+    let capacity = 1024;
+    let eight_bit = QuantParams {
+        group_size: 64,
+        bits: 8,
+        mode: QuantizedMode::Affine,
+    };
+    let mut drafter =
+        DFlashDrafter::load(&draft, &target, capacity, Some(eight_bit)).expect("load draft");
+    let opts = AneLmOptions {
+        capacity,
+        taps: drafter.target_layer_ids().to_vec(),
+        ..AneLmOptions::default()
+    };
+    let mut lm = AneLm::load(&target, &opts).expect("load target");
+    let settings = GenerateOptions {
+        max_new: 128,
+        stop: vec![151645],
+    };
+    let configs = [
+        (
+            "greedy + penalties",
+            GenerationConfig::greedy(128)
+                .with_repetition_penalty(1.1)
+                .with_presence_penalty(1.5),
+        ),
+        (
+            "seeded top-k/top-p + penalties",
+            GenerationConfig::sampling(128, 0.7)
+                .with_top_k(20)
+                .with_top_p(0.8)
+                .with_repetition_penalty(1.1)
+                .with_presence_penalty(1.5)
+                .with_seed(3),
+        ),
+    ];
+    let (_, prompt) = PROMPTS[0];
+    let (unpenalized, _) = lm
+        .generate(prompt, &settings, &mut Greedy, &mut NoDraft, |_| true)
+        .expect("unpenalized");
+    for (name, config) in &configs {
+        let mut sampler = HostLogitsSampler::new(config, prompt);
+        let (plain, p) = lm
+            .generate(prompt, &settings, &mut sampler, &mut NoDraft, |_| true)
+            .expect("plain");
+        let mut sampler = HostLogitsSampler::new(config, prompt);
+        let (spec, s) = lm
+            .generate(prompt, &settings, &mut sampler, &mut drafter, |_| true)
+            .expect("dflash");
+        eprintln!(
+            "{name}: plain {:.1} tok/s; DFlash {:.1} tok/s, {:.2} tokens/pass ({}/{} guesses kept)",
+            p.generated_tokens as f64 / p.decode_secs,
+            s.generated_tokens as f64 / s.decode_secs,
+            s.generated_tokens as f64 / (s.passes + 1) as f64,
+            s.accepted_tokens,
+            s.drafted_tokens,
+        );
+        assert_ne!(plain, unpenalized, "{name} changed nothing");
+        assert_eq!(spec, plain, "{name}: DFlash changed the output");
+        assert!(s.accepted_tokens > 0, "{name}: no draft was kept");
+    }
 }

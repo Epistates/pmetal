@@ -65,24 +65,29 @@ pub fn check_supported(config: &serde_json::Value) -> std::result::Result<(), St
 pub struct GenerateOptions {
     /// Most tokens to generate.
     pub max_new: usize,
-    /// Sampling temperature; 0 is greedy.
-    pub temperature: f32,
-    /// Sample among the `top_k` most likely tokens (0 for all).
-    pub top_k: usize,
     /// Tokens that end generation (and are returned).
     pub stop: Vec<u32>,
-    /// Seed of the sampling RNG: the same seed, prompt and model give the
-    /// same tokens. `None` seeds it from the OS.
-    pub seed: Option<u64>,
 }
 
-/// The RNG [`sample`] draws from for one generation: seeded with `seed`,
-/// or from the OS when there is none.
-pub fn sampling_rng(seed: Option<u64>) -> rand::rngs::StdRng {
-    use rand::SeedableRng;
-    match seed {
-        Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
-        None => rand::rngs::StdRng::from_rng(&mut rand::rng()),
+/// Decides each generated token from the logits at its position.
+///
+/// A generation asks for its tokens in order, one call per position: the
+/// tokens returned before a call are exactly the tokens that precede its
+/// position. So a sampler whose decision reads the tokens before it (a
+/// repetition penalty) records each token it returns, and a speculative
+/// decoder never shows it a position past a guess it would reject. Only the
+/// last call's token may go unused, when generation stops.
+pub trait TokenSampler {
+    /// The token at the next position, from its `[vocab]` logits.
+    fn sample(&mut self, logits: &[f32]) -> Result<u32>;
+}
+
+/// The most likely token, the first on a tie.
+pub struct Greedy;
+
+impl TokenSampler for Greedy {
+    fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+        Ok(argmax(logits))
     }
 }
 
@@ -366,17 +371,20 @@ impl AneLm {
 
     /// Generate after `prompt`, starting from an empty cache, until
     /// `opts.max_new` tokens, a token in `opts.stop`, or `on_token` returning
-    /// false. Returns the generated tokens.
+    /// false, each token from `sampler`. Returns the generated tokens.
     ///
     /// Each pass verifies the drafter's guesses at what follows alongside the
     /// next token, for about the cost of the next token alone, and keeps the
     /// guesses the model agrees with. The output is what decoding one token
-    /// at a time would produce, in distribution when sampling (a guess is
-    /// kept only when the token sampled at its position equals it).
+    /// at a time would produce, in distribution when sampling: the sampler
+    /// decides each position in turn, and a guess is kept only when the
+    /// token it decides there equals it, so it never sees a position past a
+    /// rejected guess ([`TokenSampler`]).
     pub fn generate(
         &mut self,
         prompt: &[u32],
         opts: &GenerateOptions,
+        sampler: &mut dyn TokenSampler,
         drafter: &mut dyn Drafter,
         mut on_token: impl FnMut(u32) -> bool,
     ) -> Result<(Vec<u32>, GenerationStats)> {
@@ -397,8 +405,6 @@ impl AneLm {
         let max_new = opts
             .max_new
             .min(self.capacity().saturating_sub(prompt.len()));
-        let mut rng = sampling_rng(opts.seed);
-        let mut pick = |row: Vec<f32>| sample(&row, opts.temperature, opts.top_k, &mut rng);
         self.truncate(0);
         let mut stats = GenerationStats {
             prompt_tokens: prompt.len(),
@@ -411,7 +417,7 @@ impl AneLm {
         for (i, chunk) in chunks.iter().enumerate() {
             let logits = self.step(chunk)?;
             if i + 1 == chunks.len() {
-                next = pick(logits.row(chunk.len() - 1));
+                next = sampler.sample(&logits.row(chunk.len() - 1))?;
             }
             if tapping {
                 drafter.observe(&self.layers.tapped(0..chunk.len()), chunk.len())?;
@@ -442,11 +448,13 @@ impl AneLm {
             let logits = self.step(&feed)?;
             stats.passes += 1;
             stats.drafted_tokens += feed.len() - 1;
+            // The sampler decides the position after `next`, then, while it
+            // agrees with the guess there, the one after that guess.
             let mut kept = 0;
-            next = pick(logits.row(0));
+            next = sampler.sample(&logits.row(0))?;
             while kept + 1 < feed.len() && next == feed[kept + 1] {
                 kept += 1;
-                next = pick(logits.row(kept));
+                next = sampler.sample(&logits.row(kept))?;
             }
             self.truncate(start + 1 + kept);
             stats.accepted_tokens += kept;
@@ -467,65 +475,6 @@ impl AneLm {
         stats.generated_tokens = out.len();
         Ok((out, stats))
     }
-}
-
-/// Sample a token from a logits vector.
-///
-/// - `temperature == 0.0`: greedy (argmax)
-/// - `temperature > 0.0`: scale → softmax → optional top-k → categorical,
-///   drawing from `rng`
-pub fn sample(logits: &[f32], temperature: f32, top_k: usize, rng: &mut impl rand::Rng) -> u32 {
-    use rand::RngExt;
-
-    if temperature < 1e-6 {
-        return argmax(logits);
-    }
-
-    let v = logits.len();
-
-    // Apply temperature
-    let mut scaled: Vec<f32> = logits.iter().map(|&l| l / temperature).collect();
-
-    // Softmax
-    let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    for x in &mut scaled {
-        *x = (*x - max_val).exp();
-    }
-    let sum: f32 = scaled.iter().sum();
-    for x in &mut scaled {
-        *x /= sum;
-    }
-
-    // Top-k filter
-    if top_k > 0 && top_k < v {
-        let mut sorted: Vec<f32> = scaled.clone();
-        sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let threshold = sorted[top_k - 1];
-        for x in &mut scaled {
-            if *x < threshold {
-                *x = 0.0;
-            }
-        }
-        let sum: f32 = scaled.iter().sum();
-        if sum > 0.0 {
-            for x in &mut scaled {
-                *x /= sum;
-            }
-        }
-    }
-
-    // Categorical sampling
-    let r: f32 = rng.random();
-    let mut cumulative = 0.0;
-    for (i, &p) in scaled.iter().enumerate() {
-        cumulative += p;
-        if r < cumulative {
-            return i as u32;
-        }
-    }
-
-    // Fallback (floating-point rounding)
-    (v - 1) as u32
 }
 
 /// Index of the largest value; the first one on a tie.
@@ -584,49 +533,12 @@ mod tests {
 
     #[test]
     fn greedy_picks_the_first_max() {
-        let mut rng = sampling_rng(Some(0));
-        assert_eq!(sample(&[0.1, 0.5, 0.3, 0.9, 0.2], 0.0, 0, &mut rng), 3);
+        let mut greedy = Greedy;
+        assert_eq!(greedy.sample(&[0.1, 0.5, 0.3, 0.9, 0.2]).unwrap(), 3);
         assert_eq!(
-            sample(&[-1.0, -2.0, 5.0, -3.0, 4.0, 0.0], 0.0, 0, &mut rng),
+            greedy.sample(&[-1.0, -2.0, 5.0, -3.0, 4.0, 0.0]).unwrap(),
             2
         );
-        assert_eq!(argmax(&[0.0; 100]), 0);
-    }
-
-    #[test]
-    fn high_temperature_reaches_every_token() {
-        let mut rng = sampling_rng(Some(0));
-        // At temperature 100 the logits are [0.1, 0, 0, 0, 0]: nearly uniform.
-        let logits = [10.0, 0.0, 0.0, 0.0, 0.0];
-        let mut counts = [0u32; 5];
-        for _ in 0..1000 {
-            counts[sample(&logits, 100.0, 0, &mut rng) as usize] += 1;
-        }
-        for (i, &c) in counts.iter().enumerate() {
-            assert!(c > 0, "token {i} never sampled at high temperature");
-        }
-    }
-
-    #[test]
-    fn top_k_never_leaves_the_top_k() {
-        let mut rng = sampling_rng(Some(0));
-        let logits = [10.0, 5.0, 0.0, 0.0, 0.0];
-        for _ in 0..500 {
-            assert!(sample(&logits, 1.0, 2, &mut rng) <= 1);
-        }
-    }
-
-    #[test]
-    fn a_seed_fixes_the_draws() {
-        // The draws used the thread's OS-seeded RNG, which no seed reached.
-        let logits = [0.0f32; 1000];
-        let draws = |seed| {
-            let mut rng = sampling_rng(Some(seed));
-            (0..32)
-                .map(|_| sample(&logits, 1.0, 0, &mut rng))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(draws(7), draws(7));
-        assert_ne!(draws(7), draws(8));
+        assert_eq!(greedy.sample(&[0.0; 100]).unwrap(), 0);
     }
 }

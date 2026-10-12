@@ -9,6 +9,10 @@
 //! gpt-oss and Gemma 4. The repetition penalty covers the prompt as well as
 //! the output, as transformers' `RepetitionPenaltyLogitsProcessor` does.
 //!
+//! The CPU hybrid engine (`infer --ane` and serve's accelerated path on a
+//! dense Qwen3.5) ignored all three, and top-p and min-p with them: it now
+//! samples its host logits through the same sampler and penalties.
+//!
 //! The model is the tiny Qwen3.5 checkpoint the parity suite ships. Its
 //! greedy decode repeats itself, so every penalty changes the tokens.
 
@@ -122,6 +126,17 @@ fn dynamic_pipelined(penalties: Penalties) -> Vec<u32> {
     out.token_ids[PROMPT.len()..].to_vec()
 }
 
+/// The CPU hybrid engine, which hands its logits to the sampler on the host.
+#[cfg(feature = "ane")]
+fn cpu_hybrid(penalties: Penalties) -> Vec<u32> {
+    let dir = checkpoint();
+    let out =
+        pmetal_models::generate_cached_hybrid_cpu(dir.path(), &PROMPT, &greedy_config(penalties))
+            .expect("generate");
+    pmetal_bridge::check_unobserved_error().expect("CPU hybrid decode: no bridge op failed");
+    out.token_ids[PROMPT.len()..].to_vec()
+}
+
 fn check(penalties: Penalties) {
     let want = dynamic(penalties);
     assert_eq!(want.len(), NEW_TOKENS);
@@ -136,6 +151,12 @@ fn check(penalties: Penalties) {
         want,
         "pipelined dynamic model, {penalties:?}"
     );
+    #[cfg(feature = "ane")]
+    assert_eq!(
+        cpu_hybrid(penalties),
+        want,
+        "CPU hybrid engine, {penalties:?}"
+    );
 }
 
 #[test]
@@ -143,6 +164,8 @@ fn unpenalized_greedy_decoding_agrees() {
     let want = dynamic(NONE);
     assert_eq!(native(NONE), want);
     assert_eq!(dynamic_pipelined(NONE), want);
+    #[cfg(feature = "ane")]
+    assert_eq!(cpu_hybrid(NONE), want);
 }
 
 #[test]
@@ -169,4 +192,36 @@ fn frequency_and_presence_penalties_are_applied_on_every_engine() {
         frequency: 0.4,
         presence: 0.3,
     });
+}
+
+/// Sampling on the CPU hybrid engine is the GPU path's sampling: with a
+/// seed, the same temperature, top-k, top-p, min-p and penalties draw the
+/// same tokens from its host logits as `generate_cached` does on the GPU.
+#[cfg(feature = "ane")]
+#[test]
+fn seeded_sampling_matches_on_the_cpu_hybrid_engine() {
+    let config = GenerationConfig::sampling(NEW_TOKENS, 0.8)
+        .with_top_k(40)
+        .with_top_p(0.9)
+        .with_min_p(0.02)
+        .with_repetition_penalty(1.2)
+        .with_presence_penalty(0.5)
+        .with_seed(7);
+    let dir = checkpoint();
+    let mut model = DynamicModel::load(dir.path()).expect("checkpoint loads");
+    let mut cache = model.create_cache(PROMPT.len() + NEW_TOKENS + 8);
+    let mut mamba = model.create_mamba_cache();
+    let want = generate_cached(
+        |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba.as_mut()),
+        &PROMPT,
+        config.clone(),
+        &mut cache,
+    )
+    .expect("generate")
+    .token_ids;
+    let got = pmetal_models::generate_cached_hybrid_cpu(dir.path(), &PROMPT, &config)
+        .expect("generate")
+        .token_ids;
+    pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+    assert_eq!(got, want);
 }

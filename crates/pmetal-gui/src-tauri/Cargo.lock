@@ -6325,7 +6325,6 @@ dependencies = [
  "objc2-metal",
  "parking_lot",
  "pmetal-core",
- "rand 0.10.3",
  "safetensors",
  "serde",
  "serde_json",

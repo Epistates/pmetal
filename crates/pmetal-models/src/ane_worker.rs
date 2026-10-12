@@ -22,6 +22,7 @@ use pmetal_metal::ane::lm::{
 use pmetal_metal::error::{MetalError, Result};
 
 use crate::dflash_drafter::DFlashDrafter;
+use crate::generation::{GenerationConfig, HostLogitsSampler};
 use crate::model_thread::ModelThread;
 
 /// How the DFlash drafter's weights are packed. At 8 bits its guesses are as
@@ -54,6 +55,9 @@ pub(crate) struct AneRequest {
     pub context: usize,
     pub input_ids: Vec<u32>,
     pub opts: GenerateOptions,
+    /// How each token is sampled: a [`HostLogitsSampler`] built from it on
+    /// the ANE thread, where its GPU arrays stay.
+    pub sampling: GenerationConfig,
 }
 
 enum Event {
@@ -136,9 +140,14 @@ fn run(
         Some((_, dflash)) => dflash,
         None => &mut lookup,
     };
-    engine
-        .lm
-        .generate(&request.input_ids, &request.opts, drafter, on_token)
+    let mut sampler = HostLogitsSampler::new(&request.sampling, &request.input_ids);
+    engine.lm.generate(
+        &request.input_ids,
+        &request.opts,
+        &mut sampler,
+        drafter,
+        on_token,
+    )
 }
 
 fn engine_for<'a>(

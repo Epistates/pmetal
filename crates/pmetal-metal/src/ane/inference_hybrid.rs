@@ -21,13 +21,13 @@
 //! ```ignore
 //! let mut engine = Qwen3NextInferenceEngine::new(config)?;
 //! engine.load_weights_safetensors(model_dir)?;
-//! let tokens = engine.generate_cached(&input_ids)?;
+//! let tokens = engine.generate_cached(&input_ids, &mut Greedy)?;
 //! ```
 
 use std::path::Path;
 
 use crate::accelerate;
-use crate::ane::lm::{sample, sampling_rng};
+use crate::ane::lm::TokenSampler;
 use crate::error::{MetalError, Result};
 
 // ============================================================================
@@ -89,16 +89,10 @@ pub struct Qwen3NextInferenceConfig {
     // --- Generation ---
     /// Whether to tie embed and lm_head weights.
     pub tie_word_embeddings: bool,
-    /// Sampling temperature (0.0 = greedy).
-    pub temperature: f32,
-    /// Top-k sampling (0 = disabled).
-    pub top_k: usize,
     /// Maximum tokens to generate.
     pub max_tokens: usize,
     /// EOS token ID for early stopping.
     pub eos_token_id: Option<u32>,
-    /// Seed of the sampling RNG (`None` seeds it from the OS).
-    pub seed: Option<u64>,
 }
 
 /// Activation on the gated-delta-net output gate.
@@ -474,15 +468,7 @@ impl Qwen3NextInferenceEngine {
     }
 
     /// Update request-scoped generation parameters without rebuilding weights.
-    pub fn set_generation_params(
-        &mut self,
-        temperature: f32,
-        top_k: usize,
-        max_tokens: usize,
-        eos_token_id: Option<u32>,
-    ) {
-        self.config.temperature = temperature;
-        self.config.top_k = top_k;
+    pub fn set_generation_params(&mut self, max_tokens: usize, eos_token_id: Option<u32>) {
         self.config.max_tokens = max_tokens;
         self.config.eos_token_id = eos_token_id;
     }
@@ -491,9 +477,14 @@ impl Qwen3NextInferenceEngine {
     // Generation
     // ========================================================================
 
-    /// Generate tokens using CPU-only decode (sequential prefill + cached decode).
-    pub fn generate_cached(&mut self, input_ids: &[u32]) -> Result<Vec<u32>> {
-        self.generate_cached_streaming(input_ids, |_| true)
+    /// Generate tokens using CPU-only decode (sequential prefill + cached
+    /// decode), each from `sampler`.
+    pub fn generate_cached(
+        &mut self,
+        input_ids: &[u32],
+        sampler: &mut dyn TokenSampler,
+    ) -> Result<Vec<u32>> {
+        self.generate_cached_streaming(input_ids, sampler, |_| true)
     }
 
     /// Logits after each token of `input_ids`, fed one at a time from a fresh
@@ -514,10 +505,12 @@ impl Qwen3NextInferenceEngine {
             .collect()
     }
 
-    /// Generate tokens with streaming callback.
+    /// Generate tokens with streaming callback, each from `sampler`, which
+    /// is asked for them in order ([`TokenSampler`]).
     pub fn generate_cached_streaming<F>(
         &mut self,
         input_ids: &[u32],
+        sampler: &mut dyn TokenSampler,
         mut on_token: F,
     ) -> Result<Vec<u32>>
     where
@@ -547,13 +540,7 @@ impl Qwen3NextInferenceEngine {
 
         // Process last prompt token to get first generation logits
         let logits = self.decode_step(*input_ids.last().unwrap(), &mut state)?;
-        let mut rng = sampling_rng(self.config.seed);
-        let next = sample(
-            &logits,
-            self.config.temperature,
-            self.config.top_k,
-            &mut rng,
-        );
+        let next = sampler.sample(&logits)?;
 
         let mut sequence = input_ids.to_vec();
 
@@ -574,12 +561,7 @@ impl Qwen3NextInferenceEngine {
             }
 
             let logits_vec = self.decode_step(*sequence.last().unwrap(), &mut state)?;
-            let next_tok = sample(
-                &logits_vec,
-                self.config.temperature,
-                self.config.top_k,
-                &mut rng,
-            );
+            let next_tok = sampler.sample(&logits_vec)?;
 
             if let Some(eos) = self.config.eos_token_id {
                 if next_tok == eos {
@@ -1457,11 +1439,8 @@ mod tests {
             full_attention_interval: 4,
             layer_types: None,
             tie_word_embeddings: true,
-            temperature: 0.0,
-            top_k: 0,
             max_tokens: 16,
             eos_token_id: None,
-            seed: None,
         }
     }
 
@@ -1513,10 +1492,8 @@ mod tests {
     fn test_set_generation_params() {
         let config = small_config();
         let mut engine = Qwen3NextInferenceEngine::new(config).unwrap();
-        engine.set_generation_params(0.75, 24, 48, Some(11));
+        engine.set_generation_params(48, Some(11));
 
-        assert_eq!(engine.config().temperature, 0.75);
-        assert_eq!(engine.config().top_k, 24);
         assert_eq!(engine.config().max_tokens, 48);
         assert_eq!(engine.config().eos_token_id, Some(11));
     }

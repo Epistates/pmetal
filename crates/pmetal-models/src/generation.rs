@@ -98,12 +98,7 @@ fn with_cached_hybrid_cpu_engine<R>(
                     "CPU-hybrid engine cache missing freshly-built entry".to_string(),
                 )
             })?;
-            engine.set_generation_params(
-                config.temperature,
-                config.top_k,
-                config.max_tokens,
-                config.eos_token_id,
-            );
+            engine.set_generation_params(config.max_tokens, config.eos_token_id);
             f(engine)
         },
     )
@@ -995,6 +990,57 @@ impl Sampler {
         );
 
         Ok(take_along_axis(&selected_logits, &inverse_indices, -1))
+    }
+}
+
+/// One generation's [`Sampler`] and [`DecodePenalties`], deciding tokens from
+/// logits an engine hands over on the host (the ANE and CPU-hybrid engines),
+/// so they are sampled and penalized as [`generate_cached`] samples and
+/// penalizes them on the GPU.
+///
+/// Each call wraps the row as `[1, vocab]` f32 logits, samples it through
+/// [`Sampler::sample`] and takes the token into the penalties, which is what
+/// [`TokenSampler`](pmetal_metal::ane::lm::TokenSampler) asks of it: the
+/// engines ask for the generation's tokens in order, a speculative one never
+/// past a guess it rejects, so the history holds exactly the tokens before
+/// each position, and the `n`-th token takes the `n`-th seeded draw.
+///
+/// Greedy decoding with no penalty has nothing to apply and draws nothing,
+/// so it takes the argmax on the host, which is the GPU's argmax (the first
+/// maximum), without the round trip: about 0.5 ms a token on a
+/// 151,936-token vocabulary, several times a pass when guesses are verified.
+#[cfg(feature = "ane")]
+pub struct HostLogitsSampler {
+    sampler: Sampler,
+    penalties: Option<DecodePenalties>,
+}
+
+#[cfg(feature = "ane")]
+impl HostLogitsSampler {
+    /// The sampler of a generation under `config` continuing `prompt`.
+    pub fn new(config: &GenerationConfig, prompt: &[u32]) -> Self {
+        Self {
+            penalties: config.decode_penalties(prompt),
+            sampler: Sampler::new(config.clone()),
+        }
+    }
+}
+
+#[cfg(feature = "ane")]
+impl pmetal_metal::ane::lm::TokenSampler for HostLogitsSampler {
+    fn sample(&mut self, logits: &[f32]) -> pmetal_metal::error::Result<u32> {
+        use pmetal_metal::error::MetalError;
+        if !self.sampler.config().do_sample && self.penalties.is_none() {
+            return pmetal_metal::ane::lm::Greedy.sample(logits);
+        }
+        let row = Array::from_f32_slice(logits, &[1, logits.len() as i32]);
+        let token = self
+            .sampler
+            .sample(&row, self.penalties.as_mut())
+            .map_err(|e| MetalError::Internal(format!("sampling: {e}")))?;
+        pmetal_bridge::check_unobserved_error()
+            .map_err(|e| MetalError::Internal(format!("sampling: {e}")))?;
+        Ok(token)
     }
 }
 
@@ -1944,8 +1990,10 @@ fn build_cached_generation_output(
 /// guesses at the following tokens verified alongside each one, which changes
 /// the speed but not the output. The guesses come from the DFlash draft model
 /// in `draft_path` (run on the GPU) when there is one, and from prompt lookup
-/// otherwise. Sampling is greedy or top-k at the request's temperature;
-/// top-p, min-p and the penalties aren't applied.
+/// otherwise. Each token is sampled from the ANE's logits as
+/// [`generate_cached`] samples it ([`HostLogitsSampler`]): temperature,
+/// top-k, top-p, min-p, the seed, and the repetition, frequency and presence
+/// penalties.
 #[cfg(feature = "ane")]
 pub fn generate_cached_ane_streaming<F>(
     model_path: &std::path::Path,
@@ -1970,10 +2018,7 @@ where
     }
     let opts = GenerateOptions {
         max_new: gen_config.max_new_tokens,
-        temperature: gen_config.temperature,
-        top_k: gen_config.top_k,
         stop: gen_config.stop_tokens.clone(),
-        seed: gen_config.seed,
     };
     let request = crate::ane_worker::AneRequest {
         model_path: model_path.to_path_buf(),
@@ -1981,6 +2026,7 @@ where
         context,
         input_ids: input_ids.to_vec(),
         opts,
+        sampling: gen_config.clone(),
     };
     let mut cancelled = false;
     let (generated, stats) = crate::ane_worker::generate(request, |token| {
@@ -2130,11 +2176,8 @@ pub fn hybrid_cpu_inference_config(
             .map_or(4, |v| v as usize),
         layer_types,
         tie_word_embeddings: text["tie_word_embeddings"].as_bool().unwrap_or(false),
-        temperature: 0.0,
-        top_k: 0,
         max_tokens: 0,
         eos_token_id: None,
-        seed: None,
     })
 }
 
@@ -2152,11 +2195,8 @@ fn build_hybrid_cpu_inference_config(
         &config_json,
         input_ids.len() + gen_config.max_new_tokens + 64,
     )?;
-    config.temperature = gen_config.temperature;
-    config.top_k = gen_config.top_k;
     config.max_tokens = gen_config.max_new_tokens;
     config.eos_token_id = gen_config.stop_tokens.first().copied();
-    config.seed = gen_config.seed;
     Ok(config)
 }
 
@@ -2166,7 +2206,8 @@ fn build_hybrid_cpu_inference_config(
 /// multiplies, eliminating GPU kernel launch overhead for batch=1 decode.
 /// GDN layers use O(1) linear recurrence; attention layers use standard KV cache.
 ///
-/// Compatible with non-MoE Qwen3.5 models (e.g., 0.8B).
+/// Compatible with non-MoE Qwen3.5 models (e.g., 0.8B). Each token is sampled
+/// as [`generate_cached`] samples it ([`HostLogitsSampler`]).
 #[cfg(feature = "ane")]
 pub fn generate_cached_hybrid_cpu(
     model_path: &std::path::Path,
@@ -2191,9 +2232,10 @@ where
     let prompt_len = input_ids.len();
     let mut cancelled = false;
     let mut saw_stop_token = false;
+    let mut sampler = HostLogitsSampler::new(gen_config, input_ids);
 
     let token_ids = with_cached_hybrid_cpu_engine(model_path, engine_config, |engine| {
-        engine.generate_cached_streaming(input_ids, |token| {
+        engine.generate_cached_streaming(input_ids, &mut sampler, |token| {
             if stop_tokens.contains(&token) {
                 saw_stop_token = true;
                 return false;
