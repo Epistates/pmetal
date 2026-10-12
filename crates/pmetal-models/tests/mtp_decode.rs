@@ -29,7 +29,7 @@ use pmetal_models::architectures::{
     Gemma4AssistantConfig, Gemma4AssistantForCausalLM, Gemma4AssistantSharedKvStates, Gemma4Config,
     Gemma4ForCausalLM, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM, load_qwen3_next_mtp_from_dir,
 };
-use pmetal_models::generation::{GenerationConfig, GenerationOutput};
+use pmetal_models::generation::{GenerationConfig, GenerationOutput, Sampler};
 use pmetal_models::mtp::{MtpDrafter, MtpTarget, generate_mtp_streaming};
 use pmetal_models::{
     DynamicModel, Gemma4MtpDrafter, Gemma4MtpVerifier, NativeQwen3MtpVerifier, Qwen3NextMtpDrafter,
@@ -75,7 +75,16 @@ fn decode<T: MtpTarget, D: MtpDrafter<T>>(
     drafter: &mut D,
     budget: usize,
 ) -> GenerationOutput {
-    let out = generate_mtp_streaming(target, drafter, &PROMPT, &greedy_config(), budget, |_| true)
+    decode_with(target, drafter, &greedy_config(), budget)
+}
+
+fn decode_with<T: MtpTarget, D: MtpDrafter<T>>(
+    target: &mut T,
+    drafter: &mut D,
+    config: &GenerationConfig,
+    budget: usize,
+) -> GenerationOutput {
+    let out = generate_mtp_streaming(target, drafter, &PROMPT, config, budget, |_| true)
         .expect("MTP decode");
     drain("MTP decode");
     out
@@ -95,20 +104,24 @@ fn assert_close(what: &str, got: &Array, want: &Array) {
     assert!(diff <= HIDDEN_TOL, "{what}: off by {diff:.3e}");
 }
 
+/// Draft logits for `token`, far enough above the rest that no penalty the
+/// loop applies to a draft moves its argmax.
 fn one_hot_logits(token: u32, vocab: i32) -> Array {
     let mut row = vec![0.0f32; vocab as usize];
-    row[token as usize] = 1.0;
+    row[token as usize] = 100.0;
     Array::from_f32_slice(&row, &[1, vocab])
 }
 
-/// A head that drafts the target's own greedy continuation, computed from
-/// scratch on a second copy of the target, except every `wrong_every`-th
-/// draft, which it gets wrong on purpose. It checks every hidden state the
-/// loop hands it against that copy.
+/// A head that drafts the target's own greedy continuation under `config`'s
+/// penalties, computed from scratch on a second copy of the target, except
+/// every `wrong_every`-th draft, which it gets wrong on purpose. It checks
+/// every hidden state the loop hands it against that copy.
 struct OracleDrafter<O: MtpTarget> {
     oracle: O,
     vocab: i32,
     wrong_every: Option<usize>,
+    sampler: Sampler,
+    prompt_len: usize,
     committed: Vec<u32>,
     round: Vec<u32>,
     drafted: usize,
@@ -116,16 +129,34 @@ struct OracleDrafter<O: MtpTarget> {
 }
 
 impl<O: MtpTarget> OracleDrafter<O> {
-    fn new(oracle: O, vocab: i32, wrong_every: Option<usize>) -> Self {
+    fn new(oracle: O, vocab: i32, wrong_every: Option<usize>, config: &GenerationConfig) -> Self {
         Self {
             oracle,
             vocab,
             wrong_every,
+            sampler: Sampler::new(config.clone()),
+            prompt_len: 0,
             committed: Vec::new(),
             round: Vec::new(),
             drafted: 0,
             seeds_checked: 0,
         }
+    }
+
+    /// The greedy token after `round`, penalized for its prompt and every
+    /// token after it, recomputed from scratch.
+    fn greedy_after_round(&mut self) -> u32 {
+        let (_, logits) = from_scratch(&mut self.oracle, &self.round);
+        let (prompt, generated) = self.round.split_at(self.prompt_len);
+        let mut penalties = self.sampler.decode_penalties(prompt);
+        if let Some(penalties) = penalties.as_mut() {
+            for &token in generated {
+                penalties.record_id(token);
+            }
+        }
+        self.sampler
+            .sample(&last_token_logits(&logits), penalties.as_mut())
+            .expect("oracle sample")
     }
 }
 
@@ -134,6 +165,7 @@ impl<T: MtpTarget, O: MtpTarget> MtpDrafter<T> for OracleDrafter<O> {
         let (want, _) = from_scratch(&mut self.oracle, prompt);
         assert_close("prefill hidden states", hidden, &want);
         self.committed = prompt.to_vec();
+        self.prompt_len = prompt.len();
         Ok(())
     }
 
@@ -159,8 +191,7 @@ impl<T: MtpTarget, O: MtpTarget> MtpDrafter<T> for OracleDrafter<O> {
             self.round = self.committed.clone();
         }
         self.round.push(token);
-        let (_, logits) = from_scratch(&mut self.oracle, &self.round);
-        let mut next = greedy_token(&last_token_logits(&logits));
+        let mut next = self.greedy_after_round();
         self.drafted += 1;
         if self.wrong_every.is_some_and(|n| self.drafted % n == 0) {
             next = (next + 1) % self.vocab as u32;
@@ -185,17 +216,21 @@ impl<T: MtpTarget, O: MtpTarget> MtpDrafter<T> for OracleDrafter<O> {
 
 /// Every draft of an oracle that never errs is accepted; one that errs on
 /// purpose gets partial rounds, which rewind the target. Both are exact.
+/// Under penalties, every draft is accepted only if each verify position is
+/// penalized for the drafts before it, and the output is exact only if the
+/// rejected ones never reach the sequence's history.
 fn check_oracle<T: MtpTarget, O: MtpTarget>(
     what: &str,
     target: &mut T,
     oracle: O,
     vocab: i32,
+    config: &GenerationConfig,
     want: &[u32],
 ) -> O {
     let mut oracle = Some(oracle);
     for (budget, wrong_every) in [(3, None), (4, Some(3)), (2, Some(2))] {
-        let mut drafter = OracleDrafter::new(oracle.take().unwrap(), vocab, wrong_every);
-        let out = decode(target, &mut drafter, budget);
+        let mut drafter = OracleDrafter::new(oracle.take().unwrap(), vocab, wrong_every, config);
+        let out = decode_with(target, &mut drafter, config, budget);
         let what = format!("{what}, oracle drafting {budget}, wrong every {wrong_every:?}");
         assert_exact(&what, &out, want);
         let m = out.speculative_metrics.expect("metrics");
@@ -434,6 +469,7 @@ fn qwen_mtp_on_the_dynamic_model() {
         &mut target,
         oracle_caches.verifier(&mut oracle_model),
         vocab,
+        &greedy_config(),
         &want,
     );
 }
@@ -449,7 +485,14 @@ fn qwen_mtp_on_the_native_engine() {
     let want = plain_greedy(&mut target, &PROMPT, NEW_TOKENS);
 
     check_qwen_head("native Qwen", &mut target, &ck, &mut head, &want);
-    check_oracle("native Qwen", &mut target, ck.native(), vocab, &want);
+    check_oracle(
+        "native Qwen",
+        &mut target,
+        ck.native(),
+        vocab,
+        &greedy_config(),
+        &want,
+    );
 }
 
 /// A partial accept on the native engine replays its GDN layers' recorded
@@ -680,6 +723,7 @@ fn gemma4_mtp_is_exact() {
         &mut target,
         Gemma4MtpVerifier::new(&mut oracle_model, &mut oracle_cache),
         GEMMA_VOCAB,
+        &greedy_config(),
         &want,
     );
 }
@@ -804,14 +848,16 @@ fn penalized_config() -> GenerationConfig {
 }
 
 /// Plain greedy decoding through the `Sampler`, which applies the penalties
-/// before its argmax, recomputed from scratch every step.
+/// before its argmax and takes every token it samples into them, with the
+/// target recomputed from scratch every step.
 fn plain_penalized<T: MtpTarget>(target: &mut T, prompt: &[u32], n: usize) -> Vec<u32> {
-    let mut sampler = pmetal_models::generation::Sampler::new(penalized_config());
+    let sampler = Sampler::new(penalized_config());
+    let mut penalties = sampler.decode_penalties(prompt);
     let mut seq = prompt.to_vec();
     for _ in 0..n {
         let (_, logits) = from_scratch(target, &seq);
         let token = sampler
-            .sample(&last_token_logits(&logits), &seq)
+            .sample(&last_token_logits(&logits), penalties.as_mut())
             .expect("sample");
         seq.push(token);
     }
@@ -850,6 +896,17 @@ fn penalized_greedy_mtp_matches_penalized_plain_greedy() {
         let what = format!("dynamic Qwen, penalized, drafting {budget}");
         assert_exact(&what, &out, &want);
     }
+    let vocab = model.config.vocab_size;
+    let mut oracle_model = ck.dynamic();
+    let mut oracle_caches = QwenCaches::new(&oracle_model);
+    check_oracle(
+        "dynamic Qwen, penalized",
+        &mut caches.verifier(&mut model),
+        oracle_caches.verifier(&mut oracle_model),
+        vocab,
+        &config,
+        &want,
+    );
 
     let mut native = ck.native();
     let want_native = plain_penalized(&mut native, &PROMPT, NEW_TOKENS);

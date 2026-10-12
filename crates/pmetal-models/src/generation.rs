@@ -24,10 +24,9 @@ use pmetal_bridge::compat::ops::{
 };
 use pmetal_bridge::compat::random::categorical;
 use pmetal_bridge::compat::{Array, Dtype, Exception};
-use pmetal_bridge::decode::{
-    DecodePenalties, greedy_token, last_token_logits, prompt_tokens_to_input, repetition_penalized,
-};
+use pmetal_bridge::decode::{DecodePenalties, last_token_logits, prompt_tokens_to_input};
 use pmetal_mlx::kv_cache::KVCache;
+#[cfg(feature = "ane")]
 use std::collections::HashMap;
 
 #[cfg(feature = "ane")]
@@ -569,6 +568,18 @@ impl GenerationConfig {
         self
     }
 
+    /// The repetition, frequency and presence penalties of a generation
+    /// from `prompt`, kept on the GPU, or `None` when this config has none.
+    /// Every token the generation emits goes into them, in order.
+    pub fn decode_penalties(&self, prompt: &[u32]) -> Option<DecodePenalties> {
+        DecodePenalties::new(
+            self.repetition_penalty,
+            self.frequency_penalty,
+            self.presence_penalty,
+            prompt,
+        )
+    }
+
     /// Set stop tokens.
     pub fn with_stop_tokens(mut self, tokens: Vec<u32>) -> Self {
         self.stop_tokens = tokens;
@@ -682,10 +693,12 @@ impl SpeculativeDecodeMetrics {
 ///
 /// Implements SOTA sampling techniques with GPU-native operations.
 /// All sampling runs on GPU without CPU round-trips for maximum performance.
+///
+/// The repetition, frequency and presence penalties read a generation's
+/// token history, which the caller keeps beside the sampler for the
+/// generation's lifetime ([`decode_penalties`](Self::decode_penalties)).
 pub struct Sampler {
     config: GenerationConfig,
-    /// Token frequency counts for frequency penalty
-    token_counts: HashMap<u32, usize>,
     /// Cached -inf scalar for filter operations (avoids allocation per token)
     neg_inf: Array,
     /// Cached inverse temperature for categorical sampling (1.0 / temp)
@@ -715,7 +728,6 @@ impl Sampler {
 
         Self {
             config,
-            token_counts: HashMap::new(),
             neg_inf,
             inv_temp,
             draws: std::cell::Cell::new(0),
@@ -731,72 +743,27 @@ impl Sampler {
             .map(|seed| pmetal_bridge::decode::draw_key(seed, draw))
     }
 
-    /// Sample the next token from logits.
+    /// Sample the next token from `[1, vocab]` logits and read it back:
+    /// [`sample_array_penalized`](Self::sample_array_penalized), then a host
+    /// sync, for loops that need each token before running the next step.
     ///
     /// Sampling order:
-    /// 1. Apply penalties (repetition, frequency, presence) on raw logits
+    /// 1. Apply `penalties` (repetition, frequency, presence) on raw logits,
+    ///    and take the sampled token into them
     /// 2. Convert logits to log probabilities: logprobs = logits - logsumexp(logits)
     /// 3. Apply filters on log probabilities (top_k, top_p, min_p)
     /// 4. Categorical sampling: categorical(logprobs * (1/temp))
     ///
-    /// All operations are GPU-native with lazy evaluation.
-    /// Only the final token extraction requires CPU sync.
-    ///
-    /// # Arguments
-    /// * `logits` - Logits for the next token `[vocab_size]`
-    /// * `generated_tokens` - Previously generated tokens (for repetition penalty)
-    ///
-    /// # Returns
-    /// The sampled token ID
-    pub fn sample(&mut self, logits: &Array, generated_tokens: &[u32]) -> Result<u32, Exception> {
-        // Ensure logits are in Float32 format (handles BFloat16 models)
-        // Note: No eval() - keeps operations lazy
-        let mut logits = ensure_f32(logits)?;
-
-        // Apply repetition penalty on raw logits (before log-softmax)
-        if self.config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
-            logits = apply_repetition_penalty(
-                &logits,
-                generated_tokens,
-                self.config.repetition_penalty,
-            )?;
-        }
-
-        // Apply frequency and presence penalties on raw logits
-        if (self.config.frequency_penalty != 0.0 || self.config.presence_penalty != 0.0)
-            && !self.token_counts.is_empty()
-        {
-            logits = apply_frequency_presence_penalty(
-                &logits,
-                &self.token_counts,
-                self.config.frequency_penalty,
-                self.config.presence_penalty,
-            )?;
-        }
-
-        // Greedy decoding - GPU-native argmax (no log-softmax needed)
-        if !self.config.do_sample {
-            let token = greedy_token(&logits);
-            self.update_counts(token);
-            return Ok(token);
-        }
-
-        // Convert logits to log probabilities:
-        // logprobs = logits - logsumexp(logits, keepdims=True)
-        let log_probs = logits_to_log_probs(&logits)?;
-
-        // Apply fused GPU-native filters (cached arrays, single reshape)
-        let log_probs = self.apply_filters_fused(&log_probs)?;
-
-        // Sample from the distribution using GPU-native categorical
-        // categorical(logprobs * (1/temp))
-        let token = gpu_categorical_sample(
-            &log_probs,
-            self.config.temperature,
-            self.next_key().as_ref(),
-        )?;
-        self.update_counts(token);
-        Ok(token)
+    /// `penalties` are the generation's, from
+    /// [`decode_penalties`](Self::decode_penalties) over its prompt, passed
+    /// for every token it samples.
+    pub fn sample(
+        &self,
+        logits: &Array,
+        penalties: Option<&mut DecodePenalties>,
+    ) -> Result<u32, Exception> {
+        let (token, _log_probs) = self.sample_array_penalized(logits, penalties)?;
+        Ok(token.item::<u32>())
     }
 
     /// Sample the next token, returning Arrays for async pipelining.
@@ -854,17 +821,13 @@ impl Sampler {
         Ok((token, log_probs))
     }
 
-    /// The penalties of a pipelined generation from `prompt`, kept on the
-    /// GPU, or `None` when this sampler's config has none. Pass them to
-    /// [`sample_array_penalized`](Self::sample_array_penalized) for every
-    /// token of the generation.
+    /// The penalties of a generation from `prompt`, kept on the GPU, or
+    /// `None` when this sampler's config has none
+    /// ([`GenerationConfig::decode_penalties`]). Pass them to
+    /// [`sample_array_penalized`](Self::sample_array_penalized) or
+    /// [`sample`](Self::sample) for every token of the generation.
     pub fn decode_penalties(&self, prompt: &[u32]) -> Option<DecodePenalties> {
-        DecodePenalties::new(
-            self.config.repetition_penalty,
-            self.config.frequency_penalty,
-            self.config.presence_penalty,
-            prompt,
-        )
+        self.config.decode_penalties(prompt)
     }
 
     /// [`sample_array`](Self::sample_array) after `penalties`, which take
@@ -881,16 +844,6 @@ impl Sampler {
         let (token, log_probs) = self.sample_array(&penalties.apply(logits))?;
         penalties.record(&token);
         Ok((token, log_probs))
-    }
-
-    /// Update token frequency counts for frequency penalty.
-    pub fn update_counts(&mut self, token: u32) {
-        count_token(&mut self.token_counts, token);
-    }
-
-    /// Reset token counts (call between generations).
-    pub fn reset_counts(&mut self) {
-        self.token_counts.clear();
     }
 
     /// Check if token is a stop token.
@@ -1152,41 +1105,24 @@ pub fn token_logprobs(
     Ok((chosen, top))
 }
 
-/// Count one more occurrence of `token`, in the counts the frequency and
-/// presence penalties read ([`sampling_log_probs_with_counts`]).
-pub fn count_token(token_counts: &mut HashMap<u32, usize>, token: u32) {
-    *token_counts.entry(token).or_insert(0) += 1;
-}
-
-/// Build the exact sampling distribution used by [`Sampler`] for a given
-/// history/count state.
+/// The exact sampling distribution [`Sampler`] draws from, for `[1, vocab]`
+/// logits and the generation's `penalties` (which this reads but does not
+/// record into).
 ///
 /// The returned array is normalized log-probabilities after repetition,
 /// frequency/presence penalties, top-k/top-p/min-p filtering, and temperature.
 /// This is useful for speculative sampling verification, where the verifier
 /// needs probabilities for both target and draft distributions rather than only
 /// the sampled token.
-pub fn sampling_log_probs_with_counts(
+pub fn sampling_log_probs(
     logits: &Array,
-    generated_tokens: &[u32],
-    token_counts: &HashMap<u32, usize>,
+    penalties: Option<&mut DecodePenalties>,
     config: &GenerationConfig,
 ) -> Result<Array, Exception> {
-    let mut logits = ensure_f32(logits)?;
-
-    if config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
-        logits = apply_repetition_penalty(&logits, generated_tokens, config.repetition_penalty)?;
-    }
-    if (config.frequency_penalty != 0.0 || config.presence_penalty != 0.0)
-        && !token_counts.is_empty()
-    {
-        logits = apply_frequency_presence_penalty(
-            &logits,
-            token_counts,
-            config.frequency_penalty,
-            config.presence_penalty,
-        )?;
-    }
+    let logits = match penalties {
+        Some(penalties) => penalties.apply(logits),
+        None => ensure_f32(logits)?,
+    };
 
     let mut log_probs = logits_to_log_probs(&logits)?;
     if config.top_k > 0 {
@@ -1313,55 +1249,6 @@ pub fn token_probability_from_log_probs(log_probs: &Array, token: u32) -> Result
     let token_index = Array::from_slice(&[token as i32], &[1, 1]);
     let log_prob = take_along_axis(&row, &token_index, -1);
     Ok(log_prob.item::<f32>().exp())
-}
-
-/// GPU-native repetition penalty over the tokens in `generated_tokens` (the
-/// prompt and the output so far): positive logits are divided by the
-/// penalty, negative ones multiplied by it
-/// ([`pmetal_bridge::decode::repetition_penalized`]).
-///
-/// `logits` can be 1-D `[vocab]` or 2-D `[1, vocab]`. Returns an array of the
-/// same shape with the penalty applied on the GPU (no host sync).
-pub fn apply_repetition_penalty(
-    logits: &Array,
-    generated_tokens: &[u32],
-    penalty: f32,
-) -> Result<Array, Exception> {
-    if generated_tokens.is_empty() || penalty == 1.0 {
-        return Ok(logits.clone());
-    }
-
-    // Ensure logits is 2D [1, vocab_size] for indexing
-    let vocab_size = logits.dim(-1) as usize;
-    let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])
-    } else {
-        logits.clone()
-    };
-
-    // Use full generated context for repetition penalty (no artificial cap)
-    let recent_tokens: Vec<i32> = generated_tokens.iter().map(|&t| t as i32).collect();
-
-    if recent_tokens.is_empty() {
-        return Ok(logits.clone());
-    }
-
-    let token_indices = Array::from_slice(&recent_tokens, &[1, recent_tokens.len() as i32]);
-
-    // Get logits at token positions: logits[:, tokens]
-    let selected_logits = take_along_axis(&logits_2d, &token_indices, -1);
-
-    let penalized = repetition_penalized(&selected_logits, penalty);
-
-    // Put the penalized values back: logits[:, tokens] = penalized
-    let result = put_along_axis(&logits_2d, &token_indices, &penalized, -1);
-
-    // Squeeze back to original shape if needed
-    if logits.ndim() == 1 {
-        Ok(result.squeeze(0))
-    } else {
-        Ok(result)
-    }
 }
 
 /// GPU-native top-k filtering - keeps only the k tokens with highest probability.
@@ -1523,90 +1410,6 @@ fn min_p_filter(logits: &Array, min_p: f32) -> Result<Array, Exception> {
     }
 }
 
-/// GPU-native frequency and presence penalties.
-///
-/// Frequency penalty: logit -= frequency_penalty * count
-/// Presence penalty: logit -= presence_penalty (if token appeared at all)
-///
-/// Uses scatter operations to stay on GPU.
-pub fn apply_frequency_presence_penalty(
-    logits: &Array,
-    token_counts: &HashMap<u32, usize>,
-    frequency_penalty: f32,
-    presence_penalty: f32,
-) -> Result<Array, Exception> {
-    if token_counts.is_empty() {
-        return Ok(logits.clone());
-    }
-
-    // Ensure logits is 2D [1, vocab_size] for indexing
-    let vocab_size = logits.dim(-1) as usize;
-    let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])
-    } else {
-        logits.clone()
-    };
-
-    // Collect token indices and their penalty values
-    let (indices, penalties): (Vec<i32>, Vec<f32>) = token_counts
-        .iter()
-        .map(|(&token, &count)| {
-            let penalty = frequency_penalty * count as f32 + presence_penalty;
-            (token as i32, penalty)
-        })
-        .unzip();
-
-    if indices.is_empty() {
-        return Ok(logits.clone());
-    }
-
-    let token_indices = Array::from_slice(&indices, &[1, indices.len() as i32]);
-    let penalty_values = Array::from_slice(&penalties, &[1, penalties.len() as i32]);
-
-    // Get current logits at token positions
-    let selected_logits = take_along_axis(&logits_2d, &token_indices, -1);
-
-    // Apply penalties: logit -= penalty
-    let penalized = selected_logits.subtract(&penalty_values);
-
-    // Put the penalized values back
-    let result = put_along_axis(&logits_2d, &token_indices, &penalized, -1);
-
-    // Squeeze back to original shape if needed
-    if logits.ndim() == 1 {
-        Ok(result.squeeze(0))
-    } else {
-        Ok(result)
-    }
-}
-
-/// GPU-native categorical sampling from log probabilities.
-///
-/// Computes categorical(logprobs * (1/temp)).
-/// Uses pmetal_bridge::compat::random::categorical for efficient GPU sampling.
-/// This is ~10x faster than CPU sampling for large vocabularies.
-/// Note: item() internally calls eval(), so no explicit eval() needed.
-fn gpu_categorical_sample(
-    log_probs: &Array,
-    temperature: f32,
-    key: Option<&Array>,
-) -> Result<u32, Exception> {
-    // Multiply log_probs by inverse temperature
-    // categorical_sampling(logits, temp) -> mx.random.categorical(logits * (1 / temp))
-    let scaled = if temperature != 1.0 && temperature > 0.0 {
-        let inv_temp = Array::from_f32(1.0 / temperature);
-        log_probs.multiply(&inv_temp)
-    } else {
-        log_probs.clone()
-    };
-
-    // Sample using GPU-native categorical (axis=-1 by default)
-    let sampled = categorical(&scaled, -1, key);
-
-    // Extract the scalar token ID (item() calls eval() internally)
-    Ok(sampled.item::<u32>())
-}
-
 /// Simple generation function that works with any model that has a `forward` method.
 ///
 /// # Arguments
@@ -1625,7 +1428,8 @@ where
     F: FnMut(&Array) -> Result<Array, Exception>,
 {
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
-    let mut sampler = Sampler::new(config.clone());
+    let sampler = Sampler::new(config.clone());
+    let mut penalties = sampler.decode_penalties(input_ids);
     let prompt_len = input_ids.len();
 
     for _ in 0..config.max_new_tokens {
@@ -1639,7 +1443,7 @@ where
         let last_logits = last_token_logits(&logits);
 
         // Sample next token
-        let next_token = sampler.sample(&last_logits, &all_tokens)?;
+        let next_token = sampler.sample(&last_logits, penalties.as_mut())?;
 
         // Check for stop token
         if sampler.is_stop_token(next_token) {
@@ -1699,7 +1503,8 @@ where
     let _wired_guard = WiredLimitGuard::new();
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
-    let mut sampler = Sampler::new(config.clone());
+    let sampler = Sampler::new(config.clone());
+    let mut penalties = sampler.decode_penalties(input_ids);
     let prompt_len = input_ids.len();
 
     // Prefill: process long prompts in chunks to bound peak allocator pressure.
@@ -1711,7 +1516,7 @@ where
     // Get logits for the last position and sample first new token
     let last_logits = last_token_logits(&logits);
 
-    let mut next_token = sampler.sample(&last_logits, &all_tokens)?;
+    let mut next_token = sampler.sample(&last_logits, penalties.as_mut())?;
 
     // Check for stop token
     if sampler.is_stop_token(next_token) {
@@ -1742,7 +1547,7 @@ where
         // next squeeze removed - select_axis already reduces dim
 
         // Sample next token
-        next_token = sampler.sample(&last_logits, &all_tokens)?;
+        next_token = sampler.sample(&last_logits, penalties.as_mut())?;
 
         // Check for stop token
         if sampler.is_stop_token(next_token) {
@@ -2413,6 +2218,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_bridge::decode::greedy_token;
 
     /// The correction distribution is the clipped, renormalized residual of
     /// the target over the draft, and the target when there is none.
@@ -2648,20 +2454,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sampling_log_probs_with_counts_applies_filters() {
+    fn test_sampling_log_probs_applies_filters() {
         let config = GenerationConfig::sampling(1, 1.0)
             .with_top_k(1)
             .with_top_p(1.0)
             .with_min_p(0.0)
             .with_repetition_penalty(1.0);
         let logits = Array::from_slice(&[0.0f32, 1.0, 3.0], &[3]);
-        let log_probs = sampling_log_probs_with_counts(
-            &logits,
-            &[],
-            &std::collections::HashMap::new(),
-            &config,
-        )
-        .unwrap();
+        let log_probs = sampling_log_probs(&logits, None, &config).unwrap();
 
         let top_prob = token_probability_from_log_probs(&log_probs, 2).unwrap();
         let masked_prob = token_probability_from_log_probs(&log_probs, 1).unwrap();
@@ -2693,13 +2493,13 @@ mod tests {
     #[test]
     fn test_sampler_greedy() {
         let config = GenerationConfig::greedy(10);
-        let mut sampler = Sampler::new(config);
+        let sampler = Sampler::new(config);
 
         let mut logits_vec = vec![-10.0f32; 100];
         logits_vec[42] = 10.0;
         let logits = Array::from_slice(&logits_vec, &[100]);
 
-        let token = sampler.sample(&logits, &[]).unwrap();
+        let token = sampler.sample(&logits, None).unwrap();
         assert_eq!(token, 42);
     }
 
@@ -2725,22 +2525,6 @@ mod tests {
         let val0 = filtered.index(0);
         val0.eval().unwrap();
         assert!(val0.item::<f32>() > f32::NEG_INFINITY);
-    }
-
-    #[test]
-    fn test_categorical_sample() {
-        // Create log probabilities where one token is dominant (log-softmax'd)
-        // Token 0 has log-prob ~0, others are -inf
-        let log_probs = Array::from_slice(&[0.0f32, -100.0, -100.0, -100.0, -100.0], &[5]);
-
-        // Seed mlx random state for reproducibility
-        pmetal_bridge::compat::random::seed(42);
-
-        // Temperature = 1.0 (no scaling)
-        let token = gpu_categorical_sample(&log_probs, 1.0, None).unwrap();
-
-        // Should almost always sample token 0 due to dominant probability
-        assert_eq!(token, 0);
     }
 
     #[test]
@@ -2788,32 +2572,35 @@ mod tests {
         assert!(config.do_sample);
     }
 
+    /// `sampling_log_probs` reads the generation's penalties without taking
+    /// anything into them; the `Sampler` takes in every token it samples.
     #[test]
-    fn test_frequency_presence_penalty() {
-        let logits = Array::from_slice(&[5.0f32, 5.0, 5.0, 5.0, 5.0], &[5]);
+    fn sampling_reads_the_penalties_and_the_sampler_records_into_them() {
+        let config = GenerationConfig::greedy(4)
+            .with_frequency_penalty(1.0)
+            .with_presence_penalty(0.5);
+        let logits = Array::from_f32_slice(&[5.0, 5.0, 5.0, 5.0, 5.0], &[1, 5]);
+        let mut penalties = config.decode_penalties(&[]);
+        for token in [0, 2, 2, 2] {
+            penalties.as_mut().unwrap().record_id(token);
+        }
 
-        // Token 0 appeared once, token 2 appeared 3 times
-        let mut counts = HashMap::new();
-        counts.insert(0, 1);
-        counts.insert(2, 3);
+        // Token 0: 5 - 1 - 0.5 = 3.5; token 2: 5 - 3 - 0.5 = 1.5.
+        for _ in 0..2 {
+            let log_probs = sampling_log_probs(&logits, penalties.as_mut(), &config).unwrap();
+            let p = |token| token_probability_from_log_probs(&log_probs, token).unwrap();
+            assert!((p(1) / p(0) - 1.5f32.exp()).abs() < 1e-3);
+            assert!((p(1) / p(2) - 3.5f32.exp()).abs() < 1e-2);
+            assert!((p(1) - p(3)).abs() < 1e-6);
+        }
 
-        // Frequency penalty = 1.0, presence penalty = 0.5
-        let filtered = apply_frequency_presence_penalty(&logits, &counts, 1.0, 0.5).unwrap();
-        filtered.eval().unwrap();
-
-        let logits_vec: Vec<f32> = filtered.as_slice::<f32>().to_vec();
-
-        // Token 0: 5.0 - 1.0*1 - 0.5 = 3.5
-        assert!((logits_vec[0] - 3.5).abs() < 0.01);
-
-        // Token 1: 5.0 (no penalty)
-        assert!((logits_vec[1] - 5.0).abs() < 0.01);
-
-        // Token 2: 5.0 - 1.0*3 - 0.5 = 1.5
-        assert!((logits_vec[2] - 1.5).abs() < 0.01);
-
-        // Token 3: 5.0 (no penalty)
-        assert!((logits_vec[3] - 5.0).abs() < 0.01);
+        // Tokens 1, 3 and 4 tie; each pick is penalized for the next.
+        let sampler = Sampler::new(config);
+        let picks: Vec<u32> = (0..3)
+            .map(|_| sampler.sample(&logits, penalties.as_mut()).unwrap())
+            .collect();
+        assert_eq!(picks, [1, 3, 4]);
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[cfg(feature = "ane")]

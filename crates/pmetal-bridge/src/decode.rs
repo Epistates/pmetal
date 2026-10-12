@@ -275,6 +275,11 @@ pub fn repetition_penalized(logits: &InlineArray, penalty: f32) -> InlineArray {
 /// [`record`](Self::record) folds a sampled token in without reading it
 /// back, so a pipelined decode loop keeps its next step queued behind the
 /// sample and every step still sees every token before it.
+///
+/// A clone shares the history's arrays and records on its own, so a
+/// speculative decoder can follow its drafts on a clone and keep only the
+/// tokens it accepts in the original.
+#[derive(Clone)]
 pub struct DecodePenalties {
     repetition: f32,
     frequency: f32,
@@ -287,6 +292,7 @@ pub struct DecodePenalties {
 }
 
 /// The token history the penalties read, as `[1, vocab]` masks.
+#[derive(Clone)]
 struct PenaltyHistory {
     /// `0..vocab`, int32.
     ids: InlineArray,
@@ -367,6 +373,11 @@ impl DecodePenalties {
             Some(history) => history.record(token),
             None => self.pending.push(token.clone()),
         }
+    }
+
+    /// [`record`](Self::record) a token the host already holds.
+    pub fn record_id(&mut self, token: u32) {
+        self.record(&InlineArray::from_slice(&[token], &[1]));
     }
 }
 
@@ -1282,6 +1293,23 @@ mod tests {
             values(&penalties.apply(&bf16)),
             [2.0, -2.0, -1.0, -3.0, 1.25, 1.0]
         );
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// A clone records on its own: what a speculative decoder records on a
+    /// clone for its drafts leaves the original's history as it was.
+    #[test]
+    fn a_clone_keeps_its_own_history() {
+        let logits = InlineArray::from_f32_slice(&[1.0, 1.0, 1.0], &[1, 3]);
+        let mut committed = DecodePenalties::new(1.0, 1.0, 0.0, &[]).unwrap();
+        committed.record_id(0);
+        assert_eq!(values(&committed.apply(&logits)), [0.0, 1.0, 1.0]);
+
+        let mut drafting = committed.clone();
+        drafting.record_id(1);
+        drafting.record_id(0);
+        assert_eq!(values(&drafting.apply(&logits)), [-1.0, 0.0, 1.0]);
+        assert_eq!(values(&committed.apply(&logits)), [0.0, 1.0, 1.0]);
         crate::check_unobserved_error().expect("no bridge op failed");
     }
 

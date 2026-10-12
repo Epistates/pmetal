@@ -1253,15 +1253,16 @@ mod tests {
         }
     }
 
-    /// The single-request path's greedy tokens: `Sampler::sample` over the
-    /// prompt and every token generated so far.
+    /// The single-request path's greedy tokens: `Sampler::sample` with the
+    /// penalties of a generation from the prompt, one token at a time.
     fn single_request_tokens(prompt: &[u32], config: GenerationConfig, max: usize) -> Vec<u32> {
-        let mut sampler = Sampler::new(config);
+        let sampler = Sampler::new(config);
+        let mut penalties = sampler.decode_penalties(prompt);
         let mut history = prompt.to_vec();
         for _ in 0..max {
             let last = *history.last().unwrap();
             let logits = Array::from_f32_slice(&hashed_logits(last), &[1, HASHED_VOCAB]);
-            let token = sampler.sample(&logits, &history).unwrap();
+            let token = sampler.sample(&logits, penalties.as_mut()).unwrap();
             history.push(token);
         }
         history.split_off(prompt.len())

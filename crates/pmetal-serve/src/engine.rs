@@ -1826,16 +1826,12 @@ impl InferenceEngine {
     /// - Wired-memory limit and generation stream are installed once per
     ///   request via RAII guards.
     ///
-    /// # Penalty lag
+    /// # Penalties
     ///
-    /// Because the next forward is scheduled before `token(N)` is
-    /// extracted, the repetition / frequency / presence penalty context
-    /// at step `N+1` is missing exactly one token (the one that will be
-    /// emitted as `token(N)`). This is the usual tradeoff of
-    /// async decode — the alternative (sync-per-step) destroys the
-    /// pipeline. In practice the lag is inaudible for soft penalties
-    /// because the missing token is one of `prompt_len + N` history
-    /// tokens feeding the scatter.
+    /// The next forward is scheduled before `token(N)` is extracted, but
+    /// its repetition / frequency / presence penalties still see
+    /// `token(N)`: the request's `DecodePenalties` take every sampled
+    /// token in on the GPU, so no step's history lags the host.
     #[allow(clippy::too_many_arguments)]
     fn run_async_decode<E>(
         model: &mut DynamicModel,

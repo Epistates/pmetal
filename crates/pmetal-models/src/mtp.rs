@@ -21,16 +21,19 @@
 //! output is the target's own: greedy decoding gives exactly the tokens plain
 //! greedy decoding does, and sampling draws from the target's distribution
 //! (rejection sampling).
-
-use std::collections::HashMap;
+//!
+//! The repetition, frequency and presence penalties read the emitted
+//! sequence's [`DecodePenalties`]. Drafting and verifying each follow the
+//! round's drafts on a clone of them, so a draft or a verify position is
+//! penalized for the drafts before it, and only the tokens the round emits
+//! go into the sequence's own.
 
 use pmetal_bridge::compat::{Array, Exception, ops::select_axis, ops::slice_axis};
-use pmetal_bridge::decode::{greedy_token, last_token_hidden, last_token_logits};
+use pmetal_bridge::decode::{DecodePenalties, greedy_token, last_token_hidden, last_token_logits};
 
 use crate::generation::{
     GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, SpeculativeDraws,
-    correction_log_probs, count_token, sampling_log_probs_with_counts,
-    token_probability_from_log_probs,
+    correction_log_probs, sampling_log_probs, token_probability_from_log_probs,
 };
 
 /// The model whose tokens an MTP decode emits: it checks the drafts.
@@ -114,7 +117,7 @@ where
     }
     let mut out = Emitter {
         token_ids: input_ids.to_vec(),
-        counts: HashMap::new(),
+        penalties: gen_config.decode_penalties(input_ids),
         num_generated: 0,
         stopped_by_token: false,
         stopped: false,
@@ -134,8 +137,7 @@ where
     // The first token is the target's alone.
     let mut pending = pick(
         &last_token_logits(&logits),
-        &out.token_ids,
-        &out.counts,
+        out.penalties.as_mut(),
         gen_config,
         &mut draws,
     )?;
@@ -150,25 +152,24 @@ where
 
         let mut drafts = Vec::with_capacity(max_draft);
         let mut draft_log_probs = Vec::with_capacity(max_draft);
-        let mut history = out.token_ids.clone();
-        let mut counts = out.counts.clone();
+        let mut drafting = out.penalties.clone();
         let mut hidden = seed.clone();
         let mut token = pending;
         for step in 0..max_draft {
             let (next_hidden, logits) = drafter.step(target, token, &hidden, step, position)?;
             token = if gen_config.do_sample {
-                let log_probs =
-                    sampling_log_probs_with_counts(&logits, &history, &counts, gen_config)?;
+                let log_probs = sampling_log_probs(&logits, drafting.as_mut(), gen_config)?;
                 let token = draws.sample(&log_probs)?;
                 draft_log_probs.push(log_probs);
                 token
             } else {
-                greedy_choice(&logits, &history, &counts, gen_config)?
+                greedy_choice(&logits, drafting.as_mut())
             };
             hidden = next_hidden;
             drafts.push(token);
-            history.push(token);
-            count_token(&mut counts, token);
+            if let Some(drafting) = drafting.as_mut() {
+                drafting.record_id(token);
+            }
             if gen_config.stop_tokens.contains(&token) {
                 break;
             }
@@ -183,19 +184,12 @@ where
                 &drafts,
                 &draft_log_probs,
                 &verify_logits,
-                &out.token_ids,
-                &out.counts,
+                out.penalties.clone(),
                 gen_config,
                 &mut draws,
             )?
         } else {
-            accept_greedy(
-                &drafts,
-                &verify_logits,
-                &out.token_ids,
-                &out.counts,
-                gen_config,
-            )?
+            accept_greedy(&drafts, &verify_logits, out.penalties.clone())
         };
         if !drafts.is_empty() {
             metrics.record_verify_step(drafts.len(), accepted);
@@ -230,10 +224,11 @@ where
     Ok(out.finish(Some(metrics)))
 }
 
-/// The emitted sequence and the stop conditions.
+/// The emitted sequence, its penalties, and the stop conditions.
 struct Emitter<'a> {
     token_ids: Vec<u32>,
-    counts: HashMap<u32, usize>,
+    /// The penalties over the prompt and every emitted token, in order.
+    penalties: Option<DecodePenalties>,
     num_generated: usize,
     stopped_by_token: bool,
     /// A stop token, the length limit, or the caller ended the decode.
@@ -244,7 +239,9 @@ struct Emitter<'a> {
 impl Emitter<'_> {
     fn emit(&mut self, token: u32, on_token: &mut impl FnMut(u32) -> bool) {
         self.token_ids.push(token);
-        count_token(&mut self.counts, token);
+        if let Some(penalties) = self.penalties.as_mut() {
+            penalties.record_id(token);
+        }
         self.num_generated += 1;
         if self.gen_config.stop_tokens.contains(&token) {
             self.stopped_by_token = true;
@@ -267,87 +264,73 @@ impl Emitter<'_> {
     }
 }
 
-/// The target's token for `[1, V]` logits: greedy, or drawn from the
-/// sampling distribution.
+/// The target's token for `[1, V]` logits under `penalties`, which this
+/// reads but does not record into: greedy, or drawn from the sampling
+/// distribution.
 fn pick(
     logits: &Array,
-    history: &[u32],
-    counts: &HashMap<u32, usize>,
+    penalties: Option<&mut DecodePenalties>,
     gen_config: &GenerationConfig,
     draws: &mut SpeculativeDraws,
 ) -> Result<u32, Exception> {
     if gen_config.do_sample {
-        let log_probs = sampling_log_probs_with_counts(logits, history, counts, gen_config)?;
+        let log_probs = sampling_log_probs(logits, penalties, gen_config)?;
         draws.sample(&log_probs)
     } else {
-        greedy_choice(logits, history, counts, gen_config)
+        Ok(greedy_choice(logits, penalties))
     }
 }
 
 /// The greedy token after the repetition, frequency and presence penalties,
-/// as plain greedy decoding picks it (the `Sampler` applies them before its
-/// argmax too).
-fn greedy_choice(
-    logits: &Array,
-    history: &[u32],
-    counts: &HashMap<u32, usize>,
-    gen_config: &GenerationConfig,
-) -> Result<u32, Exception> {
-    let penalized = gen_config.repetition_penalty != 1.0
-        || gen_config.frequency_penalty != 0.0
-        || gen_config.presence_penalty != 0.0;
-    if !penalized {
-        return Ok(greedy_token(logits));
+/// as plain greedy decoding picks it: the argmax of the penalized logits,
+/// which is what the `Sampler` takes.
+fn greedy_choice(logits: &Array, penalties: Option<&mut DecodePenalties>) -> u32 {
+    match penalties {
+        Some(penalties) => greedy_token(&penalties.apply(logits)),
+        None => greedy_token(logits),
     }
-    let log_probs = sampling_log_probs_with_counts(logits, history, counts, gen_config)?;
-    Ok(greedy_token(&log_probs))
 }
 
 /// How many drafts the target's greedy choice agrees with, and its token at
 /// the first disagreement (or after the last draft). `verify_logits[j]` is
-/// the target's choice for draft `j`, over the history that ends with the
-/// drafts before it.
+/// the target's choice for draft `j`, penalized for the emitted sequence
+/// (`penalties`) and the drafts before `j`.
 fn accept_greedy(
     drafts: &[u32],
     verify_logits: &Array,
-    history: &[u32],
-    counts: &HashMap<u32, usize>,
-    gen_config: &GenerationConfig,
-) -> Result<(usize, u32), Exception> {
-    let mut history = history.to_vec();
-    let mut counts = counts.clone();
+    mut penalties: Option<DecodePenalties>,
+) -> (usize, u32) {
     for (j, &draft) in drafts.iter().enumerate() {
         let row = select_axis(verify_logits, j as i32, 1);
-        let target = greedy_choice(&row, &history, &counts, gen_config)?;
+        let target = greedy_choice(&row, penalties.as_mut());
         if target != draft {
-            return Ok((j, target));
+            return (j, target);
         }
-        history.push(draft);
-        count_token(&mut counts, draft);
+        if let Some(penalties) = penalties.as_mut() {
+            penalties.record_id(draft);
+        }
     }
     let row = select_axis(verify_logits, drafts.len() as i32, 1);
-    let bonus = greedy_choice(&row, &history, &counts, gen_config)?;
-    Ok((drafts.len(), bonus))
+    (drafts.len(), greedy_choice(&row, penalties.as_mut()))
 }
 
 /// Rejection sampling: draft `j` is kept with probability
 /// `min(1, p(d) / q(d))`; the first rejected one is replaced by a draw from
 /// the residual `max(0, p - q)`, and a fully accepted block gets a bonus
-/// token drawn from the target.
+/// token drawn from the target. `p` is penalized for the emitted sequence
+/// (`penalties`) and the drafts before `j`, as `q` was when the draft was
+/// drawn.
 fn accept_sampled(
     drafts: &[u32],
     draft_log_probs: &[Array],
     verify_logits: &Array,
-    history: &[u32],
-    counts: &HashMap<u32, usize>,
+    mut penalties: Option<DecodePenalties>,
     gen_config: &GenerationConfig,
     draws: &mut SpeculativeDraws,
 ) -> Result<(usize, u32), Exception> {
-    let mut history = history.to_vec();
-    let mut counts = counts.clone();
     for (j, &draft) in drafts.iter().enumerate() {
         let row = select_axis(verify_logits, j as i32, 1);
-        let target = sampling_log_probs_with_counts(&row, &history, &counts, gen_config)?;
+        let target = sampling_log_probs(&row, penalties.as_mut(), gen_config)?;
         let p = token_probability_from_log_probs(&target, draft)?;
         let q = token_probability_from_log_probs(&draft_log_probs[j], draft)?;
         let keep = if q > 0.0 { (p / q).min(1.0) } else { 0.0 };
@@ -355,10 +338,11 @@ fn accept_sampled(
             let residual = correction_log_probs(&target, &draft_log_probs[j])?;
             return Ok((j, draws.sample(&residual)?));
         }
-        history.push(draft);
-        count_token(&mut counts, draft);
+        if let Some(penalties) = penalties.as_mut() {
+            penalties.record_id(draft);
+        }
     }
     let row = select_axis(verify_logits, drafts.len() as i32, 1);
-    let bonus = pick(&row, &history, &counts, gen_config, draws)?;
+    let bonus = pick(&row, penalties.as_mut(), gen_config, draws)?;
     Ok((drafts.len(), bonus))
 }
