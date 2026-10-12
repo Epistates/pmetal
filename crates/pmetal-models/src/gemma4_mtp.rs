@@ -30,14 +30,19 @@ impl Default for Gemma4MtpConfig {
     }
 }
 
+/// The target layers whose KV caches a Gemma 4 assistant attends to: the
+/// last layer of each attention type before the target's KV-shared layers.
+/// Drafting and training read them the same way.
 #[derive(Debug, Clone)]
-struct Gemma4MtpKvSources {
+pub struct Gemma4MtpKvSources {
     full_attention: Option<usize>,
     sliding_attention: Option<usize>,
 }
 
 impl Gemma4MtpKvSources {
-    fn new(target: &Gemma4Config, assistant: &Gemma4Config) -> Result<Self, Exception> {
+    /// The sources in `target` for `assistant`'s layers, or an error naming
+    /// an assistant layer whose attention type the target has no source for.
+    pub fn new(target: &Gemma4Config, assistant: &Gemma4Config) -> Result<Self, Exception> {
         let total = target.num_hidden_layers.max(0) as usize;
         let first_shared = target.first_kv_shared_layer_idx().min(total);
         let mut full_attention = None;
@@ -75,7 +80,11 @@ impl Gemma4MtpKvSources {
         })
     }
 
-    fn shared_states(&self, cache: &KVCache) -> Result<Gemma4AssistantSharedKvStates, Exception> {
+    /// The source layers' entries in the target's `cache`.
+    pub fn shared_states(
+        &self,
+        cache: &KVCache,
+    ) -> Result<Gemma4AssistantSharedKvStates, Exception> {
         let full_attention = self
             .full_attention
             .map(|layer| {

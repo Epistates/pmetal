@@ -20,11 +20,10 @@ use pmetal_mlx::{
 };
 use pmetal_models::architectures::{
     DFlashDraftModel, Gemma4AssistantConfig, Gemma4AssistantForCausalLM,
-    Gemma4AssistantGenerationConfig, Gemma4AssistantSharedKvStates, Gemma4Config,
-    Gemma4ForCausalLM, Qwen3ForCausalLM, Qwen3NextConfig, Qwen3NextForCausalLM,
-    Qwen3NextMtpForCausalLM,
+    Gemma4AssistantGenerationConfig, Gemma4Config, Gemma4ForCausalLM, Qwen3ForCausalLM,
+    Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM,
 };
-use pmetal_models::{validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair};
+use pmetal_models::{Gemma4MtpKvSources, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair};
 use serde::{Deserialize, Serialize};
 
 use crate::dflash_training::{DFlashTrainStepConfig, dflash_train_step};
@@ -210,6 +209,7 @@ pub fn gemma4_assistant_mtp_loss(
     input_ids: &Array,
 ) -> Result<Array, Exception> {
     validate_gemma4_mtp_pair(target, assistant)?;
+    let kv_sources = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)?;
     if input_ids.ndim() != 2 || input_ids.dim(1) < 3 {
         return Err(Exception::custom(format!(
             "gemma4_assistant_mtp_loss expects input_ids [B, T>=3], got {:?}",
@@ -233,7 +233,7 @@ pub fn gemma4_assistant_mtp_loss(
         let token_embed =
             Module::forward(&mut target.model.embed_tokens, &token)?.multiply(&embed_scale);
         let inputs_embeds = ops::concatenate_axis(&[&token_embed, &last_hidden], -1);
-        let shared = gemma4_shared_states_for_assistant(target, assistant, &cache)?;
+        let shared = kv_sources.shared_states(&cache)?;
         let (_, logits) = assistant.forward_logits(&inputs_embeds, &shared, pos + 1)?;
         let labels = input_ids.slice(&[0, pos + 2], &[batch, pos + 3]);
         let vocab = assistant.config.text_config.vocab_size;
@@ -525,58 +525,6 @@ fn gemma4_target_cache(target: &Gemma4ForCausalLM, max_seq_len: usize) -> KVCach
         target.config.num_key_value_heads as usize,
         target.config.head_dim as usize,
     ))
-}
-
-fn gemma4_shared_states_for_assistant(
-    target: &Gemma4ForCausalLM,
-    assistant: &Gemma4AssistantForCausalLM,
-    cache: &KVCache,
-) -> Result<Gemma4AssistantSharedKvStates, Exception> {
-    let target_config = &target.config;
-    let assistant_config = &assistant.config.text_config;
-    let total = target_config.num_hidden_layers.max(0) as usize;
-    let first_shared = target_config.first_kv_shared_layer_idx().min(total);
-    let mut full_attention = None;
-    let mut sliding_attention = None;
-    for layer_idx in 0..first_shared {
-        if target_config.is_full_attention(layer_idx) {
-            full_attention = Some(layer_idx);
-        } else {
-            sliding_attention = Some(layer_idx);
-        }
-    }
-    for layer_idx in 0..assistant_config.num_hidden_layers.max(0) as usize {
-        let source = if assistant_config.is_full_attention(layer_idx) {
-            full_attention
-        } else {
-            sliding_attention
-        };
-        if source.is_none() {
-            return Err(Exception::custom(format!(
-                "Gemma assistant layer {layer_idx} has no matching target KV source"
-            )));
-        }
-    }
-    Ok(Gemma4AssistantSharedKvStates {
-        full_attention: full_attention
-            .map(|idx| {
-                cache.get(idx).ok_or_else(|| {
-                    Exception::custom(format!(
-                        "Gemma target cache missing full KV source layer {idx}"
-                    ))
-                })
-            })
-            .transpose()?,
-        sliding_attention: sliding_attention
-            .map(|idx| {
-                cache.get(idx).ok_or_else(|| {
-                    Exception::custom(format!(
-                        "Gemma target cache missing sliding KV source layer {idx}"
-                    ))
-                })
-            })
-            .transpose()?,
-    })
 }
 
 fn save_model_safetensors_prefixed<M, F>(
@@ -890,7 +838,10 @@ mod tests {
             let embedding = Module::forward(&mut target.model.embed_tokens, &next)
                 .unwrap()
                 .multiply(&Array::from_f32(target.model.embed_scale));
-            let shared = gemma4_shared_states_for_assistant(&target, &assistant, &cache).unwrap();
+            let shared = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)
+                .unwrap()
+                .shared_states(&cache)
+                .unwrap();
             let (_, logits) = assistant
                 .forward_logits(
                     &ops::concatenate_axis(&[&embedding, &state], -1),
