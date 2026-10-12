@@ -452,6 +452,55 @@ fn qwen_mtp_on_the_native_engine() {
     check_oracle("native Qwen", &mut target, ck.native(), vocab, &want);
 }
 
+/// A partial accept on the native engine replays its GDN layers' recorded
+/// inputs over the kept tokens instead of running them through the model
+/// again, and leaves the engine where running them would: the next token's
+/// hidden state and logits match, for every prefix of the block.
+#[test]
+#[serial]
+fn native_qwen_rewind_matches_running_the_kept_tokens() {
+    const BLOCK: [u32; 5] = [23, 5, 77, 14, 9];
+    const NEXT: [u32; 1] = [31];
+    /// fp32, a block's GDN step against the same tokens run one at a time.
+    const TOL: f32 = 2e-5;
+
+    let ck = qwen_checkpoint();
+    let mut rewound = ck.native();
+    let mut replayed = ck.native();
+    for kept in 0..=BLOCK.len() {
+        rewound.reset().expect("reset");
+        rewound.forward(&PROMPT).expect("prompt");
+        rewound.verify(&BLOCK).expect("verify");
+        rewound.keep(kept).expect("rewind");
+        let (hidden, logits) = rewound.forward(&NEXT).expect("next");
+        drain("rewound");
+
+        replayed.reset().expect("reset");
+        replayed.forward(&PROMPT).expect("prompt");
+        if kept > 0 {
+            replayed.forward(&BLOCK[..kept]).expect("kept tokens");
+        }
+        let (want_hidden, want_logits) = replayed.forward(&NEXT).expect("next");
+        drain("replayed");
+
+        for (what, got, want) in [
+            ("hidden", &hidden, &want_hidden),
+            ("logits", &logits, &want_logits),
+        ] {
+            let diff = max_abs_diff(got, want);
+            println!(
+                "kept {kept} of {}: {what} max |diff| {diff:.3e}",
+                BLOCK.len()
+            );
+            assert!(
+                diff <= TOL,
+                "kept {kept} of {}: the rewound {what} are off by {diff:.3e}",
+                BLOCK.len()
+            );
+        }
+    }
+}
+
 /// The production entry point, as `pmetal infer --mtp` calls it.
 #[test]
 #[serial]

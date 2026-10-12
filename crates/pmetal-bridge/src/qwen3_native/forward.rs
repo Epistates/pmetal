@@ -45,8 +45,23 @@ pub fn forward_step_hidden(
     token_ids: &InlineArray, // [B, T]
     cache: &mut NativeCache,
 ) -> (InlineArray, InlineArray) {
+    forward_step_hidden_recording(weights, token_ids, cache, None)
+}
+
+/// [`forward_step_hidden`] for a speculative verify. With `gdn_replays`,
+/// which it clears first, each GDN layer appends its recurrence inputs, from
+/// which [`super::rewind_verify`] can undo any tail of `token_ids`.
+pub fn forward_step_hidden_recording(
+    weights: &NativeWeights,
+    token_ids: &InlineArray, // [B, T]
+    cache: &mut NativeCache,
+    mut gdn_replays: Option<&mut Vec<GdnReplay>>,
+) -> (InlineArray, InlineArray) {
+    if let Some(replays) = gdn_replays.as_deref_mut() {
+        replays.clear();
+    }
     let hidden = embed_tokens(weights, token_ids);
-    let hidden = decoder_trunk(weights, hidden, cache, None);
+    let hidden = decoder_trunk(weights, hidden, cache, None, gdn_replays);
     let logits = lm_head(weights, &hidden);
     (hidden, logits)
 }
@@ -74,7 +89,7 @@ pub fn forward_embeddings_hidden(
         "one mRoPE position per prompt token"
     );
     let embeddings = embeddings.as_dtype(weights.model_dtype);
-    let hidden = decoder_trunk(weights, embeddings, cache, Some(mrope));
+    let hidden = decoder_trunk(weights, embeddings, cache, Some(mrope), None);
     cache.rope_offset = next_rope_offset;
     let logits = lm_head(weights, &hidden);
     (hidden, logits)
@@ -100,12 +115,14 @@ pub fn embed_tokens(weights: &NativeWeights, token_ids: &InlineArray) -> InlineA
 }
 
 /// Every decoder layer and the final norm: `[B, T, hidden]` embeddings to
-/// normalized hidden states. Advances `cache.rope_offset` by `T`.
+/// normalized hidden states. Advances `cache.rope_offset` by `T`. With
+/// `gdn_replays`, each GDN layer appends its recurrence inputs.
 fn decoder_trunk(
     weights: &NativeWeights,
     mut hidden: InlineArray,
     cache: &mut NativeCache,
     mrope: Option<&MropeTables>,
+    mut gdn_replays: Option<&mut Vec<GdnReplay>>,
 ) -> InlineArray {
     let b = hidden.dim(0);
     let s = hidden.dim(1);
@@ -126,7 +143,13 @@ fn decoder_trunk(
         let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
 
         let r = if lw.is_linear {
-            let result = gdn_forward(lw, &normed, b, s, &mut cache.gdn_caches[gdn_slot], dtype);
+            let result = gdn_forward_recording(
+                lw,
+                &normed,
+                &mut cache.gdn_caches[gdn_slot],
+                dtype,
+                gdn_replays.as_deref_mut(),
+            );
             gdn_slot += 1;
             result
         } else {

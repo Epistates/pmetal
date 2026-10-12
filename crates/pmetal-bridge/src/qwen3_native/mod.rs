@@ -39,7 +39,8 @@ pub use cache::{
 };
 pub use forward::{
     compact_tree_cache, embed_tokens, forward_embeddings_hidden, forward_step, forward_step_hidden,
-    forward_step_tree_verify, forward_step_with_capture, rollback_cache,
+    forward_step_hidden_recording, forward_step_tree_verify, forward_step_with_capture,
+    rollback_cache,
 };
 pub use generate::{benchmark_trial, generate, prefill_first_token};
 pub use load::load_model;

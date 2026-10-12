@@ -16,8 +16,8 @@
 //! draft `j`. The accepted drafts are emitted, then one token from the target
 //! itself: the correction at the first rejected draft, or the bonus after the
 //! last. That token is the next round's pending token. A round therefore
-//! costs one target forward (and, on a target that rewinds by running the
-//! kept tokens again, that) and emits between 1 and `k + 1` tokens, and the
+//! costs one target forward (a recurrent layer's rewind replays only its
+//! state update over the kept tokens) and emits between 1 and `k + 1` tokens, and the
 //! output is the target's own: greedy decoding gives exactly the tokens plain
 //! greedy decoding does, and sampling draws from the target's distribution
 //! (rejection sampling).

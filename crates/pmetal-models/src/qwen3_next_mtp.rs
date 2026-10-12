@@ -11,7 +11,7 @@ use pmetal_bridge::compat::{
     ops::{concatenate_axis, slice_axis},
 };
 use pmetal_bridge::decode::{last_token_hidden, last_token_logits, prompt_tokens_to_input};
-use pmetal_bridge::qwen3_native::{self, NativeCache, NativeWeights};
+use pmetal_bridge::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 use pmetal_mlx::{
     kv_cache::{GdnVerifyInputs, KVCache, MambaCache, MambaSnapshot},
     speculative::SpecCapture,
@@ -277,14 +277,18 @@ where
     )
 }
 
-/// The native bridge Qwen engine as an [`MtpTarget`]. A verify forks the
-/// cache first, and a partial accept goes back to the fork and runs the kept
-/// tokens again.
+/// The native bridge Qwen engine as an [`MtpTarget`]. Its attention layers
+/// roll back by their cache offsets; on Qwen3.5 a verify records each GDN
+/// layer's recurrence inputs, and a partial accept replays them over the
+/// kept prefix ([`qwen3_native::rewind_verify`], as the DFlash target
+/// does), rather than running the kept tokens through the model again.
 pub struct NativeQwen3MtpVerifier {
     weights: NativeWeights,
     cache: NativeCache,
-    before_verify: Option<NativeCache>,
-    verified: Vec<u32>,
+    /// The last verify's GDN recurrence inputs, one per GDN layer.
+    gdn_replays: Vec<GdnReplay>,
+    /// Tokens in the last verify.
+    verified: usize,
     hidden_size: i32,
 }
 
@@ -301,46 +305,57 @@ impl NativeQwen3MtpVerifier {
         Ok(Self {
             cache: NativeCache::new_empty(&weights),
             weights,
-            before_verify: None,
-            verified: Vec::new(),
+            gdn_replays: Vec::new(),
+            verified: 0,
             hidden_size: config.hidden_size,
         })
+    }
+
+    /// Run `tokens`, recording what rewinding them takes when `rewindable`.
+    fn run(&mut self, tokens: &[u32], rewindable: bool) -> (Array, Array) {
+        self.verified = if rewindable { tokens.len() } else { 0 };
+        self.gdn_replays.clear();
+        let replays =
+            (rewindable && !self.cache.gdn_caches.is_empty()).then_some(&mut self.gdn_replays);
+        qwen3_native::forward_step_hidden_recording(
+            &self.weights,
+            &prompt_tokens_to_input(tokens),
+            &mut self.cache,
+            replays,
+        )
     }
 }
 
 impl MtpTarget for NativeQwen3MtpVerifier {
     fn reset(&mut self) -> Result<(), Exception> {
         self.cache = NativeCache::new_empty(&self.weights);
+        self.gdn_replays.clear();
+        self.verified = 0;
         Ok(())
     }
 
     fn forward(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
-        let input = prompt_tokens_to_input(tokens);
-        Ok(qwen3_native::forward_step_hidden(
-            &self.weights,
-            &input,
-            &mut self.cache,
-        ))
+        Ok(self.run(tokens, false))
     }
 
     fn verify(&mut self, tokens: &[u32]) -> Result<(Array, Array), Exception> {
-        self.before_verify = Some(self.cache.fork());
-        self.verified = tokens.to_vec();
-        self.forward(tokens)
+        // A one-token block is never cut back, and recording would take it
+        // off the GDN layers' compiled single-token step.
+        Ok(self.run(tokens, tokens.len() > 1))
     }
 
     fn keep(&mut self, kept: usize) -> Result<(), Exception> {
-        if kept >= self.verified.len() {
-            return Ok(());
+        let verified = std::mem::take(&mut self.verified);
+        if kept < verified {
+            qwen3_native::rewind_verify(
+                &mut self.cache,
+                &self.gdn_replays,
+                verified as i32,
+                kept as i32,
+            )
+            .map_err(|e| Exception::custom(format!("native Qwen MTP: {e}")))?;
         }
-        self.cache = self
-            .before_verify
-            .take()
-            .ok_or_else(|| Exception::custom("native Qwen MTP: keep without a verify"))?;
-        let kept_tokens = std::mem::take(&mut self.verified);
-        if kept > 0 {
-            self.forward(&kept_tokens[..kept])?;
-        }
+        self.gdn_replays.clear();
         Ok(())
     }
 }
