@@ -1167,9 +1167,9 @@ mod batching_gate_tests {
 
     #[test]
     fn penalties_remain_batched() {
-        // Phase 1b: driver calls `sample_array_with_penalties` +
-        // `update_counts` per slot so repetition / frequency / presence
-        // penalties work in the batched path.
+        // Each slot keeps its own `DecodePenalties` on the GPU, so
+        // repetition / frequency / presence penalties work in the batched
+        // path.
         for (rep, freq, pres) in [
             (Some(1.1), None, None),
             (None, Some(0.5), None),

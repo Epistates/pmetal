@@ -854,41 +854,6 @@ impl Sampler {
         Ok((token, log_probs))
     }
 
-    /// Penalty-aware variant of [`sample_array`](Self::sample_array).
-    ///
-    /// Applies repetition, frequency, and presence penalties on the raw
-    /// logits before sampling. `generated_tokens` is the full prompt + output
-    /// history (same input shape as [`sample`](Self::sample)).
-    ///
-    /// Does NOT call `update_counts` — the caller is expected to invoke
-    /// [`update_counts`](Self::update_counts) after extracting the token id
-    /// via `.item()` so the async pipeline is preserved.
-    pub fn sample_array_with_penalties(
-        &self,
-        logits: &Array,
-        generated_tokens: &[u32],
-    ) -> Result<(Array, Array), Exception> {
-        let mut penalised = ensure_f32(logits)?;
-        if self.config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
-            penalised = apply_repetition_penalty(
-                &penalised,
-                generated_tokens,
-                self.config.repetition_penalty,
-            )?;
-        }
-        if (self.config.frequency_penalty != 0.0 || self.config.presence_penalty != 0.0)
-            && !self.token_counts.is_empty()
-        {
-            penalised = apply_frequency_presence_penalty(
-                &penalised,
-                &self.token_counts,
-                self.config.frequency_penalty,
-                self.config.presence_penalty,
-            )?;
-        }
-        self.sample_array(&penalised)
-    }
-
     /// The penalties of a pipelined generation from `prompt`, kept on the
     /// GPU, or `None` when this sampler's config has none. Pass them to
     /// [`sample_array_penalized`](Self::sample_array_penalized) for every

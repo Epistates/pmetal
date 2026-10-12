@@ -6,8 +6,9 @@
 //! - A [`SlotIdxMap`] that tracks which `SlotId` lives in which row of
 //!   a [`BatchKVCache`].
 //! - A [`ContinuousEngineState`] that bundles the batched KV cache
-//!   with a per-slot [`Sampler`] so each slot has its own
-//!   temperature / top-p / penalty state.
+//!   with a per-slot [`Sampler`] and [`DecodePenalties`] so each slot
+//!   has its own temperature / top-p settings and its own penalty
+//!   history on the GPU.
 //! - A [`SlotForward`] trait that decouples the driver from
 //!   `DynamicModel` so unit tests can stub the forward pass.
 //! - Drivers [`drive_prefill_step`] and [`drive_decode_step`] that the
@@ -27,6 +28,7 @@
 
 use crate::continuous_batch::SlotId;
 use pmetal_bridge::compat::{Array, Exception};
+use pmetal_bridge::decode::DecodePenalties;
 use pmetal_mlx::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::generation::Sampler;
 use std::collections::HashMap;
@@ -161,11 +163,31 @@ impl SlotIdxMap {
     }
 }
 
+/// A slot's sampler and the penalties of its generation: the slot's
+/// prompt and every token sampled for it, kept on the GPU, so a slot's
+/// history lives with its row from admission to retirement and no other
+/// slot reads it.
+struct SlotSampling {
+    sampler: Sampler,
+    penalties: Option<DecodePenalties>,
+}
+
+impl SlotSampling {
+    /// Sample the slot's next token from its `[1, vocab]` logits, lazily;
+    /// the penalties take the token in before it reaches the host.
+    fn sample(&mut self, logits: &Array) -> Result<Array, Exception> {
+        let (token, _log_probs) = self
+            .sampler
+            .sample_array_penalized(logits, self.penalties.as_mut())?;
+        Ok(token)
+    }
+}
+
 /// Continuous-batch engine state.
 ///
-/// Holds the per-slot KV caches, per-slot samplers, and slot→idx map.
-/// Samplers are stored as `Option` so rows can sit "allocated but
-/// empty" briefly between release and the next allocate.
+/// Holds the per-slot KV caches, per-slot samplers and penalties, and
+/// slot→idx map. Samplers are stored as `Option` so rows can sit
+/// "allocated but empty" briefly between release and the next allocate.
 pub struct ContinuousEngineState {
     caches: BatchKVCache,
     /// Per-row recurrent (Mamba / gated-delta-net) state for a hybrid
@@ -176,7 +198,7 @@ pub struct ContinuousEngineState {
     /// batched decode. When `None`, the driver falls back to the
     /// per-slot `caches` path.
     fused_cache: Option<FusedBatchKVCache>,
-    samplers: Vec<Option<Sampler>>,
+    samplers: Vec<Option<SlotSampling>>,
     map: SlotIdxMap,
 }
 
@@ -242,14 +264,21 @@ impl ContinuousEngineState {
         self.map.len()
     }
 
-    /// Assign a slot to a free batch row, attaching its sampler.
+    /// Assign a slot to a free batch row, attaching its sampler and the
+    /// penalties of a generation from `prompt` (the whole prompt, including
+    /// any part restored from a prefix cache).
     ///
     /// Returns the allocated `batch_idx`, or an error if all rows are
     /// in use. Callers must check [`Self::active`] or
     /// [`crate::continuous_batch::BatcherConfig::max_slots`] before
     /// enqueueing to the scheduler; hitting this error indicates a
     /// bookkeeping bug.
-    pub fn admit(&mut self, slot: SlotId, sampler: Sampler) -> Result<usize, Exception> {
+    pub fn admit(
+        &mut self,
+        slot: SlotId,
+        sampler: Sampler,
+        prompt: &[u32],
+    ) -> Result<usize, Exception> {
         let idx = self.map.allocate(slot).ok_or_else(|| {
             Exception::custom(format!(
                 "ContinuousEngineState::admit: no free batch row for {:?} (capacity {})",
@@ -257,7 +286,8 @@ impl ContinuousEngineState {
                 self.capacity()
             ))
         })?;
-        self.samplers[idx] = Some(sampler);
+        let penalties = sampler.decode_penalties(prompt);
+        self.samplers[idx] = Some(SlotSampling { sampler, penalties });
         if let Some(fused) = self.fused_cache.as_mut() {
             fused.admit(idx)?;
         }
@@ -310,10 +340,18 @@ impl ContinuousEngineState {
         self.caches.replace(idx, cache)
     }
 
-    /// Borrow the per-slot sampler mutably.
-    pub fn sampler_for(&mut self, slot: SlotId) -> Option<&mut Sampler> {
-        let idx = self.map.get(slot)?;
-        self.samplers.get_mut(idx).and_then(|s| s.as_mut())
+    /// Sample `slot`'s next token from its `[1, vocab]` last-position
+    /// logits with the slot's sampler, after its repetition / frequency /
+    /// presence penalties, and take the token into those penalties. The
+    /// token stays lazy; the slot's next sample is penalized for it whether
+    /// or not the host has read it.
+    pub fn sample(&mut self, slot: SlotId, logits: &Array) -> Result<Array, Exception> {
+        self.map
+            .get(slot)
+            .and_then(|idx| self.samplers.get_mut(idx))
+            .and_then(Option::as_mut)
+            .ok_or_else(|| Exception::custom(format!("sample: slot {slot:?} has no sampler")))?
+            .sample(logits)
     }
 }
 
@@ -355,38 +393,36 @@ pub struct SlotStepOutput {
     pub logits: Array,
 }
 
-/// Run a batched decode step across the given
-/// `(slot, current_token, history)` tuples.
+/// Run a batched decode step across the given `(slot, current_token)`
+/// pairs.
 ///
-/// `history` is the per-slot full-context window (prompt + generated so
-/// far) used by the sampler for repetition / frequency / presence
-/// penalties. Penalties are free when the slot's `GenerationConfig` has
-/// them disabled — [`Sampler::sample_array_with_penalties`] no-ops in
-/// that case.
+/// Each slot's repetition / frequency / presence penalties read the
+/// history the slot keeps on the GPU since [admission](ContinuousEngineState::admit),
+/// so nothing about it is uploaded per step, and a slot whose
+/// `GenerationConfig` has no penalties pays nothing.
 ///
 /// The driver:
 /// 1. Schedules `forward` for each slot (one token per slot) without
 ///    evaluating — the returned logits are lazy tensors.
-/// 2. Samples the next token for each slot via its own sampler, passing
-///    the slot's history so penalties apply.
+/// 2. Samples the next token for each slot via its own sampler and
+///    penalties ([`ContinuousEngineState::sample`]), which take the token
+///    into the slot's history lazily.
 /// 3. Calls `async_eval` on the batched sample tensors so the GPU can
 ///    fuse the sampling kernels together.
 /// 4. Extracts `u32` tokens from each sampled tensor (one host sync
 ///    per slot — unavoidable without a single batched sample path).
-/// 5. Calls [`Sampler::update_counts`] per slot so frequency penalty
-///    state advances with the slot's own token stream.
 ///
 /// All forwards run on the caller's current default stream.
 pub fn drive_decode_step<F: SlotForward>(
     forward: &mut F,
     state: &mut ContinuousEngineState,
-    slots: &[(SlotId, u32, &[u32])],
+    slots: &[(SlotId, u32)],
 ) -> Result<Vec<SlotStepOutput>, Exception> {
     use pmetal_bridge::compat::ops::async_eval;
 
     // Phase 1: schedule forwards, collect lazy logits per slot.
     let mut lazy: Vec<(SlotId, Array)> = Vec::with_capacity(slots.len());
-    for &(slot, token, _) in slots {
+    for &(slot, token) in slots {
         let (cache, recurrent) = state
             .slot_caches(slot)
             .ok_or_else(|| Exception::custom(format!("decode: slot {slot:?} not admitted")))?;
@@ -399,12 +435,9 @@ pub fn drive_decode_step<F: SlotForward>(
     // last-position logits around so the caller can compute per-slot
     // logprobs later.
     let mut samples: Vec<(SlotId, Array, Array)> = Vec::with_capacity(slots.len()); // (slot, y, last_logits)
-    for ((slot, full_logits), &(_, _, history)) in lazy.into_iter().zip(slots.iter()) {
+    for (slot, full_logits) in lazy {
         let last = extract_last_logits(&full_logits)?;
-        let sampler = state
-            .sampler_for(slot)
-            .ok_or_else(|| Exception::custom(format!("sample: slot {slot:?} has no sampler")))?;
-        let (y, _filtered) = sampler.sample_array_with_penalties(&last, history)?;
+        let y = state.sample(slot, &last)?;
         samples.push((slot, y, last));
     }
 
@@ -418,14 +451,10 @@ pub fn drive_decode_step<F: SlotForward>(
         async_eval(arrays);
     }
 
-    // Phase 4: per-slot host sync + token extraction + frequency-count
-    // update so the next tick's penalties see the full history.
+    // Phase 4: per-slot host sync + token extraction.
     let mut out = Vec::with_capacity(samples.len());
     for (slot, y, last) in samples {
         let token = y.item::<u32>();
-        if let Some(sampler) = state.sampler_for(slot) {
-            sampler.update_counts(token);
-        }
         out.push(SlotStepOutput {
             slot,
             token,
@@ -447,12 +476,12 @@ pub fn drive_decode_step<F: SlotForward>(
 /// - The model powering `forward` must implement [`FusedBatchForward`]
 ///   (usually a thin closure over `DynamicModel::forward_batched`).
 ///
-/// The `slots` tuple format mirrors [`drive_decode_step`] so the pump
+/// The `slots` pair format mirrors [`drive_decode_step`] so the pump
 /// can hand the same inputs to either path.
 pub fn drive_fused_decode_step<F: FusedBatchForward>(
     forward: &mut F,
     state: &mut ContinuousEngineState,
-    slots: &[(SlotId, u32, &[u32])],
+    slots: &[(SlotId, u32)],
 ) -> Result<Vec<SlotStepOutput>, Exception> {
     use pmetal_bridge::compat::ops::async_eval;
 
@@ -468,7 +497,7 @@ pub fn drive_fused_decode_step<F: FusedBatchForward>(
     // Resolve batch indices in the same order the caller passed.
     let mut active_indices: Vec<usize> = Vec::with_capacity(slots.len());
     let mut input_tokens: Vec<i32> = Vec::with_capacity(slots.len());
-    for &(slot, token, _) in slots {
+    for &(slot, token) in slots {
         let idx = state.batch_idx(slot).ok_or_else(|| {
             Exception::custom(format!("fused decode: slot {slot:?} not admitted"))
         })?;
@@ -487,15 +516,12 @@ pub fn drive_fused_decode_step<F: FusedBatchForward>(
 
     // Extract per-slot last-position logits then sample.
     let mut samples: Vec<(SlotId, Array, Array)> = Vec::with_capacity(slots.len());
-    for (row, &(slot, _, history)) in slots.iter().enumerate() {
+    for (row, &(slot, _)) in slots.iter().enumerate() {
         let idx = Array::from_i32_slice(&[row as i32]);
         // logits: [N, 1, V] → take row → [1, 1, V] → squeeze axis 0 → [1, V]
         let row_logits = logits.take_axis(&idx, 0);
         let last = extract_last_logits(&row_logits)?;
-        let sampler = state
-            .sampler_for(slot)
-            .ok_or_else(|| Exception::custom(format!("sample: slot {slot:?} has no sampler")))?;
-        let (y, _filtered) = sampler.sample_array_with_penalties(&last, history)?;
+        let y = state.sample(slot, &last)?;
         samples.push((slot, y, last));
     }
 
@@ -510,9 +536,6 @@ pub fn drive_fused_decode_step<F: FusedBatchForward>(
     let mut out = Vec::with_capacity(samples.len());
     for (slot, y, last) in samples {
         let token = y.item::<u32>();
-        if let Some(sampler) = state.sampler_for(slot) {
-            sampler.update_counts(token);
-        }
         out.push(SlotStepOutput {
             slot,
             token,
@@ -580,7 +603,7 @@ mod tests {
     fn continuous_state_admit_retire_roundtrip() {
         let mut state = ContinuousEngineState::new(2, make_config());
         let sampler = Sampler::new(pmetal_models::generation::GenerationConfig::default());
-        let idx = state.admit(SlotId(1), sampler).unwrap();
+        let idx = state.admit(SlotId(1), sampler, &[]).unwrap();
         assert_eq!(idx, 0);
         assert_eq!(state.active(), 1);
         assert_eq!(state.batch_idx(SlotId(1)), Some(0));
@@ -671,16 +694,15 @@ mod tests {
     fn seeded_slot_tokens(others: &[Option<u64>]) -> Vec<u32> {
         let mut state = ContinuousEngineState::new(1 + others.len(), make_config());
         let seeded = SlotId(0);
-        state.admit(seeded, sampling(Some(5))).unwrap();
+        state.admit(seeded, sampling(Some(5)), &[]).unwrap();
         let other_ids: Vec<SlotId> = (1..=others.len() as u64).map(SlotId).collect();
         for (&id, &seed) in other_ids.iter().zip(others) {
-            state.admit(id, sampling(seed)).unwrap();
+            state.admit(id, sampling(seed), &[]).unwrap();
         }
-        let history: Vec<u32> = vec![];
         let mut tokens = Vec::new();
         for _ in 0..8 {
-            let mut slots = vec![(seeded, 1u32, history.as_slice())];
-            slots.extend(other_ids.iter().map(|&id| (id, 1u32, history.as_slice())));
+            let mut slots = vec![(seeded, 1u32)];
+            slots.extend(other_ids.iter().map(|&id| (id, 1u32)));
             let outs = drive_decode_step(&mut UniformForward, &mut state, &slots).unwrap();
             tokens.push(outs.iter().find(|o| o.slot == seeded).unwrap().token);
         }
@@ -714,12 +736,14 @@ mod tests {
             .admit(
                 s1,
                 Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &[],
             )
             .unwrap();
         state
             .admit(
                 s2,
                 Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &[],
             )
             .unwrap();
 
@@ -732,14 +756,7 @@ mod tests {
             calls: 0,
         };
 
-        let h1: Vec<u32> = vec![];
-        let h2: Vec<u32> = vec![];
-        let outs = drive_decode_step(
-            &mut stub,
-            &mut state,
-            &[(s1, 100, h1.as_slice()), (s2, 200, h2.as_slice())],
-        )
-        .unwrap();
+        let outs = drive_decode_step(&mut stub, &mut state, &[(s1, 100), (s2, 200)]).unwrap();
         assert_eq!(outs.len(), 2);
         assert_eq!(stub.calls, 2, "one forward per slot");
 
@@ -758,6 +775,7 @@ mod tests {
             .admit(
                 s,
                 Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &[1, 2, 3],
             )
             .unwrap();
 
@@ -782,6 +800,7 @@ mod tests {
             .admit(
                 s,
                 Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &[1, 2, 3],
             )
             .unwrap();
 
@@ -807,8 +826,7 @@ mod tests {
             next_token_per_input: HashMap::new(),
             calls: 0,
         };
-        let empty: &[u32] = &[];
-        let err = drive_decode_step(&mut stub, &mut state, &[(SlotId(99), 1, empty)]).unwrap_err();
+        let err = drive_decode_step(&mut stub, &mut state, &[(SlotId(99), 1)]).unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("not admitted"), "unexpected error: {msg}");
     }
@@ -847,14 +865,13 @@ mod tests {
         let mut state =
             ContinuousEngineState::new(2, make_config()).with_recurrent_state(&MambaCache::new(1));
         let (a, b, c) = (SlotId(1), SlotId(2), SlotId(3));
-        state.admit(a, sampler()).unwrap();
-        state.admit(b, sampler()).unwrap();
+        state.admit(a, sampler(), &[10, 11]).unwrap();
+        state.admit(b, sampler(), &[20, 21]).unwrap();
         let mut stub = RecurrentStub { seen: Vec::new() };
 
         drive_prefill_step(&mut stub, &mut state, a, &[10, 11], true).unwrap();
         drive_prefill_step(&mut stub, &mut state, b, &[20, 21], true).unwrap();
-        let empty: &[u32] = &[];
-        drive_decode_step(&mut stub, &mut state, &[(a, 12, empty), (b, 22, empty)]).unwrap();
+        drive_decode_step(&mut stub, &mut state, &[(a, 12), (b, 22)]).unwrap();
 
         let first_four = stub.seen.clone();
         let [pa, pb, da, db] = &first_four[..] else {
@@ -867,7 +884,7 @@ mod tests {
 
         // `a` finishes; `c` takes its row and must not inherit its state.
         state.retire(a);
-        assert_eq!(state.admit(c, sampler()).unwrap(), 0);
+        assert_eq!(state.admit(c, sampler(), &[30]).unwrap(), 0);
         drive_prefill_step(&mut stub, &mut state, c, &[30], true).unwrap();
         let pc = stub.seen.last().unwrap();
         assert!(pc.1, "a reused row starts from empty state");
@@ -882,9 +899,7 @@ mod tests {
                          _: &[usize],
                          _: &mut FusedBatchKVCache|
          -> Result<Array, Exception> { unreachable!() };
-        let empty: &[u32] = &[];
-        let err =
-            drive_fused_decode_step(&mut never, &mut state, &[(SlotId(1), 1, empty)]).unwrap_err();
+        let err = drive_fused_decode_step(&mut never, &mut state, &[(SlotId(1), 1)]).unwrap_err();
         assert!(format!("{err:?}").contains("recurrent"));
     }
 }

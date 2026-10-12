@@ -44,10 +44,12 @@
 //!   and attaches the entry to the emitted `TokenEvent::Token`. Tokens
 //!   without a logprob request pay nothing.
 //! - Per-slot repetition / frequency / presence penalties — each slot's
-//!   `Sampler` is built from its own `GenerationConfig`, and the
-//!   driver calls `sample_array_with_penalties(&last, &history)` plus
-//!   `update_counts(token)` so penalties apply exactly as they do in
-//!   single-slot generation. No extra work when penalties are off.
+//!   `Sampler` is built from its own `GenerationConfig` and, at admission,
+//!   given its own `DecodePenalties` over the request's whole prompt;
+//!   every token sampled for the slot is folded into them on the GPU, so
+//!   penalties apply exactly as they do in single-request generation
+//!   without uploading a token history per tick. No extra work when
+//!   penalties are off.
 
 use crate::continuous_batch::{
     BatcherConfig, ContinuousBatcher, EnqueueError, FinishReason, SlotId, SlotParams,
@@ -73,20 +75,18 @@ struct SlotRecord {
     current_token: Option<u32>,
     /// Absolute start of request — for latency metrics.
     start: Instant,
-    /// Prompt token count captured at enqueue (for Done metrics).
-    prompt_tokens: usize,
     /// Running count of emitted tokens.
     emitted: usize,
     /// Generation config used to build the per-slot sampler at admit
     /// time. Each request carries its own so temperature / top-p /
     /// penalties aren't shared across concurrent requests.
     gen_config: GenerationConfig,
-    /// Full token history (prompt + generated so far). Drives the
-    /// sampler's repetition-penalty pass each step.
-    all_tokens: Vec<u32>,
+    /// The whole prompt, including any part restored from the prefix
+    /// cache: the slot's penalties start from it at admit time, and the
+    /// prefix cache saves the KV state under it after prefill.
+    prompt: Vec<u32>,
     /// Just the generated-so-far tokens. Used for stop-sequence
-    /// detection; kept separate from `all_tokens` so we can decode only
-    /// the output text without re-decoding the prompt each tick.
+    /// detection, so only the output text is decoded each tick.
     generated: Vec<u32>,
     /// Token ids that end the request without being part of the reply.
     stop_tokens: Vec<u32>,
@@ -268,11 +268,9 @@ impl ContinuousPump {
             }
         }
 
-        // Clone the prompt into `all_tokens` so the sampler sees the
-        // full prompt when applying repetition penalty to the first
-        // generated token. The scheduler consumes the original prompt
-        // or, on a prefix hit, only its uncached suffix.
-        let all_tokens = prompt.clone();
+        // The scheduler consumes the original prompt or, on a prefix hit,
+        // only its uncached suffix; the record keeps all of it, so the
+        // repetition penalty covers the restored part too.
         let slot =
             self.batcher
                 .enqueue_with_reserved_tokens(scheduler_prompt, params, reserved_tokens)?;
@@ -282,10 +280,9 @@ impl ContinuousPump {
                 tx,
                 current_token: None,
                 start: Instant::now(),
-                prompt_tokens,
                 emitted: 0,
                 gen_config,
-                all_tokens,
+                prompt,
                 generated: Vec::new(),
                 stop_tokens,
                 stop_sequences,
@@ -415,20 +412,12 @@ impl ContinuousPump {
                 // decode step.
                 if let Some(last_logits) = maybe_last {
                     self.save_prefix_if_possible(slot);
-                    let (history, top_n) = {
-                        let rec = self
-                            .records
-                            .get(&slot)
-                            .ok_or_else(|| Exception::custom(format!("no record for {slot:?}")))?;
-                        (rec.all_tokens.clone(), rec.logprobs_top_n)
-                    };
-                    let sampler = self.state.sampler_for(slot).ok_or_else(|| {
-                        Exception::custom(format!("slot {slot:?} has no sampler"))
-                    })?;
-                    let (y, _filtered) =
-                        sampler.sample_array_with_penalties(&last_logits, &history)?;
-                    let token = y.item::<u32>();
-                    sampler.update_counts(token);
+                    let top_n = self
+                        .records
+                        .get(&slot)
+                        .ok_or_else(|| Exception::custom(format!("no record for {slot:?}")))?
+                        .logprobs_top_n;
+                    let token = self.state.sample(slot, &last_logits)?.item::<u32>();
                     let logprob = Self::compute_logprob_entry(&last_logits, token, top_n);
                     self.record_first_token(slot, token, logprob)?;
                 }
@@ -438,11 +427,8 @@ impl ContinuousPump {
             }
 
             StepInstruction::Decode { slots } => {
-                // Build (slot, current_token, history) inputs. History
-                // clones are small (at most max_seq_len tokens per
-                // slot) and happen once per tick, so no hot-path
-                // amplification.
-                let mut histories: Vec<Vec<u32>> = Vec::with_capacity(slots.len());
+                // Build (slot, current_token) inputs. Each slot's penalty
+                // history is already on the GPU with its sampler.
                 let mut inputs: Vec<(SlotId, u32)> = Vec::with_capacity(slots.len());
                 for s in &slots {
                     let rec = self
@@ -452,16 +438,10 @@ impl ContinuousPump {
                     let tok = rec.current_token.ok_or_else(|| {
                         Exception::custom(format!("slot {s:?} in Decode without a current token"))
                     })?;
-                    histories.push(rec.all_tokens.clone());
                     inputs.push((*s, tok));
                 }
-                let input_refs: Vec<(SlotId, u32, &[u32])> = inputs
-                    .iter()
-                    .zip(histories.iter())
-                    .map(|((s, t), h)| (*s, *t, h.as_slice()))
-                    .collect();
 
-                let outs = drive_decode_step(forward, &mut self.state, &input_refs)?;
+                let outs = drive_decode_step(forward, &mut self.state, &inputs)?;
 
                 // Deliver tokens + update per-slot state + feed the
                 // scheduler so it can apply stop-token / length /
@@ -486,18 +466,16 @@ impl ContinuousPump {
     /// Allocate a batch row + per-slot sampler for `slot` if not
     /// already admitted. The sampler is built from the slot's per-request
     /// `GenerationConfig` captured at `enqueue` time, so temperature /
-    /// top-p / penalties are honored per request.
+    /// top-p / penalties are honored per request, and its penalties start
+    /// from the request's whole prompt.
     fn admit_if_needed(&mut self, slot: SlotId) -> Result<(), Exception> {
         if self.state.batch_idx(slot).is_some() {
             return Ok(());
         }
-        let cfg = self
-            .records
-            .get(&slot)
-            .map(|r| r.gen_config.clone())
-            .unwrap_or_default();
-        let sampler = Sampler::new(cfg);
-        self.state.admit(slot, sampler)?;
+        let rec = self.records.get(&slot);
+        let sampler = Sampler::new(rec.map(|r| r.gen_config.clone()).unwrap_or_default());
+        let prompt = rec.map_or(&[][..], |r| r.prompt.as_slice());
+        self.state.admit(slot, sampler, prompt)?;
         let prefix_seed = self
             .records
             .get_mut(&slot)
@@ -512,10 +490,11 @@ impl ContinuousPump {
         let Some(prefix_cache) = self.prefix_cache.as_ref().cloned() else {
             return;
         };
-        let Some((tokens, prefix_hit_len)) = self.records.get(&slot).map(|rec| {
-            let end = rec.prompt_tokens.min(rec.all_tokens.len());
-            (rec.all_tokens[..end].to_vec(), rec.prefix_hit_len)
-        }) else {
+        let Some((tokens, prefix_hit_len)) = self
+            .records
+            .get(&slot)
+            .map(|rec| (rec.prompt.clone(), rec.prefix_hit_len))
+        else {
             return;
         };
         let Some(cache) = self.state.cache_for(slot) else {
@@ -601,7 +580,6 @@ impl ContinuousPump {
                 None => return Ok(false),
             };
             rec.current_token = Some(token);
-            rec.all_tokens.push(token);
             if rec.first_token_ms.is_none() {
                 rec.first_token_ms = Some(rec.start.elapsed().as_secs_f64() * 1000.0);
             }
@@ -676,7 +654,7 @@ impl ContinuousPump {
                         } else {
                             0.0
                         },
-                        prompt_tokens: rec.prompt_tokens,
+                        prompt_tokens: rec.prompt.len(),
                         completion_tokens: visible,
                     };
                     let _ = rec.tx.try_send(TokenEvent::Done {
@@ -1234,5 +1212,124 @@ mod tests {
             Some(&2u32),
             "repetition penalty should push the sampler away from 3"
         );
+    }
+
+    const HASHED_VOCAB: i32 = 24;
+
+    /// Last-position logits that depend only on the token fed: fixed,
+    /// pseudo-random values in [-3, 3), both signs, with tokens 0 to 3
+    /// raised by 1, so greedy decoding without penalties soon cycles
+    /// among those four and the penalties break the cycle.
+    fn hashed_logits(token: u32) -> Vec<f32> {
+        (0..HASHED_VOCAB as u64)
+            .map(|v| {
+                let draw = pmetal_bridge::decode::draw_bits(u64::from(token), v);
+                let bias = if v < 4 { 1.0 } else { 0.0 };
+                (draw >> 40) as f32 / (1u64 << 24) as f32 * 6.0 - 3.0 + bias
+            })
+            .collect()
+    }
+
+    struct HashedStub;
+
+    impl SlotForward for HashedStub {
+        fn forward(
+            &mut self,
+            tokens: &[u32],
+            cache: &mut KVCache,
+            _recurrent: Option<&mut MambaCache>,
+        ) -> Result<Array, Exception> {
+            let (h, d) = {
+                let c = cache.config();
+                (c.num_kv_heads as i32, c.head_dim as i32)
+            };
+            let s = tokens.len() as i32;
+            let kv = Array::zeros_f32(&[1, h, s, d]);
+            cache.update_and_fetch(0, &kv, &kv)?;
+            cache.update_and_fetch(1, &kv, &kv)?;
+            let mut data = vec![0.0f32; ((s - 1) * HASHED_VOCAB) as usize];
+            data.extend(hashed_logits(*tokens.last().unwrap()));
+            Ok(Array::from_f32_slice(&data, &[1, s, HASHED_VOCAB]))
+        }
+    }
+
+    /// The single-request path's greedy tokens: `Sampler::sample` over the
+    /// prompt and every token generated so far.
+    fn single_request_tokens(prompt: &[u32], config: GenerationConfig, max: usize) -> Vec<u32> {
+        let mut sampler = Sampler::new(config);
+        let mut history = prompt.to_vec();
+        for _ in 0..max {
+            let last = *history.last().unwrap();
+            let logits = Array::from_f32_slice(&hashed_logits(last), &[1, HASHED_VOCAB]);
+            let token = sampler.sample(&logits, &history).unwrap();
+            history.push(token);
+        }
+        history.split_off(prompt.len())
+    }
+
+    fn greedy_with(repetition: f32, frequency: f32, presence: f32) -> GenerationConfig {
+        let mut config = GenerationConfig::greedy(64);
+        config.repetition_penalty = repetition;
+        config.frequency_penalty = frequency;
+        config.presence_penalty = presence;
+        config
+    }
+
+    /// Requests decoded together each keep their own penalties over their
+    /// own prompt and output, through a request leaving the batch and
+    /// another taking its row, and pick the tokens the single-request path
+    /// picks for them alone.
+    #[tokio::test]
+    async fn batched_penalties_match_the_single_request_path() {
+        let requests = [
+            (vec![1u32, 2, 3, 4], greedy_with(1.3, 0.0, 0.0), 14usize),
+            (vec![5, 6, 7], greedy_with(1.1, 0.8, 0.3), 8),
+            (vec![8, 9, 8], greedy_with(0.7, 0.0, 0.6), 10),
+        ];
+        let mut pump = ContinuousPump::new(
+            BatcherConfig {
+                max_slots: 2,
+                max_queue_depth: 16,
+                ..BatcherConfig::default()
+            },
+            cache_cfg(),
+            None,
+        );
+        let mut receivers: Vec<_> = requests
+            .iter()
+            .map(|(prompt, config, max)| {
+                pump.enqueue(prompt.clone(), params(*max, vec![]), config.clone(), 64)
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        let mut ticks = 0;
+        while pump.tick(&mut HashedStub).unwrap() == Tick::Ran {
+            ticks += 1;
+            assert!(ticks < 200, "the pump never went idle");
+        }
+
+        for (i, ((prompt, config, max), rx)) in requests.iter().zip(&mut receivers).enumerate() {
+            let events = drain(rx);
+            assert!(
+                matches!(events.last(), Some(TokenEvent::Done { .. })),
+                "request {i} finished"
+            );
+            let batched: Vec<u32> = events
+                .iter()
+                .filter_map(|ev| match ev {
+                    TokenEvent::Token { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            let single = single_request_tokens(prompt, config.clone(), *max);
+            assert_eq!(batched, single, "request {i}: batched vs single-request");
+            let unpenalized = single_request_tokens(prompt, GenerationConfig::greedy(64), *max);
+            assert_ne!(
+                batched, unpenalized,
+                "request {i}: the penalties change nothing"
+            );
+        }
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
     }
 }
