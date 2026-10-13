@@ -1004,22 +1004,9 @@ impl InferenceGenState {
 
         if matches!(self.model, LoadedModel::NativeOnly) {
             let stop_tokens = self.gen_config.stop_tokens.clone();
-            // Wire the full filter pipeline through to the bridge.
-            // Previously top_k / top_p / min_p were silently dropped on
-            // the native path: users passing `--top-k 20 --top-p 0.95`
-            // got pure temperature sampling because SamplingParams
-            // didn't carry those fields. Now the bridge applies the
-            // full filter chain.
-            let sampling_params = pmetal_bridge::decode::SamplingParams {
-                temperature: self.gen_config.temperature,
-                top_k: self.gen_config.top_k,
-                top_p: self.gen_config.top_p,
-                min_p: self.gen_config.min_p,
-                repetition_penalty: self.gen_config.repetition_penalty,
-                frequency_penalty: self.gen_config.frequency_penalty,
-                presence_penalty: self.gen_config.presence_penalty,
-                seed: self.gen_config.seed,
-            };
+            // The native engines sample with the filters and penalties the
+            // other paths use.
+            let sampling_params = self.gen_config.sampling_params();
             let on_native_token =
                 |token| forward_native_token(&stop_tokens, &mut on_token_guarded, token);
             let output = if self.images.is_empty() && self.videos.is_empty() {

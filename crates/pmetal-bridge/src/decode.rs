@@ -119,15 +119,16 @@ pub fn scalar_f32_like(value: f32, like: &InlineArray) -> InlineArray {
 /// top-p (nucleus), and min-p, plus repetition / frequency / presence
 /// penalties. Defaults are no-ops for every filter so callers that only
 /// care about temperature can use [`SamplingParams::new`] and ignore the
-/// rest.
+/// rest. [`filtered_log_probs`] applies the filters, after the temperature.
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
+    /// Temperature; at or below 0, greedy decoding.
     pub temperature: f32,
-    /// Top-K filter. `0` disables. Keeps only the top `k` highest-logit
-    /// tokens before sampling.
+    /// Top-K filter. `0` disables. Keeps the tokens at least as likely as
+    /// the `k`-th most likely.
     pub top_k: usize,
-    /// Top-P (nucleus) filter. `1.0` disables. Keeps the smallest set of
-    /// tokens whose cumulative probability exceeds `1 - p`.
+    /// Top-P (nucleus) filter. `1.0` (or `0.0`) disables. Keeps the most
+    /// likely tokens whose probabilities sum to at least `p`.
     pub top_p: f32,
     /// Min-P filter. `0.0` disables. Drops tokens with probability less
     /// than `min_p * top_token_probability`.
@@ -173,80 +174,74 @@ impl SamplingParams {
     }
 }
 
-/// Apply the top-k filter: mask all logits except the `k` highest to
-/// negative infinity. Uses `argpartition_axis` (O(n)) instead of a full
-/// sort. Mirrors the top-k filter of `pmetal_models::generation::Sampler`,
-/// kept here so the bridge can do native-path filtered sampling without
-/// taking a dependency on `pmetal-models`.
-fn apply_top_k(logits_2d: &InlineArray, k: usize, neg_inf: &InlineArray) -> InlineArray {
-    use crate::compat::ops::{argpartition_axis, put_along_axis, slice_last_from};
-    let vocab = logits_2d.dim(-1) as usize;
-    let k = k.min(vocab).max(1);
-    // argpartition on -logits → first k indices are the top-k positions.
-    // We want the indices of the *bottom* (vocab - k) positions to mask
-    // out, which is everything past index k-1 along the partitioned axis.
-    let neg = logits_2d.negative();
-    let part = argpartition_axis(&neg, (k - 1) as i32, -1);
-    let mask_idx = slice_last_from(&part, k as i32);
-    put_along_axis(logits_2d, &mask_idx, neg_inf, -1)
-}
-
-/// Apply the top-p (nucleus) filter: keep the smallest set of tokens
-/// whose cumulative probability exceeds `p`. Mirrors
-/// `pmetal_models::generation::Sampler`'s.
-fn apply_top_p(logits_2d: &InlineArray, p: f32, neg_inf: &InlineArray) -> InlineArray {
-    use crate::compat::ops::{
-        argsort_axis, cumsum, exp, put_along_axis, take_along_axis, which, zeros_like,
-    };
-    let vocab = logits_2d.dim(-1) as usize;
-    let probs = exp(logits_2d);
-    let sorted_indices = argsort_axis(logits_2d, -1);
-    let sorted_probs = take_along_axis(&probs, &sorted_indices, -1);
-    let cumulative = cumsum(&sorted_probs, -1);
-    // Restore original ordering of the cumulative probabilities.
-    let vocab_range = InlineArray::from_i32_slice_shaped(
-        &(0..vocab as i32).collect::<Vec<_>>(),
-        &[1, vocab as i32],
-    );
-    let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices),
-        &sorted_indices,
-        &vocab_range,
-        -1,
-    );
-    let cumulative = take_along_axis(&cumulative, &inverse_indices, -1);
-    let threshold = scalar_f32_like(1.0 - p, logits_2d);
-    let keep = cumulative.greater(&threshold);
-    which(&keep, logits_2d, neg_inf)
-}
-
-/// Apply the min-p filter: drop tokens whose probability is less than
-/// `min_p * top_token_probability`. Mirrors
-/// `pmetal_models::generation::Sampler`'s.
-fn apply_min_p(logits_2d: &InlineArray, min_p: f32, neg_inf: &InlineArray) -> InlineArray {
-    use crate::compat::ops::{
-        argsort_axis, put_along_axis, slice_axis, take_along_axis, which, zeros_like,
-    };
-    let vocab = logits_2d.dim(-1) as usize;
-    let neg = logits_2d.negative();
-    let sorted_indices = argsort_axis(&neg, -1);
-    let sorted_logits = take_along_axis(logits_2d, &sorted_indices, -1);
-    let top_logits = slice_axis(&sorted_logits, -1, 0, 1);
-    let log_min_p = scalar_f32_like(min_p.ln(), logits_2d);
-    let scaled = top_logits.add(&log_min_p);
-    let drop_mask = sorted_logits.less(&scaled);
-    let selected = which(&drop_mask, neg_inf, &sorted_logits);
-    let vocab_range = InlineArray::from_i32_slice_shaped(
-        &(0..vocab as i32).collect::<Vec<_>>(),
-        &[1, vocab as i32],
-    );
-    let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices),
-        &sorted_indices,
-        &vocab_range,
-        -1,
-    );
-    take_along_axis(&selected, &inverse_indices, -1)
+/// The log-probabilities a sampled token is drawn from: `[B, vocab]` logits
+/// in f32, scaled by the temperature, as log-probabilities, then filtered by
+/// top-k, top-p and min-p, in that order. That is the order and the
+/// semantics of transformers' sampling warpers (`TemperatureLogitsWarper`,
+/// `TopKLogitsWarper`, `TopPLogitsWarper`, `MinPLogitsWarper`, each keeping
+/// at least one token), so each filter reads the distribution the ones
+/// before it left:
+///
+/// - top-k keeps the tokens at least as likely as the `k`-th most likely
+///   (all of them on a tie);
+/// - top-p keeps the most likely tokens whose probabilities, renormalized
+///   after top-k, sum to at least `p`: it drops the least likely tokens
+///   while their total stays at most `1 - p`, and on a tie at the cut keeps
+///   every token as likely as the least likely one it keeps;
+/// - min-p keeps the tokens at least `min_p` times as likely as the most
+///   likely one.
+///
+/// A dropped token's log-probability is `-inf`; the rest are the tempered
+/// distribution's, not renormalized over what is kept, which a categorical
+/// draw doesn't need (a caller wanting probabilities subtracts their
+/// `logsumexp`). A `temperature` at or below 0 is taken as 1; greedy
+/// decoding doesn't come here ([`sample_token`]).
+///
+/// Every sampler in the crate graph draws from this: [`sample_token`] for
+/// the native engines, and `pmetal_models`' `Sampler` and
+/// `sampling_log_probs`, which speculative decoding verifies against.
+pub fn filtered_log_probs(logits_2d: &InlineArray, params: &SamplingParams) -> InlineArray {
+    let mut scores = logits_2d.as_dtype(crate::compat::Dtype::Float32.as_i32());
+    if params.temperature > 0.0 && params.temperature != 1.0 {
+        scores = scores.multiply(&InlineArray::from_f32(1.0 / params.temperature));
+    }
+    let mut log_probs = scores.subtract(&scores.logsumexp(-1, true));
+    if !params.has_filters() {
+        return log_probs;
+    }
+    let neg_inf = InlineArray::from_f32(f32::NEG_INFINITY);
+    let vocab = log_probs.dim(-1);
+    if params.top_k > 0 && (params.top_k as i32) < vocab {
+        // The k-th largest value: the smallest of the top k.
+        let kth = log_probs.topk(params.top_k as i32, -1).min_axis(-1, true);
+        log_probs = log_probs.less(&kth).where_cond(&neg_inf, &log_probs);
+    }
+    if params.top_p > 0.0 && params.top_p < 1.0 {
+        // Ascending, the dropped tokens are a prefix: those whose running
+        // total of probability (renormalized over what top-k kept) is at
+        // most 1 - p, short of the last, most likely, token.
+        let order = log_probs.argsort(-1);
+        let sorted = log_probs.take_along_axis(&order, -1);
+        let renormalized = sorted.subtract(&sorted.logsumexp(-1, true));
+        let below = renormalized
+            .exp()
+            .cumsum(-1)
+            .less_equal(&InlineArray::from_f32(1.0 - params.top_p));
+        let dropped = below
+            .as_dtype(crate::compat::Dtype::Int32.as_i32())
+            .sum_axes(&[-1], true)
+            .minimum(&InlineArray::from_i32(vocab - 1));
+        let cut = sorted.take_along_axis(&dropped, -1);
+        log_probs = log_probs.less(&cut).where_cond(&neg_inf, &log_probs);
+    }
+    if params.min_p > 0.0 && params.min_p <= 1.0 {
+        // p < min_p * p_max, in log space, where renormalizing cancels.
+        let floor = log_probs
+            .max_axis(-1, true)
+            .add(&InlineArray::from_f32(params.min_p.ln()));
+        log_probs = log_probs.less(&floor).where_cond(&neg_inf, &log_probs);
+    }
+    log_probs
 }
 
 /// The repetition penalty applied to the logits of tokens already in the
@@ -465,13 +460,10 @@ pub fn draw_bits(seed: u64, draw: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Sample a token from `[B, vocab]` logits through the pipeline in
-/// `params`: temperature, then top-k, top-p and min-p, then a categorical
-/// draw with the key for `draw` (the token's index in the generated text)
+/// Sample a token from `[B, vocab]` logits under `params`: a categorical
+/// draw from [`filtered_log_probs`] (temperature, then top-k, top-p and
+/// min-p), with the key for `draw` (the token's index in the generated text)
 /// when `params` has a seed. At `temperature == 0` it is argmax.
-///
-/// The inverse-temperature scalar is cast to the logits dtype before the
-/// multiply so bf16/f16 decode graphs do not get silently promoted to f32.
 ///
 /// The penalties (`repetition_penalty`, `frequency_penalty`,
 /// `presence_penalty`) are not applied here: they act on the raw logits and
@@ -480,31 +472,7 @@ pub fn sample_token(logits_2d: &InlineArray, params: &SamplingParams, draw: u64)
     if params.temperature <= 0.0 {
         return logits_2d.argmax(-1);
     }
-    let key = params.draw_key(draw);
-    let log_probs = {
-        let inv_temp = scalar_f32_like(1.0 / params.temperature, logits_2d);
-        let lse = logits_2d.logsumexp(-1, true);
-        logits_2d.subtract(&lse).multiply(&inv_temp)
-    };
-    if !params.has_filters() {
-        return log_probs.categorical(-1, key.as_ref());
-    }
-    // Pre-construct the negative-infinity sentinel once per call. Filters
-    // splat it into masked positions; sample_token is called per step so
-    // the alloc is small but unavoidable. It could be cached on a
-    // Sampler struct if/when we factor one out.
-    let neg_inf = scalar_f32_like(f32::NEG_INFINITY, &log_probs);
-    let mut filtered = log_probs;
-    if params.top_k > 0 {
-        filtered = apply_top_k(&filtered, params.top_k, &neg_inf);
-    }
-    if params.top_p < 1.0 && params.top_p > 0.0 {
-        filtered = apply_top_p(&filtered, params.top_p, &neg_inf);
-    }
-    if params.min_p > 0.0 && params.min_p < 1.0 {
-        filtered = apply_min_p(&filtered, params.min_p, &neg_inf);
-    }
-    filtered.categorical(-1, key.as_ref())
+    filtered_log_probs(logits_2d, params).categorical(-1, params.draw_key(draw).as_ref())
 }
 
 /// Run prompt prefill and return the first sampled token (draw 0) with the
@@ -1337,6 +1305,123 @@ mod tests {
 
         let mut plain = DecodeSampler::new(SamplingParams::new(0.0), &[0]);
         assert_eq!(plain.sample(&logits).item_u32(), 0);
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// Which tokens of the distribution `probs` [`filtered_log_probs`]
+    /// keeps under `params`, and their probabilities renormalized.
+    fn kept(probs: &[f32], params: &SamplingParams) -> Vec<Option<f32>> {
+        let logits: Vec<f32> = probs.iter().map(|p| p.ln()).collect();
+        let lp = filtered_log_probs(
+            &InlineArray::from_f32_slice(&logits, &[1, probs.len() as i32]),
+            params,
+        );
+        let lp = lp.subtract(&lp.logsumexp(-1, true));
+        lp.eval();
+        crate::check_unobserved_error().expect("no bridge op failed");
+        lp.as_slice::<f32>()
+            .iter()
+            .map(|&v| (v > f32::NEG_INFINITY).then(|| v.exp()))
+            .collect()
+    }
+
+    fn sampling(temperature: f32) -> SamplingParams {
+        SamplingParams::new(temperature)
+    }
+
+    fn kept_ids(probs: &[f32], params: &SamplingParams) -> Vec<usize> {
+        kept(probs, params)
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.map(|_| i))
+            .collect()
+    }
+
+    /// Temperature comes first, as transformers applies its warpers, so
+    /// top-p reads the tempered distribution: at 0.5, `[0.5, 0.3, 0.2]`
+    /// becomes `[0.66, 0.24, 0.11]`, whose top 0.6 is the first token alone.
+    #[test]
+    fn top_p_reads_the_tempered_distribution() {
+        let probs = [0.5, 0.3, 0.2];
+        let top_p = |t| SamplingParams {
+            top_p: 0.6,
+            ..sampling(t)
+        };
+        assert_eq!(kept_ids(&probs, &top_p(1.0)), [0, 1]);
+        assert_eq!(kept_ids(&probs, &top_p(0.5)), [0]);
+        let only = kept(&probs, &top_p(0.5));
+        assert!((only[0].unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    /// Top-k keeps every token tied with the k-th, and top-p then reads
+    /// what top-k kept, renormalized: `[0.4, 0.3]` is `[0.57, 0.43]`, which
+    /// top 0.6 keeps whole.
+    #[test]
+    fn top_k_keeps_ties_and_top_p_renormalizes_after_it() {
+        let tied = [0.3, 0.3, 0.3, 0.1];
+        let top_k = |k| SamplingParams {
+            top_k: k,
+            ..sampling(1.0)
+        };
+        assert_eq!(kept_ids(&tied, &top_k(2)), [0, 1, 2]);
+        assert_eq!(kept_ids(&tied, &top_k(4)), [0, 1, 2, 3]);
+
+        let probs = [0.4, 0.3, 0.2, 0.1];
+        let both = SamplingParams {
+            top_k: 2,
+            top_p: 0.6,
+            ..sampling(1.0)
+        };
+        assert_eq!(kept_ids(&probs, &both), [0, 1]);
+        let renormalized = kept(&probs, &both);
+        assert!((renormalized[0].unwrap() - 4.0 / 7.0).abs() < 1e-6);
+    }
+
+    /// Top-p drops the least likely tokens while their total is at most
+    /// `1 - p`, always keeping the most likely one; on a tie at the cut it
+    /// keeps every token as likely as the last one kept.
+    #[test]
+    fn top_p_keeps_the_most_likely_token_and_ties_at_the_cut() {
+        let top_p = |p| SamplingParams {
+            top_p: p,
+            ..sampling(1.0)
+        };
+        // Ascending totals 0.1, 0.3, 0.6: at p = 0.65 the first two are at
+        // most 0.35.
+        assert_eq!(kept_ids(&[0.4, 0.3, 0.2, 0.1], &top_p(0.65)), [0, 1]);
+        assert_eq!(kept_ids(&[0.9, 0.1], &top_p(1e-6)), [0]);
+        assert_eq!(kept_ids(&[0.25; 4], &top_p(0.5)), [0, 1, 2, 3]);
+    }
+
+    /// Min-p keeps the tokens at least `min_p` times as likely as the most
+    /// likely, after the temperature: `[0.5, 0.3, 0.15, 0.05]` at 0.4 keeps
+    /// two, and at temperature 2 (ratios 1, 0.77, 0.55, 0.32) three.
+    #[test]
+    fn min_p_scales_with_the_most_likely_token_after_the_temperature() {
+        let min_p = |t| SamplingParams {
+            min_p: 0.4,
+            ..sampling(t)
+        };
+        let probs = [0.5, 0.3, 0.15, 0.05];
+        assert_eq!(kept_ids(&probs, &min_p(1.0)), [0, 1]);
+        assert_eq!(kept_ids(&probs, &min_p(2.0)), [0, 1, 2]);
+    }
+
+    /// The filters run on `[B, vocab]` rows independently and in f32,
+    /// whatever the logits' dtype.
+    #[test]
+    fn the_filters_run_per_row_in_f32() {
+        let logits = InlineArray::from_f32_slice(&[0.0, 1.0, 2.0, 2.0, 1.0, 0.0], &[2, 3])
+            .as_dtype(crate::compat::Dtype::Bfloat16.as_i32());
+        let params = SamplingParams {
+            top_k: 1,
+            ..sampling(0.7)
+        };
+        let lp = filtered_log_probs(&logits, &params);
+        assert_eq!(lp.dtype_raw(), crate::compat::Dtype::Float32.as_i32());
+        lp.eval();
+        let finite: Vec<bool> = lp.as_slice::<f32>().iter().map(|v| v.is_finite()).collect();
+        assert_eq!(finite, [false, false, true, true, false, false]);
         crate::check_unobserved_error().expect("no bridge op failed");
     }
 }

@@ -17,14 +17,14 @@
 //! - Uses pmetal_bridge::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
-use pmetal_bridge::compat::ops::exp;
 use pmetal_bridge::compat::ops::{
-    argmax_axis, argpartition_axis, argsort_axis, async_eval, logsumexp_axis_keepdims,
-    put_along_axis, select_axis, take_along_axis, which, zeros_like,
+    argmax_axis, async_eval, logsumexp_axis_keepdims, select_axis, take_along_axis,
 };
 use pmetal_bridge::compat::random::categorical;
 use pmetal_bridge::compat::{Array, Dtype, Exception};
-use pmetal_bridge::decode::{DecodePenalties, last_token_logits, prompt_tokens_to_input};
+use pmetal_bridge::decode::{
+    DecodePenalties, SamplingParams, filtered_log_probs, last_token_logits, prompt_tokens_to_input,
+};
 use pmetal_mlx::kv_cache::KVCache;
 #[cfg(feature = "ane")]
 use std::collections::HashMap;
@@ -255,17 +255,6 @@ where
     }
 
     last_logits.ok_or_else(|| Exception::custom("chunked prefill produced no output"))
-}
-
-/// Ensure logits are in Float32 format for sampling operations.
-/// Converts BFloat16/Float16 to Float32 if needed.
-/// Note: Does NOT call eval() - keeps operations lazy for GPU pipelining.
-fn ensure_f32(logits: &Array) -> Result<Array, Exception> {
-    match logits.dtype() {
-        Dtype::Float32 => Ok(logits.clone()),
-        Dtype::Bfloat16 | Dtype::Float16 => Ok(logits.cast(Dtype::Float32)),
-        _ => Ok(logits.cast(Dtype::Float32)),
-    }
 }
 
 /// Check if logits are Float32 (avoids clone in hot path).
@@ -575,6 +564,28 @@ impl GenerationConfig {
         )
     }
 
+    /// This config's sampling as the bridge's [`SamplingParams`], which
+    /// [`filtered_log_probs`] and the native engines read: greedy
+    /// (temperature 0) without `do_sample`, and a sampling temperature at
+    /// or below 0 taken as 1.
+    pub fn sampling_params(&self) -> SamplingParams {
+        let temperature = match (self.do_sample, self.temperature) {
+            (false, _) => 0.0,
+            (true, t) if t > 0.0 => t,
+            (true, _) => 1.0,
+        };
+        SamplingParams {
+            temperature,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            min_p: self.min_p,
+            repetition_penalty: self.repetition_penalty,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            seed: self.seed,
+        }
+    }
+
     /// Set stop tokens.
     pub fn with_stop_tokens(mut self, tokens: Vec<u32>) -> Self {
         self.stop_tokens = tokens;
@@ -694,11 +705,8 @@ impl SpeculativeDecodeMetrics {
 /// generation's lifetime ([`decode_penalties`](Self::decode_penalties)).
 pub struct Sampler {
     config: GenerationConfig,
-    /// Cached -inf scalar for filter operations (avoids allocation per token)
-    neg_inf: Array,
-    /// Cached inverse temperature for categorical sampling (1.0 / temp)
-    /// None if temp == 1.0 (no scaling needed)
-    inv_temp: Option<Array>,
+    /// `config` as the bridge reads it ([`GenerationConfig::sampling_params`]).
+    params: SamplingParams,
     /// How many tokens this sampler has drawn: with a seed, draw `n` uses
     /// [`pmetal_bridge::decode::draw_key`]`(seed, n)`.
     draws: std::cell::Cell<u64>,
@@ -709,22 +717,9 @@ impl Sampler {
     /// key derived from the seed, so the sampler's tokens don't depend on
     /// the thread it runs on or on any other random draw.
     pub fn new(config: GenerationConfig) -> Self {
-        // Pre-allocate cached scalar arrays (avoids allocation per token)
-        let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-
-        // Cache inverse temperature for categorical sampling
-        // If temp == 1.0, no scaling needed so we store None
-        let inv_temp = if config.do_sample && config.temperature != 1.0 && config.temperature > 0.0
-        {
-            Some(Array::from_f32(1.0 / config.temperature))
-        } else {
-            None
-        };
-
         Self {
+            params: config.sampling_params(),
             config,
-            neg_inf,
-            inv_temp,
             draws: std::cell::Cell::new(0),
         }
     }
@@ -745,9 +740,9 @@ impl Sampler {
     /// Sampling order:
     /// 1. Apply `penalties` (repetition, frequency, presence) on raw logits,
     ///    and take the sampled token into them
-    /// 2. Convert logits to log probabilities: logprobs = logits - logsumexp(logits)
-    /// 3. Apply filters on log probabilities (top_k, top_p, min_p)
-    /// 4. Categorical sampling: categorical(logprobs * (1/temp))
+    /// 2. Scale by the temperature and filter by top-k, top-p and min-p
+    ///    ([`filtered_log_probs`])
+    /// 3. Draw from what is left (argmax when greedy)
     ///
     /// `penalties` are the generation's, from
     /// [`decode_penalties`](Self::decode_penalties) over its prompt, passed
@@ -795,24 +790,9 @@ impl Sampler {
             return Ok((token, empty_logprobs));
         }
 
-        // Convert logits to log probabilities, in f32:
-        // logprobs = logits - logsumexp(logits, keepdims=True)
-        let log_probs = logits_to_log_probs(logits)?;
-
-        // Apply fused GPU-native filters (cached arrays, single reshape)
-        let log_probs = self.apply_filters_fused(&log_probs)?;
-
-        // Sample from the distribution using GPU-native categorical
-        // Use cached inv_temp to avoid allocation per token
+        let log_probs = filtered_log_probs(logits, &self.params);
         let key = self.next_key();
-        let token = if let Some(ref inv_temp) = self.inv_temp {
-            // Scale by cached inverse temperature
-            let scaled = log_probs.multiply(inv_temp);
-            categorical(&scaled, -1, key.as_ref())
-        } else {
-            // No temperature scaling needed (temp == 1.0)
-            categorical(&log_probs, -1, key.as_ref())
-        };
+        let token = categorical(&log_probs, -1, key.as_ref());
         Ok((token, log_probs))
     }
 
@@ -854,142 +834,6 @@ impl Sampler {
     /// Get the random seed used (useful for reproducibility logging).
     pub fn seed(&self) -> u64 {
         self.config.seed.unwrap_or(0)
-    }
-
-    /// Apply all configured filters in a single fused pass.
-    ///
-    /// Optimizations over separate filter calls:
-    /// - Ensures 2D only once at start (not per-filter)
-    /// - Reuses cached neg_inf Array (no allocation per token)
-    /// - Squeezes back only once at end (not per-filter)
-    fn apply_filters_fused(&self, log_probs: &Array) -> Result<Array, Exception> {
-        let needs_top_k = self.config.top_k > 0;
-        let needs_top_p = self.config.top_p < 1.0 && self.config.top_p > 0.0;
-        let needs_min_p = self.config.min_p > 0.0 && self.config.min_p < 1.0;
-
-        // Fast path: no filtering needed - return reference (no clone!)
-        if !needs_top_k && !needs_top_p && !needs_min_p {
-            // MLX operations create views, so returning as-is is safe
-            // The caller's logits_to_log_probs already created a new array
-            return Ok(log_probs.clone()); // NOTE: This clone is unavoidable due to return type
-        }
-
-        let vocab_size = log_probs.dim(-1) as usize;
-        let was_1d = log_probs.ndim() == 1;
-
-        // Ensure 2D once at start - NO clone needed!
-        // Filter functions (put_along_axis, which, etc.) create new arrays,
-        // so we just need a 2D view to pass to them.
-        let input_2d;
-        let input_2d_ref: &Array = if was_1d {
-            input_2d = log_probs.reshape(&[1, vocab_size as i32]);
-            &input_2d
-        } else {
-            log_probs // Already 2D, just borrow - no clone!
-        };
-
-        // First filter creates a new array, subsequent filters modify that
-        let mut result = input_2d_ref.clone(); // Single clone here
-
-        // Apply top-k filter (uses cached neg_inf)
-        if needs_top_k {
-            result = self.top_k_filter_internal(&result, vocab_size)?;
-        }
-
-        // Apply top-p filter (uses cached neg_inf)
-        if needs_top_p {
-            result = self.top_p_filter_internal(&result, vocab_size)?;
-        }
-
-        // Apply min-p filter (uses cached neg_inf)
-        if needs_min_p {
-            result = self.min_p_filter_internal(&result, vocab_size)?;
-        }
-
-        // Squeeze back once at end
-        Ok(if was_1d { result.squeeze(0) } else { result })
-    }
-
-    /// Internal top-k filter using cached arrays. Input must be 2D [1, vocab_size].
-    fn top_k_filter_internal(
-        &self,
-        logits_2d: &Array,
-        vocab_size: usize,
-    ) -> Result<Array, Exception> {
-        let k = self.config.top_k.min(vocab_size);
-
-        // argpartition on -logits gives indices that partition around k-th largest
-        let neg_logits = logits_2d.negative();
-        let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1);
-        let vocab_size_i32 = logits_2d.dim(-1);
-        let mask_idx = mask_idx.slice(&[0, k as i32], &[1, vocab_size_i32]);
-
-        // Use cached neg_inf
-        Ok(put_along_axis(logits_2d, &mask_idx, &self.neg_inf, -1))
-    }
-
-    /// Internal top-p filter using cached arrays. Input must be 2D [1, vocab_size].
-    fn top_p_filter_internal(
-        &self,
-        logits_2d: &Array,
-        vocab_size: usize,
-    ) -> Result<Array, Exception> {
-        // Convert logits to probabilities
-        let probs = exp(logits_2d);
-
-        // Sort indices in ascending order
-        let sorted_indices = argsort_axis(logits_2d, -1);
-        let sorted_probs = take_along_axis(&probs, &sorted_indices, -1);
-        let cumulative_probs = sorted_probs.cumsum(-1);
-
-        // Create inverse indices to map back
-        let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
-        let inverse_indices = put_along_axis(
-            &zeros_like(&sorted_indices),
-            &sorted_indices,
-            &vocab_range,
-            -1,
-        );
-        let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1);
-
-        // Keep tokens where cumulative probability > (1 - top_p)
-        let threshold = Array::from_f32(1.0 - self.config.top_p);
-        let mask = cumulative_probs.greater(&threshold);
-
-        // Use cached neg_inf
-        Ok(which(&mask, logits_2d, &self.neg_inf))
-    }
-
-    /// Internal min-p filter using cached arrays. Input must be 2D [1, vocab_size].
-    fn min_p_filter_internal(
-        &self,
-        logits_2d: &Array,
-        vocab_size: usize,
-    ) -> Result<Array, Exception> {
-        // Sort indices in descending order
-        let neg_logits = logits_2d.negative();
-        let sorted_indices = argsort_axis(&neg_logits, -1);
-        let sorted_logits = take_along_axis(logits_2d, &sorted_indices, -1);
-
-        // Get top logprob — take first column: [1, vocab] -> [1, 1]
-        let top_logits = sorted_logits.slice(&[0, 0], &[1, 1]);
-        let log_min_p = Array::from_f32(self.config.min_p.ln());
-        let scaled_min_p = top_logits.add(&log_min_p);
-
-        // Mask tokens below threshold
-        let tokens_to_remove = sorted_logits.less(&scaled_min_p);
-        let selected_logits = which(&tokens_to_remove, &self.neg_inf, &sorted_logits);
-
-        // Map back to original order
-        let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
-        let inverse_indices = put_along_axis(
-            &zeros_like(&sorted_indices),
-            &sorted_indices,
-            &vocab_range,
-            -1,
-        );
-
-        Ok(take_along_axis(&selected_logits, &inverse_indices, -1))
     }
 }
 
@@ -1156,35 +1000,21 @@ pub fn token_logprobs(
 /// record into).
 ///
 /// The returned array is normalized log-probabilities after repetition,
-/// frequency/presence penalties, top-k/top-p/min-p filtering, and temperature.
-/// This is useful for speculative sampling verification, where the verifier
-/// needs probabilities for both target and draft distributions rather than only
-/// the sampled token.
+/// frequency/presence penalties, temperature, and top-k/top-p/min-p filtering
+/// ([`filtered_log_probs`], renormalized over the tokens it keeps). This is
+/// useful for speculative sampling verification, where the verifier needs
+/// probabilities for both target and draft distributions rather than only the
+/// sampled token.
 pub fn sampling_log_probs(
     logits: &Array,
     penalties: Option<&mut DecodePenalties>,
     config: &GenerationConfig,
 ) -> Result<Array, Exception> {
-    let logits = match penalties {
-        Some(penalties) => penalties.apply(logits),
-        None => ensure_f32(logits)?,
+    let filtered = match penalties {
+        Some(penalties) => filtered_log_probs(&penalties.apply(logits), &config.sampling_params()),
+        None => filtered_log_probs(logits, &config.sampling_params()),
     };
-
-    let mut log_probs = logits_to_log_probs(&logits)?;
-    if config.top_k > 0 {
-        log_probs = top_k_filter(&log_probs, config.top_k)?;
-    }
-    if config.top_p > 0.0 && config.top_p < 1.0 {
-        log_probs = top_p_filter(&log_probs, config.top_p)?;
-    }
-    if config.min_p > 0.0 && config.min_p < 1.0 {
-        log_probs = min_p_filter(&log_probs, config.min_p)?;
-    }
-    if config.do_sample && config.temperature > 0.0 && config.temperature != 1.0 {
-        log_probs = log_probs.multiply(&Array::from_f32(1.0 / config.temperature));
-    }
-
-    logits_to_log_probs(&log_probs)
+    Ok(filtered.subtract(&logsumexp_axis_keepdims(&filtered, -1, true)))
 }
 
 /// The random draws of one speculative generation: the tokens it samples
@@ -1295,165 +1125,6 @@ pub fn token_probability_from_log_probs(log_probs: &Array, token: u32) -> Result
     let token_index = Array::from_slice(&[token as i32], &[1, 1]);
     let log_prob = take_along_axis(&row, &token_index, -1);
     Ok(log_prob.item::<f32>().exp())
-}
-
-/// GPU-native top-k filtering - keeps only the k tokens with highest probability.
-///
-/// Same algorithm as the reference `apply_top_k`:
-/// - Uses argpartition to find the k-th largest element efficiently
-/// - Uses put_along_axis to mask out tokens below top-k
-/// - All operations stay on GPU - no CPU round-trip
-fn top_k_filter(logits: &Array, k: usize) -> Result<Array, Exception> {
-    let vocab_size = logits.dim(-1) as usize;
-    let k = k.min(vocab_size);
-
-    // Ensure logits is 2D for consistent indexing [1, vocab_size]
-    let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])
-    } else {
-        logits.clone()
-    };
-
-    // argpartition on -logits gives indices that partition around k-th largest
-    // Elements before kth are >= kth, elements after are <= kth
-    let neg_logits = logits_2d.negative();
-    let mask_idx = argpartition_axis(&neg_logits, (k - 1) as i32, -1);
-
-    // Get indices of tokens to mask (everything after top-k)
-    let vocab_size_i32 = logits_2d.dim(-1);
-    let mask_idx = mask_idx.slice(&[0, k as i32], &[1, vocab_size_i32]);
-
-    // Create -inf value for masking
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-
-    // Put -inf at the mask indices
-    let masked = put_along_axis(&logits_2d, &mask_idx, &neg_inf, -1);
-
-    // Squeeze back to original shape if needed
-    if logits.ndim() == 1 {
-        Ok(masked.squeeze(0))
-    } else {
-        Ok(masked)
-    }
-}
-
-/// GPU-native top-p (nucleus) filtering.
-///
-/// Same algorithm as the reference `apply_top_p`:
-/// - Sorts probs in ascending order
-/// - Computes cumulative sum
-/// - Keeps tokens with cumsum > (1 - top_p) threshold
-/// - All operations stay on GPU - no CPU round-trip
-fn top_p_filter(logits: &Array, p: f32) -> Result<Array, Exception> {
-    let vocab_size = logits.dim(-1) as usize;
-
-    // Ensure logits is 2D for consistent indexing [1, vocab_size]
-    let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])
-    } else {
-        logits.clone()
-    };
-
-    // Convert logits to probabilities
-    let probs = exp(&logits_2d);
-
-    // Sort indices in ascending order (by logits, which preserves prob ordering)
-    let sorted_indices = argsort_axis(&logits_2d, -1);
-
-    // Gather sorted probs
-    let sorted_probs = take_along_axis(&probs, &sorted_indices, -1);
-
-    // Compute cumulative sum
-    let cumulative_probs = sorted_probs.cumsum(-1);
-
-    // Create inverse indices to map back to original order
-    let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
-    let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices),
-        &sorted_indices,
-        &vocab_range,
-        -1,
-    );
-
-    // Rearrange cumulative probs back to original order
-    let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1);
-
-    // Keep tokens where cumulative probability > (1 - top_p)
-    // Select tokens with cumsum > 1 - top_p
-    let threshold = Array::from_f32(1.0 - p);
-    let mask = cumulative_probs.greater(&threshold);
-
-    // Apply mask: keep original logits where mask is true, else -inf
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let result = which(&mask, &logits_2d, &neg_inf);
-
-    // Squeeze back to original shape if needed
-    if logits.ndim() == 1 {
-        Ok(result.squeeze(0))
-    } else {
-        Ok(result)
-    }
-}
-
-/// GPU-native min-p filtering - dynamic threshold based on top token probability.
-///
-/// Same algorithm as the reference `apply_min_p`:
-/// - Works in log-probability space for numerical stability
-/// - Computes scaled_min_p = top_logprob + log(min_p)
-/// - Masks tokens with logprob < scaled_min_p
-/// - All operations stay on GPU - no CPU round-trip
-///
-/// Unlike top-p which uses a fixed cumulative probability threshold,
-/// min-p scales the threshold based on the model's confidence (top token probability).
-/// This helps maintain coherence at high temperatures while allowing creativity.
-/// Recommended values: 0.05-0.1
-fn min_p_filter(logits: &Array, min_p: f32) -> Result<Array, Exception> {
-    let vocab_size = logits.dim(-1) as usize;
-
-    // Ensure logits is 2D for consistent indexing [1, vocab_size]
-    let logits_2d = if logits.ndim() == 1 {
-        logits.reshape(&[1, vocab_size as i32])
-    } else {
-        logits.clone()
-    };
-
-    // Sort indices in descending order
-    let neg_logits = logits_2d.negative();
-    let sorted_indices = argsort_axis(&neg_logits, -1);
-    let sorted_logits = take_along_axis(&logits_2d, &sorted_indices, -1);
-
-    // Get top logprob (first element after descending sort)
-    let top_logits = sorted_logits.slice(&[0, 0], &[1, 1]);
-
-    // Calculate the min_p threshold in log space: scaled_min_p = top_logprob + log(min_p)
-    let log_min_p = Array::from_f32(min_p.ln());
-    let scaled_min_p = top_logits.add(&log_min_p);
-
-    // Find tokens to remove: those with logprob < scaled_min_p
-    let tokens_to_remove = sorted_logits.less(&scaled_min_p);
-
-    // Apply mask: -inf where tokens should be removed
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let selected_logits = which(&tokens_to_remove, &neg_inf, &sorted_logits);
-
-    // Create inverse indices to map back to original order
-    let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
-    let inverse_indices = put_along_axis(
-        &zeros_like(&sorted_indices),
-        &sorted_indices,
-        &vocab_range,
-        -1,
-    );
-
-    // Rearrange back to original order
-    let result = take_along_axis(&selected_logits, &inverse_indices, -1);
-
-    // Squeeze back to original shape if needed
-    if logits.ndim() == 1 {
-        Ok(result.squeeze(0))
-    } else {
-        Ok(result)
-    }
 }
 
 /// Simple generation function that works with any model that has a `forward` method.
@@ -2464,34 +2135,59 @@ mod tests {
         assert_eq!(token, 5);
     }
 
+    /// The Sampler draws from exactly the distribution `sampling_log_probs`
+    /// reports (which speculative decoding verifies against), under every
+    /// filter, the temperature and the penalties together, and its seeded
+    /// draws land on the kept tokens about as often as that distribution
+    /// says.
     #[test]
-    fn test_top_k_filter() {
-        // Create logits where first 3 tokens have high values
-        let mut logits_vec = vec![-100.0f32; 10];
-        logits_vec[0] = 10.0;
-        logits_vec[1] = 9.0;
-        logits_vec[2] = 8.0;
-        let logits = Array::from_slice(&logits_vec, &[10]);
+    fn the_sampler_draws_from_sampling_log_probs() {
+        let config = GenerationConfig::sampling(1, 0.7)
+            .with_top_k(6)
+            .with_top_p(0.9)
+            .with_min_p(0.05)
+            .with_repetition_penalty(1.3)
+            .with_frequency_penalty(0.2)
+            .with_seed(11);
+        let logits = Array::from_slice(
+            &[2.0f32, 1.8, 1.5, 1.4, 1.0, 0.6, 0.5, -0.3, -1.0, -2.0],
+            &[1, 10],
+        );
+        let prompt = [0u32, 3];
+        let mut reported = config.decode_penalties(&prompt);
+        reported.as_mut().unwrap().record_id(1);
+        let want = sampling_log_probs(&logits, reported.as_mut(), &config).unwrap();
+        let want: Vec<f32> = want.as_slice::<f32>().iter().map(|v| v.exp()).collect();
 
-        let filtered = top_k_filter(&logits, 3).unwrap();
-        filtered.eval().unwrap();
-
-        // Get filtered values
-        let mut filtered_vec: Vec<f32> = Vec::new();
-        for i in 0..10 {
-            let val = filtered.index(i);
-            val.eval().unwrap();
-            filtered_vec.push(val.item::<f32>());
+        let sampler = Sampler::new(config.clone());
+        let mut counts = [0usize; 10];
+        let draws = 4000;
+        for _ in 0..draws {
+            let mut penalties = config.decode_penalties(&prompt);
+            penalties.as_mut().unwrap().record_id(1);
+            let (token, drawn_from) = sampler
+                .sample_array_penalized(&logits, penalties.as_mut())
+                .unwrap();
+            let drawn_from = drawn_from.subtract(&logsumexp_axis_keepdims(&drawn_from, -1, true));
+            let got: Vec<f32> = drawn_from
+                .as_slice::<f32>()
+                .iter()
+                .map(|v| v.exp())
+                .collect();
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() < 1e-6, "{got:?} against {want:?}");
+            }
+            counts[token.item::<u32>() as usize] += 1;
         }
-
-        // Check that tokens 0, 1, 2 are kept
-        assert!(filtered_vec[0] > f32::NEG_INFINITY);
-        assert!(filtered_vec[1] > f32::NEG_INFINITY);
-        assert!(filtered_vec[2] > f32::NEG_INFINITY);
-
-        // Check that other tokens are filtered
-        for val in filtered_vec.iter().skip(3).take(7) {
-            assert!(val.is_infinite());
+        pmetal_bridge::check_unobserved_error().expect("no bridge op failed");
+        assert!(want.iter().filter(|&&p| p > 0.0).count() > 2, "{want:?}");
+        assert!(want.contains(&0.0), "{want:?}");
+        for (i, (&count, &p)) in counts.iter().zip(&want).enumerate() {
+            let freq = count as f32 / draws as f32;
+            assert!(
+                (freq - p).abs() < 0.03,
+                "token {i}: drawn {freq:.3} of the time, probability {p:.3}"
+            );
         }
     }
 
@@ -2553,41 +2249,6 @@ mod tests {
         assert!(sampler.is_stop_token(2));
         assert!(sampler.is_stop_token(50256));
         assert!(!sampler.is_stop_token(100));
-    }
-
-    #[test]
-    fn test_top_p_filter() {
-        // Create logits with uneven distribution
-        let logits = Array::from_slice(&[10.0f32, 5.0, 1.0, 0.0, -10.0], &[5]);
-
-        let filtered = top_p_filter(&logits, 0.9).unwrap();
-        filtered.eval().unwrap();
-
-        // The first token has very high probability, should be kept
-        let val0 = filtered.index(0);
-        val0.eval().unwrap();
-        assert!(val0.item::<f32>() > f32::NEG_INFINITY);
-    }
-
-    #[test]
-    fn test_min_p_filter() {
-        // Create logits with descending probabilities
-        // After softmax: ~0.88, ~0.12, ~0.004, ... (very small for rest)
-        let logits = Array::from_slice(&[10.0f32, 8.0, 5.0, 1.0, -5.0], &[5]);
-
-        // With min_p = 0.1, threshold = 0.1 * 0.88 = 0.088
-        // Should keep tokens with prob >= 0.088 (token 0 and 1)
-        let filtered = min_p_filter(&logits, 0.1).unwrap();
-        filtered.eval().unwrap();
-
-        // Token 0 and 1 should be kept
-        let val0 = filtered.index(0);
-        val0.eval().unwrap();
-        assert!(val0.item::<f32>() > f32::NEG_INFINITY);
-
-        let val1 = filtered.index(1);
-        val1.eval().unwrap();
-        assert!(val1.item::<f32>() > f32::NEG_INFINITY);
     }
 
     #[test]
