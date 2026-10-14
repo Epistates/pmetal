@@ -41,35 +41,18 @@ pub(super) fn dense_mlp_forward(lw: &LayerWeights, mlp_in: &InlineArray) -> Inli
 
 #[inline]
 fn moe_routed_forward(lw: &LayerWeights, x_flat: &InlineArray) -> InlineArray {
-    let s = x_flat.dim(0);
-    let top_k = lw.moe_top_k;
-
     // ── Router ──────────────────────────────────────────────────────────────
-    // gates: [S, num_experts]
-    let gates = lw
-        .moe_router_w
-        .as_ref()
-        .expect("a MoE layer loads a router")
-        .matmul_from(x_flat)
-        .softmax_precise(-1);
-
-    // Top-k selection: argpartition returns full permutation, take last top_k.
-    // inds: [S, num_experts] → slice to [S, top_k]
-    let all_inds = gates.argpartition(-top_k, -1);
-    let num_experts_dim = gates.dim(1);
-    // MLX >= 0.32 raises "[gather] Cannot calculate VJP with respect to indices"
-    // when routing indices sit downstream of differentiable gates inside a grad
-    // trace. Gradients flow through the gathered scores, never the index path.
-    let inds = all_inds
-        .slice(&[0, num_experts_dim - top_k], &[s, num_experts_dim])
-        .stop_gradient();
-
-    // Gather expert scores: [S, top_k]
-    let mut scores = gates.take_along_axis(&inds, -1);
-    if lw.moe_norm_topk_prob {
-        let score_sum = scores.sum_axis(-1, true);
-        scores = scores.divide(&score_sum);
-    }
+    // The experts a token goes to and their weights, `[S, top_k]` each, from
+    // an f32 softmax as transformers computes it.
+    let (inds, scores) = crate::native_moe::route_top_k(
+        &lw.moe_router_w
+            .as_ref()
+            .expect("a MoE layer loads a router")
+            .matmul_from(x_flat),
+        lw.moe_top_k,
+        lw.moe_norm_topk_prob,
+        x_flat.dtype_raw(),
+    );
 
     // ── Expert dispatch: silu(gate) * up ───────────────────────────────────
     crate::native_moe::switch_glu(

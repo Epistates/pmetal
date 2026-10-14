@@ -9,6 +9,43 @@
 use crate::InlineArray;
 use crate::native_weight::LayerWeight;
 
+/// The top-k softmax router of Qwen3-MoE and the Qwen3.5 family, as
+/// transformers' `Qwen3MoeTopKRouter` and `Qwen3_5MoeTopKRouter` compute it:
+/// `[S, experts]` router logits to each row's `top_k` experts and their
+/// weights, `([S, top_k] indices, [S, top_k] weights)`.
+///
+/// The softmax runs in f32 whatever the model's dtype
+/// (`softmax(logits, dtype=torch.float)`), the experts are the `top_k` largest
+/// probabilities, and with `norm_topk_prob` the weights are renormalized to
+/// sum to one, still in f32; only then are they cast to `out_dtype`, the dtype
+/// of the expert outputs they scale. Done in bf16 throughout, the
+/// probabilities would round to 8 bits before the experts were picked and
+/// again when renormalized.
+///
+/// The indices are not differentiable: gradients reach the router through the
+/// weights alone (MLX >= 0.32 refuses a gather's VJP with respect to indices).
+pub fn route_top_k(
+    router_logits: &InlineArray,
+    top_k: i32,
+    norm_topk_prob: bool,
+    out_dtype: i32,
+) -> (InlineArray, InlineArray) {
+    let (rows, experts) = (router_logits.dim(0), router_logits.dim(1));
+    let probs = router_logits
+        .as_dtype(crate::compat::Dtype::Float32.as_i32())
+        .softmax_precise(-1);
+    // `argpartition` puts the `top_k` largest in the last `top_k` slots.
+    let inds = probs
+        .argpartition(-top_k, -1)
+        .slice(&[0, experts - top_k], &[rows, experts])
+        .stop_gradient();
+    let mut weights = probs.take_along_axis(&inds, -1);
+    if norm_topk_prob {
+        weights = weights.divide(&weights.sum_axis(-1, true));
+    }
+    (inds, weights.as_dtype(out_dtype))
+}
+
 /// `[S, hidden]` to the `[S, 1, 1, hidden]` layout `gather_mm` expects.
 ///
 /// MLX's `SwitchGLU` does `mx.expand_dims(x, (-2, -3))`. Positive axes here
@@ -154,6 +191,81 @@ mod tests {
 
     fn values(mut a: InlineArray, n: usize) -> Vec<f32> {
         a.to_f32_vec(n).expect("read back")
+    }
+
+    /// A bf16 router, as transformers runs it: probabilities and the
+    /// renormalization in f32, the weights cast to bf16 last. The same
+    /// logits through bf16 probabilities and a bf16 sum land on other
+    /// bf16 values (the test checks that they do, so it can tell the two
+    /// apart), and the experts are the same top-2 either way here.
+    #[test]
+    fn a_bf16_router_softmaxes_and_renormalizes_in_f32() {
+        let bf16 = crate::compat::Dtype::Bfloat16.as_i32();
+        let (rows, experts, top_k) = (24usize, 8usize, 2usize);
+        let logits: Vec<f32> = (0..rows * experts)
+            .map(|i| (((i * 53 + 7) % 47) as f32 - 23.0) / 6.0)
+            .collect();
+        // What the model hands the router: logits already rounded to bf16.
+        let rounded =
+            InlineArray::from_f32_slice(&logits, &[rows as i32, experts as i32]).as_dtype(bf16);
+        let host_logits = values(
+            rounded.as_dtype(crate::compat::Dtype::Float32.as_i32()),
+            rows * experts,
+        );
+
+        let (inds, weights) = route_top_k(&rounded, top_k as i32, true, bf16);
+        crate::check_unobserved_error().expect("route");
+        let inds = {
+            let mut a = inds.as_dtype(crate::compat::Dtype::Int32.as_i32());
+            a.to_f32_vec(rows * top_k).expect("indices")
+        };
+        let got = values(
+            weights.as_dtype(crate::compat::Dtype::Float32.as_i32()),
+            rows * top_k,
+        );
+
+        // f64 on the host, rounded to bf16 once at the end.
+        let to_bf16 = |v: f64| {
+            values(
+                InlineArray::from_f32_slice(&[v as f32], &[1]).as_dtype(bf16),
+                1,
+            )[0]
+        };
+        let mut bf16_pipeline_differs = false;
+        for r in 0..rows {
+            let row = &host_logits[r * experts..(r + 1) * experts];
+            let top = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let exp: Vec<f64> = row.iter().map(|&x| f64::from(x - top).exp()).collect();
+            let total: f64 = exp.iter().sum();
+            let probs: Vec<f64> = exp.iter().map(|e| e / total).collect();
+            let mut order: Vec<usize> = (0..experts).collect();
+            order.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+            let chosen = &order[..top_k];
+            let kept: f64 = chosen.iter().map(|&e| probs[e]).sum();
+            for k in 0..top_k {
+                let (e, w) = (inds[r * top_k + k] as usize, got[r * top_k + k]);
+                let want = chosen
+                    .iter()
+                    .position(|&c| c == e)
+                    .map(|_| to_bf16(probs[e] / kept))
+                    .unwrap_or_else(|| panic!("row {r}: expert {e} is not a top-{top_k} expert"));
+                assert_eq!(w, want, "row {r}, expert {e}");
+            }
+            // The bf16 pipeline: probabilities rounded, then their sum.
+            let rounded_probs: Vec<f64> = chosen
+                .iter()
+                .map(|&e| f64::from(to_bf16(probs[e])))
+                .collect();
+            let rounded_sum = f64::from(to_bf16(rounded_probs.iter().sum()));
+            bf16_pipeline_differs |= chosen
+                .iter()
+                .zip(&rounded_probs)
+                .any(|(&e, p)| to_bf16(p / rounded_sum) != to_bf16(probs[e] / kept));
+        }
+        assert!(
+            bf16_pipeline_differs,
+            "the logits do not tell an f32 router from a bf16 one"
+        );
     }
 
     /// `[E, rows, cols]` stacks of small distinct values.

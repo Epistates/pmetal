@@ -1062,13 +1062,18 @@ void mlx_inline_compiled_moe_layer_fixed(
                         int expert_count = router_w.shape(1);
 
                         auto x_flat = reshape(x, {B * S, H});
-                        auto gates = softmax(matmul(x_flat, router_w), -1, /*precise=*/true);
+                        // Routed in f32 as transformers does (`softmax(...,
+                        // dtype=torch.float)`); only the weights go back to the
+                        // model dtype.
+                        auto gates = softmax(
+                            astype(matmul(x_flat, router_w), float32), -1, /*precise=*/true);
                         auto all_inds = argpartition(gates, -TOPK, -1);
                         auto inds = slice(all_inds, {0, expert_count - TOPK}, {B * S, expert_count});
                         auto scores = take_along_axis(gates, inds, -1);
                         if (NORM_TOPK) {
                             scores = divide(scores, sum(scores, {-1}, true));
                         }
+                        scores = astype(scores, x.dtype());
 
                         auto switch_in = expand_dims(expand_dims(x_flat, 1), 2);
                         auto rhs_indices = std::optional<array>(inds);
