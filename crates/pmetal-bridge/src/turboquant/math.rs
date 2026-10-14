@@ -16,12 +16,15 @@ use crate::InlineArray;
 type BetaCodebookKey = (usize, u8);
 type BetaCodebookCache = Mutex<HashMap<BetaCodebookKey, Arc<Vec<f32>>>>;
 
-/// Lloyd-Max iteration cap.
-const LLOYD_MAX_ITERS: usize = 64;
-/// Lloyd-Max convergence threshold.
-const LLOYD_MAX_TOLERANCE: f64 = 1e-7;
-/// Number of grid points for the Beta-distribution quadrature.
-const LLOYD_GRID_POINTS: usize = 8192;
+/// Lloyd-Max iteration cap. Convergence is linear and slows as the codebook
+/// grows: 8 bits needs a few thousand sweeps, each a few hundred lookups.
+const LLOYD_MAX_ITERS: usize = 20_000;
+/// Lloyd-Max convergence threshold, in standard deviations of a coordinate.
+const LLOYD_MAX_TOLERANCE: f64 = 1e-9;
+/// Grid cells for the Beta-density quadrature.
+const LLOYD_GRID_POINTS: usize = 1 << 20;
+/// Half-width of the quadrature grid in standard deviations of a coordinate.
+const LLOYD_SUPPORT_SIGMAS: f64 = 9.0;
 
 /// Lloyd-Max optimal scalar quantisation codebook for the Beta distribution.
 ///
@@ -53,73 +56,120 @@ pub fn beta_codebook(dim: usize, bits: u8) -> Arc<Vec<f32>> {
     computed
 }
 
+/// Cumulative mass and first moment of the coordinate density on a fine grid,
+/// with linear interpolation inside a cell, so a Lloyd-Max step costs one
+/// lookup per cell boundary however many centroids there are.
+struct BetaMoments {
+    lo: f64,
+    step: f64,
+    /// `mass[i]`, `first[i]`: integrals over `[lo, lo + i * step)`.
+    mass: Vec<f64>,
+    first: Vec<f64>,
+}
+
+impl BetaMoments {
+    fn new(dim: usize) -> Self {
+        // The tails past nine standard deviations carry less than 1e-17 of
+        // the mass, far below the resolution of an 8-bit codebook.
+        let half = (LLOYD_SUPPORT_SIGMAS / (dim as f64).sqrt()).min(1.0);
+        let alpha = ((dim as f64) - 3.0) / 2.0;
+        let step = 2.0 * half / (LLOYD_GRID_POINTS as f64);
+        let mut mass = Vec::with_capacity(LLOYD_GRID_POINTS + 1);
+        let mut first = Vec::with_capacity(LLOYD_GRID_POINTS + 1);
+        let (mut m, mut f) = (0.0f64, 0.0f64);
+        mass.push(m);
+        first.push(f);
+        for i in 0..LLOYD_GRID_POINTS {
+            let x = -half + ((i as f64) + 0.5) * step;
+            let w = (1.0 - x * x).max(0.0).powf(alpha);
+            m += w;
+            f += w * x;
+            mass.push(m);
+            first.push(f);
+        }
+        // Normalise to a unit total mass.
+        let total = m;
+        for v in mass.iter_mut().chain(first.iter_mut()) {
+            *v /= total;
+        }
+        Self {
+            lo: -half,
+            step,
+            mass,
+            first,
+        }
+    }
+
+    /// `(mass, first moment)` of `[lo, x)`.
+    fn up_to(&self, x: f64) -> (f64, f64) {
+        let pos = ((x - self.lo) / self.step).clamp(0.0, (self.mass.len() - 1) as f64);
+        let cell = (pos.floor() as usize).min(self.mass.len() - 2);
+        let frac = pos - cell as f64;
+        (
+            self.mass[cell] + frac * (self.mass[cell + 1] - self.mass[cell]),
+            self.first[cell] + frac * (self.first[cell + 1] - self.first[cell]),
+        )
+    }
+
+    /// Smallest grid position whose cumulative mass reaches `target`.
+    fn quantile(&self, target: f64) -> f64 {
+        let cell = self
+            .mass
+            .partition_point(|&m| m < target)
+            .clamp(1, self.mass.len() - 1);
+        let (m0, m1) = (self.mass[cell - 1], self.mass[cell]);
+        let frac = if m1 > m0 {
+            (target - m0) / (m1 - m0)
+        } else {
+            0.5
+        };
+        self.lo + ((cell - 1) as f64 + frac) * self.step
+    }
+}
+
 pub(super) fn build_beta_codebook(dim: usize, bits: u8) -> Vec<f32> {
     let centroid_count = 1usize << bits;
-    let alpha = ((dim as f64) - 3.0) / 2.0;
-    let step = 2.0 / (LLOYD_GRID_POINTS as f64);
+    let moments = BetaMoments::new(dim);
 
-    // Quadrature grid on [-1, 1] weighted by the Beta density.
-    let mut xs = Vec::with_capacity(LLOYD_GRID_POINTS);
-    let mut weights = Vec::with_capacity(LLOYD_GRID_POINTS);
-    for idx in 0..LLOYD_GRID_POINTS {
-        let x = -1.0 + ((idx as f64) + 0.5) * step;
-        let w = if dim <= 2 {
-            1.0
-        } else {
-            (1.0 - x * x).max(0.0).powf(alpha)
-        };
-        xs.push(x);
-        weights.push(w);
-    }
-
-    // Cumulative weights for CDF-based centroid initialisation.
-    let mut cumulative = Vec::with_capacity(LLOYD_GRID_POINTS);
-    let mut total_weight = 0.0f64;
-    for &w in &weights {
-        total_weight += w;
-        cumulative.push(total_weight);
-    }
-
-    // Initialise centroids by CDF inversion.
+    // Start from the centroids of equal-probability cells.
     let mut centroids = Vec::with_capacity(centroid_count);
     for bucket in 0..centroid_count {
-        let target = ((bucket as f64) + 0.5) * total_weight / (centroid_count as f64);
-        let idx = cumulative.partition_point(|&v| v < target);
-        centroids.push(xs[idx.min(xs.len() - 1)]);
+        let left = moments.quantile(bucket as f64 / centroid_count as f64);
+        let right = moments.quantile((bucket as f64 + 1.0) / centroid_count as f64);
+        centroids.push(0.5 * (left + right));
     }
-    centroids.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-    // Iterative Lloyd-Max refinement.
+    // Lloyd-Max: move every centroid to the mean of its cell until none moves
+    // by more than a millionth of a coordinate's standard deviation. The
+    // density is symmetric, so the codebook is kept symmetric.
+    let tolerance = LLOYD_MAX_TOLERANCE / (dim as f64).sqrt();
     for _ in 0..LLOYD_MAX_ITERS {
         let mut boundaries = Vec::with_capacity(centroid_count + 1);
-        boundaries.push(-1.0f64);
-        for pair in centroids.windows(2) {
-            boundaries.push((pair[0] + pair[1]) * 0.5);
-        }
-        boundaries.push(1.0f64);
+        boundaries.push(f64::NEG_INFINITY);
+        boundaries.extend(centroids.windows(2).map(|pair| 0.5 * (pair[0] + pair[1])));
+        boundaries.push(f64::INFINITY);
 
-        let mut updated = centroids.clone();
         let mut max_change = 0.0f64;
+        let mut updated = centroids.clone();
         for bucket in 0..centroid_count {
-            let left = boundaries[bucket];
-            let right = boundaries[bucket + 1];
-            let mut weighted_sum = 0.0f64;
-            let mut weight_sum = 0.0f64;
-            for (&x, &w) in xs.iter().zip(weights.iter()) {
-                if x >= left && x < right {
-                    weighted_sum += x * w;
-                    weight_sum += w;
-                }
+            let (m_left, f_left) = moments.up_to(boundaries[bucket]);
+            let (m_right, f_right) = moments.up_to(boundaries[bucket + 1]);
+            let cell_mass = m_right - m_left;
+            if cell_mass > 0.0 {
+                updated[bucket] = (f_right - f_left) / cell_mass;
             }
-            updated[bucket] = if weight_sum > 0.0 {
-                weighted_sum / weight_sum
-            } else {
-                (left + right) * 0.5
-            };
-            max_change = max_change.max((updated[bucket] - centroids[bucket]).abs());
+        }
+        for bucket in 0..centroid_count / 2 {
+            let mirror = centroid_count - 1 - bucket;
+            let symmetric = 0.5 * (updated[mirror] - updated[bucket]);
+            updated[bucket] = -symmetric;
+            updated[mirror] = symmetric;
+        }
+        for (new, old) in updated.iter().zip(&centroids) {
+            max_change = max_change.max((new - old).abs());
         }
         centroids = updated;
-        if max_change < LLOYD_MAX_TOLERANCE {
+        if max_change < tolerance {
             break;
         }
     }

@@ -185,6 +185,9 @@ pub(super) fn should_zero_qjl() -> bool {
 mod tests;
 
 #[cfg(test)]
+mod codebook_tests;
+
+#[cfg(test)]
 mod reference_tests;
 
 // ═══════════════════════════════════════════════════════════════════════════
