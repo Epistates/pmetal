@@ -15,10 +15,11 @@ target-dir = "target"
 # An explicit PMETAL_MLX_PREFIX in the environment (CI sets one) wins.
 PMETAL_MLX_PREFIX = { value = "target/mlx-prefix", relative = true }
 
-# Release links MLX statically unless told otherwise, so a `cargo install`
-# or a downstream crate gets a binary that runs once its build directory is
-# gone. Here a release `cargo test` links ~96 test binaries, and a ~200 MB
-# static MLX in each is not viable, so this tree links it shared. The jobs
+# MLX links statically unless told otherwise, so a `cargo install` or a
+# downstream crate gets a binary that runs once its build directory is gone.
+# Here `cargo test` links ~96 test binaries per profile, and a ~200 MB static
+# MLX in each is not viable, so this tree links it shared, debug and release
+# alike, from one MLX build in target/mlx-prefix. The jobs
 # that ship a binary (`just build-cli`, release.yml, the Homebrew formula)
 # set PMETAL_MLX_STATIC=1, which wins over this.
 PMETAL_MLX_STATIC = "0"

@@ -171,13 +171,14 @@ fn prepare_cmake_source() -> PathBuf {
 //   lib/mlx.metallib     — compiled Metal kernels (when metal feature on)
 //   include/mlx/**/*.h   — MLX public + internal headers
 //
-// The fingerprint bakes in feature flags and debug/release so a
-// (metal+release) build never aliases a (no-metal+debug) build.
+// The fingerprint bakes in the feature flags and the link kind so a metal
+// build never aliases a no-metal one. The Rust profile isn't part of it:
+// MLX is built the same way for debug and release (see `run_cmake_build`),
+// so both profiles share one slot.
 
 fn mlx_fingerprint() -> String {
     let metal = cfg!(feature = "metal") as u8;
     let accelerate = cfg!(feature = "accelerate") as u8;
-    let debug = cfg!(debug_assertions) as u8;
     let target = env::var("TARGET").unwrap_or_else(|_| "unknown-target".to_string());
     let deployment = if cfg!(target_os = "macos") {
         resolve_deployment_target()
@@ -194,7 +195,7 @@ fn mlx_fingerprint() -> String {
     // the other mode gets reused.
     let static_mlx = mlx_static_requested() as u8;
     format!(
-        "{tag};target={target};macos_deployment={deployment};metal={metal};accelerate={accelerate};debug={debug};static={static_mlx};os={os}",
+        "{tag};target={target};macos_deployment={deployment};metal={metal};accelerate={accelerate};static={static_mlx};os={os}",
         tag = BUNDLED_MLX_GIT_TAG
     )
 }
@@ -345,24 +346,23 @@ fn run_cmake_build() -> PathBuf {
     #[cfg(not(feature = "accelerate"))]
     config.define("MLX_BUILD_ACCELERATE", "OFF");
 
-    #[cfg(debug_assertions)]
-    config.define("CMAKE_BUILD_TYPE", "Debug");
-    #[cfg(not(debug_assertions))]
-    {
-        config.define("CMAKE_BUILD_TYPE", "Release");
-        config.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", "ON");
-        // A shipped binary has to run on a machine that has never seen this
-        // build tree, so release links MLX statically by default
-        // (`mlx_static_requested`): the artifact carries MLX inside it, with
-        // no dylib to locate, no install name, no rpath, nothing to bundle.
-        // Dead-stripping at link time keeps it near the size of the dynamic
-        // build.
-        //
-        // This repository's own release builds opt out (PMETAL_MLX_STATIC=0
-        // in .cargo/config.toml): `libmlx.a` is ~200 MB, and a release
-        // `cargo test` links ~96 test binaries. Its release jobs set
-        // PMETAL_MLX_STATIC=1 back for the artifacts they ship.
-    }
+    // MLX is an optimized C++ library whatever the Rust profile: a debug
+    // build of pmetal debugs pmetal, and an unoptimized MLX only made its
+    // tests slower and its build a second, differently-configured MLX beside
+    // the one release uses.
+    config.define("CMAKE_BUILD_TYPE", "Release");
+    config.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", "ON");
+    // A shipped binary has to run on a machine that has never seen this
+    // build tree, so MLX links statically by default
+    // (`mlx_static_requested`): the artifact carries MLX inside it, with no
+    // dylib to locate, no install name, no rpath, nothing to bundle.
+    // Dead-stripping at link time keeps it near the size of the dynamic
+    // build.
+    //
+    // This repository's own builds opt out (PMETAL_MLX_STATIC=0 in
+    // .cargo/config.toml): `libmlx.a` is ~200 MB, and `cargo test` links ~96
+    // test binaries per profile. Its release jobs set PMETAL_MLX_STATIC=1
+    // back for the artifacts they ship.
     // Always explicit, both ways: CMake caches it in the build tree, so
     // leaving it unset for a static build meant a directory that last built
     // shared (a release `cargo test`, then PMETAL_MLX_STATIC=1) built shared
@@ -375,23 +375,22 @@ fn run_cmake_build() -> PathBuf {
     config.build()
 }
 
-/// Whether to link MLX statically in release. See the call site.
+/// Whether to link MLX statically. See the call site.
 ///
 /// Static unless `PMETAL_MLX_STATIC` says otherwise. A build with no say in
 /// the matter is a `cargo install pmetal` or a crate depending on this one,
 /// and a shared MLX there is a dylib whose install name points into a build
 /// directory that `cargo install` deletes. This repository's
-/// `.cargo/config.toml` sets `PMETAL_MLX_STATIC=0` for its own release
-/// builds, where ~96 test binaries each linking a static MLX would not be
-/// viable. Debug builds static unconditionally, so this only steers release.
+/// `.cargo/config.toml` sets `PMETAL_MLX_STATIC=0` for its own builds, where
+/// ~96 test binaries each linking a static MLX would not be viable. The same
+/// answer holds for debug and release.
 fn mlx_static_requested() -> bool {
     env::var("PMETAL_MLX_STATIC").map_or(true, |v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
-/// Whether this build produces `libmlx.dylib` (else `libmlx.a`): only a
-/// release build with PMETAL_MLX_STATIC=0.
+/// Whether this build produces `libmlx.dylib` (else `libmlx.a`).
 fn mlx_builds_shared() -> bool {
-    !cfg!(debug_assertions) && !mlx_static_requested()
+    !mlx_static_requested()
 }
 
 /// The MLX library file this build links, and the one it must not find.
@@ -527,7 +526,7 @@ fn build_and_link() {
 
     // Resolve MLX artifacts: prefer a matching cache, otherwise build and
     // (if a prefix is configured) populate the cache for next time.
-    let (mlx_lib_dir_built, mlx_include): (PathBuf, PathBuf) =
+    let (mlx_lib_dir_built, mlx_include): (PathBuf, PathBuf) = 'mlx: {
         match mlx_prefix.as_deref().and_then(try_reuse_cached_mlx) {
             Some((lib, inc)) => {
                 println!(
@@ -549,11 +548,6 @@ fn build_and_link() {
                 for dir in ["build/lib", "build/_deps/mlx-build"] {
                     let _ = std::fs::remove_file(dst.join(dir).join(other));
                 }
-                // Legacy search path — cmake puts the fetched target's libs in _deps too.
-                println!(
-                    "cargo:rustc-link-search=native={}/build/_deps/mlx-build",
-                    dst.display()
-                );
 
                 // Rewrite LC_ID_DYLIB on both copies of libmlx.dylib that live
                 // in this build tree. CMake emits the dylib into
@@ -573,20 +567,34 @@ fn build_and_link() {
 
                 if let Some(prefix) = &mlx_prefix {
                     match populate_mlx_prefix(&dst, prefix) {
-                        Ok(()) => println!(
-                            "cargo:warning=Populated MLX cache at {} (tag {BUNDLED_MLX_GIT_TAG})",
-                            prefix.display()
-                        ),
+                        Ok(()) => {
+                            println!(
+                                "cargo:warning=Populated MLX cache at {} (tag {BUNDLED_MLX_GIT_TAG})",
+                                prefix.display()
+                            );
+                            // The cache copy has the build-tree install name
+                            // baked in. Rewrite it to the cache location.
+                            #[cfg(target_os = "macos")]
+                            set_dylib_install_name(&prefix.join("lib").join(mlx_dylib_name()));
+                            // Link the cache, as every later build does, not this
+                            // build tree: a binary linked here would load MLX and
+                            // its metallib from a directory that another variant's
+                            // `cargo clean` or rebuild can delete or replace.
+                            if let Some(cached) = try_reuse_cached_mlx(prefix) {
+                                break 'mlx cached;
+                            }
+                        }
                         Err(e) => println!(
                             "cargo:warning=Failed to populate PMETAL_MLX_PREFIX cache: {e}"
                         ),
                     }
-                    // The cache copy has the build-tree install name baked in.
-                    // Rewrite it to point at the cache location so downstream
-                    // bins built against the cache also load without DYLD help.
-                    #[cfg(target_os = "macos")]
-                    set_dylib_install_name(&prefix.join("lib").join(mlx_dylib_name()));
                 }
+                // No cache: link this build tree. CMake puts the fetched
+                // target's libs in _deps too.
+                println!(
+                    "cargo:rustc-link-search=native={}/build/_deps/mlx-build",
+                    dst.display()
+                );
                 // When FETCHCONTENT_SOURCE_DIR_MLX is set (e.g., MacPorts sandbox),
                 // CMake uses that path directly and never creates _deps/mlx-src.
                 // Fall back to the env var so the bridge C++ is compiled against
@@ -601,7 +609,8 @@ fn build_and_link() {
                 };
                 (dst.join("build/lib"), mlx_inc)
             }
-        };
+        }
+    };
 
     // ── Link libmlx ──
     println!(
