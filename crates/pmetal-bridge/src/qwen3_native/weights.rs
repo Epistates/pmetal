@@ -4,12 +4,10 @@
 
 use crate::InlineArray;
 
-use super::QuantizationConfig;
-
 /// The shared projection-weight type, re-exported so this module's existing
 /// paths keep their spelling. Its definition lives in `native_weight` because
 /// Gemma 4 uses the same one.
-pub use crate::native_weight::{LayerWeight, copy_fresh_arr};
+pub use crate::native_weight::{EmbeddingWeight, LayerWeight, copy_fresh_arr};
 
 // ============================================================================
 // Per-layer weights
@@ -29,15 +27,17 @@ pub(crate) struct LayerWeights {
     pub(crate) mlp_up_w: Option<LayerWeight>,
     pub(crate) mlp_down_w: Option<LayerWeight>,
 
-    // MoE (when is_moe_layer)
-    pub(crate) moe_router_w: Option<InlineArray>,
+    // MoE (when is_moe_layer). The router and the shared expert's gate are
+    // projections like any other: MLX quantizes them (at 8 bits) in the
+    // checkpoints it converts.
+    pub(crate) moe_router_w: Option<LayerWeight>,
     pub(crate) moe_gate_w: Option<LayerWeight>,
     pub(crate) moe_up_w: Option<LayerWeight>,
     pub(crate) moe_down_w: Option<LayerWeight>,
     pub(crate) shared_gate_w: Option<LayerWeight>,
     pub(crate) shared_up_w: Option<LayerWeight>,
     pub(crate) shared_down_w: Option<LayerWeight>,
-    pub(crate) shared_expert_gate_w: Option<InlineArray>,
+    pub(crate) shared_expert_gate_w: Option<LayerWeight>,
 
     pub(crate) moe_top_k: i32,
     pub(crate) moe_norm_topk_prob: bool,
@@ -94,10 +94,9 @@ pub(crate) struct LayerWeights {
 
 /// All model weights as InlineArray.
 pub struct NativeWeights {
-    pub embed_w: InlineArray,
-    /// Quantized embedding: scales + biases (None for dense models)
-    pub embed_scales: Option<InlineArray>,
-    pub embed_biases: Option<InlineArray>,
+    /// The token embedding, dense or packed in any of MLX's modes. A tied
+    /// model's LM head is this table read as a linear layer.
+    pub embed_w: EmbeddingWeight,
     pub final_norm_w: InlineArray,
     pub final_norm_eps: f32,
     /// None when `tie_word_embeddings = true`.
@@ -106,7 +105,6 @@ pub struct NativeWeights {
     /// matrices inside the decoder blocks.
     pub lm_head_w: Option<LayerWeight>,
     pub tie_word_embeddings: bool,
-    pub quantization_config: Option<QuantizationConfig>,
     /// Per-layer weights — opaque to callers; only accessed via [`forward_step`].
     pub(crate) layers: Vec<LayerWeights>,
     /// Model activation dtype (e.g., 11 = bfloat16).

@@ -35,6 +35,21 @@ pub fn forward_step(
     logits
 }
 
+/// [`forward_step`]'s logits for the last position alone, `[B, vocab]`.
+///
+/// The LM head runs over one row instead of `T`: over a 150k-token vocabulary
+/// the logits of a long prompt are gigabytes, and all but the last row are
+/// discarded by whoever samples.
+pub fn forward_step_last(
+    weights: &NativeWeights,
+    token_ids: &InlineArray, // [B, T]
+    cache: &mut NativeCache,
+) -> InlineArray {
+    let hidden = embed_tokens(weights, token_ids);
+    let hidden = decoder_trunk(weights, hidden, cache, None, None);
+    lm_head(weights, &crate::decode::last_token_hidden(&hidden)).squeeze(1)
+}
+
 /// Forward pass returning both the final normalized hidden states and logits.
 ///
 /// Qwen MTP predictors consume the verifier's final hidden states while the
@@ -83,6 +98,31 @@ pub fn forward_embeddings_hidden(
     next_rope_offset: i32,
     cache: &mut NativeCache,
 ) -> (InlineArray, InlineArray) {
+    let hidden = embeddings_trunk(weights, embeddings, mrope, next_rope_offset, cache);
+    let logits = lm_head(weights, &hidden);
+    (hidden, logits)
+}
+
+/// [`forward_embeddings_hidden`]'s logits for the last position alone,
+/// `[B, vocab]`.
+pub fn forward_embeddings_last(
+    weights: &NativeWeights,
+    embeddings: &InlineArray, // [B, T, hidden]
+    mrope: &MropeTables,
+    next_rope_offset: i32,
+    cache: &mut NativeCache,
+) -> InlineArray {
+    let hidden = embeddings_trunk(weights, embeddings, mrope, next_rope_offset, cache);
+    lm_head(weights, &crate::decode::last_token_hidden(&hidden)).squeeze(1)
+}
+
+fn embeddings_trunk(
+    weights: &NativeWeights,
+    embeddings: &InlineArray,
+    mrope: &MropeTables,
+    next_rope_offset: i32,
+    cache: &mut NativeCache,
+) -> InlineArray {
     assert_eq!(
         mrope.len(),
         embeddings.dim(1),
@@ -91,27 +131,15 @@ pub fn forward_embeddings_hidden(
     let embeddings = embeddings.as_dtype(weights.model_dtype);
     let hidden = decoder_trunk(weights, embeddings, cache, Some(mrope), None);
     cache.rope_offset = next_rope_offset;
-    let logits = lm_head(weights, &hidden);
-    (hidden, logits)
+    hidden
 }
 
 /// Token embeddings, `[B, T, hidden]` in the model dtype.
 ///
-/// For quantized models: index into weight/scales/biases rows, then
-/// dequantize, matching Python's `QuantizedEmbedding`:
-/// `dequantize(weight[x], scales[x], biases[x])`.
+/// For quantized models only the rows `token_ids` name are unpacked, as
+/// `mlx.nn.QuantizedEmbedding` does.
 pub fn embed_tokens(weights: &NativeWeights, token_ids: &InlineArray) -> InlineArray {
-    if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
-        let qcfg = weights.quantization_config.as_ref();
-        let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-        let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-        let w_rows = weights.embed_w.take_axis(token_ids, 0); // [B, T, hidden/pack]
-        let s_rows = scales.take_axis(token_ids, 0); // [B, T, hidden/group_size]
-        let b_rows = biases.take_axis(token_ids, 0); // [B, T, hidden/group_size]
-        w_rows.dequantize(&s_rows, &b_rows, gs, bits) // [B, T, hidden] bf16
-    } else {
-        weights.embed_w.take_axis(token_ids, 0)
-    }
+    weights.embed_w.lookup(token_ids)
 }
 
 /// Every decoder layer and the final norm: `[B, T, hidden]` embeddings to
@@ -196,20 +224,18 @@ fn decoder_trunk(
     hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps)
 }
 
-/// The LM head over normalized hidden states.
-fn lm_head(weights: &NativeWeights, hidden: &InlineArray) -> InlineArray {
+/// The LM head over normalized hidden states, `[.., hidden]` to
+/// `[.., vocab]`: the embedding table read as a linear layer when the head is
+/// tied.
+pub fn lm_head(weights: &NativeWeights, hidden: &InlineArray) -> InlineArray {
     if weights.tie_word_embeddings {
-        // For quantized models: use quantized_matmul with the packed embedding weight
-        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
-            let qcfg = weights.quantization_config.as_ref();
-            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-            hidden.quantized_matmul(&weights.embed_w, scales, Some(biases), true, gs, bits)
-        } else {
-            hidden.matmul(&weights.embed_w.t())
-        }
+        weights.embed_w.as_linear(hidden)
     } else {
-        weights.lm_head_w.as_ref().unwrap().matmul_from(hidden)
+        weights
+            .lm_head_w
+            .as_ref()
+            .expect("an untied model loads an LM head")
+            .matmul_from(hidden)
     }
 }
 
@@ -250,18 +276,7 @@ pub fn forward_step_with_capture(
     let s = token_ids.dim(1);
     let dtype = weights.model_dtype;
 
-    let mut hidden =
-        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
-            let qcfg = weights.quantization_config.as_ref();
-            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-            let w_rows = weights.embed_w.take_axis(token_ids, 0);
-            let s_rows = scales.take_axis(token_ids, 0);
-            let b_rows = biases.take_axis(token_ids, 0);
-            w_rows.dequantize(&s_rows, &b_rows, gs, bits)
-        } else {
-            weights.embed_w.take_axis(token_ids, 0)
-        };
+    let mut hidden = embed_tokens(weights, token_ids);
 
     let mut gdn_slot = 0usize;
     let mut attn_slot = 0usize;
@@ -312,18 +327,7 @@ pub fn forward_step_with_capture(
     cache.rope_offset += s;
 
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
-    if weights.tie_word_embeddings {
-        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
-            let qcfg = weights.quantization_config.as_ref();
-            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-            hidden.quantized_matmul(&weights.embed_w, scales, Some(biases), true, gs, bits)
-        } else {
-            hidden.matmul(&weights.embed_w.t())
-        }
-    } else {
-        weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
-    }
+    lm_head(weights, &hidden)
 }
 
 /// Tree-verify variant of [`forward_step_with_capture`]. Each token
@@ -365,18 +369,7 @@ pub fn forward_step_tree_verify(
         attention_mask,
     };
 
-    let mut hidden =
-        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
-            let qcfg = weights.quantization_config.as_ref();
-            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-            let w_rows = weights.embed_w.take_axis(token_ids, 0);
-            let s_rows = scales.take_axis(token_ids, 0);
-            let b_rows = biases.take_axis(token_ids, 0);
-            w_rows.dequantize(&s_rows, &b_rows, gs, bits)
-        } else {
-            weights.embed_w.take_axis(token_ids, 0)
-        };
+    let mut hidden = embed_tokens(weights, token_ids);
 
     let mut gdn_slot = 0usize;
     let mut attn_slot = 0usize;
@@ -431,18 +424,7 @@ pub fn forward_step_tree_verify(
     cache.rope_offset += s;
 
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
-    if weights.tie_word_embeddings {
-        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
-            let qcfg = weights.quantization_config.as_ref();
-            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-            hidden.quantized_matmul(&weights.embed_w, scales, Some(biases), true, gs, bits)
-        } else {
-            hidden.matmul(&weights.embed_w.t())
-        }
-    } else {
-        weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
-    }
+    lm_head(weights, &hidden)
 }
 
 /// Compact the target KV cache after a tree-verify round: the verify

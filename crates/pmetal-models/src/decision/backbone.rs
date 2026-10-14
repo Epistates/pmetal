@@ -45,9 +45,9 @@ impl Backbone {
             Self::Native { weights, .. } => {
                 if weights.tie_word_embeddings {
                     weights
-                        .embed_scales
-                        .is_none()
-                        .then(|| weights.embed_w.clone())
+                        .embed_w
+                        .is_dense()
+                        .then(|| weights.embed_w.weight_arr().clone())
                 } else {
                     match weights.lm_head_w.as_ref()? {
                         // Stored pre-transposed, `[hidden, vocab]`.

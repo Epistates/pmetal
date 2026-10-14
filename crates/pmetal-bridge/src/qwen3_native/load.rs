@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{InlineArray, QuantParams, QuantizedMode};
 
-use super::weights::{LayerWeight, LayerWeights, NativeWeights, copy_fresh_arr};
+use super::weights::{EmbeddingWeight, LayerWeight, LayerWeights, NativeWeights, copy_fresh_arr};
 use super::{Qwen3Config, validate_quantization_runtime_support};
 
 // ============================================================================
@@ -61,83 +61,6 @@ use super::family::{self, canonical_checkpoint_key as canonical_key};
 const MXFP8_GROUP_SIZE: i32 = 32;
 const MXFP8_BITS: i32 = 8;
 
-// ============================================================================
-// MoE quantized expert stacking helper
-// ============================================================================
-
-/// Load pre-stacked MoE expert weights as a `LayerWeight`.
-///
-/// After Step 3e, the stacked weight tensor lives at `{base_key}.weight`.
-/// For quantized models the stacking loop also stored:
-///   `{base_key}.scales`  — [E, out, in/group_size] stacked scales
-///   `{base_key}.biases`  — [E, out, in/group_size] stacked biases
-///
-/// If both scales and biases are present → `LayerWeight::Quantized`.
-/// Otherwise → `LayerWeight::Dense` (the weight is already in [E, in, out] form
-/// from the stacking step, so no additional transpose is needed).
-fn get_stacked_expert_weight(
-    raw: &HashMap<String, InlineArray>,
-    base_key: &str,
-    group_size: i32,
-    bits: i32,
-) -> Result<LayerWeight, String> {
-    let w_key = format!("{base_key}.weight");
-    let s_key = format!("{base_key}.scales");
-    let b_key = format!("{base_key}.biases");
-    let w = raw
-        .get(&w_key)
-        .cloned()
-        .ok_or_else(|| format!("missing stacked expert weight: {w_key}"))?;
-    validate_quantization_runtime_support(bits)?;
-
-    // Float modes carry scales only, plus a per-expert `[E]` tensor scale when
-    // the checkpoint came from NVIDIA ModelOpt.
-    let tensor_scale = raw.get(&format!("{base_key}.tensor_scale")).cloned();
-    let float_modes = [
-        (
-            "mxfp8_scales",
-            QuantParams {
-                group_size: MXFP8_GROUP_SIZE,
-                bits: MXFP8_BITS,
-                mode: QuantizedMode::Mxfp8,
-            },
-        ),
-        (
-            "nvfp4_scales",
-            QuantParams::defaults_for(QuantizedMode::Nvfp4),
-        ),
-    ];
-    for (scales_name, params) in float_modes {
-        if let Some(scales) = raw.get(&format!("{base_key}.{scales_name}")) {
-            return Ok(LayerWeight::Quantized {
-                tensor_scale,
-                weight: w,
-                scales: scales.clone(),
-                biases: None,
-                params,
-            });
-        }
-    }
-
-    match (raw.get(&s_key), raw.get(&b_key)) {
-        (Some(scales), Some(biases)) => Ok(LayerWeight::Quantized {
-            tensor_scale: None,
-            weight: w,
-            scales: scales.clone(),
-            biases: Some(biases.clone()),
-            params: QuantParams {
-                group_size,
-                bits,
-                mode: QuantizedMode::Affine,
-            },
-        }),
-        _ => {
-            // Dense — already [E, in, out]; no transpose needed.
-            Ok(LayerWeight::Dense(w))
-        }
-    }
-}
-
 // Load model weights from a directory containing safetensors shards.
 //
 // Supports all three Qwen variants:
@@ -168,18 +91,23 @@ pub fn load_model(
     let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
     let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
 
-    // Quantization params are present only in quantized checkpoints.
-    let (q_bits, q_group_size) = config
-        .quantization()
-        .map(|qc| (qc.bits, qc.group_size))
-        .unwrap_or((4, 64));
-    validate_quantization_runtime_support(q_bits)?;
-    let default_params = QuantParams {
-        group_size: q_group_size,
-        bits: q_bits,
-        mode: QuantizedMode::Affine,
-    };
-    let mut stacked_quant_params: HashMap<String, QuantParams> = HashMap::new();
+    // How to read a module nothing overrides: MLX's block (which names the
+    // mode, so mxfp4 and nvfp4 checkpoints are read as such), else the plain
+    // bits and group size of a pmetal-written one, else MLX's affine defaults.
+    // Only consulted for a module that stores `scales`.
+    let default_params = config
+        .mlx_quantization
+        .as_ref()
+        .and_then(|q| q.default_params())
+        .or_else(|| {
+            config.quantization().map(|qc| QuantParams {
+                group_size: qc.group_size,
+                bits: qc.bits,
+                mode: QuantizedMode::Affine,
+            })
+        })
+        .unwrap_or_else(|| QuantParams::defaults_for(QuantizedMode::Affine));
+    validate_quantization_runtime_support(default_params.bits)?;
 
     // ── Step 3: Sanitization ────────────────────────────────────────────────
 
@@ -277,33 +205,20 @@ pub fn load_model(
         }
     }
 
-    // 3e. MoE expert weight stacking / normalization.
+    // 3e. MoE experts: Hugging Face's fused layout.
     //
-    // Python's sanitize() stacks per-expert weights into [E, out, in]:
-    //   to_join = [weights[f"{prefix}.experts.{e}.{n}.weight"] for e in range(E)]
-    //   weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+    // Experts reach the model in one of three layouts, and all of them end up
+    // as stacked `[E, out, in]` projections (dense, or packed with their
+    // scales) that `gather_mm` / `gather_qmm` run:
     //
-    // Newer Qwen3.5 MoE checkpoints already ship experts in a packed form:
-    //   - `{prefix}.experts.gate_up_proj` : [E, 2H, in]
-    //   - `{prefix}.experts.down_proj`    : [E, out, H]
-    // We normalize both layouts into the same `switch_mlp.*` keys so the hot
-    // path stays identical.
-    //
-    // For dense weights:
-    //   `gather_mm` in SwitchLinear calls `weight.swapaxes(-1,-2)` at forward
-    //   time (so it uses [E, in, out] at runtime).  We pre-transpose to
-    //   [E, in, out] here so the forward pass can call gather_mm directly
-    //   without the extra transpose node.
-    //
-    // For quantized weights:
-    //   Each expert has `.weight`, `.scales`, `.biases`.
-    //   We stack weight: [E, out, in_packed] — no transpose (gather_qmm handles layout).
-    //   We stack scales: [E, out, in/group_size].
-    //   We stack biases: [E, out, in/group_size].
-    //   These are stored under "switch_mlp.{proj}.weight/.scales/.biases".
-    //
-    // We store the stacked tensors under "switch_mlp.{n}.weight" keys matching
-    // the post-sanitize Python layout for clarity, then look them up by layer.
+    //   * `{prefix}.experts.gate_up_proj` `[E, 2I, in]` and
+    //     `{prefix}.experts.down_proj` `[E, out, I]`: transformers 5's fused
+    //     layout, split here into the next layout's keys;
+    //   * `{prefix}.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}`:
+    //     the layout `mlx_lm` converts to and saves, read as it stands;
+    //   * `{prefix}.experts.{e}.{gate,up,down}_proj.*`: one module per expert
+    //     (transformers 4, NVIDIA ModelOpt), each loaded like any projection
+    //     and stacked when the layer is built.
     if config.is_moe() {
         for li in 0..config.num_hidden_layers as usize {
             if config.is_dense_mlp_layer(li) {
@@ -327,136 +242,13 @@ pub fn load_model(
                     ));
                 }
 
-                // gate_up: [E, 2H, in] -> split into gate/up [E, H, in], then
-                // transpose to [E, in, H] for gather_mm.
-                let gate = gate_up
-                    .index((.., 0..hidden, ..))
-                    .transpose_axes(&[0, 2, 1]);
-                let up = gate_up
-                    .index((.., hidden..(hidden * 2), ..))
-                    .transpose_axes(&[0, 2, 1]);
-                // down: [E, out, H] -> [E, H, out] for gather_mm.
-                let down = down.transpose_axes(&[0, 2, 1]);
-
+                // gate_up: [E, 2I, in] splits into gate and up, [E, I, in]
+                // each, gate first.
+                let gate = gate_up.index((.., 0..hidden, ..));
+                let up = gate_up.index((.., hidden..(hidden * 2), ..));
                 raw.insert(format!("{prefix}.switch_mlp.gate_proj.weight"), gate);
                 raw.insert(format!("{prefix}.switch_mlp.up_proj.weight"), up);
                 raw.insert(format!("{prefix}.switch_mlp.down_proj.weight"), down);
-                continue;
-            }
-
-            for proj in &["gate_proj", "up_proj", "down_proj"] {
-                // Detect whether first expert is quantized. The float modes
-                // (mxfp8, and nvfp4 from a ModelOpt checkpoint) carry scales
-                // only, keyed by mode.
-                let fp_scales_key = ["mxfp8_scales", "nvfp4_scales"]
-                    .into_iter()
-                    .find(|k| raw.contains_key(&format!("{prefix}.experts.0.{proj}.{k}")));
-                let is_quantized = raw.contains_key(&format!("{prefix}.experts.0.{proj}.scales"));
-
-                if let Some(scales_name) = fp_scales_key {
-                    let expert_key =
-                        |e: usize, name: &str| format!("{prefix}.experts.{e}.{proj}.{name}");
-                    // ⚠️ Each ModelOpt expert has its own per-tensor scale.
-                    // Stacking the weights without them decodes noise.
-                    let scaled = raw.contains_key(&expert_key(0, "tensor_scale"));
-                    let mut w_shards = Vec::with_capacity(config.num_experts as usize);
-                    let mut s_shards = Vec::with_capacity(config.num_experts as usize);
-                    let mut t_shards = Vec::with_capacity(config.num_experts as usize);
-
-                    for e in 0..config.num_experts as usize {
-                        let mut take = |name: &str| {
-                            let key = expert_key(e, name);
-                            raw.remove(&key)
-                                .ok_or_else(|| format!("MoE {scales_name}: missing {key}"))
-                        };
-                        w_shards.push(take("weight")?);
-                        s_shards.push(take(scales_name)?);
-                        if scaled {
-                            t_shards.push(take("tensor_scale")?);
-                        }
-                    }
-
-                    let switch_key = |name: &str| format!("{prefix}.switch_mlp.{proj}.{name}");
-                    raw.insert(switch_key("weight"), stack_arrays(w_shards, 0)?);
-                    raw.insert(switch_key(scales_name), stack_arrays(s_shards, 0)?);
-                    if scaled {
-                        // Scalars stack to `[E]`, one per expert.
-                        raw.insert(switch_key("tensor_scale"), stack_arrays(t_shards, 0)?);
-                    }
-                } else if is_quantized {
-                    // Quantized: stack weight, scales, biases separately.
-                    let mut w_shards: Vec<InlineArray> =
-                        Vec::with_capacity(config.num_experts as usize);
-                    let mut s_shards: Vec<InlineArray> =
-                        Vec::with_capacity(config.num_experts as usize);
-                    let mut b_shards: Vec<InlineArray> =
-                        Vec::with_capacity(config.num_experts as usize);
-                    let mut expected: Option<QuantParams> = None;
-
-                    for e in 0..config.num_experts as usize {
-                        let wk = format!("{prefix}.experts.{e}.{proj}.weight");
-                        let sk = format!("{prefix}.experts.{e}.{proj}.scales");
-                        let bk = format!("{prefix}.experts.{e}.{proj}.biases");
-                        let params = quant_params_for(
-                            config,
-                            &format!("{prefix}.experts.{e}.{proj}"),
-                            default_params,
-                        );
-                        validate_quantization_runtime_support(params.bits)?;
-                        match expected {
-                            Some(first) if first != params => {
-                                return Err(format!(
-                                    "MoE quant: experts of {prefix}.experts.*.{proj} are quantized differently ({first:?} vs {params:?}) and can't be stacked"
-                                ));
-                            }
-                            Some(_) => {}
-                            None => expected = Some(params),
-                        }
-                        w_shards.push(
-                            raw.remove(&wk)
-                                .ok_or_else(|| format!("MoE quant: missing {wk}"))?,
-                        );
-                        s_shards.push(
-                            raw.remove(&sk)
-                                .ok_or_else(|| format!("MoE quant: missing {sk}"))?,
-                        );
-                        b_shards.push(
-                            raw.remove(&bk)
-                                .ok_or_else(|| format!("MoE quant: missing {bk}"))?,
-                        );
-                    }
-
-                    // Stack: weight [E, out, in_packed], scales [E, out, in/g], biases same.
-                    // For quantized gather_qmm the weight layout is [E, out, in_packed]
-                    // (no pre-transpose — gather_qmm handles the implicit transpose via
-                    // the `transpose=true` flag we pass in LayerWeight::gather_mm_from).
-                    let w_stacked = stack_arrays(w_shards, 0)?;
-                    let s_stacked = stack_arrays(s_shards, 0)?;
-                    let b_stacked = stack_arrays(b_shards, 0)?;
-
-                    raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), w_stacked);
-                    raw.insert(format!("{prefix}.switch_mlp.{proj}.scales"), s_stacked);
-                    raw.insert(format!("{prefix}.switch_mlp.{proj}.biases"), b_stacked);
-                    stacked_quant_params.insert(
-                        format!("{prefix}.switch_mlp.{proj}.weight"),
-                        expected.unwrap_or(default_params),
-                    );
-                } else {
-                    // Dense: collect and pre-transpose to [E, in, out] for gather_mm.
-                    let mut shards: Vec<InlineArray> =
-                        Vec::with_capacity(config.num_experts as usize);
-                    for e in 0..config.num_experts as usize {
-                        let key = format!("{prefix}.experts.{e}.{proj}.weight");
-                        let w = raw
-                            .remove(&key)
-                            .ok_or_else(|| format!("MoE: missing expert weight {key}"))?;
-                        shards.push(w);
-                    }
-                    // Stack [E, out, in] → then transpose to [E, in, out] for gather_mm.
-                    let stacked = stack_arrays(shards, 0)?;
-                    let transposed = stacked.transpose_axes(&[0, 2, 1]);
-                    raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), transposed);
-                }
             }
         }
     }
@@ -482,13 +274,31 @@ pub fn load_model(
         })
     };
 
-    // Load a projection weight as `LayerWeight`, auto-detecting quantized format.
+    // A module's quantization, as MLX decides it: the module is packed
+    // exactly when `{base_key}.scales` is in the weights. `scales` and
+    // `biases` are the tensors' own sibling keys (affine has both, the float
+    // modes `scales` alone), and how to read them (bits, group size, mode)
+    // comes from the checkpoint's `quantization` block, a module's own entry
+    // first. `None` when the module is dense.
+    let packed_params = |base_key: &str| -> Result<Option<QuantParams>, String> {
+        if !raw.contains_key(&format!("{base_key}.scales")) {
+            return Ok(None);
+        }
+        let has_biases = raw.contains_key(&format!("{base_key}.biases"));
+        let params =
+            quant_params_for(config, base_key, default_params).for_tensors(base_key, has_biases)?;
+        validate_quantization_runtime_support(params.bits)?;
+        Ok(Some(params))
+    };
+
+    // Load a projection weight as `LayerWeight`.
     //
-    // For a dense weight stored at `{base_key}.weight`, looks up sibling keys
-    // `{base_key}.scales` and `{base_key}.biases`.  When both are present the
-    // weight is loaded as `LayerWeight::Quantized` (no transpose — the caller
-    // passes `transpose=true` to `quantized_matmul` at runtime).  Otherwise
-    // falls back to `LayerWeight::Dense` with the weight pre-transposed.
+    // Packed (see `packed_params`) it is `LayerWeight::Quantized`, with no
+    // transpose: the kernel takes the checkpoint's `[out, in_packed]` and
+    // `transpose = true`. Otherwise it is `LayerWeight::Dense`, pre-transposed
+    // to `[in, out]`. The staged `{base_key}.mxfp8_scales` and `.nvfp4_scales`
+    // of the FP8 and ModelOpt normalizations above are packed too, with a
+    // per-tensor scale where ModelOpt gave one.
     //
     // `base_key` is the full key WITHOUT the trailing `.weight` suffix.
     let get_layer_weight = |base_key: &str| -> Result<LayerWeight, String> {
@@ -526,27 +336,15 @@ pub fn load_model(
             });
         }
 
-        match (
-            raw.contains_key(&w_key),
-            raw.contains_key(&s_key),
-            raw.contains_key(&b_key),
-        ) {
-            (true, true, true) => {
-                let params = quant_params_for(config, base_key, default_params);
-                validate_quantization_runtime_support(params.bits)?;
-                Ok(LayerWeight::Quantized {
-                    tensor_scale: None,
-                    weight: get(&w_key)?,
-                    scales: get(&s_key)?,
-                    biases: Some(get(&b_key)?),
-                    // Scales plus biases is affine, whatever the block says.
-                    params: QuantParams {
-                        mode: QuantizedMode::Affine,
-                        ..params
-                    },
-                })
-            }
-            _ => {
+        match packed_params(base_key)? {
+            Some(params) => Ok(LayerWeight::Quantized {
+                tensor_scale: None,
+                weight: get(&w_key)?,
+                scales: get(&s_key)?,
+                biases: take(&b_key),
+                params,
+            }),
+            None => {
                 // Dense path: load `.weight` and pre-transpose for matmul.
                 let w = get(&w_key)?;
                 Ok(LayerWeight::Dense(w.t()))
@@ -554,9 +352,34 @@ pub fn load_model(
         }
     };
 
-    let embed_w = get("model.embed_tokens.weight")?;
-    let embed_scales = get("model.embed_tokens.scales").ok();
-    let embed_biases = get("model.embed_tokens.biases").ok();
+    // A stack of experts at `{base_key}`, `[E, out, in]` as `mlx_lm` saves it
+    // and as the fused layout was split into above: packed as it stands,
+    // dense pre-transposed to `[E, in, out]` for `gather_mm`.
+    let stacked_projection = |base_key: &str| -> Result<LayerWeight, String> {
+        let w_key = format!("{base_key}.weight");
+        match packed_params(base_key)? {
+            Some(params) => Ok(LayerWeight::Quantized {
+                tensor_scale: None,
+                weight: get(&w_key)?,
+                scales: get(&format!("{base_key}.scales"))?,
+                biases: take(&format!("{base_key}.biases")),
+                params,
+            }),
+            None => Ok(LayerWeight::Dense(get(&w_key)?.transpose_axes(&[0, 2, 1]))),
+        }
+    };
+
+    let embed_w = {
+        let base = "model.embed_tokens";
+        let params = packed_params(base)?
+            .unwrap_or_else(|| QuantParams::defaults_for(QuantizedMode::Affine));
+        EmbeddingWeight::new(
+            get(&format!("{base}.weight"))?,
+            take(&format!("{base}.scales")),
+            take(&format!("{base}.biases")),
+            params,
+        )
+    };
     let final_norm_w = get("model.norm.weight")?;
     let final_norm_eps = config.rms_norm_eps;
     let lm_head_w = if config.tie_word_embeddings {
@@ -588,8 +411,8 @@ pub fn load_model(
     let rope_base = config.rope_theta as f32;
     let rope_scale = 1.0_f32;
     let scaled_rope = config.scaled_rope();
-    let attn_gated = !config.is_qwen3_dense();
-    let gdn_gate = if config.is_qwen3_dense() {
+    let attn_gated = !config.has_plain_attention();
+    let gdn_gate = if config.has_plain_attention() {
         family::GdnGateActivation::Silu
     } else {
         config.gdn_gate()?
@@ -620,41 +443,43 @@ pub fn load_model(
             shared_expert_gate_w,
         ) = if is_moe_layer {
             // MoE layer: router + stacked experts + shared expert.
-            // router gate: stored as [num_experts, hidden]; transpose to [hidden, num_experts].
-            // The router is a tiny matrix and is never quantized.
-            let router = get(&format!("{p}.mlp.gate.weight"))?.t();
+            // The router, `[num_experts, hidden]` in the checkpoint, is a
+            // projection like the rest, and `mlx_lm` quantizes it (at 8 bits).
+            let router = get_layer_weight(&format!("{p}.mlp.gate"))?;
 
-            // Stacked expert weights were placed under "switch_mlp.{proj}.weight" during
-            // Step 3e above.  For quantized models the stacking loop also placed
-            // "switch_mlp.{proj}.scales" and ".biases" — check for those here.
+            // Stacked as the checkpoint ships them (`switch_mlp`, or the fused
+            // layout split above), else one module per expert, stacked here.
             let stacked = |proj: &str| -> Result<LayerWeight, String> {
                 let base = format!("{p}.mlp.switch_mlp.{proj}");
-                let params = stacked_quant_params
-                    .get(&format!("{base}.weight"))
-                    .copied()
-                    .unwrap_or_else(|| quant_params_for(config, &base, default_params));
-                for part in [
-                    "weight",
-                    "scales",
-                    "biases",
-                    "mxfp8_scales",
-                    "nvfp4_scales",
-                    "tensor_scale",
-                ] {
-                    take(&format!("{base}.{part}"));
+                if raw.contains_key(&format!("{base}.weight")) {
+                    return stacked_projection(&base);
                 }
-                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)
+                let experts = (0..config.num_experts)
+                    .map(|e| get_layer_weight(&format!("{p}.mlp.experts.{e}.{proj}")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                LayerWeight::stack(experts).map_err(|e| format!("{p}.mlp.experts.*.{proj}: {e}"))
             };
             let moe_gate = stacked("gate_proj")?;
             let moe_up = stacked("up_proj")?;
             let moe_down = stacked("down_proj")?;
 
-            // Shared expert weights — may be quantized.
-            let sh_gate = get_layer_weight(&format!("{p}.mlp.shared_expert.gate_proj"))?;
-            let sh_up = get_layer_weight(&format!("{p}.mlp.shared_expert.up_proj"))?;
-            let sh_down = get_layer_weight(&format!("{p}.mlp.shared_expert.down_proj"))?;
-            // Shared expert gate: [1, hidden]; tiny matrix, never quantized.
-            let sh_eg = get(&format!("{p}.mlp.shared_expert_gate.weight"))?.t();
+            // The shared expert (the Qwen3.5 family; Qwen3-MoE has none),
+            // may be quantized. Its gate is `[1, hidden]`, quantized by
+            // `mlx_lm` like the router.
+            let shared = if config.has_shared_expert() {
+                (
+                    Some(get_layer_weight(&format!(
+                        "{p}.mlp.shared_expert.gate_proj"
+                    ))?),
+                    Some(get_layer_weight(&format!("{p}.mlp.shared_expert.up_proj"))?),
+                    Some(get_layer_weight(&format!(
+                        "{p}.mlp.shared_expert.down_proj"
+                    ))?),
+                    Some(get_layer_weight(&format!("{p}.mlp.shared_expert_gate"))?),
+                )
+            } else {
+                (None, None, None, None)
+            };
             (
                 None,
                 None,
@@ -663,10 +488,10 @@ pub fn load_model(
                 Some(moe_gate),
                 Some(moe_up),
                 Some(moe_down),
-                Some(sh_gate),
-                Some(sh_up),
-                Some(sh_down),
-                Some(sh_eg),
+                shared.0,
+                shared.1,
+                shared.2,
+                shared.3,
             )
         } else {
             // Dense MLP — may be quantized.
@@ -831,7 +656,7 @@ pub fn load_model(
     // A Qwen3.5-family checkpoint tensor that nothing above read is a weight
     // the model would run without. The vision tower and the MTP predictor
     // were dropped by name in step 3b; anything else left over is refused.
-    if !config.is_qwen3_dense() {
+    if !config.has_plain_attention() {
         let consumed = consumed.borrow();
         let mut unread: Vec<&String> = raw.keys().filter(|k| !consumed.contains(*k)).collect();
         if !unread.is_empty() {
@@ -864,7 +689,7 @@ pub fn load_model(
     let cf_arr = |w: &InlineArray| -> InlineArray { copy_fresh_arr(w, &zero) };
     let cf_lw = |w: &LayerWeight| -> LayerWeight { w.copy_fresh(&zero) };
 
-    let embed_w = cf_arr(&embed_w);
+    let embed_w = embed_w.copy_fresh(&zero);
     let final_norm_w = cf_arr(&final_norm_w);
     let lm_head_w = lm_head_w.map(|w| cf_lw(&w));
 
@@ -881,9 +706,10 @@ pub fn load_model(
         if let Some(ref w) = lw.mlp_down_w {
             lw.mlp_down_w = Some(cf_lw(w));
         }
-        // MoE — router is InlineArray; stacked expert weights are LayerWeight
+        // MoE — the router, the stacked experts and the shared expert's gate
+        // are all LayerWeights
         if let Some(ref w) = lw.moe_router_w {
-            lw.moe_router_w = Some(cf_arr(w));
+            lw.moe_router_w = Some(cf_lw(w));
         }
         if let Some(ref w) = lw.moe_gate_w {
             lw.moe_gate_w = Some(cf_lw(w));
@@ -904,7 +730,7 @@ pub fn load_model(
             lw.shared_down_w = Some(cf_lw(w));
         }
         if let Some(ref w) = lw.shared_expert_gate_w {
-            lw.shared_expert_gate_w = Some(cf_arr(w));
+            lw.shared_expert_gate_w = Some(cf_lw(w));
         }
         // Attention projections (LayerWeight); norms are InlineArray
         if let Some(ref w) = lw.attn_q_w {
@@ -975,34 +801,14 @@ pub fn load_model(
 
     Ok(NativeWeights {
         embed_w,
-        embed_scales,
-        embed_biases,
         final_norm_w,
         final_norm_eps,
         lm_head_w,
         tie_word_embeddings: config.tie_word_embeddings,
-        quantization_config: config.quantization().cloned(),
         layers,
         model_dtype,
         qjl_matrix: None, // populated by apply_qjl_matrix() when --kv-qjl is set
     })
-}
-
-// ============================================================================
-// Stack helper — joins per-expert arrays along a new axis
-// ============================================================================
-//
-// ⚠️ One `mlx::core::stack`, not a chain of pairwise concatenates. The chain
-// copied the growing accumulator at every step, O(E²) in bytes, which for a
-// 256-expert layer is gigabytes of copying per projection.
-
-fn stack_arrays(arrays: Vec<InlineArray>, axis: i32) -> Result<InlineArray, String> {
-    if arrays.is_empty() {
-        return Err("stack_arrays: empty input".to_string());
-    }
-    let stacked = crate::compat::ops::stack_axis(&arrays, axis);
-    crate::check_last_error().map_err(|e| format!("stack_arrays: {e}"))?;
-    Ok(stacked)
 }
 
 #[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]

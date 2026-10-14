@@ -38,16 +38,16 @@ pub use cache::{
     GdnCache, KvLayerCache, MixedBitConfig, NativeCache, QuantCacheConfig, QuantizedTuple,
 };
 pub use forward::{
-    compact_tree_cache, embed_tokens, forward_embeddings_hidden, forward_step, forward_step_hidden,
-    forward_step_hidden_recording, forward_step_tree_verify, forward_step_with_capture,
-    rollback_cache,
+    compact_tree_cache, embed_tokens, forward_embeddings_hidden, forward_embeddings_last,
+    forward_step, forward_step_hidden, forward_step_hidden_recording, forward_step_last,
+    forward_step_tree_verify, forward_step_with_capture, lm_head, rollback_cache,
 };
-pub use generate::{benchmark_trial, generate, prefill_first_token};
+pub use generate::{benchmark_trial, generate, prefill_chunk, prefill_first_token};
 pub use load::load_model;
 pub use speculative::{GdnReplay, rewind_verify};
 pub use weights::{
-    LayerWeight, NativeWeights, apply_kv_preconditioning, apply_outlier_permutation,
-    apply_qjl_matrix,
+    EmbeddingWeight, LayerWeight, NativeWeights, apply_kv_preconditioning,
+    apply_outlier_permutation, apply_qjl_matrix,
 };
 
 // ============================================================================
@@ -312,9 +312,28 @@ impl Qwen3Config {
         mt == "qwen3" || mt == "qwen3dense"
     }
 
-    /// Returns `true` when this is a MoE model (routed experts + shared expert).
+    /// Returns `true` for Qwen3-MoE (`qwen3_moe`: Qwen3-30B-A3B and its family),
+    /// Qwen3's attention over sparse MLPs with no shared expert.
+    pub fn is_qwen3_moe(&self) -> bool {
+        self.model_type.eq_ignore_ascii_case("qwen3_moe")
+    }
+
+    /// Returns `true` for the models with Qwen3's own attention (no output
+    /// gate, full rotary, no GatedDeltaNet layers): `qwen3` and `qwen3_moe`.
+    /// The Qwen3.5 family is the other branch.
+    pub fn has_plain_attention(&self) -> bool {
+        self.is_qwen3_dense() || self.is_qwen3_moe()
+    }
+
+    /// Returns `true` when this is a MoE model (routed experts).
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0
+    }
+
+    /// Returns `true` when a sparse layer also runs a shared expert behind its
+    /// own gate (the Qwen3.5 family); Qwen3-MoE's is the routed experts alone.
+    pub fn has_shared_expert(&self) -> bool {
+        self.shared_expert_intermediate_size > 0
     }
 
     /// Returns `true` when the MLP at the given layer index should be dense.
@@ -337,10 +356,10 @@ impl Qwen3Config {
 
     /// Effective partial rotary factor.
     ///
-    /// - Qwen3 dense: always 1.0 (full RoPE).
+    /// - Qwen3 dense and Qwen3-MoE: always 1.0 (full RoPE).
     /// - Qwen3.5: stored value, defaulting to 0.25.
     pub fn effective_partial_rotary_factor(&self) -> f64 {
-        if self.is_qwen3_dense() {
+        if self.has_plain_attention() {
             1.0
         } else {
             self.partial_rotary_factor.unwrap_or(0.25)
@@ -398,12 +417,12 @@ impl Qwen3Config {
 
     /// Returns `true` when layer `i` is a GDN (linear-attention) layer.
     ///
-    /// For Qwen3 dense, all layers are attention — never GDN.
+    /// For Qwen3 dense and Qwen3-MoE, all layers are attention — never GDN.
     /// For Qwen3.5 the checkpoint's `layer_types` decides. When a config
     /// carries none (only one built in code, since parsing expands it), every
     /// `full_attention_interval`-th layer (1-indexed) is full attention.
     pub fn is_linear_layer(&self, i: usize) -> bool {
-        if self.is_qwen3_dense() {
+        if self.has_plain_attention() {
             return false;
         }
         if let Some(types) = self.layer_types.as_ref().and_then(|t| t.get(i)) {
@@ -491,6 +510,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         text.to_owned()
     };
 
+    refuse_unrun_features(&config_str)?;
     let mut cfg: Qwen3Config =
         serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
     // MLX's per-module overrides, with their paths canonicalized the way the
@@ -518,6 +538,18 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         cfg.quantization_config = None;
         cfg.mlx_quantization = None;
     }
+    // transformers' `Qwen3MoeConfig` renormalizes the top-k weights only when
+    // told to (`norm_topk_prob` defaults to false; the released checkpoints
+    // say true). The Qwen3.5 family's defaults are filled in by `family`.
+    if cfg.is_qwen3_moe() {
+        let named = serde_json::from_str::<serde_json::Value>(&config_str)
+            .ok()
+            .and_then(|v| v.get("norm_topk_prob").cloned())
+            .is_some_and(|v| !v.is_null());
+        if !named {
+            cfg.norm_topk_prob = false;
+        }
+    }
     cfg.rotary = rotary;
     cfg.finalize();
     // Dense Qwen3 carries its scaling in `rope_scaling` (YaRN, `factor` 4 over
@@ -535,6 +567,33 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         )?);
     }
     Ok(cfg)
+}
+
+/// Refuse, by name, what a text config asks for and the engine would run
+/// without: the checkpoint would load and decode as a different model.
+///
+/// * `use_sliding_window`: windowed attention on the layers past
+///   `max_window_layers`. Only the flag matters; `sliding_window` alone is
+///   inert, as in transformers.
+/// * `attention_bias`: biases on the attention projections, which the loader
+///   does not read.
+fn refuse_unrun_features(config: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(config).map_err(|e| format!("failed to parse config: {e}"))?;
+    let on = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    if on("use_sliding_window") {
+        return Err(
+            "use_sliding_window is not supported: the native engine attends over the whole \
+             context in every layer"
+                .into(),
+        );
+    }
+    if on("attention_bias") {
+        return Err(
+            "attention_bias is not supported: the attention projections load no biases".into(),
+        );
+    }
+    Ok(())
 }
 
 fn json_quantization_is_sidecar(value: &serde_json::Value) -> bool {
@@ -573,6 +632,44 @@ mod tests {
         let err = parse_config_text(&config(r#"{"rope_type": "xpos", "factor": 2.0}"#))
             .expect_err("unknown type refused");
         assert!(err.contains("xpos"), "{err}");
+    }
+
+    /// What the engine would silently drop is refused by name: windowed
+    /// attention on some layers, and projection biases it never loads.
+    /// `sliding_window` alone, with `use_sliding_window` false (what every
+    /// released Qwen3 ships), is inert, as in transformers.
+    #[test]
+    fn features_the_engine_does_not_run_are_refused() {
+        let config = |extra: &str| {
+            format!(
+                r#"{{"model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": 2,
+                    "num_attention_heads": 4, "head_dim": 16{extra}}}"#
+            )
+        };
+        for (extra, needle) in [
+            (
+                r#", "use_sliding_window": true, "sliding_window": 4096"#,
+                "use_sliding_window",
+            ),
+            (r#", "attention_bias": true"#, "attention_bias"),
+        ] {
+            let err = parse_config_text(&config(extra)).expect_err(extra);
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
+        for extra in [
+            r#", "use_sliding_window": false, "sliding_window": 4096"#,
+            r#", "sliding_window": null"#,
+            r#", "attention_bias": false"#,
+        ] {
+            parse_config_text(&config(extra)).unwrap_or_else(|e| panic!("{extra}: {e}"));
+        }
+        // The same keys inside a Qwen3.5 text config.
+        let nested = r#"{"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text",
+            "hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 32, "linear_key_head_dim": 32,
+            "attention_bias": true}}"#;
+        let err = parse_config_text(nested).expect_err("Qwen3.5 attention_bias");
+        assert!(err.contains("attention_bias"), "{err}");
     }
 
     #[test]

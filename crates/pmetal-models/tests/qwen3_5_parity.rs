@@ -318,6 +318,179 @@ fn native_prefill_and_decode(profile: &str) {
     assert_all_pass(&format!("{profile}: native cached decode"), &reports);
 }
 
+/// The prompt in prefill passes of several sizes, the sizes chosen to split it
+/// inside a GDN layer's convolution window (kernel 4) and the reference's
+/// 64-token chunk: the last position's logits, and the caches the passes leave
+/// (a GDN layer's recurrent state included) for the decode that follows, must
+/// be `transformers`'.
+fn native_chunked_prefill(profile: &str) {
+    use pmetal_bridge::decode::{prefill_last_logits, prompt_tokens_to_input};
+    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
+    use pmetal_mlx::test_utils::to_f32_vec_eval;
+
+    let fx = checkpoint(profile);
+    let config = load_config(fx.path()).expect("native config parses");
+    let weights = load_model(fx.path(), &config).expect("native weights load");
+    drain_bridge("native load");
+    let ids: Vec<u32> = to_f32_vec_eval(&fx.input_ids())
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let t = ids.len() as i32;
+    let last = rows(&fx.tensor("logits"), t - 1, t);
+
+    let mut reports = Vec::new();
+    for chunk in [1, 2, 7, 33, 64, 69, 70, 1000] {
+        let mut cache = NativeCache::new_empty(&weights);
+        let logits = prefill_last_logits(&weights, &mut cache, &ids, chunk, forward_step_last);
+        drain_bridge("native chunked prefill");
+        reports.push(ParityReport::compute(
+            &format!("chunk_{chunk}_last_logits"),
+            &logits.reshape(&[1, 1, -1]),
+            &last,
+            PREFILL_TOL,
+        ));
+
+        let mut cache = NativeCache::new_empty(&weights);
+        let head = &ids[..ids.len() - 1];
+        prefill_last_logits(&weights, &mut cache, head, chunk, forward_step_last).eval();
+        let step = forward_step_last(
+            &weights,
+            &prompt_tokens_to_input(&ids[ids.len() - 1..]),
+            &mut cache,
+        );
+        drain_bridge("native decode after chunked prefill");
+        reports.push(ParityReport::compute(
+            &format!("chunk_{chunk}_decode"),
+            &step.reshape(&[1, 1, -1]),
+            &last,
+            DECODE_TOL,
+        ));
+    }
+    assert_all_pass(&format!("{profile}: native chunked prefill"), &reports);
+}
+
+/// Prefix reuse: a cache forked after a prompt's first part continues with the
+/// rest to the logits of the whole prompt, and a continuation on the fork
+/// leaves the original (its GatedDeltaNet state and KV buffers included) as it
+/// was, so a second request can continue from it again.
+#[test]
+#[serial]
+fn swish_native_forked_prefix_continues_to_the_whole_prompts_logits() {
+    use pmetal_bridge::decode::prefill_last_logits;
+    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
+    use pmetal_mlx::test_utils::to_f32_vec_eval;
+
+    let fx = checkpoint("swish");
+    let config = load_config(fx.path()).expect("native config parses");
+    let weights = load_model(fx.path(), &config).expect("native weights load");
+    let ids: Vec<u32> = to_f32_vec_eval(&fx.input_ids())
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let t = ids.len() as i32;
+    let last = rows(&fx.tensor("logits"), t - 1, t);
+    let (prefix, suffix) = ids.split_at(PREFILL as usize);
+
+    let mut origin = NativeCache::new_empty(&weights);
+    prefill_last_logits(&weights, &mut origin, prefix, 16, forward_step_last).eval();
+    let mut fork = origin.fork();
+
+    let mut continue_with = |cache: &mut NativeCache, tokens: &[u32], what: &str| {
+        let logits = prefill_last_logits(&weights, cache, tokens, 16, forward_step_last);
+        drain_bridge(what);
+        ParityReport::compute(what, &logits.reshape(&[1, 1, -1]), &last, PREFILL_TOL)
+    };
+    // A request that takes another path through the same prefix, then the one
+    // that matches the reference, on the fork; the original after both.
+    let other: Vec<u32> = suffix.iter().rev().copied().collect();
+    continue_with(&mut origin.fork(), &other, "other continuation");
+    let reports = vec![
+        continue_with(&mut fork, suffix, "fork continues"),
+        continue_with(&mut origin, suffix, "original continues after the fork did"),
+    ];
+    assert_all_pass("forked prefix", &reports);
+}
+
+/// An affine-quantized KV cache quantizes each token's keys and values over
+/// the head dimension alone, so the passes a prompt is prefilled in must not
+/// change what it holds: the last logits and the decode after them come out
+/// the same whatever the chunking, and stay near the unquantized reference.
+#[test]
+#[serial]
+fn swish_native_quantized_kv_prefill_does_not_depend_on_the_passes() {
+    use pmetal_bridge::decode::{prefill_last_logits, prompt_tokens_to_input};
+    use pmetal_bridge::qwen3_native::{
+        NativeCache, QuantCacheConfig, forward_step_last, load_config, load_model,
+    };
+    use pmetal_mlx::test_utils::{max_abs_diff, to_f32_vec_eval};
+
+    let fx = checkpoint("swish");
+    let config = load_config(fx.path()).expect("native config parses");
+    let weights = load_model(fx.path(), &config).expect("native weights load");
+    drain_bridge("native load");
+    let ids: Vec<u32> = to_f32_vec_eval(&fx.input_ids())
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let t = ids.len() as i32;
+    let last = rows(&fx.tensor("logits"), t - 1, t);
+    let quantized_cache = || {
+        let mut cache = NativeCache::new_empty(&weights);
+        for kv in &mut cache.kv_caches {
+            kv.quant_config = Some(QuantCacheConfig {
+                bits: 8,
+                group_size: 32,
+                mixed_bit: None,
+                qjl: false,
+            });
+        }
+        cache
+    };
+    let run = |chunk: usize| {
+        let mut cache = quantized_cache();
+        let prefill = prefill_last_logits(
+            &weights,
+            &mut cache,
+            &ids[..ids.len() - 1],
+            chunk,
+            forward_step_last,
+        );
+        prefill.eval();
+        forward_step_last(
+            &weights,
+            &prompt_tokens_to_input(&ids[ids.len() - 1..]),
+            &mut cache,
+        )
+        .reshape(&[1, 1, -1])
+    };
+
+    let whole = run(1000);
+    drain_bridge("quantized-cache decode");
+    // 8-bit keys and values are close to the reference, not equal to it.
+    let drift = max_abs_diff(&whole, &last);
+    assert!(
+        drift < 0.05,
+        "an 8-bit KV cache drifted from the reference by {drift}"
+    );
+    for chunk in [1, 7, 33] {
+        let got = run(chunk);
+        drain_bridge("quantized-cache chunked prefill");
+        let diff = max_abs_diff(&got, &whole);
+        // Not bit for bit: a pass of another size reaches the same keys by a
+        // matmul of another shape, whose rounding differs in the last place,
+        // and a value near a quantization boundary lands one level over. That
+        // is 2e-4 of a logit for single-token passes and shrinks with the
+        // pass (2e-5 at 7 tokens, 8e-7 at 33); a wrong offset or a lost
+        // chunk moves it by O(1).
+        println!("chunk {chunk}: max |difference| {diff:e}");
+        assert!(
+            diff < 2e-3,
+            "chunk {chunk}: quantized-cache logits differ from the whole-prompt prefill by {diff}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CPU hybrid engine (`infer --ane` on a flat Qwen3.5 text config)
 // ---------------------------------------------------------------------------
@@ -382,6 +555,27 @@ fn swish_mtp_head_matches_reference() {
 #[serial]
 fn swish_native_matches_transformers() {
     native_prefill_and_decode("swish");
+}
+
+#[test]
+#[serial]
+fn swish_native_chunked_prefill_matches_transformers() {
+    native_chunked_prefill("swish");
+}
+
+/// The routed-experts profile (`qwen3_5_moe`): every layer a sparse block of
+/// 8 experts, 2 per token, plus a shared expert behind its own sigmoid gate,
+/// in transformers' fused `gate_up_proj` layout. 40 tokens.
+#[test]
+#[serial]
+fn moe_native_matches_transformers() {
+    native_prefill_and_decode("moe");
+}
+
+#[test]
+#[serial]
+fn moe_native_chunked_prefill_matches_transformers() {
+    native_chunked_prefill("moe");
 }
 
 #[test]
