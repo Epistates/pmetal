@@ -11,6 +11,12 @@ use super::store::{ColdStore, DenseStore};
 use crate::InlineArray;
 use crate::compat::Dtype;
 
+/// What the kernels may differ from f64 attention over the same cache by. The
+/// queries sit in threadgroup memory as halves, which perturbs each by up to
+/// 5e-4 relative, and a logit by about as much; the quantization this is
+/// measured against is 100 times coarser at 8 bits.
+pub(super) const KERNEL_TOLERANCE: f64 = 3e-3;
+
 struct Case {
     batch: usize,
     q_heads: usize,
@@ -278,7 +284,7 @@ fn matches_reference_across_head_dims_and_bit_widths() {
     for &dim in &[64usize, 80, 96, 128, 192, 256] {
         for &(kb, vb) in &[(4u8, 4u8), (3, 2), (8, 8), (2, 5), (1, 1)] {
             let case = Case::new(dim, kb, vb);
-            assert_close(&case, &format!("d={dim} k{kb} v{vb}"), 2e-5);
+            assert_close(&case, &format!("d={dim} k{kb} v{vb}"), KERNEL_TOLERANCE);
         }
     }
 }
@@ -289,10 +295,10 @@ fn keys_and_values_may_differ_in_width() {
     let mut case = Case::new(192, 4, 3);
     case.value_dim = 128;
     case.cold = 777;
-    assert_close(&case, "mla 192/128", 2e-5);
+    assert_close(&case, "mla 192/128", KERNEL_TOLERANCE);
     let mut case = Case::new(64, 4, 4);
     case.value_dim = 256;
-    assert_close(&case, "64/256", 2e-5);
+    assert_close(&case, "64/256", KERNEL_TOLERANCE);
 }
 
 #[test]
@@ -302,7 +308,7 @@ fn matches_reference_across_sequence_lengths_around_tile_and_block_edges() {
     ] {
         let mut case = Case::new(128, 4, 4);
         case.cold = cold;
-        assert_close(&case, &format!("cold={cold}"), 2e-5);
+        assert_close(&case, &format!("cold={cold}"), KERNEL_TOLERANCE);
     }
 }
 
@@ -320,7 +326,11 @@ fn grouped_query_attention_maps_query_heads_to_their_kv_head() {
         case.kv_heads = kv_heads;
         case.batch = batch;
         case.cold = 500;
-        assert_close(&case, &format!("q{q_heads}/kv{kv_heads} b{batch}"), 2e-5);
+        assert_close(
+            &case,
+            &format!("q{q_heads}/kv{kv_heads} b{batch}"),
+            KERNEL_TOLERANCE,
+        );
     }
 }
 
@@ -345,7 +355,7 @@ fn dense_tail_alone_and_beside_the_cold_store() {
         assert_close(
             &case,
             &format!("cold {cold} sinks {sinks} ring {ring_len}/{ring_capacity}+{ring_start}"),
-            2e-5,
+            KERNEL_TOLERANCE,
         );
     }
 }
@@ -378,7 +388,7 @@ fn many_query_heads_per_kv_head_are_split_across_launches() {
         assert_close(
             &case,
             &format!("q{q_heads}/kv{kv_heads} d={dim}/{value_dim} {bits}-bit"),
-            2e-5,
+            KERNEL_TOLERANCE,
         );
     }
 }
@@ -405,7 +415,7 @@ fn a_window_or_chunk_masks_every_token_before_it() {
         case.ring_capacity = 64;
         case.ring_start = 50;
         case.first_token = first;
-        assert_close(&case, &format!("first token {first}"), 2e-5);
+        assert_close(&case, &format!("first token {first}"), KERNEL_TOLERANCE);
     }
     // No cold store.
     for first in [0usize, 2, 4, 5, 23] {
@@ -415,7 +425,11 @@ fn a_window_or_chunk_masks_every_token_before_it() {
         case.ring_len = 20;
         case.ring_capacity = 32;
         case.first_token = first;
-        assert_close(&case, &format!("no cold, first token {first}"), 2e-5);
+        assert_close(
+            &case,
+            &format!("no cold, first token {first}"),
+            KERNEL_TOLERANCE,
+        );
     }
     // Everything masked is an error, not a NaN.
     let mut case = Case::new(64, 3, 3);
@@ -436,7 +450,7 @@ fn half_precision_dense_tokens_and_queries() {
             case.ring_capacity = 64;
             // The output has the queries' precision.
             let tolerance = if query == Dtype::Float32 {
-                2e-5
+                KERNEL_TOLERANCE
             } else {
                 1.2e-2
             };
@@ -457,11 +471,11 @@ fn per_head_sink_logits_join_the_normaliser() {
     case.sinks = 2;
     case.ring_len = 20;
     case.ring_capacity = 32;
-    assert_close(&case, "with sink logits", 2e-5);
+    assert_close(&case, "with sink logits", KERNEL_TOLERANCE);
     case.cold = 0;
     case.sinks = 0;
     case.ring_len = 5;
-    assert_close(&case, "with sink logits, 5 tokens", 2e-5);
+    assert_close(&case, "with sink logits, 5 tokens", KERNEL_TOLERANCE);
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! deviation of 3. Random errors of relative size `e` in the keys move a
 //! logit by about `e` times its standard deviation, so the output errors below
 //! are those of the quantizer, not of the kernels: `attention_tests` shows
-//! the kernels agree with f64 attention over the dequantized cache to 1e-5.
+//! the kernels agree with f64 attention over the dequantized cache to 3e-3 (the queries are rounded to halves).
 
 #![cfg(test)]
 
@@ -84,7 +84,10 @@ fn the_recent_window_and_the_sinks_keep_their_tokens_exact() {
     // With the whole sequence inside the window nothing is quantized, so the
     // output is the exact attention up to f32 arithmetic.
     let err = mean_attention_error(128, 2, (4, 4), 2, Some(4096), 0);
-    assert!(err < 1e-5, "everything in the window: {err:.2e}");
+    assert!(
+        err < super::attention_tests::KERNEL_TOLERANCE,
+        "everything in the window: {err:.2e}"
+    );
     // With a window covering half of it the error is below that of
     // quantizing everything, and falls as the window grows.
     let none = mean_attention_error(128, 3, (4, 4), 3, None, 0);

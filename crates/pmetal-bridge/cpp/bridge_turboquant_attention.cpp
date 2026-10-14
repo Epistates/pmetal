@@ -74,7 +74,10 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
     constexpr uint kMaskK = (1u << kBk) - 1u;
     constexpr uint kMaskV = (1u << kBv) - 1u;
 
-    threadgroup float4 lds_q[kG * kD4];
+    // The queries live in threadgroup memory as halves: every lane reads all of them
+    // for each token, so the bytes read (not the precision, 1e-3 relative on a
+    // logit next to a quantization error of 1e-1) are what the key pass pays for.
+    threadgroup half4 lds_q[kG * kD4];
     threadgroup float lds_cbk[1u << kBk];
     threadgroup float lds_cbv[1u << kBv];
 
@@ -106,7 +109,7 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
     if (cold) {
         const device float4* q4 = (const device float4*)(q_rot + (ulong)r0 * kD);
         for (uint i = lane; i < kG * kD4; i += 32u) {
-            lds_q[i] = q4[i] * qscale;
+            lds_q[i] = half4(clamp(q4[i] * qscale, -65504.0f, 65504.0f));
         }
         for (uint i = lane; i < (1u << kBk); i += 32u) {
             lds_cbk[i] = cb_k[i];
@@ -117,7 +120,7 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
     } else {
         for (uint i = lane; i < kG * kD4; i += 32u) {
             const ulong b = (ulong)r0 * kD + (ulong)i * 4u;
-            lds_q[i] = float4(float(q[b]), float(q[b + 1u]), float(q[b + 2u]), float(q[b + 3u])) * qscale;
+            lds_q[i] = half4(clamp(float4(float(q[b]), float(q[b + 1u]), float(q[b + 2u]), float(q[b + 3u])) * qscale, -65504.0f, 65504.0f));
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -180,7 +183,7 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
                     }
                     const float4 cv = float4(c[0], c[1], c[2], c[3]);
                     for (uint g = 0u; g < kG; ++g) {
-                        s[g] += dot(lds_q[g * kD4 + i4], cv);
+                        s[g] += dot(float4(lds_q[g * kD4 + i4]), cv);
                     }
                 }
                 const float kn = k_scale[tok];
@@ -198,7 +201,7 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
                         float(kr[i4 * 4u]), float(kr[i4 * 4u + 1u]),
                         float(kr[i4 * 4u + 2u]), float(kr[i4 * 4u + 3u]));
                     for (uint g = 0u; g < kG; ++g) {
-                        s[g] += dot(lds_q[g * kD4 + i4], cv);
+                        s[g] += dot(float4(lds_q[g * kD4 + i4]), cv);
                     }
                 }
             }

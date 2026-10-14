@@ -3,6 +3,7 @@
 
 #![cfg(test)]
 
+use super::attention_tests::KERNEL_TOLERANCE;
 use super::reference_tests::{Workload, relative_error, to_host};
 use super::*;
 use crate::InlineArray;
@@ -146,7 +147,7 @@ fn a_long_decode_attends_correctly_at_every_step_across_evictions() {
             let want = w.reference_over(&k, &v, len, len);
             let err = relative_error(&to_host(&out), &want);
             assert!(
-                err < 3e-5,
+                err < KERNEL_TOLERANCE,
                 "step {t}: attention differs from the cache's contents by {err:.2e}"
             );
         }
@@ -353,7 +354,7 @@ fn attention_from_a_given_position_ignores_earlier_tokens() {
         }
         let want = w.reference_over(&ks, &vs, 200 - first, 200 - first);
         let err = relative_error(&to_host(&out), &want);
-        assert!(err < 3e-5, "first token {first}: {err:.2e}");
+        assert!(err < KERNEL_TOLERANCE, "first token {first}: {err:.2e}");
     }
 }
 
