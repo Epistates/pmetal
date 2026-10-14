@@ -103,6 +103,33 @@ pub fn check_last_error() -> BridgeResult<()> {
     }
 }
 
+/// The most recent op's error, if any, without clearing it.
+///
+/// [`check_last_error`] reports and clears. This only looks, for a caller (an
+/// evaluation) that must remember what the last op did before a successful
+/// call wipes the slot, without taking the error away from whoever reads the
+/// channel next.
+pub(crate) fn peek_last_error() -> BridgeResult<()> {
+    // SAFETY: as in `check_last_error`; nothing is cleared, so the message is
+    // copied while still valid.
+    unsafe {
+        let code = pmetal_bridge_last_error_code();
+        if code == 0 {
+            return Ok(());
+        }
+        let raw = pmetal_bridge_last_error_message();
+        let msg = if raw.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(raw).to_string_lossy().into_owned()
+        };
+        match code {
+            2 => Err(BridgeError::Unknown(msg)),
+            _ => Err(BridgeError::CxxException(msg)),
+        }
+    }
+}
+
 /// Reports the first error a bridge op recorded on this thread since one was
 /// last observed, and clears it.
 ///

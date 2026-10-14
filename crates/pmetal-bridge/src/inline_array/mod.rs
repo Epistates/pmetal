@@ -120,6 +120,9 @@ impl EvalToken {
             Ok(()) => after,
             Err(err) => {
                 let _ = after;
+                // Reporting it observes it: it must not come out of the
+                // unobserved channel a second time.
+                crate::error::clear_last_error();
                 Err(err)
             }
         }

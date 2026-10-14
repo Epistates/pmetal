@@ -38,6 +38,34 @@ fn a_chain_that_succeeds_returns_its_value() {
     assert_eq!(total.item_f32(), 14.0);
 }
 
+/// `eval` read the pending error into the token it returns, which clears it
+/// from both channels; a caller that dropped the token (`a.eval();`, the usual
+/// call) discarded the failure of whatever op came before, for good.
+#[test]
+fn eval_does_not_swallow_an_earlier_error() {
+    let a = vector(&[1.0, 2.0]);
+    let bad = vector(&[1.0, 2.0, 3.0]);
+    let broken = pmetal_bridge::expect_bridge_errors(|| a.matmul(&bad));
+    broken.eval(); // the token is dropped, as nearly every caller does
+
+    let pending = check_unobserved_error();
+    assert!(
+        pending.is_err(),
+        "the matmul failure was discarded by an eval whose token nobody read"
+    );
+}
+
+/// The token still reports it for a caller that does read it.
+#[test]
+fn the_eval_token_reports_an_earlier_error() {
+    let a = vector(&[1.0, 2.0]);
+    let bad = vector(&[1.0, 2.0, 3.0]);
+    let broken = pmetal_bridge::expect_bridge_errors(|| a.matmul(&bad));
+    let err = broken.eval().into_result().expect_err("the matmul failed");
+    assert!(err.to_string().contains("[matmul]"), "{err}");
+    assert_eq!(check_unobserved_error(), Ok(()));
+}
+
 /// An error nobody read before the call is not lost, and not blamed on the
 /// closure's own ops either: it is what comes back.
 #[test]

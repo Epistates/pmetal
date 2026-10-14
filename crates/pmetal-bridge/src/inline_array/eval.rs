@@ -14,15 +14,25 @@ use crate::error::{BridgeResult, check_last_error};
 impl InlineArray {
     // ── Eval ─────────────────────────────────────────────────────────────
 
+    /// Materialize the array. The returned token reports a failure of this
+    /// evaluation or of the op just before it (a success wipes the last-op
+    /// slot, so the token remembers what was there).
+    ///
+    /// The token is only *looked at* here: dropping it, as nearly every caller
+    /// does (`x.eval();`), leaves an earlier op's error on the channels for
+    /// the next check. It used to take the error out of them, so `eval`
+    /// discarded the failure of the op before it.
     pub fn eval(&self) -> EvalToken {
-        let prior = check_last_error();
+        let prior = crate::error::peek_last_error();
         // MLX array handles are internally mutable; eval materializes the backing
         // graph state but does not change the logical Rust ownership model.
         unsafe { mlx_inline_eval(std::ptr::from_ref(&self.raw).cast_mut()) }
         EvalToken::new(prior)
     }
+
+    /// [`eval`](Self::eval), without waiting for the result.
     pub fn async_eval(&self) -> EvalToken {
-        let prior = check_last_error();
+        let prior = crate::error::peek_last_error();
         unsafe { mlx_inline_async_eval(std::ptr::from_ref(&self.raw).cast_mut()) }
         EvalToken::new(prior)
     }
