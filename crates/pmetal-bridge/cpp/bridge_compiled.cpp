@@ -1176,7 +1176,8 @@ void mlx_inline_compiled_gemma4_attn_block(
     const mlx_inline_array* rope_freqs,    // may be null for full rotation
     const mlx_inline_array* cache_keys_in,
     const mlx_inline_array* cache_vals_in,
-    int kv_offset,
+    int kv_offset,                         // absolute position of the new token(s)
+    int cache_base,                        // absolute position of cache slot 0
     int n_heads,
     int n_kv,
     int head_dim,
@@ -1309,6 +1310,7 @@ void mlx_inline_compiled_gemma4_attn_block(
                         const array& cache_keys = ins[idx++];
                         const array& cache_vals = ins[idx++];
                         const array& kv_offset_arr = ins[idx++];
+                        const array& cache_base_arr = ins[idx++];
 
                         int B = x.shape(0);
                         int S = x.shape(1);
@@ -1369,9 +1371,16 @@ void mlx_inline_compiled_gemma4_attn_block(
                         // `arange(S)` term every prefill token would be
                         // scatter-written to the same slot, clobbering
                         // earlier positions.
+                        //
+                        // The cache buffer's slot 0 holds absolute position
+                        // `cache_base` (0 for a layer that keeps every key; a
+                        // sliding layer's buffer starts where its window does),
+                        // so the slot is `kv_offset - cache_base + s`.
                         auto seq_range = reshape(arange(S, int32), {1, 1, S, 1});
                         auto kv_indices = broadcast_to(
-                            add(seq_range, reshape(kv_offset_arr, {1, 1, 1, 1})),
+                            add(seq_range,
+                                reshape(subtract(kv_offset_arr, cache_base_arr),
+                                        {1, 1, 1, 1})),
                             {B, NKV, S, HD});
                         auto updated_keys = put_along_axis(cache_keys, kv_indices, k, 2);
                         auto updated_vals = put_along_axis(cache_vals, kv_indices, v, 2);
@@ -1387,7 +1396,11 @@ void mlx_inline_compiled_gemma4_attn_block(
                         auto query_pos = add(
                             reshape(arange(S, int32), {1, 1, S, 1}),
                             reshape(kv_offset_arr, {1, 1, 1, 1}));
-                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        // Slot `j` holds absolute position `cache_base + j`; a
+                        // slot not written yet is past every query.
+                        auto positions = add(
+                            reshape(arange(L, int32), {1, 1, 1, L}),
+                            reshape(cache_base_arr, {1, 1, 1, 1}));
                         auto valid_mask = less_equal(positions, query_pos);
                         if (SW > 0) {
                             auto in_window = greater(
@@ -1435,6 +1448,7 @@ void mlx_inline_compiled_gemma4_attn_block(
         ins.push_back(as_arr(cache_keys_in));
         ins.push_back(as_arr(cache_vals_in));
         ins.push_back(array(kv_offset));
+        ins.push_back(array(cache_base));
 
         auto result = (*compiled)(ins);
         new (dst_out->buf) array(result[0]);
@@ -1465,8 +1479,9 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
     const mlx_inline_array* rope_freqs,
     const mlx_inline_array* cache_keys_in,
     const mlx_inline_array* cache_vals_in,
-    int valid_kv_len,
+    int valid_kv_len,                      // absolute count of tokens the source cache holds
     int rope_offset,
+    int cache_base,                        // absolute position of cache slot 0
     int n_heads,
     int n_kv,
     int head_dim,
@@ -1570,6 +1585,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                         const array& cache_vals = ins[idx++];
                         const array& valid_kv_len_arr = ins[idx++];
                         const array& rope_offset_arr = ins[idx++];
+                        const array& cache_base_arr = ins[idx++];
 
                         int B = x.shape(0);
                         int S = x.shape(1);
@@ -1590,7 +1606,10 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                                            rope_offset_arr);
                         }
 
-                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        // Slot `j` holds absolute position `cache_base + j`.
+                        auto positions = add(
+                            reshape(arange(L, int32), {1, 1, 1, L}),
+                            reshape(cache_base_arr, {1, 1, 1, 1}));
                         auto valid_mask = less(
                             positions, reshape(valid_kv_len_arr, {1, 1, 1, 1}));
                         if (SW > 0) {
@@ -1631,6 +1650,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
         ins.push_back(as_arr(cache_vals_in));
         ins.push_back(array(valid_kv_len));
         ins.push_back(array(rope_offset));
+        ins.push_back(array(cache_base));
 
         auto result = (*compiled)(ins);
         new (dst_out->buf) array(result[0]);

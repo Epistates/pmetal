@@ -399,6 +399,88 @@ fn gemma4_native_moe_chunked_prefill_matches_transformers() {
     );
 }
 
+/// A cached decode far past the sliding window (8) against `transformers`,
+/// one token at a time after a prefill in passes: the sliding layers keep a
+/// window and a little more, move their buffer forward as the decode goes on
+/// (a slack of 1, 4 and the default, so the buffer moves every token, every
+/// few, and not at all), and every step must still be the reference's row.
+/// Covers KV-sharing layers reading those buffers too.
+#[test]
+fn gemma4_native_cached_decode_past_the_window_matches_transformers() {
+    use pmetal_bridge::decode::prefill_last_logits;
+    use pmetal_bridge::gemma4_native::{self, forward_step_last};
+
+    let (_dir, config, weights) = native_checkpoint(
+        shared_synthetic_config_json(),
+        "gemma4_shared_synth_weights.safetensors",
+    );
+    let ref_shard = load_shard(&fixture_path("gemma4_shared_synth_reference.safetensors"));
+    let ids: Vec<u32> = to_f32_vec_eval(&input_ids_from_shard(&ref_shard))
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let want = ref_tensor(&ref_shard, "logits");
+    let tolerance = Tolerance::new(1.5e-5, 0.0);
+    let window = config.sliding_window;
+
+    for (prefill, slack, detach) in [
+        (10usize, 1, true),
+        (10, 4, true),
+        (10, gemma4_native::SLIDING_SLACK, true),
+        (10, 4, false),
+        (3, 1, false),
+    ] {
+        let mut cache = gemma4_native::build_cache(&weights, &config);
+        for layer in &mut cache.layers {
+            layer.slack = slack;
+        }
+        prefill_last_logits(&weights, &mut cache, &ids[..prefill], 4, forward_step_last).eval();
+        if detach {
+            cache.eval_and_detach_states();
+            cache.reserve_decode_inputs((ids.len() - prefill) as i32, weights.model_dtype);
+        }
+        let mut reports = Vec::new();
+        for pos in prefill..ids.len() {
+            let step = forward_step_last(
+                &weights,
+                &pmetal_bridge::decode::prompt_tokens_to_input(&ids[pos..pos + 1]),
+                &mut cache,
+            );
+            pmetal_bridge::check_unobserved_error().expect("native decode step");
+            let row = pmetal_bridge::compat::ops::slice_axis(want, 1, pos as i32, pos as i32 + 1);
+            let name = format!("prefill {prefill}, slack {slack}, step {pos}");
+            reports.push(compare_checkpoint(
+                &name,
+                &step.reshape(&[1, 1, -1]),
+                &row,
+                &[(&name, tolerance)],
+            ));
+        }
+        print_report_table(&reports);
+        assert!(
+            reports.iter().all(|r| r.passed()),
+            "prefill {prefill}, slack {slack}, detach {detach}: decode out of tolerance"
+        );
+
+        // The sliding layers hold a window and the slack, however long the
+        // decode ran; the full layers hold everything.
+        for (i, layer) in cache.layers.iter().enumerate() {
+            let Some(keys) = layer.keys.as_ref() else {
+                continue; // a KV-sharing layer reads another's
+            };
+            match layer.window {
+                Some(_) => assert!(
+                    keys.dim(2) <= window + slack.max(1) + 4,
+                    "layer {i}: a sliding layer holds {} keys after {} tokens",
+                    keys.dim(2),
+                    layer.offset
+                ),
+                None => assert!(keys.dim(2) >= layer.offset as i32),
+            }
+        }
+    }
+}
+
 /// A long prompt's prefill holds the memory of a pass, not of the prompt:
 /// the engine's own prefill, against a whole-prompt forward that computes
 /// every position's logits as `forward_step` returns them.

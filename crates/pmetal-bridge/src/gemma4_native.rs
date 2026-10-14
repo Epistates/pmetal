@@ -468,13 +468,95 @@ pub struct NativeWeights {
     pub softcap_scalar: Option<InlineArray>,
 }
 
-/// Per-layer KV cache. Keys/values are allocated to `[B, n_kv, L, D]`
-/// where `L` grows in [`CHUNK_TOKENS`](crate::native_common::kv_cache::CHUNK_TOKENS)-token
-/// chunks.
+/// Slots a sliding layer's decode buffer holds beyond the window it keeps, so
+/// that it is moved forward once per this many tokens rather than every one.
+pub const SLIDING_SLACK: i32 = 256;
+
+/// Per-layer KV cache: keys and values `[B, n_kv, L, D]` where slot `j` holds
+/// absolute position `base + j`.
+///
+/// A layer that attends to everything (`window` is `None`) keeps every key,
+/// with `base` 0 and `L` growing in
+/// [`CHUNK_TOKENS`](crate::native_common::kv_cache::CHUNK_TOKENS)-token
+/// chunks. A sliding layer never reads further back than its window, so it
+/// keeps the window and a little more, and moves `base` forward as the
+/// prompt and the decode go on: the cache of a long context is the full
+/// layers' keys plus `window` per sliding layer, not every key of every layer.
 pub struct LayerCache {
     pub keys: Option<InlineArray>,
     pub values: Option<InlineArray>,
+    /// Tokens this layer has been fed: the absolute position of the next one.
     pub offset: usize,
+    /// Absolute position of slot 0.
+    pub base: usize,
+    /// How far back the layer attends, `None` for a full-attention layer.
+    pub window: Option<i32>,
+    /// Slots a sliding layer's decode buffer holds past its window; see
+    /// [`SLIDING_SLACK`]. A field so a test can make the buffer move often.
+    pub slack: i32,
+}
+
+impl LayerCache {
+    fn new(window: Option<i32>) -> Self {
+        Self {
+            keys: None,
+            values: None,
+            offset: 0,
+            base: 0,
+            window,
+            slack: SLIDING_SLACK,
+        }
+    }
+
+    /// Slots written: the tokens from `base` to `offset`.
+    fn filled(&self) -> i32 {
+        (self.offset - self.base) as i32
+    }
+
+    /// Make room for `tokens` more tokens in the buffer without changing what
+    /// the layer attends to.
+    ///
+    /// A full layer grows its buffer. A sliding layer whose buffer is full
+    /// drops what the window no longer reaches and moves `base` forward,
+    /// keeping the last `window` keys (the next token needs `window - 1` of
+    /// them) in a buffer with `max(tokens, slack)` free slots after them.
+    fn make_room(&mut self, batch: i32, kv_heads: i32, head_dim: i32, tokens: i32, dtype: i32) {
+        let Some(window) = self.window else {
+            crate::native_common::kv_cache::alloc_or_grow_kv(
+                crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                &mut self.keys,
+                &mut self.values,
+                batch,
+                kv_heads,
+                self.offset as i32 + tokens,
+                head_dim,
+                dtype,
+            );
+            return;
+        };
+        let filled = self.filled();
+        let capacity = self.keys.as_ref().map_or(0, |k| k.dim(2));
+        if self.keys.is_some() && filled + tokens <= capacity {
+            return;
+        }
+        let keep = filled.min(window);
+        let capacity = keep + tokens.max(self.slack);
+        let rebase = |old: Option<InlineArray>| -> InlineArray {
+            let fresh = InlineArray::zeros(&[batch, kv_heads, capacity - keep, head_dim], dtype);
+            match old {
+                Some(old) if keep > 0 => old
+                    .slice(
+                        &[0, 0, filled - keep, 0],
+                        &[batch, kv_heads, filled, head_dim],
+                    )
+                    .kv_cache_append(&fresh, 2),
+                _ => InlineArray::zeros(&[batch, kv_heads, capacity, head_dim], dtype),
+            }
+        };
+        self.keys = Some(rebase(self.keys.take()));
+        self.values = Some(rebase(self.values.take()));
+        self.base += (filled - keep) as usize;
+    }
 }
 
 /// Full-model cache. `rope_offset` mirrors the layer offsets — for Gemma 4
@@ -485,73 +567,64 @@ pub struct NativeCache {
 }
 
 impl NativeCache {
-    /// Eval every layer's KV buffer and **trim** it down to the actual
-    /// offset before decode starts. This drops the unused trailing
-    /// slots from the prefill allocation so decode-time SDPA doesn't
-    /// have to process them via validity-mask masking every step.
+    /// Evaluate every layer's KV buffer and **trim** it before decode starts:
+    /// a full layer down to the tokens it holds, a sliding layer to its window.
+    /// That drops the unused trailing slots of the prefill allocation, so
+    /// decode-time SDPA doesn't process them under a validity mask every step,
+    /// and the keys a window can no longer reach.
     /// Mirrors `qwen3_native::NativeCache::eval_and_detach_states`.
     pub fn eval_and_detach_states(&mut self) {
         for layer in self.layers.iter_mut() {
-            if let Some(k) = layer.keys.take() {
-                let trimmed = if layer.offset > 0 && (layer.offset as i32) < k.dim(2) {
-                    k.slice(
-                        &[0, 0, 0, 0],
-                        &[k.dim(0), k.dim(1), layer.offset as i32, k.dim(3)],
-                    )
+            let filled = layer.filled();
+            if filled <= 0 {
+                continue;
+            }
+            let keep = layer.window.map_or(filled, |w| filled.min(w));
+            let dropped = filled - keep;
+            let trim = |a: InlineArray| {
+                let trimmed = if dropped > 0 || filled < a.dim(2) {
+                    a.slice(&[0, 0, dropped, 0], &[a.dim(0), a.dim(1), filled, a.dim(3)])
                 } else {
-                    k
+                    a
                 };
                 trimmed.async_eval_ref();
-                layer.keys = Some(trimmed);
-            }
-            if let Some(v) = layer.values.take() {
-                let trimmed = if layer.offset > 0 && (layer.offset as i32) < v.dim(2) {
-                    v.slice(
-                        &[0, 0, 0, 0],
-                        &[v.dim(0), v.dim(1), layer.offset as i32, v.dim(3)],
-                    )
-                } else {
-                    v
-                };
-                trimmed.async_eval_ref();
-                layer.values = Some(trimmed);
-            }
+                trimmed
+            };
+            layer.keys = layer.keys.take().map(trim);
+            layer.values = layer.values.take().map(trim);
+            layer.base += dropped as usize;
         }
     }
 
-    /// Grow every layer's KV buffer to exactly `offset + additional_tokens`
-    /// slots, preparing the cache for a decode run of known length. The
-    /// resulting buffer is sized so the decode loop never grows it — and,
-    /// critically, so per-step SDPA only processes `offset + step` slots
-    /// instead of a buffer rounded up to the next 256 tokens.
+    /// Prepare every layer's buffer for a decode run of `additional_tokens`
+    /// tokens. A full layer grows to exactly `offset + additional_tokens`
+    /// slots, so the decode loop never grows it and per-step SDPA only
+    /// processes the tokens held instead of a buffer rounded up to the next
+    /// 256. A sliding layer gets room for as many as its slack holds (the
+    /// decode moves it forward when that runs out).
     pub fn reserve_decode_inputs(&mut self, additional_tokens: i32, dtype: i32) {
         if additional_tokens <= 0 {
             return;
         }
         for layer in self.layers.iter_mut() {
-            let Some(keys) = layer.keys.take() else {
+            let (Some(keys), Some(values)) = (layer.keys.as_ref(), layer.values.as_ref()) else {
                 continue;
             };
-            let Some(values) = layer.values.take() else {
-                layer.keys = Some(keys);
+            let (b, nkv, hd_k, hd_v) = (keys.dim(0), keys.dim(1), keys.dim(3), values.dim(3));
+            if layer.window.is_some() {
+                layer.make_room(b, nkv, hd_k, additional_tokens.min(layer.slack), dtype);
                 continue;
-            };
+            }
             let current = keys.dim(2);
             let target = layer.offset as i32 + additional_tokens;
             if target <= current {
-                layer.keys = Some(keys);
-                layer.values = Some(values);
                 continue;
             }
             let extend = target - current;
-            let b = keys.dim(0);
-            let nkv = keys.dim(1);
-            let hd_k = keys.dim(3);
-            let hd_v = values.dim(3);
             let ext_k = InlineArray::zeros(&[b, nkv, extend, hd_k], dtype);
             let ext_v = InlineArray::zeros(&[b, nkv, extend, hd_v], dtype);
-            layer.keys = Some(keys.kv_cache_append(&ext_k, 2));
-            layer.values = Some(values.kv_cache_append(&ext_v, 2));
+            layer.keys = layer.keys.take().map(|k| k.kv_cache_append(&ext_k, 2));
+            layer.values = layer.values.take().map(|v| v.kv_cache_append(&ext_v, 2));
         }
     }
 }
@@ -559,10 +632,8 @@ impl NativeCache {
 pub fn build_cache(_weights: &NativeWeights, config: &Gemma4Config) -> NativeCache {
     NativeCache {
         layers: (0..config.num_hidden_layers as usize)
-            .map(|_| LayerCache {
-                keys: None,
-                values: None,
-                offset: 0,
+            .map(|i| {
+                LayerCache::new((!config.is_full_attention(i)).then_some(config.sliding_window))
             })
             .collect(),
         rope_offset: 0,
@@ -711,35 +782,40 @@ fn sliding_window_mask(
 }
 
 /// Causal attention of `queries` (`[B, H, S, D]`, at absolute positions
-/// `prev..prev + S`) over the keys and values a layer's cache holds up to
-/// `prev + S`, with `window` limiting how far back a sliding layer reaches.
+/// `prev..prev + S`) over `keys` and `values`, which hold the absolute
+/// positions from `key_start` up to `prev + S`, with `window` limiting how far
+/// back a sliding layer reaches.
 ///
-/// A full layer takes MLX's causal mode over the valid cache. A sliding layer
-/// slices the cache to the keys its first query's window reaches and masks the
-/// rest, so a pass over a long prompt attends `window + S` keys per query
-/// instead of all `prev + S`; a mask handed to the fused kernel is evaluated
-/// over every key it is given, not skipped by block as causal mode is.
+/// A full layer takes MLX's causal mode over all of its keys (`key_start` 0).
+/// A sliding layer slices to the keys its first query's window reaches and
+/// masks the rest, so a pass over a long prompt attends `window + S` keys per
+/// query instead of all `prev + S`; a mask handed to the fused kernel is
+/// evaluated over every key it is given, not skipped by block as causal mode
+/// is.
 fn prefill_attention(
     queries: &InlineArray,
     keys: &InlineArray,
     values: &InlineArray,
     prev: i32,
+    key_start: i32,
     window: Option<i32>,
 ) -> InlineArray {
-    let (b, kv_heads, next, head_dim) = (keys.dim(0), keys.dim(1), keys.dim(2), keys.dim(3));
+    let (b, kv_heads, len, head_dim) = (keys.dim(0), keys.dim(1), keys.dim(2), keys.dim(3));
     let s = queries.dim(2);
-    debug_assert_eq!(next, prev + s, "keys cover the cache up to this pass");
-    let first = match window {
-        // Query `prev` reaches back `window - 1` keys; later queries reach
-        // later keys.
-        Some(window) => (prev - window + 1).max(0),
-        None => 0,
-    };
+    let next = key_start + len;
+    debug_assert_eq!(next, prev + s, "the keys end where this pass ends");
+    // Query `prev` reaches back `window - 1` keys; later queries reach later
+    // keys.
+    let first = window.map_or(key_start, |w| (prev - w + 1).max(0));
+    debug_assert!(
+        first >= key_start,
+        "the keys start before the window's reach"
+    );
     let slice = |a: &InlineArray| {
-        if first == 0 {
+        if first == key_start {
             a.clone()
         } else {
-            a.slice(&[0, 0, first, 0], &[b, kv_heads, next, head_dim])
+            a.slice(&[0, 0, first - key_start, 0], &[b, kv_heads, len, head_dim])
         }
     };
     match window {
@@ -867,6 +943,7 @@ fn shared_kv_attention_forward(
                 .expect("Gemma 4 native: missing shared KV source values"),
             cache_len,
             rope_offset,
+            source_cache.base as i32,
             layer.n_heads,
             layer.n_kv_heads,
             layer.head_dim,
@@ -878,13 +955,15 @@ fn shared_kv_attention_forward(
             layer.rope_dims,
         );
     }
+    // The source's keys from its `base` to this pass's end.
+    let filled = source_cache.filled();
     let source_keys = source_cache
         .keys
         .as_ref()
         .expect("Gemma 4 native: missing shared KV source keys")
         .slice(
             &[0, 0, 0, 0],
-            &[b, layer.n_kv_heads, cache_len, layer.head_dim],
+            &[b, layer.n_kv_heads, filled, layer.head_dim],
         );
     let source_values = source_cache
         .values
@@ -892,7 +971,7 @@ fn shared_kv_attention_forward(
         .expect("Gemma 4 native: missing shared KV source values")
         .slice(
             &[0, 0, 0, 0],
-            &[b, layer.n_kv_heads, cache_len, layer.head_dim],
+            &[b, layer.n_kv_heads, filled, layer.head_dim],
         );
 
     let normed = hidden.rms_norm(Some(&layer.input_norm_w), eps);
@@ -916,6 +995,7 @@ fn shared_kv_attention_forward(
         &source_keys,
         &source_values,
         rope_offset,
+        source_cache.base as i32,
         layer.sliding_window,
     );
 
@@ -991,40 +1071,67 @@ fn projected_attention_multi(
         )
     };
     let (queries, keys) = (rotate(&queries), rotate(&keys));
+    // The cache holds the model's dtype whatever a pass computed in: keys and
+    // values written in f32 would be read as f32 by every decode step.
+    let (keys, values) = (keys.as_dtype(dtype), values.as_dtype(dtype));
 
-    crate::native_common::kv_cache::alloc_or_grow_kv(
-        crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
-        &mut layer_cache.keys,
-        &mut layer_cache.values,
-        b,
-        n_kv,
-        next,
-        head_dim,
-        dtype,
-    );
-    let (start, stop) = ([0, 0, rope_offset, 0], [b, n_kv, next, head_dim]);
-    let all_keys = layer_cache
-        .keys
-        .take()
-        .expect("alloc_or_grow_kv allocated the keys")
-        .slice_set(&keys, &start, &stop);
-    let all_values = layer_cache
-        .values
-        .take()
-        .expect("alloc_or_grow_kv allocated the values")
-        .slice_set(&values, &start, &stop);
+    // The keys this pass attends over, and the absolute position of the first.
+    let (attended_keys, attended_values, key_start) = match layer.sliding_window {
+        // A sliding layer reaches back `window - 1` keys from this pass's
+        // first query: the tail of what it holds, then the new keys. The
+        // cache keeps exactly those, so it holds a window and a pass, not the
+        // prompt.
+        Some(window) => {
+            let first = (rope_offset - window + 1).max(0);
+            let base = layer_cache.base as i32;
+            let reach = |old: Option<InlineArray>, new: &InlineArray| match old {
+                Some(old) if rope_offset > first => old
+                    .slice(
+                        &[0, 0, first - base, 0],
+                        &[b, n_kv, rope_offset - base, head_dim],
+                    )
+                    .kv_cache_append(new, 2),
+                _ => new.clone(),
+            };
+            let all_keys = reach(layer_cache.keys.take(), &keys);
+            let all_values = reach(layer_cache.values.take(), &values);
+            layer_cache.keys = Some(all_keys.clone());
+            layer_cache.values = Some(all_values.clone());
+            layer_cache.base = first as usize;
+            (all_keys, all_values, first)
+        }
+        // A full layer writes the pass after what it holds and attends over
+        // all of it.
+        None => {
+            layer_cache.make_room(b, n_kv, head_dim, s, dtype);
+            let (start, stop) = ([0, 0, rope_offset, 0], [b, n_kv, next, head_dim]);
+            let all_keys = layer_cache
+                .keys
+                .take()
+                .expect("make_room allocated the keys")
+                .slice_set(&keys, &start, &stop);
+            let all_values = layer_cache
+                .values
+                .take()
+                .expect("make_room allocated the values")
+                .slice_set(&values, &start, &stop);
+            let valid = |a: &InlineArray| a.slice(&[0, 0, 0, 0], &stop);
+            let attended = (valid(&all_keys), valid(&all_values), 0);
+            layer_cache.keys = Some(all_keys);
+            layer_cache.values = Some(all_values);
+            attended
+        }
+    };
     layer_cache.offset = next as usize;
 
-    let valid = |a: &InlineArray| a.slice(&[0, 0, 0, 0], &stop);
     let attended = prefill_attention(
         &queries,
-        &valid(&all_keys),
-        &valid(&all_values),
+        &attended_keys,
+        &attended_values,
         rope_offset,
+        key_start,
         layer.sliding_window,
     );
-    layer_cache.keys = Some(all_keys);
-    layer_cache.values = Some(all_values);
 
     layer
         .o_w
@@ -1704,14 +1811,13 @@ fn forward_hidden(
             }
             AttentionKv::Projected { k_w, k_norm_w, v_w } => {
                 let layer_cache = &mut cache.layers[i];
-                crate::native_common::kv_cache::alloc_or_grow_kv(
-                    crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
-                    &mut layer_cache.keys,
-                    &mut layer_cache.values,
+                // Room for the token: a full layer grows its buffer, a sliding
+                // one moves its base forward once its slack is used up.
+                layer_cache.make_room(
                     hidden.dim(0),
                     layer.n_kv_heads,
-                    rope_offset + seq_len,
                     layer.head_dim,
+                    seq_len,
                     weights.model_dtype,
                 );
 
@@ -1737,6 +1843,7 @@ fn forward_hidden(
                     &cache_k,
                     &cache_v,
                     rope_offset,
+                    layer_cache.base as i32,
                     layer.n_heads,
                     layer.n_kv_heads,
                     layer.head_dim,
@@ -2348,14 +2455,20 @@ mod tests {
                 .map(|i| (((i * 29 + salt * 13) % 31) as f32 - 15.0) / 9.0)
                 .collect()
         };
-        for (prev, s, window) in [
-            (0usize, 6usize, None),
-            (7, 5, None),
-            (7, 5, Some(4usize)),
-            (20, 3, Some(6)),
-            (2, 4, Some(5)),
-            (9, 1, Some(4)),
-            (3, 4, Some(100)),
+        // (tokens before the pass, tokens in it, window, the position of the
+        // first key handed over: a sliding layer's cache starts where its
+        // window did)
+        for (prev, s, window, key_start) in [
+            (0usize, 6usize, None, 0usize),
+            (7, 5, None, 0),
+            (7, 5, Some(4usize), 0),
+            (20, 3, Some(6), 0),
+            (2, 4, Some(5), 0),
+            (9, 1, Some(4), 0),
+            (3, 4, Some(100), 0),
+            (20, 3, Some(6), 14),
+            (40, 5, Some(8), 33),
+            (9, 1, Some(4), 6),
         ] {
             let next = prev + s;
             let (q, k, v) = (
@@ -2363,17 +2476,29 @@ mod tests {
                 fill(kv_heads * next * head_dim, 2),
                 fill(kv_heads * next * head_dim, 3),
             );
+            // The keys from `key_start` on, per kv head.
+            let from = |all: &[f32]| -> Vec<f32> {
+                (0..kv_heads)
+                    .flat_map(|kv| {
+                        all[(kv * next + key_start) * head_dim..(kv + 1) * next * head_dim]
+                            .iter()
+                            .copied()
+                    })
+                    .collect()
+            };
+            let len = (next - key_start) as i32;
             let got = prefill_attention(
                 &InlineArray::from_f32_slice(&q, &[1, heads as i32, s as i32, head_dim as i32]),
                 &InlineArray::from_f32_slice(
-                    &k,
-                    &[1, kv_heads as i32, next as i32, head_dim as i32],
+                    &from(&k),
+                    &[1, kv_heads as i32, len, head_dim as i32],
                 ),
                 &InlineArray::from_f32_slice(
-                    &v,
-                    &[1, kv_heads as i32, next as i32, head_dim as i32],
+                    &from(&v),
+                    &[1, kv_heads as i32, len, head_dim as i32],
                 ),
                 prev as i32,
+                key_start as i32,
                 window.map(|w| w as i32),
             );
             crate::check_unobserved_error().expect("prefill attention");

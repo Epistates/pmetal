@@ -4,7 +4,8 @@
 //! The two alternate, so drift in the machine's load shows in both.
 //!
 //! Usage: cargo run -p pmetal-bridge --release --example native_prefill_bench -- \
-//!          --arch qwen3|gemma4 --model /path/to/checkpoint --prompt-tokens 4096 [--rounds 3]
+//!          --arch qwen3|gemma4 --model /path/to/checkpoint --prompt-tokens 4096 \
+//!          [--rounds 3] [--chunked-only]
 
 use std::path::Path;
 use std::time::Instant;
@@ -83,11 +84,18 @@ fn main() {
         other => panic!("--arch is qwen3 or gemma4, not {other}"),
     };
 
-    // One untimed pass of each warms the compiled graphs.
-    measure(false);
-    measure(true);
+    // One untimed pass of each warms the compiled graphs. A prompt too long
+    // for the whole-prompt forward's logits takes `--chunked-only`.
+    let modes: &[bool] = if args.iter().any(|a| a == "--chunked-only") {
+        &[true]
+    } else {
+        &[false, true]
+    };
+    for &chunked in modes {
+        measure(chunked);
+    }
     for round in 0..rounds {
-        for chunked in [false, true] {
+        for &chunked in modes {
             let (secs, peak, token) = measure(chunked);
             println!(
                 "round {round} {:>26}: {:8.1} ms, {:8.0} tok/s, peak {:7.0} MB (first token {token})",
