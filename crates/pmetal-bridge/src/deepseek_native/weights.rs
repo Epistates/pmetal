@@ -39,12 +39,16 @@ pub(super) struct MoeWeights {
     pub(super) shared: Option<Mlp>,
 }
 
+// A layer holds exactly one of these, loaded once: the size difference is a
+// few KB per layer, not worth an indirection on the hot path.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Ffn {
     Dense(Mlp),
     Moe(MoeWeights),
 }
 
 /// How a layer computes Q.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum QProj {
     /// `x -> q_a_proj -> rms_norm -> q_b_proj`.
     LowRank {

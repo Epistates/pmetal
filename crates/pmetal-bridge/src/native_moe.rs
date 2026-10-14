@@ -81,7 +81,7 @@ pub fn switch_glu_with(
     let top_k = inds.dim(1);
     let rows = s * top_k;
     // Positions are carried through the sort as `f32`s, exact below 2^24.
-    if rows >= SORT_THRESHOLD && rows < 1 << 24 {
+    if (SORT_THRESHOLD..1 << 24).contains(&rows) {
         return switch_glu_sorted(x_flat, gate, up, down, inds, scores, top_k, activation);
     }
 
