@@ -11,12 +11,13 @@ pub use dtype::{ArrayElement, AsDtype, BridgeScalar, bf16, f16};
 
 mod diagnostics;
 pub use diagnostics::{
-    clear_cache, disable_compile, enable_compile, eval_and_detach_many, get_active_memory,
-    get_cache_memory, get_max_recommended_size, get_peak_memory, graph_desc_count, graph_dump,
-    graph_node_count, init_device, metal_start_capture, metal_stop_capture, metallib_path,
-    new_generation_stream, reset_default_stream, reset_peak_memory, set_generation_stream,
-    set_metallib_path, set_wired_limit, set_wired_limit_max, synchronize, validate_metallib,
-    verify_buffer_layout,
+    DeviceInfo, GenerationStream, clear_cache, device_info, disable_compile, enable_compile,
+    eval_and_detach_many, get_active_memory, get_cache_memory, get_max_recommended_size,
+    get_memory_limit, get_peak_memory, graph_desc_count, graph_dump, graph_node_count, init_device,
+    metal_start_capture, metal_stop_capture, metallib_path, new_generation_stream,
+    reset_default_stream, reset_peak_memory, set_cache_limit, set_generation_stream,
+    set_memory_limit, set_metallib_path, set_wired_limit, set_wired_limit_max, synchronize,
+    validate_metallib, verify_buffer_layout,
 };
 
 mod safetensors;

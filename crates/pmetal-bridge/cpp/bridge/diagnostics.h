@@ -62,6 +62,15 @@ size_t mlx_inline_get_cache_memory(void);    // Bytes freed but held in buffer c
 size_t mlx_inline_get_peak_memory(void);     // High-water mark of active memory
 void   mlx_inline_reset_peak_memory(void);   // Reset peak tracking
 
+// ── Memory limits and the device ─────────────────────────────────────────
+size_t mlx_inline_get_memory_limit(void);
+size_t mlx_inline_set_memory_limit(size_t limit);  // Returns the previous limit
+size_t mlx_inline_set_cache_limit(size_t limit);   // Returns the previous limit
+// The GPU's description as a flat JSON object of string and unsigned-integer
+// values. Written to `buf` when it fits; returns its length (without the
+// NUL), 0 on failure. A length >= `cap` means the buffer was too small.
+size_t mlx_inline_device_info_json(char* buf, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

@@ -442,6 +442,10 @@ bridge_extern! {
     pub(super) fn mlx_inline_get_cache_memory() -> usize;
     pub(super) fn mlx_inline_get_peak_memory() -> usize;
     pub(super) fn mlx_inline_reset_peak_memory();
+    pub(super) fn mlx_inline_get_memory_limit() -> usize;
+    pub(super) fn mlx_inline_set_memory_limit(limit: usize) -> usize;
+    pub(super) fn mlx_inline_set_cache_limit(limit: usize) -> usize;
+    pub(super) fn mlx_inline_device_info_json(buf: *mut std::ffi::c_char, cap: usize) -> usize;
 
     // ── FFT ops ──
     pub(super) fn mlx_inline_rfft(dst: *mut RawBuf, a: *const RawBuf, n_fft: i32, axis: i32);

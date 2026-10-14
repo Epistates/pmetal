@@ -361,5 +361,70 @@ void mlx_inline_reset_peak_memory(void) {
     BRIDGE_GUARD("reset_peak_memory", mlx::core::reset_peak_memory());
 }
 
+size_t mlx_inline_get_memory_limit(void) {
+    size_t bytes = 0;
+    BRIDGE_GUARD("get_memory_limit", bytes = mlx::core::get_memory_limit());
+    return bytes;
+}
+
+// Returns the previous limit.
+size_t mlx_inline_set_memory_limit(size_t limit) {
+    size_t previous = 0;
+    BRIDGE_GUARD("set_memory_limit", previous = mlx::core::set_memory_limit(limit));
+    return previous;
+}
+
+// Returns the previous limit.
+size_t mlx_inline_set_cache_limit(size_t limit) {
+    size_t previous = 0;
+    BRIDGE_GUARD("set_cache_limit", previous = mlx::core::set_cache_limit(limit));
+    return previous;
+}
+
+// The GPU's description as a flat JSON object (string and unsigned-integer
+// values), written to `buf` when it fits; returns its length without the
+// terminating NUL, or 0 on failure. A caller whose buffer was too small sees
+// a length >= `cap` and tries again with a larger one.
+size_t mlx_inline_device_info_json(char* buf, size_t cap) {
+    std::string json;
+    BRIDGE_GUARD("device_info", {
+        json = "{";
+        bool first = true;
+        for (const auto& [key, value] : mlx::core::gpu::device_info()) {
+            auto quote = [](const std::string& s) {
+                std::string out = "\"";
+                for (unsigned char c : s) {
+                    if (c == '"' || c == '\\') {
+                        out += '\\';
+                        out += static_cast<char>(c);
+                    } else if (c < 0x20) {
+                        char esc[8];
+                        std::snprintf(esc, sizeof(esc), "\\u%04x", c);
+                        out += esc;
+                    } else {
+                        out += static_cast<char>(c);
+                    }
+                }
+                return out + "\"";
+            };
+            if (!first) {
+                json += ",";
+            }
+            first = false;
+            json += quote(key) + ":";
+            if (const auto* s = std::get_if<std::string>(&value)) {
+                json += quote(*s);
+            } else {
+                json += std::to_string(std::get<size_t>(value));
+            }
+        }
+        json += "}";
+    });
+    if (json.size() < cap && buf != nullptr) {
+        std::memcpy(buf, json.c_str(), json.size() + 1);
+    }
+    return json.size() > 2 ? json.size() : 0;
+}
+
 
 } // extern "C"
