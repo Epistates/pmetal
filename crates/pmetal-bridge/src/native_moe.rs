@@ -66,8 +66,8 @@ const SORT_THRESHOLD: i32 = 64;
 ///
 /// ⚠️ Grouping by expert is a 6 to 16 times faster prefill (measured: 512
 /// tokens, 64 experts of 2048 by 1408, top-6, 92 ms against 5.8 ms a layer),
-/// and a slower decode, which is why it applies from [`SORT_THRESHOLD`] rows
-/// and not always.
+/// and a slower decode, which is why it applies from 64 (row, expert)
+/// pairs and not always.
 pub fn switch_glu_with(
     x_flat: &InlineArray,
     gate: &LayerWeight,
