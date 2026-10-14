@@ -128,10 +128,7 @@ impl AdamW {
         for (key, (m, v)) in &state {
             self.inner.states.insert(
                 key.to_string(),
-                crate::optimizer::AdamState {
-                    m: m.clone(),
-                    v: v.clone(),
-                },
+                crate::optimizer::AdamState::new(m.clone(), v.clone()),
             );
         }
         self.state = state;
@@ -174,13 +171,28 @@ impl Optimizer for AdamW {
 
 impl Updatable for AdamW {
     fn updatable_states_len(&self) -> usize {
-        self.state.len() * 2
+        self.updatable_states().len()
     }
     fn updatable_states(&self) -> Vec<&Array> {
-        self.state.values().flat_map(|(m, v)| [m, v]).collect()
+        // The moments in `state` are the inner optimizer's own; half-precision
+        // parameters' f32 master copies live only there.
+        self.state
+            .values()
+            .flat_map(|(m, v)| [m, v])
+            .chain(self.inner.states.values().filter_map(|s| s.master.as_ref()))
+            .collect()
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
-        self.state.values_mut().flat_map(|(m, v)| [m, v]).collect()
+        self.state
+            .values_mut()
+            .flat_map(|(m, v)| [m, v])
+            .chain(
+                self.inner
+                    .states
+                    .values_mut()
+                    .filter_map(|s| s.master.as_mut()),
+            )
+            .collect()
     }
 }
 
