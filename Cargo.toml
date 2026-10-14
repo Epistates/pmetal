@@ -196,7 +196,6 @@ criterion = "0.8"
 tempfile = "3"
 proptest = "1.11"
 serial_test = "4.0"
-approx = "0.5"
 trybuild = "1.0"
 
 [workspace.lints.rust]
