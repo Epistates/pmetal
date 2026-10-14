@@ -109,6 +109,61 @@ fn bench_cache_decode_steps() {
     }
 }
 
+/// What writing one token into a large recent ring costs a decode step when
+/// steps are evaluated one at a time, and when the next is queued before the
+/// last finishes (as an asynchronous decode loop does).
+#[test]
+#[ignore = "benchmark"]
+fn bench_ring_write_cost() {
+    let (heads, dim, prefill) = (8usize, 128usize, 6000usize);
+    let steps = 24usize;
+    let w = super::reference_tests::Workload::new(1, heads, heads, prefill + steps, dim, 1);
+    for queued in [1usize, 4] {
+        let cfg = super::TurboQuantConfig::uniform(4, 4);
+        let mut cache = super::new_cache(cfg);
+        cache
+            .append(
+                &w.kv_slice(false, 0, prefill),
+                &w.kv_slice(true, 0, prefill),
+            )
+            .unwrap();
+        cache.eval_and_detach_gpu_state();
+        let layers = 16usize;
+        let mut caches: Vec<_> = (0..layers).map(|_| cache.fork()).collect();
+        let start = Instant::now();
+        let mut pending: Vec<InlineArray> = Vec::new();
+        for t in prefill..prefill + steps {
+            let mut total: Option<InlineArray> = None;
+            for c in caches.iter_mut() {
+                let out = c
+                    .append_and_compute_attention(
+                        &w.queries_array(),
+                        &w.kv_slice(false, t, t + 1),
+                        &w.kv_slice(true, t, t + 1),
+                        w.scale(),
+                    )
+                    .unwrap();
+                total = Some(match total {
+                    None => out,
+                    Some(sum) => sum.add(&out),
+                });
+            }
+            pending.push(total.unwrap());
+            if pending.len() >= queued {
+                for p in pending.drain(..) {
+                    p.eval();
+                }
+            }
+        }
+        crate::inline_array::synchronize();
+        let per_step = start.elapsed().as_secs_f64() * 1e3 / steps as f64;
+        eprintln!(
+            "RING {layers} layers, {queued} step(s) queued: {per_step:.2} ms per step, {:.3} ms per layer",
+            per_step / layers as f64
+        );
+    }
+}
+
 #[test]
 #[ignore = "benchmark"]
 fn bench_decode_attention() {

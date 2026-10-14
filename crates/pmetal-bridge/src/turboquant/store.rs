@@ -101,6 +101,18 @@ impl ColdStore {
         }
     }
 
+    /// Make room for `tokens` more, in one allocation.
+    pub(super) fn reserve(&mut self, keys: &Quantizer, values: &Quantizer, tokens: usize) {
+        let needed = self.len + tokens;
+        if needed > self.capacity {
+            let target = round_up(needed, GROWTH_STEP);
+            let extra = target - self.capacity;
+            self.k = self.k.grown(self.kv_rows, extra, keys.words());
+            self.v = self.v.grown(self.kv_rows, extra, values.words());
+            self.capacity = target;
+        }
+    }
+
     /// Append `tokens` quantized tokens per KV head (`rows` are ordered
     /// KV-head major, token minor).
     pub(super) fn append(
@@ -113,13 +125,13 @@ impl ColdStore {
     ) {
         let needed = self.len + tokens;
         if needed > self.capacity {
-            // Geometric growth, in whole steps, so a long decode copies the
-            // store O(log n) times, not once per eviction.
-            let target = round_up(needed.max(self.capacity + self.capacity / 2), GROWTH_STEP);
-            let extra = target - self.capacity;
-            self.k = self.k.grown(self.kv_rows, extra, keys.words());
-            self.v = self.v.grown(self.kv_rows, extra, values.words());
-            self.capacity = target;
+            // Geometric growth, so a long decode copies the store O(log n)
+            // times, not once per eviction.
+            self.reserve(
+                keys,
+                values,
+                needed.max(self.capacity + self.capacity / 2) - self.len,
+            );
         }
         self.k
             .write(self.len, k, tokens, self.kv_rows, keys.words());

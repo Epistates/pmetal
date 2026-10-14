@@ -29,6 +29,11 @@ use super::config::{TurboQuantConfig, eviction_chunk};
 use super::state::TurboQuantState;
 use super::store::{ColdStore, DenseStore};
 
+/// Tokens quantized per piece when a long run of them is (a prompt, a large
+/// eviction): 4096 tokens of 8 KV heads at head dimension 128 rotate through
+/// 17 MB of f32.
+const ENCODE_PIECE_TOKENS: usize = 4096;
+
 /// Shape of what the cache holds, fixed by the first append.
 #[derive(Debug, Clone, Copy)]
 struct Layout {
@@ -351,17 +356,31 @@ impl QuantizedKvCache {
     ) -> Result<(), String> {
         let layout = self.layout.expect("layout");
         let state = Arc::clone(self.state.as_ref().expect("state"));
-        let rows = (layout.kv_rows() * n) as i32;
-        let k = state
-            .keys
-            .encode(&keys.reshape(&[rows, layout.dim as i32]))?;
-        let v = state
-            .values
-            .encode(&values.reshape(&[rows, layout.value_dim as i32]))?;
-        self.cold
-            .as_mut()
-            .expect("cold store")
-            .append(&state.keys, &state.values, &k, &v, n);
+        let cold = self.cold.as_mut().expect("cold store");
+        // One allocation for the whole run, then fixed-size pieces: each is
+        // rotated into f32 and packed, and its temporaries are released
+        // before the next, so a long prompt never holds more than a piece's.
+        cold.reserve(&state.keys, &state.values, n);
+        let mut done = 0;
+        while done < n {
+            let piece = (n - done).min(ENCODE_PIECE_TOKENS);
+            let rows = (layout.kv_rows() * piece) as i32;
+            let take = |a: &InlineArray, width: usize| {
+                a.slice(
+                    &[0, done as i32, 0],
+                    &[layout.kv_rows() as i32, (done + piece) as i32, width as i32],
+                )
+                .reshape(&[rows, width as i32])
+            };
+            let k = state.keys.encode(&take(keys, layout.dim))?;
+            let v = state.values.encode(&take(values, layout.value_dim))?;
+            cold.append(&state.keys, &state.values, &k, &v, piece);
+            if n > ENCODE_PIECE_TOKENS {
+                let mut pending = cold.arrays_mut();
+                crate::inline_array::eval_and_detach_many(&mut pending);
+            }
+            done += piece;
+        }
         Ok(())
     }
 

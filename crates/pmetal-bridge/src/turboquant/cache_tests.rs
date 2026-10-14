@@ -187,6 +187,42 @@ fn memory_per_token_is_what_the_bit_widths_say() {
 }
 
 #[test]
+fn a_long_prompt_is_quantized_in_bounded_memory() {
+    // Quantizing 60,000 tokens of 8 KV heads at once would rotate them into
+    // two f32 copies of the prompt (245 MB each) before packing any. The cache
+    // works through the prompt in pieces, so what it needs beyond its own
+    // store is a few pieces' worth, whatever the prompt's length.
+    use crate::inline_array::{get_active_memory, get_peak_memory, reset_peak_memory};
+    let (heads, tokens, dim) = (8i32, 60_000i32, 128i32);
+    let shape = [1, heads, tokens, dim];
+    let keys = InlineArray::random_normal(&shape, Dtype::Float32.as_i32());
+    let values = InlineArray::random_normal(&shape, Dtype::Float32.as_i32());
+    keys.eval();
+    values.eval();
+    let mut cache = new_cache(config(4, 4, None, 0));
+    // Build the state (and warm the kernels) outside the measurement.
+    let warm = InlineArray::zeros(&[1, heads, 1, dim], Dtype::Float32.as_i32());
+    cache.append(&warm, &warm).unwrap();
+    cache.reset();
+    crate::inline_array::synchronize();
+    let before = get_active_memory();
+    reset_peak_memory();
+    cache.append(&keys, &values).unwrap();
+    cache.eval_and_detach_gpu_state();
+    crate::inline_array::synchronize();
+    let stored = cache.nbytes();
+    let extra = get_peak_memory().saturating_sub(before + stored);
+    assert!(
+        extra < 160 << 20,
+        "quantizing the prompt needed {} MB beyond the {} MB cache",
+        extra >> 20,
+        stored >> 20
+    );
+    assert_eq!(cache.len(), tokens as usize);
+    crate::check_unobserved_error().unwrap();
+}
+
+#[test]
 fn bf16_input_is_kept_in_bf16_and_attended_in_bf16() {
     let w = Workload::new(1, 4, 4, 200, 64, 5);
     let bf16 = |a: InlineArray| a.as_dtype(Dtype::Bfloat16.as_i32());
