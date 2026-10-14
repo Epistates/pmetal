@@ -205,7 +205,8 @@ check-version:
 # Yanked crates are `just audit`'s job, not this one.
 check-lockfile:
     cargo metadata --locked --format-version 1 > /dev/null || (echo "FAIL: Cargo.lock is out of date -- run cargo update --workspace" && exit 1)
-    @echo "Cargo.lock satisfies the manifests"
+    cargo metadata --locked --format-version 1 --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml > /dev/null || (echo "FAIL: the GUI's Cargo.lock is out of date -- run cargo update --workspace --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml" && exit 1)
+    @echo "Cargo.lock and the GUI's Cargo.lock satisfy the manifests"
 
 # Bump version across all crates (updates workspace, gui, changelog stub)
 bump new_version:
