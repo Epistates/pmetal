@@ -206,16 +206,12 @@ uint64_t pmetal_bridge_error_seq(void) {
 }
 #endif
 
-void mlx_inline_init_empty(mlx_inline_array* dst) {
-    bridge_placeholder(dst);  // MLX array default = scalar 0
-}
-
+// Constructs into `dst` without destroying what is there: `dst` must be
+// uninitialised storage. (An `init_empty` that filled slots with live scalar
+// arrays used to be the other half of this pair, and every caller that built
+// into such a slot leaked it.)
 void mlx_inline_init_copy(mlx_inline_array* dst, const mlx_inline_array* src) {
     new (dst->buf) array(as_arr(src));
-}
-
-void mlx_inline_init_move(mlx_inline_array* dst, mlx_inline_array* src) {
-    new (dst->buf) array(std::move(as_arr(src)));
 }
 
 void mlx_inline_destroy(mlx_inline_array* a) {
