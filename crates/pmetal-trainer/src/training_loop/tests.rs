@@ -899,6 +899,21 @@ fn max_abs_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
         .fold(0.0, f32::max)
 }
 
+/// The L2 norm of `a - b` over every adapter weight.
+fn l2_diff(a: &LoraWeights, b: &LoraWeights) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .map(|(k, x)| {
+            let d = x.subtract(&b[k]);
+            let sq = d.multiply(&d).sum(None);
+            sq.eval();
+            pmetal_bridge::check_unobserved_error().unwrap();
+            sq.item_f32()
+        })
+        .sum::<f32>()
+        .sqrt()
+}
+
 #[test]
 fn the_sft_loop_trains_with_the_optimizer_the_config_names() {
     use pmetal_core::OptimizerType;
@@ -932,17 +947,23 @@ fn the_sft_loop_trains_with_the_optimizer_the_config_names() {
             max_abs_diff(&trained, &init) > 1e-4,
             "{kind:?}: the loop did not move the weights"
         );
+        let update = l2_diff(&trained, &init);
         for other in kinds {
             let replayed = lora_after_replay(&mut model, other, &init, &config, &dataset);
-            let diff = max_abs_diff(&trained, &replayed);
-            // The same optimizer agrees to float rounding (GPU reductions are
-            // not bit-reproducible, and drift further with other tests on the
-            // GPU); a different one lands 1e-2 or more away.
+            // How far apart the two runs land, as a share of the update. GPU
+            // reductions are not bit-reproducible, and Adam turns a rounding
+            // difference in a gradient near zero into a difference of up to
+            // the learning rate in that one weight (it divides by sqrt(v) +
+            // eps), so the largest single difference is no measure: it once
+            // reached 1.2e-4 for AdamW against itself. Over every weight the
+            // same optimizer lands within about 3e-6 of the update, and a
+            // different one 0.29 or more away.
+            let diff = l2_diff(&trained, &replayed) / update;
             if other == kind {
-                assert!(diff < 1e-4, "{kind:?}: loop and replay differ by {diff}");
+                assert!(diff < 1e-2, "{kind:?}: loop and replay differ by {diff}");
             } else {
                 assert!(
-                    diff > 1e-3,
+                    diff > 0.1,
                     "{kind:?} trained exactly like {other:?} (diff {diff})"
                 );
             }
