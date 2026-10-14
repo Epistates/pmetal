@@ -1,8 +1,8 @@
 //! Safetensors I/O and the global MLX random-seed setter.
 //!
-//! `load_safetensors_shard` parses a `.safetensors` file once and returns every
-//! tensor as an `InlineArray`, falling back to a per-tensor path if the batched
-//! C++ loader is unavailable. `InlineArray::save_safetensors` writes a file
+//! [`try_load_safetensors_shard`] parses a `.safetensors` file once and returns
+//! every tensor as an `InlineArray`, falling back to a per-tensor path if the
+//! batched C++ loader fails. `InlineArray::save_safetensors` writes a file
 //! atomically.
 
 use std::mem::MaybeUninit;
@@ -14,6 +14,11 @@ use super::InlineArray;
 use super::RawBuf;
 use super::ffi::*;
 use crate::error::{BridgeError, BridgeResult, check_last_error};
+
+/// A load failure, naming the file.
+fn load_error(path: &str, why: impl std::fmt::Display) -> BridgeError {
+    BridgeError::CxxException(format!("[load_safetensors] {path}: {why}"))
+}
 
 // ── Batch safetensors loader ──────────────────────────────────────────────
 
@@ -30,18 +35,28 @@ use crate::error::{BridgeError, BridgeResult, check_last_error};
 /// lost 722 of them, `model.norm.weight` among them, and the loader reported a
 /// missing weight for a key that was sitting in the file.
 ///
-/// Returns `None` on I/O or parse error.  Individual key allocation failures
-/// (malformed UTF-8 key) are silently skipped.
+/// Returns `None` on I/O or parse error; [`try_load_safetensors_shard`] says
+/// why.
 pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> {
-    let Some(entries) = safetensors_entry_count(path) else {
-        // Header unreadable by the Rust parser: let the per-tensor path try.
-        return load_safetensors_shard_fallback(path);
-    };
-    if entries == 0 {
-        return Some(Vec::new());
-    }
+    try_load_safetensors_shard(path).ok()
+}
 
-    let c_path = std::ffi::CString::new(path).ok()?;
+/// [`load_safetensors_shard`], with the reason a load failed.
+///
+/// # Errors
+/// The file can't be opened or its header can't be read, MLX's loader rejects
+/// it and the per-tensor fallback can't read some tensor either (an
+/// unsupported dtype, a misaligned tensor, an `i64` value that doesn't fit the
+/// `i32` the fallback holds it in). The message carries MLX's reason and the
+/// fallback's.
+pub fn try_load_safetensors_shard(path: &str) -> BridgeResult<Vec<(String, InlineArray)>> {
+    let c_path = std::ffi::CString::new(path)
+        .map_err(|_| load_error(path, "the path contains a NUL byte"))?;
+    // The header says how many tensors there are, so no cap can cut one off.
+    let entries = safetensors_entry_count(path).map_err(|why| load_error(path, why))?;
+    if entries == 0 {
+        return Ok(Vec::new());
+    }
 
     // Allocate key-pointer buffer.  C++ will strdup into each slot.
     let mut key_ptrs: Vec<*mut std::ffi::c_char> = vec![std::ptr::null_mut(); entries];
@@ -51,23 +66,35 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
     let mut arr_slots: Vec<MaybeUninit<RawBuf>> = (0..entries)
         .map(|_| MaybeUninit::<RawBuf>::uninit())
         .collect();
+    let capacity = i32::try_from(entries)
+        .map_err(|_| load_error(path, format!("{entries} tensors are more than i32::MAX")))?;
 
-    let count = unsafe {
+    // A failure is handled below (the per-tensor fallback), so a strict build
+    // must not panic at the op.
+    let count = crate::expect_bridge_errors(|| unsafe {
         mlx_inline_load_safetensors_all(
             c_path.as_ptr(),
             key_ptrs.as_mut_ptr(),
             // Cast *mut MaybeUninit<RawBuf> → *mut RawBuf.  This is safe
             // because MaybeUninit<T> has the same layout as T.
             arr_slots.as_mut_ptr() as *mut RawBuf,
-            entries as i32,
+            capacity,
         )
-    };
+    });
 
     if count < 0 {
         // Fallback: recover tensor names from the safetensors header, then load
-        // each tensor through the single-key bridge path. This preserves a
-        // correct native load path even when the batched C++ loader fails.
-        return load_safetensors_shard_fallback(path);
+        // each tensor from the mapped file. This keeps a load working even when
+        // the batched C++ loader fails (an FP8 payload, say).
+        let mlx_says = check_last_error()
+            .err()
+            .map_or_else(|| "MLX's loader failed".to_string(), |e| e.to_string());
+        return load_safetensors_shard_fallback(path).map_err(|fallback_says| {
+            load_error(
+                path,
+                format!("{mlx_says}; per-tensor fallback: {fallback_says}"),
+            )
+        });
     }
 
     let count = count as usize;
@@ -95,92 +122,103 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
         result.push((key, array));
     }
 
-    Some(result)
+    Ok(result)
 }
 
 /// How many tensors a shard holds, from its header alone.
 ///
 /// `SafeTensors::deserialize` parses the JSON header and borrows the rest, so
 /// this does not read any tensor data.
-fn safetensors_entry_count(path: &str) -> Option<usize> {
+fn safetensors_entry_count(path: &str) -> Result<usize, String> {
     let mapped = map_safetensors_file(path)?;
-    Some(SafeTensors::deserialize(&mapped).ok()?.names().len())
+    let tensors = SafeTensors::deserialize(&mapped)
+        .map_err(|e| format!("unreadable safetensors header: {e}"))?;
+    Ok(tensors.names().len())
 }
 
-fn load_safetensors_shard_fallback(path: &str) -> Option<Vec<(String, InlineArray)>> {
+fn load_safetensors_shard_fallback(path: &str) -> Result<Vec<(String, InlineArray)>, String> {
     let mapped = map_safetensors_file(path)?;
-    let tensors = SafeTensors::deserialize(&mapped).ok()?;
+    let tensors = SafeTensors::deserialize(&mapped)
+        .map_err(|e| format!("unreadable safetensors header: {e}"))?;
     let names = tensors.names();
     let mut result = Vec::with_capacity(names.len());
     for key in names {
-        let tensor = tensors.tensor(key).ok()?;
-        let array = inline_array_from_tensor_view(&tensor)?;
+        let tensor = tensors
+            .tensor(key)
+            .map_err(|e| format!("tensor `{key}`: {e}"))?;
+        let array = inline_array_from_tensor_view(&tensor)
+            .map_err(|why| format!("tensor `{key}`: {why}"))?;
         result.push((key.to_string(), array));
     }
-    Some(result)
+    Ok(result)
 }
 
-fn map_safetensors_file(path: &str) -> Option<Mmap> {
-    let file = std::fs::File::open(path).ok()?;
-    unsafe { Mmap::map(&file).ok() }
+fn map_safetensors_file(path: &str) -> Result<Mmap, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot open: {e}"))?;
+    // SAFETY: the map is read through shared references while it lives and
+    // copied into MLX arrays before it is dropped; a file truncated underneath
+    // us is the usual mmap hazard, accepted for a model file being loaded.
+    unsafe { Mmap::map(&file) }.map_err(|e| format!("cannot map: {e}"))
 }
 
-fn as_typed_slice<T>(data: &[u8]) -> Option<&[T]> {
+fn as_typed_slice<T>(data: &[u8]) -> Result<&[T], String> {
     // SAFETY: We only accept fully aligned, remainder-free views.
     let (prefix, values, suffix) = unsafe { data.align_to::<T>() };
     if prefix.is_empty() && suffix.is_empty() {
-        Some(values)
+        Ok(values)
     } else {
-        None
+        Err(format!(
+            "the data is not aligned to {} bytes or not a whole number of elements",
+            std::mem::size_of::<T>()
+        ))
     }
 }
 
-fn shape_to_i32(shape: &[usize]) -> Option<Vec<i32>> {
-    shape.iter().map(|&dim| i32::try_from(dim).ok()).collect()
+fn shape_to_i32(shape: &[usize]) -> Result<Vec<i32>, String> {
+    shape
+        .iter()
+        .map(|&dim| i32::try_from(dim).map_err(|_| format!("dimension {dim} exceeds i32::MAX")))
+        .collect()
 }
 
 fn inline_array_from_tensor_view(
     tensor: &safetensors::tensor::TensorView<'_>,
-) -> Option<InlineArray> {
+) -> Result<InlineArray, String> {
     let shape = shape_to_i32(tensor.shape())?;
-    match tensor.dtype() {
-        SafeDtype::F32 => Some(InlineArray::from_f32_slice(
-            as_typed_slice::<f32>(tensor.data())?,
-            &shape,
-        )),
-        SafeDtype::I32 => Some(InlineArray::from_i32_slice_shaped(
-            as_typed_slice::<i32>(tensor.data())?,
-            &shape,
-        )),
-        SafeDtype::U32 => Some(InlineArray::from_u32_slice(
-            as_typed_slice::<u32>(tensor.data())?,
-            &shape,
-        )),
-        SafeDtype::U8 => Some(InlineArray::from_u8_slice(
-            as_typed_slice::<u8>(tensor.data())?,
-            &shape,
-        )),
-        SafeDtype::F16 => Some(InlineArray::from_u16_bits_slice(
-            as_typed_slice::<u16>(tensor.data())?,
-            &shape,
-            9,
-        )),
-        SafeDtype::BF16 => Some(InlineArray::from_u16_bits_slice(
-            as_typed_slice::<u16>(tensor.data())?,
-            &shape,
-            11,
-        )),
-        SafeDtype::F8_E4M3 => Some(InlineArray::from_u8_slice(
-            as_typed_slice::<u8>(tensor.data())?,
-            &shape,
-        )),
+    Ok(match tensor.dtype() {
+        SafeDtype::F32 => {
+            InlineArray::from_f32_slice(as_typed_slice::<f32>(tensor.data())?, &shape)
+        }
+        SafeDtype::I32 => {
+            InlineArray::from_i32_slice_shaped(as_typed_slice::<i32>(tensor.data())?, &shape)
+        }
+        SafeDtype::U32 => {
+            InlineArray::from_u32_slice(as_typed_slice::<u32>(tensor.data())?, &shape)
+        }
+        SafeDtype::U8 => InlineArray::from_u8_slice(as_typed_slice::<u8>(tensor.data())?, &shape),
+        SafeDtype::F16 => {
+            InlineArray::from_u16_bits_slice(as_typed_slice::<u16>(tensor.data())?, &shape, 9)
+        }
+        SafeDtype::BF16 => {
+            InlineArray::from_u16_bits_slice(as_typed_slice::<u16>(tensor.data())?, &shape, 11)
+        }
+        // MLX holds an FP8 payload in a uint8 array (see `to_fp8`).
+        SafeDtype::F8_E4M3 => {
+            InlineArray::from_u8_slice(as_typed_slice::<u8>(tensor.data())?, &shape)
+        }
         SafeDtype::I64 => {
             let values = as_typed_slice::<i64>(tensor.data())?;
-            let cast: Vec<i32> = values.iter().map(|&value| value as i32).collect();
-            Some(InlineArray::from_i32_slice_shaped(&cast, &shape))
+            let narrowed: Result<Vec<i32>, String> = values
+                .iter()
+                .map(|&value| {
+                    i32::try_from(value)
+                        .map_err(|_| format!("the i64 value {value} does not fit an i32"))
+                })
+                .collect();
+            InlineArray::from_i32_slice_shaped(&narrowed?, &shape)
         }
-        _ => None,
-    }
+        other => return Err(format!("the dtype {other:?} is not supported")),
+    })
 }
 
 /// Thin wrapper around libc free so we can call it without a libc dependency.
@@ -192,7 +230,7 @@ unsafe fn libc_free(ptr: *mut std::ffi::c_void) {
     unsafe { free(ptr) }
 }
 
-// ── Single-key loader (impl on InlineArray) ──────────────────────────────
+// ── Single-key loader and the saver (impl on InlineArray) ────────────────
 
 impl InlineArray {
     /// Write `entries` to `path` as one safetensors file, all or nothing.
@@ -249,25 +287,48 @@ impl InlineArray {
 
     /// Load a single array from a safetensors file by key name.
     /// Loads through the bridge's own MLX instance, so the array shares its
-    /// allocator with every other bridge op.
+    /// allocator with every other bridge op. `None` if the file or the key
+    /// can't be read; [`Self::try_load_safetensors`] says why.
     pub fn load_safetensors(path: &str, key: &str) -> Option<Self> {
-        let c_path = std::ffi::CString::new(path).ok()?;
-        let c_key = std::ffi::CString::new(key).ok()?;
+        Self::try_load_safetensors(path, key).ok()
+    }
+
+    /// [`Self::load_safetensors`], with the reason a load failed.
+    ///
+    /// # Errors
+    /// The file can't be opened or parsed, the key isn't in it, or its dtype
+    /// is one neither MLX's loader nor the fallback reads.
+    pub fn try_load_safetensors(path: &str, key: &str) -> BridgeResult<Self> {
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|_| load_error(path, "the path contains a NUL byte"))?;
+        let c_key = std::ffi::CString::new(key)
+            .map_err(|_| load_error(path, format!("the key {key:?} contains a NUL byte")))?;
         let mut dst = std::mem::MaybeUninit::<RawBuf>::uninit();
-        unsafe {
-            if mlx_inline_load_safetensors_key(dst.as_mut_ptr(), c_path.as_ptr(), c_key.as_ptr())
-                == 0
-            {
-                Some(Self {
-                    raw: dst.assume_init(),
-                })
-            } else {
-                let mapped = map_safetensors_file(path)?;
-                let tensors = SafeTensors::deserialize(&mapped).ok()?;
-                let tensor = tensors.tensor(key).ok()?;
-                inline_array_from_tensor_view(&tensor)
-            }
+        // A failure is handled below (the per-tensor fallback), so a strict
+        // build must not panic at the op.
+        let status = crate::expect_bridge_errors(|| unsafe {
+            mlx_inline_load_safetensors_key(dst.as_mut_ptr(), c_path.as_ptr(), c_key.as_ptr())
+        });
+        if status == 0 {
+            // SAFETY: a zero status means the callee placement-new'd the array.
+            return Ok(Self {
+                raw: unsafe { dst.assume_init() },
+            });
         }
+        let mlx_says = check_last_error()
+            .err()
+            .map_or_else(|| "MLX's loader failed".to_string(), |e| e.to_string());
+        let fallback = || -> Result<Self, String> {
+            let mapped = map_safetensors_file(path)?;
+            let tensors = SafeTensors::deserialize(&mapped)
+                .map_err(|e| format!("unreadable safetensors header: {e}"))?;
+            let tensor = tensors
+                .tensor(key)
+                .map_err(|e| format!("tensor `{key}`: {e}"))?;
+            inline_array_from_tensor_view(&tensor)
+        };
+        fallback()
+            .map_err(|why| load_error(path, format!("{mlx_says}; per-tensor fallback: {why}")))
     }
 }
 

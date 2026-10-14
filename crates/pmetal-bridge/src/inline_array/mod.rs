@@ -21,7 +21,7 @@ pub use diagnostics::{
 };
 
 mod safetensors;
-pub use safetensors::{load_safetensors_shard, random_seed};
+pub use safetensors::{load_safetensors_shard, random_seed, try_load_safetensors_shard};
 
 mod autograd;
 pub use autograd::{checkpoint_apply, checkpoint_apply_unchecked, value_and_grad};
