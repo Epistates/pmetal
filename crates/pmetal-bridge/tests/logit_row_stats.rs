@@ -112,7 +112,7 @@ fn the_logits_gradient_is_softmax_plus_onehot_plus_one() {
                         .add(&s.logit_sum.multiply(&p[4]))
                         .sum_all()
                 },
-                &[z.clone()],
+                std::slice::from_ref(&z),
                 &[t, a_arr, b_arr, c_arr],
             );
             assert_eq!(
@@ -151,8 +151,8 @@ fn a_target_outside_the_vocabulary_picks_nothing() {
                 let s = logit_row_stats(&p[0], &p[1]);
                 s.target_logit.sum_all()
             },
-            &[z.clone()],
-            &[t.clone()],
+            std::slice::from_ref(&z),
+            std::slice::from_ref(&t),
         );
         let stats = logit_row_stats(&z, &t);
         let target = read(&stats.target_logit);

@@ -1413,10 +1413,7 @@ mod tests {
     /// channels at every spatial position, then scaled per channel.
     fn torch_group_norm(
         x: &[f32],
-        batch: usize,
-        spatial: usize,
-        channels: usize,
-        groups: usize,
+        (batch, spatial, channels, groups): (usize, usize, usize, usize),
         eps: f64,
         weight: &[f32],
         bias: &[f32],
@@ -1474,10 +1471,7 @@ mod tests {
         norm.bias.value = Some(Array::from_f32_slice(&bias, &[channels as i32]));
         let want = torch_group_norm(
             &values(&x),
-            batch,
-            h * w,
-            channels,
-            groups,
+            (batch, h * w, channels, groups),
             1e-5,
             &weight,
             &bias,

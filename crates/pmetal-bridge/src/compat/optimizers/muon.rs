@@ -93,7 +93,8 @@ pub fn newton_schulz_orthogonalize(
     x
 }
 
-/// Muon over matrices. See the [module docs](self).
+/// Muon over matrices: momentum, then Newton–Schulz orthogonalization, then
+/// the step, as in the module's description above.
 #[derive(Debug)]
 pub struct Muon {
     /// Learning rate, before the shape adjustment.
