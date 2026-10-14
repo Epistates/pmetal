@@ -8,7 +8,7 @@ use std::{
 /// The MLX revision this crate builds against, tag or commit.
 ///
 /// Currently a commit on upstream main: see `cmake/CMakeLists.txt` for why.
-const BUNDLED_MLX_GIT_TAG: &str = "99f109b567b969ef06974f1e0450ce0e2eeb4de2";
+const BUNDLED_MLX_GIT_TAG: &str = "bebd6422f8db88d56e6220520a35bcd146f823f8";
 
 // ── Deployment target ──────────────────────────────────────────────────────
 
