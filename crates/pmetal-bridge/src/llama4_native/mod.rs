@@ -186,6 +186,18 @@ impl Llama4Config {
         }
         let text: Llama4TextConfig = serde_json::from_value(text)
             .map_err(|e| format!("failed to parse Llama4Config: {e}"))?;
+        if text.num_experts_per_tok < 1 || text.num_experts_per_tok > text.num_local_experts {
+            return Err(format!(
+                "llama4 config: num_experts_per_tok {} does not fit num_local_experts {}",
+                text.num_experts_per_tok, text.num_local_experts
+            ));
+        }
+        if text.attention_chunk_size < 1 {
+            return Err(format!(
+                "llama4 config: attention_chunk_size {} is not positive",
+                text.attention_chunk_size
+            ));
+        }
         let model_type = json
             .get("model_type")
             .and_then(|v| v.as_str())
@@ -323,6 +335,24 @@ mod tests {
         assert!((0..48).all(|l| config.use_rope(l) == (l % 4 != 3)));
         assert_eq!(t.attn_temperature_tuning, 1);
         assert!(!t.tie_word_embeddings);
+    }
+
+    /// A router that picks more experts than exist, or a chunk of no tokens,
+    /// is refused by name rather than run.
+    #[test]
+    fn impossible_routing_and_chunks_are_refused() {
+        let with = |k: i32, chunk: i32| {
+            super::Llama4Config::from_json(&serde_json::json!({
+                "hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 4,
+                "intermediate_size_mlp": 48, "intermediate_size": 48, "vocab_size": 64,
+                "attention_chunk_size": chunk, "num_local_experts": 4, "num_experts_per_tok": k,
+                "max_position_embeddings": 64
+            }))
+        };
+        assert!(with(2, 8).is_ok());
+        assert!(with(0, 8).unwrap_err().contains("num_experts_per_tok"));
+        assert!(with(5, 8).unwrap_err().contains("num_experts_per_tok"));
+        assert!(with(1, 0).unwrap_err().contains("attention_chunk_size"));
     }
 
     /// `tie_word_embeddings` sits outside `text_config` in a nested config and

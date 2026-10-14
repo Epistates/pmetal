@@ -1,85 +1,81 @@
-//! Feed-forward: dense SwiGLU MLP for non-MoE layers + top-1 SwitchGLU MoE
-//! with shared expert.
+//! Feed-forward: dense SwiGLU MLP for non-MoE layers + Llama 4's sigmoid-gated
+//! top-k MoE with a shared expert.
 
 use crate::InlineArray;
-use crate::native_weight::LayerWeight;
+use crate::dtype;
 
-use super::weights::{LayerWeights, MoeWeights};
+use super::weights::{Mlp, MoeWeights};
 
-pub(super) fn dense_mlp_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
-    let gate = x.matmul(lw.mlp_gate_w.as_ref().unwrap());
-    let up = x.matmul(lw.mlp_up_w.as_ref().unwrap());
-    let act = InlineArray::fused_swiglu(&gate, &up);
-    act.matmul(lw.mlp_down_w.as_ref().unwrap())
+pub(super) fn mlp_forward(mlp: &Mlp, x: &InlineArray) -> InlineArray {
+    let gate = mlp.gate.matmul_from(x);
+    let up = mlp.up.matmul_from(x);
+    mlp.down.matmul_from(&InlineArray::fused_swiglu(&gate, &up))
 }
 
-/// MoE forward pass matching Python's `MoE.__call__`.
+/// Llama 4's MoE (`Llama4TextMoe`).
 ///
-/// Python:
-/// ```python
-/// logits = self.router(x)
-/// indices = argpartition(-logits, kth=0, axis=-1)[..., :1]  # top-1
-/// scores = take_along_axis(logits, indices, axis=-1)
-/// scores = sigmoid(scores.astype(float32)).astype(x.dtype)
-/// out = self.experts(x * scores, indices).squeeze(2)
-/// return out + self.shared_expert(x)
+/// ```text
+///   logits  = router(x)                                  [B, T, E]
+///   experts = top_k(logits)                              [B, T, k]
+///   gates   = sigmoid(logits[experts]) in f32, cast back [B, T, k]
+///   out     = Σ_j expert_{experts[j]}(x · gates[j])  +  shared_expert(x)
 /// ```
 ///
-/// Weight layout in `moe` after sanitization:
-///   - `experts_gate_w`: `[E, hidden, expert_h]` — used directly as gather_mm B matrix
-///   - `experts_up_w`:   `[E, hidden, expert_h]`
-///   - `experts_down_w`: `[E, expert_h, hidden]`
-///
-/// We reshape inputs to `[B*T, 1, hidden]` for gather_mm and `rhs_indices=[B*T, 1]`.
+/// The gate scales an expert's *input*, not its output (the expert is not
+/// linear), and the gated outputs are summed without normalisation. Every
+/// release routes to one expert, so `k` is 1 in practice; the sum is the
+/// transformers' for any `k`.
 pub(super) fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> InlineArray {
-    let hidden_size = x.dim(2);
+    let hidden = x.dim(2);
     let dtype = x.dtype_raw();
+    let rows = b * s;
+    let k = moe.top_k;
 
-    // Router: [B, T, hidden] × [hidden, num_experts] → [B, T, num_experts]
-    let logits = x.matmul(&moe.router_w);
+    // Router: [B, T, hidden] -> [rows, num_experts]
+    let logits = moe.router.matmul_from(x);
+    let logits = logits.reshape(&[rows, logits.dim(2)]);
 
-    // Top-1 selection: argpartition(-logits, kth=0)  places the top-1 index
-    // at position 0. Flatten to [B*T, num_experts], slice first column → [B*T, 1].
-    let bt = b * s;
-    let num_experts = logits.dim(2);
-    let neg_logits = logits.negative();
-    let partition = neg_logits.argpartition(0, -1);
-    let part_flat = partition.reshape(&[bt, num_experts]);
-    let indices_flat = part_flat.slice(&[0, 0], &[bt, 1]); // [bt, 1] top-1 expert index
-    let indices = indices_flat.reshape(&[b, s, 1]); // [B, T, 1]
+    // `argpartition(-logits, k - 1)[:, :k]` is the top k. The indices carry
+    // no gradient (MLX rejects a gather VJP taken with respect to indices
+    // that descend from differentiable scores).
+    let inds = logits
+        .negative()
+        .argpartition(k - 1, -1)
+        .slice(&[0, 0], &[rows, k])
+        .stop_gradient();
 
-    // Gather scores for the top-1 expert, apply sigmoid in f32 for numerical stability.
-    let scores_raw = logits.take_along_axis(&indices, -1); // [B, T, 1]
-    // (Dtype id 0 is bool, which turned every logit into 1 and every gate
-    // into sigmoid(1).)
-    let scores_sig = scores_raw
-        .as_dtype(crate::dtype::F32)
+    // The gates: the sigmoid is taken in f32, as transformers takes it (dtype
+    // id 0 is bool, which once turned every logit into 1).
+    let gates = logits
+        .take_along_axis(&inds, -1)
+        .as_dtype(dtype::F32)
         .sigmoid()
-        .as_dtype(dtype); // [B, T, 1]
+        .as_dtype(dtype);
 
-    // Scale the routed input.
-    let x_scaled = x.multiply(&scores_sig); // [B, T, hidden]
+    // The shared routed-expert dispatch, one slot at a time, with the gate
+    // already applied to the input (so the output weights are 1).
+    let x_flat = x.reshape(&[rows, hidden]);
+    let ones = InlineArray::ones(&[rows, 1], dtype);
+    let mut routed: Option<InlineArray> = None;
+    for j in 0..k {
+        let slot = inds.slice(&[0, j], &[rows, j + 1]);
+        let gated = x_flat.multiply(&gates.slice(&[0, j], &[rows, j + 1]));
+        let y = crate::native_moe::switch_glu(
+            &gated,
+            &moe.experts_gate,
+            &moe.experts_up,
+            &moe.experts_down,
+            &slot,
+            &ones,
+            InlineArray::fused_swiglu,
+        );
+        routed = Some(match routed {
+            Some(sum) => sum.add(&y),
+            None => y,
+        });
+    }
+    let routed = routed.expect("top_k is at least 1");
 
-    // The shared routed-expert dispatch, with the gate already applied to
-    // the input (so the output weights are 1).
-    let x_flat = x_scaled.reshape(&[bt, hidden_size]);
-    let ones = InlineArray::ones(&[bt, 1], dtype);
-    let routed_out = crate::native_moe::switch_glu(
-        &x_flat,
-        &LayerWeight::Dense(moe.experts_gate_w.clone()),
-        &LayerWeight::Dense(moe.experts_up_w.clone()),
-        &LayerWeight::Dense(moe.experts_down_w.clone()),
-        &indices_flat,
-        &ones,
-        InlineArray::fused_swiglu,
-    )
-    .reshape(&[b, s, hidden_size]);
-
-    // Shared expert: standard dense SwiGLU MLP
-    let sh_gate = x.matmul(&moe.shared_gate_w);
-    let sh_up = x.matmul(&moe.shared_up_w);
-    let sh_act = InlineArray::fused_swiglu(&sh_gate, &sh_up);
-    let shared_out = sh_act.matmul(&moe.shared_down_w);
-
-    routed_out.add(&shared_out)
+    let shared = mlp_forward(&moe.shared, &x_flat);
+    routed.add(&shared).reshape(&[b, s, hidden])
 }
