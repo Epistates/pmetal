@@ -25,9 +25,14 @@ fn mean_attention_error(
     let mut total = 0.0;
     for seed in 0..seeds {
         let w = Workload::new(1, groups.0, groups.1, seq, dim, 100 + seed);
+        // The key frame is off here: these budgets are the quantizer's own,
+        // on a workload whose queries sit where the keys vary most (the
+        // frame's tests below use ones that do not).
         let cfg = TurboQuantConfig::uniform(bits, bits)
             .with_recent_window(window)
-            .with_sink_tokens(sinks);
+            .with_sink_tokens(sinks)
+            .with_center_keys(false)
+            .with_scale_key_channels(false);
         let (_, got) = run_cache(&w, cfg);
         total += relative_error(&got, &w.reference(seq));
     }
@@ -127,4 +132,71 @@ fn an_attention_sink_kept_exact_removes_the_error_it_would_carry() {
     // (relative error about 0.18); with it, the output is exact.
     assert!(without > 0.1, "quantized sink: {without:.4}");
     assert!(with < 0.01, "exact sink: {with:.4}");
+}
+
+#[test]
+fn centring_the_keys_removes_the_error_a_shared_key_component_causes() {
+    // Every key of a head carries the same large offset, as real keys do. It
+    // adds one constant to each query's logits, so attention is unchanged,
+    // but without centring it takes most of each key's norm and the codebook
+    // is spent on it. The window and the sinks leave both a dense and a cold
+    // part, so the shift has to be right on both sides.
+    let (q_heads, kv_heads, dim, seq) = (8usize, 2usize, 128usize, 1537usize);
+    let mean_error = |center: bool| {
+        let mut total = 0.0;
+        for seed in 0..3 {
+            let w = Workload::new(1, q_heads, kv_heads, seq, dim, 300 + seed)
+                .with_key_bias(24.0, 900 + seed);
+            let cfg = TurboQuantConfig::uniform(4, 4)
+                .with_recent_window(Some(64))
+                .with_sink_tokens(4)
+                .with_center_keys(center)
+                .with_scale_key_channels(false);
+            let (_, got) = run_cache(&w, cfg);
+            total += relative_error(&got, &w.reference(seq));
+        }
+        total / 3.0
+    };
+    let plain = mean_error(false);
+    let centred = mean_error(true);
+    eprintln!("4-bit keys with a shared offset: plain {plain:.4}, centred {centred:.4}");
+    // The budget of a 4-bit cache on keys without the offset.
+    assert!(centred < 0.19, "centred: {centred:.4}");
+    assert!(
+        plain > 2.0 * centred,
+        "plain {plain:.4} vs centred {centred:.4}"
+    );
+}
+
+#[test]
+fn scaling_the_key_channels_removes_the_error_loud_channels_cause() {
+    // A quarter of the channels vary 8x as much as the rest and the queries
+    // look at the quiet ones. The quantizer's error is as large in every
+    // direction, so next to the logits' small spread it is far too large
+    // unless the loud channels are brought down to the others' size (and
+    // the query's up by the same factor).
+    let (q_heads, kv_heads, dim, seq) = (8usize, 2usize, 128usize, 1537usize);
+    let mean_error = |bits: u8, scale: bool| {
+        let mut total = 0.0;
+        for seed in 0..3 {
+            let w = Workload::lopsided(1, q_heads, kv_heads, seq, dim, 500 + seed);
+            let cfg = TurboQuantConfig::uniform(bits, bits)
+                .with_recent_window(Some(64))
+                .with_sink_tokens(4)
+                .with_scale_key_channels(scale);
+            let (_, got) = run_cache(&w, cfg);
+            total += relative_error(&got, &w.reference(seq));
+        }
+        total / 3.0
+    };
+    for (bits, budget) in [(8u8, 0.025), (4, 0.19)] {
+        let plain = mean_error(bits, false);
+        let scaled = mean_error(bits, true);
+        eprintln!("{bits}-bit lopsided keys: plain {plain:.4}, scaled {scaled:.4}");
+        assert!(scaled < budget, "{bits}-bit scaled: {scaled:.4}");
+        assert!(
+            plain > 2.0 * scaled,
+            "{bits}-bit: plain {plain:.4} vs scaled {scaled:.4}"
+        );
+    }
 }

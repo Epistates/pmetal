@@ -7,8 +7,8 @@
 //! the nearest Lloyd-Max centroids of the coordinates of `Π x / |x|`, where `Π`
 //! is a fixed Haar-random orthogonal matrix. After the rotation every
 //! coordinate has the same Beta density whatever `x` is, so one codebook per
-//! `(head dim, bits)` serves every vector and nothing is calibrated on data;
-//! the squared error is within a constant (about 2.7) of the best any
+//! `(head dim, bits)` serves every vector and the codebooks are not calibrated
+//! on data; the squared error is within a constant (about 2.7) of the best any
 //! `bits`-bit code can do. See [`Quantizer`].
 //!
 //! Attention scores come out as `scale_k <Π q, ĉ_k>`: the query is rotated once
@@ -23,6 +23,19 @@
 //! only to feed a softmax the variance that outweighs its bias. Measured on
 //! attention output against f64 attention it loses to spending the same bit
 //! on the codebook, as independent implementations have also found.
+//!
+//! The quantizer's error is as large in every direction, which is what the
+//! rotation buys and what real keys punish: they share a large component
+//! across tokens and vary far more in some channels than in others, so a
+//! uniform error swamps the logits' small spread. Each KV head's keys are
+//! therefore put in a frame before they are quantized, calibrated on the
+//! first tokens stored: the mean is taken off and each channel is divided by
+//! its spread (`TurboQuantConfig::center_keys`, `scale_key_channels`). The
+//! logits are unchanged: the query is multiplied by the same spreads, and the
+//! mean adds one constant to a head's logits, which the softmax does not
+//! see, so the dense tokens' scores and the sink logits just have it taken
+//! off. On Qwen3-0.6B this is the difference between +273% and +0.3%
+//! perplexity at 4 bits.
 //!
 //! # Cache layout
 //!

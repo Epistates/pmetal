@@ -91,6 +91,19 @@ pub struct TurboQuantConfig {
     pub recent_window: Option<usize>,
     /// The first `sink_tokens` tokens of the sequence stay uncompressed.
     pub sink_tokens: usize,
+    /// Take each KV head's mean key off the keys before they are quantized
+    /// and account for it in attention. Real keys share a large component
+    /// across tokens that dominates their norm; quantizing it wastes the
+    /// codebook on a constant. The softmax does not see a constant added to
+    /// every logit of a head, so removing it changes nothing but the error.
+    pub center_keys: bool,
+    /// Divide each key channel by its spread (measured on the first tokens
+    /// stored) before quantizing, and multiply the query's channels by the
+    /// same spread so the logits do not change. The quantizer's error is
+    /// the same size in every direction, so without this a head whose
+    /// channels differ in spread has an error much larger, next to the
+    /// logits' own spread, than the code's width suggests.
+    pub scale_key_channels: bool,
 }
 
 impl TurboQuantConfig {
@@ -102,6 +115,8 @@ impl TurboQuantConfig {
             values: TurboQuantTensorConfig::uniform(value_bits),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             sink_tokens: DEFAULT_SINK_TOKENS,
+            center_keys: true,
+            scale_key_channels: true,
         }
     }
 
@@ -127,6 +142,8 @@ impl TurboQuantConfig {
             ),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             sink_tokens: DEFAULT_SINK_TOKENS,
+            center_keys: true,
+            scale_key_channels: true,
         }
     }
 
@@ -159,6 +176,20 @@ impl TurboQuantConfig {
     /// Replace the number of uncompressed sink tokens.
     pub const fn with_sink_tokens(mut self, tokens: usize) -> Self {
         self.sink_tokens = tokens;
+        self
+    }
+
+    /// Turn key centering on or off (on by default); see
+    /// [`TurboQuantConfig::center_keys`].
+    pub const fn with_center_keys(mut self, center: bool) -> Self {
+        self.center_keys = center;
+        self
+    }
+
+    /// Turn per-channel key scaling on or off (on by default); see
+    /// [`TurboQuantConfig::scale_key_channels`].
+    pub const fn with_scale_key_channels(mut self, scale: bool) -> Self {
+        self.scale_key_channels = scale;
         self
     }
 

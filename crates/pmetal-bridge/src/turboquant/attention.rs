@@ -239,7 +239,20 @@ fn decode_attention_launch(
     let plan = plan_blocks(visible_cold, visible_dense, n_kv_rows);
 
     let q_rows = queries.reshape(&[n_rows as i32, dim as i32]);
-    let q_rot = keys.rotate(&q_rows);
+    // Cold keys were divided channel by channel by `scale`; multiplying the
+    // query by it leaves every logit as it was.
+    let q_cold = match cold
+        .and_then(|c| c.frame.as_ref())
+        .and_then(|f| f.scale.as_ref())
+    {
+        Some(scale) => q_rows
+            .as_dtype(Dtype::Float32.as_i32())
+            .reshape(&[n_kv_rows as i32, groups as i32, dim as i32])
+            .multiply(&scale.expand_dims(1))
+            .reshape(&[n_rows as i32, dim as i32]),
+        None => q_rows.clone(),
+    };
+    let q_rot = keys.rotate(&q_cold);
 
     let placeholder;
     let cold_arrays = match cold {
@@ -265,7 +278,20 @@ fn decode_attention_launch(
     params[param::HAS_SINK_LOGITS] = i32::from(sinks.is_some());
     params[param::COLD_FIRST] = cold_first as i32;
     params[param::DENSE_FIRST] = dense_first as i32;
+    // The centre the cold keys were stored with. A cold store that has one
+    // always has it set before it holds a token.
+    let frame = cold.and_then(|c| c.frame.as_ref());
+    let centre = frame.map(|f| &f.center);
+    params[param::HAS_CENTER] = i32::from(centre.is_some());
     let params = InlineArray::from_i32_slice(&params);
+    let no_centre;
+    let centre = match centre {
+        Some(c) => c,
+        None => {
+            no_centre = InlineArray::zeros(&[1], Dtype::Float32.as_i32());
+            &no_centre
+        }
+    };
 
     let no_sinks;
     let sink_logits = match sinks {
@@ -276,7 +302,7 @@ fn decode_attention_launch(
         }
     };
 
-    let (acc, m, l) = kernels::attention_partials(&PartialsArgs {
+    let partials = kernels::attention_partials(&PartialsArgs {
         q: &q_rows,
         q_rot: &q_rot,
         k_packed: &cold_arrays.k.packed,
@@ -288,6 +314,7 @@ fn decode_attention_launch(
         dense_k: &dense.keys,
         dense_v: &dense.values,
         params: &params,
+        center: centre,
         dim,
         value_dim,
         key_bits: keys.bits(),
@@ -301,9 +328,7 @@ fn decode_attention_launch(
     .map_err(|e| e.to_string())?;
 
     let out = kernels::attention_merge(
-        &acc,
-        &m,
-        &l,
+        &partials,
         values.rotation_array(),
         sink_logits,
         &params,

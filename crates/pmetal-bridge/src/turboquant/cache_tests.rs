@@ -466,6 +466,60 @@ fn attention_from_a_given_position_ignores_earlier_tokens() {
 }
 
 #[test]
+fn sink_logits_mean_the_same_with_and_without_key_centring() {
+    // Centring shifts every logit of a head by q . mu, and a sink logit is
+    // one of them, so it has to be shifted too. The keys carry a large
+    // offset, so a sink logit left unshifted would be off by far more than
+    // the spread of the scores.
+    let w = Workload::new(1, 4, 2, 300, 64, 14).with_key_bias(24.0, 15);
+    let attend = |center: bool, sinks: Option<&InlineArray>| {
+        let mut cache = new_cache(config(8, 8, Some(32), 4).with_center_keys(center));
+        cache
+            .append(&w.kv_slice(false, 0, 300), &w.kv_slice(true, 0, 300))
+            .unwrap();
+        assert!(cache.cold_len() > 0);
+        to_host(
+            &cache
+                .compute_attention(&w.queries_array(), w.scale(), 0, sinks)
+                .unwrap(),
+        )
+    };
+    // About the size of a head's strongest scores.
+    let sink_values = [3.0f32, 5.0, 3.0, 5.0];
+    let sinks = InlineArray::from_f32_slice(&sink_values, &[4]);
+    // The exact answer: attention without the sink, scaled by the share of
+    // the softmax the real tokens keep, `1 / (1 + exp(s - logsumexp))`.
+    let (d, groups) = (w.dim, w.q_heads / w.kv_heads);
+    let mut want = w.reference(300);
+    for qh in 0..w.q_heads {
+        let q = &w.queries[qh * d..(qh + 1) * d];
+        let base = (qh / groups) * 300 * d;
+        let logits: Vec<f64> = (0..300)
+            .map(|t| {
+                let k = &w.keys[base + t * d..][..d];
+                f64::from(w.scale())
+                    * q.iter()
+                        .zip(k)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum::<f64>()
+            })
+            .collect();
+        let top = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let lse = top + logits.iter().map(|l| (l - top).exp()).sum::<f64>().ln();
+        let keep = 1.0 / (1.0 + (f64::from(sink_values[qh]) - lse).exp());
+        for x in &mut want[qh * d..(qh + 1) * d] {
+            *x *= keep;
+        }
+    }
+    let centred = attend(true, Some(&sinks));
+    let without = attend(true, None);
+    let error = relative_error(&centred, &want);
+    let effect = relative_error(&without, &want);
+    assert!(effect > 0.05, "the sink logits must matter: {effect:.4}");
+    assert!(error < 0.05, "centred attention with sinks: {error:.4}");
+}
+
+#[test]
 fn per_head_sink_logits_reach_the_cache_attention() {
     let w = Workload::new(1, 4, 4, 100, 64, 13);
     let mut cache = new_cache(config(8, 8, Some(32), 4));

@@ -524,7 +524,7 @@ Rotation-based KV cache quantization for long-context inference on the native Qw
 - **Random rotation + Lloyd-Max quantization**: every key and value is stored as one f32 scale and bit-packed centroid indices, 1 to 8 bits per coordinate. At head dimension 128 that is 3.8x smaller than bf16 at 4 bits, 4.9x at 3 bits and 7.1x at 2 bits
 - **Direct attention**: decode reads the packed cache in two kernel launches; nothing is dequantized. Any head dimension, grouped-query heads, sliding windows and per-head sink logits
 - **Sinks and a recent window stay exact**: the first tokens of a sequence and the newest `recent_window` tokens are kept uncompressed, because attention weighs them most
-- **Data-oblivious**: No calibration data required; keys and values are quantized online as they are generated
+- **Keys in a calibrated frame**: each KV head's mean key is taken off and its channels are evened out before quantizing, calibrated on the first tokens the cache stores (no calibration data). On Qwen3-0.6B text this keeps 4-bit keys and values within 0.3% perplexity of bf16 and 3-bit within 2.3%
 
 ### Training Infrastructure
 

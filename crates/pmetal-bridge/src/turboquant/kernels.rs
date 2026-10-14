@@ -33,6 +33,7 @@ bridge_extern! {
         out_acc: *mut RawBuf,
         out_m: *mut RawBuf,
         out_l: *mut RawBuf,
+        out_row_shift: *mut RawBuf,
         q: *const RawBuf,
         q_rot: *const RawBuf,
         k_packed: *const RawBuf,
@@ -44,6 +45,7 @@ bridge_extern! {
         dense_k: *const RawBuf,
         dense_v: *const RawBuf,
         params: *const RawBuf,
+        center: *const RawBuf,
         dim: u32,
         value_dim: u32,
         key_bits: u32,
@@ -61,6 +63,7 @@ bridge_extern! {
         part_l: *const RawBuf,
         inv_rot: *const RawBuf,
         sinks: *const RawBuf,
+        row_shift: *const RawBuf,
         params: *const RawBuf,
         value_dim: u32,
         q_heads: u32,
@@ -89,7 +92,8 @@ pub(super) mod param {
     pub(in crate::turboquant) const HAS_SINK_LOGITS: usize = 11;
     pub(in crate::turboquant) const COLD_FIRST: usize = 12;
     pub(in crate::turboquant) const DENSE_FIRST: usize = 13;
-    pub(in crate::turboquant) const COUNT: usize = 14;
+    pub(in crate::turboquant) const HAS_CENTER: usize = 14;
+    pub(in crate::turboquant) const COUNT: usize = 15;
 }
 
 fn uninit() -> MaybeUninit<RawBuf> {
@@ -179,6 +183,8 @@ pub(super) struct PartialsArgs<'a> {
     pub(super) dense_k: &'a InlineArray,
     pub(super) dense_v: &'a InlineArray,
     pub(super) params: &'a InlineArray,
+    /// `[KV, D]` f32 key centre; read only when `params[HAS_CENTER]` is set.
+    pub(super) center: &'a InlineArray,
     pub(super) dim: usize,
     pub(super) value_dim: usize,
     pub(super) key_bits: u8,
@@ -190,19 +196,31 @@ pub(super) struct PartialsArgs<'a> {
     pub(super) n_blocks: usize,
 }
 
-/// Pass 1: per-block `(accumulator [R, B, Dv], max [R, B], sum [R, B])`.
-pub(super) fn attention_partials(
-    a: &PartialsArgs<'_>,
-) -> BridgeResult<(InlineArray, InlineArray, InlineArray)> {
+/// What pass 1 produces.
+pub(super) struct Partials {
+    /// Per block, the unnormalised accumulator `[R, B, Dv]`.
+    pub(super) acc: InlineArray,
+    /// Per block, the running max `[R, B]` (base 2).
+    pub(super) m: InlineArray,
+    /// Per block, the running sum `[R, B]`.
+    pub(super) l: InlineArray,
+    /// Per row, `q . mu` scaled into the base-2 logit domain, `[R]`.
+    pub(super) row_shift: InlineArray,
+}
+
+/// Pass 1: per-block partial attention.
+pub(super) fn attention_partials(a: &PartialsArgs<'_>) -> BridgeResult<Partials> {
     let mut acc = uninit();
     let mut m = uninit();
     let mut l = uninit();
+    let mut row_shift = uninit();
     // SAFETY: as in `quantize_pack`.
     unsafe {
         mlx_inline_turboquant_attention_partials(
             acc.as_mut_ptr(),
             m.as_mut_ptr(),
             l.as_mut_ptr(),
+            row_shift.as_mut_ptr(),
             &a.q.raw,
             &a.q_rot.raw,
             &a.k_packed.raw,
@@ -214,6 +232,7 @@ pub(super) fn attention_partials(
             &a.dense_k.raw,
             &a.dense_v.raw,
             &a.params.raw,
+            &a.center.raw,
             a.dim as u32,
             a.value_dim as u32,
             u32::from(a.key_bits),
@@ -224,17 +243,20 @@ pub(super) fn attention_partials(
             a.n_kv_rows as u32,
             a.n_blocks as u32,
         );
-        let out = (
-            InlineArray {
+        let out = Partials {
+            acc: InlineArray {
                 raw: acc.assume_init(),
             },
-            InlineArray {
+            m: InlineArray {
                 raw: m.assume_init(),
             },
-            InlineArray {
+            l: InlineArray {
                 raw: l.assume_init(),
             },
-        );
+            row_shift: InlineArray {
+                raw: row_shift.assume_init(),
+            },
+        };
         check_last_error()?;
         Ok(out)
     }
@@ -245,9 +267,7 @@ pub(super) fn attention_partials(
 /// Returns `[R, Dv]` in `out_dtype`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn attention_merge(
-    part_acc: &InlineArray,
-    part_m: &InlineArray,
-    part_l: &InlineArray,
+    partials: &Partials,
     inv_rot: &InlineArray,
     sinks: &InlineArray,
     params: &InlineArray,
@@ -262,11 +282,12 @@ pub(super) fn attention_merge(
     unsafe {
         mlx_inline_turboquant_attention_merge(
             out.as_mut_ptr(),
-            &part_acc.raw,
-            &part_m.raw,
-            &part_l.raw,
+            &partials.acc.raw,
+            &partials.m.raw,
+            &partials.l.raw,
             &inv_rot.raw,
             &sinks.raw,
+            &partials.row_shift.raw,
             &params.raw,
             value_dim as u32,
             q_heads as u32,

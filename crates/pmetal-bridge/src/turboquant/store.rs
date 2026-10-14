@@ -85,7 +85,82 @@ pub(super) struct ColdStore {
     pub(super) len: usize,
     /// Tokens the arrays have room for.
     pub(super) capacity: usize,
+    /// How the stored keys were conditioned, fixed by the first tokens stored
+    /// and never changed after, since every stored key depends on it.
+    pub(super) frame: Option<KeyFrame>,
     kv_rows: usize,
+}
+
+/// A stored key `k` is `(k - center) / scale` before quantization.
+#[derive(Debug, Clone)]
+pub(super) struct KeyFrame {
+    /// `[KV, D]` f32, the mean key of the head.
+    pub(super) center: InlineArray,
+    /// `[KV, D]` f32 per-channel spread, if the channels are equalised.
+    pub(super) scale: Option<InlineArray>,
+}
+
+/// How far a channel's scale may stray from the head's typical one. A channel
+/// that was nearly silent on the calibration tokens must not blow up when it
+/// is not silent later, and one that shouts must not be crushed.
+const SCALE_RATIO_LIMIT: f32 = 16.0;
+
+impl KeyFrame {
+    /// The frame of `keys` (`[KV, n, D]`, any float dtype): their mean, and
+    /// the spread of each channel about it relative to the head's typical
+    /// spread. Evaluated, so it does not hold the keys' graph alive.
+    pub(super) fn calibrate(keys: &InlineArray, center: bool, scale: bool) -> Self {
+        let x = keys.as_dtype(Dtype::Float32.as_i32());
+        let kv_rows = x.dim(0);
+        let dim = x.dim(2);
+        let mean = if center {
+            x.mean_axis(1, false)
+        } else {
+            InlineArray::zeros(&[kv_rows, dim], Dtype::Float32.as_i32())
+        };
+        let scale = scale.then(|| {
+            let about = x.subtract(&mean.expand_dims(1));
+            let variance = about.multiply(&about).mean_axis(1, false);
+            let typical = variance.mean_axis(-1, true).sqrt();
+            let ratio = variance
+                .sqrt()
+                .divide(&typical.add_scalar(f32::MIN_POSITIVE));
+            let lo = InlineArray::scalar_like(1.0 / SCALE_RATIO_LIMIT, &ratio);
+            let hi = InlineArray::scalar_like(SCALE_RATIO_LIMIT, &ratio);
+            ratio.clip(Some(&lo), Some(&hi))
+        });
+        let mut frame = Self {
+            center: mean,
+            scale,
+        };
+        let mut pending: Vec<&mut InlineArray> = frame.arrays_mut().collect();
+        crate::inline_array::eval_and_detach_many(&mut pending);
+        frame
+    }
+
+    /// Take `keys` (`[KV, n, D]`, any float dtype) into the frame.
+    pub(super) fn apply(&self, keys: &InlineArray) -> InlineArray {
+        let shifted = keys
+            .as_dtype(Dtype::Float32.as_i32())
+            .subtract(&self.center.expand_dims(1));
+        match &self.scale {
+            Some(scale) => shifted.divide(&scale.expand_dims(1)),
+            None => shifted,
+        }
+    }
+
+    /// Bring `stored` (`[KV, n, D]` f32, in the frame) back to the keys.
+    pub(super) fn invert(&self, stored: &InlineArray) -> InlineArray {
+        let scaled = match &self.scale {
+            Some(scale) => stored.multiply(&scale.expand_dims(1)),
+            None => stored.clone(),
+        };
+        scaled.add(&self.center.expand_dims(1))
+    }
+
+    fn arrays_mut(&mut self) -> impl Iterator<Item = &mut InlineArray> {
+        std::iter::once(&mut self.center).chain(self.scale.as_mut())
+    }
 }
 
 impl ColdStore {
@@ -97,6 +172,7 @@ impl ColdStore {
             v: PackedStore::zeros(kv_rows, 1, values.words()),
             len: 0,
             capacity: 1,
+            frame: None,
             kv_rows,
         }
     }
@@ -152,17 +228,23 @@ impl ColdStore {
             Ok(q.decode(&rows)?
                 .reshape(&[self.kv_rows as i32, self.len as i32, q.dim() as i32]))
         };
-        Ok((decode(&self.k, keys)?, decode(&self.v, values)?))
+        let mut k = decode(&self.k, keys)?;
+        if let Some(frame) = &self.frame {
+            k = frame.invert(&k);
+        }
+        Ok((k, decode(&self.v, values)?))
     }
 
     /// Every array, for [`eval`](InlineArray::eval)-and-detach.
-    pub(super) fn arrays_mut(&mut self) -> [&mut InlineArray; 4] {
-        [
+    pub(super) fn arrays_mut(&mut self) -> Vec<&mut InlineArray> {
+        let mut arrays = vec![
             &mut self.k.packed,
             &mut self.k.scales,
             &mut self.v.packed,
             &mut self.v.scales,
-        ]
+        ];
+        arrays.extend(self.frame.iter_mut().flat_map(KeyFrame::arrays_mut));
+        arrays
     }
 }
 

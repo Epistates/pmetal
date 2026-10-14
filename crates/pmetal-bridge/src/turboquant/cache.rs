@@ -27,12 +27,15 @@ use crate::compat::Dtype;
 use super::attention::{DecodeShape, Visibility, decode_attention};
 use super::config::{TurboQuantConfig, eviction_chunk};
 use super::state::TurboQuantState;
-use super::store::{ColdStore, DenseStore};
+use super::store::{ColdStore, DenseStore, KeyFrame};
 
 /// Tokens quantized per piece when a long run of them is (a prompt, a large
 /// eviction): 4096 tokens of 8 KV heads at head dimension 128 rotate through
 /// 17 MB of f32.
 const ENCODE_PIECE_TOKENS: usize = 4096;
+
+/// The fewest tokens the key frame is calibrated from.
+const FRAME_MIN_TOKENS: usize = 16;
 
 /// Shape of what the cache holds, fixed by the first append.
 #[derive(Debug, Clone, Copy)]
@@ -109,7 +112,13 @@ impl QuantizedKvCache {
     /// Bytes of device memory the cached tokens occupy (capacity included).
     pub fn nbytes(&self) -> usize {
         let cold = self.cold.as_ref().map_or(0, |c| {
-            c.k.packed.nbytes() + c.k.scales.nbytes() + c.v.packed.nbytes() + c.v.scales.nbytes()
+            c.k.packed.nbytes()
+                + c.k.scales.nbytes()
+                + c.v.packed.nbytes()
+                + c.v.scales.nbytes()
+                + c.frame.as_ref().map_or(0, |f| {
+                    f.center.nbytes() + f.scale.as_ref().map_or(0, InlineArray::nbytes)
+                })
         });
         let dense = self
             .dense
@@ -361,6 +370,35 @@ impl QuantizedKvCache {
         // rotated into f32 and packed, and its temporaries are released
         // before the next, so a long prompt never holds more than a piece's.
         cold.reserve(&state.keys, &state.values, n);
+        let conditioned = self.config.center_keys || self.config.scale_key_channels;
+        if conditioned && cold.frame.is_none() {
+            // Calibrated on the first tokens that go cold. Any frame gives
+            // exact attention; this one removes the component the keys share
+            // and evens out the channels, which is what it is for. A frame
+            // taken from a few tokens would be mostly those tokens' own
+            // content, which it would then add to every later key, so a
+            // first run that short is stored as it is.
+            cold.frame = Some(if n < FRAME_MIN_TOKENS {
+                KeyFrame::calibrate(
+                    &InlineArray::zeros(
+                        &[layout.kv_rows() as i32, 1, layout.dim as i32],
+                        Dtype::Float32.as_i32(),
+                    ),
+                    false,
+                    false,
+                )
+            } else {
+                let first = n.min(ENCODE_PIECE_TOKENS);
+                KeyFrame::calibrate(
+                    &keys.slice(
+                        &[0, 0, 0],
+                        &[layout.kv_rows() as i32, first as i32, layout.dim as i32],
+                    ),
+                    self.config.center_keys,
+                    self.config.scale_key_channels,
+                )
+            });
+        }
         let mut done = 0;
         while done < n {
             let piece = (n - done).min(ENCODE_PIECE_TOKENS);
@@ -370,10 +408,19 @@ impl QuantizedKvCache {
                     &[0, done as i32, 0],
                     &[layout.kv_rows() as i32, (done + piece) as i32, width as i32],
                 )
-                .reshape(&[rows, width as i32])
             };
-            let k = state.keys.encode(&take(keys, layout.dim))?;
-            let v = state.values.encode(&take(values, layout.value_dim))?;
+            let take_keys = {
+                let k = take(keys, layout.dim);
+                match &cold.frame {
+                    Some(frame) => frame.apply(&k),
+                    None => k,
+                }
+            }
+            .reshape(&[rows, layout.dim as i32]);
+            let take_values =
+                take(values, layout.value_dim).reshape(&[rows, layout.value_dim as i32]);
+            let k = state.keys.encode(&take_keys)?;
+            let v = state.values.encode(&take_values)?;
             cold.append(&state.keys, &state.values, &k, &v, piece);
             if n > ENCODE_PIECE_TOKENS {
                 let mut pending = cold.arrays_mut();

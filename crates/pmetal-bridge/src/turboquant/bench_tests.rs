@@ -78,12 +78,16 @@ fn time_ms(iterations: usize, mut f: impl FnMut() -> InlineArray) -> f64 {
 fn bench_cache_decode_steps() {
     let (heads, dim, prefill) = (8usize, 128usize, 2048usize);
     let w = super::reference_tests::Workload::new(1, heads, heads, prefill + 12, dim, 1);
-    for (label, bits, window) in [
-        ("4-bit, every token quantized", 4u8, None),
-        ("4-bit, 1024-token window", 4, Some(1024usize)),
-        ("8-bit, every token quantized", 8, None),
+    for (label, bits, window, frame) in [
+        ("4-bit, every token quantized", 4u8, None, true),
+        ("4-bit, every token quantized, no key frame", 4, None, false),
+        ("4-bit, 1024-token window", 4, Some(1024usize), true),
+        ("8-bit, every token quantized", 8, None, true),
     ] {
-        let cfg = super::TurboQuantConfig::uniform(bits, bits).with_recent_window(window);
+        let cfg = super::TurboQuantConfig::uniform(bits, bits)
+            .with_recent_window(window)
+            .with_center_keys(frame)
+            .with_scale_key_channels(frame);
         let mut cache = super::new_cache(cfg);
         cache
             .append(

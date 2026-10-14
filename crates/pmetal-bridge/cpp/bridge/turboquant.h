@@ -55,13 +55,17 @@ int mlx_inline_turboquant_dequantize(
 //   v_packed: [KV, cold_cap, words_v] uint32, v_scale: [KV, cold_cap] f32
 //   cb_k, cb_v: key and value codebooks, f32
 //   dense_k:  [KV, dense_cap, dim], dense_v: [KV, dense_cap, value_dim]
-//   params:   int32[14]
+//   params:   int32[15]
+//   center:   [KV, dim] f32 key centre, read only when params[14] is set
 //   out_acc:  [R, n_blocks, value_dim] f32, out_m / out_l: [R, n_blocks] f32
+//   out_row_shift: [R] f32, the query's dot with the key centre in the
+//             base-2 logit domain (zero without a centre)
 // R = batch * q_heads, KV = batch * kv_heads, groups = q_heads / kv_heads.
 int mlx_inline_turboquant_attention_partials(
     mlx_inline_array*       out_acc,
     mlx_inline_array*       out_m,
     mlx_inline_array*       out_l,
+    mlx_inline_array*       out_row_shift,
     const mlx_inline_array* q,
     const mlx_inline_array* q_rot,
     const mlx_inline_array* k_packed,
@@ -73,6 +77,7 @@ int mlx_inline_turboquant_attention_partials(
     const mlx_inline_array* dense_k,
     const mlx_inline_array* dense_v,
     const mlx_inline_array* params,
+    const mlx_inline_array* center,
     uint32_t                dim,
     uint32_t                value_dim,
     uint32_t                key_bits,
@@ -94,6 +99,7 @@ int mlx_inline_turboquant_attention_merge(
     const mlx_inline_array* part_l,
     const mlx_inline_array* inv_rot,
     const mlx_inline_array* sinks,
+    const mlx_inline_array* row_shift,
     const mlx_inline_array* params,
     uint32_t                value_dim,
     uint32_t                q_heads,

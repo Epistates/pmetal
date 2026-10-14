@@ -55,6 +55,17 @@
 //   params[5]  tokens per block       params[11] 1 when the merge has sink logits
 //                                     params[12] first cold token attended to
 //                                     params[13] first dense token attended to
+//                                     params[14] 1 when the cold keys are centred
+//
+// Centred keys. A real model's keys share a large component from token to
+// token (a few channels sit far from zero in every token), and the error of
+// a rotation-based quantizer is proportional to a vector's whole norm, so the
+// part that carries the information, how a key differs from the others, is
+// swamped. The cache therefore stores cold keys with a fixed per-head vector
+// `mu` taken off. The softmax over a head's tokens is unchanged when the same
+// constant is taken off every logit, so cold logits are `q . (k - mu)` and
+// dense logits are shifted by `q . mu`, which this kernel computes (in the
+// log-2 domain, as `row_shift`) for the dense blocks and the merge.
 //
 // The last two let a layer attend to a suffix of the sequence (a sliding
 // window, a chunk of chunked attention) with no change in how the blocks are
@@ -132,6 +143,31 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cold keys are stored with the per-head centre `mu` taken off, so every
+    // cold logit is `q . (k - mu)`. Dense keys are stored whole, and give their
+    // logit back shifted by the same `q . mu`; the softmax over a head's
+    // tokens does not care which constant is taken off all of them.
+    float shift[kG];
+    for (uint g = 0u; g < kG; ++g) {
+        shift[g] = 0.0f;
+    }
+    if (params[14] != 0) {
+        // MLX may bind a small `center` in the constant address space, so it
+        // is indexed, not aliased through a `device` pointer.
+        for (uint g = 0u; g < kG; ++g) {
+            float part = 0.0f;
+            for (uint d = lane; d < kD; d += 32u) {
+                part += float(q[(ulong)(r0 + g) * kD + d]) * center[(ulong)kv * kD + d];
+            }
+            shift[g] = simd_sum(part) * qscale;
+        }
+    }
+    if (blk == 0u && lane == 0u) {
+        for (uint g = 0u; g < kG; ++g) {
+            row_shift[r0 + g] = shift[g];
+        }
+    }
 
     float m[kG];
     float l[kG];
@@ -211,6 +247,9 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
                     for (uint g = 0u; g < kG; ++g) {
                         s[g] += dot(float4(lds_q[g * kD4 + i4]), cv);
                     }
+                }
+                for (uint g = 0u; g < kG; ++g) {
+                    s[g] -= shift[g];
                 }
             }
         }
@@ -314,7 +353,7 @@ static const char* TURBOQUANT_ATTENTION_MERGE_SOURCE = R"(
     }
     float sink_l2 = -INFINITY;
     if (has_sink) {
-        sink_l2 = sinks[row % kHq] * log2e;
+        sink_l2 = sinks[row % kHq] * log2e - row_shift[row];
     }
     mx = simd_max(mx);
     if (lane == 0u) {
@@ -395,8 +434,8 @@ static mlx::core::fast::CustomKernelFunction& get_attention_partials_kernel(cons
         it = kernels.emplace(tag, mlx::core::fast::metal_kernel(
             "turboquant_attention_partials_" + tag,
             {"q", "q_rot", "k_packed", "k_scale", "v_packed", "v_scale",
-             "cb_k", "cb_v", "dense_k", "dense_v", "params"},
-            {"part_acc", "part_m", "part_l"},
+             "cb_k", "cb_v", "dense_k", "dense_v", "params", "center"},
+            {"part_acc", "part_m", "part_l", "row_shift"},
             TURBOQUANT_ATTENTION_PARTIALS_SOURCE,
             "",
             true,
@@ -408,7 +447,7 @@ static mlx::core::fast::CustomKernelFunction& get_attention_partials_kernel(cons
 static mlx::core::fast::CustomKernelFunction& get_attention_merge_kernel() {
     static auto kernel = mlx::core::fast::metal_kernel(
         "turboquant_attention_merge",
-        {"part_acc", "part_m", "part_l", "inv_rot", "sinks", "params"},
+        {"part_acc", "part_m", "part_l", "inv_rot", "sinks", "row_shift", "params"},
         {"out"},
         TURBOQUANT_ATTENTION_MERGE_SOURCE,
         TURBOQUANT_ATTENTION_HEADER,
@@ -423,6 +462,7 @@ int mlx_inline_turboquant_attention_partials(
     mlx_inline_array*       out_acc,
     mlx_inline_array*       out_m,
     mlx_inline_array*       out_l,
+    mlx_inline_array*       out_row_shift,
     const mlx_inline_array* q,
     const mlx_inline_array* q_rot,
     const mlx_inline_array* k_packed,
@@ -434,6 +474,7 @@ int mlx_inline_turboquant_attention_partials(
     const mlx_inline_array* dense_k,
     const mlx_inline_array* dense_v,
     const mlx_inline_array* params,
+    const mlx_inline_array* center,
     uint32_t                dim,
     uint32_t                value_dim,
     uint32_t                key_bits,
@@ -469,9 +510,10 @@ int mlx_inline_turboquant_attention_partials(
                                 dtype_tag(as_arr(dense_v).dtype());
         auto outputs = get_attention_partials_kernel(tag)(
             {qa, as_arr(q_rot), as_arr(k_packed), as_arr(k_scale), as_arr(v_packed), as_arr(v_scale),
-             as_arr(cb_k), as_arr(cb_v), da, as_arr(dense_v), as_arr(params)},
-            {{(int)n_rows, (int)n_blocks, (int)value_dim}, {(int)n_rows, (int)n_blocks}, {(int)n_rows, (int)n_blocks}},
-            {float32, float32, float32},
+             as_arr(cb_k), as_arr(cb_v), da, as_arr(dense_v), as_arr(params), as_arr(center)},
+            {{(int)n_rows, (int)n_blocks, (int)value_dim}, {(int)n_rows, (int)n_blocks},
+             {(int)n_rows, (int)n_blocks}, {(int)n_rows}},
+            {float32, float32, float32, float32},
             {32 * (int)n_blocks, (int)n_kv_rows, 1},
             {32, 1, 1},
             {{"DIM", (int)dim}, {"VDIM", (int)value_dim}, {"KBITS", (int)key_bits},
@@ -480,6 +522,7 @@ int mlx_inline_turboquant_attention_partials(
         new (out_acc->buf) array(outputs[0]);
         new (out_m->buf) array(outputs[1]);
         new (out_l->buf) array(outputs[2]);
+        new (out_row_shift->buf) array(outputs[3]);
         pmetal_bridge_clear_error_internal();
         return 0;
     } catch (const std::exception& e) {
@@ -490,6 +533,7 @@ int mlx_inline_turboquant_attention_partials(
     bridge_placeholder(out_acc);
     bridge_placeholder(out_m);
     bridge_placeholder(out_l);
+    bridge_placeholder(out_row_shift);
     return 1;
 }
 
@@ -500,6 +544,7 @@ int mlx_inline_turboquant_attention_merge(
     const mlx_inline_array* part_l,
     const mlx_inline_array* inv_rot,
     const mlx_inline_array* sinks,
+    const mlx_inline_array* row_shift,
     const mlx_inline_array* params,
     uint32_t                value_dim,
     uint32_t                q_heads,
@@ -515,7 +560,7 @@ int mlx_inline_turboquant_attention_merge(
         const Dtype dt = dtype_from_int(out_dtype);
         (void)dtype_tag(dt);
         auto outputs = get_attention_merge_kernel()(
-            {as_arr(part_acc), as_arr(part_m), as_arr(part_l), as_arr(inv_rot), as_arr(sinks), as_arr(params)},
+            {as_arr(part_acc), as_arr(part_m), as_arr(part_l), as_arr(inv_rot), as_arr(sinks), as_arr(row_shift), as_arr(params)},
             {{(int)n_rows, (int)value_dim}},
             {dt},
             {128 * (int)n_rows, 1, 1},

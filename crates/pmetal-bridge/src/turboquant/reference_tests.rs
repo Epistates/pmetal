@@ -51,6 +51,18 @@ pub(super) struct Workload {
     pub(super) queries: Vec<f32>,
 }
 
+/// Which channels of the keys vary most, and where the queries look.
+#[derive(Clone, Copy)]
+struct Spread {
+    /// Share of channels that are loud.
+    loud_share: f64,
+    /// A loud channel's standard deviation over a quiet one's.
+    loud_scale: f64,
+    /// Queries put their energy where the keys vary (the loud channels) when
+    /// true, in the quiet channels when false.
+    queries_follow_keys: bool,
+}
+
 impl Workload {
     pub(super) fn new(
         batch: usize,
@@ -60,9 +72,52 @@ impl Workload {
         dim: usize,
         seed: u64,
     ) -> Self {
+        let spread = Spread {
+            loud_share: 0.03,
+            loud_scale: 6.0,
+            queries_follow_keys: true,
+        };
+        Self::generate(batch, q_heads, kv_heads, seq, dim, seed, spread)
+    }
+
+    /// A quarter of the channels vary eight times as much as the rest, and
+    /// the queries look almost only at the quiet ones: what tells the tokens
+    /// apart is in the channels that carry the least energy, as in real
+    /// heads, where the loud channels are close to constant.
+    pub(super) fn lopsided(
+        batch: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        seq: usize,
+        dim: usize,
+        seed: u64,
+    ) -> Self {
+        let spread = Spread {
+            loud_share: 0.25,
+            loud_scale: 8.0,
+            queries_follow_keys: false,
+        };
+        Self::generate(batch, q_heads, kv_heads, seq, dim, seed, spread)
+    }
+
+    fn generate(
+        batch: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        seq: usize,
+        dim: usize,
+        seed: u64,
+        spread: Spread,
+    ) -> Self {
         let mut g = Gauss::new(seed);
         let channel_scale: Vec<f64> = (0..kv_heads * dim)
-            .map(|_| if g.uniform() < 0.03 { 6.0 } else { 1.0 })
+            .map(|_| {
+                if g.uniform() < spread.loud_share {
+                    spread.loud_scale
+                } else {
+                    1.0
+                }
+            })
             .collect();
         let mut keys = Vec::with_capacity(batch * kv_heads * seq * dim);
         let mut values = Vec::with_capacity(batch * kv_heads * seq * dim);
@@ -91,10 +146,24 @@ impl Workload {
             for qh in 0..q_heads {
                 let h = qh / groups;
                 let channels = &channel_scale[h * dim..(h + 1) * dim];
-                let mean_fourth: f64 = channels.iter().map(|s| s.powi(4)).sum::<f64>() / dim as f64;
-                let sigma = LOGIT_STD / mean_fourth.sqrt();
-                for scale in channels {
-                    queries.push((sigma * scale * g.normal()) as f32);
+                // How much of the query's energy each channel gets.
+                let weight: Vec<f64> = channels
+                    .iter()
+                    .map(|s| match (spread.queries_follow_keys, *s > 1.0) {
+                        (true, _) => *s,
+                        (false, true) => 0.05,
+                        (false, false) => 1.0,
+                    })
+                    .collect();
+                // The logits' variance is `sum (w sigma_q s)^2 / dim`.
+                let energy: f64 = weight
+                    .iter()
+                    .zip(channels)
+                    .map(|(w, s)| (w * s).powi(2))
+                    .sum();
+                let sigma = LOGIT_STD * (dim as f64 / energy).sqrt();
+                for w in &weight {
+                    queries.push((sigma * w * g.normal()) as f32);
                 }
             }
         }
@@ -108,6 +177,25 @@ impl Workload {
             values,
             queries,
         }
+    }
+
+    /// Add to every key of a head the same per-channel offset, drawn from a
+    /// Gaussian of standard deviation `magnitude`: the token-shared component
+    /// real keys carry. It adds the same `q . bias` to every logit of a head,
+    /// so the exact attention output does not change, but the keys' norms
+    /// are dominated by a constant.
+    pub(super) fn with_key_bias(mut self, magnitude: f64, seed: u64) -> Self {
+        let mut g = Gauss::new(seed);
+        let bias: Vec<f64> = (0..self.kv_heads * self.dim)
+            .map(|_| magnitude * g.normal())
+            .collect();
+        let per_head = self.seq * self.dim;
+        for (i, k) in self.keys.iter_mut().enumerate() {
+            let head = (i / per_head) % self.kv_heads;
+            let channel = i % self.dim;
+            *k += bias[head * self.dim + channel] as f32;
+        }
+        self
     }
 
     pub(super) fn scale(&self) -> f32 {
