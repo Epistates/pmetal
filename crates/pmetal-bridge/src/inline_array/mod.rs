@@ -155,6 +155,15 @@ impl Clone for InlineArray {
     }
 }
 
+// SAFETY: an `mlx::core::array` is a handle to a reference-counted
+// description, so cloning, dropping and reading the metadata of a handle from
+// any thread is sound.
+//
+// What this does NOT promise is that two threads may *evaluate* the same
+// unevaluated array at once: MLX does not lock a graph while it is being
+// evaluated, and `eval(&self)` takes a shared reference. An array that more
+// than one thread reads (shared weights, say) should be evaluated on one
+// thread before it is shared, as model loading does.
 unsafe impl Send for InlineArray {}
 unsafe impl Sync for InlineArray {}
 

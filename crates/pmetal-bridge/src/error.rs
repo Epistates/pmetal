@@ -186,6 +186,32 @@ pub fn expect_bridge_errors<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Runs a chain of bridge ops and returns the first error any of them raised.
+///
+/// An op that throws hands back a placeholder and the ops after it carry on
+/// with that, so by the end of a chain [`check_last_error`] (the last op's
+/// slot) is clean again. This reads the unobserved channel instead, which
+/// holds the first failure until it is read, wherever it sits in the chain:
+///
+/// ```ignore
+/// let y = pmetal_bridge::checked(|| x.matmul(&w).add(&b).softmax(-1))?;
+/// ```
+///
+/// An error left over from before the call (never read, never cleared) counts
+/// too and is returned in preference, so no failure is lost. Under
+/// `strict-errors` the ops inside run as ones that are allowed to fail, as
+/// with [`expect_bridge_errors`]. Without it an op that failed has already
+/// computed its placeholder, so a caller that returns `Err` here discards the
+/// result.
+pub fn checked<T>(f: impl FnOnce() -> T) -> BridgeResult<T> {
+    let earlier = check_unobserved_error();
+    let out = expect_bridge_errors(f);
+    let during = check_unobserved_error();
+    earlier?;
+    during?;
+    Ok(out)
+}
+
 /// The `strict-errors` runtime: what each bridge entry point runs around its
 /// C call (see `bridge_extern!`).
 ///

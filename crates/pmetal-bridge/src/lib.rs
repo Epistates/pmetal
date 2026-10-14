@@ -20,7 +20,7 @@ pub mod metallib;
 
 pub mod error;
 pub use error::{
-    BridgeError, BridgeResult, check_last_error, check_unobserved_error, clear_last_error,
+    BridgeError, BridgeResult, check_last_error, check_unobserved_error, checked, clear_last_error,
     error_log_mode, expect_bridge_errors, set_error_log_mode,
 };
 
