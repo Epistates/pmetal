@@ -204,14 +204,17 @@ impl InlineArray {
     pub fn lt(&self, other: &Self) -> Self {
         self.less(other)
     }
-    /// Swap two axes.
+    /// Swap two axes (negative ones count from the end), as `mx.swapaxes`.
+    /// An axis out of range is an MLX error on the error channel, like any
+    /// other op's, rather than a panic here.
     pub fn swap_axes(&self, a: i32, b: i32) -> Self {
-        let ndim = self.ndim();
-        let mut perm: Vec<i32> = (0..ndim).collect();
-        let a_idx = if a < 0 { ndim + a } else { a } as usize;
-        let b_idx = if b < 0 { ndim + b } else { b } as usize;
-        perm.swap(a_idx, b_idx);
-        self.transpose_axes(&perm)
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_swapaxes(dst.as_mut_ptr(), &self.raw, a, b);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Total element count.

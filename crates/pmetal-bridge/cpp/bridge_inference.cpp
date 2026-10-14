@@ -101,6 +101,11 @@ void mlx_inline_transpose_axes(mlx_inline_array* dst, const mlx_inline_array* a,
             as_arr(a), std::vector<int>(axes, axes + ndim))));
 }
 
+void mlx_inline_swapaxes(mlx_inline_array* dst, const mlx_inline_array* a, int axis1, int axis2) {
+    BRIDGE_TRY_DST("swapaxes", dst,
+        new (dst->buf) array(mlx::core::swapaxes(as_arr(a), axis1, axis2)));
+}
+
 void mlx_inline_cumsum(mlx_inline_array* dst, const mlx_inline_array* a, int axis) {
     BRIDGE_TRY_DST("cumsum", dst,
         new (dst->buf) array(mlx::core::cumsum(as_arr(a), axis)));

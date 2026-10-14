@@ -323,10 +323,32 @@ impl InlineArray {
             }
         }
     }
+    /// Split into `sections` equal pieces along `axis`, like
+    /// `mx.split(a, sections, axis)`. The axis must divide evenly; otherwise
+    /// MLX's error is on the error channel and the result is empty.
     pub fn split_sections(&self, sections: i32, axis: i32) -> Vec<Self> {
-        // Allocate enough output slots.
-        let max = sections as usize;
-        let mut buf: Vec<MaybeUninit<RawBuf>> = (0..max).map(|_| MaybeUninit::uninit()).collect();
+        // One output slot per section, and a valid split has at most one
+        // section per element of the axis. A count outside that is an error
+        // MLX reports (one slot is enough for it to write nothing to), and
+        // must not size the allocation: `sections` is the caller's.
+        let axis_len = {
+            let shape = self.shape();
+            let index = if axis < 0 {
+                axis + shape.len() as i32
+            } else {
+                axis
+            };
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| shape.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let slots = match usize::try_from(sections) {
+            Ok(n) if (1..=axis_len.max(1) as usize).contains(&n) => n,
+            _ => 1,
+        };
+        let mut buf: Vec<MaybeUninit<RawBuf>> = (0..slots).map(|_| MaybeUninit::uninit()).collect();
         let mut out_count: i32 = 0;
         unsafe {
             mlx_inline_split_sections(
@@ -337,6 +359,7 @@ impl InlineArray {
                 &mut out_count,
             );
         }
+        debug_assert!(out_count as usize <= slots);
         (0..out_count as usize)
             .map(|i| unsafe {
                 Self {

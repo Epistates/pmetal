@@ -68,9 +68,38 @@ impl InlineArray {
     /// Preferred over `InlineArray::from_f32(value).as_dtype(peer.dtype_raw())`
     /// because it can't be invoked without the dtype, eliminating the
     /// "forgot to cast" footgun.
+    ///
+    /// A float or complex peer takes the value in its own dtype. An integer
+    /// peer does too when the value is a whole number it can hold; any other
+    /// value (a fraction, or one out of range) stays `f32`, so combining the
+    /// two promotes the integer array to `f32` as NumPy does for `x * 0.5`,
+    /// instead of rounding the value to a different number first (`x * 0.5`
+    /// on an int32 array was `x * 0`). A bool peer takes `f32` likewise.
     #[inline]
     pub fn scalar_like(value: f32, peer: &Self) -> Self {
-        InlineArray::from_f32(value).as_dtype(peer.dtype_raw())
+        use crate::compat::Dtype;
+        let dtype = peer.dtype();
+        let holds = |lo: f64, hi: f64| {
+            let v = f64::from(value);
+            v.fract() == 0.0 && (lo..=hi).contains(&v)
+        };
+        let keeps_peer_dtype = match dtype {
+            Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16 | Dtype::Complex64 => true,
+            Dtype::Bool => false,
+            Dtype::Uint8 => holds(0.0, f64::from(u8::MAX)),
+            Dtype::Uint16 => holds(0.0, f64::from(u16::MAX)),
+            Dtype::Uint32 => holds(0.0, f64::from(u32::MAX)),
+            Dtype::Uint64 => holds(0.0, u64::MAX as f64),
+            Dtype::Int8 => holds(f64::from(i8::MIN), f64::from(i8::MAX)),
+            Dtype::Int16 => holds(f64::from(i16::MIN), f64::from(i16::MAX)),
+            Dtype::Int32 => holds(f64::from(i32::MIN), f64::from(i32::MAX)),
+            Dtype::Int64 => holds(i64::MIN as f64, i64::MAX as f64),
+        };
+        if keeps_peer_dtype {
+            InlineArray::from_f32(value).as_dtype(dtype.as_i32())
+        } else {
+            InlineArray::from_f32(value)
+        }
     }
 
     /// Creates a 0-D scalar array carrying `value` cast to the raw dtype

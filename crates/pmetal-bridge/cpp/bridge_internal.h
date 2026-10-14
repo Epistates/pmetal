@@ -309,7 +309,10 @@ static inline array gelu_family(const array& in, F formula) {
 // GDN Metal kernel getter — defined in bridge_native.cpp, used across files.
 mlx::core::fast::CustomKernelFunction& get_gdn_kernel();
 
-// Map integer dtype code to MLX Dtype.
+// Map integer dtype code to MLX Dtype. A code outside the table throws (every
+// caller runs inside a BRIDGE_TRY_* wrapper, so it reaches Rust as an error);
+// it used to come back as float32, so a bad code silently built a float32
+// array.
 static inline mlx::core::Dtype dtype_from_int(int dtype) {
     static const mlx::core::Dtype dtypes[] = {
         mlx::core::bool_,    // 0
@@ -326,7 +329,10 @@ static inline mlx::core::Dtype dtype_from_int(int dtype) {
         mlx::core::bfloat16, // 11
         mlx::core::complex64 // 12
     };
-    return (dtype >= 0 && dtype <= 12) ? dtypes[dtype] : mlx::core::float32;
+    if (dtype < 0 || dtype > 12) {
+        throw std::invalid_argument("unknown dtype code " + std::to_string(dtype));
+    }
+    return dtypes[dtype];
 }
 
 // Map Rust-side quantization mode discriminants to MLX quantized-matmul modes.

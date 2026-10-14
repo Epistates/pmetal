@@ -41,6 +41,7 @@ void mlx_inline_squeeze_axes(mlx_inline_array* dst, const mlx_inline_array* a, c
 void mlx_inline_expand_dims_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes);
 // Transpose with explicit axis permutation
 void mlx_inline_transpose_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int ndim);
+void mlx_inline_swapaxes(mlx_inline_array* dst, const mlx_inline_array* a, int axis1, int axis2);
 
 // ── Cumulative sum / lower-triangular mask ───────────────────────────────
 void mlx_inline_cumsum(mlx_inline_array* dst, const mlx_inline_array* a, int axis);

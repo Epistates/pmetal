@@ -520,6 +520,7 @@ bridge_extern! {
         axes: *const i32,
         ndim: i32,
     );
+    pub(super) fn mlx_inline_swapaxes(dst: *mut RawBuf, a: *const RawBuf, axis1: i32, axis2: i32);
     pub(super) fn mlx_inline_cumsum(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
     pub(super) fn mlx_inline_log(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_tril(dst: *mut RawBuf, a: *const RawBuf, k: i32);

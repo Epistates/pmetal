@@ -82,9 +82,19 @@ use ffi::*;
 // ── InlineArray ───────────────────────────────────────────────────────────
 
 /// Stack-allocated MLX array. Zero heap allocation per op.
+///
+/// `repr(transparent)` over the raw buffer: code that hands C++ a run of
+/// arrays (a `Vec<InlineArray>` as a `*const RawBuf`) relies on the two having
+/// one layout, which an unannotated struct does not promise.
+#[repr(transparent)]
 pub struct InlineArray {
     pub(crate) raw: RawBuf,
 }
+
+const _: () = assert!(
+    std::mem::size_of::<InlineArray>() == std::mem::size_of::<RawBuf>()
+        && std::mem::align_of::<InlineArray>() == std::mem::align_of::<RawBuf>()
+);
 
 #[derive(Clone, Debug)]
 pub struct EvalToken {
