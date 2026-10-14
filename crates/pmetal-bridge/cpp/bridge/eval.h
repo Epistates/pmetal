@@ -26,8 +26,11 @@ void mlx_inline_async_eval_arr(const mlx_inline_array* a);
 void mlx_inline_detach(mlx_inline_array* a);
 
 // ── Item extraction ──────────────────────────────────────────────────────
+// The one element of a size-1 array, converted to the return type like
+// `astype` converts (a float to an integer truncates).
 float mlx_inline_item_f32(mlx_inline_array* a);
 uint32_t mlx_inline_item_u32(mlx_inline_array* a);
+int32_t mlx_inline_item_i32(mlx_inline_array* a);
 
 // ── Layout / buffer queries ──────────────────────────────────────────────
 size_t mlx_inline_size(const mlx_inline_array* a);

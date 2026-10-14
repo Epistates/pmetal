@@ -145,6 +145,6 @@ impl BridgeScalar for u32 {
 impl BridgeScalar for i32 {
     const SLICE_DTYPES: &'static [i32] = &[7, 3];
     fn extract(arr: &InlineArray) -> i32 {
-        arr.item_u32() as i32
+        arr.item_i32()
     }
 }

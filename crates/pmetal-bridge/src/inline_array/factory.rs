@@ -11,6 +11,30 @@ use super::dtype::ArrayElement;
 use super::ffi::*;
 use super::{InlineArray, RawBuf};
 
+/// The element count `shape` describes, once `len` elements are known to
+/// cover it.
+///
+/// The slice constructors hand MLX a pointer and a shape, and MLX copies
+/// `product(shape)` elements from that pointer, so a slice shorter than the
+/// shape is an out-of-bounds read of the caller's allocation. A longer one is
+/// fine: the array takes the prefix.
+#[track_caller]
+fn check_slice_covers(what: &str, len: usize, shape: &[i32]) -> usize {
+    let mut needed: usize = 1;
+    for &dim in shape {
+        let dim = usize::try_from(dim)
+            .unwrap_or_else(|_| panic!("{what}: negative dimension in shape {shape:?}"));
+        needed = needed
+            .checked_mul(dim)
+            .unwrap_or_else(|| panic!("{what}: shape {shape:?} overflows usize"));
+    }
+    assert!(
+        len >= needed,
+        "{what}: shape {shape:?} needs {needed} elements but the slice has {len}"
+    );
+    needed
+}
+
 impl InlineArray {
     // ── Scalar / identity / iterator constructors ────────────────────────
 
@@ -78,7 +102,14 @@ impl InlineArray {
 
     // ── Shaped slice loaders ─────────────────────────────────────────────
 
+    /// A float32 array of `shape` holding the first `product(shape)` values
+    /// of `data`.
+    ///
+    /// # Panics
+    /// If `shape` has a negative dimension or `data` is shorter than the
+    /// shape needs. The slice constructors below panic the same way.
     pub fn from_f32_slice(data: &[f32], shape: &[i32]) -> Self {
+        check_slice_covers("from_f32_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_f32_slice(
@@ -94,6 +125,7 @@ impl InlineArray {
     }
 
     pub fn from_u32_slice(data: &[u32], shape: &[i32]) -> Self {
+        check_slice_covers("from_u32_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_u32_slice(
@@ -109,6 +141,7 @@ impl InlineArray {
     }
 
     pub fn from_u8_slice(data: &[u8], shape: &[i32]) -> Self {
+        check_slice_covers("from_u8_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_u8_slice(
@@ -124,6 +157,7 @@ impl InlineArray {
     }
 
     pub fn from_u16_bits_slice(data: &[u16], shape: &[i32], dtype: i32) -> Self {
+        check_slice_covers("from_u16_bits_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_u16_bits_slice(
@@ -149,24 +183,28 @@ impl InlineArray {
         if rc == 0 { Some(out) } else { None }
     }
 
-    /// Create a 1-D int32 array from a Rust slice — zero copy for token IDs.
+    /// Create a 1-D int32 array from a Rust slice (the values are copied).
     ///
     /// Typical use: prefill token IDs for `embedding.take_axis(ids, 0)`.
+    ///
+    /// # Panics
+    /// If the slice has more than `i32::MAX` elements.
     pub fn from_i32_slice(data: &[i32]) -> Self {
+        let len = i32::try_from(data.len()).expect("from_i32_slice: more than i32::MAX elements");
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_from_i32_slice(dst.as_mut_ptr(), data.as_ptr(), data.len() as i32);
+            mlx_inline_from_i32_slice(dst.as_mut_ptr(), data.as_ptr(), len);
             Self {
                 raw: dst.assume_init(),
             }
         }
     }
 
-    /// Create a shaped int32 array from a Rust slice.
-    ///
-    /// Shape must satisfy `shape.iter().product::<i32>() == data.len() as i32`.
+    /// Create a shaped int32 array from the first `product(shape)` values of
+    /// a Rust slice; panics as [`Self::from_f32_slice`] does.
     pub fn from_i32_slice_shaped(data: &[i32], shape: &[i32]) -> Self {
-        Self::from_i32_slice(data).reshape(shape)
+        let needed = check_slice_covers("from_i32_slice_shaped", data.len(), shape);
+        Self::from_i32_slice(&data[..needed]).reshape(shape)
     }
 
     /// Generic `from_slice::<T>(data, shape)`.

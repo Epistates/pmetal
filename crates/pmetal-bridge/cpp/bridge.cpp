@@ -532,12 +532,11 @@ void mlx_inline_from_i32(mlx_inline_array* dst, int val) { from_scalar(dst, val,
 
 // Query — operate directly on the inline buffer
 int mlx_inline_ndim(const mlx_inline_array* a) { return as_arr(a).ndim(); }
-int mlx_inline_dim(const mlx_inline_array* a, int axis) {
-    int ndim = as_arr(a).ndim();
-    int idx = axis < 0 ? axis + ndim : axis;
-    return as_arr(a).shape(idx);
+const int* mlx_inline_shape(const mlx_inline_array* a, int* ndim) {
+    const auto& shape = as_arr(a).shape();
+    *ndim = static_cast<int>(shape.size());
+    return shape.data();
 }
-const int* mlx_inline_shape(const mlx_inline_array* a) { return as_arr(a).shape().data(); }
 int mlx_inline_dtype(const mlx_inline_array* a) {
     // Reverse of dtype_from_int in bridge_internal.h. Returns -1 for any
     // dtype not in the enumeration so callers can detect "unknown" instead
@@ -559,35 +558,47 @@ int mlx_inline_dtype(const mlx_inline_array* a) {
     return -1; // sentinel: unknown dtype
 }
 
-// Item extraction. Scalar returns mean we can't use BRIDGE_TRY_DST; use a
+// Item extraction. A scalar return can't use BRIDGE_TRY_DST, so this is a
 // manual try/catch that sets the thread-local error and returns a sentinel.
-float mlx_inline_item_f32(mlx_inline_array* a) {
+//
+// `array::item<T>` reads the first sizeof(T) bytes of the buffer without
+// looking at the dtype, so a bf16 `3.0` read as float came back as two bytes
+// of the value and two of whatever followed. The array is converted to the
+// requested type first (one already of that type is read as it is), so the
+// result is the value, converted as `astype` converts, whatever the dtype.
+extern "C++" {
+template <typename T>
+static T item_as(mlx_inline_array* a, mlx::core::Dtype dtype, const char* op, T fallback) {
     try {
-        as_arr(a).eval();
-        float v = as_arr(a).item<float>();
+        array& src = as_arr(a);
+        src.eval();
+        T v;
+        if (src.dtype() == dtype) {
+            v = src.item<T>();
+        } else {
+            array converted = mlx::core::astype(src, dtype);
+            converted.eval();
+            v = converted.item<T>();
+        }
         pmetal_bridge_clear_error_internal();
         return v;
     } catch (const std::exception& e) {
-        pmetal_bridge_set_last_error("item_f32", e.what());
-        return 0.0f;
+        pmetal_bridge_set_last_error(op, e.what());
+        return fallback;
     } catch (...) {
-        pmetal_bridge_set_last_error("item_f32", "unknown C++ exception");
-        return 0.0f;
+        pmetal_bridge_set_last_error(op, "unknown C++ exception");
+        return fallback;
     }
 }
+}
+float mlx_inline_item_f32(mlx_inline_array* a) {
+    return item_as<float>(a, mlx::core::float32, "item_f32", 0.0f);
+}
 uint32_t mlx_inline_item_u32(mlx_inline_array* a) {
-    try {
-        as_arr(a).eval();
-        uint32_t v = as_arr(a).item<uint32_t>();
-        pmetal_bridge_clear_error_internal();
-        return v;
-    } catch (const std::exception& e) {
-        pmetal_bridge_set_last_error("item_u32", e.what());
-        return 0;
-    } catch (...) {
-        pmetal_bridge_set_last_error("item_u32", "unknown C++ exception");
-        return 0;
-    }
+    return item_as<uint32_t>(a, mlx::core::uint32, "item_u32", 0u);
+}
+int32_t mlx_inline_item_i32(mlx_inline_array* a) {
+    return item_as<int32_t>(a, mlx::core::int32, "item_i32", 0);
 }
 
 void mlx_inline_sign(mlx_inline_array* dst, const mlx_inline_array* a) {

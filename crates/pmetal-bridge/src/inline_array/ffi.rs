@@ -115,11 +115,11 @@ bridge_extern! {
     pub(super) fn mlx_inline_from_i32(dst: *mut RawBuf, val: i32);
 
     pub(super) fn mlx_inline_ndim(a: *const RawBuf) -> i32;
-    pub(super) fn mlx_inline_dim(a: *const RawBuf, axis: i32) -> i32;
-    pub(super) fn mlx_inline_shape(a: *const RawBuf) -> *const i32;
+    pub(super) fn mlx_inline_shape(a: *const RawBuf, ndim: *mut i32) -> *const i32;
     pub(super) fn mlx_inline_dtype(a: *const RawBuf) -> i32;
     pub(super) fn mlx_inline_item_f32(a: *mut RawBuf) -> f32;
     pub(super) fn mlx_inline_item_u32(a: *mut RawBuf) -> u32;
+    pub(super) fn mlx_inline_item_i32(a: *mut RawBuf) -> i32;
 
     pub(super) fn mlx_inline_sign(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_dequantize(

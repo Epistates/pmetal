@@ -103,21 +103,32 @@ impl InlineArray {
     // without changing observable behavior, so we route the read through a
     // const→mut pointer cast (matches `eval()` above).
 
+    /// The element of a one-element array as `f32`, whatever its dtype
+    /// (a bf16, f16 or integer element is converted).
     pub fn item_f32(&self) -> f32 {
         self.eval().expect("item_f32 eval failed");
         unsafe { mlx_inline_item_f32(std::ptr::from_ref(&self.raw).cast_mut()) }
     }
+
+    /// The element of a one-element array as `u32`, converted as
+    /// [`as_dtype`](Self::as_dtype) converts: a float is truncated.
     pub fn item_u32(&self) -> u32 {
         self.eval().expect("item_u32 eval failed");
         unsafe { mlx_inline_item_u32(std::ptr::from_ref(&self.raw).cast_mut()) }
     }
 
+    /// The element of a one-element array as `i32`, converted as
+    /// [`as_dtype`](Self::as_dtype) converts: a float is truncated.
+    pub fn item_i32(&self) -> i32 {
+        self.eval().expect("item_i32 eval failed");
+        unsafe { mlx_inline_item_i32(std::ptr::from_ref(&self.raw).cast_mut()) }
+    }
+
     // ── Item extraction (generic) ────────────────────────────────────────
 
-    /// Extract the scalar value from a 0-d array. Evaluates lazily if needed.
-    /// `T` must be `f32`, `u32`, or `i32` (the bridge-exported scalar types).
+    /// Extract the element of a one-element array, converted to `T`.
+    /// Evaluates lazily if needed. `T` must be `f32`, `u32`, or `i32`.
     pub fn item<T: BridgeScalar>(&self) -> T {
-        self.eval().expect("item eval failed");
         T::extract(self)
     }
 }
