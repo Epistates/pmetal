@@ -9,7 +9,7 @@
 use super::dtype::BridgeScalar;
 use super::ffi::*;
 use super::{EvalToken, InlineArray};
-use crate::error::{BridgeResult, check_last_error};
+use crate::error::BridgeResult;
 
 impl InlineArray {
     // ── Eval ─────────────────────────────────────────────────────────────

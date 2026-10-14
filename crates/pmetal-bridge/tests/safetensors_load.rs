@@ -14,7 +14,7 @@ fn temp_file(name: &str) -> PathBuf {
     dir.join(name)
 }
 
-fn write(path: &PathBuf, tensors: Vec<(&str, SafeDtype, Vec<usize>, Vec<u8>)>) {
+fn write(path: &std::path::Path, tensors: Vec<(&str, SafeDtype, Vec<usize>, Vec<u8>)>) {
     let views: HashMap<String, TensorView<'_>> = tensors
         .iter()
         .map(|(name, dtype, shape, bytes)| {
