@@ -6337,7 +6337,6 @@ name = "pmetal-mhc"
 version = "0.6.0"
 dependencies = [
  "ndarray",
- "parking_lot",
  "rand 0.10.3",
  "rand_distr",
  "serde",
