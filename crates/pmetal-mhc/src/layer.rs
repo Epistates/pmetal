@@ -3,74 +3,101 @@
 //! This module provides the main `MhcLayer` struct that wraps the mHC
 //! computation for use in transformer architectures.
 
-use crate::config::{MhcConfig, MhcConfigError};
+use crate::config::MhcConfig;
+use crate::error::MhcError;
 use crate::mappings::{
-    apply_post_res_mapping, apply_pre_mapping, compute_mappings, compute_mappings_backward,
+    apply_post_res_mapping, apply_post_res_mapping_backward, apply_pre_mapping,
+    apply_pre_mapping_backward, check_stream_shape, compute_mappings, compute_mappings_backward,
 };
 use crate::params::{MhcGradients, MhcMappings, MhcParams};
-use ndarray::{Array2, Array3};
-use parking_lot::RwLock;
-use std::sync::Arc;
+use ndarray::{Array2, Array3, Axis};
+use std::str::FromStr;
 
 /// mHC layer that manages residual stream expansion and information mixing.
 ///
-/// This layer implements the core mHC operations:
-/// 1. Pre-mapping: Aggregate n streams into layer input
-/// 2. Post-mapping + Residual: Mix layer output back into n streams
+/// A layer wraps one sublayer `F` (attention or a feed-forward block) of a
+/// transformer whose residual stream has been widened to `n` streams:
 ///
-/// # Usage
-///
-/// ```ignore
-/// let config = MhcConfig::default();
-/// let layer = MhcLayer::new(config);
-///
-/// // In forward pass:
-/// let (h_in, cache) = layer.pre_layer(&x);
-/// let h_out = sublayer_fn(h_in);  // Attention or FFN
-/// let x_next = layer.post_res_layer(&x, &h_out, &cache);
+/// ```text
+/// x_{l+1} = H^res · x_l + H^post^T · F(H^pre · x_l)
 /// ```
-#[derive(Debug)]
+///
+/// 1. Pre-mapping: aggregate the n streams into the sublayer's input
+/// 2. Post-mapping + residual: mix the sublayer's output back into the n streams
+///
+/// All activations are `[batch, n, C]`, one residual stream per row of `batch`
+/// (tokens); the layer owns its parameters and is `Send + Sync`.
+///
+/// # Training
+///
+/// The sublayer's backward pass sits between the two halves of this layer's,
+/// so [`MhcLayer::backward`] takes it as a closure:
+///
+/// ```
+/// use ndarray::{Array2, Array3};
+/// use pmetal_mhc::{MhcConfig, MhcLayer};
+///
+/// # fn main() -> Result<(), pmetal_mhc::MhcError> {
+/// let config = MhcConfig { hidden_dim: 8, ..MhcConfig::default() };
+/// let mut layer = MhcLayer::new(config)?;
+///
+/// let x = Array3::from_elem((2, 4, 8), 0.5f32);
+/// let (h_in, mappings) = layer.pre_layer(&x)?;
+/// let h_out = h_in.mapv(f32::tanh); // the sublayer
+/// let x_next = layer.post_res_layer(&x, &h_out, &mappings)?;
+///
+/// let grad_output = Array3::from_elem(x_next.raw_dim(), 1.0f32);
+/// let (grad_x, grads) = layer.backward(&x, &h_out, &mappings, &grad_output, |grad_h_out| {
+///     // the sublayer's own backward: d tanh(h) = 1 - tanh(h)^2
+///     grad_h_out * &h_in.mapv(|v| 1.0 - v.tanh().powi(2))
+/// })?;
+/// assert_eq!(grad_x.shape(), x.shape());
+/// layer.apply_gradients_sgd(&grads, 1e-3);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
 pub struct MhcLayer {
-    /// Configuration.
     config: MhcConfig,
-
-    /// Learnable parameters.
-    params: Arc<RwLock<MhcParams>>,
-
-    /// Accumulated gradients (for training).
-    gradients: Arc<RwLock<Option<MhcGradients>>>,
-
-    /// Layer index (for debugging/logging).
-    layer_idx: usize,
+    params: MhcParams,
 }
 
 impl MhcLayer {
-    /// Create a new mHC layer.
-    pub fn new(config: MhcConfig) -> Self {
+    /// Create a new mHC layer: [`MhcParams::new`] initialization, a plain
+    /// residual connection to start with.
+    ///
+    /// # Errors
+    ///
+    /// If `config` is invalid.
+    pub fn new(config: MhcConfig) -> Result<Self, MhcError> {
+        config.validate()?;
         let params = MhcParams::new(&config);
-        Self {
-            config,
-            params: Arc::new(RwLock::new(params)),
-            gradients: Arc::new(RwLock::new(None)),
-            layer_idx: 0,
-        }
+        Ok(Self { config, params })
     }
 
-    /// Create a new mHC layer with specific layer index.
-    pub fn with_layer_idx(config: MhcConfig, layer_idx: usize) -> Self {
-        let mut layer = Self::new(config);
-        layer.layer_idx = layer_idx;
-        layer
+    /// Create a new mHC layer with a reproducible initialization.
+    ///
+    /// # Errors
+    ///
+    /// If `config` is invalid.
+    pub fn with_rng<R: rand::Rng + ?Sized>(
+        config: MhcConfig,
+        rng: &mut R,
+    ) -> Result<Self, MhcError> {
+        config.validate()?;
+        let params = MhcParams::with_rng(&config, rng);
+        Ok(Self { config, params })
     }
 
     /// Create a new mHC layer with pre-initialized parameters.
-    pub fn with_params(config: MhcConfig, params: MhcParams) -> Self {
-        Self {
-            config,
-            params: Arc::new(RwLock::new(params)),
-            gradients: Arc::new(RwLock::new(None)),
-            layer_idx: 0,
-        }
+    ///
+    /// # Errors
+    ///
+    /// If `config` is invalid or `params` do not match it.
+    pub fn with_params(config: MhcConfig, params: MhcParams) -> Result<Self, MhcError> {
+        config.validate()?;
+        params.validate(&config)?;
+        Ok(Self { config, params })
     }
 
     /// Get the configuration.
@@ -78,51 +105,105 @@ impl MhcLayer {
         &self.config
     }
 
-    /// Get read access to parameters.
-    pub fn params(&self) -> impl std::ops::Deref<Target = MhcParams> + '_ {
-        self.params.read()
+    /// Get the parameters.
+    pub fn params(&self) -> &MhcParams {
+        &self.params
     }
 
-    /// Get write access to parameters.
-    pub fn params_mut(&self) -> impl std::ops::DerefMut<Target = MhcParams> + '_ {
-        self.params.write()
+    /// Get mutable access to the parameters (an optimizer's entry point).
+    ///
+    /// Shapes must stay as [`MhcParams::validate`] requires.
+    pub fn params_mut(&mut self) -> &mut MhcParams {
+        &mut self.params
+    }
+
+    fn check_batch(
+        &self,
+        x: &Array3<f32>,
+        h_out: Option<&Array2<f32>>,
+        mappings: Option<&MhcMappings>,
+    ) -> Result<(), MhcError> {
+        check_stream_shape(&x.view(), &self.config)?;
+        let batch = x.shape()[0];
+        let (n, c) = (self.config.expansion_rate, self.config.hidden_dim);
+        if let Some(h) = h_out
+            && h.shape() != [batch, c]
+        {
+            return Err(MhcError::shape(
+                "layer output",
+                format!("[{batch}, {c}]"),
+                h.shape(),
+            ));
+        }
+        if let Some(m) = mappings {
+            if m.h_pre.shape() != [batch, n] || m.h_post.shape() != [batch, n] {
+                return Err(MhcError::shape(
+                    "H^pre / H^post",
+                    format!("[{batch}, {n}]"),
+                    m.h_pre.shape(),
+                ));
+            }
+            if m.h_res.shape() != [batch, n, n] {
+                return Err(MhcError::shape(
+                    "H^res",
+                    format!("[{batch}, {n}, {n}]"),
+                    m.h_res.shape(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Pre-layer computation: compute mappings and aggregate streams.
     ///
     /// # Arguments
     ///
-    /// * `x` - Input residual stream. Shape: [batch, n, C]
+    /// * `x` - Input residual stream. Shape: `[batch, n, C]`
     ///
     /// # Returns
     ///
-    /// * Layer input (aggregated from streams). Shape: [batch, C]
-    /// * Mapping cache for use in post_res_layer
-    pub fn pre_layer(&self, x: &Array3<f32>) -> (Array2<f32>, MhcMappings) {
-        let params = self.params.read();
-        let mappings = compute_mappings(x, &params, &self.config);
+    /// * Layer input (aggregated from streams). Shape: `[batch, C]`
+    /// * The mappings, for [`post_res_layer`](Self::post_res_layer) and
+    ///   [`backward`](Self::backward)
+    ///
+    /// # Errors
+    ///
+    /// If `x` is not `[batch, n, C]` for this layer.
+    pub fn pre_layer(&self, x: &Array3<f32>) -> Result<(Array2<f32>, MhcMappings), MhcError> {
+        self.check_batch(x, None, None)?;
+        let mappings = compute_mappings(x, &self.params, &self.config);
         let h_in = apply_pre_mapping(x, &mappings.h_pre);
-        (h_in, mappings)
+        Ok((h_in, mappings))
     }
 
     /// Post-layer and residual computation: mix output back into streams.
     ///
     /// # Arguments
     ///
-    /// * `x` - Input residual stream. Shape: [batch, n, C]
-    /// * `h_out` - Layer output. Shape: [batch, C]
-    /// * `mappings` - Mapping cache from pre_layer
+    /// * `x` - Input residual stream. Shape: `[batch, n, C]`
+    /// * `h_out` - Layer output. Shape: `[batch, C]`
+    /// * `mappings` - Mappings from [`pre_layer`](Self::pre_layer)
     ///
     /// # Returns
     ///
-    /// Updated residual stream. Shape: [batch, n, C]
+    /// Updated residual stream. Shape: `[batch, n, C]`
+    ///
+    /// # Errors
+    ///
+    /// If any argument's shape disagrees with the layer's.
     pub fn post_res_layer(
         &self,
         x: &Array3<f32>,
         h_out: &Array2<f32>,
         mappings: &MhcMappings,
-    ) -> Array3<f32> {
-        apply_post_res_mapping(x, h_out, &mappings.h_post, &mappings.h_res)
+    ) -> Result<Array3<f32>, MhcError> {
+        self.check_batch(x, Some(h_out), Some(mappings))?;
+        Ok(apply_post_res_mapping(
+            x,
+            h_out,
+            &mappings.h_post,
+            &mappings.h_res,
+        ))
     }
 
     /// Combined forward pass (for simpler use cases).
@@ -131,219 +212,129 @@ impl MhcLayer {
     ///
     /// # Arguments
     ///
-    /// * `x` - Input residual stream. Shape: [batch, n, C]
+    /// * `x` - Input residual stream. Shape: `[batch, n, C]`
     /// * `layer_fn` - Function to apply between pre and post mappings
     ///
     /// # Returns
     ///
-    /// Updated residual stream. Shape: [batch, n, C]
-    pub fn forward<F>(&self, x: &Array3<f32>, layer_fn: F) -> Array3<f32>
+    /// Updated residual stream. Shape: `[batch, n, C]`
+    ///
+    /// # Errors
+    ///
+    /// If `x` or `layer_fn`'s output do not have the layer's shapes.
+    pub fn forward<F>(&self, x: &Array3<f32>, layer_fn: F) -> Result<Array3<f32>, MhcError>
     where
         F: FnOnce(&Array2<f32>) -> Array2<f32>,
     {
-        let (h_in, mappings) = self.pre_layer(x);
+        let (h_in, mappings) = self.pre_layer(x)?;
         let h_out = layer_fn(&h_in);
         self.post_res_layer(x, &h_out, &mappings)
     }
 
     /// Backward pass through the layer.
     ///
+    /// Differentiates `x_out = H^res x + H^postᵀ h_out` with `h_in = H^pre x`
+    /// and the mappings' own dependence on `x` and the parameters, around the
+    /// sublayer `h_out = F(h_in)` whose backward pass is `sublayer_backward`.
+    ///
     /// # Arguments
     ///
-    /// * `x` - Original input. Shape: [batch, n, C]
-    /// * `h_out` - Original layer output. Shape: [batch, C]
-    /// * `mappings` - Cached mappings from forward pass
-    /// * `grad_output` - Gradient from next layer. Shape: [batch, n, C]
-    /// * `grad_h_out` - Additional gradient for h_out (from layer backward). Shape: [batch, C]
+    /// * `x` - Original input. Shape: `[batch, n, C]`
+    /// * `h_out` - The sublayer's output from the forward pass. Shape: `[batch, C]`
+    /// * `mappings` - The mappings from the forward pass
+    /// * `grad_output` - Gradient from the next layer. Shape: `[batch, n, C]`
+    /// * `sublayer_backward` - Given the gradient with respect to the sublayer's
+    ///   output (`[batch, C]`), runs the sublayer's backward pass (including
+    ///   accumulating its own parameter gradients) and returns the gradient
+    ///   with respect to its input (`[batch, C]`)
     ///
     /// # Returns
     ///
-    /// * Gradient w.r.t. input x. Shape: [batch, n, C]
-    /// * Gradient w.r.t. h_in (for layer backward). Shape: [batch, C]
-    #[allow(clippy::assign_op_pattern)]
-    pub fn backward(
+    /// * Gradient with respect to the input `x`. Shape: `[batch, n, C]`
+    /// * Gradients of this layer's parameters, for the optimizer (add them
+    ///   across micro-batches with [`MhcGradients::accumulate`])
+    ///
+    /// # Errors
+    ///
+    /// If a shape disagrees with the layer's, including what `sublayer_backward`
+    /// returns.
+    pub fn backward<F>(
         &self,
         x: &Array3<f32>,
         h_out: &Array2<f32>,
         mappings: &MhcMappings,
         grad_output: &Array3<f32>,
-        grad_h_out_additional: Option<&Array2<f32>>,
-    ) -> (Array3<f32>, Array2<f32>) {
-        let batch_size = x.shape()[0];
-        let n = self.config.expansion_rate;
-        let c = self.config.hidden_dim;
-
-        // Backward through post_res_layer:
-        // x_out = H^res @ x + H^post^T @ h_out
-        //
-        // grad_x = H^res^T @ grad_output
-        // grad_h_out = H^post @ grad_output (summed over streams)
-        // grad_H^res = grad_output @ x^T
-        // grad_H^post = grad_output^T @ h_out (summed appropriately)
-
-        let mut grad_x = Array3::zeros((batch_size, n, c));
-        let mut grad_h_out = Array2::zeros((batch_size, c));
-        let mut grad_h_res = Array3::zeros((batch_size, n, n));
-        let mut grad_h_post = Array2::zeros((batch_size, n));
-
-        for b in 0..batch_size {
-            // grad_x from H^res
-            for j in 0..n {
-                for k in 0..c {
-                    let mut sum = 0.0f32;
-                    for i in 0..n {
-                        sum += mappings.h_res[[b, i, j]] * grad_output[[b, i, k]];
-                    }
-                    grad_x[[b, j, k]] = sum;
-                }
-            }
-
-            // grad_h_out from H^post
-            for k in 0..c {
-                let mut sum = 0.0f32;
-                for i in 0..n {
-                    sum += mappings.h_post[[b, i]] * grad_output[[b, i, k]];
-                }
-                grad_h_out[[b, k]] = sum;
-            }
-
-            // grad_H^res
-            for i in 0..n {
-                for j in 0..n {
-                    let mut sum = 0.0f32;
-                    for k in 0..c {
-                        sum += grad_output[[b, i, k]] * x[[b, j, k]];
-                    }
-                    grad_h_res[[b, i, j]] = sum;
-                }
-            }
-
-            // grad_H^post
-            for i in 0..n {
-                let mut sum = 0.0f32;
-                for k in 0..c {
-                    sum += grad_output[[b, i, k]] * h_out[[b, k]];
-                }
-                grad_h_post[[b, i]] = sum;
-            }
+        sublayer_backward: F,
+    ) -> Result<(Array3<f32>, MhcGradients), MhcError>
+    where
+        F: FnOnce(&Array2<f32>) -> Array2<f32>,
+    {
+        self.check_batch(x, Some(h_out), Some(mappings))?;
+        if grad_output.shape() != x.shape() {
+            return Err(MhcError::shape(
+                "grad_output",
+                format!("{:?}", x.shape()),
+                grad_output.shape(),
+            ));
         }
 
-        // Add any additional gradient for h_out (from layer backward)
-        if let Some(grad_add) = grad_h_out_additional {
-            grad_h_out = grad_h_out + grad_add;
-        }
-
-        // Backward through pre_layer:
-        // h_in = H^pre @ x (over streams)
-        //
-        // We need grad_h_in which will be provided from the layer's backward pass
-        // For now, we compute grad_x from pre_layer separately
-
-        // Backward through mapping computation
-        // This computes grad_x from the mapping computation and parameter gradients
-        let (grad_x_mappings, param_gradients) = compute_mappings_backward(
+        // x_out = H^res x + H^postᵀ h_out
+        let post_res = apply_post_res_mapping_backward(
             x,
-            &self.params.read(),
-            &self.config,
-            &grad_h_post.mapv(|_| 0.0), // We'll handle H^pre gradient separately
-            &grad_h_post,
-            &grad_h_res,
+            h_out,
+            &mappings.h_post,
+            &mappings.h_res,
+            grad_output,
         );
 
-        // Accumulate parameter gradients
-        {
-            let mut grads = self.gradients.write();
-            if let Some(ref mut g) = *grads {
-                g.accumulate(&param_gradients);
-            } else {
-                *grads = Some(param_gradients);
-            }
+        // h_out = F(h_in): the sublayer closes the loop.
+        let grad_h_in = sublayer_backward(&post_res.grad_h_out);
+        if grad_h_in.shape() != post_res.grad_h_out.shape() {
+            return Err(MhcError::shape(
+                "sublayer input gradient",
+                format!("{:?}", post_res.grad_h_out.shape()),
+                grad_h_in.shape(),
+            ));
         }
 
-        // Combine gradients
-        let grad_x_total = grad_x + grad_x_mappings;
+        // h_in = H^pre x
+        let (grad_x_pre, grad_h_pre) = apply_pre_mapping_backward(x, &mappings.h_pre, &grad_h_in);
 
-        // Gradient for h_in (to pass to layer backward)
-        let grad_h_in = grad_h_out; // This will be used by the sublayer's backward
+        // H^pre, H^post, H^res = f(x, parameters)
+        let (grad_x_mappings, grads) = compute_mappings_backward(
+            x,
+            &self.params,
+            &self.config,
+            &grad_h_pre,
+            &post_res.grad_h_post,
+            &post_res.grad_h_res,
+        );
 
-        (grad_x_total, grad_h_in)
+        let grad_x = post_res.grad_x + grad_x_pre + grad_x_mappings;
+        Ok((grad_x, grads))
     }
 
-    /// Get accumulated gradients and reset.
-    pub fn take_gradients(&self) -> Option<MhcGradients> {
-        self.gradients.write().take()
-    }
-
-    /// Reset gradients to zero.
-    pub fn zero_gradients(&self) {
-        *self.gradients.write() = None;
-    }
-
-    /// Apply gradients to parameters using SGD.
-    pub fn apply_gradients_sgd(&self, lr: f32) {
-        if let Some(grads) = self.take_gradients() {
-            let mut params = self.params.write();
-
-            params.alpha_pre -= lr * grads.d_alpha_pre;
-            params.alpha_post -= lr * grads.d_alpha_post;
-            params.alpha_res -= lr * grads.d_alpha_res;
-
-            params.b_pre = &params.b_pre - &(&grads.d_b_pre * lr);
-            params.b_post = &params.b_post - &(&grads.d_b_post * lr);
-            params.b_res = &params.b_res - &(&grads.d_b_res * lr);
-
-            params.phi_pre = &params.phi_pre - &(&grads.d_phi_pre * lr);
-            params.phi_post = &params.phi_post - &(&grads.d_phi_post * lr);
-            params.phi_res = &params.phi_res - &(&grads.d_phi_res * lr);
-
-            params.rmsnorm_weight = &params.rmsnorm_weight - &(&grads.d_rmsnorm_weight * lr);
-        }
+    /// Apply gradients to the parameters with plain SGD.
+    pub fn apply_gradients_sgd(&mut self, grads: &MhcGradients, lr: f32) {
+        let p = &mut self.params;
+        p.alpha_pre -= lr * grads.d_alpha_pre;
+        p.alpha_post -= lr * grads.d_alpha_post;
+        p.alpha_res -= lr * grads.d_alpha_res;
+        p.b_pre.scaled_add(-lr, &grads.d_b_pre);
+        p.b_post.scaled_add(-lr, &grads.d_b_post);
+        p.b_res.scaled_add(-lr, &grads.d_b_res);
+        p.phi.scaled_add(-lr, &grads.d_phi);
     }
 
     /// Get number of parameters in this layer.
     pub fn num_params(&self) -> usize {
-        self.params.read().num_params()
+        self.params.num_params()
     }
 
     /// Get memory usage in bytes.
     pub fn memory_bytes(&self) -> usize {
-        self.params.read().memory_bytes()
+        self.params.memory_bytes()
     }
-
-    /// Clone this layer (deep copy of parameters).
-    pub fn deep_clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            params: Arc::new(RwLock::new(self.params.read().clone())),
-            gradients: Arc::new(RwLock::new(None)),
-            layer_idx: self.layer_idx,
-        }
-    }
-}
-
-impl Clone for MhcLayer {
-    /// Shallow clone (shares parameters).
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            params: Arc::clone(&self.params),
-            gradients: Arc::new(RwLock::new(None)), // Don't share gradients
-            layer_idx: self.layer_idx,
-        }
-    }
-}
-
-/// Cache for mHC forward pass (for backward recomputation).
-#[derive(Debug, Clone)]
-pub struct MhcCache {
-    /// Original input.
-    pub x: Array3<f32>,
-
-    /// Layer output.
-    pub h_out: Array2<f32>,
-
-    /// Computed mappings.
-    pub mappings: MhcMappings,
 }
 
 /// A complete mHC transformer block.
@@ -373,20 +364,28 @@ where
     A: Fn(&Array2<f32>) -> Array2<f32>,
     F: Fn(&Array2<f32>) -> Array2<f32>,
 {
-    /// Create a new transformer block.
-    pub fn new(config: MhcConfig, attention: A, ffn: F, layer_idx: usize) -> Self {
-        Self {
-            mhc_attn: MhcLayer::with_layer_idx(config.clone(), layer_idx * 2),
-            mhc_ffn: MhcLayer::with_layer_idx(config, layer_idx * 2 + 1),
+    /// Create a new transformer block with independently initialized mHC layers.
+    ///
+    /// # Errors
+    ///
+    /// If `config` is invalid.
+    pub fn new(config: MhcConfig, attention: A, ffn: F) -> Result<Self, MhcError> {
+        Ok(Self {
+            mhc_attn: MhcLayer::new(config.clone())?,
+            mhc_ffn: MhcLayer::new(config)?,
             attention,
             ffn,
-        }
+        })
     }
 
     /// Forward pass through the block.
-    pub fn forward(&self, x: &Array3<f32>) -> Array3<f32> {
+    ///
+    /// # Errors
+    ///
+    /// If `x` or a sublayer's output has the wrong shape.
+    pub fn forward(&self, x: &Array3<f32>) -> Result<Array3<f32>, MhcError> {
         // Attention sublayer with mHC
-        let x = self.mhc_attn.forward(x, &self.attention);
+        let x = self.mhc_attn.forward(x, &self.attention)?;
 
         // FFN sublayer with mHC
         self.mhc_ffn.forward(&x, &self.ffn)
@@ -399,27 +398,19 @@ where
 ///
 /// # Arguments
 ///
-/// * `x` - Single-stream input. Shape: [batch, C]
+/// * `x` - Single-stream input. Shape: `[batch, C]`
 /// * `n` - Expansion rate
 ///
 /// # Returns
 ///
-/// Expanded multi-stream tensor. Shape: [batch, n, C]
+/// Expanded multi-stream tensor. Shape: `[batch, n, C]`
 pub fn expand_to_streams(x: &Array2<f32>, n: usize) -> Array3<f32> {
-    let batch_size = x.nrows();
-    let c = x.ncols();
-
-    let mut expanded = Array3::zeros((batch_size, n, c));
-
-    for b in 0..batch_size {
-        for i in 0..n {
-            for j in 0..c {
-                expanded[[b, i, j]] = x[[b, j]];
-            }
-        }
-    }
-
-    expanded
+    let (batch, c) = x.dim();
+    x.view()
+        .insert_axis(Axis(1))
+        .broadcast((batch, n, c))
+        .expect("an inserted unit axis broadcasts to any length")
+        .to_owned()
 }
 
 /// Collapse mode for multi-stream to single-stream reduction.
@@ -433,14 +424,16 @@ pub enum CollapseMode {
     Sum,
 }
 
-impl CollapseMode {
-    /// Parse a collapse mode from a string.
-    pub fn from_str_name(s: &str) -> Result<Self, MhcConfigError> {
+impl FromStr for CollapseMode {
+    type Err = MhcError;
+
+    /// Parse `"first"`, `"average"` or `"sum"`.
+    fn from_str(s: &str) -> Result<Self, MhcError> {
         match s {
             "first" => Ok(Self::First),
             "average" => Ok(Self::Average),
             "sum" => Ok(Self::Sum),
-            _ => Err(MhcConfigError::InvalidCollapseMode(s.to_string())),
+            _ => Err(MhcError::InvalidCollapseMode(s.to_string())),
         }
     }
 }
@@ -451,195 +444,216 @@ impl CollapseMode {
 ///
 /// # Arguments
 ///
-/// * `x` - Multi-stream tensor. Shape: [batch, n, C]
+/// * `x` - Multi-stream tensor. Shape: `[batch, n, C]` with `n >= 1`
 /// * `mode` - Collapse mode
 ///
 /// # Returns
 ///
-/// Single-stream output. Shape: [batch, C]
+/// Single-stream output. Shape: `[batch, C]`
 pub fn collapse_streams(x: &Array3<f32>, mode: CollapseMode) -> Array2<f32> {
-    let batch_size = x.shape()[0];
-    let n = x.shape()[1];
-    let c = x.shape()[2];
-
-    let mut collapsed = Array2::zeros((batch_size, c));
-
     match mode {
-        CollapseMode::First => {
-            for b in 0..batch_size {
-                for j in 0..c {
-                    collapsed[[b, j]] = x[[b, 0, j]];
-                }
-            }
-        }
-        CollapseMode::Average => {
-            let scale = 1.0 / n as f32;
-            for b in 0..batch_size {
-                for j in 0..c {
-                    let sum: f32 = (0..n).map(|i| x[[b, i, j]]).sum();
-                    collapsed[[b, j]] = sum * scale;
-                }
-            }
-        }
-        CollapseMode::Sum => {
-            for b in 0..batch_size {
-                for j in 0..c {
-                    let sum: f32 = (0..n).map(|i| x[[b, i, j]]).sum();
-                    collapsed[[b, j]] = sum;
-                }
-            }
-        }
+        CollapseMode::First => x.index_axis(Axis(1), 0).to_owned(),
+        CollapseMode::Average => x
+            .mean_axis(Axis(1))
+            .expect("collapsing needs at least one stream"),
+        CollapseMode::Sum => x.sum_axis(Axis(1)),
     }
-
-    collapsed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::array;
 
-    #[test]
-    fn test_layer_creation() {
-        let config = MhcConfig::default();
-        let layer = MhcLayer::new(config);
-
-        assert!(layer.num_params() > 0);
+    fn config(c: usize) -> MhcConfig {
+        MhcConfig {
+            hidden_dim: c,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn test_pre_layer() {
-        let config = MhcConfig {
-            expansion_rate: 4,
-            hidden_dim: 64,
+    fn invalid_config_is_an_error() {
+        let bad = MhcConfig {
+            expansion_rate: 0,
             ..Default::default()
         };
-        let layer = MhcLayer::new(config);
-
-        let x = Array3::from_shape_fn((8, 4, 64), |(b, i, j)| ((b + i + j) as f32) * 0.01);
-        let (h_in, mappings) = layer.pre_layer(&x);
-
-        assert_eq!(h_in.shape(), &[8, 64]);
-        assert_eq!(mappings.h_pre.shape(), &[8, 4]);
-        assert_eq!(mappings.h_post.shape(), &[8, 4]);
-        assert_eq!(mappings.h_res.shape(), &[8, 4, 4]);
+        assert!(matches!(MhcLayer::new(bad), Err(MhcError::Config(_))));
     }
 
     #[test]
-    fn test_post_res_layer() {
-        let config = MhcConfig {
-            expansion_rate: 4,
-            hidden_dim: 64,
-            ..Default::default()
-        };
-        let layer = MhcLayer::new(config);
-
-        let x = Array3::from_shape_fn((8, 4, 64), |(b, i, j)| ((b + i + j) as f32) * 0.01);
-        let (_, mappings) = layer.pre_layer(&x);
-        let h_out = Array2::from_shape_fn((8, 64), |(b, j)| ((b + j) as f32) * 0.02);
-
-        let x_next = layer.post_res_layer(&x, &h_out, &mappings);
-
-        assert_eq!(x_next.shape(), &[8, 4, 64]);
+    fn mismatched_params_are_an_error() {
+        let params = MhcParams::identity_init(&config(8));
+        assert!(matches!(
+            MhcLayer::with_params(config(16), params),
+            Err(MhcError::ShapeMismatch { .. })
+        ));
     }
 
     #[test]
-    fn test_full_forward() {
-        let config = MhcConfig {
-            expansion_rate: 4,
-            hidden_dim: 64,
-            ..Default::default()
-        };
-        let layer = MhcLayer::new(config);
+    fn shape_errors_name_the_argument() {
+        let layer = MhcLayer::new(config(8)).unwrap();
+        let bad_x = Array3::<f32>::zeros((2, 4, 9));
+        assert!(matches!(
+            layer.pre_layer(&bad_x),
+            Err(MhcError::ShapeMismatch {
+                what: "residual stream",
+                ..
+            })
+        ));
+        let x = Array3::<f32>::zeros((2, 4, 8));
+        let (_, m) = layer.pre_layer(&x).unwrap();
+        let bad_out = Array2::<f32>::zeros((3, 8));
+        assert!(matches!(
+            layer.post_res_layer(&x, &bad_out, &m),
+            Err(MhcError::ShapeMismatch {
+                what: "layer output",
+                ..
+            })
+        ));
+        let grad = Array3::<f32>::zeros((2, 4, 8));
+        let h_out = Array2::<f32>::zeros((2, 8));
+        let wrong = layer.backward(&x, &h_out, &m, &grad, |_| Array2::zeros((2, 7)));
+        assert!(matches!(
+            wrong,
+            Err(MhcError::ShapeMismatch {
+                what: "sublayer input gradient",
+                ..
+            })
+        ));
+    }
 
-        let x = Array3::from_shape_fn((8, 4, 64), |(b, i, j)| ((b + i + j) as f32) * 0.01);
+    #[test]
+    fn a_fresh_layer_is_a_plain_residual_connection() {
+        // Equal streams: H^pre averages them to x, H^post = 1, H^res ≈ I, so
+        // every output stream is x + F(x) to the identity-init tolerance.
+        let layer = MhcLayer::new(config(16)).unwrap();
+        let base =
+            Array2::from_shape_fn((3, 16), |(b, k)| ((b * 5 + k * 3) % 7) as f32 * 0.3 - 1.0);
+        let x = expand_to_streams(&base, 4);
+        let f = |h: &Array2<f32>| h.mapv(|v| v * v + 0.5 * v);
+        let y = layer.forward(&x, f).unwrap();
+        let want = &base + &f(&base);
+        for s in 0..4 {
+            for b in 0..3 {
+                for k in 0..16 {
+                    let got = y[[b, s, k]];
+                    let w = want[[b, k]];
+                    assert!(
+                        (got - w).abs() < 2e-2 * (1.0 + w.abs()),
+                        "[{b},{s},{k}] {got} vs {w}"
+                    );
+                }
+            }
+        }
+    }
 
-        // Identity layer function
-        let x_next = layer.forward(&x, |h_in| h_in.clone());
+    #[test]
+    fn deep_stack_keeps_the_streams_bounded() {
+        // 60 layers whose sublayer is zero: the residual path alone, through
+        // 60 random doubly stochastic mixes, must not grow or shrink the
+        // streams (Amax gain ≤ 1 + rounding).
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(3);
+        let c = 8;
+        let layers: Vec<MhcLayer> = (0..60)
+            .map(|_| {
+                let mut l = MhcLayer::with_rng(config(c), &mut rng).unwrap();
+                // Make the residual mixing genuinely non-trivial.
+                l.params_mut().b_res = Array2::from_shape_fn((4, 4), |(i, j)| {
+                    ((i * 3 + j * 7) % 5) as f32 * 0.5 - 1.0
+                });
+                l
+            })
+            .collect();
+        let mut x =
+            Array3::from_shape_fn((2, 4, c), |(b, s, k)| ((b + 2 * s + k) % 5) as f32 - 2.0);
+        let norm_in = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        for l in &layers {
+            x = l.forward(&x, |h| Array2::zeros(h.raw_dim())).unwrap();
+        }
+        let norm_out = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        assert!(
+            norm_out <= norm_in * (1.0 + 1e-3),
+            "{norm_in} -> {norm_out}"
+        );
+        assert!(x.iter().all(|v| v.is_finite()));
+    }
 
-        assert_eq!(x_next.shape(), &[8, 4, 64]);
+    #[test]
+    fn sgd_moves_every_parameter_against_its_gradient() {
+        let mut layer = MhcLayer::new(config(4)).unwrap();
+        let before = layer.params().clone();
+        let mut g = MhcGradients::zeros(layer.config());
+        g.d_alpha_pre = 2.0;
+        g.d_b_res[[0, 1]] = -1.0;
+        g.d_phi[[3, 5]] = 4.0;
+        layer.apply_gradients_sgd(&g, 0.5);
+        assert!((layer.params().alpha_pre - (before.alpha_pre - 1.0)).abs() < 1e-7);
+        assert_eq!(layer.params().b_res[[0, 1]], before.b_res[[0, 1]] + 0.5);
+        assert_eq!(layer.params().phi[[3, 5]], before.phi[[3, 5]] - 2.0);
+        assert_eq!(layer.params().b_pre, before.b_pre);
+    }
+
+    #[test]
+    fn clone_is_independent() {
+        let a = MhcLayer::new(config(4)).unwrap();
+        let mut b = a.clone();
+        b.params_mut().alpha_pre = 0.5;
+        assert!((a.params().alpha_pre - 0.01).abs() < 1e-7);
     }
 
     #[test]
     fn test_expand_collapse() {
-        let x = Array2::from_shape_fn((4, 8), |(b, j)| (b + j) as f32);
-
-        let expanded = expand_to_streams(&x, 4);
-        assert_eq!(expanded.shape(), &[4, 4, 8]);
-
-        // All streams should have same values
-        for b in 0..4 {
-            for i in 0..4 {
-                for j in 0..8 {
-                    assert_eq!(expanded[[b, i, j]], x[[b, j]]);
-                }
-            }
+        let x = array![[1.0f32, 2.0], [3.0, 4.0]];
+        let e = expand_to_streams(&x, 3);
+        assert_eq!(e.shape(), &[2, 3, 2]);
+        for s in 0..3 {
+            assert_eq!(e.index_axis(Axis(1), s), x);
         }
-
-        let collapsed = collapse_streams(&expanded, CollapseMode::First);
-        assert_eq!(collapsed.shape(), &[4, 8]);
-
-        // Should match original
-        for b in 0..4 {
-            for j in 0..8 {
-                assert_eq!(collapsed[[b, j]], x[[b, j]]);
-            }
-        }
+        assert_eq!(collapse_streams(&e, CollapseMode::First), x);
+        assert_eq!(collapse_streams(&e, CollapseMode::Sum), &x * 3.0);
+        assert_eq!(collapse_streams(&e, CollapseMode::Average), x);
     }
 
     #[test]
-    fn test_collapse_average() {
-        let mut expanded = Array3::zeros((2, 4, 3));
-        for b in 0..2 {
-            for i in 0..4 {
-                for j in 0..3 {
-                    expanded[[b, i, j]] = (i + 1) as f32; // 1, 2, 3, 4
-                }
-            }
+    fn collapse_average_of_distinct_streams() {
+        let mut e = Array3::zeros((2, 4, 3));
+        for i in 0..4 {
+            e.index_axis_mut(Axis(1), i).fill((i + 1) as f32);
         }
-
-        let collapsed = collapse_streams(&expanded, CollapseMode::Average);
-
-        // Average of 1, 2, 3, 4 = 2.5
-        for b in 0..2 {
-            for j in 0..3 {
-                assert!((collapsed[[b, j]] - 2.5).abs() < 1e-5);
-            }
-        }
+        assert!(
+            collapse_streams(&e, CollapseMode::Average)
+                .iter()
+                .all(|&v| (v - 2.5).abs() < 1e-6)
+        );
     }
 
     #[test]
-    fn test_gradient_accumulation() {
-        let config = MhcConfig {
-            expansion_rate: 4,
-            hidden_dim: 32,
-            ..Default::default()
-        };
-        let layer = MhcLayer::new(config);
-
-        // Run a forward pass
-        let x = Array3::from_shape_fn((4, 4, 32), |_| rand::random::<f32>() - 0.5);
-        let (h_in, mappings) = layer.pre_layer(&x);
-        let h_out = h_in.clone(); // Identity
-
-        // Fake backward
-        let grad_output = Array3::from_shape_fn((4, 4, 32), |_| rand::random::<f32>() - 0.5);
-        let _ = layer.backward(&x, &h_out, &mappings, &grad_output, None);
-
-        // Check that gradients were accumulated
-        let grads = layer.take_gradients();
-        assert!(grads.is_some());
+    fn collapse_mode_parses() {
+        assert_eq!(
+            "first".parse::<CollapseMode>().unwrap(),
+            CollapseMode::First
+        );
+        assert_eq!("sum".parse::<CollapseMode>().unwrap(), CollapseMode::Sum);
+        assert!(matches!(
+            "mean".parse::<CollapseMode>(),
+            Err(MhcError::InvalidCollapseMode(s)) if s == "mean"
+        ));
     }
 
     #[test]
-    fn test_deep_clone() {
-        let config = MhcConfig::default();
-        let layer1 = MhcLayer::new(config);
-        let layer2 = layer1.deep_clone();
-
-        // Modify layer1's params
-        layer1.params_mut().alpha_pre = 0.5;
-
-        // layer2 should be unaffected
-        assert!((layer2.params().alpha_pre - 0.01).abs() < 1e-6);
+    fn transformer_block_runs_both_sublayers() {
+        let block = MhcTransformerBlock::new(
+            config(8),
+            |h: &Array2<f32>| h.mapv(|v| v + 1.0),
+            |h: &Array2<f32>| h.mapv(|v| v * 2.0),
+        )
+        .unwrap();
+        let x = Array3::<f32>::zeros((2, 4, 8));
+        let y = block.forward(&x).unwrap();
+        assert_eq!(y.shape(), x.shape());
+        // zero streams: attention adds ≈ 1 to every stream, then the FFN doubles its input (≈ 1),
+        // adding ≈ 2 on top → ≈ 3.
+        assert!(y.iter().all(|&v| (v - 3.0).abs() < 0.1), "{y:?}");
     }
 }

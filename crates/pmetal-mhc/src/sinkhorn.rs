@@ -1,175 +1,394 @@
-//! Sinkhorn-Knopp algorithm for doubly stochastic matrix projection.
+//! Sinkhorn-Knopp projection onto the doubly stochastic matrices.
 //!
-//! This module implements the Sinkhorn-Knopp algorithm that projects matrices
-//! onto the Birkhoff polytope (set of doubly stochastic matrices).
-//!
-//! A doubly stochastic matrix has:
-//! - All entries non-negative
-//! - All rows sum to 1
-//! - All columns sum to 1
+//! A doubly stochastic matrix has non-negative entries and every row and
+//! column summing to 1: the Birkhoff polytope. mHC constrains each layer's
+//! residual mixing matrix to it, which keeps the layer's gain on the residual
+//! stream at most 1 and closed under composition.
 //!
 //! # Algorithm
 //!
-//! Given an input matrix H̃, the algorithm:
-//! 1. Exponentiates to ensure positivity: M⁽⁰⁾ = exp(H̃)
-//! 2. Iteratively alternates row and column normalization:
-//!    M⁽ᵗ⁾ = T_r(T_c(M⁽ᵗ⁻¹⁾))
-//! 3. Converges to a doubly stochastic matrix as t → ∞
+//! The projection follows the released DeepSeek-V4 hyper-connection kernel
+//! (`hc_split_sinkhorn`), which is the paper's `M⁽⁰⁾ = exp(H̃)`,
+//! `M⁽ᵗ⁾ = T_r(T_c(M⁽ᵗ⁻¹⁾))` with the first step done as a softmax:
+//!
+//! ```text
+//! M = softmax_rows(H̃) + ε                       (exp, then the first T_r)
+//! M = M / (colsum(M) + ε)                       (T_c)
+//! repeat iterations - 1 times:
+//!     M = M / (rowsum(M) + ε)                   (T_r)
+//!     M = M / (colsum(M) + ε)                   (T_c)
+//! ```
+//!
+//! That is `iterations` row/column pairs in all (the paper's `t_max = 20`),
+//! ending on a column step, so columns sum to 1 up to `ε` and rows converge
+//! towards it. Starting from the row softmax rather than a bare `exp` is the
+//! numerically stable form: `exp` overflows `f32` for logits above 88, while the
+//! softmax subtracts the row maximum first and the first row normalization
+//! would have divided that shift out anyway. The iteration count is fixed, with
+//! no early exit, so the map is a smooth, deterministic function of its input
+//! and [`sinkhorn_knopp_backward`] differentiates exactly what the forward ran.
+//!
+//! # Gradients
+//!
+//! Every step is a normalization `y = q / (sum(q) + ε)` along one axis, whose
+//! adjoint is `g_q = (g_y − Σ g_y ⊙ y) / (sum(q) + ε)` along that axis, and the
+//! softmax's is `g_z = p ⊙ (g_p − Σ g_p ⊙ p)`. The backward replays the forward,
+//! keeping each step's output and denominators, and walks them in reverse: O(n²)
+//! per iteration.
 //!
 //! # References
 //!
 //! - Sinkhorn & Knopp (1967): "Concerning nonnegative matrices and doubly stochastic matrices"
 //! - arXiv:2512.24880: mHC paper
 
+use crate::error::MhcError;
 use ndarray::{Array2, Array3};
 
-/// Configuration for Sinkhorn-Knopp algorithm.
-#[derive(Debug, Clone, Copy)]
+/// Configuration for the Sinkhorn-Knopp projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SinkhornConfig {
-    /// Maximum number of iterations.
-    pub max_iterations: usize,
+    /// Number of row/column normalization pairs. The paper uses 20.
+    pub iterations: usize,
 
-    /// Epsilon for numerical stability.
+    /// Added to every element after the softmax and to every normalizing sum,
+    /// so a row or column that underflows to zero cannot divide by zero.
+    /// The release uses `1e-6`.
     pub epsilon: f32,
-
-    /// Early stopping tolerance (if row/col sums are within this of 1.0).
-    pub tolerance: f32,
 }
 
 impl Default for SinkhornConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 20,
-            epsilon: 1e-8,
-            tolerance: 1e-6,
+            iterations: crate::DEFAULT_SINKHORN_ITERATIONS,
+            epsilon: 1e-6,
         }
     }
 }
 
-/// Result of Sinkhorn-Knopp iteration.
+impl SinkhornConfig {
+    /// Check the configuration: at least one iteration, a positive finite `epsilon`.
+    pub fn validate(&self) -> Result<(), MhcError> {
+        if self.iterations == 0 {
+            return Err(crate::MhcConfigError::InvalidSinkhornIterations(0).into());
+        }
+        if !(self.epsilon.is_finite() && self.epsilon > 0.0) {
+            return Err(crate::MhcConfigError::InvalidEpsilon(self.epsilon).into());
+        }
+        Ok(())
+    }
+}
+
+/// Result of a Sinkhorn-Knopp projection.
 #[derive(Debug, Clone)]
 pub struct SinkhornResult {
-    /// The projected doubly stochastic matrix.
+    /// The projected, approximately doubly stochastic matrix.
     pub matrix: Array2<f32>,
 
-    /// Number of iterations performed.
-    pub iterations: usize,
-
-    /// Whether convergence was achieved.
-    pub converged: bool,
-
-    /// Maximum deviation from row sum = 1.
+    /// Maximum deviation of a row sum from 1.
     pub row_error: f32,
 
-    /// Maximum deviation from column sum = 1.
+    /// Maximum deviation of a column sum from 1.
     pub col_error: f32,
 }
 
-/// Apply Sinkhorn-Knopp algorithm to project a matrix onto the doubly stochastic manifold.
+// ---------------------------------------------------------------------------
+// Kernels on flat row-major `n × n` slices
+// ---------------------------------------------------------------------------
+
+/// `out = softmax_rows(z)`, with the row maximum subtracted.
+fn softmax_rows(z: &[f32], n: usize, out: &mut [f32]) {
+    for (zr, or) in z.chunks_exact(n).zip(out.chunks_exact_mut(n)) {
+        let max = zr.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for (o, &v) in or.iter_mut().zip(zr) {
+            *o = (v - max).exp();
+            sum += *o;
+        }
+        let inv = 1.0 / sum;
+        or.iter_mut().for_each(|o| *o *= inv);
+    }
+}
+
+/// Divide every row by `rowsum + eps`; the denominators go to `d` (`n` of them).
+fn normalize_rows(m: &mut [f32], n: usize, eps: f32, d: &mut [f32]) {
+    for (row, d_i) in m.chunks_exact_mut(n).zip(d.iter_mut()) {
+        *d_i = row.iter().sum::<f32>() + eps;
+        let inv = 1.0 / *d_i;
+        row.iter_mut().for_each(|v| *v *= inv);
+    }
+}
+
+/// Divide every column by `colsum + eps`; the denominators go to `d` (`n` of them).
+fn normalize_cols(m: &mut [f32], n: usize, eps: f32, d: &mut [f32]) {
+    d.fill(eps);
+    for row in m.chunks_exact(n) {
+        for (d_j, &v) in d.iter_mut().zip(row) {
+            *d_j += v;
+        }
+    }
+    for row in m.chunks_exact_mut(n) {
+        for (v, &d_j) in row.iter_mut().zip(d.iter()) {
+            *v /= d_j;
+        }
+    }
+}
+
+/// One saved normalization step, kept for the backward pass.
+struct Step {
+    /// The step's output `y`, `n × n`.
+    y: Vec<f32>,
+    /// The `n` denominators `sum + ε` it divided by.
+    d: Vec<f32>,
+    /// `true` for a row normalization, `false` for a column one.
+    rows: bool,
+}
+
+/// Run the projection of `z` into `out`; with `trace`, record what the backward
+/// pass needs.
+fn project(
+    z: &[f32],
+    n: usize,
+    cfg: &SinkhornConfig,
+    out: &mut [f32],
+    mut trace: Option<(&mut Vec<f32>, &mut Vec<Step>)>,
+) {
+    softmax_rows(z, n, out);
+    if let Some((p, _)) = trace.as_mut() {
+        p.clear();
+        p.extend_from_slice(out);
+    }
+    out.iter_mut().for_each(|v| *v += cfg.epsilon);
+
+    let mut d = vec![0.0f32; n];
+    let mut step = |out: &mut [f32], rows: bool, d: &mut Vec<f32>| {
+        if rows {
+            normalize_rows(out, n, cfg.epsilon, d);
+        } else {
+            normalize_cols(out, n, cfg.epsilon, d);
+        }
+        if let Some((_, steps)) = trace.as_mut() {
+            steps.push(Step {
+                y: out.to_vec(),
+                d: d.clone(),
+                rows,
+            });
+        }
+    };
+
+    step(out, false, &mut d);
+    for _ in 1..cfg.iterations {
+        step(out, true, &mut d);
+        step(out, false, &mut d);
+    }
+}
+
+/// Gradient of `project` with respect to `z`, from the trace of its forward run.
+fn project_backward(n: usize, p: &[f32], steps: &[Step], grad_out: &[f32], grad_z: &mut [f32]) {
+    grad_z.copy_from_slice(grad_out);
+    for s in steps.iter().rev() {
+        if s.rows {
+            for ((g_row, y_row), &d_i) in grad_z
+                .chunks_exact_mut(n)
+                .zip(s.y.chunks_exact(n))
+                .zip(&s.d)
+            {
+                let dot: f32 = g_row.iter().zip(y_row).map(|(g, y)| g * y).sum();
+                g_row.iter_mut().for_each(|g| *g = (*g - dot) / d_i);
+            }
+        } else {
+            let mut dot = vec![0.0f32; n];
+            for (g_row, y_row) in grad_z.chunks_exact(n).zip(s.y.chunks_exact(n)) {
+                for ((acc, g), y) in dot.iter_mut().zip(g_row).zip(y_row) {
+                    *acc += g * y;
+                }
+            }
+            for g_row in grad_z.chunks_exact_mut(n) {
+                for ((g, &acc), &d_j) in g_row.iter_mut().zip(&dot).zip(&s.d) {
+                    *g = (*g - acc) / d_j;
+                }
+            }
+        }
+    }
+    // Softmax: g_z = p ⊙ (g − Σ g ⊙ p), per row. (The `+ ε` before the first
+    // normalization is a constant shift and passes the gradient through.)
+    for (g_row, p_row) in grad_z.chunks_exact_mut(n).zip(p.chunks_exact(n)) {
+        let dot: f32 = g_row.iter().zip(p_row).map(|(g, p)| g * p).sum();
+        g_row
+            .iter_mut()
+            .zip(p_row)
+            .for_each(|(g, &p)| *g = p * (*g - dot));
+    }
+}
+
+fn square_size(shape: &[usize], what: &str) -> usize {
+    let n = shape[shape.len() - 1];
+    assert!(
+        shape[shape.len() - 2] == n,
+        "{what} must be square, got {}x{}",
+        shape[shape.len() - 2],
+        n
+    );
+    n
+}
+
+fn assert_config(cfg: &SinkhornConfig) {
+    if let Err(e) = cfg.validate() {
+        panic!("invalid Sinkhorn configuration: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Project a matrix of logits onto the doubly stochastic manifold.
+///
+/// See the [module docs](self) for the exact iteration.
 ///
 /// # Arguments
 ///
-/// * `h_tilde` - Input matrix (unconstrained). Shape: [n, n]
-/// * `config` - Algorithm configuration
+/// * `h_tilde` - Unconstrained logits `H̃`. Shape `[n, n]`, finite.
+/// * `config` - Iteration count and epsilon.
 ///
-/// # Returns
+/// # Panics
 ///
-/// Doubly stochastic matrix where rows and columns sum to 1.
+/// If `h_tilde` is not square or `config` is invalid
+/// ([`SinkhornConfig::validate`]).
 pub fn sinkhorn_knopp(h_tilde: &Array2<f32>, config: &SinkhornConfig) -> SinkhornResult {
-    let n = h_tilde.nrows();
-    assert_eq!(n, h_tilde.ncols(), "Matrix must be square");
-
-    // Step 1: Exponentiate to make all entries positive
-    let mut m: Array2<f32> = h_tilde.mapv(|x| x.exp());
-
-    let mut converged = false;
-    let mut iterations = 0;
-
-    // Step 2: Iterate row and column normalization
-    for t in 0..config.max_iterations {
-        iterations = t + 1;
-
-        // Row normalization: M[i,:] = M[i,:] / sum(M[i,:])
-        for i in 0..n {
-            let row_sum: f32 = m.row(i).iter().sum();
-            let inv_sum = 1.0 / (row_sum + config.epsilon);
-            for j in 0..n {
-                m[[i, j]] *= inv_sum;
-            }
-        }
-
-        // Column normalization: M[:,j] = M[:,j] / sum(M[:,j])
-        for j in 0..n {
-            let col_sum: f32 = m.column(j).iter().sum();
-            let inv_sum = 1.0 / (col_sum + config.epsilon);
-            for i in 0..n {
-                m[[i, j]] *= inv_sum;
-            }
-        }
-
-        // Check convergence
-        let (row_error, col_error) = compute_errors(&m);
-        if row_error < config.tolerance && col_error < config.tolerance {
-            converged = true;
-            break;
-        }
-    }
-
-    let (row_error, col_error) = compute_errors(&m);
-
+    assert_config(config);
+    let n = square_size(h_tilde.shape(), "Sinkhorn input");
+    let z = h_tilde.as_standard_layout();
+    let mut out = Array2::<f32>::zeros((n, n));
+    project(
+        z.as_slice().expect("standard layout is contiguous"),
+        n,
+        config,
+        out.as_slice_mut().expect("fresh array is contiguous"),
+        None,
+    );
+    let (row_error, col_error) = compute_errors(&out);
     SinkhornResult {
-        matrix: m,
-        iterations,
-        converged,
+        matrix: out,
         row_error,
         col_error,
     }
 }
 
-/// Batched Sinkhorn-Knopp for multiple matrices.
+/// Batched [`sinkhorn_knopp`].
 ///
 /// # Arguments
 ///
-/// * `h_tilde_batch` - Batch of input matrices. Shape: [batch, n, n]
-/// * `config` - Algorithm configuration
+/// * `h_tilde_batch` - Batch of logit matrices. Shape `[batch, n, n]`
+/// * `config` - Iteration count and epsilon.
 ///
-/// # Returns
+/// # Panics
 ///
-/// Batch of doubly stochastic matrices.
+/// If the matrices are not square or `config` is invalid.
 pub fn sinkhorn_knopp_batch(h_tilde_batch: &Array3<f32>, config: &SinkhornConfig) -> Array3<f32> {
-    let batch_size = h_tilde_batch.shape()[0];
-    let n = h_tilde_batch.shape()[1];
-    assert_eq!(n, h_tilde_batch.shape()[2], "Matrices must be square");
-
-    let mut output = Array3::zeros((batch_size, n, n));
-
-    // Process each matrix in the batch
-    // Note: In production, this would be parallelized or done in a GPU kernel
-    for b in 0..batch_size {
-        let h_tilde = h_tilde_batch.slice(ndarray::s![b, .., ..]).to_owned();
-        let result = sinkhorn_knopp(&h_tilde, config);
-        output
-            .slice_mut(ndarray::s![b, .., ..])
-            .assign(&result.matrix);
+    assert_config(config);
+    let n = square_size(h_tilde_batch.shape(), "Sinkhorn inputs");
+    let z = h_tilde_batch.as_standard_layout();
+    let z = z.as_slice().expect("standard layout is contiguous");
+    let mut out = Array3::<f32>::zeros(h_tilde_batch.raw_dim());
+    let o = out.as_slice_mut().expect("fresh array is contiguous");
+    for (zb, ob) in z.chunks_exact(n * n).zip(o.chunks_exact_mut(n * n)) {
+        project(zb, n, config, ob, None);
     }
-
-    output
+    out
 }
 
-/// Compute row and column sum errors.
+/// Backward pass through [`sinkhorn_knopp`]: the gradient of a loss with
+/// respect to the logits `H̃`, given its gradient with respect to the output.
+///
+/// This is the exact adjoint of the forward (same `iterations`, same `epsilon`),
+/// so it matches a finite-difference derivative of [`sinkhorn_knopp`] to
+/// `f32` rounding.
+///
+/// # Arguments
+///
+/// * `h_tilde` - The input the forward pass was given. Shape `[n, n]`
+/// * `grad_output` - Gradient with respect to the projected matrix. Shape `[n, n]`
+/// * `config` - The configuration the forward pass used.
+///
+/// # Panics
+///
+/// If the shapes differ, `h_tilde` is not square or `config` is invalid.
+pub fn sinkhorn_knopp_backward(
+    h_tilde: &Array2<f32>,
+    grad_output: &Array2<f32>,
+    config: &SinkhornConfig,
+) -> Array2<f32> {
+    assert_config(config);
+    let n = square_size(h_tilde.shape(), "Sinkhorn input");
+    assert_eq!(
+        h_tilde.shape(),
+        grad_output.shape(),
+        "grad_output must match the Sinkhorn input's shape"
+    );
+    let z = h_tilde.as_standard_layout();
+    let g = grad_output.as_standard_layout();
+    let mut grad_z = Array2::<f32>::zeros((n, n));
+    backward_one(
+        z.as_slice().expect("standard layout is contiguous"),
+        g.as_slice().expect("standard layout is contiguous"),
+        n,
+        config,
+        grad_z.as_slice_mut().expect("fresh array is contiguous"),
+    );
+    grad_z
+}
+
+/// Batched [`sinkhorn_knopp_backward`]. Shapes `[batch, n, n]`.
+pub fn sinkhorn_knopp_backward_batch(
+    h_tilde_batch: &Array3<f32>,
+    grad_output: &Array3<f32>,
+    config: &SinkhornConfig,
+) -> Array3<f32> {
+    assert_config(config);
+    let n = square_size(h_tilde_batch.shape(), "Sinkhorn inputs");
+    assert_eq!(
+        h_tilde_batch.shape(),
+        grad_output.shape(),
+        "grad_output must match the Sinkhorn inputs' shape"
+    );
+    let z = h_tilde_batch.as_standard_layout();
+    let g = grad_output.as_standard_layout();
+    let (z, g) = (
+        z.as_slice().expect("standard layout is contiguous"),
+        g.as_slice().expect("standard layout is contiguous"),
+    );
+    let mut out = Array3::<f32>::zeros(h_tilde_batch.raw_dim());
+    let o = out.as_slice_mut().expect("fresh array is contiguous");
+    for ((zb, gb), ob) in z
+        .chunks_exact(n * n)
+        .zip(g.chunks_exact(n * n))
+        .zip(o.chunks_exact_mut(n * n))
+    {
+        backward_one(zb, gb, n, config, ob);
+    }
+    out
+}
+
+fn backward_one(z: &[f32], g: &[f32], n: usize, cfg: &SinkhornConfig, grad_z: &mut [f32]) {
+    let mut out = vec![0.0f32; n * n];
+    let mut p = Vec::with_capacity(n * n);
+    let mut steps = Vec::with_capacity(2 * cfg.iterations);
+    project(z, n, cfg, &mut out, Some((&mut p, &mut steps)));
+    project_backward(n, &p, &steps, g, grad_z);
+}
+
+/// Maximum deviation of the row sums and of the column sums from 1.
 fn compute_errors(m: &Array2<f32>) -> (f32, f32) {
-    let n = m.nrows();
-
-    // Maximum deviation from row sum = 1
-    let row_error = (0..n)
-        .map(|i| (m.row(i).iter().sum::<f32>() - 1.0).abs())
+    let row_error = m
+        .rows()
+        .into_iter()
+        .map(|r| (r.sum() - 1.0).abs())
         .fold(0.0f32, f32::max);
-
-    // Maximum deviation from column sum = 1
-    let col_error = (0..n)
-        .map(|j| (m.column(j).iter().sum::<f32>() - 1.0).abs())
+    let col_error = m
+        .columns()
+        .into_iter()
+        .map(|c| (c.sum() - 1.0).abs())
         .fold(0.0f32, f32::max);
-
     (row_error, col_error)
 }
 
@@ -178,203 +397,71 @@ fn compute_errors(m: &Array2<f32>) -> (f32, f32) {
 /// # Arguments
 ///
 /// * `m` - Matrix to verify
-/// * `tolerance` - Maximum allowed deviation from 1.0 for row/column sums
+/// * `tolerance` - Maximum allowed deviation from 1.0 for row/column sums, and
+///   from 0.0 for a negative entry
 ///
 /// # Returns
 ///
-/// True if the matrix is doubly stochastic within tolerance.
+/// True if the matrix is square, non-negative and its row and column sums are
+/// within `tolerance` of 1. `NaN` entries make it false.
 pub fn is_doubly_stochastic(m: &Array2<f32>, tolerance: f32) -> bool {
-    let n = m.nrows();
-    if n != m.ncols() {
+    if m.nrows() != m.ncols() {
         return false;
     }
-
-    // Check non-negativity
-    if m.iter().any(|&x| x < -tolerance) {
+    if m.iter().any(|&x| x.is_nan() || x < -tolerance) {
         return false;
     }
-
-    // Check row sums
-    for i in 0..n {
-        let row_sum: f32 = m.row(i).iter().sum();
-        if (row_sum - 1.0).abs() > tolerance {
-            return false;
-        }
-    }
-
-    // Check column sums
-    for j in 0..n {
-        let col_sum: f32 = m.column(j).iter().sum();
-        if (col_sum - 1.0).abs() > tolerance {
-            return false;
-        }
-    }
-
-    true
+    let (row_error, col_error) = compute_errors(m);
+    row_error <= tolerance && col_error <= tolerance
 }
 
-/// Compute the Amax Gain Magnitude for forward signal.
-///
-/// This is the maximum absolute row sum, capturing worst-case signal amplification.
+/// The Amax gain magnitude of the forward signal: the largest absolute row sum
+/// of `m`, the worst-case amplification of a residual-stream component.
 pub fn amax_gain_forward(m: &Array2<f32>) -> f32 {
-    let n = m.nrows();
-    (0..n)
-        .map(|i| m.row(i).iter().map(|x| x.abs()).sum::<f32>())
+    m.rows()
+        .into_iter()
+        .map(|r| r.iter().map(|x| x.abs()).sum::<f32>())
         .fold(0.0f32, f32::max)
 }
 
-/// Compute the Amax Gain Magnitude for backward gradient.
-///
-/// This is the maximum absolute column sum, capturing worst-case gradient amplification.
+/// The Amax gain magnitude of the backward gradient: the largest absolute
+/// column sum of `m`, the worst-case amplification of a gradient component.
 pub fn amax_gain_backward(m: &Array2<f32>) -> f32 {
-    let n = m.ncols();
-    (0..n)
-        .map(|j| m.column(j).iter().map(|x| x.abs()).sum::<f32>())
+    m.columns()
+        .into_iter()
+        .map(|c| c.iter().map(|x| x.abs()).sum::<f32>())
         .fold(0.0f32, f32::max)
 }
 
-/// Compute composite mapping across multiple layers.
+/// Compose mappings across layers: the ordered product `M_1 M_2 ... M_k`.
 ///
-/// # Arguments
+/// Products of doubly stochastic matrices are doubly stochastic, so this is
+/// the effective residual mapping of the stack and its [`amax_gain_forward`]
+/// stays near 1 however deep it is.
 ///
-/// * `matrices` - List of H^res matrices from consecutive layers
+/// # Errors
 ///
-/// # Returns
-///
-/// The product ∏ H^res, which should remain doubly stochastic.
-pub fn composite_mapping(matrices: &[Array2<f32>]) -> Result<Array2<f32>, crate::MhcConfigError> {
-    if matrices.is_empty() {
-        return Err(crate::MhcConfigError::EmptyComposite);
+/// [`MhcError::EmptyComposite`] for an empty list and
+/// [`MhcError::ShapeMismatch`] if the matrices are not all the same square size.
+pub fn composite_mapping(matrices: &[Array2<f32>]) -> Result<Array2<f32>, MhcError> {
+    let Some(first) = matrices.first() else {
+        return Err(MhcError::EmptyComposite);
+    };
+    let n = first.nrows();
+    for m in matrices {
+        if m.shape() != [n, n] {
+            return Err(MhcError::shape(
+                "composite matrix",
+                format!("[{n}, {n}]"),
+                m.shape(),
+            ));
+        }
     }
-
-    let n = matrices[0].nrows();
     let mut result = Array2::eye(n);
-
     for m in matrices {
         result = result.dot(m);
     }
-
     Ok(result)
-}
-
-/// Backward pass through Sinkhorn-Knopp.
-///
-/// Computes the gradient of the loss with respect to the input H̃
-/// given the gradient with respect to the output M.
-///
-/// # Arguments
-///
-/// * `h_tilde` - Original input to Sinkhorn-Knopp
-/// * `grad_output` - Gradient w.r.t. the output doubly stochastic matrix
-/// * `config` - Algorithm configuration
-///
-/// # Returns
-///
-/// Gradient w.r.t. the input H̃.
-pub fn sinkhorn_knopp_backward(
-    h_tilde: &Array2<f32>,
-    grad_output: &Array2<f32>,
-    config: &SinkhornConfig,
-) -> Array2<f32> {
-    let n = h_tilde.nrows();
-
-    // We need to backprop through the Sinkhorn iterations.
-    // This is done by:
-    // 1. Recomputing the forward pass, storing intermediates
-    // 2. Backpropping through each iteration in reverse
-
-    // Forward pass with intermediate storage
-    let mut intermediates: Vec<Array2<f32>> = Vec::with_capacity(config.max_iterations + 1);
-
-    // Initial: M⁰ = exp(H̃)
-    let m_0: Array2<f32> = h_tilde.mapv(|x| x.exp());
-    intermediates.push(m_0.clone());
-
-    let mut m = m_0;
-
-    for _ in 0..config.max_iterations {
-        // Row normalization
-        let mut m_row = m.clone();
-        for i in 0..n {
-            let row_sum: f32 = m_row.row(i).iter().sum();
-            let inv_sum = 1.0 / (row_sum + config.epsilon);
-            for j in 0..n {
-                m_row[[i, j]] *= inv_sum;
-            }
-        }
-
-        // Column normalization
-        let mut m_col = m_row.clone();
-        for j in 0..n {
-            let col_sum: f32 = m_col.column(j).iter().sum();
-            let inv_sum = 1.0 / (col_sum + config.epsilon);
-            for i in 0..n {
-                m_col[[i, j]] *= inv_sum;
-            }
-        }
-
-        m = m_col;
-        intermediates.push(m.clone());
-    }
-
-    // Backward pass
-    let mut grad = grad_output.clone();
-
-    for t in (0..config.max_iterations).rev() {
-        let m_prev = &intermediates[t];
-
-        // Backward through column normalization
-        let mut m_row = m_prev.clone();
-        for i in 0..n {
-            let row_sum: f32 = m_row.row(i).iter().sum();
-            let inv_sum = 1.0 / (row_sum + config.epsilon);
-            for j in 0..n {
-                m_row[[i, j]] *= inv_sum;
-            }
-        }
-
-        let mut grad_m_row: Array2<f32> = Array2::zeros((n, n));
-        for j in 0..n {
-            let col_sum: f32 = m_row.column(j).iter().sum();
-            let inv_sum = 1.0 / (col_sum + config.epsilon);
-            let inv_sum_sq = inv_sum * inv_sum;
-
-            for i in 0..n {
-                let grad_ij = grad[[i, j]];
-                // Gradient from direct term
-                grad_m_row[[i, j]] += grad_ij * inv_sum;
-                // Gradient from normalization term
-                for k in 0..n {
-                    grad_m_row[[k, j]] -= grad_ij * m_row[[k, j]] * m_row[[i, j]] * inv_sum_sq;
-                }
-            }
-        }
-
-        // Backward through row normalization
-        let mut grad_m_prev: Array2<f32> = Array2::zeros((n, n));
-        for i in 0..n {
-            let row_sum: f32 = m_prev.row(i).iter().sum();
-            let inv_sum = 1.0 / (row_sum + config.epsilon);
-            let inv_sum_sq = inv_sum * inv_sum;
-
-            for j in 0..n {
-                let grad_ij = grad_m_row[[i, j]];
-                // Gradient from direct term
-                grad_m_prev[[i, j]] += grad_ij * inv_sum;
-                // Gradient from normalization term
-                for k in 0..n {
-                    grad_m_prev[[i, k]] -= grad_ij * m_prev[[i, k]] * m_prev[[i, j]] * inv_sum_sq;
-                }
-            }
-        }
-
-        grad = grad_m_prev;
-    }
-
-    // Backward through exp: d/dH̃[exp(H̃)] = exp(H̃) ⊙ grad
-    let m_0 = &intermediates[0];
-
-    m_0 * &grad
 }
 
 #[cfg(test)]
@@ -382,243 +469,157 @@ mod tests {
     use super::*;
     use ndarray::array;
 
-    #[test]
-    fn test_sinkhorn_convergence() {
-        let h_tilde = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
-        let config = SinkhornConfig::default();
-
-        let result = sinkhorn_knopp(&h_tilde, &config);
-
-        assert!(result.converged);
-        assert!(is_doubly_stochastic(&result.matrix, 1e-4));
+    fn cfg(iterations: usize) -> SinkhornConfig {
+        SinkhornConfig {
+            iterations,
+            epsilon: 1e-6,
+        }
     }
 
-    #[test]
-    fn test_sinkhorn_non_negativity() {
-        let h_tilde = array![[-1.0, -2.0], [3.0, 4.0]];
-        let config = SinkhornConfig::default();
-
-        let result = sinkhorn_knopp(&h_tilde, &config);
-
-        // All entries should be non-negative
-        assert!(result.matrix.iter().all(|&x| x >= 0.0));
+    fn logits3() -> Array2<f32> {
+        array![[0.5, -1.0, 2.0], [1.5, 0.25, -0.75], [-2.0, 0.8, 1.1]]
     }
 
+    /// Values from a float64 evaluation of the release's `hc_split_sinkhorn`
+    /// recipe (row softmax, `+ε`, column step, then row/column pairs).
     #[test]
-    fn test_sinkhorn_row_sums() {
-        let h_tilde = array![
-            [0.5, 1.5, 2.0, 0.3],
-            [1.0, 2.0, 3.0, 1.5],
-            [0.2, 0.8, 1.2, 0.9],
-            [2.1, 1.3, 0.7, 1.8]
+    fn matches_the_release_recipe_on_hand_computed_values() {
+        let expected: [(usize, [[f64; 3]; 3]); 3] = [
+            (
+                1,
+                [
+                    [0.190749726, 0.059283127, 0.552741337],
+                    [0.781798168, 0.311981133, 0.053278921],
+                    [0.027451017, 0.628734224, 0.393979039],
+                ],
+            ),
+            (
+                2,
+                [
+                    [0.251356824, 0.078184431, 0.620222777],
+                    [0.720990441, 0.287955653, 0.041839770],
+                    [0.027651678, 0.633858857, 0.337936553],
+                ],
+            ),
+            (
+                20,
+                [
+                    [0.278624043, 0.084663294, 0.636711663],
+                    [0.692566163, 0.270211820, 0.037221017],
+                    [0.028808794, 0.645123886, 0.326066320],
+                ],
+            ),
         ];
-        let config = SinkhornConfig::default();
-
-        let result = sinkhorn_knopp(&h_tilde, &config);
-
-        // Check row sums
-        for i in 0..4 {
-            let row_sum: f32 = result.matrix.row(i).iter().sum();
-            assert!((row_sum - 1.0).abs() < 1e-4, "Row {} sum: {}", i, row_sum);
+        for (iters, want) in expected {
+            let got = sinkhorn_knopp(&logits3(), &cfg(iters)).matrix;
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert!(
+                        (f64::from(got[[i, j]]) - want[i][j]).abs() < 2e-6,
+                        "iterations {iters} [{i},{j}]: {} vs {}",
+                        got[[i, j]],
+                        want[i][j]
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn test_sinkhorn_col_sums() {
-        let h_tilde = array![
-            [0.5, 1.5, 2.0, 0.3],
-            [1.0, 2.0, 3.0, 1.5],
-            [0.2, 0.8, 1.2, 0.9],
-            [2.1, 1.3, 0.7, 1.8]
-        ];
-        let config = SinkhornConfig::default();
+    fn result_is_doubly_stochastic_with_reported_errors() {
+        let r = sinkhorn_knopp(&logits3(), &cfg(20));
+        assert!(is_doubly_stochastic(&r.matrix, 1e-3));
+        assert!(r.col_error < 1e-5 && r.row_error < 1e-3, "{r:?}");
+        assert!(r.matrix.iter().all(|&x| x > 0.0));
+    }
 
-        let result = sinkhorn_knopp(&h_tilde, &config);
+    #[test]
+    fn large_logits_do_not_overflow() {
+        // exp(100) is inf in f32; a bare exp-then-normalize gives NaN here.
+        let z = array![[100.0, -100.0], [-100.0, 100.0]];
+        let m = sinkhorn_knopp(&z, &cfg(20)).matrix;
+        assert!(m.iter().all(|v| v.is_finite()), "{m:?}");
+        assert!((m[[0, 0]] - 1.0).abs() < 1e-5 && m[[0, 1]] < 1e-5);
+        let z = array![[1e30, 0.0], [0.0, 1e30]];
+        assert!(
+            sinkhorn_knopp(&z, &cfg(5))
+                .matrix
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
 
-        // Check column sums
-        for j in 0..4 {
-            let col_sum: f32 = result.matrix.column(j).iter().sum();
-            assert!(
-                (col_sum - 1.0).abs() < 1e-4,
-                "Column {} sum: {}",
-                j,
-                col_sum
+    #[test]
+    fn uniform_logits_give_the_uniform_matrix() {
+        let m = sinkhorn_knopp(&Array2::from_elem((4, 4), 3.0), &cfg(20)).matrix;
+        for &v in &m {
+            assert!((v - 0.25).abs() < 1e-6, "{v}");
+        }
+    }
+
+    #[test]
+    fn batch_matches_the_single_matrix_path() {
+        let batch = Array3::from_shape_fn((5, 4, 4), |(b, i, j)| {
+            ((b * 7 + i * 3 + j * 5) % 11) as f32 * 0.4 - 2.0
+        });
+        let out = sinkhorn_knopp_batch(&batch, &cfg(20));
+        let grad = Array3::from_shape_fn((5, 4, 4), |(b, i, j)| ((b + 2 * i + j) % 5) as f32 - 2.0);
+        let gout = sinkhorn_knopp_backward_batch(&batch, &grad, &cfg(20));
+        for b in 0..5 {
+            let z = batch.index_axis(ndarray::Axis(0), b).to_owned();
+            let g = grad.index_axis(ndarray::Axis(0), b).to_owned();
+            assert_eq!(
+                sinkhorn_knopp(&z, &cfg(20)).matrix,
+                out.index_axis(ndarray::Axis(0), b)
+            );
+            assert_eq!(
+                sinkhorn_knopp_backward(&z, &g, &cfg(20)),
+                gout.index_axis(ndarray::Axis(0), b)
             );
         }
     }
 
     #[test]
-    fn test_compositional_closure() {
-        // Property: Product of doubly stochastic matrices is doubly stochastic
-        let config = SinkhornConfig::default();
-        let mut rng = rand::rng();
-
-        let matrices: Vec<Array2<f32>> = (0..10)
-            .map(|_| {
-                let h_tilde = Array2::from_shape_fn((4, 4), |_| {
-                    use rand::RngExt;
-                    rng.random_range(-2.0..2.0)
+    fn composite_closure_and_amax_gain() {
+        let mats: Vec<Array2<f32>> = (0..60)
+            .map(|k| {
+                let z = Array2::from_shape_fn((4, 4), |(i, j)| {
+                    (((k * 13 + i * 5 + j * 3) % 17) as f32) * 0.25 - 2.0
                 });
-                sinkhorn_knopp(&h_tilde, &config).matrix
+                sinkhorn_knopp(&z, &cfg(20)).matrix
             })
             .collect();
-
-        let composite = composite_mapping(&matrices).unwrap();
-
-        // Composite should still be doubly stochastic
-        assert!(
-            is_doubly_stochastic(&composite, 1e-3),
-            "Composite is not doubly stochastic"
-        );
+        let c = composite_mapping(&mats).unwrap();
+        assert!(is_doubly_stochastic(&c, 1e-3));
+        assert!(amax_gain_forward(&c) < 1.0 + 1e-3);
+        assert!(amax_gain_backward(&c) < 1.0 + 1e-3);
     }
 
     #[test]
-    fn test_amax_gain_bounded() {
-        // Doubly stochastic matrices should have Amax gain ≤ 1 (approximately)
-        let h_tilde = array![
-            [1.0, 2.0, 0.5, 1.5],
-            [0.8, 1.2, 2.1, 0.9],
-            [1.5, 0.7, 1.3, 2.0],
-            [2.0, 1.8, 0.6, 0.4]
-        ];
-        let config = SinkhornConfig::default();
-
-        let result = sinkhorn_knopp(&h_tilde, &config);
-
-        let forward_gain = amax_gain_forward(&result.matrix);
-        let backward_gain = amax_gain_backward(&result.matrix);
-
-        // For a doubly stochastic matrix, Amax gain should be close to 1
-        assert!(forward_gain <= 1.0 + 1e-4, "Forward gain: {}", forward_gain);
-        assert!(
-            backward_gain <= 1.0 + 1e-4,
-            "Backward gain: {}",
-            backward_gain
-        );
+    fn composite_rejects_empty_and_mismatched() {
+        assert!(matches!(
+            composite_mapping(&[]),
+            Err(MhcError::EmptyComposite)
+        ));
+        let a = Array2::<f32>::eye(3);
+        let b = Array2::<f32>::eye(4);
+        assert!(matches!(
+            composite_mapping(&[a, b]),
+            Err(MhcError::ShapeMismatch { .. })
+        ));
     }
 
     #[test]
-    fn test_spectral_norm_bounded() {
-        // The spectral norm of a doubly stochastic matrix is bounded by 1
-        let h_tilde = array![
-            [1.0, 2.0, 3.0, 4.0],
-            [2.0, 1.0, 4.0, 3.0],
-            [3.0, 4.0, 1.0, 2.0],
-            [4.0, 3.0, 2.0, 1.0]
-        ];
-        let config = SinkhornConfig::default();
-
-        let result = sinkhorn_knopp(&h_tilde, &config);
-
-        // Approximate spectral norm via power iteration
-        let mut v = Array2::from_elem((4, 1), 0.5);
-        for _ in 0..100 {
-            let av = result.matrix.dot(&v);
-            let norm: f32 = av.iter().map(|x| x * x).sum::<f32>().sqrt();
-            v = av / norm;
-        }
-        let av = result.matrix.dot(&v);
-        let spectral_norm: f32 = av.iter().map(|x| x * x).sum::<f32>().sqrt();
-
+    fn invalid_configs_are_reported() {
+        assert!(cfg(0).validate().is_err());
         assert!(
-            spectral_norm <= 1.0 + 1e-4,
-            "Spectral norm: {}",
-            spectral_norm
+            SinkhornConfig {
+                iterations: 3,
+                epsilon: 0.0
+            }
+            .validate()
+            .is_err()
         );
-    }
-
-    #[test]
-    fn test_batched_sinkhorn() {
-        let batch = Array3::from_shape_fn((8, 4, 4), |(_, i, j)| ((i + j) as f32) * 0.5);
-        let config = SinkhornConfig::default();
-
-        let output = sinkhorn_knopp_batch(&batch, &config);
-
-        assert_eq!(output.shape(), &[8, 4, 4]);
-
-        // Check each matrix in batch is doubly stochastic
-        for b in 0..8 {
-            let m = output.slice(ndarray::s![b, .., ..]).to_owned();
-            assert!(
-                is_doubly_stochastic(&m, 1e-4),
-                "Batch {} is not doubly stochastic",
-                b
-            );
-        }
-    }
-
-    #[test]
-    fn test_deep_composition_stability() {
-        // Test that even 60 layers deep, the composite remains stable
-        let config = SinkhornConfig::default();
-        let mut rng = rand::rng();
-
-        let matrices: Vec<Array2<f32>> = (0..60)
-            .map(|_| {
-                let h_tilde = Array2::from_shape_fn((4, 4), |_| {
-                    use rand::RngExt;
-                    rng.random_range(-2.0..2.0)
-                });
-                sinkhorn_knopp(&h_tilde, &config).matrix
-            })
-            .collect();
-
-        let composite = composite_mapping(&matrices).unwrap();
-
-        let forward_gain = amax_gain_forward(&composite);
-        let backward_gain = amax_gain_backward(&composite);
-
-        // Paper shows max ~1.6 for 60 layers
-        assert!(
-            forward_gain < 3.0,
-            "Forward gain too high: {}",
-            forward_gain
-        );
-        assert!(
-            backward_gain < 3.0,
-            "Backward gain too high: {}",
-            backward_gain
-        );
-
-        // Should still be approximately doubly stochastic
-        assert!(
-            is_doubly_stochastic(&composite, 0.1),
-            "Deep composite lost doubly stochastic property"
-        );
-    }
-
-    #[test]
-    fn test_backward_gradient_shape() {
-        let h_tilde = array![[1.0, 2.0], [3.0, 4.0]];
-        let grad_output = array![[0.1, 0.2], [0.3, 0.4]];
-        let config = SinkhornConfig::default();
-
-        let grad_input = sinkhorn_knopp_backward(&h_tilde, &grad_output, &config);
-
-        assert_eq!(grad_input.shape(), h_tilde.shape());
-    }
-
-    #[test]
-    fn test_backward_gradient_nonzero() {
-        // Verify backward pass produces non-zero gradients
-        let h_tilde = array![[0.5, 1.0], [1.5, 0.8]];
-        let config = SinkhornConfig::default();
-
-        // Loss = sum of all elements (simple test loss)
-        let grad_output = Array2::ones((2, 2));
-
-        // Analytical gradient
-        let grad_analytical = sinkhorn_knopp_backward(&h_tilde, &grad_output, &config);
-
-        // Gradient should be non-zero for at least some elements
-        let grad_norm: f32 = grad_analytical.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            grad_norm > 0.0,
-            "Gradient should be non-zero, got norm: {}",
-            grad_norm
-        );
-
-        // Gradient should have same shape as input
-        assert_eq!(grad_analytical.shape(), h_tilde.shape());
+        assert!(cfg(1).validate().is_ok());
     }
 }

@@ -3,12 +3,13 @@
 //! This module provides configuration structures for mHC layers,
 //! including expansion rate, Sinkhorn iterations, and initialization parameters.
 
+use crate::sinkhorn::SinkhornConfig;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for mHC (Manifold-Constrained Hyper-Connections).
 ///
 /// Based on the DeepSeek paper arXiv:2512.24880.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MhcConfig {
     /// Expansion rate (number of parallel streams).
     ///
@@ -39,34 +40,20 @@ pub struct MhcConfig {
     /// When false, only static biases are used.
     pub use_dynamic_mappings: bool,
 
-    /// Recomputation block size (L_r) for activation checkpointing.
-    ///
-    /// If None, automatically computed as sqrt(n*L/(n+2)).
-    /// If Some, uses the specified value.
-    pub recompute_block_size: Option<usize>,
-
-    /// Epsilon for numerical stability in RMSNorm and Sinkhorn.
+    /// Epsilon for numerical stability: the RMSNorm's, the one added to `H^pre`
+    /// and inside the Sinkhorn projection. The released models use `1e-6`.
     pub epsilon: f32,
-
-    /// Whether to use mixed precision (BF16 activations, FP32 mappings).
-    pub use_mixed_precision: bool,
-
-    /// Whether to fuse kernels for efficiency.
-    pub fuse_kernels: bool,
 }
 
 impl Default for MhcConfig {
     fn default() -> Self {
         Self {
-            expansion_rate: 4,
-            sinkhorn_iterations: 20,
+            expansion_rate: crate::DEFAULT_EXPANSION_RATE,
+            sinkhorn_iterations: crate::DEFAULT_SINKHORN_ITERATIONS,
             alpha_init: 0.01,
             hidden_dim: 2560, // 27B model default
             use_dynamic_mappings: true,
-            recompute_block_size: None,
             epsilon: 1e-6,
-            use_mixed_precision: true,
-            fuse_kernels: true,
         }
     }
 }
@@ -122,6 +109,21 @@ impl MhcConfig {
         self.expansion_rate
     }
 
+    /// Width of the fused dynamic projection: `n` for `H^pre`, `n` for `H^post`
+    /// and `n²` for `H^res` (`2n + n²`).
+    pub fn mixing_dim(&self) -> usize {
+        let n = self.expansion_rate;
+        2 * n + n * n
+    }
+
+    /// The Sinkhorn settings this configuration implies.
+    pub fn sinkhorn_config(&self) -> SinkhornConfig {
+        SinkhornConfig {
+            iterations: self.sinkhorn_iterations,
+            epsilon: self.epsilon,
+        }
+    }
+
     /// Create configuration from a preset.
     pub fn from_preset(preset: MhcPreset) -> Self {
         preset.to_config()
@@ -143,10 +145,10 @@ impl MhcConfig {
         if self.hidden_dim == 0 {
             return Err(MhcConfigError::InvalidHiddenDim(self.hidden_dim));
         }
-        if self.alpha_init <= 0.0 || self.alpha_init >= 1.0 {
+        if !(self.alpha_init > 0.0 && self.alpha_init < 1.0) {
             return Err(MhcConfigError::InvalidAlphaInit(self.alpha_init));
         }
-        if self.epsilon <= 0.0 {
+        if !(self.epsilon.is_finite() && self.epsilon > 0.0) {
             return Err(MhcConfigError::InvalidEpsilon(self.epsilon));
         }
         Ok(())
@@ -154,7 +156,7 @@ impl MhcConfig {
 }
 
 /// Configuration errors for mHC.
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum MhcConfigError {
     /// Expansion rate must be greater than 0.
     #[error("Invalid expansion rate: {0} (must be > 0)")]
@@ -176,17 +178,9 @@ pub enum MhcConfigError {
     #[error("Invalid alpha init: {0} (must be in (0, 1))")]
     InvalidAlphaInit(f32),
 
-    /// Epsilon must be greater than 0.
-    #[error("Invalid epsilon: {0} (must be > 0)")]
+    /// Epsilon must be finite and greater than 0.
+    #[error("Invalid epsilon: {0} (must be finite and > 0)")]
     InvalidEpsilon(f32),
-
-    /// Unknown collapse mode string.
-    #[error("Invalid collapse mode: '{0}' (expected 'first', 'average', or 'sum')")]
-    InvalidCollapseMode(String),
-
-    /// Empty matrix list for composite mapping.
-    #[error("Cannot compute composite of empty matrix list")]
-    EmptyComposite,
 }
 
 /// Presets for different model scales.
@@ -235,44 +229,104 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.expanded_dim(), 10240);
+        assert_eq!(config.mixing_dim(), 24);
     }
 
     #[test]
     fn test_optimal_recompute_block_size() {
         let config = MhcConfig::default();
         // For n=4, L=30: sqrt(4*30/6) = sqrt(20) ≈ 4.47 → 5
-        let block_size = config.optimal_recompute_block_size(30);
-        assert!((4..=6).contains(&block_size));
+        assert_eq!(config.optimal_recompute_block_size(30), 5);
     }
 
     #[test]
-    #[allow(clippy::field_reassign_with_default)]
     fn test_validation_errors() {
-        let mut config = MhcConfig::default();
-
-        config.expansion_rate = 0;
+        let ok = MhcConfig::default();
+        let cases: [(MhcConfig, MhcConfigError); 7] = [
+            (
+                MhcConfig {
+                    expansion_rate: 0,
+                    ..ok.clone()
+                },
+                MhcConfigError::InvalidExpansionRate(0),
+            ),
+            (
+                MhcConfig {
+                    expansion_rate: 17,
+                    ..ok.clone()
+                },
+                MhcConfigError::ExpansionRateTooLarge(17),
+            ),
+            (
+                MhcConfig {
+                    sinkhorn_iterations: 0,
+                    ..ok.clone()
+                },
+                MhcConfigError::InvalidSinkhornIterations(0),
+            ),
+            (
+                MhcConfig {
+                    hidden_dim: 0,
+                    ..ok.clone()
+                },
+                MhcConfigError::InvalidHiddenDim(0),
+            ),
+            (
+                MhcConfig {
+                    alpha_init: 1.0,
+                    ..ok.clone()
+                },
+                MhcConfigError::InvalidAlphaInit(1.0),
+            ),
+            (
+                MhcConfig {
+                    epsilon: 0.0,
+                    ..ok.clone()
+                },
+                MhcConfigError::InvalidEpsilon(0.0),
+            ),
+            (
+                MhcConfig {
+                    epsilon: f32::INFINITY,
+                    ..ok
+                },
+                MhcConfigError::InvalidEpsilon(f32::INFINITY),
+            ),
+        ];
+        for (config, want) in cases {
+            assert_eq!(config.validate(), Err(want));
+        }
+        // NaN fails every comparison, so it must be rejected explicitly.
+        let nan = MhcConfig {
+            alpha_init: f32::NAN,
+            ..MhcConfig::default()
+        };
         assert!(matches!(
-            config.validate(),
-            Err(MhcConfigError::InvalidExpansionRate(0))
-        ));
-
-        config.expansion_rate = 4;
-        config.sinkhorn_iterations = 0;
-        assert!(matches!(
-            config.validate(),
-            Err(MhcConfigError::InvalidSinkhornIterations(0))
+            nan.validate(),
+            Err(MhcConfigError::InvalidAlphaInit(_))
         ));
     }
 
     #[test]
     fn test_presets() {
-        let small = MhcPreset::Small.to_config();
-        assert_eq!(small.hidden_dim, 1280);
+        assert_eq!(MhcPreset::Small.to_config().hidden_dim, 1280);
+        assert_eq!(MhcPreset::Medium.to_config().hidden_dim, 1920);
+        assert_eq!(MhcPreset::Large.to_config().hidden_dim, 2560);
+    }
 
-        let medium = MhcPreset::Medium.to_config();
-        assert_eq!(medium.hidden_dim, 1920);
-
-        let large = MhcPreset::Large.to_config();
-        assert_eq!(large.hidden_dim, 2560);
+    #[test]
+    fn sinkhorn_config_follows_the_model_config() {
+        let c = MhcConfig {
+            sinkhorn_iterations: 7,
+            epsilon: 1e-5,
+            ..MhcConfig::default()
+        };
+        assert_eq!(
+            c.sinkhorn_config(),
+            SinkhornConfig {
+                iterations: 7,
+                epsilon: 1e-5
+            }
+        );
     }
 }

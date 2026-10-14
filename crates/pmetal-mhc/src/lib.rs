@@ -4,38 +4,48 @@
 //! instability in Hyper-Connections by constraining residual connection matrices to
 //! lie on a doubly stochastic manifold.
 //!
+//! It is a self-contained CPU reference implementation on `ndarray` (`f32`, with
+//! the reductions that need it accumulated in `f64`): forward and backward
+//! passes, written out and checked against finite differences and against
+//! float64 evaluations of the paper's equations. Accelerated implementations
+//! test themselves against it.
+//!
 //! # Overview
 //!
 //! mHC extends standard residual connections by:
 //! 1. Expanding the residual stream from dimension C to n×C (expansion rate n)
 //! 2. Learning mappings H^pre, H^post, H^res that mix information across streams
-//! 3. Constraining these mappings to be doubly stochastic via Sinkhorn-Knopp projection
+//! 3. Constraining H^res to be doubly stochastic via Sinkhorn-Knopp projection
+//!    (and H^pre, H^post to be positive via sigmoids)
+//!
+//! The layer is `x_{l+1} = H^res x_l + H^postᵀ F(H^pre x_l)`.
 //!
 //! # Key Properties
 //!
-//! - **Identity Mapping**: Doubly stochastic matrices preserve signal flow
+//! - **Identity Mapping**: a fresh layer ([`MhcParams::identity_init`]) is a plain
+//!   residual connection
 //! - **Compositional Closure**: Products of doubly stochastic matrices remain doubly stochastic
 //! - **Stable Gradients**: Amax gain magnitude ≈ 1 throughout training
 //!
 //! # Example
 //!
-//! ```rust,ignore
-//! use pmetal_mhc::{MhcConfig, MhcLayer, MhcParams, MhcPreset};
+//! ```
+//! use ndarray::Array3;
+//! use pmetal_mhc::{MhcConfig, MhcLayer};
 //!
-//! // Create configuration from preset
-//! let config = MhcConfig::from_preset(MhcPreset::Medium);
+//! # fn main() -> Result<(), pmetal_mhc::MhcError> {
+//! let config = MhcConfig { hidden_dim: 16, ..MhcConfig::default() };
+//! let layer = MhcLayer::new(config)?;
 //!
-//! // Initialize parameters
-//! let params = MhcParams::new(&config);
-//!
-//! // Create mHC layer
-//! let mut layer = MhcLayer::new(params, config);
-//!
-//! // Forward pass with sublayer computation
-//! let output = layer.forward(&input, |h_in| {
-//!     // Your attention/FFN computation here
-//!     sublayer.forward(h_in)
-//! });
+//! // [batch, n streams, C]
+//! let x = Array3::from_elem((2, 4, 16), 0.1f32);
+//! let y = layer.forward(&x, |h_in| {
+//!     // your attention / FFN computation on the aggregated [batch, C] input
+//!     h_in.mapv(|v| 2.0 * v)
+//! })?;
+//! assert_eq!(y.shape(), x.shape());
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # References
@@ -46,6 +56,7 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod error;
 pub mod layer;
 pub mod mappings;
 pub mod params;
@@ -53,12 +64,17 @@ pub mod sinkhorn;
 
 // Re-exports for convenience
 pub use config::{MhcConfig, MhcConfigError, MhcPreset};
-pub use layer::{CollapseMode, MhcCache, MhcLayer, MhcTransformerBlock};
-pub use mappings::{apply_post_res_mapping, apply_pre_mapping, compute_mappings};
-pub use params::{MhcGradients, MhcMappings, MhcParams};
+pub use error::MhcError;
+pub use layer::{CollapseMode, MhcLayer, MhcTransformerBlock, collapse_streams, expand_to_streams};
+pub use mappings::{
+    PostResGrads, apply_post_res_mapping, apply_post_res_mapping_backward, apply_pre_mapping,
+    apply_pre_mapping_backward, compute_mappings, compute_mappings_backward,
+};
+pub use params::{MhcGradients, MhcMappings, MhcParams, RES_OFF_DIAGONAL_INIT};
 pub use sinkhorn::{
-    SinkhornConfig, amax_gain_backward, amax_gain_forward, composite_mapping, is_doubly_stochastic,
-    sinkhorn_knopp, sinkhorn_knopp_backward, sinkhorn_knopp_batch,
+    SinkhornConfig, SinkhornResult, amax_gain_backward, amax_gain_forward, composite_mapping,
+    is_doubly_stochastic, sinkhorn_knopp, sinkhorn_knopp_backward, sinkhorn_knopp_backward_batch,
+    sinkhorn_knopp_batch,
 };
 
 /// Version of the mHC implementation.
@@ -75,181 +91,10 @@ pub const DEFAULT_SINKHORN_ITERATIONS: usize = 20;
 /// Convenient re-exports for common usage.
 pub mod prelude {
     pub use crate::config::{MhcConfig, MhcPreset};
+    pub use crate::error::MhcError;
     pub use crate::layer::{MhcLayer, MhcTransformerBlock};
     pub use crate::params::{MhcGradients, MhcMappings, MhcParams};
     pub use crate::sinkhorn::SinkhornConfig;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndarray::Array2;
-
-    #[test]
-    fn test_sinkhorn_produces_doubly_stochastic() {
-        let n = 4;
-        let matrix =
-            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i * n + j) as f32 + 1.0) * 0.1);
-
-        let config = SinkhornConfig::default();
-        let result = sinkhorn_knopp(&matrix, &config);
-
-        assert!(is_doubly_stochastic(&result.matrix, 1e-5));
-    }
-
-    #[test]
-    fn test_composite_preserves_doubly_stochastic() {
-        let n = 4;
-        let config = SinkhornConfig::default();
-
-        let a_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j) as f32 + 0.1) * 0.1);
-        let b_input =
-            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i * 2 + j) as f32 + 0.2) * 0.1);
-
-        let a = sinkhorn_knopp(&a_input, &config).matrix;
-        let b = sinkhorn_knopp(&b_input, &config).matrix;
-
-        let c = composite_mapping(&[a, b]).unwrap();
-
-        assert!(is_doubly_stochastic(&c, 1e-4));
-    }
-
-    #[test]
-    fn test_doubly_stochastic_preserves_sum() {
-        // Key property: A doubly stochastic matrix preserves the sum of each column
-        // If H is doubly stochastic, then for any x, sum(H @ x, axis=0) = sum(x, axis=0)
-        let n = 4;
-        let c = 64;
-
-        // Create a random doubly stochastic matrix
-        let h_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j) as f32 * 0.1);
-        let config = SinkhornConfig::default();
-        let h = sinkhorn_knopp(&h_input, &config).matrix;
-
-        // Create input matrix
-        let x = Array2::<f32>::from_shape_fn((n, c), |(i, j)| (i * c + j) as f32);
-
-        // Apply mapping: y = H @ x
-        let y = h.dot(&x);
-
-        // Check that column sums are preserved
-        // sum(y, axis=0) should equal sum(x, axis=0) for doubly stochastic H
-        for j in 0..c {
-            let x_col_sum: f32 = (0..n).map(|i| x[[i, j]]).sum();
-            let y_col_sum: f32 = (0..n).map(|i| y[[i, j]]).sum();
-            assert!(
-                (x_col_sum - y_col_sum).abs() < 1e-3,
-                "Column {} sum not preserved: x={}, y={}",
-                j,
-                x_col_sum,
-                y_col_sum
-            );
-        }
-    }
-
-    #[test]
-    fn test_amax_gain_near_unity() {
-        let n = 4;
-        let config = SinkhornConfig::default();
-
-        let h_pre_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j) as f32 * 0.1);
-        let h_post_input =
-            Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i * j) as f32 * 0.05 + 0.1);
-        let h_res_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j * 2) as f32 * 0.08);
-
-        let h_pre = sinkhorn_knopp(&h_pre_input, &config).matrix;
-        let h_post = sinkhorn_knopp(&h_post_input, &config).matrix;
-        let h_res = sinkhorn_knopp(&h_res_input, &config).matrix;
-
-        // Compute composite for layer l
-        let h_post_t = h_post.t().to_owned();
-        let composite = composite_mapping(&[h_res, h_post_t, h_pre]).unwrap();
-
-        // Amax gain should be close to 1 for doubly stochastic composite
-        let amax = amax_gain_forward(&composite);
-        assert!(
-            (0.5..=2.0).contains(&amax),
-            "Amax gain out of expected range: {}",
-            amax
-        );
-    }
-
-    #[test]
-    fn test_config_validation() {
-        // Valid config
-        let config = MhcConfig::from_preset(MhcPreset::Small);
-        assert!(config.validate().is_ok());
-
-        // Invalid expansion rate
-        let mut invalid = config.clone();
-        invalid.expansion_rate = 0;
-        assert!(invalid.validate().is_err());
-
-        // Invalid Sinkhorn iterations
-        let mut invalid = config.clone();
-        invalid.sinkhorn_iterations = 0;
-        assert!(invalid.validate().is_err());
-    }
-
-    #[test]
-    fn test_params_initialization() {
-        let config = MhcConfig::from_preset(MhcPreset::Small);
-        let params = MhcParams::new(&config);
-
-        let n = config.expansion_rate;
-
-        // Check dimensions - alpha values are scalars
-        assert_eq!(params.b_pre.len(), n);
-        assert_eq!(params.b_post.len(), n);
-        assert_eq!(params.b_res.shape(), &[n, n]);
-
-        // Check alpha initialization (should be near config.alpha_init)
-        assert!(
-            (params.alpha_pre - config.alpha_init).abs() < 0.5,
-            "Alpha initialization off: {} vs {}",
-            params.alpha_pre,
-            config.alpha_init
-        );
-    }
-
-    #[test]
-    fn test_gradient_accumulation() {
-        let config = MhcConfig::from_preset(MhcPreset::Small);
-        let mut grads = MhcGradients::zeros(&config);
-
-        grads.d_alpha_pre = 1.0;
-
-        let mut other_grads = MhcGradients::zeros(&config);
-        other_grads.d_alpha_pre = 2.0;
-
-        grads.accumulate(&other_grads);
-
-        // Should have accumulated
-        assert!((grads.d_alpha_pre - 3.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_gradient_clipping() {
-        let config = MhcConfig::from_preset(MhcPreset::Small);
-        let mut grads = MhcGradients::zeros(&config);
-
-        grads.d_alpha_pre = 100.0;
-        grads.d_alpha_post = 100.0;
-        grads.d_alpha_res = 100.0;
-
-        let initial_norm = grads.norm();
-        assert!(initial_norm > 1.0);
-
-        grads.clip_norm(1.0);
-
-        // Norm should be clipped
-        let clipped_norm = grads.norm();
-        assert!(
-            clipped_norm <= 1.0 + 1e-5,
-            "Gradient norm not clipped: {}",
-            clipped_norm
-        );
-    }
 }
 
 /// Compiles the code blocks in `README.md` as doctests, so the crate's front

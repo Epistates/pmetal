@@ -4,71 +4,86 @@ Manifold-Constrained Hyper-Connections (mHC) for stable deep network training.
 
 ## Overview
 
-This crate implements Manifold-Constrained Hyper-Connections from [DeepSeek-AI](https://arxiv.org/abs/2512.24880), a technique that replaces standard residual connections with learnable, doubly stochastic mixing matrices. By constraining residual mappings to the doubly stochastic manifold via Sinkhorn-Knopp projections, mHC keeps signal amplification bounded (Amax gain ~ 1) even in very deep networks (60+ layers).
+This crate implements Manifold-Constrained Hyper-Connections from [DeepSeek-AI](https://arxiv.org/abs/2512.24880), a technique that replaces a transformer's single residual stream with `n` parallel streams mixed by learned, doubly stochastic matrices. Constraining the residual mixing matrix to the doubly stochastic manifold with a Sinkhorn-Knopp projection keeps signal amplification bounded (Amax gain ~ 1) even in very deep networks (60+ layers).
+
+It is a self-contained CPU reference implementation on `ndarray`: `f32` throughout, with the long reductions (the RMSNorm's mean of squares, gradient norms) accumulated in `f64`. Forward and backward passes are written out by hand and verified against finite differences and against float64 transcriptions of the paper's equations (`tests/`). Accelerated implementations are tested against it.
 
 ## Architecture
 
 ```text
-Input [batch, n, C]
+Input x  [batch, n, C]
     │
     ▼
-┌──────────────────────────────────────────┐
-│ compute_mappings()                       │
-│  1. Flatten → RMSNorm                   │
-│  2. Linear projection: α·(x·φ) + b     │
-│  3. Constraints:                         │
-│     H^pre  ← σ(·)           ∈ [0, 1]   │
-│     H^post ← 2σ(·)          ∈ [0, 2]   │
-│     H^res  ← Sinkhorn(·)    doubly stochastic │
-└──────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│ compute_mappings()                                         │
+│  1. x' = RMSNorm(vec(x))                      (no weight)  │
+│  2. proj = x' · φ                  φ: [nC, 2n + n²]        │
+│  3. H̃ = α · proj + b           per mapping: pre, post, res │
+│  4. Constraints:                                           │
+│     H^pre  = σ(H̃^pre) + ε                    ∈ (0, 1]      │
+│     H^post = 2σ(H̃^post)                      ∈ (0, 2)      │
+│     H^res  = Sinkhorn(H̃^res)       approximately doubly stochastic │
+└───────────────────────────────────────────────────────────┘
     │
     ▼
-apply_pre_mapping(x, H^pre) → [batch, C]
+apply_pre_mapping(x, H^pre) → h_in [batch, C]
     │
     ▼
-┌──────────────────────────────────────────┐
-│         Sublayer (Attention / FFN)        │
-└──────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│               Sublayer F (attention / FFN)                 │
+└───────────────────────────────────────────────────────────┘
     │
     ▼
 apply_post_res_mapping(x, h_out, H^post, H^res)
-    x_{l+1} = H^res @ x + H^post^T @ h_out
+    x_{l+1} = H^res · x + H^postᵀ · h_out
     │
     ▼
 Output [batch, n, C]
 ```
 
-## Features
+## Parameters and initialization
 
-- **Training Stability**: Doubly stochastic constraints guarantee bounded signal flow across arbitrary depth
-- **Compositional Closure**: Products of doubly stochastic matrices remain doubly stochastic
-- **Dynamic Mappings**: Input-dependent via learned projections, or static for reduced parameters
-- **Mixed Precision**: BF16 activations with FP32 mappings
-- **Complete Training Support**: Forward and backward passes with gradient accumulation
+`MhcParams` holds the three gates `α` (initialized to `alpha_init = 0.01`), the static biases `b_pre`, `b_post`, `b_res` and one fused projection `φ` of shape `[nC, 2n + n²]` whose columns feed `H^pre`, `H^post` and `H^res` in that order: one matrix product per token gives all three mappings, in the layout the released models store. The RMSNorm has no weight of its own; a per-channel scale would only duplicate `φ`'s rows.
+
+A fresh layer is a plain residual connection when its streams are equal (the usual start: the embedding replicated `n` times, see `expand_to_streams`). `MhcParams::identity_init` sets
+
+- `b_pre` so that `H^pre = 1/n` (the streams' mean),
+- `b_post = 0`, so `H^post = 1`,
+- `b_res` to 0 on the diagonal and -8 elsewhere, so `H^res` is the identity to within ~3e-4 per entry,
+- `φ = 0`;
+
+`MhcParams::new` and `MhcParams::with_rng` add a small random `φ ~ N(0, 0.02²)`. Seed it for reproducible runs.
+
+## Sinkhorn-Knopp
+
+`H^res` is the iterated normalization of `exp(H̃^res)`, written as in the released DeepSeek-V4 kernel: a row softmax (the stable form of `exp`, then the first row normalization), `+ ε`, then `iterations` rounds of column and row normalization with `+ ε` in every denominator, ending on a column step. The iteration count is fixed (20, as in the paper), so the map is smooth and its gradient is exact: `sinkhorn_knopp_backward` replays the forward and runs each normalization's adjoint in reverse, O(n²) per iteration. Columns of the result sum to 1; rows converge towards it (within 1e-3 for logits within ±1.5 at 20 iterations; the more skewed the matrix, the slower).
 
 ## Usage
 
 ```rust,no_run
 use ndarray::{Array2, Array3};
-use pmetal_mhc::{MhcConfig, MhcLayer, MhcPreset};
+use pmetal_mhc::{MhcConfig, MhcError, MhcLayer, MhcPreset};
 
 fn step(
     attention_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
+    attention_backward: impl FnOnce(&Array2<f32>) -> Array2<f32>,
     grad_output: &Array3<f32>,
-) {
+) -> Result<(), MhcError> {
     let config = MhcConfig::from_preset(MhcPreset::Medium);
-    let layer = MhcLayer::new(config);
+    let mut layer = MhcLayer::new(config)?;
 
     // Forward
-    let x: Array3<f32> = Array3::zeros((2, 4, 512));
-    let (h_in, mappings) = layer.pre_layer(&x);
+    let x: Array3<f32> = Array3::zeros((2, 4, 1920));
+    let (h_in, mappings) = layer.pre_layer(&x)?;
     let h_out = attention_fn(&h_in);
-    let _output = layer.post_res_layer(&x, &h_out, &mappings);
+    let _output = layer.post_res_layer(&x, &h_out, &mappings)?;
 
-    // Backward
-    let (_grad_x, _grad_h_in) = layer.backward(&x, &h_out, &mappings, grad_output, None);
+    // Backward: the sublayer's own backward pass runs inside the layer's.
+    let (_grad_x, grads) =
+        layer.backward(&x, &h_out, &mappings, grad_output, attention_backward)?;
 
-    layer.apply_gradients_sgd(1e-3);
+    layer.apply_gradients_sgd(&grads, 1e-3);
+    Ok(())
 }
 ```
 
@@ -76,15 +91,15 @@ fn step(
 
 ```rust,no_run
 use ndarray::{Array2, Array3};
-use pmetal_mhc::{MhcConfig, MhcPreset, MhcTransformerBlock};
+use pmetal_mhc::{MhcConfig, MhcError, MhcPreset, MhcTransformerBlock};
 
 fn block(
     attn_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
     ffn_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
     x: &Array3<f32>,
-) -> Array3<f32> {
+) -> Result<Array3<f32>, MhcError> {
     let config = MhcConfig::from_preset(MhcPreset::Medium);
-    let block = MhcTransformerBlock::new(config, attn_fn, ffn_fn, 0);
+    let block = MhcTransformerBlock::new(config, attn_fn, ffn_fn)?;
     block.forward(x)
 }
 ```
@@ -102,29 +117,23 @@ fn block(
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `expansion_rate` | Stream expansion factor | 3 |
-| `sinkhorn_iterations` | Sinkhorn-Knopp iterations | 10 |
+| `expansion_rate` | Number of streams `n` | 4 |
+| `sinkhorn_iterations` | Row/column normalization rounds | 20 |
 | `alpha_init` | Gating factor initialization | 0.01 |
-| `hidden_dim` | Hidden dimension | 2560 |
-| `dynamic_mappings` | Input-dependent mappings | true |
-| `epsilon` | Sinkhorn numerical stability | 1e-6 |
-| `mixed_precision` | BF16 activations | false |
-| `fuse_kernels` | Enable kernel fusion | true |
+| `hidden_dim` | Per-stream dimension `C` | 2560 |
+| `use_dynamic_mappings` | Input-dependent mappings (else static biases only) | true |
+| `epsilon` | RMSNorm, `H^pre` and Sinkhorn epsilon | 1e-6 |
 
-## Sinkhorn-Knopp Algorithm
+## Verification
 
-The doubly stochastic constraint is enforced via iterative row/column normalization:
-
-1. Exponentiate input to ensure positivity
-2. Alternately normalize rows and columns until convergence
-3. Result: rows and columns each sum to 1
-
-This guarantees the residual mixing matrix preserves signal magnitude, enabling stable training at depth.
+- `tests/reference_gradients.rs`: float64 transcription of the paper's equations (independent of the crate) compared with the crate's forward, and every gradient (the input, `α`, `b`, `φ`, through the Sinkhorn projection, the RMSNorm, the sublayer) compared with finite differences of that reference.
+- `tests/properties.rs`: Sinkhorn invariants for arbitrary logits (property tests), bf16-rounded streams, extreme magnitudes.
+- Unit tests pin Sinkhorn and the mappings to hand-computed values.
 
 ## Benchmarks
 
 ```bash
-cargo bench --bench sinkhorn       # Sinkhorn-Knopp at n={4,8,16,32}
+cargo bench --bench sinkhorn       # Sinkhorn-Knopp at n={4,8,16,32}, forward and backward
 cargo bench --bench mhc_kernels    # Mapping computation across presets
 ```
 
@@ -133,10 +142,11 @@ cargo bench --bench mhc_kernels    # Mapping computation across presets
 | Module | Description |
 |--------|-------------|
 | `config` | Configuration and presets |
-| `params` | Learnable parameters and gradients |
+| `params` | Learnable parameters, initialization and gradients |
 | `layer` | MhcLayer and MhcTransformerBlock |
-| `mappings` | Mapping computation pipeline |
+| `mappings` | Mapping computation, application and their backward passes |
 | `sinkhorn` | Sinkhorn-Knopp forward and backward |
+| `error` | `MhcError` |
 
 ## References
 

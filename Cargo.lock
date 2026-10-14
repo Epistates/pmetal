@@ -5416,10 +5416,8 @@ dependencies = [
 name = "pmetal-mhc"
 version = "0.6.0"
 dependencies = [
- "approx",
  "criterion",
  "ndarray",
- "parking_lot",
  "proptest",
  "rand 0.10.3",
  "rand_distr",
