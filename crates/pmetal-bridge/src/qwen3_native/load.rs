@@ -411,8 +411,8 @@ pub fn load_model(
     let rope_base = config.rope_theta as f32;
     let rope_scale = 1.0_f32;
     let scaled_rope = config.scaled_rope();
-    let attn_gated = !config.is_qwen3_dense();
-    let gdn_gate = if config.is_qwen3_dense() {
+    let attn_gated = !config.has_plain_attention();
+    let gdn_gate = if config.has_plain_attention() {
         family::GdnGateActivation::Silu
     } else {
         config.gdn_gate()?
@@ -463,12 +463,23 @@ pub fn load_model(
             let moe_up = stacked("up_proj")?;
             let moe_down = stacked("down_proj")?;
 
-            // Shared expert weights — may be quantized.
-            let sh_gate = get_layer_weight(&format!("{p}.mlp.shared_expert.gate_proj"))?;
-            let sh_up = get_layer_weight(&format!("{p}.mlp.shared_expert.up_proj"))?;
-            let sh_down = get_layer_weight(&format!("{p}.mlp.shared_expert.down_proj"))?;
-            // Shared expert gate: `[1, hidden]`, quantized by `mlx_lm` like the router.
-            let sh_eg = get_layer_weight(&format!("{p}.mlp.shared_expert_gate"))?;
+            // The shared expert (the Qwen3.5 family; Qwen3-MoE has none),
+            // may be quantized. Its gate is `[1, hidden]`, quantized by
+            // `mlx_lm` like the router.
+            let shared = if config.has_shared_expert() {
+                (
+                    Some(get_layer_weight(&format!(
+                        "{p}.mlp.shared_expert.gate_proj"
+                    ))?),
+                    Some(get_layer_weight(&format!("{p}.mlp.shared_expert.up_proj"))?),
+                    Some(get_layer_weight(&format!(
+                        "{p}.mlp.shared_expert.down_proj"
+                    ))?),
+                    Some(get_layer_weight(&format!("{p}.mlp.shared_expert_gate"))?),
+                )
+            } else {
+                (None, None, None, None)
+            };
             (
                 None,
                 None,
@@ -477,10 +488,10 @@ pub fn load_model(
                 Some(moe_gate),
                 Some(moe_up),
                 Some(moe_down),
-                Some(sh_gate),
-                Some(sh_up),
-                Some(sh_down),
-                Some(sh_eg),
+                shared.0,
+                shared.1,
+                shared.2,
+                shared.3,
             )
         } else {
             // Dense MLP — may be quantized.
@@ -645,7 +656,7 @@ pub fn load_model(
     // A Qwen3.5-family checkpoint tensor that nothing above read is a weight
     // the model would run without. The vision tower and the MTP predictor
     // were dropped by name in step 3b; anything else left over is refused.
-    if !config.is_qwen3_dense() {
+    if !config.has_plain_attention() {
         let consumed = consumed.borrow();
         let mut unread: Vec<&String> = raw.keys().filter(|k| !consumed.contains(*k)).collect();
         if !unread.is_empty() {

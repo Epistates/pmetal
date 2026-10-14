@@ -24,7 +24,7 @@ pub(crate) fn ensure_native_bridge_metal_available() -> Result<(), String> {
 /// Supported model architectures for native inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeArch {
-    /// Dense Qwen3 (`model_type = "qwen3"`).
+    /// Qwen3 and Qwen3-MoE (`model_type = "qwen3"` / `"qwen3_moe"`).
     Qwen3,
     /// Qwen3.5 dense or MoE (`qwen3_5*` and `qwen3_5_moe*` model types).
     Qwen3_5,
@@ -102,7 +102,7 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
     let mt = mt.strip_suffix("_mtp").unwrap_or(mt);
 
     match mt {
-        "qwen3" | "qwen3dense" => Some(NativeArch::Qwen3),
+        "qwen3" | "qwen3dense" | "qwen3_moe" => Some(NativeArch::Qwen3),
         "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6"
         | "qwen3_6_text" | "qwen3_6_moe" | "qwen3_6_moe_text" => Some(NativeArch::Qwen3_5),
         "llama4" | "llama4_text" => Some(NativeArch::Llama4),
@@ -205,6 +205,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.json"), json).unwrap();
         dir
+    }
+
+    #[test]
+    fn detects_qwen3_moe_as_the_qwen3_engine() {
+        let dir = write_temp_config(r#"{"model_type":"qwen3_moe"}"#);
+        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

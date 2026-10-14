@@ -312,9 +312,28 @@ impl Qwen3Config {
         mt == "qwen3" || mt == "qwen3dense"
     }
 
-    /// Returns `true` when this is a MoE model (routed experts + shared expert).
+    /// Returns `true` for Qwen3-MoE (`qwen3_moe`: Qwen3-30B-A3B and its family),
+    /// Qwen3's attention over sparse MLPs with no shared expert.
+    pub fn is_qwen3_moe(&self) -> bool {
+        self.model_type.eq_ignore_ascii_case("qwen3_moe")
+    }
+
+    /// Returns `true` for the models with Qwen3's own attention (no output
+    /// gate, full rotary, no GatedDeltaNet layers): `qwen3` and `qwen3_moe`.
+    /// The Qwen3.5 family is the other branch.
+    pub fn has_plain_attention(&self) -> bool {
+        self.is_qwen3_dense() || self.is_qwen3_moe()
+    }
+
+    /// Returns `true` when this is a MoE model (routed experts).
     pub fn is_moe(&self) -> bool {
         self.num_experts > 0
+    }
+
+    /// Returns `true` when a sparse layer also runs a shared expert behind its
+    /// own gate (the Qwen3.5 family); Qwen3-MoE's is the routed experts alone.
+    pub fn has_shared_expert(&self) -> bool {
+        self.shared_expert_intermediate_size > 0
     }
 
     /// Returns `true` when the MLP at the given layer index should be dense.
@@ -337,10 +356,10 @@ impl Qwen3Config {
 
     /// Effective partial rotary factor.
     ///
-    /// - Qwen3 dense: always 1.0 (full RoPE).
+    /// - Qwen3 dense and Qwen3-MoE: always 1.0 (full RoPE).
     /// - Qwen3.5: stored value, defaulting to 0.25.
     pub fn effective_partial_rotary_factor(&self) -> f64 {
-        if self.is_qwen3_dense() {
+        if self.has_plain_attention() {
             1.0
         } else {
             self.partial_rotary_factor.unwrap_or(0.25)
@@ -398,12 +417,12 @@ impl Qwen3Config {
 
     /// Returns `true` when layer `i` is a GDN (linear-attention) layer.
     ///
-    /// For Qwen3 dense, all layers are attention — never GDN.
+    /// For Qwen3 dense and Qwen3-MoE, all layers are attention — never GDN.
     /// For Qwen3.5 the checkpoint's `layer_types` decides. When a config
     /// carries none (only one built in code, since parsing expands it), every
     /// `full_attention_interval`-th layer (1-indexed) is full attention.
     pub fn is_linear_layer(&self, i: usize) -> bool {
-        if self.is_qwen3_dense() {
+        if self.has_plain_attention() {
             return false;
         }
         if let Some(types) = self.layer_types.as_ref().and_then(|t| t.get(i)) {
@@ -518,6 +537,18 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         cfg.quantization_mlx = None;
         cfg.quantization_config = None;
         cfg.mlx_quantization = None;
+    }
+    // transformers' `Qwen3MoeConfig` renormalizes the top-k weights only when
+    // told to (`norm_topk_prob` defaults to false; the released checkpoints
+    // say true). The Qwen3.5 family's defaults are filled in by `family`.
+    if cfg.is_qwen3_moe() {
+        let named = serde_json::from_str::<serde_json::Value>(&config_str)
+            .ok()
+            .and_then(|v| v.get("norm_topk_prob").cloned())
+            .is_some_and(|v| !v.is_null());
+        if !named {
+            cfg.norm_topk_prob = false;
+        }
     }
     cfg.rotary = rotary;
     cfg.finalize();
