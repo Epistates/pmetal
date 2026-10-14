@@ -132,7 +132,9 @@ impl LoraAdapter {
         let combined = weight.add(&self.delta());
         let merged = match &self.magnitude {
             Some(magnitude) => {
-                let norm = column_norms(&combined).add_scalar(DORA_EPS);
+                // Constant to autograd, as in the live forward, so a caller
+                // training through the folded weight gets the same gradients.
+                let norm = column_norms(&combined).stop_gradient().add_scalar(DORA_EPS);
                 combined.multiply(&magnitude.divide(&norm))
             }
             None => combined,
@@ -699,6 +701,43 @@ mod tests {
         crate::check_unobserved_error().expect("no bridge error");
         for (w, m) in want_y.iter().zip(&merged_y) {
             assert!((w - m).abs() < 0.05, "merged {m}, adapted {w}");
+        }
+    }
+
+    /// A caller that multiplies by the folded weight (cut cross-entropy over
+    /// an adapted LM head) must get the gradients the layer's own forward
+    /// gives, which for DoRA means the same constant norm.
+    #[test]
+    fn the_effective_weight_trains_like_the_forward() {
+        let (weight, a, b, magnitude, x, scale) = dora_parts();
+        let target = random::uniform_range(-1.0, 1.0, &[4, 5], Dtype::Float32);
+        let params = [a, b, magnitude];
+        let run = |folded: bool| {
+            crate::inline_array::value_and_grad(
+                |p| {
+                    let layer = dora_layer(&weight, &p[0], &p[1], &p[2], scale);
+                    let y = if folded {
+                        p[3].matmul(&layer.effective_weight().expect("no dropout").t())
+                    } else {
+                        layer.forward(&p[3])
+                    };
+                    y.multiply(&p[4]).sum_all()
+                },
+                &params,
+                &[x.clone(), target.clone()],
+            )
+        };
+        let (_, live) = run(false);
+        let (_, folded) = run(true);
+        for (name, (l, f)) in ["A", "B", "magnitude"].iter().zip(live.iter().zip(&folded)) {
+            let (l, f) = (values(l.clone()), values(f.clone()));
+            crate::check_unobserved_error().expect("no bridge error");
+            for (l, f) in l.iter().zip(&f) {
+                assert!(
+                    (l - f).abs() < 1e-4 * (1.0 + l.abs()),
+                    "d/d{name}: folded {f}, live {l}"
+                );
+            }
         }
     }
 
