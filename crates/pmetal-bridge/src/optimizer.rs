@@ -167,26 +167,84 @@ pub enum ParamClass {
     Regular,
 }
 
-/// Per-parameter Adam state: the two moments, always f32, and for a
-/// half-precision parameter an f32 master copy it is rounded from.
+/// An f32 master copy of a half-precision parameter, which every optimizer
+/// updates through.
 ///
 /// A bf16 weight near 1 moves in steps of 2⁻⁸, so a learning-rate-sized update
 /// rounds away every time it is added to the weight itself; the master copy
-/// accumulates it and the weight is what the master rounds to. `1 − lr·λ` and
-/// β₂ = 0.999 are also 1.0 in bf16, which is why the arithmetic is f32 too.
+/// accumulates it and the weight is what the master rounds to. A parameter
+/// that is already f32 has no master copy and is updated in place.
+///
+/// An optimizer calls [`weight`](Self::weight) for the f32 weight to update,
+/// and [`commit`](Self::commit) with the updated one.
+#[derive(Default, Debug)]
+pub struct MasterWeight {
+    value: Option<InlineArray>,
+    /// The parameter array the last commit produced, to tell when something
+    /// else has replaced it (a checkpoint load, an adapter merge) and the
+    /// master copy is stale. Held, not just identified, so that no new array
+    /// can take its identity while it is the one compared against.
+    produced: Option<InlineArray>,
+}
+
+impl MasterWeight {
+    /// Whether `dtype` is one a master copy is kept for.
+    fn is_half(dtype: i32) -> bool {
+        matches!(Dtype::from_raw(dtype), Dtype::Float16 | Dtype::Bfloat16)
+    }
+
+    /// The f32 weight an update of `parameter` starts from: the master copy,
+    /// unless the parameter was replaced since the commit that produced it.
+    pub fn weight(&self, parameter: &InlineArray) -> InlineArray {
+        let current = self
+            .produced
+            .as_ref()
+            .is_some_and(|produced| produced.id() == parameter.id());
+        match &self.value {
+            Some(master) if current && Self::is_half(parameter.dtype_raw()) => master.clone(),
+            _ => parameter.as_dtype(Dtype::Float32.as_i32()),
+        }
+    }
+
+    /// Store `weight`, the updated f32 weight, into `parameter`: rounded to
+    /// its dtype with a master copy kept for a half-precision one, as it is
+    /// for any other.
+    pub fn commit(&mut self, parameter: &mut InlineArray, weight: InlineArray) {
+        let dtype = parameter.dtype_raw();
+        if Self::is_half(dtype) {
+            *parameter = weight.as_dtype(dtype);
+            self.value = Some(weight);
+            self.produced = Some(parameter.clone());
+        } else {
+            *parameter = weight.as_dtype(dtype);
+            self.value = None;
+            self.produced = None;
+        }
+    }
+
+    /// The f32 master copy, for a half-precision parameter that has taken a
+    /// step.
+    pub fn value(&self) -> Option<&InlineArray> {
+        self.value.as_ref()
+    }
+
+    /// The master copy, mutably.
+    pub fn value_mut(&mut self) -> Option<&mut InlineArray> {
+        self.value.as_mut()
+    }
+}
+
+/// Per-parameter Adam state: the two moments, always f32 (`1 − lr·λ` and
+/// β₂ = 0.999 are 1.0 in bf16, which is why the arithmetic is f32), and the
+/// [master copy](MasterWeight) of a half-precision parameter.
 #[non_exhaustive]
 pub struct AdamState {
     /// First moment (exponential moving average of gradients), f32.
     pub m: InlineArray,
     /// Second moment (exponential moving average of squared gradients), f32.
     pub v: InlineArray,
-    /// The f32 master copy of an f16 or bf16 parameter; `None` for others.
-    pub master: Option<InlineArray>,
-    /// The parameter array this state last produced, to tell when something
-    /// else has replaced it (a checkpoint load, an adapter merge) and the
-    /// master copy is stale. Held, not just identified, so that no new array
-    /// can take its identity while it is the one compared against.
-    produced: Option<InlineArray>,
+    /// The f32 master copy of an f16 or bf16 parameter.
+    pub master: MasterWeight,
 }
 
 impl AdamState {
@@ -196,21 +254,20 @@ impl AdamState {
         Self {
             m,
             v,
-            master: None,
-            produced: None,
+            master: MasterWeight::default(),
         }
     }
 
     /// Every array the state holds, for evaluating it between steps.
     pub fn arrays(&self) -> impl Iterator<Item = &InlineArray> {
-        [&self.m, &self.v].into_iter().chain(self.master.as_ref())
+        [&self.m, &self.v].into_iter().chain(self.master.value())
     }
 
     /// [`arrays`](Self::arrays), mutably.
     pub fn arrays_mut(&mut self) -> impl Iterator<Item = &mut InlineArray> {
         [&mut self.m, &mut self.v]
             .into_iter()
-            .chain(self.master.as_mut())
+            .chain(self.master.value_mut())
     }
 }
 
@@ -408,11 +465,6 @@ impl AdamW {
             self.step_count_inner,
         );
         let f32_ = Dtype::Float32.as_i32();
-        let param_dtype = parameter.dtype_raw();
-        let half = matches!(
-            Dtype::from_raw(param_dtype),
-            Dtype::Float16 | Dtype::Bfloat16
-        );
 
         let state = self.states.entry(name.to_string()).or_insert_with(|| {
             let shape = parameter.shape().to_vec();
@@ -428,16 +480,7 @@ impl AdamW {
             }
         }
 
-        // The weight the update starts from: the master copy, unless the
-        // parameter was replaced since the step that produced it.
-        let current = state
-            .produced
-            .as_ref()
-            .is_some_and(|produced| produced.id() == parameter.id());
-        let weight = match (&state.master, half && current) {
-            (Some(master), true) => master.clone(),
-            _ => parameter.as_dtype(f32_),
-        };
+        let weight = state.master.weight(parameter);
         let gradient = gradient.as_dtype(f32_);
 
         let weight = if s.decay != 1.0 {
@@ -459,13 +502,7 @@ impl AdamW {
             .add_scalar(s.eps);
         let weight = weight.subtract(&state.m.divide(&denom).mul_scalar(s.step_size));
 
-        if half {
-            *parameter = weight.as_dtype(param_dtype);
-            state.master = Some(weight);
-            state.produced = Some(parameter.clone());
-        } else {
-            *parameter = weight;
-        }
+        state.master.commit(parameter, weight);
     }
 }
 
@@ -776,12 +813,7 @@ mod tests {
         let state = &opt.states["w"];
         assert_eq!(state.m.dtype(), Dtype::Float32);
         assert_eq!(state.v.dtype(), Dtype::Float32);
-        let master = read(
-            state
-                .master
-                .as_ref()
-                .expect("a bf16 parameter has a master"),
-        );
+        let master = read(state.master.value().expect("a bf16 parameter has a master"));
         for i in 0..2 {
             assert!(
                 (master[i] as f64 - want[i]).abs() < 1e-4,
@@ -833,7 +865,7 @@ mod tests {
         let mut param = InlineArray::from_f32_slice(&[1.0], &[1]);
         opt.advance_step();
         opt.step_single("w", &InlineArray::from_f32_slice(&[1.0], &[1]), &mut param);
-        assert!(opt.states["w"].master.is_none());
+        assert!(opt.states["w"].master.value().is_none());
     }
 
     #[test]

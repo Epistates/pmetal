@@ -38,9 +38,10 @@ pub fn info_nce_loss(
     let labels: Vec<i32> = (0..batch_size).collect();
     let labels_arr = Array::from_slice(&labels, &[batch_size]);
 
-    let ce = pmetal_bridge::compat::losses::CrossEntropy::new()?;
-    let loss = ce.apply(&sim_scaled, &labels_arr)?;
-    Ok(loss.mean(None))
+    Ok(pmetal_bridge::training::cross_entropy_loss_dense(
+        &sim_scaled,
+        &labels_arr,
+    ))
 }
 
 /// Triplet margin loss using cosine distance.
@@ -168,6 +169,38 @@ mod tests {
             data[b * dim as usize] = 1.0;
         }
         Array::from_slice(&data, &[batch, dim])
+    }
+
+    /// Orthonormal anchors and positives at temperature 1 score each anchor
+    /// `[1, 0]` against its own positive: `-log(e / (e + 1)) = log(1 + 1/e)`
+    /// per row. The loss used to weight each row's log-probabilities by the
+    /// *labels* (0, 1, ...) instead of picking the labelled one, which gives
+    /// 0.813 here.
+    #[test]
+    fn info_nce_is_the_cross_entropy_of_the_diagonal() {
+        let eye = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], &[2, 2]);
+        let loss = info_nce_loss(&eye, &eye, 1.0).unwrap();
+        let want = (1.0 + (-1.0f64).exp()).ln() as f32;
+        let got: f32 = loss.item();
+        assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+
+        // Three rows, a non-trivial similarity matrix, at temperature 0.5.
+        let a = Array::from_slice(&[1.0f32, 0.0, 0.6, 0.8, 0.0, 1.0], &[3, 2]);
+        let p = Array::from_slice(&[0.8f32, 0.6, 0.0, 1.0, 1.0, 0.0], &[3, 2]);
+        let (av, pv) = (
+            [[1.0f64, 0.0], [0.6, 0.8], [0.0, 1.0]],
+            [[0.8f64, 0.6], [0.0, 1.0], [1.0, 0.0]],
+        );
+        let mut want = 0.0;
+        for i in 0..3 {
+            let s: Vec<f64> = (0..3)
+                .map(|j| (av[i][0] * pv[j][0] + av[i][1] * pv[j][1]) / 0.5)
+                .collect();
+            let lse = s.iter().map(|x| x.exp()).sum::<f64>().ln();
+            want += (lse - s[i]) / 3.0;
+        }
+        let got: f32 = info_nce_loss(&a, &p, 0.5).unwrap().item();
+        assert!((got as f64 - want).abs() < 1e-5, "{got} vs {want}");
     }
 
     #[test]

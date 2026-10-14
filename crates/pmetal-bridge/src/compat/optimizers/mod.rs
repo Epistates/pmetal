@@ -1,6 +1,15 @@
+//! The optimizer trait and the optimizers over compat arrays: [`AdamW`],
+//! [`Sgd`], [`MomentumSgd`], [`Lion`], [`Adafactor`] and [`Muon`].
+
 use super::{Array, Exception, FlattenedModuleParam, ModuleParameters, ModuleParametersExt};
 use std::collections::HashMap;
 use std::rc::Rc;
+
+mod first_order;
+mod muon;
+
+pub use first_order::{Adafactor, Lion, MomentumSgd, SecondMoment, Sgd};
+pub use muon::{LrAdjust, Muon, MuonAdamW, NS_COEFFICIENTS, newton_schulz_orthogonalize};
 
 /// Optimizer state: stores (momentum, velocity) tensors per parameter.
 pub type State<V> = HashMap<Rc<str>, V>;
@@ -179,7 +188,7 @@ impl Updatable for AdamW {
         self.state
             .values()
             .flat_map(|(m, v)| [m, v])
-            .chain(self.inner.states.values().filter_map(|s| s.master.as_ref()))
+            .chain(self.inner.states.values().filter_map(|s| s.master.value()))
             .collect()
     }
     fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
@@ -190,7 +199,7 @@ impl Updatable for AdamW {
                 self.inner
                     .states
                     .values_mut()
-                    .filter_map(|s| s.master.as_mut()),
+                    .filter_map(|s| s.master.value_mut()),
             )
             .collect()
     }
@@ -232,60 +241,6 @@ impl AdamWBuilder {
                 .with_betas(self.betas.0, self.betas.1)
                 .with_eps(self.eps),
         ))
-    }
-}
-
-/// SGD optimizer — vanilla stochastic gradient descent with no momentum.
-pub struct Sgd {
-    pub lr: Array,
-    pub state: State<()>,
-}
-
-impl std::fmt::Debug for Sgd {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Sgd").finish()
-    }
-}
-
-impl Sgd {
-    pub fn new(lr: f32) -> Self {
-        Self {
-            lr: Array::from_f32(lr),
-            state: HashMap::new(),
-        }
-    }
-}
-
-impl Optimizer for Sgd {
-    type State = State<()>;
-    fn state(&self) -> &Self::State {
-        &self.state
-    }
-    fn state_mut(&mut self) -> &mut Self::State {
-        &mut self.state
-    }
-    fn update_single(
-        &mut self,
-        _key: &Rc<str>,
-        gradient: &Array,
-        parameter: &mut Array,
-    ) -> Result<(), Exception> {
-        let lr_val = self.lr.clone().item_f32();
-        let lr_arr = Array::from_f32(lr_val);
-        *parameter = parameter.subtract(&gradient.multiply(&lr_arr));
-        Ok(())
-    }
-}
-
-impl Updatable for Sgd {
-    fn updatable_states_len(&self) -> usize {
-        0
-    }
-    fn updatable_states(&self) -> Vec<&Array> {
-        vec![]
-    }
-    fn updatable_states_mut(&mut self) -> Vec<&mut Array> {
-        vec![]
     }
 }
 
