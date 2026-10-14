@@ -184,6 +184,9 @@ pub(super) fn should_zero_qjl() -> bool {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod reference_tests;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Public convenience constructors
 // ═══════════════════════════════════════════════════════════════════════════
