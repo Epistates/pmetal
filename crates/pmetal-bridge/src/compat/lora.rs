@@ -61,9 +61,9 @@ pub struct LoraAdapter {
 impl LoraAdapter {
     /// Build an adapter for a layer of shape `[out_features, in_features]`.
     ///
-    /// `use_rslora` switches the scale to `alpha / sqrt(rank)` and widens the
-    /// `A` initialisation to `sqrt(1 / rank)`, per Kalajdzievski (2023), so the
-    /// update's norm stops depending on rank.
+    /// `use_rslora` switches the scale to `alpha / sqrt(rank)`, per
+    /// Kalajdzievski (2023), so the update's norm stops depending on rank.
+    /// `A` starts uniform on `±1/√in_features` either way, as PEFT's does.
     pub fn new(
         in_features: i32,
         out_features: i32,
@@ -81,11 +81,7 @@ impl LoraAdapter {
         } else {
             alpha / rank as f32
         };
-        let a_bound = if use_rslora {
-            (1.0_f32 / rank as f32).sqrt()
-        } else {
-            (3.0_f32 / in_features as f32).sqrt()
-        };
+        let a_bound = 1.0_f32 / (in_features as f32).sqrt();
         Ok(Self {
             a: random::uniform_range(-a_bound, a_bound, &[rank, in_features], Dtype::Float32),
             b: super::ops::zeros(&[out_features, rank], Dtype::Float32),
@@ -412,6 +408,32 @@ mod tests {
         let rs = LoraAdapter::new(8, 8, 16, 32.0, true).expect("rslora");
         assert_eq!(plain.scale, 32.0 / 16.0);
         assert_eq!(rs.scale, 32.0 / 4.0);
+    }
+
+    /// `A` starts uniform on `±1/√in_features`, which is what PEFT's
+    /// `kaiming_uniform_(a=√5)` comes to, and it does
+    /// not depend on the rank: rsLoRA changes the scale and nothing else
+    /// (Kalajdzievski 2023 §3 takes `A`'s variance independent of `r`).
+    #[test]
+    fn a_starts_uniform_on_one_over_root_in_features() {
+        for (in_features, rank, rslora) in [(4096, 16, false), (4096, 16, true), (512, 64, true)] {
+            let adapter =
+                LoraAdapter::new(in_features, 8, rank, 32.0, rslora).expect("adapter");
+            let a = values(adapter.a.clone());
+            let bound = 1.0 / (in_features as f32).sqrt();
+            let max = a.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+            assert!(
+                max <= bound,
+                "in={in_features} rank={rank} rslora={rslora}: |A| reaches {max}, bound {bound}"
+            );
+            // Uniform on ±bound has variance bound²/3.
+            let var = a.iter().map(|v| v * v).sum::<f32>() / a.len() as f32;
+            let want = bound * bound / 3.0;
+            assert!(
+                (var / want - 1.0).abs() < 0.05,
+                "in={in_features} rank={rank} rslora={rslora}: variance {var}, want {want}"
+            );
+        }
     }
 
     /// DoRA seeds its magnitude from the base weight's column norms, so the
