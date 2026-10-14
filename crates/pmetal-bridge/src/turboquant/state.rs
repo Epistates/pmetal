@@ -1,130 +1,50 @@
-//! Shared TurboQuant state: per-tensor runtime selection plus the
-//! `(key, value)` core pair built once per `(dim, config)` combination.
+//! Shared TurboQuant state: the key and value quantizers of a model.
 //!
-//! The `TurboQuantState` is expensive to construct (QR decomposition +
-//! Lloyd-Max) and immutable after construction; wrap it in `Arc` and
-//! share it across every layer/head that uses the same shape.
+//! Building one costs a Haar-random rotation and a Lloyd-Max codebook per
+//! distinct `(head dim, bits)`, so a model builds it once and shares it, in
+//! an `Arc`, between all its layers.
 
 use std::sync::Arc;
 
-use super::config::{TurboQuantConfig, TurboQuantQjlMode, TurboQuantTensorConfig};
-use super::core::TurboQuantCore;
+use super::config::{TurboQuantConfig, TurboQuantTensorConfig};
+use super::quantizer::Quantizer;
 
-/// Per-tensor runtime — selects between a single Uniform core and a
-/// regular/outlier Mixed core pair. Constructed via [`build_tensor_runtime`].
-#[derive(Debug, Clone)]
-pub(super) enum TensorRuntime {
-    Uniform {
-        config: TurboQuantTensorConfig,
-        core: Arc<TurboQuantCore>,
-    },
-    Mixed {
-        config: TurboQuantTensorConfig,
-        regular_core: Arc<TurboQuantCore>,
-        outlier_core: Arc<TurboQuantCore>,
-    },
-}
-
-/// Shared TurboQuant state for a given K/V head dimension and config.
-///
-/// Expensive to build (QR decomposition + Lloyd-Max).  Wrap in `Arc` and share
-/// across all layers and heads that share the same (dim, config) pair.
+/// The quantizers for one pair of key and value head dimensions.
 #[derive(Debug, Clone)]
 pub struct TurboQuantState {
-    pub(super) keys: TensorRuntime,
-    pub(super) values: TensorRuntime,
-    /// QJL residual mode. `Standard` uses 1 bit per dim for QJL; `NoQjl`
-    /// (Variant F) gives the codebook a full extra bit and skips QJL.
-    pub(super) qjl: TurboQuantQjlMode,
+    pub(super) keys: Arc<Quantizer>,
+    pub(super) values: Arc<Quantizer>,
 }
 
 impl TurboQuantState {
-    /// Build a new state.  Typical latency: ~50–200 ms for dim=128.
-    pub fn new(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> Self {
-        config.keys.assert_valid(key_dim, "keys");
-        config.values.assert_valid(value_dim, "values");
-
-        // Cache cores so (dim, bits) pairs that appear for both keys and values
-        // share the same Arc.
-        let mut core_cache = std::collections::HashMap::<(usize, u8), Arc<TurboQuantCore>>::new();
-        let mut get_core = |subdim: usize, max_mse_bits: u8| {
-            core_cache
-                .entry((subdim, max_mse_bits))
-                .or_insert_with(|| Arc::new(TurboQuantCore::new(subdim, max_mse_bits)))
-                .clone()
+    /// Build the state for `key_dim`-wide keys and `value_dim`-wide values.
+    /// Fails when the configuration asks for something the cache does not
+    /// support.
+    pub fn new(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> Result<Self, String> {
+        config.validate()?;
+        let (
+            TurboQuantTensorConfig::Uniform { bits: key_bits },
+            TurboQuantTensorConfig::Uniform { bits: value_bits },
+        ) = (config.keys, config.values)
+        else {
+            unreachable!("checked above");
         };
-
-        let keys = build_tensor_runtime(key_dim, config.keys, true, &mut get_core);
-        let values = build_tensor_runtime(value_dim, config.values, false, &mut get_core);
-
-        Self {
-            keys,
-            values,
-            qjl: config.qjl,
-        }
+        let keys = Arc::new(Quantizer::new(key_dim, key_bits));
+        let values = if value_dim == key_dim && value_bits == key_bits {
+            Arc::clone(&keys)
+        } else {
+            Arc::new(Quantizer::new(value_dim, value_bits))
+        };
+        Ok(Self { keys, values })
     }
 
-    /// `true` when the fused GPU attention kernels accept this state's
-    /// `(config, dim)` combination. When `false`, the cache still produces
-    /// correct results — it just falls back to dequantize+SDPA, which is
-    /// roughly 2–4× slower at decode time. Use this to surface "slow path"
-    /// warnings in model-load logs.
-    ///
-    /// Coverage as of 2026-04: fused attention requires Uniform precision
-    /// for both keys and values. Mixed precision and head_dims other than
-    /// 128 / 256 fall back.
-    pub fn has_gpu_attention_support(&self) -> bool {
-        self.gpu_attention_unsupported_reason_inner().is_none()
+    /// The key quantizer.
+    pub fn keys(&self) -> &Quantizer {
+        &self.keys
     }
 
-    /// Return a static string describing why fused GPU attention is
-    /// unsupported for this state, or a placeholder when it *is* supported.
-    pub fn gpu_attention_unsupported_reason(&self) -> &'static str {
-        self.gpu_attention_unsupported_reason_inner()
-            .unwrap_or("fused GPU attention is supported for this state")
-    }
-
-    fn gpu_attention_unsupported_reason_inner(&self) -> Option<&'static str> {
-        if !matches!(self.keys, TensorRuntime::Uniform { .. }) {
-            return Some("keys use Mixed precision (no fused attention kernel)");
-        }
-        if !matches!(self.values, TensorRuntime::Uniform { .. }) {
-            return Some("values use Mixed precision (no fused attention kernel)");
-        }
-        None
-    }
-}
-
-fn build_tensor_runtime<F>(
-    total_dim: usize,
-    config: TurboQuantTensorConfig,
-    _is_keys: bool,
-    get_core: &mut F,
-) -> TensorRuntime
-where
-    F: FnMut(usize, u8) -> Arc<TurboQuantCore>,
-{
-    match config {
-        TurboQuantTensorConfig::Uniform { bits } => {
-            TensorRuntime::Uniform {
-                config,
-                // Build the full MSE codebook ladder even for keys so pure-MSE
-                // key paths (for example the full-byte D256 experiments) can
-                // reuse the same core without a second cache format.
-                core: get_core(total_dim, bits),
-            }
-        }
-        TurboQuantTensorConfig::Mixed {
-            regular_bits,
-            outlier_bits,
-            outlier_count,
-        } => {
-            let regular_dim = total_dim - outlier_count;
-            TensorRuntime::Mixed {
-                config,
-                regular_core: get_core(regular_dim, regular_bits),
-                outlier_core: get_core(outlier_count, outlier_bits),
-            }
-        }
+    /// The value quantizer.
+    pub fn values(&self) -> &Quantizer {
+        &self.values
     }
 }

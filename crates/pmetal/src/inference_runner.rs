@@ -11,7 +11,7 @@ use std::{
 };
 
 use pmetal_bridge::turboquant::{
-    TurboQuantConfig as BridgeTurboQuantConfig, TurboQuantQjlMode as BridgeTurboQuantQjlMode,
+    TurboQuantConfig as BridgeTurboQuantConfig,
     TurboQuantTensorConfig as BridgeTurboQuantTensorConfig,
 };
 use pmetal_data::Tokenizer;
@@ -1395,7 +1395,11 @@ fn native_cache_mode_supported(
 ) -> bool {
     match mode {
         CacheMode::Standard => true,
-        CacheMode::TurboQuant { .. } => info.supports_turboquant,
+        // The native cache quantizes uniform widths only; a mixed-precision
+        // preset runs on the shared model path's cache.
+        CacheMode::TurboQuant { config } => {
+            info.supports_turboquant && bridge_turboquant_config(config).validate().is_ok()
+        }
         // Zero-overhead quantized KV cache via quantized_matmul.
         // MLX supports 2, 3, 4, 5, 6, 8 bits for affine group quantization.
         CacheMode::Quantized { bits, .. } => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
@@ -1461,51 +1465,21 @@ fn turboquant_config_from_mode(
     }
 
     match mode {
-        CacheMode::TurboQuant { config } => Some(BridgeTurboQuantConfig {
-            keys: bridge_turboquant_tensor_config(config.keys),
-            values: bridge_turboquant_tensor_config(config.values),
-            recent_window: config.recent_window,
-            qjl: bridge_turboquant_qjl_mode(config.qjl),
-            skiplist_threshold: config.skiplist_threshold,
-            outliers: bridge_turboquant_outlier_mode(config.outliers),
-            pack_mode: bridge_turboquant_pack_mode(config.pack_mode),
-            // Phase H: warm tier is bridge-only for now; pmetal-mlx will
-            // mirror once the bridge implementation lands. The conversion
-            // call site here always builds a 2-tier bridge cache.
-            warm_tier: None,
-        }),
+        CacheMode::TurboQuant { config } => Some(bridge_turboquant_config(config)),
         _ => None,
     }
 }
 
-fn bridge_turboquant_outlier_mode(
-    mode: pmetal_mlx::kv_cache::TurboQuantOutlierMode,
-) -> pmetal_bridge::turboquant::TurboQuantOutlierMode {
-    use pmetal_bridge::turboquant::TurboQuantOutlierMode as Dst;
-    use pmetal_mlx::kv_cache::TurboQuantOutlierMode as Src;
-    match mode {
-        Src::None => Dst::None,
-        Src::PerBlock { k } => Dst::PerBlock { k },
-    }
-}
-
-fn bridge_turboquant_pack_mode(
-    mode: pmetal_mlx::kv_cache::TurboQuantPackMode,
-) -> pmetal_bridge::turboquant::TurboQuantPackMode {
-    use pmetal_bridge::turboquant::TurboQuantPackMode as Dst;
-    use pmetal_mlx::kv_cache::TurboQuantPackMode as Src;
-    match mode {
-        Src::Bitstream => Dst::Bitstream,
-        Src::Fullbyte => Dst::Fullbyte,
-    }
-}
-
-fn bridge_turboquant_qjl_mode(
-    qjl: pmetal_mlx::kv_cache::TurboQuantQjlMode,
-) -> BridgeTurboQuantQjlMode {
-    match qjl {
-        pmetal_mlx::kv_cache::TurboQuantQjlMode::Standard => BridgeTurboQuantQjlMode::Standard,
-        pmetal_mlx::kv_cache::TurboQuantQjlMode::NoQjl => BridgeTurboQuantQjlMode::NoQjl,
+/// The native cache's configuration for a shared-path one. The native cache
+/// quantizes keys with the MSE codebook alone (no QJL residual) and has no
+/// per-block outliers, pack modes or skip-list: those knobs belong to the
+/// other TurboQuant cache.
+fn bridge_turboquant_config(config: TurboQuantConfig) -> BridgeTurboQuantConfig {
+    BridgeTurboQuantConfig {
+        keys: bridge_turboquant_tensor_config(config.keys),
+        values: bridge_turboquant_tensor_config(config.values),
+        recent_window: config.recent_window,
+        ..BridgeTurboQuantConfig::uniform(8, 8)
     }
 }
 
@@ -2283,6 +2257,13 @@ mod tests {
             qwen,
             CacheMode::TurboQuant {
                 config: TurboQuantConfig::uniform(8, 8),
+            }
+        ));
+        // Mixed-precision presets run on the shared path's cache.
+        assert!(!native_cache_mode_supported(
+            qwen,
+            CacheMode::TurboQuant {
+                config: TurboQuantConfig::preset_q3_5(128),
             }
         ));
         assert!(!native_cache_mode_supported(
