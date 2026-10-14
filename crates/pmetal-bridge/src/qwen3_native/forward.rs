@@ -35,6 +35,21 @@ pub fn forward_step(
     logits
 }
 
+/// [`forward_step`]'s logits for the last position alone, `[B, vocab]`.
+///
+/// The LM head runs over one row instead of `T`: over a 150k-token vocabulary
+/// the logits of a long prompt are gigabytes, and all but the last row are
+/// discarded by whoever samples.
+pub fn forward_step_last(
+    weights: &NativeWeights,
+    token_ids: &InlineArray, // [B, T]
+    cache: &mut NativeCache,
+) -> InlineArray {
+    let hidden = embed_tokens(weights, token_ids);
+    let hidden = decoder_trunk(weights, hidden, cache, None, None);
+    lm_head(weights, &crate::decode::last_token_hidden(&hidden)).squeeze(1)
+}
+
 /// Forward pass returning both the final normalized hidden states and logits.
 ///
 /// Qwen MTP predictors consume the verifier's final hidden states while the
@@ -83,6 +98,31 @@ pub fn forward_embeddings_hidden(
     next_rope_offset: i32,
     cache: &mut NativeCache,
 ) -> (InlineArray, InlineArray) {
+    let hidden = embeddings_trunk(weights, embeddings, mrope, next_rope_offset, cache);
+    let logits = lm_head(weights, &hidden);
+    (hidden, logits)
+}
+
+/// [`forward_embeddings_hidden`]'s logits for the last position alone,
+/// `[B, vocab]`.
+pub fn forward_embeddings_last(
+    weights: &NativeWeights,
+    embeddings: &InlineArray, // [B, T, hidden]
+    mrope: &MropeTables,
+    next_rope_offset: i32,
+    cache: &mut NativeCache,
+) -> InlineArray {
+    let hidden = embeddings_trunk(weights, embeddings, mrope, next_rope_offset, cache);
+    lm_head(weights, &crate::decode::last_token_hidden(&hidden)).squeeze(1)
+}
+
+fn embeddings_trunk(
+    weights: &NativeWeights,
+    embeddings: &InlineArray,
+    mrope: &MropeTables,
+    next_rope_offset: i32,
+    cache: &mut NativeCache,
+) -> InlineArray {
     assert_eq!(
         mrope.len(),
         embeddings.dim(1),
@@ -91,8 +131,7 @@ pub fn forward_embeddings_hidden(
     let embeddings = embeddings.as_dtype(weights.model_dtype);
     let hidden = decoder_trunk(weights, embeddings, cache, Some(mrope), None);
     cache.rope_offset = next_rope_offset;
-    let logits = lm_head(weights, &hidden);
-    (hidden, logits)
+    hidden
 }
 
 /// Token embeddings, `[B, T, hidden]` in the model dtype.

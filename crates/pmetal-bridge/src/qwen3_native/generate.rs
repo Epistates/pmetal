@@ -5,18 +5,44 @@ use crate::decode::{DecodeSampler, SamplingParams};
 use crate::inline_array as bridge;
 
 use super::cache::NativeCache;
-use super::forward::forward_step;
+use super::forward::{forward_step, forward_step_last};
 use super::weights::NativeWeights;
 
 /// Run prompt prefill and return the first sampled token and the
 /// generation's sampler, which [`generate`] continues.
+///
+/// The prompt goes through in [`PREFILL_CHUNK`](crate::decode::PREFILL_CHUNK)
+/// passes (see [`prefill_chunk`]) and only the last position's logits are
+/// computed.
 pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
     params: SamplingParams,
 ) -> (u32, DecodeSampler) {
-    crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
+    crate::decode::prefill_first_token_chunked(
+        weights,
+        cache,
+        input_ids,
+        params,
+        prefill_chunk(cache),
+        forward_step_last,
+    )
+}
+
+/// Tokens per prefill pass for `cache`: [`PREFILL_CHUNK`](crate::decode::PREFILL_CHUNK),
+/// or the whole prompt when the cache is TurboQuant's.
+///
+/// TurboQuant prefills a prompt's attention densely, from the pass's own keys
+/// and values, only when the cache is empty; a later pass attends to the
+/// dequantized earlier ones instead, which would make a long prompt's output
+/// depend on its chunking.
+pub fn prefill_chunk(cache: &NativeCache) -> usize {
+    if cache.kv_caches.iter().any(|kv| kv.turboquant.is_some()) {
+        usize::MAX
+    } else {
+        crate::decode::PREFILL_CHUNK
+    }
 }
 
 // ============================================================================

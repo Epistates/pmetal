@@ -494,6 +494,74 @@ pub fn prefill_first_token<Weights, Cache>(
     (token.item_u32(), sampler)
 }
 
+/// Prompt tokens a prefill forward pass takes at once.
+///
+/// A longer prompt goes through in passes of this many, each attending to the
+/// cache the ones before it filled. That bounds the activations a forward
+/// holds (a MoE layer's token-expert rows, a sliding-window layer's mask) by
+/// the chunk rather than the prompt, and ends each pass's graph at the cache
+/// writes, where one graph over the whole prompt would grow with it.
+pub const PREFILL_CHUNK: usize = 2048;
+
+/// Run `tokens` through a model in passes of at most `chunk` tokens, and return
+/// the `[1, vocab]` logits of the last position.
+///
+/// `forward_last` takes one chunk as the `[1, T]` int32 input
+/// [`prompt_tokens_to_input`] builds, advances `cache` by it, and returns the
+/// logits of its last position only, `[1, vocab]`. Taking the LM head to one
+/// row instead of the chunk's `T` is the point: over a Gemma 4 vocabulary
+/// (262144) the logits of a 4096-token chunk are 4 GB in bf16, and the head
+/// matmul over them is more work than a small model's layers. Only the last
+/// chunk's logits are wanted, so the others are evaluated just to finish their
+/// cache writes and are dropped.
+///
+/// `cache` may already hold earlier tokens (a reused prefix): `tokens` are then
+/// the ones after it.
+///
+/// # Panics
+///
+/// If `tokens` is empty or `chunk` is 0.
+pub fn prefill_last_logits<Weights, Cache>(
+    weights: &Weights,
+    cache: &mut Cache,
+    tokens: &[u32],
+    chunk: usize,
+    mut forward_last: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
+) -> InlineArray {
+    assert!(!tokens.is_empty(), "prefill needs at least one token");
+    assert!(chunk > 0, "a prefill chunk holds at least one token");
+    let passes = tokens.len().div_ceil(chunk);
+    let mut logits = None;
+    for (index, part) in tokens.chunks(chunk).enumerate() {
+        let out = forward_last(weights, &prompt_tokens_to_input(part), cache);
+        if index + 1 < passes {
+            out.eval();
+            crate::inline_array::clear_cache();
+        } else {
+            logits = Some(out);
+        }
+    }
+    logits.expect("tokens is not empty")
+}
+
+/// [`prefill_first_token`] for engines whose forward can return the last
+/// position's logits alone and take the prompt in chunks: see
+/// [`prefill_last_logits`].
+pub fn prefill_first_token_chunked<Weights, Cache>(
+    weights: &Weights,
+    cache: &mut Cache,
+    input_ids: &[u32],
+    params: SamplingParams,
+    chunk: usize,
+    forward_last: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
+) -> (u32, DecodeSampler) {
+    let mut sampler = DecodeSampler::new(params, input_ids);
+    let last_logits = prefill_last_logits(weights, cache, input_ids, chunk, forward_last);
+    let token = sampler.sample(&last_logits);
+    token.eval();
+    (token.item_u32(), sampler)
+}
+
 /// Cache-aware causal attention.
 ///
 /// Uses `mask=None` for single-token decode (`N == 1`) and `"causal"`
@@ -1202,6 +1270,49 @@ mod tests {
             "last_token_hidden"
         );
         crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// The passes take the prompt in order, each the size asked for but the
+    /// last, which takes the rest; each sees the cache the ones before it
+    /// filled; and what comes back is the last pass's result alone.
+    #[test]
+    fn prefill_last_logits_runs_the_passes_in_order_and_returns_the_last() {
+        let tokens: Vec<u32> = (10..20).collect();
+        for (chunk, passes) in [(1, 10), (3, 4), (4, 3), (10, 1), (11, 1), (usize::MAX, 1)] {
+            let mut cache: Vec<u32> = Vec::new();
+            let mut sizes = Vec::new();
+            let logits = prefill_last_logits(&(), &mut cache, &tokens, chunk, |_, part, cache| {
+                let mut part = part.reshape(&[-1]);
+                let n = part.size();
+                let ids: Vec<u32> = part
+                    .to_f32_vec(n)
+                    .unwrap()
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect();
+                sizes.push(ids.len());
+                cache.extend(&ids);
+                // The cache so far, and the pass's own last token.
+                InlineArray::from_f32_slice(
+                    &[cache.len() as f32, *ids.last().unwrap() as f32],
+                    &[1, 2],
+                )
+            });
+            assert_eq!(sizes.len(), passes, "chunk {chunk}");
+            assert!(
+                sizes[..passes - 1].iter().all(|&s| s == chunk),
+                "chunk {chunk}: {sizes:?}"
+            );
+            assert_eq!(cache, tokens, "chunk {chunk}: tokens in order");
+            assert_eq!(values(&logits), [10.0, 19.0], "chunk {chunk}");
+        }
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one token")]
+    fn prefill_last_logits_refuses_an_empty_prompt() {
+        prefill_last_logits(&(), &mut (), &[], 8, |_, _, _| InlineArray::from_f32(0.0));
     }
 
     #[test]

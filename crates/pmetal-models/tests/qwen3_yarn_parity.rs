@@ -140,6 +140,58 @@ fn dynamic_qwen3_yarn_matches_transformers() {
     assert!(!model.supports_fused_batched());
 }
 
+/// The prompt in prefill passes of several sizes, YaRN's scaled rotation
+/// included (it is positioned by each pass's offset): the last position's
+/// logits and the decode after them must be `transformers`'.
+#[test]
+#[serial]
+fn native_qwen3_yarn_chunked_prefill_matches_transformers() {
+    use pmetal_bridge::decode::{prefill_last_logits, prompt_tokens_to_input};
+    use pmetal_bridge::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
+    use pmetal_mlx::test_utils::to_f32_vec_eval;
+
+    let fx = checkpoint();
+    let config = load_config(fx.path()).expect("native config parses");
+    let weights = load_model(fx.path(), &config).expect("native weights load");
+    drain_bridge("native load");
+    let ids: Vec<u32> = to_f32_vec_eval(&fx.tensor("input_ids"))
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let t = ids.len() as i32;
+    let last = rows(&fx.tensor("logits"), t - 1, t);
+
+    let mut reports = Vec::new();
+    for chunk in [1, 5, 16, 40, 95, 96, 1000] {
+        let mut cache = NativeCache::new_empty(&weights);
+        let logits = prefill_last_logits(&weights, &mut cache, &ids, chunk, forward_step_last);
+        drain_bridge("native chunked prefill");
+        reports.push(ParityReport::compute(
+            &format!("chunk_{chunk}_last_logits"),
+            &logits.reshape(&[1, 1, -1]),
+            &last,
+            TOL,
+        ));
+
+        let mut cache = NativeCache::new_empty(&weights);
+        let head = &ids[..ids.len() - 1];
+        prefill_last_logits(&weights, &mut cache, head, chunk, forward_step_last).eval();
+        let step = forward_step_last(
+            &weights,
+            &prompt_tokens_to_input(&ids[ids.len() - 1..]),
+            &mut cache,
+        );
+        drain_bridge("native decode after chunked prefill");
+        reports.push(ParityReport::compute(
+            &format!("chunk_{chunk}_decode"),
+            &step.reshape(&[1, 1, -1]),
+            &last,
+            TOL,
+        ));
+    }
+    assert_all_pass("native chunked prefill", &reports);
+}
+
 #[test]
 #[serial]
 fn native_qwen3_yarn_matches_transformers() {

@@ -592,24 +592,26 @@ pub fn run_native_multimodal_inference_ext(
         quant_config,
         &mut on_token,
         move |weights, cache, ids, params| {
-            pmetal_bridge::decode::prefill_first_token(
+            // One pass: the merged embeddings and their 3-D positions cover the
+            // whole prompt, so it is not split into chunks.
+            pmetal_bridge::decode::prefill_first_token_chunked(
                 weights,
                 cache,
                 ids,
                 params,
+                ids.len(),
                 |weights, prompt, cache| {
                     let text = qwen3_native::embed_tokens(weights, prompt);
                     let embeddings = encoded
                         .merge(&text, &prompt_ids, &multimodal)
                         .expect("media token counts were checked by the vision encode");
-                    qwen3_native::forward_embeddings_hidden(
+                    qwen3_native::forward_embeddings_last(
                         weights,
                         &embeddings,
                         &tables,
                         encoded.positions.next_position,
                         cache,
                     )
-                    .1
                 },
             )
         },

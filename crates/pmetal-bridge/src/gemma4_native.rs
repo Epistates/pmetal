@@ -1419,6 +1419,33 @@ fn ensure_cache_capacity(
 /// `forward_step` contract `crate::decode::*` expects: takes `weights`,
 /// `input_ids` as an `[B, T]` int array, and a mutable `cache`.
 ///
+/// Returns the logits of every position, `[B, T, vocab]`; a prefill that only
+/// wants the last one calls [`forward_step_last`].
+pub fn forward_step(
+    weights: &NativeWeights,
+    input_ids: &InlineArray,
+    cache: &mut NativeCache,
+) -> InlineArray {
+    logits_from_hidden(weights, &forward_hidden(weights, input_ids, cache))
+}
+
+/// [`forward_step`]'s logits for the last position alone, `[B, vocab]`.
+///
+/// The LM head and its softcap run over one row instead of `T`: over Gemma 4's
+/// 262144-token vocabulary the logits of a long prompt are gigabytes, and all
+/// but the last row are discarded by whoever samples.
+pub fn forward_step_last(
+    weights: &NativeWeights,
+    input_ids: &InlineArray,
+    cache: &mut NativeCache,
+) -> InlineArray {
+    let hidden = forward_hidden(weights, input_ids, cache);
+    logits_from_hidden(weights, &crate::decode::last_token_hidden(&hidden)).squeeze(1)
+}
+
+/// The final norm's output for every position, `[B, T, hidden]`: everything
+/// [`forward_step`] does before the LM head.
+///
 /// Structured after `qwen3_native::forward_step`: norms and residuals run
 /// as plain per-op calls in Rust, attention goes through
 /// `compiled_gemma4_attn_block` (the narrow qkv → sdpa → o_proj fusion),
@@ -1426,7 +1453,7 @@ fn ensure_cache_capacity(
 /// the norms and MLP inside bigger compiled lambdas made the graph
 /// harder to fuse efficiently; matching Qwen3's layout recovers the
 /// single-compile-per-layer pattern.
-pub fn forward_step(
+fn forward_hidden(
     weights: &NativeWeights,
     input_ids: &InlineArray,
     cache: &mut NativeCache,
@@ -1610,14 +1637,17 @@ pub fn forward_step(
         );
     }
 
-    // 3. Final norm + tied LM head + logit softcap.
-    let normed = hidden.rms_norm(Some(&weights.final_norm_w), eps);
+    hidden.rms_norm(Some(&weights.final_norm_w), eps)
+}
+
+/// The LM head and the final logit softcap over normalized hidden states.
+fn logits_from_hidden(weights: &NativeWeights, normed: &InlineArray) -> InlineArray {
     let raw_logits = match weights.lm_head_w.as_ref() {
-        Some(w) => w.matmul_from(&normed),
+        Some(w) => w.matmul_from(normed),
         // Tied embedding: `as_linear` is `mlx.nn.Embedding.as_linear`, which
         // takes the `[vocab, hidden]` table's transpose for a dense model and
         // runs a quantized matmul against the packed rows otherwise.
-        None => weights.embed_w.as_linear(&normed),
+        None => weights.embed_w.as_linear(normed),
     };
     match weights.softcap_scalar.as_ref() {
         Some(cap_arr) => {
@@ -1634,13 +1664,22 @@ pub fn forward_step(
 // Public prefill / generate wrappers
 // ----------------------------------------------------------------------------
 
+/// Prefill `input_ids` in [`PREFILL_CHUNK`](crate::decode::PREFILL_CHUNK)
+/// passes and sample the first token from the last position's logits.
 pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
     params: crate::decode::SamplingParams,
 ) -> (u32, crate::decode::DecodeSampler) {
-    crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
+    crate::decode::prefill_first_token_chunked(
+        weights,
+        cache,
+        input_ids,
+        params,
+        crate::decode::PREFILL_CHUNK,
+        forward_step_last,
+    )
 }
 
 pub fn generate(

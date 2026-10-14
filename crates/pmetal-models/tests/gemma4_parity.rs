@@ -283,11 +283,15 @@ fn gemma4_native_moe_synthetic_parity() {
     );
 }
 
-fn run_native_synthetic_parity(
-    label: &str,
+/// The fixture as a checkpoint directory, loaded by the native engine. The
+/// directory is returned so it outlives the weights' lazily read tensors.
+fn native_checkpoint(
     config_json: &str,
     weights_fixture: &str,
-    reference_fixture: &str,
+) -> (
+    tempfile::TempDir,
+    pmetal_bridge::gemma4_native::Gemma4Config,
+    pmetal_bridge::gemma4_native::NativeWeights,
 ) {
     use pmetal_bridge::gemma4_native;
 
@@ -302,6 +306,140 @@ fn run_native_synthetic_parity(
 
     let config = gemma4_native::load_config(dir.path()).expect("native config parses");
     let weights = gemma4_native::load_model(dir.path(), &config).expect("native load");
+    (dir, config, weights)
+}
+
+/// A prompt in prefill passes of every size around the sliding window (8) and
+/// the prompt length (12): the last position's logits, and the cache the
+/// passes leave, must be the whole-prompt forward's, which is `transformers`'.
+#[test]
+fn gemma4_native_chunked_prefill_matches_transformers() {
+    run_native_chunked_prefill(
+        "dense",
+        synthetic_config_json(),
+        "gemma4_synth_weights.safetensors",
+        "gemma4_synth_reference.safetensors",
+    );
+}
+
+#[test]
+fn gemma4_native_moe_chunked_prefill_matches_transformers() {
+    run_native_chunked_prefill(
+        "MoE",
+        moe_synthetic_config_json(),
+        "gemma4_moe_synth_weights.safetensors",
+        "gemma4_moe_synth_reference.safetensors",
+    );
+}
+
+/// A long prompt's prefill holds the memory of a pass, not of the prompt:
+/// the engine's own prefill, against a whole-prompt forward that computes
+/// every position's logits as `forward_step` returns them.
+#[test]
+#[serial_test::serial]
+fn gemma4_native_prefill_memory_is_bounded_by_the_pass() {
+    use pmetal_bridge::decode::{SamplingParams, prefill_first_token};
+    use pmetal_bridge::gemma4_native::{self, forward_step};
+    use pmetal_bridge::inline_array::{clear_cache, get_peak_memory, reset_peak_memory};
+
+    let (_dir, config, weights) =
+        native_checkpoint(synthetic_config_json(), "gemma4_synth_weights.safetensors");
+    // 16384 tokens, 8 passes: its logits alone are 16384 x 512 x 4 bytes.
+    let prompt: Vec<u32> = (0..16384).map(|i| (i * 7 % 512) as u32).collect();
+    let peak = |prefill: &dyn Fn(&mut gemma4_native::NativeCache) -> u32| {
+        let mut cache = gemma4_native::build_cache(&weights, &config);
+        clear_cache();
+        reset_peak_memory();
+        let token = prefill(&mut cache);
+        pmetal_bridge::check_unobserved_error().expect("native prefill");
+        (get_peak_memory(), token)
+    };
+    let (whole, whole_token) = peak(&|cache| {
+        prefill_first_token(
+            &weights,
+            cache,
+            &prompt,
+            SamplingParams::new(0.0),
+            forward_step,
+        )
+        .0
+    });
+    let (chunked, chunked_token) = peak(&|cache| {
+        gemma4_native::prefill_first_token(&weights, cache, &prompt, SamplingParams::new(0.0)).0
+    });
+    println!("prefill peak: whole prompt {whole} bytes, in passes {chunked} bytes");
+    assert_eq!(chunked_token, whole_token, "the same first token");
+    assert!(
+        chunked * 2 < whole,
+        "prefill in passes peaked at {chunked} bytes against {whole} for the whole prompt"
+    );
+}
+
+fn run_native_chunked_prefill(
+    label: &str,
+    config_json: &str,
+    weights_fixture: &str,
+    reference_fixture: &str,
+) {
+    use pmetal_bridge::decode::prefill_last_logits;
+    use pmetal_bridge::gemma4_native::{self, forward_step_last};
+
+    let (_dir, config, weights) = native_checkpoint(config_json, weights_fixture);
+    let ref_shard = load_shard(&fixture_path(reference_fixture));
+    let ids: Vec<u32> = to_f32_vec_eval(&input_ids_from_shard(&ref_shard))
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    let want = ref_tensor(&ref_shard, "logits");
+    let len = ids.len() as i32;
+    let last = pmetal_bridge::compat::ops::slice_axis(want, 1, len - 1, len);
+    // The same bound as `run_native_synthetic_parity`'s logits.
+    let tolerance = Tolerance::new(1.5e-5, 0.0);
+
+    for chunk in [1, 3, 5, 8, 11, 12, 100] {
+        let mut cache = gemma4_native::build_cache(&weights, &config);
+        let logits = prefill_last_logits(&weights, &mut cache, &ids, chunk, forward_step_last);
+        pmetal_bridge::check_unobserved_error().expect("native chunked prefill");
+        let report = compare_checkpoint(
+            &format!("{label} chunk {chunk}"),
+            &logits.reshape(&[1, 1, -1]),
+            &last,
+            &[(&format!("{label} chunk {chunk}"), tolerance)],
+        );
+        print_report_table(std::slice::from_ref(&report));
+        assert!(report.passed(), "{label}: chunk {chunk} last logits");
+
+        // The cache the passes leave decodes on: all but the last token in
+        // chunks, then the last one as a decode step.
+        let mut cache = gemma4_native::build_cache(&weights, &config);
+        let head = &ids[..ids.len() - 1];
+        prefill_last_logits(&weights, &mut cache, head, chunk, forward_step_last).eval();
+        let step = gemma4_native::forward_step_last(
+            &weights,
+            &pmetal_bridge::decode::prompt_tokens_to_input(&ids[ids.len() - 1..]),
+            &mut cache,
+        );
+        pmetal_bridge::check_unobserved_error().expect("native decode after chunked prefill");
+        let report = compare_checkpoint(
+            &format!("{label} decode after chunk {chunk}"),
+            &step.reshape(&[1, 1, -1]),
+            &last,
+            &[(&format!("{label} decode after chunk {chunk}"), tolerance)],
+        );
+        print_report_table(std::slice::from_ref(&report));
+        assert!(report.passed(), "{label}: decode after chunk {chunk}");
+    }
+}
+
+fn run_native_synthetic_parity(
+    label: &str,
+    config_json: &str,
+    weights_fixture: &str,
+    reference_fixture: &str,
+) {
+    use pmetal_bridge::gemma4_native;
+
+    let (_dir, config, weights) = native_checkpoint(config_json, weights_fixture);
     let mut cache = gemma4_native::build_cache(&weights, &config);
 
     let ref_shard = load_shard(&fixture_path(reference_fixture));
