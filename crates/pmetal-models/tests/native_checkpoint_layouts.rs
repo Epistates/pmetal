@@ -306,6 +306,55 @@ fn assert_same_logits(what: &str, got: &Array, want: &Array, tolerance: f32) {
     );
 }
 
+/// A bf16 checkpoint stays bf16 through a multi-token pass and a decode step:
+/// the logits and every cache (KV and the GatedDeltaNet convolution and
+/// recurrent state, which carries its own dtype), for the hybrid routed model.
+#[test]
+fn a_bf16_checkpoint_stays_bf16_through_prefill_and_decode() {
+    use pmetal_bridge::compat::Dtype;
+    use pmetal_bridge::decode::prompt_tokens_to_input;
+
+    let bf16 = Dtype::Bfloat16.as_i32();
+    let tensors: Tensors = base_tensors()
+        .into_iter()
+        .map(|(k, v)| {
+            let cast = if v.ndim() > 0 { v.as_dtype(bf16) } else { v };
+            (k, cast)
+        })
+        .collect();
+    let dir = write_checkpoint(&base_config(), &tensors);
+    let config = load_config(dir.path()).expect("config parses");
+    let weights = load_model(dir.path(), &config).expect("checkpoint loads");
+    assert_eq!(weights.model_dtype, bf16);
+
+    let mut cache = NativeCache::new_empty(&weights);
+    let ids = input_ids();
+    let logits = forward_step(&weights, &ids, &mut cache);
+    let step = forward_step(&weights, &prompt_tokens_to_input(&[3]), &mut cache);
+    drain("bf16 forward");
+    assert_eq!(logits.dtype_raw(), bf16, "prefill logits");
+    assert_eq!(step.dtype_raw(), bf16, "decode logits");
+    for (i, kv) in cache.kv_caches.iter().enumerate() {
+        assert_eq!(
+            kv.keys.as_ref().unwrap().dtype_raw(),
+            bf16,
+            "layer {i} keys"
+        );
+        assert_eq!(
+            kv.values.as_ref().unwrap().dtype_raw(),
+            bf16,
+            "layer {i} values"
+        );
+    }
+    for (i, gdn) in cache.gdn_caches.iter().enumerate() {
+        assert_eq!(
+            gdn.conv_state.as_ref().unwrap().dtype_raw(),
+            bf16,
+            "gdn {i} conv"
+        );
+    }
+}
+
 /// transformers 4 and NVIDIA ModelOpt store one module per expert.
 #[test]
 fn one_module_per_expert_loads_the_same_model() {
