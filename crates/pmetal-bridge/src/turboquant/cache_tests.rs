@@ -187,6 +187,66 @@ fn memory_per_token_is_what_the_bit_widths_say() {
 }
 
 #[test]
+fn while_nothing_is_quantized_attention_is_exact_and_goes_through_sdpa() {
+    // Within the window and the sinks every token is dense: the result is the
+    // plain attention over the original keys and values, to f32 arithmetic,
+    // whatever the head grouping, with or without per-head sink logits, and
+    // when the queries and the stored tokens differ in dtype.
+    let w = Workload::new(1, 8, 2, 300, 64, 21);
+    let mut cache = new_cache(config(2, 2, Some(4096), 4));
+    cache
+        .append(&w.kv_slice(false, 0, 300), &w.kv_slice(true, 0, 300))
+        .unwrap();
+    assert_eq!(cache.cold_len(), 0);
+    let exact = w.reference(300);
+    let out = to_host(
+        &cache
+            .compute_attention(&w.queries_array(), w.scale(), 0, None)
+            .unwrap(),
+    );
+    assert!(relative_error(&out, &exact) < 1e-5);
+    // Sink logits far above and far below every score: heads that take the
+    // whole softmax vanish, the others are untouched.
+    let logits = InlineArray::from_f32_slice(
+        &[200.0, -200.0, 200.0, -200.0, 200.0, -200.0, 200.0, -200.0],
+        &[8],
+    );
+    let with = to_host(
+        &cache
+            .compute_attention(&w.queries_array(), w.scale(), 0, Some(&logits))
+            .unwrap(),
+    );
+    for h in 0..8 {
+        let (got, want) = (&with[h * 64..(h + 1) * 64], &exact[h * 64..(h + 1) * 64]);
+        if h % 2 == 0 {
+            assert!(got.iter().all(|v| v.abs() < 1e-6), "head {h} should vanish");
+        } else {
+            let num: f64 = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (f64::from(*a) - b).powi(2))
+                .sum();
+            let den: f64 = want.iter().map(|b| b * b).sum();
+            assert!((num / den).sqrt() < 1e-5, "head {h} should be untouched");
+        }
+    }
+    // bf16 tokens, f32 queries.
+    let mut bf16_cache = new_cache(config(2, 2, Some(4096), 4));
+    let bf16 = |a: InlineArray| a.as_dtype(Dtype::Bfloat16.as_i32());
+    bf16_cache
+        .append(
+            &bf16(w.kv_slice(false, 0, 300)),
+            &bf16(w.kv_slice(true, 0, 300)),
+        )
+        .unwrap();
+    let out = bf16_cache
+        .compute_attention(&w.queries_array(), w.scale(), 0, None)
+        .unwrap();
+    assert_eq!(out.dtype_raw(), Dtype::Float32.as_i32());
+    assert!(relative_error(&to_host(&out), &exact) < 1e-2);
+}
+
+#[test]
 fn a_long_prompt_is_quantized_in_bounded_memory() {
     // Quantizing 60,000 tokens of 8 KV heads at once would rotate them into
     // two f32 copies of the prompt (245 MB each) before packing any. The cache

@@ -164,6 +164,67 @@ fn bench_ring_write_cost() {
     }
 }
 
+/// The recent ring alone (a context shorter than the window) against MLX's
+/// own SDPA over the same bf16 tokens.
+#[test]
+#[ignore = "benchmark"]
+fn bench_dense_only_attention() {
+    let (batch, q_heads, kv_heads, dim) = (1usize, 32usize, 8usize, 128usize);
+    let kv = batch * kv_heads;
+    let mut g = Gauss::new(11);
+    let q_data: Vec<f32> = (0..batch * q_heads * dim)
+        .map(|_| g.normal() as f32)
+        .collect();
+    let queries =
+        InlineArray::from_f32_slice(&q_data, &[batch as i32, q_heads as i32, 1, dim as i32])
+            .as_dtype(Dtype::Bfloat16.as_i32());
+    let scale = 1.0 / (dim as f32).sqrt();
+    let shape = DecodeShape {
+        batch,
+        q_heads,
+        kv_heads,
+        dim,
+        value_dim: dim,
+    };
+    let keys = Quantizer::new(dim, 4);
+    let values = Quantizer::new(dim, 4);
+    for &n in &[1024usize, 2048, 4096, 8192] {
+        let k_dense = InlineArray::random_normal(
+            &[batch as i32, kv_heads as i32, n as i32, dim as i32],
+            Dtype::Bfloat16.as_i32(),
+        );
+        let v_dense = InlineArray::random_normal(
+            &[batch as i32, kv_heads as i32, n as i32, dim as i32],
+            Dtype::Bfloat16.as_i32(),
+        );
+        k_dense.eval();
+        v_dense.eval();
+        let t_sdpa = time_ms(30, || queries.sdpa(&k_dense, &v_dense, scale, ""));
+        let mut store = DenseStore::new(kv, dim, dim, Dtype::Bfloat16.as_i32(), 4, n + 1024);
+        store.push(
+            &k_dense.reshape(&[kv as i32, n as i32, dim as i32]),
+            &v_dense.reshape(&[kv as i32, n as i32, dim as i32]),
+            n,
+        );
+        store.keys.eval();
+        store.values.eval();
+        let t = time_ms(30, || {
+            let visibility = Visibility {
+                first_token: 0,
+                sink_logits: None,
+            };
+            decode_attention(
+                &queries, scale, visibility, &shape, &keys, &values, None, &store,
+            )
+            .expect("attention")
+        });
+        eprintln!(
+            "DENSE n={n:5}: mlx sdpa {t_sdpa:.3} ms, ring kernels {t:.3} ms ({:.2}x)",
+            t_sdpa / t
+        );
+    }
+}
+
 #[test]
 #[ignore = "benchmark"]
 fn bench_decode_attention() {

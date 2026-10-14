@@ -433,6 +433,20 @@ impl QuantizedKvCache {
                 layout.dim
             ));
         }
+        if queries.dim(1) as usize % layout.heads != 0 {
+            return Err(format!(
+                "TurboQuant: {} query heads is not a multiple of {} KV heads",
+                queries.dim(1),
+                layout.heads
+            ));
+        }
+        let dense = self.dense.as_ref().expect("dense store");
+        // Nothing quantized yet, nothing masked: the tokens are dense and
+        // contiguous (the sinks, then the ring, which has not been evicted
+        // from), so MLX's own SDPA reads them in place.
+        if self.cold_len() == 0 && first_token == 0 && dense.tokens() > 0 {
+            return self.dense_only_attention(queries, scale, sink_logits, layout, dense);
+        }
         let shape = DecodeShape {
             batch: layout.batch,
             q_heads: queries.dim(1) as usize,
@@ -453,6 +467,49 @@ impl QuantizedKvCache {
             self.cold.as_ref().filter(|c| c.len > 0),
             self.dense.as_ref().expect("dense store"),
         )
+    }
+
+    /// Decode attention when every cached token is dense: MLX's fused SDPA
+    /// over the first `tokens` slots of the dense store.
+    fn dense_only_attention(
+        &self,
+        queries: &InlineArray,
+        scale: f32,
+        sink_logits: Option<&InlineArray>,
+        layout: Layout,
+        dense: &DenseStore,
+    ) -> Result<InlineArray, String> {
+        let tokens = dense.tokens() as i32;
+        let view = |store: &InlineArray, width: usize| -> InlineArray {
+            let used = store
+                .slice(&[0, 0, 0], &[layout.kv_rows() as i32, tokens, width as i32])
+                .reshape(&[
+                    layout.batch as i32,
+                    layout.heads as i32,
+                    tokens,
+                    width as i32,
+                ]);
+            if used.dtype_raw() == queries.dtype_raw() {
+                used
+            } else {
+                used.as_dtype(queries.dtype_raw())
+            }
+        };
+        let keys = view(&dense.keys, layout.dim);
+        let values = view(&dense.values, layout.value_dim);
+        let out = match sink_logits {
+            None => queries.sdpa(&keys, &values, scale, ""),
+            Some(sinks) => queries.sdpa_with_sinks(
+                &keys,
+                &values,
+                scale,
+                "",
+                None,
+                &sinks.as_dtype(Dtype::Float32.as_i32()),
+            ),
+        };
+        crate::error::check_last_error().map_err(|err| err.to_string())?;
+        Ok(out)
     }
 
     /// Every cached key as `[B, H, T, D]`, in the dtype the keys were appended
