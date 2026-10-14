@@ -168,6 +168,12 @@ impl From<&str> for Exception {
     }
 }
 
+impl From<crate::BridgeError> for Exception {
+    fn from(err: crate::BridgeError) -> Self {
+        Self::custom(err.to_string())
+    }
+}
+
 // ── Param ────────────────────────────────────────────────────────────────────
 
 /// A trainable-parameter wrapper.
@@ -578,6 +584,12 @@ impl From<String> for IoError {
 impl From<&str> for IoError {
     fn from(s: &str) -> Self {
         Self::new(s)
+    }
+}
+
+impl From<crate::BridgeError> for IoError {
+    fn from(err: crate::BridgeError) -> Self {
+        Self::new(err.to_string())
     }
 }
 

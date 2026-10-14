@@ -45,7 +45,8 @@ pub fn save_checkpoint<M: ModuleParameters>(
     for (_, arr) in &entries {
         arr.eval();
     }
-    InlineArray::save_safetensors(&dir.join("model.safetensors").to_string_lossy(), &entries);
+    InlineArray::save_safetensors(&dir.join("model.safetensors").to_string_lossy(), &entries)
+        .map_err(|e| PretrainError::Checkpoint(format!("save model weights: {e}")))?;
 
     // Optimizer state: m and v for each parameter
     let state = optimizer.state();
@@ -61,7 +62,8 @@ pub fn save_checkpoint<M: ModuleParameters>(
     InlineArray::save_safetensors(
         &dir.join("optimizer.safetensors").to_string_lossy(),
         &opt_ref,
-    );
+    )
+    .map_err(|e| PretrainError::Checkpoint(format!("save optimizer state: {e}")))?;
 
     // Metadata JSON
     let json = serde_json::to_string_pretty(meta)

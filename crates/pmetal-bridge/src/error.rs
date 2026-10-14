@@ -103,6 +103,33 @@ pub fn check_last_error() -> BridgeResult<()> {
     }
 }
 
+/// The most recent op's error, if any, without clearing it.
+///
+/// [`check_last_error`] reports and clears. This only looks, for a caller (an
+/// evaluation) that must remember what the last op did before a successful
+/// call wipes the slot, without taking the error away from whoever reads the
+/// channel next.
+pub(crate) fn peek_last_error() -> BridgeResult<()> {
+    // SAFETY: as in `check_last_error`; nothing is cleared, so the message is
+    // copied while still valid.
+    unsafe {
+        let code = pmetal_bridge_last_error_code();
+        if code == 0 {
+            return Ok(());
+        }
+        let raw = pmetal_bridge_last_error_message();
+        let msg = if raw.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(raw).to_string_lossy().into_owned()
+        };
+        match code {
+            2 => Err(BridgeError::Unknown(msg)),
+            _ => Err(BridgeError::CxxException(msg)),
+        }
+    }
+}
+
 /// Reports the first error a bridge op recorded on this thread since one was
 /// last observed, and clears it.
 ///
@@ -186,6 +213,32 @@ pub fn expect_bridge_errors<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Runs a chain of bridge ops and returns the first error any of them raised.
+///
+/// An op that throws hands back a placeholder and the ops after it carry on
+/// with that, so by the end of a chain [`check_last_error`] (the last op's
+/// slot) is clean again. This reads the unobserved channel instead, which
+/// holds the first failure until it is read, wherever it sits in the chain:
+///
+/// ```ignore
+/// let y = pmetal_bridge::checked(|| x.matmul(&w).add(&b).softmax(-1))?;
+/// ```
+///
+/// An error left over from before the call (never read, never cleared) counts
+/// too and is returned in preference, so no failure is lost. Under
+/// `strict-errors` the ops inside run as ones that are allowed to fail, as
+/// with [`expect_bridge_errors`]. Without it an op that failed has already
+/// computed its placeholder, so a caller that returns `Err` here discards the
+/// result.
+pub fn checked<T>(f: impl FnOnce() -> T) -> BridgeResult<T> {
+    let earlier = check_unobserved_error();
+    let out = expect_bridge_errors(f);
+    let during = check_unobserved_error();
+    earlier?;
+    during?;
+    Ok(out)
+}
+
 /// The `strict-errors` runtime: what each bridge entry point runs around its
 /// C call (see `bridge_extern!`).
 ///
@@ -240,6 +293,12 @@ pub(crate) mod strict {
         pub(crate) fn end(self, op: &'static str) {
             DEPTH.set(DEPTH.get() - 1);
             if !self.outermost || std::thread::panicking() {
+                return;
+            }
+            // A callback panicked and its wrapper is about to re-raise that
+            // panic; the error C++ recorded for the abandoned call would only
+            // replace it with a less useful one.
+            if crate::callback::is_pending() {
                 return;
             }
             let seq = error_seq();

@@ -8,7 +8,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -113,6 +115,99 @@ static inline array bridge_sdpa(const array& q, const array& k, const array& v, 
     return mx::fast::scaled_dot_product_attention(q, k, v, scale, mask_mode, mask, sinks);
 }
 
+// ---------------------------------------------------------------------------
+// MLX's compile cache
+// ---------------------------------------------------------------------------
+//
+// `mlx::core::compile` keeps its traces in one process-wide table (a map of
+// vectors of entries) that MLX does not lock: finding or adding an entry from
+// two threads at once corrupts it, and an entry is marked filled before its
+// tape is built, so a second thread that finds it in between replays an empty
+// tape. The bridge's own per-block caches are vectors of the same kind. Every
+// entry point that calls a compiled function (building the graph, never
+// evaluating it) holds this for the call. Recursive, since a Rust closure
+// MLX traces may call another compiled op on the same thread. Leaked, so it
+// has no destructor to order against libmlx's at exit.
+inline std::recursive_mutex& compile_cache_mutex() {
+    static auto* mutex = new std::recursive_mutex;
+    return *mutex;
+}
+
+class CompileCacheLock {
+public:
+    CompileCacheLock() : guard_(compile_cache_mutex()) {}
+
+private:
+    std::lock_guard<std::recursive_mutex> guard_;
+};
+
+// ---------------------------------------------------------------------------
+// Callbacks into Rust
+// ---------------------------------------------------------------------------
+//
+// `value_and_grad`, `checkpoint` and the generic compile wrapper call a Rust
+// closure from inside MLX. The closure's Rust side catches a panic (one can
+// not unwind through this frame) and reports it as a non-zero return; a
+// non-zero return is turned into this exception, which MLX unwinds through
+// like any other and the bridge entry point catches. The panic itself is
+// re-raised by the Rust caller once the entry point has returned.
+struct RustCallbackPanicked : std::runtime_error {
+    RustCallbackPanicked() : std::runtime_error("a Rust callback panicked") {}
+};
+
+// The arrays handed to a callback: copies of `args` in raw buffers, destroyed
+// with this object, on every path out including an exception.
+class CallbackInputs {
+public:
+    explicit CallbackInputs(const std::vector<array>& args)
+        : bufs_(args.size()), ptrs_(args.size()) {
+        for (size_t i = 0; i < args.size(); ++i) {
+            new (bufs_[i].buf) array(args[i]);
+            ptrs_[i] = &bufs_[i];
+        }
+    }
+    ~CallbackInputs() {
+        for (auto& b : bufs_) {
+            as_arr(&b).~array();
+        }
+    }
+    CallbackInputs(const CallbackInputs&) = delete;
+    CallbackInputs& operator=(const CallbackInputs&) = delete;
+
+    const mlx_inline_array* const* data() const { return ptrs_.data(); }
+    int size() const { return static_cast<int>(ptrs_.size()); }
+
+private:
+    std::vector<mlx_inline_array> bufs_;
+    std::vector<const mlx_inline_array*> ptrs_;
+};
+
+// Output slots a callback writes into. They start uninitialised: the callback
+// placement-news the slots it uses and says how many (`written`), and only
+// those are read back and destroyed. Pre-filling them would leak one array per
+// slot per call, since placement-new does not destroy what it overwrites.
+class CallbackOutputs {
+public:
+    explicit CallbackOutputs(int capacity) : bufs_(capacity > 0 ? capacity : 0) {}
+    ~CallbackOutputs() {
+        for (int i = 0; i < written_; ++i) {
+            as_arr(&bufs_[i]).~array();
+        }
+    }
+    CallbackOutputs(const CallbackOutputs&) = delete;
+    CallbackOutputs& operator=(const CallbackOutputs&) = delete;
+
+    mlx_inline_array* data() { return bufs_.data(); }
+    int capacity() const { return static_cast<int>(bufs_.size()); }
+    // Take ownership of the first `n` slots (the count the callback reported).
+    void adopt(int n) { written_ = n; }
+    const array& operator[](int i) const { return as_arr(&bufs_[i]); }
+
+private:
+    std::vector<mlx_inline_array> bufs_;
+    int written_ = 0;
+};
+
 // Standard try/catch wrapper for ops that construct a single output via
 // placement-new into `dst->buf`. On success, clears any prior error and
 // runs `body` (which is expected to placement-new into dst->buf). On
@@ -214,7 +309,10 @@ static inline array gelu_family(const array& in, F formula) {
 // GDN Metal kernel getter — defined in bridge_native.cpp, used across files.
 mlx::core::fast::CustomKernelFunction& get_gdn_kernel();
 
-// Map integer dtype code to MLX Dtype.
+// Map integer dtype code to MLX Dtype. A code outside the table throws (every
+// caller runs inside a BRIDGE_TRY_* wrapper, so it reaches Rust as an error);
+// it used to come back as float32, so a bad code silently built a float32
+// array.
 static inline mlx::core::Dtype dtype_from_int(int dtype) {
     static const mlx::core::Dtype dtypes[] = {
         mlx::core::bool_,    // 0
@@ -231,7 +329,10 @@ static inline mlx::core::Dtype dtype_from_int(int dtype) {
         mlx::core::bfloat16, // 11
         mlx::core::complex64 // 12
     };
-    return (dtype >= 0 && dtype <= 12) ? dtypes[dtype] : mlx::core::float32;
+    if (dtype < 0 || dtype > 12) {
+        throw std::invalid_argument("unknown dtype code " + std::to_string(dtype));
+    }
+    return dtypes[dtype];
 }
 
 // Map Rust-side quantization mode discriminants to MLX quantized-matmul modes.

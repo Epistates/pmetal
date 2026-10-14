@@ -282,7 +282,8 @@ fn nvfp4_checkpoint_dir() -> tempfile::TempDir {
     Array::save_safetensors(
         dir.path().join("model.safetensors").to_str().unwrap(),
         &entries,
-    );
+    )
+    .expect("save the weights");
     std::fs::copy(
         fixture_path("qwen4_exp_synth_config.json"),
         dir.path().join("config.json"),

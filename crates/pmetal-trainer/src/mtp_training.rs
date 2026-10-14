@@ -548,7 +548,7 @@ where
         .iter()
         .map(|(key, value)| (key.as_str(), value))
         .collect();
-    Array::save_safetensors(path_string(path.as_ref())?.as_str(), &entries);
+    Array::save_safetensors(path_string(path.as_ref())?.as_str(), &entries)?;
     Ok(())
 }
 
@@ -567,7 +567,7 @@ fn save_optimizer_state(dir: &Path, optimizer: &AdamW) -> Result<(), Exception> 
     Array::save_safetensors(
         path_string(&dir.join("optimizer.safetensors"))?.as_str(),
         &entries,
-    );
+    )?;
     Ok(())
 }
 

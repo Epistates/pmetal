@@ -738,6 +738,11 @@ fn build_and_link() {
     println!("cargo:rerun-if-env-changed=PMETAL_MLX_PREFIX");
     println!("cargo:rerun-if-env-changed=PMETAL_MLX_LIB_DIR");
     println!("cargo:rerun-if-env-changed=PMETAL_MLX_STATIC");
+    // The deployment target is in the MLX fingerprint and in every C++ flag,
+    // and the FetchContent variables pick which MLX sources cmake builds.
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    println!("cargo:rerun-if-env-changed=FETCHCONTENT_FULLY_DISCONNECTED");
+    println!("cargo:rerun-if-env-changed=FETCHCONTENT_SOURCE_DIR_MLX");
 }
 
 fn main() {

@@ -3709,7 +3709,8 @@ fn run_fuse_in_process(
         .iter()
         .map(|(key, value)| (key.as_str(), value))
         .collect();
-    pmetal::mlx::Array::save_safetensors(output_file_str, &entries);
+    pmetal::mlx::Array::save_safetensors(output_file_str, &entries)
+        .map_err(|e| AppError(e.to_string()))?;
 
     // Generate model.safetensors.index.json (required by many model loaders)
     let mut weight_map = serde_json::Map::new();

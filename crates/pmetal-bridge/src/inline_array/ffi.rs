@@ -115,11 +115,11 @@ bridge_extern! {
     pub(super) fn mlx_inline_from_i32(dst: *mut RawBuf, val: i32);
 
     pub(super) fn mlx_inline_ndim(a: *const RawBuf) -> i32;
-    pub(super) fn mlx_inline_dim(a: *const RawBuf, axis: i32) -> i32;
-    pub(super) fn mlx_inline_shape(a: *const RawBuf) -> *const i32;
+    pub(super) fn mlx_inline_shape(a: *const RawBuf, ndim: *mut i32) -> *const i32;
     pub(super) fn mlx_inline_dtype(a: *const RawBuf) -> i32;
     pub(super) fn mlx_inline_item_f32(a: *mut RawBuf) -> f32;
     pub(super) fn mlx_inline_item_u32(a: *mut RawBuf) -> u32;
+    pub(super) fn mlx_inline_item_i32(a: *mut RawBuf) -> i32;
 
     pub(super) fn mlx_inline_sign(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_dequantize(
@@ -442,6 +442,10 @@ bridge_extern! {
     pub(super) fn mlx_inline_get_cache_memory() -> usize;
     pub(super) fn mlx_inline_get_peak_memory() -> usize;
     pub(super) fn mlx_inline_reset_peak_memory();
+    pub(super) fn mlx_inline_get_memory_limit() -> usize;
+    pub(super) fn mlx_inline_set_memory_limit(limit: usize) -> usize;
+    pub(super) fn mlx_inline_set_cache_limit(limit: usize) -> usize;
+    pub(super) fn mlx_inline_device_info_json(buf: *mut std::ffi::c_char, cap: usize) -> usize;
 
     // ── FFT ops ──
     pub(super) fn mlx_inline_rfft(dst: *mut RawBuf, a: *const RawBuf, n_fft: i32, axis: i32);
@@ -516,6 +520,7 @@ bridge_extern! {
         axes: *const i32,
         ndim: i32,
     );
+    pub(super) fn mlx_inline_swapaxes(dst: *mut RawBuf, a: *const RawBuf, axis1: i32, axis2: i32);
     pub(super) fn mlx_inline_cumsum(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
     pub(super) fn mlx_inline_log(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_tril(dst: *mut RawBuf, a: *const RawBuf, k: i32);
@@ -1347,13 +1352,16 @@ bridge_extern! {
     );
 
     // ── Autograd: value_and_grad ──
+    // The callback returns 0 on success and non-zero when its Rust closure
+    // panicked (see `crate::callback`); every output slot starts uninitialised
+    // and is initialised by the call on every path.
     pub(super) fn mlx_inline_value_and_grad(
         forward_fn: unsafe extern "C" fn(
             *const *const RawBuf,
             i32,
             *mut RawBuf,
             *mut std::ffi::c_void,
-        ),
+        ) -> i32,
         ctx: *mut std::ffi::c_void,
         all_arrays: *const *const RawBuf,
         n_params: i32,
@@ -1396,7 +1404,7 @@ bridge_extern! {
             *mut RawBuf,          // outputs_out  (flat array, capacity = n_outputs_max)
             *mut i32,             // n_outputs_out (written by callback)
             *mut std::ffi::c_void,
-        ),
+        ) -> i32, // 0, or non-zero when the closure panicked
         // Takes ownership of `ctx`; `drop_fn` is called when C++ releases it.
         ctx: *mut std::ffi::c_void,
         drop_fn: unsafe extern "C" fn(*mut std::ffi::c_void),

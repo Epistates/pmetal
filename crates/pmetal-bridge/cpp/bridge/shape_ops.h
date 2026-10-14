@@ -12,8 +12,9 @@ extern "C" {
 
 // ── Shape / dtype queries ────────────────────────────────────────────────
 int mlx_inline_ndim(const mlx_inline_array* a);
-int mlx_inline_dim(const mlx_inline_array* a, int axis);
-const int* mlx_inline_shape(const mlx_inline_array* a);
+// The array's own shape storage, and its length in `*ndim`. Borrowed: valid
+// while the array lives. Not dereferenceable when `*ndim` is 0.
+const int* mlx_inline_shape(const mlx_inline_array* a, int* ndim);
 int mlx_inline_dtype(const mlx_inline_array* a);
 
 // ── Stack / concatenate ──────────────────────────────────────────────────
@@ -40,6 +41,7 @@ void mlx_inline_squeeze_axes(mlx_inline_array* dst, const mlx_inline_array* a, c
 void mlx_inline_expand_dims_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int num_axes);
 // Transpose with explicit axis permutation
 void mlx_inline_transpose_axes(mlx_inline_array* dst, const mlx_inline_array* a, const int* axes, int ndim);
+void mlx_inline_swapaxes(mlx_inline_array* dst, const mlx_inline_array* a, int axis1, int axis2);
 
 // ── Cumulative sum / lower-triangular mask ───────────────────────────────
 void mlx_inline_cumsum(mlx_inline_array* dst, const mlx_inline_array* a, int axis);

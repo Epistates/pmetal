@@ -74,7 +74,7 @@ impl InlineArray {
     }
 
     /// Checked native E4M3 FP8 dequantization to the requested floating dtype.
-    pub fn try_from_fp8(&self, dtype: i32) -> BridgeResult<Self> {
+    pub fn try_from_fp8(&self, dtype: impl crate::inline_array::IntoDtype) -> BridgeResult<Self> {
         checked(|| self.from_fp8(dtype))
     }
 

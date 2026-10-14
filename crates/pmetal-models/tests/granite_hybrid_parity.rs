@@ -289,7 +289,7 @@ fn incomplete_checkpoint_is_refused() {
     let path = fx.path().join("model.safetensors");
     std::fs::remove_file(&path).unwrap();
     let refs: Vec<(&str, &Array)> = weights.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    Array::save_safetensors(path.to_str().unwrap(), &refs);
+    Array::save_safetensors(path.to_str().unwrap(), &refs).expect("rewrite weights");
     drain_bridge("rewrite weights");
 
     let err = DynamicModel::load(fx.path()).expect_err("an expert bank is missing");
@@ -352,7 +352,7 @@ fn mlx_layout_loads_to_the_same_model() {
         let path = fx.path().join("model.safetensors");
         std::fs::remove_file(&path).unwrap();
         let refs: Vec<(&str, &Array)> = weights.iter().map(|(k, v)| (k.as_str(), v)).collect();
-        Array::save_safetensors(path.to_str().unwrap(), &refs);
+        Array::save_safetensors(path.to_str().unwrap(), &refs).expect("rewrite weights");
         drain_bridge("rewrite weights");
 
         let mut model = DynamicModel::load(fx.path()).expect("MLX layout loads");

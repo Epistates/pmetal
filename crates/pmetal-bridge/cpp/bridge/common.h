@@ -50,9 +50,9 @@ typedef struct {
 } mlx_inline_qweight;
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────
-void mlx_inline_init_empty(mlx_inline_array* dst);
+// `init_copy` constructs into uninitialised storage (it does not destroy what
+// is there); `destroy` runs the array's destructor.
 void mlx_inline_init_copy(mlx_inline_array* dst, const mlx_inline_array* src);
-void mlx_inline_init_move(mlx_inline_array* dst, mlx_inline_array* src);
 void mlx_inline_destroy(mlx_inline_array* a);
 
 // ── Size query (for Rust build-time verification) ─────────────────────────

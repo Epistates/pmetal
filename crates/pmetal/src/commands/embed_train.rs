@@ -437,7 +437,7 @@ pub(crate) async fn run_embed_train(
         .iter()
         .map(|(name, value)| (name.as_ref(), value))
         .collect();
-    pmetal_bridge::compat::Array::save_safetensors(output_path_str, &entries);
+    pmetal_bridge::compat::Array::save_safetensors(output_path_str, &entries)?;
 
     // Copy config.json and tokenizer files so the output is a complete model directory
     for file in &[

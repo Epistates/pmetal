@@ -2,9 +2,14 @@
 // Extracted from bridge.cpp for maintainability.
 
 #include "bridge_internal.h"
+#include "mlx/io/load.h"
+#include <cerrno>
 #include <cmath>
+#include <cstdio>
+#include <fcntl.h>
 #include <memory>
 #include <numeric>
+#include <unistd.h>
 
 extern "C" {
 
@@ -282,15 +287,97 @@ void mlx_inline_less_equal(mlx_inline_array* dst, const mlx_inline_array* a, con
 
 // ── Training ops: serialization ──────────────────────────────────────────────
 
+extern "C++" {
+namespace {
+
+// A file writer over a POSIX descriptor, so the bytes can be forced to disk
+// before the file is renamed into place. MLX's own `FileWriter` keeps its
+// descriptor private.
+class SyncedFileWriter : public mlx::core::io::Writer {
+public:
+    explicit SyncedFileWriter(const std::string& path)
+        : label_(path), fd_(::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644)) {}
+    ~SyncedFileWriter() override {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+    SyncedFileWriter(const SyncedFileWriter&) = delete;
+    SyncedFileWriter& operator=(const SyncedFileWriter&) = delete;
+
+    bool is_open() const override { return fd_ >= 0; }
+    bool good() const override { return fd_ >= 0; }
+    size_t tell() override { return static_cast<size_t>(::lseek(fd_, 0, SEEK_CUR)); }
+    void seek(int64_t off, std::ios_base::seekdir way = std::ios_base::beg) override {
+        ::lseek(fd_, off, way == std::ios_base::beg ? SEEK_SET : SEEK_CUR);
+    }
+    void write(const char* data, size_t n) override {
+        while (n != 0) {
+            const ssize_t m = ::write(fd_, data, std::min(n, static_cast<size_t>(INT32_MAX)));
+            if (m <= 0) {
+                throw std::runtime_error(
+                    "unable to write " + std::to_string(n) + " bytes to " + label_ + ": "
+                    + std::strerror(errno));
+            }
+            data += m;
+            n -= static_cast<size_t>(m);
+        }
+    }
+    std::string label() const override { return "file " + label_; }
+
+    // On macOS plain fsync leaves the data in the drive's cache;
+    // F_FULLFSYNC is what makes it durable.
+    void sync() {
+#ifdef F_FULLFSYNC
+        if (::fcntl(fd_, F_FULLFSYNC) == 0) {
+            return;
+        }
+#endif
+        if (::fsync(fd_) != 0) {
+            throw std::runtime_error("unable to sync " + label_ + ": " + std::strerror(errno));
+        }
+    }
+
+private:
+    std::string label_;
+    int fd_;
+};
+
+}  // namespace
+}  // extern "C++"
+
+// Writes to `<path>.partial`, syncs it, and renames it over `path`, so a
+// crash or a full disk leaves the previous file intact instead of a torn one.
+// `path` is used as given: MLX's own path overload appends ".safetensors" to
+// a name without it, which sent `x.tmp` to `x.tmp.safetensors`.
 void mlx_inline_save_safetensors(const char* path, const char** keys,
                                   const mlx_inline_array* arrays, int count) {
     BRIDGE_TRY_VOID("save_safetensors", {
         std::unordered_map<std::string, array> map;
         map.reserve(count);
         for (int i = 0; i < count; i++) {
-            map.emplace(std::string(keys[i]), as_arr(&arrays[i]));
+            if (!map.emplace(std::string(keys[i]), as_arr(&arrays[i])).second) {
+                throw std::invalid_argument(
+                    std::string("duplicate tensor name: ") + keys[i]);
+            }
         }
-        mlx::core::save_safetensors(std::string(path), std::move(map));
+        const std::string final_path(path);
+        const std::string partial_path = final_path + ".partial";
+        try {
+            {
+                auto writer = std::make_shared<SyncedFileWriter>(partial_path);
+                mlx::core::save_safetensors(writer, std::move(map));
+                writer->sync();
+            }
+            if (std::rename(partial_path.c_str(), final_path.c_str()) != 0) {
+                throw std::runtime_error(
+                    "unable to move " + partial_path + " to " + final_path + ": "
+                    + std::strerror(errno));
+            }
+        } catch (...) {
+            std::remove(partial_path.c_str());
+            throw;
+        }
     });
 }
 
@@ -476,26 +563,17 @@ void mlx_inline_value_and_grad(
     // The lambda takes a std::vector<array> (MLX convention) and returns one.
     auto cpp_forward = [&](std::vector<array> args) -> std::vector<array> {
         // Wrap each array in a temporary InlineArray so Rust can read them.
-        std::vector<mlx_inline_array> bufs(args.size());
-        std::vector<const mlx_inline_array*> ptrs(args.size());
-        for (size_t i = 0; i < args.size(); i++) {
-            new (bufs[i].buf) array(args[i]);
-            ptrs[i] = &bufs[i];
-        }
+        CallbackInputs in(args);
 
+        // The callback placement-news the loss on success, so the slot is
+        // left uninitialised (an initialised one would leak when overwritten).
         mlx_inline_array loss_buf;
-        mlx_inline_init_empty(&loss_buf);
-        forward_fn(ptrs.data(), (int)ptrs.size(), &loss_buf, ctx);
-
-        array result = as_arr(&loss_buf);
-
-        // Destroy temporaries (arrays, not loss_buf which we've already copied).
-        for (auto& b : bufs) {
-            as_arr(&b).~array();
+        if (forward_fn(in.data(), in.size(), &loss_buf, ctx) != 0) {
+            throw RustCallbackPanicked();
         }
+        array result = as_arr(&loss_buf);
         as_arr(&loss_buf).~array();
-
-        return {result};
+        return {std::move(result)};
     };
 
     // argnums: differentiate w.r.t. the first n_params inputs.
@@ -739,16 +817,6 @@ bool mlx_inline_is_tracer(const mlx_inline_array* a) {
     return as_arr(a).is_tracer();
 }
 
-typedef void (*mlx_rust_checkpoint_fn)(
-    const mlx_inline_array* const* all_arrays,
-    int n_total,
-    mlx_inline_array* outputs_out,
-    int* n_outputs_out,
-    void* ctx
-);
-
-typedef void (*mlx_rust_drop_fn)(void* ctx);
-
 void mlx_inline_checkpoint(
     mlx_rust_checkpoint_fn forward_fn,
     void* ctx,
@@ -779,43 +847,32 @@ void mlx_inline_checkpoint(
     auto cpp_forward = [forward_fn, ctx_guard, n_outputs_max](
                            const std::vector<array>& args) -> std::vector<array> {
         // Wrap each array as a temporary InlineArray for the Rust callback.
-        std::vector<mlx_inline_array> bufs(args.size());
-        std::vector<const mlx_inline_array*> ptrs(args.size());
-        for (size_t i = 0; i < args.size(); i++) {
-            new (bufs[i].buf) array(args[i]);
-            ptrs[i] = &bufs[i];
-        }
+        CallbackInputs in(args);
 
-        // Raw storage for the callback to placement-new its outputs into.
-        // Deliberately left uninitialised: the callback placement-news each
-        // slot it uses, and placement-new does not destroy what it overwrites,
-        // so pre-filling these would leak one array per slot per call.  Only
-        // the slots the callback reports are read back and destroyed.
-        std::vector<mlx_inline_array> out_bufs(n_outputs_max);
+        // Raw storage for the callback to placement-new its outputs into;
+        // only the slots it reports are read back and destroyed.
+        CallbackOutputs out(n_outputs_max);
         int n_out = 0;
+        int status;
         {
             // A checkpointed forward exists to be differentiated; its
             // recomputation runs inside the backward pass.
             BridgeGradScope grad_scope;
-            forward_fn(ptrs.data(), (int)ptrs.size(), out_bufs.data(), &n_out, ctx_guard.get());
+            status = forward_fn(in.data(), in.size(), out.data(), &n_out, ctx_guard.get());
         }
-        if (n_out > n_outputs_max) {
-            n_out = n_outputs_max;
+        if (status != 0) {
+            throw RustCallbackPanicked();
         }
+        if (n_out > out.capacity()) {
+            n_out = out.capacity();
+        }
+        out.adopt(n_out);
 
-        // Collect outputs before destroying the bufs.
         std::vector<array> results;
         results.reserve(n_out);
         for (int i = 0; i < n_out; i++) {
-            results.push_back(as_arr(&out_bufs[i]));
-            as_arr(&out_bufs[i]).~array();
+            results.push_back(out[i]);
         }
-
-        // Destroy input wrappers.
-        for (auto& b : bufs) {
-            as_arr(&b).~array();
-        }
-
         return results;
     };
 

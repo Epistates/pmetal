@@ -68,6 +68,7 @@ extern "C" {
 void mlx_inline_fused_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up) {
     BRIDGE_TRY_DST("fused_swiglu", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& g = inputs[0];
@@ -87,6 +88,7 @@ void mlx_inline_fused_swiglu(mlx_inline_array* dst,
 void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up) {
     BRIDGE_TRY_DST("fused_geglu_tanh", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& g = inputs[0];
@@ -109,6 +111,7 @@ void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
 
 void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
     BRIDGE_TRY_DST("fused_silu", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -122,6 +125,7 @@ void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
 void mlx_inline_fused_compute_g(mlx_inline_array* dst,
     const mlx_inline_array* a_log, const mlx_inline_array* a, const mlx_inline_array* dt_bias) {
     BRIDGE_TRY_DST("fused_compute_g", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto decay = exp(astype(inputs[0], float32));
@@ -136,6 +140,7 @@ void mlx_inline_fused_compute_g(mlx_inline_array* dst,
 void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* gate) {
     BRIDGE_TRY_DST("fused_precise_swiglu", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -152,6 +157,7 @@ void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
 void mlx_inline_fused_precise_sigmoid_gate(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* gate) {
     BRIDGE_TRY_DST("fused_precise_sigmoid_gate", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -195,6 +201,7 @@ void mlx_inline_compiled_gdn_layer_fixed(
     // Heap-leaked to avoid cross-DSO static destructor ordering crash.
     static auto* entries = new std::vector<Entry>();
     try {
+        CompileCacheLock cache_lock;
         CompiledFn* compiled = nullptr;
         for (auto& e : *entries) {
             if (e.nv == nv && e.nk == nk && e.dk == dk && e.dv == dv && e.cd == cd
@@ -330,6 +337,7 @@ void mlx_inline_compiled_attn_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int has_freqs = rope_freqs != nullptr ? 1 : 0;
@@ -553,6 +561,7 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(normed).dtype().val());
@@ -773,6 +782,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(normed).dtype().val());
@@ -1008,6 +1018,7 @@ void mlx_inline_compiled_moe_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int hidden = as_arr(x).shape(2);
         int num_experts = as_arr(router_w).shape(1);
@@ -1139,10 +1150,11 @@ void mlx_inline_compiled_moe_layer_fixed(
 //        (out)
 //
 // Each call site keeps a list of `Entry` records keyed by shape signature
-// (batch, seq_len, cache_len, n_heads, n_kv, head_dim, k_eq_v, has_freqs)
-// plus the quantization signature of every projection, so prefill-vs-decode,
-// sliding-vs-full and 4-bit-vs-8-bit layers each get their own
-// shapeless=false compiled trace.
+// (batch, seq_len, cache_len, n_heads, n_kv, head_dim, k_eq_v, has_freqs),
+// every scalar the trace bakes in (norm epsilons, RoPE base and width), and
+// the quantization signature of every projection, so prefill-vs-decode,
+// sliding-vs-full and 4-bit-vs-8-bit layers, and models that differ in any
+// of those values, each get their own shapeless=false compiled trace.
 //
 // Projections arrive as `mlx_inline_qweight` rather than bare arrays. Each one
 // occupies three input slots (weight, scales, biases) whether or not it is
@@ -1183,26 +1195,26 @@ void mlx_inline_compiled_gemma4_attn_block(
     float rope_base,                       // ignored when rope_freqs != null
     int rope_dims                          // = head_dim for partial freqs path
 ) {
+    // Everything the trace depends on. A trace is replayed whenever the key
+    // matches, so a value the lambda below bakes in and this omits is replayed
+    // stale for the next caller that differs in it (the norm epsilons, the
+    // RoPE base and the rotated width were left out, and a second model with
+    // the same geometry ran the first one's).
+    struct Key {
+        int batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims;
+        int k_eq_v, has_freqs, sliding_window, dtype;
+        float in_norm_eps, qk_norm_eps, post_norm_eps, rope_base;
+        QProjSig q_sig, k_sig, v_sig, o_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int cache_len;
-        int n_heads;
-        int n_kv;
-        int head_dim;
-        int k_eq_v;
-        int has_freqs;
-        int sliding_window;
-        int dtype;
-        QProjSig q_sig;
-        QProjSig k_sig;
-        QProjSig v_sig;
-        QProjSig o_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int cache_len = as_arr(cache_keys_in).shape(2);
@@ -1216,22 +1228,13 @@ void mlx_inline_compiled_gemma4_attn_block(
         QProjSig v_sig = use_k_eq_v ? QProjSig{} : qproj_sig(v_w);
         QProjSig o_sig = qproj_sig(o_w);
 
+        const Key key{batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims,
+                      static_cast<int>(use_k_eq_v), has_freqs, sliding_window, dtype,
+                      in_norm_eps, qk_norm_eps, post_norm_eps, rope_base,
+                      q_sig, k_sig, v_sig, o_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.cache_len == cache_len
-                && entry.n_heads == n_heads
-                && entry.n_kv == n_kv
-                && entry.head_dim == head_dim
-                && entry.k_eq_v == static_cast<int>(use_k_eq_v)
-                && entry.has_freqs == has_freqs
-                && entry.sliding_window == sliding_window
-                && entry.dtype == dtype
-                && entry.q_sig == q_sig
-                && entry.k_sig == k_sig
-                && entry.v_sig == v_sig
-                && entry.o_sig == o_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1256,20 +1259,7 @@ void mlx_inline_compiled_gemma4_attn_block(
             QProjSig OS = o_sig;
 
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                cache_len,
-                n_heads,
-                n_kv,
-                head_dim,
-                static_cast<int>(use_k_eq_v),
-                has_freqs,
-                sliding_window,
-                dtype,
-                q_sig,
-                k_sig,
-                v_sig,
-                o_sig,
+                key,
                 *make_compiled_fixed(
                     [NH, NKV, HD, RD, L, SW, KEV, HAS_FREQS, INE, QKE, PNE, RBASE,
                      QS, KS, VS, OS]
@@ -1472,23 +1462,22 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
     float rope_base,
     int rope_dims
 ) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims;
+        int has_freqs, sliding_window, dtype;
+        float in_norm_eps, q_norm_eps, post_norm_eps, rope_base;
+        QProjSig q_sig, o_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int cache_len;
-        int n_heads;
-        int n_kv;
-        int head_dim;
-        int has_freqs;
-        int sliding_window;
-        int dtype;
-        QProjSig q_sig;
-        QProjSig o_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int cache_len = as_arr(cache_keys_in).shape(2);
@@ -1497,19 +1486,13 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
         QProjSig q_sig = qproj_sig(q_w);
         QProjSig o_sig = qproj_sig(o_w);
 
+        const Key key{batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims,
+                      has_freqs, sliding_window, dtype,
+                      in_norm_eps, q_norm_eps, post_norm_eps, rope_base,
+                      q_sig, o_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.cache_len == cache_len
-                && entry.n_heads == n_heads
-                && entry.n_kv == n_kv
-                && entry.head_dim == head_dim
-                && entry.has_freqs == has_freqs
-                && entry.sliding_window == sliding_window
-                && entry.dtype == dtype
-                && entry.q_sig == q_sig
-                && entry.o_sig == o_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1531,17 +1514,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
             QProjSig OS = o_sig;
 
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                cache_len,
-                n_heads,
-                n_kv,
-                head_dim,
-                has_freqs,
-                sliding_window,
-                dtype,
-                q_sig,
-                o_sig,
+                key,
                 *make_compiled_fixed(
                     [NH, NKV, HD, RD, L, SW, HAS_FREQS, INE, QNE, PNE, RBASE, QS, OS]
                     (const std::vector<array>& ins) -> std::vector<array> {
@@ -1650,20 +1623,21 @@ void mlx_inline_compiled_gemma4_mlp_block(
     float pre_norm_eps,
     float post_norm_eps
 ) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, hidden, intermediate, dtype;
+        float pre_norm_eps, post_norm_eps;
+        QProjSig gate_sig, up_sig, down_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int hidden;
-        int intermediate;
-        int dtype;
-        QProjSig gate_sig;
-        QProjSig up_sig;
-        QProjSig down_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int hidden = as_arr(x).shape(2);
@@ -1673,16 +1647,11 @@ void mlx_inline_compiled_gemma4_mlp_block(
         QProjSig up_sig = qproj_sig(up_w);
         QProjSig down_sig = qproj_sig(down_w);
 
+        const Key key{batch, seq_len, hidden, intermediate, dtype,
+                      pre_norm_eps, post_norm_eps, gate_sig, up_sig, down_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.hidden == hidden
-                && entry.intermediate == intermediate
-                && entry.dtype == dtype
-                && entry.gate_sig == gate_sig
-                && entry.up_sig == up_sig
-                && entry.down_sig == down_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1695,14 +1664,7 @@ void mlx_inline_compiled_gemma4_mlp_block(
             QProjSig US = up_sig;
             QProjSig DS = down_sig;
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                hidden,
-                intermediate,
-                dtype,
-                gate_sig,
-                up_sig,
-                down_sig,
+                key,
                 *make_compiled_fixed(
                     [PRE, POST, GS, US, DS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
@@ -1786,19 +1748,21 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
     const mlx_inline_array* post_norm_w,
     float post_norm_eps
 ) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, hidden, per_layer_hidden, dtype;
+        float post_norm_eps;
+        QProjSig gate_sig, projection_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int hidden;
-        int per_layer_hidden;
-        int dtype;
-        QProjSig gate_sig;
-        QProjSig projection_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int hidden = as_arr(x).shape(2);
@@ -1807,15 +1771,11 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
         QProjSig gate_sig = qproj_sig(gate_w);
         QProjSig projection_sig = qproj_sig(projection_w);
 
+        const Key key{batch, seq_len, hidden, per_layer_hidden, dtype,
+                      post_norm_eps, gate_sig, projection_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.hidden == hidden
-                && entry.per_layer_hidden == per_layer_hidden
-                && entry.dtype == dtype
-                && entry.gate_sig == gate_sig
-                && entry.projection_sig == projection_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1826,13 +1786,7 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
             QProjSig GS = gate_sig;
             QProjSig PS = projection_sig;
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                hidden,
-                per_layer_hidden,
-                dtype,
-                gate_sig,
-                projection_sig,
+                key,
                 *make_compiled_fixed(
                     [POST, GS, PS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
@@ -1918,54 +1872,37 @@ struct BridgeCompiledHandle {
 // inline buffer, hand control to Rust, then collect the Rust-populated
 // outputs back into a std::vector<array>.
 //
-// The `mlx_inline_init_copy` on each input is the same pattern used by
-// `value_and_grad`'s trampoline; it gives Rust a borrowed InlineArray
-// whose placement-new'd underlying array is destroyed on the way out.
+// Rust gets a borrowed InlineArray per input, whose placement-new'd array is
+// destroyed on the way out (`CallbackInputs`), and `n_outputs_max`
+// uninitialised slots to placement-new its results into (`CallbackOutputs`).
 static std::vector<array> rust_compile_trampoline(
     const std::vector<array>& inputs,
     const CompileCtx* cctx
 ) {
-    // Wrap inputs as mlx_inline_array buffers.
-    std::vector<mlx_inline_array> input_bufs(inputs.size());
-    std::vector<const mlx_inline_array*> input_ptrs(inputs.size());
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        new (input_bufs[i].buf) array(inputs[i]);
-        input_ptrs[i] = &input_bufs[i];
-    }
-
-    // Allocate output buffers — Rust writes into these and updates n_out.
-    std::vector<mlx_inline_array> output_bufs(cctx->n_outputs_max);
-    for (int i = 0; i < cctx->n_outputs_max; ++i) {
-        mlx_inline_init_empty(&output_bufs[i]);
-    }
+    CallbackInputs in(inputs);
+    CallbackOutputs out(cctx->n_outputs_max);
 
     int n_out = 0;
-    cctx->fn(
-        input_ptrs.data(),
-        static_cast<int>(inputs.size()),
-        output_bufs.data(),
-        &n_out,
-        cctx->ctx
-    );
+    const int status = cctx->fn(
+        in.data(), in.size(), out.data(), out.capacity(), &n_out, cctx->ctx);
+    if (status == 2) {
+        // The closure made more arrays than there are slots; `n_out` says how
+        // many, and Rust wrote none of them.
+        throw std::invalid_argument(
+            "the compiled closure returned " + std::to_string(n_out)
+            + " arrays but n_outputs_max is " + std::to_string(out.capacity()));
+    }
+    if (status != 0) {
+        throw RustCallbackPanicked();
+    }
+    n_out = std::max(0, std::min(n_out, out.capacity()));
+    out.adopt(n_out);
 
-    // Collect results before destroying the output buffers.
     std::vector<array> results;
-    results.reserve(static_cast<size_t>(std::max(0, n_out)));
-    int n_to_collect = std::max(0, std::min(n_out, cctx->n_outputs_max));
-    for (int i = 0; i < n_to_collect; ++i) {
-        results.push_back(as_arr(&output_bufs[i]));
+    results.reserve(static_cast<size_t>(n_out));
+    for (int i = 0; i < n_out; ++i) {
+        results.push_back(out[i]);
     }
-
-    // Destroy all output buffers (including any Rust didn't fill — those
-    // still hold the default placement-new from mlx_inline_init_empty).
-    for (int i = 0; i < cctx->n_outputs_max; ++i) {
-        as_arr(&output_bufs[i]).~array();
-    }
-    // Destroy input wrappers.
-    for (auto& b : input_bufs) {
-        as_arr(&b).~array();
-    }
-
     return results;
 }
 
@@ -2016,6 +1953,7 @@ int mlx_inline_compile_call(
         return -1;
     }
     try {
+        CompileCacheLock cache_lock;
         auto* h = static_cast<BridgeCompiledHandle*>(compiled_handle);
 
         std::vector<array> input_arrs;
@@ -2026,7 +1964,12 @@ int mlx_inline_compile_call(
 
         auto results = h->fn(input_arrs);
 
-        int n = std::min(static_cast<int>(results.size()), n_outputs_max);
+        if (static_cast<int>(results.size()) > n_outputs_max) {
+            throw std::invalid_argument(
+                "the compiled closure returned " + std::to_string(results.size())
+                + " arrays but n_outputs_max is " + std::to_string(n_outputs_max));
+        }
+        const int n = static_cast<int>(results.size());
         for (int i = 0; i < n; ++i) {
             new (outputs[i].buf) array(std::move(results[i]));
         }
@@ -2046,6 +1989,8 @@ int mlx_inline_compile_call(
 
 void mlx_inline_compile_free(void* compiled_handle) {
     if (compiled_handle) {
+        // Destroying the closure erases its entries from MLX's compile cache.
+        CompileCacheLock cache_lock;
         delete static_cast<BridgeCompiledHandle*>(compiled_handle);
     }
 }

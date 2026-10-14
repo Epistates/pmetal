@@ -153,6 +153,73 @@ pub fn get_max_recommended_size() -> usize {
     unsafe { mlx_inline_get_max_recommended_size() }
 }
 
+/// MLX's memory limit in bytes: a guideline for the most the allocator uses
+/// during graph evaluation, past which (with no RAM or swap left) an
+/// allocation fails. Defaults to 1.5 times [`get_max_recommended_size`] on a
+/// Metal device.
+pub fn get_memory_limit() -> usize {
+    unsafe { mlx_inline_get_memory_limit() }
+}
+
+/// Set the memory limit (see [`get_memory_limit`]). Returns the previous one.
+pub fn set_memory_limit(limit: usize) -> usize {
+    unsafe { mlx_inline_set_memory_limit(limit) }
+}
+
+/// Set the buffer-cache limit: past it, free buffers are returned to the
+/// system on the next allocation. `0` turns the cache off. Defaults to the
+/// memory limit. Returns the previous limit.
+pub fn set_cache_limit(limit: usize) -> usize {
+    unsafe { mlx_inline_set_cache_limit(limit) }
+}
+
+/// What MLX knows about the GPU.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DeviceInfo {
+    /// Marketing name, e.g. "Apple M4 Max".
+    pub device_name: String,
+    /// Metal architecture name, e.g. "applegpu_g16s".
+    pub architecture: String,
+    /// Installed RAM in bytes (the GPU shares it).
+    pub memory_size: u64,
+    /// The device's `recommendedMaxWorkingSetSize` in bytes: what
+    /// [`set_wired_limit`] is checked against.
+    pub max_recommended_working_set_size: u64,
+    /// The largest single buffer Metal will allocate, in bytes.
+    pub max_buffer_length: u64,
+    /// Metal's resource limit (`iogpu.rsrc_limit`): the most buffers alive at once.
+    pub resource_limit: u64,
+}
+
+/// Describe the GPU MLX runs on.
+///
+/// # Errors
+/// When there is no Metal device, or MLX can't build it.
+pub fn device_info() -> crate::BridgeResult<DeviceInfo> {
+    let mut buf: Vec<std::ffi::c_char> = vec![0; 1024];
+    let len = loop {
+        // SAFETY: `buf` is `buf.len()` writable bytes.
+        let len = unsafe { mlx_inline_device_info_json(buf.as_mut_ptr(), buf.len()) };
+        if len == 0 {
+            crate::check_last_error()?;
+            return Err(crate::BridgeError::CxxException(
+                "[device_info] MLX reports no device".into(),
+            ));
+        }
+        if len < buf.len() {
+            break len;
+        }
+        buf = vec![0; len + 1];
+    };
+    // SAFETY: the callee wrote `len` bytes and a NUL into `buf`.
+    let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), len) };
+    serde_json::from_slice(bytes).map_err(|e| {
+        crate::BridgeError::CxxException(format!(
+            "[device_info] unreadable device description: {e}"
+        ))
+    })
+}
+
 // ── Stream management ────────────────────────────────────────────────────
 
 /// Create this thread's generation stream, once per thread; make it the
@@ -188,6 +255,57 @@ pub fn reset_default_stream() {
 pub fn synchronize() {
     unsafe {
         mlx_inline_synchronize();
+    }
+}
+
+thread_local! {
+    /// Open [`GenerationStream`]s on this thread.
+    static STREAM_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's generation stream as the default stream, for as long as the
+/// value lives.
+///
+/// [`new_generation_stream`] + [`set_generation_stream`] + [`synchronize`] +
+/// [`reset_default_stream`] have to pair up on every path out of a
+/// generation, early returns and panics included: a default stream left
+/// pointing at the generation stream makes array destructors run on it and
+/// race Metal's teardown. This does the pairing. Dropping it waits for the
+/// stream's pending work, then restores MLX's own default stream. Guards nest;
+/// only the outermost one restores.
+///
+/// The stream belongs to the thread that made it, so the guard is neither
+/// `Send` nor `Sync`.
+#[must_use = "the stream is the default only while this lives"]
+pub struct GenerationStream {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl GenerationStream {
+    /// Make this thread's generation stream (once per thread) the default.
+    pub fn enter() -> Self {
+        STREAM_DEPTH.with(|depth| {
+            if depth.get() == 0 {
+                new_generation_stream();
+                set_generation_stream();
+            }
+            depth.set(depth.get() + 1);
+        });
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for GenerationStream {
+    fn drop(&mut self) {
+        STREAM_DEPTH.with(|depth| {
+            depth.set(depth.get() - 1);
+            if depth.get() == 0 {
+                synchronize();
+                reset_default_stream();
+            }
+        });
     }
 }
 

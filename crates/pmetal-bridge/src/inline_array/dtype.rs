@@ -6,6 +6,33 @@
 
 use super::InlineArray;
 
+// ── IntoDtype: a dtype argument, typed or as the raw code ────────────────
+
+/// A dtype argument: the typed [`crate::compat::Dtype`], or the raw `i32`
+/// code the FFI uses (see [`crate::dtype`]).
+///
+/// The constructors and casts take `impl IntoDtype`, so a call site can name
+/// the dtype (`Dtype::Bfloat16`) rather than pass a number, and the ones that
+/// already pass a code keep compiling.
+pub trait IntoDtype: Copy {
+    /// The raw dtype code.
+    fn dtype_code(self) -> i32;
+}
+
+impl IntoDtype for i32 {
+    #[inline]
+    fn dtype_code(self) -> i32 {
+        self
+    }
+}
+
+impl IntoDtype for crate::compat::Dtype {
+    #[inline]
+    fn dtype_code(self) -> i32 {
+        self.as_i32()
+    }
+}
+
 // ── AsDtype: sealed trait for as_type<T>() ──────────────────────────────
 
 /// Sealed trait mapping Rust primitive types to MLX dtype IDs.
@@ -145,6 +172,6 @@ impl BridgeScalar for u32 {
 impl BridgeScalar for i32 {
     const SLICE_DTYPES: &'static [i32] = &[7, 3];
     fn extract(arr: &InlineArray) -> i32 {
-        arr.item_u32() as i32
+        arr.item_i32()
     }
 }

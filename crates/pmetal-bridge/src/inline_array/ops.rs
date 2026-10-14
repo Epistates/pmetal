@@ -7,7 +7,7 @@
 
 use std::mem::MaybeUninit;
 
-use super::dtype::AsDtype;
+use super::dtype::{AsDtype, IntoDtype};
 use super::ffi::*;
 use super::{InlineArray, RawBuf, binop, unop};
 
@@ -127,7 +127,9 @@ impl InlineArray {
         }
     }
 
-    pub fn as_dtype(&self, dtype: i32) -> Self {
+    /// Cast to `dtype`: a [`crate::compat::Dtype`] or its raw code.
+    pub fn as_dtype(&self, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_astype(dst.as_mut_ptr(), &self.raw, dtype);
@@ -142,7 +144,8 @@ impl InlineArray {
     /// No values are converted. The last axis rescales by the ratio of the
     /// two element sizes, so `[out, n]` `uint8` viewed as `uint32` is
     /// `[out, n / 4]`.
-    pub fn view(&self, dtype: i32) -> Self {
+    pub fn view(&self, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_view(dst.as_mut_ptr(), &self.raw, dtype);
@@ -167,7 +170,8 @@ impl InlineArray {
     }
 
     /// Dequantize an MLX E4M3 FP8 payload into a floating-point dtype.
-    pub fn from_fp8(&self, dtype: i32) -> Self {
+    pub fn from_fp8(&self, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_fp8(dst.as_mut_ptr(), &self.raw, dtype);
@@ -204,14 +208,17 @@ impl InlineArray {
     pub fn lt(&self, other: &Self) -> Self {
         self.less(other)
     }
-    /// Swap two axes.
+    /// Swap two axes (negative ones count from the end), as `mx.swapaxes`.
+    /// An axis out of range is an MLX error on the error channel, like any
+    /// other op's, rather than a panic here.
     pub fn swap_axes(&self, a: i32, b: i32) -> Self {
-        let ndim = self.ndim();
-        let mut perm: Vec<i32> = (0..ndim).collect();
-        let a_idx = if a < 0 { ndim + a } else { a } as usize;
-        let b_idx = if b < 0 { ndim + b } else { b } as usize;
-        perm.swap(a_idx, b_idx);
-        self.transpose_axes(&perm)
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_swapaxes(dst.as_mut_ptr(), &self.raw, a, b);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
     }
 
     /// Total element count.

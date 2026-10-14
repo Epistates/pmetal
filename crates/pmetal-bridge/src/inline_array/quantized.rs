@@ -2,8 +2,6 @@
 //!
 //! - `quantize_weights` / `dequantize`: per-group int4 / int8 quantization.
 //! - `quantized_matmul` / `gather_qmm`: dense and MoE-routed quantized matmul.
-//! - `save_safetensors`: save-side of the safetensors codec (the load side
-//!   lives in [`super::safetensors`]).
 
 use std::mem::MaybeUninit;
 
@@ -308,28 +306,6 @@ impl InlineArray {
                     raw: s.assume_init(),
                 },
             )
-        }
-    }
-
-    // ── save-side of the safetensors codec ──────────────────────────────
-
-    /// Save arrays to safetensors format.
-    pub fn save_safetensors(path: &str, entries: &[(&str, &InlineArray)]) {
-        let c_path = std::ffi::CString::new(path).expect("null byte in path");
-        let c_keys: Vec<std::ffi::CString> = entries
-            .iter()
-            .map(|(k, _)| std::ffi::CString::new(*k).expect("null byte in key"))
-            .collect();
-        let key_ptrs: Vec<*const std::ffi::c_char> = c_keys.iter().map(|k| k.as_ptr()).collect();
-        // Build a contiguous array of RawBufs (copy refs, not move)
-        let raw_arrays: Vec<RawBuf> = entries.iter().map(|(_, a)| a.raw).collect();
-        unsafe {
-            mlx_inline_save_safetensors(
-                c_path.as_ptr(),
-                key_ptrs.as_ptr(),
-                raw_arrays.as_ptr(),
-                entries.len() as i32,
-            );
         }
     }
 }

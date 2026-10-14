@@ -7,9 +7,33 @@
 
 use std::mem::MaybeUninit;
 
-use super::dtype::ArrayElement;
+use super::dtype::{ArrayElement, IntoDtype};
 use super::ffi::*;
 use super::{InlineArray, RawBuf};
+
+/// The element count `shape` describes, once `len` elements are known to
+/// cover it.
+///
+/// The slice constructors hand MLX a pointer and a shape, and MLX copies
+/// `product(shape)` elements from that pointer, so a slice shorter than the
+/// shape is an out-of-bounds read of the caller's allocation. A longer one is
+/// fine: the array takes the prefix.
+#[track_caller]
+fn check_slice_covers(what: &str, len: usize, shape: &[i32]) -> usize {
+    let mut needed: usize = 1;
+    for &dim in shape {
+        let dim = usize::try_from(dim)
+            .unwrap_or_else(|_| panic!("{what}: negative dimension in shape {shape:?}"));
+        needed = needed
+            .checked_mul(dim)
+            .unwrap_or_else(|| panic!("{what}: shape {shape:?} overflows usize"));
+    }
+    assert!(
+        len >= needed,
+        "{what}: shape {shape:?} needs {needed} elements but the slice has {len}"
+    );
+    needed
+}
 
 impl InlineArray {
     // ── Scalar / identity / iterator constructors ────────────────────────
@@ -56,7 +80,8 @@ impl InlineArray {
         }
     }
 
-    pub fn zeros(shape: &[i32], dtype: i32) -> Self {
+    pub fn zeros(shape: &[i32], dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_zeros(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
@@ -66,7 +91,8 @@ impl InlineArray {
         }
     }
 
-    pub fn ones(shape: &[i32], dtype: i32) -> Self {
+    pub fn ones(shape: &[i32], dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_ones(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
@@ -78,7 +104,14 @@ impl InlineArray {
 
     // ── Shaped slice loaders ─────────────────────────────────────────────
 
+    /// A float32 array of `shape` holding the first `product(shape)` values
+    /// of `data`.
+    ///
+    /// # Panics
+    /// If `shape` has a negative dimension or `data` is shorter than the
+    /// shape needs. The slice constructors below panic the same way.
     pub fn from_f32_slice(data: &[f32], shape: &[i32]) -> Self {
+        check_slice_covers("from_f32_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_f32_slice(
@@ -94,6 +127,7 @@ impl InlineArray {
     }
 
     pub fn from_u32_slice(data: &[u32], shape: &[i32]) -> Self {
+        check_slice_covers("from_u32_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_u32_slice(
@@ -109,6 +143,7 @@ impl InlineArray {
     }
 
     pub fn from_u8_slice(data: &[u8], shape: &[i32]) -> Self {
+        check_slice_covers("from_u8_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_u8_slice(
@@ -123,7 +158,9 @@ impl InlineArray {
         }
     }
 
-    pub fn from_u16_bits_slice(data: &[u16], shape: &[i32], dtype: i32) -> Self {
+    pub fn from_u16_bits_slice(data: &[u16], shape: &[i32], dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
+        check_slice_covers("from_u16_bits_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_from_u16_bits_slice(
@@ -149,24 +186,28 @@ impl InlineArray {
         if rc == 0 { Some(out) } else { None }
     }
 
-    /// Create a 1-D int32 array from a Rust slice — zero copy for token IDs.
+    /// Create a 1-D int32 array from a Rust slice (the values are copied).
     ///
     /// Typical use: prefill token IDs for `embedding.take_axis(ids, 0)`.
+    ///
+    /// # Panics
+    /// If the slice has more than `i32::MAX` elements.
     pub fn from_i32_slice(data: &[i32]) -> Self {
+        let len = i32::try_from(data.len()).expect("from_i32_slice: more than i32::MAX elements");
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
-            mlx_inline_from_i32_slice(dst.as_mut_ptr(), data.as_ptr(), data.len() as i32);
+            mlx_inline_from_i32_slice(dst.as_mut_ptr(), data.as_ptr(), len);
             Self {
                 raw: dst.assume_init(),
             }
         }
     }
 
-    /// Create a shaped int32 array from a Rust slice.
-    ///
-    /// Shape must satisfy `shape.iter().product::<i32>() == data.len() as i32`.
+    /// Create a shaped int32 array from the first `product(shape)` values of
+    /// a Rust slice; panics as [`Self::from_f32_slice`] does.
     pub fn from_i32_slice_shaped(data: &[i32], shape: &[i32]) -> Self {
-        Self::from_i32_slice(data).reshape(shape)
+        let needed = check_slice_covers("from_i32_slice_shaped", data.len(), shape);
+        Self::from_i32_slice(&data[..needed]).reshape(shape)
     }
 
     /// Generic `from_slice::<T>(data, shape)`.
@@ -183,7 +224,8 @@ impl InlineArray {
 
     /// Create a range [0, 1, ..., n-1] with full Metal buffer (no broadcast).
     /// Useful for benchmarks — ensures matmuls read real data from GPU memory.
-    pub fn arange(n: i32, dtype: i32) -> Self {
+    pub fn arange(n: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = std::mem::MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_arange(dst.as_mut_ptr(), n, dtype);
@@ -207,14 +249,15 @@ impl InlineArray {
     }
 
     /// Sample from N(0,1) with the calling thread's default key.
-    pub fn random_normal(shape: &[i32], dtype: i32) -> Self {
+    pub fn random_normal(shape: &[i32], dtype: impl IntoDtype) -> Self {
         Self::random_normal_keyed(shape, dtype, None)
     }
 
     /// Sample from N(0,1). With a `key` ([`Self::random_key`]) the draw is a
     /// function of it alone; without one it takes the calling thread's
     /// default key, which every unkeyed draw advances.
-    pub fn random_normal_keyed(shape: &[i32], dtype: i32, key: Option<&Self>) -> Self {
+    pub fn random_normal_keyed(shape: &[i32], dtype: impl IntoDtype, key: Option<&Self>) -> Self {
+        let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -232,14 +275,15 @@ impl InlineArray {
     }
 
     /// Sample from U(0,1) with the calling thread's default key.
-    pub fn random_uniform(shape: &[i32], dtype: i32) -> Self {
+    pub fn random_uniform(shape: &[i32], dtype: impl IntoDtype) -> Self {
         Self::random_uniform_keyed(shape, dtype, None)
     }
 
     /// Sample from U(0,1). With a `key` ([`Self::random_key`]) the draw is a
     /// function of it alone; without one it takes the calling thread's
     /// default key, which every unkeyed draw advances.
-    pub fn random_uniform_keyed(shape: &[i32], dtype: i32, key: Option<&Self>) -> Self {
+    pub fn random_uniform_keyed(shape: &[i32], dtype: impl IntoDtype, key: Option<&Self>) -> Self {
+        let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -281,9 +325,10 @@ impl InlineArray {
         low: i32,
         high: i32,
         shape: &[i32],
-        dtype: i32,
+        dtype: impl IntoDtype,
         key: Option<&Self>,
     ) -> Self {
+        let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -304,7 +349,8 @@ impl InlineArray {
 
     // ── Creation helpers: full, eye, tri ─────────────────────────────────
 
-    pub fn full(shape: &[i32], val: f32, dtype: i32) -> Self {
+    pub fn full(shape: &[i32], val: f32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_full(
@@ -321,7 +367,8 @@ impl InlineArray {
     }
 
     /// Identity matrix [n, n].
-    pub fn eye(n: i32, dtype: i32) -> Self {
+    pub fn eye(n: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_eye(dst.as_mut_ptr(), n, dtype);
@@ -332,7 +379,8 @@ impl InlineArray {
     }
 
     /// Triangular matrix [n, m] with diagonal offset k.
-    pub fn tri(n: i32, m: i32, k: i32, dtype: i32) -> Self {
+    pub fn tri(n: i32, m: i32, k: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_tri(dst.as_mut_ptr(), n, m, k, dtype);
@@ -344,7 +392,8 @@ impl InlineArray {
 
     // ── linspace ─────────────────────────────────────────────────────────
 
-    pub fn linspace(start: f32, stop: f32, n: i32, dtype: i32) -> Self {
+    pub fn linspace(start: f32, stop: f32, n: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_linspace(dst.as_mut_ptr(), start, stop, n, dtype);

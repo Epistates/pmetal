@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use pmetal_bridge::compat::Array;
+use pmetal_bridge::compat::{Array, Exception};
 use pmetal_bridge::inline_array;
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,7 @@ use crate::{Result, SftError};
 /// called whenever the training loop takes a new in-memory best snapshot so
 /// that the weights are recoverable if the process is interrupted and resumed.
 ///
-/// The file is written atomically via a `.tmp` rename to avoid leaving a
+/// The file is written atomically (beside the file, then renamed) to avoid leaving a
 /// partially-written snapshot that could corrupt a resume.
 pub fn save_best_snapshot(checkpoint_dir: &Path, weights: &HashMap<Rc<str>, Array>) -> Result<()> {
     fs::create_dir_all(checkpoint_dir).map_err(|e| {
@@ -35,19 +35,10 @@ pub fn save_best_snapshot(checkpoint_dir: &Path, weights: &HashMap<Rc<str>, Arra
         ))
     })?;
 
-    let tmp_path = checkpoint_dir.join("best_snapshot.safetensors.tmp");
+    // The save is atomic (written beside the file and renamed over it).
     let final_path = checkpoint_dir.join("best_snapshot.safetensors");
-
-    let tmp_path_str = path_as_str(&tmp_path)?;
     let entries: Vec<(&str, &Array)> = weights.iter().map(|(k, v)| (k.as_ref(), v)).collect();
-    Array::save_safetensors(tmp_path_str, &entries);
-
-    fs::rename(&tmp_path, &final_path).map_err(|e| {
-        SftError::Io(std::io::Error::new(
-            e.kind(),
-            format!("Failed to rename best snapshot: {e}"),
-        ))
-    })?;
+    Array::save_safetensors(path_as_str(&final_path)?, &entries).map_err(Exception::from)?;
 
     tracing::debug!("Persisted best snapshot to {:?}", final_path);
     Ok(())
@@ -177,7 +168,7 @@ fn write_checkpoint_to_dir<'a>(
 
     let weights_path = dir.join("lora_weights.safetensors");
     let entries: Vec<(&str, &Array)> = params.into_iter().collect();
-    Array::save_safetensors(path_as_str(&weights_path)?, &entries);
+    Array::save_safetensors(path_as_str(&weights_path)?, &entries).map_err(Exception::from)?;
 
     let metadata_path = dir.join("metadata.json");
     let mut file = File::create(&metadata_path).map_err(|e| {

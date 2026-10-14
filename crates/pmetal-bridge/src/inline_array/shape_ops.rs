@@ -15,12 +15,38 @@ impl InlineArray {
     pub fn ndim(&self) -> i32 {
         unsafe { mlx_inline_ndim(&self.raw) }
     }
+
+    /// Size of one axis; negative axes count from the end.
+    ///
+    /// # Panics
+    /// If `axis` is outside `-ndim..ndim`, as slice indexing would.
     pub fn dim(&self, axis: i32) -> i32 {
-        unsafe { mlx_inline_dim(&self.raw, axis) }
+        let shape = self.shape();
+        let ndim = shape.len() as i32;
+        let index = if axis < 0 { axis + ndim } else { axis };
+        match usize::try_from(index).ok().and_then(|i| shape.get(i)) {
+            Some(&len) => len,
+            None => panic!("axis {axis} is out of range for an array with {ndim} dimensions"),
+        }
     }
+
+    /// The shape, borrowed from the array.
     pub fn shape(&self) -> &[i32] {
-        unsafe { std::slice::from_raw_parts(mlx_inline_shape(&self.raw), self.ndim() as usize) }
+        let mut ndim = 0;
+        // SAFETY: the pointer addresses `ndim` ints in the array's own shape
+        // vector, which lives as long as `self` and which no `&self` method
+        // changes. A 0-d array's pointer may be null or dangling, so it is
+        // never turned into a slice.
+        unsafe {
+            let ptr = mlx_inline_shape(&self.raw, &mut ndim);
+            if ndim <= 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(ptr, ndim as usize)
+            }
+        }
     }
+
     pub fn dtype_raw(&self) -> i32 {
         unsafe { mlx_inline_dtype(&self.raw) }
     }
@@ -55,8 +81,18 @@ impl InlineArray {
         }
     }
 
+    /// `self[start..stop]` along every axis, stride 1.
+    ///
+    /// # Panics
+    /// If `start` and `stop` differ in length.
     #[inline]
+    #[track_caller]
     pub fn slice(&self, start: &[i32], stop: &[i32]) -> Self {
+        assert_eq!(
+            start.len(),
+            stop.len(),
+            "slice: start and stop must name the same number of axes"
+        );
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_slice(
@@ -72,11 +108,21 @@ impl InlineArray {
         }
     }
 
-    /// In-place slice update. Consumes self so MLX sees refcount=1 and can
-    /// mutate the buffer directly (zero allocation). Matches Python's
-    /// `self.keys[..., prev:offset, :] = keys` pattern.
+    /// A copy of `self` with `value` written into `[start..stop]`. When the
+    /// caller drops its handle to `self` afterwards (`x = x.slice_set(..)`)
+    /// MLX sees a sole owner and updates the buffer in place, with no
+    /// allocation. Matches Python's `self.keys[..., prev:offset, :] = keys`.
+    ///
+    /// # Panics
+    /// If `start` and `stop` differ in length.
     #[inline]
+    #[track_caller]
     pub fn slice_set(&self, value: &Self, start: &[i32], stop: &[i32]) -> Self {
+        assert_eq!(
+            start.len(),
+            stop.len(),
+            "slice_set: start and stop must name the same number of axes"
+        );
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_slice_set(
@@ -277,10 +323,32 @@ impl InlineArray {
             }
         }
     }
+    /// Split into `sections` equal pieces along `axis`, like
+    /// `mx.split(a, sections, axis)`. The axis must divide evenly; otherwise
+    /// MLX's error is on the error channel and the result is empty.
     pub fn split_sections(&self, sections: i32, axis: i32) -> Vec<Self> {
-        // Allocate enough output slots.
-        let max = sections as usize;
-        let mut buf: Vec<MaybeUninit<RawBuf>> = (0..max).map(|_| MaybeUninit::uninit()).collect();
+        // One output slot per section, and a valid split has at most one
+        // section per element of the axis. A count outside that is an error
+        // MLX reports (one slot is enough for it to write nothing to), and
+        // must not size the allocation: `sections` is the caller's.
+        let axis_len = {
+            let shape = self.shape();
+            let index = if axis < 0 {
+                axis + shape.len() as i32
+            } else {
+                axis
+            };
+            usize::try_from(index)
+                .ok()
+                .and_then(|i| shape.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let slots = match usize::try_from(sections) {
+            Ok(n) if (1..=axis_len.max(1) as usize).contains(&n) => n,
+            _ => 1,
+        };
+        let mut buf: Vec<MaybeUninit<RawBuf>> = (0..slots).map(|_| MaybeUninit::uninit()).collect();
         let mut out_count: i32 = 0;
         unsafe {
             mlx_inline_split_sections(
@@ -291,6 +359,7 @@ impl InlineArray {
                 &mut out_count,
             );
         }
+        debug_assert!(out_count as usize <= slots);
         (0..out_count as usize)
             .map(|i| unsafe {
                 Self {

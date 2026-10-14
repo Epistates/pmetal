@@ -7,20 +7,21 @@
 use std::mem::MaybeUninit;
 
 mod dtype;
-pub use dtype::{ArrayElement, AsDtype, BridgeScalar, bf16, f16};
+pub use dtype::{ArrayElement, AsDtype, BridgeScalar, IntoDtype, bf16, f16};
 
 mod diagnostics;
 pub use diagnostics::{
-    clear_cache, disable_compile, enable_compile, eval_and_detach_many, get_active_memory,
-    get_cache_memory, get_max_recommended_size, get_peak_memory, graph_desc_count, graph_dump,
-    graph_node_count, init_device, metal_start_capture, metal_stop_capture, metallib_path,
-    new_generation_stream, reset_default_stream, reset_peak_memory, set_generation_stream,
-    set_metallib_path, set_wired_limit, set_wired_limit_max, synchronize, validate_metallib,
-    verify_buffer_layout,
+    DeviceInfo, GenerationStream, clear_cache, device_info, disable_compile, enable_compile,
+    eval_and_detach_many, get_active_memory, get_cache_memory, get_max_recommended_size,
+    get_memory_limit, get_peak_memory, graph_desc_count, graph_dump, graph_node_count, init_device,
+    metal_start_capture, metal_stop_capture, metallib_path, new_generation_stream,
+    reset_default_stream, reset_peak_memory, set_cache_limit, set_generation_stream,
+    set_memory_limit, set_metallib_path, set_wired_limit, set_wired_limit_max, synchronize,
+    validate_metallib, verify_buffer_layout,
 };
 
 mod safetensors;
-pub use safetensors::{load_safetensors_shard, random_seed};
+pub use safetensors::{load_safetensors_shard, random_seed, try_load_safetensors_shard};
 
 mod autograd;
 pub use autograd::{checkpoint_apply, checkpoint_apply_unchecked, value_and_grad};
@@ -81,9 +82,19 @@ use ffi::*;
 // ── InlineArray ───────────────────────────────────────────────────────────
 
 /// Stack-allocated MLX array. Zero heap allocation per op.
+///
+/// `repr(transparent)` over the raw buffer: code that hands C++ a run of
+/// arrays (a `Vec<InlineArray>` as a `*const RawBuf`) relies on the two having
+/// one layout, which an unannotated struct does not promise.
+#[repr(transparent)]
 pub struct InlineArray {
     pub(crate) raw: RawBuf,
 }
+
+const _: () = assert!(
+    std::mem::size_of::<InlineArray>() == std::mem::size_of::<RawBuf>()
+        && std::mem::align_of::<InlineArray>() == std::mem::align_of::<RawBuf>()
+);
 
 #[derive(Clone, Debug)]
 pub struct EvalToken {
@@ -109,6 +120,9 @@ impl EvalToken {
             Ok(()) => after,
             Err(err) => {
                 let _ = after;
+                // Reporting it observes it: it must not come out of the
+                // unobserved channel a second time.
+                crate::error::clear_last_error();
                 Err(err)
             }
         }
@@ -144,6 +158,15 @@ impl Clone for InlineArray {
     }
 }
 
+// SAFETY: an `mlx::core::array` is a handle to a reference-counted
+// description, so cloning, dropping and reading the metadata of a handle from
+// any thread is sound.
+//
+// What this does NOT promise is that two threads may *evaluate* the same
+// unevaluated array at once: MLX does not lock a graph while it is being
+// evaluated, and `eval(&self)` takes a shared reference. An array that more
+// than one thread reads (shared weights, say) should be evaluated on one
+// thread before it is shared, as model loading does.
 unsafe impl Send for InlineArray {}
 unsafe impl Sync for InlineArray {}
 
