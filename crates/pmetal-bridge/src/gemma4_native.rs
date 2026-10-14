@@ -111,9 +111,9 @@ pub struct Gemma4Config {
     /// `None` (the transformers default) applies no softcap.
     #[serde(default)]
     pub final_logit_softcapping: Option<f32>,
-    /// Per-layer `"sliding_attention"` / `"full_attention"`. [`parse_config_text`]
-    /// fills in `Gemma4TextConfig`'s default (every sixth layer full) when the
-    /// config has none, and makes the last layer full as it does.
+    /// Per-layer `"sliding_attention"` / `"full_attention"`. Parsing fills in
+    /// `Gemma4TextConfig`'s default (every sixth layer full) when the config
+    /// has none, and makes the last layer full as it does.
     #[serde(default)]
     pub layer_types: Vec<String>,
     /// `"all"` makes every layer attend bidirectionally; `"vision"` only

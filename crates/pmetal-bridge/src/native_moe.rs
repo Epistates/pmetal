@@ -370,7 +370,7 @@ mod tests {
     /// threshold nothing is reordered.
     #[test]
     fn grouping_by_expert_changes_no_row() {
-        assert!(48 * 2 >= GROUPING_THRESHOLD && 16 * 2 < GROUPING_THRESHOLD);
+        const { assert!(48 * 2 >= GROUPING_THRESHOLD && 16 * 2 < GROUPING_THRESHOLD) };
         run_dense(48);
         run_dense(16);
     }
