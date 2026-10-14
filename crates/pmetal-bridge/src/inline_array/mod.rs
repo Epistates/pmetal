@@ -26,7 +26,9 @@ mod autograd;
 pub use autograd::{checkpoint_apply, checkpoint_apply_unchecked, value_and_grad};
 
 mod cce;
-pub use cce::{FusedCceOutput, FusedCceParams, cut_cross_entropy_fused};
+pub use cce::{
+    FusedCceOutput, FusedCceParams, LogitRowStats, cut_cross_entropy_fused, logit_row_stats,
+};
 
 mod compiled;
 mod eval;

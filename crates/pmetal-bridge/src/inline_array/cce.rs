@@ -110,3 +110,58 @@ pub fn cut_cross_entropy_fused(
         })),
     }
 }
+
+/// What a cross-entropy needs of each row of a `[tokens, vocab]` logit
+/// matrix, all `[tokens]` f32.
+#[derive(Debug)]
+pub struct LogitRowStats {
+    /// The row's logsumexp.
+    pub lse: InlineArray,
+    /// The logit at the row's target, as stored; zero where the target is
+    /// outside the vocabulary.
+    pub target_logit: InlineArray,
+    /// The sum of the row's logits.
+    pub logit_sum: InlineArray,
+}
+
+/// Each row's logsumexp, target logit and logit sum, from one pass over the
+/// row in f32 whatever the logits' dtype.
+///
+/// Differentiable with respect to `logits`: the gradient is built by one
+/// kernel, in the logits' dtype, and the f32 `[tokens, vocab]` copy of the
+/// logits (and of their gradient) that the same statistics built from MLX ops
+/// would hold never exists. On a device without Metal, or for a dtype the
+/// kernels don't take, the statistics come from MLX ops instead.
+///
+/// Like any other op, an input the kernels reject (a matrix that isn't
+/// `[tokens, vocab]`, a target count that isn't the token count) leaves the
+/// error on the bridge's channel and placeholder arrays in its place.
+///
+/// * `logits` - `[tokens, vocab]`
+/// * `targets` - `[tokens]`, integer
+pub fn logit_row_stats(logits: &InlineArray, targets: &InlineArray) -> LogitRowStats {
+    let mut lse = MaybeUninit::<RawBuf>::uninit();
+    let mut target = MaybeUninit::<RawBuf>::uninit();
+    let mut sum = MaybeUninit::<RawBuf>::uninit();
+    unsafe {
+        mlx_inline_ce_row_stats(
+            lse.as_mut_ptr(),
+            target.as_mut_ptr(),
+            sum.as_mut_ptr(),
+            &logits.raw,
+            &targets.raw,
+        );
+        // Every path leaves all three outputs holding an array.
+        LogitRowStats {
+            lse: InlineArray {
+                raw: lse.assume_init(),
+            },
+            target_logit: InlineArray {
+                raw: target.assume_init(),
+            },
+            logit_sum: InlineArray {
+                raw: sum.assume_init(),
+            },
+        }
+    }
+}
