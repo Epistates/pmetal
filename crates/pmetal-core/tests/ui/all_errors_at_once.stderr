@@ -1,0 +1,17 @@
+error: `min` only applies to numeric fields
+ --> tests/ui/all_errors_at_once.rs:6:43
+  |
+6 |     #[job(label = "A", group = "G", min = 1)]
+  |                                           ^
+
+error: `invert` only applies together with `flag`
+ --> tests/ui/all_errors_at_once.rs:8:37
+  |
+8 |     #[job(label = "B", group = "G", invert)]
+  |                                     ^^^^^^
+
+error: field `c` needs `#[job(label = "...")]`
+  --> tests/ui/all_errors_at_once.rs:11:5
+   |
+11 |     c: String,
+   |     ^

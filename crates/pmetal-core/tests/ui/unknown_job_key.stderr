@@ -1,0 +1,5 @@
+error: unknown #[job(...)] key
+ --> tests/ui/unknown_job_key.rs:6:37
+  |
+6 |     #[job(label = "L", group = "G", lable = "typo")]
+  |                                     ^^^^^

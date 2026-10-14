@@ -1,0 +1,5 @@
+error: field `f` needs `#[job(label = "...")]`
+ --> tests/ui/missing_label.rs:7:5
+  |
+7 |     f: String,
+  |     ^

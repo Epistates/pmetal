@@ -1,0 +1,5 @@
+error: `max` is below `min`
+ --> tests/ui/max_below_min.rs:6:52
+  |
+6 |     #[job(label = "L", group = "G", min = 5, max = 1)]
+  |                                                    ^

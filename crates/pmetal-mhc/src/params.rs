@@ -1,18 +1,42 @@
 //! Learnable parameters for mHC layers.
 //!
-//! This module defines the parameter structures used by mHC layers,
-//! including gating factors, biases, and projection matrices.
+//! This module defines the parameter structures used by mHC layers: the
+//! gating factors, the static biases and the fused dynamic projection.
 
 use crate::config::MhcConfig;
-use ndarray::{Array1, Array2};
-use rand_distr::{Distribution, Normal, Uniform};
+use crate::error::MhcError;
+use ndarray::{Array1, Array2, ArrayView2, s};
+use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
+
+/// Logit given to every off-diagonal entry of `b_res` at initialization (the
+/// diagonal gets 0). After the Sinkhorn projection that is the identity to
+/// within `3e-4` per entry for `n = 4`, so a fresh layer leaves each stream
+/// where it was.
+pub const RES_OFF_DIAGONAL_INIT: f32 = -8.0;
+
+/// Standard deviation of the dynamic projection's random initialization.
+const PHI_INIT_STD: f32 = 0.02;
 
 /// Learnable parameters for a single mHC layer.
 ///
 /// These parameters define the mappings H^pre, H^post, and H^res
-/// that govern information flow in the mHC architecture.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// that govern information flow in the mHC architecture:
+///
+/// ```text
+/// x' = RMSNorm(vec(x))                                    [nC]
+/// proj = x' · φ                                           [2n + n²]
+/// H̃^pre  = α_pre  · proj[..n]       + b_pre               [n]
+/// H̃^post = α_post · proj[n..2n]     + b_post              [n]
+/// H̃^res  = α_res  · mat(proj[2n..]) + b_res               [n, n]
+/// ```
+///
+/// The three projections are one matrix, so the dynamic mappings of a token
+/// cost a single `[nC] × [nC, 2n + n²]` product, and the layout is the one the
+/// released models store (`fn`, transposed, with the columns ordered pre, post,
+/// res). The RMSNorm carries no weight of its own: a per-channel scale of `x'`
+/// is a scale of the rows of φ, so it would only duplicate φ's parameters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MhcParams {
     // === Gating Factors (α) ===
     /// Gating factor for H^pre mapping.
@@ -31,121 +55,97 @@ pub struct MhcParams {
     /// Static bias for H^post mapping. Shape: `[n]`
     pub b_post: Array1<f32>,
 
-    /// Static bias for H^res mapping. Shape: [n, n]
+    /// Static bias for H^res mapping. Shape: `[n, n]`
     pub b_res: Array2<f32>,
 
-    // === Dynamic Mapping Projections (φ) ===
-    /// Projection for dynamic H^pre mapping. Shape: [nC, n]
-    pub phi_pre: Array2<f32>,
-
-    /// Projection for dynamic H^post mapping. Shape: [nC, n]
-    pub phi_post: Array2<f32>,
-
-    /// Projection for dynamic H^res mapping. Shape: [nC, n²]
-    pub phi_res: Array2<f32>,
-
-    // === RMSNorm Weight (absorbed into φ) ===
-    /// RMSNorm weight for input normalization. Shape: `[nC]`
-    pub rmsnorm_weight: Array1<f32>,
+    // === Dynamic Mapping Projection (φ) ===
+    /// Fused projection of the normalized stream to the three mappings'
+    /// logits. Shape: `[nC, 2n + n²]`; columns `0..n` feed H^pre, `n..2n`
+    /// H^post and `2n..` H^res (row-major `n × n`).
+    pub phi: Array2<f32>,
 }
 
 impl MhcParams {
-    /// Create new parameters with the given configuration.
+    /// Create new parameters with the given configuration, drawing the
+    /// projection from the thread's random generator.
     ///
-    /// Initializes parameters according to the paper's recommendations:
-    /// - α values initialized to `alpha_init` (typically 0.01)
-    /// - Biases initialized to produce identity-like behavior
-    /// - Projections initialized with small random values
+    /// Use [`MhcParams::with_rng`] for a reproducible initialization.
     pub fn new(config: &MhcConfig) -> Self {
-        let n = config.expansion_rate;
-        let c = config.hidden_dim;
-        let nc = n * c;
-        let n_sq = n * n;
-
-        // Initialize gating factors to small values
-        let alpha = config.alpha_init;
-
-        // Initialize biases
-        // b_pre: uniform weights (1/n) so all streams contribute equally initially
-        let b_pre = Array1::from_elem(n, 1.0 / n as f32);
-
-        // b_post: ones so output distributes to all streams
-        let b_post = Array1::ones(n);
-
-        // b_res: identity matrix (preserves streams initially)
-        let mut b_res = Array2::zeros((n, n));
-        for i in 0..n {
-            b_res[[i, i]] = 1.0;
-        }
-
-        // Initialize projections with small random values
-        let mut rng = rand::rng();
-        let std_dev = 0.02; // Small initialization
-        let normal = Normal::new(0.0, std_dev).expect("valid std_dev");
-
-        let phi_pre = Array2::from_shape_fn((nc, n), |_| normal.sample(&mut rng) as f32);
-        let phi_post = Array2::from_shape_fn((nc, n), |_| normal.sample(&mut rng) as f32);
-        let phi_res = Array2::from_shape_fn((nc, n_sq), |_| normal.sample(&mut rng) as f32);
-
-        // RMSNorm weight initialized to ones
-        let rmsnorm_weight = Array1::ones(nc);
-
-        Self {
-            alpha_pre: alpha,
-            alpha_post: alpha,
-            alpha_res: alpha,
-            b_pre,
-            b_post,
-            b_res,
-            phi_pre,
-            phi_post,
-            phi_res,
-            rmsnorm_weight,
-        }
+        Self::with_rng(config, &mut rand::rng())
     }
 
-    /// Create random parameters for testing.
-    pub fn random(config: &MhcConfig) -> Self {
-        let n = config.expansion_rate;
-        let c = config.hidden_dim;
-        let nc = n * c;
-        let n_sq = n * n;
+    /// Create new parameters, drawing the projection from `rng`.
+    ///
+    /// See [`MhcParams::identity_init`] for the static part: a fresh layer is
+    /// a plain residual connection when its streams start out equal.
+    /// The projection starts as `N(0, 0.02²)`, small enough next to the gates
+    /// (`α = 0.01`) that the dynamic part begins as a perturbation.
+    pub fn with_rng<R: rand::Rng + ?Sized>(config: &MhcConfig, rng: &mut R) -> Self {
+        let mut params = Self::identity_init(config);
+        let normal = Normal::new(0.0, PHI_INIT_STD).expect("a positive std is valid");
+        params.phi.mapv_inplace(|_| normal.sample(&mut *rng));
+        params
+    }
 
-        let mut rng = rand::rng();
-        let uniform = Uniform::new(-1.0, 1.0).expect("valid range");
+    /// Parameters whose mappings are the same for every input and make the
+    /// layer a plain residual connection when the `n` streams are equal:
+    ///
+    /// - `b_pre` gives `H^pre = 1/n` (the mean of the streams: `σ(b) + ε = 1/n`),
+    /// - `b_post = 0` gives `H^post = 2σ(0) = 1`,
+    /// - `b_res` is [`RES_OFF_DIAGONAL_INIT`] off the diagonal and 0 on it, so
+    ///   `H^res` is the identity to within a few 1e-4,
+    /// - `φ = 0`.
+    ///
+    /// Then `x_{l+1} = x + F(x)` in every stream.
+    pub fn identity_init(config: &MhcConfig) -> Self {
+        let n = config.expansion_rate;
+        let nc = config.expanded_dim();
+
+        // σ(b) + ε = 1/n  ⇒  b = logit(1/n − ε).
+        let p = (1.0 / n as f64 - config.epsilon as f64).clamp(1e-12, 1.0 - 1e-12);
+        let b_pre_value = (p / (1.0 - p)).ln() as f32;
+
+        let b_res = Array2::from_shape_fn(
+            (n, n),
+            |(i, j)| {
+                if i == j { 0.0 } else { RES_OFF_DIAGONAL_INIT }
+            },
+        );
 
         Self {
             alpha_pre: config.alpha_init,
             alpha_post: config.alpha_init,
             alpha_res: config.alpha_init,
-            b_pre: Array1::from_shape_fn(n, |_| uniform.sample(&mut rng) as f32),
-            b_post: Array1::from_shape_fn(n, |_| uniform.sample(&mut rng) as f32),
-            b_res: Array2::from_shape_fn((n, n), |_| uniform.sample(&mut rng) as f32),
-            phi_pre: Array2::from_shape_fn((nc, n), |_| uniform.sample(&mut rng) as f32),
-            phi_post: Array2::from_shape_fn((nc, n), |_| uniform.sample(&mut rng) as f32),
-            phi_res: Array2::from_shape_fn((nc, n_sq), |_| uniform.sample(&mut rng) as f32),
-            rmsnorm_weight: Array1::ones(nc),
+            b_pre: Array1::from_elem(n, b_pre_value),
+            b_post: Array1::zeros(n),
+            b_res,
+            phi: Array2::zeros((nc, config.mixing_dim())),
         }
+    }
+
+    /// The columns of φ that feed H^pre. Shape: `[nC, n]`
+    pub fn phi_pre(&self) -> ArrayView2<'_, f32> {
+        let n = self.b_pre.len();
+        self.phi.slice(s![.., ..n])
+    }
+
+    /// The columns of φ that feed H^post. Shape: `[nC, n]`
+    pub fn phi_post(&self) -> ArrayView2<'_, f32> {
+        let n = self.b_pre.len();
+        self.phi.slice(s![.., n..2 * n])
+    }
+
+    /// The columns of φ that feed H^res (row-major `n × n`). Shape: `[nC, n²]`
+    pub fn phi_res(&self) -> ArrayView2<'_, f32> {
+        let n = self.b_pre.len();
+        self.phi.slice(s![.., 2 * n..])
     }
 
     /// Get the total number of parameters.
     pub fn num_params(&self) -> usize {
         let n = self.b_pre.len();
-
-        // Gating factors: 3
-        let gating = 3;
-
-        // Biases: n + n + n²
-        let biases = n + n + n * n;
-
-        // Projections: nC×n + nC×n + nC×n²
-        let nc = self.phi_pre.nrows();
-        let projections = nc * n + nc * n + nc * n * n;
-
-        // RMSNorm: nC
-        let rmsnorm = nc;
-
-        gating + biases + projections + rmsnorm
+        // Gating factors, biases, projection.
+        3 + (2 * n + n * n) + self.phi.len()
     }
 
     /// Get memory usage in bytes (assuming f32).
@@ -154,68 +154,23 @@ impl MhcParams {
     }
 
     /// Validate parameter shapes against configuration.
-    pub fn validate(&self, config: &MhcConfig) -> Result<(), ParamsValidationError> {
+    pub fn validate(&self, config: &MhcConfig) -> Result<(), MhcError> {
         let n = config.expansion_rate;
-        let nc = config.expanded_dim();
-        let n_sq = n * n;
-
-        if self.b_pre.len() != n {
-            return Err(ParamsValidationError::ShapeMismatch {
-                param: "b_pre".into(),
-                expected: vec![n],
-                actual: vec![self.b_pre.len()],
-            });
-        }
-
-        if self.b_post.len() != n {
-            return Err(ParamsValidationError::ShapeMismatch {
-                param: "b_post".into(),
-                expected: vec![n],
-                actual: vec![self.b_post.len()],
-            });
-        }
-
-        if self.b_res.shape() != [n, n] {
-            return Err(ParamsValidationError::ShapeMismatch {
-                param: "b_res".into(),
-                expected: vec![n, n],
-                actual: self.b_res.shape().to_vec(),
-            });
-        }
-
-        if self.phi_pre.shape() != [nc, n] {
-            return Err(ParamsValidationError::ShapeMismatch {
-                param: "phi_pre".into(),
-                expected: vec![nc, n],
-                actual: self.phi_pre.shape().to_vec(),
-            });
-        }
-
-        if self.phi_post.shape() != [nc, n] {
-            return Err(ParamsValidationError::ShapeMismatch {
-                param: "phi_post".into(),
-                expected: vec![nc, n],
-                actual: self.phi_post.shape().to_vec(),
-            });
-        }
-
-        if self.phi_res.shape() != [nc, n_sq] {
-            return Err(ParamsValidationError::ShapeMismatch {
-                param: "phi_res".into(),
-                expected: vec![nc, n_sq],
-                actual: self.phi_res.shape().to_vec(),
-            });
-        }
-
-        if self.rmsnorm_weight.len() != nc {
-            return Err(ParamsValidationError::ShapeMismatch {
-                param: "rmsnorm_weight".into(),
-                expected: vec![nc],
-                actual: vec![self.rmsnorm_weight.len()],
-            });
-        }
-
-        Ok(())
+        let check = |what: &'static str, expected: Vec<usize>, actual: &[usize]| {
+            if expected == actual {
+                Ok(())
+            } else {
+                Err(MhcError::shape(what, format!("{expected:?}"), actual))
+            }
+        };
+        check("b_pre", vec![n], self.b_pre.shape())?;
+        check("b_post", vec![n], self.b_post.shape())?;
+        check("b_res", vec![n, n], self.b_res.shape())?;
+        check(
+            "phi",
+            vec![config.expanded_dim(), config.mixing_dim()],
+            self.phi.shape(),
+        )
     }
 }
 
@@ -225,13 +180,13 @@ impl MhcParams {
 /// from the input and parameters for a specific batch.
 #[derive(Debug, Clone)]
 pub struct MhcMappings {
-    /// Pre-mapping H^pre. Shape: [batch, n]
+    /// Pre-mapping H^pre. Shape: `[batch, n]`
     pub h_pre: Array2<f32>,
 
-    /// Post-mapping H^post. Shape: [batch, n]
+    /// Post-mapping H^post. Shape: `[batch, n]`
     pub h_post: Array2<f32>,
 
-    /// Residual mapping H^res (doubly stochastic). Shape: [batch, n, n]
+    /// Residual mapping H^res (doubly stochastic). Shape: `[batch, n, n]`
     pub h_res: ndarray::Array3<f32>,
 }
 
@@ -257,7 +212,7 @@ impl MhcMappings {
 }
 
 /// Gradients for mHC parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MhcGradients {
     /// Gradient for alpha_pre.
     pub d_alpha_pre: f32,
@@ -274,28 +229,17 @@ pub struct MhcGradients {
     /// Gradient for b_post. Shape: `[n]`
     pub d_b_post: Array1<f32>,
 
-    /// Gradient for b_res. Shape: [n, n]
+    /// Gradient for b_res. Shape: `[n, n]`
     pub d_b_res: Array2<f32>,
 
-    /// Gradient for phi_pre. Shape: [nC, n]
-    pub d_phi_pre: Array2<f32>,
-
-    /// Gradient for phi_post. Shape: [nC, n]
-    pub d_phi_post: Array2<f32>,
-
-    /// Gradient for phi_res. Shape: [nC, n²]
-    pub d_phi_res: Array2<f32>,
-
-    /// Gradient for rmsnorm_weight. Shape: `[nC]`
-    pub d_rmsnorm_weight: Array1<f32>,
+    /// Gradient for phi. Shape: `[nC, 2n + n²]`
+    pub d_phi: Array2<f32>,
 }
 
 impl MhcGradients {
     /// Create zero gradients with the given configuration.
     pub fn zeros(config: &MhcConfig) -> Self {
         let n = config.expansion_rate;
-        let nc = config.expanded_dim();
-        let n_sq = n * n;
 
         Self {
             d_alpha_pre: 0.0,
@@ -304,10 +248,7 @@ impl MhcGradients {
             d_b_pre: Array1::zeros(n),
             d_b_post: Array1::zeros(n),
             d_b_res: Array2::zeros((n, n)),
-            d_phi_pre: Array2::zeros((nc, n)),
-            d_phi_post: Array2::zeros((nc, n)),
-            d_phi_res: Array2::zeros((nc, n_sq)),
-            d_rmsnorm_weight: Array1::zeros(nc),
+            d_phi: Array2::zeros((config.expanded_dim(), config.mixing_dim())),
         }
     }
 
@@ -319,10 +260,7 @@ impl MhcGradients {
         self.d_b_pre += &other.d_b_pre;
         self.d_b_post += &other.d_b_post;
         self.d_b_res += &other.d_b_res;
-        self.d_phi_pre += &other.d_phi_pre;
-        self.d_phi_post += &other.d_phi_post;
-        self.d_phi_res += &other.d_phi_res;
-        self.d_rmsnorm_weight += &other.d_rmsnorm_weight;
+        self.d_phi += &other.d_phi;
     }
 
     /// Scale all gradients by a factor.
@@ -333,31 +271,22 @@ impl MhcGradients {
         self.d_b_pre *= factor;
         self.d_b_post *= factor;
         self.d_b_res *= factor;
-        self.d_phi_pre *= factor;
-        self.d_phi_post *= factor;
-        self.d_phi_res *= factor;
-        self.d_rmsnorm_weight *= factor;
+        self.d_phi *= factor;
     }
 
-    /// Compute gradient norm (L2).
+    /// Compute gradient norm (L2), accumulated in `f64`.
     pub fn norm(&self) -> f32 {
-        let mut sum = 0.0f32;
-
-        sum += self.d_alpha_pre * self.d_alpha_pre;
-        sum += self.d_alpha_post * self.d_alpha_post;
-        sum += self.d_alpha_res * self.d_alpha_res;
-
-        sum += self.d_b_pre.iter().map(|x| x * x).sum::<f32>();
-        sum += self.d_b_post.iter().map(|x| x * x).sum::<f32>();
-        sum += self.d_b_res.iter().map(|x| x * x).sum::<f32>();
-
-        sum += self.d_phi_pre.iter().map(|x| x * x).sum::<f32>();
-        sum += self.d_phi_post.iter().map(|x| x * x).sum::<f32>();
-        sum += self.d_phi_res.iter().map(|x| x * x).sum::<f32>();
-
-        sum += self.d_rmsnorm_weight.iter().map(|x| x * x).sum::<f32>();
-
-        sum.sqrt()
+        let sq = |a: &[f32]| a.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>();
+        let scalars = [self.d_alpha_pre, self.d_alpha_post, self.d_alpha_res];
+        let arrays = self
+            .d_b_pre
+            .iter()
+            .chain(&self.d_b_post)
+            .chain(&self.d_b_res)
+            .chain(&self.d_phi)
+            .copied();
+        let total = sq(&scalars) + arrays.map(|x| f64::from(x) * f64::from(x)).sum::<f64>();
+        total.sqrt() as f32
     }
 
     /// Clip gradients by norm.
@@ -369,24 +298,10 @@ impl MhcGradients {
     }
 }
 
-/// Errors during parameter validation.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum ParamsValidationError {
-    /// Shape mismatch between expected and actual.
-    #[error("Shape mismatch for {param}: expected {expected:?}, got {actual:?}")]
-    ShapeMismatch {
-        /// Parameter name.
-        param: String,
-        /// Expected shape.
-        expected: Vec<usize>,
-        /// Actual shape.
-        actual: Vec<usize>,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     #[test]
     fn test_params_creation() {
@@ -394,11 +309,12 @@ mod tests {
         let params = MhcParams::new(&config);
 
         assert!(params.validate(&config).is_ok());
-        assert!(params.num_params() > 0);
+        // 3 gates, 2·4 + 16 biases, a 10240 × 24 projection.
+        assert_eq!(params.num_params(), 3 + 24 + 10240 * 24);
     }
 
     #[test]
-    fn test_params_shapes() {
+    fn test_params_shapes_and_views() {
         let config = MhcConfig {
             expansion_rate: 4,
             hidden_dim: 256,
@@ -409,10 +325,71 @@ mod tests {
         assert_eq!(params.b_pre.len(), 4);
         assert_eq!(params.b_post.len(), 4);
         assert_eq!(params.b_res.shape(), &[4, 4]);
-        assert_eq!(params.phi_pre.shape(), &[1024, 4]); // 4*256 = 1024
-        assert_eq!(params.phi_post.shape(), &[1024, 4]);
-        assert_eq!(params.phi_res.shape(), &[1024, 16]); // 4*4 = 16
-        assert_eq!(params.rmsnorm_weight.len(), 1024);
+        assert_eq!(params.phi.shape(), &[1024, 24]);
+        assert_eq!(params.phi_pre().shape(), &[1024, 4]);
+        assert_eq!(params.phi_post().shape(), &[1024, 4]);
+        assert_eq!(params.phi_res().shape(), &[1024, 16]);
+        assert_eq!(params.phi_post()[[3, 0]], params.phi[[3, 4]]);
+        assert_eq!(params.phi_res()[[3, 5]], params.phi[[3, 13]]);
+    }
+
+    #[test]
+    fn validate_reports_the_offending_parameter() {
+        let config = MhcConfig {
+            hidden_dim: 8,
+            ..Default::default()
+        };
+        let mut params = MhcParams::identity_init(&config);
+        params.b_res = Array2::zeros((4, 3));
+        match params.validate(&config) {
+            Err(MhcError::ShapeMismatch { what, .. }) => assert_eq!(what, "b_res"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn seeded_initialization_is_reproducible_and_scaled() {
+        let config = MhcConfig {
+            hidden_dim: 128,
+            ..Default::default()
+        };
+        let a = MhcParams::with_rng(&config, &mut rand::rngs::StdRng::seed_from_u64(7));
+        let b = MhcParams::with_rng(&config, &mut rand::rngs::StdRng::seed_from_u64(7));
+        let c = MhcParams::with_rng(&config, &mut rand::rngs::StdRng::seed_from_u64(8));
+        assert_eq!(a, b);
+        assert_ne!(a.phi, c.phi);
+        let n = a.phi.len() as f64;
+        let mean = a.phi.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
+        let var = a
+            .phi
+            .iter()
+            .map(|&v| (f64::from(v) - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        assert!(
+            mean.abs() < 1e-3 && (var.sqrt() - 0.02).abs() < 1e-3,
+            "{mean} {var}"
+        );
+    }
+
+    #[test]
+    fn identity_init_biases() {
+        let config = MhcConfig::default();
+        let p = MhcParams::identity_init(&config);
+
+        // σ(b_pre) + ε is 1/n.
+        for &b in &p.b_pre {
+            let h = 1.0 / (1.0 + (-f64::from(b)).exp()) + f64::from(config.epsilon);
+            assert!((h - 0.25).abs() < 1e-7, "{h}");
+        }
+        assert!(p.b_post.iter().all(|&b| b == 0.0));
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = if i == j { 0.0 } else { RES_OFF_DIAGONAL_INIT };
+                assert_eq!(p.b_res[[i, j]], want);
+            }
+        }
+        assert!(p.phi.iter().all(|&v| v == 0.0));
     }
 
     #[test]
@@ -424,41 +401,17 @@ mod tests {
         };
 
         let mut grads = MhcGradients::zeros(&config);
-        grads.d_alpha_pre = 1.0;
-        grads.d_alpha_post = 2.0;
-        grads.d_alpha_res = 3.0;
-
-        let norm = grads.norm();
-        assert!(norm > 0.0);
+        grads.d_alpha_pre = 3.0;
+        grads.d_b_res[[1, 2]] = 4.0;
+        assert!((grads.norm() - 5.0).abs() < 1e-6);
 
         grads.clip_norm(1.0);
-        assert!(grads.norm() <= 1.0 + 1e-6);
-    }
+        assert!((grads.norm() - 1.0).abs() < 1e-6);
+        assert!((grads.d_alpha_pre - 0.6).abs() < 1e-6);
 
-    #[test]
-    fn test_initial_biases() {
-        let config = MhcConfig {
-            expansion_rate: 4,
-            ..Default::default()
-        };
-        let params = MhcParams::new(&config);
-
-        // b_pre should be uniform (1/n)
-        for &v in params.b_pre.iter() {
-            assert!((v - 0.25).abs() < 1e-6);
-        }
-
-        // b_post should be ones
-        for &v in params.b_post.iter() {
-            assert!((v - 1.0).abs() < 1e-6);
-        }
-
-        // b_res should be identity
-        for i in 0..4 {
-            for j in 0..4 {
-                let expected = if i == j { 1.0 } else { 0.0 };
-                assert!((params.b_res[[i, j]] - expected).abs() < 1e-6);
-            }
-        }
+        let mut other = MhcGradients::zeros(&config);
+        other.d_phi[[2, 3]] = 2.0;
+        grads.accumulate(&other);
+        assert_eq!(grads.d_phi[[2, 3]], 2.0);
     }
 }

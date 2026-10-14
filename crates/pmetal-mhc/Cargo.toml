@@ -12,9 +12,6 @@ categories = ["science", "mathematics"]
 # Math
 ndarray = { workspace = true, features = ["serde"] }
 
-# Concurrency
-parking_lot = { workspace = true }
-
 # Serialization - use workspace
 serde = { workspace = true }
 
@@ -27,7 +24,6 @@ rand_distr = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
-approx = { workspace = true }
 proptest = { workspace = true }
 
 [[bench]]
