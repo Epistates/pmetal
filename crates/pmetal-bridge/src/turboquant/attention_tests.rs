@@ -320,6 +320,7 @@ fn grouped_query_attention_maps_query_heads_to_their_kv_head() {
         (6, 3, 2),
         (16, 2, 1),
         (4, 4, 3),
+        (1, 1, 1),
     ] {
         let mut case = Case::new(128, 4, 4);
         case.q_heads = q_heads;
