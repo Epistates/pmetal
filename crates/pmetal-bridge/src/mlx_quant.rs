@@ -82,6 +82,7 @@ pub struct TensorQuant {
 /// - `lm_head.weight` — LM head
 /// - `*layernorm*`, `*ln_*`, `*.norm.*`, `*.norm` — any normalization layer
 /// - `*.gate.weight` — MoE router gate (routing precision is critical)
+/// - `*.shared_expert_gate.weight` — the Qwen3.5 shared expert's gate
 /// - `*a_log*`, `*A_log*`, `*dt_bias*`, `*conv1d*` — GDN / Mamba parameters
 pub fn is_critical_tensor(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -113,6 +114,11 @@ pub fn is_critical_tensor(name: &str) -> bool {
     // MoE router gates — small tensors, but routing errors compound across
     // all layers.
     if lower.ends_with(".gate.weight") {
+        return true;
+    }
+    // The shared expert's gate (Qwen3.5 family): one logit per token that
+    // scales the whole shared expert in every layer.
+    if lower.ends_with(".shared_expert_gate.weight") {
         return true;
     }
 
@@ -860,6 +866,20 @@ mod tests {
         assert!(is_critical_tensor("model.layers.0.linear_attn.dt_bias"));
         assert!(is_critical_tensor(
             "model.layers.0.linear_attn.conv1d.weight"
+        ));
+    }
+
+    /// The Qwen3.5 shared expert's gate is a `[1, hidden]` logit that scales
+    /// the whole shared expert in every layer; `mlx_lm` keeps it at 8 bits
+    /// beside the router, and this quantizer keeps both out of the low-bit
+    /// allocation.
+    #[test]
+    fn critical_tensor_shared_expert_gate() {
+        assert!(is_critical_tensor(
+            "model.language_model.layers.3.mlp.shared_expert_gate.weight"
+        ));
+        assert!(!is_critical_tensor(
+            "model.layers.3.mlp.shared_expert.gate_proj.weight"
         ));
     }
 
