@@ -233,6 +233,23 @@ fn split_sections_with_a_bad_count_is_an_error_not_a_panic_or_an_allocation() {
     }
 }
 
+/// The constructors and casts take the typed `Dtype` as well as the raw code.
+#[test]
+fn a_dtype_argument_can_be_typed_or_a_raw_code() {
+    let typed = InlineArray::zeros(&[2, 2], Dtype::Bfloat16);
+    assert_eq!(typed.dtype(), Dtype::Bfloat16);
+    assert_eq!(InlineArray::ones(&[2], 11).dtype(), Dtype::Bfloat16);
+    let x = InlineArray::from_f32_slice(&[1.5, 2.5], &[2]);
+    assert_eq!(x.as_dtype(Dtype::Int32).dtype(), Dtype::Int32);
+    assert_eq!(x.as_dtype(Dtype::Float16.as_i32()).dtype(), Dtype::Float16);
+    assert_eq!(InlineArray::arange(4, Dtype::Int32).dtype(), Dtype::Int32);
+    assert_eq!(
+        InlineArray::full(&[2], 3.0, Dtype::Float16).dtype(),
+        Dtype::Float16
+    );
+    check_unobserved_error().expect("bridge error");
+}
+
 /// An unknown dtype code came back as float32.
 #[test]
 fn an_unknown_dtype_code_is_an_error_not_float32() {

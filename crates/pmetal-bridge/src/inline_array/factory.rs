@@ -7,7 +7,7 @@
 
 use std::mem::MaybeUninit;
 
-use super::dtype::ArrayElement;
+use super::dtype::{ArrayElement, IntoDtype};
 use super::ffi::*;
 use super::{InlineArray, RawBuf};
 
@@ -80,7 +80,8 @@ impl InlineArray {
         }
     }
 
-    pub fn zeros(shape: &[i32], dtype: i32) -> Self {
+    pub fn zeros(shape: &[i32], dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_zeros(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
@@ -90,7 +91,8 @@ impl InlineArray {
         }
     }
 
-    pub fn ones(shape: &[i32], dtype: i32) -> Self {
+    pub fn ones(shape: &[i32], dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_ones(dst.as_mut_ptr(), shape.as_ptr(), shape.len() as i32, dtype);
@@ -156,7 +158,8 @@ impl InlineArray {
         }
     }
 
-    pub fn from_u16_bits_slice(data: &[u16], shape: &[i32], dtype: i32) -> Self {
+    pub fn from_u16_bits_slice(data: &[u16], shape: &[i32], dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         check_slice_covers("from_u16_bits_slice", data.len(), shape);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -221,7 +224,8 @@ impl InlineArray {
 
     /// Create a range [0, 1, ..., n-1] with full Metal buffer (no broadcast).
     /// Useful for benchmarks — ensures matmuls read real data from GPU memory.
-    pub fn arange(n: i32, dtype: i32) -> Self {
+    pub fn arange(n: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = std::mem::MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_arange(dst.as_mut_ptr(), n, dtype);
@@ -245,14 +249,15 @@ impl InlineArray {
     }
 
     /// Sample from N(0,1) with the calling thread's default key.
-    pub fn random_normal(shape: &[i32], dtype: i32) -> Self {
+    pub fn random_normal(shape: &[i32], dtype: impl IntoDtype) -> Self {
         Self::random_normal_keyed(shape, dtype, None)
     }
 
     /// Sample from N(0,1). With a `key` ([`Self::random_key`]) the draw is a
     /// function of it alone; without one it takes the calling thread's
     /// default key, which every unkeyed draw advances.
-    pub fn random_normal_keyed(shape: &[i32], dtype: i32, key: Option<&Self>) -> Self {
+    pub fn random_normal_keyed(shape: &[i32], dtype: impl IntoDtype, key: Option<&Self>) -> Self {
+        let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -270,14 +275,15 @@ impl InlineArray {
     }
 
     /// Sample from U(0,1) with the calling thread's default key.
-    pub fn random_uniform(shape: &[i32], dtype: i32) -> Self {
+    pub fn random_uniform(shape: &[i32], dtype: impl IntoDtype) -> Self {
         Self::random_uniform_keyed(shape, dtype, None)
     }
 
     /// Sample from U(0,1). With a `key` ([`Self::random_key`]) the draw is a
     /// function of it alone; without one it takes the calling thread's
     /// default key, which every unkeyed draw advances.
-    pub fn random_uniform_keyed(shape: &[i32], dtype: i32, key: Option<&Self>) -> Self {
+    pub fn random_uniform_keyed(shape: &[i32], dtype: impl IntoDtype, key: Option<&Self>) -> Self {
+        let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -319,9 +325,10 @@ impl InlineArray {
         low: i32,
         high: i32,
         shape: &[i32],
-        dtype: i32,
+        dtype: impl IntoDtype,
         key: Option<&Self>,
     ) -> Self {
+        let dtype = dtype.dtype_code();
         let key = key.map_or(std::ptr::null(), |k| &k.raw as *const RawBuf);
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
@@ -342,7 +349,8 @@ impl InlineArray {
 
     // ── Creation helpers: full, eye, tri ─────────────────────────────────
 
-    pub fn full(shape: &[i32], val: f32, dtype: i32) -> Self {
+    pub fn full(shape: &[i32], val: f32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_full(
@@ -359,7 +367,8 @@ impl InlineArray {
     }
 
     /// Identity matrix [n, n].
-    pub fn eye(n: i32, dtype: i32) -> Self {
+    pub fn eye(n: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_eye(dst.as_mut_ptr(), n, dtype);
@@ -370,7 +379,8 @@ impl InlineArray {
     }
 
     /// Triangular matrix [n, m] with diagonal offset k.
-    pub fn tri(n: i32, m: i32, k: i32, dtype: i32) -> Self {
+    pub fn tri(n: i32, m: i32, k: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_tri(dst.as_mut_ptr(), n, m, k, dtype);
@@ -382,7 +392,8 @@ impl InlineArray {
 
     // ── linspace ─────────────────────────────────────────────────────────
 
-    pub fn linspace(start: f32, stop: f32, n: i32, dtype: i32) -> Self {
+    pub fn linspace(start: f32, stop: f32, n: i32, dtype: impl IntoDtype) -> Self {
+        let dtype = dtype.dtype_code();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_linspace(dst.as_mut_ptr(), start, stop, n, dtype);

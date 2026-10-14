@@ -7,7 +7,7 @@
 use std::mem::MaybeUninit;
 
 mod dtype;
-pub use dtype::{ArrayElement, AsDtype, BridgeScalar, bf16, f16};
+pub use dtype::{ArrayElement, AsDtype, BridgeScalar, IntoDtype, bf16, f16};
 
 mod diagnostics;
 pub use diagnostics::{

@@ -111,7 +111,7 @@ impl InlineArray {
     /// forget. Use [`InlineArray::scalar_like`] when a peer array is in
     /// scope; use this variant when only the raw dtype id is available.
     #[inline]
-    pub fn scalar_with_dtype(value: f32, dtype: i32) -> Self {
+    pub fn scalar_with_dtype(value: f32, dtype: impl crate::inline_array::IntoDtype) -> Self {
         InlineArray::from_f32(value).as_dtype(dtype)
     }
 
