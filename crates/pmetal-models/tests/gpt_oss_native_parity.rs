@@ -346,7 +346,8 @@ fn native_gpt_oss_refuses_an_mlx_quantization_by_name() {
     InlineArray::save_safetensors(
         dir.path().join("model.safetensors").to_str().unwrap(),
         &[("model.layers.0.self_attn.q_proj.scales", &scales)],
-    );
+    )
+    .expect("save the weights");
     let config = load_config(dir.path()).expect("config parses");
     let err = load_model(dir.path(), &config).expect_err("MLX-quantized weights are refused");
     assert!(err.contains("q_proj.scales"), "{err}");

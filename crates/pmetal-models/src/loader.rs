@@ -2340,7 +2340,7 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.as_str(), value))
             .collect();
-        Array::save_safetensors(path.to_string_lossy().as_ref(), &entries);
+        Array::save_safetensors(path.to_string_lossy().as_ref(), &entries)?;
         Ok(())
     }
 

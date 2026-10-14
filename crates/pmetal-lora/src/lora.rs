@@ -61,6 +61,6 @@ where
         .iter()
         .map(|(key, value)| (key.as_ref(), value))
         .collect();
-    Array::save_safetensors(path_str, &entries);
+    Array::save_safetensors(path_str, &entries).map_err(Exception::from)?;
     Ok(())
 }

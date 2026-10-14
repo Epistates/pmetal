@@ -514,7 +514,7 @@ pub fn quantize_and_save_mlx(
             .map(|(k, idx)| (k.as_str(), &owned_arrays[*idx]))
             .collect();
 
-        InlineArray::save_safetensors(shard_path_str, &save_entries);
+        InlineArray::save_safetensors(shard_path_str, &save_entries).map_err(|e| e.to_string())?;
     }
 
     // --- Write weight-map index ---

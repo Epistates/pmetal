@@ -1,8 +1,9 @@
-//! Bulk safetensors shard loader and global MLX random-seed setter.
+//! Safetensors I/O and the global MLX random-seed setter.
 //!
 //! `load_safetensors_shard` parses a `.safetensors` file once and returns every
 //! tensor as an `InlineArray`, falling back to a per-tensor path if the batched
-//! C++ loader is unavailable.
+//! C++ loader is unavailable. `InlineArray::save_safetensors` writes a file
+//! atomically.
 
 use std::mem::MaybeUninit;
 
@@ -12,6 +13,7 @@ use safetensors::{Dtype as SafeDtype, SafeTensors};
 use super::InlineArray;
 use super::RawBuf;
 use super::ffi::*;
+use crate::error::{BridgeError, BridgeResult, check_last_error};
 
 // ── Batch safetensors loader ──────────────────────────────────────────────
 
@@ -193,6 +195,58 @@ unsafe fn libc_free(ptr: *mut std::ffi::c_void) {
 // ── Single-key loader (impl on InlineArray) ──────────────────────────────
 
 impl InlineArray {
+    /// Write `entries` to `path` as one safetensors file, all or nothing.
+    ///
+    /// The bytes go to `<path>.partial`, are forced to disk, and are renamed
+    /// over `path`, so an interrupted save or a full disk leaves the previous
+    /// file as it was rather than a torn one; the partial file is removed on
+    /// failure. `path` is used exactly as given (any extension). Arrays are
+    /// evaluated as part of the save.
+    ///
+    /// # Errors
+    /// A duplicate or NUL-containing name, an empty array (safetensors can't
+    /// hold one), an unwritable path or a failed write.
+    pub fn save_safetensors(path: &str, entries: &[(&str, &InlineArray)]) -> BridgeResult<()> {
+        let invalid = |what: String| {
+            Err(BridgeError::CxxException(format!(
+                "[save_safetensors] {what}"
+            )))
+        };
+        let Ok(c_path) = std::ffi::CString::new(path) else {
+            return invalid(format!("path {path:?} contains a NUL byte"));
+        };
+        let mut c_keys = Vec::with_capacity(entries.len());
+        for (key, _) in entries {
+            match std::ffi::CString::new(*key) {
+                Ok(c_key) => c_keys.push(c_key),
+                Err(_) => return invalid(format!("tensor name {key:?} contains a NUL byte")),
+            }
+        }
+        let key_ptrs: Vec<*const std::ffi::c_char> = c_keys.iter().map(|k| k.as_ptr()).collect();
+        // The arrays as a contiguous run of buffers, copied bitwise: the
+        // callee copies each array (a reference-count bump) and the
+        // originals outlive the call.
+        let raw_arrays: Vec<RawBuf> = entries.iter().map(|(_, a)| a.raw).collect();
+        let count = i32::try_from(entries.len()).map_err(|_| {
+            BridgeError::CxxException("[save_safetensors] more than i32::MAX tensors".into())
+        })?;
+        // The failure comes back as the `Err` below, so a strict build must
+        // not panic at the op.
+        crate::expect_bridge_errors(|| {
+            // SAFETY: `c_path` and every key are NUL-terminated and outlive
+            // the call; `raw_arrays` holds `count` initialised buffers.
+            unsafe {
+                mlx_inline_save_safetensors(
+                    c_path.as_ptr(),
+                    key_ptrs.as_ptr(),
+                    raw_arrays.as_ptr(),
+                    count,
+                );
+            }
+            check_last_error()
+        })
+    }
+
     /// Load a single array from a safetensors file by key name.
     /// Loads through the bridge's own MLX instance, so the array shares its
     /// allocator with every other bridge op.
@@ -252,7 +306,7 @@ mod tests {
             .map(String::as_str)
             .zip(arrays.iter())
             .collect();
-        InlineArray::save_safetensors(path_str, &entries);
+        InlineArray::save_safetensors(path_str, &entries).expect("shard saves");
 
         let loaded = load_safetensors_shard(path_str).expect("shard loads");
         assert_eq!(loaded.len(), ENTRIES, "every tensor comes back");

@@ -182,7 +182,7 @@ pub(crate) async fn run_fuse(
         .iter()
         .map(|(key, value)| (key.as_str(), value))
         .collect();
-    pmetal_bridge::compat::Array::save_safetensors(output_file_str, &entries);
+    pmetal_bridge::compat::Array::save_safetensors(output_file_str, &entries)?;
 
     // Generate model.safetensors.index.json (required by many model loaders)
     let mut weight_map = serde_json::Map::new();

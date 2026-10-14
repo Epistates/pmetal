@@ -2,9 +2,14 @@
 // Extracted from bridge.cpp for maintainability.
 
 #include "bridge_internal.h"
+#include "mlx/io/load.h"
+#include <cerrno>
 #include <cmath>
+#include <cstdio>
+#include <fcntl.h>
 #include <memory>
 #include <numeric>
+#include <unistd.h>
 
 extern "C" {
 
@@ -282,15 +287,97 @@ void mlx_inline_less_equal(mlx_inline_array* dst, const mlx_inline_array* a, con
 
 // ── Training ops: serialization ──────────────────────────────────────────────
 
+extern "C++" {
+namespace {
+
+// A file writer over a POSIX descriptor, so the bytes can be forced to disk
+// before the file is renamed into place. MLX's own `FileWriter` keeps its
+// descriptor private.
+class SyncedFileWriter : public mlx::core::io::Writer {
+public:
+    explicit SyncedFileWriter(const std::string& path)
+        : label_(path), fd_(::open(path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644)) {}
+    ~SyncedFileWriter() override {
+        if (fd_ >= 0) {
+            ::close(fd_);
+        }
+    }
+    SyncedFileWriter(const SyncedFileWriter&) = delete;
+    SyncedFileWriter& operator=(const SyncedFileWriter&) = delete;
+
+    bool is_open() const override { return fd_ >= 0; }
+    bool good() const override { return fd_ >= 0; }
+    size_t tell() override { return static_cast<size_t>(::lseek(fd_, 0, SEEK_CUR)); }
+    void seek(int64_t off, std::ios_base::seekdir way = std::ios_base::beg) override {
+        ::lseek(fd_, off, way == std::ios_base::beg ? SEEK_SET : SEEK_CUR);
+    }
+    void write(const char* data, size_t n) override {
+        while (n != 0) {
+            const ssize_t m = ::write(fd_, data, std::min(n, static_cast<size_t>(INT32_MAX)));
+            if (m <= 0) {
+                throw std::runtime_error(
+                    "unable to write " + std::to_string(n) + " bytes to " + label_ + ": "
+                    + std::strerror(errno));
+            }
+            data += m;
+            n -= static_cast<size_t>(m);
+        }
+    }
+    std::string label() const override { return "file " + label_; }
+
+    // On macOS plain fsync leaves the data in the drive's cache;
+    // F_FULLFSYNC is what makes it durable.
+    void sync() {
+#ifdef F_FULLFSYNC
+        if (::fcntl(fd_, F_FULLFSYNC) == 0) {
+            return;
+        }
+#endif
+        if (::fsync(fd_) != 0) {
+            throw std::runtime_error("unable to sync " + label_ + ": " + std::strerror(errno));
+        }
+    }
+
+private:
+    std::string label_;
+    int fd_;
+};
+
+}  // namespace
+}  // extern "C++"
+
+// Writes to `<path>.partial`, syncs it, and renames it over `path`, so a
+// crash or a full disk leaves the previous file intact instead of a torn one.
+// `path` is used as given: MLX's own path overload appends ".safetensors" to
+// a name without it, which sent `x.tmp` to `x.tmp.safetensors`.
 void mlx_inline_save_safetensors(const char* path, const char** keys,
                                   const mlx_inline_array* arrays, int count) {
     BRIDGE_TRY_VOID("save_safetensors", {
         std::unordered_map<std::string, array> map;
         map.reserve(count);
         for (int i = 0; i < count; i++) {
-            map.emplace(std::string(keys[i]), as_arr(&arrays[i]));
+            if (!map.emplace(std::string(keys[i]), as_arr(&arrays[i])).second) {
+                throw std::invalid_argument(
+                    std::string("duplicate tensor name: ") + keys[i]);
+            }
         }
-        mlx::core::save_safetensors(std::string(path), std::move(map));
+        const std::string final_path(path);
+        const std::string partial_path = final_path + ".partial";
+        try {
+            {
+                auto writer = std::make_shared<SyncedFileWriter>(partial_path);
+                mlx::core::save_safetensors(writer, std::move(map));
+                writer->sync();
+            }
+            if (std::rename(partial_path.c_str(), final_path.c_str()) != 0) {
+                throw std::runtime_error(
+                    "unable to move " + partial_path + " to " + final_path + ": "
+                    + std::strerror(errno));
+            }
+        } catch (...) {
+            std::remove(partial_path.c_str());
+            throw;
+        }
     });
 }
 

@@ -212,7 +212,8 @@ fn dflash2_loader_is_strict() {
         .remove("layers.1.mlp_conv.base_kernel")
         .expect("fixture has the tensor");
     let arrays: Vec<(&str, &Array)> = weights.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    Array::save_safetensors(dir.join("model.safetensors").to_str().unwrap(), &arrays);
+    Array::save_safetensors(dir.join("model.safetensors").to_str().unwrap(), &arrays)
+        .expect("save the weights");
     let err = load_dflash_draft(dir, DFlashDraftQuant::None).unwrap_err();
     assert!(
         err.to_string().contains("layers.1.mlp_conv.base_kernel"),
