@@ -1052,12 +1052,7 @@ fn run_deepseek(
             )
         },
         deepseek_native::load_model,
-        move |_, config| {
-            deepseek_native::NativeCache::new_with_quant(
-                config.num_hidden_layers as usize,
-                quant_config,
-            )
-        },
+        move |weights, _| deepseek_native::NativeCache::new_with_quant(weights, quant_config),
         deepseek_native::prefill_first_token,
         |weights, _config, cache, first_tok, remaining, sampler, on_token| {
             deepseek_native::generate(weights, cache, first_tok, remaining, sampler, on_token)

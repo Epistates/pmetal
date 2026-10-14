@@ -5,7 +5,8 @@ use crate::inline_array as bridge;
 
 use super::attention::mla_forward;
 use super::cache::NativeCache;
-use super::moe::{dense_mlp_forward, moe_forward};
+use super::moe::{mlp_forward, moe_forward};
+use super::weights::Ffn;
 use super::weights::NativeWeights;
 
 /// Run one forward step. `token_ids` is `[B, T]` int32. Returns `[B, T, vocab]`.
@@ -18,7 +19,7 @@ pub fn forward_step(
     let s = token_ids.dim(1);
 
     // Embedding lookup: [B, T, hidden]
-    let mut hidden = weights.embed_w.take_axis(token_ids, 0);
+    let mut hidden = weights.embed_w.lookup(token_ids);
 
     for (li, lw) in weights.layers.iter().enumerate() {
         let cache_slot = &mut cache.mla_caches[li];
@@ -36,10 +37,9 @@ pub fn forward_step(
         let mlp_in = h.rms_norm(Some(&lw.post_ln_w), lw.norm_eps);
 
         // MLP / MoE
-        let mlp_out = if lw.is_moe {
-            moe_forward(lw, &mlp_in, b, s)
-        } else {
-            dense_mlp_forward(lw, &mlp_in)
+        let mlp_out = match &lw.ffn {
+            Ffn::Moe(moe) => moe_forward(moe, &mlp_in, b, s),
+            Ffn::Dense(mlp) => mlp_forward(mlp, &mlp_in),
         };
 
         // Residual
@@ -51,10 +51,9 @@ pub fn forward_step(
 
     // Final norm + LM head
     let normed = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
-    if weights.tie_word_embeddings {
-        normed.matmul(&weights.embed_w.t())
-    } else {
-        normed.matmul(weights.lm_head_w.as_ref().unwrap())
+    match &weights.lm_head_w {
+        Some(head) => head.matmul_from(&normed),
+        None => weights.embed_w.as_linear(&normed),
     }
 }
 
@@ -129,7 +128,7 @@ pub fn benchmark_trial(
     generation_tokens: usize,
 ) -> crate::decode::BenchmarkTrial {
     crate::inline_array::reset_peak_memory();
-    let mut cache = NativeCache::new_empty(weights.layers.len());
+    let mut cache = NativeCache::new_empty(weights);
 
     let prompt_tic = std::time::Instant::now();
     let (first_tok, mut sampler) = prefill_first_token(

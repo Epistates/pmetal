@@ -5,7 +5,10 @@
 use crate::InlineArray;
 
 use super::cache::MlaLayerCache;
-use super::weights::LayerWeights;
+use super::weights::{LayerWeights, QProj};
+
+/// RMSNorm epsilon of the two latent norms (`q_a_layernorm`, `kv_a_layernorm`).
+const LATENT_NORM_EPS: f32 = 1e-6;
 
 /// Multi-head Latent Attention forward pass.
 ///
@@ -39,12 +42,14 @@ pub(super) fn mla_forward(
     // ── Q projection ─────────────────────────────────────────────────────
     // Low-rank: x → q_a_proj → rms_norm → q_b_proj → [B, S, H, q_head_dim]
     // Direct:   x → q_proj → [B, S, H, q_head_dim]
-    let q_raw = if let Some(ref q_a_w) = lw.q_a_w {
-        let q_a = x.matmul(q_a_w);
-        let q_a_norm = q_a.rms_norm(lw.q_a_norm_w.as_ref(), 1e-6);
-        q_a_norm.matmul(lw.q_b_w.as_ref().unwrap())
-    } else {
-        x.matmul(lw.q_w.as_ref().unwrap())
+    // The two latent norms use a fixed epsilon of 1e-6, as transformers'
+    // `RMSNorm(q_lora_rank)` / `RMSNorm(kv_lora_rank)` do, whatever the
+    // config's `rms_norm_eps` says of the layer norms.
+    let q_raw = match &lw.q {
+        QProj::LowRank { a, a_norm, b } => {
+            b.matmul_from(&a.matmul_from(x).rms_norm(Some(a_norm), LATENT_NORM_EPS))
+        }
+        QProj::Direct(w) => w.matmul_from(x),
     };
     // Reshape to [B, S, H, q_head_dim] then transpose to [B, H, S, q_head_dim]
     let q = q_raw
@@ -57,14 +62,14 @@ pub(super) fn mla_forward(
 
     // ── KV compression ───────────────────────────────────────────────────
     // x → kv_a_proj_with_mqa → [B, S, kv_lora_rank + qk_rope_head_dim]
-    let compressed_kv = x.matmul(&lw.kv_a_proj_w);
+    let compressed_kv = lw.kv_a.matmul_from(x);
     // Split: [compressed_kv (lora_rank), k_pe_raw (rope_dim)]
     let mut kv_parts = compressed_kv.split(&[lora_rank], -1);
     let k_pe_raw = kv_parts.pop().unwrap(); // [B, S, rope_dim]
     let compressed = kv_parts.pop().unwrap(); // [B, S, lora_rank]
 
     // RMS-norm the latent.
-    let kv_latent_tok = compressed.rms_norm(Some(&lw.kv_a_norm_w), 1e-6);
+    let kv_latent_tok = compressed.rms_norm(Some(&lw.kv_a_norm_w), LATENT_NORM_EPS);
 
     // Reshape k_pe_raw → [B, 1, S, rope_dim] and transpose → [B, 1, S, rope_dim]
     // (Python: reshape(B,L,1,rope_dim).transpose(0,2,1,3) → [B,1,S,rope_dim])
@@ -93,9 +98,9 @@ pub(super) fn mla_forward(
         let bits = qcfg.bits as i32;
         let group_size = qcfg.group_size;
         let uint32_dt = crate::compat::Dtype::Uint32.as_i32();
-        // Use bf16 (dtype=11) for scales/biases — same convention as the
-        // main quantized KV cache in qwen3_native.
-        let dtype = 11i32; // bf16
+        // Scales and biases in the model dtype, as the main quantized KV
+        // cache in qwen3_native does.
+        let dtype = x.dtype_raw();
 
         // ---- kv_latent: [B, 1, S, lora_rank] ----
         let packed_lat = (lora_rank * bits + 31) / 32;
@@ -188,19 +193,18 @@ pub(super) fn mla_forward(
 
         (all_kv_latent, all_k_pe)
     } else {
-        // ── Standard bf16 path ────────────────────────────────────────────
+        // ── Standard path, in the model dtype ─────────────────────────────
         // MLA stores `kv_latent` (B,1,T,lora_rank) and `k_pe` (B,1,T,rope_dim)
         // — same time axis, different last dims — so each leg uses
-        // alloc_or_grow_buffer with a per-leg shape closure. dtype 11 is
-        // bfloat16 (matches the reference MLA cache layout).
+        // alloc_or_grow_buffer with a per-leg shape closure.
         use crate::native_common::kv_cache::{GrowthPolicy, alloc_or_grow_buffer};
-        const BF16: i32 = 11;
+        let dtype = x.dtype_raw();
         alloc_or_grow_buffer(
             GrowthPolicy::AmortizedChunked,
             &mut cache.kv_latent,
             next,
             2,
-            BF16,
+            dtype,
             |cap| [b, 1, cap, lora_rank],
         );
         alloc_or_grow_buffer(
@@ -208,7 +212,7 @@ pub(super) fn mla_forward(
             &mut cache.k_pe,
             next,
             2,
-            BF16,
+            dtype,
             |cap| [b, 1, cap, rope_dim],
         );
 
@@ -277,11 +281,8 @@ pub(super) fn mla_forward(
 
     let output = if s == 1 {
         // ── Decode path ───────────────────────────────────────────────────
-        // q_nope: [B, H, 1, nope_dim]
-        // embed_q_w (stored as [H, lora_rank, nope_dim]) → swapaxes(-1,-2) = [H, nope_dim, lora_rank]
-        // The transpose is done by multiplying: q_nope @ embed_q_w.transpose_axes([0,2,1])
-        let embed_q_t = lw.embed_q_w.transpose_axes(&[0, 2, 1]); // [H, nope_dim, lora_rank]
-        let q_nope_latent = q_nope.matmul(&embed_q_t); // [B, H, 1, lora_rank]
+        // q_nope: [B, H, 1, nope_dim] @ W_UK [H, nope_dim, lora_rank]
+        let q_nope_latent = q_nope.matmul(&lw.w_uk); // [B, H, 1, lora_rank]
 
         // k = v = kv_latent (all_kv_latent): [B, 1, T, lora_rank]
         // SDPA: q_nope_latent [B, H, 1, lora_rank] vs k,v [B, 1, T, lora_rank]
@@ -290,34 +291,21 @@ pub(super) fn mla_forward(
         let out_latent =
             q_nope_latent.sdpa_with_mask(&all_kv_latent, &all_kv_latent, scale, Some(&pe_scores)); // [B, H, 1, lora_rank]
 
-        // Project through unembed_out:
-        // unembed_out_w: [H, v_dim, lora_rank]
-        // out_latent [B, H, 1, lora_rank] @ unembed_out_w.transpose_axes([0,2,1]) [H, lora_rank, v_dim]
-        // Wait — Python: unembed_out(output) with default transpose=True:
-        //   output @ unembed_out.weight.swapaxes(-1,-2)
-        //   where unembed_out.weight = [H, v_dim, lora_rank] (from sanitize: wv)
-        //   swapaxes(-1,-2) = [H, lora_rank, v_dim]
-        // So: [B, H, 1, lora] @ [H, lora, v_dim] → [B, H, 1, v_dim]
-        let unembed_t = lw.unembed_out_w.transpose_axes(&[0, 2, 1]); // [H, lora, v_dim]
-        out_latent.matmul(&unembed_t) // [B, H, 1, v_dim]
+        // [B, H, 1, lora] @ W_UV^T [H, lora, v_dim] → [B, H, 1, v_dim]
+        out_latent.matmul(&lw.w_uv_t)
     } else {
         // ── Prefill path ──────────────────────────────────────────────────
-        // Expand K (nope component): kv_latent @ embed_q_w (transpose=False)
-        //   all_kv_latent: [B, 1, T, lora_rank]
-        //   embed_q_w:     [H, lora_rank, nope_dim]
-        //   matmul: [B, 1, T, lora] @ [H, lora, nope] → [B, H, T, nope]
-        let k_nope = all_kv_latent.matmul(&lw.embed_q_w); // [B, H, T, nope_dim] via broadcast
+        // Expand K (nope component): [B, 1, T, lora] @ W_UK^T [H, lora, nope]
+        // → [B, H, T, nope]; V: [B, 1, T, lora] @ W_UV^T [H, lora, v] → [B, H, T, v].
+        let k_nope = all_kv_latent.matmul(&lw.w_uk.transpose_axes(&[0, 2, 1]));
+        let v = all_kv_latent.matmul(&lw.w_uv_t);
 
-        // Expand V: kv_latent @ unembed_out_w.swapaxes(-1,-2)
-        //   unembed_out_w: [H, v_dim, lora_rank]
-        //   swapaxes(-1,-2) = [H, lora_rank, v_dim]
-        //   matmul: [B, 1, T, lora] @ [H, lora, v_dim] → [B, H, T, v_dim]
-        let unembed_t = lw.unembed_out_w.transpose_axes(&[0, 2, 1]); // [H, lora, v_dim]
-        let v = all_kv_latent.matmul(&unembed_t); // [B, H, T, v_dim]
-
-        // SDPA: q_nope [B, H, S, nope_dim] vs k_nope [B, H, T, nope_dim] vs v [B, H, T, v_dim]
-        // with pe_scores [B, H, S, T] as additive bias.
-        q_nope.sdpa_with_mask(&k_nope, &v, scale, Some(&pe_scores)) // [B, H, S, v_dim]
+        // SDPA: q_nope [B, H, S, nope] vs k_nope [B, H, T, nope] vs v
+        // [B, H, T, v], with pe_scores [B, H, S, T] as the additive bias. The
+        // bias is not causal by itself: queries at positions `prev..next` see
+        // the keys `0..=their own position`, so the rest is masked out of it.
+        let bias = causal_bias(&pe_scores, prev, s, next);
+        q_nope.sdpa_with_mask(&k_nope, &v, scale, Some(&bias)) // [B, H, S, v_dim]
     };
 
     // ── Output projection ─────────────────────────────────────────────────
@@ -326,5 +314,15 @@ pub(super) fn mla_forward(
         .transpose_axes(&[0, 2, 1, 3])
         .reshape(&[b, s, n_heads * v_dim]);
 
-    output_flat.matmul(&lw.o_proj_w)
+    lw.o_proj.matmul_from(&output_flat)
+}
+
+/// `scores` `[B, H, S, T]` with every key after a query's own position set to
+/// `-inf`: query `i` of `S` sits at position `prev + i`, over `T = prev + S`
+/// keys.
+fn causal_bias(scores: &InlineArray, prev: i32, s: i32, t: i32) -> InlineArray {
+    // `tri(S, T, prev)[i, j]` is 1 where `j <= i + prev`.
+    let visible = InlineArray::tri(s, t, prev, crate::dtype::BOOL);
+    let masked = InlineArray::scalar_like(f32::NEG_INFINITY, scores);
+    visible.where_cond(scores, &masked)
 }
