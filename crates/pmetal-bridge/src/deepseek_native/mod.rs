@@ -1,21 +1,25 @@
-//! Standalone DeepSeek V3/R1 inference engine, independent of pmetal-models.
+//! Standalone DeepSeek V2 / V3 / R1 inference engine, independent of pmetal-models.
 //!
 //! Implements Multi-head Latent Attention (MLA), the defining innovation of
-//! DeepSeek V3. Instead of caching full K,V tensors, MLA caches a compressed
+//! DeepSeek V2. Instead of caching full K,V tensors, MLA caches a compressed
 //! latent vector `c_kv` (shape `[B, 1, T, kv_lora_rank]`) and `k_pe` (shape
 //! `[B, 1, T, qk_rope_head_dim]`). K and V are reconstructed on the fly
 //! during each attention step via per-head linear projections.
 //!
-//! MoE routing uses the `noaux_tc` group-aware top-k method with sigmoid
-//! scoring and auxiliary-loss-free load balancing (e_score_correction_bias).
+//! MoE routing follows the config's `scoring_func` and `topk_method`: V3's
+//! `noaux_tc` (sigmoid scores, an auxiliary-loss-free correction bias, group-
+//! limited top-k, normalised and scaled weights) and V2's softmax with the
+//! plain (`greedy`) or group-limited (`group_limited_greedy`) top-k. The
+//! routed experts and every projection run packed when the checkpoint is an
+//! MLX quantization.
 //!
 //! Every op on the hot path uses [`InlineArray`](crate::InlineArray) — no per-op heap allocation.
 //!
 //! The stack is split across focused submodules:
-//!   * `weights` — layer weight struct, safetensors loading, FP8 dequant, expert stacking
+//!   * `weights` — layer weight structs and the checkpoint loader (dense or packed)
 //!   * `cache` — MLA latent + k_pe cache (bf16 + affine-quantized variants)
 //!   * `attention` — MLA forward (decode absorbs embed_q; prefill expands K/V)
-//!   * `moe` — dense SwiGLU MLP + group-aware noaux_tc top-k MoE
+//!   * `moe` — dense SwiGLU MLP + the router and routed experts
 //!   * `forward` — full-model forward + prefill/prime/generate wrappers
 
 use serde::Deserialize;
@@ -28,6 +32,7 @@ mod weights;
 
 pub use cache::{MlaLayerCache, NativeCache};
 pub use forward::{benchmark_trial, forward_step, generate, prefill_first_token};
+pub use moe::{ScoringFunc, TopkMethod};
 pub use weights::{NativeWeights, load_model};
 
 // ============================================================================
@@ -52,14 +57,8 @@ fn default_routed_scaling_factor() -> f32 {
 fn default_norm_topk_prob() -> bool {
     true
 }
-fn default_n_group() -> i32 {
-    1
-}
-fn default_topk_group() -> i32 {
-    1
-}
-fn default_false() -> bool {
-    false
+fn default_true() -> bool {
+    true
 }
 fn default_moe_layer_freq() -> i32 {
     1
@@ -71,10 +70,11 @@ fn default_model_type() -> String {
     "deepseek_v3".to_string()
 }
 
-/// Minimal, serde-deserializable DeepSeek V3/R1 config.
+/// Minimal, serde-deserializable DeepSeek V2 / V3 / R1 config.
 ///
 /// Only the fields required for inference are included; unknown keys are
-/// silently ignored by serde.
+/// silently ignored by serde, and [`load_config`] refuses the ones that name a
+/// feature this engine does not implement.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepSeekConfig {
     #[serde(default = "default_model_type")]
@@ -99,10 +99,20 @@ pub struct DeepSeekConfig {
     pub routed_scaling_factor: f32,
     #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
-    #[serde(default = "default_n_group")]
-    pub n_group: i32,
-    #[serde(default = "default_topk_group")]
-    pub topk_group: i32,
+    /// Expert groups the group-limited top-k picks among; absent or `null`
+    /// is 1.
+    #[serde(default)]
+    pub n_group: Option<i32>,
+    /// Groups kept; absent or `null` is 1.
+    #[serde(default)]
+    pub topk_group: Option<i32>,
+    /// `sigmoid` (V3) or `softmax` (V2). Absent: the model type's.
+    #[serde(default)]
+    pub scoring_func: Option<ScoringFunc>,
+    /// `noaux_tc` (V3), `greedy` or `group_limited_greedy` (V2). Absent: the
+    /// model type's.
+    #[serde(default)]
+    pub topk_method: Option<TopkMethod>,
     pub num_experts_per_tok: i32,
     #[serde(default = "default_moe_layer_freq")]
     pub moe_layer_freq: i32,
@@ -132,13 +142,29 @@ pub struct DeepSeekConfig {
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
 
+    /// Rotate adjacent channel pairs (DeepSeek's layout, and every release's)
+    /// rather than the two halves; transformers' `rope_interleave`.
+    #[serde(default = "default_true")]
+    pub rope_interleave: bool,
+
     #[serde(default)]
     pub max_position_embeddings: Option<i32>,
 
-    #[serde(default = "default_false")]
+    #[serde(default)]
+    pub hidden_act: Option<String>,
+
+    #[serde(default)]
     pub attention_bias: bool,
 
-    #[serde(default = "default_false")]
+    #[serde(default)]
+    pub mlp_bias: bool,
+
+    /// DeepSeek-V3.2's sparse-attention indexer; present means a model this
+    /// engine would run as dense MLA, which is a different model.
+    #[serde(default)]
+    pub index_topk: Option<i32>,
+
+    #[serde(default)]
     pub tie_word_embeddings: bool,
 }
 
@@ -162,7 +188,7 @@ impl DeepSeekConfig {
             },
             self.rope_theta,
             1.0,
-            true,
+            self.rope_interleave,
         )
         .map_err(|e| format!("deepseek config: {e}"))
     }
@@ -182,19 +208,103 @@ impl DeepSeekConfig {
         let li = layer_id as i32;
         li >= self.first_k_dense_replace && li % self.moe_layer_freq == 0
     }
+
+    /// Whether this is a V2-family config (softmax routing unless it says
+    /// otherwise).
+    fn is_v2(&self) -> bool {
+        self.model_type == "deepseek_v2"
+    }
+
+    /// How expert scores are computed.
+    pub fn scoring(&self) -> ScoringFunc {
+        self.scoring_func.unwrap_or(if self.is_v2() {
+            ScoringFunc::Softmax
+        } else {
+            ScoringFunc::Sigmoid
+        })
+    }
+
+    /// How the top-k experts are chosen.
+    pub fn topk(&self) -> TopkMethod {
+        self.topk_method.unwrap_or(if self.is_v2() {
+            TopkMethod::Greedy
+        } else {
+            TopkMethod::NoauxTc
+        })
+    }
+
+    /// Expert groups (1 when the config has none).
+    pub fn n_group(&self) -> i32 {
+        self.n_group.unwrap_or(1)
+    }
+
+    /// Groups kept by the group-limited top-k (1 when the config has none).
+    pub fn topk_group(&self) -> i32 {
+        self.topk_group.unwrap_or(1)
+    }
+
+    /// Refuse a config this engine would run as a different model.
+    pub fn validate(&self) -> Result<(), String> {
+        let bad = |what: String| Err(format!("deepseek config: {what}"));
+        if self.index_topk.is_some() {
+            return bad(
+                "`index_topk` marks DeepSeek-V3.2's sparse-attention indexer, which \
+                        the native engine does not implement"
+                    .into(),
+            );
+        }
+        if let Some(act) = &self.hidden_act
+            && act != "silu"
+        {
+            return bad(format!("hidden_act `{act}` is not supported (silu only)"));
+        }
+        if self.attention_bias {
+            return bad("`attention_bias: true` is not supported".into());
+        }
+        if self.mlp_bias {
+            return bad("`mlp_bias: true` is not supported".into());
+        }
+        let Some(experts) = self.n_routed_experts else {
+            return Ok(());
+        };
+        let (groups, kept, top_k) = (self.n_group(), self.topk_group(), self.num_experts_per_tok);
+        if experts < 1 || top_k < 1 || top_k > experts {
+            return bad(format!(
+                "num_experts_per_tok {top_k} does not fit n_routed_experts {experts}"
+            ));
+        }
+        if self.topk() != TopkMethod::Greedy {
+            if groups < 1 || experts % groups != 0 {
+                return bad(format!(
+                    "n_routed_experts {experts} does not divide into n_group {groups}"
+                ));
+            }
+            if kept < 1 || kept > groups {
+                return bad(format!("topk_group {kept} is not within n_group {groups}"));
+            }
+            if top_k > kept * (experts / groups) {
+                return bad(format!(
+                    "num_experts_per_tok {top_k} exceeds the {} experts of the {kept} kept groups",
+                    kept * (experts / groups)
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Parse `config.json` from a model directory.
+/// Parse and check `config.json` from a model directory.
 pub fn load_config(model_dir: &std::path::Path) -> Result<DeepSeekConfig, String> {
     let text = crate::native_loader::read_config_json(model_dir)?;
     let cfg: DeepSeekConfig =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+    cfg.validate()?;
     Ok(cfg)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DeepSeekConfig;
+    use super::{DeepSeekConfig, ScoringFunc, TopkMethod};
 
     /// DeepSeek-V3's released attention config: YaRN factor 40 over 4096
     /// with `mscale = mscale_all_dim = 1`. The native engine used to rotate
@@ -234,5 +344,111 @@ mod tests {
             let w = w.as_f64().unwrap();
             assert!(((*g as f64) - w).abs() <= 2e-6 * w, "{g} vs {w}");
         }
+    }
+
+    fn parse(json: &str) -> DeepSeekConfig {
+        let config: DeepSeekConfig = serde_json::from_str(json).expect("released config parses");
+        config.validate().expect("released config is supported");
+        config
+    }
+
+    /// The released V3 / R1 `config.json` routes by sigmoid scores and the
+    /// group-limited `noaux_tc` top-k: 256 experts in 8 groups, 4 kept.
+    #[test]
+    fn released_v3_config_routes_by_noaux_tc() {
+        let c = parse(include_str!("../../tests/fixtures/deepseek_v3_config.json"));
+        assert_eq!(c.scoring(), ScoringFunc::Sigmoid);
+        assert_eq!(c.topk(), TopkMethod::NoauxTc);
+        assert_eq!((c.n_group(), c.topk_group()), (8, 4));
+        assert_eq!(c.q_lora_rank, Some(1536));
+        assert!(c.is_moe_layer(3) && !c.is_moe_layer(2));
+    }
+
+    /// V2-Lite's `config.json` has `"q_lora_rank": null` (a direct Q
+    /// projection), softmax scoring and the plain top-k over one group.
+    #[test]
+    fn released_v2_lite_config_routes_by_softmax_greedy() {
+        let c = parse(include_str!(
+            "../../tests/fixtures/deepseek_v2_lite_config.json"
+        ));
+        assert_eq!(c.scoring(), ScoringFunc::Softmax);
+        assert_eq!(c.topk(), TopkMethod::Greedy);
+        assert_eq!(c.q_lora_rank, None);
+        assert!(!c.is_moe_layer(0) && c.is_moe_layer(1));
+    }
+
+    /// A config that omits `scoring_func` and `topk_method` gets its model
+    /// type's: V2 softmax and greedy, anything else V3's.
+    #[test]
+    fn routing_defaults_follow_the_model_type() {
+        let base = |model_type: &str| {
+            serde_json::from_value::<DeepSeekConfig>(serde_json::json!({
+                "model_type": model_type, "intermediate_size": 8, "num_experts_per_tok": 2,
+                "num_hidden_layers": 1, "num_attention_heads": 1, "kv_lora_rank": 4,
+                "qk_rope_head_dim": 4, "v_head_dim": 4, "qk_nope_head_dim": 4
+            }))
+            .unwrap()
+        };
+        let v2 = base("deepseek_v2");
+        assert_eq!(
+            (v2.scoring(), v2.topk()),
+            (ScoringFunc::Softmax, TopkMethod::Greedy)
+        );
+        let v3 = base("deepseek_v3");
+        assert_eq!(
+            (v3.scoring(), v3.topk()),
+            (ScoringFunc::Sigmoid, TopkMethod::NoauxTc)
+        );
+    }
+
+    /// Configs for models this engine would run as something else are
+    /// refused by name, not run.
+    #[test]
+    fn unsupported_configs_are_refused() {
+        let with = |extra: serde_json::Value| {
+            let mut json = serde_json::json!({
+                "intermediate_size": 8, "num_experts_per_tok": 2, "num_hidden_layers": 1,
+                "num_attention_heads": 1, "kv_lora_rank": 4, "qk_rope_head_dim": 4,
+                "v_head_dim": 4, "qk_nope_head_dim": 4, "n_routed_experts": 8,
+                "n_group": 4, "topk_group": 2
+            });
+            json.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<DeepSeekConfig>(json)
+                .unwrap()
+                .validate()
+        };
+        assert!(with(serde_json::json!({})).is_ok());
+        assert!(
+            with(serde_json::json!({"index_topk": 2048}))
+                .unwrap_err()
+                .contains("index_topk")
+        );
+        assert!(
+            with(serde_json::json!({"attention_bias": true}))
+                .unwrap_err()
+                .contains("attention_bias")
+        );
+        assert!(
+            with(serde_json::json!({"hidden_act": "gelu"}))
+                .unwrap_err()
+                .contains("gelu")
+        );
+        assert!(
+            with(serde_json::json!({"n_group": 3}))
+                .unwrap_err()
+                .contains("n_group")
+        );
+        assert!(
+            with(serde_json::json!({"topk_group": 5}))
+                .unwrap_err()
+                .contains("topk_group")
+        );
+        assert!(
+            with(serde_json::json!({"num_experts_per_tok": 5}))
+                .unwrap_err()
+                .contains("kept groups")
+        );
     }
 }

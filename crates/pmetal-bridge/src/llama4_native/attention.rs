@@ -11,55 +11,31 @@ use super::weights::LayerWeights;
 // Chunk mask construction
 // ============================================================================
 
-/// Build the boolean chunk attention mask for a prefill pass.
+/// The boolean chunk attention mask of a prefill pass, `[1, 1, s, end]`
+/// (`end = offset + s`) so it broadcasts over batch and heads and goes to
+/// SDPA as it is: `mask[.., i, j]` is true when the query at position
+/// `offset + i` attends to the key at position `j`.
 ///
-/// Returns shape `[s, offset + s]` bool mask where `mask[i, j] = true` means
-/// query token at position `(offset + i)` can attend to key token at position `j`.
-///
-/// A query at position `r` can attend to key at position `l` when:
-///   `l <= r`  (causal)  AND  `r // chunk_size == l // chunk_size`  (same chunk)
+/// A query at position `r` attends to the key at `l` when `l <= r` (causal)
+/// and `r / chunk_size == l / chunk_size` (same chunk), transformers'
+/// `create_chunked_causal_mask`. Only the two chunk-id vectors are built on
+/// the host, `O(s + end)`; the `s x end` comparison runs on the device.
 pub(super) fn build_chunk_mask(offset: i32, s: i32, end: i32, chunk_size: i32) -> InlineArray {
-    // We build the mask on CPU as an i32 slice (1 = attend, 0 = mask out)
-    // and pass it to MLX as a bool array via InlineArray::from_i32_slice.
-    // For typical prefill sizes this is fast enough; for very long sequences
-    // we could build it with MLX ops, but let's keep it simple.
-    let total_kv = end as usize;
-    let mut mask_data = vec![0i32; s as usize * total_kv];
-
-    for qi in 0..s as usize {
-        let q_pos = (offset + qi as i32) as usize;
-        let q_chunk = q_pos / chunk_size as usize;
-        for ki in 0..total_kv {
-            let k_chunk = ki / chunk_size as usize;
-            if ki <= q_pos && k_chunk == q_chunk {
-                mask_data[qi * total_kv + ki] = 1;
-            }
-        }
-    }
-
-    // Create [s, total_kv] int32 array then cast to bool (dtype=7 in MLX).
-    let flat = InlineArray::from_i32_slice(&mask_data);
-
-    // Cast to bfloat16 additive mask: 0 → 0.0, 1 → ... actually MLX sdpa_with_mask
-    // expects an additive float mask where -inf means masked. Convert boolean to float:
-    // where mask=1 → 0.0, mask=0 → -inf (large negative).
-    // We return the boolean-as-int32 array and convert in the attention function
-    // using where_cond.
-    flat.reshape(&[s, end])
-}
-
-/// Convert a 0/1 int32 mask `[q, k]` to an additive attention bias `[q, k]`.
-/// 0 → -1e9 (masked), 1 → 0.0 (unmasked).
-fn make_additive_mask(bool_mask: &InlineArray, dtype: i32) -> InlineArray {
-    // large negative value in the model dtype
-    let neg_inf = InlineArray::scalar_with_dtype(-1e9, dtype);
-    let zero = InlineArray::scalar_with_dtype(0.0, dtype);
-    // where(bool_mask != 0, 0.0, -1e9)
-    // bool_mask contains 0 or 1 as int32; `where_cond` treats nonzero as true.
-    bool_mask
-        .as_dtype(0)
-        .where_cond(&zero, &neg_inf)
-        .as_dtype(dtype)
+    use crate::dtype::I32;
+    let chunk_ids = |from: i32, to: i32| {
+        let ids: Vec<i32> = (from..to).map(|p| p / chunk_size).collect();
+        InlineArray::from_i32_slice(&ids)
+    };
+    let q_chunk = chunk_ids(offset, end).reshape(&[s, 1]);
+    let k_chunk = chunk_ids(0, end).reshape(&[1, end]);
+    let q_pos = InlineArray::arange(s, I32)
+        .add(&InlineArray::from_i32(offset))
+        .reshape(&[s, 1]);
+    let k_pos = InlineArray::arange(end, I32).reshape(&[1, end]);
+    q_chunk
+        .eq(&k_chunk)
+        .logical_and(&k_pos.less_equal(&q_pos))
+        .reshape(&[1, 1, s, end])
 }
 
 // ============================================================================
@@ -74,7 +50,7 @@ pub(super) fn attn_forward(
     s: i32,
     cache: &mut KvLayerCache,
     rope_offset: i32,
-    chunk_mask: Option<&InlineArray>, // prefill only — [s, offset+s]
+    chunk_mask: Option<&InlineArray>, // prefill only — bool, [1, 1, s, offset+s]
     chunk_size: i32,
 ) -> InlineArray {
     let n_heads = lw.n_heads;
@@ -118,6 +94,7 @@ pub(super) fn attn_forward(
         && cache.turboquant.is_none()
         && cache.quant_config.is_none()
         && let Some(rope_kernel) = rope_kernel
+        && let Some((q_w, k_w, v_w, o_w)) = lw.dense_attention()
     {
         // Biases are all-or-none in real Llama 4 configs (audited at load
         // time). Disallow the mixed case to keep the compiled graph simple
@@ -158,10 +135,10 @@ pub(super) fn attn_forward(
             let (output, new_cache_keys, new_cache_vals) =
                 InlineArray::compiled_llama4_attn_layer_fixed(
                     normed,
-                    &lw.attn_q_w,
-                    &lw.attn_k_w,
-                    &lw.attn_v_w,
-                    &lw.attn_o_w,
+                    q_w,
+                    k_w,
+                    v_w,
+                    o_w,
                     qb,
                     kb,
                     vb,
@@ -192,9 +169,9 @@ pub(super) fn attn_forward(
     }
 
     // Q, K, V projections
-    let mut queries = normed.matmul(&lw.attn_q_w);
-    let mut keys = normed.matmul(&lw.attn_k_w);
-    let mut values = normed.matmul(&lw.attn_v_w);
+    let mut queries = lw.attn_q.matmul_from(normed);
+    let mut keys = lw.attn_k.matmul_from(normed);
+    let mut values = lw.attn_v.matmul_from(normed);
 
     // Optional biases
     if let Some(ref qb) = lw.attn_q_b {
@@ -274,8 +251,7 @@ pub(super) fn attn_forward(
         // Local-layer prefill with chunk_mask: TurboQuant's direct-attention
         // path doesn't accept a custom additive mask, so we mirror the affine
         // prefill — append, dequantize the full cache, run sdpa_with_mask.
-        if let (true, Some(mask_int)) = (lw.use_rope, chunk_mask) {
-            let dtype = queries.dtype_raw();
+        if let (true, Some(mask)) = (lw.use_rope, chunk_mask) {
             tq_cache
                 .append(&keys, &values)
                 .expect("Llama 4 TurboQuant masked prefill append failed");
@@ -286,9 +262,7 @@ pub(super) fn attn_forward(
                 .dequantize_values()
                 .expect("Llama 4 TurboQuant masked prefill failed to dequantize values");
             cache.offset = next;
-            let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
-            let mask_4d = mask_full.reshape(&[1, 1, s, next]);
-            let output = queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d));
+            let output = queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(mask));
             crate::error::check_last_error()
                 .expect("Llama 4 TurboQuant masked prefill SDPA failed");
             output
@@ -412,7 +386,7 @@ pub(super) fn attn_forward(
             .slice(&[0, 0, kv_start, 0], &[b, n_kv_heads, next, scales_dim]);
 
         if lw.use_rope {
-            if let Some(mask_int) = chunk_mask {
+            if let Some(mask) = chunk_mask {
                 // Prefill with chunk mask: dequantize for masked SDPA.
                 // Memory savings still apply; compute overhead only at prefill.
                 let kp_flat = cached_kp.reshape(&[b * n_kv_heads * next, packed_dim]);
@@ -429,9 +403,7 @@ pub(super) fn attn_forward(
                     .dequantize(&vs_flat, &vb_flat, group_size, bits)
                     .reshape(&[b, n_kv_heads, next, head_dim]);
 
-                let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
-                let mask_4d = mask_full.reshape(&[1, 1, s, next]);
-                queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
+                queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(mask))
             } else {
                 // Decode on a local layer — pure zero-overhead quantized path
                 crate::decode::quantized_sdpa(
@@ -514,12 +486,8 @@ pub(super) fn attn_forward(
             // - For decode (s=1): the keys read start at the token's chunk
             //   (`kv_start`), so every one of them is visible.
             // - For prefill (s>1): apply the chunk mask.
-            if let Some(mask_int) = chunk_mask {
-                // Build [s, next] additive mask and reshape to [1, 1, s, next] for SDPA.
-                let dtype = queries.dtype_raw();
-                let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
-                let mask_4d = mask_full.reshape(&[1, 1, s, next]);
-                queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
+            if let Some(mask) = chunk_mask {
+                queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(mask))
             } else {
                 // Decode: causal (only 1 query token, always valid)
                 crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
@@ -536,7 +504,7 @@ pub(super) fn attn_forward(
         .reshape(&[b, s, n_heads * head_dim]);
 
     // Output projection + optional bias
-    let mut result = output.matmul(&lw.attn_o_w);
+    let mut result = lw.attn_o.matmul_from(&output);
     if let Some(ref ob) = lw.attn_o_b {
         result = result.add(ob);
     }
@@ -583,4 +551,44 @@ fn apply_temperature_tuning(
     // in f32 and cast back, as transformers does.
     let scale_arr = InlineArray::from_f32_slice(&scales, &[1, 1, s, 1]);
     queries.multiply(&scale_arr).as_dtype(dtype)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chunk mask against the rule written out per (query, key) pair:
+    /// causal, and the same chunk. Offsets on and off a chunk boundary, a
+    /// chunk larger than the prompt, a single-token chunk, and a prefill that
+    /// continues a cache.
+    #[test]
+    fn chunk_mask_is_causal_within_a_chunk() {
+        for (offset, s, chunk) in [
+            (0, 13, 4),
+            (5, 8, 4),
+            (8, 8, 4),
+            (0, 20, 64),
+            (3, 9, 1),
+            (30, 2, 8),
+        ] {
+            let end = offset + s;
+            let mask = build_chunk_mask(offset, s, end, chunk);
+            assert_eq!(mask.shape(), vec![1, 1, s, end]);
+            let mut got = mask.as_dtype(crate::dtype::F32);
+            got.eval();
+            let got = got.to_f32_vec((s * end) as usize).expect("readback");
+            for q in 0..s {
+                for k in 0..end {
+                    let r = offset + q;
+                    let want = k <= r && k / chunk == r / chunk;
+                    assert_eq!(
+                        got[(q * end + k) as usize] != 0.0,
+                        want,
+                        "offset {offset}, {s} queries, chunk {chunk}: query {r}, key {k}"
+                    );
+                }
+            }
+        }
+        crate::check_unobserved_error().expect("bridge ops succeeded");
+    }
 }

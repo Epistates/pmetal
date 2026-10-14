@@ -1,34 +1,50 @@
-//! Per-layer + full-model weight bundles + safetensors loader.
+//! Per-layer + full-model weight bundles and the checkpoint loader.
 //!
-//! Sanitization mirrors Python's `Model.sanitize()`:
-//! * Vision / projector weight removal
-//! * VLM prefix stripping (`language_model.model.X` → `model.X`)
-//! * Expert weight split: `experts.gate_up_proj` → `experts.gate_proj.weight`
-//!   and `experts.up_proj.weight` (split last axis); `experts.down_proj` is
-//!   already `[E, in, out]`
-//! * All projection weights pre-transposed to `[in, out]` form for efficient matmul
+//! Every projection, the experts and the embeddings load dense or packed, as
+//! the checkpoint stores them (see [`crate::native_checkpoint`]). Keys are
+//! read in the text model's namespace: vision and projector tensors are
+//! dropped and the multimodal prefixes (`language_model.model.X`,
+//! `model.language_model.X`) fold onto `model.X`.
+//!
+//! Three expert layouts load, each to `[E, in, out]` (what `gather_mm` takes):
+//!
+//! * transformers' (`Llama4TextExperts`, every release): `experts.gate_up_proj`
+//!   `[E, hidden, 2 * expert_hidden]`, gate then up along the last axis, and
+//!   `experts.down_proj` `[E, expert_hidden, hidden]`, both applied as `x @ W`,
+//! * the stacked per-projection layout of a Linear (`experts.{gate,up,down}_proj.weight`,
+//!   `[E, out, in]`), dense or packed, which is what MLX conversions ship.
 
 use crate::InlineArray;
+use crate::native_checkpoint::Checkpoint;
+use crate::native_weight::{EmbeddingWeight, LayerWeight, copy_fresh_arr};
 
 use super::Llama4Config;
 
-/// MoE expert weight block. Weights are stored pre-transposed to `[num_experts, in, out]`
-/// form for `gather_mm` (which expects `b` with shape `[experts, K, N]`).
+/// A gated MLP: the dense layers' and the shared expert's.
+pub(super) struct Mlp {
+    pub(super) gate: LayerWeight,
+    pub(super) up: LayerWeight,
+    pub(super) down: LayerWeight,
+}
+
+/// MoE layer: the router, the routed experts and the shared expert.
 pub(super) struct MoeWeights {
-    /// `[num_experts, in_dim, expert_hidden]` — gate projection
-    pub(super) experts_gate_w: InlineArray,
-    /// `[num_experts, in_dim, expert_hidden]` — up projection
-    pub(super) experts_up_w: InlineArray,
-    /// `[num_experts, expert_hidden, in_dim]` — down projection
-    pub(super) experts_down_w: InlineArray,
-    /// Router: `[in_dim, num_experts]` (pre-transposed from `[num_experts, in_dim]`)
-    pub(super) router_w: InlineArray,
-    /// Shared expert gate: `[in_dim, intermediate_size_mlp]`
-    pub(super) shared_gate_w: InlineArray,
-    /// Shared expert up: `[in_dim, intermediate_size_mlp]`
-    pub(super) shared_up_w: InlineArray,
-    /// Shared expert down: `[intermediate_size_mlp, in_dim]`
-    pub(super) shared_down_w: InlineArray,
+    /// Routed experts, `[E, in, out]` dense or packed as stored.
+    pub(super) experts_gate: LayerWeight,
+    pub(super) experts_up: LayerWeight,
+    pub(super) experts_down: LayerWeight,
+    /// `hidden -> experts`.
+    pub(super) router: LayerWeight,
+    pub(super) top_k: i32,
+    pub(super) shared: Mlp,
+}
+
+// A layer holds exactly one of these, loaded once: the size difference is a
+// few KB per layer, not worth an indirection on the hot path.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum Ffn {
+    Dense(Mlp),
+    Moe(MoeWeights),
 }
 
 pub(super) struct LayerWeights {
@@ -40,11 +56,11 @@ pub(super) struct LayerWeights {
     pub(super) post_ln_w: InlineArray,
     pub(super) norm_eps: f32,
 
-    // ── Attention projection ──
-    pub(super) attn_q_w: InlineArray, // [in, n_heads * head_dim]
-    pub(super) attn_k_w: InlineArray, // [in, n_kv_heads * head_dim]
-    pub(super) attn_v_w: InlineArray, // [in, n_kv_heads * head_dim]
-    pub(super) attn_o_w: InlineArray, // [n_heads * head_dim, in]
+    // ── Attention projections ──
+    pub(super) attn_q: LayerWeight,
+    pub(super) attn_k: LayerWeight,
+    pub(super) attn_v: LayerWeight,
+    pub(super) attn_o: LayerWeight,
 
     // Optional bias (when attention_bias=true)
     pub(super) attn_q_b: Option<InlineArray>,
@@ -68,30 +84,55 @@ pub(super) struct LayerWeights {
     pub(super) floor_scale: i32,
     pub(super) layer_attn_scale: f32,
 
-    // ── Feed-forward: either MoE or dense MLP ──
-    pub(super) is_moe: bool,
-    // Dense MLP (non-MoE layers)
-    pub(super) mlp_gate_w: Option<InlineArray>, // [in, intermediate_size_mlp]
-    pub(super) mlp_up_w: Option<InlineArray>,
-    pub(super) mlp_down_w: Option<InlineArray>,
-    // MoE
-    pub(super) moe: Option<MoeWeights>,
+    pub(super) ffn: Ffn,
 }
 
-/// All model weights as InlineArrays.
+impl LayerWeights {
+    /// The four attention projections when all are dense: the compiled
+    /// single-token graph takes dense matrices, so a packed layer decodes
+    /// through the per-op path instead.
+    pub(super) fn dense_attention(
+        &self,
+    ) -> Option<(&InlineArray, &InlineArray, &InlineArray, &InlineArray)> {
+        match (&self.attn_q, &self.attn_k, &self.attn_v, &self.attn_o) {
+            (
+                LayerWeight::Dense(q),
+                LayerWeight::Dense(k),
+                LayerWeight::Dense(v),
+                LayerWeight::Dense(o),
+            ) => Some((q, k, v, o)),
+            _ => None,
+        }
+    }
+}
+
+/// All model weights.
 pub struct NativeWeights {
-    pub embed_w: InlineArray,      // [vocab, hidden]
+    pub embed_w: EmbeddingWeight,
     pub final_norm_w: InlineArray, // [hidden]
     pub final_norm_eps: f32,
     /// `None` when `tie_word_embeddings = true`.
-    pub lm_head_w: Option<InlineArray>, // [hidden, vocab] (pre-transposed)
+    pub lm_head_w: Option<LayerWeight>,
     pub tie_word_embeddings: bool,
     /// Per-layer weights — only accessed via [`super::forward_step`].
     pub(super) layers: Vec<LayerWeights>,
-    /// Model activation dtype (11 = bfloat16, 1 = float16, 0 = float32).
+    /// The dtype the trunk computes in (11 = bfloat16, 1 = float16, 0 = float32).
     pub model_dtype: i32,
     /// Chunk size for local attention (from config).
     pub attention_chunk_size: i32,
+}
+
+impl NativeWeights {
+    /// Whether any projection or expert tensor is held packed.
+    pub fn is_packed(&self) -> bool {
+        self.layers.iter().any(|lw| {
+            lw.dense_attention().is_none()
+                || match &lw.ffn {
+                    Ffn::Moe(m) => !m.experts_gate.is_dense(),
+                    Ffn::Dense(m) => !m.gate.is_dense(),
+                }
+        })
+    }
 }
 
 impl std::fmt::Debug for NativeWeights {
@@ -105,116 +146,74 @@ impl std::fmt::Debug for NativeWeights {
     }
 }
 
-/// Load model weights from a directory containing safetensors shards.
-///
-/// Applies all sanitization required by the reference implementation:
-/// - Vision / projector weight removal
-/// - Expert weight splitting: `experts.gate_up_proj` → `experts.gate_proj.weight` +
-///   `experts.up_proj.weight` (split on last axis); `experts.down_proj` kept as
-///   `[E, expert_hidden, hidden]`
-/// - `language_model.` prefix stripping for VLM checkpoints
-/// - All projection weights pre-transposed to `[in, out]` form for efficient matmul
+/// A checkpoint key in the text model's namespace, or `None` for what the
+/// engine never loads (the vision tower and its projector).
+fn text_key(key: &str) -> Option<String> {
+    if key.contains("vision_model") || key.contains("multi_modal_projector") {
+        return None;
+    }
+    // `language_model.model.X` and `language_model.lm_head.X` fold onto `X`'s
+    // text-only names; `model.language_model.X` (transformers 5) onto `model.X`.
+    if let Some(rest) = key.strip_prefix("language_model.") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = key.strip_prefix("model.language_model.") {
+        return Some(format!("model.{rest}"));
+    }
+    Some(key.to_string())
+}
+
+fn load_mlp(ckpt: &mut Checkpoint, prefix: &str) -> Result<Mlp, String> {
+    Ok(Mlp {
+        gate: ckpt.linear(&format!("{prefix}.gate_proj"))?,
+        up: ckpt.linear(&format!("{prefix}.up_proj"))?,
+        down: ckpt.linear(&format!("{prefix}.down_proj"))?,
+    })
+}
+
+/// The routed experts under `{ff}.experts`, from either layout in the module
+/// docs.
+fn load_experts(
+    ckpt: &mut Checkpoint,
+    ff: &str,
+    expert_hidden: i32,
+) -> Result<(LayerWeight, LayerWeight, LayerWeight), String> {
+    let experts = format!("{ff}.experts");
+    // Already `[E, in, out]`: no transpose, and gate comes first.
+    if let Some(gate_up) = ckpt.take_opt(&format!("{experts}.gate_up_proj")) {
+        let mut halves = gate_up.split(&[expert_hidden], -1);
+        let up = halves.pop().expect("split yields two parts");
+        let gate = halves.pop().expect("split yields two parts");
+        let down = ckpt.take(&format!("{experts}.down_proj"))?;
+        return Ok((
+            LayerWeight::Dense(gate),
+            LayerWeight::Dense(up),
+            LayerWeight::Dense(down),
+        ));
+    }
+    Ok((
+        ckpt.stacked(&format!("{experts}.gate_proj"))?,
+        ckpt.stacked(&format!("{experts}.up_proj"))?,
+        ckpt.stacked(&format!("{experts}.down_proj"))?,
+    ))
+}
+
+/// Load a Llama 4 checkpoint directory.
 pub fn load_model(
     model_dir: &std::path::Path,
     config: &Llama4Config,
 ) -> Result<NativeWeights, String> {
     let tc = config.text();
+    let mut ckpt = Checkpoint::open("llama4", model_dir, text_key)?;
+    let model_dtype = ckpt.dtype();
 
-    // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
-    let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
-    let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
-
-    // ── Step 3: Sanitization ────────────────────────────────────────────────
-
-    // 3a. Strip VLM prefixes:
-    //     "language_model.model.X" → "model.X"
-    //     "language_model.lm_head.*" → "lm_head.*"
-    //     "model.language_model.X" → "model.X"
-    // Also drop vision and projector weights.
-    let original_keys: Vec<String> = raw.keys().cloned().collect();
-    for old_key in original_keys {
-        // Drop vision / projector weights.
-        if old_key.contains("vision_model") || old_key.contains("multi_modal_projector") {
-            raw.remove(&old_key);
-            continue;
-        }
-
-        let mut new_key = old_key.clone();
-        if new_key.starts_with("language_model.model.") {
-            new_key = new_key.replacen("language_model.", "", 1);
-        } else if new_key.starts_with("language_model.") {
-            // e.g. "language_model.lm_head.weight"
-            new_key = new_key.replacen("language_model.", "", 1);
-        } else if new_key.starts_with("model.language_model.") {
-            new_key = new_key.replacen("model.language_model.", "model.", 1);
-        }
-
-        if new_key != old_key {
-            if let Some(v) = raw.remove(&old_key) {
-                raw.insert(new_key, v);
-            }
-        }
-    }
-
-    // 3b. Experts, to the `[E, in, out]` layout `gather_mm(x, b, None, idx)`
-    // takes as `b` (`[E, K, N]`).
-    //
-    // transformers' layout (`Llama4TextExperts`, every release) is already
-    // applied as `x @ W`:
-    //   `experts.gate_up_proj` [E, hidden, 2 * expert_hidden], gate then up
-    //   (`gate_up.chunk(2, dim=-1)`), and `experts.down_proj`
-    //   [E, expert_hidden, hidden]. Neither needs a transpose.
-    // A stacked per-projection layout (`experts.{gate,up,down}_proj.weight`,
-    // `[E, out, in]` like a Linear) is transposed to `[E, in, out]`.
-    for li in 0..tc.num_hidden_layers as usize {
-        if !config.is_moe_layer(li) {
-            continue;
-        }
-        let prefix = format!("model.layers.{li}.feed_forward.experts");
-        if let Some(gate_up) = raw.remove(&format!("{prefix}.gate_up_proj")) {
-            let mut parts = gate_up.split(&[tc.intermediate_size], -1);
-            let up = parts.pop().unwrap();
-            let gate = parts.pop().unwrap();
-            raw.insert(format!("{prefix}.gate_proj.weight"), gate);
-            raw.insert(format!("{prefix}.up_proj.weight"), up);
-            if let Some(down) = raw.remove(&format!("{prefix}.down_proj")) {
-                raw.insert(format!("{prefix}.down_proj.weight"), down);
-            }
-        } else {
-            for proj in ["gate_proj", "up_proj", "down_proj"] {
-                let key = format!("{prefix}.{proj}.weight");
-                if let Some(w) = raw.remove(&key) {
-                    raw.insert(key, w.transpose_axes(&[0, 2, 1]));
-                }
-            }
-        }
-    }
-
-    // ── Step 4: Build per-layer weight structs ──────────────────────────────
-
-    let detected_dtype = raw
-        .get("model.embed_tokens.weight")
-        .map(|w| w.dtype_raw())
-        .unwrap_or(11); // 11 = bfloat16
-
-    let get = |key: &str| -> Result<InlineArray, String> {
-        raw.get(key).cloned().ok_or_else(|| {
-            let parts: Vec<&str> = key.rsplitn(2, '.').collect();
-            let suffix = parts[0];
-            let close: Vec<&String> = raw.keys().filter(|k| k.ends_with(suffix)).take(5).collect();
-            format!("missing weight key: {key} (close matches: {close:?})")
-        })
-    };
-
-    let try_get = |key: &str| -> Option<InlineArray> { raw.get(key).cloned() };
-
-    let embed_w = get("model.embed_tokens.weight")?;
-    let final_norm_w = get("model.norm.weight")?;
+    let embed_w = ckpt.embedding("model.embed_tokens")?;
+    let final_norm_w = ckpt.take("model.norm.weight")?;
     let lm_head_w = if tc.tie_word_embeddings {
+        ckpt.take_opt("lm_head.weight");
         None
     } else {
-        // Stored as [vocab, hidden] — transpose to [hidden, vocab] for matmul.
-        Some(get("lm_head.weight")?.t())
+        Some(ckpt.linear("lm_head")?)
     };
 
     let n_heads = tc.num_attention_heads;
@@ -227,86 +226,42 @@ pub fn load_model(
     let rotary = config.rotary()?;
 
     let mut layers = Vec::with_capacity(tc.num_hidden_layers as usize);
-
     for li in 0..tc.num_hidden_layers as usize {
         let p = format!("model.layers.{li}");
-        let use_rope = config.use_rope(li);
-        let is_moe = config.is_moe_layer(li);
-
-        let input_ln_w = get(&format!("{p}.input_layernorm.weight"))?;
-        let post_ln_w = get(&format!("{p}.post_attention_layernorm.weight"))?;
-
-        // Attention projections — stored as [out, in], transpose to [in, out].
         let sa = format!("{p}.self_attn");
-        let attn_q_w = get(&format!("{sa}.q_proj.weight"))?.t();
-        let attn_k_w = get(&format!("{sa}.k_proj.weight"))?.t();
-        let attn_v_w = get(&format!("{sa}.v_proj.weight"))?.t();
-        let attn_o_w = get(&format!("{sa}.o_proj.weight"))?.t();
+        let ff = format!("{p}.feed_forward");
+        let use_rope = config.use_rope(li);
 
-        // Optional biases
-        let attn_q_b = try_get(&format!("{sa}.q_proj.bias"));
-        let attn_k_b = try_get(&format!("{sa}.k_proj.bias"));
-        let attn_v_b = try_get(&format!("{sa}.v_proj.bias"));
-        let attn_o_b = try_get(&format!("{sa}.o_proj.bias"));
-
-        // QK-norm only on RoPE layers (and only when use_qk_norm=true in config)
-        let attn_qk_norm = use_rope && tc.use_qk_norm;
-
-        // Feed-forward
-        let (mlp_gate_w, mlp_up_w, mlp_down_w, moe) = if is_moe {
-            let ff = format!("{p}.feed_forward");
-            let exp = format!("{ff}.experts");
-
-            // Expert gate/up/down — shapes already sanitized in step 3b.
-            // gate_proj: [E, in_dim, expert_hidden]
-            // up_proj:   [E, in_dim, expert_hidden]
-            // down_proj: [E, expert_hidden, in_dim]
-            let gate_w = get(&format!("{exp}.gate_proj.weight"))?;
-            let up_w = get(&format!("{exp}.up_proj.weight"))?;
-            let down_w = get(&format!("{exp}.down_proj.weight"))?;
-
-            // Router: [num_experts, in_dim] → pre-transpose to [in_dim, num_experts]
-            let router_w = get(&format!("{ff}.router.weight"))?.t();
-
-            // Shared expert — stored as standard [out, in], transposed to [in, out]
-            let sh = format!("{ff}.shared_expert");
-            let sh_gate_w = get(&format!("{sh}.gate_proj.weight"))?.t();
-            let sh_up_w = get(&format!("{sh}.up_proj.weight"))?.t();
-            let sh_down_w = get(&format!("{sh}.down_proj.weight"))?.t();
-
-            let moe_weights = MoeWeights {
-                experts_gate_w: gate_w,
-                experts_up_w: up_w,
-                experts_down_w: down_w,
-                router_w,
-                shared_gate_w: sh_gate_w,
-                shared_up_w: sh_up_w,
-                shared_down_w: sh_down_w,
-            };
-            (None, None, None, Some(moe_weights))
+        let ffn = if config.is_moe_layer(li) {
+            let (experts_gate, experts_up, experts_down) =
+                load_experts(&mut ckpt, &ff, tc.intermediate_size)?;
+            Ffn::Moe(MoeWeights {
+                experts_gate,
+                experts_up,
+                experts_down,
+                router: ckpt.linear(&format!("{ff}.router"))?,
+                top_k: tc.num_experts_per_tok,
+                shared: load_mlp(&mut ckpt, &format!("{ff}.shared_expert"))?,
+            })
         } else {
-            // Dense MLP — uses intermediate_size_mlp
-            let ff = format!("{p}.feed_forward");
-            let gate_w = get(&format!("{ff}.gate_proj.weight"))?.t();
-            let up_w = get(&format!("{ff}.up_proj.weight"))?.t();
-            let down_w = get(&format!("{ff}.down_proj.weight"))?.t();
-            (Some(gate_w), Some(up_w), Some(down_w), None)
+            Ffn::Dense(load_mlp(&mut ckpt, &ff)?)
         };
 
         layers.push(LayerWeights {
             use_rope,
-            input_ln_w,
-            post_ln_w,
+            input_ln_w: ckpt.take(&format!("{p}.input_layernorm.weight"))?,
+            post_ln_w: ckpt.take(&format!("{p}.post_attention_layernorm.weight"))?,
             norm_eps: tc.rms_norm_eps,
-            attn_q_w,
-            attn_k_w,
-            attn_v_w,
-            attn_o_w,
-            attn_q_b,
-            attn_k_b,
-            attn_v_b,
-            attn_o_b,
-            attn_qk_norm,
+            attn_q: ckpt.linear(&format!("{sa}.q_proj"))?,
+            attn_k: ckpt.linear(&format!("{sa}.k_proj"))?,
+            attn_v: ckpt.linear(&format!("{sa}.v_proj"))?,
+            attn_o: ckpt.linear(&format!("{sa}.o_proj"))?,
+            attn_q_b: ckpt.take_opt(&format!("{sa}.q_proj.bias")),
+            attn_k_b: ckpt.take_opt(&format!("{sa}.k_proj.bias")),
+            attn_v_b: ckpt.take_opt(&format!("{sa}.v_proj.bias")),
+            attn_o_b: ckpt.take_opt(&format!("{sa}.o_proj.bias")),
+            // QK-norm only on RoPE layers (and only when use_qk_norm=true in config)
+            attn_qk_norm: use_rope && tc.use_qk_norm,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -315,70 +270,79 @@ pub fn load_model(
             attn_temperature_tuning: tc.attn_temperature_tuning,
             floor_scale: tc.floor_scale,
             layer_attn_scale: tc.attn_scale,
-            is_moe,
-            mlp_gate_w,
-            mlp_up_w,
-            mlp_down_w,
-            moe,
+            ffn,
         });
     }
 
-    // ── Step 5: copy_fresh — force all weights into fresh Metal buffers ─────
-    let zero = InlineArray::scalar_with_dtype(0.0, detected_dtype);
-    let copy_fresh = |w: &InlineArray| -> InlineArray {
-        let mut fresh = w.add(&zero);
-        fresh.eval();
-        fresh.detach();
-        fresh
+    // A tensor of a text layer nothing above read belongs to a feature this
+    // engine does not run; loading past it would run a different model.
+    let unread: Vec<&str> = ckpt
+        .unclaimed()
+        .into_iter()
+        .filter(|k| k.starts_with("model.layers."))
+        .collect();
+    if !unread.is_empty() {
+        return Err(format!(
+            "llama4: {} checkpoint tensors in the text layers are not part of the model this \
+             engine runs, first: {:?}",
+            unread.len(),
+            &unread[..unread.len().min(5)]
+        ));
+    }
+
+    // Force every weight into a fresh Metal buffer (the expert split above is
+    // a strided view of the fused tensor).
+    let zero = InlineArray::scalar_with_dtype(0.0, model_dtype);
+    let fresh = |a: &InlineArray| copy_fresh_arr(a, &zero);
+    let opt = |a: &mut Option<InlineArray>| *a = a.as_ref().map(fresh);
+    let embed_w = match embed_w {
+        EmbeddingWeight::Dense(w) => EmbeddingWeight::Dense(fresh(&w)),
+        packed @ EmbeddingWeight::Quantized { .. } => packed,
     };
-
-    let embed_w = copy_fresh(&embed_w);
-    let final_norm_w = copy_fresh(&final_norm_w);
-    let lm_head_w = lm_head_w.map(|w| copy_fresh(&w));
-
+    let final_norm_w = fresh(&final_norm_w);
+    let lm_head_w = lm_head_w.map(|w| w.copy_fresh(&zero));
     for lw in &mut layers {
-        lw.input_ln_w = copy_fresh(&lw.input_ln_w);
-        lw.post_ln_w = copy_fresh(&lw.post_ln_w);
-        lw.attn_q_w = copy_fresh(&lw.attn_q_w);
-        lw.attn_k_w = copy_fresh(&lw.attn_k_w);
-        lw.attn_v_w = copy_fresh(&lw.attn_v_w);
-        lw.attn_o_w = copy_fresh(&lw.attn_o_w);
-        if let Some(ref b) = lw.attn_q_b {
-            lw.attn_q_b = Some(copy_fresh(b));
+        lw.input_ln_w = fresh(&lw.input_ln_w);
+        lw.post_ln_w = fresh(&lw.post_ln_w);
+        for w in [
+            &mut lw.attn_q,
+            &mut lw.attn_k,
+            &mut lw.attn_v,
+            &mut lw.attn_o,
+        ] {
+            *w = w.copy_fresh(&zero);
         }
-        if let Some(ref b) = lw.attn_k_b {
-            lw.attn_k_b = Some(copy_fresh(b));
+        for b in [
+            &mut lw.attn_q_b,
+            &mut lw.attn_k_b,
+            &mut lw.attn_v_b,
+            &mut lw.attn_o_b,
+        ] {
+            opt(b);
         }
-        if let Some(ref b) = lw.attn_v_b {
-            lw.attn_v_b = Some(copy_fresh(b));
-        }
-        if let Some(ref b) = lw.attn_o_b {
-            lw.attn_o_b = Some(copy_fresh(b));
-        }
-        if let Some(ref w) = lw.mlp_gate_w {
-            lw.mlp_gate_w = Some(copy_fresh(w));
-        }
-        if let Some(ref w) = lw.mlp_up_w {
-            lw.mlp_up_w = Some(copy_fresh(w));
-        }
-        if let Some(ref w) = lw.mlp_down_w {
-            lw.mlp_down_w = Some(copy_fresh(w));
-        }
-        if let Some(ref mut moe) = lw.moe {
-            moe.experts_gate_w = copy_fresh(&moe.experts_gate_w);
-            moe.experts_up_w = copy_fresh(&moe.experts_up_w);
-            moe.experts_down_w = copy_fresh(&moe.experts_down_w);
-            moe.router_w = copy_fresh(&moe.router_w);
-            moe.shared_gate_w = copy_fresh(&moe.shared_gate_w);
-            moe.shared_up_w = copy_fresh(&moe.shared_up_w);
-            moe.shared_down_w = copy_fresh(&moe.shared_down_w);
+        let mlp = |m: &mut Mlp| {
+            m.gate = m.gate.copy_fresh(&zero);
+            m.up = m.up.copy_fresh(&zero);
+            m.down = m.down.copy_fresh(&zero);
+        };
+        match &mut lw.ffn {
+            Ffn::Dense(m) => mlp(m),
+            Ffn::Moe(moe) => {
+                moe.experts_gate = moe.experts_gate.copy_fresh(&zero);
+                moe.experts_up = moe.experts_up.copy_fresh(&zero);
+                moe.experts_down = moe.experts_down.copy_fresh(&zero);
+                moe.router = moe.router.copy_fresh(&zero);
+                mlp(&mut moe.shared);
+            }
         }
     }
+    crate::check_unobserved_error()
+        .map_err(|e| format!("llama4: loading the weights failed: {e}"))?;
 
     eprintln!(
         "[LLAMA4_NATIVE] load_model: {} layers, dtype={}, chunk_size={}",
         layers.len(),
-        detected_dtype,
+        model_dtype,
         tc.attention_chunk_size
     );
 
@@ -389,7 +353,7 @@ pub fn load_model(
         lm_head_w,
         tie_word_embeddings: tc.tie_word_embeddings,
         layers,
-        model_dtype: detected_dtype,
+        model_dtype,
         attention_chunk_size: tc.attention_chunk_size,
     })
 }

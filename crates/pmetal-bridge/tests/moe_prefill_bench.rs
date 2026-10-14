@@ -93,7 +93,7 @@ fn grouped_and_router_order_prefill() {
                         &down,
                         &inds,
                         &scores,
-                        InlineArray::fused_swiglu,
+                        |g, u, _| InlineArray::fused_swiglu(g, u),
                         grouped,
                     )
                 })

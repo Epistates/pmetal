@@ -1,239 +1,177 @@
-//! Dense SwiGLU MLP + DeepSeek V3 `noaux_tc` group-aware top-k MoE routing
-//! with auxiliary-loss-free load balancing.
+//! Dense SwiGLU MLP and DeepSeek's routed MoE: the router (V3's `noaux_tc`
+//! and V2's softmax, plain or group-limited) and the routed experts.
+
+use serde::Deserialize;
 
 use crate::InlineArray;
+use crate::dtype;
 
-use super::weights::LayerWeights;
+use super::weights::{Mlp, MoeWeights};
 
-pub(super) fn dense_mlp_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
-    let gate = x.matmul(lw.mlp_gate_w.as_ref().unwrap());
-    let up = x.matmul(lw.mlp_up_w.as_ref().unwrap());
-    let act = InlineArray::fused_swiglu(&gate, &up);
-    act.matmul(lw.mlp_down_w.as_ref().unwrap())
+/// How the router turns its logits into expert scores: the config's
+/// `scoring_func`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringFunc {
+    /// V3: an independent sigmoid per expert.
+    Sigmoid,
+    /// V2: a softmax over all experts.
+    Softmax,
 }
 
-/// DeepSeek V3 MoE forward pass.
-///
-/// Implements the `noaux_tc` group-aware routing with auxiliary-loss-free
-/// load balancing (`e_score_correction_bias`):
-///
-/// 1. Compute gate logits: `gates = x @ gate_weight.T`
-/// 2. sigmoid(gates) → raw scores + e_score_correction_bias → biased scores
-/// 3. Group-aware top-k: mask bottom `n_group - topk_group` groups then top_k
-/// 4. Re-gather original sigmoid scores for the selected experts → normalize
-/// 5. `gather_mm` for gate/up projections, fused SwiGLU, `gather_mm` for down
-/// 6. Weighted sum over selected experts + shared expert contribution
-pub(super) fn moe_forward(lw: &LayerWeights, x: &InlineArray, b: i32, s: i32) -> InlineArray {
-    let moe = lw.moe.as_ref().unwrap();
+/// How the router picks the top-k experts: the config's `topk_method`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopkMethod {
+    /// V3: the bias-corrected scores, restricted to the `topk_group` groups
+    /// whose two best experts score highest; the weights are the uncorrected
+    /// scores.
+    NoauxTc,
+    /// V2: the `top_k` best scores.
+    Greedy,
+    /// V2 (the 236B): the `top_k` best scores among the `topk_group` groups
+    /// whose best expert scores highest.
+    GroupLimitedGreedy,
+}
 
-    // ── Expert routing ───────────────────────────────────────────────────
-    // x: [B, S, hidden] → flatten to [B*S, hidden] for routing.
-    let x_2d = x.reshape(&[b * s, -1]); // [T, hidden]
+pub(super) fn mlp_forward(mlp: &Mlp, x: &InlineArray) -> InlineArray {
+    let gate = mlp.gate.matmul_from(x);
+    let up = mlp.up.matmul_from(x);
+    mlp.down.matmul_from(&InlineArray::fused_swiglu(&gate, &up))
+}
 
-    // Gate logits: [T, n_experts]
-    let gates = x_2d.matmul(&moe.gate_weight.t());
-
-    // Sigmoid scores.
-    let orig_scores = gates.sigmoid().as_dtype(11); // float32 in Python, bf16 here
-
-    // Biased scores for routing (e_score_correction_bias is NOT normalised into output).
-    let biased_scores = orig_scores.add(&moe.e_score_correction_bias);
-
-    // Group-aware top-k selection.
-    let (inds, scores) = group_topk(
-        &biased_scores,
-        &orig_scores,
-        moe.n_routed_experts,
-        moe.n_group,
-        moe.topk_group,
-        moe.top_k,
-        moe.routed_scaling_factor,
-        moe.norm_topk_prob,
+/// DeepSeek MoE forward pass: the routed experts, each row through its
+/// `top_k` of them weighted by the router, plus the shared expert.
+pub(super) fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> InlineArray {
+    let hidden = x.dim(2);
+    let x_flat = x.reshape(&[b * s, hidden]);
+    let (inds, weights) = moe.router.route(&x_flat);
+    let weights = weights.as_dtype(x.dtype_raw());
+    let routed = crate::native_moe::switch_glu(
+        &x_flat,
+        &moe.gate,
+        &moe.up,
+        &moe.down,
+        &inds,
+        &weights,
+        InlineArray::fused_swiglu,
     );
-
-    // ── Routed expert computation ─────────────────────────────────────────
-    // gather_mm(x_2d, gate_w, lhs=None, rhs=inds, sorted=False)
-    // gate_w: [n_experts, inter_size, hidden] — gather selects expert slices
-    // For gather_mm with stacked [E, Out, In] (pre-transposed):
-    //   result: [T*top_k, inter_size]
-    // Python's SwitchGLU does:
-    //   gate_proj: x → [T, top_k, inter]  via gather_mm
-    //   up_proj:   x → [T, top_k, inter]  via gather_mm
-    //   down_proj: swiglu_out → [T, top_k, hidden] via gather_mm
-    //   weighted sum: * scores[..., None]  → [T, top_k, hidden] → sum(-2)
-
-    // x_2d [T, hidden], gate_w [E, inter, hidden] stored as [E, inter, hidden]
-    // gather_mm expects: a [T, hidden] @ b [E, hidden, inter] with rhs_indices selecting per row.
-    // We stored the expert weight stacks as-is from safetensors: [E, inter, hidden]
-    // To get [T*k, inter] output we need: x[rhs_inds] @ w[rhs_inds].T which is gather_mm(x, w, rhs=inds, sorted=False)
-    // MLX gather_mm: a [T, D] @ b [E, D, M] with rhs [T, k] → [T, k, M]
-    // Our stacked shape from safetensors is [E, inter, hidden], so direct matmul gives inter per row.
-    // We call gather_mm(x_2d, w, None, inds_for_gather, false) to select top-k expert rows.
-
-    let gate_out = x_2d.gather_mm(&moe.gate_w, None, Some(&inds), false); // [T, k, inter]
-    let up_out = x_2d.gather_mm(&moe.up_w, None, Some(&inds), false); // [T, k, inter]
-    let activated = InlineArray::fused_swiglu(&gate_out, &up_out); // [T, k, inter]
-
-    // down_proj: [T, k, inter] @ down_w[experts] → [T, k, hidden]
-    let down_out = activated.gather_mm(&moe.down_w, None, Some(&inds), false); // [T, k, hidden]
-
-    // Weighted sum: scores [T, k, 1] * down_out [T, k, hidden] → sum over k → [T, hidden]
-    let scores_3d = scores.reshape(&[b * s, moe.top_k, 1]);
-    let weighted = down_out.multiply(&scores_3d);
-    let mut y = weighted.sum_axis(-2, false); // [T, hidden]
-
-    // ── Shared expert ─────────────────────────────────────────────────────
-    if let (Some(sg), Some(su), Some(sd)) =
-        (&moe.shared_gate_w, &moe.shared_up_w, &moe.shared_down_w)
-    {
-        let sh_gate = x_2d.matmul(sg);
-        let sh_up = x_2d.matmul(su);
-        let sh_act = InlineArray::fused_swiglu(&sh_gate, &sh_up);
-        let sh_out = sh_act.matmul(sd);
-        y = y.add(&sh_out);
-    }
-
-    // Reshape back to [B, S, hidden]
-    y.reshape(&[b, s, -1])
+    let y = match &moe.shared {
+        Some(shared) => routed.add(&mlp_forward(shared, &x_flat)),
+        None => routed,
+    };
+    y.reshape(&[b, s, hidden])
 }
 
-// ============================================================================
-// Group-aware top-k routing
-// ============================================================================
+/// The router: gate weights and the settings of one MoE layer's top-k.
+pub(super) struct Router {
+    /// `[hidden, experts]`, `f32`: the gate is applied to the `f32` hidden
+    /// state, as transformers does, so near-ties between experts resolve as
+    /// they do there.
+    pub(super) weight: InlineArray,
+    /// `[experts]`, `f32`: V3's `e_score_correction_bias`, which steers the
+    /// choice and never the weights.
+    pub(super) bias: Option<InlineArray>,
+    pub(super) scoring: ScoringFunc,
+    pub(super) method: TopkMethod,
+    pub(super) n_group: i32,
+    pub(super) topk_group: i32,
+    pub(super) top_k: i32,
+    pub(super) routed_scaling_factor: f32,
+    pub(super) norm_topk_prob: bool,
+}
 
-/// Implements `group_expert_select` from the Python code.
+impl Router {
+    /// `[rows, hidden]` to each row's `top_k` experts, `[rows, top_k]` `int32`,
+    /// and their weights, `[rows, top_k]` `f32`.
+    ///
+    /// ```text
+    ///   scores  = sigmoid(x @ W) | softmax(x @ W)           (f32)
+    ///   choice  = scores + bias                              (noaux_tc only)
+    ///   choice  = choice, limited to the best groups         (grouped methods)
+    ///   experts = top_k(choice)
+    ///   weights = scores[experts], normalised to sum 1 when norm_topk_prob,
+    ///             times routed_scaling_factor
+    /// ```
+    pub(super) fn route(&self, x_flat: &InlineArray) -> (InlineArray, InlineArray) {
+        let logits = x_flat.as_dtype(dtype::F32).matmul(&self.weight);
+        let scores = match self.scoring {
+            ScoringFunc::Sigmoid => logits.sigmoid(),
+            ScoringFunc::Softmax => logits.softmax_precise(-1),
+        };
+        let choice = match &self.bias {
+            Some(bias) => scores.add(bias),
+            None => scores.clone(),
+        };
+        let choice = match self.method {
+            TopkMethod::Greedy => choice,
+            TopkMethod::NoauxTc | TopkMethod::GroupLimitedGreedy => limit_to_groups(
+                &choice,
+                self.method,
+                self.n_group,
+                self.topk_group,
+                // transformers masks V3's choice to -inf and V2's scores to 0.
+                if self.method == TopkMethod::NoauxTc {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                },
+            ),
+        };
+        let rows = choice.dim(0);
+        // `argpartition(-x, k - 1)[:, :k]` is the top k of `x`. The indices
+        // carry no gradient: MLX rejects a gather VJP taken with respect to
+        // indices that descend from differentiable scores.
+        let inds = choice
+            .negative()
+            .argpartition(self.top_k - 1, -1)
+            .slice(&[0, 0], &[rows, self.top_k])
+            .stop_gradient();
+        let weights = scores.take_along_axis(&inds, -1);
+        let weights = if self.norm_topk_prob {
+            let total = weights
+                .sum_axis(-1, true)
+                .add(&InlineArray::scalar_like(1e-20, &weights));
+            weights.divide(&total)
+        } else {
+            weights
+        };
+        let scale = InlineArray::scalar_like(self.routed_scaling_factor, &weights);
+        (inds, weights.multiply(&scale))
+    }
+}
+
+/// `choice` `[rows, experts]` with every expert outside the `topk_group` best
+/// of `n_group` groups replaced by `fill`.
 ///
-/// Returns `(inds, scores)` where:
-/// - `inds`:   [T, top_k] int32 — selected expert indices
-/// - `scores`: [T, top_k] bf16 — normalized routing weights
-///
-/// When `n_group == 1` and `topk_group == 1`, this degenerates to simple
-/// top-k on sigmoid scores (the V3 671B default of n_group=8, topk_group=4
-/// applies group masking for load balance).
-#[allow(clippy::too_many_arguments)]
-fn group_topk(
-    biased_scores: &InlineArray, // [T, n_experts] — for routing decision
-    orig_scores: &InlineArray,   // [T, n_experts] — for weight computation
-    n_experts: i32,
+/// A group's score is the sum of its two best experts (`NoauxTc`) or its best
+/// expert (`GroupLimitedGreedy`).
+fn limit_to_groups(
+    choice: &InlineArray,
+    method: TopkMethod,
     n_group: i32,
     topk_group: i32,
-    top_k: i32,
-    routed_scaling_factor: f32,
-    norm_topk_prob: bool,
-) -> (InlineArray, InlineArray) {
-    let scores = if n_group > 1 {
-        // Reshape to [T, n_group, experts_per_group]
-        let t = biased_scores.dim(0);
-        let experts_per_group = n_experts / n_group;
-        let s_grouped = biased_scores.reshape(&[t, n_group, experts_per_group]);
-
-        // Group scores: sum of top-2 within each group → [T, n_group]
-        // Python: mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        // We approximate top-2 sum as the full group sum (conservative),
-        // or use argpartition: take top-2 per group explicitly.
-        let group_score = top2_sum_per_group(&s_grouped, n_group, experts_per_group);
-
-        // Mask bottom (n_group - topk_group) groups: zero out their experts.
-        let k_mask = n_group - topk_group;
-        let mask_inds = group_score.argpartition(k_mask - 1, -1); // [T, n_group, 1] indices of bottom-k
-
-        // Build zero mask over groups: [T, n_group, 1] → zero out those groups.
-        // We use a simple approach: set masked groups to -inf before per-group argpartition.
-        let masked = apply_group_mask(
-            &s_grouped,
-            &mask_inds,
-            t,
-            n_group,
-            experts_per_group,
-            k_mask,
-        );
-
-        // Flatten masked scores back to [T, n_experts]
-        masked.reshape(&[t, n_experts])
-    } else {
-        biased_scores.clone()
-    };
-
-    // Top-k selection on (possibly group-masked) biased scores.
-    let t = scores.dim(0);
-    // argpartition(-scores, kth=top_k-1) gives indices of top-k (unsorted).
-    let neg_scores = scores.negative();
-    let part_inds = neg_scores.argpartition(top_k - 1, -1); // [T, n_experts]
-    // Take first top_k indices: [T, top_k]. MLX >= 0.32 rejects a gather VJP
-    // taken with respect to indices, and these descend from differentiable
-    // scores — cut the trace here; gradients flow through `sel_scores`.
-    let inds = part_inds.slice(&[0, 0], &[t, top_k]).stop_gradient(); // [T, top_k]
-
-    // Gather orig_scores at selected indices: [T, top_k]
-    let sel_scores = orig_scores.take_along_axis(&inds, -1); // [T, top_k]
-
-    // Normalize / scale.
-    let final_scores = if top_k > 1 && norm_topk_prob {
-        let denom = sel_scores.sum_axis(-1, true); // [T, 1]
-        let normed = sel_scores.divide(&denom);
-        let scale_arr = InlineArray::scalar_like(routed_scaling_factor, &normed);
-        normed.multiply(&scale_arr)
-    } else {
-        let scale_arr = InlineArray::scalar_like(routed_scaling_factor, &sel_scores);
-        sel_scores.multiply(&scale_arr)
-    };
-
-    (inds, final_scores)
-}
-
-/// Compute the sum of the top-2 values per group.
-/// Approximation: use argpartition to find top-2 then sum.
-///
-/// s_grouped: [T, n_group, epg]  (epg = experts_per_group)
-/// Returns:   [T, n_group, 1]
-fn top2_sum_per_group(s_grouped: &InlineArray, _n_group: i32, _epg: i32) -> InlineArray {
-    // argpartition(s_grouped, kth=epg-2, axis=-1) gives indices such that
-    // the last 2 elements are the top-2 (in some order).
-    // Python: mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-    // We use: take top-2 via argpartition, gather, sum.
-    let epg = s_grouped.dim(-1);
-    if epg <= 2 {
-        // Sum all if 2 or fewer experts per group.
-        return s_grouped.sum_axis(-1, true);
-    }
-    // argpartition(-s, kth=1, axis=-1): first 2 elements have the top-2.
-    let neg = s_grouped.negative();
-    let part = neg.argpartition(1, -1); // [T, n_group, epg]
-    let top2_inds = part
-        .slice(&[0, 0, 0], &[s_grouped.dim(0), s_grouped.dim(1), 2])
-        .stop_gradient(); // [T, n_group, 2]
-    let top2_vals = s_grouped.take_along_axis(&top2_inds, -1); // [T, n_group, 2]
-    top2_vals.sum_axis(-1, true) // [T, n_group, 1]
-}
-
-/// Zero out experts in the bottom (n_group - topk_group) groups.
-///
-/// s_grouped:  [T, n_group, epg]
-/// mask_inds:  [T, n_group, 1] — indices of bottom-k groups per token
-/// Returns:    [T, n_group, epg] with bottom groups zeroed
-fn apply_group_mask(
-    s_grouped: &InlineArray,
-    _mask_inds: &InlineArray,
-    _t: i32,
-    _n_group: i32,
-    _epg: i32,
-    _k_mask: i32,
+    fill: f32,
 ) -> InlineArray {
-    // Approximate: sum group scores to rank groups, mask bottom k.
-    // Full implementation would use put_along_axis (not available in bridge),
-    // so we use a conservative approach: for groups not selected, we zero out
-    // by subtracting a large value via per-group comparison.
-    //
-    // Simpler working approach: use group_score to identify selected groups,
-    // build a boolean mask of shape [T, n_group] via comparison, then
-    // broadcast multiply into [T, n_group, epg].
-    //
-    // Since put_along_axis is not in the bridge, we return the scores as-is
-    // (group masking skipped). This is correct for n_group=1 (V3 default small
-    // models). For the full 671B (n_group=8, topk_group=4), group masking
-    // slightly affects routing quality but not correctness. Users requiring
-    // exact group masking can extend via a custom bridge call.
-    //
-    // TODO: add put_along_axis to bridge.h for full group masking.
-    s_grouped.clone()
+    let (rows, experts) = (choice.dim(0), choice.dim(1));
+    let per_group = experts / n_group;
+    let grouped = choice.reshape(&[rows, n_group, per_group]);
+    let group_scores = match method {
+        TopkMethod::GroupLimitedGreedy => grouped.max_axis(-1, false),
+        _ => grouped.topk(per_group.min(2), -1).sum_axis(-1, false),
+    };
+    // The best `topk_group` groups of each row, as a `[rows, n_group]` mask.
+    let best = group_scores
+        .negative()
+        .argpartition(topk_group - 1, -1)
+        .slice(&[0, 0], &[rows, topk_group])
+        .stop_gradient();
+    let group_ids = InlineArray::arange(n_group, dtype::I32);
+    let kept = best
+        .reshape(&[rows, topk_group, 1])
+        .eq(&group_ids)
+        .any(Some(&[1]), false)
+        .expand_dims(-1);
+    let fill = InlineArray::scalar_like(fill, choice);
+    kept.where_cond(&grouped, &fill).reshape(&[rows, experts])
 }

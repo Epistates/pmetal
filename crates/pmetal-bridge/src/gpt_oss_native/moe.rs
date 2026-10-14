@@ -3,6 +3,7 @@
 //! `GptOssMLP` and the gpt-oss reference implementation compute them.
 
 use crate::InlineArray;
+use crate::native_weight::LayerWeight;
 
 use super::weights::LayerWeights;
 
@@ -18,22 +19,22 @@ pub(super) fn moe_forward(lw: &LayerWeights, normed: &InlineArray, b: i32, s: i3
     let hidden_size = normed.dim(2);
     let rows = b * s;
     let x = normed.reshape(&[rows, hidden_size]);
-    let (inds, scores) = route(&x, &lw.moe_router_w, &lw.moe_router_b, lw.moe_top_k);
+    let (inds, scores) = route(&x, &lw.moe_router, &lw.moe_router_b, lw.moe_top_k);
     lw.moe_experts
         .forward(&x, &inds, &scores, lw.swiglu_alpha, lw.swiglu_limit)
         .reshape(&[b, s, hidden_size])
 }
 
-/// gpt-oss's router: the `top_k` largest of `x @ w + b` (`w` `[hidden, E]`)
-/// and a softmax over just those. Only the order of the logits picks the
-/// experts; the indices carry no gradient.
+/// gpt-oss's router: the `top_k` largest of `router(x) + b` (`router`
+/// `hidden -> E`, dense or packed) and a softmax over just those. Only the
+/// order of the logits picks the experts; the indices carry no gradient.
 pub fn route(
     x_flat: &InlineArray,
-    w: &InlineArray,
+    router: &LayerWeight,
     b: &InlineArray,
     top_k: i32,
 ) -> (InlineArray, InlineArray) {
-    let logits = x_flat.matmul(w).add(b);
+    let logits = router.matmul_from(x_flat).add(b);
     let (rows, n_experts) = (logits.dim(0), logits.dim(1));
     let inds = logits
         .argpartition(-top_k, -1)

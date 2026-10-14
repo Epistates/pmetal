@@ -251,6 +251,155 @@ fn native_llama4_moe_matches_transformers() {
     check_native("moe");
 }
 
+/// An MLX-style 4-bit quantization of the multimodal fixture (group 32, the
+/// router at 8 bits, the experts split into MLX's stacked `[E, out, in]`
+/// projections, the tied embedding packed so the head runs `as_linear` on
+/// it), and the same weights dequantized to dense in the same layout. The
+/// packed model has to give the dense one's logits over a prefill and a cached
+/// decode (packed attention decodes per op, the dense twin through the
+/// compiled graph).
+///
+/// What does not divide into groups (the 48-wide shared expert's
+/// `down_proj` and the experts' own) stays dense in both, as a
+/// mixed-precision checkpoint leaves it.
+#[test]
+#[serial]
+fn native_llama4_runs_an_mlx_quantized_checkpoint() {
+    use pmetal_bridge::llama4_native::{NativeCache, forward_step, load_config, load_model};
+
+    const GROUP: i32 = 32;
+    let source = load_shard(&fixture_path("llama4_native_weights.safetensors"));
+    let mut packed: Vec<(String, Array)> = Vec::new();
+    let mut dense: Vec<(String, Array)> = Vec::new();
+    let mut both: Vec<(String, Array)> = Vec::new();
+    let mut overrides = serde_json::Map::new();
+    let mut quantize = |module: &str, w: &Array, bits: i32| {
+        let (q, scales, biases) = w.quantize_weights(GROUP, bits);
+        let deq = q.dequantize(&scales, &biases, GROUP, bits);
+        packed.push((format!("{module}.weight"), q));
+        packed.push((format!("{module}.scales"), scales));
+        packed.push((format!("{module}.biases"), biases));
+        dense.push((format!("{module}.weight"), deq));
+        if bits != 4 {
+            overrides.insert(
+                module.to_string(),
+                serde_json::json!({"group_size": GROUP, "bits": bits}),
+            );
+        }
+    };
+    let mut keys: Vec<&String> = source.keys().collect();
+    keys.sort();
+    for key in keys {
+        let w = &source[key];
+        if let Some(prefix) = key.strip_suffix(".experts.gate_up_proj") {
+            // `[E, H, 2I]`, gate then up, applied `x @ W`: MLX's layout is
+            // one `[E, I, H]` projection each.
+            let inter = w.dim(2) / 2;
+            let halves = w.split(&[inter], 2);
+            for (name, half) in ["gate_proj", "up_proj"].iter().zip(&halves) {
+                quantize(
+                    &format!("{prefix}.experts.{name}"),
+                    &half.swap_axes(1, 2),
+                    4,
+                );
+            }
+        } else if let Some(prefix) = key.strip_suffix(".experts.down_proj") {
+            both.push((
+                format!("{prefix}.experts.down_proj.weight"),
+                w.swap_axes(1, 2),
+            ));
+        } else if let (Some(module), true) = (
+            key.strip_suffix(".weight"),
+            w.ndim() == 2 && w.dim(1) % GROUP == 0 && !key.contains("norm"),
+        ) {
+            let bits = if module.ends_with(".router") { 8 } else { 4 };
+            quantize(module, w, bits);
+        } else {
+            both.push((key.clone(), w.clone()));
+        }
+    }
+
+    let write = |name: &str, tensors: &[(String, Array)], quantization: bool| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture_path("llama4_native_config.json")).unwrap(),
+        )
+        .unwrap();
+        if quantization {
+            let mut block = serde_json::json!({"group_size": GROUP, "bits": 4});
+            block.as_object_mut().unwrap().extend(overrides.clone());
+            config["quantization"] = block;
+        }
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let entries: Vec<(&str, &Array)> = tensors
+            .iter()
+            .chain(both.iter())
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        Array::save_safetensors(
+            dir.path().join("model.safetensors").to_str().unwrap(),
+            &entries,
+        )
+        .expect("save the weights");
+        drain_bridge(name);
+        let config = load_config(dir.path()).expect("config parses");
+        let weights = load_model(dir.path(), &config).expect("weights load");
+        drain_bridge(name);
+        (dir, weights)
+    };
+    let (_packed_dir, packed_weights) = write("packed", &packed, true);
+    let (_dense_dir, dense_weights) = write("dense", &dense, false);
+    assert!(
+        packed_weights.is_packed(),
+        "the weights were unpacked at load"
+    );
+    assert!(!dense_weights.is_packed());
+
+    let reference = load_shard(&fixture_path("llama4_native_reference.safetensors"));
+    let ids = ref_tensor(&reference, "input_ids").clone();
+    let t = ids.dim(1);
+    let run = |weights: &pmetal_bridge::llama4_native::NativeWeights, chunks: &[i32]| {
+        let mut cache = NativeCache::new_empty(weights);
+        let mut start = 0;
+        let mut logits = Vec::new();
+        for &len in chunks {
+            logits.push(forward_step(
+                weights,
+                &rows(&ids, start, start + len),
+                &mut cache,
+            ));
+            start += len;
+        }
+        drain_bridge("forward");
+        logits
+    };
+    let mut steps = vec![PREFILL];
+    steps.extend(std::iter::repeat_n(1, (t - PREFILL) as usize));
+    for (title, chunks) in [("prefill", vec![t]), ("cached decode", steps)] {
+        let want = run(&dense_weights, &chunks);
+        let got = run(&packed_weights, &chunks);
+        let reports: Vec<_> = got
+            .iter()
+            .zip(&want)
+            .enumerate()
+            .map(|(i, (g, w))| ParityReport::compute(&format!("step_{i}"), g, w, TOL))
+            .collect();
+        assert_all_pass(&format!("mlx-quantized: {title}"), &reports);
+    }
+}
+
+/// The released multimodal layout: `model_type: llama4` with the text model
+/// under `text_config` and `tie_word_embeddings` at the top level only (here
+/// true, so there is no `lm_head`), tensors under `language_model.model.*`
+/// beside vision tower and projector tensors, a dense layer between the MoE
+/// ones, and the router taking its top 2: gated expert outputs summed, which
+/// every release (top-1) never exercises but transformers' router defines.
+#[test]
+#[serial]
+fn native_llama4_reads_the_released_multimodal_layout() {
+    check_native("native");
+}
+
 /// `attention_chunk_size` 6 on the 20-token prompt: the RoPE layers attend
 /// within chunks `0..6, 6..12, …` (transformers' chunked causal mask), the
 /// NoPE layer to the whole prefix. The prefill of 7 already crosses a chunk

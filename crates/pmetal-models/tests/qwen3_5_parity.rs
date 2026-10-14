@@ -396,7 +396,7 @@ fn swish_native_forked_prefix_continues_to_the_whole_prompts_logits() {
     prefill_last_logits(&weights, &mut origin, prefix, 16, forward_step_last).eval();
     let mut fork = origin.fork();
 
-    let mut continue_with = |cache: &mut NativeCache, tokens: &[u32], what: &str| {
+    let continue_with = |cache: &mut NativeCache, tokens: &[u32], what: &str| {
         let logits = prefill_last_logits(&weights, cache, tokens, 16, forward_step_last);
         drain_bridge(what);
         ParityReport::compute(what, &logits.reshape(&[1, 1, -1]), &last, PREFILL_TOL)

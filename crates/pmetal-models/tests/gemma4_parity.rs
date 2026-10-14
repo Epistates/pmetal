@@ -526,7 +526,8 @@ fn gemma4_native_prefill_stays_in_the_models_dtype() {
         Array::save_safetensors(
             dir.path().join("model.safetensors").to_str().unwrap(),
             &entries,
-        );
+        )
+        .expect("save the weights");
         let config = gemma4_native::load_config(dir.path()).expect("config parses");
         let weights = gemma4_native::load_model(dir.path(), &config).expect("native load");
         assert_eq!(weights.model_dtype, bf16, "{label}: the checkpoint is bf16");

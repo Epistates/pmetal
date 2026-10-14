@@ -62,7 +62,8 @@ fn write_checkpoint(config: &Value, tensors: &Tensors) -> tempfile::TempDir {
     InlineArray::save_safetensors(
         dir.path().join("model.safetensors").to_str().unwrap(),
         &entries,
-    );
+    )
+    .expect("save the weights");
     dir
 }
 

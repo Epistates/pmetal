@@ -3,6 +3,8 @@
 use crate::InlineArray;
 use crate::inline_array as bridge;
 
+use super::weights::NativeWeights;
+
 /// Per-layer MLA cache.
 ///
 /// Instead of caching full K and V tensors, MLA caches:
@@ -52,9 +54,9 @@ impl NativeCache {
         self.clone()
     }
 
-    /// Create a fresh empty cache.
-    pub fn new_empty(num_layers: usize) -> Self {
-        Self::new_with_quant(num_layers, None)
+    /// Create a fresh empty cache for the given weight set.
+    pub fn new_empty(weights: &NativeWeights) -> Self {
+        Self::new_with_quant(weights, None)
     }
 
     /// Create a cache with optional affine KV quantization.
@@ -63,10 +65,10 @@ impl NativeCache {
     /// a latent vector rather than full K/V tensors. Quantization provides
     /// further memory reduction at the cost of a dequantization step before SDPA.
     pub fn new_with_quant(
-        num_layers: usize,
+        weights: &NativeWeights,
         quant_config: Option<crate::qwen3_native::QuantCacheConfig>,
     ) -> Self {
-        let mla_caches = (0..num_layers)
+        let mla_caches = (0..weights.layers.len())
             .map(|_| MlaLayerCache {
                 kv_latent: None,
                 k_pe: None,

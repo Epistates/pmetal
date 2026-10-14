@@ -5,7 +5,8 @@ use crate::inline_array as bridge;
 
 use super::attention::{attn_forward, build_chunk_mask};
 use super::cache::NativeCache;
-use super::moe::{dense_mlp_forward, moe_forward};
+use super::moe::{mlp_forward, moe_forward};
+use super::weights::Ffn;
 use super::weights::NativeWeights;
 
 /// Run one forward step — works for both T=1 decode and T=N prefill.
@@ -25,7 +26,7 @@ pub fn forward_step(
     let s = token_ids.dim(1);
 
     // Embedding lookup: [B, T, hidden]
-    let mut hidden = weights.embed_w.take_axis(token_ids, 0);
+    let mut hidden = weights.embed_w.lookup(token_ids);
 
     // Build chunk mask for local layers (chunked attention).
     // Python computes this once per forward:
@@ -44,7 +45,7 @@ pub fn forward_step(
     // token (T=1) needs no mask: the attention reads the keys from the start
     // of its chunk (`attn_forward`'s `kv_start`).
     let chunk_mask: Option<InlineArray> = if s > 1 {
-        // Bool mask shape [s, offset + s]. We start key positions at zero
+        // Bool mask shape [1, 1, s, offset + s]. We start key positions at zero
         // because the native path never trims the cache front (the reference
         // ChunkedKVCache eviction is replaced here by a mask-only constraint
         // — see KvLayerCache doc-comment).
@@ -76,10 +77,9 @@ pub fn forward_step(
         let mlp_in = h.rms_norm(Some(&lw.post_ln_w), lw.norm_eps);
 
         // Feed-forward (MoE or dense)
-        let ff_out = if lw.is_moe {
-            moe_forward(lw.moe.as_ref().unwrap(), &mlp_in, b, s)
-        } else {
-            dense_mlp_forward(lw, &mlp_in)
+        let ff_out = match &lw.ffn {
+            Ffn::Moe(moe) => moe_forward(moe, &mlp_in, b, s),
+            Ffn::Dense(mlp) => mlp_forward(mlp, &mlp_in),
         };
 
         // Residual add
@@ -91,10 +91,9 @@ pub fn forward_step(
 
     // Final norm + LM head.
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
-    if weights.tie_word_embeddings {
-        hidden.matmul(&weights.embed_w.t())
-    } else {
-        hidden.matmul(weights.lm_head_w.as_ref().unwrap())
+    match &weights.lm_head_w {
+        Some(head) => head.matmul_from(&hidden),
+        None => weights.embed_w.as_linear(&hidden),
     }
 }
 

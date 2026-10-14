@@ -80,16 +80,40 @@ pub fn switch_glu(
     scores: &InlineArray,
     activation: impl Fn(&InlineArray, &InlineArray) -> InlineArray,
 ) -> InlineArray {
+    switch_glu_with(x_flat, gate, up, down, inds, scores, |gate, up, _| {
+        activation(gate, up)
+    })
+}
+
+/// From this many `(token, expert)` pairs up, [`switch_glu`] groups the pairs
+/// by expert, as MLX's `SwitchGLU` does. Below it (a decode step, a short
+/// draft block) the sort costs more than the kernel it enables saves.
+pub const GROUPING_THRESHOLD: i32 = 64;
+
+/// [`switch_glu`] with an activation that sees which expert each row of its
+/// inputs went through, for activations with per-expert terms (gpt-oss's
+/// expert biases).
+///
+/// `expert_ids` has the leading shape of `gate` and `up` less their last two
+/// axes: `[S, top_k]` as the router gave it, or `[S * top_k]` when the pairs
+/// were grouped by expert. An activation that is elementwise in its inputs
+/// ignores it; one that adds a per-expert tensor takes
+/// `bias.take_axis(expert_ids, 0).expand_dims(-2)` and so has the right
+/// layout either way.
+pub fn switch_glu_with(
+    x_flat: &InlineArray,
+    gate: &LayerWeight,
+    up: &LayerWeight,
+    down: &LayerWeight,
+    inds: &InlineArray,
+    scores: &InlineArray,
+    activation: impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
+) -> InlineArray {
     let grouped = x_flat.dim(0) * inds.dim(1) >= GROUPING_THRESHOLD;
     switch_glu_grouped(x_flat, gate, up, down, inds, scores, activation, grouped)
 }
 
-/// From this many `(token, expert)` pairs up, [`switch_glu`] groups the pairs
-/// by expert. Below it (a decode step, a short draft block) the sort costs more
-/// than the kernel it enables saves.
-pub const GROUPING_THRESHOLD: i32 = 64;
-
-/// [`switch_glu`] with the choice of order made by the caller.
+/// [`switch_glu_with`] with the choice of order made by the caller.
 ///
 /// With `grouped` the `(token, expert)` pairs are sorted by expert before the
 /// gather matmuls and put back after, so each expert's rows form one
@@ -107,12 +131,10 @@ pub fn switch_glu_grouped(
     down: &LayerWeight,
     inds: &InlineArray,
     scores: &InlineArray,
-    activation: impl Fn(&InlineArray, &InlineArray) -> InlineArray,
+    activation: impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
     grouped: bool,
 ) -> InlineArray {
-    let s = x_flat.dim(0);
-    let top_k = inds.dim(1);
-
+    let (s, top_k) = (x_flat.dim(0), inds.dim(1));
     let per_expert = if grouped {
         per_expert_grouped(x_flat, gate, up, down, inds, &activation)
     } else {
@@ -132,13 +154,13 @@ fn per_expert_in_router_order(
     up: &LayerWeight,
     down: &LayerWeight,
     inds: &InlineArray,
-    activation: &impl Fn(&InlineArray, &InlineArray) -> InlineArray,
+    activation: &impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
 ) -> InlineArray {
     // [S, 1, 1, hidden] -> [S, top_k, 1, intermediate]
     let switch_in = switch_glu_input(x_flat);
     let gated = gate.gather_mm_from(&switch_in, None, Some(inds), false);
     let upped = up.gather_mm_from(&switch_in, None, Some(inds), false);
-    let activated = activation(&gated, &upped);
+    let activated = activation(&gated, &upped, inds);
 
     // [S, top_k, 1, hidden] -> [S, top_k, hidden]
     down.gather_mm_from(&activated, None, Some(inds), false)
@@ -153,13 +175,14 @@ fn per_expert_grouped(
     up: &LayerWeight,
     down: &LayerWeight,
     inds: &InlineArray,
-    activation: &impl Fn(&InlineArray, &InlineArray) -> InlineArray,
+    activation: &impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
 ) -> InlineArray {
     let (s, top_k) = (inds.dim(0), inds.dim(1));
     let pairs = s * top_k;
 
-    // The expert and the token of every pair, in router order.
-    let experts = inds.reshape(&[pairs]);
+    // The expert and the token of every pair, in router order. The ids carry
+    // no gradient; they only say where each row goes.
+    let experts = inds.reshape(&[pairs]).stop_gradient();
     let tokens = InlineArray::arange(s, crate::compat::Dtype::Int32.as_i32())
         .reshape(&[s, 1])
         .broadcast_to(&[s, top_k])
@@ -176,7 +199,7 @@ fn per_expert_grouped(
     let rows = x_flat.take_axis(&sorted_tokens, 0).expand_dims(1);
     let gated = gate.gather_mm_from(&rows, None, Some(&sorted_experts), true);
     let upped = up.gather_mm_from(&rows, None, Some(&sorted_experts), true);
-    let activated = activation(&gated, &upped);
+    let activated = activation(&gated, &upped, &sorted_experts);
     let down = down.gather_mm_from(&activated, None, Some(&sorted_experts), true);
 
     let hidden = down.dim(-1);
@@ -420,9 +443,11 @@ mod tests {
             InlineArray::fused_swiglu,
         );
         let in_router_order =
-            per_expert_in_router_order(&x, &gate, &up, &down, &inds, &InlineArray::fused_swiglu)
-                .multiply(&scores.reshape(&[tokens as i32, 2, 1]))
-                .sum_axis(-2, false);
+            per_expert_in_router_order(&x, &gate, &up, &down, &inds, &|g, u, _| {
+                InlineArray::fused_swiglu(g, u)
+            })
+            .multiply(&scores.reshape(&[tokens as i32, 2, 1]))
+            .sum_axis(-2, false);
         crate::check_unobserved_error().expect("packed switch_glu");
 
         let n = tokens * hidden;
@@ -436,5 +461,193 @@ mod tests {
             worst < 1e-3,
             "grouped and router-order products differ by {worst}"
         );
+    }
+}
+
+/// The dispatch against loops that run one expert on one row at a time:
+/// per-expert activation terms, gradients, and both sides of the threshold.
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+
+    /// Deterministic values in roughly [-0.5, 0.5], all different.
+    fn values(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    fn array(shape: &[i32], seed: u64) -> InlineArray {
+        let n = shape.iter().product::<i32>() as usize;
+        InlineArray::from_f32_slice(&values(n, seed), shape)
+    }
+
+    fn to_vec(a: &InlineArray) -> Vec<f32> {
+        let mut a = a.clone();
+        a.eval();
+        let n = a.size();
+        a.to_f32_vec(n).expect("f32 readback")
+    }
+
+    /// `s` rows through `top_k` of 8 experts (hidden 12, intermediate 20,
+    /// distinct weights and biases for gate and up so a swap or a mixed-up
+    /// expert fails), each expert's rows weighted by its own score, against a
+    /// loop that runs one expert on one row at a time.
+    fn check(s: i32, top_k: i32) {
+        let (e, h, i) = (8, 12, 20);
+        let x = array(&[s, h], 1);
+        let (gate_w, up_w, down_w) = (
+            array(&[e, h, i], 2),
+            array(&[e, h, i], 3),
+            array(&[e, i, h], 4),
+        );
+        let (gate_b, up_b) = (array(&[e, i], 5), array(&[e, i], 6));
+        // Skewed, distinct within a row: a row's first expert is `(7 s) % 8`.
+        let ids: Vec<i32> = (0..s)
+            .flat_map(|r| (0..top_k).map(move |j| (r * 7 + j * 3 + (r % 3)) % e))
+            .collect();
+        let inds = InlineArray::from_i32_slice(&ids).reshape(&[s, top_k]);
+        let scores = array(&[s, top_k], 7);
+
+        let (gate, up, down) = (
+            LayerWeight::Dense(gate_w.clone()),
+            LayerWeight::Dense(up_w.clone()),
+            LayerWeight::Dense(down_w.clone()),
+        );
+        let got = switch_glu_with(&x, &gate, &up, &down, &inds, &scores, |g, u, expert_ids| {
+            let bias = |b: &InlineArray| b.take_axis(expert_ids, 0).expand_dims(-2);
+            InlineArray::fused_swiglu(&g.add(&bias(&gate_b)), &u.add(&bias(&up_b)))
+        });
+        assert_eq!(got.shape(), vec![s, h]);
+
+        let score_values = to_vec(&scores);
+        let mut want = vec![0f32; (s * h) as usize];
+        for r in 0..s {
+            let xr = x.slice(&[r, 0], &[r + 1, h]);
+            for j in 0..top_k {
+                let ex = ids[(r * top_k + j) as usize];
+                let w = |a: &InlineArray, rows: i32, cols: i32| {
+                    a.slice(&[ex, 0, 0], &[ex + 1, rows, cols])
+                        .reshape(&[rows, cols])
+                };
+                let b = |a: &InlineArray| a.slice(&[ex, 0], &[ex + 1, i]);
+                let g = xr.matmul(&w(&gate_w, h, i)).add(&b(&gate_b));
+                let u = xr.matmul(&w(&up_w, h, i)).add(&b(&up_b));
+                let y = InlineArray::fused_swiglu(&g, &u).matmul(&w(&down_w, i, h));
+                let weight = score_values[(r * top_k + j) as usize];
+                for (acc, v) in want[(r * h) as usize..((r + 1) * h) as usize]
+                    .iter_mut()
+                    .zip(to_vec(&y))
+                {
+                    *acc += weight * v;
+                }
+            }
+        }
+        crate::check_unobserved_error().expect("bridge ops succeeded");
+        let worst = to_vec(&got)
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-5, "s={s} top_k={top_k}: max |diff| {worst:e}");
+    }
+
+    /// Training sends gradients through the grouped dispatch: the input's and
+    /// every expert weight's match those of a loop that runs one expert on
+    /// one row at a time.
+    #[test]
+    fn grouped_dispatch_passes_the_per_row_loops_gradients() {
+        use crate::inline_array::value_and_grad;
+        let (s, top_k, e, h, i) = (30, 3, 8, 12, 20);
+        let ids: Vec<i32> = (0..s)
+            .flat_map(|r| (0..top_k).map(move |j| (r * 5 + j * 3 + (r % 3)) % e))
+            .collect();
+        let inds = InlineArray::from_i32_slice(&ids).reshape(&[s, top_k]);
+        let scores = array(&[s, top_k], 7);
+        let probe = array(&[s, h], 8);
+        let constants = [inds.clone(), scores.clone(), probe];
+        let inputs = [
+            array(&[s, h], 1),
+            array(&[e, h, i], 2),
+            array(&[e, h, i], 3),
+            array(&[e, i, h], 4),
+        ];
+
+        let grouped = |a: &[InlineArray]| {
+            let (gate, up, down) = (
+                LayerWeight::Dense(a[1].clone()),
+                LayerWeight::Dense(a[2].clone()),
+                LayerWeight::Dense(a[3].clone()),
+            );
+            let y = switch_glu(
+                &a[0],
+                &gate,
+                &up,
+                &down,
+                &a[4],
+                &a[5],
+                InlineArray::fused_swiglu,
+            );
+            y.multiply(&a[6]).sum_all()
+        };
+        let per_row = |a: &[InlineArray]| {
+            let mut rows = Vec::new();
+            for r in 0..s {
+                let xr = a[0].slice(&[r, 0], &[r + 1, h]);
+                let mut acc = InlineArray::zeros(&[1, h], crate::dtype::F32);
+                for j in 0..top_k {
+                    let ex = ids[(r * top_k + j) as usize];
+                    let w = |m: &InlineArray, rows: i32, cols: i32| {
+                        m.slice(&[ex, 0, 0], &[ex + 1, rows, cols])
+                            .reshape(&[rows, cols])
+                    };
+                    let act = InlineArray::fused_swiglu(
+                        &xr.matmul(&w(&a[1], h, i)),
+                        &xr.matmul(&w(&a[2], h, i)),
+                    );
+                    let weight = a[5].slice(&[r, j], &[r + 1, j + 1]);
+                    acc = acc.add(&act.matmul(&w(&a[3], i, h)).multiply(&weight));
+                }
+                rows.push(acc);
+            }
+            let y = rows[1..]
+                .iter()
+                .fold(rows[0].clone(), |all, row| all.concatenate_2(row, 0));
+            y.multiply(&a[6]).sum_all()
+        };
+
+        let (want_loss, want) = value_and_grad(per_row, &inputs, &constants);
+        let (got_loss, got) = value_and_grad(grouped, &inputs, &constants);
+        crate::check_unobserved_error().expect("bridge ops succeeded");
+        assert!((got_loss.item_f32() - want_loss.item_f32()).abs() < 1e-4);
+        for (n, (g, w)) in got.iter().zip(&want).enumerate() {
+            let worst = to_vec(g)
+                .iter()
+                .zip(to_vec(w))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let scale = to_vec(w).iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(scale > 1e-3, "gradient {n} is all zeros");
+            assert!(
+                worst < 1e-4 * scale.max(1.0),
+                "gradient {n}: max |diff| {worst:e}"
+            );
+        }
+    }
+
+    /// Few rows take the per-row gather, many take the grouped one; both give
+    /// the per-row loop's sum.
+    #[test]
+    fn dispatch_matches_a_per_row_loop_below_and_above_the_grouping_threshold() {
+        check(5, 3); // 15 pairs: per-row gather
+        check(21, 3); // 63 pairs: still per-row
+        check(22, 3); // 66 pairs: grouped
+        check(41, 2); // 82 pairs, other top_k: grouped
     }
 }

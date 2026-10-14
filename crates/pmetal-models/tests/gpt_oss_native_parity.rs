@@ -61,6 +61,11 @@ fn checkpoint(model: &str, weights_file: &str) -> Fixture {
         dir.path().join("model.safetensors"),
     )
     .expect("copy weights");
+    checkpoint_in(dir, model)
+}
+
+/// The checkpoint already written into `dir`, with `model`'s reference.
+fn checkpoint_in(dir: tempfile::TempDir, model: &str) -> Fixture {
     let weights = load(dir.path());
     Fixture {
         _dir: dir,
@@ -124,12 +129,17 @@ fn run_chunks(fx: &Fixture, chunks: &[i32], compiled: bool) -> Vec<(i32, InlineA
 }
 
 fn check_layout(model: &str, weights_file: &str) {
-    let fx = checkpoint(model, weights_file);
+    check_fixture(weights_file, &checkpoint(model, weights_file));
+}
+
+/// Prefill, cached decode (compiled and per-op) and chunked prefill of `fx`
+/// against its transformers reference.
+fn check_fixture(weights_file: &str, fx: &Fixture) {
     let want = fx.tensor("logits");
     let t = want.dim(1);
 
     // Uncached prefill of the whole prompt.
-    let whole = run_chunks(&fx, &[t], true);
+    let whole = run_chunks(fx, &[t], true);
     let logits = &whole[0].1;
     assert_all_pass(
         &format!("{weights_file}: prefill"),
@@ -143,8 +153,8 @@ fn check_layout(model: &str, weights_file: &str) {
     // the compiled graph and through the per-op path.
     let mut chunks = vec![3];
     chunks.extend(std::iter::repeat_n(1, (t - 3) as usize));
-    let compiled = run_chunks(&fx, &chunks, true);
-    let per_op = run_chunks(&fx, &chunks, false);
+    let compiled = run_chunks(fx, &chunks, true);
+    let per_op = run_chunks(fx, &chunks, false);
     let mut reports = Vec::new();
     let mut graph_vs_ops = 0f32;
     for ((start, step), (_, op_step)) in compiled.iter().zip(&per_op) {
@@ -166,7 +176,7 @@ fn check_layout(model: &str, weights_file: &str) {
 
     // A second prefill chunk that starts past the window: the ring has
     // wrapped, and the chunk's queries need the band mask.
-    let reports: Vec<_> = run_chunks(&fx, &[6, 4, 1, 1], true)
+    let reports: Vec<_> = run_chunks(fx, &[6, 4, 1, 1], true)
         .iter()
         .map(|(start, logits)| {
             ParityReport::compute(
@@ -331,25 +341,184 @@ fn packed_experts_pass_the_gradient_to_their_input() {
     );
 }
 
-/// An MLX quantization packs every projection, which this engine doesn't
-/// read: loading one is refused by name, not decoded as noise.
+/// The MXFP4 fixture as MLX's `gpt-oss-*-MXFP4-Q8` conversions write it: the
+/// experts as stacked `experts.{gate,up,down}_proj.{weight,scales}` (the
+/// release's blocks viewed as `uint32`, gate and up de-interleaved) and
+/// `experts.*_proj.bias`, plus a `quantization` block in `mxfp4` mode.
+///
+/// With `pack_the_rest`, also the attention projections, the router, the
+/// embeddings and the head as 8-bit affine (group 32), and the same weights
+/// as a dense twin: `(packed, twin)` directories. Without, the experts are
+/// the only packed tensors and the model is exactly the fixture's.
+fn mlx_mxfp4_checkpoint(pack_the_rest: bool) -> (tempfile::TempDir, Option<tempfile::TempDir>) {
+    const U32: i32 = 3;
+    const GROUP: i32 = 32;
+    let source = load_shard(&fixture_path("gpt_oss_mxfp4_weights.safetensors"));
+    let mut config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture_path("gpt_oss_mxfp4_config.json")).unwrap(),
+    )
+    .unwrap();
+    let mut quantization = serde_json::json!({"group_size": GROUP, "bits": 4, "mode": "mxfp4"});
+
+    // The experts as MLX stacks them (exact: they are the fixture's bytes),
+    // the other packed tensors and their dense twins, and what both keep.
+    let mut experts_packed: Vec<(String, Array)> = Vec::new();
+    let mut rest_packed: Vec<(String, Array)> = Vec::new();
+    let mut rest_twin: Vec<(String, Array)> = Vec::new();
+    let mut both: Vec<(String, Array)> = Vec::new();
+    // `[E, 2R, ..]` to its even and odd rows `[E, R, ..]`, contiguous.
+    let deinterleave = |a: &Array| {
+        let (e, rows) = (a.dim(0), a.dim(1));
+        let rest: Vec<i32> = (2..a.ndim()).map(|i| a.dim(i)).collect();
+        let mut shape = vec![e, rows / 2, 2];
+        shape.extend(&rest);
+        let split = a.reshape(&shape);
+        let mut out_shape = vec![e, rows / 2];
+        out_shape.extend(&rest);
+        let pick = |which: i32| {
+            let (mut start, mut stop) = (vec![0; shape.len()], shape.clone());
+            (start[2], stop[2]) = (which, which + 1);
+            split.slice(&start, &stop).reshape(&out_shape)
+        };
+        (pick(0), pick(1))
+    };
+    let as_u32 = |blocks: &Array| {
+        let (e, rows, groups) = (blocks.dim(0), blocks.dim(1), blocks.dim(2));
+        blocks.view(U32).reshape(&[e, rows, groups * 4])
+    };
+    let mut keys: Vec<&String> = source.keys().collect();
+    keys.sort();
+    for key in keys {
+        let w = &source[key];
+        let (prefix, name) = key.rsplit_once('.').unwrap_or(("", key));
+        let experts = prefix.ends_with(".mlp.experts");
+        match (experts, name) {
+            (true, "gate_up_proj_blocks") => {
+                let (gate_w, up_w) = deinterleave(&as_u32(w));
+                let (gate_s, up_s) =
+                    deinterleave(&source[&format!("{prefix}.gate_up_proj_scales")]);
+                for (proj, weight, scales) in
+                    [("gate_proj", gate_w, gate_s), ("up_proj", up_w, up_s)]
+                {
+                    experts_packed.push((format!("{prefix}.{proj}.weight"), weight));
+                    experts_packed.push((format!("{prefix}.{proj}.scales"), scales));
+                }
+            }
+            (true, "down_proj_blocks") => {
+                experts_packed.push((format!("{prefix}.down_proj.weight"), as_u32(w)));
+                experts_packed.push((
+                    format!("{prefix}.down_proj.scales"),
+                    source[&format!("{prefix}.down_proj_scales")].clone(),
+                ));
+            }
+            (true, "gate_up_proj_scales" | "down_proj_scales") => {}
+            (true, "gate_up_proj_bias") => {
+                let (gate, up) = deinterleave(&w.reshape(&[w.dim(0), w.dim(1), 1]));
+                let (gate, up) = (gate.squeeze(2), up.squeeze(2));
+                for (proj, b) in [("gate_proj", gate), ("up_proj", up)] {
+                    both.push((format!("{prefix}.{proj}.bias"), b));
+                }
+            }
+            (true, "down_proj_bias") => both.push((format!("{prefix}.down_proj.bias"), w.clone())),
+            _ if pack_the_rest
+                && w.ndim() == 2
+                && w.dim(1) % GROUP == 0
+                && (key.contains("self_attn.")
+                    || key.contains(".router.")
+                    || key.contains("embed_tokens")
+                    || key.starts_with("lm_head"))
+                && name == "weight" =>
+            {
+                let (q, scales, biases) = w.quantize_weights(GROUP, 8);
+                let deq = q.dequantize(&scales, &biases, GROUP, 8);
+                rest_packed.push((key.clone(), q));
+                rest_packed.push((format!("{prefix}.scales"), scales));
+                rest_packed.push((format!("{prefix}.biases"), biases));
+                rest_twin.push((key.clone(), deq));
+                quantization[prefix] = serde_json::json!({"group_size": GROUP, "bits": 8});
+            }
+            _ => both.push((key.clone(), w.clone())),
+        }
+    }
+    config["quantization"] = quantization;
+
+    let write = |tensors: &[(String, Array)], config: &serde_json::Value| {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+        let entries: Vec<(&str, &Array)> = tensors
+            .iter()
+            .chain(both.iter())
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        InlineArray::save_safetensors(
+            dir.path().join("model.safetensors").to_str().unwrap(),
+            &entries,
+        )
+        .expect("save the weights");
+        drain_bridge("write checkpoint");
+        dir
+    };
+    let packed_dir = write(
+        &experts_packed
+            .iter()
+            .chain(&rest_packed)
+            .cloned()
+            .collect::<Vec<_>>(),
+        &config,
+    );
+    let twin_dir = pack_the_rest.then(|| {
+        // The twin keeps the experts packed too (they are exact) and has the
+        // rest dense; its block says how to read the experts and no more.
+        let mut twin_config = config.clone();
+        twin_config["quantization"] =
+            serde_json::json!({"group_size": GROUP, "bits": 4, "mode": "mxfp4"});
+        write(
+            &experts_packed
+                .iter()
+                .chain(&rest_twin)
+                .cloned()
+                .collect::<Vec<_>>(),
+            &twin_config,
+        )
+    });
+    (packed_dir, twin_dir)
+}
+
+/// MLX's MXFP4 experts alone, read from the stacked packed layout: exactly
+/// the model transformers ran, so it must match it.
 #[test]
 #[serial]
-fn native_gpt_oss_refuses_an_mlx_quantization_by_name() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::fs::copy(
-        fixture_path("gpt_oss_native_config.json"),
-        dir.path().join("config.json"),
-    )
-    .expect("copy config");
-    let scales = InlineArray::zeros(&[64, 1], pmetal_bridge::compat::Dtype::Float32.as_i32());
-    InlineArray::save_safetensors(
-        dir.path().join("model.safetensors").to_str().unwrap(),
-        &[("model.layers.0.self_attn.q_proj.scales", &scales)],
-    )
-    .expect("save the weights");
-    let config = load_config(dir.path()).expect("config parses");
-    let err = load_model(dir.path(), &config).expect_err("MLX-quantized weights are refused");
-    assert!(err.contains("q_proj.scales"), "{err}");
-    drain_bridge("refusal");
+fn native_gpt_oss_reads_the_mlx_stacked_mxfp4_experts() {
+    let (dir, _) = mlx_mxfp4_checkpoint(false);
+    let fx = checkpoint_in(dir, "gpt_oss_mxfp4");
+    assert!(fx.weights.experts_packed());
+    assert!(!fx.weights.attention_packed());
+    check_fixture("mlx stacked mxfp4 experts", &fx);
+}
+
+/// MLX's `MXFP4-Q8` conversion in full: experts in mxfp4, attention, router,
+/// embeddings and head 8-bit affine. Packed attention decodes per op; the
+/// dense twin's decodes through the compiled graph. Both give the same logits.
+#[test]
+#[serial]
+fn native_gpt_oss_runs_an_mlx_mxfp4_q8_checkpoint() {
+    let (packed_dir, twin_dir) = mlx_mxfp4_checkpoint(true);
+    let packed = checkpoint_in(packed_dir, "gpt_oss_mxfp4");
+    let twin = checkpoint_in(twin_dir.expect("twin"), "gpt_oss_mxfp4");
+    assert!(packed.weights.experts_packed() && packed.weights.attention_packed());
+    assert!(twin.weights.experts_packed() && !twin.weights.attention_packed());
+
+    let t = packed.tensor("logits").dim(1);
+    let mut steps = vec![3];
+    steps.extend(std::iter::repeat_n(1, (t - 3) as usize));
+    for (title, chunks) in [("prefill", vec![t]), ("cached decode", steps)] {
+        let want = run_chunks(&twin, &chunks, true);
+        let got = run_chunks(&packed, &chunks, true);
+        let reports: Vec<_> = got
+            .iter()
+            .zip(&want)
+            .map(|((start, g), (_, w))| ParityReport::compute(&format!("pos_{start}"), g, w, TOL))
+            .collect();
+        assert_all_pass(&format!("mlx mxfp4-q8: {title}"), &reports);
+    }
 }
