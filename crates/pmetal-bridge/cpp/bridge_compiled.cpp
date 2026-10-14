@@ -68,6 +68,7 @@ extern "C" {
 void mlx_inline_fused_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up) {
     BRIDGE_TRY_DST("fused_swiglu", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& g = inputs[0];
@@ -87,6 +88,7 @@ void mlx_inline_fused_swiglu(mlx_inline_array* dst,
 void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up) {
     BRIDGE_TRY_DST("fused_geglu_tanh", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& g = inputs[0];
@@ -109,6 +111,7 @@ void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
 
 void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
     BRIDGE_TRY_DST("fused_silu", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -122,6 +125,7 @@ void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
 void mlx_inline_fused_compute_g(mlx_inline_array* dst,
     const mlx_inline_array* a_log, const mlx_inline_array* a, const mlx_inline_array* dt_bias) {
     BRIDGE_TRY_DST("fused_compute_g", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto decay = exp(astype(inputs[0], float32));
@@ -136,6 +140,7 @@ void mlx_inline_fused_compute_g(mlx_inline_array* dst,
 void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* gate) {
     BRIDGE_TRY_DST("fused_precise_swiglu", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -152,6 +157,7 @@ void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
 void mlx_inline_fused_precise_sigmoid_gate(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* gate) {
     BRIDGE_TRY_DST("fused_precise_sigmoid_gate", dst, {
+        CompileCacheLock cache_lock;
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -195,6 +201,7 @@ void mlx_inline_compiled_gdn_layer_fixed(
     // Heap-leaked to avoid cross-DSO static destructor ordering crash.
     static auto* entries = new std::vector<Entry>();
     try {
+        CompileCacheLock cache_lock;
         CompiledFn* compiled = nullptr;
         for (auto& e : *entries) {
             if (e.nv == nv && e.nk == nk && e.dk == dk && e.dv == dv && e.cd == cd
@@ -330,6 +337,7 @@ void mlx_inline_compiled_attn_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int has_freqs = rope_freqs != nullptr ? 1 : 0;
@@ -553,6 +561,7 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(normed).dtype().val());
@@ -773,6 +782,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(normed).shape(0);
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(normed).dtype().val());
@@ -1008,6 +1018,7 @@ void mlx_inline_compiled_moe_layer_fixed(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int hidden = as_arr(x).shape(2);
         int num_experts = as_arr(router_w).shape(1);
@@ -1203,6 +1214,7 @@ void mlx_inline_compiled_gemma4_attn_block(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int cache_len = as_arr(cache_keys_in).shape(2);
@@ -1489,6 +1501,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int cache_len = as_arr(cache_keys_in).shape(2);
@@ -1664,6 +1677,7 @@ void mlx_inline_compiled_gemma4_mlp_block(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int hidden = as_arr(x).shape(2);
@@ -1799,6 +1813,7 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
     static auto* entries = new std::vector<Entry>();
 
     try {
+        CompileCacheLock cache_lock;
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int hidden = as_arr(x).shape(2);
@@ -1999,6 +2014,7 @@ int mlx_inline_compile_call(
         return -1;
     }
     try {
+        CompileCacheLock cache_lock;
         auto* h = static_cast<BridgeCompiledHandle*>(compiled_handle);
 
         std::vector<array> input_arrs;
@@ -2034,6 +2050,8 @@ int mlx_inline_compile_call(
 
 void mlx_inline_compile_free(void* compiled_handle) {
     if (compiled_handle) {
+        // Destroying the closure erases its entries from MLX's compile cache.
+        CompileCacheLock cache_lock;
         delete static_cast<BridgeCompiledHandle*>(compiled_handle);
     }
 }

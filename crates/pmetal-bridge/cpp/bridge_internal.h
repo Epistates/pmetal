@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -113,6 +114,32 @@ static inline array bridge_sdpa(const array& q, const array& k, const array& v, 
     }
     return mx::fast::scaled_dot_product_attention(q, k, v, scale, mask_mode, mask, sinks);
 }
+
+// ---------------------------------------------------------------------------
+// MLX's compile cache
+// ---------------------------------------------------------------------------
+//
+// `mlx::core::compile` keeps its traces in one process-wide table (a map of
+// vectors of entries) that MLX does not lock: finding or adding an entry from
+// two threads at once corrupts it, and an entry is marked filled before its
+// tape is built, so a second thread that finds it in between replays an empty
+// tape. The bridge's own per-block caches are vectors of the same kind. Every
+// entry point that calls a compiled function (building the graph, never
+// evaluating it) holds this for the call. Recursive, since a Rust closure
+// MLX traces may call another compiled op on the same thread. Leaked, so it
+// has no destructor to order against libmlx's at exit.
+inline std::recursive_mutex& compile_cache_mutex() {
+    static auto* mutex = new std::recursive_mutex;
+    return *mutex;
+}
+
+class CompileCacheLock {
+public:
+    CompileCacheLock() : guard_(compile_cache_mutex()) {}
+
+private:
+    std::lock_guard<std::recursive_mutex> guard_;
+};
 
 // ---------------------------------------------------------------------------
 // Callbacks into Rust
