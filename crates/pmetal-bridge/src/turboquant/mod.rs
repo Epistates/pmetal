@@ -11,9 +11,12 @@
 //! the squared error is within a constant (about 2.7) of the best any
 //! `bits`-bit code can do. See [`Quantizer`].
 //!
-//! Attention scores come out as `|k| <Π q, ŷ_k>`: the query is rotated once
+//! Attention scores come out as `scale_k <Π q, ĉ_k>`: the query is rotated once
 //! per step and the cached rows stay packed and rotated. The values' weighted
-//! sum is accumulated in the rotated basis and rotated back once.
+//! sum is accumulated in the rotated basis and rotated back once. The scale
+//! is the vector's norm times the least-squares gain of its reconstruction, an
+//! addition to the paper that removes the per-vector shrinkage of a Lloyd-Max
+//! codebook (see [`Quantizer`]).
 //!
 //! The paper's second stage, the one-bit QJL sketch of the residual that
 //! makes the inner-product estimate unbiased, is not used: it is unbiased

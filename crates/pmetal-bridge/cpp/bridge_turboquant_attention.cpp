@@ -11,10 +11,18 @@
 //           uncompressed, in the model's dtype and the original basis. The
 //           recent ones live in a ring.
 //
-// The score of a cold token is `|k| * <Π q, ŷ_k>` and the value it adds is
-// `|v| * ŷ_v` in the rotated basis, so the queries are rotated once per step
-// and no key or value is ever rotated back. The accumulator of the cold blocks
-// stays in the rotated basis and is rotated back once, after the merge.
+// The score of a cold token is `scale_k * <Π q, ĉ_k>` (ĉ the codebook entries
+// its indices name) and the value it adds is `scale_v * ĉ_v` in the rotated
+// basis, so the queries are rotated once per step and no key or value is ever
+// rotated back. The accumulator of the cold blocks stays in the rotated basis
+// and is rotated back once, after the merge.
+//
+// The block pass reads each key row 16 bytes at a time into registers and
+// holds the queries in threadgroup memory as halves (a lane reads every query
+// head's query for every token it scores, so those bytes bound the pass); the
+// rounding is at most 5e-4 relative per element. A lookup table of centroids
+// is a 16-entry threadgroup array: tables of 256 pairs bank-conflicted, and
+// lookups by simd shuffle were slower still.
 //
 // Pass 1 (`attention_partials`)
 //   One threadgroup is one simdgroup: it owns one run of `tokens_per_block`
