@@ -160,6 +160,51 @@ fn moe_synthetic_config_json() -> &'static str {
     }"#
 }
 
+/// The E2B/E4B shape: six layers, the last two sharing the KV cache of the
+/// last layer of their own attention type (3 for sliding, 2 for full), with
+/// per-layer input embeddings. The native engine's only fixture for either.
+fn shared_synthetic_config_json() -> &'static str {
+    r#"{
+        "model_type": "gemma4_text",
+        "vocab_size": 512,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "global_head_dim": 64,
+        "num_global_key_value_heads": 1,
+        "max_position_embeddings": 131072,
+        "rms_norm_eps": 1e-6,
+        "attention_k_eq_v": true,
+        "tie_word_embeddings": true,
+        "sliding_window": 8,
+        "final_logit_softcapping": 30.0,
+        "layer_types": [
+            "sliding_attention", "sliding_attention", "full_attention",
+            "sliding_attention", "sliding_attention", "full_attention"
+        ],
+        "rope_parameters": {
+            "full_attention": {
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 1000000.0,
+                "rope_type": "proportional"
+            },
+            "sliding_attention": {
+                "partial_rotary_factor": 1.0,
+                "rope_theta": 10000.0,
+                "rope_type": "default"
+            }
+        },
+        "hidden_size_per_layer_input": 16,
+        "vocab_size_per_layer_input": 512,
+        "num_kv_shared_layers": 2,
+        "use_double_wide_mlp": false,
+        "enable_moe_block": false
+    }"#
+}
+
 /// Build the Rust Gemma4 model from a config JSON + weight fixture and return
 /// it ready for forward passes.
 fn build_model(config_json: &str, weights_fixture: &str) -> Gemma4ForCausalLM {
@@ -267,6 +312,28 @@ fn gemma4_native_synthetic_parity() {
         synthetic_config_json(),
         "gemma4_synth_weights.safetensors",
         "gemma4_synth_reference.safetensors",
+    );
+}
+
+/// The native engine's KV-sharing layers and per-layer inputs (E2B/E4B)
+/// against `transformers`, over 40 tokens so the window of 8 is long past.
+#[test]
+fn gemma4_native_shared_kv_synthetic_parity() {
+    run_native_synthetic_parity(
+        "shared-KV",
+        shared_synthetic_config_json(),
+        "gemma4_shared_synth_weights.safetensors",
+        "gemma4_shared_synth_reference.safetensors",
+    );
+}
+
+#[test]
+fn gemma4_native_shared_kv_chunked_prefill_matches_transformers() {
+    run_native_chunked_prefill(
+        "shared-KV",
+        shared_synthetic_config_json(),
+        "gemma4_shared_synth_weights.safetensors",
+        "gemma4_shared_synth_reference.safetensors",
     );
 }
 

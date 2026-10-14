@@ -426,7 +426,8 @@ pub struct NativeWeights {
 }
 
 /// Per-layer KV cache. Keys/values are allocated to `[B, n_kv, L, D]`
-/// where `L` grows in `CACHE_STEP_SIZE`-token chunks.
+/// where `L` grows in [`CHUNK_TOKENS`](crate::native_common::kv_cache::CHUNK_TOKENS)-token
+/// chunks.
 pub struct LayerCache {
     pub keys: Option<InlineArray>,
     pub values: Option<InlineArray>,
@@ -477,10 +478,9 @@ impl NativeCache {
 
     /// Grow every layer's KV buffer to exactly `offset + additional_tokens`
     /// slots, preparing the cache for a decode run of known length. The
-    /// resulting buffer is sized so the decode loop never hits the
-    /// `ensure_cache_capacity` grow path — and, critically, so per-step
-    /// SDPA only processes `offset + step` slots instead of the
-    /// CACHE_STEP_SIZE-rounded-up 256-token buffer.
+    /// resulting buffer is sized so the decode loop never grows it — and,
+    /// critically, so per-step SDPA only processes `offset + step` slots
+    /// instead of a buffer rounded up to the next 256 tokens.
     pub fn reserve_decode_inputs(&mut self, additional_tokens: i32, dtype: i32) {
         if additional_tokens <= 0 {
             return;
@@ -529,8 +529,6 @@ pub fn build_cache(_weights: &NativeWeights, config: &Gemma4Config) -> NativeCac
 // ----------------------------------------------------------------------------
 // Loader
 // ----------------------------------------------------------------------------
-
-const CACHE_STEP_SIZE: i32 = 256;
 
 /// One Gemma 4 layer's rotation, as both engines run it: the channels it
 /// rotates, and for a partial (`proportional`) layer the `[head_dim / 2]`
@@ -643,32 +641,74 @@ fn apply_gemma4_partial_rope(
     new_left.concatenate_2(&new_right, -1)
 }
 
-fn build_sliding_attention_mask(
-    offset: i32,
+/// Which keys each query of a sliding-window layer may attend to: a boolean
+/// `[1, 1, query_len, key_len]` that is true where the key's absolute position
+/// is no later than the query's and less than `window` behind it.
+///
+/// The queries sit at absolute positions `query_start..query_start + query_len`
+/// and the keys at `key_start..key_start + key_len`, so a pass can hand
+/// attention only the slice of the cache its window reaches.
+fn sliding_window_mask(
+    query_start: i32,
     query_len: i32,
+    key_start: i32,
     key_len: i32,
     window: i32,
 ) -> InlineArray {
-    let total_kv = key_len as usize;
-    let mut mask_data = vec![0i32; query_len as usize * total_kv];
-    for qi in 0..query_len as usize {
-        let q_pos = offset + qi as i32;
-        let start = (q_pos - window + 1).max(0) as usize;
-        let end = q_pos as usize;
-        for ki in start..=end.min(total_kv.saturating_sub(1)) {
-            mask_data[qi * total_kv + ki] = 1;
-        }
-    }
-    InlineArray::from_i32_slice(&mask_data).reshape(&[query_len, key_len])
+    let int32 = Dtype::Int32.as_i32();
+    let queries = InlineArray::arange(query_len, int32)
+        .add(&InlineArray::from_i32(query_start))
+        .reshape(&[query_len, 1]);
+    let keys = InlineArray::arange(key_len, int32)
+        .add(&InlineArray::from_i32(key_start))
+        .reshape(&[1, key_len]);
+    let not_after = keys.less_equal(&queries);
+    let within = keys.greater(&queries.subtract(&InlineArray::from_i32(window)));
+    crate::compat::ops::logical_and(&not_after, &within).reshape(&[1, 1, query_len, key_len])
 }
 
-fn make_additive_mask(bool_mask: &InlineArray, dtype: i32) -> InlineArray {
-    let neg_inf = InlineArray::scalar_with_dtype(-1e9, dtype);
-    let zero = InlineArray::scalar_with_dtype(0.0, dtype);
-    bool_mask
-        .as_dtype(Dtype::Bool.as_i32())
-        .where_cond(&zero, &neg_inf)
-        .as_dtype(dtype)
+/// Causal attention of `queries` (`[B, H, S, D]`, at absolute positions
+/// `prev..prev + S`) over the keys and values a layer's cache holds up to
+/// `prev + S`, with `window` limiting how far back a sliding layer reaches.
+///
+/// A full layer takes MLX's causal mode over the valid cache. A sliding layer
+/// slices the cache to the keys its first query's window reaches and masks the
+/// rest, so a pass over a long prompt attends `window + S` keys per query
+/// instead of all `prev + S`; a mask handed to the fused kernel is evaluated
+/// over every key it is given, not skipped by block as causal mode is.
+fn prefill_attention(
+    queries: &InlineArray,
+    keys: &InlineArray,
+    values: &InlineArray,
+    prev: i32,
+    window: Option<i32>,
+) -> InlineArray {
+    let (b, kv_heads, next, head_dim) = (keys.dim(0), keys.dim(1), keys.dim(2), keys.dim(3));
+    let s = queries.dim(2);
+    debug_assert_eq!(next, prev + s, "keys cover the cache up to this pass");
+    let first = match window {
+        // Query `prev` reaches back `window - 1` keys; later queries reach
+        // later keys.
+        Some(window) => (prev - window + 1).max(0),
+        None => 0,
+    };
+    let slice = |a: &InlineArray| {
+        if first == 0 {
+            a.clone()
+        } else {
+            a.slice(&[0, 0, first, 0], &[b, kv_heads, next, head_dim])
+        }
+    };
+    match window {
+        // Some query's window leaves out a key the causal mask would allow.
+        // (When the window covers everything up to the last query, it is the
+        // causal mask.)
+        Some(window) if prev + s > window => {
+            let mask = sliding_window_mask(prev, s, first, next - first, window);
+            queries.sdpa_with_mask(&slice(keys), &slice(values), 1.0, Some(&mask))
+        }
+        _ => crate::decode::sdpa_causal_like_mlx(queries, keys, values, 1.0, s),
+    }
 }
 
 fn compute_per_layer_inputs(
@@ -828,26 +868,13 @@ fn shared_kv_attention_forward(
         layer.rope_freqs.as_ref(),
     );
 
-    let attn_out = if let Some(window) = layer.sliding_window {
-        if s == 1 {
-            let start = (cache_len - window).max(0);
-            let keys = source_keys.slice(
-                &[0, 0, start, 0],
-                &[b, layer.n_kv_heads, cache_len, layer.head_dim],
-            );
-            let values = source_values.slice(
-                &[0, 0, start, 0],
-                &[b, layer.n_kv_heads, cache_len, layer.head_dim],
-            );
-            queries.sdpa_with_mask(&keys, &values, 1.0, None)
-        } else {
-            let mask = build_sliding_attention_mask(rope_offset, s, cache_len, window);
-            let mask = make_additive_mask(&mask, hidden.dtype_raw()).reshape(&[1, 1, s, cache_len]);
-            queries.sdpa_with_mask(&source_keys, &source_values, 1.0, Some(&mask))
-        }
-    } else {
-        crate::decode::sdpa_causal_like_mlx(&queries, &source_keys, &source_values, 1.0, s)
-    };
+    let attn_out = prefill_attention(
+        &queries,
+        &source_keys,
+        &source_values,
+        rope_offset,
+        layer.sliding_window,
+    );
 
     layer
         .o_w
@@ -856,6 +883,113 @@ fn shared_kv_attention_forward(
             s,
             layer.n_heads * layer.head_dim,
         ]))
+        .rms_norm(Some(&layer.post_attn_norm_w), eps)
+}
+
+/// A layer that projects its own keys and values, attending over a pass of
+/// more than one token (a prefill chunk, a verified draft block): input norm,
+/// projections, per-head norms, RoPE, the cache write, attention, the output
+/// projection and the post-attention norm. `rope_offset` is the number of
+/// tokens the cache already holds.
+///
+/// This is what `compiled_gemma4_attn_block` computes, per op. That block is
+/// traced per cache length and prefill shape, so every prompt of a new length
+/// compiled and kept a graph for good, and it scatters the new rows with
+/// `put_along_axis` and masks over the whole cache; here the write is a slice
+/// update and attention sees only the keys in its reach ([`prefill_attention`]).
+/// A single token goes through the compiled block, whose shape is fixed for the
+/// length of a decode.
+#[allow(clippy::too_many_arguments)]
+fn projected_attention_multi(
+    hidden: &InlineArray,
+    layer: &LayerWeights,
+    k_w: &LayerWeight,
+    k_norm_w: &InlineArray,
+    v_w: Option<&LayerWeight>,
+    layer_cache: &mut LayerCache,
+    rope_offset: i32,
+    dtype: i32,
+    eps: f32,
+) -> InlineArray {
+    let (b, s) = (hidden.dim(0), hidden.dim(1));
+    let (n_heads, n_kv, head_dim) = (layer.n_heads, layer.n_kv_heads, layer.head_dim);
+    let next = rope_offset + s;
+
+    let normed = hidden.rms_norm(Some(&layer.input_norm_w), eps);
+    let queries = layer
+        .q_w
+        .matmul_from(&normed)
+        .reshape(&[b, s, n_heads, head_dim])
+        .rms_norm(Some(&layer.q_norm_w), eps)
+        .transpose_axes(&[0, 2, 1, 3]);
+    let raw_keys = k_w.matmul_from(&normed);
+    // `attention_k_eq_v`: the values are the raw key projection, before k_norm.
+    let raw_values = match v_w {
+        Some(v_w) => v_w.matmul_from(&normed),
+        None => raw_keys.clone(),
+    };
+    let keys = raw_keys
+        .reshape(&[b, s, n_kv, head_dim])
+        .rms_norm(Some(k_norm_w), eps)
+        .transpose_axes(&[0, 2, 1, 3]);
+    let values = raw_values
+        .reshape(&[b, s, n_kv, head_dim])
+        .rms_norm(None, eps)
+        .transpose_axes(&[0, 2, 1, 3]);
+
+    let rotate = |x: &InlineArray| {
+        apply_gemma4_partial_rope(
+            x,
+            head_dim,
+            layer.rope_dims,
+            layer.rope_base,
+            rope_offset,
+            layer.rope_freqs.as_ref(),
+        )
+    };
+    let (queries, keys) = (rotate(&queries), rotate(&keys));
+
+    crate::native_common::kv_cache::alloc_or_grow_kv(
+        crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+        &mut layer_cache.keys,
+        &mut layer_cache.values,
+        b,
+        n_kv,
+        next,
+        head_dim,
+        dtype,
+    );
+    let (start, stop) = ([0, 0, rope_offset, 0], [b, n_kv, next, head_dim]);
+    let all_keys = layer_cache
+        .keys
+        .take()
+        .expect("alloc_or_grow_kv allocated the keys")
+        .slice_set(&keys, &start, &stop);
+    let all_values = layer_cache
+        .values
+        .take()
+        .expect("alloc_or_grow_kv allocated the values")
+        .slice_set(&values, &start, &stop);
+    layer_cache.offset = next as usize;
+
+    let valid = |a: &InlineArray| a.slice(&[0, 0, 0, 0], &stop);
+    let attended = prefill_attention(
+        &queries,
+        &valid(&all_keys),
+        &valid(&all_values),
+        rope_offset,
+        layer.sliding_window,
+    );
+    layer_cache.keys = Some(all_keys);
+    layer_cache.values = Some(all_values);
+
+    layer
+        .o_w
+        .matmul_from(
+            &attended
+                .transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[b, s, n_heads * head_dim]),
+        )
         .rms_norm(Some(&layer.post_attn_norm_w), eps)
 }
 
@@ -1378,35 +1512,6 @@ fn moe_feed_forward(
 // Forward step
 // ----------------------------------------------------------------------------
 
-fn ensure_cache_capacity(
-    layer_cache: &mut LayerCache,
-    needed: i32,
-    n_kv: i32,
-    head_dim: i32,
-    dtype: Dtype,
-) {
-    let needs_grow = match layer_cache.keys.as_ref() {
-        None => true,
-        Some(k) => k.dim(2) < needed,
-    };
-    if !needs_grow {
-        return;
-    }
-    let alloc = ((needed + CACHE_STEP_SIZE - 1) / CACHE_STEP_SIZE) * CACHE_STEP_SIZE;
-    let shape = [1, n_kv, alloc, head_dim];
-    let new_k = InlineArray::zeros(&shape, dtype.as_i32());
-    let new_v = InlineArray::zeros(&shape, dtype.as_i32());
-    if let (Some(existing_k), Some(existing_v)) =
-        (layer_cache.keys.take(), layer_cache.values.take())
-    {
-        layer_cache.keys = Some(existing_k.kv_cache_append(&new_k, 2));
-        layer_cache.values = Some(existing_v.kv_cache_append(&new_v, 2));
-    } else {
-        layer_cache.keys = Some(new_k);
-        layer_cache.values = Some(new_v);
-    }
-}
-
 // Tanh-approx GEGLU runs through the shapeless-compiled
 // `InlineArray::fused_geglu_tanh` helper (see bridge_compiled.cpp).
 // Its scalar constants are cast to `gate.dtype()` inside the compiled
@@ -1458,7 +1563,6 @@ fn forward_hidden(
     input_ids: &InlineArray,
     cache: &mut NativeCache,
 ) -> InlineArray {
-    let dtype = Dtype::from_raw(weights.model_dtype);
     let seq_len = input_ids.dim(1);
     let profile = std::env::var_os("PMETAL_GEMMA4_TIMING").is_some();
     let t_start = if profile {
@@ -1510,10 +1614,31 @@ fn forward_hidden(
                 cache.layers[i].offset = source_offset;
                 attn
             }
+            AttentionKv::Projected { k_w, k_norm_w, v_w } if seq_len > 1 => {
+                projected_attention_multi(
+                    &hidden,
+                    layer,
+                    k_w,
+                    k_norm_w,
+                    v_w.as_ref(),
+                    &mut cache.layers[i],
+                    rope_offset,
+                    weights.model_dtype,
+                    eps,
+                )
+            }
             AttentionKv::Projected { k_w, k_norm_w, v_w } => {
                 let layer_cache = &mut cache.layers[i];
-                let needed = rope_offset + seq_len;
-                ensure_cache_capacity(layer_cache, needed, layer.n_kv_heads, layer.head_dim, dtype);
+                crate::native_common::kv_cache::alloc_or_grow_kv(
+                    crate::native_common::kv_cache::GrowthPolicy::AmortizedChunked,
+                    &mut layer_cache.keys,
+                    &mut layer_cache.values,
+                    hidden.dim(0),
+                    layer.n_kv_heads,
+                    rope_offset + seq_len,
+                    layer.head_dim,
+                    weights.model_dtype,
+                );
 
                 let cache_k = layer_cache.keys.take().unwrap();
                 let cache_v = layer_cache.values.take().unwrap();
@@ -1705,8 +1830,7 @@ pub fn generate(
         move |cache| {
             // Trim the prefill-allocated KV slack then grow to exactly
             // `prompt_len + max_tokens` so decode-time SDPA walks the
-            // real cache length instead of the CACHE_STEP_SIZE-rounded
-            // allocation. Mirrors qwen3_native's decode priming.
+            // real cache length instead of the chunk-rounded allocation. Mirrors qwen3_native's decode priming.
             cache.eval_and_detach_states();
             cache.reserve_decode_inputs(reserve, model_dtype);
         },
@@ -2045,10 +2169,16 @@ mod tests {
         }
     }
 
+    fn mask_rows(mask: InlineArray, n: usize) -> Vec<f32> {
+        let mut mask = mask.as_dtype(Dtype::Float32.as_i32()).reshape(&[-1]);
+        mask.to_f32_vec(n).expect("to_f32_vec")
+    }
+
+    /// Queries at 4, 5 and 6 against keys 0 to 6 with a window of 3: each sees
+    /// itself and the two before it.
     #[test]
     fn sliding_attention_mask_respects_offset_window() {
-        let mut mask = build_sliding_attention_mask(4, 3, 7, 3);
-        let got = mask.to_f32_vec(21).expect("to_f32_vec");
+        let got = mask_rows(sliding_window_mask(4, 3, 0, 7, 3), 21);
         assert_eq!(
             got,
             vec![
@@ -2057,6 +2187,105 @@ mod tests {
                 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0,
             ]
         );
+        // The same queries against the keys from 2 on: the first two columns
+        // gone, the rest unchanged.
+        let from_two = mask_rows(sliding_window_mask(4, 3, 2, 5, 3), 15);
+        assert_eq!(
+            from_two,
+            vec![
+                1.0, 1.0, 1.0, 0.0, 0.0, //
+                0.0, 1.0, 1.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0, 1.0, 1.0,
+            ]
+        );
+    }
+
+    /// Attention over a pass of `s` tokens after `prev` cached ones, against
+    /// softmax over the allowed keys worked out on the host: for a full layer,
+    /// for a sliding layer whose window does and does not reach back to the
+    /// start of the cache, and with a window longer than the whole sequence.
+    #[test]
+    fn prefill_attention_matches_a_host_softmax() {
+        let (heads, kv_heads, head_dim) = (4usize, 2usize, 4usize);
+        let fill = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 29 + salt * 13) % 31) as f32 - 15.0) / 9.0)
+                .collect()
+        };
+        for (prev, s, window) in [
+            (0usize, 6usize, None),
+            (7, 5, None),
+            (7, 5, Some(4usize)),
+            (20, 3, Some(6)),
+            (2, 4, Some(5)),
+            (9, 1, Some(4)),
+            (3, 4, Some(100)),
+        ] {
+            let next = prev + s;
+            let (q, k, v) = (
+                fill(heads * s * head_dim, 1),
+                fill(kv_heads * next * head_dim, 2),
+                fill(kv_heads * next * head_dim, 3),
+            );
+            let got = prefill_attention(
+                &InlineArray::from_f32_slice(&q, &[1, heads as i32, s as i32, head_dim as i32]),
+                &InlineArray::from_f32_slice(
+                    &k,
+                    &[1, kv_heads as i32, next as i32, head_dim as i32],
+                ),
+                &InlineArray::from_f32_slice(
+                    &v,
+                    &[1, kv_heads as i32, next as i32, head_dim as i32],
+                ),
+                prev as i32,
+                window.map(|w| w as i32),
+            );
+            crate::check_unobserved_error().expect("prefill attention");
+            let mut got = got.reshape(&[-1]);
+            let got = got.to_f32_vec(heads * s * head_dim).expect("read back");
+
+            let mut want = vec![0f32; heads * s * head_dim];
+            for h in 0..heads {
+                let kv = h / (heads / kv_heads);
+                for r in 0..s {
+                    let pos = prev + r;
+                    let allowed: Vec<usize> = (0..next)
+                        .filter(|&j| j <= pos && window.is_none_or(|w| j + w > pos))
+                        .collect();
+                    let scores: Vec<f64> = allowed
+                        .iter()
+                        .map(|&j| {
+                            (0..head_dim)
+                                .map(|d| {
+                                    f64::from(q[(h * s + r) * head_dim + d])
+                                        * f64::from(k[(kv * next + j) * head_dim + d])
+                                })
+                                .sum()
+                        })
+                        .collect();
+                    let top = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let weights: Vec<f64> = scores.iter().map(|x| (x - top).exp()).collect();
+                    let total: f64 = weights.iter().sum();
+                    for d in 0..head_dim {
+                        want[(h * s + r) * head_dim + d] = allowed
+                            .iter()
+                            .zip(&weights)
+                            .map(|(&j, w)| w / total * f64::from(v[(kv * next + j) * head_dim + d]))
+                            .sum::<f64>()
+                            as f32;
+                    }
+                }
+            }
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                worst < 1e-4,
+                "prev {prev}, {s} tokens, window {window:?}: off by {worst}"
+            );
+        }
     }
 
     /// `mlx-community/gemma-4-12B-it-bf16` and `-31b-it-bf16` publish the text
