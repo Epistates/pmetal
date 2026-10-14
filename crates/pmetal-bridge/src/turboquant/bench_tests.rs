@@ -42,17 +42,33 @@ fn synthetic_cold(kv: usize, n: usize, keys: &Quantizer, values: &Quantizer) -> 
     store
 }
 
+/// Milliseconds per call when `LAYERS` calls are queued into one evaluation,
+/// as a decode step queues one attention per layer.
+const LAYERS: usize = 32;
+
 fn time_ms(iterations: usize, mut f: impl FnMut() -> InlineArray) -> f64 {
-    for _ in 0..5 {
-        f().eval();
+    let mut step = || {
+        let mut total = f();
+        for _ in 1..LAYERS {
+            total = total.add(&f());
+        }
+        total.eval();
+    };
+    for _ in 0..3 {
+        step();
     }
     crate::inline_array::synchronize();
-    let start = Instant::now();
-    for _ in 0..iterations {
-        f().eval();
-    }
-    crate::inline_array::synchronize();
-    start.elapsed().as_secs_f64() * 1e3 / iterations as f64
+    // The fastest of several runs: the machine is shared, and noise only adds.
+    (0..5)
+        .map(|_| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                step();
+            }
+            crate::inline_array::synchronize();
+            start.elapsed().as_secs_f64() * 1e3 / (iterations * LAYERS) as f64
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Milliseconds of each of the first decode steps through the cache, after a
@@ -113,7 +129,16 @@ fn bench_decode_attention() {
         dim,
         value_dim: dim,
     };
+    let only_n: Option<usize> = std::env::var("TQ_BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let only_bits: Option<u8> = std::env::var("TQ_BENCH_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok());
     for &n in &[4096usize, 32768, 131072] {
+        if only_n.is_some_and(|x| x != n) {
+            continue;
+        }
         // bf16 reference: MLX's own vector SDPA.
         let k_dense = InlineArray::random_normal(
             &[batch as i32, kv_heads as i32, n as i32, dim as i32],
@@ -132,6 +157,9 @@ fn bench_decode_attention() {
             bytes_bf16 / t_bf16 / 1e6
         );
         for &bits in &[8u8, 4, 3, 2] {
+            if only_bits.is_some_and(|x| x != bits) {
+                continue;
+            }
             let keys = Quantizer::new(dim, bits);
             let values = Quantizer::new(dim, bits);
             let cold = synthetic_cold(kv, n, &keys, &values);

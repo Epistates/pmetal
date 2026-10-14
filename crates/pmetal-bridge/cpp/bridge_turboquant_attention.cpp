@@ -62,6 +62,7 @@
 
 static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
     constexpr uint kD = (uint)DIM;
+    constexpr uint kD4 = kD / 4u;
     constexpr uint kDv = (uint)VDIM;
     constexpr uint kBk = (uint)KBITS;
     constexpr uint kBv = (uint)VBITS;
@@ -73,7 +74,7 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
     constexpr uint kMaskK = (1u << kBk) - 1u;
     constexpr uint kMaskV = (1u << kBv) - 1u;
 
-    threadgroup float lds_q[kG * kD];
+    threadgroup float4 lds_q[kG * kD4];
     threadgroup float lds_cbk[1u << kBk];
     threadgroup float lds_cbv[1u << kBv];
 
@@ -103,8 +104,9 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
     const int t_end = min(t_begin + tokens_per_block, cold ? n_cold : n_dense);
 
     if (cold) {
-        for (uint i = lane; i < kG * kD; i += 32u) {
-            lds_q[i] = q_rot[(ulong)r0 * kD + i] * qscale;
+        const device float4* q4 = (const device float4*)(q_rot + (ulong)r0 * kD);
+        for (uint i = lane; i < kG * kD4; i += 32u) {
+            lds_q[i] = q4[i] * qscale;
         }
         for (uint i = lane; i < (1u << kBk); i += 32u) {
             lds_cbk[i] = cb_k[i];
@@ -113,8 +115,9 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
             lds_cbv[i] = cb_v[i];
         }
     } else {
-        for (uint i = lane; i < kG * kD; i += 32u) {
-            lds_q[i] = float(q[(ulong)r0 * kD + i]) * qscale;
+        for (uint i = lane; i < kG * kD4; i += 32u) {
+            const ulong b = (ulong)r0 * kD + (ulong)i * 4u;
+            lds_q[i] = float4(float(q[b]), float(q[b + 1u]), float(q[b + 2u]), float(q[b + 3u])) * qscale;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -134,6 +137,7 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
         const int t = t0 + (int)lane;
         const bool valid = t < t_end;
 
+        // Score one token per lane, for every query head of the KV head.
         float s[kG];
         for (uint g = 0u; g < kG; ++g) {
             s[g] = 0.0f;
@@ -143,17 +147,40 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
             if (cold) {
                 const ulong tok = (ulong)kv * cap_cold + (uint)t;
                 const device uint* row = k_packed + tok * kWk;
-                for (uint i = 0u; i < kD; ++i) {
-                    const uint bit = i * kBk;
-                    const uint wi = bit >> 5u;
-                    const uint off = bit & 31u;
-                    uint x = row[wi] >> off;
-                    if (off + kBk > 32u) {
-                        x |= row[wi + 1u] << (32u - off);
+                // The row's words in registers, loaded 16 bytes at a time; the
+                // loops below have compile-time bounds, so every index into
+                // them is static after unrolling.
+                uint wv[kWk];
+                const device packed_uint4* row4 = (const device packed_uint4*)row;
+                #pragma clang loop unroll(full)
+                for (uint w = 0u; w + 4u <= kWk; w += 4u) {
+                    const packed_uint4 v4 = row4[w / 4u];
+                    wv[w] = v4[0];
+                    wv[w + 1u] = v4[1];
+                    wv[w + 2u] = v4[2];
+                    wv[w + 3u] = v4[3];
+                }
+                #pragma clang loop unroll(full)
+                for (uint w = (kWk / 4u) * 4u; w < kWk; ++w) {
+                    wv[w] = row[w];
+                }
+                #pragma clang loop unroll(full)
+                for (uint i4 = 0u; i4 < kD4; ++i4) {
+                    float c[4];
+                    #pragma clang loop unroll(full)
+                    for (uint k = 0u; k < 4u; ++k) {
+                        const uint bit = (i4 * 4u + k) * kBk;
+                        const uint wi = bit >> 5u;
+                        const uint off = bit & 31u;
+                        uint x = wv[wi] >> off;
+                        if (off + kBk > 32u) {
+                            x |= wv[wi + 1u] << (32u - off);
+                        }
+                        c[k] = lds_cbk[x & kMaskK];
                     }
-                    const float c = lds_cbk[x & kMaskK];
+                    const float4 cv = float4(c[0], c[1], c[2], c[3]);
                     for (uint g = 0u; g < kG; ++g) {
-                        s[g] = fma(lds_q[g * kD + i], c, s[g]);
+                        s[g] += dot(lds_q[g * kD4 + i4], cv);
                     }
                 }
                 const float kn = k_scale[tok];
@@ -166,15 +193,18 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
                     ? (uint)t
                     : (uint)n_sink + (uint)((ring_start + (t - n_sink)) % ring_cap);
                 auto kr = dense_k + ((ulong)kv * cap_dense + slot) * kD;
-                for (uint i = 0u; i < kD; ++i) {
-                    const float c = float(kr[i]);
+                for (uint i4 = 0u; i4 < kD4; ++i4) {
+                    const float4 cv = float4(
+                        float(kr[i4 * 4u]), float(kr[i4 * 4u + 1u]),
+                        float(kr[i4 * 4u + 2u]), float(kr[i4 * 4u + 3u]));
                     for (uint g = 0u; g < kG; ++g) {
-                        s[g] = fma(lds_q[g * kD + i], c, s[g]);
+                        s[g] += dot(lds_q[g * kD4 + i4], cv);
                     }
                 }
             }
         }
 
+        // Online softmax over the tile, in base 2.
         float pv[kG];
         for (uint g = 0u; g < kG; ++g) {
             const float sv = valid ? s[g] : -INFINITY;
@@ -189,6 +219,7 @@ static const char* TURBOQUANT_ATTENTION_PARTIALS_SOURCE = R"(
             pv[g] = p * vscale;
         }
 
+        // Accumulate the tile's values, a slice of the dimensions per lane.
         const int tile = min(32, t_end - t0);
         for (int j = 0; j < tile; ++j) {
             float p[kG];
@@ -343,6 +374,7 @@ static std::string dtype_tag(mlx::core::Dtype dt) {
     throw std::invalid_argument("[turboquant_attention] only f32, f16 and bf16 inputs are supported");
 }
 
+
 static mlx::core::fast::CustomKernelFunction& get_attention_partials_kernel(const std::string& tag) {
     static std::mutex mutex;
     static std::map<std::string, mlx::core::fast::CustomKernelFunction> kernels;
@@ -410,6 +442,9 @@ int mlx_inline_turboquant_attention_partials(
         }
         if (n_rows != n_kv_rows / kv_heads * kv_heads * groups || n_kv_rows % kv_heads != 0) {
             throw std::invalid_argument("[turboquant_attention_partials] row counts disagree with heads");
+        }
+        if (dim % 4 != 0) {
+            throw std::invalid_argument("[turboquant_attention_partials] the key dimension must be a multiple of 4");
         }
         const size_t lds_bytes =
             4 * ((size_t)groups * dim + ((size_t)1 << key_bits) + ((size_t)1 << value_bits));

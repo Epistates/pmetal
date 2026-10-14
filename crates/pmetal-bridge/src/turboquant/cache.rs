@@ -171,6 +171,12 @@ impl QuantizedKvCache {
             keys.dim(3) as usize,
             values.dim(3) as usize,
         );
+        if seen.2 % 4 != 0 {
+            return Err(format!(
+                "TurboQuant: the key head dimension must be a multiple of 4, got {}",
+                seen.2
+            ));
+        }
         if let Some(layout) = self.layout {
             if (layout.batch, layout.heads, layout.dim, layout.value_dim) != seen {
                 return Err(format!(
