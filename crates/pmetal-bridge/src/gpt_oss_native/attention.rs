@@ -268,18 +268,19 @@ fn sliding_attention(
 /// `[s, kv_len]` boolean mask for queries at `prev..prev + s` over keys at
 /// `prev + s - kv_len..prev + s`: `true` where `q - window < k <= q`.
 fn band_mask(prev: i32, s: i32, kv_len: i32, window: i32) -> InlineArray {
+    use crate::dtype::I32;
     let first_key = prev + s - kv_len;
-    let mut allowed = Vec::with_capacity((s * kv_len) as usize);
-    for qi in 0..s {
-        let qp = prev + qi;
-        for kj in 0..kv_len {
-            let kp = first_key + kj;
-            allowed.push(i32::from(kp <= qp && qp - kp < window));
-        }
-    }
-    InlineArray::from_i32_slice(&allowed)
-        .reshape(&[s, kv_len])
-        .as_dtype(crate::compat::Dtype::Bool.as_i32())
+    let q_pos = InlineArray::arange(s, I32)
+        .add(&InlineArray::from_i32(prev))
+        .reshape(&[s, 1]);
+    let k_pos = InlineArray::arange(kv_len, I32)
+        .add(&InlineArray::from_i32(first_key))
+        .reshape(&[1, kv_len]);
+    // How far each key sits behind each query: the band is `0 <= d < window`.
+    let behind = q_pos.subtract(&k_pos);
+    behind
+        .greater_equal(&InlineArray::from_i32(0))
+        .logical_and(&behind.lt(&InlineArray::from_i32(window)))
 }
 
 /// Full attention over a growing buffer in the model dtype.
@@ -398,4 +399,33 @@ fn quantized_attention(
         bits,
         Some(&lw.attn_sinks),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The band mask against the rule written out per (query, key) pair, for
+    /// a first chunk, a chunk that wraps the ring, and one far past it.
+    #[test]
+    fn band_mask_is_the_sliding_window() {
+        for (prev, s, kv_len, window) in [(0, 9, 9, 4), (4, 6, 10, 4), (30, 5, 9, 4), (7, 1, 4, 4)]
+        {
+            let mut mask = band_mask(prev, s, kv_len, window).as_dtype(crate::dtype::F32);
+            mask.eval();
+            let got = mask.to_f32_vec((s * kv_len) as usize).expect("readback");
+            let first_key = prev + s - kv_len;
+            for qi in 0..s {
+                for kj in 0..kv_len {
+                    let (q, k) = (prev + qi, first_key + kj);
+                    assert_eq!(
+                        got[(qi * kv_len + kj) as usize] != 0.0,
+                        k <= q && q - k < window,
+                        "prev {prev}, {s} queries over {kv_len} keys, window {window}: query {q}, key {k}"
+                    );
+                }
+            }
+        }
+        crate::check_unobserved_error().expect("bridge ops succeeded");
+    }
 }
