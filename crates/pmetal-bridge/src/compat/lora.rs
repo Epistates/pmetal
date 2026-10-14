@@ -106,7 +106,8 @@ impl LoraAdapter {
     /// In-place form of [`with_dora`](Self::with_dora), for callers holding a
     /// `&mut` to an already-attached adapter.
     pub fn set_dora(&mut self, base_weight: &Array) {
-        self.magnitude = Some(column_norms(base_weight));
+        // A trainable parameter, so f32 whatever the base weight's dtype.
+        self.magnitude = Some(column_norms(&base_weight.as_dtype(Dtype::Float32.as_i32())));
     }
 
     /// Set the adapter's input dropout.
@@ -124,15 +125,19 @@ impl LoraAdapter {
     ///
     /// For LoRA that is `W + s·B·A`. For DoRA the update is renormalised:
     /// `m·(W + s·B·A) / ‖W + s·B·A‖_col`.
+    ///
+    /// Computed in the adapter's width and rounded once to `weight`'s dtype,
+    /// so folding an adapter into a bf16 model leaves a bf16 weight.
     pub fn merged_weight(&self, weight: &Array) -> Array {
         let combined = weight.add(&self.delta());
-        match &self.magnitude {
+        let merged = match &self.magnitude {
             Some(magnitude) => {
-                let norm = column_norms(&combined).add(&Array::from_f32(1e-6));
+                let norm = column_norms(&combined).add_scalar(DORA_EPS);
                 combined.multiply(&magnitude.divide(&norm))
             }
             None => combined,
-        }
+        };
+        merged.as_dtype(weight.dtype_raw())
     }
 
     /// Fold this adapter into `weight`, remembering how to undo it.
@@ -154,7 +159,7 @@ impl LoraAdapter {
         }
         *weight = match self.unmerged_weight.take() {
             Some(original) => original,
-            None => weight.subtract(&self.delta()),
+            None => weight.subtract(&self.delta()).as_dtype(weight.dtype_raw()),
         };
         self.merged = false;
     }
@@ -176,12 +181,23 @@ impl LoraAdapter {
     /// matmuls against the activations, which is the whole point of the
     /// factorisation.
     pub fn apply(&self, x: &Array, weight: &Array, bias: Option<&Array>) -> Array {
-        self.apply_to_product(x, x.matmul(&weight.t()), &|| weight.clone(), bias)
+        let y = super::layers::linear_forward_array(x, weight, None);
+        self.apply_to_product(
+            x,
+            y,
+            &|| super::layers::fp8_weight_for_compute(weight),
+            bias,
+        )
     }
 
     /// [`apply`](Self::apply) given the base product `y = x·Wᵀ` already, for
     /// a base weight stored packed. `weight` produces the dense `W`, which
     /// only DoRA's normalisation reads.
+    ///
+    /// The adapter's arithmetic runs at its own width (its tensors are f32
+    /// whatever the base is), and the layer's output comes back at the base
+    /// product's, rounded once at the end, so a bf16 model stays bf16 through
+    /// an adapted layer as it does through a plain one.
     pub(crate) fn apply_to_product(
         &self,
         x: &Array,
@@ -192,6 +208,7 @@ impl LoraAdapter {
         if self.merged {
             return add_bias(y, bias);
         }
+        let out_dtype = y.dtype_raw();
 
         let x_in = if self.training && self.dropout > 0.0 {
             dropout(x, self.dropout)
@@ -204,26 +221,67 @@ impl LoraAdapter {
             .multiply(&self.scale_arr);
         let y = y.add(&delta);
 
-        // DoRA rescales by `m / ‖W + s·B·A‖_col` — the norm of the *combined*
-        // weight, as Liu et al. define it and as PEFT computes it. Scaling the
-        // output per row is the same thing as scaling the weight's rows, which
-        // is what makes `merged_weight` agree with this exactly.
-        //
-        // It does mean materialising `B·A` on the forward, which is the cost
-        // DoRA carries over LoRA. Normalising by `‖W‖` instead would avoid that
-        // and is a good approximation near initialisation, but it would make a
-        // merged model compute something a live one does not.
+        // DoRA rescales each output row by `m / ‖W + s·B·A‖`, the norm of the
+        // *combined* weight's row, as Liu et al. define it and as PEFT
+        // computes it. Scaling the output per row is the same thing as
+        // scaling the weight's rows, which is what makes `merged_weight`
+        // agree with this exactly.
         let y = match &self.magnitude {
-            Some(magnitude) => {
-                let combined = weight().add(&self.delta());
-                let norm = column_norms(&combined).add(&Array::from_f32(1e-6));
-                y.multiply(&magnitude.divide(&norm).squeeze_axes(&[-1]))
-            }
+            Some(magnitude) => y.multiply(&self.dora_scale(magnitude, &weight())),
             None => y,
+        };
+        let y = if y.dtype_raw() == out_dtype {
+            y
+        } else {
+            y.as_dtype(out_dtype)
         };
         add_bias(y, bias)
     }
+
+    /// DoRA's per-row factor `m / (‖W + s·B·A‖ + ε)`, `[out]`.
+    ///
+    /// The norm is held constant for the gradient (the DoRA paper's §4.3, and
+    /// what PEFT does): `m` and the additive update carry the training
+    /// signal, and the backward neither differentiates through `W + s·B·A`
+    /// nor keeps a dense copy of it.
+    fn dora_scale(&self, magnitude: &Array, weight: &Array) -> Array {
+        let norm = self.combined_row_norms(weight).stop_gradient();
+        magnitude
+            .squeeze_axes(&[-1])
+            .divide(&norm.add_scalar(DORA_EPS))
+    }
+
+    /// `‖W + s·B·A‖` per row, `[out]`, in f32, without forming `B·A`:
+    ///
+    /// ```text
+    /// ‖wᵢ + s·bᵢA‖² = ‖wᵢ‖² + 2s·bᵢ·(A·wᵢ) + s²·bᵢ(AAᵀ)bᵢᵀ
+    /// ```
+    ///
+    /// Two `[out, rank]` products and one `[rank, rank]` Gram matrix stand
+    /// in for the dense `[out, in]` update.
+    fn combined_row_norms(&self, weight: &Array) -> Array {
+        let f32_ = Dtype::Float32.as_i32();
+        let (w, a, b) = (
+            weight.as_dtype(f32_),
+            self.a.as_dtype(f32_),
+            self.b.as_dtype(f32_),
+        );
+        let w_sq = w.square().sum_axis(1, false);
+        let cross = w.matmul(&a.t()).multiply(&b).sum_axis(1, false);
+        let gram = a.matmul(&a.t());
+        let b_sq = b.matmul(&gram).multiply(&b).sum_axis(1, false);
+        // Cancellation can leave a hair under zero for a row the update all
+        // but cancels.
+        w_sq.add(&cross.mul_scalar(2.0 * self.scale))
+            .add(&b_sq.mul_scalar(self.scale * self.scale))
+            .maximum(&Array::scalar_like(0.0, &w_sq))
+            .sqrt()
+    }
 }
+
+/// DoRA's `ε`, added to the norm so a row the update zeroes does not divide
+/// by zero. The same in the live forward and in the merged weight.
+const DORA_EPS: f32 = 1e-6;
 
 fn add_bias(y: Array, bias: Option<&Array>) -> Array {
     match bias {
@@ -238,11 +296,13 @@ fn column_norms(weight: &Array) -> Array {
 }
 
 /// Inverted dropout: zero a fraction `p` of entries and scale the rest up, so
-/// the expectation is unchanged and inference needs no rescaling.
+/// the expectation is unchanged and inference needs no rescaling. The result
+/// has `x`'s dtype.
 fn dropout(x: &Array, p: f32) -> Array {
     let keep = 1.0 - p;
     let mask = random::bernoulli(&Array::from_f32(keep), x.shape());
-    x.multiply(&mask.multiply(&Array::from_f32(1.0 / keep)))
+    x.multiply(&mask.as_dtype(x.dtype_raw()))
+        .mul_scalar(1.0 / keep)
 }
 
 #[cfg(test)]
@@ -417,8 +477,7 @@ mod tests {
     #[test]
     fn a_starts_uniform_on_one_over_root_in_features() {
         for (in_features, rank, rslora) in [(4096, 16, false), (4096, 16, true), (512, 64, true)] {
-            let adapter =
-                LoraAdapter::new(in_features, 8, rank, 32.0, rslora).expect("adapter");
+            let adapter = LoraAdapter::new(in_features, 8, rank, 32.0, rslora).expect("adapter");
             let a = values(adapter.a.clone());
             let bound = 1.0 / (in_features as f32).sqrt();
             let max = a.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
@@ -455,6 +514,169 @@ mod tests {
                 (b - a).abs() < 1e-3,
                 "DoRA init moved the output from {b} to {a}"
             );
+        }
+    }
+
+    /// A DoRA layer with every tensor away from its initial value, so no
+    /// term of the update is accidentally zero: `[out=5, in=6]`, rank 3.
+    fn dora_parts() -> (Array, Array, Array, Array, Array, f32) {
+        let weight = random::uniform_range(-1.0, 1.0, &[5, 6], Dtype::Float32);
+        let a = random::uniform_range(-0.5, 0.5, &[3, 6], Dtype::Float32);
+        let b = random::uniform_range(-0.5, 0.5, &[5, 3], Dtype::Float32);
+        let magnitude = random::uniform_range(0.5, 2.0, &[5, 1], Dtype::Float32);
+        let x = random::uniform_range(-1.0, 1.0, &[4, 6], Dtype::Float32);
+        (weight, a, b, magnitude, x, 2.0)
+    }
+
+    /// DoRA as Liu et al. write it, spelled out densely:
+    /// `y = (x·Wᵀ + s·x·Aᵀ·Bᵀ) · m/‖W + s·B·A‖`, the norm per output row and
+    /// held constant for the gradient (§4.3, and what PEFT does).
+    fn dora_reference(
+        weight: &Array,
+        a: &Array,
+        b: &Array,
+        magnitude: &Array,
+        x: &Array,
+        scale: f32,
+    ) -> Array {
+        let combined = weight.add(&b.matmul(a).mul_scalar(scale));
+        let norm = combined
+            .square()
+            .sum_axis(1, false)
+            .sqrt()
+            .add_scalar(1e-6)
+            .stop_gradient();
+        let y = x
+            .matmul(&weight.t())
+            .add(&x.matmul(&a.t()).matmul(&b.t()).mul_scalar(scale));
+        y.multiply(&magnitude.squeeze_axes(&[-1]).divide(&norm))
+    }
+
+    fn dora_layer(weight: &Array, a: &Array, b: &Array, magnitude: &Array, scale: f32) -> Linear {
+        let mut layer = Linear::new(6, 5, false).expect("layer");
+        layer.weight.value = weight.clone();
+        let adapter = layer.attach_lora(3, scale * 3.0, false).expect("attach");
+        adapter.a = a.clone();
+        adapter.b = b.clone();
+        adapter.magnitude = Some(magnitude.clone());
+        assert_eq!(adapter.scale, scale);
+        layer
+    }
+
+    #[test]
+    fn dora_computes_the_definition() {
+        let (weight, a, b, magnitude, x, scale) = dora_parts();
+        let layer = dora_layer(&weight, &a, &b, &magnitude, scale);
+        let want = values(dora_reference(&weight, &a, &b, &magnitude, &x, scale));
+        let got = values(layer.forward(&x));
+        crate::check_unobserved_error().expect("no bridge error");
+        for (w, g) in want.iter().zip(&got) {
+            assert!((w - g).abs() < 1e-5, "DoRA output {g}, definition {w}");
+        }
+    }
+
+    /// The norm in DoRA's denominator is a constant to autograd. Treating it
+    /// as one is what the paper prescribes to keep the backward cheap and
+    /// what PEFT does; differentiating through it too gives a different
+    /// gradient to `A` and `B` and holds another dense `[out, in]` copy of
+    /// the update for the backward.
+    #[test]
+    fn dora_does_not_differentiate_its_norm() {
+        let (weight, a, b, magnitude, x, scale) = dora_parts();
+        let target = random::uniform_range(-1.0, 1.0, &[4, 5], Dtype::Float32);
+        let params = [a.clone(), b.clone(), magnitude.clone()];
+
+        let (_, want) = crate::inline_array::value_and_grad(
+            |p| {
+                let y = dora_reference(&weight, &p[0], &p[1], &p[2], &p[3], scale);
+                y.multiply(&p[4]).sum_all()
+            },
+            &params,
+            &[x.clone(), target.clone()],
+        );
+        let (_, got) = crate::inline_array::value_and_grad(
+            |p| {
+                let layer = dora_layer(&weight, &p[0], &p[1], &p[2], scale);
+                layer.forward(&p[3]).multiply(&p[4]).sum_all()
+            },
+            &params,
+            &[x, target],
+        );
+        for (name, (w, g)) in ["A", "B", "magnitude"].iter().zip(want.iter().zip(&got)) {
+            let (w, g) = (values(w.clone()), values(g.clone()));
+            crate::check_unobserved_error().expect("no bridge error");
+            for (w, g) in w.iter().zip(&g) {
+                assert!(
+                    (w - g).abs() < 1e-4 * (1.0 + w.abs()),
+                    "d/d{name}: {g}, constant-norm reference {w}"
+                );
+            }
+        }
+    }
+
+    /// Folding an adapter into a bf16 weight leaves a bf16 weight, and
+    /// unfolding it brings one back: the adapter's f32 arithmetic is rounded
+    /// to the weight's width, not carried into it.
+    #[test]
+    fn merging_keeps_the_weights_dtype() {
+        for dora in [false, true] {
+            let mut layer = trained_layer(dora);
+            layer.weight.value = layer.weight.value.as_dtype(Dtype::Bfloat16.as_i32());
+            layer.merge_lora();
+            assert_eq!(
+                layer.weight.value.dtype(),
+                Dtype::Bfloat16,
+                "dora={dora} merge"
+            );
+            layer.unmerge_lora();
+            assert_eq!(
+                layer.weight.value.dtype(),
+                Dtype::Bfloat16,
+                "dora={dora} unmerge"
+            );
+            crate::check_unobserved_error().expect("no bridge error");
+        }
+    }
+
+    /// An FP8 base weight is its bytes until unpacked: an adapter on one
+    /// computes what it does on the unpacked weight, and merging it unpacks
+    /// the weight first rather than adding to the bytes.
+    #[test]
+    fn an_adapter_on_an_fp8_weight_computes_on_the_unpacked_one() {
+        let dense = random::uniform_range(-1.0, 1.0, &[4, 8], Dtype::Bfloat16);
+        let x = random::uniform_range(-1.0, 1.0, &[2, 8], Dtype::Bfloat16);
+        let fp8 = crate::compat::ops::to_fp8(&dense).expect("to_fp8");
+        let unpacked = crate::compat::ops::from_fp8(&fp8, Dtype::Bfloat16).expect("from_fp8");
+
+        let adapt = |weight: &Array| {
+            let mut layer = Linear::new(8, 4, false).expect("layer");
+            layer.weight.value = weight.clone();
+            let adapter = layer.attach_lora(2, 4.0, false).expect("attach");
+            adapter.a = Array::from_f32_slice(
+                &[
+                    0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8, 0.9, 1.0, -0.1, 0.2, 0.3, -0.4, 0.5,
+                    0.6,
+                ],
+                &[2, 8],
+            );
+            adapter.b =
+                Array::from_f32_slice(&[0.3, -0.4, 0.5, 0.6, -0.7, 0.8, 0.2, -0.1], &[4, 2]);
+            layer
+        };
+        let (want, mut packed) = (adapt(&unpacked), adapt(&fp8));
+        let want_y = values(want.forward(&x).as_dtype(Dtype::Float32.as_i32()));
+        let got_y = values(packed.forward(&x).as_dtype(Dtype::Float32.as_i32()));
+        crate::check_unobserved_error().expect("no bridge error");
+        for (w, g) in want_y.iter().zip(&got_y) {
+            assert!((w - g).abs() < 1e-5, "fp8 base {g}, unpacked {w}");
+        }
+
+        packed.merge_lora();
+        assert_eq!(packed.weight.value.dtype(), Dtype::Bfloat16);
+        let merged_y = values(packed.forward(&x).as_dtype(Dtype::Float32.as_i32()));
+        crate::check_unobserved_error().expect("no bridge error");
+        for (w, m) in want_y.iter().zip(&merged_y) {
+            assert!((w - m).abs() < 0.05, "merged {m}, adapted {w}");
         }
     }
 

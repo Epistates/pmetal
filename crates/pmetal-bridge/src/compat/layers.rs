@@ -7,7 +7,7 @@ use crate::native_weight::QuantParams;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-fn fp8_weight_for_compute(weight: &Array) -> Array {
+pub(super) fn fp8_weight_for_compute(weight: &Array) -> Array {
     if weight.dtype() == super::Dtype::Uint8 {
         ops::from_fp8(weight, super::Dtype::Bfloat16).expect("failed to dequantize FP8 weight")
     } else {
@@ -15,7 +15,7 @@ fn fp8_weight_for_compute(weight: &Array) -> Array {
     }
 }
 
-fn linear_forward_array(x: &Array, weight: &Array, bias: Option<&Array>) -> Array {
+pub(super) fn linear_forward_array(x: &Array, weight: &Array, bias: Option<&Array>) -> Array {
     let weight = fp8_weight_for_compute(weight);
     let x = if weight.dtype() == super::Dtype::Bfloat16 && x.dtype() != super::Dtype::Bfloat16 {
         x.as_dtype(super::Dtype::Bfloat16.as_i32())
@@ -224,6 +224,8 @@ impl Linear {
     pub fn merge_lora(&mut self) {
         if self.adapter.as_ref().is_some_and(|a| !a.merged) {
             self.dequantize();
+            // An FP8 weight is stored as its bytes: unpack before adding to it.
+            self.weight.value = fp8_weight_for_compute(&self.weight.value);
         }
         if let Some(adapter) = self.adapter.as_mut() {
             adapter.merge_into(&mut self.weight.value);
