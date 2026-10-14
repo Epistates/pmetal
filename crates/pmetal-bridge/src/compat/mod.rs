@@ -786,35 +786,13 @@ pub mod ops_ext {
 
 // ── losses ───────────────────────────────────────────────────────────────────
 pub mod losses {
-    use super::{Array, Exception};
+    use super::Array;
 
     #[derive(Debug, Clone, Copy)]
     pub enum LossReduction {
         None,
         Sum,
         Mean,
-    }
-
-    /// Categorical cross-entropy loss.
-    ///
-    /// Computes `softmax_cross_entropy(logits, targets, axis=-1)` element-wise.
-    /// `targets` must be integer class indices.
-    #[derive(Debug, Clone, Default)]
-    pub struct CrossEntropy;
-
-    impl CrossEntropy {
-        /// Construct a CrossEntropy loss (infallible — Result is for API parity).
-        pub fn new() -> Result<Self, Exception> {
-            Ok(Self)
-        }
-
-        /// Compute per-token cross-entropy loss.
-        ///
-        /// `logits`: `[..., vocab]`, `targets`: `[...]` integer indices.
-        /// Returns per-element loss `[...]`.
-        pub fn apply(&self, logits: &Array, targets: &Array) -> Result<Array, Exception> {
-            Ok(logits.cross_entropy(targets, -1))
-        }
     }
 
     pub struct BinaryCrossEntropyBuilder {

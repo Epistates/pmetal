@@ -811,13 +811,20 @@ impl LayerNormBuilder {
 
 // ── GroupNorm ─────────────────────────────────────────────────────────────
 
-/// Group normalization.
+/// Group normalization over a channels-last `[batch, spatial..., channels]`
+/// input, as `torch.nn.GroupNorm` does over channels-first.
+///
+/// Group `g` is the consecutive channels `g·C/G ..< (g+1)·C/G`, normalized
+/// over those channels at every spatial position, which is how every
+/// PyTorch-trained checkpoint's groups are laid out. (MLX's own default
+/// layout interleaves them instead, channel `c` in group `c % G`, and would
+/// normalize such a network's activations over the wrong sets.) The
+/// statistics are taken in f32, and the output has the input's dtype.
 #[derive(Debug, Clone)]
 pub struct GroupNorm {
     pub group_count: i32,
     pub dimensions: i32,
-    pub eps: Array,
-    pub pytorch_compatible: bool,
+    pub eps: f32,
     pub weight: Param<Option<Array>>,
     pub bias: Param<Option<Array>>,
 }
@@ -825,15 +832,8 @@ pub struct GroupNorm {
 impl GroupNorm {
     pub const DEFAULT_EPS: f32 = 1e-5;
     pub const DEFAULT_AFFINE: bool = true;
-    pub const DEFAULT_PYTORCH_COMPATIBLE: bool = false;
 
-    pub fn new(
-        group_count: i32,
-        dims: i32,
-        eps: f32,
-        affine: bool,
-        pytorch_compatible: bool,
-    ) -> Self {
+    pub fn new(group_count: i32, dims: i32, eps: f32, affine: bool) -> Self {
         let (w, b) = if affine {
             (
                 Some(ops::ones(&[dims], super::Dtype::Float32)),
@@ -845,48 +845,33 @@ impl GroupNorm {
         Self {
             group_count,
             dimensions: dims,
-            eps: Array::from_f32(eps),
-            pytorch_compatible,
+            eps,
             weight: Param::new(w),
             bias: Param::new(b),
         }
     }
 
     pub fn forward(&self, x: &Array) -> Array {
-        let eps_f = self.eps.clone().item_f32();
         let batch = x.dim(0);
         let dims = x.dim(-1);
         let group_size = dims / self.group_count;
+        let out_dtype = x.dtype_raw();
 
-        if self.pytorch_compatible {
-            // PyTorch layout: [B, H, W, C] → reshape to [B, H*W, groups, group_size]
-            let x2 = x.reshape(&[batch, -1, self.group_count, group_size]);
-            let x2 = x2
-                .transpose_axes(&[0, 2, 1, 3])
-                .reshape(&[batch, self.group_count, -1]);
-            let x2 = x2.layer_norm(None, None, eps_f);
-            let ndim = x.ndim();
-            let new_shape: Vec<i32> = std::iter::once(batch)
-                .chain(x.shape()[1..(ndim as usize - 1)].iter().copied())
-                .chain(std::iter::once(dims))
-                .collect();
-            let x2 = x2.reshape(&[batch, self.group_count, -1, group_size]);
-            let x2 = x2.transpose_axes(&[0, 2, 1, 3]).reshape(&new_shape);
-            self.apply_affine(x2)
+        // [B, spatial, G, C/G] → [B, G, spatial·C/G]: one row per group.
+        let rows = x
+            .reshape(&[batch, -1, self.group_count, group_size])
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, self.group_count, -1]);
+        let rows = rows.layer_norm(None, None, self.eps);
+        let x = rows
+            .reshape(&[batch, self.group_count, -1, group_size])
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(x.shape());
+        let y = self.apply_affine(x);
+        if y.dtype_raw() == out_dtype {
+            y
         } else {
-            let x2 = x.reshape(&[batch, -1, self.group_count]);
-            // instance norm per group
-            let mean = x2.mean_axis(1, true);
-            let var = x2.subtract(&mean).square().mean_axis(1, true);
-            let eps_arr = Array::from_f32(eps_f);
-            let x2 = x2.subtract(&mean).multiply(&var.add(&eps_arr).rsqrt());
-            let ndim = x.ndim();
-            let new_shape: Vec<i32> = std::iter::once(batch)
-                .chain(x.shape()[1..(ndim as usize - 1)].iter().copied())
-                .chain(std::iter::once(dims))
-                .collect();
-            let x2 = x2.reshape(&new_shape);
-            self.apply_affine(x2)
+            y.as_dtype(out_dtype)
         }
     }
 
@@ -918,7 +903,6 @@ pub struct GroupNormBuilder {
     dims: i32,
     eps: f32,
     affine: bool,
-    pytorch_compatible: bool,
 }
 
 impl GroupNormBuilder {
@@ -928,7 +912,6 @@ impl GroupNormBuilder {
             dims,
             eps: GroupNorm::DEFAULT_EPS,
             affine: GroupNorm::DEFAULT_AFFINE,
-            pytorch_compatible: GroupNorm::DEFAULT_PYTORCH_COMPATIBLE,
         }
     }
     pub fn eps(mut self, eps: f32) -> Self {
@@ -939,17 +922,12 @@ impl GroupNormBuilder {
         self.affine = a;
         self
     }
-    pub fn pytorch_compatible(mut self, p: bool) -> Self {
-        self.pytorch_compatible = p;
-        self
-    }
     pub fn build(self) -> Result<GroupNorm, Exception> {
         Ok(GroupNorm::new(
             self.group_count,
             self.dims,
             self.eps,
             self.affine,
-            self.pytorch_compatible,
         ))
     }
 }
@@ -1415,51 +1393,119 @@ impl super::builder::Builder<Conv2d> for Conv2dBuilder {
     }
 }
 
-// ── Sequential ────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::super::{Dtype, random};
+    use super::*;
 
-/// Sequential container — applies a list of `Module<&Array>`s in order.
-pub struct Sequential {
-    layers: Vec<Box<dyn super::Module<&'static Array, Output = Array, Error = super::Exception>>>,
-}
+    fn values(a: &Array) -> Vec<f32> {
+        let mut a = a.as_dtype(super::super::Dtype::Float32.as_i32());
+        a.eval();
+        let n = a.size();
+        let v = a.to_f32_vec(n).expect("readable");
+        crate::check_unobserved_error().expect("no bridge error");
+        v
+    }
 
-// Note: Sequential is intentionally left minimal. Full implementation would
-// require boxing with `dyn Module` trait objects which require 'static lifetimes.
-// For now it's a stub that satisfies type-checking.
-impl std::fmt::Debug for Sequential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Sequential({})", self.layers.len())
+    /// `torch.nn.GroupNorm(groups, channels)` over a channels-last
+    /// `[batch, spatial..., channels]` input, in f64: group `g` is the
+    /// consecutive channels `g·C/G ..< (g+1)·C/G`, normalized over those
+    /// channels at every spatial position, then scaled per channel.
+    fn torch_group_norm(
+        x: &[f32],
+        batch: usize,
+        spatial: usize,
+        channels: usize,
+        groups: usize,
+        eps: f64,
+        weight: &[f32],
+        bias: &[f32],
+    ) -> Vec<f64> {
+        let per = channels / groups;
+        let mut out = vec![0.0; x.len()];
+        for b in 0..batch {
+            for g in 0..groups {
+                let idx = |s: usize, c: usize| (b * spatial + s) * channels + g * per + c;
+                let n = (spatial * per) as f64;
+                let mean: f64 = (0..spatial)
+                    .flat_map(|s| (0..per).map(move |c| (s, c)))
+                    .map(|(s, c)| x[idx(s, c)] as f64)
+                    .sum::<f64>()
+                    / n;
+                let var: f64 = (0..spatial)
+                    .flat_map(|s| (0..per).map(move |c| (s, c)))
+                    .map(|(s, c)| (x[idx(s, c)] as f64 - mean).powi(2))
+                    .sum::<f64>()
+                    / n;
+                for s in 0..spatial {
+                    for c in 0..per {
+                        let ch = g * per + c;
+                        out[idx(s, c)] = (x[idx(s, c)] as f64 - mean) / (var + eps).sqrt()
+                            * weight[ch] as f64
+                            + bias[ch] as f64;
+                    }
+                }
+            }
+        }
+        out
     }
-}
 
-impl Default for Sequential {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+    /// Loaded checkpoints are PyTorch's, and PyTorch's groups are consecutive
+    /// channels. MLX's own default layout interleaves them (channel `c`
+    /// joins group `c % G`), which normalizes a PyTorch-trained network's
+    /// activations over the wrong sets.
+    #[test]
+    fn group_norm_groups_consecutive_channels() {
+        random::seed(21);
+        let (batch, h, w, channels, groups) = (2usize, 3usize, 4usize, 8usize, 4usize);
+        let x = random::uniform_range(
+            -2.0,
+            3.0,
+            &[batch as i32, h as i32, w as i32, channels as i32],
+            Dtype::Float32,
+        );
+        let weight: Vec<f32> = (0..channels).map(|c| 0.5 + 0.25 * c as f32).collect();
+        let bias: Vec<f32> = (0..channels).map(|c| 0.1 * c as f32 - 0.3).collect();
 
-impl Sequential {
-    pub fn new() -> Self {
-        Self { layers: Vec::new() }
+        let mut norm = GroupNormBuilder::new(groups as i32, channels as i32)
+            .build()
+            .expect("build");
+        norm.weight.value = Some(Array::from_f32_slice(&weight, &[channels as i32]));
+        norm.bias.value = Some(Array::from_f32_slice(&bias, &[channels as i32]));
+        let want = torch_group_norm(
+            &values(&x),
+            batch,
+            h * w,
+            channels,
+            groups,
+            1e-5,
+            &weight,
+            &bias,
+        );
+        let got = values(&norm.forward(&x));
+        for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+            assert!((w - *g as f64).abs() < 1e-4, "element {i}: {g} vs {w}");
+        }
     }
-}
 
-// `Sequential` stores `dyn Module` trait objects, which cannot be downcast back
-// to `Linear`. Nothing in the workspace builds a model out of it.
-impl super::VisitLinears for Sequential {
-    fn visit_linears_mut(&mut self, _prefix: &str, _f: &mut dyn FnMut(&str, &mut Linear)) {}
-}
-
-impl ModuleParameters for Sequential {
-    fn num_parameters(&self) -> usize {
-        0
-    }
-    fn parameters(&self) -> super::ModuleParamRef<'_> {
-        HashMap::new()
-    }
-    fn parameters_mut(&mut self) -> super::ModuleParamMut<'_> {
-        HashMap::new()
-    }
-    fn trainable_parameters(&self) -> super::ModuleParamRef<'_> {
-        HashMap::new()
+    /// A half-precision activation stays half precision through the layer,
+    /// with the statistics taken in f32.
+    #[test]
+    fn group_norm_keeps_a_half_precision_dtype() {
+        random::seed(22);
+        // Fresh parameters are f32, a loaded checkpoint's are the activations'.
+        for params in [Dtype::Float32, Dtype::Bfloat16] {
+            let mut norm = GroupNorm::new(4, 8, 1e-5, true);
+            norm.weight.value = norm
+                .weight
+                .value
+                .take()
+                .map(|w| w.as_dtype(params.as_i32()));
+            norm.bias.value = norm.bias.value.take().map(|b| b.as_dtype(params.as_i32()));
+            let x = random::uniform_range(-2.0, 3.0, &[2, 3, 4, 8], Dtype::Bfloat16);
+            let y = norm.forward(&x);
+            assert_eq!(y.dtype(), Dtype::Bfloat16, "{params:?} parameters");
+            values(&y);
+        }
     }
 }

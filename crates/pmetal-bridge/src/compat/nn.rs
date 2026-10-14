@@ -1,7 +1,7 @@
 // Layer types, activations and autograd, under one `nn` path.
 pub use super::layers::{
     Conv1d, Conv1dBuilder, Conv2d, Conv2dBuilder, Embedding, GroupNorm, GroupNormBuilder,
-    LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder, Sequential,
+    LayerNorm, LayerNormBuilder, Linear, LinearBuilder, RmsNorm, RmsNormBuilder,
 };
 
 use super::{Array, Exception};
@@ -71,9 +71,6 @@ pub fn softmax(a: &Array, axis: i32) -> Array {
 }
 pub fn leaky_relu(a: &Array, neg_slope: f32) -> Array {
     a.leaky_relu(neg_slope)
-}
-pub fn cross_entropy(logits: &Array, targets: &Array, axis: i32) -> Array {
-    logits.cross_entropy(targets, axis)
 }
 
 /// Compute `(loss, gradients)` via callback-based autograd — explicit-array form.
