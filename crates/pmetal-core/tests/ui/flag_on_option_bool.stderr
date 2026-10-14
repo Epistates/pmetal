@@ -1,0 +1,5 @@
+error: `flag` may only be applied to `bool` fields
+ --> tests/ui/flag_on_option_bool.rs:6:51
+  |
+6 |     #[job(label = "L", group = "G", argv = "--f", flag)]
+  |                                                   ^^^^

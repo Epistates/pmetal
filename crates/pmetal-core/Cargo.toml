@@ -21,5 +21,9 @@ serde_json = { workspace = true }
 serde-saphyr = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# Compile-fail snapshots for `#[derive(JobSpec)]` (tests/ui).
+trybuild = { workspace = true }
+
 [lints]
 workspace = true

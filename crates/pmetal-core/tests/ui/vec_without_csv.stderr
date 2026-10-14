@@ -1,0 +1,5 @@
+error: `Vec<String>` fields with `argv` must use `#[job(csv)]`
+ --> tests/ui/vec_without_csv.rs:7:5
+  |
+7 |     f: Vec<String>,
+  |     ^

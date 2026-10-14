@@ -1,0 +1,5 @@
+error: `label` is set more than once
+ --> tests/ui/duplicate_key.rs:6:24
+  |
+6 |     #[job(label = "A", label = "B", group = "G")]
+  |                        ^^^^^

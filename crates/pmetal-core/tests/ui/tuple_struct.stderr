@@ -1,0 +1,5 @@
+error: JobSpec only supports structs with named fields
+ --> tests/ui/tuple_struct.rs:5:8
+  |
+5 | struct S(String);
+  |        ^

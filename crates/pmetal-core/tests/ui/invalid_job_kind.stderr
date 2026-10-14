@@ -1,0 +1,5 @@
+error: `Train Job` is not a `JobKind` variant name
+ --> tests/ui/invalid_job_kind.rs:4:15
+  |
+4 | #[spec(kind = "Train Job", subcommand = "t")]
+  |               ^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: `required` is only supported on `String`, `Vec<String>` and `Option<_>` fields
+ --> tests/ui/required_on_number.rs:6:37
+  |
+6 |     #[job(label = "L", group = "G", required)]
+  |                                     ^^^^^^^^

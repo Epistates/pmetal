@@ -1,0 +1,5 @@
+error: `invert` only applies together with `flag`
+ --> tests/ui/invert_without_flag.rs:6:51
+  |
+6 |     #[job(label = "L", group = "G", argv = "--f", invert)]
+  |                                                   ^^^^^^
