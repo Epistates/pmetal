@@ -209,18 +209,24 @@ impl GptOssExperts {
         limit: f32,
     ) -> InlineArray {
         let (rows, top_k) = (inds.dim(0), inds.dim(1));
-        let inter = self.gate_bias.dim(1);
-        let bias_for =
-            |bias: &InlineArray| bias.take_axis(inds, 0).reshape(&[rows, top_k, 1, inter]);
-        let (gate_b, up_b) = (bias_for(&self.gate_bias), bias_for(&self.up_bias));
-        let routed = crate::native_moe::switch_glu(
+        // The biases follow the rows through the dispatch, whichever order it
+        // runs them in: each row's expert ids pick its own.
+        let routed = crate::native_moe::switch_glu_with(
             x_flat,
             &self.gate,
             &self.up,
             &self.down,
             inds,
             scores,
-            |gate, up| glu(&gate.add(&gate_b), &up.add(&up_b), alpha, limit),
+            |gate, up, expert_ids| {
+                let bias_for = |bias: &InlineArray| bias.take_axis(expert_ids, 0).expand_dims(-2);
+                glu(
+                    &gate.add(&bias_for(&self.gate_bias)),
+                    &up.add(&bias_for(&self.up_bias)),
+                    alpha,
+                    limit,
+                )
+            },
         );
         // The down bias, weighted like the expert outputs it belongs to.
         let down_b = self
