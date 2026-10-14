@@ -1150,10 +1150,11 @@ void mlx_inline_compiled_moe_layer_fixed(
 //        (out)
 //
 // Each call site keeps a list of `Entry` records keyed by shape signature
-// (batch, seq_len, cache_len, n_heads, n_kv, head_dim, k_eq_v, has_freqs)
-// plus the quantization signature of every projection, so prefill-vs-decode,
-// sliding-vs-full and 4-bit-vs-8-bit layers each get their own
-// shapeless=false compiled trace.
+// (batch, seq_len, cache_len, n_heads, n_kv, head_dim, k_eq_v, has_freqs),
+// every scalar the trace bakes in (norm epsilons, RoPE base and width), and
+// the quantization signature of every projection, so prefill-vs-decode,
+// sliding-vs-full and 4-bit-vs-8-bit layers, and models that differ in any
+// of those values, each get their own shapeless=false compiled trace.
 //
 // Projections arrive as `mlx_inline_qweight` rather than bare arrays. Each one
 // occupies three input slots (weight, scales, biases) whether or not it is
@@ -1194,21 +1195,20 @@ void mlx_inline_compiled_gemma4_attn_block(
     float rope_base,                       // ignored when rope_freqs != null
     int rope_dims                          // = head_dim for partial freqs path
 ) {
+    // Everything the trace depends on. A trace is replayed whenever the key
+    // matches, so a value the lambda below bakes in and this omits is replayed
+    // stale for the next caller that differs in it (the norm epsilons, the
+    // RoPE base and the rotated width were left out, and a second model with
+    // the same geometry ran the first one's).
+    struct Key {
+        int batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims;
+        int k_eq_v, has_freqs, sliding_window, dtype;
+        float in_norm_eps, qk_norm_eps, post_norm_eps, rope_base;
+        QProjSig q_sig, k_sig, v_sig, o_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int cache_len;
-        int n_heads;
-        int n_kv;
-        int head_dim;
-        int k_eq_v;
-        int has_freqs;
-        int sliding_window;
-        int dtype;
-        QProjSig q_sig;
-        QProjSig k_sig;
-        QProjSig v_sig;
-        QProjSig o_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1228,22 +1228,13 @@ void mlx_inline_compiled_gemma4_attn_block(
         QProjSig v_sig = use_k_eq_v ? QProjSig{} : qproj_sig(v_w);
         QProjSig o_sig = qproj_sig(o_w);
 
+        const Key key{batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims,
+                      static_cast<int>(use_k_eq_v), has_freqs, sliding_window, dtype,
+                      in_norm_eps, qk_norm_eps, post_norm_eps, rope_base,
+                      q_sig, k_sig, v_sig, o_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.cache_len == cache_len
-                && entry.n_heads == n_heads
-                && entry.n_kv == n_kv
-                && entry.head_dim == head_dim
-                && entry.k_eq_v == static_cast<int>(use_k_eq_v)
-                && entry.has_freqs == has_freqs
-                && entry.sliding_window == sliding_window
-                && entry.dtype == dtype
-                && entry.q_sig == q_sig
-                && entry.k_sig == k_sig
-                && entry.v_sig == v_sig
-                && entry.o_sig == o_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1268,20 +1259,7 @@ void mlx_inline_compiled_gemma4_attn_block(
             QProjSig OS = o_sig;
 
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                cache_len,
-                n_heads,
-                n_kv,
-                head_dim,
-                static_cast<int>(use_k_eq_v),
-                has_freqs,
-                sliding_window,
-                dtype,
-                q_sig,
-                k_sig,
-                v_sig,
-                o_sig,
+                key,
                 *make_compiled_fixed(
                     [NH, NKV, HD, RD, L, SW, KEV, HAS_FREQS, INE, QKE, PNE, RBASE,
                      QS, KS, VS, OS]
@@ -1484,18 +1462,16 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
     float rope_base,
     int rope_dims
 ) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims;
+        int has_freqs, sliding_window, dtype;
+        float in_norm_eps, q_norm_eps, post_norm_eps, rope_base;
+        QProjSig q_sig, o_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int cache_len;
-        int n_heads;
-        int n_kv;
-        int head_dim;
-        int has_freqs;
-        int sliding_window;
-        int dtype;
-        QProjSig q_sig;
-        QProjSig o_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1510,19 +1486,13 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
         QProjSig q_sig = qproj_sig(q_w);
         QProjSig o_sig = qproj_sig(o_w);
 
+        const Key key{batch, seq_len, cache_len, n_heads, n_kv, head_dim, rope_dims,
+                      has_freqs, sliding_window, dtype,
+                      in_norm_eps, q_norm_eps, post_norm_eps, rope_base,
+                      q_sig, o_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.cache_len == cache_len
-                && entry.n_heads == n_heads
-                && entry.n_kv == n_kv
-                && entry.head_dim == head_dim
-                && entry.has_freqs == has_freqs
-                && entry.sliding_window == sliding_window
-                && entry.dtype == dtype
-                && entry.q_sig == q_sig
-                && entry.o_sig == o_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1544,17 +1514,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
             QProjSig OS = o_sig;
 
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                cache_len,
-                n_heads,
-                n_kv,
-                head_dim,
-                has_freqs,
-                sliding_window,
-                dtype,
-                q_sig,
-                o_sig,
+                key,
                 *make_compiled_fixed(
                     [NH, NKV, HD, RD, L, SW, HAS_FREQS, INE, QNE, PNE, RBASE, QS, OS]
                     (const std::vector<array>& ins) -> std::vector<array> {
@@ -1663,15 +1623,15 @@ void mlx_inline_compiled_gemma4_mlp_block(
     float pre_norm_eps,
     float post_norm_eps
 ) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, hidden, intermediate, dtype;
+        float pre_norm_eps, post_norm_eps;
+        QProjSig gate_sig, up_sig, down_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int hidden;
-        int intermediate;
-        int dtype;
-        QProjSig gate_sig;
-        QProjSig up_sig;
-        QProjSig down_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1687,16 +1647,11 @@ void mlx_inline_compiled_gemma4_mlp_block(
         QProjSig up_sig = qproj_sig(up_w);
         QProjSig down_sig = qproj_sig(down_w);
 
+        const Key key{batch, seq_len, hidden, intermediate, dtype,
+                      pre_norm_eps, post_norm_eps, gate_sig, up_sig, down_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.hidden == hidden
-                && entry.intermediate == intermediate
-                && entry.dtype == dtype
-                && entry.gate_sig == gate_sig
-                && entry.up_sig == up_sig
-                && entry.down_sig == down_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1709,14 +1664,7 @@ void mlx_inline_compiled_gemma4_mlp_block(
             QProjSig US = up_sig;
             QProjSig DS = down_sig;
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                hidden,
-                intermediate,
-                dtype,
-                gate_sig,
-                up_sig,
-                down_sig,
+                key,
                 *make_compiled_fixed(
                     [PRE, POST, GS, US, DS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
@@ -1800,14 +1748,15 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
     const mlx_inline_array* post_norm_w,
     float post_norm_eps
 ) {
+    // Everything the trace depends on (see `mlx_inline_compiled_gemma4_attn_block`).
+    struct Key {
+        int batch, seq_len, hidden, per_layer_hidden, dtype;
+        float post_norm_eps;
+        QProjSig gate_sig, projection_sig;
+        bool operator==(const Key&) const = default;
+    };
     struct Entry {
-        int batch;
-        int seq_len;
-        int hidden;
-        int per_layer_hidden;
-        int dtype;
-        QProjSig gate_sig;
-        QProjSig projection_sig;
+        Key key;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1822,15 +1771,11 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
         QProjSig gate_sig = qproj_sig(gate_w);
         QProjSig projection_sig = qproj_sig(projection_w);
 
+        const Key key{batch, seq_len, hidden, per_layer_hidden, dtype,
+                      post_norm_eps, gate_sig, projection_sig};
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
-            if (entry.batch == batch
-                && entry.seq_len == seq_len
-                && entry.hidden == hidden
-                && entry.per_layer_hidden == per_layer_hidden
-                && entry.dtype == dtype
-                && entry.gate_sig == gate_sig
-                && entry.projection_sig == projection_sig) {
+            if (entry.key == key) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1841,13 +1786,7 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
             QProjSig GS = gate_sig;
             QProjSig PS = projection_sig;
             entries->push_back(Entry{
-                batch,
-                seq_len,
-                hidden,
-                per_layer_hidden,
-                dtype,
-                gate_sig,
-                projection_sig,
+                key,
                 *make_compiled_fixed(
                     [POST, GS, PS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
