@@ -84,7 +84,7 @@ fn main() {
     eprintln!("Prefill graph built. Evaluating...");
 
     let seq_len = token_ids.len() as i32;
-    let vocab = weights.embed_w.dim(0);
+    let vocab = weights.embed_w.weight_arr().dim(0);
     let last_logits = logits
         .reshape(&[seq_len, vocab])
         .slice(&[seq_len - 1, 0], &[seq_len, vocab]);

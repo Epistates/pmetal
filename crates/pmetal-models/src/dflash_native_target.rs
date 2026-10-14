@@ -171,23 +171,9 @@ fn trace_taps(tap_layers: &[usize], captured: &[Array]) {
 
 impl DFlashTarget for NativeQwen3Target {
     fn embed_tokens(&mut self, input_ids: &Array) -> Result<Array, Exception> {
-        // Quantized embeddings dequantize inside the native forward; for
-        // DFlash's `noise_embedding = target.embed_tokens(block_input)`
-        // call we replicate the same path the forward takes.
-        if let (Some(scales), Some(biases)) = (
-            self.weights.embed_scales.as_ref(),
-            self.weights.embed_biases.as_ref(),
-        ) {
-            let qcfg = self.weights.quantization_config.as_ref();
-            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-            let w_rows = self.weights.embed_w.take_axis(input_ids, 0);
-            let s_rows = scales.take_axis(input_ids, 0);
-            let b_rows = biases.take_axis(input_ids, 0);
-            Ok(w_rows.dequantize(&s_rows, &b_rows, gs, bits))
-        } else {
-            Ok(self.weights.embed_w.take_axis(input_ids, 0))
-        }
+        // DFlash's `noise_embedding = target.embed_tokens(block_input)` is the
+        // lookup the native forward itself takes.
+        Ok(qwen3_native::embed_tokens(&self.weights, input_ids))
     }
 
     fn forward_with_capture(
@@ -215,33 +201,12 @@ impl DFlashTarget for NativeQwen3Target {
     }
 
     fn lm_head_project(&mut self, hidden: &Array) -> Result<Array, Exception> {
-        if self.weights.tie_word_embeddings {
-            if let (Some(scales), Some(biases)) = (
-                self.weights.embed_scales.as_ref(),
-                self.weights.embed_biases.as_ref(),
-            ) {
-                let qcfg = self.weights.quantization_config.as_ref();
-                let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
-                let bits = qcfg.map(|q| q.bits).unwrap_or(4);
-                Ok(hidden.quantized_matmul(
-                    &self.weights.embed_w,
-                    scales,
-                    Some(biases),
-                    true,
-                    gs,
-                    bits,
-                ))
-            } else {
-                Ok(hidden.matmul(&self.weights.embed_w.t()))
-            }
-        } else {
-            let lm_head = self.weights.lm_head_w.as_ref().ok_or_else(|| {
-                Exception::custom(
-                    "NativeQwen3Target: untied model has no lm_head_w loaded".to_string(),
-                )
-            })?;
-            Ok(lm_head.matmul_from(hidden))
+        if !self.weights.tie_word_embeddings && self.weights.lm_head_w.is_none() {
+            return Err(Exception::custom(
+                "NativeQwen3Target: untied model has no lm_head_w loaded".to_string(),
+            ));
         }
+        Ok(qwen3_native::lm_head(&self.weights, hidden))
     }
 
     fn reset_state(&mut self) {

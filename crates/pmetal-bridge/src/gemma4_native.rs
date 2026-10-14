@@ -1128,6 +1128,22 @@ pub fn load_model(
             .and_then(|q| q.params_for(module).or_else(|| q.default_params()))
             .unwrap_or_else(|| QuantParams::defaults_for(crate::QuantizedMode::Affine))
     };
+    // `params_for`, checked against the tensors the module stores when it is
+    // packed: a block and weights that disagree about the scheme are an error,
+    // not a model that decodes noise.
+    let params_for_tensors = |module: &str,
+                              scales: &Option<InlineArray>,
+                              biases: &Option<InlineArray>|
+     -> Result<QuantParams, String> {
+        let params = params_for(module);
+        if scales.is_some() {
+            params
+                .for_tensors(module, biases.is_some())
+                .map_err(|e| format!("Gemma 4 native: {e}"))
+        } else {
+            Ok(params)
+        }
+    };
 
     let take = |map: &mut std::collections::HashMap<String, InlineArray>,
                 key: &str|
@@ -1168,15 +1184,23 @@ pub fn load_model(
             .ok_or_else(|| format!("Gemma 4 native: missing weight {module}.weight"))?;
         let scales = map.remove(&format!("{module}.scales"));
         let biases = map.remove(&format!("{module}.biases"));
-        Ok(LayerWeight::new(weight, scales, biases, params_for(module)))
+        let params = params_for_tensors(module, &scales, &biases)?;
+        Ok(LayerWeight::new(weight, scales, biases, params))
     };
 
-    let embed_w = EmbeddingWeight::new(
-        take(&mut raw, "model.embed_tokens.weight")?,
-        raw.remove("model.embed_tokens.scales"),
-        raw.remove("model.embed_tokens.biases"),
-        params_for("model.embed_tokens"),
-    );
+    let embed_w = {
+        let (scales, biases) = (
+            raw.remove("model.embed_tokens.scales"),
+            raw.remove("model.embed_tokens.biases"),
+        );
+        let params = params_for_tensors("model.embed_tokens", &scales, &biases)?;
+        EmbeddingWeight::new(
+            take(&mut raw, "model.embed_tokens.weight")?,
+            scales,
+            biases,
+            params,
+        )
+    };
     let final_norm_w = take(&mut raw, "model.norm.weight")?;
     let lm_head_w = if config.tie_word_embeddings {
         None
@@ -1186,12 +1210,20 @@ pub fn load_model(
     let per_layer_inputs = if config.uses_per_layer_inputs() {
         let total_ple_dim = config.num_hidden_layers * config.per_layer_input_dim();
         Some(PerLayerInputWeights {
-            embed_w: EmbeddingWeight::new(
-                take(&mut raw, "model.embed_tokens_per_layer.weight")?,
-                raw.remove("model.embed_tokens_per_layer.scales"),
-                raw.remove("model.embed_tokens_per_layer.biases"),
-                params_for("model.embed_tokens_per_layer"),
-            ),
+            embed_w: {
+                let module = "model.embed_tokens_per_layer";
+                let (scales, biases) = (
+                    raw.remove(&format!("{module}.scales")),
+                    raw.remove(&format!("{module}.biases")),
+                );
+                let params = params_for_tensors(module, &scales, &biases)?;
+                EmbeddingWeight::new(
+                    take(&mut raw, &format!("{module}.weight"))?,
+                    scales,
+                    biases,
+                    params,
+                )
+            },
             projection_w: take_proj(&mut raw, "model.per_layer_model_projection")?,
             projection_norm_w: take(&mut raw, "model.per_layer_projection_norm.weight")?,
             embed_scale_scalar: InlineArray::scalar_with_dtype(

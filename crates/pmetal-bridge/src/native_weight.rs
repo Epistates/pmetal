@@ -46,6 +46,27 @@ impl QuantParams {
             mode,
         }
     }
+
+    /// These parameters checked against the tensors a module actually
+    /// stores: affine quantization is the one mode with `biases`, and the
+    /// float modes (mxfp4, nvfp4, mxfp8) are `scales` alone.
+    ///
+    /// A mismatch means the config block and the weights disagree about the
+    /// scheme: read anyway, the module loads, runs, and decodes noise.
+    pub fn for_tensors(self, module: &str, has_biases: bool) -> Result<Self, String> {
+        match (self.mode, has_biases) {
+            (QuantizedMode::Affine, true) => Ok(self),
+            (QuantizedMode::Affine, false) => Err(format!(
+                "{module} has scales but no biases, which is not affine quantization; its \
+                 checkpoint's `quantization` block names no float mode for it (read as {self:?})"
+            )),
+            (mode, true) => Err(format!(
+                "{module} has biases, which only affine quantization has, but its \
+                 `quantization` block says {mode:?}"
+            )),
+            (_, false) => Ok(self),
+        }
+    }
 }
 
 /// A checkpoint's `quantization` block, read the way MLX-format loaders read it.
@@ -743,6 +764,24 @@ impl EmbeddingWeight {
             }
         }
     }
+
+    /// Re-materialise every array into a fresh buffer.
+    pub fn copy_fresh(&self, zero: &InlineArray) -> Self {
+        match self {
+            Self::Dense(w) => Self::Dense(copy_fresh_arr(w, zero)),
+            Self::Quantized {
+                weight,
+                scales,
+                biases,
+                params,
+            } => Self::Quantized {
+                weight: copy_fresh_arr(weight, zero),
+                scales: copy_fresh_arr(scales, zero),
+                biases: biases.as_ref().map(|b| copy_fresh_arr(b, zero)),
+                params: *params,
+            },
+        }
+    }
 }
 
 /// The dtype a checkpoint's trunk computes in.
@@ -1093,6 +1132,28 @@ mod tests {
     fn an_unknown_mode_is_rejected() {
         let block = serde_json::json!({"group_size": 64, "bits": 4, "mode": "int3_pairwise"});
         assert!(MlxQuantization::from_json(&block, identity).is_none());
+    }
+
+    /// Affine is the one mode with biases; the float modes are scales alone.
+    /// A block and weights that disagree are refused, since read either way
+    /// the module loads and decodes noise.
+    #[test]
+    fn quantization_params_are_checked_against_the_stored_tensors() {
+        let affine = QuantParams::defaults_for(QuantizedMode::Affine);
+        let mxfp4 = QuantParams::defaults_for(QuantizedMode::Mxfp4);
+        assert_eq!(affine.for_tensors("m", true), Ok(affine));
+        assert_eq!(mxfp4.for_tensors("m", false), Ok(mxfp4));
+        let err = affine
+            .for_tensors("model.layers.0.mlp.gate", false)
+            .unwrap_err();
+        assert!(
+            err.contains("model.layers.0.mlp.gate") && err.contains("no biases"),
+            "{err}"
+        );
+        let err = mxfp4
+            .for_tensors("model.layers.0.mlp.gate", true)
+            .unwrap_err();
+        assert!(err.contains("biases") && err.contains("Mxfp4"), "{err}");
     }
 
     #[test]

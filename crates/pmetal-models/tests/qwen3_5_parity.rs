@@ -442,6 +442,21 @@ fn swish_native_chunked_prefill_matches_transformers() {
     native_chunked_prefill("swish");
 }
 
+/// The routed-experts profile (`qwen3_5_moe`): every layer a sparse block of
+/// 8 experts, 2 per token, plus a shared expert behind its own sigmoid gate,
+/// in transformers' fused `gate_up_proj` layout. 40 tokens.
+#[test]
+#[serial]
+fn moe_native_matches_transformers() {
+    native_prefill_and_decode("moe");
+}
+
+#[test]
+#[serial]
+fn moe_native_chunked_prefill_matches_transformers() {
+    native_chunked_prefill("moe");
+}
+
 #[test]
 #[serial]
 fn sigmoid_dynamic_prefill_matches_transformers() {

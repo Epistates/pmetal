@@ -46,8 +46,11 @@ fn moe_routed_forward(lw: &LayerWeights, x_flat: &InlineArray) -> InlineArray {
 
     // ── Router ──────────────────────────────────────────────────────────────
     // gates: [S, num_experts]
-    let gates = x_flat
-        .matmul(lw.moe_router_w.as_ref().unwrap())
+    let gates = lw
+        .moe_router_w
+        .as_ref()
+        .expect("a MoE layer loads a router")
+        .matmul_from(x_flat)
         .softmax_precise(-1);
 
     // Top-k selection: argpartition returns full permutation, take last top_k.
@@ -88,14 +91,14 @@ pub(super) fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
 
     if s == 1 {
         if let (
-            Some(router_w),
+            Some(LayerWeight::Dense(router_w)),
             Some(LayerWeight::Dense(moe_gate_w)),
             Some(LayerWeight::Dense(moe_up_w)),
             Some(LayerWeight::Dense(moe_down_w)),
             Some(LayerWeight::Dense(shared_gate_w)),
             Some(LayerWeight::Dense(shared_up_w)),
             Some(LayerWeight::Dense(shared_down_w)),
-            Some(shared_expert_gate_w),
+            Some(LayerWeight::Dense(shared_expert_gate_w)),
         ) = (
             lw.moe_router_w.as_ref(),
             lw.moe_gate_w.as_ref(),
@@ -130,15 +133,23 @@ pub(super) fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
     //
     // shared_expert(x): standard SwiGLU MLP with its own gate/up/down weights.
     // shared_expert_gate: Linear(hidden, 1) → sigmoid → scales shared output.
-    let sh_gate = lw.shared_gate_w.as_ref().unwrap().matmul_from(&x_flat);
-    let sh_up = lw.shared_up_w.as_ref().unwrap().matmul_from(&x_flat);
-    let sh_act = InlineArray::fused_swiglu(&sh_gate, &sh_up);
-    let sh_out = lw.shared_down_w.as_ref().unwrap().matmul_from(&sh_act);
+    // A sparse block without one (Qwen3-MoE) is just the routed experts.
+    let (Some(shared_gate), Some(shared_up), Some(shared_down), Some(shared_scale)) = (
+        lw.shared_gate_w.as_ref(),
+        lw.shared_up_w.as_ref(),
+        lw.shared_down_w.as_ref(),
+        lw.shared_expert_gate_w.as_ref(),
+    ) else {
+        return y_routed.reshape(&[b, t, h]);
+    };
+    let sh_act = InlineArray::fused_swiglu(
+        &shared_gate.matmul_from(&x_flat),
+        &shared_up.matmul_from(&x_flat),
+    );
+    let sh_out = shared_down.matmul_from(&sh_act);
 
     // shared_expert_gate: [S, 1] sigmoid gate
-    let sh_scale = x_flat
-        .matmul(lw.shared_expert_gate_w.as_ref().unwrap())
-        .sigmoid();
+    let sh_scale = shared_scale.matmul_from(&x_flat).sigmoid();
     let y_shared = sh_out.multiply(&sh_scale);
 
     // ── Combine ──────────────────────────────────────────────────────────────

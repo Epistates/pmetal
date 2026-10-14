@@ -40,14 +40,14 @@ pub use cache::{
 pub use forward::{
     compact_tree_cache, embed_tokens, forward_embeddings_hidden, forward_embeddings_last,
     forward_step, forward_step_hidden, forward_step_hidden_recording, forward_step_last,
-    forward_step_tree_verify, forward_step_with_capture, rollback_cache,
+    forward_step_tree_verify, forward_step_with_capture, lm_head, rollback_cache,
 };
 pub use generate::{benchmark_trial, generate, prefill_chunk, prefill_first_token};
 pub use load::load_model;
 pub use speculative::{GdnReplay, rewind_verify};
 pub use weights::{
-    LayerWeight, NativeWeights, apply_kv_preconditioning, apply_outlier_permutation,
-    apply_qjl_matrix,
+    EmbeddingWeight, LayerWeight, NativeWeights, apply_kv_preconditioning,
+    apply_outlier_permutation, apply_qjl_matrix,
 };
 
 // ============================================================================
