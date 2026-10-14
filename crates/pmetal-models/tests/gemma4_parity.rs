@@ -481,6 +481,71 @@ fn gemma4_native_cached_decode_past_the_window_matches_transformers() {
     }
 }
 
+/// A bf16 checkpoint stays bf16 through a multi-token pass: the residual
+/// stream, the logits and every layer's cache. A pass that promoted one op to
+/// f32 carries f32 through every layer after it (each matmul then casts its
+/// bf16 weights per op), writes f32 keys and values if the cache takes the
+/// pass's dtype, and returns f32 logits.
+#[test]
+fn gemma4_native_prefill_stays_in_the_models_dtype() {
+    use pmetal_bridge::compat::Dtype;
+    use pmetal_bridge::gemma4_native;
+
+    let bf16 = Dtype::Bfloat16.as_i32();
+    for (label, config_json, weights_fixture, reference) in [
+        (
+            "dense",
+            synthetic_config_json(),
+            "gemma4_synth_weights.safetensors",
+            "gemma4_synth_reference.safetensors",
+        ),
+        (
+            "per-layer inputs and shared KV",
+            shared_synthetic_config_json(),
+            "gemma4_shared_synth_weights.safetensors",
+            "gemma4_shared_synth_reference.safetensors",
+        ),
+        (
+            "MoE",
+            moe_synthetic_config_json(),
+            "gemma4_moe_synth_weights.safetensors",
+            "gemma4_moe_synth_reference.safetensors",
+        ),
+    ] {
+        // The fixture's weights, cast to bf16.
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("config.json"), config_json).expect("write config");
+        let tensors: Vec<(String, Array)> = load_shard(&fixture_path(weights_fixture))
+            .into_iter()
+            .map(|(k, v)| {
+                let cast = if v.ndim() > 0 { v.as_dtype(bf16) } else { v };
+                (k, cast)
+            })
+            .collect();
+        let entries: Vec<(&str, &Array)> = tensors.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        Array::save_safetensors(
+            dir.path().join("model.safetensors").to_str().unwrap(),
+            &entries,
+        );
+        let config = gemma4_native::load_config(dir.path()).expect("config parses");
+        let weights = gemma4_native::load_model(dir.path(), &config).expect("native load");
+        assert_eq!(weights.model_dtype, bf16, "{label}: the checkpoint is bf16");
+
+        let ids = input_ids_from_shard(&load_shard(&fixture_path(reference)));
+        let mut cache = gemma4_native::build_cache(&weights, &config);
+        let logits = gemma4_native::forward_step(&weights, &ids, &mut cache);
+        pmetal_bridge::check_unobserved_error().expect("native forward");
+        assert_eq!(logits.dtype_raw(), bf16, "{label}: logits dtype");
+        for (i, layer) in cache.layers.iter().enumerate() {
+            for (name, array) in [("keys", &layer.keys), ("values", &layer.values)] {
+                if let Some(array) = array {
+                    assert_eq!(array.dtype_raw(), bf16, "{label}: layer {i} {name}");
+                }
+            }
+        }
+    }
+}
+
 /// A long prompt's prefill holds the memory of a pass, not of the prompt:
 /// the engine's own prefill, against a whole-prompt forward that computes
 /// every position's logits as `forward_step` returns them.

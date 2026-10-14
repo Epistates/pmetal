@@ -31,7 +31,7 @@
 use serde::Deserialize;
 
 use crate::InlineArray;
-use crate::compat::{Dtype, nn};
+use crate::compat::Dtype;
 use crate::inline_array as bridge;
 use crate::native_weight::{EmbeddingWeight, LayerWeight, QuantParams, detect_model_dtype};
 
@@ -906,10 +906,13 @@ fn apply_per_layer_input_block(
     }
     let residual = hidden.clone();
     let gate = ple.gate_w.matmul_from(hidden);
-    let activated = nn::gelu_tanh_approximate(&gate);
+    // `gelu(gate) * layer_input`, in the gate's dtype: `gelu_approx` builds
+    // its polynomial from f32 scalars, which promoted a bf16 residual stream
+    // to f32 at the first layer with per-layer inputs and kept it there for
+    // the rest of every multi-token pass.
     let projected = ple
         .projection_w
-        .matmul_from(&activated.multiply(layer_per_input))
+        .matmul_from(&InlineArray::fused_geglu_tanh(&gate, layer_per_input))
         .rms_norm(Some(&ple.post_norm_w), eps);
     residual.add(&projected)
 }
