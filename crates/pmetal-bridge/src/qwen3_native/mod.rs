@@ -491,6 +491,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
         text.to_owned()
     };
 
+    refuse_unrun_features(&config_str)?;
     let mut cfg: Qwen3Config =
         serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
     // MLX's per-module overrides, with their paths canonicalized the way the
@@ -537,6 +538,33 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     Ok(cfg)
 }
 
+/// Refuse, by name, what a text config asks for and the engine would run
+/// without: the checkpoint would load and decode as a different model.
+///
+/// * `use_sliding_window`: windowed attention on the layers past
+///   `max_window_layers`. Only the flag matters; `sliding_window` alone is
+///   inert, as in transformers.
+/// * `attention_bias`: biases on the attention projections, which the loader
+///   does not read.
+fn refuse_unrun_features(config: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(config).map_err(|e| format!("failed to parse config: {e}"))?;
+    let on = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    if on("use_sliding_window") {
+        return Err(
+            "use_sliding_window is not supported: the native engine attends over the whole \
+             context in every layer"
+                .into(),
+        );
+    }
+    if on("attention_bias") {
+        return Err(
+            "attention_bias is not supported: the attention projections load no biases".into(),
+        );
+    }
+    Ok(())
+}
+
 fn json_quantization_is_sidecar(value: &serde_json::Value) -> bool {
     value
         .get("quant_method")
@@ -573,6 +601,44 @@ mod tests {
         let err = parse_config_text(&config(r#"{"rope_type": "xpos", "factor": 2.0}"#))
             .expect_err("unknown type refused");
         assert!(err.contains("xpos"), "{err}");
+    }
+
+    /// What the engine would silently drop is refused by name: windowed
+    /// attention on some layers, and projection biases it never loads.
+    /// `sliding_window` alone, with `use_sliding_window` false (what every
+    /// released Qwen3 ships), is inert, as in transformers.
+    #[test]
+    fn features_the_engine_does_not_run_are_refused() {
+        let config = |extra: &str| {
+            format!(
+                r#"{{"model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": 2,
+                    "num_attention_heads": 4, "head_dim": 16{extra}}}"#
+            )
+        };
+        for (extra, needle) in [
+            (
+                r#", "use_sliding_window": true, "sliding_window": 4096"#,
+                "use_sliding_window",
+            ),
+            (r#", "attention_bias": true"#, "attention_bias"),
+        ] {
+            let err = parse_config_text(&config(extra)).expect_err(extra);
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
+        for extra in [
+            r#", "use_sliding_window": false, "sliding_window": 4096"#,
+            r#", "sliding_window": null"#,
+            r#", "attention_bias": false"#,
+        ] {
+            parse_config_text(&config(extra)).unwrap_or_else(|e| panic!("{extra}: {e}"));
+        }
+        // The same keys inside a Qwen3.5 text config.
+        let nested = r#"{"model_type": "qwen3_5", "text_config": {"model_type": "qwen3_5_text",
+            "hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 32, "linear_key_head_dim": 32,
+            "attention_bias": true}}"#;
+        let err = parse_config_text(nested).expect_err("Qwen3.5 attention_bias");
+        assert!(err.contains("attention_bias"), "{err}");
     }
 
     #[test]

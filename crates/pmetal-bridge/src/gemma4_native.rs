@@ -51,11 +51,9 @@ fn default_rope_theta_sliding() -> f32 {
 fn default_partial_rotary_factor() -> f32 {
     1.0
 }
+/// `Gemma4TextConfig.sliding_window`.
 fn default_sliding_window() -> i32 {
-    1024
-}
-fn default_final_logit_softcapping() -> Option<f32> {
-    Some(30.0)
+    512
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -110,10 +108,22 @@ pub struct Gemma4Config {
     pub tie_word_embeddings: bool,
     #[serde(default = "default_sliding_window")]
     pub sliding_window: i32,
-    #[serde(default = "default_final_logit_softcapping")]
+    /// `None` (the transformers default) applies no softcap.
+    #[serde(default)]
     pub final_logit_softcapping: Option<f32>,
+    /// Per-layer `"sliding_attention"` / `"full_attention"`. [`parse_config_text`]
+    /// fills in `Gemma4TextConfig`'s default (every sixth layer full) when the
+    /// config has none, and makes the last layer full as it does.
     #[serde(default)]
     pub layer_types: Vec<String>,
+    /// `"all"` makes every layer attend bidirectionally; `"vision"` only
+    /// opens attention among a prompt's image tokens, which leaves a text
+    /// prompt causal. Only the unset and `"vision"` cases run.
+    #[serde(default)]
+    pub use_bidirectional_attention: Option<String>,
+    /// Biases on the attention projections, which the engine does not load.
+    #[serde(default)]
+    pub attention_bias: bool,
     #[serde(default)]
     pub rope_parameters: Option<Gemma4RopeConfig>,
 
@@ -244,13 +254,29 @@ impl Gemma4Config {
     }
 
     fn validate_supported(&self) -> Result<(), String> {
+        // Both the MLP's activation and the per-layer-input gate's.
         if let Some(ref act) = self.hidden_activation
-            && self.uses_per_layer_inputs()
             && !matches!(act.as_str(), "gelu" | "gelu_pytorch_tanh" | "gelu_tanh")
         {
             return Err(format!(
-                "Gemma 4 native: unsupported per-layer-input activation {act:?}"
+                "Gemma 4 native: unsupported hidden_activation {act:?}; the MLP and the \
+                 per-layer-input gate are tanh-approximate GELU"
             ));
+        }
+        match self.use_bidirectional_attention.as_deref() {
+            None | Some("vision") => {}
+            Some(other) => {
+                return Err(format!(
+                    "Gemma 4 native: use_bidirectional_attention {other:?} is not supported; \
+                     the engine's attention is causal"
+                ));
+            }
+        }
+        if self.attention_bias {
+            return Err(
+                "Gemma 4 native: attention_bias is not supported; the projections load no biases"
+                    .to_string(),
+            );
         }
         if self.uses_moe()
             && (self.num_experts.is_none()
@@ -285,9 +311,26 @@ fn parse_config_text(text: &str) -> Result<Gemma4Config, String> {
         text.to_owned()
     };
 
-    let cfg: Gemma4Config = serde_json::from_str(&config_str)
+    let mut cfg: Gemma4Config = serde_json::from_str(&config_str)
         .map_err(|e| format!("failed to parse gemma4 config: {e}"))?;
     cfg.validate_supported()?;
+    // `Gemma4TextConfig.__post_init__`: every sixth layer is full attention
+    // unless the config says otherwise, and the last one always is.
+    if cfg.layer_types.is_empty() {
+        cfg.layer_types = (0..cfg.num_hidden_layers)
+            .map(|i| {
+                if (i + 1) % 6 == 0 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(last) = cfg.layer_types.last_mut() {
+        *last = "full_attention".to_string();
+    }
     Ok(cfg)
 }
 
@@ -1983,6 +2026,8 @@ mod tests {
                 "sliding_attention".to_string(),
                 "full_attention".to_string(),
             ],
+            use_bidirectional_attention: None,
+            attention_bias: false,
             rope_parameters: None,
             hidden_size_per_layer_input: Some(2),
             vocab_size_per_layer_input: Some(8),
@@ -2037,6 +2082,65 @@ mod tests {
         assert_eq!(cfg.per_layer_input_vocab_size(), 262144);
         assert_eq!(cfg.num_kv_shared_layers(), 18);
         assert_eq!(cfg.first_kv_shared_layer_idx(), 24);
+    }
+
+    fn minimal_config(extra: &str) -> String {
+        format!(
+            r#"{{"vocab_size": 16, "hidden_size": 8, "num_hidden_layers": 12,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+                "hidden_size_per_layer_input": 0{extra}}}"#
+        )
+    }
+
+    /// What `Gemma4TextConfig` does with keys a `config.json` leaves out: no
+    /// final softcap, a window of 512, and layers in its default 5:1 pattern.
+    #[test]
+    fn absent_keys_take_transformers_defaults() {
+        let cfg = parse_config_text(&minimal_config("")).expect("parses");
+        assert_eq!(cfg.final_logit_softcapping, None);
+        assert_eq!(cfg.sliding_window, 512);
+        assert_eq!(cfg.layer_types.len(), 12);
+        let full: Vec<usize> = (0..12).filter(|&i| cfg.is_full_attention(i)).collect();
+        assert_eq!(full, [5, 11]);
+
+        let capped = parse_config_text(&minimal_config(r#", "final_logit_softcapping": 30.0"#))
+            .expect("parses");
+        assert_eq!(capped.final_logit_softcapping, Some(30.0));
+    }
+
+    /// `Gemma4TextConfig.__post_init__` forces the last layer to full
+    /// attention, whatever `layer_types` says.
+    #[test]
+    fn the_last_layer_is_full_attention() {
+        let cfg = parse_config_text(
+            r#"{"vocab_size": 16, "hidden_size": 8, "num_hidden_layers": 3,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 4,
+                "hidden_size_per_layer_input": 0,
+                "layer_types": ["sliding_attention", "full_attention", "sliding_attention"]}"#,
+        )
+        .expect("parses");
+        assert!(cfg.is_full_attention(1));
+        assert!(cfg.is_full_attention(2), "the last layer is forced full");
+    }
+
+    /// A config asking for what the engine would silently drop is refused by
+    /// name rather than run as something else.
+    #[test]
+    fn features_the_engine_does_not_run_are_refused() {
+        for (extra, needle) in [
+            (r#", "use_bidirectional_attention": "all""#, "bidirectional"),
+            (r#", "attention_bias": true"#, "attention_bias"),
+            (r#", "hidden_activation": "silu""#, "hidden_activation"),
+        ] {
+            let err = parse_config_text(&minimal_config(extra)).expect_err(extra);
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
+        // Vision-only bidirectionality leaves a text prompt causal.
+        parse_config_text(&minimal_config(
+            r#", "use_bidirectional_attention": "vision""#,
+        ))
+        .expect("vision-only bidirectional attention is a text-causal model");
+        parse_config_text(&minimal_config(r#", "attention_bias": false"#)).expect("parses");
     }
 
     #[test]
