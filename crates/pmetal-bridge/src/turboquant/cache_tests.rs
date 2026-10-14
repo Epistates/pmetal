@@ -293,6 +293,13 @@ fn wrong_shapes_are_refused_not_misread() {
             )
             .is_err()
     );
+    // A key head dimension the kernels cannot read four coordinates at a time of.
+    let odd = Workload::new(1, 2, 2, 5, 66, 1);
+    assert!(
+        new_cache(config(4, 4, Some(32), 4))
+            .append(&odd.kv_slice(false, 0, 5), &odd.kv_slice(true, 0, 5))
+            .is_err()
+    );
     // Keys and values of different lengths.
     assert!(
         cache
