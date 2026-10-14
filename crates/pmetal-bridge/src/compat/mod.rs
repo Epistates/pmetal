@@ -373,6 +373,7 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
 /// seeds it) unless given a key ([`random::key`]).
 pub mod random {
     use super::{Array, Dtype};
+    use std::cell::Cell;
 
     pub fn normal(shape: &[i32], dtype: Dtype) -> Array {
         Array::random_normal(shape, dtype.as_i32())
@@ -390,8 +391,59 @@ pub mod random {
     pub fn uniform_keyed(shape: &[i32], dtype: Dtype, key: Option<&Array>) -> Array {
         Array::random_uniform_keyed(shape, dtype.as_i32(), key)
     }
+    /// Seed the thread's global MLX key and its [dropout stream](dropout_mask).
     pub fn seed(s: u64) {
         crate::inline_array::random_seed(s);
+        DROPOUT_STREAM.with(|stream| stream.set((s, 0)));
+    }
+
+    thread_local! {
+        /// `(seed, draws so far)` of the dropout stream.
+        static DROPOUT_STREAM: Cell<(u64, u64)> = Cell::new((clock_seed(), 0));
+    }
+
+    fn clock_seed() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    }
+
+    /// SplitMix64's output for draw `n` of a stream seeded with `seed`.
+    fn splitmix(seed: u64, n: u64) -> u64 {
+        let mut z = seed.wrapping_add(n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A Bernoulli(`keep`) mask of `shape`, `true` where an element is kept,
+    /// drawn from the thread's dropout stream.
+    ///
+    /// The stream is a counter, not MLX's global key, and that is the point:
+    /// a gradient-checkpointed block runs its forward again during the
+    /// backward pass, and a mask drawn again from a moving global key is
+    /// another mask. [`checkpointed`](super::checkpointed) replays the
+    /// stream from where the block's forward started, so the recompute draws
+    /// the masks the forward did. [`seed`] resets it.
+    pub fn dropout_mask(keep: f32, shape: &[i32]) -> Array {
+        let (seed, n) = DROPOUT_STREAM.with(|stream| {
+            let (seed, n) = stream.get();
+            stream.set((seed, n + 1));
+            (seed, n)
+        });
+        let key = Array::random_key(splitmix(seed, n));
+        let u = Array::random_uniform_keyed(shape, Dtype::Float32.as_i32(), Some(&key));
+        u.less(&Array::from_f32(keep))
+    }
+
+    /// How many masks the dropout stream has drawn.
+    pub(crate) fn dropout_position() -> u64 {
+        DROPOUT_STREAM.with(|stream| stream.get().1)
+    }
+
+    /// Move the dropout stream to draw number `position`.
+    pub(crate) fn set_dropout_position(position: u64) {
+        DROPOUT_STREAM.with(|stream| stream.set((stream.get().0, position)));
     }
     /// Integers drawn uniformly from `[low, high)`. With a `key` the draw is
     /// a function of it alone; without one it takes the thread's global key.

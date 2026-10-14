@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::compat::{Array, Exception, ModuleParametersExt};
+use crate::compat::{Array, Exception, ModuleParametersExt, random};
 use crate::inline_array::checkpoint_apply_unchecked;
 
 /// Run `forward` on `module` under gradient checkpointing.
@@ -91,6 +91,14 @@ where
     let failure: Rc<RefCell<Option<Exception>>> = Rc::new(RefCell::new(None));
     let closure_failure = Rc::clone(&failure);
 
+    // The forward draws dropout masks, and the backward pass runs it again.
+    // The recompute must draw the same ones, or the gradient belongs to a
+    // network the loss never saw. The first run (this call's forward) leaves
+    // the stream advanced, for the blocks after it; every later run starts
+    // from where the first did and hands the stream back as it found it.
+    let stream_start = random::dropout_position();
+    let mut forward_done = false;
+
     // `move` matters. A borrowing closure would capture `n_inputs` and `names`
     // as pointers into this frame, and the backward recompute reads them after
     // the frame has returned. That does not fail loudly; it reads whatever is
@@ -111,7 +119,17 @@ where
                 }
             }
 
-            match forward(module, &arrays[..n_inputs]) {
+            let outer_position = random::dropout_position();
+            if forward_done {
+                random::set_dropout_position(stream_start);
+            }
+            let result = forward(module, &arrays[..n_inputs]);
+            if forward_done {
+                random::set_dropout_position(outer_position);
+            }
+            forward_done = true;
+
+            match result {
                 Ok(out) => vec![out],
                 Err(e) => {
                     *closure_failure.borrow_mut() = Some(e);
@@ -254,6 +272,64 @@ mod tests {
                  captured rather than threaded through checkpoint()"
             );
         }
+    }
+
+    /// Gradients of `Σ forward(x)²` over the adapter, with dropout live,
+    /// from the draw `seed` fixes. `checkpoint` picks the forward's form.
+    fn dropout_gradients(seed: u64, checkpoint: bool) -> Vec<Array> {
+        let x = input();
+        let mut module = adapted_linear();
+        {
+            let adapter = module.adapter.as_mut().unwrap();
+            adapter.dropout = 0.5;
+            adapter.training = true;
+        }
+        let a = module.adapter.as_ref().unwrap().a.clone();
+        let b = module.adapter.as_ref().unwrap().b.clone();
+        crate::compat::random::seed(seed);
+        let (_, grads) = value_and_grad(
+            |arrays| {
+                module.adapter.as_mut().unwrap().a = arrays[0].clone();
+                module.adapter.as_mut().unwrap().b = arrays[1].clone();
+                let y = if checkpoint {
+                    unsafe {
+                        checkpointed(&mut module, &arrays[2..], |m, ins| {
+                            crate::compat::Module::forward(m, &ins[0])
+                        })
+                    }
+                    .unwrap()
+                } else {
+                    crate::compat::Module::forward(&mut module, &arrays[2]).unwrap()
+                };
+                y.square().sum_all()
+            },
+            &[a, b],
+            &[x],
+        );
+        crate::check_unobserved_error().expect("no bridge error");
+        grads
+    }
+
+    /// The backward pass recomputes the forward, and a dropout mask drawn
+    /// again is another mask: the gradient would then belong to a network
+    /// the loss never saw. PyTorch's `checkpoint` restores the RNG state
+    /// for the recompute for this reason.
+    #[test]
+    fn a_checkpointed_dropout_is_recomputed_with_the_same_mask() {
+        let plain = dropout_gradients(7, false);
+        let checkpointed = dropout_gradients(7, true);
+        for (i, (p, c)) in plain.iter().zip(&checkpointed).enumerate() {
+            assert!(p.abs().max(None).item_f32() > 0.0, "gradient {i} is zero");
+            let diff = p.subtract(c).abs().max(None).item_f32();
+            assert!(
+                diff < 1e-5,
+                "gradient {i} differs by {diff} once the forward is checkpointed"
+            );
+        }
+        // And the mask is a draw, not a constant: another seed, another gradient.
+        let other = dropout_gradients(8, false);
+        let moved = plain[1].subtract(&other[1]).abs().max(None).item_f32();
+        assert!(moved > 1e-3, "two seeds drew the same dropout mask");
     }
 
     #[test]

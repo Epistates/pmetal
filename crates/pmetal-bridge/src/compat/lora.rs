@@ -300,7 +300,7 @@ fn column_norms(weight: &Array) -> Array {
 /// has `x`'s dtype.
 fn dropout(x: &Array, p: f32) -> Array {
     let keep = 1.0 - p;
-    let mask = random::bernoulli(&Array::from_f32(keep), x.shape());
+    let mask = random::dropout_mask(keep, x.shape());
     x.multiply(&mask.as_dtype(x.dtype_raw()))
         .mul_scalar(1.0 / keep)
 }
@@ -612,6 +612,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Inverted dropout: each element survives with probability `1 - p`,
+    /// scaled by `1/(1 - p)`, so the expectation is the input.
+    #[test]
+    fn dropout_keeps_a_fraction_and_scales_it_up() {
+        random::seed(3);
+        let p = 0.25;
+        let x = Array::ones(&[200_000], Dtype::Float32.as_i32());
+        let y = values(dropout(&x, p));
+        let kept = y.iter().filter(|v| **v != 0.0).count() as f32 / y.len() as f32;
+        assert!((kept - (1.0 - p)).abs() < 0.01, "kept {kept}");
+        assert!(
+            y.iter()
+                .all(|v| *v == 0.0 || (*v - 1.0 / (1.0 - p)).abs() < 1e-6)
+        );
+        // Seeded draws repeat; successive draws differ.
+        random::seed(3);
+        let again = values(dropout(&x, p));
+        assert_eq!(y, again, "a seed must fix the mask");
+        let next = values(dropout(&x, p));
+        assert_ne!(y, next, "successive masks must differ");
     }
 
     /// Folding an adapter into a bf16 weight leaves a bf16 weight, and
