@@ -44,6 +44,7 @@ pub mod training;
 pub mod turboquant;
 pub mod turboquant_dispatch;
 
+pub mod native_checkpoint;
 pub mod native_common;
 pub mod native_loader;
 pub mod native_moe;
