@@ -8,6 +8,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::InlineArray;
 
 /// Deterministic xorshift Gaussian stream.
 pub(super) struct Gauss(u64);
@@ -32,6 +33,9 @@ impl Gauss {
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
     }
 }
+
+/// Standard deviation of the attention logits the workload's queries produce.
+const LOGIT_STD: f64 = 3.0;
 
 /// Keys with the structure real models show: a few high-variance channels and
 /// token norms that vary by a factor of a few. Values are plain Gaussian with
@@ -77,15 +81,20 @@ impl Workload {
                 }
             }
         }
-        // Queries share the key channel scale and are large enough for a
-        // peaked softmax (logit std about 2.5 after the 1/sqrt(d) scale).
+        // Queries put their energy in the same channels as the keys, scaled
+        // so the logits (after the 1/sqrt(d) scale) have a standard
+        // deviation of `LOGIT_STD`: a clearly peaked softmax, as real heads
+        // have, not a one-hot one.
         let mut queries = Vec::with_capacity(batch * q_heads * dim);
         let groups = q_heads / kv_heads;
         for _ in 0..batch {
             for qh in 0..q_heads {
                 let h = qh / groups;
-                for c in 0..dim {
-                    queries.push((2.5 * channel_scale[h * dim + c] * g.normal()) as f32);
+                let channels = &channel_scale[h * dim..(h + 1) * dim];
+                let mean_fourth: f64 = channels.iter().map(|s| s.powi(4)).sum::<f64>() / dim as f64;
+                let sigma = LOGIT_STD / mean_fourth.sqrt();
+                for scale in channels {
+                    queries.push((sigma * scale * g.normal()) as f32);
                 }
             }
         }
@@ -226,82 +235,4 @@ pub(super) fn run_cache(w: &Workload, config: TurboQuantConfig) -> (QuantizedKvC
 pub(super) fn to_host(a: &InlineArray) -> Vec<f32> {
     let n: i32 = a.shape().iter().product();
     a.reshape(&[n]).to_f32_vec(n as usize).expect("read array")
-}
-
-/// Per-token relative reconstruction error summary: (mean, p99, max).
-pub(super) fn token_errors(orig: &[f32], got: &[f32], dim: usize) -> (f64, f64, f64) {
-    let mut errs: Vec<f64> = orig
-        .chunks(dim)
-        .zip(got.chunks(dim))
-        .map(|(a, b)| {
-            let num: f64 = a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum();
-            let den: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum();
-            (num / den.max(1e-30)).sqrt()
-        })
-        .collect();
-    errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mean = errs.iter().sum::<f64>() / errs.len() as f64;
-    (mean, errs[errs.len() * 99 / 100], *errs.last().unwrap())
-}
-
-#[test]
-#[ignore = "exploration table"]
-fn explore_reconstruction_error() {
-    for &dim in &[64usize, 128, 256] {
-        for &(kb, vb) in &[(8u8, 8u8), (4, 4), (3, 3)] {
-            for qjl in [TurboQuantQjlMode::Standard, TurboQuantQjlMode::NoQjl] {
-                let w = Workload::new(1, 4, 4, 1500, dim, 11 + dim as u64);
-                let cfg = TurboQuantConfig::uniform(kb, vb)
-                    .with_recent_window(None)
-                    .with_qjl_mode(qjl);
-                let mut cache = new_cache(cfg);
-                cache
-                    .append(&w.kv_slice(false, 0, 1500), &w.kv_slice(true, 0, 1500))
-                    .unwrap();
-                let dk = to_host(&cache.dequantize_keys().unwrap());
-                let dv = to_host(&cache.dequantize_values().unwrap());
-                let (km, kp, kx) = token_errors(&w.keys, &dk, dim);
-                let (vm, vp, vx) = token_errors(&w.values, &dv, dim);
-                eprintln!(
-                    "d={dim:3} k{kb}v{vb} {qjl:?}: K mean/p99/max={km:.4}/{kp:.4}/{kx:.4}  V mean/p99/max={vm:.4}/{vp:.4}/{vx:.4}"
-                );
-            }
-        }
-    }
-    crate::check_unobserved_error().expect("bridge op threw");
-}
-
-#[test]
-#[ignore = "exploration table"]
-fn explore_attention_error_table() {
-    let mut rows = Vec::new();
-    for &dim in &[64usize, 96, 128, 192, 256] {
-        for &(kb, vb) in &[(8u8, 8u8), (4, 4), (3, 3)] {
-            for qjl in [TurboQuantQjlMode::Standard, TurboQuantQjlMode::NoQjl] {
-                for &(qh, kvh) in &[(4usize, 4usize), (8, 2)] {
-                    for &seq in &[1500usize, 1537] {
-                        let w = Workload::new(1, qh, kvh, seq, dim, 7 + dim as u64);
-                        let cfg = TurboQuantConfig::uniform(kb, vb)
-                            .with_recent_window(None)
-                            .with_qjl_mode(qjl);
-                        let (cache, got) = run_cache(&w, cfg);
-                        let reference = w.reference(seq);
-                        let err = relative_error(&got, &reference);
-                        let dk = to_host(&cache.dequantize_keys().unwrap());
-                        let dv = to_host(&cache.dequantize_values().unwrap());
-                        let deq = w.reference_over(&dk, &dv, seq, seq);
-                        let deq32: Vec<f32> = deq.iter().map(|x| *x as f32).collect();
-                        let quant_err = relative_error(&deq32, &reference);
-                        let kernel_err = relative_error(&got, &deq);
-                        rows.push(format!(
-                            "d={dim:3} k{kb}v{vb} {qjl:?} q{qh}/kv{kvh} T={seq}: fused_vs_ref={err:.4} dequant_vs_ref={quant_err:.4} fused_vs_dequant={kernel_err:.4}"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    for r in rows {
-        eprintln!("{r}");
-    }
 }

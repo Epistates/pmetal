@@ -1,964 +1,366 @@
-//! [`QuantizedKvCache`] — the per-layer state machine.
+//! [`QuantizedKvCache`]: one attention layer's TurboQuant KV cache.
 //!
-//! Owns the hot-fp16 ring + cold-compressed stores and orchestrates encode,
-//! eviction, dequantize, and the fused-attention dispatch decision tree. The
-//! GPU score and dequantize kernels live in [`super::dispatch`]; the host
-//! encode/decode primitives live in [`super::encode`].
+//! A sequence is stored in three parts, oldest first:
+//!
+//! ```text
+//!  sinks        the first `sink_tokens` tokens, uncompressed
+//!  cold         everything older than the recent window, quantized
+//!  recent ring  the newest `recent_window` tokens (up to one eviction chunk
+//!               more), uncompressed
+//! ```
+//!
+//! The sinks are the tokens attention concentrates on whatever the
+//! query is, so they are the ones whose quantization noise is multiplied by
+//! the largest weights. The recent window is kept exact for the same reason
+//! the first tokens are: locality puts most of the weight there. When the ring
+//! fills, its oldest `eviction chunk` tokens are quantized into the cold
+//! store in one batch.
+//!
+//! A decode step attends to all three parts in one pass (see
+//! `cpp/bridge_turboquant_attention.cpp`), reading the cold part packed.
 
 use std::sync::Arc;
 
 use crate::InlineArray;
+use crate::compat::Dtype;
 
-use super::config::{HOT_EVICTION_CHUNK, TurboQuantConfig, TurboQuantTensorConfig};
-use super::dispatch::{
-    gpu_dequantize_keys, gpu_dequantize_keys_mixed, gpu_dequantize_values,
-    gpu_dequantize_values_mixed, gpu_quantize_kv, gpu_quantize_kv_mixed,
-};
-use super::encode::{decode_key_rows, decode_value_rows, encode_key_rows, encode_value_rows};
-use super::host_keystore::{QuantizedKeyStore, QuantizedValueStore};
-use super::math::{f32_rows_to_bhsd_array, inline_array_to_bshd_rows};
-use super::state::{TensorRuntime, TurboQuantState};
-use super::{
-    eval_stage_micros, trace_turboquant_bridge, turboquant_q8_fullbyte_enabled,
-    turboquant_trace_enabled,
-};
+use super::attention::{DecodeShape, Visibility, decode_attention};
+use super::config::{TurboQuantConfig, eviction_chunk};
+use super::state::TurboQuantState;
+use super::store::{ColdStore, DenseStore};
 
-/// Compressed KV cache for one attention layer.
-///
-/// Stores all cached positions as bit-packed indices + f32 metadata.
-/// Backed by [`TurboQuantState`] for dequantisation.
-#[derive(Debug, Clone)]
-pub struct QuantizedKvCache {
-    /// Compressed keys — inner-product optimised (MSE + QJL).
-    pub keys: Option<QuantizedKeyStore>,
-    /// Compressed values — MSE optimised.
-    pub values: Option<QuantizedValueStore>,
-    /// Layout from the first append (batch, heads, key_dim, value_dim).
-    layout: Option<CacheLayout>,
-    /// Total cached positions (cold + warm + hot). Public for compatibility
-    /// with callers that still read it directly. Maintained as the invariant
-    /// `offset == cold_offset + warm_offset + hot_offset` after every
-    /// append/rollback. `warm_offset` is the warm sub-cache's `offset` (or 0
-    /// when the warm tier is disabled).
-    pub offset: usize,
-    /// Tokens currently sitting compressed in the cold stores. The GPU
-    /// uniform attention kernels score against `cold_offset` slots.
-    cold_offset: usize,
-    /// Tokens currently held uncompressed in the fp16/bf16 hot ring.
-    hot_offset: usize,
-    /// Ring-buffer start index for the oldest hot token. `hot_offset` is the
-    /// active length; active slots are logically
-    /// `hot_start..hot_start + hot_offset` modulo the allocated capacity.
-    hot_start: usize,
-    /// Hot-ring keys, shape `[B, H_kv, hot_capacity, D_k]`. Native dtype
-    /// (whatever was passed in on first append). `None` when the recent
-    /// window is disabled or no tokens are currently uncompressed.
-    pub(super) hot_keys: Option<InlineArray>,
-    /// Hot-ring values, same shape semantics as `hot_keys`.
-    pub(super) hot_values: Option<InlineArray>,
-    /// Native dtype of the hot ring (taken from the first append). When the
-    /// cold side is dequantized for the mixed-attention path, the cold
-    /// f32/bf16 output is cast to this dtype before concatenation.
-    hot_dtype: Option<i32>,
-    /// Config used to build this cache.
-    pub config: TurboQuantConfig,
-    /// Shared pre-computed matrices and codebooks.
-    pub state: Option<Arc<TurboQuantState>>,
-    /// Phase H — warm tier between hot fp16 and cold compressed. When
-    /// `config.warm_tier.is_some()`, hot evictions feed this nested cache
-    /// (no hot ring of its own — `recent_window: None`). Once `warm.offset`
-    /// exceeds `config.warm_tier.window`, the entire warm contents are
-    /// dequantised and re-quantised into the outer cold store, and the
-    /// warm sub-cache is reset. Boxed to break the recursive type cycle.
-    pub(super) warm: Option<Box<QuantizedKvCache>>,
-}
-
+/// Shape of what the cache holds, fixed by the first append.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct CacheLayout {
+struct Layout {
     batch: usize,
     heads: usize,
-    key_dim: usize,
+    dim: usize,
     value_dim: usize,
+    /// dtype of the uncompressed tokens (that of the first keys appended).
+    dtype: i32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum UniformAttentionBenchMode {
-    Split,
-    SpecializedQ8D128TwoPass,
-    SpecializedQ8D256TwoPass,
-    SpecializedQ8D256FullbytePass1,
-    SpecializedQ8D256FullbytePass2,
-    SpecializedQ8D256FullbyteSplitDenseV,
-    SpecializedQ8D256FullbyteLocalSoftmax,
+impl Layout {
+    fn kv_rows(&self) -> usize {
+        self.batch * self.heads
+    }
+}
+
+/// Compressed KV cache of one attention layer.
+#[derive(Debug, Clone)]
+pub struct QuantizedKvCache {
+    /// Tokens cached: sinks, cold and recent together.
+    pub offset: usize,
+    /// The configuration the cache was built with.
+    pub config: TurboQuantConfig,
+    /// Rotations and codebooks, shared between the layers of a model.
+    pub state: Option<Arc<TurboQuantState>>,
+    layout: Option<Layout>,
+    cold: Option<ColdStore>,
+    dense: Option<DenseStore>,
 }
 
 impl QuantizedKvCache {
-    /// Create an empty cache.  `state` should be `None` on first use; call
-    /// `append` to populate.
+    /// An empty cache that builds its quantizers on the first append.
     pub fn new(config: TurboQuantConfig) -> Self {
-        // Phase H: when a warm tier is configured, allocate a nested cache
-        // with the warm precision and the hot ring disabled. Hot evictions
-        // feed this sub-cache; warm migrations dequantise+re-encode out of
-        // it into the outer cold store.
-        let warm = config.warm_tier.map(|warm_cfg| {
-            let warm_inner_config = TurboQuantConfig {
-                keys: warm_cfg.keys,
-                values: warm_cfg.values,
-                recent_window: None, // warm has no hot ring
-                qjl: config.qjl,
-                skiplist_threshold: None, // skiplist sits at the outer (cold) tier
-                outliers: config.outliers,
-                pack_mode: config.pack_mode,
-                warm_tier: None, // no nested-nested warming
-            };
-            Box::new(QuantizedKvCache::new(warm_inner_config))
-        });
         Self {
-            keys: None,
-            values: None,
-            layout: None,
             offset: 0,
-            cold_offset: 0,
-            hot_offset: 0,
-            hot_start: 0,
-            hot_keys: None,
-            hot_values: None,
-            hot_dtype: None,
             config,
             state: None,
-            warm,
+            layout: None,
+            cold: None,
+            dense: None,
         }
     }
 
-    /// Create with a pre-built shared state (avoids re-building QR/Lloyd-Max).
+    /// An empty cache that uses `state`, built once for the model and shared
+    /// by every layer.
     pub fn with_state(config: TurboQuantConfig, state: Arc<TurboQuantState>) -> Self {
         let mut cache = Self::new(config);
         cache.state = Some(state);
         cache
     }
 
-    /// Current number of cached sequence positions.
+    /// Tokens cached.
     pub fn len(&self) -> usize {
         self.offset
     }
 
-    /// True when no positions have been cached yet.
+    /// True when nothing is cached.
     pub fn is_empty(&self) -> bool {
         self.offset == 0
     }
 
-    /// Reset to empty (retains pre-built state and config).
-    pub fn reset(&mut self) {
-        self.keys = None;
-        self.values = None;
-        self.layout = None;
-        self.hot_keys = None;
-        self.hot_values = None;
-        self.hot_dtype = None;
-        self.offset = 0;
-        self.cold_offset = 0;
-        self.hot_offset = 0;
-        self.hot_start = 0;
-        if let Some(warm) = self.warm.as_mut() {
-            warm.reset();
-        }
-    }
-
-    /// Number of tokens currently held uncompressed in the hot ring.
+    /// Tokens held uncompressed: the sinks and the recent ring.
     pub fn hot_len(&self) -> usize {
-        self.hot_offset
+        self.dense.as_ref().map_or(0, DenseStore::tokens)
     }
 
-    /// Number of tokens that have been compressed into the cold stores.
+    /// Tokens held quantized.
     pub fn cold_len(&self) -> usize {
-        self.cold_offset
+        self.cold.as_ref().map_or(0, |c| c.len)
     }
 
-    /// Phase H: number of tokens currently in the warm sub-cache (0 when
-    /// warm tier is disabled).
-    pub fn warm_len(&self) -> usize {
-        self.warm.as_ref().map(|w| w.offset).unwrap_or(0)
+    /// Bytes of device memory the cached tokens occupy (capacity included).
+    pub fn nbytes(&self) -> usize {
+        let cold = self.cold.as_ref().map_or(0, |c| {
+            c.k.packed.nbytes() + c.k.scales.nbytes() + c.v.packed.nbytes() + c.v.scales.nbytes()
+        });
+        let dense = self
+            .dense
+            .as_ref()
+            .map_or(0, |d| d.keys.nbytes() + d.values.nbytes());
+        cold + dense
     }
 
-    /// Phase I — COW fork of the cache. Returns an independent
-    /// `QuantizedKvCache` that shares the underlying MLX storage with
-    /// `self` until either side mutates (i.e. appends).
-    ///
-    /// `kv_cache_append` always returns a *new* `InlineArray` rather than
-    /// mutating in place, and MLX arrays are reference-counted under the
-    /// hood, so the clone is O(layers) ref-count bumps — orders of
-    /// magnitude cheaper than dequantising and re-encoding the prefix.
-    ///
-    /// This is PagedAttention-style prefix
-    /// sharing for the *single-sequence* case: any number of forks can
-    /// hold the same cached prefix, and only the appended suffix per
-    /// fork costs new memory. It does NOT yet integrate with
-    /// `ServePrefixCache` — that work belongs in pmetal-serve and is the
-    /// follow-up to wire this primitive into the cross-request prefix
-    /// share path.
-    ///
-    /// Mutating semantics: after `fork()`, `self` and the returned
-    /// cache are fully independent. Appends to one do not appear in
-    /// the other. Reading either side is identical until divergence.
+    /// Forget every cached token, keeping the configuration and the state.
+    pub fn reset(&mut self) {
+        self.offset = 0;
+        self.layout = None;
+        self.cold = None;
+        self.dense = None;
+    }
+
+    /// An independent copy that shares storage with this cache until either
+    /// side appends. MLX arrays are immutable values and every write makes a
+    /// new one, so this costs a reference count per array, however long the
+    /// cached sequence: the cheap prefix share a serving prefix cache needs.
     pub fn fork(&self) -> Self {
-        // Clone is already O(layers) MLX-arc bumps (see InlineArray::Clone
-        // → mlx_inline_init_copy, which is a ref-count increment) — no
-        // deep-copy on either side. The recursive `warm` field clones
-        // its own state via the same mechanism.
         self.clone()
     }
 
-    /// Hot-ring capacity = `recent_window + HOT_EVICTION_CHUNK` when the
-    /// window is enabled, `0` when disabled (legacy compress-everything mode).
-    fn hot_capacity(&self) -> usize {
-        self.config
+    /// Cut the lazy graph behind the cached arrays by evaluating them.
+    pub fn eval_and_detach_gpu_state(&mut self) {
+        let mut pending: Vec<&mut InlineArray> = Vec::new();
+        if let Some(cold) = self.cold.as_mut() {
+            pending.extend(cold.arrays_mut());
+        }
+        if let Some(dense) = self.dense.as_mut() {
+            pending.extend(dense.arrays_mut());
+        }
+        if !pending.is_empty() {
+            crate::inline_array::eval_and_detach_many(&mut pending);
+        }
+    }
+
+    fn ensure_layout(
+        &mut self,
+        keys: &InlineArray,
+        values: &InlineArray,
+    ) -> Result<Layout, String> {
+        if keys.ndim() != 4 || values.ndim() != 4 {
+            return Err(format!(
+                "TurboQuant: expected [B, H, S, D] keys and values, got {} and {} dimensions",
+                keys.ndim(),
+                values.ndim()
+            ));
+        }
+        if keys.dim(0) != values.dim(0)
+            || keys.dim(1) != values.dim(1)
+            || keys.dim(2) != values.dim(2)
+        {
+            return Err(format!(
+                "TurboQuant: keys {:?} and values {:?} disagree on batch, heads or length",
+                keys.shape(),
+                values.shape()
+            ));
+        }
+        let seen = (
+            keys.dim(0) as usize,
+            keys.dim(1) as usize,
+            keys.dim(3) as usize,
+            values.dim(3) as usize,
+        );
+        if let Some(layout) = self.layout {
+            if (layout.batch, layout.heads, layout.dim, layout.value_dim) != seen {
+                return Err(format!(
+                    "TurboQuant: the cache holds [{}, {}, *, {}] keys and [.., {}] values, \
+                     cannot append [{}, {}, *, {}] keys and [.., {}] values",
+                    layout.batch,
+                    layout.heads,
+                    layout.dim,
+                    layout.value_dim,
+                    seen.0,
+                    seen.1,
+                    seen.2,
+                    seen.3
+                ));
+            }
+            return Ok(layout);
+        }
+        let layout = Layout {
+            batch: seen.0,
+            heads: seen.1,
+            dim: seen.2,
+            value_dim: seen.3,
+            dtype: keys.dtype_raw(),
+        };
+        let state = match &self.state {
+            Some(state) => Arc::clone(state),
+            None => {
+                let state = Arc::new(TurboQuantState::new(
+                    layout.dim,
+                    layout.value_dim,
+                    self.config,
+                )?);
+                self.state = Some(Arc::clone(&state));
+                state
+            }
+        };
+        if state.keys.dim() != layout.dim || state.values.dim() != layout.value_dim {
+            return Err(format!(
+                "TurboQuant: the shared state quantizes {}-wide keys and {}-wide values, \
+                 the cache is being given {} and {}",
+                state.keys.dim(),
+                state.values.dim(),
+                layout.dim,
+                layout.value_dim
+            ));
+        }
+        let ring_capacity = self
+            .config
             .recent_window
-            .map(|w| w + HOT_EVICTION_CHUNK)
-            .unwrap_or(0)
+            .map_or(0, |w| w + eviction_chunk(w));
+        self.dense = Some(DenseStore::new(
+            layout.kv_rows(),
+            layout.dim,
+            layout.value_dim,
+            layout.dtype,
+            self.config.sink_tokens,
+            ring_capacity,
+        ));
+        self.cold = Some(ColdStore::empty(
+            layout.kv_rows(),
+            &state.keys,
+            &state.values,
+        ));
+        // `empty` is a placeholder with room for one token; the first append
+        // allocates for real.
+        if let Some(cold) = self.cold.as_mut() {
+            cold.len = 0;
+        }
+        self.layout = Some(layout);
+        Ok(layout)
     }
 
-    fn active_hot_slice(
-        arr: &InlineArray,
-        layout: CacheLayout,
-        hot_start: usize,
-        hot_len: usize,
-        feature_dim: usize,
-    ) -> Option<InlineArray> {
-        if hot_len == 0 {
-            return None;
-        }
-        let capacity = arr.dim(2) as usize;
-        if capacity == 0 {
-            return None;
-        }
-        if hot_len > capacity {
-            return None;
-        }
-        let start = hot_start % capacity;
-        let first_len = hot_len.min(capacity - start);
-        let first = arr.slice(
-            &[0, 0, start as i32, 0],
-            &[
-                layout.batch as i32,
-                layout.heads as i32,
-                (start + first_len) as i32,
-                feature_dim as i32,
-            ],
-        );
-        if first_len == hot_len {
-            Some(first)
-        } else {
-            let second_len = hot_len - first_len;
-            let second = arr.slice(
-                &[0, 0, 0, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    second_len as i32,
-                    feature_dim as i32,
-                ],
-            );
-            Some(first.concatenate_2(&second, 2))
-        }
-    }
-
-    fn write_hot_chunk(
-        arr: &mut InlineArray,
-        src: &InlineArray,
-        layout: CacheLayout,
-        write_start: usize,
-        seq_len: usize,
-        feature_dim: usize,
-    ) {
-        let capacity = arr.dim(2) as usize;
-        debug_assert!(capacity > 0);
-        let start = write_start % capacity;
-        let first_len = seq_len.min(capacity - start);
-        if first_len == seq_len {
-            *arr = arr.slice_set(
-                src,
-                &[0, 0, start as i32, 0],
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    (start + seq_len) as i32,
-                    feature_dim as i32,
-                ],
-            );
-            return;
-        }
-
-        let first_src = src.slice(
-            &[0, 0, 0, 0],
-            &[
-                layout.batch as i32,
-                layout.heads as i32,
-                first_len as i32,
-                feature_dim as i32,
-            ],
-        );
-        *arr = arr.slice_set(
-            &first_src,
-            &[0, 0, start as i32, 0],
-            &[
-                layout.batch as i32,
-                layout.heads as i32,
-                capacity as i32,
-                feature_dim as i32,
-            ],
-        );
-
-        let second_len = seq_len - first_len;
-        let second_src = src.slice(
-            &[0, 0, first_len as i32, 0],
-            &[
-                layout.batch as i32,
-                layout.heads as i32,
-                seq_len as i32,
-                feature_dim as i32,
-            ],
-        );
-        *arr = arr.slice_set(
-            &second_src,
-            &[0, 0, 0, 0],
-            &[
-                layout.batch as i32,
-                layout.heads as i32,
-                second_len as i32,
-                feature_dim as i32,
-            ],
-        );
-    }
-
-    /// Append new keys and values.
-    ///
-    /// `keys` and `values` must have shape `[B, H, S, D]` as f32 or bf16.
-    ///
-    /// For the Uniform quantisation config the entire pipeline runs on-GPU:
-    /// normalise → rotate → argmin codebook → QJL projection → sign.
-    /// No GPU→CPU transfer happens.  Results are stored as `InlineArray`s and
-    /// concatenated along the T axis on subsequent calls.
-    ///
-    /// For the Mixed (outlier-aware) config the CPU path is used (outlier mask
-    /// selection requires a per-row top-k sort that is not trivially vectorisable).
-    ///
-    /// Returns an error string on shape mismatch.
-    ///
-    /// Dispatches to one of two paths based on `config.recent_window`:
-    /// - `None` (legacy): every appended token is compressed immediately.
-    /// - `Some(N)`: the newest `N` tokens stay in an uncompressed fp16/bf16
-    ///   hot ring; older history is evicted into the cold compressed stores
-    ///   in `HOT_EVICTION_CHUNK` batches. Short-context callers therefore
-    ///   pay zero compression overhead.
+    /// Append `[B, H, S, D]` keys and `[B, H, S, Dv]` values.
     pub fn append(&mut self, keys: &InlineArray, values: &InlineArray) -> Result<(), String> {
         let layout = self.ensure_layout(keys, values)?;
-        let seq_len = keys.dim(2) as usize;
-        if seq_len == 0 {
+        let seq = keys.dim(2) as usize;
+        if seq == 0 {
             return Ok(());
         }
+        let kv_rows = layout.kv_rows() as i32;
+        let keys = keys
+            .as_dtype(layout.dtype)
+            .reshape(&[kv_rows, seq as i32, layout.dim as i32]);
+        let values =
+            values
+                .as_dtype(layout.dtype)
+                .reshape(&[kv_rows, seq as i32, layout.value_dim as i32]);
 
-        match self.config.recent_window {
-            None => {
-                self.compress_into_cold(keys, values, layout, seq_len)?;
-                self.offset = self.cold_offset + self.warm_len() + self.hot_offset;
-                Ok(())
-            }
-            Some(window) => self.append_with_recent_window(keys, values, layout, seq_len, window),
-        }
-    }
-
-    /// Compress and accumulate `keys`/`values` (shape `[B, H, S, D]`) directly
-    /// into the cold stores, advancing `self.cold_offset` by `seq_len`.
-    /// Mirrors the legacy compress-immediately path.
-    fn compress_into_cold(
-        &mut self,
-        keys: &InlineArray,
-        values: &InlineArray,
-        layout: CacheLayout,
-        seq_len: usize,
-    ) -> Result<(), String> {
-        let config = self.config;
-        let state = self.state.get_or_insert_with(|| {
-            Arc::new(TurboQuantState::new(
-                layout.key_dim,
-                layout.value_dim,
-                config,
-            ))
-        });
-        let state = Arc::clone(state);
-
-        // Cast to f32 once — needed for both GPU and CPU paths.
-        let keys_f32 = keys.as_dtype(10 /* float32 */);
-        let values_f32 = values.as_dtype(10 /* float32 */);
-
-        let ks = self.keys.get_or_insert_with(|| {
-            // Phase E (per-block outliers): when outliers are configured,
-            // the host encode path stores the top-K per-row override
-            // alongside the regular sub-vector. Resolve the K from the
-            // active mode + key_dim — same gate as the encode path.
-            let outlier_k = match config.outliers {
-                super::TurboQuantOutlierMode::None => 0,
-                super::TurboQuantOutlierMode::PerBlock { k } => {
-                    let k = usize::from(k);
-                    if k == 0 || k > layout.key_dim { 0 } else { k }
-                }
-            };
-            QuantizedKeyStore::new_with_outliers(config.keys, config.qjl, outlier_k)
-        });
-        let vs = self
-            .values
-            .get_or_insert_with(|| QuantizedValueStore::new(config.values));
-
-        // ── GPU path (Uniform only) ───────────────────────────────────────
-        let gpu_keys_ok = matches!(config.keys, TurboQuantTensorConfig::Uniform { .. });
-        let gpu_vals_ok = matches!(config.values, TurboQuantTensorConfig::Uniform { .. });
-
-        if gpu_keys_ok && gpu_vals_ok {
-            if let Some((new_ks_gpu, new_vs_gpu)) =
-                gpu_quantize_kv(&state, &keys_f32, &values_f32, config)
-            {
-                match ks.gpu.as_mut() {
-                    None => ks.gpu = Some(new_ks_gpu),
-                    Some(g) => g.append(new_ks_gpu),
-                }
-                match vs.gpu.as_mut() {
-                    None => vs.gpu = Some(new_vs_gpu),
-                    Some(g) => g.append(new_vs_gpu),
-                }
-                self.cold_offset += seq_len;
-                return Ok(());
-            }
-            // GPU path failed — fall through to CPU. The CPU encode path
-            // now mirrors the Phase E.3 override (extract top-K, zero body
-            // pre-quant, scatter exact f32 values back into the rotated
-            // reconstruction so the residual at outlier channels is 0 and
-            // decode-time reconstruction restores them). PerBlock outliers
-            // are still gated to Uniform configs only — Mixed (per-channel
-            // outlier sub-vector) configs would need the per-block search
-            // to skip the mixed-outlier channels, which isn't wired yet.
-            if config.outliers.is_enabled()
-                && !matches!(config.keys, TurboQuantTensorConfig::Uniform { .. })
-            {
-                return Err("TurboQuant per-block outliers (PerBlock) on a Mixed \
-                     keys config are not yet supported — disable outliers, \
-                     switch to Uniform keys, or use a GPU-encoded config."
-                    .to_string());
-            }
-        }
-
-        // ── CPU fallback path ─────────────────────────────────────────────
-        let key_rows = inline_array_to_bshd_rows(&keys_f32)?;
-        let value_rows = inline_array_to_bshd_rows(&values_f32)?;
-
-        let rows_per_seq = layout.batch * layout.heads;
-        debug_assert_eq!(key_rows.len(), rows_per_seq * seq_len * layout.key_dim);
-
-        let encoded_keys = encode_key_rows(
-            &state.keys,
-            layout.key_dim,
-            &key_rows,
-            state.qjl,
-            config.outliers,
-        );
-        let encoded_values = encode_value_rows(&state.values, layout.value_dim, &value_rows);
-
-        ks.extend(
-            &encoded_keys.regular,
-            encoded_keys.outlier.as_ref(),
-            encoded_keys.outlier_mask.as_ref(),
-        );
-        vs.extend(
-            &encoded_values.regular,
-            encoded_values.outlier.as_ref(),
-            encoded_values.outlier_mask.as_ref(),
-        );
-
-        // ── Mixed GPU path ────────────────────────────────────────────────
-        // Mirrors the Uniform GPU path above but populates gpu_mixed instead
-        // of gpu, alongside (not in lieu of) the CPU PackedBits stores. The
-        // CPU stores remain the authoritative source for the score kernel
-        // (which still reads PackedBits); the GPU store is consumed by the
-        // cold dequantize path so reconstruction never re-uploads via CPU.
-        let mixed_keys = matches!(config.keys, TurboQuantTensorConfig::Mixed { .. });
-        let mixed_vals = matches!(config.values, TurboQuantTensorConfig::Mixed { .. });
-        if mixed_keys && mixed_vals {
-            if let Some((new_ks_gpu, new_vs_gpu)) =
-                gpu_quantize_kv_mixed(&state, &keys_f32, &values_f32, config)
-            {
-                match ks.gpu_mixed.as_mut() {
-                    None => ks.gpu_mixed = Some(new_ks_gpu),
-                    Some(g) => g.append(new_ks_gpu),
-                }
-                match vs.gpu_mixed.as_mut() {
-                    None => vs.gpu_mixed = Some(new_vs_gpu),
-                    Some(g) => g.append(new_vs_gpu),
-                }
-            }
-        }
-
-        self.cold_offset += seq_len;
-        Ok(())
-    }
-
-    /// Append into the hot fp16/bf16 ring, evicting oldest tokens to the cold
-    /// stores once the ring exceeds `window + HOT_EVICTION_CHUNK`.
-    fn append_with_recent_window(
-        &mut self,
-        keys: &InlineArray,
-        values: &InlineArray,
-        layout: CacheLayout,
-        seq_len: usize,
-        window: usize,
-    ) -> Result<(), String> {
-        // Lock in the hot dtype on first append. All subsequent writes go
-        // through `as_dtype` so the ring always carries a single dtype.
-        if self.hot_dtype.is_none() {
-            self.hot_dtype = Some(keys.dtype_raw());
-        }
-        let hot_dtype = self.hot_dtype.unwrap();
-        let base_capacity = self.hot_capacity().max(seq_len).max(1);
-
-        // If the steady-state ring is full, evict before writing. This keeps
-        // decode from growing the hot buffer just to spill immediately.
-        if let Some(hot_keys) = self.hot_keys.as_ref() {
-            let capacity = hot_keys.dim(2) as usize;
-            if self.hot_offset + seq_len > capacity && self.hot_offset > window {
-                let overflow = self.hot_offset + seq_len - capacity;
-                let evict_seq = self
-                    .hot_offset
-                    .saturating_sub(window)
-                    .max(overflow)
-                    .min(self.hot_offset);
-                self.evict_oldest_to_cold(layout, evict_seq)?;
-            }
-        }
-
-        // Lazy-allocate (or grow) the hot ring.
-        if self.hot_keys.is_none() {
-            self.hot_start = 0;
-            self.hot_keys = Some(InlineArray::zeros(
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    base_capacity as i32,
-                    layout.key_dim as i32,
-                ],
-                hot_dtype,
-            ));
-            self.hot_values = Some(InlineArray::zeros(
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    base_capacity as i32,
-                    layout.value_dim as i32,
-                ],
-                hot_dtype,
-            ));
-        } else if self.hot_offset + seq_len > self.hot_keys.as_ref().unwrap().dim(2) as usize {
-            // One-shot prefill larger than the current ring — grow to fit.
-            let need = self.hot_offset + seq_len;
-            let new_cap = need.max(base_capacity);
-            let prev_keys = self.hot_keys.take().unwrap();
-            let prev_values = self.hot_values.take().unwrap();
-            let mut new_keys = InlineArray::zeros(
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    new_cap as i32,
-                    layout.key_dim as i32,
-                ],
-                hot_dtype,
-            );
-            let mut new_values = InlineArray::zeros(
-                &[
-                    layout.batch as i32,
-                    layout.heads as i32,
-                    new_cap as i32,
-                    layout.value_dim as i32,
-                ],
-                hot_dtype,
-            );
-            if self.hot_offset > 0 {
-                let kept_keys = Self::active_hot_slice(
-                    &prev_keys,
-                    layout,
-                    self.hot_start,
-                    self.hot_offset,
-                    layout.key_dim,
-                )
-                .ok_or_else(|| "TurboQuant hot keys invalid during grow".to_string())?;
-                let kept_values = Self::active_hot_slice(
-                    &prev_values,
-                    layout,
-                    self.hot_start,
-                    self.hot_offset,
-                    layout.value_dim,
-                )
-                .ok_or_else(|| "TurboQuant hot values invalid during grow".to_string())?;
-                new_keys = new_keys.slice_set(
-                    &kept_keys,
-                    &[0, 0, 0, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.key_dim as i32,
-                    ],
-                );
-                new_values = new_values.slice_set(
-                    &kept_values,
-                    &[0, 0, 0, 0],
-                    &[
-                        layout.batch as i32,
-                        layout.heads as i32,
-                        self.hot_offset as i32,
-                        layout.value_dim as i32,
-                    ],
-                );
-            }
-            self.hot_start = 0;
-            self.hot_keys = Some(new_keys);
-            self.hot_values = Some(new_values);
-        }
-
-        // Write the new chunk at the logical tail of the ring.
-        let capacity = self
-            .hot_keys
-            .as_ref()
-            .expect("hot_keys allocated above")
-            .dim(2) as usize;
-        let write_start = (self.hot_start + self.hot_offset) % capacity;
-        let keys_typed = keys.as_dtype(hot_dtype);
-        let values_typed = values.as_dtype(hot_dtype);
-        {
-            let hot_keys = self.hot_keys.as_mut().expect("hot_keys allocated above");
-            Self::write_hot_chunk(
-                hot_keys,
-                &keys_typed,
-                layout,
-                write_start,
-                seq_len,
-                layout.key_dim,
-            );
-        }
-        {
-            let hot_values = self
-                .hot_values
-                .as_mut()
-                .expect("hot_values allocated above");
-            Self::write_hot_chunk(
-                hot_values,
-                &values_typed,
-                layout,
-                write_start,
-                seq_len,
-                layout.value_dim,
-            );
-        }
-        self.hot_offset += seq_len;
-        self.offset = self.cold_offset + self.warm_len() + self.hot_offset;
-
-        // Drain the oldest tokens once the ring fills past `window + chunk`.
-        // Eviction is amortized: each call moves `min(overflow, chunk)` tokens
-        // instead of one-token-at-a-time shuffles.
-        while self.hot_offset > window + HOT_EVICTION_CHUNK {
-            let evict_seq = self
-                .hot_offset
-                .saturating_sub(window)
-                .min(HOT_EVICTION_CHUNK);
-            self.evict_oldest_to_cold(layout, evict_seq)?;
-        }
-        Ok(())
-    }
-
-    /// Move the leading `evict_seq` logical tokens out of the hot ring into cold.
-    /// Caller must guarantee `evict_seq <= self.hot_offset`.
-    fn evict_oldest_to_cold(
-        &mut self,
-        layout: CacheLayout,
-        evict_seq: usize,
-    ) -> Result<(), String> {
-        if evict_seq == 0 {
-            return Ok(());
-        }
-        let remain = self.hot_offset - evict_seq;
-        let capacity = self
-            .hot_keys
-            .as_ref()
-            .ok_or_else(|| "TurboQuant hot keys missing during evict".to_string())?
-            .dim(2) as usize;
-
-        // Phase 1: extract the leading logical slice we want to compress into
-        // owned values. The immutable
-        // borrows of `hot_keys`/`hot_values` are dropped at the end of this
-        // block before any `&mut self` call below.
-        let (evict_keys, evict_values) = {
-            let hot_keys = self
-                .hot_keys
+        let (sink_room, ring_capacity, ring_len, window) = {
+            let dense = self
+                .dense
                 .as_ref()
-                .ok_or_else(|| "TurboQuant hot keys missing during evict".to_string())?;
-            let hot_values = self
-                .hot_values
-                .as_ref()
-                .ok_or_else(|| "TurboQuant hot values missing during evict".to_string())?;
-            let evict_keys =
-                Self::active_hot_slice(hot_keys, layout, self.hot_start, evict_seq, layout.key_dim)
-                    .ok_or_else(|| "TurboQuant hot keys invalid during evict".to_string())?;
-            let evict_values = Self::active_hot_slice(
-                hot_values,
-                layout,
-                self.hot_start,
-                evict_seq,
-                layout.value_dim,
+                .expect("dense store exists after layout");
+            (
+                dense.sink_room(),
+                dense.ring_capacity,
+                dense.ring_len,
+                self.config.recent_window,
             )
-            .ok_or_else(|| "TurboQuant hot values invalid during evict".to_string())?;
-            (evict_keys, evict_values)
         };
-
-        // Phase 2: mutate. The borrows above are dropped.
-        // Phase H: when a warm tier is configured, hot evictions feed the
-        // warm sub-cache instead of going straight to cold. The warm
-        // sub-cache itself has `recent_window: None`, so its `append` runs
-        // straight through `compress_into_cold` at warm precision. Once the
-        // warm sub-cache holds more than `warm_window` slots, dequantise
-        // its full contents and re-quantise into the outer cold store at
-        // cold precision (`config.keys`/`config.values`), then reset warm.
-        // Result: oldest=cold, mid=warm, newest=hot — true 3-tier ordering.
-        if self.warm.is_some() {
-            // Tier-1 ingest: warm sub-cache (no nested hot ring).
-            self.warm
-                .as_mut()
-                .expect("warm checked Some")
-                .append(&evict_keys, &evict_values)?;
-
-            // Tier-2 migration on overflow.
-            let warm_window = self
-                .config
-                .warm_tier
-                .expect("warm_tier mirrors warm.is_some")
-                .window;
-            let warm_offset = self.warm.as_ref().expect("warm Some").offset;
-            if warm_offset > warm_window {
-                let warm_keys_full = self
-                    .warm
-                    .as_ref()
-                    .expect("warm Some")
-                    .dequantize_keys()
-                    .ok_or_else(|| {
-                        "TurboQuant warm tier: dequantize_keys returned None during \
-                         migration to cold"
-                            .to_string()
-                    })?;
-                let warm_values_full = self
-                    .warm
-                    .as_ref()
-                    .expect("warm Some")
-                    .dequantize_values()
-                    .ok_or_else(|| {
-                    "TurboQuant warm tier: dequantize_values returned None during \
-                         migration to cold"
-                        .to_string()
-                })?;
-                let warm_count = warm_offset;
-                self.warm.as_mut().expect("warm Some").reset();
-                self.compress_into_cold(&warm_keys_full, &warm_values_full, layout, warm_count)?;
+        let to_sink = seq.min(sink_room);
+        if to_sink > 0 {
+            let dense = self.dense.as_mut().expect("dense store");
+            dense.push(
+                &slice_tokens(&keys, layout, 0, to_sink, true),
+                &slice_tokens(&values, layout, 0, to_sink, false),
+                to_sink,
+            );
+        }
+        let rest = seq - to_sink;
+        if rest > 0 {
+            let rest_k = slice_tokens(&keys, layout, to_sink, seq, true);
+            let rest_v = slice_tokens(&values, layout, to_sink, seq, false);
+            match window {
+                None => self.compress(&rest_k, &rest_v, rest)?,
+                Some(window) => {
+                    if ring_len + rest > ring_capacity {
+                        if rest >= window {
+                            // The new tokens alone fill the window: everything
+                            // already in the ring goes cold, then all of the new
+                            // tokens but the last `window`.
+                            self.evict_ring(ring_len)?;
+                            let direct = rest - window;
+                            if direct > 0 {
+                                self.compress(
+                                    &slice_tokens(&rest_k, layout, 0, direct, true),
+                                    &slice_tokens(&rest_v, layout, 0, direct, false),
+                                    direct,
+                                )?;
+                            }
+                            self.push_ring(
+                                &slice_tokens(&rest_k, layout, direct, rest, true),
+                                &slice_tokens(&rest_v, layout, direct, rest, false),
+                                window,
+                            );
+                        } else {
+                            self.evict_ring(ring_len + rest - window)?;
+                            self.push_ring(&rest_k, &rest_v, rest);
+                        }
+                    } else {
+                        self.push_ring(&rest_k, &rest_v, rest);
+                    }
+                }
             }
-        } else {
-            self.compress_into_cold(&evict_keys, &evict_values, layout, evict_seq)?;
         }
-        if remain > 0 {
-            self.hot_start = (self.hot_start + evict_seq) % capacity;
-        } else {
-            // Hot ring fully drained — drop the buffers until the next append.
-            self.hot_keys = None;
-            self.hot_values = None;
-            self.hot_start = 0;
-        }
-        self.hot_offset = remain;
-        self.offset = self.cold_offset + self.warm_len() + self.hot_offset;
+        self.offset += seq;
         Ok(())
     }
 
-    /// Dequantise and return all cached keys as an `InlineArray` of shape
-    /// `[B, H, T, D]` (f32). The returned tensor includes both the compressed
-    /// cold history and the uncompressed hot tail (the latter cast to f32).
-    ///
-    /// Uses the GPU path when keys were quantised on-GPU; otherwise falls back
-    /// to the CPU decode path.
-    pub fn dequantize_keys(&self) -> Option<InlineArray> {
-        let layout = self.layout?;
-
-        let cold = if self.cold_offset > 0 {
-            let ks = self.keys.as_ref()?;
-            let state = self.state.as_ref()?;
-            if let Some(ref g) = ks.gpu {
-                let TurboQuantTensorConfig::Uniform { bits } = self.config.keys else {
-                    unreachable!("Uniform GpuKeyStore only exists for Uniform config")
-                };
-                Some(gpu_dequantize_keys(g, &state.keys, bits, state.qjl)?)
-            } else if let Some(ref g) = ks.gpu_mixed {
-                // Phase 3c: GPU-side Mixed dequantize avoids the CPU→GPU
-                // upload that dominated the dequantize+SDPA fallback. The
-                // result is `[B, H, T, D]` f32 already on device, ready for
-                // SDPA. Parity is gated by the round-trip test (see
-                // `turboquant_gpu_mixed_storage_round_trip_matches_cpu_dequantize`).
-                Some(gpu_dequantize_keys_mixed(g, &state.keys, &self.config)?)
-            } else {
-                let rows = decode_key_rows(&state.keys, layout.key_dim, ks, state.qjl);
-                Some(f32_rows_to_bhsd_array(
-                    &rows,
-                    layout.batch,
-                    layout.heads,
-                    self.cold_offset,
-                    layout.key_dim,
-                ))
-            }
-        } else {
-            None
-        };
-
-        // Phase H: warm sub-cache between cold and hot. Cast to f32 so the
-        // dtype matches the cold path. The warm tier's own dequantize runs
-        // its (cold + hot) merge — but because we configure warm with
-        // `recent_window: None`, its hot is always empty, so the result is
-        // just the warm-encoded slots.
-        let warm = self.warm.as_ref().and_then(|w| w.dequantize_keys());
-
-        let hot = if self.hot_offset > 0 {
-            let hot_keys = self.hot_keys.as_ref()?;
-            let active = Self::active_hot_slice(
-                hot_keys,
-                layout,
-                self.hot_start,
-                self.hot_offset,
-                layout.key_dim,
-            )?;
-            // Cold is f32; cast hot to f32 so concat dtypes match.
-            Some(active.as_dtype(10))
-        } else {
-            None
-        };
-
-        // Temporal order: cold (oldest) → warm (mid) → hot (newest).
-        let mut combined = match (cold, warm, hot) {
-            (Some(c), Some(w), Some(h)) => c.concatenate_2(&w, 2).concatenate_2(&h, 2),
-            (Some(c), Some(w), None) => c.concatenate_2(&w, 2),
-            (Some(c), None, Some(h)) => c.concatenate_2(&h, 2),
-            (None, Some(w), Some(h)) => w.concatenate_2(&h, 2),
-            (Some(c), None, None) => c,
-            (None, Some(w), None) => w,
-            (None, None, Some(h)) => h,
-            (None, None, None) => return None,
-        };
-        let mut to_eval = vec![&mut combined];
-        crate::inline_array::eval_and_detach_many(&mut to_eval);
-        Some(combined)
+    fn push_ring(&mut self, keys: &InlineArray, values: &InlineArray, n: usize) {
+        self.dense
+            .as_mut()
+            .expect("dense store")
+            .push(keys, values, n);
     }
 
-    /// Dequantise and return all cached values as an `InlineArray` of shape
-    /// `[B, H, T, D]` (f32). Includes both compressed cold history and the
-    /// uncompressed hot tail (cast to f32).
-    pub fn dequantize_values(&self) -> Option<InlineArray> {
-        let layout = self.layout?;
-
-        let cold = if self.cold_offset > 0 {
-            let vs = self.values.as_ref()?;
-            let state = self.state.as_ref()?;
-            if let Some(ref g) = vs.gpu {
-                let TurboQuantTensorConfig::Uniform { bits } = self.config.values else {
-                    unreachable!("Uniform GpuValueStore only exists for Uniform config")
-                };
-                Some(gpu_dequantize_values(g, &state.values, bits)?)
-            } else if let Some(ref g) = vs.gpu_mixed {
-                // Phase 3c: see `dequantize_keys` for the rationale.
-                Some(gpu_dequantize_values_mixed(g, &state.values, &self.config)?)
-            } else {
-                let rows = decode_value_rows(&state.values, layout.value_dim, vs);
-                Some(f32_rows_to_bhsd_array(
-                    &rows,
-                    layout.batch,
-                    layout.heads,
-                    self.cold_offset,
-                    layout.value_dim,
-                ))
-            }
-        } else {
-            None
-        };
-
-        // Phase H: warm sub-cache between cold and hot.
-        let warm = self.warm.as_ref().and_then(|w| w.dequantize_values());
-
-        let hot = if self.hot_offset > 0 {
-            let hot_values = self.hot_values.as_ref()?;
-            let active = Self::active_hot_slice(
-                hot_values,
-                layout,
-                self.hot_start,
-                self.hot_offset,
-                layout.value_dim,
-            )?;
-            Some(active.as_dtype(10))
-        } else {
-            None
-        };
-
-        let mut combined = match (cold, warm, hot) {
-            (Some(c), Some(w), Some(h)) => c.concatenate_2(&w, 2).concatenate_2(&h, 2),
-            (Some(c), Some(w), None) => c.concatenate_2(&w, 2),
-            (Some(c), None, Some(h)) => c.concatenate_2(&h, 2),
-            (None, Some(w), Some(h)) => w.concatenate_2(&h, 2),
-            (Some(c), None, None) => c,
-            (None, Some(w), None) => w,
-            (None, None, Some(h)) => h,
-            (None, None, None) => return None,
-        };
-        let mut to_eval = vec![&mut combined];
-        crate::inline_array::eval_and_detach_many(&mut to_eval);
-        Some(combined)
+    /// Move the `n` oldest recent tokens into the cold store.
+    fn evict_ring(&mut self, n: usize) -> Result<(), String> {
+        if n == 0 {
+            return Ok(());
+        }
+        let (keys, values) = self.dense.as_mut().expect("dense store").evict(n);
+        self.compress(&keys, &values, n)
     }
 
-    /// Evaluate and detach GPU-resident cache arrays to keep graph chains short.
-    pub fn eval_and_detach_gpu_state(&mut self) {
-        let mut to_eval = Vec::new();
-        if let Some(keys) = &mut self.keys {
-            if let Some(gpu) = &mut keys.gpu {
-                gpu.collect_for_detach(&mut to_eval);
-            }
-            if let Some(gpu) = &mut keys.gpu_mixed {
-                gpu.collect_for_detach(&mut to_eval);
-            }
-        }
-        if let Some(values) = &mut self.values {
-            if let Some(gpu) = &mut values.gpu {
-                gpu.collect_for_detach(&mut to_eval);
-            }
-            if let Some(gpu) = &mut values.gpu_mixed {
-                gpu.collect_for_detach(&mut to_eval);
-            }
-        }
-        if let Some(hot) = self.hot_keys.as_mut() {
-            to_eval.push(hot);
-        }
-        if let Some(hot) = self.hot_values.as_mut() {
-            to_eval.push(hot);
-        }
-        if !to_eval.is_empty() {
-            crate::inline_array::eval_and_detach_many(&mut to_eval);
-        }
+    /// Quantize `n` tokens (`[KV, n, D]` and `[KV, n, Dv]`) onto the cold store.
+    fn compress(
+        &mut self,
+        keys: &InlineArray,
+        values: &InlineArray,
+        n: usize,
+    ) -> Result<(), String> {
+        let layout = self.layout.expect("layout");
+        let state = Arc::clone(self.state.as_ref().expect("state"));
+        let rows = (layout.kv_rows() * n) as i32;
+        let k = state
+            .keys
+            .encode(&keys.reshape(&[rows, layout.dim as i32]))?;
+        let v = state
+            .values
+            .encode(&values.reshape(&[rows, layout.value_dim as i32]))?;
+        self.cold
+            .as_mut()
+            .expect("cold store")
+            .append(&state.keys, &state.values, &k, &v, n);
+        Ok(())
     }
 
-    /// Append a single-token KV chunk and compute attention output.
-    ///
-    /// Dispatch:
-    /// - **Hot-only** (`cold_offset == 0`, common for short prompts when the
-    ///   recent fp16 window is enabled): run standard SDPA against the active
-    ///   prefix of the hot ring. No quantization round-trip on the decode path.
-    /// - **Cold-only** (`hot_offset == 0`, recent window disabled or fully
-    ///   evicted): try the optimized GPU TurboQuant attention kernels.
-    /// - **Mixed**: dequantize the cold cache, concat with the active hot
-    ///   suffix, run standard SDPA. Correctness-first; a future v2 may
-    ///   score hot directly + cold compressedly in one kernel.
+    /// Append one token and return the attention output of `queries` over the
+    /// whole cache, `[B, Hq, 1, Dv]`. `keys` and `values` are `[B, H, 1, D]`.
     pub fn append_and_compute_attention(
         &mut self,
         queries: &InlineArray,
@@ -966,1845 +368,139 @@ impl QuantizedKvCache {
         values: &InlineArray,
         scale: f32,
     ) -> Result<InlineArray, String> {
-        if queries.ndim() != 4
-            || keys.ndim() != 4
-            || values.ndim() != 4
-            || queries.dim(2) != 1
-            || keys.dim(2) != 1
-            || values.dim(2) != 1
-        {
+        if keys.ndim() != 4 || keys.dim(2) != 1 || values.dim(2) != 1 || queries.dim(2) != 1 {
             return Err(
                 "TurboQuant direct attention requires [B, H, 1, D] single-token decode inputs"
                     .to_string(),
             );
         }
-
-        let layout = self.ensure_layout(keys, values)?;
         self.append(keys, values)?;
-        let query_dtype = queries.dtype_raw();
-        let queries_f32 = if query_dtype == 10 {
-            queries.clone()
-        } else {
-            queries.as_dtype(10)
-        };
-
-        // Hot-only: standard fused SDPA against the fp16/bf16 hot ring.
-        // Skips both the GPU TurboQuant kernels and any dequantize allocation.
-        if self.cold_offset == 0 && self.hot_offset > 0 {
-            let hot_keys = self
-                .hot_keys
-                .as_ref()
-                .ok_or_else(|| "TurboQuant hot keys missing".to_string())?;
-            let hot_values = self
-                .hot_values
-                .as_ref()
-                .ok_or_else(|| "TurboQuant hot values missing".to_string())?;
-            let active_keys = Self::active_hot_slice(
-                hot_keys,
-                layout,
-                self.hot_start,
-                self.hot_offset,
-                layout.key_dim,
-            )
-            .ok_or_else(|| "TurboQuant hot keys invalid".to_string())?
-            .as_dtype(10);
-            let active_values = Self::active_hot_slice(
-                hot_values,
-                layout,
-                self.hot_start,
-                self.hot_offset,
-                layout.value_dim,
-            )
-            .ok_or_else(|| "TurboQuant hot values invalid".to_string())?
-            .as_dtype(10);
-
-            let q_heads = queries.dim(1) as usize;
-            let kv_heads = layout.heads;
-            let (keys_for_attn, values_for_attn) = if q_heads == kv_heads {
-                (active_keys, active_values)
-            } else {
-                let groups = q_heads / kv_heads;
-                if groups * kv_heads != q_heads {
-                    return Err(format!(
-                        "TurboQuant GQA mismatch: query heads {q_heads} not divisible by kv heads {kv_heads}"
-                    ));
-                }
-                (
-                    active_keys.repeat(groups as i32, 1),
-                    active_values.repeat(groups as i32, 1),
-                )
-            };
-            let output = crate::decode::try_sdpa_causal_like_mlx(
-                &queries_f32,
-                &keys_for_attn,
-                &values_for_attn,
-                scale,
-                queries.dim(2),
-            )
-            .map_err(|err| err.to_string())?;
-            return Ok(if query_dtype == 10 {
-                output
-            } else {
-                output.as_dtype(query_dtype)
-            });
-        }
-
-        // Phase F: Hamming skip-list pre-filter for very long contexts.
-        // Gated on `config.skiplist_threshold`; the encode path only allocates
-        // the sign-hash buffer when the threshold is set, so a missing buffer
-        // here means the user opted out and we fall through to the dense path.
-        // V1 supports cold-only Variant F (NoQjl) without GQA expansion;
-        // mixed/standard/GQA cases fall through to the existing dispatch.
-        if self.hot_offset == 0 {
-            if let Some(output) =
-                self.try_hamming_skiplist_attention(&queries_f32, layout, scale, query_dtype)
-            {
-                return Ok(if query_dtype == 10 || output.dtype_raw() == query_dtype {
-                    output
-                } else {
-                    output.as_dtype(query_dtype)
-                });
-            }
-        }
-
-        // Cold-only: optimized GPU TurboQuant kernels. The score-against-cold
-        // assumption inside `try_gpu_uniform_attention` is only correct when
-        // the hot ring is empty.
-        if self.hot_offset == 0 {
-            if let Some(output) =
-                self.try_gpu_uniform_attention(&queries_f32, layout, scale, query_dtype)
-            {
-                return Ok(if query_dtype == 10 || output.dtype_raw() == query_dtype {
-                    output
-                } else {
-                    output.as_dtype(query_dtype)
-                });
-            }
-        }
-
-        // Mixed (or cold-only fallback): dequantize the full cache (cold +
-        // hot tail) and run standard SDPA. dequantize_keys/values returns
-        // concat(cold_f32, hot_f32) automatically.
-        let full_keys = self
-            .dequantize_keys()
-            .ok_or_else(|| "TurboQuant failed to dequantize keys".to_string())?;
-        let full_values = self
-            .dequantize_values()
-            .ok_or_else(|| "TurboQuant failed to dequantize values".to_string())?;
-
-        let q_heads = queries.dim(1) as usize;
-        let kv_heads = layout.heads;
-        let (keys_for_attn, values_for_attn) = if q_heads == kv_heads {
-            (full_keys, full_values)
-        } else {
-            let groups = q_heads / kv_heads;
-            if groups * kv_heads != q_heads {
-                return Err(format!(
-                    "TurboQuant GQA mismatch: query heads {q_heads} not divisible by kv heads {kv_heads}"
-                ));
-            }
-            (
-                full_keys.repeat(groups as i32, 1),
-                full_values.repeat(groups as i32, 1),
-            )
-        };
-
-        let queries_f32 = queries.as_dtype(10);
-        let output = crate::decode::try_sdpa_causal_like_mlx(
-            &queries_f32,
-            &keys_for_attn,
-            &values_for_attn,
-            scale,
-            queries.dim(2),
-        )
-        .map_err(|err| err.to_string())?;
-        Ok(if queries.dtype_raw() == 10 {
-            output
-        } else {
-            output.as_dtype(queries.dtype_raw())
-        })
+        self.compute_attention(queries, scale, 0, None)
     }
 
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_attention_core_precomputed(
+    /// Attention of one query token per head, `queries` `[B, Hq, 1, D]`, over
+    /// the cached tokens at absolute positions `first_token..`, without
+    /// appending anything. `sink_logits` is one logit per query head that
+    /// joins the softmax normaliser without contributing a value.
+    pub fn compute_attention(
         &self,
-        query_rot: &InlineArray,
-        query_proj: &InlineArray,
-        q_heads: i32,
+        queries: &InlineArray,
         scale: f32,
-        mode: UniformAttentionBenchMode,
-    ) -> Option<InlineArray> {
-        let layout = self.layout?;
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let (value_core, value_bits) = match &state.values {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-
-        let key_dim = layout.key_dim as i32;
-        let value_dim = layout.value_dim as i32;
-        let kv_heads_i32 = layout.heads as i32;
-        let q_rows = query_rot.dim(0);
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        if q_rows <= 0 || n_seq <= 0 || cache_seq_capacity < n_seq || kv_heads_i32 <= 0 {
-            return None;
-        }
-
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        let key_norms = ks
-            .key_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_residual_norms = ks
-            .residual_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_slot_scale = ks
-            .key_slot_scale_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let qjl_words = ks.qjl_words();
-
-        match mode {
-            UniformAttentionBenchMode::SpecializedQ8D128TwoPass => {
-                if key_bits != 8
-                    || value_bits != 8
-                    || key_dim != 128
-                    || value_dim != 128
-                    || qjl_words != 4
-                {
-                    return None;
-                }
-                let key_indices =
-                    ks.indices_t_array()
-                        .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-                let key_qjl_signs =
-                    ks.qjl_signs_t_array()?
-                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
-                let value_indices =
-                    vs.indices_t_array()?
-                        .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
-                InlineArray::turboquant_attention_q8_d128_2pass(
-                    query_rot,
-                    query_proj,
-                    &key_indices,
-                    &key_qjl_signs,
-                    &key_norms,
-                    &key_residual_norms,
-                    &key_slot_scale,
-                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                    &value_indices,
-                    &vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
-                    value_core.codebook_arr(value_bits)?,
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                    scale,
-                )
-            }
-            UniformAttentionBenchMode::SpecializedQ8D256TwoPass => self
-                .try_gpu_uniform_attention_q8_d256_precomputed(
-                    query_rot,
-                    Some(query_proj),
-                    q_heads,
-                    scale,
-                ),
-            UniformAttentionBenchMode::SpecializedQ8D256FullbytePass1 => {
-                if key_bits != 8
-                    || value_bits != 8
-                    || key_dim != 256
-                    || value_dim != 256
-                    || n_seq < 1024
-                {
-                    return None;
-                }
-                if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
-                    ks.q8_fullbyte_seq.as_ref(),
-                    ks.q8_slot_scales_seq.as_ref(),
-                    vs.d256_rot_values_seq.as_ref(),
-                ) {
-                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
-                        query_rot,
-                        &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                        key_core.codebook_arr(key_bits)?,
-                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                        scale,
-                    )
-                } else {
-                    None
-                }
-            }
-            UniformAttentionBenchMode::SpecializedQ8D256FullbytePass2 => {
-                if key_bits != 8
-                    || value_bits != 8
-                    || key_dim != 256
-                    || value_dim != 256
-                    || n_seq < 1024
-                {
-                    return None;
-                }
-                let (partials, sums, maxs) = self
-                    .bench_gpu_uniform_attention_state_precomputed_fullbyte(
-                        query_rot, q_heads, scale,
-                    )?;
-                InlineArray::turboquant_attention_q8_d256_pass2_merge(
-                    &partials,
-                    &sums,
-                    &maxs,
-                    q_rows as u32,
-                    sums.dim(1) as u32,
-                )
-            }
-            UniformAttentionBenchMode::SpecializedQ8D256FullbyteSplitDenseV => {
-                if key_bits != 8
-                    || value_bits != 8
-                    || key_dim != 256
-                    || value_dim != 256
-                    || n_seq < 1024
-                {
-                    return None;
-                }
-                if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
-                    ks.q8_fullbyte_seq.as_ref(),
-                    ks.q8_slot_scales_seq.as_ref(),
-                    vs.d256_rot_values_seq.as_ref(),
-                ) {
-                    let scores = InlineArray::turboquant_score_q8_d256_fullbyte(
-                        query_rot,
-                        &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                        key_core.codebook_arr(key_bits)?,
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                        scale,
-                    )?;
-                    let weights = scores.softmax(-1);
-                    InlineArray::turboquant_weighted_sum_d256_dense_values(
-                        &weights,
-                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                    )
-                } else {
-                    None
-                }
-            }
-            UniformAttentionBenchMode::SpecializedQ8D256FullbyteLocalSoftmax => {
-                if key_bits != 8
-                    || value_bits != 8
-                    || key_dim != 256
-                    || value_dim != 256
-                    || n_seq < 1024
-                {
-                    return None;
-                }
-                if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
-                    ks.q8_fullbyte_seq.as_ref(),
-                    ks.q8_slot_scales_seq.as_ref(),
-                    vs.d256_rot_values_seq.as_ref(),
-                ) {
-                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
-                        query_rot,
-                        &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                        key_core.codebook_arr(key_bits)?,
-                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                        scale,
-                    )
-                } else {
-                    None
-                }
-            }
-            UniformAttentionBenchMode::Split => {
-                let scores = self
-                    .bench_gpu_uniform_scores_precomputed(query_rot, query_proj, q_heads, scale)?;
-                let weights = scores.softmax(-1);
-                InlineArray::turboquant_weighted_decode(
-                    &weights,
-                    &vs.indices_t_array()?,
-                    &vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
-                    value_core.codebook_arr(value_bits)?,
-                    value_dim as u32,
-                    1u32 << value_bits,
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                )
-            }
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_query_transforms(
-        &self,
-        queries_f32: &InlineArray,
-    ) -> Option<(InlineArray, InlineArray)> {
-        let state = self.state.as_ref()?;
-        let key_core = match &state.keys {
-            TensorRuntime::Uniform { core, .. } => core,
-            _ => return None,
-        };
-        let key_rot = key_core.inverse_rotation_arr.as_ref()?;
-        let key_proj = key_core.inverse_qjl_arr.as_ref()?;
-        let batch = queries_f32.dim(0);
-        let q_heads = queries_f32.dim(1);
-        let key_dim = queries_f32.dim(3);
-        let q_rows = batch * q_heads;
-        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        Some((query_rows.matmul(key_rot), query_rows.matmul(key_proj)))
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_query_transforms_wht(
-        &self,
-        queries_f32: &InlineArray,
-    ) -> Option<(InlineArray, InlineArray)> {
-        let state = self.state.as_ref()?;
-        let key_core = match &state.keys {
-            TensorRuntime::Uniform { core, .. } => core,
-            _ => return None,
-        };
-        let batch = queries_f32.dim(0);
-        let q_heads = queries_f32.dim(1);
-        let key_dim = queries_f32.dim(3);
-        if key_dim != 256 {
-            return None;
-        }
-        let q_rows = batch * q_heads;
-        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        Some((
-            key_core.rotate_rows_wht(&query_rows)?,
-            key_core.project_rows_wht(&query_rows)?,
-        ))
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_output_inverse_rotate_wht(
-        &self,
-        decoded_rot: &InlineArray,
-    ) -> Option<InlineArray> {
-        let state = self.state.as_ref()?;
-        let value_core = match &state.values {
-            TensorRuntime::Uniform { core, .. } => core,
-            _ => return None,
-        };
-        let dim = decoded_rot.dim(1);
-        if dim != 256 {
-            return None;
-        }
-        value_core.inverse_rotate_rows_wht(decoded_rot)
-    }
-    fn try_gpu_uniform_attention_q8_d256_precomputed(
-        &self,
-        query_rot: &InlineArray,
-        query_proj: Option<&InlineArray>,
-        q_heads: i32,
-        scale: f32,
-    ) -> Option<InlineArray> {
-        let layout = self.layout?;
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let (value_core, value_bits) = match &state.values {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-
-        let key_dim = layout.key_dim as i32;
-        let value_dim = layout.value_dim as i32;
-        let q_rows = query_rot.dim(0);
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        if key_bits != 8
-            || value_bits != 8
-            || key_dim != 256
-            || value_dim != 256
-            || n_seq < 1024
-            || q_rows <= 0
-            || q_heads <= 0
-            || (q_heads % layout.heads as i32) != 0
-            || (q_heads / layout.heads as i32) > 8
-            || cache_seq_capacity < n_seq
-        {
-            return None;
-        }
-
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
-            ks.q8_fullbyte_seq.as_ref(),
-            ks.q8_slot_scales_seq.as_ref(),
-            vs.d256_rot_values_seq.as_ref(),
-        ) {
-            InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
-                query_rot,
-                &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                key_core.codebook_arr(key_bits)?,
-                &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )
-        } else {
-            let qjl_words = ks.qjl_words();
-            if qjl_words != 8 {
-                return None;
-            }
-            let query_proj = query_proj?;
-            if let (Some(key_bytes), Some(slot_scales), Some(value_rot_dense)) = (
-                ks.q8_keybytes_seq.as_ref(),
-                ks.q8_slot_scales_seq.as_ref(),
-                vs.d256_rot_values_seq.as_ref(),
-            ) {
-                InlineArray::turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
-                    query_rot,
-                    query_proj,
-                    &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                    &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                    scale,
-                )
-            } else if let (Some(kv_bytes), Some(slot_scales)) =
-                (ks.q8_kvbytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
-            {
-                if let Some(value_rot_dense) = vs.d256_rot_values_seq.as_ref() {
-                    InlineArray::turboquant_attention_q8_d256_packed_kv_dense_values_2pass(
-                        query_rot,
-                        query_proj,
-                        &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                        key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                        scale,
-                    )
-                } else {
-                    InlineArray::turboquant_attention_q8_d256_packed_kv_2pass(
-                        query_rot,
-                        query_proj,
-                        &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                        key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                        value_core.codebook_arr(value_bits)?,
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                        scale,
-                    )
-                }
-            } else if let (Some(key_bytes), Some(slot_scales)) =
-                (ks.q8_keybytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
-            {
-                InlineArray::turboquant_attention_q8_d256_packed_keys_2pass(
-                    query_rot,
-                    query_proj,
-                    &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                    &vs.indices
-                        .as_ref()?
-                        .reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                    value_core.codebook_arr(value_bits)?,
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                    scale,
-                )
-            } else {
-                InlineArray::turboquant_attention_q8_d256_2pass(
-                    query_rot,
-                    query_proj,
-                    &ks.indices_t_array()
-                        .reshape(&[kv_rows, key_dim, cache_seq_capacity]),
-                    &ks.qjl_signs_t_array()?
-                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]),
-                    &ks.key_norms_array()?
-                        .reshape(&[kv_rows, cache_seq_capacity]),
-                    &ks.residual_norms_array()?
-                        .reshape(&[kv_rows, cache_seq_capacity]),
-                    &ks.key_slot_scale_array()?
-                        .reshape(&[kv_rows, cache_seq_capacity]),
-                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                    &vs.indices_t_array()?
-                        .reshape(&[kv_rows, value_dim, cache_seq_capacity]),
-                    &vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
-                    value_core.codebook_arr(value_bits)?,
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                    scale,
-                )
-            }
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_scores_precomputed(
-        &self,
-        query_rot: &InlineArray,
-        query_proj: &InlineArray,
-        q_heads: i32,
-        scale: f32,
-    ) -> Option<InlineArray> {
-        let layout = self.layout?;
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let key_dim = layout.key_dim as i32;
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        let q_rows = query_rot.dim(0);
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        let qjl_words = ks.qjl_words();
-        let key_norms = ks
-            .key_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_residual_norms = ks
-            .residual_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_slot_scale = ks
-            .key_slot_scale_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        if key_bits == 8
-            && key_dim == 256
-            && qjl_words == 8
-            && q_heads > 0
-            && (q_heads % layout.heads as i32) == 0
-            && (q_heads / layout.heads as i32) <= 8
-        {
-            if let Some(scores) = InlineArray::turboquant_score_q8_d256(
-                query_rot,
-                query_proj,
-                &ks.indices_t_array(),
-                &ks.qjl_signs_t_array()?,
-                &key_norms,
-                &key_residual_norms,
-                &key_slot_scale,
-                key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            ) {
-                return Some(scores);
-            }
-        }
-        InlineArray::turboquant_score(
-            query_rot,
-            query_proj,
-            &ks.indices_t_array(),
-            &ks.qjl_signs_t_array()?,
-            &key_norms,
-            &key_residual_norms,
-            &key_slot_scale,
-            key_core.codebook_arr(key_bits.saturating_sub(1))?,
-            key_dim as u32,
-            qjl_words as u32,
-            key_core.codebook_arr(key_bits.saturating_sub(1))?.dim(0) as u32,
-            q_rows as u32,
-            n_seq as u32,
-            cache_seq_capacity as u32,
-            q_heads as u32,
-            layout.heads as u32,
-            scale,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_scores_precomputed_fullbyte(
-        &self,
-        query_rot: &InlineArray,
-        q_heads: i32,
-        scale: f32,
-    ) -> Option<InlineArray> {
-        let layout = self.layout?;
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let key_dim = layout.key_dim as i32;
-        let q_rows = query_rot.dim(0);
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        if key_bits != 8
-            || key_dim != 256
-            || q_heads <= 0
-            || q_rows <= 0
-            || n_seq <= 0
-            || cache_seq_capacity < n_seq
-        {
-            return None;
-        }
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        if let (Some(key_indices), Some(slot_scales)) =
-            (ks.q8_fullbyte_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
-        {
-            InlineArray::turboquant_score_q8_d256_fullbyte(
-                query_rot,
-                &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                key_core.codebook_arr(key_bits)?,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )
-        } else {
-            None
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_attention_state_precomputed_fullbyte(
-        &self,
-        query_rot: &InlineArray,
-        q_heads: i32,
-        scale: f32,
-    ) -> Option<(InlineArray, InlineArray, InlineArray)> {
-        let layout = self.layout?;
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let key_dim = layout.key_dim as i32;
-        let value_dim = layout.value_dim as i32;
-        let q_rows = query_rot.dim(0);
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        if key_bits != 8
-            || key_dim != 256
-            || value_dim != 256
-            || q_heads <= 0
-            || q_rows <= 0
-            || n_seq < 1024
-            || cache_seq_capacity < n_seq
-        {
-            return None;
-        }
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        if let (Some(key_indices), Some(slot_scales), Some(value_rot_dense)) = (
-            ks.q8_fullbyte_seq.as_ref(),
-            ks.q8_slot_scales_seq.as_ref(),
-            vs.d256_rot_values_seq.as_ref(),
-        ) {
-            InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
-                query_rot,
-                &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
-                key_core.codebook_arr(key_bits)?,
-                &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )
-        } else {
-            None
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_weighted_decode(
-        &self,
-        weights: &InlineArray,
-        q_heads: i32,
-    ) -> Option<InlineArray> {
-        let layout = self.layout?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-        let (value_core, value_bits) = match &state.values {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let value_dim = layout.value_dim as i32;
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        let q_rows = weights.dim(0);
-        let n_seq = self.cold_offset as i32;
-        let indices_t = vs.indices_t_array()?;
-        InlineArray::turboquant_weighted_decode(
-            weights,
-            &indices_t,
-            &vs.norms_array()?.reshape(&[kv_rows, indices_t.dim(3)]),
-            value_core.codebook_arr(value_bits)?,
-            value_dim as u32,
-            1u32 << value_bits,
-            q_rows as u32,
-            n_seq as u32,
-            indices_t.dim(3) as u32,
-            q_heads as u32,
-            layout.heads as u32,
-        )
-    }
-
-    #[doc(hidden)]
-    pub fn bench_gpu_uniform_weighted_sum_dense_values(
-        &self,
-        weights: &InlineArray,
-        q_heads: i32,
-    ) -> Option<InlineArray> {
-        let layout = self.layout?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let value_dim = layout.value_dim as i32;
-        let q_rows = weights.dim(0);
-        let n_seq = self.cold_offset as i32;
-        let value_rot_dense = vs.d256_rot_values_seq.as_ref()?;
-        let cache_seq_capacity = value_rot_dense.dim(2);
-        if value_dim != 256 || q_rows <= 0 || n_seq <= 0 || cache_seq_capacity < n_seq {
-            return None;
-        }
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        InlineArray::turboquant_weighted_sum_d256_dense_values(
-            weights,
-            &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
-            q_rows as u32,
-            n_seq as u32,
-            cache_seq_capacity as u32,
-            q_heads as u32,
-            layout.heads as u32,
-        )
-    }
-
-    /// Variant F (NoQjl) fast path. Mirrors `try_gpu_uniform_attention` but
-    /// dispatches to the `no_qjl` kernel families that don't read
-    /// `qjl_signs` / `residual_norms`. Currently wired:
-    ///   - d128/8b/8b uniform (`turboquant_attention_q8_d128_no_qjl_2pass`)
-    ///   - d256/8b/8b uniform (`turboquant_attention_q8_d256_no_qjl_2pass`)
-    ///
-    /// Other configs (mixed, packed_keys variants) return None and the
-    /// outer caller falls through to dequantize + SDPA. New no_qjl kernels
-    /// can be wired here as they're added without touching the dispatch.
-    fn try_gpu_uniform_attention_no_qjl(
-        &self,
-        queries_f32: &InlineArray,
-        layout: CacheLayout,
-        scale: f32,
-        output_dtype: i32,
-    ) -> Option<InlineArray> {
-        // Phase E.3 / E.4: outlier override is applied during
-        // gpu_dequantize_keys; the fused score kernels read codebook +
-        // slot_scale only and would silently miss the override. The d256
-        // fullbyte fast path below has an `_with_outlier_bias` variant
-        // (Phase E.4 V1) that adds a precomputed per-(q-row, slot) bias
-        // term capturing the outlier contribution, so it stays on the
-        // GPU when outliers are enabled. The d128 + d256 base no_qjl_2pass
-        // paths do NOT have outlier-bias variants yet — `outliers_active`
-        // gates them off so attention falls through to dequantize+SDPA.
-        // Phase H: warm-tier presence forces dequant+SDPA fallback so the
-        // fused score kernels don't miss the warm history.
-        if self.warm.as_ref().is_some_and(|w| w.offset > 0) {
-            return None;
-        }
-        let outliers_active = self.config.outliers.is_enabled();
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let (value_core, value_bits) = match &state.values {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-
-        let batch = queries_f32.dim(0);
-        let q_heads = queries_f32.dim(1);
-        let key_dim = queries_f32.dim(3);
-        let value_dim = layout.value_dim as i32;
-        let q_rows = batch * q_heads;
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        // Currently d128/8b/8b and d256/8b/8b are supported. n_seq < 1024
-        // falls back to dequantize+SDPA which is fine — the kernel is the
-        // long-context win.
-        let dim_supported =
-            (key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256);
-        // Phase D.3.1 / Phase G: NoQjl supports `key_bits in 2..=8` at
-        // d128/d256. The score kernels load 256 codebook entries
-        // unconditionally, so we pass a 256-padded view (entries past
-        // `2^bits` zeroed and never indexed because all stored indices fit
-        // in `[0, 2^bits)`). Phase G extends from 4..=8 to 2..=8 — the
-        // codebook math is identical and the encoder's argmin uses the real
-        // `2^bits`-entry codebook. Practical use of 2..=3 bits requires
-        // pairing with Variant G outliers (config.outliers = PerBlock { k })
-        // to capture the heavy tail; without outliers the codebook gap on
-        // raw 2-bit/3-bit dominates attention quality. Values stay 8-bit —
-        // the dense-values fast path stores bf16 directly, and the
-        // `no_qjl_2pass` paths still use a 256-entry value codebook.
-        if !(2..=8).contains(&key_bits)
-            || value_bits != 8
-            || !dim_supported
-            || n_seq < 1024
-            || cache_seq_capacity < n_seq
-            || q_heads <= 0
-            || (q_heads % layout.heads as i32) != 0
-        {
-            return None;
-        }
-
-        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        let query_rot = key_core.rotate_array(&query_rows)?;
-
-        let kv_rows = (layout.batch * layout.heads) as i32;
-
-        // Variant F uses the full key_bits codebook for keys; values use
-        // their own codebook at value_bits resolution. Score kernels read a
-        // fixed 256-entry threadgroup codebook regardless of `bits`, so
-        // we pad the key view; the value view is already 256 entries
-        // (value_bits == 8 above).
-        let key_codebook = key_core.codebook_arr_padded_256(key_bits)?;
-        let value_codebook = value_core.codebook_arr(value_bits)?;
-
-        // d256 fast path: when the cache populated the seq-major shadows
-        // (`q8_slot_scales_seq` + `d256_rot_values_seq`), reuse the existing
-        // `fullbyte_dense_values_2pass` kernel. It's structurally NoQjl-shaped
-        // already (full 8-bit centroid index, no `query_proj`, no QJL term),
-        // and NoQjl's `k_indices` were quantised from `k_rot / slot_scale` so
-        // the kernel's `score_part *= key_slot_scale` recovers the original
-        // magnitude exactly. Limited to `groups <= 8` (kernel's threadgroup
-        // limit). Falls through to the base `no_qjl_2pass` kernel otherwise.
-        if key_dim == 256 && (q_heads / layout.heads as i32) <= 8 {
-            if let (Some(slot_scales), Some(value_rot_dense)) = (
-                ks.q8_slot_scales_seq.as_ref(),
-                vs.d256_rot_values_seq.as_ref(),
-            ) {
-                let key_indices_seq = ks.indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]);
-                let slot_scales_3d = slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]);
-                let value_rot_dense_3d =
-                    value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]);
-                let aggregated_rot = if outliers_active {
-                    // Slot scales pack key_norm at component 0; slice it for
-                    // the bias compute. Other components (residual_norm,
-                    // value_norm, key_slot_scale) aren't used by the bias.
-                    let key_norms_kv = slot_scales_3d
-                        .slice(&[0, 0, 0], &[kv_rows, cache_seq_capacity, 1])
-                        .reshape(&[kv_rows, cache_seq_capacity]);
-                    let outlier_bias = self.compute_no_qjl_outlier_bias(
-                        ks,
-                        &key_norms_kv,
-                        &query_rot,
-                        kv_rows,
-                        q_rows,
-                        cache_seq_capacity,
-                    )?;
-                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_with_outlier_bias(
-                        &query_rot,
-                        &key_indices_seq,
-                        &slot_scales_3d,
-                        key_codebook,
-                        &value_rot_dense_3d,
-                        &outlier_bias,
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                        scale,
-                    )
-                } else {
-                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
-                        &query_rot,
-                        &key_indices_seq,
-                        &slot_scales_3d,
-                        key_codebook,
-                        &value_rot_dense_3d,
-                        q_rows as u32,
-                        n_seq as u32,
-                        cache_seq_capacity as u32,
-                        q_heads as u32,
-                        layout.heads as u32,
-                        scale,
-                    )
-                };
-                if let Some(aggregated_rot) = aggregated_rot {
-                    let output_rows =
-                        value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
-                    return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
-                }
-            }
-        }
-
-        let key_norms = ks
-            .key_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_slot_scale = ks
-            .key_slot_scale_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        // Indices are scattered as [B, H, T, D]; the kernel reads them in the
-        // [N, D, S] layout it expects.
-        let key_indices_t = ks
-            .indices_t_array()
-            .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-        let value_indices_t =
-            vs.indices_t_array()?
-                .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
-        let value_norms = vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]);
-
-        // Phase E.4 V2: outlier-bias siblings of the d128/d256 base
-        // no_qjl_2pass kernels. The bias compute is shared with the d256
-        // fullbyte path — the only difference is the key_norms source
-        // (standalone here vs sliced from slot_scales there).
-        let aggregated_rot = if outliers_active {
-            let outlier_bias = self.compute_no_qjl_outlier_bias(
-                ks,
-                &key_norms,
-                &query_rot,
-                kv_rows,
-                q_rows,
-                cache_seq_capacity,
-            )?;
-            if key_dim == 128 {
-                InlineArray::turboquant_attention_q8_d128_no_qjl_2pass_with_outlier_bias(
-                    &query_rot,
-                    &key_indices_t,
-                    &key_norms,
-                    &key_slot_scale,
-                    key_codebook,
-                    &value_indices_t,
-                    &value_norms,
-                    value_codebook,
-                    &outlier_bias,
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                    scale,
-                )?
-            } else {
-                InlineArray::turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias(
-                    &query_rot,
-                    &key_indices_t,
-                    &key_norms,
-                    &key_slot_scale,
-                    key_codebook,
-                    &value_indices_t,
-                    &value_norms,
-                    value_codebook,
-                    &outlier_bias,
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                    scale,
-                )?
-            }
-        } else if key_dim == 128 {
-            InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
-                &query_rot,
-                &key_indices_t,
-                &key_norms,
-                &key_slot_scale,
-                key_codebook,
-                &value_indices_t,
-                &value_norms,
-                value_codebook,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )?
-        } else {
-            InlineArray::turboquant_attention_q8_d256_no_qjl_2pass(
-                &query_rot,
-                &key_indices_t,
-                &key_norms,
-                &key_slot_scale,
-                key_codebook,
-                &value_indices_t,
-                &value_norms,
-                value_codebook,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )?
-        };
-
-        // Output is in the value's rotated frame; inverse-rotate via value_core.
-        let output_rows = value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
-        Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
-    }
-
-    /// Phase F: Hamming skip-list pre-filter dispatch.
-    ///
-    /// Computes a per-query 1-bit sign hash, runs the XOR/popcount Hamming
-    /// distance kernel against the cached sign hashes, picks the M slots with
-    /// the smallest distances, gathers those slots' packed key/value cache
-    /// rows into a contiguous M-length scratch view, and runs the existing
-    /// Variant F (NoQjl) score kernel over that subset. The kernel's
-    /// Phase E.4: precompute the per-(q-row, slot) outlier bias term that
-    /// the no_qjl score kernels add to their dense score before softmax.
-    /// The encoder zeros outlier coords during encode (so the dense path
-    /// contributes 0 there), and this bias adds them back at their
-    /// original-magnitude rotated values:
-    ///
-    ///   bias[q_row, slot] = key_norm[kv_row(q_row), slot]
-    ///                     · Σ_k q_rot[q_row, channels[kv_row, slot, k]]
-    ///                          · values[kv_row, slot, k]
-    ///
-    /// Returns a `[q_rows, cache_seq_capacity]` f32 InlineArray. GQA
-    /// resolves via `q_row / groups → kv_row` indexing. Returns None
-    /// when the GpuKeyStore lacks outlier buffers (caller should not
-    /// have entered this path; defensive guard only).
-    ///
-    /// `key_norms_kv` is `[kv_rows, cache_seq_capacity]` f32. d256 fullbyte
-    /// callers slice it from `slot_scales[..., 0]` (component 0 of the
-    /// packed slot_scales seq shadow); d128 + d256-base callers pass the
-    /// standalone `key_norms_array()` view directly.
-    fn compute_no_qjl_outlier_bias(
-        &self,
-        ks: &super::gpu_keystore::GpuKeyStore,
-        key_norms_kv: &InlineArray,
-        query_rot: &InlineArray,
-        kv_rows: i32,
-        q_rows: i32,
-        cache_seq_capacity: i32,
-    ) -> Option<InlineArray> {
-        let outlier_channels = ks.outlier_channels.as_ref()?;
-        let outlier_values = ks.outlier_values.as_ref()?;
-        let outlier_k = outlier_channels.dim(3);
-        if outlier_k <= 0 {
-            return None;
-        }
-        let oc_3d = outlier_channels.reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
-        let ov_3d = outlier_values
-            .as_dtype(crate::compat::Dtype::Float32.as_i32())
-            .reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
-
-        let groups = q_rows / kv_rows;
-        let kv_idx_for_q: Vec<i32> = (0..q_rows).map(|q| q / groups).collect();
-        let kv_idx = InlineArray::from_i32_slice(&kv_idx_for_q);
-
-        let oc_q = oc_3d.take_axis(&kv_idx, 0);
-        let ov_q = ov_3d.take_axis(&kv_idx, 0);
-
-        let oc_q_i32 = oc_q.as_dtype(crate::compat::Dtype::Int32.as_i32());
-        let oc_flat = oc_q_i32.reshape(&[q_rows, cache_seq_capacity * outlier_k]);
-        let q_at_chans_flat = query_rot.take_along_axis(&oc_flat, -1);
-        let q_at_chans = q_at_chans_flat.reshape(&[q_rows, cache_seq_capacity, outlier_k]);
-
-        let products = q_at_chans.multiply(&ov_q);
-        let correction = products.sum_axis(-1, false);
-
-        let key_norms_q = key_norms_kv.take_axis(&kv_idx, 0);
-
-        Some(correction.multiply(&key_norms_q))
-    }
-
-    /// `cache_seq_capacity` is set to M so its strided indexing addresses the
-    /// gathered scratch buffers correctly.
-    ///
-    /// V1 gates: skiplist_threshold set + cold_offset > threshold + sign_hash
-    /// populated + Variant F (NoQjl) Uniform key/value config + d128 or d256 +
-    /// non-GQA (q_heads == kv_heads). GQA + Standard QJL + Mixed all fall
-    /// through to the dense kernel path.
-    fn try_hamming_skiplist_attention(
-        &self,
-        queries_f32: &InlineArray,
-        layout: CacheLayout,
-        scale: f32,
-        output_dtype: i32,
-    ) -> Option<InlineArray> {
-        let threshold = self.config.skiplist_threshold?;
-        if self.cold_offset <= threshold {
-            return None;
-        }
-        // Phase H: warm-tier presence forces dequant+SDPA fallback. The
-        // skiplist sign_hash buffer lives on the cold store only.
-        if self.warm.as_ref().is_some_and(|w| w.offset > 0) {
-            return None;
-        }
-        // Phase E.3: see try_gpu_uniform_attention_no_qjl — score kernels
-        // would miss the outlier override. Fall through to dequantize+SDPA.
-        if self.config.outliers.is_enabled() {
-            return None;
-        }
-        let state = self.state.as_ref()?;
-        if !matches!(state.qjl, super::TurboQuantQjlMode::NoQjl) {
-            return None;
-        }
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let sign_hash = ks.sign_hash.as_ref()?;
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        let (value_core, value_bits) = match &state.values {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            _ => return None,
-        };
-        if key_bits != 8 || value_bits != 8 {
-            return None;
-        }
-
-        let batch = queries_f32.dim(0);
-        let q_heads = queries_f32.dim(1);
-        let kv_heads = layout.heads as i32;
-        let key_dim = queries_f32.dim(3);
-        let value_dim = layout.value_dim as i32;
-        // GQA: q_heads must be a positive multiple of kv_heads. Hamming
-        // pre-filter runs per-q-row via row → kv_row = row / groups inside
-        // the kernel; gather uses flat-index take_axis to pick per-q-row
-        // slot subsets from kv-row-indexed cache buffers without expanding.
-        if kv_heads <= 0 || q_heads <= 0 || (q_heads % kv_heads) != 0 {
-            return None;
-        }
-        let groups = q_heads / kv_heads;
-        if !((key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256)) {
-            return None;
-        }
-
-        let q_rows = batch * q_heads;
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        if cache_seq_capacity < n_seq {
-            return None;
-        }
-        let packed_dim = (key_dim + 31) / 32;
-        // Top-M defaults to min(cold_offset, 2048). top_m ≤ n_seq by
-        // construction; the equal case still exercises the gather path
-        // (no-op selection) and is allowed so smaller-than-2048 caches
-        // near the threshold still go through the dispatch.
-        let top_m = (self.cold_offset.min(2048)) as i32;
-        if top_m <= 0 {
-            return None;
-        }
-
-        // 1. Rotate query into the same frame as the encoded keys.
-        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        let query_rot = key_core.rotate_array(&query_rows)?;
-
-        // 2. Pack query sign bits → [q_rows, packed_dim] u32.
-        let query_signs = InlineArray::turboquant_pack_sign_bits(
-            &query_rot,
-            key_dim as u32,
-            packed_dim as u32,
-            q_rows as u32,
-        )?;
-
-        // 3. Slice cold sign-hash. Storage is [B, kv_heads, S_cap, packed_dim].
-        // Reshape to [kv_rows, n_seq, packed_dim] — kernel maps q_row →
-        // kv_row = q_row / groups internally.
-        let sign_hash_active = sign_hash
-            .slice(
-                &[0, 0, 0, 0],
-                &[layout.batch as i32, kv_heads, n_seq, packed_dim],
-            )
-            .reshape(&[kv_rows, n_seq, packed_dim]);
-
-        // 4. Hamming distances [q_rows, n_seq] u32.
-        let distances = InlineArray::turboquant_hamming_distances(
-            &query_signs,
-            &sign_hash_active,
-            packed_dim as u32,
-            q_rows as u32,
-            n_seq as u32,
-            groups as u32,
-        )?;
-
-        // 5. argpartition for the M smallest distances. argpartition pivots
-        // such that result[..kth] are <= result[kth]; pivot at top_m - 1 to
-        // place the M smallest in [0..top_m].
-        let part = distances.argpartition(top_m - 1, -1);
-        let top_indices = part.slice(&[0, 0], &[q_rows, top_m]);
-
-        // 6. Per-q-row gather from kv-row-indexed cache buffers using flat
-        // take_axis: flat_idx[q, m] = (q_row / groups) * S_cap + top[q, m].
-        // For non-GQA (groups=1, q_rows=kv_rows) this is equivalent to the
-        // V1 broadcast take_along_axis. For GQA (groups>1), it correctly
-        // routes each q_row to its kv_row's cache without expanding the
-        // source (which would be O(groups · kv_rows · S_cap · D)).
-        let kv_row_for_q: Vec<i32> = (0..q_rows)
-            .map(|q| (q / groups) * cache_seq_capacity)
-            .collect();
-        let kv_offset = InlineArray::from_i32_slice_shaped(&kv_row_for_q, &[q_rows, 1]);
-        let top_indices_i32 = top_indices.as_dtype(crate::compat::Dtype::Int32.as_i32());
-        let flat_idx_2d = top_indices_i32.add(&kv_offset); // [q_rows, top_m] i32
-
-        // For [kv_rows, key_dim, S_cap]: transpose to [kv_rows, S_cap, key_dim],
-        // flatten to [kv_rows*S_cap, key_dim], take_axis with flat_idx, then
-        // transpose to [q_rows, key_dim, top_m].
-        let key_indices_t = ks.indices_t_array();
-        let key_indices_kvs_d = key_indices_t
-            .reshape(&[kv_rows, key_dim, cache_seq_capacity])
-            .transpose_axes(&[0, 2, 1])
-            .reshape(&[kv_rows * cache_seq_capacity, key_dim]);
-        let gathered_key_indices_t = key_indices_kvs_d
-            .take_axis(&flat_idx_2d, 0) // [q_rows, top_m, key_dim]
-            .transpose_axes(&[0, 2, 1]); // [q_rows, key_dim, top_m]
-
-        let value_indices_kvs_d = vs
-            .indices_t_array()?
-            .reshape(&[kv_rows, value_dim, cache_seq_capacity])
-            .transpose_axes(&[0, 2, 1])
-            .reshape(&[kv_rows * cache_seq_capacity, value_dim]);
-        let gathered_value_indices_t = value_indices_kvs_d
-            .take_axis(&flat_idx_2d, 0)
-            .transpose_axes(&[0, 2, 1]);
-
-        // For [kv_rows, S_cap]: flatten to [kv_rows*S_cap], take_axis with
-        // flat_idx → [q_rows, top_m].
-        let key_norms_flat = ks
-            .key_norms_array()?
-            .reshape(&[kv_rows * cache_seq_capacity]);
-        let gathered_key_norms = key_norms_flat.take_axis(&flat_idx_2d, 0);
-
-        let key_slot_scale_flat = ks
-            .key_slot_scale_array()?
-            .reshape(&[kv_rows * cache_seq_capacity]);
-        let gathered_key_slot_scale = key_slot_scale_flat.take_axis(&flat_idx_2d, 0);
-
-        let value_norms_flat = vs.norms_array()?.reshape(&[kv_rows * cache_seq_capacity]);
-        let gathered_value_norms = value_norms_flat.take_axis(&flat_idx_2d, 0);
-
-        let key_codebook = key_core.codebook_arr(key_bits)?;
-        let value_codebook = value_core.codebook_arr(value_bits)?;
-
-        // 7. Run the existing Variant F kernel on the gathered subset.
-        // Each q_row now has its own slice; pass q_heads = kv_heads = q_heads
-        // so the kernel treats the gathered cache as 1:1 (groups=1 inside
-        // the score kernel — GQA was already resolved during gather).
-        let aggregated_rot = if key_dim == 128 {
-            InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
-                &query_rot,
-                &gathered_key_indices_t,
-                &gathered_key_norms,
-                &gathered_key_slot_scale,
-                key_codebook,
-                &gathered_value_indices_t,
-                &gathered_value_norms,
-                value_codebook,
-                q_rows as u32,
-                top_m as u32,
-                top_m as u32,
-                q_heads as u32,
-                q_heads as u32,
-                scale,
-            )?
-        } else {
-            InlineArray::turboquant_attention_q8_d256_no_qjl_2pass(
-                &query_rot,
-                &gathered_key_indices_t,
-                &gathered_key_norms,
-                &gathered_key_slot_scale,
-                key_codebook,
-                &gathered_value_indices_t,
-                &gathered_value_norms,
-                value_codebook,
-                q_rows as u32,
-                top_m as u32,
-                top_m as u32,
-                q_heads as u32,
-                q_heads as u32,
-                scale,
-            )?
-        };
-
-        let output_rows = value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
-        Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
-    }
-
-    fn try_gpu_uniform_attention(
-        &self,
-        queries_f32: &InlineArray,
-        layout: CacheLayout,
-        scale: f32,
-        output_dtype: i32,
-    ) -> Option<InlineArray> {
-        // Phase E.3: outlier override lives in gpu_dequantize_keys; the fused
-        // score kernels read codebook + slot_scale only and would miss it.
-        // Force dequantize+SDPA so attention sees the full reconstruction.
-        if self.config.outliers.is_enabled() {
-            return None;
-        }
-        // Phase H: when the warm tier has data, the fast-path GPU score
-        // kernels see only the cold store and would miss the warm history.
-        // Fall through to the dequant+SDPA mixed path which interleaves
-        // [cold, warm, hot] in temporal order.
-        if self.warm.as_ref().is_some_and(|w| w.offset > 0) {
-            return None;
-        }
-        let ks = self.keys.as_ref()?.gpu.as_ref()?;
-        let vs = self.values.as_ref()?.gpu.as_ref()?;
-        let state = self.state.as_ref()?;
-        // Variant F (NoQjl): dispatch to the no_qjl fast path. Currently
-        // wired for d128/8b/8b uniform; other configs fall back to
-        // dequantize+SDPA inside the no_qjl helper.
-        if matches!(state.qjl, super::TurboQuantQjlMode::NoQjl) {
-            return self.try_gpu_uniform_attention_no_qjl(queries_f32, layout, scale, output_dtype);
-        }
-
-        let (key_core, key_bits) = match &state.keys {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            TensorRuntime::Uniform { .. } | TensorRuntime::Mixed { .. } => return None,
-        };
-        let (value_core, value_bits) = match &state.values {
-            TensorRuntime::Uniform {
-                config: TurboQuantTensorConfig::Uniform { bits },
-                core,
-            } => (core, *bits),
-            TensorRuntime::Uniform { .. } | TensorRuntime::Mixed { .. } => return None,
-        };
-
-        let batch = queries_f32.dim(0);
-        let q_heads = queries_f32.dim(1);
-        let key_dim = queries_f32.dim(3);
-        let value_dim = layout.value_dim as i32;
-        let q_rows = batch * q_heads;
-        let n_seq = self.cold_offset as i32;
-        let cache_seq_capacity = ks.cache_seq_capacity();
-        if q_rows <= 0 || n_seq <= 0 || cache_seq_capacity < n_seq {
-            return None;
-        }
-
-        let trace_timing = turboquant_trace_enabled();
-        let query_ready_us = if trace_timing {
-            eval_stage_micros(queries_f32)
-        } else {
-            0
-        };
-        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        // Phase D.2: pack_mode = Fullbyte enables the long-context fullbyte
-        // path the same way the env-var debug override does — both are valid
-        // ways to opt in.
-        let pack_mode_fullbyte =
-            matches!(self.config.pack_mode, super::TurboQuantPackMode::Fullbyte);
-        let can_try_q8_fullbyte = (turboquant_q8_fullbyte_enabled() || pack_mode_fullbyte)
-            && key_bits == 8
-            && value_bits == 8
-            && key_dim == 256
-            && value_dim == 256
-            && n_seq >= 1024
-            && ks.q8_fullbyte_seq.is_some()
-            && ks.q8_slot_scales_seq.is_some()
-            && vs.d256_rot_values_seq.is_some();
-        let mut project_us = 0;
-        // Fused rotate+project: saves one dispatch per layer by doing
-        // `input @ [inv_rot | inv_qjl]` as a single [N, 2*dim] matmul
-        // instead of two separate [N, dim] matmuls. Only applied when
-        // both outputs are needed (i.e., the q8 fullbyte fast path is
-        // not taken). Falls back to sequential calls if the stacked
-        // matrix wasn't built.
-        let (query_rot, mut query_proj) = if !can_try_q8_fullbyte {
-            if let Some((rot, proj)) = key_core.rotate_and_project_array(&query_rows) {
-                (rot, Some(proj))
-            } else {
-                let rot = key_core.rotate_array(&query_rows)?;
-                let proj = key_core.project_array(&query_rows)?;
-                (rot, Some(proj))
-            }
-        } else {
-            (key_core.rotate_array(&query_rows)?, None)
-        };
-        let rotate_us = if trace_timing {
-            eval_stage_micros(&query_rot)
-        } else {
-            0
-        };
-        if let Some(proj) = query_proj.as_ref() {
-            if trace_timing {
-                project_us = eval_stage_micros(proj);
-            }
-        }
-
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        let key_norms = ks
-            .key_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_residual_norms = ks
-            .residual_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_slot_scale = ks
-            .key_slot_scale_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let qjl_words = ks.qjl_words();
-        if can_try_q8_fullbyte {
-            if let Some(decoded_rot) =
-                self.try_gpu_uniform_attention_q8_d256_precomputed(&query_rot, None, q_heads, scale)
-            {
-                let decode_us = if trace_timing {
-                    eval_stage_micros(&decoded_rot)
-                } else {
-                    0
-                };
-                let output_rows =
-                    value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
-                let inverse_rotate_us = if trace_timing {
-                    eval_stage_micros(&output_rows)
-                } else {
-                    0
-                };
-                if trace_timing {
-                    trace_turboquant_bridge(&format!(
-                        "gpu_uniform_q8_d256_fullbyte_densev_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
-                        n_seq,
-                        q_rows,
-                        query_ready_us,
-                        rotate_us,
-                        project_us,
-                        decode_us,
-                        inverse_rotate_us,
-                    ));
-                }
-                return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
-            }
-        }
-        if query_proj.is_none() {
-            let projected = key_core.project_array(&query_rows)?;
-            if trace_timing {
-                project_us = eval_stage_micros(&projected);
-            }
-            query_proj = Some(projected);
-        }
-        let query_proj = query_proj.as_ref()?;
-        let key_codebook = key_core.codebook_arr(key_bits.saturating_sub(1))?;
-        if let Some(decoded_rot) = self.try_gpu_uniform_attention_q8_d256_precomputed(
-            &query_rot,
-            Some(query_proj),
-            q_heads,
-            scale,
-        ) {
-            let decode_us = if trace_timing {
-                eval_stage_micros(&decoded_rot)
-            } else {
-                0
-            };
-            let output_rows = value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
-            let inverse_rotate_us = if trace_timing {
-                eval_stage_micros(&output_rows)
-            } else {
-                0
-            };
-            if trace_timing {
-                trace_turboquant_bridge(&format!(
-                    "gpu_uniform_q8_d256_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
-                    n_seq,
-                    q_rows,
-                    query_ready_us,
-                    rotate_us,
-                    project_us,
-                    decode_us,
-                    inverse_rotate_us,
-                ));
-            }
-            return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
-        }
-        if key_bits == 8 && value_bits == 8 && key_dim == 128 && value_dim == 128 && n_seq >= 1024 {
-            let key_indices = ks
-                .indices_t_array()
-                .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-            let value_indices =
-                vs.indices_t_array()?
-                    .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
-            let value_norms = vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]);
-
-            if q_heads > 8 {
-                if let Some(key_bytes) = ks.q8_keybytes_t.as_ref() {
-                    let key_bytes = key_bytes.reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-                    if let Some(decoded_rot) =
-                        InlineArray::turboquant_attention_q8_d128_packed_keys_2pass(
-                            &query_rot,
-                            query_proj,
-                            &key_bytes,
-                            &key_norms,
-                            &key_residual_norms,
-                            &key_slot_scale,
-                            key_codebook,
-                            &value_indices,
-                            &value_norms,
-                            value_core.codebook_arr(value_bits)?,
-                            q_rows as u32,
-                            n_seq as u32,
-                            cache_seq_capacity as u32,
-                            q_heads as u32,
-                            layout.heads as u32,
-                            scale,
-                        )
-                    {
-                        let decode_us = if trace_timing {
-                            eval_stage_micros(&decoded_rot)
-                        } else {
-                            0
-                        };
-                        let output_rows =
-                            value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
-                        let inverse_rotate_us = if trace_timing {
-                            eval_stage_micros(&output_rows)
-                        } else {
-                            0
-                        };
-                        if trace_timing {
-                            trace_turboquant_bridge(&format!(
-                                "gpu_uniform_q8_d128_packed_keys_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
-                                n_seq,
-                                q_rows,
-                                query_ready_us,
-                                rotate_us,
-                                project_us,
-                                decode_us,
-                                inverse_rotate_us,
-                            ));
-                        }
-                        return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
-                    }
-                }
-            } else if qjl_words == 4 {
-                let key_qjl_signs =
-                    ks.qjl_signs_t_array()?
-                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
-                if let Some(decoded_rot) = InlineArray::turboquant_attention_q8_d128_2pass(
-                    &query_rot,
-                    query_proj,
-                    &key_indices,
-                    &key_qjl_signs,
-                    &key_norms,
-                    &key_residual_norms,
-                    &key_slot_scale,
-                    key_codebook,
-                    &value_indices,
-                    &value_norms,
-                    value_core.codebook_arr(value_bits)?,
-                    q_rows as u32,
-                    n_seq as u32,
-                    cache_seq_capacity as u32,
-                    q_heads as u32,
-                    layout.heads as u32,
-                    scale,
-                ) {
-                    let decode_us = if trace_timing {
-                        eval_stage_micros(&decoded_rot)
-                    } else {
-                        0
-                    };
-                    let output_rows =
-                        value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
-                    let inverse_rotate_us = if trace_timing {
-                        eval_stage_micros(&output_rows)
-                    } else {
-                        0
-                    };
-                    if trace_timing {
-                        trace_turboquant_bridge(&format!(
-                            "gpu_uniform_q8_d128_2pass_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score=0 softmax=0 decode={} inverse_rotate={}",
-                            n_seq,
-                            q_rows,
-                            query_ready_us,
-                            rotate_us,
-                            project_us,
-                            decode_us,
-                            inverse_rotate_us,
-                        ));
-                    }
-                    return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
-                }
-            }
-        }
-
-        let scores =
-            self.bench_gpu_uniform_scores_precomputed(&query_rot, query_proj, q_heads, scale)?;
-        let score_us = if trace_timing {
-            eval_stage_micros(&scores)
-        } else {
-            0
-        };
-        let weights = scores.softmax(-1);
-        let softmax_us = if trace_timing {
-            eval_stage_micros(&weights)
-        } else {
-            0
-        };
-        let value_norms = vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]);
-        let decoded_rot = InlineArray::turboquant_weighted_decode(
-            &weights,
-            &vs.indices_t_array()?,
-            &value_norms,
-            value_core.codebook_arr(value_bits)?,
-            value_dim as u32,
-            1u32 << value_bits,
-            q_rows as u32,
-            n_seq as u32,
-            cache_seq_capacity as u32,
-            q_heads as u32,
-            layout.heads as u32,
-        )?;
-        let decode_us = if trace_timing {
-            eval_stage_micros(&decoded_rot)
-        } else {
-            0
-        };
-        let output_rows = value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
-        let inverse_rotate_us = if trace_timing {
-            eval_stage_micros(&output_rows)
-        } else {
-            0
-        };
-        if trace_timing {
-            trace_turboquant_bridge(&format!(
-                "gpu_uniform_stage_us seq={} q_rows={} query_ready={} rotate={} project={} score={} softmax={} decode={} inverse_rotate={}",
-                n_seq,
-                q_rows,
-                query_ready_us,
-                rotate_us,
-                project_us,
-                score_us,
-                softmax_us,
-                decode_us,
-                inverse_rotate_us
-            ));
-        }
-        Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
-    }
-
-    fn ensure_layout(
-        &mut self,
-        keys: &InlineArray,
-        values: &InlineArray,
-    ) -> Result<CacheLayout, String> {
-        // Validate shape: [B, H, S, D]
-        if keys.ndim() != 4 || values.ndim() != 4 {
+        first_token: usize,
+        sink_logits: Option<&InlineArray>,
+    ) -> Result<InlineArray, String> {
+        let layout = self
+            .layout
+            .ok_or("TurboQuant: attention over an empty cache")?;
+        let state = self.state.as_ref().ok_or("TurboQuant: no state")?;
+        if queries.ndim() != 4 || queries.dim(2) != 1 {
             return Err(format!(
-                "TurboQuant: expected 4-D keys/values, got ndim {} / {}",
-                keys.ndim(),
-                values.ndim()
+                "TurboQuant decode attention takes [B, Hq, 1, D] queries, got {:?}",
+                queries.shape()
             ));
         }
-
-        let b = keys.dim(0) as usize;
-        let h = keys.dim(1) as usize;
-        let kd = keys.dim(3) as usize;
-        let vd = values.dim(3) as usize;
-
-        if let Some(existing) = self.layout {
-            if existing.batch != b
-                || existing.heads != h
-                || existing.key_dim != kd
-                || existing.value_dim != vd
-            {
-                return Err(format!(
-                    "TurboQuant: layout mismatch — expected [{b},{h},*,{kd}] / [{b},{h},*,{vd}]"
-                ));
-            }
-            return Ok(existing);
+        if queries.dim(0) as usize != layout.batch || queries.dim(3) as usize != layout.dim {
+            return Err(format!(
+                "TurboQuant: queries {:?} do not fit a cache of [{}, {}, *, {}]",
+                queries.shape(),
+                layout.batch,
+                layout.heads,
+                layout.dim
+            ));
         }
-
-        let layout = CacheLayout {
-            batch: b,
-            heads: h,
-            key_dim: kd,
-            value_dim: vd,
+        let shape = DecodeShape {
+            batch: layout.batch,
+            q_heads: queries.dim(1) as usize,
+            kv_heads: layout.heads,
+            dim: layout.dim,
+            value_dim: layout.value_dim,
         };
-        self.layout = Some(layout);
-        Ok(layout)
+        decode_attention(
+            queries,
+            scale,
+            Visibility {
+                first_token,
+                sink_logits,
+            },
+            &shape,
+            &state.keys,
+            &state.values,
+            self.cold.as_ref().filter(|c| c.len > 0),
+            self.dense.as_ref().expect("dense store"),
+        )
     }
+
+    /// Every cached key as `[B, H, T, D]`, in the dtype the keys were appended
+    /// in: the sinks and recent tokens exact, the rest dequantized.
+    pub fn dequantize_keys(&self) -> Option<InlineArray> {
+        self.dequantized(true)
+    }
+
+    /// Every cached value as `[B, H, T, Dv]`; see [`Self::dequantize_keys`].
+    pub fn dequantize_values(&self) -> Option<InlineArray> {
+        self.dequantized(false)
+    }
+
+    fn dequantized(&self, keys: bool) -> Option<InlineArray> {
+        let layout = self.layout?;
+        let state = self.state.as_ref()?;
+        let dense = self.dense.as_ref()?;
+        let cold = self.cold.as_ref().filter(|c| c.len > 0);
+        let cold_part = match cold {
+            Some(c) => {
+                let (k, v) = c.dequantize(&state.keys, &state.values).ok()?;
+                Some(if keys { k } else { v }.as_dtype(layout.dtype))
+            }
+            None => None,
+        };
+        let ordered = dense.ordered().map(|(k, v)| if keys { k } else { v });
+        // Sinks first, then the cold store, then the ring.
+        let sinks = dense.sink_len;
+        let width = if keys { layout.dim } else { layout.value_dim };
+        let parts: Vec<InlineArray> = match (ordered, cold_part) {
+            (Some(all), Some(cold)) => {
+                let kv = layout.kv_rows() as i32;
+                let total = dense.tokens() as i32;
+                let sink = all.slice(&[0, 0, 0], &[kv, sinks as i32, width as i32]);
+                let ring = all.slice(&[0, sinks as i32, 0], &[kv, total, width as i32]);
+                let mut parts = Vec::new();
+                if sinks > 0 {
+                    parts.push(sink);
+                }
+                parts.push(cold);
+                if total as usize > sinks {
+                    parts.push(ring);
+                }
+                parts
+            }
+            (Some(all), None) => vec![all],
+            (None, Some(cold)) => vec![cold],
+            (None, None) => return None,
+        };
+        let mut iter = parts.into_iter();
+        let mut out = iter.next()?;
+        for part in iter {
+            out = out.concatenate_2(&part, 1);
+        }
+        Some(out.reshape(&[
+            layout.batch as i32,
+            layout.heads as i32,
+            self.offset as i32,
+            width as i32,
+        ]))
+    }
+
+    /// Dtype of the uncompressed tokens, once something has been appended.
+    pub fn dtype(&self) -> Option<Dtype> {
+        self.layout.map(|l| Dtype::from_raw(l.dtype))
+    }
+}
+
+/// Tokens `lo..hi` of a `[KV, S, width]` array.
+fn slice_tokens(a: &InlineArray, layout: Layout, lo: usize, hi: usize, keys: bool) -> InlineArray {
+    let width = if keys { layout.dim } else { layout.value_dim };
+    a.slice(
+        &[0, lo as i32, 0],
+        &[layout.kv_rows() as i32, hi as i32, width as i32],
+    )
 }

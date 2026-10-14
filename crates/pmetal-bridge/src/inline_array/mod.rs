@@ -41,7 +41,6 @@ mod quantized;
 pub use quantized::QuantizedMode;
 mod reductions;
 mod shape_ops;
-mod turboquant_methods;
 
 /// Size of `mlx::core::array` in bytes. Must match MLX_ARRAY_SIZE in bridge.h.
 const ARRAY_BUF_SIZE: usize = 128;

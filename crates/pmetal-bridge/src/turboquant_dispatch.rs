@@ -4,10 +4,10 @@
 //! `llama4_native`, …) needs the same decode-time decision tree once it has
 //! a `QuantizedKvCache`:
 //!
-//! - **Decode (S=1)**: run the optimized `append_and_compute_attention` path
-//!   inside the cache (cold-only GPU TurboQuant kernels, hot-only fp16 SDPA,
-//!   or dequantize-and-concat when mixed) and surface errors instead of
-//!   silently switching cache semantics mid-layer.
+//! - **Decode (S=1)**: run `append_and_compute_attention`, which attends to
+//!   the sinks, the packed cold store and the recent ring in one fused pass
+//!   straight from the packed cache, and surface errors instead of silently
+//!   switching cache semantics mid-layer.
 //! - **Prefill (S>1)**: append into the cache, then run standard SDPA. When
 //!   `prev == 0` (first prefill, no prior history) use the fresh keys/values
 //!   directly — no dequantization needed. Otherwise dequantize the full

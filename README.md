@@ -519,13 +519,12 @@ Native ANE integration for power-efficient training and inference:
 
 ### TurboQuant KV Cache
 
-Near-optimal KV cache compression for long-context inference:
+Rotation-based KV cache quantization for long-context inference on the native Qwen3, Qwen3.5 and Llama 4 engines:
 
-- **Random rotation + Lloyd-Max quantization**: 4-6x cache compression with near-zero quality loss
-- **Mixed-precision presets**: `q3_5` (near-lossless), `q2_5` (6.4x compression)
-- **QJL residual correction**: Unbiased inner product estimates via Johnson-Lindenstrauss random projection
-- **Direct attention path**: Single-token decode avoids full cache dequantization
-- **Data-oblivious**: No calibration data required — quantizes online as KV entries are generated
+- **Random rotation + Lloyd-Max quantization**: every key and value is stored as one f32 scale and bit-packed centroid indices, 1 to 8 bits per coordinate. At head dimension 128 that is 3.8x smaller than bf16 at 4 bits, 4.9x at 3 bits and 7.1x at 2 bits
+- **Direct attention**: decode reads the packed cache in two kernel launches; nothing is dequantized. Any head dimension, grouped-query heads, sliding windows and per-head sink logits
+- **Sinks and a recent window stay exact**: the first tokens of a sequence and the newest `recent_window` tokens are kept uncompressed, because attention weighs them most
+- **Data-oblivious**: No calibration data required; keys and values are quantized online as they are generated
 
 ### Training Infrastructure
 
