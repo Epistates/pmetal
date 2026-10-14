@@ -381,6 +381,45 @@ mod tests {
         }
     }
 
+    /// Activations that are not GELU keep a half-precision input's dtype: an
+    /// f32 constant in the op would promote the layer's output, and MLX
+    /// carries that through the rest of the model.
+    #[test]
+    fn the_other_activations_keep_a_half_precision_dtype() {
+        let n = 33;
+        let xs: Vec<f32> = (0..n).map(|i| -4.0 + 0.25 * i as f32).collect();
+        for dtype in [Dtype::Bfloat16, Dtype::Float16] {
+            let x = Array::from_f32_slice(&xs, &[n as i32]).as_dtype(dtype.as_i32());
+            for (name, f) in [
+                ("relu", relu as fn(&Array) -> Array),
+                ("silu", silu),
+                ("sigmoid", sigmoid),
+                ("softplus", softplus),
+                ("log_sigmoid", log_sigmoid),
+                ("leaky_relu", |a: &Array| leaky_relu(a, 0.1)),
+            ] {
+                let y = f(&x);
+                assert_eq!(y.dtype(), dtype, "{name} on {dtype:?}");
+                values(y, n);
+            }
+        }
+    }
+
+    /// `x` where positive, `slope·x` elsewhere, for any slope: `max(x,
+    /// slope·x)` is that only up to a slope of 1.
+    #[test]
+    fn leaky_relu_is_x_above_zero_and_slope_times_x_below() {
+        let xs = [-2.0_f32, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let x = Array::from_f32_slice(&xs, &[7]);
+        for slope in [0.01_f32, 0.2, 1.0, 2.5] {
+            let got = values(leaky_relu(&x, slope), 7);
+            for (&v, &g) in xs.iter().zip(&got) {
+                let want = if v > 0.0 { v } else { slope * v };
+                assert_eq!(g, want, "leaky_relu({v}, slope {slope})");
+            }
+        }
+    }
+
     /// A bf16/f16 input is evaluated in f32 and comes back as f32, as these
     /// activations always have (their f32 constants promoted it). Keeping the
     /// input's dtype instead is a deliberate, separate decision: it moves Gemma
