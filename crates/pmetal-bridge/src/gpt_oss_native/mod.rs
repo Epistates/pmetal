@@ -237,18 +237,50 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<GptOssConfig, String> 
     // Some checkpoints nest config under "text_config"
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
-    let config_str = if json.get("text_config").is_some() {
-        serde_json::to_string(&json["text_config"]).map_err(|e| e.to_string())?
-    } else {
-        text
-    };
-    serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))
+    GptOssConfig::from_json(&json)
+}
+
+impl GptOssConfig {
+    /// Read a `config.json` value, flat or with the text model nested under
+    /// `text_config`. `tie_word_embeddings`, which a nested config keeps at
+    /// the top, applies to the text model unless it states its own.
+    pub fn from_json(json: &serde_json::Value) -> Result<Self, String> {
+        let mut text = json.get("text_config").unwrap_or(json).clone();
+        if let (Some(obj), Some(tie)) = (text.as_object_mut(), json.get("tie_word_embeddings")) {
+            obj.entry("tie_word_embeddings")
+                .or_insert_with(|| tie.clone());
+        }
+        serde_json::from_value(text).map_err(|e| format!("failed to parse config: {e}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::GptOssConfig;
     use crate::rope::{RopeConfig, Rotary};
+
+    /// A nested config keeps `tie_word_embeddings` at the top, where the text
+    /// model's reads it unless it states its own, as for every wrapper.
+    #[test]
+    fn outer_tie_word_embeddings_reaches_the_text_config() {
+        let nested = |outer: bool, inner: Option<bool>| {
+            let mut text = serde_json::json!({"hidden_size": 32});
+            if let Some(inner) = inner {
+                text["tie_word_embeddings"] = inner.into();
+            }
+            GptOssConfig::from_json(&serde_json::json!({
+                "tie_word_embeddings": outer, "text_config": text
+            }))
+            .unwrap()
+            .tie_word_embeddings
+        };
+        assert!(nested(true, None));
+        assert!(!nested(false, None));
+        assert!(!nested(true, Some(false)));
+        assert!(nested(false, Some(true)));
+        let flat = GptOssConfig::from_json(&serde_json::json!({"tie_word_embeddings": true}));
+        assert!(flat.unwrap().tie_word_embeddings);
+    }
 
     /// The native engine rotated every gpt-oss with plain RoPE at
     /// `rope_theta`. It now runs the release's YaRN (`truncate: false`) and

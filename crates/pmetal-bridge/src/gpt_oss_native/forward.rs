@@ -30,7 +30,7 @@ pub fn forward_step(
 
     // Embedding lookup: [B, T, hidden]
     // MLX >= 0.32: indices must be stop_gradient'd inside a grad trace
-    let mut hidden = weights.embed_w.take_axis(&token_ids.stop_gradient(), 0);
+    let mut hidden = weights.embed_w.lookup(&token_ids.stop_gradient());
 
     for (li, lw) in weights.layers.iter().enumerate() {
         // Input LayerNorm
@@ -65,10 +65,9 @@ pub fn forward_step(
 
     // Final norm + LM head
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
-    if weights.tie_word_embeddings {
-        hidden.matmul(&weights.embed_w.t())
-    } else {
-        hidden.matmul(weights.lm_head_w.as_ref().unwrap())
+    match &weights.lm_head_w {
+        Some(head) => head.matmul_from(&hidden),
+        None => weights.embed_w.as_linear(&hidden),
     }
 }
 

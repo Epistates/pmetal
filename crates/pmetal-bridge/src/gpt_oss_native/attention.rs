@@ -9,6 +9,8 @@
 
 use crate::InlineArray;
 
+use crate::native_weight::LayerWeight;
+
 use super::cache::KvLayerCache;
 use super::weights::LayerWeights;
 
@@ -30,8 +32,8 @@ pub(super) fn attn_forward(
     let head_dim = lw.attn_head_dim;
 
     // Q, K, V projections — [B, S, n_heads*head_dim], with their biases.
-    let project = |w: &InlineArray, bias: &Option<InlineArray>| {
-        let y = normed.matmul(w);
+    let project = |w: &LayerWeight, bias: &Option<InlineArray>| {
+        let y = w.matmul_from(normed);
         match bias {
             Some(bias) => y.add(bias),
             None => y,
@@ -41,9 +43,9 @@ pub(super) fn attn_forward(
         x.reshape(&[b, s, n, head_dim])
             .transpose_axes(&[0, 2, 1, 3])
     };
-    let q = heads(project(&lw.attn_q_w, &lw.attn_q_b), n_heads);
-    let k = heads(project(&lw.attn_k_w, &lw.attn_k_b), n_kv_heads);
-    let v = heads(project(&lw.attn_v_w, &lw.attn_v_b), n_kv_heads);
+    let q = heads(project(&lw.attn_q, &lw.attn_q_b), n_heads);
+    let k = heads(project(&lw.attn_k, &lw.attn_k_b), n_kv_heads);
+    let v = heads(project(&lw.attn_v, &lw.attn_v_b), n_kv_heads);
 
     // Full RoPE (no partial rotation): YaRN's frequencies and attention
     // factor, split-half.
@@ -61,7 +63,7 @@ pub(super) fn attn_forward(
     let output = output
         .transpose_axes(&[0, 2, 1, 3])
         .reshape(&[b, s, n_heads * head_dim]);
-    let proj = output.matmul(&lw.attn_o_w);
+    let proj = lw.attn_o.matmul_from(&output);
     match &lw.attn_o_b {
         Some(ob) => proj.add(ob),
         None => proj,
@@ -88,6 +90,7 @@ fn compiled_decode(
         return None;
     }
     let rope = lw.attn_rotary.fixed_kernel(rope_offset as i64 + 1)?;
+    let (q_w, k_w, v_w, o_w) = lw.dense_attention()?;
     let (Some(qb), Some(kb), Some(vb), Some(ob)) = (
         lw.attn_q_b.as_ref(),
         lw.attn_k_b.as_ref(),
@@ -119,10 +122,10 @@ fn compiled_decode(
     let cache_vals = cache.values.take().unwrap();
     let (output, keys, values) = InlineArray::compiled_gptoss_attn_layer_fixed(
         normed,
-        &lw.attn_q_w,
-        &lw.attn_k_w,
-        &lw.attn_v_w,
-        &lw.attn_o_w,
+        q_w,
+        k_w,
+        v_w,
+        o_w,
         qb,
         kb,
         vb,

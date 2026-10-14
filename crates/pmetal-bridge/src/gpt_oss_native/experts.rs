@@ -1,6 +1,6 @@
 //! gpt-oss's routed experts, as both engines hold and run them.
 //!
-//! Three checkpoint layouts load, each to the `[E, in, out]`-applied stack
+//! Four checkpoint layouts load, each to the `[E, in, out]`-applied stack
 //! [`crate::native_moe::switch_glu`] dispatches over:
 //!
 //! * the release's MXFP4 (`experts.gate_up_proj_blocks` `[E, 2I, H/32, 16]`
@@ -11,7 +11,9 @@
 //! * transformers' dense layout (`experts.gate_up_proj` `[E, H, 2I]`,
 //!   `down_proj` `[E, I, H]`, applied as `x @ W`),
 //! * the stacked per-projection layout MLX conversions ship
-//!   (`experts.{gate,up,down}_proj.weight`, `[E, out, in]`).
+//!   (`experts.{gate,up,down}_proj.weight`, `[E, out, in]`),
+//! * that layout packed by MLX (`experts.*_proj.{weight,scales[,biases]}`,
+//!   `mxfp4` in the `MXFP4-Q8` conversions), kept packed.
 //!
 //! Gate and up are interleaved along the fused projection's outputs
 //! (`gate_up[..., ::2]`, `gate_up[..., 1::2]`), biases included.
@@ -20,6 +22,7 @@ use std::collections::HashMap;
 
 use crate::InlineArray;
 use crate::QuantizedMode;
+use crate::native_checkpoint::Checkpoint;
 use crate::native_weight::{LayerWeight, QuantParams};
 
 /// One layer's routed experts with their biases.
@@ -92,12 +95,45 @@ fn mxfp4(blocks: &InlineArray, scales: InlineArray) -> Result<LayerWeight, Strin
 }
 
 impl GptOssExperts {
+    /// Read the experts under `prefix` out of a [`Checkpoint`], removing
+    /// what it takes: any layout [`Self::from_checkpoint`] reads, and the
+    /// stacked layout packed as MLX writes it
+    /// (`experts.{gate,up,down}_proj.{weight,scales[,biases]}` with the
+    /// mode and widths the checkpoint's `quantization` block gives, `mxfp4`
+    /// in the `MXFP4-Q8` conversions, and the biases beside them).
+    pub fn from_tensors(ckpt: &mut Checkpoint, prefix: &str) -> Result<Self, String> {
+        if ckpt.contains(&format!("{prefix}.gate_proj.scales")) {
+            let proj = |name: &str| format!("{prefix}.{name}_proj");
+            return Ok(Self {
+                gate: ckpt.stacked(&proj("gate"))?,
+                up: ckpt.stacked(&proj("up"))?,
+                down: ckpt.stacked(&proj("down"))?,
+                gate_bias: ckpt.take(&format!("{}.bias", proj("gate")))?,
+                up_bias: ckpt.take(&format!("{}.bias", proj("up")))?,
+                down_bias: ckpt.take(&format!("{}.bias", proj("down")))?,
+            });
+        }
+        let experts = Self::from_checkpoint(ckpt.tensors_mut(), prefix)?;
+        let dotted = format!("{prefix}.");
+        ckpt.tensors_mut()
+            .retain(|key, _| !key.starts_with(&dotted));
+        Ok(experts)
+    }
+
     /// Read the experts under `prefix` (`model.layers.N.mlp.experts`) from
-    /// any of the layouts in the module docs.
+    /// any of the unpacked-or-MXFP4 layouts in the module docs. A stacked
+    /// layout packed by MLX needs its quantization parameters: use
+    /// [`Self::from_tensors`].
     pub fn from_checkpoint(
         raw: &HashMap<String, InlineArray>,
         prefix: &str,
     ) -> Result<Self, String> {
+        if raw.contains_key(&format!("{prefix}.gate_proj.scales")) {
+            return Err(format!(
+                "gpt_oss: the experts under {prefix} are an MLX quantization, which needs its \
+                 quantization block to read"
+            ));
+        }
         let get = |name: &str| {
             raw.get(&format!("{prefix}.{name}"))
                 .cloned()
