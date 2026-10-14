@@ -160,24 +160,43 @@ pub struct Llama4TextConfig {
     pub tie_word_embeddings: bool,
 }
 
-/// Outer model config — Llama 4 nests text config under `text_config`.
-#[derive(Debug, Clone, Deserialize)]
+/// Model config: the text model's [`Llama4TextConfig`] and the outer
+/// `model_type`.
+///
+/// A multimodal checkpoint nests the text model under `text_config` and keeps
+/// `tie_word_embeddings` (and the vision settings) at the top; a text-only
+/// one is flat.
+#[derive(Debug, Clone)]
 pub struct Llama4Config {
     pub model_type: String,
-
-    /// Present in multi-modal checkpoint JSON.
-    #[serde(default)]
-    pub text_config: Option<Llama4TextConfig>,
-
-    /// Flattened text config fields — present in text-only configs.
-    #[serde(flatten)]
-    pub text: Llama4TextConfig,
+    text: Llama4TextConfig,
 }
 
 impl Llama4Config {
-    /// Resolve the effective text config regardless of nesting.
+    /// Read a `config.json` value, nested or flat.
+    ///
+    /// `tie_word_embeddings` is the one text-level setting a nested config
+    /// keeps outside `text_config`; it applies when the text config does not
+    /// state it.
+    pub fn from_json(json: &serde_json::Value) -> Result<Self, String> {
+        let mut text = json.get("text_config").unwrap_or(json).clone();
+        if let (Some(obj), Some(tie)) = (text.as_object_mut(), json.get("tie_word_embeddings")) {
+            obj.entry("tie_word_embeddings")
+                .or_insert_with(|| tie.clone());
+        }
+        let text: Llama4TextConfig = serde_json::from_value(text)
+            .map_err(|e| format!("failed to parse Llama4Config: {e}"))?;
+        let model_type = json
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("llama4")
+            .to_string();
+        Ok(Self { model_type, text })
+    }
+
+    /// The text model's config.
     pub fn text(&self) -> &Llama4TextConfig {
-        self.text_config.as_ref().unwrap_or(&self.text)
+        &self.text
     }
 
     /// Returns `true` when layer `li` (0-indexed) is a MoE layer: listed in
@@ -245,30 +264,7 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Llama4Config, String> 
     let text = crate::native_loader::read_config_json(model_dir)?;
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
-
-    // If the outer config has `text_config`, try deserializing that inner object
-    // as the canonical text config and wrap it.  Otherwise deserialize the
-    // whole JSON as a flat Llama4Config.
-    if json.get("text_config").is_some() {
-        let cfg: Llama4Config = serde_json::from_str(&text)
-            .map_err(|e| format!("failed to parse Llama4Config: {e}"))?;
-        Ok(cfg)
-    } else {
-        // Flat layout: embed a synthetic `model_type` field if absent, then
-        // deserialize the whole object as both outer + inner config.
-        let mut obj = json.clone();
-        if !obj
-            .as_object()
-            .map(|o| o.contains_key("model_type"))
-            .unwrap_or(false)
-        {
-            obj["model_type"] = serde_json::Value::String("llama4".to_string());
-        }
-        let config_str = serde_json::to_string(&obj).map_err(|e| e.to_string())?;
-        let cfg: Llama4Config = serde_json::from_str(&config_str)
-            .map_err(|e| format!("failed to parse Llama4Config (flat): {e}"))?;
-        Ok(cfg)
-    }
+    Llama4Config::from_json(&json)
 }
 
 #[cfg(test)]
@@ -280,7 +276,7 @@ mod tests {
     /// `no_rope_layers`; the engine refused the bool and ignored the lists.
     #[test]
     fn released_config_keys_are_read() {
-        let config: Llama4Config = serde_json::from_value(serde_json::json!({
+        let config = Llama4Config::from_json(&serde_json::json!({
             "model_type": "llama4_text", "hidden_size": 32, "num_hidden_layers": 4,
             "num_attention_heads": 4, "head_dim": 8, "intermediate_size_mlp": 48,
             "intermediate_size": 48, "vocab_size": 64, "attention_chunk_size": 64,
@@ -292,7 +288,7 @@ mod tests {
         assert!((0..4).all(|l| !config.is_moe_layer(l)));
         assert!(!config.use_rope(1) && config.use_rope(3));
 
-        let numeric: Llama4Config = serde_json::from_value(serde_json::json!({
+        let numeric = Llama4Config::from_json(&serde_json::json!({
             "model_type": "llama4_text", "hidden_size": 32, "num_hidden_layers": 4,
             "num_attention_heads": 4, "intermediate_size_mlp": 48, "intermediate_size": 48,
             "vocab_size": 64, "attention_chunk_size": 64, "num_local_experts": 2,
@@ -304,6 +300,59 @@ mod tests {
         assert!(numeric.is_moe_layer(0) && !numeric.use_rope(3));
     }
 
+    /// The released Scout `config.json` (multimodal: the text model nests under
+    /// `text_config`, `tie_word_embeddings` and nothing else text-level sits
+    /// at the top) loads into the engine's text config.
+    #[test]
+    fn released_scout_config_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            include_str!("../../tests/fixtures/llama4_scout_config.json"),
+        )
+        .unwrap();
+        let config = super::load_config(dir.path()).expect("released Scout config");
+        let t = config.text();
+        assert_eq!(
+            (t.hidden_size, t.num_hidden_layers, t.num_attention_heads),
+            (5120, 48, 40)
+        );
+        assert_eq!(config.num_kv_heads(), 8);
+        assert_eq!(config.head_dim(), 128);
+        assert!((0..48).all(|l| config.is_moe_layer(l)));
+        assert!((0..48).all(|l| config.use_rope(l) == (l % 4 != 3)));
+        assert_eq!(t.attn_temperature_tuning, 1);
+        assert!(!t.tie_word_embeddings);
+    }
+
+    /// `tie_word_embeddings` sits outside `text_config` in a nested config and
+    /// applies to the text model unless it states its own.
+    #[test]
+    fn outer_tie_word_embeddings_reaches_the_text_config() {
+        let text = serde_json::json!({
+            "hidden_size": 32, "num_hidden_layers": 1, "num_attention_heads": 4,
+            "intermediate_size_mlp": 48, "intermediate_size": 48, "vocab_size": 64,
+            "attention_chunk_size": 64, "num_local_experts": 2, "num_experts_per_tok": 1,
+            "max_position_embeddings": 64
+        });
+        let nested = |outer: bool, inner: Option<bool>| {
+            let mut t = text.clone();
+            if let Some(inner) = inner {
+                t["tie_word_embeddings"] = inner.into();
+            }
+            super::Llama4Config::from_json(&serde_json::json!({
+                "model_type": "llama4", "tie_word_embeddings": outer, "text_config": t
+            }))
+            .unwrap()
+            .text()
+            .tie_word_embeddings
+        };
+        assert!(nested(true, None));
+        assert!(!nested(false, None));
+        assert!(!nested(true, Some(false)));
+        assert!(nested(false, Some(true)));
+    }
+
     /// Llama 4 Scout ships `rope_type: "llama3"` (factor 16, low and high
     /// band factors both 1). The native engine ran it as plain RoPE; it now
     /// rotates with transformers' bands (the shared fixture's
@@ -311,7 +360,7 @@ mod tests {
     /// graph the bands' period table.
     #[test]
     fn scout_rotates_with_the_llama3_bands() {
-        let config: Llama4Config = serde_json::from_value(serde_json::json!({
+        let config = Llama4Config::from_json(&serde_json::json!({
             "model_type": "llama4_text", "hidden_size": 256, "num_hidden_layers": 4,
             "num_attention_heads": 2, "head_dim": 128, "intermediate_size_mlp": 64,
             "intermediate_size": 64, "vocab_size": 32, "attention_chunk_size": 8192,
