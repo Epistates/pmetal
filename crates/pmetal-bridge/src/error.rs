@@ -242,6 +242,12 @@ pub(crate) mod strict {
             if !self.outermost || std::thread::panicking() {
                 return;
             }
+            // A callback panicked and its wrapper is about to re-raise that
+            // panic; the error C++ recorded for the abandoned call would only
+            // replace it with a less useful one.
+            if crate::callback::is_pending() {
+                return;
+            }
             let seq = error_seq();
             if seq == SEEN.get() {
                 return;

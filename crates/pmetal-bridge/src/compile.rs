@@ -73,9 +73,10 @@ type mlx_rust_compile_forward_fn = unsafe extern "C" fn(
     inputs: *const *const RawBuf,
     n_inputs: i32,
     outputs: *mut RawBuf,
+    n_outputs_max: i32,
     n_outputs_written: *mut i32,
     ctx: *mut c_void,
-);
+) -> i32;
 
 // Redeclared here so we don't need to widen the visibility of the
 // `extern "C"` block in `inline_array.rs`. Rust treats these as distinct
@@ -100,7 +101,6 @@ bridge_extern! {
     fn mlx_inline_compile_free(compiled_handle: *mut c_void);
 
     fn mlx_inline_init_copy(dst: *mut RawBuf, src: *const RawBuf);
-    fn mlx_inline_init_empty(dst: *mut RawBuf);
 }
 
 // ---------------------------------------------------------------------------
@@ -117,47 +117,61 @@ unsafe extern "C" fn trampoline(
     inputs: *const *const RawBuf,
     n_inputs: i32,
     outputs: *mut RawBuf,
+    n_outputs_max: i32,
     n_outputs_written: *mut i32,
     ctx: *mut c_void,
-) {
-    // SAFETY: `ctx` originated from `Box::into_raw(Box<BoxedClosure>)`.
-    let closure = unsafe { &mut *(ctx as *mut BoxedClosure) };
+) -> i32 {
+    // A panic in the closure can't unwind through the C++ frames above, so it
+    // is parked and re-raised by `CompiledFn::call` (see `crate::callback`).
+    let mut too_many = None;
+    let status = crate::callback::guard(|| {
+        // SAFETY: `ctx` originated from `Box::into_raw(Box<BoxedClosure>)`.
+        let closure = unsafe { &mut *(ctx as *mut BoxedClosure) };
 
-    let n_inputs = n_inputs.max(0) as usize;
-    // Wrap each input pointer as an owned `InlineArray` backed by a
-    // placement-copy of the C++ array. Matches the value_and_grad
-    // trampoline pattern.
-    let input_arrays: Vec<InlineArray> = (0..n_inputs)
-        .map(|i| {
-            let raw_ptr = unsafe { *inputs.add(i) };
-            let mut dst = MaybeUninit::<RawBuf>::uninit();
-            unsafe { mlx_inline_init_copy(dst.as_mut_ptr(), raw_ptr) };
-            InlineArray {
-                raw: unsafe { dst.assume_init() },
-            }
-        })
-        .collect();
+        let n_inputs = n_inputs.max(0) as usize;
+        // Wrap each input pointer as an owned `InlineArray` backed by a
+        // placement-copy of the C++ array.
+        let input_arrays: Vec<InlineArray> = (0..n_inputs)
+            .map(|i| {
+                let raw_ptr = unsafe { *inputs.add(i) };
+                let mut dst = MaybeUninit::<RawBuf>::uninit();
+                unsafe { mlx_inline_init_copy(dst.as_mut_ptr(), raw_ptr) };
+                InlineArray {
+                    raw: unsafe { dst.assume_init() },
+                }
+            })
+            .collect();
 
-    let results = closure(&input_arrays);
+        let results = closure(&input_arrays);
 
-    // Write outputs back. The C++ side pre-initialised every output slot
-    // with an empty array via `mlx_inline_init_empty`, so we destructively
-    // overwrite up to results.len() slots by placement-copying.
-    let n_out = results.len();
-    for (i, out_arr) in results.into_iter().enumerate() {
-        let slot = unsafe { outputs.add(i) };
-        // Destroy the placeholder empty array first.
-        unsafe {
-            std::ptr::drop_in_place(slot as *mut InlineArray as *mut ());
+        // The slots are uninitialised and `n_outputs_max` of them: more
+        // results than that is an error for the caller, not a write past the
+        // end.
+        if results.len() > n_outputs_max.max(0) as usize {
+            too_many = Some(results.len());
+            return;
         }
-        unsafe { mlx_inline_init_copy(slot, out_arr.as_raw_ptr()) };
-        // `out_arr` drops at end of this iteration, releasing its own copy.
-    }
-
-    unsafe {
-        *n_outputs_written = n_out as i32;
+        for (i, out_arr) in results.iter().enumerate() {
+            // SAFETY: slot `i` is within the `n_outputs_max` slots and holds
+            // no array to destroy.
+            unsafe { mlx_inline_init_copy(outputs.add(i), out_arr.as_raw_ptr()) };
+        }
+        // SAFETY: `n_outputs_written` is the caller's out-parameter.
+        unsafe { *n_outputs_written = results.len() as i32 };
+    });
+    match too_many {
+        Some(n) if status == crate::callback::OK => {
+            // SAFETY: as above.
+            unsafe { *n_outputs_written = n as i32 };
+            TOO_MANY_OUTPUTS
+        }
+        _ => status,
     }
 }
+
+/// What the trampoline returns when the closure made more arrays than there
+/// are output slots (`mlx_rust_compile_forward_fn`).
+const TOO_MANY_OUTPUTS: i32 = 2;
 
 // ---------------------------------------------------------------------------
 // Public wrapper
@@ -241,29 +255,30 @@ impl CompiledFn {
     ///
     /// `inputs` are borrowed — they're placement-copied into MLX's
     /// `std::vector<array>` on the C++ side, so the caller retains
-    /// ownership. The returned vector holds up to `n_outputs_max` arrays
-    /// (the exact count is whatever the closure's last call produced).
+    /// ownership. The returned vector holds the arrays the closure made (at
+    /// most `n_outputs_max`; a closure that makes more is an error).
+    ///
+    /// MLX calls the closure while it traces, which is the first call for a
+    /// shape (the first call at all when compiled shapeless). A panic in the
+    /// closure then continues out of this method with its original payload.
     pub fn call(&mut self, inputs: &[&InlineArray]) -> BridgeResult<Vec<InlineArray>> {
         let input_ptrs: Vec<*const RawBuf> =
             inputs.iter().map(|a| &a.raw as *const RawBuf).collect();
 
-        // Allocate output slots — they'll receive placement-new'd arrays
-        // from the C++ side on success.
-        let mut outputs: Vec<InlineArray> = (0..self.n_outputs_max as usize)
-            .map(|_| {
-                let mut dst = MaybeUninit::<RawBuf>::uninit();
-                unsafe { mlx_inline_init_empty(dst.as_mut_ptr()) };
-                InlineArray {
-                    raw: unsafe { dst.assume_init() },
-                }
-            })
+        // The slots are left uninitialised for the C++ side to placement-new
+        // into; only the ones it reports are claimed below. Filling them with
+        // arrays first would leak each one it overwrote.
+        let mut outputs: Vec<MaybeUninit<RawBuf>> = (0..self.n_outputs_max as usize)
+            .map(|_| MaybeUninit::uninit())
             .collect();
 
         let mut n_written: i32 = 0;
         // SAFETY: handle is valid (NonNull, created by compile_make);
         // input_ptrs contains pointers to the caller's InlineArray::raw
-        // fields; outputs has n_outputs_max valid slots.
-        let rc = unsafe {
+        // fields; outputs has n_outputs_max slots.
+        // A failure is returned to the caller, so a strict build must not
+        // panic at the op.
+        let rc = crate::expect_bridge_errors(|| unsafe {
             mlx_inline_compile_call(
                 self.handle.as_ptr(),
                 input_ptrs.as_ptr(),
@@ -272,7 +287,10 @@ impl CompiledFn {
                 self.n_outputs_max,
                 &mut n_written as *mut i32,
             )
-        };
+        });
+
+        // A panic in the closure (while MLX traced it) continues here.
+        crate::callback::resume_pending();
 
         if rc != 0 {
             return Err(check_last_error()
@@ -282,8 +300,14 @@ impl CompiledFn {
                 )));
         }
 
-        outputs.truncate(n_written.max(0) as usize);
-        Ok(outputs)
+        // SAFETY: the C++ side placement-new'd exactly `n_written` slots.
+        let written = (n_written.max(0) as usize).min(outputs.len());
+        Ok(outputs[..written]
+            .iter()
+            .map(|slot| InlineArray {
+                raw: unsafe { slot.assume_init_read() },
+            })
+            .collect())
     }
 
     /// Number of outputs this compiled closure can produce per call.

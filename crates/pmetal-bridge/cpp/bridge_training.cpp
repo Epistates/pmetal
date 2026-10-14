@@ -476,26 +476,17 @@ void mlx_inline_value_and_grad(
     // The lambda takes a std::vector<array> (MLX convention) and returns one.
     auto cpp_forward = [&](std::vector<array> args) -> std::vector<array> {
         // Wrap each array in a temporary InlineArray so Rust can read them.
-        std::vector<mlx_inline_array> bufs(args.size());
-        std::vector<const mlx_inline_array*> ptrs(args.size());
-        for (size_t i = 0; i < args.size(); i++) {
-            new (bufs[i].buf) array(args[i]);
-            ptrs[i] = &bufs[i];
-        }
+        CallbackInputs in(args);
 
+        // The callback placement-news the loss on success, so the slot is
+        // left uninitialised (an initialised one would leak when overwritten).
         mlx_inline_array loss_buf;
-        mlx_inline_init_empty(&loss_buf);
-        forward_fn(ptrs.data(), (int)ptrs.size(), &loss_buf, ctx);
-
-        array result = as_arr(&loss_buf);
-
-        // Destroy temporaries (arrays, not loss_buf which we've already copied).
-        for (auto& b : bufs) {
-            as_arr(&b).~array();
+        if (forward_fn(in.data(), in.size(), &loss_buf, ctx) != 0) {
+            throw RustCallbackPanicked();
         }
+        array result = as_arr(&loss_buf);
         as_arr(&loss_buf).~array();
-
-        return {result};
+        return {std::move(result)};
     };
 
     // argnums: differentiate w.r.t. the first n_params inputs.
@@ -739,16 +730,6 @@ bool mlx_inline_is_tracer(const mlx_inline_array* a) {
     return as_arr(a).is_tracer();
 }
 
-typedef void (*mlx_rust_checkpoint_fn)(
-    const mlx_inline_array* const* all_arrays,
-    int n_total,
-    mlx_inline_array* outputs_out,
-    int* n_outputs_out,
-    void* ctx
-);
-
-typedef void (*mlx_rust_drop_fn)(void* ctx);
-
 void mlx_inline_checkpoint(
     mlx_rust_checkpoint_fn forward_fn,
     void* ctx,
@@ -779,43 +760,32 @@ void mlx_inline_checkpoint(
     auto cpp_forward = [forward_fn, ctx_guard, n_outputs_max](
                            const std::vector<array>& args) -> std::vector<array> {
         // Wrap each array as a temporary InlineArray for the Rust callback.
-        std::vector<mlx_inline_array> bufs(args.size());
-        std::vector<const mlx_inline_array*> ptrs(args.size());
-        for (size_t i = 0; i < args.size(); i++) {
-            new (bufs[i].buf) array(args[i]);
-            ptrs[i] = &bufs[i];
-        }
+        CallbackInputs in(args);
 
-        // Raw storage for the callback to placement-new its outputs into.
-        // Deliberately left uninitialised: the callback placement-news each
-        // slot it uses, and placement-new does not destroy what it overwrites,
-        // so pre-filling these would leak one array per slot per call.  Only
-        // the slots the callback reports are read back and destroyed.
-        std::vector<mlx_inline_array> out_bufs(n_outputs_max);
+        // Raw storage for the callback to placement-new its outputs into;
+        // only the slots it reports are read back and destroyed.
+        CallbackOutputs out(n_outputs_max);
         int n_out = 0;
+        int status;
         {
             // A checkpointed forward exists to be differentiated; its
             // recomputation runs inside the backward pass.
             BridgeGradScope grad_scope;
-            forward_fn(ptrs.data(), (int)ptrs.size(), out_bufs.data(), &n_out, ctx_guard.get());
+            status = forward_fn(in.data(), in.size(), out.data(), &n_out, ctx_guard.get());
         }
-        if (n_out > n_outputs_max) {
-            n_out = n_outputs_max;
+        if (status != 0) {
+            throw RustCallbackPanicked();
         }
+        if (n_out > out.capacity()) {
+            n_out = out.capacity();
+        }
+        out.adopt(n_out);
 
-        // Collect outputs before destroying the bufs.
         std::vector<array> results;
         results.reserve(n_out);
         for (int i = 0; i < n_out; i++) {
-            results.push_back(as_arr(&out_bufs[i]));
-            as_arr(&out_bufs[i]).~array();
+            results.push_back(out[i]);
         }
-
-        // Destroy input wrappers.
-        for (auto& b : bufs) {
-            as_arr(&b).~array();
-        }
-
         return results;
     };
 

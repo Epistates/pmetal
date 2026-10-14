@@ -287,26 +287,22 @@ void mlx_inline_compiled_moe_layer_fixed(
 void mlx_inline_enable_compile(void);
 void mlx_inline_disable_compile(void);
 
-// Compile a flat array→array function with shapeless=false.
-// inputs: array of InlineArrays to compile over. outputs: caller provides buffer.
-// build_fn is called ONCE to trace the graph; subsequent calls replay the tape.
-// The function takes N inputs and produces M outputs.
-void mlx_inline_compile_fixed(
-    const mlx_inline_array* inputs, int num_inputs,
-    mlx_inline_array* outputs, int num_outputs,
-    int compile_id);
-
 // ── Generic mlx::core::compile() wrapper ─────────────────────────────────
 //
 // Callback invoked by MLX when the compiled closure is called. Converts
 // input mlx::core::array values into `mlx_inline_array` buffers, then
 // calls `forward_fn` with them. The Rust side writes output arrays into
-// `outputs` (caller-allocated with space for `n_outputs_max` slots) and
-// sets `*n_outputs_written` to the actual count.
-typedef void (*mlx_rust_compile_forward_fn)(
+// `outputs` (`n_outputs_max` uninitialised slots) by placement-new and sets
+// `*n_outputs_written` to the count, returning 0. Returns 2 when the closure
+// made more arrays than there are slots (nothing written, the count in
+// `*n_outputs_written`), and 1 when the Rust closure panicked (nothing
+// written). Either abandons the call; the panic is re-raised on the Rust side
+// once `mlx_inline_compile_call` returns.
+typedef int (*mlx_rust_compile_forward_fn)(
     const mlx_inline_array* const* inputs,
     int n_inputs,
     mlx_inline_array* outputs,
+    int n_outputs_max,
     int* n_outputs_written,
     void* ctx
 );
@@ -324,8 +320,11 @@ void* mlx_inline_compile_make(
 );
 
 // Invoke a compiled closure. `inputs` is a flat array of N input handles;
-// on success `outputs[0..*n_outputs_written-1]` hold the result arrays
-// (caller must have allocated at least `n_outputs_max` slots).
+// on success `outputs[0..*n_outputs_written-1]` hold the result arrays,
+// placement-new'd into the caller's `n_outputs_max` slots, which must start
+// uninitialised (a live array there would be overwritten without being
+// destroyed). A closure that makes more than `n_outputs_max` arrays is an
+// error, not truncated.
 //
 // Returns 0 on success, -1 on any failure (check pmetal_bridge_last_error_*).
 int mlx_inline_compile_call(

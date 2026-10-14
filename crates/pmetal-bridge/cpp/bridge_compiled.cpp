@@ -1918,54 +1918,37 @@ struct BridgeCompiledHandle {
 // inline buffer, hand control to Rust, then collect the Rust-populated
 // outputs back into a std::vector<array>.
 //
-// The `mlx_inline_init_copy` on each input is the same pattern used by
-// `value_and_grad`'s trampoline; it gives Rust a borrowed InlineArray
-// whose placement-new'd underlying array is destroyed on the way out.
+// Rust gets a borrowed InlineArray per input, whose placement-new'd array is
+// destroyed on the way out (`CallbackInputs`), and `n_outputs_max`
+// uninitialised slots to placement-new its results into (`CallbackOutputs`).
 static std::vector<array> rust_compile_trampoline(
     const std::vector<array>& inputs,
     const CompileCtx* cctx
 ) {
-    // Wrap inputs as mlx_inline_array buffers.
-    std::vector<mlx_inline_array> input_bufs(inputs.size());
-    std::vector<const mlx_inline_array*> input_ptrs(inputs.size());
-    for (size_t i = 0; i < inputs.size(); ++i) {
-        new (input_bufs[i].buf) array(inputs[i]);
-        input_ptrs[i] = &input_bufs[i];
-    }
-
-    // Allocate output buffers — Rust writes into these and updates n_out.
-    std::vector<mlx_inline_array> output_bufs(cctx->n_outputs_max);
-    for (int i = 0; i < cctx->n_outputs_max; ++i) {
-        mlx_inline_init_empty(&output_bufs[i]);
-    }
+    CallbackInputs in(inputs);
+    CallbackOutputs out(cctx->n_outputs_max);
 
     int n_out = 0;
-    cctx->fn(
-        input_ptrs.data(),
-        static_cast<int>(inputs.size()),
-        output_bufs.data(),
-        &n_out,
-        cctx->ctx
-    );
+    const int status = cctx->fn(
+        in.data(), in.size(), out.data(), out.capacity(), &n_out, cctx->ctx);
+    if (status == 2) {
+        // The closure made more arrays than there are slots; `n_out` says how
+        // many, and Rust wrote none of them.
+        throw std::invalid_argument(
+            "the compiled closure returned " + std::to_string(n_out)
+            + " arrays but n_outputs_max is " + std::to_string(out.capacity()));
+    }
+    if (status != 0) {
+        throw RustCallbackPanicked();
+    }
+    n_out = std::max(0, std::min(n_out, out.capacity()));
+    out.adopt(n_out);
 
-    // Collect results before destroying the output buffers.
     std::vector<array> results;
-    results.reserve(static_cast<size_t>(std::max(0, n_out)));
-    int n_to_collect = std::max(0, std::min(n_out, cctx->n_outputs_max));
-    for (int i = 0; i < n_to_collect; ++i) {
-        results.push_back(as_arr(&output_bufs[i]));
+    results.reserve(static_cast<size_t>(n_out));
+    for (int i = 0; i < n_out; ++i) {
+        results.push_back(out[i]);
     }
-
-    // Destroy all output buffers (including any Rust didn't fill — those
-    // still hold the default placement-new from mlx_inline_init_empty).
-    for (int i = 0; i < cctx->n_outputs_max; ++i) {
-        as_arr(&output_bufs[i]).~array();
-    }
-    // Destroy input wrappers.
-    for (auto& b : input_bufs) {
-        as_arr(&b).~array();
-    }
-
     return results;
 }
 
@@ -2026,7 +2009,12 @@ int mlx_inline_compile_call(
 
         auto results = h->fn(input_arrs);
 
-        int n = std::min(static_cast<int>(results.size()), n_outputs_max);
+        if (static_cast<int>(results.size()) > n_outputs_max) {
+            throw std::invalid_argument(
+                "the compiled closure returned " + std::to_string(results.size())
+                + " arrays but n_outputs_max is " + std::to_string(n_outputs_max));
+        }
+        const int n = static_cast<int>(results.size());
         for (int i = 0; i < n; ++i) {
             new (outputs[i].buf) array(std::move(results[i]));
         }

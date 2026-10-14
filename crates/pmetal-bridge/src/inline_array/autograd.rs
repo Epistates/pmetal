@@ -25,29 +25,33 @@ pub fn value_and_grad<F>(
 where
     F: FnMut(&[InlineArray]) -> InlineArray,
 {
-    // Trampoline: C++ calls this with InlineArray-sized buffers
+    // Trampoline: C++ calls this with InlineArray-sized buffers. A panic in
+    // `loss_fn` can't unwind through the C++ frames above, so it is parked and
+    // re-raised once the call returns (see `crate::callback`).
     unsafe extern "C" fn trampoline<F: FnMut(&[InlineArray]) -> InlineArray>(
         all_arrays: *const *const RawBuf,
         n_total: i32,
         loss_out: *mut RawBuf,
         ctx: *mut std::ffi::c_void,
-    ) {
-        let f = unsafe { &mut *(ctx as *mut F) };
-        // Wrap raw pointers as borrowed InlineArrays (no ownership transfer)
-        let arrays: Vec<InlineArray> = (0..n_total as usize)
-            .map(|i| {
-                let ptr = unsafe { *all_arrays.add(i) };
-                let mut dst = MaybeUninit::<RawBuf>::uninit();
-                unsafe { mlx_inline_init_copy(dst.as_mut_ptr(), ptr) };
-                InlineArray {
-                    raw: unsafe { dst.assume_init() },
-                }
-            })
-            .collect();
-        let loss = f(&arrays);
-        // Write loss into output buffer (placement-copy)
-        unsafe { mlx_inline_init_copy(loss_out, &loss.raw) };
-        // arrays and loss drop here (calling mlx_inline_destroy for each)
+    ) -> i32 {
+        crate::callback::guard(|| {
+            let f = unsafe { &mut *(ctx as *mut F) };
+            // Wrap raw pointers as borrowed InlineArrays (no ownership transfer)
+            let arrays: Vec<InlineArray> = (0..n_total as usize)
+                .map(|i| {
+                    let ptr = unsafe { *all_arrays.add(i) };
+                    let mut dst = MaybeUninit::<RawBuf>::uninit();
+                    unsafe { mlx_inline_init_copy(dst.as_mut_ptr(), ptr) };
+                    InlineArray {
+                        raw: unsafe { dst.assume_init() },
+                    }
+                })
+                .collect();
+            let loss = f(&arrays);
+            // Write loss into output buffer (placement-copy)
+            unsafe { mlx_inline_init_copy(loss_out, &loss.raw) };
+            // arrays and loss drop here (calling mlx_inline_destroy for each)
+        })
     }
 
     let n_params = params.len();
@@ -60,12 +64,14 @@ where
         .map(|a| &a.raw as *const RawBuf)
         .collect();
 
-    let mut loss = InlineArray::from_f32(0.0);
-    let mut grads: Vec<InlineArray> = (0..n_params).map(|_| InlineArray::from_f32(0.0)).collect();
-    let mut grad_ptrs: Vec<*mut RawBuf> = grads
-        .iter_mut()
-        .map(|g| &mut g.raw as *mut RawBuf)
-        .collect();
+    // The call fills every slot on every path (on failure with placeholders),
+    // by placement-new, so they start uninitialised: a live array in a slot
+    // would be overwritten without being destroyed, one leaked array per slot
+    // per step.
+    let mut loss = MaybeUninit::<RawBuf>::uninit();
+    let mut grads: Vec<MaybeUninit<RawBuf>> =
+        (0..n_params).map(|_| MaybeUninit::uninit()).collect();
+    let mut grad_ptrs: Vec<*mut RawBuf> = grads.iter_mut().map(|g| g.as_mut_ptr()).collect();
 
     unsafe {
         mlx_inline_value_and_grad(
@@ -74,11 +80,23 @@ where
             all_ptrs.as_ptr(),
             n_params as i32,
             n_total as i32,
-            &mut loss.raw,
+            loss.as_mut_ptr(),
             grad_ptrs.as_mut_ptr(),
         );
     }
 
+    // SAFETY: the call initialised the loss and every gradient slot.
+    let loss = InlineArray {
+        raw: unsafe { loss.assume_init() },
+    };
+    let grads: Vec<InlineArray> = grads
+        .into_iter()
+        .map(|g| InlineArray {
+            raw: unsafe { g.assume_init() },
+        })
+        .collect();
+
+    crate::callback::resume_pending();
     (loss, grads)
 }
 
@@ -183,32 +201,39 @@ where
         outputs_out: *mut RawBuf,
         n_outputs_out: *mut i32,
         ctx: *mut std::ffi::c_void,
-    ) {
-        let f = unsafe { &mut *(ctx as *mut F) };
+    ) -> i32 {
+        crate::callback::guard(|| {
+            let f = unsafe { &mut *(ctx as *mut F) };
 
-        // Borrow-wrap each input pointer as an InlineArray (copy-construct).
-        let arrays: Vec<InlineArray> = (0..n_total as usize)
-            .map(|i| {
-                let ptr = unsafe { *all_arrays.add(i) };
-                let mut dst = MaybeUninit::<RawBuf>::uninit();
-                unsafe { mlx_inline_init_copy(dst.as_mut_ptr(), ptr) };
-                InlineArray {
-                    raw: unsafe { dst.assume_init() },
-                }
-            })
-            .collect();
+            // Borrow-wrap each input pointer as an InlineArray (copy-construct).
+            let arrays: Vec<InlineArray> = (0..n_total as usize)
+                .map(|i| {
+                    let ptr = unsafe { *all_arrays.add(i) };
+                    let mut dst = MaybeUninit::<RawBuf>::uninit();
+                    unsafe { mlx_inline_init_copy(dst.as_mut_ptr(), ptr) };
+                    InlineArray {
+                        raw: unsafe { dst.assume_init() },
+                    }
+                })
+                .collect();
 
-        let results = f(&arrays);
-        // `outputs_out` holds MAX_OUTPUTS slots; writing past them would run off
-        // the end of the caller's buffer.
-        let n = results.len().min(MAX_OUTPUTS);
+            let results = f(&arrays);
+            // `outputs_out` holds MAX_OUTPUTS slots; writing past them would
+            // run off the end of the caller's buffer, and dropping the rest
+            // would hand back a block missing outputs.
+            assert!(
+                results.len() <= MAX_OUTPUTS,
+                "checkpoint_apply: the closure returned {} arrays, at most {MAX_OUTPUTS} are supported",
+                results.len()
+            );
 
-        // Write each output via placement-copy into the caller's flat buffer.
-        for (i, r) in results.iter().take(n).enumerate() {
-            unsafe { mlx_inline_init_copy(outputs_out.add(i), &r.raw) };
-        }
-        unsafe { *n_outputs_out = n as i32 };
-        // `arrays` and `results` drop here, calling mlx_inline_destroy for each.
+            // Write each output via placement-copy into the caller's flat buffer.
+            for (i, r) in results.iter().enumerate() {
+                unsafe { mlx_inline_init_copy(outputs_out.add(i), &r.raw) };
+            }
+            unsafe { *n_outputs_out = results.len() as i32 };
+            // `arrays` and `results` drop here, calling mlx_inline_destroy for each.
+        })
     }
 
     // Frees the boxed closure once C++ drops the last copy of the checkpointed
@@ -250,5 +275,6 @@ where
     // MAX_OUTPUTS on its side), and wrote 0 if it threw.
     let n = (n_written as usize).min(MAX_OUTPUTS);
     unsafe { output_storage.set_len(n) };
+    crate::callback::resume_pending();
     output_storage
 }

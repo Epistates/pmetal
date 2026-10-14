@@ -5,9 +5,9 @@
 //! bytes as a value, or let a C++ exception unwind into Rust. Expected values
 //! are written out by hand.
 
+use pmetal_bridge::InlineArray;
 use pmetal_bridge::check_unobserved_error;
 use pmetal_bridge::compat::Dtype;
-use pmetal_bridge::InlineArray;
 
 fn scalar(value: f32, dtype: Dtype) -> InlineArray {
     InlineArray::from_f32(value).as_dtype(dtype.as_i32())

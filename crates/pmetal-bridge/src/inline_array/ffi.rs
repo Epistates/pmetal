@@ -1347,13 +1347,16 @@ bridge_extern! {
     );
 
     // ── Autograd: value_and_grad ──
+    // The callback returns 0 on success and non-zero when its Rust closure
+    // panicked (see `crate::callback`); every output slot starts uninitialised
+    // and is initialised by the call on every path.
     pub(super) fn mlx_inline_value_and_grad(
         forward_fn: unsafe extern "C" fn(
             *const *const RawBuf,
             i32,
             *mut RawBuf,
             *mut std::ffi::c_void,
-        ),
+        ) -> i32,
         ctx: *mut std::ffi::c_void,
         all_arrays: *const *const RawBuf,
         n_params: i32,
@@ -1396,7 +1399,7 @@ bridge_extern! {
             *mut RawBuf,          // outputs_out  (flat array, capacity = n_outputs_max)
             *mut i32,             // n_outputs_out (written by callback)
             *mut std::ffi::c_void,
-        ),
+        ) -> i32, // 0, or non-zero when the closure panicked
         // Takes ownership of `ctx`; `drop_fn` is called when C++ releases it.
         ctx: *mut std::ffi::c_void,
         drop_fn: unsafe extern "C" fn(*mut std::ffi::c_void),

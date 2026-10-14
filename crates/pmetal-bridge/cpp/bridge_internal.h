@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <exception>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -112,6 +113,73 @@ static inline array bridge_sdpa(const array& q, const array& k, const array& v, 
     }
     return mx::fast::scaled_dot_product_attention(q, k, v, scale, mask_mode, mask, sinks);
 }
+
+// ---------------------------------------------------------------------------
+// Callbacks into Rust
+// ---------------------------------------------------------------------------
+//
+// `value_and_grad`, `checkpoint` and the generic compile wrapper call a Rust
+// closure from inside MLX. The closure's Rust side catches a panic (one can
+// not unwind through this frame) and reports it as a non-zero return; a
+// non-zero return is turned into this exception, which MLX unwinds through
+// like any other and the bridge entry point catches. The panic itself is
+// re-raised by the Rust caller once the entry point has returned.
+struct RustCallbackPanicked : std::runtime_error {
+    RustCallbackPanicked() : std::runtime_error("a Rust callback panicked") {}
+};
+
+// The arrays handed to a callback: copies of `args` in raw buffers, destroyed
+// with this object, on every path out including an exception.
+class CallbackInputs {
+public:
+    explicit CallbackInputs(const std::vector<array>& args)
+        : bufs_(args.size()), ptrs_(args.size()) {
+        for (size_t i = 0; i < args.size(); ++i) {
+            new (bufs_[i].buf) array(args[i]);
+            ptrs_[i] = &bufs_[i];
+        }
+    }
+    ~CallbackInputs() {
+        for (auto& b : bufs_) {
+            as_arr(&b).~array();
+        }
+    }
+    CallbackInputs(const CallbackInputs&) = delete;
+    CallbackInputs& operator=(const CallbackInputs&) = delete;
+
+    const mlx_inline_array* const* data() const { return ptrs_.data(); }
+    int size() const { return static_cast<int>(ptrs_.size()); }
+
+private:
+    std::vector<mlx_inline_array> bufs_;
+    std::vector<const mlx_inline_array*> ptrs_;
+};
+
+// Output slots a callback writes into. They start uninitialised: the callback
+// placement-news the slots it uses and says how many (`written`), and only
+// those are read back and destroyed. Pre-filling them would leak one array per
+// slot per call, since placement-new does not destroy what it overwrites.
+class CallbackOutputs {
+public:
+    explicit CallbackOutputs(int capacity) : bufs_(capacity > 0 ? capacity : 0) {}
+    ~CallbackOutputs() {
+        for (int i = 0; i < written_; ++i) {
+            as_arr(&bufs_[i]).~array();
+        }
+    }
+    CallbackOutputs(const CallbackOutputs&) = delete;
+    CallbackOutputs& operator=(const CallbackOutputs&) = delete;
+
+    mlx_inline_array* data() { return bufs_.data(); }
+    int capacity() const { return static_cast<int>(bufs_.size()); }
+    // Take ownership of the first `n` slots (the count the callback reported).
+    void adopt(int n) { written_ = n; }
+    const array& operator[](int i) const { return as_arr(&bufs_[i]); }
+
+private:
+    std::vector<mlx_inline_array> bufs_;
+    int written_ = 0;
+};
 
 // Standard try/catch wrapper for ops that construct a single output via
 // placement-new into `dst->buf`. On success, clears any prior error and

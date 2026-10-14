@@ -10,8 +10,11 @@ extern "C" {
 #endif
 
 // ── Autograd: value_and_grad ─────────────────────────────────────────────
-// Callback type for Rust forward function.
-typedef void (*mlx_rust_forward_fn)(
+// Callback type for Rust forward function. On return 0 it has placement-new'd
+// the loss into `loss_out`; non-zero means the Rust closure panicked, wrote
+// nothing, and the call is abandoned (the panic is re-raised on the Rust side
+// once the entry point returns).
+typedef int (*mlx_rust_forward_fn)(
     const mlx_inline_array* const* all_arrays,
     int n_total,
     mlx_inline_array* loss_out,
@@ -38,8 +41,9 @@ bool mlx_inline_is_tracer(const mlx_inline_array* a);
 
 // ── Gradient checkpointing ───────────────────────────────────────────────
 // Callback type for the checkpointed inner function.
-// Writes output arrays into outputs_out[0..*n_outputs_out-1].
-typedef void (*mlx_rust_checkpoint_fn)(
+// Writes output arrays into outputs_out[0..*n_outputs_out-1] and returns 0, or
+// returns non-zero (having written nothing) when the Rust closure panicked.
+typedef int (*mlx_rust_checkpoint_fn)(
     const mlx_inline_array* const* all_arrays,
     int n_total,
     mlx_inline_array* outputs_out,
