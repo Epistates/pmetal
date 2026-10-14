@@ -70,14 +70,19 @@ pub(super) struct Visibility<'a> {
 /// The first cold token and the first dense token a step attends to, given
 /// that the sequence is `sinks`, then `cold`, then the ring, and that
 /// everything before absolute position `first_token` is masked.
-fn first_visible(first_token: usize, sink_len: usize, cold_len: usize) -> (usize, usize) {
+fn first_visible(
+    first_token: usize,
+    sink_len: usize,
+    cold_len: usize,
+    dense_len: usize,
+) -> (usize, usize) {
     let cold_first = first_token.saturating_sub(sink_len).min(cold_len);
     let dense_first = if first_token < sink_len {
         first_token
     } else {
         sink_len + first_token.saturating_sub(sink_len + cold_len)
     };
-    (cold_first, dense_first)
+    (cold_first, dense_first.min(dense_len))
 }
 
 /// Threadgroup memory a kernel launch may use.
@@ -221,7 +226,8 @@ fn decode_attention_launch(
     let n_kv_rows = batch * kv_heads;
     let cold_tokens = cold.map_or(0, |c| c.len);
     let dense_tokens = dense.tokens();
-    let (cold_first, dense_first) = first_visible(first_token, dense.sink_len, cold_tokens);
+    let (cold_first, dense_first) =
+        first_visible(first_token, dense.sink_len, cold_tokens, dense_tokens);
     let visible_cold = cold_tokens - cold_first;
     let visible_dense = dense_tokens - dense_first;
     if visible_cold + visible_dense == 0 {

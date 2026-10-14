@@ -452,6 +452,17 @@ fn attention_from_a_given_position_ignores_earlier_tokens() {
         let err = relative_error(&to_host(&out), &want);
         assert!(err < KERNEL_TOLERANCE, "first token {first}: {err:.2e}");
     }
+    // A start past the last cached token leaves nothing to attend to: an
+    // error, whether or not the tokens before it are cold.
+    for first in [200usize, 201, 10_000] {
+        let err = cache
+            .compute_attention(&w.queries_array(), w.scale(), first, None)
+            .expect_err("nothing to attend to");
+        assert!(
+            err.contains("no cached token"),
+            "first token {first}: {err}"
+        );
+    }
 }
 
 #[test]
