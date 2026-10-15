@@ -164,7 +164,7 @@ pub trait DFlashTarget {
     /// verify step. Default: delegates to [`KVCache::rollback`] on the
     /// provided external cache.
     ///
-    /// Native-runtime targets own their own cache and override this to
+    /// Native-engine targets own their own cache and override this to
     /// rewind the internal state (recurrent layers included, from what
     /// [`Self::verify_with_capture`] recorded), ignoring the external
     /// `kv_cache` arg.
@@ -219,7 +219,7 @@ pub trait DFlashTarget {
     /// Compact the target's KV cache after a tree-verify round: the
     /// `tree_length` rows at `[past_length..past_length+tree_length]`
     /// are reduced to `accepted_indices.len()` rows (in the same
-    /// order). Default: no-op. Only the native-runtime target
+    /// order). Default: no-op. Only the native-engine target
     /// implements this today.
     fn compact_tree_cache(
         &mut self,
@@ -1154,7 +1154,7 @@ impl DFlashTarget for DynamicModel {
             // Phi-4-mini ties, so a direct `lm_head` projection here draws on
             // a head the checkpoint never filled.
             Self::Phi(m) | Self::Phi4(m) => m.project_logits(hidden),
-            Self::DeepSeek(m) => Ok(Module::forward(&mut m.lm_head, hidden)?),
+            Self::DeepSeek(m) => Ok(m.lm_head_forward(hidden)),
             Self::Qwen3MoE(m) => match &mut m.lm_head {
                 Some(lm) => Ok(Module::forward(lm, hidden)?),
                 None => {

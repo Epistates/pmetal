@@ -1,7 +1,8 @@
 //! GPT-OSS model architecture (OpenAI's first open-weight models).
 //!
 //! Implements GPT-OSS with:
-//! - Mixture of Experts (MoE) with Top-4 sigmoid routing
+//! - Mixture of Experts (MoE) with a biased top-4 router (softmax over the
+//!   chosen logits)
 //! - Alternating sliding window (128) and full attention patterns
 //! - SwiGLU activation with clamping (limit=7.0)
 //! - Grouped Multi-Query Attention (GQA, group size 8)
@@ -26,7 +27,8 @@ use pmetal_runtime::impl_module_params;
 
 use crate::checkpointing::checkpointed_layer;
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
-use pmetal_runtime::gpt_oss_native::GptOssExperts;
+use pmetal_runtime::gpt_oss_native::{GptOssExperts, glu, route_logits};
+use pmetal_runtime::native_weight::LayerWeight;
 
 /// gpt-oss's GLU slope, `gate · σ(1.702 · gate)`.
 const SWIGLU_ALPHA: f32 = 1.702;
@@ -565,39 +567,10 @@ impl GptOssMLP {
 /// and the `+1` on the up branch is the identity-shift the model trains
 /// deviations against. The clamps bound the two *inputs* (asymmetrically), not
 /// the product — this keeps activations in range for MXFP4 inference.
-fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
-    const ALPHA: f32 = SWIGLU_ALPHA;
-    let lim = Array::from_f32(limit);
-    let neg_lim = Array::from_f32(-limit);
-    // gate: clamp the upper bound only (min stays unbounded).
-    let x_glu = ops::minimum(gate, &lim);
-    // up: symmetric clamp to [-limit, limit].
-    let x_linear = ops::maximum(&ops::minimum(up, &lim), &neg_lim);
-    // QuickGELU gate: x_glu * sigmoid(alpha * x_glu).
-    let glu = x_glu.multiply(&ops::sigmoid(&x_glu.multiply(&Array::from_f32(ALPHA))));
-    // up branch carries a +1 identity shift.
-    Ok(glu.multiply(&x_linear.add(&Array::from_f32(1.0))))
-}
-
-/// GPT-OSS router selection — spec of record: HF `modeling_gpt_oss`
-/// (`GptOssTopKRouter`): select the top-k
-/// experts from the RAW router logits, then take `softmax` over the selected
-/// logits. NOT sigmoid, and NOT renormalized — the softmax over the chosen
-/// logits already sums to 1.
 ///
-/// Returns `(top_indices [.., k] i32, weights [.., k])`.
-fn router_topk_softmax(gate_logits: &Array, top_k: i32) -> (Array, Array) {
-    // O(E) top-k: argpartition places the k largest at the tail, then slice.
-    let part = ops::argpartition_axis(gate_logits, -top_k, -1);
-    // Routing indices are a discrete selection — no gradient should ever flow
-    // through them, only through the gathered logits. MLX >= 0.32 enforces
-    // this, raising "[gather] Cannot calculate VJP with respect to indices"
-    // when they sit downstream of differentiable logits inside a grad trace;
-    // v0.31 tolerated it and could silently produce NaN instead.
-    let top_indices = ops::stop_gradient(&ops::slice_last_from(&part, -top_k).as_type::<i32>());
-    let top_logits = gate_logits.take_along_axis(&top_indices, -1);
-    let weights = ops::softmax_axis(&top_logits, -1);
-    (top_indices, weights)
+/// The one implementation is [`glu`], the native engine's.
+fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
+    Ok(glu(gate, up, SWIGLU_ALPHA, limit))
 }
 
 /// GPT-OSS expert MLP with bias and SwiGLU clamping.
@@ -644,7 +617,17 @@ impl GptOssMoEExpert {
     }
 }
 
-/// GPT-OSS MoE block with sigmoid routing.
+/// The per-expert weights and biases of a [`GptOssMoE`] stacked over a leading
+/// expert axis, as the gather matmuls read them, and the identity of every
+/// handle they were built from (a replaced weight makes them stale).
+#[derive(Debug)]
+struct StackedExperts {
+    experts: GptOssExperts,
+    signature: Vec<usize>,
+}
+
+/// GPT-OSS MoE block: a biased top-k router with a softmax over the chosen
+/// logits, and clamped-GLU experts with biases.
 #[derive(Debug)]
 pub struct GptOssMoE {
     /// Top-k experts per token.
@@ -657,20 +640,9 @@ pub struct GptOssMoE {
     experts: Vec<GptOssMoEExpert>,
     /// SwiGLU limit for clamping.
     swiglu_limit: f32,
-    /// Stacked gate projection weights `[num_experts, hidden, intermediate]`.
-    stacked_gate_proj: Option<Array>,
-    /// Stacked up projection weights `[num_experts, hidden, intermediate]`.
-    stacked_up_proj: Option<Array>,
-    /// Stacked down projection weights `[num_experts, intermediate, hidden]`.
-    stacked_down_proj: Option<Array>,
-    /// Stacked gate bias `[num_experts, intermediate]`.
-    stacked_gate_bias: Option<Array>,
-    /// Stacked up bias `[num_experts, intermediate]`.
-    stacked_up_bias: Option<Array>,
-    /// Stacked down bias `[num_experts, hidden]`.
-    stacked_down_bias: Option<Array>,
-    /// Signature of the current expert weight/bias handles.
-    stacked_signature: Option<Vec<usize>>,
+    /// `experts` stacked, built on first use and rebuilt when a weight is
+    /// replaced.
+    stacked: Option<StackedExperts>,
     /// The experts as a checkpoint ships them fused (the release's MXFP4,
     /// kept packed, or transformers' dense `gate_up_proj`), frozen, in place
     /// of `experts`. See [`GptOssMoE::set_fused_experts`].
@@ -703,13 +675,7 @@ impl GptOssMoE {
             gate,
             experts,
             swiglu_limit,
-            stacked_gate_proj: None,
-            stacked_up_proj: None,
-            stacked_down_proj: None,
-            stacked_gate_bias: None,
-            stacked_up_bias: None,
-            stacked_down_bias: None,
-            stacked_signature: None,
+            stacked: None,
             fused: None,
         })
     }
@@ -721,13 +687,7 @@ impl GptOssMoE {
     /// them to everything below.
     pub fn set_fused_experts(&mut self, experts: GptOssExperts) {
         self.experts.clear();
-        self.stacked_gate_proj = None;
-        self.stacked_up_proj = None;
-        self.stacked_down_proj = None;
-        self.stacked_gate_bias = None;
-        self.stacked_up_bias = None;
-        self.stacked_down_bias = None;
-        self.stacked_signature = None;
+        self.stacked = None;
         self.fused = Some(experts);
     }
 
@@ -741,145 +701,80 @@ impl GptOssMoE {
         // detection key. It is valid on unevaluated lazy arrays, unlike
         // `data_ptr()` which segfaults when the buffer has not been
         // materialised.
+        let bias_id = |linear: &nn::Linear| {
+            linear
+                .bias
+                .as_ref()
+                .as_ref()
+                .map(|bias| bias.id())
+                .unwrap_or(0)
+        };
         let mut signature = Vec::with_capacity(self.experts.len() * 6);
         for expert in &self.experts {
-            signature.push(expert.gate_proj.weight.as_ref().id());
-            signature.push(
-                expert
-                    .gate_proj
-                    .bias
-                    .as_ref()
-                    .as_ref()
-                    .map(|bias| bias.id())
-                    .unwrap_or(0),
-            );
-            signature.push(expert.up_proj.weight.as_ref().id());
-            signature.push(
-                expert
-                    .up_proj
-                    .bias
-                    .as_ref()
-                    .as_ref()
-                    .map(|bias| bias.id())
-                    .unwrap_or(0),
-            );
-            signature.push(expert.down_proj.weight.as_ref().id());
-            signature.push(
-                expert
-                    .down_proj
-                    .bias
-                    .as_ref()
-                    .as_ref()
-                    .map(|bias| bias.id())
-                    .unwrap_or(0),
-            );
+            for linear in [&expert.gate_proj, &expert.up_proj, &expert.down_proj] {
+                signature.push(linear.weight.as_ref().id());
+                signature.push(bias_id(linear));
+            }
         }
         signature
     }
 
-    fn stack_expert_weights(
-        &self,
-    ) -> Result<(Array, Array, Array, Array, Array, Array), Exception> {
-        let gate_weights: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                dequantize_fp8_weight_for_compute(expert.gate_proj.weight.as_ref()).map(|w| w.t())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let up_weights: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                dequantize_fp8_weight_for_compute(expert.up_proj.weight.as_ref()).map(|w| w.t())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let down_weights: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                dequantize_fp8_weight_for_compute(expert.down_proj.weight.as_ref()).map(|w| w.t())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let gate_biases: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                expert
-                    .gate_proj
-                    .bias
-                    .as_ref()
-                    .map(|b| b.as_ref().clone())
-                    .unwrap_or_else(|| Array::zeros_f32(&[expert.gate_proj.weight.as_ref().dim(0)]))
-            })
-            .collect();
-        let up_biases: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                expert
-                    .up_proj
-                    .bias
-                    .as_ref()
-                    .map(|b| b.as_ref().clone())
-                    .unwrap_or_else(|| Array::zeros_f32(&[expert.up_proj.weight.as_ref().dim(0)]))
-            })
-            .collect();
-        let down_biases: Vec<Array> = self
-            .experts
-            .iter()
-            .map(|expert| {
-                expert
-                    .down_proj
-                    .bias
-                    .as_ref()
-                    .map(|b| b.as_ref().clone())
-                    .unwrap_or_else(|| Array::zeros_f32(&[expert.down_proj.weight.as_ref().dim(0)]))
-            })
-            .collect();
-
-        Ok((
-            pmetal_runtime::compat::ops::stack_axis(&gate_weights, 0),
-            pmetal_runtime::compat::ops::stack_axis(&up_weights, 0),
-            pmetal_runtime::compat::ops::stack_axis(&down_weights, 0),
-            pmetal_runtime::compat::ops::stack_axis(&gate_biases, 0),
-            pmetal_runtime::compat::ops::stack_axis(&up_biases, 0),
-            pmetal_runtime::compat::ops::stack_axis(&down_biases, 0),
-        ))
+    /// The per-expert `Linear`s as one [`GptOssExperts`]: weights transposed
+    /// to `[E, in, out]`, biases `[E, out]` (zero where an expert has none).
+    fn stack_expert_weights(&self) -> Result<GptOssExperts, Exception> {
+        let weights = |linear: fn(&GptOssMoEExpert) -> &nn::Linear| -> Result<Array, Exception> {
+            let transposed = self
+                .experts
+                .iter()
+                .map(|expert| {
+                    dequantize_fp8_weight_for_compute(linear(expert).weight.as_ref()).map(|w| w.t())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ops::stack_axis(&transposed, 0))
+        };
+        let biases = |linear: fn(&GptOssMoEExpert) -> &nn::Linear| -> Array {
+            let per_expert: Vec<Array> = self
+                .experts
+                .iter()
+                .map(|expert| {
+                    let linear = linear(expert);
+                    linear
+                        .bias
+                        .as_ref()
+                        .map(|b| b.as_ref().clone())
+                        .unwrap_or_else(|| Array::zeros_f32(&[linear.weight.as_ref().dim(0)]))
+                })
+                .collect();
+            ops::stack_axis(&per_expert, 0)
+        };
+        Ok(GptOssExperts {
+            gate: LayerWeight::Dense(weights(|e| &e.gate_proj)?),
+            up: LayerWeight::Dense(weights(|e| &e.up_proj)?),
+            down: LayerWeight::Dense(weights(|e| &e.down_proj)?),
+            gate_bias: biases(|e| &e.gate_proj),
+            up_bias: biases(|e| &e.up_proj),
+            down_bias: biases(|e| &e.down_proj),
+        })
     }
 
     fn ensure_stacked(&mut self) -> Result<(), Exception> {
         let signature = self.current_signature();
-        let needs_refresh = self.stacked_gate_proj.is_none()
-            || self.stacked_up_proj.is_none()
-            || self.stacked_down_proj.is_none()
-            || self.stacked_gate_bias.is_none()
-            || self.stacked_up_bias.is_none()
-            || self.stacked_down_bias.is_none()
-            || self.stacked_signature.as_ref() != Some(&signature);
+        let needs_refresh = self
+            .stacked
+            .as_ref()
+            .is_none_or(|stacked| stacked.signature != signature);
 
         if needs_refresh {
-            let (
-                stacked_gate_proj,
-                stacked_up_proj,
-                stacked_down_proj,
-                stacked_gate_bias,
-                stacked_up_bias,
-                stacked_down_bias,
-            ) = self.stack_expert_weights()?;
-            stacked_gate_proj.eval();
-            stacked_up_proj.eval();
-            stacked_down_proj.eval();
-            stacked_gate_bias.eval();
-            stacked_up_bias.eval();
-            stacked_down_bias.eval();
-            self.stacked_gate_proj = Some(stacked_gate_proj);
-            self.stacked_up_proj = Some(stacked_up_proj);
-            self.stacked_down_proj = Some(stacked_down_proj);
-            self.stacked_gate_bias = Some(stacked_gate_bias);
-            self.stacked_up_bias = Some(stacked_up_bias);
-            self.stacked_down_bias = Some(stacked_down_bias);
-            self.stacked_signature = Some(signature);
+            let experts = self.stack_expert_weights()?;
+            for weight in [&experts.gate, &experts.up, &experts.down] {
+                if let LayerWeight::Dense(w) = weight {
+                    w.eval();
+                }
+            }
+            for bias in [&experts.gate_bias, &experts.up_bias, &experts.down_bias] {
+                bias.eval();
+            }
+            self.stacked = Some(StackedExperts { experts, signature });
         }
 
         Ok(())
@@ -895,28 +790,13 @@ impl GptOssMoE {
 
     /// Whether the stacked expert cache is populated.
     pub fn has_stacked_moe(&self) -> bool {
-        self.stacked_gate_proj.is_some()
-            && self.stacked_up_proj.is_some()
-            && self.stacked_down_proj.is_some()
-            && self.stacked_gate_bias.is_some()
-            && self.stacked_up_bias.is_some()
-            && self.stacked_down_bias.is_some()
+        self.stacked.is_some()
     }
 
-    fn route_topk(&mut self, hidden_flat: &Array) -> Result<(i32, i32, Array, Array), Exception> {
-        let batch_seq = hidden_flat.dim(0);
-        let hidden_size = hidden_flat.dim(1);
-
-        let gate_logits = self.gate.forward(hidden_flat);
-        let (top_indices, weights) = router_topk_softmax(&gate_logits, self.top_k as i32);
-
-        Ok((batch_seq, hidden_size, top_indices, weights))
-    }
-
-    fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
-        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)]);
-        let result = pmetal_runtime::compat::ops::matmul(&x_expanded, w);
-        Ok(result.squeeze_axes(&[1]))
+    /// The router: top-k over `gate(x)` (with its bias) and a softmax over the
+    /// chosen logits, [`route_logits`], the native engine's.
+    fn route_topk(&self, hidden_flat: &Array) -> (Array, Array) {
+        route_logits(&self.gate.forward(hidden_flat), self.top_k as i32)
     }
 
     #[cfg(test)]
@@ -925,8 +805,7 @@ impl GptOssMoE {
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden_size = shape[shape.len() - 1];
         let hidden_flat = x.reshape(&[batch_seq, hidden_size]);
-        let (_batch_seq, _hidden_size, top_indices, normalized_weights) =
-            self.route_topk(&hidden_flat)?;
+        let (top_indices, normalized_weights) = self.route_topk(&hidden_flat);
 
         top_indices.eval();
         normalized_weights.eval();
@@ -977,94 +856,23 @@ impl GptOssMoE {
         Ok(output.reshape(&output_shape))
     }
 
-    fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
-        self.ensure_stacked()?;
-
-        let shape = x.shape();
-        let hidden_flat = x.reshape(&[
-            shape[..shape.len() - 1].iter().product(),
-            shape[shape.len() - 1],
-        ]);
-        let (batch_seq, hidden_size, top_indices, normalized_weights) =
-            self.route_topk(&hidden_flat)?;
-        let top_k = self.top_k as i32;
-        let mut output = pmetal_runtime::compat::ops::zeros_dtype(
-            &[batch_seq, hidden_size],
-            hidden_flat.dtype(),
-        );
-
-        for slot in 0..top_k {
-            let slot_experts =
-                pmetal_runtime::compat::ops::slice_axis(&top_indices, -1, slot, slot + 1)
-                    .reshape(&[top_indices.dim(0)]);
-            let slot_weights =
-                pmetal_runtime::compat::ops::slice_axis(&normalized_weights, -1, slot, slot + 1);
-            let gate_weights = self
-                .stacked_gate_proj
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-            let up_weights = self
-                .stacked_up_proj
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-            let down_weights = self
-                .stacked_down_proj
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-            let gate_bias = self
-                .stacked_gate_bias
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-            let up_bias = self
-                .stacked_up_bias
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-            let down_bias = self
-                .stacked_down_bias
-                .as_ref()
-                .unwrap()
-                .take_axis(&slot_experts, 0);
-
-            let gate_out = self
-                .batched_matmul(&hidden_flat, &gate_weights)?
-                .add(&gate_bias);
-            let up_out = self
-                .batched_matmul(&hidden_flat, &up_weights)?
-                .add(&up_bias);
-            let clamped = clamp_swiglu_hidden(&gate_out, &up_out, self.swiglu_limit)?;
-            let slot_out = self
-                .batched_matmul(&clamped, &down_weights)?
-                .add(&down_bias);
-            output = output.add(&slot_out.multiply(&slot_weights));
-        }
-
-        let mut output_shape = shape.to_vec();
-        output_shape[shape.len() - 1] = hidden_size;
-        Ok(output.reshape(&output_shape))
-    }
-
     /// Forward pass through MoE.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let _ = self.router_aux_loss_coef;
-        if self.fused.is_some() {
-            return self.forward_fused(x);
+        if self.fused.is_none() {
+            self.ensure_stacked()?;
         }
-        self.forward_stacked(x)
-    }
+        let experts = match (&self.fused, &self.stacked) {
+            (Some(fused), _) => fused,
+            (None, Some(stacked)) => &stacked.experts,
+            (None, None) => unreachable!("ensure_stacked builds the stack"),
+        };
 
-    /// The router here, the experts through [`GptOssExperts::forward`].
-    fn forward_fused(&mut self, x: &Array) -> Result<Array, Exception> {
         let shape = x.shape().to_vec();
         let hidden_size = shape[shape.len() - 1];
         let hidden_flat = x.reshape(&[-1, hidden_size]);
-        let (_, _, top_indices, weights) = self.route_topk(&hidden_flat)?;
-        let fused = self.fused.as_ref().expect("fused experts");
-        let out = fused.forward(
+        let (top_indices, weights) = self.route_topk(&hidden_flat);
+        let out = experts.forward(
             &hidden_flat,
             &top_indices,
             &weights.as_dtype(hidden_flat.dtype().as_i32()),
@@ -1072,7 +880,7 @@ impl GptOssMoE {
             self.swiglu_limit,
         );
         pmetal_runtime::check_unobserved_error()
-            .map_err(|e| Exception::custom(format!("gpt_oss: fused experts: {e}")))?;
+            .map_err(|e| Exception::custom(format!("gpt_oss: experts: {e}")))?;
         Ok(out.reshape(&shape))
     }
 }
@@ -1286,8 +1094,9 @@ impl GptOssModel {
 pub struct GptOssForCausalLM {
     /// Base model.
     pub model: GptOssModel,
-    /// Language model head.
-    pub lm_head: nn::Linear,
+    /// Language model head; `None` when `tie_word_embeddings` ties it to the
+    /// token embedding.
+    pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(GptOssForCausalLM; model, lm_head);
 
@@ -1296,11 +1105,26 @@ impl GptOssForCausalLM {
     pub fn new(config: GptOssConfig) -> Result<Self, Exception> {
         let model = GptOssModel::new(config.clone())?;
 
-        let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-            .bias(false)
-            .build()?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
+        };
 
         Ok(Self { model, lm_head })
+    }
+
+    /// Project hidden states to vocabulary logits, through the LM head when
+    /// the checkpoint has one and the tied embedding otherwise.
+    pub fn lm_head_forward(&self, hidden: &Array) -> Array {
+        match &self.lm_head {
+            Some(lm_head) => lm_head.forward(hidden),
+            None => self.model.embed_tokens.as_linear(hidden),
+        }
     }
 
     /// Forward pass returning logits.
@@ -1311,7 +1135,7 @@ impl GptOssForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(input_ids, mask, cache)?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Forward pass with one rotary position per token; see
@@ -1325,7 +1149,7 @@ impl GptOssForCausalLM {
         let hidden = self
             .model
             .forward_with_positions(input_ids, mask, positions)?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Forward pass that records hidden states into a DFlash capture
@@ -1340,7 +1164,7 @@ impl GptOssForCausalLM {
         let hidden =
             self.model
                 .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Eagerly build stacked expert caches for all MoE layers.
@@ -1469,7 +1293,7 @@ mod tests {
         // pmetal path used sigmoid + L1-normalization, which gives different
         // weights. One token, 4 experts; top-2 selects experts 3 (4.0) & 1 (2.0).
         let logits = Array::from_slice(&[1.0_f32, 2.0, 0.5, 4.0], &[1, 4]);
-        let (indices, mut weights) = router_topk_softmax(&logits, 2);
+        let (indices, mut weights) = route_logits(&logits, 2);
         let mut idx = indices.as_type::<f32>();
         let inds: Vec<i32> = idx
             .to_f32_vec(2)
@@ -1593,10 +1417,12 @@ mod tests {
             config.router_aux_loss_coef,
         )
         .unwrap();
+        // 80 tokens x 2 experts: past the point where the dispatch groups the
+        // (token, expert) pairs by expert.
         let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
-            &[2, 5, config.hidden_size],
+            &[2, 40, config.hidden_size],
             pmetal_runtime::compat::Dtype::Float32,
         );
 
@@ -1663,6 +1489,26 @@ mod tests {
             max_diff.item::<f32>() < 1e-4,
             "gpt-oss stacked cache failed to refresh after weight change"
         );
+    }
+
+    /// A config that ties the head to the embedding builds no head, and the
+    /// logits are the hidden states against the embedding table.
+    #[test]
+    #[serial]
+    fn test_gpt_oss_tied_head_projects_through_the_embedding() {
+        let mut model = GptOssForCausalLM::new(GptOssConfig {
+            tie_word_embeddings: true,
+            ..tiny_gpt_oss_config()
+        })
+        .unwrap();
+        assert!(model.lm_head.is_none());
+        let ids = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+        let hidden = model.model.forward(&ids, None, None).unwrap();
+        let want = hidden.matmul(&model.model.embed_tokens.weight.value.t());
+        let got = model.forward(&ids, None, None).unwrap();
+        let diff = got.subtract(&want).abs().max(None);
+        diff.eval();
+        assert!(diff.item::<f32>() < 1e-5);
     }
 
     #[test]

@@ -120,7 +120,7 @@ fn gpt_oss_synthetic_parity() {
         .model
         .forward_with_capture(&input_ids, None, None, None, Some(&mut capture))
         .expect("forward_with_capture runs");
-    let logits = model.lm_head.forward(&final_hidden);
+    let logits = model.lm_head_forward(&final_hidden);
 
     let layer0 = capture
         .hidden_states

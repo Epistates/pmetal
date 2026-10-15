@@ -17,7 +17,7 @@
 //! checks it against transformers.
 //!
 //! Every op on the hot path uses [`InlineArray`](crate::InlineArray) (stack-allocated `mlx::core::array`,
-//! direct C++ bridge). This eliminates ALL per-op heap allocation, matching
+//! direct C++ calls). This eliminates ALL per-op heap allocation, matching
 //! Python/nanobind's direct C++ binding performance.
 //!
 //! The stack is split across focused submodules:
@@ -38,8 +38,10 @@ mod weights;
 
 pub use cache::{KvLayerCache, NativeCache};
 pub use experts::{GptOssExperts, glu};
-pub use forward::{benchmark_trial, forward_step, generate, prefill_first_token};
-pub use moe::route;
+pub use forward::{
+    benchmark_trial, forward_step, forward_step_last, generate, prefill_first_token,
+};
+pub use moe::{route, route_logits};
 pub use weights::{NativeWeights, load_model};
 
 // ============================================================================

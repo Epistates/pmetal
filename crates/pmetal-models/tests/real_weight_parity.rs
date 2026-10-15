@@ -286,7 +286,7 @@ fn rank_of(row: &[f32], token: i32) -> usize {
 /// while attention computes nothing.
 fn drain(stage: &str) -> Result<(), String> {
     pmetal_runtime::check_unobserved_error()
-        .map_err(|e| format!("{stage} raised a bridge exception: {e}"))
+        .map_err(|e| format!("{stage} raised a runtime exception: {e}"))
 }
 
 /// Everything one checkpoint contributes: the taps it produced, whatever went
@@ -576,18 +576,17 @@ fn unclaimed_is_expected(key: &str) -> bool {
 /// loader actually assigns.
 ///
 /// Multimodal wrappers nest the text stack under `model.language_model.` and
-/// the dispatcher strips the infix back to `model.` before assignment. DeepSeek
-/// goes further and renames its whole mixture; that rewrite is the loader's own
-/// `deepseek_param_name`, called here rather than restated, so the check cannot
-/// drift from what actually runs.
+/// the dispatcher strips the infix back to `model.` before assignment.
+/// DeepSeek's loader stacks each layer's expert-per-key tensors into
+/// `mlp.switch_mlp.*`, which this applies to the names as
+/// `deepseek::stack_experts` does to the tensors.
 fn loader_normalized(arch: ModelArchitecture, key: &str) -> String {
-    let stripped = key.replace("model.language_model.", "model.");
-    let renamed = if arch == ModelArchitecture::DeepSeek {
-        pmetal_models::loader::deepseek_param_name(&stripped).unwrap_or(stripped)
+    let collapsed = collapse_indices(&key.replace("model.language_model.", "model."));
+    if arch == ModelArchitecture::DeepSeek {
+        collapsed.replace(".mlp.experts.N.", ".mlp.switch_mlp.")
     } else {
-        stripped
-    };
-    collapse_indices(&renamed)
+        collapsed
+    }
 }
 
 /// Whether this architecture assigns weights by matching parameter names

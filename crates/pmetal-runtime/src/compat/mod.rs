@@ -37,7 +37,7 @@ pub use lora::LoraAdapter;
 /// Array element type — integer codes matching MLX's `mlx_dtype` enum.
 ///
 /// The `#[repr(i32)]` discriminants are kept in sync with `bridge.h` so that
-/// `dtype.as_i32()` can be passed directly to every bridge function that
+/// `dtype.as_i32()` can be passed directly to every runtime function that
 /// accepts a `dtype: i32` parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
@@ -58,7 +58,7 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    /// Return the raw `i32` code expected by bridge functions.
+    /// Return the raw `i32` code expected by runtime functions.
     #[inline]
     pub fn as_i32(self) -> i32 {
         self as i32
@@ -238,6 +238,33 @@ impl<T> std::ops::DerefMut for Param<T> {
 impl<T: AsRef<U>, U> AsRef<U> for Param<T> {
     fn as_ref(&self) -> &U {
         self.value.as_ref()
+    }
+}
+
+// ── Buffer ───────────────────────────────────────────────────────────────────
+
+/// A tensor a model carries and a checkpoint stores that no optimizer trains,
+/// such as DeepSeek's router `e_score_correction_bias`: a load-balancing
+/// offset the routing reads, updated by a rule of its own, never by a
+/// gradient.
+///
+/// It is in [`ModuleParameters::parameters`] (a checkpoint loads it and saves
+/// it, a load that finds no tensor for it is visible) and absent from
+/// [`ModuleParameters::trainable_parameters`] (the optimizer is never handed
+/// it, so weight decay cannot erode it).
+#[derive(Debug, Clone)]
+pub struct Buffer(pub Array);
+
+impl std::ops::Deref for Buffer {
+    type Target = Array;
+    fn deref(&self) -> &Array {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Buffer {
+    fn deref_mut(&mut self) -> &mut Array {
+        &mut self.0
     }
 }
 
@@ -787,7 +814,7 @@ pub mod ops_ext {
         Array::addmm(c, a, b)
     }
     pub fn argmax_axis(a: &Array, axis: i32, keepdims: bool) -> Array {
-        // bridge has argmax(axis) without keepdims; wrap manually
+        // runtime has argmax(axis) without keepdims; wrap manually
         let out = a.argmax(axis);
         if keepdims { out.expand_dims(axis) } else { out }
     }

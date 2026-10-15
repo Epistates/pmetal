@@ -3,6 +3,10 @@
 //! The [`ShardableModel`] trait decomposes a model's forward pass into
 //! discrete stages (embed → layers → normalize → lm_head) so that
 //! different pipeline stages can be assigned to different nodes.
+//!
+//! Which layers a node gets is `pmetal_distributed::layer_assignment`'s
+//! decision (the memory-bounded dynamic-programming solver, or the
+//! proportional split); a [`PipelineShard`] only runs the range it is given.
 
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception};
@@ -130,87 +134,6 @@ impl<M: ShardableModel> PipelineShard<M> {
     }
 }
 
-/// Layer assignment: divide N layers among K nodes.
-///
-/// Returns a `Vec<Range<usize>>` where index `i` is the layer range for node `i`.
-///
-/// Proportional allocation based on available RAM. With equal RAM, layers
-/// are split as evenly as possible. With 2-4 nodes, this is an exhaustive
-/// search over contiguous splits to minimize the maximum per-node cost.
-pub fn assign_layers_proportional(num_layers: usize, available_ram: &[u64]) -> Vec<Range<usize>> {
-    let world_size = available_ram.len();
-    assert!(world_size > 0 && num_layers > 0);
-
-    #[allow(clippy::single_range_in_vec_init)]
-    if world_size == 1 {
-        return vec![0..num_layers];
-    }
-
-    let total_ram: u64 = available_ram.iter().sum();
-    let mut assignments = Vec::with_capacity(world_size);
-    let mut start = 0;
-
-    for (i, &ram) in available_ram.iter().enumerate() {
-        if i == world_size - 1 {
-            // Last node gets remaining layers
-            assignments.push(start..num_layers);
-        } else {
-            let proportion = ram as f64 / total_ram as f64;
-            let count = (proportion * num_layers as f64).round() as usize;
-            let count = count.max(1).min(num_layers - start - (world_size - i - 1));
-            assignments.push(start..start + count);
-            start += count;
-        }
-    }
-
-    assignments
-}
-
-/// Layer assignment: bandwidth-aware optimization.
-///
-/// Minimizes the bottleneck link cost by assigning more layers to the
-/// node with faster connections. For 2-4 nodes, exhaustive search over
-/// all valid contiguous splits is feasible.
-pub fn assign_layers_bandwidth_aware(
-    num_layers: usize,
-    available_ram: &[u64],
-    bandwidths: &[u64],
-) -> Vec<Range<usize>> {
-    let world_size = available_ram.len();
-    assert_eq!(world_size, bandwidths.len());
-
-    if world_size <= 1 {
-        return assign_layers_proportional(num_layers, available_ram);
-    }
-
-    // For small world_size (2-4), exhaustive search over contiguous splits
-    if world_size == 2 {
-        let mut best_split = 1;
-        let mut best_cost = u64::MAX;
-
-        for split in 1..num_layers {
-            // Cost: max(layers_per_node / bandwidth)
-            let cost_0 = split as u64 * 1000 / bandwidths[0].max(1);
-            let cost_1 = (num_layers - split) as u64 * 1000 / bandwidths[1].max(1);
-            let max_cost = cost_0.max(cost_1);
-            if max_cost < best_cost {
-                best_cost = max_cost;
-                best_split = split;
-            }
-        }
-
-        return vec![0..best_split, best_split..num_layers];
-    }
-
-    // For 3+ nodes, fall back to proportional (weighted by bandwidth * ram)
-    let weights: Vec<u64> = available_ram
-        .iter()
-        .zip(bandwidths.iter())
-        .map(|(&r, &b)| (r / 1_000_000).max(1) * (b / 1_000_000).max(1))
-        .collect();
-    assign_layers_proportional(num_layers, &weights)
-}
-
 /// Load only the safetensors keys needed for a given layer range + first/last shard.
 ///
 /// Filters keys by `model.layers.{idx}.` prefix, plus embed_tokens if first,
@@ -265,32 +188,6 @@ pub fn filter_weight_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn proportional_equal_ram() {
-        let assignments = assign_layers_proportional(32, &[16_000, 16_000]);
-        assert_eq!(assignments.len(), 2);
-        assert_eq!(assignments[0], 0..16);
-        assert_eq!(assignments[1], 16..32);
-    }
-
-    #[test]
-    fn proportional_unequal_ram() {
-        let assignments = assign_layers_proportional(32, &[48_000, 16_000]);
-        assert_eq!(assignments.len(), 2);
-        // 48/(48+16) = 0.75 → 24 layers for node 0
-        assert_eq!(assignments[0], 0..24);
-        assert_eq!(assignments[1], 24..32);
-    }
-
-    #[test]
-    fn proportional_three_nodes() {
-        let assignments = assign_layers_proportional(30, &[10_000, 10_000, 10_000]);
-        assert_eq!(assignments.len(), 3);
-        assert_eq!(assignments[0], 0..10);
-        assert_eq!(assignments[1], 10..20);
-        assert_eq!(assignments[2], 20..30);
-    }
 
     #[test]
     fn filter_keys_first_shard() {

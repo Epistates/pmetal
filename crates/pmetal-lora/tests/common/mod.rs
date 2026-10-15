@@ -538,26 +538,9 @@ pub fn stage(case: &ArchCase) -> Result<PathBuf, String> {
     }
     eval(params.values()).map_err(|e| format!("eval checkpoint tensors: {e}"))?;
 
-    // Which `mlp` prefixes are DeepSeek MoE blocks, recognised by the `w1/w2/w3`
-    // expert naming `deepseek_param_name` produces. Keying on the rename's own
-    // signature rather than on "has experts" keeps other MoE architectures,
-    // whose parameter paths already are checkpoint keys, out of the rewrite.
-    let moe_prefixes: std::collections::HashSet<String> = params
-        .keys()
-        .filter_map(|path| {
-            let idx = path.find(".mlp.experts.")?;
-            let (prefix, tail) = path.split_at(idx + ".mlp.".len());
-            let member = tail.strip_prefix("experts.")?.split_once('.')?.1;
-            matches!(member, "w1.weight" | "w2.weight" | "w3.weight").then(|| prefix.to_string())
-        })
-        .collect();
-
     let checkpoint: HashMap<Rc<str>, Array> = params
         .into_iter()
-        .map(|(path, value)| {
-            let key = checkpoint_key(&path, |prefix| moe_prefixes.contains(prefix));
-            (Rc::from(key.as_str()), value)
-        })
+        .map(|(path, value)| (Rc::from(checkpoint_key(&path).as_str()), value))
         .collect();
     save_safetensors_map(dir.join("model.safetensors"), &checkpoint)
         .map_err(|e| format!("write checkpoint: {e}"))?;
@@ -568,58 +551,22 @@ pub fn stage(case: &ArchCase) -> Result<PathBuf, String> {
 /// Rewrite a pmetal parameter path into the key a checkpoint would use.
 ///
 /// The two are the same almost everywhere, which is what lets
-/// `assign_loaded_weights` match by exact name. Two architectures differ, and
-/// both handle it with a bespoke loader that walks the struct instead of
-/// matching names, so nothing in production notices — but it does mean their
-/// flattened parameters are not a valid checkpoint, and this test has to bridge
-/// the gap itself.
+/// `assign_loaded_weights` match by exact name. Gemma differs, and handles it
+/// with a bespoke loader that walks the struct instead of matching names, so
+/// nothing in production notices — but it does mean its flattened parameters
+/// are not a valid checkpoint, and this test has to span the gap itself.
 ///
 /// **Gemma.** `GemmaLayers` holds `gemma1` and `gemma2` as separate fields so
 /// one struct can carry either layer shape, and `impl_module_params!` puts that
 /// field name into the path: `model.layers.gemma1.0.self_attn.q_proj.weight`
 /// where the checkpoint says `model.layers.0.self_attn.q_proj.weight`.
-///
-/// **DeepSeek.** `deepseek_param_name` renames three things inside a MoE `mlp`
-/// on the way in; this is its inverse. `is_moe_layer` distinguishes the shared
-/// expert (which pmetal merges into `mlp` with no prefix) from a dense MLP,
-/// which would otherwise be the same path.
-pub fn checkpoint_key(param_path: &str, is_moe_layer: impl Fn(&str) -> bool) -> String {
+pub fn checkpoint_key(param_path: &str) -> String {
     for variant in ["model.layers.gemma1.", "model.layers.gemma2."] {
         if let Some(rest) = param_path.strip_prefix(variant) {
             return format!("model.layers.{rest}");
         }
     }
-
-    let Some(idx) = param_path.find(".mlp.") else {
-        return param_path.to_string();
-    };
-    let (prefix, tail) = param_path.split_at(idx + ".mlp.".len());
-    if !is_moe_layer(prefix) {
-        return param_path.to_string();
-    }
-
-    // `mlp.weight.weight` is the router: `DeepSeekMoEGate`'s own Linear field is
-    // called `weight`, so the flattened path double-nests.
-    if tail == "weight.weight" {
-        return format!("{prefix}gate.weight");
-    }
-    if let Some(rest) = tail.strip_prefix("experts.") {
-        if let Some((index, member)) = rest.split_once('.') {
-            let renamed = match member {
-                "w1.weight" => Some("gate_proj.weight"),
-                "w3.weight" => Some("up_proj.weight"),
-                "w2.weight" => Some("down_proj.weight"),
-                _ => None,
-            };
-            if let Some(renamed) = renamed {
-                return format!("{prefix}experts.{index}.{renamed}");
-            }
-        }
-        return param_path.to_string();
-    }
-    // Anything else directly under a MoE layer's `mlp` is the shared expert,
-    // which pmetal merges in with no prefix.
-    format!("{prefix}shared_experts.{tail}")
+    param_path.to_string()
 }
 
 /// The name of every projection in `model`, the LM head's included.
@@ -688,7 +635,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
             )]);
             model.set_lora_parameters(&nudged);
             let after = model.forward(&ids, None).expect("forward");
-            pmetal_runtime::check_unobserved_error().expect("no bridge error");
+            pmetal_runtime::check_unobserved_error().expect("no runtime error");
             let moved = max_abs_diff(&before, &after);
             // NaN compares unequal to everything, so a broken forward would
             // pass for one the adapter reached.

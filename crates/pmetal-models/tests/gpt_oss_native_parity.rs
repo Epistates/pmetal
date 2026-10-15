@@ -25,8 +25,9 @@ use common::{fixture_path, load_shard, ref_tensor};
 use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_runtime::InlineArray;
 use pmetal_runtime::compat::{Array, ops::slice_axis};
+use pmetal_runtime::decode::prefill_last_logits;
 use pmetal_runtime::gpt_oss_native::{
-    NativeCache, NativeWeights, forward_step, load_config, load_model,
+    NativeCache, NativeWeights, forward_step, forward_step_last, load_config, load_model,
 };
 use serial_test::serial;
 
@@ -77,7 +78,7 @@ fn checkpoint_in(dir: tempfile::TempDir, model: &str) -> Fixture {
 fn load(path: &Path) -> NativeWeights {
     let config = load_config(path).expect("config parses");
     let weights = load_model(path, &config).expect("weights load");
-    drain_bridge("load");
+    drain_runtime("load");
     weights
 }
 
@@ -85,8 +86,8 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
     slice_axis(a, 1, start, end)
 }
 
-fn drain_bridge(op: &str) {
-    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+fn drain_runtime(op: &str) {
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: runtime error: {e}"));
 }
 
 fn max_abs_diff(a: &Array, b: &Array) -> f32 {
@@ -116,7 +117,7 @@ fn run_chunks(fx: &Fixture, chunks: &[i32], compiled: bool) -> Vec<(i32, InlineA
     let mut out = Vec::new();
     for &len in chunks {
         let logits = forward_step(&fx.weights, &rows(&ids, start, start + len), &mut cache);
-        drain_bridge("forward step");
+        drain_runtime("forward step");
         out.push((start, logits));
         start += len;
         if start == chunks[0] {
@@ -188,6 +189,36 @@ fn check_fixture(weights_file: &str, fx: &Fixture) {
         })
         .collect();
     assert_all_pass(&format!("{weights_file}: chunked prefill"), &reports);
+
+    // The prompt prefilled in passes through the last-row forward, as
+    // generation does for a long prompt: the logits of the final position and
+    // no other row's, with passes that start past the window of 4.
+    let prompt: Vec<u32> = {
+        let ids = fx.tensor("input_ids");
+        ids.eval();
+        ids.as_slice::<i32>().iter().map(|&t| t as u32).collect()
+    };
+    for chunk in [3, 5, usize::MAX] {
+        pmetal_runtime::decode::set_compiled_decode(true);
+        let mut cache = NativeCache::new_empty(&fx.weights);
+        let last = prefill_last_logits(&fx.weights, &mut cache, &prompt, chunk, forward_step_last);
+        drain_runtime("last-row prefill");
+        assert_eq!(last.dim(0), 1);
+        assert_eq!(
+            last.dim(1),
+            want.dim(2),
+            "one row of logits, not one per token"
+        );
+        assert_all_pass(
+            &format!("{weights_file}: last-row prefill in passes of {chunk}"),
+            &[ParityReport::compute(
+                "last_logits",
+                &last.expand_dims(1),
+                &rows(&want, t - 1, t),
+                TOL,
+            )],
+        );
+    }
 }
 
 #[test]
@@ -244,9 +275,9 @@ fn check_dynamic(model: &str, weights_file: &str) {
     let t = ids.dim(1);
 
     let mut dynamic = DynamicModel::load(dir.path()).expect("checkpoint loads");
-    drain_bridge("dynamic load");
+    drain_runtime("dynamic load");
     let logits = dynamic.forward(&ids, None).expect("forward");
-    drain_bridge("dynamic forward");
+    drain_runtime("dynamic forward");
     assert_all_pass(
         &format!("{weights_file}: dynamic forward"),
         &[ParityReport::compute_with_per_position(
@@ -261,7 +292,7 @@ fn check_dynamic(model: &str, weights_file: &str) {
         let step = dynamic
             .forward_with_cache(&rows(&ids, start, start + len), None, Some(&mut cache))
             .expect("cached step");
-        drain_bridge("dynamic cached step");
+        drain_runtime("dynamic cached step");
         reports.push(ParityReport::compute(
             &format!("pos_{start}"),
             &step,
@@ -322,10 +353,10 @@ fn packed_experts_pass_the_gradient_to_their_input() {
             &[],
         )
         .unwrap();
-        drain_bridge("value_and_grad");
+        drain_runtime("value_and_grad");
         assert!(loss.item::<f32>().is_finite());
         grads[0].eval();
-        drain_bridge("gradient");
+        drain_runtime("gradient");
         grads[0].clone()
     };
     let through_packed = grad_of(moe);
@@ -456,7 +487,7 @@ fn mlx_mxfp4_checkpoint(pack_the_rest: bool) -> (tempfile::TempDir, Option<tempf
             &entries,
         )
         .expect("save the weights");
-        drain_bridge("write checkpoint");
+        drain_runtime("write checkpoint");
         dir
     };
     let packed_dir = write(
