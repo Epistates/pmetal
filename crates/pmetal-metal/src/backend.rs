@@ -35,7 +35,7 @@ use crate::{
         fused_norm_lora::{FusedNormLoraConfig, FusedNormLoraOutput},
         fused_rope::FusedRoPEConfig,
         fused_swiglu::{FusedMLPOutput, FusedSwiGLUConfig, FusedSwiGLUOutput},
-        fused_training::{AdamWConfig, BatchedCommandBuffer, ParamInfo},
+        fused_training::BatchedCommandBuffer,
     },
 };
 
@@ -63,9 +63,6 @@ pub struct BackendCaps {
 
     /// Whether this backend provides fused SwiGLU.
     pub has_swiglu: bool,
-
-    /// Whether this backend provides fused AdamW optimizer.
-    pub has_adamw: bool,
 
     /// Whether this backend provides fused RoPE.
     pub has_rope: bool,
@@ -101,7 +98,6 @@ impl BackendCaps {
             has_flash_attention: true,
             has_mpp_flash_attention: false,
             has_swiglu: true,
-            has_adamw: true,
             has_rope: true,
             has_norm_lora: true,
             has_lora: true,
@@ -137,7 +133,6 @@ impl BackendCaps {
             has_mpp_flash_attention: true,
             // Wired: MppFusedSwiGLU (LoRA path now uses MPP variant).
             has_swiglu: true,
-            has_adamw: true,
             // Wired: MppFusedRoPE.
             has_rope: true,
             // Wired: MppFusedNormLora.
@@ -188,26 +183,6 @@ impl GemmDescriptor {
             use_fp16: true,
         }
     }
-}
-
-/// Descriptor for the AdamW optimizer step.
-///
-/// Mirrors `FusedAdamW::queue_update` parameters.
-#[derive(Debug)]
-pub struct AdamWDescriptor<'a> {
-    /// Flattened parameter buffer.
-    pub params: &'a MetalBuffer<f32>,
-    /// Flattened gradient buffer.
-    pub grads: &'a MetalBuffer<f32>,
-    /// First moment buffer.
-    pub m: &'a MetalBuffer<f32>,
-    /// Second moment buffer.
-    pub v: &'a MetalBuffer<f32>,
-    /// Per-parameter metadata (offset, size, moment offsets), every
-    /// parameter in group 0.
-    pub param_info: &'a MetalBuffer<ParamInfo>,
-    /// Optimizer hyperparameters, for every parameter.
-    pub config: AdamWConfig,
 }
 
 // ============================================================================
@@ -380,47 +355,6 @@ pub trait KernelBackend: Send + Sync {
         lora_a: &dyn AsMetalBuffer,
         lora_b: &dyn AsMetalBuffer,
     ) -> Result<FusedLoraOutput>;
-
-    // ---- Training optimizers and losses -------------------------------------
-
-    /// Queue a fused AdamW optimizer step into a batched command buffer.
-    ///
-    /// This encodes the dispatch but does **not** execute it — callers must
-    /// call `batch.execute()` after queuing all operations.
-    fn fused_adamw_step(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        desc: &AdamWDescriptor<'_>,
-    ) -> Result<()>;
-
-    /// Execute a fused AdamW optimizer step, creating its own command buffer.
-    ///
-    /// Unlike [`fused_adamw_step`], this method does not require an existing
-    /// [`BatchedCommandBuffer`]. It creates a temporary command buffer internally,
-    /// executes the step synchronously, and waits for completion before returning.
-    ///
-    /// # When to use
-    ///
-    /// Use this method from backends (like [`Metal4Backend`]) that cannot encode
-    /// into a shared [`BatchedCommandBuffer`] because their MPP dispatch model
-    /// owns its own command buffer per call.
-    ///
-    /// Metal 3 callers should prefer [`fused_adamw_step`] for batching efficiency.
-    ///
-    /// [`fused_adamw_step`]: KernelBackend::fused_adamw_step
-    /// [`Metal4Backend`]: crate::metal4::Metal4Backend
-    fn fused_adamw_step_standalone(
-        &self,
-        ctx: &Arc<MetalContext>,
-        desc: &AdamWDescriptor<'_>,
-    ) -> Result<()> {
-        // Default: fall through to error — backends that support this override it.
-        let _ = ctx;
-        let _ = desc;
-        Err(crate::error::MetalError::ExecutionFailed(
-            "fused_adamw_step_standalone not implemented for this backend".into(),
-        ))
-    }
 
     /// Fused RoPE: apply rotary position embeddings in-place to Q (and optionally K).
     ///

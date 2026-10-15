@@ -11,7 +11,7 @@ use half::f16;
 use objc2_metal::MTLCommandBuffer;
 
 use crate::{
-    backend::{AdamWDescriptor, BackendCaps, GemmDescriptor, KernelBackend},
+    backend::{BackendCaps, GemmDescriptor, KernelBackend},
     buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},
     context::MetalContext,
     error::Result,
@@ -387,24 +387,6 @@ impl KernelBackend for Metal4Backend {
             output,
             intermediate: None,
         })
-    }
-
-    // ---- Training optimizers and losses -------------------------------------
-
-    fn fused_adamw_step(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        desc: &AdamWDescriptor<'_>,
-    ) -> Result<()> {
-        self.fallback.fused_adamw_step(batch, desc)
-    }
-
-    fn fused_adamw_step_standalone(
-        &self,
-        ctx: &Arc<MetalContext>,
-        desc: &AdamWDescriptor<'_>,
-    ) -> Result<()> {
-        self.fallback.fused_adamw_step_standalone(ctx, desc)
     }
 
     fn fused_rope(

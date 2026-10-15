@@ -44,9 +44,7 @@ pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
 pub use fused_swiglu::{
     FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
 };
-pub use fused_training::{
-    AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, FusedGradientClipping, ParamInfo,
-};
+pub use fused_training::{AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, ParamInfo};
 pub use mpp_flash_attention::{
     MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
 };

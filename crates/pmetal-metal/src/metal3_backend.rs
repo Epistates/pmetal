@@ -3,20 +3,13 @@
 //! [`Metal3Backend`] implements [`KernelBackend`] by forwarding every method to
 //! the corresponding existing Metal 3 kernel struct. No logic lives here; this
 //! file is pure glue.
-//!
-//! # Resolved stubs
-//!
-//! All `todo!()` stubs have been closed:
-//!
-//! - **`fused_lora_forward`** and **`fused_adamw_step`**: wired directly, with param-info extraction from
-//!   the `AdamWDescriptor` for AdamW.
 
 use std::sync::Arc;
 
 use half::f16;
 
 use crate::{
-    backend::{AdamWDescriptor, BackendCaps, GemmDescriptor, KernelBackend},
+    backend::{BackendCaps, GemmDescriptor, KernelBackend},
     buffer::{AsMetalBuffer, MetalBuffer},
     context::MetalContext,
     error::Result,
@@ -29,7 +22,7 @@ use crate::{
         fused_swiglu::{
             FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
         },
-        fused_training::{BatchedCommandBuffer, FusedAdamW},
+        fused_training::BatchedCommandBuffer,
         mpp_gemm::MppGemm,
     },
 };
@@ -224,57 +217,6 @@ impl KernelBackend for Metal3Backend {
     ) -> Result<FusedLoraOutput> {
         let kernel = FusedLora::new(ctx.clone(), config.clone())?;
         kernel.forward(x, weight, lora_a, lora_b)
-    }
-
-    // ---- Training optimizers and losses -------------------------------------
-
-    /// Fused AdamW step via [`FusedAdamW::queue_update`].
-    ///
-    /// [`FusedAdamW::new`] needs `&[usize]` param sizes to pre-compute the
-    /// kernel grid (`max_param_size`, `num_params`). [`AdamWDescriptor`] does
-    /// not carry that slice directly, but `param_info` is a `MetalBuffer<ParamInfo>`
-    /// where each `ParamInfo::size` holds the per-parameter element count.
-    /// We read the slice, extract sizes, build a temporary `FusedAdamW`, and
-    /// delegate to `queue_update`.
-    fn fused_adamw_step(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        desc: &AdamWDescriptor<'_>,
-    ) -> Result<()> {
-        let param_sizes: Vec<usize> = desc
-            .param_info
-            .as_slice()
-            .iter()
-            .map(|p| p.size as usize)
-            .collect();
-        let adamw = FusedAdamW::new(self.ctx.clone(), &param_sizes);
-        adamw.queue_update(
-            batch,
-            desc.params,
-            desc.grads,
-            desc.m,
-            desc.v,
-            desc.param_info,
-            &[desc.config.scalars()?],
-        )
-    }
-
-    /// Standalone AdamW step: creates a temporary [`BatchedCommandBuffer`],
-    /// queues the update, and executes it synchronously.
-    ///
-    /// This satisfies the [`KernelBackend::fused_adamw_step_standalone`] contract
-    /// for callers (e.g. [`Metal4Backend`] dispatch glue) that need a
-    /// self-contained call without an externally owned batch.
-    ///
-    /// [`Metal4Backend`]: crate::metal4::Metal4Backend
-    fn fused_adamw_step_standalone(
-        &self,
-        _ctx: &Arc<MetalContext>,
-        desc: &AdamWDescriptor<'_>,
-    ) -> Result<()> {
-        let mut batch = BatchedCommandBuffer::new(self.ctx.clone())?;
-        self.fused_adamw_step(&mut batch, desc)?;
-        batch.execute()
     }
 
     /// Fused RoPE via [`FusedRoPE`].
