@@ -169,7 +169,7 @@ impl TiesConfig {
 /// - Sign consensus
 pub struct FusedMergeMetal {
     ctx: Arc<MetalContext>,
-    tuner: Tuner,
+    tuner: Arc<Tuner>,
     tuned_config: Option<MergeTunedConfig>,
 }
 
@@ -177,8 +177,8 @@ impl FusedMergeMetal {
     /// Create a new fused merge kernel handler.
     pub fn new(ctx: Arc<MetalContext>) -> Self {
         Self {
+            tuner: Arc::clone(ctx.tuner()),
             ctx,
-            tuner: Tuner::with_persistent_cache(),
             tuned_config: None,
         }
     }

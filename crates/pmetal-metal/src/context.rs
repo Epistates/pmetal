@@ -37,6 +37,10 @@ use crate::tuna::Tuner;
 static GLOBAL_CONTEXT: OnceLock<Result<Arc<MetalContext>>> = OnceLock::new();
 static DEVICE_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
+/// A digest of the compiled shader libraries, computed by the build script.
+/// Cached tuning results are scoped to it.
+const KERNEL_FINGERPRINT: &str = env!("PMETAL_KERNEL_FINGERPRINT");
+
 /// Embedded Metal 3 library binary (compiled at build time).
 const METAL_LIBRARY_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pmetal_kernels.metallib"));
@@ -729,7 +733,7 @@ impl MetalContext {
         );
 
         let pipeline_cache = RwLock::new(cache);
-        let tuner = Arc::new(Tuner::with_persistent_cache());
+        let tuner = Arc::new(Tuner::for_device(&properties, KERNEL_FINGERPRINT));
 
         Ok(Self {
             device,
