@@ -5390,6 +5390,7 @@ dependencies = [
  "objc2-metal",
  "parking_lot",
  "pmetal-core",
+ "pmetal-runtime",
  "rand 0.10.3",
  "safetensors",
  "serde",

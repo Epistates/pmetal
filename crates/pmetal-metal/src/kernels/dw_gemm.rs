@@ -9,7 +9,11 @@
 //! Kernel: `dw_gemm_accum` — `C = alpha * A @ B^T + beta * C`
 //!
 //! At 579M params (d=1024, h=2816, s=512): 20 layers × 7 GEMMs = 140 dispatches,
-//! ~230 GFLOP total. Projected 5.5× speedup over cblas on CPU.
+//! ~230 GFLOP total.
+//!
+//! The kernel is a 64 × 64 × 16 tiled SGEMM on `simdgroup_matrix` fragments. It
+//! zero-fills partial tiles, so M, N and K may be anything, and with
+//! `beta == 0` it never reads `C`, so a fresh buffer is fine as the output.
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -43,9 +47,10 @@ crate::msl_layout::msl_layout!(DwGemmParams, size = 20, {
     beta: 16,
 });
 
-/// Tile dimensions — must match `dw_gemm.metal` constants.
+/// Tile dimensions and threads per threadgroup — must match `dw_gemm.metal`.
 const BM: usize = 64;
 const BN: usize = 64;
+const THREADS_PER_GROUP: usize = 128;
 
 /// Minimum model dimension to use GPU path. Below this threshold the
 /// Metal dispatch overhead exceeds the compute win over cblas.
@@ -141,10 +146,10 @@ impl DwGemm {
             depth: 1,
         };
 
-        // 16×16 = 256 threads per threadgroup
+        // Four simdgroups, 2 x 2 over the 64 x 64 tile.
         let threadgroup_size = MTLSize {
-            width: 16,
-            height: 16,
+            width: THREADS_PER_GROUP,
+            height: 1,
             depth: 1,
         };
 
