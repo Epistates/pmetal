@@ -48,7 +48,7 @@ Use `pmetal info` to display all detected hardware properties.
 
 On UltraFusion machines, `pmetal info` now also reports the local same-process executor scaffold: per-die resource slices, the in-memory stage count, and the heuristic 32 TB/s interconnect used by PMetal's local UltraFusion planner.
 
-Use `pmetal bench-corpus` to collect a comparable kernel report for the current machine. That corpus exercises standard-Metal hot paths on M1-M4, includes fused-merge plus initial MoE/model-family coverage across Apple7-Apple10, and adds MPP GEMM coverage on Apple10/M5 when NAX is available.
+Use `pmetal bench-corpus` to collect a comparable kernel report for the current machine. That corpus exercises standard-Metal hot paths on M1-M4, includes fused-merge plus initial MoE/model-family coverage across Apple7-Apple10.
 
 Use `pmetal bench-workload` when you want a fast end-to-end regression loop instead of only kernel microbenchmarks. The default workload uses the cached `Qwen/Qwen3-0.6B` model plus `TeichAI/gemini-3-pro-preview-high-reasoning-250x`, and the inference report now records the KV cache mode chosen on the current machine.
 
