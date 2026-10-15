@@ -1461,18 +1461,6 @@ impl TurboQuantKvCache {
         fused_sdpa(queries, &full_keys, &full_values, attn_config, None)
     }
 
-    /// Whether the cache supports trim.
-    pub fn is_trimmable(&self) -> bool {
-        true
-    }
-
-    /// Trim `n` tokens from the logical tail.
-    pub fn trim(&mut self, n: usize) -> usize {
-        let trimmed = n.min(self.offset);
-        self.rollback(trimmed);
-        trimmed
-    }
-
     /// Roll back the last `n` cached tokens.
     ///
     /// Hot tokens trim first (cheap, just decrement `hot_offset`). If `n`
@@ -2936,11 +2924,6 @@ fn matmul_rows(matrix: &[f32], dim: usize, rows: &[f32]) -> Vec<f32> {
 
 fn l2_norm(values: &[f32]) -> f32 {
     values.iter().map(|value| value * value).sum::<f32>().sqrt()
-}
-
-/// Convenience constructor for a TurboQuant KV cache.
-pub fn create_turboquant_cache(key_bits: u8, value_bits: u8) -> TurboQuantKvCache {
-    TurboQuantKvCache::new(key_bits, value_bits)
 }
 
 pub(crate) fn create_turboquant_runtime(

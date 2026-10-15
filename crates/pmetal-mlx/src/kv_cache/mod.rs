@@ -41,7 +41,6 @@
 mod fused_batch;
 mod mamba;
 mod quantized;
-mod rotating;
 mod standard;
 #[cfg(test)]
 mod tests;
@@ -50,7 +49,6 @@ mod turboquant;
 pub use fused_batch::*;
 pub use mamba::*;
 pub use quantized::*;
-pub use rotating::*;
 pub use standard::*;
 pub use turboquant::*;
 
@@ -73,14 +71,6 @@ pub struct KVCacheConfig {
     pub dtype: Dtype,
     /// Cache mode.
     pub mode: CacheMode,
-    /// Whether to eagerly pre-allocate the full context window upfront.
-    /// When true, allocates memory for max_seq_len tokens at creation time.
-    /// This provides predictable memory usage but uses more memory initially.
-    /// Default: false (lazy allocation in 256-token chunks).
-    pub eager_allocate: bool,
-    /// Batch size for eager allocation (only used when eager_allocate=true).
-    /// Default: 1
-    pub eager_batch_size: usize,
 }
 
 /// KV cache mode.
@@ -306,8 +296,6 @@ impl KVCacheConfig {
             value_head_dim: head_dim,
             dtype: Dtype::Float32,
             mode: CacheMode::Standard,
-            eager_allocate: false,
-            eager_batch_size: 1,
         }
     }
 
@@ -427,30 +415,6 @@ impl KVCacheConfig {
         self
     }
 
-    /// Enable eager pre-allocation of the full context window.
-    ///
-    /// When enabled, the KV cache will allocate memory for the full `max_seq_len`
-    /// at creation time rather than growing dynamically. This provides:
-    /// - **Predictable memory usage**: Know exactly how much memory is needed upfront
-    /// - **No allocation during generation**: Faster token generation
-    /// - **Memory fragmentation prevention**: Single contiguous allocation
-    ///
-    /// Trade-off: Uses more memory initially even for short sequences.
-    ///
-    /// # Arguments
-    /// * `batch_size` - Batch size to pre-allocate for (typically 1 for inference)
-    ///
-    /// # Example
-    /// ```ignore
-    /// let config = KVCacheConfig::new(32, 4096, 8, 128)
-    ///     .with_eager_allocate(1);  // Pre-allocate for batch_size=1
-    /// let cache = KVCache::new(config);  // ~1GB allocated immediately
-    /// ```
-    pub fn with_eager_allocate(mut self, batch_size: usize) -> Self {
-        self.eager_allocate = true;
-        self.eager_batch_size = batch_size;
-        self
-    }
 
     /// Calculate the memory footprint for this configuration in bytes.
     ///
@@ -498,8 +462,7 @@ impl KVCacheConfig {
                     Dtype::Float16 | Dtype::Bfloat16 => 2,
                     _ => 4,
                 };
-                self.eager_batch_size.max(1)
-                    * self.num_kv_heads
+                self.num_kv_heads
                     * self.max_seq_len
                     * (key_dim + value_dim)
                     * bytes_per_element

@@ -1,6 +1,6 @@
-//! Standard KV cache implementation with lazy and eager allocation.
+//! The dense KV cache and the cache every model's layers share.
 
-use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
+use pmetal_runtime::compat::{Array, Exception, ops};
 
 use crate::kernels::FusedAttentionConfig;
 
@@ -40,46 +40,7 @@ impl LayerCache {
         }
     }
 
-    /// Create a new layer cache with pre-allocated buffers.
-    fn new_eager(
-        batch_size: usize,
-        num_kv_heads: usize,
-        max_seq_len: usize,
-        key_head_dim: usize,
-        value_head_dim: usize,
-        dtype: Dtype,
-    ) -> Self {
-        let k_shape = [
-            batch_size as i32,
-            num_kv_heads as i32,
-            max_seq_len as i32,
-            key_head_dim as i32,
-        ];
-        let v_shape = [
-            batch_size as i32,
-            num_kv_heads as i32,
-            max_seq_len as i32,
-            value_head_dim as i32,
-        ];
-        let keys = Some(ops::zeros(&k_shape, dtype));
-        let values = Some(ops::zeros(&v_shape, dtype));
-
-        Self {
-            keys,
-            values,
-            offset: 0,
-            tokens_seen: 0,
-        }
-    }
-
     fn reset(&mut self) {
-        // For eager allocation, just reset offset but keep buffers
-        self.offset = 0;
-        self.tokens_seen = 0;
-        // Note: We don't set keys/values to None to preserve the pre-allocated buffers
-    }
-
-    fn reset_full(&mut self) {
         self.keys = None;
         self.values = None;
         self.offset = 0;
@@ -106,10 +67,8 @@ pub struct KVCache {
 }
 
 impl KVCache {
-    /// Create a new KV cache with the given configuration.
-    ///
-    /// If `eager_allocate` is enabled in the config, this will pre-allocate
-    /// the full context window immediately and may fail if memory is insufficient.
+    /// Create a new KV cache with the given configuration. Buffers are
+    /// allocated as tokens arrive.
     pub fn new(config: KVCacheConfig) -> Self {
         let layer_caches = (0..config.num_layers).map(|_| LayerCache::new()).collect();
 
@@ -154,59 +113,6 @@ impl KVCache {
         }
     }
 
-    /// Create a new KV cache with eager pre-allocation.
-    ///
-    /// Pre-allocates the full `max_seq_len` context window for all layers.
-    /// Returns an error if memory allocation fails.
-    ///
-    /// # Memory Calculation
-    /// Memory = 2 × num_layers × batch_size × num_kv_heads × max_seq_len × head_dim × dtype_size
-    ///
-    /// # Example
-    /// ```ignore
-    /// let config = KVCacheConfig::new(32, 4096, 8, 128)
-    ///     .with_eager_allocate(1)
-    ///     .with_dtype(Dtype::Float16);
-    /// println!("Will allocate: {}", config.memory_footprint_human());
-    /// let cache = KVCache::new_eager(config)?;
-    /// ```
-    pub fn new_eager(config: KVCacheConfig) -> Result<Self, Exception> {
-        if !config.eager_allocate {
-            // Fall back to lazy allocation
-            return Ok(Self::new(config));
-        }
-
-        let mut layer_caches = Vec::with_capacity(config.num_layers);
-        for _ in 0..config.num_layers {
-            layer_caches.push(LayerCache::new_eager(
-                config.eager_batch_size,
-                config.num_kv_heads,
-                config.max_seq_len,
-                config.head_dim,
-                config.value_head_dim,
-                config.dtype,
-            ));
-        }
-
-        // Evaluate all allocations to materialize them on device
-        for cache in &mut layer_caches {
-            if let Some(ref mut k) = cache.keys {
-                k.eval();
-            }
-            if let Some(ref mut v) = cache.values {
-                v.eval();
-            }
-        }
-
-        Ok(Self {
-            config,
-            layer_caches,
-            quantized_layers: None,
-            turboquant_layers: None,
-            total_tokens: 0,
-        })
-    }
-
     /// Get the cache configuration.
     pub fn config(&self) -> &KVCacheConfig {
         &self.config
@@ -232,85 +138,6 @@ impl KVCache {
     /// of round-tripping through dense fp16 snapshots.
     pub fn fork(&self) -> Self {
         self.clone()
-    }
-
-    /// Take the layer's KV buffers and current offset for a fused
-    /// compiled update step (used by `compiled_*_attn_block` callers).
-    /// The buffer is grown to fit the next `prev_offset + new_seq_len`
-    /// tokens before being handed out, so the compiled call can write
-    /// `new_seq_len` rows at `prev_offset` via `put_along_axis`.
-    ///
-    /// The caller is responsible for invoking
-    /// [`KVCache::commit_compiled_layer_buffers`] with the *new* keys
-    /// and values returned by the compiled function — otherwise the
-    /// layer cache is left in an inconsistent state.
-    pub fn take_compiled_layer_buffers(
-        &mut self,
-        layer_idx: usize,
-        new_seq_len: usize,
-        n_kv_heads: i32,
-        key_head_dim: i32,
-        value_head_dim: i32,
-        dtype: Dtype,
-    ) -> Result<(Array, Array, usize), Exception> {
-        if layer_idx >= self.config.num_layers {
-            return Err(Exception::custom(format!(
-                "Layer index {} out of range (num_layers={})",
-                layer_idx, self.config.num_layers
-            )));
-        }
-        if self.quantized_layers.is_some() || self.turboquant_layers.is_some() {
-            return Err(Exception::custom(
-                "compiled cache buffer access is unsupported for quantized caches",
-            ));
-        }
-        let cache = &mut self.layer_caches[layer_idx];
-        let prev_offset = cache.offset;
-        let needed = prev_offset + new_seq_len;
-        let needs_grow = match cache.keys.as_ref() {
-            None => true,
-            Some(k) => (k.dim(2) as usize) < needed,
-        };
-        if needs_grow {
-            // Pre-allocate in chunks of CACHE_STEP_SIZE.
-            let n_steps = needed.div_ceil(CACHE_STEP_SIZE);
-            let new_alloc_len = n_steps * CACHE_STEP_SIZE;
-            let batch = 1; // current callers all use batch=1
-            let k_shape = [batch, n_kv_heads, new_alloc_len as i32, key_head_dim];
-            let v_shape = [batch, n_kv_heads, new_alloc_len as i32, value_head_dim];
-            let new_k = ops::zeros(&k_shape, dtype);
-            let new_v = ops::zeros(&v_shape, dtype);
-            if let (Some(existing_k), Some(existing_v)) = (&cache.keys, &cache.values) {
-                cache.keys = Some(ops::concatenate_axis(&[existing_k, &new_k], 2));
-                cache.values = Some(ops::concatenate_axis(&[existing_v, &new_v], 2));
-            } else {
-                cache.keys = Some(new_k);
-                cache.values = Some(new_v);
-            }
-        }
-        let keys = cache.keys.take().unwrap();
-        let values = cache.values.take().unwrap();
-        Ok((keys, values, prev_offset))
-    }
-
-    /// Commit the new KV buffers returned by a compiled fused step back
-    /// to the layer cache. `new_offset` is the post-update offset
-    /// (typically `prev_offset + new_seq_len`).
-    pub fn commit_compiled_layer_buffers(
-        &mut self,
-        layer_idx: usize,
-        new_keys: Array,
-        new_values: Array,
-        new_offset: usize,
-    ) {
-        let cache = &mut self.layer_caches[layer_idx];
-        cache.keys = Some(new_keys);
-        cache.values = Some(new_values);
-        cache.offset = new_offset;
-        cache.tokens_seen = cache.tokens_seen.max(new_offset);
-        if layer_idx == 0 {
-            self.total_tokens = new_offset;
-        }
     }
 
     /// Get the current cached sequence length.
@@ -344,20 +171,9 @@ impl KVCache {
         }
     }
 
-    /// Check if the cache is pre-allocated (eager mode).
-    pub fn is_preallocated(&self) -> bool {
-        self.config.eager_allocate
-            && self
-                .layer_caches
-                .first()
-                .map(|c| c.keys.is_some())
-                .unwrap_or(false)
-    }
-
     /// Reset the cache for a new generation.
     ///
-    /// For eager-allocated caches, this resets the offset but preserves the
-    /// pre-allocated buffers. For lazy caches, this deallocates all memory.
+    /// Every layer's buffers are released.
     pub fn reset(&mut self) {
         if let Some(ref mut q_layers) = self.quantized_layers {
             for cache in q_layers {
@@ -367,35 +183,10 @@ impl KVCache {
             for cache in tq_layers {
                 cache.reset();
             }
-        } else if self.config.eager_allocate {
-            for cache in &mut self.layer_caches {
-                cache.reset();
-            }
         } else {
             for cache in &mut self.layer_caches {
-                cache.reset_full();
-            }
-        }
-        self.total_tokens = 0;
-    }
-
-    /// Fully reset the cache, deallocating all memory.
-    ///
-    /// Unlike `reset()`, this always deallocates the buffers even for
-    /// eager-allocated caches. Use this to free memory when done.
-    pub fn reset_full(&mut self) {
-        if let Some(ref mut q_layers) = self.quantized_layers {
-            for cache in q_layers {
                 cache.reset();
             }
-        }
-        if let Some(ref mut tq_layers) = self.turboquant_layers {
-            for cache in tq_layers {
-                cache.reset();
-            }
-        }
-        for cache in &mut self.layer_caches {
-            cache.reset_full();
         }
         self.total_tokens = 0;
     }
@@ -708,21 +499,6 @@ impl KVCache {
             .map(Some)
     }
 
-    /// Legacy update method - DEPRECATED, use update_and_fetch instead.
-    /// Kept for backwards compatibility.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use update_and_fetch instead for SOTA performance"
-    )]
-    pub fn update(
-        &mut self,
-        layer_idx: usize,
-        new_keys: &Array,
-        new_values: &Array,
-    ) -> Result<(Array, Array), Exception> {
-        self.update_and_fetch(layer_idx, new_keys, new_values)
-    }
-
     /// Get cached keys and values for a layer without updating.
     ///
     /// Returns sliced views up to the actual sequence length (not the pre-allocated buffer size).
@@ -855,34 +631,6 @@ impl KVCache {
             )))
         }
     }
-}
-
-/// Convenience function to create a standard KV cache.
-pub fn create_kv_cache(
-    num_layers: usize,
-    max_seq_len: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> KVCache {
-    KVCache::new(KVCacheConfig::new(
-        num_layers,
-        max_seq_len,
-        num_kv_heads,
-        head_dim,
-    ))
-}
-
-/// Convenience function to create a sliding window KV cache.
-pub fn create_sliding_window_cache(
-    num_layers: usize,
-    window_size: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> KVCache {
-    KVCache::new(
-        KVCacheConfig::new(num_layers, window_size * 2, num_kv_heads, head_dim)
-            .with_sliding_window(window_size),
-    )
 }
 
 /// Batch of KV caches for parallel generation.

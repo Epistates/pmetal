@@ -260,18 +260,6 @@ impl QuantizedKVCache {
         Ok((dk, dv))
     }
 
-    /// Check if trimmable.
-    pub fn is_trimmable(&self) -> bool {
-        true
-    }
-
-    /// Trim n tokens.
-    pub fn trim(&mut self, n: usize) -> usize {
-        let trimmed = n.min(self.offset);
-        self.offset -= trimmed;
-        trimmed
-    }
-
     /// Roll back (discard) the last `n` tokens from the cache.
     pub fn rollback(&mut self, n: usize) {
         let new_offset = self.offset.saturating_sub(n);
@@ -337,9 +325,4 @@ impl QuantizedKVCache {
             0
         }
     }
-}
-
-/// Convenience function to create a quantized KV cache.
-pub fn create_quantized_cache(bits: u8, group_size: usize) -> QuantizedKVCache {
-    QuantizedKVCache::new(bits, group_size)
 }
