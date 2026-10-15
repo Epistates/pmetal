@@ -104,7 +104,8 @@ fn attention_transfer(t: &[f64], s: &[f64]) -> f64 {
 fn bf16_attention_maps_are_reduced_in_f32() {
     let (t, s) = (attention(0.3), attention(1.7));
     let (t64, s64) = (rounded(&t, Dtype::Bfloat16), rounded(&s, Dtype::Bfloat16));
-    let cases: [(&str, AttentionTransferLoss, fn(&[f64], &[f64]) -> f64); 3] = [
+    type Reference = fn(&[f64], &[f64]) -> f64;
+    let cases: [(&str, AttentionTransferLoss, Reference); 3] = [
         ("mse", AttentionTransferLoss::mse(), mse),
         ("kl", AttentionTransferLoss::kl(), kl),
         (
