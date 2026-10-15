@@ -216,6 +216,19 @@ impl ColdStore {
         self.len = needed;
     }
 
+    /// Drop the newest `n` quantized tokens (all of them if fewer are held)
+    /// and return how many went. The packed rows stay where they are, to be
+    /// overwritten. An emptied store forgets its key frame: the next tokens
+    /// that go cold calibrate a new one.
+    pub(super) fn drop_newest(&mut self, n: usize) -> usize {
+        let dropped = n.min(self.len);
+        self.len -= dropped;
+        if self.len == 0 {
+            self.frame = None;
+        }
+        dropped
+    }
+
     /// Keys and values of the whole store as `[KV, len, D]` f32 in the
     /// original basis.
     pub(super) fn dequantize(
@@ -352,6 +365,25 @@ impl DenseStore {
             self.ring_len += run;
             done += run;
         }
+    }
+
+    /// Drop the newest `n` ring tokens (all of them if the ring holds fewer)
+    /// and return how many went; the slots are free for the next push.
+    pub(super) fn drop_newest_ring(&mut self, n: usize) -> usize {
+        let dropped = n.min(self.ring_len);
+        self.ring_len -= dropped;
+        if self.ring_len == 0 {
+            self.ring_start = 0;
+        }
+        dropped
+    }
+
+    /// Drop the newest `n` sink tokens (all of them if fewer are held) and
+    /// return how many went.
+    pub(super) fn drop_newest_sinks(&mut self, n: usize) -> usize {
+        let dropped = n.min(self.sink_len);
+        self.sink_len -= dropped;
+        dropped
     }
 
     /// The `n` oldest ring tokens as `[KV, n, D]` and `[KV, n, Dv]`, removed

@@ -122,6 +122,78 @@ fn every_append_pattern_keeps_the_sequence_intact_and_in_order() {
 }
 
 #[test]
+fn truncate_gives_back_the_newest_tokens_and_appending_resumes() {
+    // A speculative verify appends a draft and takes back what was rejected.
+    // However the cut falls (inside the ring, into the quantized history, or
+    // into the sinks) the cache then holds exactly the earlier tokens, and
+    // appending the same tokens again restores the sequence.
+    let total = 330usize;
+    let w = Workload::new(1, 2, 2, total, 64, 21);
+    for window in [Some(32usize), None] {
+        let cfg = config(8, 8, window, 4);
+        for filled in [2usize, 5, 20, 60, 130, 330] {
+            for cut in [1usize, 3, 8, 40, 100, 400] {
+                let mut cache = new_cache(cfg);
+                // The prompt in one piece, then the draft token by token.
+                let prompt = filled.saturating_sub(7).max(1);
+                cache
+                    .append(&w.kv_slice(false, 0, prompt), &w.kv_slice(true, 0, prompt))
+                    .unwrap();
+                for t in prompt..filled {
+                    cache
+                        .append(&w.kv_slice(false, t, t + 1), &w.kv_slice(true, t, t + 1))
+                        .unwrap();
+                }
+                let removed = cache.truncate(cut);
+                assert_eq!(
+                    removed,
+                    cut.min(filled),
+                    "window {window:?} filled {filled}"
+                );
+                let kept = filled - removed;
+                assert_eq!(cache.len(), kept);
+                if kept > 0 {
+                    assert_contents(&cache, &w, kept, cfg);
+                } else {
+                    assert!(cache.is_empty() && cache.nbytes() == 0);
+                }
+                cache
+                    .append(
+                        &w.kv_slice(false, kept, filled),
+                        &w.kv_slice(true, kept, filled),
+                    )
+                    .unwrap();
+                assert_contents(&cache, &w, filled, cfg);
+                crate::check_unobserved_error().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn attention_after_a_truncate_ignores_the_tokens_taken_back() {
+    let (q_heads, kv_heads, dim) = (4usize, 2usize, 64usize);
+    let w = Workload::new(1, q_heads, kv_heads, 200, dim, 22);
+    let cfg = config(8, 8, Some(32), 4);
+    let mut cache = new_cache(cfg);
+    cache
+        .append(&w.kv_slice(false, 0, 200), &w.kv_slice(true, 0, 200))
+        .unwrap();
+    assert_eq!(cache.truncate(60), 60);
+    let out = cache
+        .compute_attention(&w.queries_array(), w.scale(), 0, None)
+        .unwrap();
+    let k = to_host(&cache.dequantize_keys().unwrap());
+    let v = to_host(&cache.dequantize_values().unwrap());
+    let want = w.reference_over(&k, &v, 140, 140);
+    let err = relative_error(&to_host(&out), &want);
+    assert!(
+        err < KERNEL_TOLERANCE,
+        "attention after truncate: {err:.2e}"
+    );
+}
+
+#[test]
 fn a_long_decode_attends_correctly_at_every_step_across_evictions() {
     // 400 single-token steps through a 32-token window: the ring wraps and
     // is evicted a dozen times. At selected steps the fused attention equals

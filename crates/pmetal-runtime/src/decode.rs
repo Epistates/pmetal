@@ -624,8 +624,8 @@ pub fn quantized_sdpa(
     sinks: Option<&InlineArray>,
 ) -> InlineArray {
     quantized_sdpa_kv(
-        queries, q_keys, q_values, scale, query_len, n_q_heads, n_kv_heads, group_size, bits,
-        bits, sinks,
+        queries, q_keys, q_values, scale, query_len, n_q_heads, n_kv_heads, group_size, bits, bits,
+        sinks,
     )
 }
 
