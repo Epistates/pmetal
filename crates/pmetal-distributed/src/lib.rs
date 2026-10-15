@@ -195,7 +195,7 @@ pub use expert_parallel::{CapacityConfig, ExpertDispatcher, ExpertPlacement};
 pub use context_parallel::{CPMode, ring_attention_forward};
 
 #[cfg(feature = "zero")]
-pub use zero::{ZeROPartitioner, ZeROStage};
+pub use zero::{ShardOptimizer, ShardedAdamW, ZeROStage, ZeroLayout, ZeroOptimizer};
 
 #[cfg(feature = "pipeline-training")]
 pub use pipeline_training::{MicroBatchAction, ZBAction, schedule_1f1b, schedule_zero_bubble};
@@ -464,7 +464,7 @@ pub mod prelude {
     pub use crate::context_parallel::CPMode;
 
     #[cfg(feature = "zero")]
-    pub use crate::zero::{ZeROPartitioner, ZeROStage};
+    pub use crate::zero::{ZeROStage, ZeroLayout, ZeroOptimizer};
 
     #[cfg(feature = "pipeline-training")]
     pub use crate::pipeline_training::{MicroBatchAction, ZBAction};

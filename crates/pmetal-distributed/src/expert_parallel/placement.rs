@@ -124,66 +124,6 @@ impl ExpertPlacement {
     pub fn is_local(&self, expert_id: usize, rank: usize) -> bool {
         self.rank_for_expert[expert_id] == rank
     }
-
-    /// Build a ZeRO param-name → rank assignment that keeps each expert's
-    /// optimizer state on the same rank that owns its forward weights.
-    ///
-    /// The input `stacked_param_names` are keys like
-    /// `"model.layers.3.mlp.switch_mlp.gate_proj.weight"` whose leading
-    /// tensor axis is the expert dim. Each such param is assigned as a
-    /// whole to rank 0 — a limitation of parameter-granularity ZeRO. If
-    /// you want per-expert ownership of optimizer state, pair this with
-    /// `ExpertSharded` weight sharding so the param stored on each rank
-    /// only contains *that rank's* experts, and ZeRO Stage 1 will
-    /// partition the already-sharded tensor normally.
-    ///
-    /// For non-expert-stacked params, caller should fall back to
-    /// [`crate::zero::ZeROPartitioner::new`]'s round-robin assignment.
-    ///
-    /// # Note
-    ///
-    /// This helper exists so ZeRO and expert-parallel cannot drift apart:
-    /// if you change the expert-ID → rank mapping, both modules go
-    /// through [`crate::expert_shard::expert_range`].
-    pub fn zero_stacked_assignment(
-        &self,
-        stacked_param_names: impl IntoIterator<Item = String>,
-    ) -> std::collections::HashMap<String, usize> {
-        let mut map = std::collections::HashMap::new();
-        for name in stacked_param_names {
-            // The tensor has already been expert-sharded on each rank;
-            // every rank owns "its slice" — but in a parameter-granular
-            // ZeRO map the whole stacked param is one logical unit.
-            // Assigning to rank 0 lets the standard ZeRO path skip
-            // re-partitioning MoE tensors (they're already sharded by
-            // `ExpertSharded`). Callers that want per-expert ownership
-            // should use `per_rank_stacked_assignment` instead.
-            map.insert(name, 0);
-        }
-        map
-    }
-
-    /// Build a ZeRO assignment where each stacked expert param is
-    /// "virtually" split by expert and each rank claims optimizer state
-    /// only for its owned experts.
-    ///
-    /// Returned keys are of the form `"{base}#expert={eid}"` — intended
-    /// for an optimizer that expands a stacked tensor into per-expert
-    /// sub-groups. If your optimizer does not support that expansion,
-    /// prefer [`Self::zero_stacked_assignment`].
-    pub fn per_rank_stacked_assignment(
-        &self,
-        stacked_param_names: impl IntoIterator<Item = String>,
-    ) -> std::collections::HashMap<String, usize> {
-        let mut map = std::collections::HashMap::new();
-        for name in stacked_param_names {
-            for eid in 0..self.total_experts {
-                let owner = self.rank_for_expert[eid];
-                map.insert(format!("{name}#expert={eid}"), owner);
-            }
-        }
-        map
-    }
 }
 
 #[cfg(test)]
@@ -285,22 +225,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn per_rank_stacked_assignment_follows_expert_ownership() {
-        let p = ExpertPlacement::uniform(8, 2, 2);
-        let map =
-            p.per_rank_stacked_assignment(["layer.0.switch_mlp.gate_proj.weight".to_string()]);
-        // Rank 0 owns experts 0..4, rank 1 owns 4..8.
-        for eid in 0..4 {
-            let key = format!("layer.0.switch_mlp.gate_proj.weight#expert={eid}");
-            assert_eq!(map[&key], 0);
-        }
-        for eid in 4..8 {
-            let key = format!("layer.0.switch_mlp.gate_proj.weight#expert={eid}");
-            assert_eq!(map[&key], 1);
         }
     }
 
