@@ -25,7 +25,7 @@ al. (2015), so its gradient keeps the same scale as the temperature changes.
 
 ## Features
 
-- **TAID**: Temporally Adaptive Interpolated Distillation (ICLR 2025 SOTA) — `TaidDistiller` with configurable schedules
+- **TAID**: Temporally Adaptive Interpolated Distillation (Shing et al., ICLR 2025) — `TaidDistiller`: a logit-space intermediate target whose interpolation `t` adapts to the student's progress
 - **Cross-Vocabulary Distillation**: Sparse top-k alignment for teacher/student vocab mismatch (e.g. Qwen3 to Qwen3.5)
 - **Progressive Distillation**: Temperature annealing schedules
 - **Offline Distillation**: Compressed logit caching for large teachers (`LogitCache`, `LogitCompressor`)
