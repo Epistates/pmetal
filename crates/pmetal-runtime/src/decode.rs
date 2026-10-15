@@ -1252,39 +1252,66 @@ pub fn quantized_sdpa_with_qjl(
     }
 }
 
-/// Shared generation-session setup for bridge-native decode loops.
+/// A generation's stream and memory limits, held for as long as it decodes:
+/// this thread's generation stream as the default stream
+/// ([`GenerationStream`]) and the wired memory limit at the device's
+/// recommended maximum ([`WiredLimit`]). Dropping it waits for the stream's
+/// pending work and puts both back, on every path out of the generation, a
+/// panic included (a default stream left pointing at the generation stream
+/// makes array destructors race Metal's teardown).
+#[must_use = "the stream and the limit are in force only while this lives"]
+pub struct GenerationSession {
+    // The stream is released first, then the limit.
+    _stream: crate::inline_array::GenerationStream,
+    _wired: crate::inline_array::WiredLimit,
+}
+
+impl GenerationSession {
+    /// Enter the generation stream and raise the wired limit.
+    pub fn enter() -> Self {
+        Self {
+            _stream: crate::inline_array::GenerationStream::enter(),
+            _wired: crate::inline_array::WiredLimit::max(),
+        }
+    }
+}
+
+/// Shared generation-session setup for native decode loops.
 ///
 /// `mlx::core::enable_compile()` was benchmarked and shown to regress decode
-/// throughput on the active native paths, so the canonical bridge path keeps
+/// throughput on the active native paths, so the canonical runtime path keeps
 /// it disabled here.
 fn begin_generation_session_impl(
     tag: &str,
     _model_dtype: i32,
     reset_peak_memory: bool,
     log_session: bool,
-) {
+) -> GenerationSession {
     crate::inline_array::clear_cache();
     if reset_peak_memory {
         crate::inline_array::reset_peak_memory();
     }
-    static GENERATION_STREAM_INIT: std::sync::Once = std::sync::Once::new();
-    GENERATION_STREAM_INIT.call_once(crate::inline_array::new_generation_stream);
-    crate::inline_array::set_generation_stream();
-    crate::inline_array::set_wired_limit_max();
-
     let _ = (tag, log_session);
+    GenerationSession::enter()
 }
 
-pub fn begin_generation_session(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, true, true);
+/// Clear the allocator's cache, reset its peak and enter a
+/// [`GenerationSession`].
+pub fn begin_generation_session(tag: &str, model_dtype: i32) -> GenerationSession {
+    begin_generation_session_impl(tag, model_dtype, true, true)
 }
 
-pub fn begin_generation_session_preserve_peak(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, false, true);
+/// [`begin_generation_session`] keeping the allocator's peak.
+pub fn begin_generation_session_preserve_peak(tag: &str, model_dtype: i32) -> GenerationSession {
+    begin_generation_session_impl(tag, model_dtype, false, true)
 }
 
-pub fn begin_generation_session_preserve_peak_silent(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, false, false);
+/// [`begin_generation_session_preserve_peak`] without the session log line.
+pub fn begin_generation_session_preserve_peak_silent(
+    tag: &str,
+    model_dtype: i32,
+) -> GenerationSession {
+    begin_generation_session_impl(tag, model_dtype, false, false)
 }
 
 /// Prime a decode loop by preparing the cache, running one forward step, and
@@ -1302,7 +1329,10 @@ pub fn prime_generation<Weights, Cache>(
     mut prepare_cache: impl FnMut(&mut Cache),
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
 ) -> InlineArray {
-    begin_generation_session_impl(tag, model_dtype, reset_peak_memory, log_session);
+    // Held until the first token is queued: the stream is restored (after
+    // waiting for that token's forward, which the loop would wait for first
+    // anyway) when this returns, and the decode loop enters its own.
+    let _session = begin_generation_session_impl(tag, model_dtype, reset_peak_memory, log_session);
     prepare_cache(cache);
 
     let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
@@ -1327,6 +1357,9 @@ pub fn generate_from_primed_sample<Weights, Cache>(
     mut on_token: impl FnMut(u32) -> bool,
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
 ) -> (Vec<u32>, Option<DecodeMetrics>) {
+    // On the generation stream and under the raised wired limit until the
+    // loop is done, whichever way it ends.
+    let _session = GenerationSession::enter();
     let mut tokens = Vec::with_capacity(max_tokens);
     let mut step_times: Vec<f64> = Vec::new();
 
@@ -1396,12 +1429,9 @@ pub fn generate_from_primed_sample<Weights, Cache>(
         None
     };
 
-    crate::inline_array::synchronize();
-    // Restore the default stream before returning. InlineArray Drops happen
-    // when the caller's weights/cache go out of scope — they must execute on
-    // the main stream, not the generation stream, to avoid SIGSEGV from
-    // Metal teardown racing with stream cleanup.
-    crate::inline_array::reset_default_stream();
+    // Dropping the session waits for the stream and restores the default
+    // one: the caller's weights and cache are dropped on the main stream, not
+    // the generation stream, which Metal's teardown would race.
     (tokens, metrics)
 }
 
