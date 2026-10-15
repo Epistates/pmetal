@@ -1,6 +1,6 @@
 //! Loopback rings for tests. Nothing here leaves 127.0.0.1.
 
-use crate::collective::{RingCollective, chunk_range};
+use crate::collective::RingCollective;
 use crate::config::DistributedConfig;
 use crate::secret::ClusterSecret;
 use crate::transport::{
@@ -90,6 +90,7 @@ pub(crate) async fn tcp_link_pair(security: LinkSecurity) -> (Link, Link) {
 }
 
 /// Deterministic noise in `[-1, 1)`, a different stream for each seed.
+#[cfg(any(feature = "zero", feature = "diloco"))]
 pub(crate) fn noise(seed: u64, len: usize) -> Vec<f32> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..len)
@@ -105,7 +106,9 @@ pub(crate) fn noise(seed: u64, len: usize) -> Vec<f32> {
 /// The mean a ring all-reduce computes, element by element, adding the ranks'
 /// values in the order the ring does (chunk `c` is summed starting at rank
 /// `c + 1`), so a test can demand the very same bits.
+#[cfg(any(feature = "zero", feature = "diloco"))]
 pub(crate) fn ring_mean(inputs: &[Vec<f32>]) -> Vec<f32> {
+    use crate::collective::chunk_range;
     let n = inputs.len();
     let len = inputs[0].len();
     let mut out = vec![0f32; len];

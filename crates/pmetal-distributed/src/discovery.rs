@@ -567,6 +567,34 @@ fn multiaddr_to_socket_addr(addr: &Multiaddr) -> Option<SocketAddr> {
 mod tests {
     use super::*;
 
+    /// A peer is admitted only with a proof made from the cluster secret and
+    /// its own peer id: not one made from another secret, not one lifted from
+    /// another peer, and not none at all.
+    #[test]
+    fn membership_attestation_binds_the_secret_and_the_peer() {
+        let secret = ClusterSecret::generate();
+        let stranger_secret = ClusterSecret::generate();
+        let (alice, mallory) = (PeerId::random(), PeerId::random());
+
+        let alices = agent_version(Some(&secret), &alice);
+        assert!(attestation_is_valid(&secret, &alice, &alices));
+
+        // Another cluster's secret.
+        let wrong_secret = agent_version(Some(&stranger_secret), &alice);
+        assert!(!attestation_is_valid(&secret, &alice, &wrong_secret));
+        // Alice's attestation, replayed by a different peer id.
+        assert!(!attestation_is_valid(&secret, &mallory, &alices));
+        // No attestation, and a malformed one.
+        assert!(!attestation_is_valid(
+            &secret,
+            &alice,
+            &agent_version(None, &alice)
+        ));
+        let truncated = &alices[..alices.len() - 2];
+        assert!(!attestation_is_valid(&secret, &alice, truncated));
+        assert!(!attestation_is_valid(&secret, &alice, "pmetal/1.0 attest="));
+    }
+
     #[test]
     fn test_multiaddr_to_socket_addr() {
         let addr: Multiaddr = "/ip4/192.168.1.100/tcp/5000".parse().unwrap();

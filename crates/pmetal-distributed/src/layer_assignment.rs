@@ -137,10 +137,10 @@ pub fn assign_layers(problem: &LayerProblem<'_>) -> DistributedResult<Vec<Range<
         }
     };
     let mut best: Vec<Vec<Option<(Score, usize)>>> = vec![vec![None; layers + 1]; n];
-    for l in 1..=layers {
+    for (l, slot) in best[0].iter_mut().enumerate().skip(1) {
         if fits(0, 0, l) {
             let t = time(0, 0, l);
-            best[0][l] = Some(((t, t * t), 0));
+            *slot = Some(((t, t * t), 0));
         }
     }
     for s in 1..n {
@@ -305,7 +305,7 @@ mod tests {
         // A node with almost no memory still gets its one layer.
         let r = assign_layers_proportional(10, &[1_000_000, 1]).unwrap();
         assert_eq!(r.iter().map(Range::len).sum::<usize>(), 10);
-        assert!(r[1].len() >= 1);
+        assert!(!r[1].is_empty());
     }
 
     /// Rounding each share and giving the last node the rest drifted from
@@ -381,7 +381,7 @@ mod tests {
     /// faster slowest stage.
     #[test]
     fn the_solver_matches_exhaustive_search() {
-        let mut seed = 0x1234_5678_9ABC_DEFu64;
+        let mut seed = 0x0123_4567_89AB_CDEF_u64;
         let mut next = |m: u64| {
             seed ^= seed << 13;
             seed ^= seed >> 7;

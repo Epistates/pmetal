@@ -127,7 +127,7 @@ async fn plain_averaging_is_the_special_case_of_unit_lr_and_no_momentum() {
                 g.iter().zip(&local).map(|(g, l)| g - l).collect()
             })
             .collect();
-        reference_round(&config, &mut g, &mut vec![0.0; LEN], &ring_mean(&deltas));
+        reference_round(&config, &mut g, &mut [0.0; LEN], &ring_mean(&deltas));
         g
     };
     for (a, b) in first_round.iter().zip(&mean_of_locals) {
