@@ -142,7 +142,7 @@ pub struct SamplingParams {
     /// model give the same tokens. `None` draws from the thread's MLX key.
     pub seed: Option<u64>,
     /// `(token, bias)` pairs added to the logits before sampling, after the
-    /// penalties ([`LogitBias`](crate::logits_processor::LogitBias)). Empty
+    /// penalties ([`LogitBias`]). Empty
     /// for none.
     pub logit_bias: Vec<(u32, f32)>,
 }
@@ -1255,8 +1255,9 @@ pub fn quantized_sdpa_with_qjl(
 
 /// A generation's stream and memory limits, held for as long as it decodes:
 /// this thread's generation stream as the default stream
-/// ([`GenerationStream`]) and the wired memory limit at the device's
-/// recommended maximum ([`WiredLimit`]). Dropping it waits for the stream's
+/// ([`GenerationStream`](crate::inline_array::GenerationStream)) and the
+/// wired memory limit at the device's recommended maximum
+/// ([`WiredLimit`](crate::inline_array::WiredLimit)). Dropping it waits for the stream's
 /// pending work and puts both back, on every path out of the generation, a
 /// panic included (a default stream left pointing at the generation stream
 /// makes array destructors race Metal's teardown).

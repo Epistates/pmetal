@@ -88,7 +88,7 @@ pub(super) fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> 
 /// The settings of one MoE layer's top-k, and the top-k itself: DeepSeek's
 /// router from its logits on.
 ///
-/// This is the one implementation. The native engine's [`Router`] and the
+/// This is the one implementation. The native engine's router and the
 /// shared-path model (`pmetal_models`' `DeepSeekMoEGate`, which training and
 /// the adapters run) both route through [`DeepseekRouting::route`], so the
 /// model that is trained picks the experts the model that is served picks.
