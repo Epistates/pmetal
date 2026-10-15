@@ -1,19 +1,12 @@
 //! Kernel dispatch router — selects Metal 3 or Metal 4 backend per operation.
 //!
-//! [`KernelDispatch`] is the single entry point for all kernel routing decisions.
-//! It holds both backends and exposes methods that return the appropriate
-//! [`KernelBackend`] reference for a given operation shape.
+//! [`KernelDispatch`] holds both backends and exposes methods that return the
+//! appropriate [`KernelBackend`] reference.
 //!
 //! # Routing policy
 //!
-//! - **`backend_for_gemm(m, n, k)`**: Returns Metal 4 when `#[cfg(has_metal4)]`
-//!   and the Metal 4 backend is present and [`KernelBackend::should_handle_gemm`]
-//!   returns `true`. Falls back to Metal 3 otherwise (decode M=1, unaligned K,
-//!   or Metal 4 not compiled in).
-//!
 //! - **`preferred_backend()`**: Returns Metal 4 when available; Metal 3
-//!   otherwise. Used for non-shape-dependent ops (e.g., MPP flash attention)
-//!   where Metal 4 unconditionally wins.
+//!   otherwise.
 //!
 //! - **`metal3()`**: Explicit Metal 3 accessor for callers that need to bypass
 //!   routing (e.g., fallback paths inside the Metal 4 backend itself).
@@ -84,33 +77,9 @@ impl KernelDispatch {
 
     // ---- Routing methods ----------------------------------------------------
 
-    /// Select the backend for a GEMM of the given shape.
-    ///
-    /// Returns Metal 4 when:
-    /// - `has_metal4` is compiled in, **and**
-    /// - `self.metal4` is `Some`, **and**
-    /// - [`KernelBackend::should_handle_gemm`] on the Metal 4 backend returns `true`.
-    ///
-    /// Falls back to Metal 3 for:
-    /// - Decode / matvec (M = 1) — MPP tile constraints waste threads.
-    /// - K not divisible by 32 — NAX alignment requirement.
-    /// - All non-Metal-4 builds.
-    pub fn backend_for_gemm(&self, m: usize, n: usize, k: usize) -> &dyn KernelBackend {
-        #[cfg(has_metal4)]
-        if let Some(ref m4) = self.metal4 {
-            if m4.should_handle_gemm(m, n, k) {
-                return m4;
-            }
-        }
-        // Suppress unused-variable warnings on Metal 3 builds.
-        let _ = (m, n, k);
-        &self.metal3
-    }
-
     /// Select the preferred backend for non-shape-dependent operations.
     ///
-    /// Returns Metal 4 when available (e.g., MPP flash attention); Metal 3
-    /// otherwise. Operations that always require a specific backend (e.g.,
+    /// Returns Metal 4 when available; Metal 3 otherwise. Operations that always require a specific backend (e.g.,
     /// training losses only on Metal 3) should call the backend directly via
     /// [`metal3`][KernelDispatch::metal3].
     pub fn preferred_backend(&self) -> &dyn KernelBackend {
@@ -126,9 +95,6 @@ impl KernelDispatch {
     /// Used for explicit fallback paths and for operations that Metal 4 does
     /// not support (training losses, etc.) as advertised by
     /// [`BackendCaps::metal4`][crate::backend::BackendCaps::metal4].
-    ///
-    /// Note: RoPE is wired to Metal 4 on M5+ hardware and is no longer a
-    /// Metal-3-only operation.
     pub fn metal3(&self) -> &Metal3Backend {
         &self.metal3
     }

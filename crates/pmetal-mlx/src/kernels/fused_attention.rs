@@ -10,19 +10,15 @@
 //! - 30-50% faster than manual SDPA for single-token inference
 //! - Reduced memory bandwidth by avoiding intermediate tensor materialization
 //! - Native GQA support eliminates expand_kv_heads overhead
+//!
+//! MLX's kernels are also what attention runs on under autograd, so one path
+//! serves inference and training. A hand-written Metal attention kernel used to
+//! sit in front of it; it was slower than MLX at every prefill length measured
+//! (2.4x to 2.6x at 512 to 8192 tokens), wrong for odd lengths, aligned its
+//! causal mask to the top-left instead of MLX's bottom-right for a query
+//! shorter than its keys, and could not be differentiated, so it was removed.
 
-use std::{sync::OnceLock, time::Instant};
-
-use pmetal_metal::{
-    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, KernelDispatch,
-    MetalContext, MppFlashAttention, MppFlashAttentionConfig,
-    context::{DeviceProperties, DeviceTier},
-};
 use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
-use serde::{Deserialize, Serialize};
-
-use super::persistent_cache::PersistentChoiceCache;
-use super::utils::{array_to_metal_buffer_f16, metal_buffer_into_array_f16};
 
 /// Attention mask type for fused attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,128 +29,6 @@ pub enum AttentionMaskType {
     Causal,
     /// Sliding window causal mask with given window size.
     SlidingWindow(i32),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum AttentionBackendChoice {
-    MlxFast,
-    MetalFlash,
-    MppFlash,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AttentionDispatchKey {
-    device_name: String,
-    device_tier: &'static str,
-    dtype: &'static str,
-    batch: i32,
-    num_heads: i32,
-    num_kv_heads: i32,
-    query_seq_len: i32,
-    kv_seq_len: i32,
-    head_dim: i32,
-    value_head_dim: i32,
-    mask_type: AttentionMaskType,
-    softcap_bits: Option<u32>,
-}
-
-static ATTENTION_BACKEND_CACHE: OnceLock<PersistentChoiceCache<AttentionBackendChoice>> =
-    OnceLock::new();
-
-fn attention_backend_cache() -> &'static PersistentChoiceCache<AttentionBackendChoice> {
-    ATTENTION_BACKEND_CACHE.get_or_init(|| PersistentChoiceCache::new("attention_backends.json"))
-}
-
-fn device_tier_key(tier: DeviceTier) -> &'static str {
-    match tier {
-        DeviceTier::Base => "base",
-        DeviceTier::Pro => "pro",
-        DeviceTier::Max => "max",
-        DeviceTier::Ultra => "ultra",
-    }
-}
-
-fn dtype_key(dtype: Dtype) -> Option<&'static str> {
-    match dtype {
-        Dtype::Float16 => Some("f16"),
-        Dtype::Float32 => Some("f32"),
-        Dtype::Bfloat16 => Some("bf16"),
-        _ => None,
-    }
-}
-
-/// Bucket a sequence length so that adjacent decode steps share a cache
-/// entry. Without this, every decode step grows the KV cache by 1 and
-/// forces a fresh backend benchmark — that's a 5-10x slowdown per step
-/// compared to the steady-state cached backend. Bucketing to the next
-/// power of two means we re-benchmark only when the cache passes a
-/// power-of-two boundary, which doubles the amortisation window each
-/// time.
-fn bucket_seq_len(seq_len: i32) -> i32 {
-    if seq_len <= 1 {
-        return 1;
-    }
-    let mut bucket = 1i32;
-    while bucket < seq_len {
-        bucket <<= 1;
-    }
-    bucket
-}
-
-impl AttentionDispatchKey {
-    fn new(
-        props: &DeviceProperties,
-        dtype: Dtype,
-        q_shape: &[i32],
-        k_shape: &[i32],
-        config: &FusedAttentionConfig,
-    ) -> Option<Self> {
-        Some(Self {
-            device_name: props.name.clone(),
-            device_tier: device_tier_key(props.device_tier),
-            dtype: dtype_key(dtype)?,
-            batch: q_shape[0],
-            num_heads: q_shape[1],
-            num_kv_heads: k_shape[1],
-            query_seq_len: bucket_seq_len(q_shape[2]),
-            kv_seq_len: bucket_seq_len(k_shape[2]),
-            head_dim: q_shape[3],
-            value_head_dim: config.effective_value_head_dim(),
-            mask_type: config.mask_type,
-            softcap_bits: config.logit_softcapping.map(f32::to_bits),
-        })
-    }
-
-    fn cache_key(&self) -> String {
-        format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}",
-            self.device_name,
-            self.device_tier,
-            self.dtype,
-            self.batch,
-            self.num_heads,
-            self.num_kv_heads,
-            self.query_seq_len,
-            self.kv_seq_len,
-            self.head_dim,
-            self.value_head_dim,
-            self.mask_type,
-            self.softcap_bits
-        )
-    }
-}
-
-fn cached_attention_backend(key: &AttentionDispatchKey) -> Option<AttentionBackendChoice> {
-    attention_backend_cache().get(&key.cache_key())
-}
-
-fn cache_attention_backend(key: AttentionDispatchKey, backend: AttentionBackendChoice) {
-    attention_backend_cache().insert(key.cache_key(), backend);
-}
-
-#[cfg(test)]
-fn clear_cached_attention_backends() {
-    attention_backend_cache().clear();
 }
 
 /// Configuration for fused attention.
@@ -277,24 +151,6 @@ pub fn fused_sdpa(
     });
     let custom_mask = coerced_mask.as_ref().or(custom_mask);
 
-    // The Metal FlashAttention backends copy Q/K/V into Metal buffers and
-    // build their output from one, so autograd sees that output as a
-    // constant: Q, K and V (and every projection and adapter feeding them)
-    // would train on zero. MLX's SDPA has a VJP, so attention a gradient will
-    // flow through always takes it.
-    if !needs_gradient(queries, keys, values) {
-        if let Some(output) =
-            try_selected_attention_backend(queries, keys, values, config, custom_mask)?
-        {
-            return Ok(output);
-        }
-
-        if let Some(output) = try_metal_flash_attention(queries, keys, values, config, custom_mask)?
-        {
-            return Ok(output);
-        }
-    }
-
     // Apply logit softcapping if configured (Gemma2 style)
     // This requires pre/post processing around attention
     if let Some(cap) = config.logit_softcapping {
@@ -302,226 +158,6 @@ pub fn fused_sdpa(
     }
 
     fast_fused_sdpa(queries, keys, values, config, custom_mask)
-}
-
-/// Whether autograd is tracing any of the attention inputs, so the output must
-/// stay in MLX's graph. See [`any_traced`](super::utils::any_traced).
-pub(crate) fn needs_gradient(queries: &Array, keys: &Array, values: &Array) -> bool {
-    super::utils::any_traced(&[queries, keys, values])
-}
-
-fn try_selected_attention_backend(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    custom_mask: Option<&Array>,
-) -> Result<Option<Array>, Exception> {
-    let metal_ctx = match MetalContext::global() {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            tracing::debug!("Metal attention selection unavailable, falling back: {error}");
-            return Ok(None);
-        }
-    };
-
-    let Some(dispatch_key) = benchmarkable_attention_dispatch_key(
-        queries,
-        keys,
-        values,
-        config,
-        custom_mask,
-        metal_ctx.properties(),
-    ) else {
-        return Ok(None);
-    };
-
-    if let Some(backend) = cached_attention_backend(&dispatch_key) {
-        return execute_attention_backend(backend, queries, keys, values, config, &metal_ctx)
-            .map(Some)
-            .or_else(|error| {
-                tracing::debug!(
-                    "Cached {:?} attention backend failed, falling back to MLX fast SDPA: {error}",
-                    backend
-                );
-                cache_attention_backend(dispatch_key.clone(), AttentionBackendChoice::MlxFast);
-                reference_attention_output(queries, keys, values, config).map(Some)
-            });
-    }
-
-    let (backend, output) =
-        benchmark_attention_backends(queries, keys, values, config, &metal_ctx)?;
-    cache_attention_backend(dispatch_key, backend);
-    Ok(Some(output))
-}
-
-fn benchmarkable_attention_dispatch_key(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    custom_mask: Option<&Array>,
-    props: &DeviceProperties,
-) -> Option<AttentionDispatchKey> {
-    if custom_mask.is_some() {
-        return None;
-    }
-
-    if !flash_attention_supported(queries, keys, values, custom_mask) {
-        return None;
-    }
-
-    let q_shape = queries.shape();
-    let k_shape = keys.shape();
-    AttentionDispatchKey::new(props, queries.dtype(), q_shape, k_shape, config)
-}
-
-fn execute_attention_backend(
-    backend: AttentionBackendChoice,
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    metal_ctx: &std::sync::Arc<MetalContext>,
-) -> Result<Array, Exception> {
-    match backend {
-        AttentionBackendChoice::MlxFast => {
-            reference_attention_output(queries, keys, values, config)
-        }
-        AttentionBackendChoice::MetalFlash => {
-            run_metal_flash_attention(queries, keys, values, config, metal_ctx)
-        }
-        AttentionBackendChoice::MppFlash => {
-            run_mpp_flash_attention(queries, keys, values, config, metal_ctx)
-        }
-    }
-}
-
-fn benchmark_attention_backends(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    metal_ctx: &std::sync::Arc<MetalContext>,
-) -> Result<(AttentionBackendChoice, Array), Exception> {
-    let reference_start = Instant::now();
-    let reference_output = reference_attention_output(queries, keys, values, config)?;
-    let ref_eval = reference_output.clone();
-    ref_eval.eval();
-    let reference_elapsed = reference_start.elapsed();
-
-    let mut best_backend = AttentionBackendChoice::MlxFast;
-    let mut best_elapsed = reference_elapsed;
-    let mut best_output = reference_output.clone();
-
-    if let Some((elapsed, output)) = benchmark_attention_candidate(
-        AttentionBackendChoice::MetalFlash,
-        queries,
-        keys,
-        values,
-        config,
-        metal_ctx,
-        &reference_output,
-    )? {
-        if elapsed < best_elapsed {
-            best_backend = AttentionBackendChoice::MetalFlash;
-            best_elapsed = elapsed;
-            best_output = output;
-        }
-    }
-
-    if mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.dispatch()) {
-        if let Some((elapsed, output)) = benchmark_attention_candidate(
-            AttentionBackendChoice::MppFlash,
-            queries,
-            keys,
-            values,
-            config,
-            metal_ctx,
-            &reference_output,
-        )? {
-            if elapsed < best_elapsed {
-                best_backend = AttentionBackendChoice::MppFlash;
-                best_elapsed = elapsed;
-                best_output = output;
-            }
-        }
-    }
-
-    tracing::debug!(
-        "Selected {:?} attention backend ({:?})",
-        best_backend,
-        best_elapsed
-    );
-    Ok((best_backend, best_output))
-}
-
-fn benchmark_attention_candidate(
-    backend: AttentionBackendChoice,
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    metal_ctx: &std::sync::Arc<MetalContext>,
-    reference: &Array,
-) -> Result<Option<(std::time::Duration, Array)>, Exception> {
-    let start = Instant::now();
-    let output = match execute_attention_backend(backend, queries, keys, values, config, metal_ctx)
-    {
-        Ok(output) => {
-            let out_eval = output.clone();
-            out_eval.eval();
-            output
-        }
-        Err(error) => {
-            tracing::debug!("{backend:?} attention benchmark failed: {error}");
-            return Ok(None);
-        }
-    };
-    let elapsed = start.elapsed();
-    let max_diff = max_abs_diff(reference, &output)?;
-    let reference_scale = max_abs(reference)?;
-    if !candidate_matches_reference(max_diff, reference_scale) {
-        tracing::debug!(
-            "Rejecting {:?} attention backend: max_diff={:.5e} against a reference scale of {:.5e}",
-            backend,
-            max_diff,
-            reference_scale
-        );
-        return Ok(None);
-    }
-
-    Ok(Some((elapsed, output)))
-}
-
-/// Whether a candidate backend's output is close enough to the reference's to
-/// be worth timing.
-///
-/// Judged against the reference's own scale, not an absolute constant. The
-/// Metal backends stage Q/K/V through f16, whose smallest normal is ~6e-5, and
-/// not every model keeps its activations near 1: Nemotron-H's residual stream
-/// sits around 1e-17, where the f16 path returns all zeros. Against a fixed
-/// 0.1 that scored as a perfect match, so the zero-returning backend won on
-/// speed and was cached, and every attention layer in the architecture
-/// contributed nothing.
-///
-/// The ratio is the same 0.1 the absolute rule used, so a unit-scale tensor
-/// accepts and rejects exactly as it did before.
-fn candidate_matches_reference(max_diff: f32, reference_scale: f32) -> bool {
-    max_diff <= 0.1 * reference_scale
-}
-
-fn reference_attention_output(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-) -> Result<Array, Exception> {
-    if let Some(cap) = config.logit_softcapping {
-        manual_sdpa_with_softcapping(queries, keys, values, config, None, cap)
-    } else {
-        fast_fused_sdpa(queries, keys, values, config, None)
-    }
 }
 
 fn fast_fused_sdpa(
@@ -556,259 +192,6 @@ fn fast_fused_sdpa(
                 .as_dtype(queries.dtype().as_i32());
             Ok(queries.sdpa_with_mask(keys, values, config.scale, Some(&mask)))
         }
-    }
-}
-
-fn try_metal_flash_attention(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    custom_mask: Option<&Array>,
-) -> Result<Option<Array>, Exception> {
-    if !flash_attention_supported(queries, keys, values, custom_mask) {
-        return Ok(None);
-    }
-
-    let metal_ctx = match MetalContext::global() {
-        Ok(ctx) => ctx,
-        Err(error) => {
-            tracing::debug!("Metal FlashAttention unavailable, falling back to MLX: {error}");
-            return Ok(None);
-        }
-    };
-
-    match run_metal_flash_attention(queries, keys, values, config, &metal_ctx) {
-        Ok(output) => Ok(Some(output)),
-        Err(error) => {
-            tracing::debug!(
-                "Metal FlashAttention unavailable, falling back to MLX/manual attention: {}",
-                error
-            );
-            Ok(None)
-        }
-    }
-}
-
-fn flash_attention_supported(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    custom_mask: Option<&Array>,
-) -> bool {
-    if custom_mask.is_some() {
-        return false;
-    }
-
-    if !matches!(
-        queries.dtype(),
-        Dtype::Float16 | Dtype::Float32 | Dtype::Bfloat16
-    ) || queries.dtype() != keys.dtype()
-        || queries.dtype() != values.dtype()
-    {
-        return false;
-    }
-
-    let q_shape = queries.shape();
-    let k_shape = keys.shape();
-    let v_shape = values.shape();
-
-    if q_shape.len() != 4 || k_shape.len() != 4 || v_shape.len() != 4 {
-        return false;
-    }
-
-    // Metal flash attention kernels tile over head_dim and assume K_dim == V_dim.
-    // Asymmetric value dims (e.g. DeepSeek MLA) must fall through to MLX SDPA.
-    if q_shape[3] != v_shape[3] {
-        return false;
-    }
-
-    matches!(q_shape[3] as usize, 64 | 80 | 96 | 128 | 256)
-}
-
-/// Shape-only eligibility check for MPP flash attention (no hardware check).
-///
-/// Separated from [`mpp_flash_attention_supported`] so that unit tests can
-/// exercise shape logic without needing a live [`KernelDispatch`].
-fn mpp_flash_attention_shape_ok(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    custom_mask: Option<&Array>,
-) -> bool {
-    flash_attention_supported(queries, keys, values, custom_mask)
-        && matches!(queries.shape()[3], 64 | 80 | 96 | 128)
-}
-
-/// Full eligibility check for MPP flash attention: hardware capability + shape.
-///
-/// Uses [`KernelDispatch::preferred_backend`] to determine whether the Metal 4
-/// backend is available on this device, rather than calling `has_nax()` directly.
-fn mpp_flash_attention_supported(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    custom_mask: Option<&Array>,
-    dispatch: &KernelDispatch,
-) -> bool {
-    dispatch.preferred_backend().caps().has_mpp_flash_attention
-        && mpp_flash_attention_shape_ok(queries, keys, values, custom_mask)
-}
-
-/// Largest magnitude in `array`, as f32.
-fn max_abs(array: &Array) -> Result<f32, Exception> {
-    let array = if array.dtype() == Dtype::Float32 {
-        array.clone()
-    } else {
-        array.as_dtype(Dtype::Float32.as_i32())
-    };
-    let max = array.abs_val().max(None);
-    max.eval();
-    Ok(max.item_f32())
-}
-
-fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
-    let lhs = if lhs.dtype() == Dtype::Float32 {
-        lhs.clone()
-    } else {
-        lhs.as_dtype(Dtype::Float32.as_i32())
-    };
-    let rhs = if rhs.dtype() == Dtype::Float32 {
-        rhs.clone()
-    } else {
-        rhs.as_dtype(Dtype::Float32.as_i32())
-    };
-
-    let diff = lhs.subtract(&rhs).abs_val().max(None);
-    let diff_owned = diff.clone();
-    diff_owned.eval();
-    Ok(diff_owned.item_f32())
-}
-
-fn run_metal_flash_attention(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    metal_ctx: &std::sync::Arc<MetalContext>,
-) -> Result<Array, Exception> {
-    let q_shape = queries.shape();
-    let k_shape = keys.shape();
-    let v_shape = values.shape();
-    let head_dim = q_shape[3] as usize;
-    // Output uses value dimension (may differ from key dim for asymmetric archs)
-    let out_head_dim = v_shape[3];
-    let sliding_window = match config.mask_type {
-        AttentionMaskType::SlidingWindow(window) => Some(window as usize),
-        _ => None,
-    };
-
-    let fa_config = MetalFlashAttentionConfig {
-        batch_size: q_shape[0] as usize,
-        num_heads: q_shape[1] as usize,
-        num_kv_heads: k_shape[1] as usize,
-        query_seq_len: q_shape[2] as usize,
-        kv_seq_len: k_shape[2] as usize,
-        head_dim,
-        scale: Some(config.scale),
-        is_causal: !matches!(config.mask_type, AttentionMaskType::None),
-        sliding_window,
-        softcap: config.logit_softcapping,
-        is_training: false,
-    };
-
-    let flash_attn = match FlashAttention::new(metal_ctx.clone(), fa_config) {
-        Ok(flash_attn) => flash_attn,
-        Err(error) => {
-            return Err(Exception::custom(error.to_string()));
-        }
-    };
-
-    let q_buffer = array_to_metal_buffer_f16(metal_ctx, queries)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    let k_buffer = array_to_metal_buffer_f16(metal_ctx, keys)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    let v_buffer = array_to_metal_buffer_f16(metal_ctx, values)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-
-    let output = match flash_attn.forward(&q_buffer, &k_buffer, &v_buffer) {
-        Ok(output) => output,
-        Err(error) => {
-            return Err(Exception::custom(error.to_string()));
-        }
-    };
-
-    let out_shape = &[q_shape[0], q_shape[1], q_shape[2], out_head_dim];
-    let output = metal_buffer_into_array_f16(output.output, out_shape)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-
-    if queries.dtype() == Dtype::Float16 {
-        Ok(output)
-    } else {
-        Ok(output.as_dtype(queries.dtype().as_i32()))
-    }
-}
-
-fn run_mpp_flash_attention(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    metal_ctx: &std::sync::Arc<MetalContext>,
-) -> Result<Array, Exception> {
-    if !mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.dispatch()) {
-        return Err(Exception::custom(
-            "MPP FlashAttention unsupported for current device or shape".to_string(),
-        ));
-    }
-
-    let q_shape = queries.shape();
-    let k_shape = keys.shape();
-    let v_shape = values.shape();
-    let out_head_dim = v_shape[3];
-    let mpp_config = MppFlashAttentionConfig {
-        batch_size: q_shape[0] as usize,
-        num_heads: q_shape[1] as usize,
-        num_kv_heads: k_shape[1] as usize,
-        query_seq_len: q_shape[2] as usize,
-        kv_seq_len: k_shape[2] as usize,
-        head_dim: q_shape[3] as usize,
-        scale: Some(config.scale),
-        is_causal: !matches!(config.mask_type, AttentionMaskType::None),
-        sliding_window: match config.mask_type {
-            AttentionMaskType::SlidingWindow(window) => Some(window as usize),
-            _ => None,
-        },
-        softcap: config.logit_softcapping,
-    };
-
-    let flash_attn = MppFlashAttention::new(metal_ctx.clone(), mpp_config)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    if !flash_attn.is_available() {
-        return Err(Exception::custom(
-            "MPP FlashAttention unavailable on current device".to_string(),
-        ));
-    }
-
-    let q_buffer = array_to_metal_buffer_f16(metal_ctx, queries)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    let k_buffer = array_to_metal_buffer_f16(metal_ctx, keys)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-    let v_buffer = array_to_metal_buffer_f16(metal_ctx, values)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-
-    let output = flash_attn
-        .forward(&q_buffer, &k_buffer, &v_buffer)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-
-    let out_shape = &[q_shape[0], q_shape[1], q_shape[2], out_head_dim];
-    let output = metal_buffer_into_array_f16(output.output, out_shape)
-        .map_err(|error| Exception::custom(error.to_string()))?;
-
-    if queries.dtype() == Dtype::Float16 {
-        Ok(output)
-    } else {
-        Ok(output.as_dtype(queries.dtype().as_i32()))
     }
 }
 
@@ -1157,31 +540,6 @@ mod tests {
         random::normal(shape, Dtype::Float32)
     }
 
-    fn test_device_properties() -> DeviceProperties {
-        DeviceProperties {
-            name: "Apple M5 Test".to_string(),
-            max_threads_per_threadgroup: 1024,
-            max_threadgroup_memory_length: 32 * 1024,
-            has_unified_memory: true,
-            recommended_working_set_size: 8 * 1024 * 1024 * 1024,
-            max_buffer_length: 256 * 1024 * 1024,
-            gpu_family: pmetal_metal::context::AppleGPUFamily::Apple10,
-            device_tier: DeviceTier::Max,
-            has_dynamic_caching: true,
-            has_hardware_ray_tracing: true,
-            has_mesh_shaders: true,
-            has_nax: true,
-            architecture_gen: 17,
-            memory_bandwidth_gbps: 546.0,
-            memory_bandwidth_source:
-                pmetal_metal::context::MemoryBandwidthSource::SpecTableFallback,
-            gpu_core_count: 40,
-            ane_core_count: 16,
-            is_ultra_fusion: false,
-            die_count: 1,
-        }
-    }
-
     /// An f32 additive mask against a bf16 model must work.
     ///
     /// MLX's SDPA refuses a mask that doesn't promote to the output dtype — it
@@ -1297,38 +655,6 @@ mod tests {
                 .any(|(a, b)| (a - b).abs() > 1e-3),
             "a {window}-token window over {seq} tokens produced plain causal attention"
         );
-    }
-
-    /// Backend selection must judge accuracy against the tensor's own scale.
-    ///
-    /// The Metal backends stage Q/K/V through f16, whose smallest normal is
-    /// ~6e-5. A model whose activations sit far below that gets all zeros back,
-    /// and the old absolute `max_diff > 0.1` rule scored those zeros as a
-    /// perfect match — so the zero-returning backend won on speed and was
-    /// cached. Nemotron-H runs at ~1e-17 and lost every attention layer to it,
-    /// which showed up only as a real-weight forward divergence.
-    #[test]
-    fn a_candidate_is_judged_against_the_reference_scale() {
-        // The case that broke: candidate returned all zeros, reference is
-        // ~1e-17. `max_diff` is 1e-17, which clears any absolute 0.1.
-        assert!(
-            !candidate_matches_reference(1e-17, 1e-17),
-            "a candidate that zeroed the whole tensor was accepted"
-        );
-
-        // Unit-scale behaviour is unchanged: the ratio is the same 0.1 the
-        // absolute rule used when the reference happened to be near 1.
-        assert!(candidate_matches_reference(0.05, 1.0));
-        assert!(!candidate_matches_reference(0.15, 1.0));
-
-        // f16 staging costs ~1e-3 relative; that has to keep passing at any
-        // scale, or every model below unit scale loses its fast backends.
-        assert!(candidate_matches_reference(1e-20, 1e-17));
-        assert!(candidate_matches_reference(1e3, 1e6));
-
-        // A genuinely all-zero reference admits only an all-zero candidate.
-        assert!(candidate_matches_reference(0.0, 0.0));
-        assert!(!candidate_matches_reference(1e-30, 0.0));
     }
 
     #[test]
@@ -1501,45 +827,6 @@ mod tests {
 
         let _ = &output; // eval not needed
         assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_metal_matches_fast_reference() {
-        let batch = 1;
-        let n_heads = 4;
-        let n_kv_heads = 2;
-        let seq_len = 8;
-        let head_dim = 64;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-        let reference = fast_fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let output = output.as_dtype(Dtype::Float32.as_i32());
-        let reference = reference.as_dtype(Dtype::Float32.as_i32());
-        let _ = &output; // eval not needed
-        let _ = &reference; // eval not needed
-
-        let mut out_m = output.clone();
-        out_m.eval();
-        let mut ref_m = reference.clone();
-        ref_m.eval();
-        let out_n = out_m.size();
-        let ref_n = ref_m.size();
-        let out_data = out_m.to_f32_vec(out_n).unwrap_or_default();
-        let ref_data = ref_m.to_f32_vec(ref_n).unwrap_or_default();
-        for (actual, expected) in out_data.iter().zip(ref_data.iter()) {
-            assert!(
-                (actual - expected).abs() < 0.1,
-                "Metal attention diverged from MLX fast path: actual={}, expected={}",
-                actual,
-                expected
-            );
-        }
     }
 
     #[test]
@@ -1724,131 +1011,6 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
-    fn test_attention_backend_cache_roundtrip() {
-        clear_cached_attention_backends();
-
-        let key = AttentionDispatchKey {
-            device_name: "Apple M5 Max".to_string(),
-            device_tier: "max",
-            dtype: "f16",
-            batch: 1,
-            num_heads: 8,
-            num_kv_heads: 2,
-            query_seq_len: 16,
-            kv_seq_len: 16,
-            head_dim: 64,
-            value_head_dim: 64,
-            mask_type: AttentionMaskType::Causal,
-            softcap_bits: None,
-        };
-
-        assert_eq!(cached_attention_backend(&key), None);
-        cache_attention_backend(key.clone(), AttentionBackendChoice::MppFlash);
-        assert_eq!(
-            cached_attention_backend(&key),
-            Some(AttentionBackendChoice::MppFlash)
-        );
-
-        clear_cached_attention_backends();
-    }
-
-    #[test]
-    fn test_benchmarkable_attention_dispatch_key_accepts_softcapping_and_tracks_cap() {
-        let props = test_device_properties();
-        let queries = random_tensor(&[1, 4, 8, 64]);
-        let keys = random_tensor(&[1, 4, 8, 64]);
-        let values = random_tensor(&[1, 4, 8, 64]);
-        let config = FusedAttentionConfig::new(4, 4, 64).with_logit_softcapping(30.0);
-        let other_config = FusedAttentionConfig::new(4, 4, 64).with_logit_softcapping(50.0);
-
-        let key =
-            benchmarkable_attention_dispatch_key(&queries, &keys, &values, &config, None, &props)
-                .expect("softcapped inference shapes should remain benchmarkable");
-        let other_key = benchmarkable_attention_dispatch_key(
-            &queries,
-            &keys,
-            &values,
-            &other_config,
-            None,
-            &props,
-        )
-        .expect("softcapped inference shapes should remain benchmarkable");
-
-        assert_eq!(key.softcap_bits, Some(30.0f32.to_bits()));
-        assert_eq!(other_key.softcap_bits, Some(50.0f32.to_bits()));
-        assert_ne!(key.cache_key(), other_key.cache_key());
-    }
-
-    #[test]
-    fn test_reference_attention_output_matches_manual_softcapping() {
-        let queries = random_tensor(&[1, 4, 8, 64]);
-        let keys = random_tensor(&[1, 4, 8, 64]);
-        let values = random_tensor(&[1, 4, 8, 64]);
-        let config = FusedAttentionConfig::new(4, 4, 64).with_logit_softcapping(30.0);
-
-        let reference = reference_attention_output(&queries, &keys, &values, &config).unwrap();
-        let manual =
-            manual_sdpa_with_softcapping(&queries, &keys, &values, &config, None, 30.0).unwrap();
-
-        let max_diff = max_abs_diff(&reference, &manual).unwrap();
-        assert!(max_diff <= 1e-3, "softcap reference drifted: {max_diff}");
-    }
-
-    #[test]
-    fn test_mpp_flash_attention_shape_ok_accepted_and_rejected_head_dims() {
-        // Hardware capability gating (has_nax / preferred_backend) is exercised
-        // by integration tests that run on a live MetalContext.  Unit tests here
-        // verify only the shape predicate via `mpp_flash_attention_shape_ok`.
-
-        let queries = random_tensor(&[1, 4, 8, 128]);
-        let keys = random_tensor(&[1, 4, 8, 128]);
-        let values = random_tensor(&[1, 4, 8, 128]);
-        assert!(mpp_flash_attention_shape_ok(&queries, &keys, &values, None));
-
-        let queries_d64 = random_tensor(&[1, 4, 8, 64]);
-        let keys_d64 = random_tensor(&[1, 4, 8, 64]);
-        let values_d64 = random_tensor(&[1, 4, 8, 64]);
-        assert!(mpp_flash_attention_shape_ok(
-            &queries_d64,
-            &keys_d64,
-            &values_d64,
-            None
-        ));
-
-        let queries_d96 = random_tensor(&[1, 4, 8, 96]);
-        let keys_d96 = random_tensor(&[1, 4, 8, 96]);
-        let values_d96 = random_tensor(&[1, 4, 8, 96]);
-        assert!(mpp_flash_attention_shape_ok(
-            &queries_d96,
-            &keys_d96,
-            &values_d96,
-            None
-        ));
-
-        let queries_d80 = random_tensor(&[1, 4, 8, 80]);
-        let keys_d80 = random_tensor(&[1, 4, 8, 80]);
-        let values_d80 = random_tensor(&[1, 4, 8, 80]);
-        assert!(mpp_flash_attention_shape_ok(
-            &queries_d80,
-            &keys_d80,
-            &values_d80,
-            None
-        ));
-
-        // head_dim=72 is not in the allowed set; must be rejected.
-        let queries_d72 = random_tensor(&[1, 4, 8, 72]);
-        let keys_d72 = random_tensor(&[1, 4, 8, 72]);
-        let values_d72 = random_tensor(&[1, 4, 8, 72]);
-        assert!(!mpp_flash_attention_shape_ok(
-            &queries_d72,
-            &keys_d72,
-            &values_d72,
-            None
-        ));
-    }
-
-    #[test]
     fn test_fused_sdpa_asymmetric_value_head_dim() {
         // DeepSeek-style: key_dim=128, value_dim=64
         let batch = 1;
@@ -1900,27 +1062,6 @@ mod tests {
     }
 
     #[test]
-    fn test_flash_attention_rejects_asymmetric_dims() {
-        let key_dim = 128;
-        let value_dim = 64;
-        let queries = random_tensor(&[1, 4, 8, key_dim]);
-        let keys = random_tensor(&[1, 4, 8, key_dim]);
-        let values = random_tensor(&[1, 4, 8, value_dim]);
-
-        // Metal flash attention should reject asymmetric dims
-        assert!(!flash_attention_supported(&queries, &keys, &values, None));
-
-        // Symmetric dims should pass (assuming head_dim is supported)
-        let values_sym = random_tensor(&[1, 4, 8, key_dim]);
-        assert!(flash_attention_supported(
-            &queries,
-            &keys,
-            &values_sym,
-            None
-        ));
-    }
-
-    #[test]
     fn test_asymmetric_softcapping_output_shape() {
         let batch = 1;
         let n_heads = 4;
@@ -1949,30 +1090,6 @@ mod tests {
         assert_eq!(config.effective_value_head_dim(), 64);
     }
 
-    #[test]
-    fn test_needs_gradient_follows_the_trace() {
-        use pmetal_runtime::compat::nn::value_and_grad_explicit;
-
-        let param = random_tensor(&[1, 2, 4, 64]);
-        let frozen = random_tensor(&[1, 2, 4, 64]);
-        assert!(!needs_gradient(&param, &frozen, &frozen));
-
-        let mut seen = Vec::new();
-        let _ = value_and_grad_explicit(
-            |a: &[Array]| {
-                let q = a[0].multiply(&Array::from_f32(2.0));
-                seen.push(needs_gradient(&q, &frozen, &frozen));
-                seen.push(needs_gradient(&frozen, &frozen, &frozen));
-                q.sum_all()
-            },
-            std::slice::from_ref(&param),
-            &[],
-        )
-        .unwrap();
-        assert_eq!(seen, [true, false]);
-        assert!(!needs_gradient(&param, &frozen, &frozen));
-    }
-
     /// Plain causal attention in f32 from primitives with known VJPs.
     fn reference_causal_attention(q: &Array, k: &Array, v: &Array, scale: f32) -> Array {
         let repeats = q.dim(1) / k.dim(1);
@@ -1985,30 +1102,36 @@ mod tests {
         scores.softmax(-1).matmul(&v)
     }
 
-    /// A forward that is being differentiated must keep its attention in
-    /// MLX's graph even when the backend cache says a Metal kernel is fastest
-    /// for the shape. The Metal kernels build their output from a Metal
-    /// buffer, so taking one here would hand autograd a constant and give
-    /// Q/K/V (and every adapter feeding them) a zero gradient.
+    /// Largest magnitude in `array`.
+    fn max_abs(array: &Array) -> Result<f32, Exception> {
+        let max = array.as_dtype(Dtype::Float32.as_i32()).abs_val().max(None);
+        max.eval();
+        Ok(max.item_f32())
+    }
+
+    /// Largest absolute difference between two arrays.
+    fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
+        let diff = lhs
+            .as_dtype(Dtype::Float32.as_i32())
+            .subtract(&rhs.as_dtype(Dtype::Float32.as_i32()))
+            .abs_val()
+            .max(None);
+        diff.eval();
+        Ok(diff.item_f32())
+    }
+
+    /// The gradient through `fused_sdpa` must match plain attention built from
+    /// primitives with known VJPs, for Q, K and V.
     #[test]
-    #[serial_test::serial]
     fn test_attention_under_autograd_keeps_its_gradient() {
         use pmetal_runtime::compat::nn::value_and_grad_explicit;
 
-        clear_cached_attention_backends();
         let (heads, kv_heads, head_dim, len) = (4, 2, 128, 2048);
         random::seed(3);
         let q = random::uniform_range(-1.0, 1.0, &[1, heads, len, head_dim], Dtype::Float32);
         let k = random::uniform_range(-1.0, 1.0, &[1, kv_heads, len, head_dim], Dtype::Float32);
         let v = random::uniform_range(-1.0, 1.0, &[1, kv_heads, len, head_dim], Dtype::Float32);
         let config = FusedAttentionConfig::new(heads, kv_heads, head_dim);
-
-        // Pin the Metal kernel for this shape, as a benchmark that favoured
-        // it would have.
-        let ctx = MetalContext::global().unwrap();
-        let key = benchmarkable_attention_dispatch_key(&q, &k, &v, &config, None, ctx.properties())
-            .expect("the shape is one the Metal kernels serve");
-        cache_attention_backend(key, AttentionBackendChoice::MetalFlash);
 
         // Only the last few query rows enter the loss, so it stays O(1) and a
         // finite difference resolves it in f32.
@@ -2041,7 +1164,6 @@ mod tests {
         };
         let fused = grads(&|a| fused_sdpa(&a[0], &a[1], &a[2], &config, None).unwrap());
         let reference = grads(&|a| reference_causal_attention(&a[0], &a[1], &a[2], scale));
-        clear_cached_attention_backends();
 
         for (name, (got, want)) in ["dq", "dk", "dv"].iter().zip(fused.iter().zip(&reference)) {
             let scale = max_abs(want).unwrap();

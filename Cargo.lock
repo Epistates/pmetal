@@ -5416,7 +5416,6 @@ dependencies = [
 name = "pmetal-mlx"
 version = "0.6.0"
 dependencies = [
- "dirs 7.0.0",
  "half",
  "pmetal-core",
  "pmetal-metal",

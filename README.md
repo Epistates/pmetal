@@ -347,7 +347,7 @@ PMetal automatically detects Apple Silicon capabilities at startup and tunes ker
 
 **Auto-detected features**: GPU family, device tier, core counts, memory bandwidth, dynamic caching, mesh shaders, NAX (M5+), UltraFusion topology (via `sysctl hw.packages`), ANE availability.
 
-**Tier-based kernel tuning**: Matrix tile sizes, FlashAttention block sizes, fused kernel threadgroup sizes, and batch multipliers are automatically selected based on device tier (Base/Pro/Max/Ultra) and GPU family. See [`docs/hardware-support.md`](docs/hardware-support.md) for the full tuning matrix.
+**Tier-based kernel tuning**: Fused kernel threadgroup sizes, chunk sizes, and batch multipliers are automatically selected based on device tier (Base/Pro/Max/Ultra) and GPU family. See [`docs/hardware-support.md`](docs/hardware-support.md) for the full tuning matrix.
 
 ## Architecture
 
@@ -496,16 +496,10 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 
 Custom Metal shaders provide significant speedups:
 
-- **FlashAttention**: O(n) memory attention with fused softmax, tier-aware block sizes
 - **Fused GDN**: Gated Delta Network recurrence kernel (ported from FLA Triton) — single-pass state update with SIMD reductions
-- **Fused LoRA**: Combined forward pass for adapter layers
 - **Fused Cross-Entropy**: Chunked vocabulary loss computation
 - **Fused Linear Cross-Entropy**: Skips logits materialization entirely
-- **Fused RoPE**: Rotary position embeddings in-kernel
-- **Fused SwiGLU**: Fused gate + activation with tier-tuned threadgroups
-- **Fused RMSNorm + LoRA**: Combined normalization and adapter projection
 - **Fused Sampler**: JIT-compiled token sampling
-- **Fused MLP**: Combined gate/up/down projections
 - **Async Scheduler**: Double/triple-buffered GPU command scheduling
 
 ### ANE (Neural Engine) Pipeline

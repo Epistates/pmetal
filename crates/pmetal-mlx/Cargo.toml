@@ -18,7 +18,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 half = { workspace = true }
-dirs = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]

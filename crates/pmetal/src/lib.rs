@@ -132,10 +132,8 @@ pub mod prelude {
     // Metal prelude minus Result (use metal::Result explicitly to avoid ambiguity)
     #[cfg(feature = "metal")]
     pub use pmetal_metal::prelude::{
-        BufferUsage, FlashAttention, FlashAttentionConfig, FlashAttentionVarlen,
-        FlashAttentionVarlenConfig, FusedCrossEntropy, FusedCrossEntropyConfig,
-        FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig, FusedLora, FusedLoraConfig,
-        MetalBuffer, MetalContext, MetalError, PipelineCache,
+        BufferUsage, FusedCrossEntropy, FusedCrossEntropyConfig, FusedLinearCrossEntropy,
+        FusedLinearCrossEntropyConfig, MetalBuffer, MetalContext, MetalError, PipelineCache,
     };
 
     // MLX prelude minus Dtype (use mlx::Dtype explicitly to avoid ambiguity with core::Dtype)

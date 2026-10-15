@@ -4,18 +4,15 @@ High-performance Metal GPU kernels for Apple Silicon.
 
 ## Overview
 
-This crate provides custom Metal shaders that accelerate LLM training and inference on Apple Silicon. These kernels are the foundation of PMetal's performance advantages over Python-based frameworks.
+This crate provides custom Metal shaders for the operations the tensor runtime has no op for. Dense attention, RoPE, SwiGLU, LoRA and GEMM are deliberately not here: the runtime runs them in its lazy graph, with autodiff, and a hand-written kernel for any of them measured slower than the runtime op.
 
 ## Features
 
-- **FlashAttention**: O(n) memory attention with fused softmax (forward + backward)
-- **Fused LoRA**: Combined base + adapter forward pass (~2x speedup)
 - **Fused Cross-Entropy**: Chunked vocabulary loss (avoids logits materialization)
-- **Fused RoPE**: Rotary position embeddings computed in-kernel
-- **Fused SwiGLU**: MLP activation fusion
-- **Fused Norm+LoRA**: Combined layer norm and adapter application
-- **Fused GDN**: Gated Delta Network recurrence (Metal shader, 32-thread SIMD)
-- **MoE Routing**: Expert selection and dispatch kernel
+- **Fused AdamW** and **FP8 training** kernels
+- **Quantized and MoE GEMMs**: dequantizing matmuls, grouped expert GEMMs, fused expert MLPs
+- **dW GEMM**: the f32 weight-gradient GEMM the ANE trainer batches into one command buffer
+- **Model merging** and **TurboQuant** KV-cache transforms
 
 ## Architecture
 
@@ -65,43 +62,27 @@ The ANE module provides a complete training and inference pipeline using Apple's
 queue and pipeline cache are shared.
 
 ```rust,no_run
-use half::f16;
 use pmetal_metal::{
-    FlashAttention, FlashAttentionConfig, MetalBuffer, MetalContext, Result,
+    FusedCrossEntropy, FusedCrossEntropyConfig, MetalBuffer, MetalContext, Result,
 };
 
-fn attend(
-    queries: &MetalBuffer<f16>,
-    keys: &MetalBuffer<f16>,
-    values: &MetalBuffer<f16>,
-) -> Result<()> {
+fn loss(logits: &MetalBuffer<f32>, targets: &MetalBuffer<i32>) -> Result<()> {
     let ctx = MetalContext::global()?;
 
-    let config = FlashAttentionConfig {
-        batch_size: 1,
-        num_heads: 32,
-        num_kv_heads: 8, // GQA; set equal to num_heads for standard MHA
-        query_seq_len: 512,
-        kv_seq_len: 512,
-        head_dim: 128,
-        is_causal: true,
-        ..Default::default()
-    };
-
-    let attention = FlashAttention::new(ctx, config)?;
-    let _output = attention.forward(queries, keys, values)?;
+    // 512 tokens over a 32k vocabulary.
+    let config = FusedCrossEntropyConfig::new(512, 32_768);
+    let cross_entropy = FusedCrossEntropy::new(ctx, config)?;
+    let _output = cross_entropy.forward(logits, targets)?;
     Ok(())
 }
 ```
 
 ## Kernels
 
-| Kernel | Speedup | Memory | Description |
-|--------|---------|--------|-------------|
-| `flash_attention` | 1.5-2x | O(n) vs O(n²) | Memory-efficient attention |
-| `fused_lora` | ~2x | Same | Combined base+adapter forward |
-| `fused_cross_entropy` | 1.3x | O(1) per chunk | Chunked loss computation |
-| `fused_rope` | 1.2x | Same | In-kernel position encoding |
+| Kernel | Memory | Description |
+|--------|--------|-------------|
+| `fused_cross_entropy` | O(1) per chunk | Chunked loss computation |
+| `dw_gemm` | Same | f32 weight-gradient GEMM for the ANE trainer |
 
 ## Requirements
 

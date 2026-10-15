@@ -353,42 +353,14 @@ impl DeviceTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let Some(dev) = &self.device else {
+        if self.device.is_none() {
             return;
-        };
-
-        let tier = &dev.device_tier;
+        }
 
         let lines = vec![
             Line::from(vec![
-                Span::styled("FlashAttention (d=128): ", THEME.kv_key),
-                Span::styled(
-                    match tier.as_str() {
-                        "Max" | "Ultra" => "64x64",
-                        _ => "32x32",
-                    },
-                    THEME.kv_value,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Fused NormLora TG:      ", THEME.kv_key),
-                Span::styled(
-                    match tier.as_str() {
-                        "Max" | "Ultra" => "256",
-                        _ => "128",
-                    },
-                    THEME.kv_value,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Fused SwiGLU TG:        ", THEME.kv_key),
-                Span::styled(
-                    match tier.as_str() {
-                        "Max" | "Ultra" => "512",
-                        _ => "256",
-                    },
-                    THEME.kv_value,
-                ),
+                Span::styled("Attention, GEMM, RoPE, MLP, LoRA: ", THEME.kv_key),
+                Span::styled("tensor runtime", THEME.kv_value),
             ]),
             Line::from(""),
             Line::from(vec![Span::styled(
