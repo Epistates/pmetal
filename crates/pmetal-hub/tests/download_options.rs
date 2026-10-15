@@ -482,6 +482,22 @@ async fn a_dataset_download_is_pinned_and_limited_to_its_split() {
 }
 
 #[tokio::test]
+async fn a_transfer_that_returns_an_error_page_leaves_nothing_poisoned_behind() {
+    let (hub, cache) = hub_with_model("o/m").await;
+    let opts = options(&hub, cache.path());
+    // The metadata request succeeds; the transfer after it answers 403 with a
+    // JSON error body, as an expired signed link does.
+    hub.fail_get("tokenizer.json", 403, 1);
+
+    let first = download_model_with("o/m", &opts).await;
+    assert!(first.is_err(), "an error page is not a tokenizer");
+
+    // With the fault gone, the same call gets the real file, not the page.
+    let dir = download_model_with("o/m", &opts).await.unwrap();
+    assert_eq!(std::fs::read(dir.join("tokenizer.json")).unwrap(), b"{}");
+}
+
+#[tokio::test]
 async fn repositories_that_are_not_language_models_still_download() {
     isolate_env();
     let hub = FakeHub::start().await;

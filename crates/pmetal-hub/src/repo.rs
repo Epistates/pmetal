@@ -9,7 +9,7 @@ use hf_hub::repository::RepoTreeEntry;
 use hf_hub::{HFClient, HFError, HFRepository, RepoTypeDataset, RepoTypeModel, split_id};
 use pmetal_core::{PMetalError, Result};
 
-use crate::cache::{RepoKind, repo_folder};
+use crate::cache::{InProgress, RepoKind, repo_folder, snapshot_dir};
 use crate::client::hub_error_in;
 use crate::select::RepoFile;
 
@@ -195,16 +195,21 @@ impl RepoHandle {
     }
 
     /// Download exactly `paths` of `commit` into the cache, concurrently; the
-    /// snapshot directory.
+    /// snapshot directory, and the mark that it is still being filled. The
+    /// caller checks what arrived and then calls [`InProgress::finish`]; until
+    /// then cache lookups skip the snapshot.
     pub(crate) async fn download_snapshot(
         &self,
         commit: &str,
         paths: &[String],
         max_workers: Option<usize>,
         progress: Option<Progress>,
-    ) -> Result<PathBuf> {
+    ) -> Result<(PathBuf, InProgress)> {
         let patterns: Vec<String> = paths.iter().map(|p| exact_glob(p)).collect();
-        on_repo!(self, r => r
+        let cache_root = on_repo!(self, r => r.client().cache_dir().to_path_buf());
+        let snapshot = snapshot_dir(&cache_root, &self.folder(), commit);
+        let mark = InProgress::begin(&snapshot)?;
+        let downloaded = on_repo!(self, r => r
             .snapshot_download()
             .revision(commit.to_owned())
             .allow_patterns(patterns)
@@ -212,7 +217,8 @@ impl RepoHandle {
             .maybe_progress(progress)
             .send()
             .await
-            .map_err(|e| self.err(&e)))
+            .map_err(|e| self.err(&e)))?;
+        Ok((downloaded, mark))
     }
 
     /// Map a Hub failure on this repository to a user-facing error.

@@ -129,7 +129,33 @@ pub(crate) fn snapshot_dir(cache_root: &Path, folder: &str, sha: &str) -> PathBu
     cache_root.join(folder).join("snapshots").join(sha)
 }
 
-/// Pick a cached snapshot of a repository that `accept`s.
+/// The name of the file that marks a snapshot a download is still working on.
+const IN_PROGRESS_MARKER: &str = ".pmetal-incomplete";
+
+/// A snapshot a download has begun and not yet checked. The marker is written
+/// before the first byte moves and removed by [`finish`](Self::finish) once
+/// every file has been verified, so a snapshot left half-filled by an error,
+/// a crash or a killed process is never taken for a finished one: lookups skip
+/// it, and the next download fills it in.
+pub(crate) struct InProgress(PathBuf);
+
+impl InProgress {
+    /// Mark `snapshot` as being downloaded.
+    pub(crate) fn begin(snapshot: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(snapshot)?;
+        let marker = snapshot.join(IN_PROGRESS_MARKER);
+        std::fs::write(&marker, b"")?;
+        Ok(Self(marker))
+    }
+
+    /// The download is complete and verified: clear the mark.
+    pub(crate) fn finish(self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
+/// Pick a cached snapshot of a repository that `accept`s. A snapshot a
+/// download has not finished is never accepted.
 ///
 /// With a `revision`: that commit, or the commit the revision name points at.
 /// Without: what `refs/main` points at first, then every snapshot, newest
@@ -170,7 +196,9 @@ pub(crate) fn find_snapshot(
             candidates.extend(others.into_iter().map(|(_, p)| p));
         }
     }
-    candidates.into_iter().find(|p| p.is_dir() && accept(p))
+    candidates
+        .into_iter()
+        .find(|p| p.is_dir() && !p.join(IN_PROGRESS_MARKER).exists() && accept(p))
 }
 
 /// Evict a single model from the local HuggingFace hub cache.
@@ -306,6 +334,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         put_model(root.path(), SHA_A, false);
         assert!(find_cached_model_in(root.path(), "o/m", None).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_a_download_has_not_finished_is_not_cached() {
+        let root = tempfile::tempdir().unwrap();
+        let snap = put_model(root.path(), SHA_A, true);
+        let mark = InProgress::begin(&snap).unwrap();
+        // Weights and config are all there, but nobody has checked the rest.
+        assert!(find_cached_model_in(root.path(), "o/m", None).is_none());
+        assert!(find_cached_model_in(root.path(), "o/m", Some(SHA_A)).is_none());
+        mark.finish();
+        assert_eq!(find_cached_model_in(root.path(), "o/m", None), Some(snap));
     }
 
     #[test]

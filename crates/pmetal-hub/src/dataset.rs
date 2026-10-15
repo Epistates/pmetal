@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use pmetal_core::{PMetalError, Result, SecretString};
 
 use crate::cache::{is_commit_sha, write_ref};
-use crate::download::{DownloadOptions, progress_handle};
+use crate::download::{DownloadOptions, check_downloaded, progress_handle};
 use crate::repo::{RepoHandle, is_network_unavailable};
 use crate::select::RepoFile;
 
@@ -150,7 +150,7 @@ pub async fn download_dataset_with(
         )));
     }
     let paths: Vec<String> = wanted.iter().map(|f| f.path.clone()).collect();
-    let snapshot = repo
+    let (snapshot, in_progress) = repo
         .download_snapshot(
             &commit,
             &paths,
@@ -158,7 +158,9 @@ pub async fn download_dataset_with(
             progress_handle(&options.progress),
         )
         .await?;
+    check_downloaded(&snapshot, &wanted, options.verify)?;
     record_ref(&cache_root, &repo, options.revision.as_deref(), &commit);
+    in_progress.finish();
     Ok(snapshot)
 }
 
@@ -287,7 +289,7 @@ pub async fn download_dataset_parquet_with(
             continue;
         }
         let paths: Vec<String> = parquet.iter().map(|f| f.path.clone()).collect();
-        let snapshot = repo
+        let (snapshot, in_progress) = repo
             .download_snapshot(
                 &commit,
                 &paths,
@@ -295,9 +297,11 @@ pub async fn download_dataset_parquet_with(
                 progress_handle(&options.progress),
             )
             .await?;
+        check_downloaded(&snapshot, &parquet, options.verify)?;
         if !is_conversion {
             record_ref(&cache_root, &repo, revision, &commit);
         }
+        in_progress.finish();
         return Ok(paths.iter().map(|p| snapshot.join(p)).collect());
     }
     Err(PMetalError::Hub(format!(

@@ -210,22 +210,9 @@ async fn fetch_model(model_id: &str, options: &DownloadOptions) -> Result<PathBu
         .clone()
         .map(|cb| Progress::new(CallbackHandler::new(cb)));
     let paths: Vec<String> = plan.model.files.iter().map(|f| f.path.clone()).collect();
-    let snapshot = repo
+    let (snapshot, in_progress) = repo
         .download_snapshot(&plan.commit, &paths, options.max_workers, progress)
         .await?;
-
-    // Name the revision in the cache, as the Hub's own tools do, so the next
-    // lookup (including an offline one) finds this commit by name.
-    let ref_name = match revision {
-        Some(r) if is_commit_sha(r) => None,
-        Some(r) => Some(r),
-        None => Some("main"),
-    };
-    if let Some(name) = ref_name {
-        if let Err(e) = write_ref(&cache_root, &repo.folder(), name, &plan.commit) {
-            tracing::warn!("Could not record {name} for {model_id}: {e}");
-        }
-    }
 
     check_downloaded(&snapshot, &plan.model.files, options.verify)?;
     if let SelectedWeights::Gguf { .. } = plan.model.weights {
@@ -244,6 +231,21 @@ async fn fetch_model(model_id: &str, options: &DownloadOptions) -> Result<PathBu
             )));
         }
     }
+
+    // Everything is here and checked. Name the revision in the cache, as the
+    // Hub's own tools do, so the next lookup (including an offline one) finds
+    // this commit by name, and let lookups see the snapshot.
+    let ref_name = match revision {
+        Some(r) if is_commit_sha(r) => None,
+        Some(r) => Some(r),
+        None => Some("main"),
+    };
+    if let Some(name) = ref_name {
+        if let Err(e) = write_ref(&cache_root, &repo.folder(), name, &plan.commit) {
+            tracing::warn!("Could not record {name} for {model_id}: {e}");
+        }
+    }
+    in_progress.finish();
     Ok(snapshot)
 }
 
@@ -352,35 +354,45 @@ fn cached_or_offline_error(
 
 /// Check every planned file arrived with the size (and, if asked, the hash)
 /// the Hub listed.
-fn check_downloaded(snapshot: &Path, planned: &[RepoFile], verify: Verification) -> Result<()> {
+pub(crate) fn check_downloaded(
+    snapshot: &Path,
+    planned: &[RepoFile],
+    verify: Verification,
+) -> Result<()> {
     if verify == Verification::None {
         return Ok(());
     }
     let mut problems = Vec::new();
     for file in planned {
         let path = snapshot.join(&file.path);
-        match std::fs::metadata(&path) {
-            Err(_) => problems.push(format!("{} is missing", file.path)),
-            Ok(meta) if meta.len() != file.size => problems.push(format!(
+        let problem = match std::fs::metadata(&path) {
+            Err(_) => Some(format!("{} is missing", file.path)),
+            Ok(meta) if meta.len() != file.size => Some(format!(
                 "{} is {} bytes, the Hub lists {}",
                 file.path,
                 meta.len(),
                 file.size
             )),
-            Ok(_) => {
-                if verify == Verification::Sha256 {
-                    if let Some(expected) = &file.sha256 {
-                        match sha256_of(&path) {
-                            Ok(actual) if actual.eq_ignore_ascii_case(expected) => {}
-                            Ok(actual) => problems.push(format!(
-                                "{} has SHA-256 {actual}, the Hub lists {expected}",
-                                file.path
-                            )),
-                            Err(e) => problems.push(format!("{}: {e}", file.path)),
-                        }
-                    }
-                }
+            Ok(_) => match (&file.sha256, verify) {
+                (Some(expected), Verification::Sha256) => match sha256_of(&path) {
+                    Ok(actual) if actual.eq_ignore_ascii_case(expected) => None,
+                    Ok(actual) => Some(format!(
+                        "{} has SHA-256 {actual}, the Hub lists {expected}",
+                        file.path
+                    )),
+                    Err(e) => Some(format!("{}: {e}", file.path)),
+                },
+                _ => None,
+            },
+        };
+        if let Some(problem) = problem {
+            // A file that is not what the Hub listed (a transfer that stored
+            // an error page, a bit flipped on disk) must not stay in the cache:
+            // later calls would take it for the file and never fetch it again.
+            if path.exists() {
+                discard_cached_file(&path);
             }
+            problems.push(problem);
         }
     }
     if problems.is_empty() {
@@ -391,6 +403,33 @@ fn check_downloaded(snapshot: &Path, planned: &[RepoFile], verify: Verification)
             problems.into_iter().take(10).collect::<Vec<_>>().join("; ")
         )))
     }
+}
+
+/// Remove a bad file from a cache snapshot: the snapshot's link and, when the
+/// link leads into the repository's `blobs/` directory, the blob it points at,
+/// so the next download fetches the file again.
+fn discard_cached_file(path: &Path) {
+    let blob = std::fs::read_link(path).ok().map(|target| {
+        if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or(Path::new(".")).join(target)
+        }
+    });
+    let _ = std::fs::remove_file(path);
+    if let Some(blob) = blob {
+        let in_blobs = blob
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == "blobs");
+        if in_blobs {
+            let _ = std::fs::remove_file(blob);
+        }
+    }
+    tracing::warn!(
+        "Discarded {} from the cache; it will be fetched again",
+        path.display()
+    );
 }
 
 /// SHA-256 of a file, as lowercase hex.

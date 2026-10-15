@@ -4,7 +4,7 @@
 //! A checkpoint is a ZIP archive (stored, uncompressed; ZIP64 for the big
 //! shards) holding a Python pickle that describes the tensors and one raw
 //! storage file per tensor. [`TorchArchive`] maps the file, runs the pickle
-//! through a restricted interpreter (see [`pickle`]: it knows a short
+//! through a restricted interpreter (it knows a short
 //! allow-list of globals and refuses everything else, so opening an untrusted
 //! file cannot execute code), and hands out each tensor as a slice of the
 //! mapping. Nothing is copied until a caller does.

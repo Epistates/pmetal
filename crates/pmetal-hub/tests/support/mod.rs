@@ -102,6 +102,8 @@ impl Repo {
 
 struct Fault {
     path_contains: String,
+    /// Only requests with this method, when set.
+    method: Option<&'static str>,
     status: u16,
     remaining: usize,
 }
@@ -163,6 +165,18 @@ impl FakeHub {
     pub fn fail(&self, path_contains: &str, status: u16, times: usize) {
         self.inner.lock().unwrap().faults.push(Fault {
             path_contains: path_contains.to_owned(),
+            method: None,
+            status,
+            remaining: times,
+        });
+    }
+
+    /// [`fail`](Self::fail) for `GET` requests only: the metadata `HEAD`
+    /// succeeds and the transfer that follows does not.
+    pub fn fail_get(&self, path_contains: &str, status: u16, times: usize) {
+        self.inner.lock().unwrap().faults.push(Fault {
+            path_contains: path_contains.to_owned(),
+            method: Some("GET"),
             status,
             remaining: times,
         });
@@ -331,7 +345,10 @@ fn handle(
 ) -> Response {
     // Injected faults come first.
     for fault in &mut inner.faults {
-        if fault.remaining > 0 && path.contains(&fault.path_contains) {
+        if fault.remaining > 0
+            && path.contains(&fault.path_contains)
+            && fault.method.is_none_or(|m| m == method)
+        {
             fault.remaining -= 1;
             // Status 0 is a Hub that has stopped answering.
             if fault.status == 0 {
