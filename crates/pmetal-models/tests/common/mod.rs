@@ -13,6 +13,8 @@
 
 use std::path::PathBuf;
 
+pub mod gemma4;
+
 pub use pmetal_cache::test_utils::{load_shard, ref_tensor};
 
 /// Resolve `tests/fixtures/<name>` relative to this crate.

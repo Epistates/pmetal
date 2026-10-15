@@ -23,6 +23,9 @@
 
 mod common;
 
+use common::gemma4::{
+    moe_synthetic_config_json, shared_synthetic_config_json, synthetic_config_json,
+};
 use common::{fixture_path, load_shard, ref_tensor};
 
 use std::collections::HashMap;
@@ -35,46 +38,6 @@ use pmetal_cache::test_utils::{
 use pmetal_runtime::compat::{Array, ops};
 
 use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4ForCausalLM, load_gemma4_weights};
-
-/// The synthetic config the fixture was generated with. Changing a field
-/// here without regenerating the fixture breaks the comparison.
-fn synthetic_config_json() -> &'static str {
-    r#"{
-        "model_type": "gemma4_text",
-        "vocab_size": 512,
-        "hidden_size": 128,
-        "intermediate_size": 256,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 32,
-        "global_head_dim": 64,
-        "num_global_key_value_heads": 1,
-        "max_position_embeddings": 131072,
-        "rms_norm_eps": 1e-6,
-        "attention_k_eq_v": true,
-        "tie_word_embeddings": true,
-        "sliding_window": 8,
-        "final_logit_softcapping": 30.0,
-        "layer_types": ["sliding_attention", "full_attention"],
-        "rope_parameters": {
-            "full_attention": {
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
-                "rope_type": "proportional"
-            },
-            "sliding_attention": {
-                "partial_rotary_factor": 1.0,
-                "rope_theta": 10000.0,
-                "rope_type": "default"
-            }
-        },
-        "hidden_size_per_layer_input": 0,
-        "num_kv_shared_layers": 0,
-        "use_double_wide_mlp": false,
-        "enable_moe_block": false
-    }"#
-}
 
 /// Tolerance table used by the synthetic test.
 ///
@@ -115,94 +78,6 @@ fn gemma4_31b_tolerances(tap_layers: &[i32]) -> Vec<(String, Tolerance)> {
         t.push((format!("layer_{idx}_hidden"), Tolerance::new(atol, rtol)));
     }
     t
-}
-
-/// MoE synthetic config the fixture was generated with (same geometry as the
-/// dense fixture with the routed-experts branch enabled).
-fn moe_synthetic_config_json() -> &'static str {
-    r#"{
-        "model_type": "gemma4_text",
-        "vocab_size": 512,
-        "hidden_size": 128,
-        "intermediate_size": 256,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 32,
-        "global_head_dim": 64,
-        "num_global_key_value_heads": 1,
-        "max_position_embeddings": 131072,
-        "rms_norm_eps": 1e-6,
-        "attention_k_eq_v": true,
-        "tie_word_embeddings": true,
-        "sliding_window": 8,
-        "final_logit_softcapping": 30.0,
-        "layer_types": ["sliding_attention", "full_attention"],
-        "rope_parameters": {
-            "full_attention": {
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
-                "rope_type": "proportional"
-            },
-            "sliding_attention": {
-                "partial_rotary_factor": 1.0,
-                "rope_theta": 10000.0,
-                "rope_type": "default"
-            }
-        },
-        "hidden_size_per_layer_input": 0,
-        "num_kv_shared_layers": 0,
-        "use_double_wide_mlp": false,
-        "enable_moe_block": true,
-        "num_experts": 4,
-        "top_k_experts": 2,
-        "moe_intermediate_size": 64
-    }"#
-}
-
-/// The E2B/E4B shape: six layers, the last two sharing the KV cache of the
-/// last layer of their own attention type (3 for sliding, 2 for full), with
-/// per-layer input embeddings. The native engine's only fixture for either.
-fn shared_synthetic_config_json() -> &'static str {
-    r#"{
-        "model_type": "gemma4_text",
-        "vocab_size": 512,
-        "hidden_size": 128,
-        "intermediate_size": 256,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 32,
-        "global_head_dim": 64,
-        "num_global_key_value_heads": 1,
-        "max_position_embeddings": 131072,
-        "rms_norm_eps": 1e-6,
-        "attention_k_eq_v": true,
-        "tie_word_embeddings": true,
-        "sliding_window": 8,
-        "final_logit_softcapping": 30.0,
-        "layer_types": [
-            "sliding_attention", "sliding_attention", "full_attention",
-            "sliding_attention", "sliding_attention", "full_attention"
-        ],
-        "rope_parameters": {
-            "full_attention": {
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
-                "rope_type": "proportional"
-            },
-            "sliding_attention": {
-                "partial_rotary_factor": 1.0,
-                "rope_theta": 10000.0,
-                "rope_type": "default"
-            }
-        },
-        "hidden_size_per_layer_input": 16,
-        "vocab_size_per_layer_input": 512,
-        "num_kv_shared_layers": 2,
-        "use_double_wide_mlp": false,
-        "enable_moe_block": false
-    }"#
 }
 
 /// Build the Rust Gemma4 model from a config JSON + weight fixture and return
