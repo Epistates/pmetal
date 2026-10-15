@@ -577,8 +577,16 @@ fn unclaimed_is_expected(key: &str) -> bool {
 ///
 /// Multimodal wrappers nest the text stack under `model.language_model.` and
 /// the dispatcher strips the infix back to `model.` before assignment.
-fn loader_normalized(key: &str) -> String {
-    collapse_indices(&key.replace("model.language_model.", "model."))
+/// DeepSeek's loader stacks each layer's expert-per-key tensors into
+/// `mlp.switch_mlp.*`, which this applies to the names as
+/// `deepseek::stack_experts` does to the tensors.
+fn loader_normalized(arch: ModelArchitecture, key: &str) -> String {
+    let collapsed = collapse_indices(&key.replace("model.language_model.", "model."));
+    if arch == ModelArchitecture::DeepSeek {
+        collapsed.replace(".mlp.experts.N.", ".mlp.switch_mlp.")
+    } else {
+        collapsed
+    }
 }
 
 /// Whether this architecture assigns weights by matching parameter names
@@ -767,7 +775,7 @@ fn released_checkpoints_claim_every_tensor() {
         let unclaimed: BTreeSet<String> = names
             .iter()
             .filter(|k| !unclaimed_is_expected(k))
-            .map(|k| loader_normalized(k))
+            .map(|k| loader_normalized(arch, k))
             .filter(|k| !params.contains(k))
             .collect();
 

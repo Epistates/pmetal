@@ -738,34 +738,39 @@ impl DeepSeekMoEGate {
     }
 }
 
-/// One routed expert: a SwiGLU MLP, its projections under the names a
-/// checkpoint gives them.
+/// A layer's routed experts, stacked over a leading expert axis in the layout
+/// an MLX checkpoint stores them (`switch_mlp`), each projection a weight
+/// `[experts, out, in]`.
 ///
-/// Plain weights, not `Linear`s: the routed experts are read through the
-/// stacked gather kernels ([`DeepSeekMoE`]), so an adapter on one would never
-/// be applied.
+/// Stacked, not a `Linear` per expert, so a layer holds three arrays whatever
+/// the expert count, the gather matmuls read them as they are (a transposed
+/// view, no copy), and nothing is kept twice. A checkpoint with an expert per
+/// key (the released one) is stacked at load ([`stack_experts`]).
+///
+/// Plain weights, not `Linear`s: the experts are read through the gather
+/// kernels, so an adapter on one would never be applied.
 #[derive(Debug)]
-pub struct DeepSeekExpert {
-    /// `[moe_intermediate, hidden]`.
+pub struct DeepSeekExperts {
+    /// `[experts, moe_intermediate, hidden]`.
     pub gate_proj: MoeLinear,
-    /// `[moe_intermediate, hidden]`.
+    /// `[experts, moe_intermediate, hidden]`.
     pub up_proj: MoeLinear,
-    /// `[hidden, moe_intermediate]`.
+    /// `[experts, hidden, moe_intermediate]`.
     pub down_proj: MoeLinear,
 }
-impl_module_params!(DeepSeekExpert; gate_proj, up_proj, down_proj);
+impl_module_params!(DeepSeekExperts; gate_proj, up_proj, down_proj);
 
-impl DeepSeekExpert {
-    /// A randomly initialised expert (lazily: a checkpoint's weights replace
+impl DeepSeekExperts {
+    /// Randomly initialised experts (lazily: a checkpoint's weights replace
     /// the draw before anything computes it).
-    pub fn new(hidden_size: i32, intermediate_size: i32) -> Self {
+    pub fn new(num_experts: i32, hidden_size: i32, intermediate_size: i32) -> Self {
         let init = |in_features: i32, out_features: i32| {
             let bound = (in_features as f32).sqrt().recip();
             MoeLinear {
                 weight: pmetal_runtime::compat::random::uniform_range(
                     -bound,
                     bound,
-                    &[out_features, in_features],
+                    &[num_experts, out_features, in_features],
                     Dtype::Float32,
                 ),
             }
@@ -777,42 +782,96 @@ impl DeepSeekExpert {
         }
     }
 
-    /// `down(silu(gate(x)) * up(x))`.
-    #[cfg(test)]
-    fn forward(&self, x: &Array) -> Array {
-        let hidden = nn::silu(&self.gate_proj.forward(x)).multiply(&self.up_proj.forward(x));
-        self.down_proj.forward(&hidden)
+    /// The projections as the gather matmuls take them, `[experts, in, out]`.
+    fn dense_weights(&self) -> Result<(LayerWeight, LayerWeight, LayerWeight)> {
+        let weight = |linear: &MoeLinear| -> Result<LayerWeight> {
+            Ok(LayerWeight::Dense(
+                dequantize_fp8_weight_for_compute(&linear.weight)?.swap_axes(-1, -2),
+            ))
+        };
+        Ok((
+            weight(&self.gate_proj)?,
+            weight(&self.up_proj)?,
+            weight(&self.down_proj)?,
+        ))
     }
 }
 
-/// The routed experts of a layer stacked over a leading expert axis, each
-/// weight `[experts, in, out]`, as the gather matmuls read them.
-#[derive(Debug)]
-struct StackedExperts {
-    gate: LayerWeight,
-    up: LayerWeight,
-    down: LayerWeight,
-    /// The identity of every expert weight these were built from; a weight
-    /// that has since been replaced makes them stale.
-    signature: Vec<usize>,
+/// A checkpoint's tensors with each layer's routed experts stacked: the
+/// released layout names an expert per key,
+/// `mlp.experts.{e}.{gate,up,down}_proj.weight`, and the model holds them as
+/// `mlp.switch_mlp.{gate,up,down}_proj.weight`, `[experts, out, in]` (what an
+/// MLX conversion stores). Keys that are not an expert's pass through.
+///
+/// The stack is one lazy concatenation: evaluated, each expert is read once
+/// and written into its slot of the result, so a layer is never held twice. An
+/// expert missing from the run `0..n` is an error naming it.
+pub fn stack_experts(
+    weights: std::collections::HashMap<String, Array>,
+) -> Result<std::collections::HashMap<String, Array>> {
+    use std::collections::{BTreeMap, HashMap};
+
+    // (layer prefix `…mlp`, projection) -> expert index -> weight
+    let mut experts: HashMap<(String, String), BTreeMap<usize, Array>> = HashMap::new();
+    let mut out = HashMap::with_capacity(weights.len());
+    for (key, value) in weights {
+        let parsed = key.split_once(".mlp.experts.").and_then(|(layer, rest)| {
+            let (index, member) = rest.split_once('.')?;
+            let proj = member.strip_suffix(".weight")?;
+            matches!(proj, "gate_proj" | "up_proj" | "down_proj")
+                .then(|| {
+                    Some((
+                        format!("{layer}.mlp"),
+                        proj.to_string(),
+                        index.parse().ok()?,
+                    ))
+                })
+                .flatten()
+        });
+        match parsed {
+            Some((layer, proj, index)) => {
+                experts
+                    .entry((layer, proj))
+                    .or_default()
+                    .insert(index, value);
+            }
+            None => {
+                out.insert(key, value);
+            }
+        }
+    }
+    for ((layer, proj), by_index) in experts {
+        let count = by_index.len();
+        if let Some(missing) = (0..count).find(|e| !by_index.contains_key(e)) {
+            return Err(Exception::custom(format!(
+                "deepseek: {layer}.experts.{missing}.{proj}.weight is missing from a run of \
+                 {count} experts"
+            )));
+        }
+        let ordered: Vec<Array> = by_index.into_values().collect();
+        out.insert(
+            format!("{layer}.switch_mlp.{proj}.weight"),
+            ops::stack_axis(&ordered, 0),
+        );
+    }
+    pmetal_runtime::check_unobserved_error()
+        .map_err(|e| Exception::custom(format!("deepseek: stacking the experts failed: {e}")))?;
+    Ok(out)
 }
 
 #[derive(Debug)]
 pub struct DeepSeekMoE {
     pub gate: DeepSeekMoEGate,
-    pub experts: Vec<DeepSeekExpert>,
+    pub switch_mlp: DeepSeekExperts,
     pub shared_experts: Option<DeepSeekMLP>,
-    stacked: Option<StackedExperts>,
 }
-// The layout of a checkpoint: `gate.weight`, `gate.e_score_correction_bias`,
-// `experts.N.{gate,up,down}_proj.weight`, `shared_experts.*`.
-impl_module_params!(DeepSeekMoE; gate, experts, shared_experts);
+// The layout of a checkpoint after [`stack_experts`]: `gate.weight`,
+// `gate.e_score_correction_bias`, `switch_mlp.{gate,up,down}_proj.weight`,
+// `shared_experts.*`.
+impl_module_params!(DeepSeekMoE; gate, switch_mlp, shared_experts);
 
 impl DeepSeekMoE {
     pub fn new(config: &DeepSeekConfig) -> Result<Self> {
-        let experts = (0..config.n_routed_experts.unwrap_or(8))
-            .map(|_| DeepSeekExpert::new(config.hidden_size, config.moe_intermediate_size))
-            .collect();
         let shared_experts = if let Some(n_shared) = config.n_shared_experts {
             Some(DeepSeekMLP::new(
                 config.hidden_size,
@@ -823,71 +882,13 @@ impl DeepSeekMoE {
         };
         Ok(Self {
             gate: DeepSeekMoEGate::new(config)?,
-            experts,
+            switch_mlp: DeepSeekExperts::new(
+                config.n_routed_experts.unwrap_or(8),
+                config.hidden_size,
+                config.moe_intermediate_size,
+            ),
             shared_experts,
-            stacked: None,
         })
-    }
-
-    fn current_stacked_weight_signature(&self) -> Vec<usize> {
-        // Use `Array::id()` (MLX array_desc pointer) as the change-detection
-        // key. Unlike `data_ptr()`, it is safe on lazy (unevaluated) weights,
-        // so we do not have to materialise every expert tensor just to take
-        // its address.
-        let mut signature = Vec::with_capacity(self.experts.len() * 3);
-        for expert in &self.experts {
-            signature.push(expert.gate_proj.weight.id());
-            signature.push(expert.up_proj.weight.id());
-            signature.push(expert.down_proj.weight.id());
-        }
-        signature
-    }
-
-    fn stack_expert_weights(&self) -> Result<(Array, Array, Array)> {
-        let stack = |weight: fn(&DeepSeekExpert) -> &Array| -> Result<Array> {
-            let transposed = self
-                .experts
-                .iter()
-                .map(|expert| dequantize_fp8_weight_for_compute(weight(expert)).map(|w| w.t()))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(ops::stack_axis(&transposed, 0))
-        };
-        Ok((
-            stack(|e| &e.gate_proj.weight)?,
-            stack(|e| &e.up_proj.weight)?,
-            stack(|e| &e.down_proj.weight)?,
-        ))
-    }
-
-    fn ensure_stacked_moe(&mut self) -> Result<()> {
-        let signature = self.current_stacked_weight_signature();
-        let needs_refresh = self
-            .stacked
-            .as_ref()
-            .is_none_or(|stacked| stacked.signature != signature);
-
-        if needs_refresh {
-            let (gate, up, down) = self.stack_expert_weights()?;
-            gate.eval();
-            up.eval();
-            down.eval();
-            self.stacked = Some(StackedExperts {
-                gate: LayerWeight::Dense(gate),
-                up: LayerWeight::Dense(up),
-                down: LayerWeight::Dense(down),
-                signature,
-            });
-        }
-
-        Ok(())
-    }
-
-    pub fn init_stacked_moe(&mut self) -> Result<()> {
-        self.ensure_stacked_moe()
-    }
-
-    pub fn has_stacked_moe(&self) -> bool {
-        self.stacked.is_some()
     }
 
     /// Every expert over every token, each weighted by the gate's weight for
@@ -900,12 +901,17 @@ impl DeepSeekMoE {
         let flat = x.reshape(&[-1, hidden]);
         let (expert_indices, expert_weights) = self.gate.forward(&flat)?;
         let mut routed = ops::zeros_dtype(&[flat.dim(0), hidden], flat.dtype());
-        for (e, expert) in self.experts.iter().enumerate() {
+        let expert =
+            |linear: &MoeLinear, e: i32| ops::slice_axis(&linear.weight, 0, e, e + 1).squeeze(0);
+        for e in 0..self.switch_mlp.gate_proj.weight.dim(0) {
             let picked = expert_indices
-                .equal(&Array::from_int(e as i32))
+                .equal(&Array::from_int(e))
                 .as_dtype(expert_weights.dtype().as_i32());
             let weight = picked.multiply(&expert_weights).sum_axis(-1, true);
-            routed = routed.add(&expert.forward(&flat).multiply(&weight));
+            let hidden_act = nn::silu(&flat.matmul(&expert(&self.switch_mlp.gate_proj, e).t()))
+                .multiply(&flat.matmul(&expert(&self.switch_mlp.up_proj, e).t()));
+            let out = hidden_act.matmul(&expert(&self.switch_mlp.down_proj, e).t());
+            routed = routed.add(&out.multiply(&weight));
         }
         let moe_out = routed.reshape(&shape);
         if let Some(ref mut shared) = self.shared_experts {
@@ -918,9 +924,8 @@ impl DeepSeekMoE {
     /// The routed experts through grouped gather matmuls (the shared
     /// `native_moe::switch_glu`, which the native engine runs too), plus the
     /// shared expert.
-    fn forward_stacked(&mut self, x: &Array) -> Result<Array> {
-        self.ensure_stacked_moe()?;
-        let stacked = self.stacked.as_ref().expect("stacked experts");
+    pub fn forward(&mut self, x: &Array) -> Result<Array> {
+        let (gate, up, down) = self.switch_mlp.dense_weights()?;
 
         let shape = x.shape().to_vec();
         let hidden_size = shape[shape.len() - 1];
@@ -928,9 +933,9 @@ impl DeepSeekMoE {
         let (expert_indices, expert_weights) = self.gate.forward(&hidden_flat)?;
         let routed = native_moe::switch_glu(
             &hidden_flat,
-            &stacked.gate,
-            &stacked.up,
-            &stacked.down,
+            &gate,
+            &up,
+            &down,
             &expert_indices,
             &expert_weights.as_dtype(hidden_flat.dtype().as_i32()),
             |gate, up| nn::silu(gate).multiply(up),
@@ -942,10 +947,6 @@ impl DeepSeekMoE {
         } else {
             Ok(moe_out)
         }
-    }
-
-    pub fn forward(&mut self, x: &Array) -> Result<Array> {
-        self.forward_stacked(x)
     }
 }
 
@@ -1024,13 +1025,6 @@ impl DeepSeekMLPType {
             DeepSeekMLPType::MoE(moe) => moe.forward(x),
         }
     }
-
-    pub fn init_stacked_moe(&mut self) -> Result<()> {
-        match self {
-            Self::Dense(_) => Ok(()),
-            Self::MoE(moe) => moe.init_stacked_moe(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1085,10 +1079,6 @@ impl DeepSeekDecoderLayer {
             cache,
             positions,
         )
-    }
-
-    pub fn init_stacked_moe(&mut self) -> Result<()> {
-        self.mlp.init_stacked_moe()
     }
 }
 
@@ -1221,13 +1211,6 @@ impl DeepSeekModel {
         }
         let out = self.norm.forward(&h);
         Ok((out, all_hidden))
-    }
-
-    pub fn init_stacked_moe(&mut self) -> Result<()> {
-        for layer in &mut self.layers {
-            layer.init_stacked_moe()?;
-        }
-        Ok(())
     }
 }
 
@@ -1404,14 +1387,6 @@ impl DeepSeek {
             .with_value_head_dim(self.config.v_head_dim as usize),
         )
     }
-
-    pub fn init_stacked_moe(&mut self) -> Result<()> {
-        self.model.init_stacked_moe()?;
-        for module in &mut self.mtp_modules {
-            module.layer.init_stacked_moe()?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1451,32 +1426,30 @@ mod tests {
         }
     }
 
-    /// Fill the experts (zero until a checkpoint loads them) and the router
-    /// bias with random values, so the comparison below has something to
-    /// compare.
-    fn randomize_experts(moe: &mut DeepSeekMoE) {
-        let random = |shape: &[i32]| {
-            pmetal_runtime::compat::random::uniform_range(-0.5, 0.5, shape, Dtype::Float32)
-        };
-        for expert in &mut moe.experts {
-            for linear in [
-                &mut expert.gate_proj,
-                &mut expert.up_proj,
-                &mut expert.down_proj,
-            ] {
-                linear.weight = random(&linear.weight.shape().to_vec());
-            }
-        }
-        let experts = moe.experts.len() as i32;
-        moe.gate.e_score_correction_bias = Buffer(random(&[experts]));
+    /// A random router bias (zero until a checkpoint loads it), so the
+    /// choice of experts below depends on it.
+    fn randomize_bias(moe: &mut DeepSeekMoE) {
+        let experts = moe.switch_mlp.gate_proj.weight.dim(0);
+        moe.gate.e_score_correction_bias = Buffer(pmetal_runtime::compat::random::uniform_range(
+            -0.5,
+            0.5,
+            &[experts],
+            Dtype::Float32,
+        ));
+    }
+
+    fn max_diff(a: &Array, b: &Array) -> f32 {
+        let diff = a.subtract(b).abs().max(None);
+        diff.eval();
+        diff.item::<f32>()
     }
 
     #[test]
     #[serial]
-    fn test_deepseek_moe_stacked_matches_reference() {
+    fn test_deepseek_moe_matches_reference() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        randomize_experts(&mut moe);
+        randomize_bias(&mut moe);
         // 80 tokens x 2 experts: past the point where the dispatch groups the
         // (token, expert) pairs by expert; the parity fixtures (12 tokens) run
         // the router-order path.
@@ -1484,95 +1457,106 @@ mod tests {
             -1.0,
             1.0,
             &[2, 40, config.hidden_size],
-            pmetal_runtime::compat::Dtype::Float32,
+            Dtype::Float32,
         );
 
         let reference = moe.forward_reference(&x).unwrap();
         let fast = moe.forward(&x).unwrap();
-        reference.eval().unwrap();
-        fast.eval().unwrap();
-
-        assert!(moe.has_stacked_moe());
-
-        let max_diff = fast
-            .subtract(&reference)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap();
-        max_diff.eval().unwrap();
+        pmetal_runtime::check_unobserved_error().expect("runtime error");
         assert!(
-            max_diff.item::<f32>() < 1e-4,
-            "deepseek stacked MoE drifted from reference"
+            max_diff(&fast, &reference) < 1e-4,
+            "deepseek MoE drifted from reference"
         );
     }
 
+    /// The experts are the parameters, with nothing derived from them: a
+    /// replaced weight is what the next forward runs.
     #[test]
     #[serial]
-    fn test_deepseek_moe_cache_refreshes_after_weight_change() {
+    fn test_deepseek_moe_runs_the_weights_it_holds() {
         let config = tiny_deepseek_moe_config();
         let mut moe = DeepSeekMoE::new(&config).unwrap();
-        randomize_experts(&mut moe);
         let x = pmetal_runtime::compat::random::uniform_range(
             -1.0,
             1.0,
             &[1, 4, config.hidden_size],
-            pmetal_runtime::compat::Dtype::Float32,
+            Dtype::Float32,
         );
 
-        let _ = moe.forward(&x).unwrap();
-        assert!(moe.has_stacked_moe());
-
-        for expert in &mut moe.experts {
-            expert.gate_proj.weight =
-                Array::zeros_f32(&[config.moe_intermediate_size, config.hidden_size]);
-        }
-
+        let before = moe.forward(&x).unwrap();
+        moe.switch_mlp.gate_proj.weight = Array::zeros_f32(&[
+            config.n_routed_experts.unwrap(),
+            config.moe_intermediate_size,
+            config.hidden_size,
+        ]);
         let reference = moe.forward_reference(&x).unwrap();
-        let fast = moe.forward(&x).unwrap();
-        reference.eval().unwrap();
-        fast.eval().unwrap();
-
-        let max_diff = fast
-            .subtract(&reference)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap();
-        max_diff.eval().unwrap();
+        let after = moe.forward(&x).unwrap();
+        assert!(max_diff(&after, &reference) < 1e-4);
         assert!(
-            max_diff.item::<f32>() < 1e-4,
-            "deepseek stacked cache failed to refresh after weight change"
+            max_diff(&after, &before) > 1e-3,
+            "zeroing every gate projection changed nothing"
         );
+    }
+
+    /// A released checkpoint names an expert per key; the model holds each
+    /// layer's experts stacked, in an MLX conversion's `switch_mlp` layout.
+    #[test]
+    #[serial]
+    fn test_deepseek_stack_experts_stacks_per_expert_keys() {
+        use std::collections::HashMap;
+        let (experts, out, inp) = (3, 4, 5);
+        let layer = "model.layers.2.mlp";
+        let per_expert: Vec<Array> = (0..experts)
+            .map(|e| Array::from_slice(&vec![e as f32 + 1.0; (out * inp) as usize], &[out, inp]))
+            .collect();
+        let mut weights: HashMap<String, Array> = HashMap::new();
+        for (e, w) in per_expert.iter().enumerate() {
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                weights.insert(format!("{layer}.experts.{e}.{proj}.weight"), w.clone());
+            }
+        }
+        weights.insert(format!("{layer}.gate.weight"), per_expert[0].clone());
+        weights.insert(
+            format!("{layer}.shared_experts.gate_proj.weight"),
+            per_expert[1].clone(),
+        );
+
+        let stacked = stack_experts(weights).unwrap();
+        assert_eq!(
+            stacked.len(),
+            3 + 2,
+            "three stacks, the gate and the shared expert"
+        );
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            let w = &stacked[&format!("{layer}.switch_mlp.{proj}.weight")];
+            assert_eq!(w.shape(), &[experts, out, inp]);
+            for e in 0..experts {
+                let slice = ops::slice_axis(w, 0, e, e + 1);
+                let want = Array::full(&[1, out, inp], e as f32 + 1.0, Dtype::Float32);
+                assert!(
+                    max_diff(&slice, &want) == 0.0,
+                    "{proj}: expert {e} is not in slot {e}"
+                );
+            }
+        }
+        assert!(stacked.contains_key(&format!("{layer}.gate.weight")));
+        assert!(stacked.contains_key(&format!("{layer}.shared_experts.gate_proj.weight")));
     }
 
     #[test]
     #[serial]
-    fn test_deepseek_full_model_init_stacked_moe_preserves_forward() {
-        let config = tiny_deepseek_moe_config();
-        let mut model = DeepSeek::new(config).unwrap();
-        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
-
-        let reference = model.forward(&input_ids, None, None).unwrap();
-        model.init_stacked_moe().unwrap();
-        let fast = model.forward(&input_ids, None, None).unwrap();
-        reference.eval().unwrap();
-        fast.eval().unwrap();
-
-        let max_diff = fast
-            .subtract(&reference)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap();
-        max_diff.eval().unwrap();
-        assert!(
-            max_diff.item::<f32>() < 1e-4,
-            "deepseek full model drifted after stacked init"
-        );
+    fn test_deepseek_stack_experts_names_a_missing_expert() {
+        use std::collections::HashMap;
+        let w = Array::zeros_f32(&[2, 2]);
+        let mut weights: HashMap<String, Array> = HashMap::new();
+        for e in [0, 1, 3] {
+            weights.insert(
+                format!("model.layers.1.mlp.experts.{e}.up_proj.weight"),
+                w.clone(),
+            );
+        }
+        let err = stack_experts(weights).expect_err("expert 2 is missing");
+        assert!(err.to_string().contains("experts.2.up_proj"), "{err}");
     }
 
     /// A config that ties the head to the embedding builds no head, and the

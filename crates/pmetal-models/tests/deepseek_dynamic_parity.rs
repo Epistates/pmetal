@@ -133,17 +133,21 @@ fn dynamic_deepseek_v2_group_limited_matches_transformers() {
     );
 }
 
-/// The parameter tree is the checkpoint's own layout, so a saved model is a
-/// checkpoint and the loader needs no renames: every parameter has a tensor in
-/// the fixture, and every fixture tensor of the trunk has a parameter. The
-/// router bias is a parameter (loaded, saved) the optimizer is never handed.
+/// The parameter tree is the checkpoint's own layout with each layer's experts
+/// stacked (what an MLX conversion stores), so a saved model is a checkpoint:
+/// every parameter has a tensor in the stacked fixture, and every fixture
+/// tensor of the trunk has a parameter. The router bias is a parameter
+/// (loaded, saved) the optimizer is never handed.
 #[test]
 #[serial]
 fn dynamic_deepseek_parameters_are_the_checkpoints_tensors() {
     use pmetal_runtime::compat::ModuleParametersExt;
 
     let fx = checkpoint("v3", "deepseek_native_v3_weights.safetensors");
-    let shard = load_shard(&fixture_path("deepseek_native_v3_weights.safetensors"));
+    let shard = pmetal_models::architectures::deepseek::stack_experts(load_shard(&fixture_path(
+        "deepseek_native_v3_weights.safetensors",
+    )))
+    .expect("the experts stack");
     let params = fx.model.flatten_params();
     let trainable = fx.model.flatten_trainable_params();
 
@@ -167,4 +171,45 @@ fn dynamic_deepseek_parameters_are_the_checkpoints_tensors() {
         "the router bias is not trainable"
     );
     assert!(trainable.contains_key("model.layers.1.mlp.gate.weight"));
+}
+
+/// An MLX conversion stores each layer's experts stacked (`mlp.switch_mlp`):
+/// the same weights written that way load into the same model and give the
+/// reference's logits, with no stacking left to do at load.
+#[test]
+#[serial]
+fn dynamic_deepseek_loads_an_mlx_stacked_checkpoint() {
+    let stacked = pmetal_models::architectures::deepseek::stack_experts(load_shard(&fixture_path(
+        "deepseek_native_v3_weights.safetensors",
+    )))
+    .expect("the experts stack");
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::copy(
+        fixture_path("deepseek_native_v3_config.json"),
+        dir.path().join("config.json"),
+    )
+    .expect("copy config");
+    let entries: Vec<(&str, &Array)> = stacked.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    assert!(entries.iter().any(|(k, _)| k.contains(".switch_mlp.")));
+    Array::save_safetensors(
+        dir.path().join("model.safetensors").to_str().unwrap(),
+        &entries,
+    )
+    .expect("save the stacked checkpoint");
+    drain("save");
+
+    let mut model = DynamicModel::load(dir.path()).expect("the stacked checkpoint loads");
+    drain("load");
+    let reference = load_shard(&fixture_path("deepseek_native_v3_reference.safetensors"));
+    let ids = ref_tensor(&reference, "input_ids").clone();
+    let logits = model.forward(&ids, None).expect("forward");
+    drain("forward");
+    let report = ParityReport::compute_with_per_position(
+        "logits",
+        &logits,
+        ref_tensor(&reference, "logits"),
+        TOL,
+    );
+    print_report_table(std::slice::from_ref(&report));
+    assert!(report.passed());
 }
