@@ -177,3 +177,112 @@ fn snake_keeps_the_input_dtype_and_stays_accurate_in_half_precision() {
     assert!(worst < 3e-2, "half-precision snake error {worst}");
     assert_runtime_ok();
 }
+
+/// Gradients of `sum(f(x) * w)` with respect to `x` and the parameters, with
+/// `f` built from the given parameter values.
+fn weighted_grads(
+    fx: &Fixture,
+    params: &[Array],
+    f: impl Fn(&Array, &[Array]) -> Array,
+) -> Vec<Array> {
+    let w = nlc(&fx.array("grad_w"));
+    let mut all = vec![nlc(&fx.array("x"))];
+    all.extend(params.iter().cloned());
+    let (loss, grads) = pmetal_runtime::compat::nn::value_and_grad_explicit(
+        |p| f(&p[0], &p[1..]).multiply(&w).sum_all(),
+        &all,
+        &[],
+    )
+    .unwrap();
+    loss.eval();
+    grads
+}
+
+#[test]
+fn snake_gradients_match_reference() {
+    let fx = Fixture::load("activation");
+    for (tag, logscale, has_beta) in [
+        ("grad_snakebeta_log", true, true),
+        ("grad_snake_lin", false, false),
+    ] {
+        let mut params = vec![fx.array(&format!("{tag}.alpha"))];
+        if has_beta {
+            params.push(fx.array(&format!("{tag}.beta")));
+        }
+        let grads = weighted_grads(&fx, &params, |x, p| {
+            if has_beta {
+                let mut act = SnakeBeta::new(C, logscale).unwrap();
+                act.alpha.value = p[0].clone();
+                act.beta.value = p[1].clone();
+                act.forward(x).unwrap()
+            } else {
+                let mut act = Snake::new(C, logscale).unwrap();
+                act.alpha.value = p[0].clone();
+                act.forward(x).unwrap()
+            }
+        });
+        assert_close(
+            &ncl(&grads[0]),
+            fx.shape(&format!("{tag}.dx")),
+            fx.values(&format!("{tag}.dx")),
+            1e-4,
+            1e-4,
+            &format!("{tag}.dx"),
+        );
+        assert_close_slice(
+            &to_vec(&grads[1]),
+            fx.values(&format!("{tag}.dalpha")),
+            1e-4,
+            1e-4,
+            &format!("{tag}.dalpha"),
+        );
+        if has_beta {
+            assert_close_slice(
+                &to_vec(&grads[2]),
+                fx.values(&format!("{tag}.dbeta")),
+                1e-4,
+                1e-4,
+                &format!("{tag}.dbeta"),
+            );
+        }
+    }
+    assert_runtime_ok();
+}
+
+#[test]
+fn anti_aliased_activation_gradients_match_reference() {
+    let fx = Fixture::load("activation");
+    let params = [fx.array("grad_act1d.alpha"), fx.array("grad_act1d.beta")];
+    let grads = weighted_grads(&fx, &params, |x, p| {
+        let mut snake = SnakeBeta::new(C, true).unwrap();
+        snake.alpha.value = p[0].clone();
+        snake.beta.value = p[1].clone();
+        Activation1d::new(PeriodicActivation::SnakeBeta(snake))
+            .unwrap()
+            .forward(x)
+            .unwrap()
+    });
+    assert_close(
+        &ncl(&grads[0]),
+        fx.shape("grad_act1d.dx"),
+        fx.values("grad_act1d.dx"),
+        1e-4,
+        1e-4,
+        "dx",
+    );
+    assert_close_slice(
+        &to_vec(&grads[1]),
+        fx.values("grad_act1d.dalpha"),
+        1e-4,
+        1e-4,
+        "dalpha",
+    );
+    assert_close_slice(
+        &to_vec(&grads[2]),
+        fx.values("grad_act1d.dbeta"),
+        1e-4,
+        1e-4,
+        "dbeta",
+    );
+    assert_runtime_ok();
+}
