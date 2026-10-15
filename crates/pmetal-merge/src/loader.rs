@@ -93,6 +93,8 @@ pub struct SafetensorsLoader {
     files: Vec<MappedFile>,
     /// Tensor name to the file holding it.
     tensor_to_file: HashMap<String, usize>,
+    /// FP8 weight name to the tensor holding its block-wise inverse scales.
+    fp8_scales: HashMap<String, String>,
 }
 
 /// Weight files named by a `model.safetensors.index.json`, in the index's
@@ -183,18 +185,73 @@ impl SafetensorsLoader {
             files.push(mapped);
         }
 
-        info!("Indexed {} tensors", tensor_to_file.len());
+        // FP8 (E4M3) weights come with `<weight>_scale_inv` tensors: one inverse
+        // scale per block. They are part of the weight, so they are consumed
+        // when it loads and are not tensors of their own.
+        let mut fp8_scales = HashMap::new();
+        for (name, &file_idx) in &tensor_to_file {
+            let is_fp8 = files[file_idx]
+                .tensor_meta(name)
+                .is_ok_and(|m| m.dtype == Dtype::F8_E4M3);
+            let scale = format!("{name}_scale_inv");
+            if is_fp8 && tensor_to_file.contains_key(&scale) {
+                fp8_scales.insert(name.clone(), scale);
+            }
+        }
+
+        info!(
+            "Indexed {} tensors ({} FP8 weights with block scales)",
+            tensor_to_file.len() - fp8_scales.len(),
+            fp8_scales.len()
+        );
 
         Ok(Self {
             path,
             files,
             tensor_to_file,
+            fp8_scales,
         })
     }
 
     /// Get the model path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether `name` is a scale tensor consumed by an FP8 weight.
+    fn is_fp8_scale(&self, name: &str) -> bool {
+        name.strip_suffix("_scale_inv")
+            .is_some_and(|weight| self.fp8_scales.get(weight).is_some_and(|s| s == name))
+    }
+
+    /// An FP8 (E4M3) weight dequantized to f32 with its block-wise inverse
+    /// scales, `weight = fp8 * scale_inv[block]`; without scales the payload
+    /// is just widened.
+    fn load_fp8(&self, name: &str, file: &MappedFile, shape: &[i32]) -> Result<Array> {
+        let f32_code = pmetal_runtime::compat::Dtype::Float32.as_i32();
+        let payload = Array::from_u8_slice(file.tensor_bytes(name)?, shape);
+        let dequantized = match self.fp8_scales.get(name) {
+            Some(scale_name) => {
+                let scale_file = self.locate(scale_name)?;
+                let scale_meta = scale_file.tensor_meta(scale_name)?;
+                let scale_shape: Vec<i32> = scale_meta.shape.iter().map(|&d| d as i32).collect();
+                let scale_values = decode_f32(
+                    scale_file.tensor_bytes(scale_name)?,
+                    scale_meta.dtype,
+                    scale_name,
+                )?;
+                let scale = Array::from_f32_slice(&scale_values, &scale_shape);
+                pmetal_runtime::native_loader::dequantize_fp8_e4m3_scaled_weight(
+                    &payload, &scale, f32_code,
+                )
+                .map_err(|e| MergeError::ModelLoad(format!("tensor {name}: {e}")))?
+            }
+            None => payload
+                .try_from_fp8(f32_code)
+                .map_err(|e| MergeError::ModelLoad(format!("tensor {name}: {e}")))?,
+        };
+        pmetal_runtime::check_unobserved_error()?;
+        Ok(dequantized)
     }
 
     fn locate(&self, name: &str) -> Result<&MappedFile> {
@@ -207,19 +264,23 @@ impl SafetensorsLoader {
 
 impl TensorLoader for SafetensorsLoader {
     fn tensor_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.tensor_to_file.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .tensor_to_file
+            .keys()
+            .filter(|n| !self.is_fp8_scale(n))
+            .cloned()
+            .collect();
         names.sort();
         names
     }
 
     fn has_tensor(&self, name: &str) -> bool {
-        self.tensor_to_file.contains_key(name)
+        self.tensor_to_file.contains_key(name) && !self.is_fp8_scale(name)
     }
 
     fn load_tensor(&self, name: &str) -> Result<Array> {
         let file = self.locate(name)?;
         let meta = file.tensor_meta(name)?;
-        let values = decode_f32(file.tensor_bytes(name)?, meta.dtype, name)?;
         let shape = meta
             .shape
             .iter()
@@ -229,6 +290,10 @@ impl TensorLoader for SafetensorsLoader {
                 })
             })
             .collect::<Result<Vec<i32>>>()?;
+        if meta.dtype == Dtype::F8_E4M3 {
+            return self.load_fp8(name, file, &shape);
+        }
+        let values = decode_f32(file.tensor_bytes(name)?, meta.dtype, name)?;
         Ok(Array::from_f32_slice(&values, &shape))
     }
 
