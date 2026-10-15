@@ -201,3 +201,64 @@ fn a_quantized_rollout_cache_decodes_the_group() {
         assert_eq!(tokens, &single.token_ids[0]);
     }
 }
+
+/// Decode speed of a rollout group against the same group one completion at a
+/// time (what each completion cost before the group decoded as one batch),
+/// on a real checkpoint: `PMETAL_ROLLOUT_MODEL` is the model directory.
+/// Greedy tokens are compared too; at bf16 a batch-shaped matmul can round a
+/// near-tie the other way, so a few differences are reported, not failed.
+#[test]
+#[serial]
+#[ignore = "needs a real checkpoint; set PMETAL_ROLLOUT_MODEL"]
+fn a_real_checkpoint_decodes_a_group_faster_than_one_at_a_time() {
+    let Some(dir) = std::env::var_os("PMETAL_ROLLOUT_MODEL") else {
+        panic!("set PMETAL_ROLLOUT_MODEL to a model directory");
+    };
+    let mut model = pmetal_models::DynamicModel::load(std::path::Path::new(&dir)).expect("model");
+    let prompt: Vec<u32> = (0..96).map(|i| 100 + (i * 37) % 900).collect();
+    let max_len = prompt.len() + 128;
+    let kv = model.create_cache(max_len).config().clone();
+    let (group, new_tokens) = (8usize, 64usize);
+
+    let rollout = |model: &mut pmetal_models::DynamicModel, n: usize| {
+        let config = BatchedRlConfig::new(n)
+            .with_max_new_tokens(new_tokens)
+            .with_temperature(0.0)
+            .without_prefix_cache();
+        let start = std::time::Instant::now();
+        let out = BatchedRlGenerator::new(config, kv.clone())
+            .generate(
+                |input, cache| model.forward_with_cache(input, None, Some(cache)),
+                &prompt,
+            )
+            .expect("rollout");
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
+        (out, start.elapsed())
+    };
+    // Warm the kernels.
+    rollout(&mut model, group);
+    rollout(&mut model, 1);
+
+    let (batched, batched_time) = rollout(&mut model, group);
+    let mut one_at_a_time = std::time::Duration::ZERO;
+    let mut single = None;
+    for _ in 0..group {
+        let (out, time) = rollout(&mut model, 1);
+        one_at_a_time += time;
+        single = Some(out);
+    }
+    let single = single.unwrap();
+    let agree = batched
+        .token_ids
+        .iter()
+        .filter(|t| **t == single.token_ids[0])
+        .count();
+    eprintln!(
+        "group of {group}, {new_tokens} tokens: batched {:.0} ms, one at a time {:.0} ms ({:.2}x); \
+         {agree} of {group} rows equal the single-sequence tokens",
+        batched_time.as_secs_f64() * 1e3,
+        one_at_a_time.as_secs_f64() * 1e3,
+        one_at_a_time.as_secs_f64() / batched_time.as_secs_f64(),
+    );
+    assert!(agree >= group - 1, "{agree} of {group} rows agree");
+}
