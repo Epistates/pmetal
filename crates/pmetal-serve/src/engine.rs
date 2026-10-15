@@ -40,6 +40,9 @@ pub struct SamplingParams {
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub seed: Option<u64>,
+    /// `(token, bias)` added to the logits before sampling (OpenAI's
+    /// `logit_bias`).
+    pub logit_bias: Vec<(u32, f32)>,
     pub extra_stop_token_ids: Vec<u32>,
     pub stop_sequences: Vec<String>,
     /// When `Some(n)`, emit per-token log-probabilities alongside generated
@@ -214,6 +217,7 @@ fn build_generation_config_from_parts(
     if let Some(pp) = params.presence_penalty {
         config = config.with_presence_penalty(pp);
     }
+    config.logit_bias = params.logit_bias.clone();
     config
 }
 
@@ -1421,6 +1425,15 @@ impl InferenceEngine {
                 ));
             }
         }
+        if let Some((token, bias)) = params
+            .logit_bias
+            .iter()
+            .find(|(_, bias)| !(-100.0..=100.0).contains(bias))
+        {
+            return Err(ServeError::BadRequest(format!(
+                "logit_bias for token {token} must be in [-100, 100], got {bias}"
+            )));
+        }
         Ok(())
     }
 
@@ -2608,6 +2621,7 @@ mod tests {
             extra_stop_token_ids: vec![99],
             stop_sequences: vec![],
             logprobs_top_n: None,
+            logit_bias: Vec::new(),
         };
 
         let config = build_generation_config_from_parts(&[1, 2], 32, &params);
@@ -2814,6 +2828,31 @@ mod tests {
         panic!("stream closed without Done");
     }
 
+    /// A request's `logit_bias` reaches the generation config the sampler is
+    /// built from, and a bias outside OpenAI's [-100, 100] is refused.
+    #[test]
+    fn logit_bias_reaches_the_sampler_and_is_range_checked() {
+        let params = SamplingParams {
+            logit_bias: vec![(5, -100.0), (9, 3.5)],
+            ..greedy(8)
+        };
+        let config = build_generation_config_from_parts(&[2], 64, &params);
+        assert_eq!(config.logit_bias, vec![(5, -100.0), (9, 3.5)]);
+        assert_eq!(config.sampling_params().logit_bias, config.logit_bias);
+        assert!(InferenceEngine::validate_params(&params, 64).is_ok());
+
+        let too_big = SamplingParams {
+            logit_bias: vec![(5, 101.0)],
+            ..greedy(8)
+        };
+        assert!(InferenceEngine::validate_params(&too_big, 64).is_err());
+        let not_finite = SamplingParams {
+            logit_bias: vec![(5, f32::NAN)],
+            ..greedy(8)
+        };
+        assert!(InferenceEngine::validate_params(&not_finite, 64).is_err());
+    }
+
     fn greedy(max_tokens: usize) -> SamplingParams {
         SamplingParams {
             max_tokens,
@@ -2828,6 +2867,7 @@ mod tests {
             extra_stop_token_ids: vec![],
             stop_sequences: vec![],
             logprobs_top_n: None,
+            logit_bias: Vec::new(),
         }
     }
 

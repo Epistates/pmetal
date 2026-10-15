@@ -10,9 +10,8 @@
 //! so nearly every round rolls the target's state back. Whatever the draft
 //! says, the tokens must not change.
 
-mod common;
+use std::path::PathBuf;
 
-use common::fixture_path;
 use pmetal_models::GenerationConfig;
 use pmetal_models::architectures::dflash_draft::{
     DFlashDraftConfig, DFlashDraftModel, DFlashExtras,
@@ -23,6 +22,12 @@ use serial_test::serial;
 
 const PROMPT: [u32; 6] = [3, 11, 7, 2, 9, 40];
 const NEW_TOKENS: usize = 36;
+
+fn fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
 
 fn checkpoint(prefix: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");

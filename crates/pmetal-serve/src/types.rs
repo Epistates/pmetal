@@ -178,6 +178,11 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// OpenAI's `logit_bias`: token id (as a string) to a bias in
+    /// `[-100, 100]` added to that token's logit before sampling. -100 all
+    /// but bans a token, 100 all but forces it.
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     /// OpenAI-compatible tool definitions. When present, the chat template
     /// injects them into the system prompt so the model is aware it may emit
     /// tool calls. Best-effort JSON parsing of the model's output after
@@ -290,6 +295,11 @@ pub struct CompletionRequest {
     pub presence_penalty: Option<f32>,
     #[serde(default)]
     pub seed: Option<u64>,
+    /// OpenAI's `logit_bias`: token id (as a string) to a bias in
+    /// `[-100, 100]` added to that token's logit before sampling. -100 all
+    /// but bans a token, 100 all but forces it.
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<String, f32>>,
     /// OpenAI `/v1/completions` uses a single numeric field for logprobs:
     /// the number of top alternative tokens to include, per token. `0` means
     /// only the chosen token's logprob. `None` disables logprob collection.
