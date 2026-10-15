@@ -6,12 +6,11 @@
 //! committed (and the ones that must never be), their bytes, the commit
 //! message, and the token on every request.
 
-#![allow(unsafe_code)] // `std::env::set_var` (edition 2024)
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
+use pmetal_core::SecretString;
 use pmetal_hub::{UploadOptions, upload_model};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -123,12 +122,6 @@ async fn upload_creates_the_repo_and_commits_only_the_model_files() {
     let log = Arc::new(Mutex::new(Vec::new()));
     tokio::spawn(serve(listener, base.clone(), log.clone()));
 
-    // No other test in this binary reads the environment.
-    unsafe {
-        std::env::set_var("HF_ENDPOINT", &base);
-        std::env::set_var("HF_TOKEN", "hf_fake_write_token");
-    }
-
     let model = tempfile::tempdir().unwrap();
     let dir = model.path();
     let config = br#"{"model_type":"qwen3"}"#;
@@ -153,9 +146,13 @@ async fn upload_creates_the_repo_and_commits_only_the_model_files() {
         private: true,
         commit_message: Some("Publish the tiny adapter".into()),
         ignore: vec!["checkpoints/**".into()],
+        endpoint: Some(base.clone()),
         ..Default::default()
     };
-    let report = upload_model(dir, "me/tiny", None, &options).await.unwrap();
+    let token = SecretString::new("hf_fake_write_token");
+    let report = upload_model(dir, "me/tiny", Some(&token), &options)
+        .await
+        .unwrap();
 
     assert_eq!(report.repo_url, format!("{base}/me/tiny"));
     assert_eq!(

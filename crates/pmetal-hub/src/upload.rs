@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use hf_hub::RepoTypeModel;
 use pmetal_core::{PMetalError, Result, SecretString};
 
-use crate::download::{build_client, hub_error};
+use crate::client::{HubOptions, hub_error_in};
 
 /// Files never worth publishing: VCS metadata, Finder and AppleDouble
 /// droppings (exFAT and network volumes grow a `._name` beside every file),
@@ -36,6 +36,9 @@ pub struct UploadOptions {
     pub create_pr: bool,
     /// Extra glob patterns (relative to the directory) to leave out.
     pub ignore: Vec<String>,
+    /// Hub base URL, for a mirror or a private deployment; `HF_ENDPOINT` or
+    /// `https://huggingface.co` when `None`.
+    pub endpoint: Option<String>,
 }
 
 /// Where an upload landed.
@@ -85,7 +88,12 @@ pub async fn upload_model(
         )));
     }
 
-    let client = build_client(token)?;
+    let client = HubOptions {
+        token: token.cloned(),
+        endpoint: options.endpoint.clone(),
+        ..HubOptions::default()
+    }
+    .client()?;
 
     let repo_url = client
         .create_repository()
@@ -95,7 +103,7 @@ pub async fn upload_model(
         .exist_ok(true)
         .send()
         .await
-        .map_err(hub_error)?
+        .map_err(|e| hub_error_in(repo_id, &e))?
         .url;
 
     let commit_message = options.commit_message.clone().unwrap_or_else(|| {
@@ -116,7 +124,7 @@ pub async fn upload_model(
         .ignore_patterns(ignore_patterns(&options.ignore))
         .send()
         .await
-        .map_err(hub_error)?;
+        .map_err(|e| hub_error_in(repo_id, &e))?;
 
     Ok(UploadReport {
         repo_url,

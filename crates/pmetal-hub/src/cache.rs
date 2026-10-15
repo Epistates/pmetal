@@ -1,7 +1,12 @@
-//! Local cache management.
+//! Local cache management, in the standard Hub cache layout
+//! (`models--owner--name/{blobs,refs,snapshots}`), shared with the Hub's own
+//! tools: a model downloaded by one is found by the others.
+
+use std::path::{Path, PathBuf};
 
 use pmetal_core::Result;
-use std::path::PathBuf;
+
+use crate::verify::verify_model_dir;
 
 /// Get the HuggingFace home directory, resolved the way the Python
 /// `huggingface_hub` library does it.
@@ -10,7 +15,7 @@ use std::path::PathBuf;
 /// 1. `HF_HOME`
 /// 2. `$XDG_CACHE_HOME/huggingface`
 /// 3. `~/.cache/huggingface` — default on all platforms
-fn hf_home() -> PathBuf {
+pub(crate) fn hf_home() -> PathBuf {
     if let Some(home) = std::env::var_os("HF_HOME") {
         return PathBuf::from(home);
     }
@@ -57,6 +62,117 @@ pub fn pmetal_cache_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".cache/pmetal"))
 }
 
+/// The kind of repository a cache folder holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RepoKind {
+    Model,
+    Dataset,
+}
+
+impl RepoKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            RepoKind::Model => "models",
+            RepoKind::Dataset => "datasets",
+        }
+    }
+}
+
+/// `models--owner--name`: the cache folder of a repository.
+pub(crate) fn repo_folder(kind: RepoKind, repo_id: &str) -> String {
+    format!("{}--{}", kind.prefix(), repo_id.replace('/', "--"))
+}
+
+/// Whether `revision` is a full commit id (40 hex digits), not a name.
+pub(crate) fn is_commit_sha(revision: &str) -> bool {
+    revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The commit a cached revision name points at (`refs/<name>`).
+pub(crate) fn read_ref(cache_root: &Path, folder: &str, revision: &str) -> Option<String> {
+    let sha = std::fs::read_to_string(cache_root.join(folder).join("refs").join(revision)).ok()?;
+    let sha = sha.trim();
+    is_commit_sha(sha).then(|| sha.to_owned())
+}
+
+/// Record that `revision` currently points at `sha` (`refs/<revision>`), as
+/// the Hub's own tools do, so later offline lookups of the name find the
+/// snapshot. Written to a temporary file and renamed into place.
+pub(crate) fn write_ref(
+    cache_root: &Path,
+    folder: &str,
+    revision: &str,
+    sha: &str,
+) -> std::io::Result<()> {
+    // A revision name is never a path: refuse anything that would climb out
+    // of `refs/`.
+    if revision
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("'{revision}' is not a usable revision name"),
+        ));
+    }
+    let path = cache_root.join(folder).join("refs").join(revision);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("pmetal-tmp");
+    std::fs::write(&tmp, sha)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// The snapshot directory of a commit.
+pub(crate) fn snapshot_dir(cache_root: &Path, folder: &str, sha: &str) -> PathBuf {
+    cache_root.join(folder).join("snapshots").join(sha)
+}
+
+/// Pick a cached snapshot of a repository that `accept`s.
+///
+/// With a `revision`: that commit, or the commit the revision name points at.
+/// Without: what `refs/main` points at first, then every snapshot, newest
+/// first. `None` when nothing acceptable is cached.
+pub(crate) fn find_snapshot(
+    cache_root: &Path,
+    kind: RepoKind,
+    repo_id: &str,
+    revision: Option<&str>,
+    accept: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let folder = repo_folder(kind, repo_id);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    match revision {
+        Some(rev) if is_commit_sha(rev) => candidates.push(snapshot_dir(cache_root, &folder, rev)),
+        Some(rev) => {
+            if let Some(sha) = read_ref(cache_root, &folder, rev) {
+                candidates.push(snapshot_dir(cache_root, &folder, &sha));
+            }
+        }
+        None => {
+            if let Some(sha) = read_ref(cache_root, &folder, "main") {
+                candidates.push(snapshot_dir(cache_root, &folder, &sha));
+            }
+            let mut others: Vec<_> = std::fs::read_dir(cache_root.join(&folder).join("snapshots"))
+                .ok()?
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| {
+                    let modified = e
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    (modified, e.path())
+                })
+                .collect();
+            others.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+            candidates.extend(others.into_iter().map(|(_, p)| p));
+        }
+    }
+    candidates.into_iter().find(|p| p.is_dir() && accept(p))
+}
+
 /// Evict a single model from the local HuggingFace hub cache.
 ///
 /// Removes the cache directory for `repo_id` (e.g., `"Qwen/Qwen3-0.6B"`).
@@ -65,135 +181,84 @@ pub fn pmetal_cache_dir() -> PathBuf {
 ///
 /// Returns `Ok(())` if the directory did not exist (idempotent).
 pub fn evict_model(repo_id: &str) -> Result<()> {
-    // Convert "org/name" → "models--org--name"
-    let dir_name = format!("models--{}", repo_id.replace('/', "--"));
-    let model_cache_dir = cache_dir().join(dir_name);
-    if model_cache_dir.exists() {
-        std::fs::remove_dir_all(&model_cache_dir)?;
+    let dir = cache_dir().join(repo_folder(RepoKind::Model, repo_id));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
 }
 
-/// Check if a model is already cached locally and return its path.
+/// Check if a model is already cached locally and return its snapshot path.
 ///
-/// Looks for `<cache_dir>/models--<org>--<name>/snapshots/<hash>/config.json`
-/// which is the HF hub cache layout. Returns the snapshot directory if found.
-/// This is a fast local-only check — no network calls.
+/// A snapshot counts only if [`verify_model_dir`] finds it complete: a
+/// readable `config.json` and every weight file present and the length its
+/// header declares. That keeps a download interrupted before the last shard
+/// from being mistaken for a model. Prefers the snapshot `refs/main` points at.
+/// This is a fast local-only check: no network calls, and only file headers are
+/// read.
 pub fn find_cached_model(repo_id: &str) -> Option<PathBuf> {
-    let dir_name = format!("models--{}", repo_id.replace('/', "--"));
-    let model_cache_dir = cache_dir().join(dir_name);
-    let snapshots_dir = model_cache_dir.join("snapshots");
-
-    if !snapshots_dir.is_dir() {
-        return None;
-    }
-
-    // Find the most recent snapshot that contains config.json
-    let mut snapshots: Vec<_> = std::fs::read_dir(&snapshots_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-
-    // Sort by modification time descending (most recent first)
-    snapshots.sort_by(|a, b| {
-        let t_a = a
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let t_b = b
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        t_b.cmp(&t_a)
-    });
-
-    for snap in snapshots {
-        let snap_path = snap.path();
-        // A valid model snapshot must have config.json
-        if snap_path.join("config.json").exists() && shards_complete(&snap_path) {
-            return Some(snap_path);
-        }
-    }
-
-    None
+    find_cached_model_in(&cache_dir(), repo_id, None)
 }
 
-/// Whether every shard a snapshot's `model.safetensors.index.json` names is
-/// present. A snapshot without an index has nothing to check.
-///
-/// ⚠️ A download interrupted after the index but before the last shard (a
-/// 429 from the Hub does it) leaves a snapshot with `config.json` that is
-/// missing weights. Treating that as cached made every retry return early, so
-/// the gap could never be filled, and the load then failed on the missing
-/// shard. A missing blob behind a snapshot symlink reads as absent here.
-fn shards_complete(snapshot: &std::path::Path) -> bool {
-    let Ok(index) = std::fs::read_to_string(snapshot.join("model.safetensors.index.json")) else {
-        return true;
-    };
-    let Ok(index) = serde_json::from_str::<serde_json::Value>(&index) else {
-        return false;
-    };
-    let Some(weight_map) = index.get("weight_map").and_then(|m| m.as_object()) else {
-        return false;
-    };
-    weight_map
-        .values()
-        .filter_map(|shard| shard.as_str())
-        .all(|shard| snapshot.join(shard).exists())
+/// [`find_cached_model`] in a given cache directory, for one revision (a
+/// commit id or a branch or tag name the cache has seen) or, with `None`, the
+/// best snapshot.
+pub fn find_cached_model_in(
+    cache_root: &Path,
+    repo_id: &str,
+    revision: Option<&str>,
+) -> Option<PathBuf> {
+    find_snapshot(cache_root, RepoKind::Model, repo_id, revision, |snapshot| {
+        verify_model_dir(snapshot).is_complete()
+    })
 }
 
 /// Check if a dataset is already cached locally and return its path.
 ///
-/// Same as `find_cached_model` but for datasets.
+/// Same as [`find_cached_model`] but for datasets, whose snapshots count as
+/// soon as they hold a file.
 pub fn find_cached_dataset(repo_id: &str) -> Option<PathBuf> {
-    let dir_name = format!("datasets--{}", repo_id.replace('/', "--"));
-    let cache_root = cache_dir();
-    let dataset_cache_dir = cache_root.join(&dir_name);
-    let snapshots_dir = dataset_cache_dir.join("snapshots");
-
-    if !snapshots_dir.is_dir() {
-        return None;
-    }
-
-    let mut snapshots: Vec<_> = std::fs::read_dir(&snapshots_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .collect();
-
-    snapshots.sort_by(|a, b| {
-        let t_a = a
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        let t_b = b
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        t_b.cmp(&t_a)
-    });
-
-    for snap in snapshots {
-        let snap_path = snap.path();
-        // A valid dataset snapshot should have at least one file
-        if std::fs::read_dir(&snap_path)
-            .ok()
-            .map(|rd| rd.count() > 0)
-            .unwrap_or(false)
-        {
-            return Some(snap_path);
-        }
-    }
-
-    None
+    find_snapshot(&cache_dir(), RepoKind::Dataset, repo_id, None, |snapshot| {
+        std::fs::read_dir(snapshot).is_ok_and(|mut entries| entries.next().is_some())
+    })
 }
 
-/// Clear the model cache.
+/// The top-level entries of a Hub cache directory that belong to the cache:
+/// repository folders and the lock directory.
+fn is_cache_entry(name: &str) -> bool {
+    name.starts_with("models--")
+        || name.starts_with("datasets--")
+        || name.starts_with("spaces--")
+        || name == ".locks"
+}
+
+/// Clear the hub cache: every cached repository, model and dataset alike.
+///
+/// Removes only the cache's own entries (`models--*`, `datasets--*`,
+/// `spaces--*`, `.locks`), never the directory itself or anything else that
+/// happens to live in it, so a mis-set `HF_HUB_CACHE` cannot turn this into
+/// "delete that directory".
 pub fn clear_cache() -> Result<()> {
-    let cache = cache_dir();
-    if cache.exists() {
-        std::fs::remove_dir_all(&cache)?;
+    clear_cache_in(&cache_dir())
+}
+
+fn clear_cache_in(cache: &Path) -> Result<()> {
+    if !cache.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(cache)?.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_cache_entry(&name) {
+            continue;
+        }
+        // A symlinked entry is unlinked, never followed.
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
     }
     Ok(())
 }
@@ -216,55 +281,135 @@ pub fn cache_size() -> Result<u64> {
     Ok(size)
 }
 
-// Note: walkdir dependency would need to be added to Cargo.toml
-
 #[cfg(test)]
 mod tests {
-    use super::shards_complete;
+    use super::*;
+    use crate::tensors::write_test_safetensors;
 
-    fn snapshot(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("pmetal-hub-cache-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("model.safetensors.index.json"),
-            r#"{"weight_map": {"a.w": "model-00001-of-00002.safetensors",
-                               "b.w": "model-00002-of-00002.safetensors"}}"#,
-        )
-        .unwrap();
-        dir
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A cache with `models--o--m` holding a complete snapshot at `sha`.
+    fn put_model(root: &Path, sha: &str, with_weights: bool) -> PathBuf {
+        let snap = snapshot_dir(root, "models--o--m", sha);
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("config.json"), "{}").unwrap();
+        if with_weights {
+            write_test_safetensors(&snap.join("model.safetensors"), &[("w", "F16", &[4])]);
+        }
+        snap
     }
 
-    /// The shape a 429 left behind: the index and the first shard, with the
-    /// second shard's snapshot symlink pointing at a blob that never arrived.
+    #[test]
+    fn a_snapshot_without_weights_is_not_cached() {
+        // What an interrupted download leaves: the config, no weights.
+        let root = tempfile::tempdir().unwrap();
+        put_model(root.path(), SHA_A, false);
+        assert!(find_cached_model_in(root.path(), "o/m", None).is_none());
+    }
+
     #[test]
     fn a_snapshot_missing_a_shard_is_not_cached() {
-        let dir = snapshot("partial");
-        std::fs::write(dir.join("model-00001-of-00002.safetensors"), b"x").unwrap();
-        std::os::unix::fs::symlink(
-            dir.join("never-downloaded-blob"),
-            dir.join("model-00002-of-00002.safetensors"),
+        let root = tempfile::tempdir().unwrap();
+        let snap = put_model(root.path(), SHA_A, false);
+        write_test_safetensors(&snap.join("s1.safetensors"), &[("w", "F16", &[4])]);
+        std::fs::write(
+            snap.join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a":"s1.safetensors","b":"s2.safetensors"}}"#,
         )
         .unwrap();
-        assert!(!shards_complete(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(find_cached_model_in(root.path(), "o/m", None).is_none());
     }
 
     #[test]
-    fn a_snapshot_with_every_shard_is_cached() {
-        let dir = snapshot("complete");
-        std::fs::write(dir.join("model-00001-of-00002.safetensors"), b"x").unwrap();
-        std::fs::write(dir.join("model-00002-of-00002.safetensors"), b"x").unwrap();
-        assert!(shards_complete(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_complete_snapshot_is_found() {
+        let root = tempfile::tempdir().unwrap();
+        let snap = put_model(root.path(), SHA_A, true);
+        assert_eq!(find_cached_model_in(root.path(), "o/m", None), Some(snap));
     }
 
     #[test]
-    fn a_single_file_snapshot_has_nothing_to_check() {
-        let dir = snapshot("single");
-        std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
-        assert!(shards_complete(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn main_wins_over_a_newer_snapshot_of_another_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let wanted = put_model(root.path(), SHA_A, true);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        put_model(root.path(), SHA_B, true); // newer on disk
+        write_ref(root.path(), "models--o--m", "main", SHA_A).unwrap();
+        assert_eq!(find_cached_model_in(root.path(), "o/m", None), Some(wanted));
+    }
+
+    #[test]
+    fn a_revision_resolves_through_refs_or_as_a_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let a = put_model(root.path(), SHA_A, true);
+        let b = put_model(root.path(), SHA_B, true);
+        write_ref(root.path(), "models--o--m", "v1", SHA_A).unwrap();
+        assert_eq!(
+            find_cached_model_in(root.path(), "o/m", Some("v1")),
+            Some(a)
+        );
+        assert_eq!(
+            find_cached_model_in(root.path(), "o/m", Some(SHA_B)),
+            Some(b)
+        );
+        assert!(find_cached_model_in(root.path(), "o/m", Some("never-seen")).is_none());
+    }
+
+    #[test]
+    fn a_ref_cannot_climb_out_of_the_cache() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(write_ref(root.path(), "models--o--m", "../../escape", SHA_A).is_err());
+        assert!(write_ref(root.path(), "models--o--m", "a//b", SHA_A).is_err());
+        write_ref(root.path(), "models--o--m", "refs/pr/1", SHA_A).unwrap();
+        assert_eq!(
+            read_ref(root.path(), "models--o--m", "refs/pr/1").as_deref(),
+            Some(SHA_A)
+        );
+    }
+
+    #[test]
+    fn commit_ids_are_forty_hex_digits() {
+        assert!(is_commit_sha(SHA_A));
+        assert!(!is_commit_sha("main"));
+        assert!(!is_commit_sha(&SHA_A[..39]));
+        assert!(!is_commit_sha(&"g".repeat(40)));
+    }
+
+    #[test]
+    fn repo_folders_follow_the_hub_layout() {
+        assert_eq!(
+            repo_folder(RepoKind::Model, "Qwen/Qwen3-0.6B"),
+            "models--Qwen--Qwen3-0.6B"
+        );
+        assert_eq!(
+            repo_folder(RepoKind::Dataset, "tatsu-lab/alpaca"),
+            "datasets--tatsu-lab--alpaca"
+        );
+    }
+
+    #[test]
+    fn clearing_removes_repositories_and_leaves_everything_else() {
+        // A mis-set HF_HUB_CACHE pointing at a directory with real contents.
+        let root = tempfile::tempdir().unwrap();
+        put_model(root.path(), SHA_A, true);
+        std::fs::create_dir_all(root.path().join("datasets--o--d/snapshots")).unwrap();
+        std::fs::create_dir_all(root.path().join(".locks/models--o--m")).unwrap();
+        std::fs::create_dir_all(root.path().join("Documents")).unwrap();
+        std::fs::write(root.path().join("Documents/thesis.txt"), "keep").unwrap();
+        std::fs::write(root.path().join("notes.txt"), "keep").unwrap();
+
+        clear_cache_in(root.path()).unwrap();
+
+        assert!(!root.path().join("models--o--m").exists());
+        assert!(!root.path().join("datasets--o--d").exists());
+        assert!(!root.path().join(".locks").exists());
+        assert!(root.path().join("Documents/thesis.txt").exists());
+        assert!(root.path().join("notes.txt").exists());
+        assert!(root.path().is_dir());
+    }
+
+    #[test]
+    fn clearing_a_missing_cache_is_fine() {
+        clear_cache_in(Path::new("/definitely/not/here")).unwrap();
     }
 }
