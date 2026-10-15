@@ -60,7 +60,7 @@ petgraph = { workspace = true }
 dirs = { workspace = true }
 sha3 = { workspace = true }
 # Authenticated, encrypted links (Noise) and the secret that keys them.
-snow = { workspace = true }
+snow = { workspace = true, features = ["ring-accelerated"] }
 secrecy = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
