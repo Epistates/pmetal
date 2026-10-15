@@ -10,12 +10,12 @@ This crate provides custom Metal shaders that accelerate LLM training and infere
 
 - **FlashAttention**: O(n) memory attention with fused softmax (forward + backward)
 - **Fused LoRA**: Combined base + adapter forward pass (~2x speedup)
-- **Fused Cross-Entropy**: Chunked vocabulary loss (avoids logits materialization)
 - **Fused RoPE**: Rotary position embeddings computed in-kernel
 - **Fused SwiGLU**: MLP activation fusion
 - **Fused Norm+LoRA**: Combined layer norm and adapter application
 - **Fused GDN**: Gated Delta Network recurrence (Metal shader, 32-thread SIMD)
-- **MoE Routing**: Expert selection and dispatch kernel
+- **Fused AdamW**: One-dispatch optimizer update over every parameter
+- **Offloaded MoE experts**: Single-expert gate/up/down on 4- and 2-bit weights read straight from a record buffer
 
 ## Architecture
 
@@ -100,7 +100,6 @@ fn attend(
 |--------|---------|--------|-------------|
 | `flash_attention` | 1.5-2x | O(n) vs O(n²) | Memory-efficient attention |
 | `fused_lora` | ~2x | Same | Combined base+adapter forward |
-| `fused_cross_entropy` | 1.3x | O(1) per chunk | Chunked loss computation |
 | `fused_rope` | 1.2x | Same | In-kernel position encoding |
 
 ## Requirements

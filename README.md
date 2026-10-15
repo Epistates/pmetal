@@ -499,8 +499,6 @@ Custom Metal shaders provide significant speedups:
 - **FlashAttention**: O(n) memory attention with fused softmax, tier-aware block sizes
 - **Fused GDN**: Gated Delta Network recurrence kernel (ported from FLA Triton) — single-pass state update with SIMD reductions
 - **Fused LoRA**: Combined forward pass for adapter layers
-- **Fused Cross-Entropy**: Chunked vocabulary loss computation
-- **Fused Linear Cross-Entropy**: Skips logits materialization entirely
 - **Fused RoPE**: Rotary position embeddings in-kernel
 - **Fused SwiGLU**: Fused gate + activation with tier-tuned threadgroups
 - **Fused RMSNorm + LoRA**: Combined normalization and adapter projection

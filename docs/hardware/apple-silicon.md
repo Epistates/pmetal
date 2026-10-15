@@ -52,7 +52,7 @@ Use `pmetal bench-corpus` to collect a comparable kernel report for the current 
 
 Use `pmetal bench-workload` when you want a fast end-to-end regression loop instead of only kernel microbenchmarks. The default workload uses the cached `Qwen/Qwen3-0.6B` model plus `TeichAI/gemini-3-pro-preview-high-reasoning-250x`, and the inference report now records the KV cache mode chosen on the current machine.
 
-Across Apple7-10 GPUs, PMetal now benchmarks, persists, and reuses standard-Metal Tuna specializations for `fused_swiglu`, `fused_mlp`, `fused_norm_lora`, fused linear cross-entropy, and fused merge. Shared MLX MoE routers now use GPU-native `argpartition` selection instead of heavier full sorts or CPU top-k paths. M1-M4 remain first-class paths rather than “fallback” hardware. PMetal also now auto-selects the inference KV cache mode: on Apple7-Apple9 it prefers fp16 KV cache when the model plus context comfortably fit the device budget and only promotes to q8 when memory pressure justifies it.
+Across Apple7-10 GPUs, PMetal now benchmarks, persists, and reuses standard-Metal Tuna specializations for `fused_swiglu`, `fused_mlp`, and `fused_norm_lora`. Shared MLX MoE routers now use GPU-native `argpartition` selection instead of heavier full sorts or CPU top-k paths. M1-M4 remain first-class paths rather than “fallback” hardware. PMetal also now auto-selects the inference KV cache mode: on Apple7-Apple9 it prefers fp16 KV cache when the model plus context comfortably fit the device budget and only promotes to q8 when memory pressure justifies it.
 
 ## M5-Specific: NAX
 

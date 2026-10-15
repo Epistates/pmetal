@@ -132,28 +132,6 @@ Heuristic seed values before benchmark candidate generation:
 
 The lower Base-tier values apply to smaller `intermediate_size` shapes; higher values apply to larger MLPs.
 
-### Fused Linear Cross-Entropy (`fused_cross_entropy.rs`)
-
-The fused linear CE path now benchmarks and persists both its `CE_THREADS_PER_TOKEN` specialization and default vocabulary chunk size per device, dtype, and problem shape. The MLX CutCrossEntropy fallback uses the same resolved default chunk size when the caller leaves the chunk size at the default, so M1-M4 and M5 share the measured chunk choice instead of drifting apart.
-
-Heuristic seed values before benchmark candidate generation:
-
-| Tier | Threads / Token | Chunk Size |
-|------|-----------------|-----------|
-| Base | 128 / 256 / 512 | 1024 or 2048 |
-| Pro | 256 / 512 / 1024 | 2048 or 4096 |
-| Max | 256 / 512 / 1024 | 4096 or 8192 |
-| Ultra | 256 / 512 / 1024 | 4096 or 8192 |
-
-Thread count seeds still scale with vocabulary size and clamp to the device maximum:
-- Base-tier: `< 32k vocab` → `128`, `32k..128k` → `256`, `> 128k` → `512`
-- Pro / Max / Ultra: `< 32k vocab` → `256`, `32k..128k` → `512`, `> 128k` → `1024`
-
-Chunk-size seeds still narrow for wider hidden states:
-- Base: `1024` once `hidden_size >= 4096`
-- Pro: `2048` once `hidden_size >= 8192`
-- Max / Ultra: `4096` once `hidden_size >= 8192`
-
 ### Batch Size Multiplier
 
 | Tier | Multiplier |
@@ -195,12 +173,9 @@ Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS.
 Replace hardcoded tier-based parameters with runtime optimization:
 
 - [x] Persist hot-path inference backend benchmarks across launches (FlashAttention vs MLX SDPA, MPP vs MLX matmul)
-- [x] Benchmark and persist MLX CutCrossEntropy vs Metal fused linear cross-entropy backend choice for benchmarkable shapes
-- [x] Benchmark and persist fused linear cross-entropy thread/chunk specialization per device, dtype, and problem shape
 - [x] Benchmark and persist standard Metal FlashAttention block-size selection for supported head dimensions
-- [x] Wire broader standard-Metal fused kernels through persisted Tuna specialization (`fused_swiglu`, `fused_mlp`, `fused_norm_lora`, fused linear cross-entropy)
+- [x] Wire broader standard-Metal fused kernels through persisted Tuna specialization (`fused_swiglu`, `fused_mlp`, `fused_norm_lora`)
 - [x] Benchmark and persist standard-Metal `fused_swiglu`, `fused_mlp`, and `fused_norm_lora` kernel specialization choices
-- [x] Benchmark and persist standard-Metal `fused_merge` specialization choices, with device-safe cache keys and `merge.json` disk persistence
 - [x] Add a structured `pmetal bench-corpus` kernel benchmark command for comparable per-tier measurements on M1-M4 and M5, including initial MoE/model-family cases
 - [x] Add a real `pmetal bench-workload` command for fast end-to-end Qwen3/dataset regression runs on local Apple Silicon, and record the selected inference KV cache mode in the report
 - [x] Auto-select fp16 vs q8 KV cache for inference based on model/context fit instead of hardcoding q8 as the default on Apple7-Apple9
