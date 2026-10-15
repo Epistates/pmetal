@@ -193,6 +193,13 @@ impl GgmlType {
         }
     }
 
+    /// Whether the type stores blocks of quantized values (as opposed to plain
+    /// floats and integers). Such a file must declare
+    /// `general.quantization_version`.
+    pub fn is_quantized(&self) -> bool {
+        self.block_size() > 1
+    }
+
     /// Get the block size (number of elements per block) for quantized types.
     pub fn block_size(&self) -> usize {
         match self {

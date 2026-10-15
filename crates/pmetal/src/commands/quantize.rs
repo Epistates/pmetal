@@ -1433,8 +1433,7 @@ pub(crate) async fn run_quantization(
 
     // 8. Write GGUF output
     let validated_output = crate::validate_output_path(output_path, "quantization output")?;
-    let mut file = std::fs::File::create(&validated_output)?;
-    builder.write(&mut file)?;
+    builder.write_file(&validated_output)?;
 
     println!("Quantization complete!");
     Ok(())

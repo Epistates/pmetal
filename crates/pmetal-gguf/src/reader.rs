@@ -1013,11 +1013,12 @@ mod tests {
         ));
 
         // A uint64 alignment is not what the specification defines.
-        let mut builder = crate::GgufBuilder::with_model("llama", "tiny");
-        builder.add_metadata(crate::keys::GENERAL_ALIGNMENT, MetadataValue::Uint64(32));
-        builder.add_f32_tensor("w", vec![2], vec![1.0, 2.0]);
+        let mut bytes = header_v3(0, 1);
+        write_string_v3(&mut bytes, "general.alignment");
+        bytes.write_u32::<LittleEndian>(10).unwrap();
+        bytes.write_u64::<LittleEndian>(32).unwrap();
         assert!(matches!(
-            read(builder.build_to_bytes().unwrap()).unwrap_err(),
+            read(bytes).unwrap_err(),
             GgufReadError::InvalidAlignmentType(_)
         ));
     }
@@ -1075,12 +1076,23 @@ mod tests {
     #[test]
     fn every_truncation_of_a_valid_file_is_an_error() {
         let valid = small_valid_file();
-        assert!(read(valid.clone()).is_ok());
-        for len in 0..valid.len() {
-            assert!(
-                read(valid[..len].to_vec()).is_err(),
-                "a {len}-byte prefix of a {}-byte file was accepted",
-                valid.len()
+        let content = read(valid.clone()).unwrap();
+        // The writer pads after the last tensor; losing only that padding
+        // leaves a complete file.
+        let complete = content.tensor_data_range("w").unwrap().end as usize;
+        assert!(complete <= valid.len());
+        for len in 0..=valid.len() {
+            let result = read(valid[..len].to_vec());
+            assert_eq!(
+                result.is_ok(),
+                len >= complete,
+                "a {len}-byte prefix of the {}-byte file (data ends at {complete}) was {}",
+                valid.len(),
+                if result.is_ok() {
+                    "accepted"
+                } else {
+                    "rejected"
+                }
             );
         }
     }
