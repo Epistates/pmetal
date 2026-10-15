@@ -38,9 +38,12 @@
 //! }
 //! ```
 
+mod dense;
 mod fused_batch;
 mod mamba;
 mod quantized;
+#[cfg(test)]
+mod reference_tests;
 mod standard;
 #[cfg(test)]
 mod tests;
@@ -79,15 +82,19 @@ pub enum CacheMode {
     /// Standard cache - stores all past tokens.
     #[default]
     Standard,
-    /// Sliding window cache with fixed size.
+    /// Sliding window cache: a query attends to the `window_size` newest
+    /// tokens, its own included. Memory is bounded by the window however
+    /// long the sequence runs.
     SlidingWindow {
-        /// Maximum number of past tokens to keep in cache.
+        /// Tokens a query attends to, its own included.
         window_size: usize,
     },
-    /// Rotating cache - circular buffer with fixed max size.
-    /// More memory-efficient than sliding window for long sequences.
+    /// Sliding window with attention sinks: a query attends to the first
+    /// `keep` tokens of the sequence and to the newest ones, `max_size` in
+    /// all. Keeping the first tokens keeps the softmax stable once the
+    /// window has moved past them (arXiv:2309.17453).
     Rotating {
-        /// Maximum number of tokens to keep.
+        /// Tokens a query attends to, the sinks and its own included.
         max_size: usize,
         /// Number of initial tokens to always keep (typically prompt tokens).
         keep: usize,
@@ -414,7 +421,6 @@ impl KVCacheConfig {
         };
         self
     }
-
 
     /// Calculate the memory footprint for this configuration in bytes.
     ///

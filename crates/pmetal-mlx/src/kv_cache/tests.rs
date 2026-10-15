@@ -170,16 +170,21 @@ fn test_kv_cache_sliding_window() {
 
     assert_eq!(cache.seq_len(), 15);
 
-    // Add 10 more - should trigger sliding window
+    // Add 10 more. The first of them still sees the 19 tokens before it, so
+    // all 25 keys come back even though the window is 20.
     let k2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
     let v2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
     let (cached_k, _) = cache.update_and_fetch(0, &k2, &v2).unwrap();
-
-    // Should be trimmed to window size of 20, seq is axis 2
-    assert_eq!(cached_k.dim(2), 20);
+    assert_eq!(cached_k.dim(2), 25);
     assert_eq!(cache.seq_len(), 20);
     // But total tokens should reflect actual count
     assert_eq!(cache.total_tokens(), 25);
+
+    // A single token attends to exactly the window.
+    let k3 = ops::ones(&[1, 4, 1, 64], Dtype::Float32);
+    let (cached_k, _) = cache.update_and_fetch(0, &k3, &k3).unwrap();
+    assert_eq!(cached_k.dim(2), 20);
+    assert_eq!(cache.total_tokens(), 26);
 }
 
 #[test]
@@ -374,16 +379,29 @@ fn test_kv_cache_rotating_window_preserves_keep_tokens() {
     let first = seq_tensor(0.0, 4);
     let second = seq_tensor(4.0, 4);
     let _ = cache.update_and_fetch(0, &first, &first).unwrap();
-    let (cached_k, cached_v) = cache.update_and_fetch(0, &second, &second).unwrap();
+    let (cached_k, _) = cache.update_and_fetch(0, &second, &second).unwrap();
 
     assert_eq!(cache.seq_len(), 6);
     assert_eq!(cache.total_tokens(), 8);
     assert_eq!(cache.rope_offset_for(0), 8);
+    // The chunk's first query still needs the three tokens before it.
+    assert_eq!(
+        to_f32_vec_eval(&cached_k),
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    );
 
-    let k_vec = to_f32_vec_eval(&cached_k);
-    let v_vec = to_f32_vec_eval(&cached_v);
-    assert_eq!(k_vec, vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0]);
-    assert_eq!(v_vec, vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0]);
+    // One more token attends to the two sinks and the newest four.
+    let third = seq_tensor(8.0, 1);
+    let (cached_k, cached_v) = cache.update_and_fetch(0, &third, &third).unwrap();
+    assert_eq!(
+        to_f32_vec_eval(&cached_k),
+        vec![0.0, 1.0, 5.0, 6.0, 7.0, 8.0]
+    );
+    assert_eq!(
+        to_f32_vec_eval(&cached_v),
+        vec![0.0, 1.0, 5.0, 6.0, 7.0, 8.0]
+    );
+    assert_eq!(cache.rope_offset_for(0), 9);
 }
 
 #[test]
@@ -877,8 +895,7 @@ fn test_turboquant_direct_attention_matches_reference_asymmetric_value_dim() {
 #[test]
 fn test_kv_cache_memory_footprint() {
     // 32 layers × 2 (K+V) × 1 batch × 8 heads × 2048 seq × 128 dim × 2 bytes (fp16)
-    let config = KVCacheConfig::new(32, 2048, 8, 128)
-        .with_dtype(Dtype::Float16);
+    let config = KVCacheConfig::new(32, 2048, 8, 128).with_dtype(Dtype::Float16);
 
     let expected = 32 * 2 * 8 * 2048 * 128 * 2; // layers * K+V * heads * seq * dim * sizeof(f16)
     assert_eq!(config.memory_footprint(), expected);
@@ -887,8 +904,7 @@ fn test_kv_cache_memory_footprint() {
 #[test]
 fn test_kv_cache_memory_footprint_fp32() {
     // 16 layers × 2 (K+V) × 1 batch × 4 heads × 1024 seq × 64 dim × 4 bytes (fp32)
-    let config = KVCacheConfig::new(16, 1024, 4, 64)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(16, 1024, 4, 64).with_dtype(Dtype::Float32);
 
     let expected = 16 * 2 * 4 * 1024 * 64 * 4; // layers * K+V * heads * seq * dim * sizeof(f32)
     assert_eq!(config.memory_footprint(), expected);
@@ -896,8 +912,7 @@ fn test_kv_cache_memory_footprint_fp32() {
 
 #[test]
 fn test_kv_cache_memory_footprint_human_bytes() {
-    let config = KVCacheConfig::new(1, 1, 1, 1)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(1, 1, 1, 1).with_dtype(Dtype::Float32);
 
     // 1 × 2 × 1 × 1 × 1 × 1 × 4 = 8 bytes
     assert_eq!(config.memory_footprint_human(), "8 bytes");
@@ -905,8 +920,7 @@ fn test_kv_cache_memory_footprint_human_bytes() {
 
 #[test]
 fn test_kv_cache_memory_footprint_human_kb() {
-    let config = KVCacheConfig::new(1, 128, 1, 1)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(1, 128, 1, 1).with_dtype(Dtype::Float32);
 
     // 1 × 2 × 1 × 1 × 128 × 1 × 4 = 1024 bytes = 1 KB
     assert_eq!(config.memory_footprint_human(), "1.00 KB");
@@ -914,8 +928,7 @@ fn test_kv_cache_memory_footprint_human_kb() {
 
 #[test]
 fn test_kv_cache_memory_footprint_human_mb() {
-    let config = KVCacheConfig::new(1, 2048, 8, 64)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(1, 2048, 8, 64).with_dtype(Dtype::Float32);
 
     // 1 × 2 × 1 × 8 × 2048 × 64 × 4 = 8,388,608 bytes = 8 MB
     let human = config.memory_footprint_human();
@@ -926,8 +939,7 @@ fn test_kv_cache_memory_footprint_human_mb() {
 fn test_kv_cache_memory_footprint_human_gb() {
     // Need to exceed 1 GB (1,073,741,824 bytes)
     // 32 layers × 2 × 1 batch × 8 heads × 8192 seq × 128 dim × 2 bytes = 1 GB
-    let config = KVCacheConfig::new(32, 8192, 8, 128)
-        .with_dtype(Dtype::Float16);
+    let config = KVCacheConfig::new(32, 8192, 8, 128).with_dtype(Dtype::Float16);
 
     let human = config.memory_footprint_human();
     assert!(human.contains("GB"), "Expected GB, got: {}", human);
