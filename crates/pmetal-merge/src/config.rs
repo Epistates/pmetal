@@ -382,10 +382,16 @@ pub struct MergeParameters {
     #[serde(default)]
     pub gamma: Option<f32>,
 
-    /// Use int8 mask for memory efficiency.
+    /// Seed for the stochastic methods (DARE, DELLA). Each tensor and each
+    /// model draws its own independent mask from it, so a merge is
+    /// reproducible and no two task vectors share a drop pattern. Defaults
+    /// to [`DEFAULT_SEED`].
     #[serde(default)]
-    pub int8_mask: Option<bool>,
+    pub seed: Option<u64>,
 }
+
+/// The seed used when none is configured: merges are reproducible by default.
+pub const DEFAULT_SEED: u64 = 0;
 
 impl MergeParameters {
     // ------------------------------------------------------------------
@@ -464,6 +470,11 @@ impl MergeParameters {
         self.epsilon.unwrap_or(0.1)
     }
 
+    /// Get the seed of the stochastic methods, [`DEFAULT_SEED`] unless set.
+    pub fn seed(&self) -> u64 {
+        self.seed.unwrap_or(DEFAULT_SEED)
+    }
+
     /// Get gamma with default of 0.01.
     pub fn gamma(&self) -> f32 {
         self.gamma.unwrap_or(0.01)
@@ -502,7 +513,7 @@ impl MergeParameters {
             rescale: other.rescale.or(self.rescale),
             epsilon: other.epsilon.or(self.epsilon),
             gamma: other.gamma.or(self.gamma),
-            int8_mask: other.int8_mask.or(self.int8_mask),
+            seed: other.seed.or(self.seed),
         }
     }
 }

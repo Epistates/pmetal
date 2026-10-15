@@ -1,75 +1,46 @@
-//! DELLA-Merging - Magnitude-based adaptive dropout for model merging.
+//! DELLA-Merging - magnitude-aware dropout for task vectors.
 //!
-//! DELLA (Drop and rEscaLe with Learned Amplification) improves on DARE by using
-//! magnitude-proportional dropout: higher-magnitude task-vector entries are *more*
-//! likely to be dropped, unlike TIES/DARE where magnitude is used to *keep* entries.
-//! The counter-intuitive direction is intentional: large task-vector deltas are
-//! often outliers that cause interference, so selectively suppressing them reduces
-//! cross-task conflicts while preserving the smaller, more generalizable updates.
+//! DELLA (Deep et al., "DELLA-Merging: Reducing Interference in Model
+//! Merging through Magnitude-Based Sampling", 2024, arXiv:2406.11617) refines
+//! DARE's uniform dropout. Its MAGPRUNE step ranks the entries of each row of
+//! a task vector by magnitude and gives each a keep probability that grows
+//! linearly with its rank, from `density - epsilon` for the smallest entry to
+//! `density + epsilon` for the largest. Small updates, which carry the least
+//! signal, are dropped most often, yet the average keep rate stays `density`.
+//! Every survivor is divided by its own keep probability, so each entry's
+//! expectation is unchanged:
 //!
-//! # Algorithm
+//! ```text
+//! p_i  = (density - epsilon) + 2 * epsilon * rank_i / (n - 1)     (per row)
+//! τ̂_i  = τ_i / p_i   with probability p_i, else 0
+//! ```
 //!
-//! For each model with task vector τ = W_ft - W_base:
+//! The thinned vectors are then combined as in TIES (elect a sign by total
+//! mass, take the disjoint mean) for `della`, or as a weighted sum for
+//! `della_linear`:
 //!
-//! 1. Compute drop probabilities proportional to |τ|:
-//!    ```text
-//!    p_drop[i] = softmax(|τ[i]| / temperature)[i]   (exponential, default)
-//!    p_drop[i] = |τ[i]| / sum(|τ|)                  (linear variant)
-//!    ```
-//! 2. Sample a Bernoulli mask M using these probabilities:
-//!    ```text
-//!    M[i] ~ Bernoulli(1 - p_drop[i])
-//!    ```
-//! 3. Rescale to maintain the expected value:
-//!    ```text
-//!    sparse_τ[i] = M[i] * τ[i] / (1 - p_drop[i])
-//!    ```
-//! 4. Combine with weights and add back to base:
-//!    ```text
-//!    W_merged = W_base + lambda * sum_m(w_m * sparse_τ_m)
-//!    ```
+//! ```text
+//! θ = θ_base + λ · combine(τ̂_1, ..., τ̂_N)
+//! ```
 //!
-//! # Variants
-//!
-//! - **DELLA** (default): exponential softmax probability — emphasises dropping
-//!   the very largest entries more aggressively.
-//! - **DELLA-Linear**: linear probability normalisation — softer version, closer
-//!   to DARE in behaviour but still magnitude-biased.
-//!
-//! # References
-//!
-//! - "DELLA-Merging: Reducing Interference in Model Merging through Magnitude-Based
-//!   Sampling" (Yu et al., 2024), arXiv:2406.11617.
+//! `density` is per model, `epsilon` is the global `epsilon` parameter
+//! (default 0.1), and each (tensor, model) pair draws its own mask from the
+//! `seed` parameter.
 
 use super::MergeMethod;
-use crate::{MergeError, MergeParameters, Result, SignElection, disjoint_merge};
-use pmetal_runtime::compat::{Array, Dtype};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use crate::consensus::combine_task_vectors;
+use crate::seed::mask_seed;
+use crate::{MergeError, MergeParameters, Result, sparsify_della};
+use pmetal_runtime::compat::Array;
 
 /// DELLA merge implementation.
-///
-/// Implements magnitude-proportional dropout: higher-magnitude task-vector entries
-/// have a higher probability of being dropped, which reduces interference from
-/// large, potentially conflicting parameter changes.
 #[derive(Debug, Clone)]
 pub struct DellaMerge {
-    /// Whether to use TIES-style sign consensus after sparsification.
-    /// `true`  → della (paper default)
-    /// `false` → della_linear
+    /// Whether to elect a sign and take the disjoint mean (`della`) instead
+    /// of a plain weighted sum (`della_linear`).
     use_ties_consensus: bool,
 
-    /// Whether to use exponential (softmax-based) probability scaling.
-    /// `true`  → exponential softmax (default, more aggressive outlier removal)
-    /// `false` → linear normalisation (softer, closer to DARE)
-    use_exponential: bool,
-
-    /// Temperature for the softmax in the exponential variant.
-    /// Lower values → sharper, more focused dropout on the top entries.
-    /// Default: 1.0
-    temperature: f32,
-
-    /// Optional RNG seed for reproducible results.
+    /// Seed overriding the `seed` merge parameter.
     seed: Option<u64>,
 }
 
@@ -80,183 +51,84 @@ impl Default for DellaMerge {
 }
 
 impl DellaMerge {
-    /// Create a new DELLA merge (exponential variant with TIES consensus).
+    /// DELLA with TIES sign election (`della`).
     pub fn new() -> Self {
         Self {
             use_ties_consensus: true,
-            use_exponential: true,
-            temperature: 1.0,
             seed: None,
         }
     }
 
-    /// Create a DELLA-Linear merge (linear variant, no sign consensus).
+    /// DELLA with a weighted-sum combination (`della_linear`).
     pub fn linear() -> Self {
         Self {
             use_ties_consensus: false,
-            use_exponential: false,
-            temperature: 1.0,
             seed: None,
         }
     }
 
-    /// Enable TIES-style sign consensus.
-    pub fn with_ties(mut self) -> Self {
-        self.use_ties_consensus = true;
-        self
-    }
-
-    /// Set the softmax temperature (exponential variant only).
-    ///
-    /// Lower values increase the contrast between low- and high-magnitude entries,
-    /// making the dropout more focused on the largest task-vector values.
-    pub fn with_temperature(mut self, temperature: f32) -> Self {
-        self.temperature = temperature.max(1e-8);
-        self
-    }
-
-    /// Set the RNG seed for reproducible dropout masks.
+    /// Fix the seed, taking precedence over the `seed` merge parameter.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
 
-    /// Compute task vector δ = W_ft - W_base.
-    fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base))
-    }
-
-    /// Compute element-wise drop probabilities using exponential (softmax) scaling.
-    ///
-    /// p_drop[i] = exp(|τ[i]| / T) / sum_j(exp(|τ[j]| / T))
-    ///
-    /// These are proper probabilities summing to 1. Higher-magnitude entries get
-    /// higher drop probability, concentrating the budget on removing the largest
-    /// (most likely interfering) changes.
-    fn drop_probs_exponential(abs_vals: &[f32], temperature: f32) -> Vec<f32> {
-        if abs_vals.is_empty() {
-            return Vec::new();
+    fn merge_tensor(
+        &self,
+        name: &str,
+        tensors: &[Array],
+        base_tensor: Option<&Array>,
+        params: &[MergeParameters],
+        global_params: &MergeParameters,
+    ) -> Result<Array> {
+        if tensors.is_empty() {
+            return Err(MergeError::NotEnoughModels {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        let base = base_tensor.ok_or_else(|| MergeError::BaseModelRequired {
+            method: self.name().to_string(),
+        })?;
+        if params.len() != tensors.len() {
+            return Err(MergeError::InvalidConfig(format!(
+                "{} tensors but {} per-model parameter sets",
+                tensors.len(),
+                params.len()
+            )));
         }
 
-        // Numerically stable softmax: subtract max before exponentiating.
-        let max_val = abs_vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let epsilon = global_params.epsilon();
+        let seed = self.seed.unwrap_or_else(|| global_params.seed());
 
-        let exps: Vec<f32> = abs_vals
-            .iter()
-            .map(|&v| ((v - max_val) / temperature).exp())
-            .collect();
-
-        let sum: f32 = exps.iter().sum();
-
-        if sum < 1e-30 {
-            // Degenerate case: all values are effectively 0 — uniform probability.
-            let n = abs_vals.len() as f32;
-            return vec![1.0 / n; abs_vals.len()];
+        let mut sparse = Vec::with_capacity(tensors.len());
+        let mut weights = Vec::with_capacity(tensors.len());
+        for (slot, (tensor, per_model)) in tensors.iter().zip(params).enumerate() {
+            let effective = global_params.merge_with(per_model);
+            let task_vector = tensor.subtract(base);
+            sparse.push(sparsify_della(
+                &task_vector,
+                effective.density(),
+                epsilon,
+                mask_seed(seed, name, slot),
+                true,
+            )?);
+            weights.push(effective.weight());
         }
 
-        exps.iter().map(|&e| e / sum).collect()
-    }
-
-    /// Compute element-wise drop probabilities using linear scaling.
-    ///
-    /// p_drop[i] = |τ[i]| / sum_j(|τ[j]|)
-    ///
-    /// A simpler alternative to the exponential variant. Proportionally assigns
-    /// dropout probability to each parameter based on its fractional contribution
-    /// to the total task-vector mass.
-    fn drop_probs_linear(abs_vals: &[f32]) -> Vec<f32> {
-        if abs_vals.is_empty() {
-            return Vec::new();
-        }
-
-        let sum: f32 = abs_vals.iter().sum();
-
-        if sum < 1e-30 {
-            // Degenerate case: all values are zero — uniform probability.
-            let n = abs_vals.len() as f32;
-            return vec![1.0 / n; abs_vals.len()];
-        }
-
-        abs_vals.iter().map(|&v| v / sum).collect()
-    }
-
-    /// Apply DELLA magnitude-proportional sparsification to a single task vector.
-    ///
-    /// # Arguments
-    /// * `delta`   - The task vector to sparsify.
-    /// * `density` - Global fraction of parameters to *keep* on average (0.0–1.0).
-    ///   This modulates the drop probabilities so the expected fraction
-    ///   of kept parameters equals `density`.
-    ///
-    /// # Implementation note
-    ///
-    /// The raw per-element drop probability from the distribution sums to 1, but we
-    /// want the *expected* fraction dropped to equal `(1 - density)`. We scale each
-    /// raw probability by `(1 - density)` so the distribution integrates to the
-    /// desired sparsity, then clamp individual probabilities to [0, 1).
-    /// The rescaling factor for kept entries is then `1 / (1 - p_drop_scaled[i])`.
-    fn della_sparsify(&self, delta: &Array, density: f32) -> Result<Array> {
-        if density >= 1.0 {
-            return Ok(delta.clone());
-        }
-        if density <= 0.0 {
-            return Ok(Array::zeros(delta.shape(), Dtype::Float32.as_i32()));
-        }
-
-        let original_shape = delta.shape().to_vec();
-        let mut flat = delta.reshape(&[-1]);
-        let n = original_shape
-            .iter()
-            .map(|&d| d as usize)
-            .product::<usize>();
-        let values: Vec<f32> = flat.to_f32_vec(n).unwrap_or_default();
-
-        // Compute absolute values for probability computation.
-        let abs_vals: Vec<f32> = values.iter().map(|v| v.abs()).collect();
-
-        // Compute raw drop probabilities (sum to 1.0 across all elements).
-        let raw_probs = if self.use_exponential {
-            Self::drop_probs_exponential(&abs_vals, self.temperature)
-        } else {
-            Self::drop_probs_linear(&abs_vals)
-        };
-
-        // Scale probabilities so expected dropped fraction = (1 - density).
-        // p_drop_scaled[i] = raw_probs[i] * n * (1 - density)
-        // This gives: E[#dropped] = sum(p_drop_scaled) = n * (1 - density), which
-        // means E[kept fraction] = density, matching the DARE/TIES convention.
-        let target_drop_rate = 1.0 - density;
-        let scale = (n as f32) * target_drop_rate;
-
-        let drop_probs: Vec<f32> = raw_probs
-            .iter()
-            .map(|&p| (p * scale).clamp(0.0, 1.0 - 1e-7))
-            .collect();
-
-        // Sample Bernoulli mask: keep[i] = 1 with probability (1 - drop_probs[i]).
-        let mut rng: Box<dyn rand::Rng> = match self.seed {
-            Some(s) => Box::new(StdRng::seed_from_u64(s)),
-            None => Box::new(rand::rng()),
-        };
-
-        let mut result_vals = vec![0.0_f32; n];
-        for i in 0..n {
-            let keep_prob = 1.0 - drop_probs[i];
-            if rng.random::<f32>() < keep_prob {
-                // Rescale to maintain expected value: divide by keep probability.
-                result_vals[i] = values[i] / keep_prob;
-            }
-            // Otherwise: result_vals[i] = 0.0 (already initialised above).
-        }
-
-        let result_flat = Array::from_f32_slice(&result_vals, &[n as i32]);
-        Ok(result_flat.reshape(&original_shape))
+        let combined = combine_task_vectors(
+            &sparse,
+            &weights,
+            self.use_ties_consensus,
+            global_params.normalize(),
+        )?;
+        Ok(base.add(&combined.multiply(&Array::from_f32(global_params.lambda()))))
     }
 }
 
 impl MergeMethod for DellaMerge {
     fn name(&self) -> &'static str {
-        if self.use_exponential {
+        if self.use_ties_consensus {
             "della"
         } else {
             "della_linear"
@@ -264,10 +136,10 @@ impl MergeMethod for DellaMerge {
     }
 
     fn description(&self) -> &'static str {
-        if self.use_exponential {
-            "Magnitude-proportional dropout (exponential) with rescaling"
+        if self.use_ties_consensus {
+            "Magnitude-ranked dropout (MAGPRUNE) with TIES sign election"
         } else {
-            "Magnitude-proportional dropout (linear) with rescaling"
+            "Magnitude-ranked dropout (MAGPRUNE) with linear combination"
         }
     }
 
@@ -282,312 +154,140 @@ impl MergeMethod for DellaMerge {
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
-        if tensors.is_empty() {
-            return Err(MergeError::NotEnoughModels {
-                expected: 1,
-                actual: 0,
-            });
-        }
+        self.merge_tensor("", tensors, base_tensor, params, global_params)
+    }
 
-        let base = base_tensor.ok_or_else(|| MergeError::BaseModelRequired {
-            method: self.name().to_string(),
-        })?;
-
-        // Compute task vectors δ_m = W_m - W_base.
-        let task_vectors: Vec<Array> = tensors
-            .iter()
-            .map(|t| Self::task_vector(t, base))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Collect per-model parameters, merging with global defaults.
-        let densities: Vec<f32> = params
-            .iter()
-            .map(|p| global_params.merge_with(p).density())
-            .collect();
-
-        let weights: Vec<f32> = params
-            .iter()
-            .map(|p| global_params.merge_with(p).weight())
-            .collect();
-
-        let lambda = global_params.lambda();
-
-        // Apply DELLA sparsification to each task vector.
-        let sparse_vectors: Vec<Array> = task_vectors
-            .iter()
-            .zip(densities.iter())
-            .map(|(tv, &density)| self.della_sparsify(tv, density))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Combine: optionally apply sign consensus, then weighted sum.
-        let weighted_sum = if self.use_ties_consensus {
-            disjoint_merge(
-                &sparse_vectors,
-                &weights,
-                SignElection::Mass,
-                global_params.normalize(),
-            )?
-        } else {
-            let shape = task_vectors[0].shape();
-            let mut acc = Array::zeros(shape, Dtype::Float32.as_i32());
-            for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
-                let weighted = vector.multiply(&Array::from_f32(*weight));
-                acc = acc.add(&weighted);
-            }
-            acc
-        };
-
-        // Scale by lambda and add back to base model.
-        let delta = weighted_sum.multiply(&Array::from_f32(lambda));
-        Ok(base.add(&delta))
+    fn merge_named(
+        &self,
+        name: &str,
+        tensors: &[Array],
+        base_tensor: Option<&Array>,
+        params: &[MergeParameters],
+        global_params: &MergeParameters,
+    ) -> Result<Array> {
+        let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
+        self.merge_tensor(
+            name,
+            tensors,
+            base_tensor,
+            &params,
+            &global_params.resolved(name),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{arr, assert_close, values, weight_density};
 
     #[test]
-    fn test_della_default_name() {
-        let della = DellaMerge::new();
-        assert_eq!(della.name(), "della");
-        assert!(della.use_exponential);
-        assert!(della.use_ties_consensus);
+    fn names_and_variants() {
+        assert_eq!(DellaMerge::new().name(), "della");
+        assert_eq!(DellaMerge::linear().name(), "della_linear");
+        assert!(DellaMerge::new().requires_base_model());
     }
 
     #[test]
-    fn test_della_linear_name() {
-        let della = DellaMerge::linear();
-        assert_eq!(della.name(), "della_linear");
-        assert!(!della.use_exponential);
-        assert!(!della.use_ties_consensus);
+    fn full_density_reduces_to_the_combination_step() {
+        // Nothing is dropped at density 1, so della_linear is the weighted
+        // sum: base 1 + (1*2 + 1*4) / 2 = 4.
+        let base = arr(&[1.0], &[1]);
+        let models = [arr(&[3.0], &[1]), arr(&[5.0], &[1])];
+        let params = [weight_density(1.0, 1.0), weight_density(1.0, 1.0)];
+        let out = DellaMerge::linear()
+            .merge(&models, Some(&base), &params, &MergeParameters::default())
+            .unwrap();
+        assert_close(&values(&out), &[4.0], 1e-6);
     }
 
     #[test]
-    fn test_drop_probs_exponential_sum_to_one() {
-        let vals = vec![0.1, 0.5, 0.3, 1.0, 0.2];
-        let probs = DellaMerge::drop_probs_exponential(&vals, 1.0);
-        let sum: f32 = probs.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "probs should sum to 1, got {}",
-            sum
-        );
-        for &p in &probs {
-            assert!((0.0..=1.0).contains(&p), "probability out of range: {}", p);
-        }
-    }
-
-    #[test]
-    fn test_drop_probs_exponential_magnitude_ordering() {
-        // Larger magnitudes should get larger drop probability.
-        let vals = vec![0.1, 1.0]; // second is much larger
-        let probs = DellaMerge::drop_probs_exponential(&vals, 1.0);
-        assert!(
-            probs[1] > probs[0],
-            "larger magnitude should have higher drop probability: {:?}",
-            probs
-        );
-    }
-
-    #[test]
-    fn test_drop_probs_linear_sum_to_one() {
-        let vals = vec![0.2, 0.3, 0.5];
-        let probs = DellaMerge::drop_probs_linear(&vals);
-        let sum: f32 = probs.iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-5,
-            "linear probs should sum to 1, got {}",
-            sum
-        );
-    }
-
-    #[test]
-    fn test_drop_probs_linear_proportional() {
-        let vals = vec![1.0, 3.0]; // second is 3x larger
-        let probs = DellaMerge::drop_probs_linear(&vals);
-        // p[0] = 1/4 = 0.25, p[1] = 3/4 = 0.75
-        assert!((probs[0] - 0.25).abs() < 1e-5);
-        assert!((probs[1] - 0.75).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_della_preserves_base_with_zero_lambda() {
-        let della = DellaMerge::new().with_seed(42);
-
-        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
-
-        let params = vec![MergeParameters {
-            weight: Some(1.0_f32.into()),
-            density: Some(0.5_f32.into()),
-            ..Default::default()
-        }];
-
+    fn survivors_are_divided_by_their_rank_dependent_keep_probability() {
+        // One model, one row of 1000 entries with magnitudes 1..=1000 and
+        // density 0.5, epsilon 0.4: the entry of rank r keeps with
+        // p = 0.1 + 0.8 r / 999 and, if kept, is 1/p times its value.
+        let n = 1000;
+        let task: Vec<f32> = (1..=n).map(|i| i as f32).collect();
+        let base = arr(&vec![0.0; n], &[1, n as i32]);
+        let models = [arr(&task, &[1, n as i32])];
         let global = MergeParameters {
-            lambda: Some(0.0_f32.into()),
+            epsilon: Some(0.4),
+            normalize: Some(false),
             ..Default::default()
         };
-
-        let mut result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice = result.to_f32_vec(3).unwrap();
-        let mut base_clone = base.clone();
-        let base_slice = base_clone.to_f32_vec(3).unwrap();
-
-        // With lambda=0, result should equal base regardless of sparsification.
-        for (r, b) in result_slice.iter().zip(base_slice.iter()) {
-            assert!((r - b).abs() < 1e-5, "expected base {}, got {}", b, r);
+        let out = values(
+            &DellaMerge::linear()
+                .merge(&models, Some(&base), &[weight_density(1.0, 0.5)], &global)
+                .unwrap(),
+        );
+        let mut kept = 0_i32;
+        for (r, (&x, &y)) in task.iter().zip(&out).enumerate() {
+            if y != 0.0 {
+                kept += 1;
+                let p = 0.1 + 0.8 * r as f32 / (n as f32 - 1.0);
+                assert!((y - x / p).abs() <= 1e-3 * (x / p), "rank {r}: {y} vs {}", x / p);
+            }
         }
+        // E[kept] = n * density = 500; binomial sigma is about 16.
+        assert!((kept - 500).abs() < 100, "kept {kept}");
     }
 
     #[test]
-    fn test_della_full_density_preserves_task_vector() {
-        // With density=1.0, no elements are dropped.
-        // With a single model and lambda=1, result should equal the fine-tuned model.
-        let della = DellaMerge::new().with_seed(42);
-
-        let base = Array::from_f32_slice(&[0.0_f32, 0.0, 0.0], &[3]);
-        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-
-        let params = vec![MergeParameters {
-            weight: Some(1.0_f32.into()),
-            density: Some(1.0_f32.into()),
-            ..Default::default()
-        }];
-        let global = MergeParameters {
-            lambda: Some(1.0_f32.into()),
-            ..Default::default()
+    fn merges_are_reproducible_and_seeded_per_model() {
+        let n = 2048;
+        let base = arr(&vec![0.0; n], &[1, n as i32]);
+        let task: Vec<f32> = (1..=n).map(|i| i as f32).collect();
+        let models = [arr(&task, &[1, n as i32]), arr(&task, &[1, n as i32])];
+        let params = [weight_density(1.0, 0.5), weight_density(1.0, 0.5)];
+        let run = |seed| {
+            let global = MergeParameters {
+                seed,
+                normalize: Some(false),
+                ..Default::default()
+            };
+            values(
+                &DellaMerge::linear()
+                    .merge(&models, Some(&base), &params, &global)
+                    .unwrap(),
+            )
         };
+        assert_eq!(run(None), run(None));
+        assert_ne!(run(Some(1)), run(Some(2)));
 
-        let mut result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice = result.to_f32_vec(3).unwrap();
-
-        // density=1.0 means no dropout → result equals t1
-        for (i, r) in result_slice.iter().enumerate() {
-            assert!(
-                (r - (i as f32 + 1.0)).abs() < 1e-5,
-                "index {}: expected {}, got {}",
-                i,
-                i as f32 + 1.0,
-                r
-            );
-        }
+        // Two identical models still drop different entries: at many
+        // positions exactly one of them survives, so the value is x/p where
+        // both surviving would give 2x/p (default epsilon 0.1, so p runs
+        // from 0.4 to 0.6 with rank).
+        let out = run(Some(1));
+        let one_of_two = out
+            .iter()
+            .zip(&task)
+            .enumerate()
+            .filter(|(r, (y, x))| {
+                let p = 0.4 + 0.2 * *r as f32 / (n as f32 - 1.0);
+                (**y - **x / p).abs() <= 1e-3 * (**x / p)
+            })
+            .count();
+        // P(exactly one) = 2p(1-p), about 0.48 here.
+        assert!(one_of_two > n / 3, "{one_of_two} positions kept by one model only");
     }
 
     #[test]
-    fn test_della_zero_density_gives_base() {
-        let della = DellaMerge::new().with_seed(42);
-
-        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_f32_slice(&[5.0_f32, 6.0, 7.0], &[3]);
-
-        let params = vec![MergeParameters {
-            weight: Some(1.0_f32.into()),
-            density: Some(0.0_f32.into()),
-            ..Default::default()
-        }];
-        let global = MergeParameters {
-            lambda: Some(1.0_f32.into()),
-            ..Default::default()
-        };
-
-        let mut result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice = result.to_f32_vec(3).unwrap();
-        let mut base_clone = base.clone();
-        let base_slice = base_clone.to_f32_vec(3).unwrap();
-
-        // density=0.0 → all task vector entries dropped → result equals base
-        for (r, b) in result_slice.iter().zip(base_slice.iter()) {
-            assert!((r - b).abs() < 1e-5, "expected base {}, got {}", b, r);
-        }
-    }
-
-    #[test]
-    fn test_della_output_shape_preserved() {
-        let della = DellaMerge::new().with_seed(7);
-        let base = Array::from_f32_slice(&[0.0_f32; 12], &[3, 4]);
-        let t1 = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
-
-        let params = vec![MergeParameters::default()];
+    fn rejects_a_missing_base_and_bad_parameters() {
+        let models = [arr(&[1.0], &[1])];
+        let params = [weight_density(1.0, 0.5)];
         let global = MergeParameters::default();
-
-        let result = della.merge(&[t1], Some(&base), &params, &global).unwrap();
-        assert_eq!(result.shape(), &[3, 4]);
-    }
-
-    #[test]
-    fn test_della_requires_base() {
-        let della = DellaMerge::new();
-        assert!(della.requires_base_model());
-    }
-
-    #[test]
-    fn test_della_seeded_reproducible() {
-        let base = Array::from_f32_slice(&[0.0_f32; 8], &[8]);
-        let t1 = Array::from_f32_slice(&[1.0_f32, 0.5, 2.0, 0.1, 0.8, 0.3, 1.5, 0.6], &[8]);
-
-        let params = vec![MergeParameters {
-            weight: Some(1.0_f32.into()),
-            density: Some(0.5_f32.into()),
-            ..Default::default()
-        }];
-        let global = MergeParameters {
-            lambda: Some(1.0_f32.into()),
-            ..Default::default()
-        };
-
-        let mut r1 = DellaMerge::new()
-            .with_seed(99)
-            .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
-            .unwrap();
-        let mut r2 = DellaMerge::new()
-            .with_seed(99)
-            .merge(&[t1], Some(&base), &params, &global)
-            .unwrap();
-
-        let s1 = r1.to_f32_vec(8).unwrap();
-        let s2 = r2.to_f32_vec(8).unwrap();
-        assert_eq!(s1, s2, "same seed must produce identical results");
-    }
-
-    #[test]
-    fn test_della_linear_vs_exponential_differ() {
-        // The two variants should produce different results on non-trivial input.
-        let base = Array::from_f32_slice(&[0.0_f32; 8], &[8]);
-        let t1 = Array::from_f32_slice(&[0.1_f32, 5.0, 0.2, 4.0, 0.3, 3.0, 0.4, 2.0], &[8]);
-
-        let params = vec![MergeParameters {
-            weight: Some(1.0_f32.into()),
-            density: Some(0.5_f32.into()),
-            ..Default::default()
-        }];
-        let global = MergeParameters {
-            lambda: Some(1.0_f32.into()),
-            ..Default::default()
-        };
-
-        // Use same seed to ensure the only difference is the probability computation.
-        let mut exp_result = DellaMerge::new()
-            .with_seed(42)
-            .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
-            .unwrap();
-        let mut lin_result = DellaMerge::linear()
-            .with_seed(42)
-            .merge(&[t1], Some(&base), &params, &global)
-            .unwrap();
-
-        let s_exp = exp_result.to_f32_vec(8).unwrap();
-        let s_lin = lin_result.to_f32_vec(8).unwrap();
-
-        // Results will differ because softmax vs linear produce different probabilities.
-        // The test just verifies both run without errors and produce finite values.
+        assert!(DellaMerge::new().merge(&models, None, &params, &global).is_err());
+        let base = arr(&[0.0], &[1]);
         assert!(
-            s_exp.iter().all(|x| x.is_finite()),
-            "exponential variant produced non-finite values"
+            DellaMerge::new()
+                .merge(&models, Some(&base), &[weight_density(1.0, 1.5)], &global)
+                .is_err()
         );
         assert!(
-            s_lin.iter().all(|x| x.is_finite()),
-            "linear variant produced non-finite values"
+            DellaMerge::new()
+                .merge(&models, Some(&base), &[], &global)
+                .is_err()
         );
     }
 }

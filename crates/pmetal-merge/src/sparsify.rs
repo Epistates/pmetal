@@ -1,611 +1,358 @@
-//! Sparsification strategies for model merging.
+//! Sparsification of task vectors.
 //!
-//! Sparsification reduces interference when merging models by keeping only
-//! the most important parameters (by some criterion) and zeroing the rest.
+//! Merging methods that combine task vectors first thin each one out so the
+//! entries that survive interfere less. The strategies here differ in how
+//! they choose what survives:
 //!
-//! # Optimizations
+//! - [`sparsify_by_magnitude`]: keep the largest-magnitude entries (the trim
+//!   step of TIES, Yadav et al. 2023).
+//! - [`sparsify_dare`]: drop entries uniformly at random and rescale the rest
+//!   by `1 / density` (DARE, Yu et al. 2024).
+//! - [`sparsify_della`]: drop at random with a probability that falls with
+//!   magnitude rank inside each row, rescaling each survivor by its own keep
+//!   probability (MAGPRUNE of DELLA, Deep et al. 2024).
+//! - [`sparsify_breadcrumbs`]: keep the middle of the magnitude range, masking
+//!   both the smallest entries and the largest outliers (Model Breadcrumbs,
+//!   Davari and Belilovsky 2024).
 //!
-//! This module provides two implementations:
-//!
-//! 1. **Standard**: Uses full sorting O(n log n) - reliable but slower
-//! 2. **Online**: Uses Quickselect O(n) - faster for large tensors
-//!
-//! The online implementation uses the Quickselect algorithm (Floyd-Rivest variant)
-//! to find the k-th percentile threshold in linear time on average.
+//! All of them run as MLX operations: thresholds come from a top-k
+//! selection on the device and random masks from MLX's keyed generator, so
+//! a tensor never takes a round trip through host memory and a seed fixes
+//! the mask.
 
-use crate::Result;
+use crate::{MergeError, Result};
 use pmetal_runtime::compat::{Array, Dtype};
 
-/// Sparsify a tensor by keeping only the top `density` fraction by magnitude.
+fn f32_code() -> i32 {
+    Dtype::Float32.as_i32()
+}
+
+/// Reject a density outside `[0, 1]` (or NaN) with a message naming it.
+pub fn validate_density(density: f32) -> Result<()> {
+    if (0.0..=1.0).contains(&density) {
+        Ok(())
+    } else {
+        Err(MergeError::InvalidConfig(format!(
+            "density must be in [0.0, 1.0], got {density}"
+        )))
+    }
+}
+
+/// How many of `n` entries a `density` fraction keeps: the nearest integer,
+/// and at least one for a positive density.
+fn keep_count(density: f32, n: usize) -> usize {
+    let exact = f64::from(density) * n as f64;
+    (exact.round() as usize).clamp(usize::from(density > 0.0), n)
+}
+
+fn zeros_like_f32(tensor: &Array) -> Array {
+    Array::zeros(tensor.shape(), f32_code())
+}
+
+/// The `keep`-th largest value of `abs_flat` (`1 <= keep <= len`).
+fn kth_largest(abs_flat: &Array, keep: usize) -> Result<f32> {
+    let k = i32::try_from(keep)
+        .map_err(|_| MergeError::InvalidConfig(format!("tensor too large to select from: {keep}")))?;
+    Ok(abs_flat.topk(k, 0).min(None).item_f32())
+}
+
+/// Keep the top `density` fraction of `tensor` by magnitude and zero the rest.
 ///
-/// # Arguments
-/// * `tensor` - Input tensor to sparsify
-/// * `density` - Fraction of elements to keep (0.0 to 1.0)
-///
-/// # Returns
-/// A tensor with the same shape where only the top `density` elements are kept,
-/// rest are zeroed.
+/// Entries tied with the threshold are all kept, so a tensor with many equal
+/// magnitudes can keep slightly more than `density`; zeros stay zero either
+/// way.
 pub fn sparsify_by_magnitude(tensor: &Array, density: f32) -> Result<Array> {
+    validate_density(density)?;
     if density >= 1.0 {
         return Ok(tensor.clone());
     }
     if density <= 0.0 {
-        return Ok(Array::zeros(tensor.shape(), Dtype::Float32.as_i32()));
+        return Ok(zeros_like_f32(tensor));
     }
-
-    // Flatten for processing
-    let original_shape = tensor.shape().to_vec();
-    let flat = tensor.reshape(&[-1]);
-    let n = flat.dim(0) as usize;
-
-    // Compute absolute values
-    let mut abs_vals = flat.abs_val();
-    let abs_slice: Vec<f32> = abs_vals.to_f32_vec(n).unwrap();
-
-    // Find threshold value (k-th largest magnitude)
-    let k = ((1.0 - density) * n as f32).ceil() as usize;
-    let k = k.min(n.saturating_sub(1));
-
-    // Get sorted magnitudes
-    let mut sorted_abs: Vec<f32> = abs_slice.clone();
-    sorted_abs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    let threshold = sorted_abs[k];
-
-    // Create mask: 1 where |x| >= threshold, 0 otherwise
-    let threshold_array = Array::from_f32(threshold);
-    let mask = abs_vals.greater_equal(&threshold_array);
-    let mask_f32 = mask.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
-
-    // Apply mask
-    let result_flat = flat.multiply(&mask_f32);
-    Ok(result_flat.reshape(&original_shape))
+    let abs = tensor.abs_val().reshape(&[-1]);
+    let keep = keep_count(density, abs.size());
+    let threshold = kth_largest(&abs, keep)?;
+    let mask = tensor.abs_val().greater_equal(&Array::from_f32(threshold));
+    Ok(mask.where_cond(tensor, &zeros_like_f32(tensor)))
 }
 
-/// Sparsify a tensor by keeping only the middle `density` fraction.
-/// This removes both the largest (gamma fraction) and smallest values.
+/// Model Breadcrumbs' mask: zero the smallest `1 - density` fraction by
+/// magnitude and the largest `gamma` fraction (the outliers), keep the rest.
 ///
-/// Used by the "breadcrumbs" merge method.
-///
-/// # Arguments
-/// * `tensor` - Input tensor to sparsify
-/// * `density` - Fraction of elements to keep (0.0 to 1.0)
-/// * `gamma` - Fraction of largest outliers to remove (0.0 to 1.0)
+/// # Errors
+/// `density` or `gamma` outside `[0, 1]`, or `gamma > density`.
 pub fn sparsify_breadcrumbs(tensor: &Array, density: f32, gamma: f32) -> Result<Array> {
-    if density >= 1.0 && gamma <= 0.0 {
-        return Ok(tensor.clone());
-    }
-
-    // Flatten for processing
-    let original_shape = tensor.shape().to_vec();
-    let flat = tensor.reshape(&[-1]);
-    let n = flat.dim(0) as usize;
-
-    // Compute absolute values
-    let mut abs_vals = flat.abs_val();
-    let abs_slice: Vec<f32> = abs_vals.to_f32_vec(n).unwrap();
-
-    // Get sorted magnitudes with indices
-    let mut indexed: Vec<(usize, f32)> =
-        abs_slice.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-
-    // Determine thresholds
-    // Remove smallest (1-density) and largest (gamma) fractions
-    let lower_k = ((1.0 - density) * n as f32).ceil() as usize;
-    let upper_k = ((1.0 - gamma) * n as f32).floor() as usize;
-
-    // Create mask
-    let mut mask = vec![0.0_f32; n];
-    for (idx, _) in indexed
-        .iter()
-        .skip(lower_k)
-        .take(upper_k.saturating_sub(lower_k))
-    {
-        mask[*idx] = 1.0;
-    }
-
-    let mask_array = Array::from_f32_slice(&mask, &[n as i32]);
-    let result_flat = flat.multiply(&mask_array);
-    Ok(result_flat.reshape(&original_shape))
-}
-
-// =============================================================================
-// Online (O(n)) Sparsification
-// =============================================================================
-
-/// Find the k-th smallest element using Quickselect algorithm.
-///
-/// This is an O(n) average case algorithm for finding the k-th order statistic,
-/// compared to O(n log n) for full sorting.
-///
-/// # Arguments
-/// * `data` - Mutable slice of values (will be partially reordered)
-/// * `k` - The index of the element to find (0-based)
-///
-/// # Returns
-/// The k-th smallest element in the array.
-pub fn quickselect(data: &mut [f32], k: usize) -> f32 {
-    if data.len() == 1 {
-        return data[0];
-    }
-
-    let k = k.min(data.len() - 1);
-    quickselect_impl(data, 0, data.len() - 1, k)
-}
-
-fn quickselect_impl(data: &mut [f32], left: usize, right: usize, k: usize) -> f32 {
-    if left == right {
-        return data[left];
-    }
-
-    // Use median-of-three pivot selection for better average case
-    let pivot_idx = median_of_three(data, left, right);
-    let pivot_idx = partition(data, left, right, pivot_idx);
-
-    if k == pivot_idx {
-        data[k]
-    } else if k < pivot_idx {
-        quickselect_impl(data, left, pivot_idx.saturating_sub(1), k)
-    } else {
-        quickselect_impl(data, pivot_idx + 1, right, k)
-    }
-}
-
-/// Select median-of-three as pivot for better performance.
-fn median_of_three(data: &[f32], left: usize, right: usize) -> usize {
-    let mid = left + (right - left) / 2;
-
-    let a = data[left];
-    let b = data[mid];
-    let c = data[right];
-
-    if (a <= b && b <= c) || (c <= b && b <= a) {
-        mid
-    } else if (b <= a && a <= c) || (c <= a && a <= b) {
-        left
-    } else {
-        right
-    }
-}
-
-/// Partition array around pivot and return final pivot position.
-fn partition(data: &mut [f32], left: usize, right: usize, pivot_idx: usize) -> usize {
-    let pivot_value = data[pivot_idx];
-
-    // Move pivot to end
-    data.swap(pivot_idx, right);
-
-    let mut store_idx = left;
-    for i in left..right {
-        if data[i] < pivot_value {
-            data.swap(i, store_idx);
-            store_idx += 1;
-        }
-    }
-
-    // Move pivot to final position
-    data.swap(store_idx, right);
-    store_idx
-}
-
-/// Sparsify a tensor using O(n) Quickselect algorithm.
-///
-/// This is faster than the standard implementation for large tensors,
-/// as it avoids the O(n log n) full sort.
-///
-/// # Arguments
-/// * `tensor` - Input tensor to sparsify
-/// * `density` - Fraction of elements to keep (0.0 to 1.0)
-///
-/// # Returns
-/// A tensor with the same shape where only the top `density` elements are kept.
-pub fn sparsify_by_magnitude_online(tensor: &Array, density: f32) -> Result<Array> {
-    if density >= 1.0 {
-        return Ok(tensor.clone());
+    validate_density(density)?;
+    if !(0.0..=1.0).contains(&gamma) || gamma > density {
+        return Err(MergeError::InvalidConfig(format!(
+            "gamma must be in [0.0, density={density}], got {gamma}"
+        )));
     }
     if density <= 0.0 {
-        return Ok(Array::zeros(tensor.shape(), Dtype::Float32.as_i32()));
+        return Ok(zeros_like_f32(tensor));
     }
-
-    // Flatten for processing
-    let original_shape = tensor.shape().to_vec();
-    let flat = tensor.reshape(&[-1]);
-    let n = flat.dim(0) as usize;
-
-    // Compute absolute values
-    let mut abs_vals = flat.abs_val();
-    let mut abs_slice: Vec<f32> = abs_vals.to_f32_vec(n).unwrap();
-
-    // Find threshold using O(n) Quickselect
-    let k = ((1.0 - density) * n as f32).ceil() as usize;
-    let k = k.min(n.saturating_sub(1));
-
-    let threshold = quickselect(&mut abs_slice, k);
-
-    // Create mask: 1 where |x| >= threshold, 0 otherwise
-    let threshold_array = Array::from_f32(threshold);
-    let mask = abs_vals.greater_equal(&threshold_array);
-    let mask_f32 = mask.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
-
-    // Apply mask
-    let result_flat = flat.multiply(&mask_f32);
-    Ok(result_flat.reshape(&original_shape))
-}
-
-/// Batch sparsify multiple tensors with potentially different densities.
-///
-/// This processes multiple tensors efficiently, sharing overhead costs.
-///
-/// # Arguments
-/// * `tensors` - Slice of tensors to sparsify
-/// * `densities` - Density for each tensor (must match length of tensors)
-///
-/// # Returns
-/// Vector of sparsified tensors in the same order.
-pub fn sparsify_batch_by_magnitude(tensors: &[Array], densities: &[f32]) -> Result<Vec<Array>> {
-    assert_eq!(
-        tensors.len(),
-        densities.len(),
-        "Number of tensors must match number of densities"
-    );
-
-    tensors
-        .iter()
-        .zip(densities.iter())
-        .map(|(tensor, &density)| sparsify_by_magnitude_online(tensor, density))
-        .collect()
-}
-
-/// Compute threshold values for multiple tensors without applying sparsification.
-///
-/// This is useful when you need to inspect or reuse thresholds.
-///
-/// # Arguments
-/// * `tensors` - Slice of tensors
-/// * `densities` - Density for each tensor
-///
-/// # Returns
-/// Vector of threshold values for each tensor.
-pub fn compute_thresholds(tensors: &[Array], densities: &[f32]) -> Result<Vec<f32>> {
-    assert_eq!(
-        tensors.len(),
-        densities.len(),
-        "Number of tensors must match number of densities"
-    );
-
-    let mut thresholds = Vec::with_capacity(tensors.len());
-
-    for (tensor, &density) in tensors.iter().zip(densities.iter()) {
-        if density >= 1.0 {
-            thresholds.push(0.0);
-            continue;
-        }
-        if density <= 0.0 {
-            thresholds.push(f32::MAX);
-            continue;
-        }
-
-        let flat = tensor.reshape(&[-1]);
-        let n = flat.dim(0) as usize;
-
-        let mut abs_vals = flat.abs_val();
-        let mut abs_slice: Vec<f32> = abs_vals.to_f32_vec(n).unwrap();
-
-        let k = ((1.0 - density) * n as f32).ceil() as usize;
-        let k = k.min(n.saturating_sub(1));
-
-        let threshold = quickselect(&mut abs_slice, k);
-        thresholds.push(threshold);
-    }
-
-    Ok(thresholds)
-}
-
-/// Apply pre-computed thresholds to tensors.
-///
-/// This separates threshold computation from application, enabling
-/// Metal kernel acceleration of the masking step.
-///
-/// # Arguments
-/// * `tensors` - Slice of tensors
-/// * `thresholds` - Pre-computed threshold for each tensor
-///
-/// # Returns
-/// Vector of sparsified tensors.
-pub fn apply_thresholds(tensors: &[Array], thresholds: &[f32]) -> Result<Vec<Array>> {
-    assert_eq!(
-        tensors.len(),
-        thresholds.len(),
-        "Number of tensors must match number of thresholds"
-    );
-
-    let mut results = Vec::with_capacity(tensors.len());
-
-    for (tensor, &threshold) in tensors.iter().zip(thresholds.iter()) {
-        if threshold == 0.0 {
-            // density >= 1.0, keep all
-            results.push(tensor.clone());
-            continue;
-        }
-        if threshold == f32::MAX {
-            // density <= 0.0, zero all
-            results.push(Array::zeros(tensor.shape(), Dtype::Float32.as_i32()));
-            continue;
-        }
-
-        let original_shape = tensor.shape().to_vec();
-        let flat = tensor.reshape(&[-1]);
-        let abs_vals = flat.abs_val();
-
-        let threshold_array = Array::from_f32(threshold);
-        let mask = abs_vals.greater_equal(&threshold_array);
-        let mask_f32 = mask.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
-
-        let result_flat = flat.multiply(&mask_f32);
-        results.push(result_flat.reshape(&original_shape));
-    }
-
-    Ok(results)
-}
-
-/// DARE (Drop And REscale) sparsification with random masking.
-///
-/// Instead of keeping by magnitude, randomly drops elements and rescales
-/// the remaining ones to maintain expected sum.
-///
-/// # Arguments
-/// * `tensor` - Input tensor
-/// * `density` - Fraction of elements to keep
-/// * `seed` - Optional seed for reproducibility
-///
-/// # Returns
-/// Sparsified and rescaled tensor.
-pub fn sparsify_dare(tensor: &Array, density: f32, seed: Option<u64>) -> Result<Array> {
-    if density >= 1.0 {
-        return Ok(tensor.clone());
-    }
-    if density <= 0.0 {
-        return Ok(Array::zeros(tensor.shape(), Dtype::Float32.as_i32()));
-    }
-
-    let original_shape = tensor.shape().to_vec();
-    let flat = tensor.reshape(&[-1]);
-    let n = flat.dim(0) as usize;
-
-    // Generate random mask with optional seed
-    use rand::{RngExt, SeedableRng};
-
-    let mut rng = if let Some(s) = seed {
-        rand::rngs::StdRng::seed_from_u64(s)
+    let abs = tensor.abs_val();
+    let flat = abs.reshape(&[-1]);
+    let n = flat.size();
+    let mut mask = if density >= 1.0 {
+        None
     } else {
-        rand::rngs::StdRng::from_rng(&mut rand::rng())
+        let floor = kth_largest(&flat, keep_count(density, n))?;
+        Some(abs.greater_equal(&Array::from_f32(floor)))
     };
+    let outliers = keep_count(gamma, n);
+    if gamma > 0.0 && outliers > 0 {
+        let ceiling = kth_largest(&flat, outliers)?;
+        let below = abs.less(&Array::from_f32(ceiling));
+        mask = Some(match mask {
+            Some(m) => m.multiply(&below),
+            None => below,
+        });
+    }
+    Ok(match mask {
+        Some(m) => m.where_cond(tensor, &zeros_like_f32(tensor)),
+        None => tensor.clone(),
+    })
+}
 
-    let mut mask_data = Vec::with_capacity(n);
+/// DARE: drop each entry independently with probability `1 - density` and,
+/// with `rescale`, multiply the survivors by `1 / density` so the expected
+/// value is unchanged.
+///
+/// The mask is a function of `seed` and the tensor's shape only.
+pub fn sparsify_dare(tensor: &Array, density: f32, seed: u64, rescale: bool) -> Result<Array> {
+    validate_density(density)?;
+    if density >= 1.0 {
+        return Ok(tensor.clone());
+    }
+    if density <= 0.0 {
+        return Ok(zeros_like_f32(tensor));
+    }
+    let key = Array::random_key(seed);
+    let draw = Array::random_uniform_keyed(tensor.shape(), f32_code(), Some(&key));
+    let keep = draw.less(&Array::from_f32(density));
+    let scaled = if rescale {
+        tensor.multiply(&Array::from_f32(1.0 / density))
+    } else {
+        tensor.clone()
+    };
+    Ok(keep.where_cond(&scaled, &zeros_like_f32(tensor)))
+}
 
-    for _ in 0..n {
-        if rng.random::<f32>() < density {
-            // Rescale by 1/density to maintain expected sum
-            mask_data.push(1.0 / density);
-        } else {
-            mask_data.push(0.0);
-        }
+/// DELLA's MAGPRUNE: drop entries at random with a probability that depends
+/// on the entry's magnitude rank within its row.
+///
+/// Rows are the leading axis (a 1-D tensor is one row; trailing axes are
+/// flattened into the row). Within a row the keep probability rises linearly
+/// with magnitude rank from `density - epsilon` for the smallest entry to
+/// `density + epsilon` for the largest, so small updates are dropped more
+/// often and the average keep rate stays `density`. With `rescale` each
+/// survivor is divided by its own keep probability, which keeps the expected
+/// value of every entry unchanged.
+///
+/// The mask is a function of `seed` and the tensor's shape only.
+///
+/// # Errors
+/// `density` outside `[0, 1]`, or a negative or non-finite `epsilon`.
+pub fn sparsify_della(
+    tensor: &Array,
+    density: f32,
+    epsilon: f32,
+    seed: u64,
+    rescale: bool,
+) -> Result<Array> {
+    validate_density(density)?;
+    if !epsilon.is_finite() || epsilon < 0.0 {
+        return Err(MergeError::InvalidConfig(format!(
+            "DELLA epsilon must be finite and non-negative, got {epsilon}"
+        )));
+    }
+    if density >= 1.0 {
+        return Ok(tensor.clone());
+    }
+    if density <= 0.0 {
+        return Ok(zeros_like_f32(tensor));
     }
 
-    let mask = Array::from_f32_slice(&mask_data, &[n as i32]);
-    let result_flat = flat.multiply(&mask);
-    Ok(result_flat.reshape(&original_shape))
+    let shape = tensor.shape().to_vec();
+    let rows = if shape.len() >= 2 { shape[0] } else { 1 };
+    let cols = tensor.size() as i32 / rows.max(1);
+    let matrix = tensor.reshape(&[rows, cols]);
+
+    // The magnitude rank of every entry within its row: sorting the sort
+    // order yields the inverse permutation.
+    let order = matrix.abs_val().argsort(1);
+    let rank = order.argsort(1).as_dtype(f32_code());
+    let position = if cols > 1 {
+        rank.divide(&Array::from_f32((cols - 1) as f32))
+    } else {
+        Array::from_f32(0.5)
+    };
+    let keep_prob = position
+        .multiply(&Array::from_f32(2.0 * epsilon))
+        .add(&Array::from_f32(density - epsilon))
+        .clip(Some(&Array::from_f32(0.0)), Some(&Array::from_f32(1.0)));
+
+    let key = Array::random_key(seed);
+    let draw = Array::random_uniform_keyed(&[rows, cols], f32_code(), Some(&key));
+    let keep = draw.less(&keep_prob);
+    let survivors = if rescale {
+        // A kept entry has keep_prob > 0 (draw < 0 never happens), so the
+        // guard only keeps the dropped lanes finite.
+        let safe = keep_prob.maximum(&Array::from_f32(f32::MIN_POSITIVE));
+        matrix.divide(&safe)
+    } else {
+        matrix
+    };
+    let zeros = Array::zeros(&[rows, cols], f32_code());
+    Ok(keep.where_cond(&survivors, &zeros).reshape(&shape))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{arr, assert_close, values};
 
     #[test]
-    fn test_sparsify_full_density() {
-        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let mut result = sparsify_by_magnitude(&tensor, 1.0).unwrap();
-        let result_slice = result.to_f32_vec(4).unwrap();
-
-        assert_eq!(result_slice, vec![1.0, 2.0, 3.0, 4.0]);
+    fn magnitude_keeps_the_largest_entries() {
+        let t = arr(&[-4.0, 1.0, -2.0, 3.0], &[4]);
+        let out = sparsify_by_magnitude(&t, 0.5).unwrap();
+        assert_close(&values(&out), &[-4.0, 0.0, 0.0, 3.0], 0.0);
     }
 
     #[test]
-    fn test_sparsify_zero_density() {
-        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let mut result = sparsify_by_magnitude(&tensor, 0.0).unwrap();
-        let result_slice = result.to_f32_vec(4).unwrap();
-
-        assert_eq!(result_slice, vec![0.0, 0.0, 0.0, 0.0]);
+    fn magnitude_density_one_and_zero_are_identity_and_zeros() {
+        let t = arr(&[1.0, -2.0, 3.0, 4.0], &[2, 2]);
+        let all = sparsify_by_magnitude(&t, 1.0).unwrap();
+        assert_close(&values(&all), &[1.0, -2.0, 3.0, 4.0], 0.0);
+        let none = sparsify_by_magnitude(&t, 0.0).unwrap();
+        assert_close(&values(&none), &[0.0; 4], 0.0);
+        assert_eq!(none.shape(), &[2, 2]);
     }
 
     #[test]
-    fn test_sparsify_half_density() {
-        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let mut result = sparsify_by_magnitude(&tensor, 0.5).unwrap();
-        let result_slice = result.to_f32_vec(4).unwrap();
-
-        // Should keep the two largest by magnitude (3.0 and 4.0)
-        assert_eq!(result_slice[0], 0.0);
-        assert_eq!(result_slice[1], 0.0);
-        assert_eq!(result_slice[2], 3.0);
-        assert_eq!(result_slice[3], 4.0);
+    fn magnitude_rounds_the_kept_count_to_nearest() {
+        // 0.3 of 10 entries is 3 (not 2 through a float-ceil artefact).
+        let t = arr(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], &[10]);
+        let out = values(&sparsify_by_magnitude(&t, 0.3).unwrap());
+        assert_eq!(out.iter().filter(|v| **v != 0.0).count(), 3);
+        assert_close(&out[7..], &[8.0, 9.0, 10.0], 0.0);
     }
 
     #[test]
-    fn test_sparsify_preserves_shape() {
-        let tensor = Array::from_f32_slice(&[1.0_f32; 12], &[3, 4]);
-        let result = sparsify_by_magnitude(&tensor, 0.5).unwrap();
-        assert_eq!(result.shape(), &[3, 4]);
+    fn invalid_densities_are_rejected() {
+        let t = arr(&[1.0], &[1]);
+        assert!(sparsify_by_magnitude(&t, 1.5).is_err());
+        assert!(sparsify_by_magnitude(&t, -0.1).is_err());
+        assert!(sparsify_by_magnitude(&t, f32::NAN).is_err());
+        assert!(sparsify_dare(&t, 2.0, 0, true).is_err());
+        assert!(sparsify_della(&t, 2.0, 0.1, 0, true).is_err());
+        assert!(sparsify_della(&t, 0.5, -0.1, 0, true).is_err());
     }
 
     #[test]
-    fn test_sparsify_handles_negative() {
-        let tensor = Array::from_f32_slice(&[-4.0_f32, 1.0, -2.0, 3.0], &[4]);
-        let mut result = sparsify_by_magnitude(&tensor, 0.5).unwrap();
-        let result_slice = result.to_f32_vec(4).unwrap();
-
-        // Should keep -4.0 and 3.0 (largest magnitudes)
-        assert_eq!(result_slice[0], -4.0);
-        assert_eq!(result_slice[1], 0.0);
-        assert_eq!(result_slice[2], 0.0);
-        assert_eq!(result_slice[3], 3.0);
-    }
-
-    #[test]
-    fn test_breadcrumbs_removes_outliers() {
-        // Values sorted by magnitude: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
-        let tensor = Array::from_f32_slice(
-            &[0.5_f32, 1.0, 0.3, 0.8, 0.1, 0.6, 0.9, 0.4, 0.2, 0.7],
-            &[10],
+    fn breadcrumbs_masks_both_tails_by_magnitude() {
+        // Magnitudes 0.1 .. 1.0. density 0.8 drops the smallest two (0.1,
+        // 0.2); gamma 0.1 drops the largest one (1.0).
+        let t = arr(&[0.5, -1.0, 0.3, 0.8, 0.1, 0.6, 0.9, -0.4, 0.2, 0.7], &[10]);
+        let out = sparsify_breadcrumbs(&t, 0.8, 0.1).unwrap();
+        assert_close(
+            &values(&out),
+            &[0.5, 0.0, 0.3, 0.8, 0.0, 0.6, 0.9, -0.4, 0.0, 0.7],
+            0.0,
         );
-
-        // Keep middle 50% (indices 2-7 in sorted order), remove smallest and largest
-        let mut result = sparsify_breadcrumbs(&tensor, 0.6, 0.1).unwrap();
-        let result_slice = result.to_f32_vec(10).unwrap();
-
-        // 1.0 (largest) should be removed
-        assert_eq!(result_slice[1], 0.0);
-        // 0.1 (smallest) should be removed
-        assert_eq!(result_slice[4], 0.0);
-    }
-
-    // =============================================================================
-    // Online Sparsification Tests
-    // =============================================================================
-
-    #[test]
-    fn test_quickselect_small() {
-        let mut data = vec![5.0, 2.0, 8.0, 1.0, 9.0];
-        let median = quickselect(&mut data, 2);
-        assert!((median - 5.0).abs() < 1e-6);
     }
 
     #[test]
-    fn test_quickselect_min() {
-        let mut data = vec![5.0, 2.0, 8.0, 1.0, 9.0];
-        let min = quickselect(&mut data, 0);
-        assert!((min - 1.0).abs() < 1e-6);
+    fn breadcrumbs_with_zero_gamma_only_trims_the_bottom() {
+        let t = arr(&[1.0, 2.0, 3.0, 4.0], &[4]);
+        let out = sparsify_breadcrumbs(&t, 0.5, 0.0).unwrap();
+        assert_close(&values(&out), &[0.0, 0.0, 3.0, 4.0], 0.0);
+        // density 1 with gamma 0.25 only removes the top outlier.
+        let out = sparsify_breadcrumbs(&t, 1.0, 0.25).unwrap();
+        assert_close(&values(&out), &[1.0, 2.0, 3.0, 0.0], 0.0);
+        assert!(sparsify_breadcrumbs(&t, 0.5, 0.75).is_err());
     }
 
     #[test]
-    fn test_quickselect_max() {
-        let mut data = vec![5.0, 2.0, 8.0, 1.0, 9.0];
-        let max = quickselect(&mut data, 4);
-        assert!((max - 9.0).abs() < 1e-6);
+    fn dare_survivors_are_rescaled_and_the_rate_matches_density() {
+        let n = 20_000;
+        let t = arr(&vec![1.0; n], &[n as i32]);
+        let out = values(&sparsify_dare(&t, 0.25, 11, true).unwrap());
+        assert!(out.iter().all(|&v| v == 0.0 || v == 4.0));
+        let kept = out.iter().filter(|&&v| v != 0.0).count() as f32 / n as f32;
+        // Binomial sigma is about 0.003, so this is a 6-sigma bound.
+        assert!((kept - 0.25).abs() < 0.02, "kept fraction {kept}");
+        // Without rescale the survivors are untouched.
+        let out = values(&sparsify_dare(&t, 0.25, 11, false).unwrap());
+        assert!(out.iter().all(|&v| v == 0.0 || v == 1.0));
     }
 
     #[test]
-    fn test_quickselect_single() {
-        let mut data = vec![42.0];
-        let result = quickselect(&mut data, 0);
-        assert!((result - 42.0).abs() < 1e-6);
+    fn dare_mask_is_a_function_of_the_seed() {
+        let n = 4096;
+        let t = arr(&vec![1.0; n], &[n as i32]);
+        let a = values(&sparsify_dare(&t, 0.5, 5, false).unwrap());
+        let b = values(&sparsify_dare(&t, 0.5, 5, false).unwrap());
+        let c = values(&sparsify_dare(&t, 0.5, 6, false).unwrap());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]
-    fn test_online_sparsify_matches_standard() {
-        // Online should produce same results as standard for identical inputs
-        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8]);
+    fn della_keeps_large_entries_more_often_and_rescales_by_keep_probability() {
+        // One row of 2000 magnitudes 1..=2000, density 0.5, epsilon 0.4:
+        // the keep probability runs linearly from 0.1 (rank 0) to 0.9.
+        let n = 2000;
+        let row: Vec<f32> = (1..=n).map(|i| i as f32).collect();
+        let t = arr(&row, &[1, n as i32]);
+        let out = values(&sparsify_della(&t, 0.5, 0.4, 3, true).unwrap());
 
-        let mut standard = sparsify_by_magnitude(&tensor, 0.5).unwrap();
-        let mut online = sparsify_by_magnitude_online(&tensor, 0.5).unwrap();
-
-        let standard_slice = standard.to_f32_vec(8).unwrap();
-        let online_slice = online.to_f32_vec(8).unwrap();
-
-        // Both should keep the top 50% by magnitude
-        assert_eq!(standard_slice, online_slice);
-    }
-
-    #[test]
-    fn test_online_sparsify_full_density() {
-        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let mut result = sparsify_by_magnitude_online(&tensor, 1.0).unwrap();
-        let result_slice = result.to_f32_vec(4).unwrap();
-
-        assert_eq!(result_slice, vec![1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_online_sparsify_zero_density() {
-        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let mut result = sparsify_by_magnitude_online(&tensor, 0.0).unwrap();
-        let result_slice = result.to_f32_vec(4).unwrap();
-
-        assert_eq!(result_slice, vec![0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn test_batch_sparsify() {
-        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let t2 = Array::from_f32_slice(&[0.5_f32, 1.5, 2.5, 3.5], &[4]);
-
-        let results = sparsify_batch_by_magnitude(&[t1, t2], &[0.5, 0.5]).unwrap();
-
-        assert_eq!(results.len(), 2);
-
-        // First tensor: keep 3.0 and 4.0
-        let r1 = results[0].clone().to_f32_vec(4).unwrap();
-        assert_eq!(r1[0], 0.0);
-        assert_eq!(r1[1], 0.0);
-        assert_eq!(r1[2], 3.0);
-        assert_eq!(r1[3], 4.0);
-
-        // Second tensor: keep 2.5 and 3.5
-        let r2 = results[1].clone().to_f32_vec(4).unwrap();
-        assert_eq!(r2[0], 0.0);
-        assert_eq!(r2[1], 0.0);
-        assert_eq!(r2[2], 2.5);
-        assert_eq!(r2[3], 3.5);
-    }
-
-    #[test]
-    fn test_compute_and_apply_thresholds() {
-        let t1 = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[4]);
-        let t2 = Array::from_f32_slice(&[0.5_f32, 1.5, 2.5, 3.5], &[4]);
-
-        let thresholds = compute_thresholds(&[t1.clone(), t2.clone()], &[0.5, 0.5]).unwrap();
-
-        assert_eq!(thresholds.len(), 2);
-
-        // Apply thresholds
-        let results = apply_thresholds(&[t1, t2], &thresholds).unwrap();
-
-        // Verify results match direct sparsification
-        let r1 = results[0].clone().to_f32_vec(4).unwrap();
-        assert_eq!(r1[2], 3.0);
-        assert_eq!(r1[3], 4.0);
-    }
-
-    #[test]
-    fn test_dare_sparsification_seeded() {
-        let tensor = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8]);
-
-        // Same seed should produce same result
-        let result1 = sparsify_dare(&tensor, 0.5, Some(42)).unwrap();
-        let result2 = sparsify_dare(&tensor, 0.5, Some(42)).unwrap();
-
-        let r1 = result1.clone().to_f32_vec(8).unwrap();
-        let r2 = result2.clone().to_f32_vec(8).unwrap();
-
-        assert_eq!(r1, r2);
-    }
-
-    #[test]
-    fn test_dare_rescaling() {
-        let tensor = Array::from_f32_slice(&[1.0_f32, 1.0, 1.0, 1.0], &[4]);
-
-        // With density=0.5, kept values should be scaled by 1/0.5 = 2.0
-        let mut result = sparsify_dare(&tensor, 0.5, Some(12345)).unwrap();
-        let result_slice = result.to_f32_vec(4).unwrap();
-
-        // Count non-zero values
-        let non_zero: Vec<f32> = result_slice.iter().copied().filter(|&x| x != 0.0).collect();
-
-        // All non-zero values should be 2.0 (1.0 * 1/0.5)
-        for val in &non_zero {
-            assert!((val - 2.0).abs() < 1e-6);
+        // Every survivor is x / p with p the reference probability for its
+        // rank (here rank = x - 1).
+        for (i, (&x, &y)) in row.iter().zip(&out).enumerate() {
+            if y != 0.0 {
+                let p = 0.1 + 0.8 * (i as f32) / (n as f32 - 1.0);
+                assert!((y - x / p).abs() <= 1e-3 * (x / p), "entry {i}: {y} vs {}", x / p);
+            }
         }
+        // The lower quarter is kept about 0.2 of the time, the upper about 0.8.
+        let rate = |range: std::ops::Range<usize>| {
+            out[range.clone()].iter().filter(|&&v| v != 0.0).count() as f32 / range.len() as f32
+        };
+        let (low, high) = (rate(0..n / 4), rate(3 * n / 4..n));
+        assert!((low - 0.2).abs() < 0.08, "low-magnitude keep rate {low}");
+        assert!((high - 0.8).abs() < 0.08, "high-magnitude keep rate {high}");
+    }
+
+    #[test]
+    fn della_ranks_each_row_on_its_own() {
+        // Two rows with the same shape of magnitudes but 1000x apart: the
+        // ranks, and so the keep probabilities, are identical.
+        let n = 1000;
+        let small: Vec<f32> = (1..=n).map(|i| i as f32 * 1e-3).collect();
+        let big: Vec<f32> = (1..=n).map(|i| i as f32).collect();
+        let t = arr(&[small.clone(), big.clone()].concat(), &[2, n as i32]);
+        let out = values(&sparsify_della(&t, 0.5, 0.4, 9, true).unwrap());
+        let (a, b) = out.split_at(n);
+        for i in 0..n {
+            let p = 0.1 + 0.8 * (i as f32) / (n as f32 - 1.0);
+            for (row_vals, src) in [(a, &small), (b, &big)] {
+                if row_vals[i] != 0.0 {
+                    let want = src[i] / p;
+                    assert!((row_vals[i] - want).abs() <= 1e-3 * want);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn della_without_epsilon_is_uniform_dare() {
+        let n = 20_000;
+        let t = arr(&vec![1.0; n], &[1, n as i32]);
+        let out = values(&sparsify_della(&t, 0.25, 0.0, 1, true).unwrap());
+        assert!(out.iter().all(|&v| v == 0.0 || v == 4.0));
+        let kept = out.iter().filter(|&&v| v != 0.0).count() as f32 / n as f32;
+        assert!((kept - 0.25).abs() < 0.02, "kept fraction {kept}");
     }
 }

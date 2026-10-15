@@ -89,6 +89,33 @@ pub fn disjoint_merge(
     Ok(numerator.divide(&safe))
 }
 
+/// Combine sparsified task vectors into one: the disjoint merge when
+/// `elect_sign` (TIES-style), else the weighted sum, which `normalize`
+/// divides by the total weight.
+pub(crate) fn combine_task_vectors(
+    task_vectors: &[Array],
+    weights: &[f32],
+    elect_sign: bool,
+    normalize: bool,
+) -> Result<Array> {
+    if elect_sign {
+        return disjoint_merge(task_vectors, weights, SignElection::Mass, normalize);
+    }
+    check_inputs(task_vectors, weights)?;
+    let total: f32 = weights.iter().sum();
+    if normalize && total.abs() < 1e-12 {
+        return Err(crate::MergeError::InvalidConfig(
+            "Cannot normalize weights: they sum to zero".to_string(),
+        ));
+    }
+    let divisor = if normalize { total } else { 1.0 };
+    let mut sum = Array::zeros(task_vectors[0].shape(), Dtype::Float32.as_i32());
+    for (tv, &w) in task_vectors.iter().zip(weights) {
+        sum = sum.add(&tv.multiply(&Array::from_f32(w / divisor)));
+    }
+    Ok(sum)
+}
+
 fn check_inputs(task_vectors: &[Array], weights: &[f32]) -> Result<()> {
     if task_vectors.is_empty() {
         return Err(crate::MergeError::NotEnoughModels {
@@ -162,6 +189,18 @@ mod tests {
         let tvs = [arr(&[2.0, -3.0], &[2])];
         let out = disjoint_merge(&tvs, &[1.0], SignElection::Mass, true).unwrap();
         assert_close(&values(&out), &[2.0, -3.0], 1e-6);
+    }
+
+    #[test]
+    fn combine_without_election_is_the_weighted_sum() {
+        let tvs = [arr(&[4.0, 8.0], &[2]), arr(&[8.0, -8.0], &[2])];
+        // (1 * 4 + 3 * 8) / 4 = 7 and (1 * 8 - 3 * 8) / 4 = -4 normalized;
+        // 28 and -16 as a plain sum.
+        let out = combine_task_vectors(&tvs, &[1.0, 3.0], false, true).unwrap();
+        assert_close(&values(&out), &[7.0, -4.0], 1e-6);
+        let out = combine_task_vectors(&tvs, &[1.0, 3.0], false, false).unwrap();
+        assert_close(&values(&out), &[28.0, -16.0], 1e-6);
+        assert!(combine_task_vectors(&tvs, &[1.0, -1.0], false, true).is_err());
     }
 
     #[test]

@@ -46,6 +46,7 @@ mod merge;
 pub mod methods;
 pub mod moe_align;
 pub mod sanity;
+mod seed;
 mod sparsify;
 #[cfg(test)]
 mod test_util;
