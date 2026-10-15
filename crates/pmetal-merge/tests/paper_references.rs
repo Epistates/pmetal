@@ -2,8 +2,8 @@
 //! enough to work out by hand. Public API only.
 
 use pmetal_merge::{
-    BreadcrumbsMerge, DellaMerge, MergeMethod, MergeParameters, ModelStockMerge, SlerpMerge,
-    TaskArithmeticMerge,
+    BreadcrumbsMerge, DellaMerge, MergeMethod, MergeParameters, ModelStockMerge, MultiSlerpMerge,
+    SlerpMerge, TaskArithmeticMerge,
 };
 use pmetal_runtime::compat::Array;
 
@@ -158,4 +158,27 @@ fn slerp_interpolates_along_the_arc() {
     let want = [((1.0 - t) * theta).sin(), (t * theta).sin()];
     let out = SlerpMerge::slerp(&a, &b, t).unwrap();
     assert_close(&read(&out), &want, 1e-5);
+}
+
+/// Multi-SLERP of two models with weights (1 - t, t) is the SLERP point at t,
+/// not the normalized weighted mean: orthogonal unit vectors at t = 0.25 sit
+/// at 22.5 degrees, where the normalized mean would give 18.4.
+#[test]
+fn multislerp_of_two_models_is_the_slerp_point() {
+    let (a, b) = (arr(&[1.0, 0.0]), arr(&[0.0, 1.0]));
+    let params = [
+        MergeParameters {
+            weight: Some(0.75_f32.into()),
+            ..Default::default()
+        },
+        MergeParameters {
+            weight: Some(0.25_f32.into()),
+            ..Default::default()
+        },
+    ];
+    let out = MultiSlerpMerge::new()
+        .merge(&[a, b], None, &params, &MergeParameters::default())
+        .unwrap();
+    let angle = std::f32::consts::FRAC_PI_8;
+    assert_close(&read(&out), &[angle.cos(), angle.sin()], 1e-5);
 }
