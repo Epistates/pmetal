@@ -215,8 +215,7 @@ fn a_tree_forward_gives_each_node_the_logits_of_its_own_path() {
     let draft_logits = Array::from_slice(&rows, &[3, 80]);
     let tree = build_tree(&draft_logits, 9);
     assert!(
-        tree.node_depths.iter().any(|&d| d == 2)
-            && tree.parents.iter().filter(|&&p| p == 0).count() > 1,
+        tree.node_depths.contains(&2) && tree.parents.iter().filter(|&&p| p == 0).count() > 1,
         "the tree should branch and go deep: {:?}",
         tree.node_depths
     );

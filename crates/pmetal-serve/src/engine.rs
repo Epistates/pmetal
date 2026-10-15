@@ -3022,7 +3022,7 @@ mod tests {
     #[test]
     fn detect_stop_sequence_suffix_finds_a_match_at_the_end_of_a_long_generation() {
         let tokenizer = subword_tokenizer();
-        let mut generated = vec![1u32, 5].repeat(5000);
+        let mut generated = [1u32, 5].repeat(5000);
         generated.extend([2, 3]);
         assert_eq!(
             detect_stop_sequence_suffix(&tokenizer, &generated, &["END".to_string()]),
