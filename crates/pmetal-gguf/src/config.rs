@@ -208,10 +208,8 @@ mod tests {
             map.insert(k.to_string(), v);
         }
         GgufContent {
-            version: crate::GgufVersion::V3,
             metadata: map,
-            tensor_infos: HashMap::new(),
-            tensor_data_offset: 0,
+            ..GgufContent::default()
         }
     }
 
@@ -242,12 +240,7 @@ mod tests {
 
     #[test]
     fn test_config_from_gguf_no_architecture() {
-        let content = GgufContent {
-            version: crate::GgufVersion::V3,
-            metadata: HashMap::new(),
-            tensor_infos: HashMap::new(),
-            tensor_data_offset: 0,
-        };
+        let content = GgufContent::default();
         assert!(config_from_gguf(&content).is_none());
     }
 

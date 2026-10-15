@@ -96,6 +96,57 @@ pub enum GgmlType {
     Q1_0 = 41,
 }
 
+impl TryFrom<u32> for GgmlType {
+    type Error = ();
+
+    /// Decode the type id stored in a tensor-info entry.
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ok(match value {
+            0 => Self::F32,
+            1 => Self::F16,
+            2 => Self::Q4_0,
+            3 => Self::Q4_1,
+            6 => Self::Q5_0,
+            7 => Self::Q5_1,
+            8 => Self::Q8_0,
+            9 => Self::Q8_1,
+            10 => Self::Q2K,
+            11 => Self::Q3K,
+            12 => Self::Q4K,
+            13 => Self::Q5K,
+            14 => Self::Q6K,
+            15 => Self::Q8K,
+            16 => Self::Iq2Xxs,
+            17 => Self::Iq2Xs,
+            18 => Self::Iq3Xxs,
+            19 => Self::Iq1S,
+            20 => Self::Iq4Nl,
+            21 => Self::Iq3S,
+            22 => Self::Iq2S,
+            23 => Self::Iq4Xs,
+            24 => Self::I8,
+            25 => Self::I16,
+            26 => Self::I32,
+            27 => Self::I64,
+            28 => Self::F64,
+            29 => Self::Iq1M,
+            30 => Self::Bf16,
+            31 => Self::Q4_0_4_4,
+            32 => Self::Q4_0_4_8,
+            33 => Self::Q4_0_8_8,
+            34 => Self::Tq1_0,
+            35 => Self::Tq2_0,
+            36 => Self::Iq4Nl_4_4,
+            37 => Self::Iq4Nl_4_8,
+            38 => Self::Iq4Nl_8_8,
+            39 => Self::Mxfp4,
+            40 => Self::Nvfp4,
+            41 => Self::Q1_0,
+            _ => return Err(()),
+        })
+    }
+}
+
 impl GgmlType {
     /// Get the number of bytes per element for this type.
     /// Note: For quantized types, this returns the block size in bytes.
@@ -220,7 +271,7 @@ pub enum MetadataValueType {
 }
 
 /// A metadata value in GGUF format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
     /// 8-bit unsigned integer
     Uint8(u8),
