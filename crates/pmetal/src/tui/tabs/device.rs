@@ -26,7 +26,6 @@ pub struct DeviceInfo {
     pub has_nax: bool,
     pub supports_ane: bool,
     pub batch_size_multiplier: usize,
-    pub tile_size: (u32, u32, u32),
     pub architecture_gen: u32,
     pub memory_bandwidth_gbps: f64,
     pub gpu_core_count: u32,
@@ -55,7 +54,6 @@ impl DeviceInfo {
             has_nax: props.has_nax,
             supports_ane: ctx.supports_neural_engine(),
             batch_size_multiplier: props.batch_size_multiplier(),
-            tile_size: props.recommended_tile_size(),
             architecture_gen: props.architecture_gen,
             memory_bandwidth_gbps: props.memory_bandwidth_gbps,
             gpu_core_count: props.gpu_core_count,
@@ -278,17 +276,6 @@ impl DeviceTab {
             Line::from(vec![
                 Span::styled("Batch Multiplier: ", THEME.kv_key),
                 Span::styled(format!("{}x", dev.batch_size_multiplier), THEME.kv_value),
-            ])
-            .render(row, buf);
-        }
-
-        let y_offset = y_offset + 1;
-        if inner.y + y_offset < inner.y + inner.height {
-            let row = Rect::new(inner.x, inner.y + y_offset, inner.width, 1);
-            let (m, n, k) = dev.tile_size;
-            Line::from(vec![
-                Span::styled("   Tile Size MNK: ", THEME.kv_key),
-                Span::styled(format!("{m}x{n}x{k}"), THEME.kv_value),
             ])
             .render(row, buf);
         }

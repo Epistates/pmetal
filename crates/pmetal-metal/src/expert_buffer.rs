@@ -1,30 +1,40 @@
 #![allow(unsafe_code)]
 
-//! 2 MB-aligned buffer pool for expert weight offloading.
+//! Page-aligned buffer pool for expert weight offloading.
 //!
 //! Expert weight offloading streams quantized MoE expert weights from disk into
-//! GPU-visible memory at decode time, hiding I/O latency behind compute.  The
-//! critical constraint is **zero-copy**: `pread(2)` writes directly into the
-//! aligned region, and the same region is immediately GPU-accessible as a Metal
-//! `StorageModeShared` buffer — no intermediate bounce buffer required.
+//! GPU-visible memory at decode time.  The critical constraint is
+//! **zero-copy on the GPU side**: `pread(2)` writes directly into a
+//! page-aligned region, and the same region is immediately GPU-accessible as a
+//! Metal `StorageModeShared` buffer — no bounce buffer between the read and the
+//! kernel.
+//!
+//! # What the pool is, and is not
+//!
+//! The pool is a bounded set of destination buffers, not a cache.  It keeps no
+//! expert resident across uses and evicts nothing: the operating system's page
+//! cache already holds recently read expert files in free memory and serves a
+//! repeat read at memory speed, which no cache of our own can beat while
+//! sharing that memory with it.  The buffers are read into with plain
+//! `pread` (never `F_NOCACHE`) so that the page cache keeps working.
+//!
+//! Reading from the SSD and running GPU kernels do not overlap profitably on
+//! Apple Silicon: both draw on the same unified memory and the same fabric.
+//! The second buffer of each pair exists so the *next* expert's read can be
+//! issued while the current kernel is encoded, not because the transfer hides
+//! behind compute.
 //!
 //! # Alignment requirement
 //!
-//! macOS requires that memory passed to
-//! `newBufferWithBytesNoCopy:length:options:deallocator:` be aligned to the
-//! system's virtual-memory page size.  On Apple Silicon the page size is 16 KB,
-//! but large-page mappings use 2 MB boundaries, which is also the natural
-//! alignment for MoE expert weights (typically 256 KiB – 4 MiB per expert).
-//! Using 2 MB alignment:
+//! `newBufferWithBytesNoCopy:length:options:deallocator:` needs memory aligned
+//! to the system page size, with a length that is a multiple of it (16 KiB on
+//! Apple Silicon).  Buffers are anonymous page mappings: page-aligned,
+//! zero-filled, and committed lazily, so a buffer larger than the expert it
+//! carries costs only the pages that are touched.
 //!
-//! - Satisfies Metal's page-alignment requirement on all Apple Silicon variants.
-//! - Keeps each buffer on a single huge-page, reducing TLB pressure during GPU
-//!   scatter-gather DMA.
-//! - Allows `pread` to write at full DMA bandwidth without cross-page tearing.
+//! # Pool design
 //!
-//! # Pool design — double buffering
-//!
-//! The pool holds `2 * K` buffers (two "slots" per active expert stream):
+//! The pool holds `2 * K` buffers:
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
@@ -33,13 +43,15 @@
 //! │  │ buf[0] │  │ buf[1] │  │ buf[2] │  │ buf[3] │  …  2*K total  │
 //! │  └────────┘  └────────┘  └────────┘  └────────┘                 │
 //! └──────────────────────────────────────────────────────────────────┘
-//!       │  acquire()                              │  release()
+//!       │  acquire()                              │  release() / drop
 //!       ▼                                         │
 //!    pread() ──► GPU kernel ──► done ─────────────┘
 //! ```
 //!
-//! While the GPU processes expert *N* (buffer A), the I/O thread prefetches
-//! expert *N+1* into buffer B, so neither side ever stalls.
+//! A buffer taken from the pool returns to it when it is released **or
+//! dropped**, so an error path or a panic between `acquire` and `release`
+//! cannot shrink the pool until `acquire_blocking` waits forever.  Either way
+//! the caller must have waited for the GPU to finish with it first.
 //!
 //! # Thread safety
 //!
@@ -65,7 +77,6 @@
 //! // I/O thread: acquire a buffer, fill it with pread, hand it to the GPU.
 //! let mut buf = pool.acquire_blocking();
 //! let n = buf.pread(file.as_raw_fd(), file_offset)?;
-//! assert_eq!(n, buf.size());
 //! // Pass buf.metal_buffer() to your compute encoder …
 //!
 //! // When done, return the buffer to the pool.
@@ -73,6 +84,7 @@
 //! ```
 
 use std::collections::VecDeque;
+use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -89,87 +101,107 @@ use crate::error::{MetalError, Result};
 // POSIX FFI (inline — avoids adding a `libc` dependency)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 2 MiB alignment — satisfies Metal's page-alignment requirement and keeps
-/// each buffer on a single huge-page boundary.
-pub const ALIGN_2MB: usize = 2 * 1024 * 1024;
-
 mod sys {
     use std::ffi::c_void;
 
-    // posix_memalign(3): allocates `size` bytes with `alignment`-byte alignment.
-    // Returns 0 on success, an errno value on failure.
-    // `alignment` must be a power of two and a multiple of sizeof(void*).
-    //
+    pub const PROT_READ: i32 = 0x1;
+    pub const PROT_WRITE: i32 = 0x2;
+    pub const MAP_PRIVATE: i32 = 0x0002;
+    pub const MAP_ANON: i32 = 0x1000;
+    pub const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
+    pub const EINTR: i32 = 4;
+
+    // mmap(2) with MAP_ANON: page-aligned, zero-filled, lazily committed.
     // pread(2): read `count` bytes from fd at `offset` into `buf` without
     // advancing the file position.  Returns bytes read, or -1 on error.
     unsafe extern "C" {
-        pub fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> i32;
-        pub fn free(ptr: *mut c_void);
+        pub fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn pread(fd: i32, buf: *mut c_void, count: usize, offset: i64) -> isize;
+        pub fn getpagesize() -> i32;
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AlignedBuffer
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A 2 MB-aligned CPU allocation wrapped as a GPU-visible Metal buffer.
-///
-/// The allocation is made with `posix_memalign(ALIGN_2MB, size)` and registered
-/// with Metal via `newBufferWithBytesNoCopy:length:options:deallocator:` using
-/// `StorageModeShared`.  No bytes are ever copied: the CPU and GPU share the
-/// same physical pages.
-///
-/// # Ownership
-///
-/// `AlignedBuffer` owns the underlying allocation.  When dropped:
-///
-/// 1. The [`Retained`] Metal buffer handle is released (ARC decrement).  Metal
-///    will stop accessing the pages once all GPU work referencing them has
-///    completed, but the caller is responsible for ensuring the GPU has finished
-///    before dropping.
-/// 2. The raw allocation is freed with `free(3)`.
-///
-/// To avoid use-after-free, always wait for GPU completion before dropping or
-/// returning the buffer to the pool.
-pub struct AlignedBuffer {
-    /// Raw 2 MB-aligned allocation.  Kept alive for the lifetime of
-    /// `metal_buf` and freed in `Drop`.
-    raw: NonNull<std::ffi::c_void>,
-
-    /// Byte capacity of the allocation.
-    size: usize,
-
-    /// Metal buffer wrapping `raw` (no-copy, shared storage).
-    ///
-    /// Wrapped in `ManuallyDrop` so that our `Drop` implementation controls the
-    /// exact drop order: Metal buffer ARC is decremented first, then the backing
-    /// allocation is freed.  Without `ManuallyDrop`, Rust would auto-drop
-    /// `metal_buf` *after* our `Drop::drop` body runs, which means `free` would
-    /// execute while Metal still holds a CPU-side retain on the allocation.
-    metal_buf: std::mem::ManuallyDrop<Retained<ProtocolObject<dyn MTLBuffer>>>,
+/// The system page size in bytes (16 KiB on Apple Silicon).
+pub fn page_size() -> usize {
+    // SAFETY: `getpagesize` takes no arguments and has no preconditions.
+    let size = unsafe { sys::getpagesize() };
+    usize::try_from(size)
+        .ok()
+        .filter(|s| s.is_power_of_two())
+        .unwrap_or(16 * 1024)
 }
 
-impl AlignedBuffer {
-    /// Allocate a new 2 MB-aligned buffer and register it with `device` as a
-    /// shared Metal buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `device` — the Metal device to register the buffer with.
-    /// * `size`   — number of bytes to allocate.  Must be `> 0`.  The actual
-    ///   allocation is rounded up to the next multiple of [`ALIGN_2MB`] so that
-    ///   the buffer always covers at least `size` bytes and the registration
-    ///   satisfies Metal's page-alignment length requirement.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MetalError::BufferCreation`] if:
-    ///
-    /// - `size` is zero.
-    /// - `posix_memalign` fails (ENOMEM / EINVAL).
-    /// - `newBufferWithBytesNoCopy` returns `nil` (device out of resources).
-    pub fn new(device: &ProtocolObject<dyn MTLDevice>, size: usize) -> Result<Self> {
+/// The most bytes one `pread` call is asked for; macOS rejects a count above
+/// `INT_MAX`.
+const MAX_READ_CHUNK: usize = 1 << 30;
+
+/// Read until `len` bytes arrive or the file ends, retrying calls a signal
+/// interrupted and continuing after short reads.
+///
+/// `read_at(dst, count, offset)` is one `pread`.  Returns the bytes read,
+/// which is less than `len` only at end of file.
+fn read_fully(
+    mut read_at: impl FnMut(*mut u8, usize, u64) -> std::io::Result<usize>,
+    dst: *mut u8,
+    len: usize,
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut done = 0usize;
+    while done < len {
+        let position = offset.checked_add(done as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "file offset overflows")
+        })?;
+        // SAFETY: `done < len`, and the caller guarantees `dst` is valid for `len` bytes.
+        let at = unsafe { dst.add(done) };
+        match read_at(at, (len - done).min(MAX_READ_CHUNK), position) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(error) if error.raw_os_error() == Some(sys::EINTR) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(done)
+}
+
+/// `pread(2)` as an `io::Result`.
+fn pread_syscall(fd: i32, dst: *mut u8, count: usize, offset: u64) -> std::io::Result<usize> {
+    let offset = i64::try_from(offset).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "file offset exceeds i64")
+    })?;
+    // SAFETY: the caller of `read_fully` guarantees `dst` is valid for
+    // `count` writable bytes; `fd` is an integer the kernel validates.
+    let n = unsafe { sys::pread(fd, dst.cast(), count, offset) };
+    usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Allocation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// An anonymous page mapping wrapped as a no-copy Metal buffer.
+///
+/// Dropping releases the Metal buffer first, then unmaps the memory it
+/// aliased.
+struct Allocation {
+    /// Start of the mapping.
+    raw: NonNull<std::ffi::c_void>,
+    /// Length of the mapping in bytes, a multiple of the page size.
+    size: usize,
+    /// Metal buffer over `raw`.  `ManuallyDrop` so `Drop` can release it
+    /// strictly before the memory goes away.
+    metal_buf: ManuallyDrop<Retained<ProtocolObject<dyn MTLBuffer>>>,
+}
+
+impl Allocation {
+    fn new(device: &ProtocolObject<dyn MTLDevice>, size: usize) -> Result<Self> {
         if size == 0 {
             return Err(MetalError::BufferCreation {
                 size: 0,
@@ -177,73 +209,59 @@ impl AlignedBuffer {
             });
         }
 
-        // Round up to the next multiple of ALIGN_2MB so that both the
-        // allocation size and the Metal buffer length are page-aligned.
-        let alloc_size = size.div_ceil(ALIGN_2MB) * ALIGN_2MB;
+        // Round up so the mapping and the Metal buffer length are both whole pages.
+        let page = page_size();
+        let alloc_size =
+            size.checked_next_multiple_of(page)
+                .ok_or_else(|| MetalError::BufferCreation {
+                    size,
+                    reason: "size rounded up to a page overflows".to_string(),
+                })?;
 
-        // ── allocate ──────────────────────────────────────────────────────────
-        let raw = {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-
-            // SAFETY:
-            // 1. `ptr` is a valid stack variable whose address we pass.
-            // 2. `ALIGN_2MB` is a power of two and a multiple of `sizeof(void*)`.
-            // 3. `alloc_size` is a non-zero multiple of `ALIGN_2MB`.
-            let rc = unsafe { sys::posix_memalign(&mut ptr, ALIGN_2MB, alloc_size) };
-            if rc != 0 {
-                return Err(MetalError::BufferCreation {
-                    size: alloc_size,
-                    reason: format!(
-                        "posix_memalign({ALIGN_2MB}, {alloc_size}) failed with errno {rc}"
-                    ),
-                });
-            }
-
-            // SAFETY: `posix_memalign` returned 0, so `ptr` is now a valid
-            // non-null pointer to `alloc_size` bytes of writable memory.
-            NonNull::new(ptr).ok_or_else(|| MetalError::BufferCreation {
-                size: alloc_size,
-                reason: "posix_memalign returned null despite rc == 0".to_string(),
-            })?
-        };
-
-        // ── register with Metal (no-copy) ────────────────────────────────────
-        //
-        // `StorageModeShared`: unified memory — both CPU and GPU can read/write
-        // the same physical pages.
-        //
-        // `HazardTrackingModeTracked`: Metal automatically inserts barriers when
-        // buffers transition between CPU and GPU access, preventing data races
-        // without manual fencing in the common case.
-        //
-        // `deallocator: None`: we own the allocation and free it in `Drop`.
-        // We must not free it before all GPU work referencing this buffer has
-        // completed; the pool's `release` / `acquire_blocking` protocol enforces
-        // this by requiring callers to wait for GPU completion first.
-        let options =
-            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeTracked;
-
-        // SAFETY:
-        // 1. `raw.as_ptr()` is non-null, 2 MB-aligned, and valid for
-        //    `alloc_size` bytes — guaranteed by `posix_memalign` above.
-        // 2. `alloc_size` matches the allocation length exactly.
-        // 3. `options` requests shared storage, which is valid for unified
-        //    memory on Apple Silicon.
-        // 4. `deallocator` is `None`: Metal will not attempt to free the memory;
-        //    our `Drop` implementation calls `free` after the Metal buffer handle
-        //    (and thus all GPU references) have been released.
-        let metal_buf = unsafe {
-            device.newBufferWithBytesNoCopy_length_options_deallocator(
-                NonNull::new_unchecked(raw.as_ptr()),
+        // SAFETY: an anonymous private mapping at a kernel-chosen address
+        // (`addr` null, `fd` -1); no existing memory is touched.
+        let ptr = unsafe {
+            sys::mmap(
+                std::ptr::null_mut(),
                 alloc_size,
-                options,
-                None, // deallocator: we handle lifetime in Drop
+                sys::PROT_READ | sys::PROT_WRITE,
+                sys::MAP_PRIVATE | sys::MAP_ANON,
+                -1,
+                0,
             )
+        };
+        let raw = if ptr == sys::MAP_FAILED {
+            None
+        } else {
+            NonNull::new(ptr)
         }
         .ok_or_else(|| MetalError::BufferCreation {
             size: alloc_size,
-            reason: "newBufferWithBytesNoCopy returned nil — device out of resources?".to_string(),
+            reason: format!("mmap failed: {}", std::io::Error::last_os_error()),
         })?;
+
+        // `StorageModeShared`: unified memory, CPU and GPU share the pages.
+        // `HazardTrackingModeTracked`: Metal orders GPU access to the buffer.
+        let options =
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeTracked;
+
+        // SAFETY: `raw` is page-aligned and valid for `alloc_size` bytes
+        // (a whole number of pages), as `newBufferWithBytesNoCopy` requires.
+        // `deallocator` is `None` because `Drop` unmaps the memory after
+        // releasing the Metal buffer.
+        let metal_buf = unsafe {
+            device
+                .newBufferWithBytesNoCopy_length_options_deallocator(raw, alloc_size, options, None)
+        };
+        let Some(metal_buf) = metal_buf else {
+            // SAFETY: the mapping was made above and nothing else refers to it.
+            unsafe { sys::munmap(raw.as_ptr(), alloc_size) };
+            return Err(MetalError::BufferCreation {
+                size: alloc_size,
+                reason: "newBufferWithBytesNoCopy returned nil — device out of resources?"
+                    .to_string(),
+            });
+        };
 
         debug!(
             size_requested = size,
@@ -255,17 +273,86 @@ impl AlignedBuffer {
         Ok(Self {
             raw,
             size: alloc_size,
-            metal_buf: std::mem::ManuallyDrop::new(metal_buf),
+            metal_buf: ManuallyDrop::new(metal_buf),
+        })
+    }
+}
+
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        // SAFETY: `metal_buf` is initialised in `new` and dropped only here.
+        // Releasing it first means the Metal object no longer refers to the
+        // pages by the time they are unmapped; the owner is contractually
+        // responsible for having waited for any GPU work that used them.
+        unsafe { ManuallyDrop::drop(&mut self.metal_buf) };
+
+        // SAFETY: `raw`/`size` describe exactly the mapping `mmap` returned,
+        // not yet unmapped.
+        unsafe { sys::munmap(self.raw.as_ptr(), self.size) };
+
+        debug!(ptr = ?self.raw.as_ptr(), "AlignedBuffer freed");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AlignedBuffer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A page-aligned CPU allocation wrapped as a GPU-visible Metal buffer.
+///
+/// The memory is an anonymous mapping (zero-filled until written), registered
+/// with Metal via `newBufferWithBytesNoCopy:length:options:deallocator:` using
+/// `StorageModeShared`.  No bytes are ever copied: the CPU and GPU share the
+/// same physical pages.
+///
+/// # Ownership
+///
+/// `AlignedBuffer` owns the underlying allocation.  A buffer acquired from an
+/// [`ExpertBufferPool`] goes back to that pool when dropped; any other buffer
+/// releases the Metal handle and unmaps the memory.  Either way, always wait
+/// for GPU completion before dropping or releasing the buffer: the GPU reads
+/// these pages directly.
+pub struct AlignedBuffer {
+    /// The mapping and its Metal buffer.  Taken out on drop.
+    allocation: ManuallyDrop<Allocation>,
+
+    /// The pool this buffer returns to when dropped, set while it is checked out.
+    home: Option<Arc<PoolInner>>,
+}
+
+impl AlignedBuffer {
+    /// Allocate a new page-aligned buffer and register it with `device` as a
+    /// shared Metal buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `device` — the Metal device to register the buffer with.
+    /// * `size`   — number of bytes to allocate.  Must be `> 0`.  The actual
+    ///   allocation is rounded up to a whole number of pages
+    ///   ([`page_size`]) so that the registration satisfies Metal's
+    ///   page-alignment length requirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MetalError::BufferCreation`] if:
+    ///
+    /// - `size` is zero.
+    /// - the mapping cannot be made.
+    /// - `newBufferWithBytesNoCopy` returns `nil` (device out of resources).
+    pub fn new(device: &ProtocolObject<dyn MTLDevice>, size: usize) -> Result<Self> {
+        Ok(Self {
+            allocation: ManuallyDrop::new(Allocation::new(device, size)?),
+            home: None,
         })
     }
 
     // ── accessors ─────────────────────────────────────────────────────────────
 
     /// The total byte capacity of the allocation (rounded up from the requested
-    /// size to the next multiple of [`ALIGN_2MB`]).
+    /// size to a whole number of pages).
     #[inline]
     pub fn size(&self) -> usize {
-        self.size
+        self.allocation.size
     }
 
     /// A reference to the underlying Metal buffer.
@@ -274,7 +361,7 @@ impl AlignedBuffer {
     /// dispatching a GPU kernel over the expert weights.
     #[inline]
     pub fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
-        &self.metal_buf
+        &self.allocation.metal_buf
     }
 
     /// A retained (ref-counted) clone of the Metal buffer handle.
@@ -283,7 +370,7 @@ impl AlignedBuffer {
     /// (e.g., when passing into a closure or async task).
     #[inline]
     pub fn metal_buffer_retained(&self) -> Retained<ProtocolObject<dyn MTLBuffer>> {
-        (*self.metal_buf).clone()
+        (*self.allocation.metal_buf).clone()
     }
 
     /// A raw byte pointer to the beginning of the aligned allocation.
@@ -298,7 +385,7 @@ impl AlignedBuffer {
     /// before submitting GPU work.
     #[inline]
     pub fn as_ptr(&self) -> *mut u8 {
-        self.raw.as_ptr() as *mut u8
+        self.allocation.raw.as_ptr() as *mut u8
     }
 
     /// An immutable byte slice covering the full allocation.
@@ -307,9 +394,9 @@ impl AlignedBuffer {
     /// in-flight GPU writes that might target this buffer.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
-        // SAFETY: `raw` is valid for `size` bytes for the lifetime of `self`,
-        // and we only expose immutable access here.
-        unsafe { std::slice::from_raw_parts(self.raw.as_ptr() as *const u8, self.size) }
+        // SAFETY: the mapping is valid and initialised (zero-filled) for
+        // `size` bytes for the lifetime of `self`; only immutable access here.
+        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.size()) }
     }
 
     /// A mutable byte slice covering the full allocation.
@@ -320,9 +407,9 @@ impl AlignedBuffer {
     /// writing this buffer.
     #[inline]
     pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `raw` is valid for `size` bytes and exclusively owned by
-        // this struct at the point where the caller holds `&mut self`.
-        unsafe { std::slice::from_raw_parts_mut(self.raw.as_ptr() as *mut u8, self.size) }
+        // SAFETY: the mapping is valid for `size` bytes and exclusively owned
+        // by this struct at the point where the caller holds `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.as_ptr(), self.size()) }
     }
 
     /// Copy a byte slice into the start of the buffer.
@@ -331,11 +418,11 @@ impl AlignedBuffer {
     /// have the expert bytes resident in CPU memory and want to preserve the
     /// aligned Metal-shared fast path for subsequent GPU dispatch.
     pub fn write_prefix(&mut self, src: &[u8]) -> Result<()> {
-        if src.len() > self.size {
+        if src.len() > self.size() {
             return Err(MetalError::InvalidConfig(format!(
                 "write_prefix: source length {} exceeds buffer size {}",
                 src.len(),
-                self.size
+                self.size()
             )));
         }
 
@@ -351,15 +438,16 @@ impl AlignedBuffer {
     /// This is the safe counterpart to [`Self::as_bytes_mut`] for callers that
     /// only need to fill a bounded prefix before handing the buffer to Metal.
     pub fn prefix_mut(&mut self, len: usize) -> Result<&mut [u8]> {
-        if len > self.size {
+        if len > self.size() {
             return Err(MetalError::InvalidConfig(format!(
                 "prefix_mut: requested prefix {} exceeds buffer size {}",
-                len, self.size
+                len,
+                self.size()
             )));
         }
 
         // SAFETY: `self` is exclusively borrowed and the returned slice is
-        // bounded to `len <= self.size`.
+        // bounded to `len <= self.size()`.
         let bytes = unsafe { self.as_bytes_mut() };
         Ok(&mut bytes[..len])
     }
@@ -368,67 +456,30 @@ impl AlignedBuffer {
 
     /// Fill the buffer from a file using `pread(2)` at the given byte offset.
     ///
-    /// Reads exactly [`Self::size`] bytes from `fd` starting at `file_offset`
-    /// directly into the aligned memory.  Because the memory is Metal-shared,
-    /// there is no copy step; the GPU can access the data immediately after this
+    /// Reads [`Self::size`] bytes from `fd` starting at `file_offset` directly
+    /// into the aligned memory, retrying reads a signal interrupted and
+    /// continuing after short reads.  Because the memory is Metal-shared, there
+    /// is no copy step; the GPU can access the data immediately after this
     /// call returns.
-    ///
-    /// # Arguments
-    ///
-    /// * `fd`          — file descriptor open for reading.
-    /// * `file_offset` — byte offset in the file at which to start reading.
     ///
     /// # Returns
     ///
     /// The number of bytes actually read.  This equals [`Self::size`] unless the
-    /// file is shorter than expected, in which case the trailing bytes of the
-    /// buffer are left unchanged (typically zeroed from initialization).
+    /// file ends first, in which case the rest of the buffer keeps what it had
+    /// (zero, for a fresh buffer; the previous contents for a reused one).
     ///
     /// # Errors
     ///
-    /// Returns [`MetalError::ExecutionFailed`] if the underlying `pread` syscall
-    /// returns `-1`.
+    /// Returns [`MetalError::ExecutionFailed`] if the underlying `pread` fails.
     pub fn pread(&mut self, fd: i32, file_offset: u64) -> Result<usize> {
-        let count = self.size;
-        let dst = self.raw.as_ptr();
-
-        // SAFETY:
-        // 1. `dst` is valid for `count` bytes of writes (guaranteed by
-        //    `posix_memalign` with `alloc_size == self.size`).
-        // 2. `fd` is a caller-supplied file descriptor; we trust the caller to
-        //    provide a valid, readable fd.
-        // 3. `file_offset` is cast to `i64`; offsets ≥ 2^63 are unsupported but
-        //    unrealistic for expert weight files.
-        // 4. `pread` does not advance the file position, so concurrent reads on
-        //    the same fd from other threads are safe (the fd itself is not
-        //    mutated by pread).
-        let n = unsafe { sys::pread(fd, dst, count, file_offset as i64) };
-
-        if n < 0 {
-            // `pread` returns -1 and sets errno on error.  We capture the errno
-            // value via `std::io::Error::last_os_error()` for a human-readable
-            // message without adding extra dependencies.
-            let err = std::io::Error::last_os_error();
-            return Err(MetalError::ExecutionFailed(format!(
-                "pread(fd={fd}, offset={file_offset}, count={count}) failed: {err}"
-            )));
-        }
-
-        trace!(
-            fd,
-            file_offset,
-            requested = count,
-            read = n,
-            "AlignedBuffer::pread"
-        );
-
-        Ok(n as usize)
+        let count = self.size();
+        self.pread_range(fd, file_offset, 0, count)
     }
 
     /// Fill a sub-range of the buffer from a file using `pread(2)`.
     ///
     /// Reads up to `byte_len` bytes from `fd` at `file_offset` into the buffer
-    /// starting at `buf_offset`.
+    /// starting at `buf_offset`, retrying and continuing as [`Self::pread`] does.
     ///
     /// # Errors
     ///
@@ -445,70 +496,56 @@ impl AlignedBuffer {
         let end = buf_offset.checked_add(byte_len).ok_or_else(|| {
             MetalError::InvalidConfig("buf_offset + byte_len overflows usize".to_string())
         })?;
-        if end > self.size {
+        if end > self.size() {
             return Err(MetalError::InvalidConfig(format!(
                 "pread_range: range [{}..{}) exceeds buffer size {}",
-                buf_offset, end, self.size
+                buf_offset,
+                end,
+                self.size()
             )));
         }
 
-        // SAFETY: `dst` is within the valid allocation as checked above.
-        let dst =
-            unsafe { (self.raw.as_ptr() as *mut u8).add(buf_offset) } as *mut std::ffi::c_void;
-
-        let n = unsafe { sys::pread(fd, dst, byte_len, file_offset as i64) };
-
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(MetalError::ExecutionFailed(format!(
+        // SAFETY: `buf_offset <= end <= size`, so the pointer stays in the mapping.
+        let dst = unsafe { self.as_ptr().add(buf_offset) };
+        let read = read_fully(
+            |at, count, offset| pread_syscall(fd, at, count, offset),
+            dst,
+            byte_len,
+            file_offset,
+        )
+        .map_err(|err| {
+            MetalError::ExecutionFailed(format!(
                 "pread(fd={fd}, offset={file_offset}, count={byte_len}) failed: {err}"
-            )));
-        }
+            ))
+        })?;
 
-        Ok(n as usize)
+        trace!(
+            fd,
+            file_offset,
+            requested = byte_len,
+            read,
+            "AlignedBuffer::pread"
+        );
+        Ok(read)
     }
 }
 
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
-        let raw_ptr = self.raw.as_ptr();
-
-        // Step 1: Release the Metal buffer CPU-side ARC retain.
-        //
-        // `self.metal_buf` is a `ManuallyDrop<Retained<…>>`, so Rust will never
-        // auto-drop it — we must do so explicitly here.  This decrements the
-        // Objective-C retain count.  After this point, the Metal object is kept
-        // alive only by any in-flight command buffers that themselves hold a
-        // retain (via the GPU driver's internal bookkeeping).  Once those
-        // command buffers complete, Metal releases its retain and the MTLBuffer
-        // object is deallocated — but it will no longer attempt DMA into the
-        // backing allocation because Metal's hazard tracking will have already
-        // flushed all pending work before the command buffer completes.
-        //
-        // The caller is contractually responsible for waiting on GPU completion
-        // before dropping `AlignedBuffer`.
-        //
-        // SAFETY: `self.metal_buf` was initialized in `AlignedBuffer::new` and
-        // has not been dropped before (it is `ManuallyDrop`).  Calling
-        // `ManuallyDrop::drop` exactly once here is correct.
-        unsafe { std::mem::ManuallyDrop::drop(&mut self.metal_buf) };
-
-        // Step 2: Free the backing allocation.
-        //
-        // SAFETY:
-        // 1. `raw_ptr` was returned by `posix_memalign`, so `free(3)` is the
-        //    correct deallocation call.
-        // 2. We have released the Metal CPU-side retain above; the allocation is
-        //    no longer reachable from Metal on the CPU side.
-        // 3. `raw_ptr` has not been freed before (we own the allocation
-        //    exclusively for its entire lifetime).
-        unsafe { sys::free(raw_ptr) };
-
-        debug!(ptr = ?raw_ptr, "AlignedBuffer freed");
+        // SAFETY: `allocation` is taken exactly once, here.
+        let allocation = unsafe { ManuallyDrop::take(&mut self.allocation) };
+        match self.home.take() {
+            // A pooled buffer goes back to its pool rather than shrinking it.
+            Some(home) => home.give_back(AlignedBuffer {
+                allocation: ManuallyDrop::new(allocation),
+                home: None,
+            }),
+            None => drop(allocation),
+        }
     }
 }
 
-// SAFETY: `AlignedBuffer` owns a raw allocation and an `Retained<MTLBuffer>`.
+// SAFETY: `AlignedBuffer` owns a mapping and a `Retained<MTLBuffer>`.
 // `Retained` is `Send` in the objc2 ecosystem (MTLBuffer is thread-safe at the
 // Objective-C ARC level).  We never hand out raw mutable references to the
 // allocation without requiring exclusive access (`&mut self` or ownership).
@@ -523,8 +560,8 @@ unsafe impl Send for AlignedBuffer {}
 impl std::fmt::Debug for AlignedBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AlignedBuffer")
-            .field("ptr", &self.raw.as_ptr())
-            .field("size", &self.size)
+            .field("ptr", &self.allocation.raw.as_ptr())
+            .field("size", &self.allocation.size)
             .finish()
     }
 }
@@ -538,9 +575,9 @@ impl std::fmt::Debug for AlignedBuffer {
 pub struct ExpertBufferPoolConfig {
     /// Byte capacity of each individual buffer.
     ///
-    /// Typically the size of one expert's weight tensor, rounded up so that
-    /// every expert fits in a single buffer.  The actual allocation will be
-    /// rounded up to the next multiple of [`ALIGN_2MB`].
+    /// Typically the size of one expert's weight tensor, so that every expert
+    /// fits in a single buffer.  The actual allocation is rounded up to a
+    /// whole number of pages ([`page_size`]).
     pub buffer_size: usize,
 
     /// Number of *concurrent expert streams* (`K`).
@@ -561,7 +598,7 @@ impl ExpertBufferPoolConfig {
     }
 }
 
-/// Pre-allocated pool of 2 MB-aligned, GPU-visible buffers for expert weight
+/// Pre-allocated pool of page-aligned, GPU-visible buffers for expert weight
 /// offloading.
 ///
 /// See the [module documentation](self) for an overview of the design.
@@ -573,13 +610,14 @@ impl ExpertBufferPoolConfig {
 /// - [`try_acquire`](ExpertBufferPool::try_acquire) — non-blocking attempt;
 ///   returns `None` if the pool is empty.
 /// - [`release`](ExpertBufferPool::release) — return a buffer to the pool after
-///   GPU work has completed.
+///   GPU work has completed.  Dropping the buffer does the same.
 ///
 /// # Memory accounting
 ///
-/// The pool eagerly allocates all `2 * K` buffers at construction time so that
+/// The pool eagerly maps all `2 * K` buffers at construction time so that
 /// the first `acquire` call never triggers a large allocation on the critical
-/// path.
+/// path.  The mappings are zero-filled and committed lazily, so memory is
+/// resident only for the pages an expert read touches.
 pub struct ExpertBufferPool {
     inner: Arc<PoolInner>,
 }
@@ -597,12 +635,31 @@ struct PoolInner {
     /// Total number of buffers managed by this pool.
     total: usize,
 
-    /// Byte capacity of each individual buffer (after alignment rounding).
+    /// Byte capacity of each individual buffer (after page rounding).
     buffer_size: usize,
 }
 
+impl PoolInner {
+    /// Put `buf` back in the queue and wake one waiter.
+    fn give_back(&self, buf: AlignedBuffer) {
+        debug_assert_eq!(buf.size(), self.buffer_size, "buffer from another pool");
+        {
+            let mut guard = self.available.lock();
+            guard.push_back(buf);
+            trace!(available = guard.len(), "ExpertBufferPool: buffer returned");
+        }
+        self.returned.notify_one();
+    }
+
+    /// Mark `buf` as checked out of this pool, so dropping it returns it.
+    fn check_out(self: &Arc<Self>, mut buf: AlignedBuffer) -> AlignedBuffer {
+        buf.home = Some(Arc::clone(self));
+        buf
+    }
+}
+
 impl ExpertBufferPool {
-    /// Create a new pool and eagerly allocate all `2 * K` buffers.
+    /// Create a new pool and eagerly map all `2 * K` buffers.
     ///
     /// # Arguments
     ///
@@ -641,7 +698,7 @@ impl ExpertBufferPool {
         }
 
         // Capture the actual allocation size (may be larger than requested due
-        // to ALIGN_2MB rounding) from the first buffer.
+        // to page rounding) from the first buffer.
         let actual_size = queue[0].size();
 
         debug!(
@@ -664,7 +721,8 @@ impl ExpertBufferPool {
     /// Block until a buffer is available, then return it.
     ///
     /// If all `2 * K` buffers are currently checked out, this call sleeps on a
-    /// condition variable until one is returned via [`release`](Self::release).
+    /// condition variable until one is returned via [`release`](Self::release)
+    /// or by dropping it.
     ///
     /// # Deadlock warning
     ///
@@ -675,9 +733,9 @@ impl ExpertBufferPool {
         loop {
             if let Some(buf) = guard.pop_front() {
                 trace!(remaining = guard.len(), "ExpertBufferPool: buffer acquired");
-                return buf;
+                return self.inner.check_out(buf);
             }
-            // Queue is empty — wait for a release() notification.
+            // Queue is empty — wait for a buffer to come back.
             self.inner.returned.wait(&mut guard);
         }
     }
@@ -688,14 +746,12 @@ impl ExpertBufferPool {
     /// buffers are currently checked out.
     pub fn try_acquire(&self) -> Option<AlignedBuffer> {
         let mut guard = self.inner.available.lock();
-        let buf = guard.pop_front();
-        if buf.is_some() {
-            trace!(
-                remaining = guard.len(),
-                "ExpertBufferPool: buffer acquired (try)"
-            );
-        }
-        buf
+        let buf = guard.pop_front()?;
+        trace!(
+            remaining = guard.len(),
+            "ExpertBufferPool: buffer acquired (try)"
+        );
+        Some(self.inner.check_out(buf))
     }
 
     /// Return a buffer to the pool.
@@ -706,27 +762,11 @@ impl ExpertBufferPool {
     /// completed before calling `release`.  The simplest way is to call
     /// `commandBuffer.waitUntilCompleted()` before releasing.
     ///
-    /// # Panics
-    ///
-    /// Panics in debug builds if `buf.size()` does not match the pool's
-    /// configured `buffer_size`, which would indicate that a buffer from a
-    /// different pool or allocation is being returned.
+    /// Releasing is dropping: a buffer goes back to the pool it was acquired
+    /// from, so a buffer from another pool returns to that pool, never to this
+    /// one, and one that came from no pool is freed.
     pub fn release(&self, buf: AlignedBuffer) {
-        debug_assert_eq!(
-            buf.size(),
-            self.inner.buffer_size,
-            "ExpertBufferPool::release: buffer size {} does not match pool size {}",
-            buf.size(),
-            self.inner.buffer_size,
-        );
-
-        {
-            let mut guard = self.inner.available.lock();
-            guard.push_back(buf);
-            trace!(available = guard.len(), "ExpertBufferPool: buffer released");
-        }
-        // Wake one waiter (if any).
-        self.inner.returned.notify_one();
+        drop(buf);
     }
 
     /// Total number of buffers managed by this pool (`2 * K`).
@@ -735,13 +775,15 @@ impl ExpertBufferPool {
         self.inner.total
     }
 
-    /// Byte capacity of each individual buffer (after 2 MB alignment rounding).
+    /// Byte capacity of each individual buffer (after page rounding).
     #[inline]
     pub fn buffer_size(&self) -> usize {
         self.inner.buffer_size
     }
 
-    /// Total memory held by this pool in bytes (`total_buffers * buffer_size`).
+    /// Total memory mapped by this pool in bytes (`total_buffers * buffer_size`).
+    ///
+    /// This is address space; resident memory is the pages reads have touched.
     #[inline]
     pub fn total_bytes(&self) -> usize {
         self.inner.total * self.inner.buffer_size
@@ -761,13 +803,6 @@ impl ExpertBufferPool {
         self.inner.total - self.available_count()
     }
 }
-
-// SAFETY: `ExpertBufferPool` wraps an `Arc<PoolInner>` which itself contains
-// a `Mutex`-protected `VecDeque` of `AlignedBuffer`s.  `AlignedBuffer: Send`,
-// `Mutex<VecDeque<AlignedBuffer>>: Send + Sync`, and `Arc<T>: Send + Sync`
-// when `T: Send + Sync`.  Therefore `ExpertBufferPool` is `Send + Sync`.
-unsafe impl Send for ExpertBufferPool {}
-unsafe impl Sync for ExpertBufferPool {}
 
 impl Clone for ExpertBufferPool {
     /// Clone returns a new handle to the *same* pool (shared ownership via
@@ -798,6 +833,8 @@ mod tests {
     use super::*;
     use crate::context::MetalContext;
 
+    const MIB: usize = 1024 * 1024;
+
     fn make_pool(k: usize, buf_size: usize) -> ExpertBufferPool {
         let ctx = MetalContext::new().expect("Metal context");
         ExpertBufferPool::new(
@@ -810,37 +847,121 @@ mod tests {
         .expect("pool creation")
     }
 
+    // ── read_fully ────────────────────────────────────────────────────────────
+
+    /// A reader over `data` that returns at most `chunk` bytes per call and
+    /// fails with EINTR on the calls listed in `interrupt_on`.
+    fn scripted_reader<'a>(
+        data: &'a [u8],
+        chunk: usize,
+        interrupt_on: &'a [usize],
+    ) -> impl FnMut(*mut u8, usize, u64) -> std::io::Result<usize> + 'a {
+        let mut calls = 0usize;
+        move |dst, count, offset| {
+            calls += 1;
+            if interrupt_on.contains(&calls) {
+                return Err(std::io::Error::from_raw_os_error(sys::EINTR));
+            }
+            let offset = offset as usize;
+            let available = data.len().saturating_sub(offset);
+            let n = count.min(chunk).min(available);
+            // SAFETY: the test passes a destination with room for `count` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), dst, n) };
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_fully_continues_after_short_reads() {
+        let data: Vec<u8> = (0..100u8).collect();
+        let mut out = vec![0u8; 100];
+        let read = read_fully(scripted_reader(&data, 7, &[]), out.as_mut_ptr(), 100, 0).unwrap();
+        assert_eq!(read, 100);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn read_fully_retries_an_interrupted_call() {
+        let data: Vec<u8> = (0..50u8).collect();
+        let mut out = vec![0u8; 50];
+        let read =
+            read_fully(scripted_reader(&data, 20, &[1, 3]), out.as_mut_ptr(), 50, 0).unwrap();
+        assert_eq!(read, 50);
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn read_fully_stops_at_end_of_file() {
+        let data: Vec<u8> = (0..10u8).collect();
+        let mut out = vec![0u8; 32];
+        let read = read_fully(scripted_reader(&data, 4, &[]), out.as_mut_ptr(), 32, 0).unwrap();
+        assert_eq!(read, 10);
+        assert_eq!(&out[..10], &data[..]);
+        assert!(out[10..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn read_fully_honours_the_file_offset() {
+        let data: Vec<u8> = (0..64u8).collect();
+        let mut out = vec![0u8; 16];
+        let read = read_fully(scripted_reader(&data, 5, &[]), out.as_mut_ptr(), 16, 40).unwrap();
+        assert_eq!(read, 16);
+        assert_eq!(out, &data[40..56]);
+    }
+
+    #[test]
+    fn read_fully_reports_a_real_error() {
+        let mut out = vec![0u8; 8];
+        let result = read_fully(
+            |_, _, _| Err(std::io::Error::from_raw_os_error(5)),
+            out.as_mut_ptr(),
+            8,
+            0,
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(5));
+    }
+
     // ── AlignedBuffer ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_aligned_buffer_allocation() {
         let ctx = MetalContext::new().unwrap();
-        let buf = AlignedBuffer::new(ctx.device(), 4 * 1024 * 1024).unwrap();
+        let buf = AlignedBuffer::new(ctx.device(), 4 * MIB).unwrap();
 
-        // Allocation is rounded up to 2 MB boundary.
-        assert_eq!(buf.size() % ALIGN_2MB, 0);
-        assert!(buf.size() >= 4 * 1024 * 1024);
+        // Allocation is a whole number of pages.
+        assert_eq!(buf.size() % page_size(), 0);
+        assert!(buf.size() >= 4 * MIB);
 
-        // The raw pointer must satisfy our alignment contract.
+        // The raw pointer must satisfy Metal's alignment contract.
         let ptr = buf.as_ptr() as usize;
-        assert_eq!(ptr % ALIGN_2MB, 0, "pointer is not 2 MB-aligned");
+        assert_eq!(ptr % page_size(), 0, "pointer is not page-aligned");
     }
 
     #[test]
     fn test_aligned_buffer_size_rounding() {
         let ctx = MetalContext::new().unwrap();
+        let page = page_size();
 
-        // A 1-byte request should be rounded up to exactly ALIGN_2MB.
+        // A 1-byte request is rounded up to exactly one page.
         let buf = AlignedBuffer::new(ctx.device(), 1).unwrap();
-        assert_eq!(buf.size(), ALIGN_2MB);
+        assert_eq!(buf.size(), page);
 
-        // An exact multiple should stay the same.
-        let buf2 = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
-        assert_eq!(buf2.size(), ALIGN_2MB);
+        // An exact multiple stays the same.
+        let buf2 = AlignedBuffer::new(ctx.device(), 3 * page).unwrap();
+        assert_eq!(buf2.size(), 3 * page);
 
-        // ALIGN_2MB + 1 should round up to 2 * ALIGN_2MB.
-        let buf3 = AlignedBuffer::new(ctx.device(), ALIGN_2MB + 1).unwrap();
-        assert_eq!(buf3.size(), 2 * ALIGN_2MB);
+        // One byte more rounds up to the next page.
+        let buf3 = AlignedBuffer::new(ctx.device(), 3 * page + 1).unwrap();
+        assert_eq!(buf3.size(), 4 * page);
+    }
+
+    /// An expert smaller than a huge page costs the pool a page-rounded buffer,
+    /// not a 2 MiB one.
+    #[test]
+    fn a_small_expert_is_not_padded_to_megabytes() {
+        let ctx = MetalContext::new().unwrap();
+        let buf = AlignedBuffer::new(ctx.device(), 300 * 1024).unwrap();
+        assert!(buf.size() < 512 * 1024, "{} bytes", buf.size());
     }
 
     #[test]
@@ -853,15 +974,35 @@ mod tests {
     #[test]
     fn test_aligned_buffer_metal_buffer() {
         let ctx = MetalContext::new().unwrap();
-        let buf = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
+        let buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
         // Verify the Metal buffer has the expected length.
         assert_eq!(buf.metal_buffer().length(), buf.size());
+    }
+
+    /// The Metal buffer aliases the mapping: the GPU sees what the CPU wrote.
+    #[test]
+    fn the_metal_buffer_aliases_the_allocation() {
+        let ctx = MetalContext::new().unwrap();
+        let buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
+        assert_eq!(
+            buf.metal_buffer().contents().as_ptr().cast_const(),
+            buf.as_ptr().cast_const().cast::<std::ffi::c_void>()
+        );
+    }
+
+    /// A new buffer reads as zeros.  `as_bytes` makes a `&[u8]` of the whole
+    /// allocation, which must not be uninitialised memory.
+    #[test]
+    fn a_new_buffer_is_zero_filled() {
+        let ctx = MetalContext::new().unwrap();
+        let buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
+        assert!(buf.as_bytes().iter().all(|&b| b == 0));
     }
 
     #[test]
     fn test_aligned_buffer_write_read() {
         let ctx = MetalContext::new().unwrap();
-        let mut buf = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
+        let mut buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
 
         // Write a pattern into the aligned memory via the raw pointer.
         // SAFETY: no concurrent GPU access in this test.
@@ -871,8 +1012,7 @@ mod tests {
         }
 
         // Read back and verify.
-        let slice2 = unsafe { buf.as_bytes_mut() };
-        for (i, &byte) in slice2.iter().enumerate() {
+        for (i, &byte) in buf.as_bytes().iter().enumerate() {
             assert_eq!(byte, (i % 251) as u8);
         }
     }
@@ -880,13 +1020,10 @@ mod tests {
     #[test]
     fn test_aligned_buffer_write_prefix() {
         let ctx = MetalContext::new().unwrap();
-        let mut buf = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
+        let mut buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
         let payload = [9u8, 7, 5, 3, 1];
         buf.write_prefix(&payload).unwrap();
-
-        // SAFETY: no concurrent GPU access in this test.
-        let slice = unsafe { buf.as_bytes_mut() };
-        assert_eq!(&slice[..payload.len()], &payload);
+        assert_eq!(&buf.as_bytes()[..payload.len()], &payload);
     }
 
     #[test]
@@ -896,27 +1033,38 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
 
         // Write 4 MB of known data.
-        let data: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 199) as u8).collect();
+        let data: Vec<u8> = (0..4 * MIB).map(|i| (i % 199) as u8).collect();
         tmp.write_all(&data).unwrap();
         tmp.flush().unwrap();
 
         let ctx = MetalContext::new().unwrap();
-        let mut buf = AlignedBuffer::new(ctx.device(), 4 * 1024 * 1024).unwrap();
+        let mut buf = AlignedBuffer::new(ctx.device(), 4 * MIB).unwrap();
 
         use std::os::unix::io::AsRawFd;
         let fd = tmp.as_raw_fd();
         let n = buf.pread(fd, 0).unwrap();
         assert_eq!(n, buf.size()); // entire buffer should be filled
 
-        // Verify the first 4 MB of content.
-        let slice = unsafe { buf.as_bytes_mut() };
-        for (i, &byte) in slice[..data.len()].iter().enumerate() {
-            assert_eq!(
-                byte, data[i],
-                "mismatch at byte {i}: got {byte}, want {}",
-                data[i]
-            );
-        }
+        assert_eq!(&buf.as_bytes()[..data.len()], &data[..]);
+    }
+
+    /// A file shorter than the buffer fills a prefix and reports its length.
+    #[test]
+    fn pread_of_a_short_file_reports_the_length_read() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let data: Vec<u8> = (0..100_000).map(|i| (i % 233) as u8).collect();
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let ctx = MetalContext::new().unwrap();
+        let mut buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
+        let n = buf.pread(tmp.as_raw_fd(), 0).unwrap();
+        assert_eq!(n, data.len());
+        assert_eq!(&buf.as_bytes()[..n], &data[..]);
+        assert!(buf.as_bytes()[n..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -929,35 +1077,40 @@ mod tests {
         tmp.flush().unwrap();
 
         let ctx = MetalContext::new().unwrap();
-        let mut buf = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
-
-        // Zero the buffer first.
-        unsafe { buf.as_bytes_mut() }.fill(0u8);
+        let mut buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
 
         use std::os::unix::io::AsRawFd;
         let n = buf
             .pread_range(tmp.as_raw_fd(), 0, 0, payload.len())
             .unwrap();
         assert_eq!(n, payload.len());
-
-        let slice = unsafe { buf.as_bytes_mut() };
-        assert_eq!(&slice[..payload.len()], payload);
+        assert_eq!(&buf.as_bytes()[..payload.len()], payload);
     }
 
     #[test]
     fn test_pread_range_out_of_bounds() {
         let ctx = MetalContext::new().unwrap();
-        let mut buf = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
+        let mut buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
         // Attempt to read past the end of the buffer.
         let result = buf.pread_range(0, 0, buf.size() - 1, 2);
         assert!(result.is_err(), "out-of-bounds range should be rejected");
+    }
+
+    #[test]
+    fn pread_on_a_bad_descriptor_is_an_error() {
+        let ctx = MetalContext::new().unwrap();
+        let mut buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
+        assert!(matches!(
+            buf.pread(-1, 0),
+            Err(MetalError::ExecutionFailed(_))
+        ));
     }
 
     // ── ExpertBufferPool ──────────────────────────────────────────────────────
 
     #[test]
     fn test_pool_creation() {
-        let pool = make_pool(4, 4 * 1024 * 1024);
+        let pool = make_pool(4, 4 * MIB);
         assert_eq!(pool.total_buffers(), 8);
         assert_eq!(pool.available_count(), 8);
         assert_eq!(pool.in_flight_count(), 0);
@@ -979,7 +1132,7 @@ mod tests {
         let r2 = ExpertBufferPool::new(
             &ctx,
             ExpertBufferPoolConfig {
-                buffer_size: ALIGN_2MB,
+                buffer_size: 2 * MIB,
                 k: 0,
             },
         );
@@ -988,7 +1141,7 @@ mod tests {
 
     #[test]
     fn test_pool_acquire_release_cycle() {
-        let pool = make_pool(2, ALIGN_2MB);
+        let pool = make_pool(2, 2 * MIB);
         assert_eq!(pool.available_count(), 4);
 
         let b0 = pool.acquire_blocking();
@@ -1005,9 +1158,59 @@ mod tests {
         assert_eq!(pool.available_count(), 4);
     }
 
+    /// A buffer that an error path or a panic drops instead of releasing must
+    /// not shrink the pool; before, it was gone for good and the pool's
+    /// `acquire_blocking` eventually waited forever.
+    #[test]
+    fn a_dropped_buffer_returns_to_the_pool() {
+        let pool = make_pool(1, 2 * MIB);
+        let b0 = pool.acquire_blocking();
+        let b1 = pool.acquire_blocking();
+        assert_eq!(pool.available_count(), 0);
+
+        drop(b0);
+        assert_eq!(pool.available_count(), 1);
+        assert_eq!(pool.in_flight_count(), 1);
+
+        // And a blocked acquirer is woken by a drop.
+        let pool = Arc::new(pool);
+        let waiter = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let first = pool.acquire_blocking();
+                let second = pool.acquire_blocking(); // blocks until b1 is dropped
+                drop((first, second));
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(b1);
+        waiter.join().expect("waiter woke and finished");
+        assert_eq!(pool.available_count(), 2);
+    }
+
+    #[test]
+    fn a_buffer_outlives_the_pool_handle_that_issued_it() {
+        let pool = make_pool(1, 2 * MIB);
+        let buf = pool.acquire_blocking();
+        drop(pool);
+        // Returning it to a pool nobody else holds is fine, and frees it.
+        drop(buf);
+    }
+
+    /// Releasing a buffer to the wrong pool returns it to the pool it came from.
+    #[test]
+    fn a_foreign_buffer_goes_home_not_into_this_pool() {
+        let ours = make_pool(1, 2 * MIB);
+        let theirs = make_pool(1, 2 * MIB);
+        let stray = theirs.acquire_blocking();
+        ours.release(stray);
+        assert_eq!(ours.available_count(), 2);
+        assert_eq!(theirs.available_count(), 2);
+    }
+
     #[test]
     fn test_pool_try_acquire_exhaustion() {
-        let pool = make_pool(1, ALIGN_2MB); // 2 total buffers
+        let pool = make_pool(1, 2 * MIB); // 2 total buffers
         let b0 = pool.try_acquire().expect("first acquire");
         let b1 = pool.try_acquire().expect("second acquire");
         let b2 = pool.try_acquire();
@@ -1023,7 +1226,7 @@ mod tests {
 
     #[test]
     fn test_pool_clone_shares_state() {
-        let pool = make_pool(1, ALIGN_2MB);
+        let pool = make_pool(1, 2 * MIB);
         let pool2 = pool.clone();
 
         let buf = pool.acquire_blocking();
@@ -1038,7 +1241,7 @@ mod tests {
         use std::sync::Arc as StdArc;
         use std::time::Duration;
 
-        let pool = StdArc::new(make_pool(1, ALIGN_2MB));
+        let pool = StdArc::new(make_pool(1, 2 * MIB));
         // Drain the pool.
         let b0 = pool.acquire_blocking();
         let b1 = pool.acquire_blocking();
@@ -1063,13 +1266,10 @@ mod tests {
 
     #[test]
     fn test_pool_memory_accounting() {
-        let pool = make_pool(3, 4 * 1024 * 1024);
-        // 6 buffers, each rounded up to ALIGN_2MB (4 MiB ≤ ALIGN_2MB, so stays 4 MiB)
-        // Actually 4 MiB < 2 MiB is false; 4 MiB = 2 * 2 MiB = 2 * ALIGN_2MB? No:
-        // ALIGN_2MB = 2 MiB = 2*1024*1024; 4 MiB = 4*1024*1024 = 2 * ALIGN_2MB.
-        let expected_buf_size = 2 * ALIGN_2MB; // 4 MiB rounds up to 4 MiB (exact multiple)
-        assert_eq!(pool.buffer_size(), expected_buf_size);
-        assert_eq!(pool.total_bytes(), 6 * expected_buf_size);
+        let pool = make_pool(3, 4 * MIB);
+        // 6 buffers of 4 MiB, a whole number of pages already.
+        assert_eq!(pool.buffer_size(), 4 * MIB);
+        assert_eq!(pool.total_bytes(), 6 * 4 * MIB);
     }
 
     #[test]
@@ -1081,14 +1281,14 @@ mod tests {
     #[test]
     fn test_aligned_buffer_debug_format() {
         let ctx = MetalContext::new().unwrap();
-        let buf = AlignedBuffer::new(ctx.device(), ALIGN_2MB).unwrap();
+        let buf = AlignedBuffer::new(ctx.device(), 2 * MIB).unwrap();
         let s = format!("{buf:?}");
         assert!(s.contains("AlignedBuffer"), "debug format: {s}");
     }
 
     #[test]
     fn test_pool_debug_format() {
-        let pool = make_pool(2, ALIGN_2MB);
+        let pool = make_pool(2, 2 * MIB);
         let s = format!("{pool:?}");
         assert!(s.contains("ExpertBufferPool"), "debug format: {s}");
     }

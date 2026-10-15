@@ -1,52 +1,60 @@
 #![allow(unsafe_code)]
 
-//! Tuna: The "Tuna" Kernel Auto-Tuner.
+//! Tuna: the kernel auto-tuner.
 //!
-//! "Tuna" automatically finds the optimal kernel parameters (tile sizes, etc.)
-//! for the running hardware (e.g., M1 vs M3 Max) by benchmarking candidates at runtime.
+//! "Tuna" finds good kernel parameters (tile sizes, threadgroup shapes) for the
+//! running hardware by benchmarking candidates at runtime.
 //!
 //! # How it works
 //!
 //! 1. **Check Cache**: Looks up if we've already tuned this kernel for the given problem size.
-//! 2. **Generate Candidates**: Creates a list of valid tile configurations (e.g., 32x32, 64x32).
-//! 3. **Benchmark**: Runs each candidate for a few iterations, measuring execution time.
-//! 4. **Select Winner**: Picks the fastest config and caches it.
+//! 2. **Generate Candidates**: Creates a list of valid configurations (e.g., 32x32, 64x32),
+//!    led by the heuristic's choice.
+//! 3. **Benchmark**: Times each candidate (the median of five runs after a warm-up). A
+//!    candidate whose command buffer fails is skipped.
+//! 4. **Select Winner**: The fastest candidate replaces the heuristic only if it is at least
+//!    3 percent faster, so noise cannot flip the choice from run to run. A winner is cached.
 //!
 //! # Persistent Disk Cache
 //!
-//! When created via [`Tuner::with_persistent_cache`], tuning results are stored at
-//! `~/.cache/pmetal/tuna/` as JSON files (one per kernel type). This means subsequent
-//! process launches skip the benchmarking phase entirely for previously-seen problem sizes.
+//! A tuner made with [`Tuner::for_device`] stores results as JSON files (one per kernel
+//! type) under `~/.cache/pmetal/tuna/<scope>/`. The scope names the chip (including its GPU
+//! core count) and a digest of the compiled shader library, so results are never reused
+//! across different silicon or different builds of the kernels. Subsequent launches skip
+//! the benchmarking phase for previously-seen problem sizes. Concurrent processes merge
+//! their results into the same files.
 //!
 //! # Example
 //!
 //! ```ignore
-//! let tuner = Tuner::new();
-//! let config = tuner.tune_cross_entropy(&ctx, num_tokens, vocab_size)?;
+//! let ctx = MetalContext::global()?;
+//! let config = ctx.tuner().tune_cross_entropy(&ctx, num_tokens, vocab_size)?;
 //! println!("Best config: {:?}", config);
 //!
-//! // Or with persistent cache:
-//! let tuner = Tuner::with_persistent_cache();
-//! let config = tuner.tune_cross_entropy(&ctx, num_tokens, vocab_size)?;
+//! // A tuner of your own, in memory only:
+//! let tuner = Tuner::new();
 //! ```
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use half::f16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
 };
+use parking_lot::Mutex;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
-use crate::context::{DeviceProperties, DeviceTier, MetalContext};
+use crate::context::{CommandQueueExt, DeviceProperties, DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
 use crate::kernels::fused_cross_entropy::{FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig};
 use crate::kernels::fused_merge::{MergeConfig, TensorInfo};
@@ -117,62 +125,251 @@ fn sanitize_threads_per_token_candidate(
         * 32
 }
 
-fn dedupe_cross_entropy_configs(
-    configs: Vec<CrossEntropyTunedConfig>,
-) -> Vec<CrossEntropyTunedConfig> {
-    let mut unique = Vec::with_capacity(configs.len());
-    for config in configs {
-        if !unique.contains(&config) {
-            unique.push(config);
+/// `items` without repeats, keeping the first of each and the order.
+fn dedupe<T: PartialEq>(items: Vec<T>) -> Vec<T> {
+    let mut unique = Vec::with_capacity(items.len());
+    for item in items {
+        if !unique.contains(&item) {
+            unique.push(item);
         }
     }
     unique
 }
 
 // ============================================================================
-// Disk cache free helpers (outside Tuner so borrowck is happy)
+// Choosing the fastest candidate
 // ============================================================================
 
-/// Read a JSON file at `path` and merge its entries into `cache`.
+/// How much faster than the incumbent a candidate must measure to replace it.
 ///
-/// Errors are logged and silently ignored.
-fn load_disk_cache_file<T>(path: &PathBuf, cache: &Mutex<HashMap<String, T>>)
-where
-    T: for<'de> Deserialize<'de>,
-{
-    if !path.exists() {
-        debug!("Disk cache file not found, skipping: {}", path.display());
-        return;
-    }
+/// Timing a kernel a few times on a machine doing other work is noisy to a few
+/// percent. A smaller "win" is as likely noise as speed, and a choice that
+/// flips from run to run is one nobody can reproduce or reason about, so the
+/// incumbent (the heuristic) keeps its place unless the gain is clear.
+const MIN_GAIN: f64 = 0.03;
 
-    match fs::read_to_string(path) {
-        Err(e) => warn!("Failed to read disk cache {}: {}", path.display(), e),
-        Ok(contents) => match serde_json::from_str::<HashMap<String, T>>(&contents) {
-            Err(e) => warn!("Failed to parse disk cache {}: {}", path.display(), e),
-            Ok(map) => {
-                let entries = map.len();
-                match cache.lock() {
-                    Err(e) => warn!("Mutex poisoned reading disk cache: {}", e),
-                    Ok(mut guard) => {
-                        guard.extend(map);
-                        debug!(
-                            "Loaded {} entries from disk cache: {}",
-                            entries,
-                            path.display()
-                        );
-                    }
-                }
-            }
-        },
+/// Timed runs behind each candidate's measurement.
+const BENCH_SAMPLES: usize = 5;
+
+/// Fail a benchmark whose command buffer the GPU rejected. Such a buffer
+/// completes almost at once, which would make the broken candidate look like
+/// the fastest one.
+fn check_completed(command_buffer: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
+    match command_buffer.error() {
+        Some(error) => Err(MetalError::ExecutionFailed(error.to_string())),
+        None => Ok(()),
     }
 }
 
-fn cache_device_tier_label(tier: DeviceTier) -> &'static str {
-    match tier {
-        DeviceTier::Base => "base",
-        DeviceTier::Pro => "pro",
-        DeviceTier::Max => "max",
-        DeviceTier::Ultra => "ultra",
+/// The median of `samples` (the mean of the middle two for an even count).
+fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    let mid = samples.len() / 2;
+    if samples.len() % 2 == 1 {
+        samples[mid]
+    } else {
+        (samples[mid - 1] + samples[mid]) / 2.0
+    }
+}
+
+/// Median wall-clock seconds of `samples` runs of `op`, after `warmups`
+/// runs that are not timed (they compile pipelines and warm caches). A median
+/// shrugs off the one run a context switch stretched, which a mean would not.
+fn median_seconds(
+    warmups: usize,
+    samples: usize,
+    mut op: impl FnMut() -> Result<()>,
+) -> Result<f64> {
+    for _ in 0..warmups {
+        op()?;
+    }
+    let mut times = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let start = Instant::now();
+        op()?;
+        times.push(start.elapsed().as_secs_f64());
+    }
+    Ok(median(times))
+}
+
+/// Pick the fastest of `candidates` by measured time, as `(config, seconds)`.
+///
+/// The `incumbent` is measured first and keeps its place unless a candidate
+/// beats it by [`MIN_GAIN`]; among candidates that do, the fastest wins and a
+/// tie goes to the earlier one, so the order of the list (not noise) decides.
+/// A candidate whose `measure` fails is skipped, including the incumbent: if
+/// the incumbent cannot run, the fastest candidate that can takes over.
+/// `None` means nothing could be measured at all.
+fn pick_fastest<C: Copy + PartialEq>(
+    incumbent: C,
+    candidates: &[C],
+    mut measure: impl FnMut(C) -> Result<f64>,
+) -> Option<(C, f64)> {
+    let incumbent_time = measure(incumbent).ok().filter(|t| t.is_finite());
+    let mut best = incumbent_time.map(|t| (incumbent, t));
+    // A challenger must beat the incumbent's time by the margin, and then
+    // only the best so far.
+    let bar = incumbent_time.map_or(f64::INFINITY, |t| t * (1.0 - MIN_GAIN));
+
+    for &candidate in candidates.iter().filter(|&&c| c != incumbent) {
+        let Ok(time) = measure(candidate) else {
+            continue;
+        };
+        if !time.is_finite() {
+            continue;
+        }
+        let beats_best = best.is_none_or(|(_, best_time)| time < best_time);
+        if beats_best && (incumbent_time.is_none() || time < bar) {
+            best = Some((candidate, time));
+        }
+    }
+    best
+}
+
+// ============================================================================
+// Device-scoped disk cache
+// ============================================================================
+
+/// A map of tuned configurations, optionally mirrored to one JSON file.
+struct TuneCache<T> {
+    /// The file this cache lives in, within the tuner's directory.
+    file: &'static str,
+    entries: Mutex<HashMap<String, T>>,
+}
+
+impl<T> TuneCache<T>
+where
+    T: Copy + Serialize + DeserializeOwned,
+{
+    fn new(file: &'static str) -> Self {
+        Self {
+            file,
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<T> {
+        self.entries.lock().get(key).copied()
+    }
+
+    /// Remember `value` for this process only.
+    fn insert(&self, key: &str, value: T) {
+        self.entries.lock().insert(key.to_string(), value);
+    }
+
+    /// Merge the entries stored in `dir` under this cache's file.
+    fn load_from(&self, dir: &Path) {
+        let stored = read_cache_file::<T>(&dir.join(self.file));
+        debug!("Loaded {} tuning entries from {}", stored.len(), self.file);
+        self.entries.lock().extend(stored);
+    }
+
+    /// Remember `value` and write the cache to `dir`.
+    ///
+    /// Another process may have written entries since this one loaded, so the
+    /// file is read back and merged (this process's entries win) before it is
+    /// replaced; the replacement is a rename of a complete temporary file, so
+    /// a reader never sees a partial one.
+    fn persist(&self, dir: &Path, key: &str, value: T) {
+        self.insert(key, value);
+        let path = dir.join(self.file);
+        let mut merged = read_cache_file::<T>(&path);
+        merged.extend(self.entries.lock().clone());
+        write_cache_file(&path, &merged);
+    }
+}
+
+/// Read a cache file: the entries it holds, or none if it is missing or
+/// unreadable (a corrupt file is logged and ignored, never fatal).
+fn read_cache_file<T: DeserializeOwned>(path: &Path) -> HashMap<String, T> {
+    match fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(error) => {
+            warn!("Failed to read tuning cache {}: {}", path.display(), error);
+            HashMap::new()
+        }
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|error| {
+            warn!(
+                "Ignoring unparsable tuning cache {}: {}",
+                path.display(),
+                error
+            );
+            HashMap::new()
+        }),
+    }
+}
+
+/// Replace `path` with `entries`, atomically, through a temporary file named
+/// for this process and call so concurrent writers never share one.
+fn write_cache_file<T: Serialize>(path: &Path, entries: &HashMap<String, T>) {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let json = match serde_json::to_string_pretty(entries) {
+        Ok(json) => json,
+        Err(error) => {
+            warn!(
+                "Failed to serialize tuning cache {}: {}",
+                path.display(),
+                error
+            );
+            return;
+        }
+    };
+    if let Err(error) = fs::write(&tmp, json).and_then(|()| fs::rename(&tmp, path)) {
+        warn!("Failed to write tuning cache {}: {}", path.display(), error);
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+/// FNV-1a, 64-bit: a hash that is the same on every machine and Rust version,
+/// which a name that outlives the process needs (`DefaultHasher` promises
+/// neither).
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The directory name that scopes cached results to the hardware and the
+/// kernels they were measured with: a different chip (or a different core
+/// count of one), or a rebuilt shader library, is a different directory, so a
+/// result is never reused for kernels or silicon it was not measured on.
+fn scope_dir_name(props: &DeviceProperties, kernel_fingerprint: &str) -> String {
+    let identity = format!("{}:{kernel_fingerprint}", device_cache_identity(props));
+    format!("{:016x}", fnv1a(identity.as_bytes()))
+}
+
+/// How long an unused scope directory is kept; a rebuild of the shaders leaves
+/// the previous build's directory behind.
+const STALE_SCOPE_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Remove sibling scope directories nothing has touched for [`STALE_SCOPE_AGE`].
+fn prune_stale_scopes(root: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !path.is_dir() {
+            continue;
+        }
+        let newest = fs::read_dir(&path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|file| file.metadata().ok()?.modified().ok())
+            .max()
+            .or_else(|| entry.metadata().ok()?.modified().ok());
+        let stale = newest
+            .is_some_and(|modified| modified.elapsed().is_ok_and(|age| age > STALE_SCOPE_AGE));
+        if stale {
+            debug!("Removing stale tuning cache {}", path.display());
+            let _ = fs::remove_dir_all(&path);
+        }
     }
 }
 
@@ -180,7 +377,7 @@ fn device_cache_identity(props: &DeviceProperties) -> String {
     format!(
         "{}:{}:{}:{}",
         props.name,
-        cache_device_tier_label(props.device_tier),
+        device_tier_key(props.device_tier),
         props.architecture_gen,
         props.gpu_core_count
     )
@@ -200,17 +397,18 @@ fn merge_cache_key(props: &DeviceProperties, num_elements: usize, num_models: us
 // ============================================================================
 
 /// The Auto-Tuner.
+///
+/// Results are cached per problem shape in memory and, for a tuner made with
+/// [`Tuner::for_device`] or [`Tuner::with_cache_dir`], on disk.
 pub struct Tuner {
-    /// Cache of best configurations for merge ops.
-    /// Key: "merge:device_name:device_tier:architecture_gen:gpu_core_count:num_elements:num_models"
-    merge_cache: Mutex<HashMap<String, MergeTunedConfig>>,
+    /// Merge kernel launch shape.
+    /// Key: "merge:device:num_elements:num_models"
+    merge: TuneCache<MergeTunedConfig>,
 
-    /// Cache of best configurations for cross-entropy kernels.
-    /// Keys cover both generic logits CE and fused-linear CE shapes.
-    cross_entropy_cache: Mutex<HashMap<String, CrossEntropyTunedConfig>>,
+    /// Fused linear cross-entropy kernels.
+    cross_entropy: TuneCache<CrossEntropyTunedConfig>,
 
-    /// Path for persistent cache storage (`~/.cache/pmetal/tuna/` by default).
-    /// `None` means no disk persistence (in-memory only).
+    /// Directory the caches are mirrored to; `None` means in-memory only.
     cache_dir: Option<PathBuf>,
 }
 
@@ -224,135 +422,102 @@ impl Tuner {
     /// Create a new Tuner instance with in-memory cache only.
     pub fn new() -> Self {
         Self {
-            merge_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
+            merge: TuneCache::new("merge.json"),
+            cross_entropy: TuneCache::new("cross_entropy.json"),
             cache_dir: None,
         }
     }
 
-    /// Create a new Tuner with a persistent disk cache at `~/.cache/pmetal/tuna/`.
-    ///
-    /// Any previously-tuned configurations are loaded from disk immediately.
-    /// New results are written through to disk as they are produced.
-    pub fn with_persistent_cache() -> Self {
-        let cache_dir = dirs::cache_dir().map(|p| p.join("pmetal").join("tuna"));
-
-        let mut tuner = Self {
-            merge_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
-            cache_dir: cache_dir.clone(),
-        };
-
-        if cache_dir.is_some() {
-            tuner.load_disk_cache();
-        }
-
+    /// Create a Tuner that keeps its results in `dir`, loading any already there.
+    pub fn with_cache_dir(dir: PathBuf) -> Self {
+        let mut tuner = Self::new();
+        tuner.cache_dir = Some(dir);
+        tuner.load_disk_cache();
         tuner
     }
 
-    // -------------------------------------------------------------------------
-    // Disk cache helpers
-    // -------------------------------------------------------------------------
-
-    /// Load all kernel caches from disk into the in-memory maps.
+    /// Create a Tuner with a persistent cache for this device and these kernels.
     ///
-    /// Errors are logged and silently ignored so that a corrupt/missing cache
-    /// file never prevents the tuner from running.
-    fn load_disk_cache(&mut self) {
-        // Clone the dir so we don't hold a borrow on self while accessing fields.
-        let dir = match &self.cache_dir {
-            Some(d) => d.clone(),
-            None => return,
+    /// Results live under `~/.cache/pmetal/tuna/<scope>/`, where the scope
+    /// names the chip (name, tier, generation and GPU core count) and
+    /// `kernel_fingerprint`, a digest of the compiled shader library. A
+    /// different machine, or kernels that have changed since the result was
+    /// measured, therefore start from an empty cache instead of reusing a
+    /// choice made for something else. Scope directories untouched for 30 days
+    /// are removed.
+    pub fn for_device(props: &DeviceProperties, kernel_fingerprint: &str) -> Self {
+        let Some(root) = dirs::cache_dir().map(|dir| dir.join("pmetal").join("tuna")) else {
+            return Self::new();
         };
-
-        load_disk_cache_file::<MergeTunedConfig>(&dir.join("merge.json"), &self.merge_cache);
-        load_disk_cache_file::<CrossEntropyTunedConfig>(
-            &dir.join("cross_entropy.json"),
-            &self.cross_entropy_cache,
-        );
+        let dir = root.join(scope_dir_name(props, kernel_fingerprint));
+        prune_stale_scopes(&root, &dir);
+        Self::with_cache_dir(dir)
     }
 
-    /// Ensure the cache directory exists, creating it if necessary.
-    fn ensure_cache_dir(&self) -> Option<&PathBuf> {
-        let dir = self.cache_dir.as_ref()?;
-        if !dir.exists() {
-            if let Err(e) = fs::create_dir_all(dir) {
-                warn!("Failed to create cache directory {}: {}", dir.display(), e);
-                return None;
-            }
-            debug!("Created cache directory: {}", dir.display());
+    /// Load every cache's stored entries.
+    ///
+    /// Errors are logged and ignored so that a corrupt or missing cache file
+    /// never prevents the tuner from running.
+    fn load_disk_cache(&mut self) {
+        let Some(dir) = self.cache_dir.clone() else {
+            return;
+        };
+        self.merge.load_from(&dir);
+        self.cross_entropy.load_from(&dir);
+    }
+
+    /// The cache directory, created if it does not exist yet.
+    fn ensure_cache_dir(&self) -> Option<&Path> {
+        let dir = self.cache_dir.as_deref()?;
+        if let Err(error) = fs::create_dir_all(dir) {
+            warn!(
+                "Failed to create cache directory {}: {}",
+                dir.display(),
+                error
+            );
+            return None;
         }
         Some(dir)
     }
 
-    /// Persist the full merge in-memory cache to `merge.json`.
-    fn save_merge_to_disk(&self, key: &str, config: &MergeTunedConfig) {
-        let Some(dir) = self.ensure_cache_dir() else {
-            return;
-        };
-        let path = dir.join("merge.json");
-        self.flush_cache_file(&path, &self.merge_cache, key, config);
-    }
-
-    /// Persist the full cross-entropy in-memory cache to `cross_entropy.json`.
-    fn save_cross_entropy_to_disk(&self, key: &str, config: &CrossEntropyTunedConfig) {
-        let Some(dir) = self.ensure_cache_dir() else {
-            return;
-        };
-        let path = dir.join("cross_entropy.json");
-        self.flush_cache_file(&path, &self.cross_entropy_cache, key, config);
-    }
-
-    /// Generic helper: insert `key`→`config` into the mutex-guarded map, then
-    /// atomically write the entire map to `path` as JSON.
+    /// Choose a configuration for `key`, benchmarking only on a cache miss.
     ///
-    /// Writing the full map (not just appending) keeps the file valid JSON even
-    /// if a previous write was interrupted.
-    fn flush_cache_file<T>(
+    /// `plan` yields the incumbent (the heuristic's choice) and the candidates
+    /// to try against it. A measured winner is cached and written to disk. If
+    /// nothing could be measured, the incumbent is used for this process but
+    /// not written, so a later run with a quiet GPU measures again instead of
+    /// inheriting an untested guess.
+    fn select<C>(
         &self,
-        path: &PathBuf,
-        cache: &Mutex<HashMap<String, T>>,
+        cache: &TuneCache<C>,
+        what: &str,
         key: &str,
-        config: &T,
-    ) where
-        T: Serialize + Clone,
+        plan: impl FnOnce() -> (C, Vec<C>),
+        measure: impl FnMut(C) -> Result<f64>,
+    ) -> C
+    where
+        C: Copy + PartialEq + std::fmt::Debug + Serialize + DeserializeOwned,
     {
-        // Insert the new entry first.
-        let snapshot: HashMap<String, T> = match cache.lock() {
-            Err(e) => {
-                warn!("Mutex poisoned writing disk cache: {}", e);
-                return;
-            }
-            Ok(mut guard) => {
-                guard.insert(key.to_string(), config.clone());
-                guard.clone()
-            }
-        };
-
-        // Serialize and write atomically via a temp file.
-        let tmp_path = path.with_extension("json.tmp");
-        match serde_json::to_string_pretty(&snapshot) {
-            Err(e) => warn!("Failed to serialize cache for {}: {}", path.display(), e),
-            Ok(json) => {
-                if let Err(e) = fs::write(&tmp_path, &json) {
-                    warn!(
-                        "Failed to write tmp cache file {}: {}",
-                        tmp_path.display(),
-                        e
-                    );
-                    return;
-                }
-                if let Err(e) = fs::rename(&tmp_path, path) {
-                    warn!("Failed to rename cache file {}: {}", path.display(), e);
-                    // Clean up the orphaned tmp file if possible.
-                    let _ = fs::remove_file(&tmp_path);
-                    return;
-                }
-                debug!(
-                    "Saved {} entries to disk cache: {}",
-                    snapshot.len(),
-                    path.display()
+        if let Some(hit) = cache.get(key) {
+            return hit;
+        }
+        let (incumbent, candidates) = plan();
+        match pick_fastest(incumbent, &candidates, measure) {
+            Some((best, seconds)) => {
+                info!(
+                    "Selected {what} config {best:?} ({:.3} ms)",
+                    seconds * 1000.0
                 );
+                match self.ensure_cache_dir() {
+                    Some(dir) => cache.persist(dir, key, best),
+                    None => cache.insert(key, best),
+                }
+                best
+            }
+            None => {
+                debug!("No {what} candidate could be measured; using {incumbent:?}");
+                cache.insert(key, incumbent);
+                incumbent
             }
         }
     }
@@ -363,28 +528,12 @@ impl Tuner {
 
     /// Get a cached merge configuration if available.
     pub fn get_merge_config(&self, key: &str) -> Option<MergeTunedConfig> {
-        let cache = self
-            .merge_cache
-            .lock()
-            .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))
-            .ok()?;
-        cache.get(key).copied()
+        self.merge.get(key)
     }
 
     /// Store a merge configuration in the cache.
     pub fn set_merge_config(&self, key: String, config: MergeTunedConfig) {
-        match self
-            .merge_cache
-            .lock()
-            .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))
-        {
-            Ok(mut cache) => {
-                cache.insert(key, config);
-            }
-            Err(e) => {
-                tracing::error!("Failed to acquire merge_cache lock: {}", e);
-            }
-        }
+        self.merge.insert(&key, config);
     }
 
     // =========================================================================
@@ -408,50 +557,21 @@ impl Tuner {
     ) -> Result<MergeTunedConfig> {
         let key = merge_cache_key(context.properties(), num_elements, num_models);
 
-        // Check cache
-        if let Some(config) = self.get_merge_config(&key) {
-            return Ok(config);
-        }
-
-        info!(
-            "Tuning merge kernel for {} elements, {} models...",
-            num_elements, num_models
-        );
-
-        // Generate candidates based on device tier
-        let candidates = self.generate_merge_candidates(context);
-        debug!("Generated {} merge candidates for device", candidates.len());
-
-        let mut best_config = MergeTunedConfig::default();
-        let mut best_time = f64::INFINITY;
-
-        // Benchmark each candidate
-        for config in candidates {
-            match self.benchmark_merge(context, config, num_elements) {
-                Ok(time) => {
-                    debug!("Merge config {:?} took {:.3} ms", config, time * 1000.0);
-                    if time < best_time {
-                        best_time = time;
-                        best_config = config;
-                    }
-                }
-                Err(e) => {
-                    debug!("Merge config {:?} failed: {}", config, e);
-                }
-            }
-        }
-
-        info!(
-            "Best merge config: {:?} ({:.3} ms)",
-            best_config,
-            best_time * 1000.0
-        );
-
-        // Cache result
-        self.set_merge_config(key.clone(), best_config);
-        self.save_merge_to_disk(&key, &best_config);
-
-        Ok(best_config)
+        Ok(self.select(
+            &self.merge,
+            "merge",
+            &key,
+            || {
+                info!(
+                    "Tuning merge kernel for {} elements, {} models...",
+                    num_elements, num_models
+                );
+                let candidates = self.generate_merge_candidates(context);
+                debug!("Generated {} merge candidates for device", candidates.len());
+                (MergeTunedConfig::default(), candidates)
+            },
+            |candidate| self.benchmark_merge(context, candidate, num_elements),
+        ))
     }
 
     /// Generate candidate configurations for merge kernels.
@@ -601,22 +721,7 @@ impl Tuner {
             threshold: 0.0,
         };
 
-        // Warmup
-        self.dispatch_merge_kernel(
-            context,
-            &pipeline,
-            config,
-            &buf_input,
-            &buf_output,
-            &params,
-            &tensor_info,
-            num_elements,
-        )?;
-
-        // Benchmark
-        let start = Instant::now();
-        let iterations = 5;
-        for _ in 0..iterations {
+        median_seconds(1, BENCH_SAMPLES, || {
             self.dispatch_merge_kernel(
                 context,
                 &pipeline,
@@ -626,11 +731,8 @@ impl Tuner {
                 &params,
                 &tensor_info,
                 num_elements,
-            )?;
-        }
-        let elapsed = start.elapsed();
-
-        Ok(elapsed.as_secs_f64() / iterations as f64)
+            )
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -646,9 +748,7 @@ impl Tuner {
         num_elements: usize,
     ) -> Result<()> {
         let queue = context.command_queue();
-        let buffer = queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandQueueCreation)?;
+        let buffer = queue.new_command_buffer()?;
         let encoder = buffer
             .computeCommandEncoder()
             .ok_or(MetalError::CommandQueueCreation)?;
@@ -685,119 +785,7 @@ impl Tuner {
 
         buffer.commit();
         buffer.waitUntilCompleted();
-
-        Ok(())
-    }
-
-    // =========================================================================
-    // Cross-Entropy Kernel Tuning (heuristic)
-    // =========================================================================
-
-    /// Tune the cross-entropy loss kernel for the given problem size.
-    ///
-    /// Cross-entropy over large vocabularies is dominated by the softmax
-    /// reduction. The threadgroup size controls parallelism of that reduction
-    /// sweep; larger threadgroups amortize overhead for wide vocabularies but
-    /// require more threadgroup memory on tighter devices.
-    ///
-    /// # Arguments
-    /// * `context` - Metal context
-    /// * `num_tokens` - Number of tokens in the batch
-    /// * `vocab_size` - Vocabulary size
-    ///
-    /// # Returns
-    /// Heuristically-selected optimal configuration for cross-entropy on this hardware.
-    pub fn tune_cross_entropy(
-        &self,
-        context: &MetalContext,
-        num_tokens: usize,
-        vocab_size: usize,
-    ) -> Result<CrossEntropyTunedConfig> {
-        let key = format!("cross_entropy:{}:{}", num_tokens, vocab_size);
-
-        // Check in-memory cache
-        {
-            let cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            if let Some(&config) = cache.get(&key) {
-                return Ok(config);
-            }
-        }
-
-        debug!(
-            "Selecting cross-entropy config for [T={}, V={}]",
-            num_tokens, vocab_size
-        );
-
-        let config = self.select_cross_entropy_config(context, vocab_size);
-
-        info!(
-            "Selected cross-entropy config: {:?} (heuristic, vocab={}, device tier: {:?})",
-            config,
-            vocab_size,
-            context.properties().device_tier
-        );
-
-        // Update in-memory cache
-        {
-            let mut cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            cache.insert(key.clone(), config);
-        }
-
-        // Write-through to disk
-        self.save_cross_entropy_to_disk(&key, &config);
-
-        Ok(config)
-    }
-
-    /// Select the best cross-entropy config using heuristics.
-    ///
-    /// Decision rationale:
-    /// - `threadgroup_size`: Larger vocabularies need more parallel threads to
-    ///   sweep the reduction without serialising too much. Cap at the device
-    ///   max_threads_per_threadgroup.
-    /// - `chunk_size`: Tile the vocabulary to fit output logits into cache.
-    ///   High-bandwidth devices have larger effective caches so larger tiles pay off.
-    fn select_cross_entropy_config(
-        &self,
-        context: &MetalContext,
-        vocab_size: usize,
-    ) -> CrossEntropyTunedConfig {
-        use crate::context::DeviceTier;
-
-        let props = context.properties();
-        let max_threads = props.max_threads_per_threadgroup as u32;
-
-        // Scale threadgroup size with vocab breadth:
-        //   < 32k  → 256 threads (most LLM tokenizers)
-        //   32k–128k → 512 threads (LLaMA-3, Mistral)
-        //   > 128k → 1024 threads (Llama-3 extended, Falcon-180B)
-        // Always clamp to the hardware maximum.
-        let threadgroup_size = if vocab_size < 32_768 {
-            256_u32
-        } else if vocab_size < 131_072 {
-            512_u32
-        } else {
-            1024_u32
-        }
-        .min(max_threads);
-
-        // chunk_size: vocabulary tile for the softmax sweep.
-        let chunk_size = match props.device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => 8192,
-            DeviceTier::Pro => 4096,
-            DeviceTier::Base => 2048,
-        };
-
-        CrossEntropyTunedConfig {
-            threadgroup_size,
-            chunk_size,
-        }
+        check_completed(&buffer)
     }
 
     /// Tune the fused linear cross-entropy kernel for the given problem shape.
@@ -820,94 +808,37 @@ impl Tuner {
             config.hidden_size,
             config.vocab_size
         );
+        let max_threads = props.max_threads_per_threadgroup as u32;
 
-        {
-            let cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            if let Some(&cached) = cache.get(&key) {
-                return Ok(cached);
-            }
-        }
-
-        debug!(
-            "Selecting fused linear CE config for [T={}, H={}, V={}, dtype={}]",
-            config.num_tokens,
-            config.hidden_size,
-            config.vocab_size,
-            if config.use_fp16 { "f16" } else { "f32" }
-        );
-
-        let heuristic = self.heuristic_fused_linear_cross_entropy_config(
-            props.device_tier,
-            config.hidden_size,
-            config.vocab_size,
-            props.max_threads_per_threadgroup as u32,
-        );
-        let candidates = self.candidate_fused_linear_cross_entropy_configs(
-            props.device_tier,
-            config.hidden_size,
-            config.vocab_size,
-            props.max_threads_per_threadgroup as u32,
-        );
-        let mut best_config = heuristic;
-        let mut best_time = f64::INFINITY;
-
-        info!(
-            "Tuning fused linear CE config for [T={}, H={}, V={}, dtype={}]...",
-            config.num_tokens,
-            config.hidden_size,
-            config.vocab_size,
-            if config.use_fp16 { "f16" } else { "f32" }
-        );
-
-        for candidate in candidates {
-            match self.benchmark_fused_linear_cross_entropy(context, config, candidate) {
-                Ok(elapsed) => {
-                    debug!(
-                        "Fused linear CE config {:?} took {:.3} ms",
-                        candidate,
-                        elapsed * 1000.0
-                    );
-                    if elapsed < best_time {
-                        best_time = elapsed;
-                        best_config = candidate;
-                    }
-                }
-                Err(error) => {
-                    debug!(
-                        "Fused linear CE config {:?} failed benchmarking: {}",
-                        candidate, error
-                    );
-                }
-            }
-        }
-
-        if best_time.is_finite() {
-            info!(
-                "Selected fused linear CE config: {:?} ({:.3} ms)",
-                best_config,
-                best_time * 1000.0
-            );
-        } else {
-            debug!(
-                "Falling back to heuristic fused linear CE config {:?} for [H={}, V={}] on {:?}",
-                best_config, config.hidden_size, config.vocab_size, props.device_tier
-            );
-        }
-
-        {
-            let mut cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            cache.insert(key.clone(), best_config);
-        }
-
-        self.save_cross_entropy_to_disk(&key, &best_config);
-
-        Ok(best_config)
+        Ok(self.select(
+            &self.cross_entropy,
+            "fused linear CE",
+            &key,
+            || {
+                info!(
+                    "Tuning fused linear CE config for [T={}, H={}, V={}, dtype={}]...",
+                    config.num_tokens,
+                    config.hidden_size,
+                    config.vocab_size,
+                    if config.use_fp16 { "f16" } else { "f32" }
+                );
+                (
+                    self.heuristic_fused_linear_cross_entropy_config(
+                        props.device_tier,
+                        config.hidden_size,
+                        config.vocab_size,
+                        max_threads,
+                    ),
+                    self.candidate_fused_linear_cross_entropy_configs(
+                        props.device_tier,
+                        config.hidden_size,
+                        config.vocab_size,
+                        max_threads,
+                    ),
+                )
+            },
+            |candidate| self.benchmark_fused_linear_cross_entropy(context, config, candidate),
+        ))
     }
 
     fn heuristic_fused_linear_cross_entropy_config(
@@ -1009,7 +940,7 @@ impl Tuner {
             });
         }
 
-        dedupe_cross_entropy_configs(configs)
+        dedupe(configs)
     }
 
     fn benchmark_fused_linear_cross_entropy(
@@ -1074,15 +1005,11 @@ impl Tuner {
                 BufferUsage::Shared,
             )?;
 
-            kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
-
-            let iterations = 3;
-            let start = Instant::now();
-            for _ in 0..iterations {
+            return median_seconds(1, BENCH_SAMPLES, || {
                 let output = kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
                 std::hint::black_box(output);
-            }
-            return Ok(start.elapsed().as_secs_f64() / iterations as f64);
+                Ok(())
+            });
         }
 
         let hidden_states = MetalBuffer::<f32>::zeros(
@@ -1096,16 +1023,11 @@ impl Tuner {
             BufferUsage::Shared,
         )?;
 
-        kernel.forward(&hidden_states, &lm_head_weight, &targets)?;
-
-        let iterations = 3;
-        let start = Instant::now();
-        for _ in 0..iterations {
+        median_seconds(1, BENCH_SAMPLES, || {
             let output = kernel.forward(&hidden_states, &lm_head_weight, &targets)?;
             std::hint::black_box(output);
-        }
-
-        Ok(start.elapsed().as_secs_f64() / iterations as f64)
+            Ok(())
+        })
     }
 }
 
@@ -1187,7 +1109,118 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Tuner construction
+    // Choosing the fastest candidate
+    // -------------------------------------------------------------------------
+
+    /// Measure from a table; a candidate missing from it fails to run.
+    fn table(times: &[(u32, f64)]) -> impl FnMut(u32) -> Result<f64> + '_ {
+        move |candidate| {
+            times
+                .iter()
+                .find(|(c, _)| *c == candidate)
+                .map(|(_, t)| *t)
+                .ok_or_else(|| MetalError::ExecutionFailed(format!("{candidate} failed")))
+        }
+    }
+
+    /// A candidate only a hair faster than the incumbent is noise, and a
+    /// choice that flips with the noise is not reproducible.
+    #[test]
+    fn a_marginal_win_does_not_displace_the_incumbent() {
+        let times = [(1, 1.000), (2, 0.985), (3, 0.99)];
+        assert_eq!(
+            pick_fastest(1, &[1, 2, 3], table(&times)).map(|(c, _)| c),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_clear_win_displaces_the_incumbent() {
+        let times = [(1, 1.0), (2, 0.9), (3, 0.8)];
+        assert_eq!(pick_fastest(1, &[1, 2, 3], table(&times)), Some((3, 0.8)));
+    }
+
+    /// The same measurements give the same choice whatever order the
+    /// candidates come in, as long as the winner is clear.
+    #[test]
+    fn the_choice_does_not_depend_on_candidate_order() {
+        let times = [(1, 1.0), (2, 0.5), (3, 0.9), (4, 0.7)];
+        let a = pick_fastest(1, &[1, 2, 3, 4], table(&times));
+        let b = pick_fastest(1, &[4, 3, 2, 1], table(&times));
+        assert_eq!(a, b);
+        assert_eq!(a.map(|(c, _)| c), Some(2));
+    }
+
+    #[test]
+    fn equally_fast_candidates_resolve_to_the_earlier() {
+        let times = [(1, 1.0), (2, 0.5), (3, 0.5)];
+        assert_eq!(
+            pick_fastest(1, &[1, 2, 3], table(&times)).map(|(c, _)| c),
+            Some(2)
+        );
+    }
+
+    /// A candidate that fails to run can never be chosen, however its
+    /// neighbours measure; this is what keeps a broken variant out.
+    #[test]
+    fn a_failing_candidate_is_never_chosen() {
+        let times = [(1, 1.0), (3, 0.9)];
+        assert_eq!(
+            pick_fastest(1, &[1, 2, 3], table(&times)).map(|(c, _)| c),
+            Some(3)
+        );
+        // Not measuring a number that is NaN or infinite either.
+        let times = [(1, 1.0), (2, f64::NAN), (3, f64::INFINITY)];
+        assert_eq!(
+            pick_fastest(1, &[1, 2, 3], table(&times)).map(|(c, _)| c),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_failing_incumbent_gives_way_to_the_fastest_that_runs() {
+        let times = [(2, 0.9), (3, 0.95)];
+        assert_eq!(pick_fastest(1, &[1, 2, 3], table(&times)), Some((2, 0.9)));
+    }
+
+    #[test]
+    fn nothing_measurable_picks_nothing() {
+        assert_eq!(pick_fastest(1, &[1, 2, 3], table(&[])), None);
+    }
+
+    #[test]
+    fn the_median_ignores_one_stretched_run() {
+        assert_eq!(median(vec![5.0, 1.0, 1.1, 1.2, 1.05]), 1.1);
+        assert_eq!(median(vec![1.0, 3.0]), 2.0);
+        assert_eq!(median(vec![7.0]), 7.0);
+    }
+
+    #[test]
+    fn median_seconds_runs_the_warmups_untimed_and_stops_at_a_failure() {
+        let mut calls = 0;
+        let seconds = median_seconds(2, 5, || {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 7);
+        assert!(seconds >= 0.0);
+
+        let mut calls = 0;
+        let result = median_seconds(1, 5, || {
+            calls += 1;
+            if calls == 3 {
+                Err(MetalError::ExecutionFailed("gpu fault".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tuner construction and the device-scoped cache
     // -------------------------------------------------------------------------
 
     #[test]
@@ -1196,13 +1229,28 @@ mod tests {
         assert!(tuner.cache_dir.is_none());
     }
 
+    /// A different chip, a binned part of the same chip, or a rebuilt shader
+    /// library each get their own cache directory.
     #[test]
-    fn tuner_with_persistent_cache_has_cache_dir() {
-        let tuner = Tuner::with_persistent_cache();
-        // dirs::cache_dir() should always resolve on macOS
-        assert!(tuner.cache_dir.is_some());
-        let dir = tuner.cache_dir.unwrap();
-        assert!(dir.ends_with("pmetal/tuna"));
+    fn the_cache_scope_names_the_device_and_the_kernels() {
+        let full = test_device_properties("Apple M4 Max", DeviceTier::Max, 16, 40);
+        let binned = test_device_properties("Apple M4 Max", DeviceTier::Max, 16, 32);
+        let other = test_device_properties("Apple M3 Max", DeviceTier::Max, 15, 40);
+
+        let scope = scope_dir_name(&full, "00aa");
+        assert_eq!(scope, scope_dir_name(&full, "00aa"));
+        assert_ne!(scope, scope_dir_name(&full, "00ab"));
+        assert_ne!(scope, scope_dir_name(&binned, "00aa"));
+        assert_ne!(scope, scope_dir_name(&other, "00aa"));
+        assert_eq!(scope.len(), 16);
+        assert!(scope.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn fnv1a_matches_the_published_vectors() {
+        assert_eq!(fnv1a(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     // -------------------------------------------------------------------------
@@ -1238,147 +1286,209 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Disk cache round-trip (uses tempdir)
+    // Disk cache (uses tempdir)
     // -------------------------------------------------------------------------
 
+    const CE_KEY: &str = "cross_entropy:4:2048";
+    const CE_FAST: CrossEntropyTunedConfig = CrossEntropyTunedConfig {
+        threadgroup_size: 512,
+        chunk_size: 4096,
+    };
+    const CE_SLOW: CrossEntropyTunedConfig = CrossEntropyTunedConfig {
+        threadgroup_size: 128,
+        chunk_size: 1024,
+    };
+
+    fn ce_times(config: CrossEntropyTunedConfig) -> Result<f64> {
+        Ok(if config == CE_FAST { 0.5 } else { 1.0 })
+    }
+
+    /// A measured winner is written, and a second process reads it back
+    /// without measuring anything.
     #[test]
-    fn disk_cache_write_read_roundtrip() {
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+    fn a_measured_choice_survives_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("scope");
 
-        // Construct a tuner whose cache_dir points at our temp location.
-        let tuner = Tuner {
-            merge_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
-            cache_dir: Some(cache_path.clone()),
-        };
+        let first = Tuner::with_cache_dir(dir.clone());
+        let chosen = first.select(
+            &first.cross_entropy,
+            "cross-entropy",
+            CE_KEY,
+            || (CE_SLOW, vec![CE_SLOW, CE_FAST]),
+            ce_times,
+        );
+        assert_eq!(chosen, CE_FAST);
+        assert!(dir.join("cross_entropy.json").exists());
 
-        let key = "cross_entropy:4:2048";
-        let config = CrossEntropyTunedConfig {
-            threadgroup_size: 512,
-            chunk_size: 4096,
-        };
+        let second = Tuner::with_cache_dir(dir);
+        let reread = second.select(
+            &second.cross_entropy,
+            "cross-entropy",
+            CE_KEY,
+            || panic!("a cached shape is not planned again"),
+            |_| panic!("a cached shape is not measured again"),
+        );
+        assert_eq!(reread, CE_FAST);
+    }
 
-        tuner.save_cross_entropy_to_disk(key, &config);
+    /// With nothing measurable the heuristic is used for this process, but
+    /// the file is not written: a later run on a quiet GPU measures again.
+    #[test]
+    fn an_unmeasured_choice_is_not_written_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("scope");
 
-        // Verify the file exists and contains valid JSON.
-        let json_path = cache_path.join("cross_entropy.json");
-        assert!(
-            json_path.exists(),
-            "cross_entropy.json should have been created"
+        let tuner = Tuner::with_cache_dir(dir.clone());
+        let chosen = tuner.select(
+            &tuner.cross_entropy,
+            "cross-entropy",
+            CE_KEY,
+            || (CE_SLOW, vec![CE_SLOW, CE_FAST]),
+            |_| Err(MetalError::ExecutionFailed("busy".into())),
+        );
+        assert_eq!(chosen, CE_SLOW);
+        assert_eq!(tuner.cross_entropy.get(CE_KEY), Some(CE_SLOW));
+        assert!(!dir.join("cross_entropy.json").exists());
+    }
+
+    /// Two processes tuning different shapes must not erase each other's
+    /// results: the file is merged on write, not replaced by one process's map.
+    #[test]
+    fn concurrent_writers_keep_each_others_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("scope");
+
+        // Both loaded before either wrote.
+        let a = Tuner::with_cache_dir(dir.clone());
+        let b = Tuner::with_cache_dir(dir.clone());
+        a.select(
+            &a.cross_entropy,
+            "cross-entropy",
+            "cross_entropy:shape-a",
+            || (CE_SLOW, vec![CE_FAST]),
+            ce_times,
+        );
+        b.select(
+            &b.cross_entropy,
+            "cross-entropy",
+            "cross_entropy:shape-b",
+            || (CE_SLOW, vec![CE_FAST]),
+            ce_times,
         );
 
-        let contents = fs::read_to_string(&json_path).unwrap();
-        let map: HashMap<String, CrossEntropyTunedConfig> =
-            serde_json::from_str(&contents).unwrap();
-        assert_eq!(map.get(key), Some(&config));
+        let fresh = Tuner::with_cache_dir(dir);
+        assert_eq!(
+            fresh.cross_entropy.get("cross_entropy:shape-a"),
+            Some(CE_FAST)
+        );
+        assert_eq!(
+            fresh.cross_entropy.get("cross_entropy:shape-b"),
+            Some(CE_FAST)
+        );
     }
 
     #[test]
-    fn disk_cache_load_populates_in_memory() {
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
-        fs::create_dir_all(&cache_path).unwrap();
-
-        // Write a hand-crafted JSON file for cross-entropy.
-        let key = "cross_entropy:8:4096";
-        let config = CrossEntropyTunedConfig {
-            threadgroup_size: 256,
-            chunk_size: 2048,
-        };
-        let map: HashMap<&str, CrossEntropyTunedConfig> = [(key, config)].into_iter().collect();
-        let json = serde_json::to_string_pretty(&map).unwrap();
-        fs::write(cache_path.join("cross_entropy.json"), &json).unwrap();
-
-        // Build a tuner pointing at that directory and call load_disk_cache.
-        let mut tuner = Tuner {
-            merge_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
-            cache_dir: Some(cache_path),
-        };
-        tuner.load_disk_cache();
-
-        let guard = tuner.cross_entropy_cache.lock().unwrap();
-        assert_eq!(guard.get(key), Some(&config));
+    fn writing_leaves_no_temporary_files_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("scope");
+        let tuner = Tuner::with_cache_dir(dir.clone());
+        for shape in 0..5 {
+            tuner.select(
+                &tuner.cross_entropy,
+                "cross-entropy",
+                &format!("cross_entropy:{shape}"),
+                || (CE_SLOW, vec![CE_FAST]),
+                ce_times,
+            );
+        }
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["cross_entropy.json"]);
     }
 
+    /// A damaged cache file is ignored, never fatal.
     #[test]
-    fn merge_disk_cache_write_read_roundtrip() {
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+    fn a_corrupt_cache_file_is_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("scope");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("cross_entropy.json"), "{ not json").unwrap();
 
-        let tuner = Tuner {
-            merge_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
-            cache_dir: Some(cache_path.clone()),
-        };
+        let tuner = Tuner::with_cache_dir(dir);
+        assert_eq!(tuner.cross_entropy.get(CE_KEY), None);
+        let chosen = tuner.select(
+            &tuner.cross_entropy,
+            "cross-entropy",
+            CE_KEY,
+            || (CE_SLOW, vec![CE_FAST]),
+            ce_times,
+        );
+        assert_eq!(chosen, CE_FAST);
+    }
 
-        let key = "merge:Apple M4 Max:max:16:40:1048576:8";
+    /// The on-disk format is a flat JSON object of key to configuration, as
+    /// earlier versions wrote it.
+    #[test]
+    fn the_cache_file_format_is_a_flat_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("scope");
+        fs::create_dir_all(&dir).unwrap();
+
+        let key = "merge:Apple M5 Max:max:17:40:1048576:4";
         let config = MergeTunedConfig {
             threads_per_group: 512,
             elements_per_thread: 8,
-            use_simd: true,
-        };
-        tuner.save_merge_to_disk(key, &config);
-
-        let json_path = cache_path.join("merge.json");
-        assert!(json_path.exists(), "merge.json should have been created");
-
-        let contents = fs::read_to_string(&json_path).unwrap();
-        let map: HashMap<String, MergeTunedConfig> = serde_json::from_str(&contents).unwrap();
-        assert_eq!(map.get(key), Some(&config));
-    }
-
-    #[test]
-    fn merge_disk_cache_load_populates_in_memory() {
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
-        fs::create_dir_all(&cache_path).unwrap();
-
-        let key = "merge:Apple M5 Pro:pro:17:28:2097152:6";
-        let config = MergeTunedConfig {
-            threads_per_group: 256,
-            elements_per_thread: 8,
-            use_simd: true,
+            use_simd: false,
         };
         let map: HashMap<&str, MergeTunedConfig> = [(key, config)].into_iter().collect();
-        let json = serde_json::to_string_pretty(&map).unwrap();
-        fs::write(cache_path.join("merge.json"), &json).unwrap();
+        fs::write(
+            dir.join("merge.json"),
+            serde_json::to_string_pretty(&map).unwrap(),
+        )
+        .unwrap();
 
-        let mut tuner = Tuner {
-            merge_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
-            cache_dir: Some(cache_path),
+        let tuner = Tuner::with_cache_dir(dir);
+        assert_eq!(tuner.merge.get(key), Some(config));
+    }
+
+    /// Scope directories nothing has used for a month are removed; recent
+    /// ones, and the current one, are kept.
+    #[test]
+    fn stale_scopes_are_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let make = |name: &str, age_days: u64| {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("cross_entropy.json");
+            fs::write(&file, "{}").unwrap();
+            let when = std::time::SystemTime::now()
+                - std::time::Duration::from_secs(age_days * 24 * 60 * 60);
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            dir
         };
-        tuner.load_disk_cache();
+        let keep = make("current", 90);
+        make("old", 45);
+        make("recent", 3);
 
-        let guard = tuner.merge_cache.lock().unwrap();
-        assert_eq!(guard.get(key), Some(&config));
+        prune_stale_scopes(root, &keep);
+
+        assert!(keep.exists(), "the current scope is never pruned");
+        assert!(root.join("recent").exists());
+        assert!(!root.join("old").exists());
     }
 
     // -------------------------------------------------------------------------
     // Standard-Metal tuning sanity checks
     // -------------------------------------------------------------------------
-
-    /// Verify threadgroup_size scales with vocab_size.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn cross_entropy_threadgroup_scales_with_vocab() {
-        let ctx = MetalContext::new().expect("Metal required");
-        let tuner = Tuner::new();
-
-        let c_small = tuner
-            .tune_cross_entropy(&ctx, 16, 8192)
-            .expect("cross_entropy small vocab");
-        let c_large = tuner
-            .tune_cross_entropy(&ctx, 16, 200_000)
-            .expect("cross_entropy large vocab");
-
-        assert!(
-            c_large.threadgroup_size >= c_small.threadgroup_size,
-            "Larger vocab should have >= threadgroup_size"
-        );
-    }
 
     #[test]
     fn fused_linear_cross_entropy_heuristic_tracks_tier_and_shape() {
@@ -1479,10 +1589,7 @@ mod tests {
             .tune_fused_linear_cross_entropy(&ctx, &wider)
             .expect("wider tune");
 
-        let cache = tuner
-            .cross_entropy_cache
-            .lock()
-            .expect("cross_entropy cache");
+        let cache = tuner.cross_entropy.entries.lock();
         let fused_entries = cache
             .keys()
             .filter(|key| key.starts_with("fused_linear_ce:"))

@@ -17,12 +17,11 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLComputePipelineState, MTLSize,
 };
 
 use crate::buffer::{BufferUsage, MetalBuffer};
-use crate::context::MetalContext;
+use crate::context::{CommandQueueExt, MetalContext};
 use crate::error::{MetalError, Result};
 
 #[repr(C)]
@@ -130,11 +129,7 @@ impl TurboQuantTransform {
             cache.get_or_create_pipeline(self.ctx.device(), "turboquant_apply_rows", None)?
         };
 
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = self.ctx.command_queue().new_command_buffer()?;
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;

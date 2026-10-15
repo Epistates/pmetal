@@ -38,26 +38,20 @@
 pub mod accelerate;
 #[cfg(feature = "ane")]
 pub mod ane;
-pub mod backend;
-pub mod bridge;
 pub mod buffer;
+pub(crate) mod chip;
 pub mod context;
-pub mod dispatch;
 pub mod error;
 pub mod expert_buffer;
 pub mod kernels;
-pub mod metal3_backend;
-#[cfg(has_metal4)]
-pub mod metal4;
 pub(crate) mod msl_layout;
 pub mod neon_convert;
 pub mod pipeline;
 pub mod tuna;
+pub mod view;
 
-pub use bridge::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 pub use buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
 pub use context::MetalContext;
-pub use dispatch::KernelDispatch;
 pub use error::{MetalError, Result};
 pub use kernels::fused_cross_entropy::{
     FusedCrossEntropy,
@@ -78,6 +72,7 @@ pub use kernels::fused_moe::{
 pub use kernels::mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
 pub use kernels::turboquant::TurboQuantTransform;
 pub use pipeline::{FunctionConstant, PipelineCache};
+pub use view::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 
 /// Prelude for convenient imports.
 pub mod prelude {

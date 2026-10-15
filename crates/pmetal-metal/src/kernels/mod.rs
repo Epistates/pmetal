@@ -7,7 +7,6 @@
 //! optimizers, merging, KV-cache transforms) and the weight-gradient GEMM the
 //! ANE trainer batches into its own command buffer.
 
-pub mod batch_encoder;
 pub mod dequant;
 pub mod dispatch;
 pub mod dw_gemm;
@@ -17,7 +16,6 @@ pub mod fused_merge;
 pub mod fused_moe;
 pub mod fused_training;
 pub mod moe;
-pub mod mpp_bench;
 pub mod mpp_dispatch;
 pub mod mpp_quantized;
 pub mod turboquant;

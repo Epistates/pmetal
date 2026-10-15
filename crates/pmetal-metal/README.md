@@ -21,7 +21,7 @@ pmetal-metal/
 ├── src/
 │   ├── context.rs        # Thread-safe Metal device management
 │   ├── buffer.rs         # Type-safe GPU buffer abstraction
-│   ├── bridge.rs         # MLX array ↔ Metal buffer conversion
+│   ├── view.rs           # Zero-copy Metal views of runtime arrays
 │   ├── pipeline.rs       # Compute pipeline management
 │   ├── accelerate.rs     # vDSP/cblas wrappers (RMSNorm, Adam, GEMM, etc.)
 │   ├── kernels/
