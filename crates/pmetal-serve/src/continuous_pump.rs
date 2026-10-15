@@ -59,8 +59,8 @@ use crate::continuous_driver::{
     ContinuousEngineState, SlotForward, drive_decode_step, drive_prefill_step,
 };
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
-use crate::prefix_cache::ServePrefixCache;
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
+use pmetal_mlx::prefix_cache::PrefixCache;
 use pmetal_models::generation::{GenerationConfig, Sampler, token_logprobs};
 use pmetal_runtime::compat::{Array, Exception};
 use std::collections::HashMap;
@@ -132,7 +132,7 @@ pub struct ContinuousPump {
     /// pass `None`.
     tokenizer: Option<Arc<pmetal_data::Tokenizer>>,
     /// Optional cross-request prefix cache shared with the engine.
-    prefix_cache: Option<Arc<Mutex<ServePrefixCache>>>,
+    prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
 }
 
 impl ContinuousPump {
@@ -153,7 +153,7 @@ impl ContinuousPump {
         config: BatcherConfig,
         cache_config: KVCacheConfig,
         tokenizer: Option<Arc<pmetal_data::Tokenizer>>,
-        prefix_cache: Option<Arc<Mutex<ServePrefixCache>>>,
+        prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
     ) -> Self {
         let max_slots = config.max_slots;
         let batcher = ContinuousBatcher::new(config);
@@ -236,29 +236,27 @@ impl ContinuousPump {
         let mut prefix_hit_len = 0usize;
         if let Some(prefix_cache) = self.prefix_cache.as_ref() {
             match prefix_cache.lock() {
-                Ok(mut guard) => {
-                    match guard.find_longest_prefix(&prompt, self.cache_config.clone()) {
-                        Ok(Some(hit)) => {
-                            prefix_hit_len = hit.prefix_len;
-                            scheduler_prompt = prompt[prefix_hit_len..].to_vec();
-                            prefix_seed = Some(hit.restored_cache);
-                            tracing::debug!(
-                                target: "pmetal_serve::continuous_pump",
-                                restored = prefix_hit_len,
-                                total = prompt_tokens,
-                                "continuous-batch prefix cache hit"
-                            );
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "pmetal_serve::continuous_pump",
-                                error = %e,
-                                "ignoring prefix-cache restore failure"
-                            );
-                        }
+                Ok(mut guard) => match guard.find_longest_prefix(&prompt, &self.cache_config) {
+                    Ok(Some(hit)) => {
+                        prefix_hit_len = hit.prefix_len;
+                        scheduler_prompt = prompt[prefix_hit_len..].to_vec();
+                        prefix_seed = Some(hit.restored_cache);
+                        tracing::debug!(
+                            target: "pmetal_serve::continuous_pump",
+                            restored = prefix_hit_len,
+                            total = prompt_tokens,
+                            "continuous-batch prefix cache hit"
+                        );
                     }
-                }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "pmetal_serve::continuous_pump",
+                            error = %e,
+                            "ignoring prefix-cache restore failure"
+                        );
+                    }
+                },
                 Err(_) => {
                     tracing::warn!(
                         target: "pmetal_serve::continuous_pump",
@@ -919,7 +917,7 @@ mod tests {
             }
         }
 
-        let prefix_cache = Arc::new(Mutex::new(ServePrefixCache::new(8, 0)));
+        let prefix_cache = Arc::new(Mutex::new(PrefixCache::new(8, 0)));
         prefix_cache
             .lock()
             .unwrap()
@@ -951,7 +949,7 @@ mod tests {
         let hit = prefix_cache
             .lock()
             .unwrap()
-            .find_longest_prefix(&[1, 2, 3, 4], cache_cfg())
+            .find_longest_prefix(&[1, 2, 3, 4], &cache_cfg())
             .unwrap()
             .expect("extended prompt should be cached after prefill");
         assert_eq!(hit.prefix_len, 3);

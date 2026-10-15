@@ -480,7 +480,7 @@ pub struct InferenceEngine {
     /// safely snapshot-truncated) and for every request where the
     /// engine is also running the ANE backend.
     /// Its entries are only touched on the model thread.
-    prefix_cache: Arc<Mutex<crate::prefix_cache::ServePrefixCache>>,
+    prefix_cache: Arc<Mutex<pmetal_mlx::prefix_cache::PrefixCache>>,
     /// The continuous-batching pump while it is enabled (`None` by
     /// default). The model thread drives it; this handle is for
     /// [`continuous_batching_depth`](Self::continuous_batching_depth).
@@ -705,7 +705,7 @@ struct GpuRequestContext {
     max_seq_len: usize,
     cache_mode_override: Option<CacheMode>,
     tokenizer: Arc<pmetal_data::Tokenizer>,
-    prefix_cache: Arc<Mutex<crate::prefix_cache::ServePrefixCache>>,
+    prefix_cache: Arc<Mutex<pmetal_mlx::prefix_cache::PrefixCache>>,
 }
 
 /// One GPU generation request, run on the model thread.
@@ -858,7 +858,7 @@ impl InferenceEngine {
             stop_token_ids,
             created_at: chrono::Utc::now().timestamp(),
             cache_mode_override: None,
-            prefix_cache: Arc::new(Mutex::new(crate::prefix_cache::ServePrefixCache::new(
+            prefix_cache: Arc::new(Mutex::new(pmetal_mlx::prefix_cache::PrefixCache::new(
                 DEFAULT_PREFIX_CACHE_ENTRIES,
                 DEFAULT_PREFIX_CACHE_BYTES,
             ))),
@@ -885,7 +885,7 @@ impl InferenceEngine {
     /// unbounded.
     pub fn set_prefix_cache_limits(&self, max_entries: usize, max_bytes: usize) {
         if let Ok(mut pc) = self.prefix_cache.lock() {
-            *pc = crate::prefix_cache::ServePrefixCache::new(max_entries, max_bytes);
+            *pc = pmetal_mlx::prefix_cache::PrefixCache::new(max_entries, max_bytes);
         }
     }
 
@@ -1810,7 +1810,7 @@ impl InferenceEngine {
         stop_sequences: &[String],
         logprobs_top_n: Option<usize>,
         prefill_step_size: usize,
-        prefix_cache: Option<&Arc<Mutex<crate::prefix_cache::ServePrefixCache>>>,
+        prefix_cache: Option<&Arc<Mutex<pmetal_mlx::prefix_cache::PrefixCache>>>,
         media: Option<&MediaForward>,
         start: Instant,
         mut on_token: E,
@@ -1851,7 +1851,7 @@ impl InferenceEngine {
                     Err(_) => return Err(ServeError::Busy),
                 };
                 match guard
-                    .find_longest_prefix(input_ids, cache.config().clone())
+                    .find_longest_prefix(input_ids, cache.config())
                     .map_err(ServeError::Model)?
                 {
                     Some(hit) => {

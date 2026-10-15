@@ -535,6 +535,138 @@ fn memory_accounting_follows_the_stored_dtype() {
 }
 
 // ---------------------------------------------------------------------------
+// Prefix cache
+// ---------------------------------------------------------------------------
+
+/// Run `request` through `prefix_cache` the way a server does: restore what
+/// it can, run the rest, store the result. Returns the logits of the tokens
+/// it ran and how many tokens the hit covered.
+fn serve(
+    toy: &Toy,
+    prefix_cache: &mut crate::prefix_cache::PrefixCache,
+    config: &KVCacheConfig,
+    request: &[u32],
+    vis: Visibility,
+) -> (Vec<f32>, usize) {
+    let (mut cache, covered) = match prefix_cache.find_longest_prefix(request, config).unwrap() {
+        Some(hit) => (hit.restored_cache, hit.prefix_len),
+        None => (KVCache::new(config.clone()), 0),
+    };
+    assert_eq!(cache.total_tokens(), covered);
+    let ids: Vec<i32> = request[covered..].iter().map(|&t| t as i32).collect();
+    let logits = toy.cached_chunk(&mut cache, &ids, vis);
+    prefix_cache.insert(request, &cache);
+    (logits, covered)
+}
+
+fn ids_to_u32(ids: &[i32]) -> Vec<u32> {
+    ids.iter().map(|&t| t as u32).collect()
+}
+
+#[test]
+fn prefix_cache_hits_continue_with_the_logits_of_an_uncached_run() {
+    let toy = Toy::new(80);
+    let system = tokens(30, 81);
+    let mut first = system.clone();
+    first.extend(tokens(12, 82));
+    let mut second = system.clone();
+    second.extend(tokens(9, 83));
+    let mut third = first.clone();
+    third.extend(tokens(5, 84));
+
+    let config = cache_config();
+    let mut prefix_cache = crate::prefix_cache::PrefixCache::new(8, 0);
+    let vis = Visibility::default();
+
+    // Cold, then a request that shares only the system prompt, then one
+    // that extends the first request, then the first request again.
+    let (logits, covered) = serve(&toy, &mut prefix_cache, &config, &ids_to_u32(&first), vis);
+    assert_eq!(covered, 0);
+    assert!(max_diff(&logits, &toy.reference(&first, vis)) < 2e-4);
+
+    let (logits, covered) = serve(&toy, &mut prefix_cache, &config, &ids_to_u32(&second), vis);
+    assert_eq!(covered, 30, "the system prompt is shared");
+    let reference = toy.reference(&second, vis);
+    assert!(max_diff(&logits, rows(&reference, 30, 39)) < 2e-4);
+
+    let (logits, covered) = serve(&toy, &mut prefix_cache, &config, &ids_to_u32(&third), vis);
+    assert_eq!(covered, 42, "the whole first request");
+    let reference = toy.reference(&third, vis);
+    assert!(max_diff(&logits, rows(&reference, 42, 47)) < 2e-4);
+
+    let (logits, covered) = serve(&toy, &mut prefix_cache, &config, &ids_to_u32(&first), vis);
+    assert_eq!(covered, 41, "all but the token that produces the logits");
+    let reference = toy.reference(&first, vis);
+    assert!(max_diff(&logits, rows(&reference, 41, 42)) < 2e-4);
+}
+
+#[test]
+fn prefix_cache_hits_on_compressed_caches_stay_within_their_error() {
+    let toy = Toy::new(85);
+    let shared = tokens(40, 86);
+    let mut a = shared.clone();
+    a.extend(tokens(10, 87));
+    let mut b = shared.clone();
+    b.extend(tokens(8, 88));
+    let vis = Visibility::default();
+    let cases: [(&str, KVCacheConfig, f32); 2] = [
+        // Recent tokens are exact: nothing differs from a cold run.
+        ("turboquant", turbo(TurboQuantConfig::uniform(4, 4)), 3e-4),
+        ("8-bit", quantized_config(8), 0.16),
+    ];
+    for (name, config, bound) in cases {
+        let mut prefix_cache = crate::prefix_cache::PrefixCache::new(8, 0);
+        serve(&toy, &mut prefix_cache, &config, &ids_to_u32(&a), vis);
+        let (logits, covered) = serve(&toy, &mut prefix_cache, &config, &ids_to_u32(&b), vis);
+        assert_eq!(covered, 40, "{name}");
+        let reference = toy.reference(&b, vis);
+        let diff = max_diff(&logits, rows(&reference, 40, 48));
+        assert!(diff < bound, "{name}: max diff {diff}");
+    }
+}
+
+#[test]
+fn prefix_cache_uses_a_windowed_entry_whole_and_never_cut_past_its_window() {
+    let toy = Toy::new(89);
+    let (config, vis) = windowed(24, 4);
+    // 300 tokens through a 24-token window: the buffer has been compacted.
+    let first = ids_to_u32(&tokens(300, 90));
+    let mut prefix_cache = crate::prefix_cache::PrefixCache::new(8, 0);
+    let mut cache = KVCache::new(config.clone());
+    let ids: Vec<i32> = first.iter().map(|&t| t as i32).collect();
+    let mut chunks = vec![40];
+    chunks.extend(std::iter::repeat_n(1, 260));
+    toy.cached(&mut cache, &ids, &chunks, vis);
+    prefix_cache.insert(&first, &cache);
+
+    // An extension of the whole entry is served exactly.
+    let mut longer = first.clone();
+    longer.extend([3u32, 4, 5]);
+    let hit = prefix_cache
+        .find_longest_prefix(&longer, &config)
+        .unwrap()
+        .expect("the whole entry extends");
+    assert_eq!(hit.prefix_len, 300);
+    let mut restored = hit.restored_cache;
+    let logits = toy.cached_chunk(&mut restored, &[3, 4, 5], vis);
+    let mut all_ids = ids.clone();
+    all_ids.extend([3, 4, 5]);
+    let reference = toy.reference(&all_ids, vis);
+    assert!(max_diff(&logits, rows(&reference, 300, 303)) < 2e-4);
+
+    // A request that shares only the first 100 tokens cannot be served by
+    // cutting a cache whose window has long moved past token 100.
+    let mut diverging = first[..100].to_vec();
+    diverging.extend([9u32, 9, 9]);
+    assert!(
+        prefix_cache
+            .find_longest_prefix(&diverging, &config)
+            .unwrap()
+            .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Quantized cache
 // ---------------------------------------------------------------------------
 

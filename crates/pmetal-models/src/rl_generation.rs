@@ -33,7 +33,7 @@
 use pmetal_runtime::compat::{Array, Exception, ops};
 
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
-use pmetal_mlx::prefix_cache::PrefixCachedGenerator;
+use pmetal_mlx::prefix_cache::PrefixCache;
 
 use crate::generation::{GenerationConfig, Sampler};
 
@@ -227,8 +227,8 @@ impl BatchedRlConfig {
 pub struct BatchedRlGenerator {
     /// Configuration.
     config: BatchedRlConfig,
-    /// Prefix cache generator.
-    prefix_cache: Option<PrefixCachedGenerator>,
+    /// Prefix cache.
+    prefix_cache: Option<PrefixCache>,
     /// KV cache config for creating new caches.
     kv_config: KVCacheConfig,
     /// Sampler with the full filter chain (temperature, top-k, top-p, min-p).
@@ -241,7 +241,7 @@ impl BatchedRlGenerator {
     /// Create a new batched RL generator.
     pub fn new(config: BatchedRlConfig, kv_config: KVCacheConfig) -> Self {
         let prefix_cache = if config.use_prefix_cache {
-            Some(PrefixCachedGenerator::new(32, kv_config.clone()))
+            Some(PrefixCache::new(32, 0))
         } else {
             None
         };
@@ -284,71 +284,46 @@ impl BatchedRlGenerator {
         let mut finished: Vec<bool> = vec![false; batch_size];
         let mut stopped_by_token: Vec<bool> = vec![false; batch_size];
 
-        // Create KV caches for each sequence
-        let mut caches: Vec<KVCache> = (0..batch_size)
-            .map(|_| KVCache::new(self.kv_config.clone()))
-            .collect();
-
-        // Check prefix cache for pre-filled cache
-        let prefilled = if let Some(ref mut prefix_gen) = self.prefix_cache {
-            prefix_gen.try_get_cache(prompt_tokens)?
-        } else {
-            None
-        };
-
-        // Prefill phase: process the prompt
+        // Prefill the prompt once. A prefix-cache hit covers its leading
+        // tokens (all but the last when the prompt repeats), so only the
+        // rest runs, and what runs also yields the logits of the prompt's
+        // last token, which every completion's first token is sampled from.
         let prompt_len = prompt_tokens.len();
-        let prompt_input = Array::from_slice(
-            &prompt_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-            &[1, prompt_len as i32],
-        );
-
-        // Replicate for batch
-        let _batched_prompt = self.replicate_for_batch(&prompt_input, batch_size);
-
-        // If we have a prefilled cache, copy it to all sequences
-        if let Some(ref prefilled_cache) = prefilled {
-            // Clone the prefilled cache for each sequence
-            for cache in caches.iter_mut() {
-                for layer_idx in 0..self.kv_config.num_layers {
-                    if let Some((k, v)) = prefilled_cache.get(layer_idx) {
-                        cache.update_and_fetch(layer_idx, &k, &v)?;
-                    }
-                }
+        if prompt_len == 0 {
+            return Err(Exception::custom("cannot generate from an empty prompt"));
+        }
+        let hit = match self.prefix_cache.as_mut() {
+            Some(prefix_cache) => {
+                prefix_cache.find_longest_prefix(prompt_tokens, &self.kv_config)?
             }
+            None => None,
+        };
+        let (mut prefilled, covered) = match hit {
+            Some(hit) => (hit.restored_cache, hit.prefix_len),
+            None => (KVCache::new(self.kv_config.clone()), 0),
+        };
+        let suffix: Vec<i32> = prompt_tokens[covered..].iter().map(|&t| t as i32).collect();
+        let suffix_len = suffix.len();
+        let suffix_input = Array::from_slice(&suffix, &[1, suffix_len as i32]);
+        let logits = forward_fn(&suffix_input, &mut prefilled)?;
+        logits.eval();
+        // logits [1, L, V] -> [1, V] at the prompt's last position.
+        let last_logits = ops::select_axis(&logits, suffix_len as i32 - 1, 1);
+        if let Some(prefix_cache) = self.prefix_cache.as_mut() {
+            prefix_cache.insert(prompt_tokens, &prefilled);
         }
 
-        // Forward pass on prompt (or just get first token if prefilled)
-        // For simplicity, we process one cache at a time in this version
-        // A fully optimized version would batch across caches too
+        // Each completion continues from its own fork of the prefilled cache
+        // and draws its first token from the same logits.
+        let mut caches: Vec<KVCache> = (0..batch_size).map(|_| prefilled.fork()).collect();
         let mut current_tokens: Vec<u32> = vec![0; batch_size];
-
         for seq_idx in 0..batch_size {
-            if prefilled.is_none() {
-                // Forward on prompt
-                let logits = forward_fn(&prompt_input, &mut caches[seq_idx])?;
-                logits.eval();
-
-                // Sample the first token from the last prompt position:
-                // logits [1, L, V] -> [1, V].
-                let last_logits =
-                    pmetal_runtime::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
-                let token = self.sample(&last_logits)?;
-                current_tokens[seq_idx] = token;
-                sequences[seq_idx].push(token);
-
-                if self.is_stop_token(token) {
-                    finished[seq_idx] = true;
-                    stopped_by_token[seq_idx] = true;
-                }
-            }
-        }
-
-        // Cache the prompt if this was first time
-        if prefilled.is_none() {
-            if let Some(ref mut prefix_gen) = self.prefix_cache {
-                // Cache using the first sequence's cache (all should be identical at this point)
-                prefix_gen.cache_prompt(prompt_tokens, &caches[0]);
+            let token = self.sample(&last_logits)?;
+            current_tokens[seq_idx] = token;
+            sequences[seq_idx].push(token);
+            if self.is_stop_token(token) {
+                finished[seq_idx] = true;
+                stopped_by_token[seq_idx] = true;
             }
         }
 
@@ -748,21 +723,11 @@ impl BatchedRlGenerator {
         self.config.stop_tokens.contains(&token)
     }
 
-    /// Replicate input for batch.
-    fn replicate_for_batch(&self, input: &Array, batch_size: usize) -> RlGenResult<Array> {
-        if batch_size == 1 {
-            return Ok(input.clone());
-        }
-
-        // Tile the input along batch dimension
-        let tiles = vec![input.clone(); batch_size];
-        let refs: Vec<&Array> = tiles.iter().collect();
-        Ok(ops::concatenate_axis(&refs, 0))
-    }
-
-    /// Get prefix cache statistics.
+    /// Prefix cache statistics: `(hits, misses, hit_rate)`.
     pub fn prefix_cache_stats(&self) -> Option<(usize, usize, f64)> {
-        self.prefix_cache.as_ref().map(|pc| pc.stats())
+        self.prefix_cache
+            .as_ref()
+            .map(|pc| (pc.hits() as usize, pc.misses() as usize, pc.hit_rate()))
     }
 
     /// Clear prefix cache.
@@ -865,11 +830,16 @@ mod tests {
     }
 
     /// A stand-in model whose logits put 30 on (token + 1) mod 16 at every
-    /// position, so its greedy continuation of any prompt counts upward.
-    fn counting_model(input: &Array, _cache: &mut KVCache) -> RlGenResult<Array> {
+    /// position, so its greedy continuation of any prompt counts upward. It
+    /// stores a zero key and value per token, as a real model stores its own.
+    fn counting_model(input: &Array, cache: &mut KVCache) -> RlGenResult<Array> {
         const VOCAB: usize = 16;
         input.eval();
         let ids: Vec<i32> = input.as_slice::<i32>().to_vec();
+        let kv = Array::zeros_f32(&[1, 4, ids.len() as i32, 64]);
+        for layer in 0..2 {
+            cache.update_and_fetch(layer, &kv, &kv)?;
+        }
         let mut logits = vec![0.0f32; ids.len() * VOCAB];
         for (pos, &id) in ids.iter().enumerate() {
             logits[pos * VOCAB + (id as usize + 1) % VOCAB] = 30.0;
@@ -937,6 +907,56 @@ mod tests {
         }
         let stats = generator.last_speculative_stats().unwrap();
         assert_eq!(stats.total_draft_accepted, stats.total_draft_proposed);
+    }
+
+    #[test]
+    fn a_prefix_cache_hit_samples_from_the_prompt_logits() {
+        // The second rollout of a prompt restores its KV state. It must still
+        // produce the first token from the prompt's last logits, not from
+        // nothing, and so complete exactly as the first did.
+        let config = || BatchedRlConfig {
+            temperature: 1.0,
+            ..BatchedRlConfig::new(3)
+                .with_max_new_tokens(5)
+                .with_stop_tokens(vec![15])
+                .with_seed(1)
+        };
+        let mut generator = BatchedRlGenerator::new(config(), create_test_kv_config());
+        let cold = generator.generate(counting_model, &[2, 3, 4]).unwrap();
+        let warm = generator.generate(counting_model, &[2, 3, 4]).unwrap();
+        pmetal_runtime::check_unobserved_error().unwrap();
+        assert_eq!(cold.token_ids[0], vec![2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(warm.token_ids, cold.token_ids);
+        assert_eq!(warm.num_generated, cold.num_generated);
+        let (_, _, hit_rate) = generator.prefix_cache_stats().unwrap();
+        assert!(hit_rate > 0.0, "the second rollout should hit the cache");
+    }
+
+    #[test]
+    fn the_prompt_is_prefilled_once_for_all_completions() {
+        // The completions of one prompt share its KV state: the prompt runs
+        // through the model once, however many are sampled, and a repeat of
+        // it runs only the token that produces the logits.
+        let config = BatchedRlConfig::new(4)
+            .with_max_new_tokens(3)
+            .with_stop_tokens(vec![15])
+            .with_seed(2);
+        let mut generator = BatchedRlGenerator::new(config, create_test_kv_config());
+        let prompt_runs = std::cell::RefCell::new(Vec::new());
+        let run = |input: &Array, cache: &mut KVCache| {
+            if input.dim(1) > 1 {
+                prompt_runs.borrow_mut().push(input.dim(1));
+            }
+            counting_model(input, cache)
+        };
+        generator.generate(&run, &[2, 3, 4, 5]).unwrap();
+        assert_eq!(*prompt_runs.borrow(), vec![4], "one prefill of four tokens");
+        generator.generate(&run, &[2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(
+            *prompt_runs.borrow(),
+            vec![4],
+            "the shared four tokens are not run again"
+        );
     }
 
     #[test]
