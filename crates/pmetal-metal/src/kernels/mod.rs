@@ -4,7 +4,6 @@
 //! with a focus on transformer attention mechanisms and efficient training
 //! operations.
 
-pub mod dispatch;
 pub mod dw_gemm;
 pub mod flash_attention;
 pub mod fused_lora;

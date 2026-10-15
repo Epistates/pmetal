@@ -446,26 +446,31 @@ mod tests {
         let ctx = MetalContext::new().unwrap();
         let mut cache = ctx.pipeline_cache_mut();
         let before = cache.len();
-        let with = |threads: u32| constants(&[(0, FunctionConstant::UInt(threads))]);
+        let with = |threads: u32| {
+            constants(&[
+                (0, FunctionConstant::UInt(threads)),
+                (1, FunctionConstant::UInt(2048)),
+            ])
+        };
 
         let small = cache
             .get_or_create_specialized_pipeline_typed(
                 ctx.device(),
-                "fused_linear_cross_entropy_forward",
+                "fused_swiglu_forward",
                 &with(32),
             )
             .unwrap();
         let large = cache
             .get_or_create_specialized_pipeline_typed(
                 ctx.device(),
-                "fused_linear_cross_entropy_forward",
+                "fused_swiglu_forward",
                 &with(256),
             )
             .unwrap();
         let small_again = cache
             .get_or_create_specialized_pipeline_typed(
                 ctx.device(),
-                "fused_linear_cross_entropy_forward",
+                "fused_swiglu_forward",
                 &with(32),
             )
             .unwrap();
