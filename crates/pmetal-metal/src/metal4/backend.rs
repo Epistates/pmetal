@@ -21,7 +21,6 @@ use crate::{
     kernels::fused_moe::ExpertBits,
     kernels::{
         flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
-        fused_cross_entropy::{FusedCrossEntropyConfig, FusedCrossEntropyOutput},
         fused_lora::{FusedLoraConfig, FusedLoraOutput},
         fused_norm_lora::{FusedNormLoraConfig, FusedNormLoraOutput},
         fused_rope::FusedRoPEConfig,
@@ -30,7 +29,6 @@ use crate::{
         moe::{MoeConfig, MoeRouting},
         mpp_dw_gemm::{MppDwGemm, MppDwGemmConfig},
         mpp_flash_attention::{MppFlashAttentionBackward, MppFlashAttentionConfig as MppFAConfig},
-        mpp_fused_cross_entropy::{MppFusedCrossEntropy, MppFusedCrossEntropyConfig},
         mpp_fused_lora::{MppFusedLora, MppFusedLoraConfig},
         mpp_fused_moe::{MppFusedMoEQuant, MppFusedMoEQuantConfig, MppGroupedGemmTileCount},
         mpp_fused_norm_lora::{MppFusedNormLora, MppFusedNormLoraConfig},
@@ -591,40 +589,6 @@ impl KernelBackend for Metal4Backend {
             &mpp_info_buf,
             &desc.config,
         )
-    }
-
-    fn fused_cross_entropy(
-        &self,
-        ctx: &Arc<MetalContext>,
-        config: &FusedCrossEntropyConfig,
-        logits: &dyn AsMetalBuffer,
-        targets: &MetalBuffer<i32>,
-    ) -> Result<FusedCrossEntropyOutput> {
-        let mpp_config = MppFusedCrossEntropyConfig {
-            num_tokens: config.num_tokens,
-            vocab_size: config.vocab_size,
-            ignore_index: config.ignore_index,
-            use_fp16: config.use_fp16,
-            forward_only: false,
-        };
-        let dispatcher = MppFusedCrossEntropy::new(self.ctx.clone(), mpp_config);
-
-        if !dispatcher.is_available() {
-            return self
-                .fallback
-                .fused_cross_entropy(ctx, config, logits, targets);
-        }
-
-        let losses = MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
-        let logsumexp = MetalBuffer::<f32>::new(&self.ctx, config.num_tokens, BufferUsage::Shared)?;
-
-        // MPP cross-entropy fwd+bwd kernel writes gradients into grad_logits.
-        // For the forward-only output shape (losses + logsumexp), we pass logsumexp
-        // as the grad_logits placeholder and a single-element loss accumulator.
-        let loss_accum = MetalBuffer::<f32>::new(&self.ctx, 1, BufferUsage::Shared)?;
-        dispatcher.execute(logits, targets, &logsumexp, &loss_accum)?;
-
-        Ok(FusedCrossEntropyOutput { losses, logsumexp })
     }
 
     fn fused_rope(

@@ -21,8 +21,7 @@
 //!   as `MetalBuffer<u16>` (same 2-byte layout, Metal does not distinguish them)
 //!   and passed directly to [`FusedMoeExpert::forward_single_expert`].
 //!
-//! - **`fused_lora_forward`**, **`fused_cross_entropy`** and
-//!   **`fused_adamw_step`**: wired directly, with param-info extraction from
+//! - **`fused_lora_forward`** and **`fused_adamw_step`**: wired directly, with param-info extraction from
 //!   the `AdamWDescriptor` for AdamW.
 
 use std::sync::Arc;
@@ -40,9 +39,6 @@ use crate::{
     kernels::{
         dw_gemm::DwGemm,
         flash_attention::{FlashAttention, FlashAttentionConfig, FlashAttentionOutput},
-        fused_cross_entropy::{
-            FusedCrossEntropy, FusedCrossEntropyConfig, FusedCrossEntropyOutput,
-        },
         fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput},
         fused_moe::{ExpertWeightBuffers, FusedMoeExpert},
         fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput},
@@ -357,22 +353,6 @@ impl KernelBackend for Metal3Backend {
         let mut batch = BatchedCommandBuffer::new(self.ctx.clone())?;
         self.fused_adamw_step(&mut batch, desc)?;
         batch.execute()
-    }
-
-    /// Fused cross-entropy via `FusedCrossEntropy::forward_dyn`.
-    ///
-    /// The trait provides `logits: &dyn AsMetalBuffer` to support both f32
-    /// and f16 logits without an extra type parameter. [`FusedCrossEntropy`]
-    /// exposes `forward_dyn` which accepts the same type-erased buffer.
-    fn fused_cross_entropy(
-        &self,
-        ctx: &Arc<MetalContext>,
-        config: &FusedCrossEntropyConfig,
-        logits: &dyn AsMetalBuffer,
-        targets: &MetalBuffer<i32>,
-    ) -> Result<FusedCrossEntropyOutput> {
-        let kernel = FusedCrossEntropy::new(ctx.clone(), config.clone())?;
-        kernel.forward_dyn(logits, targets)
     }
 
     /// Fused RoPE via [`FusedRoPE`].

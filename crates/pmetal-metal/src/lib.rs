@@ -89,15 +89,6 @@ pub use kernels::flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
     FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
 };
-pub use kernels::fused_cross_entropy::{
-    FusedCrossEntropy,
-    FusedCrossEntropyConfig,
-    FusedCrossEntropyOutput,
-    // Chunked vocabulary optimization: fused linear + cross-entropy (skips logits materialization)
-    FusedLinearCrossEntropy,
-    FusedLinearCrossEntropyConfig,
-    FusedLinearCrossEntropyOutput,
-};
 pub use kernels::fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use kernels::fused_moe::{
     ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig,
@@ -121,10 +112,6 @@ pub mod prelude {
     pub use crate::error::{MetalError, Result};
     pub use crate::kernels::flash_attention::{
         FlashAttention, FlashAttentionConfig, FlashAttentionVarlen, FlashAttentionVarlenConfig,
-    };
-    pub use crate::kernels::fused_cross_entropy::{
-        FusedCrossEntropy, FusedCrossEntropyConfig, FusedLinearCrossEntropy,
-        FusedLinearCrossEntropyConfig,
     };
     pub use crate::kernels::fused_lora::{FusedLora, FusedLoraConfig};
     pub use crate::kernels::mpp_flash_attention::{MppFlashAttention, MppFlashAttentionConfig};

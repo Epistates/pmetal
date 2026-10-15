@@ -50,7 +50,6 @@ use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::{DeviceProperties, DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
 use crate::kernels::flash_attention::{FlashAttention, FlashAttentionConfig};
-use crate::kernels::fused_cross_entropy::{FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig};
 use crate::kernels::fused_lora::{FusedLoraConfig, FusedLoraParams};
 use crate::kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig};
 use crate::kernels::fused_swiglu::{FusedMLP, FusedSwiGLUConfig};
@@ -100,27 +99,6 @@ impl Default for SwiGLUTunedConfig {
         Self {
             threads_per_token: 256,
             chunk_size: 2048,
-        }
-    }
-}
-
-/// Configuration for tuned cross-entropy loss kernels.
-///
-/// Cross-entropy over large vocabularies benefits from threadgroup-level
-/// reduction and chunked accumulation to avoid numerical issues.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CrossEntropyTunedConfig {
-    /// Threads per threadgroup for the reduction sweep.
-    pub threadgroup_size: u32,
-    /// Number of vocabulary elements processed per chunk.
-    pub chunk_size: u32,
-}
-
-impl Default for CrossEntropyTunedConfig {
-    fn default() -> Self {
-        Self {
-            threadgroup_size: 256,
-            chunk_size: 4096,
         }
     }
 }
@@ -353,18 +331,6 @@ fn dedupe_norm_lora_configs(configs: Vec<NormLoraTunedConfig>) -> Vec<NormLoraTu
     unique
 }
 
-fn dedupe_cross_entropy_configs(
-    configs: Vec<CrossEntropyTunedConfig>,
-) -> Vec<CrossEntropyTunedConfig> {
-    let mut unique = Vec::with_capacity(configs.len());
-    for config in configs {
-        if !unique.contains(&config) {
-            unique.push(config);
-        }
-    }
-    unique
-}
-
 // ============================================================================
 // Disk cache free helpers (outside Tuner so borrowck is happy)
 // ============================================================================
@@ -453,10 +419,6 @@ pub struct Tuner {
     /// Key: "swiglu:batch:hidden:intermediate"
     swiglu_cache: Mutex<HashMap<String, SwiGLUTunedConfig>>,
 
-    /// Cache of best configurations for cross-entropy kernels.
-    /// Keys cover both generic logits CE and fused-linear CE shapes.
-    cross_entropy_cache: Mutex<HashMap<String, CrossEntropyTunedConfig>>,
-
     /// Cache of best configurations for FlashAttention block sizes.
     /// Key: "flash_attention:device_name:device_tier:..."
     flash_attention_cache: Mutex<HashMap<String, FlashAttentionTunedConfig>>,
@@ -486,7 +448,6 @@ impl Tuner {
         Self {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -504,7 +465,6 @@ impl Tuner {
         let mut tuner = Self {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -535,10 +495,6 @@ impl Tuner {
 
         load_disk_cache_file::<TunedConfig>(&dir.join("lora_forward.json"), &self.cache);
         load_disk_cache_file::<SwiGLUTunedConfig>(&dir.join("swiglu.json"), &self.swiglu_cache);
-        load_disk_cache_file::<CrossEntropyTunedConfig>(
-            &dir.join("cross_entropy.json"),
-            &self.cross_entropy_cache,
-        );
         load_disk_cache_file::<FlashAttentionTunedConfig>(
             &dir.join("flash_attention.json"),
             &self.flash_attention_cache,
@@ -582,15 +538,6 @@ impl Tuner {
         };
         let path = dir.join("swiglu.json");
         self.flush_cache_file(&path, &self.swiglu_cache, key, config);
-    }
-
-    /// Persist the full cross-entropy in-memory cache to `cross_entropy.json`.
-    fn save_cross_entropy_to_disk(&self, key: &str, config: &CrossEntropyTunedConfig) {
-        let Some(dir) = self.ensure_cache_dir() else {
-            return;
-        };
-        let path = dir.join("cross_entropy.json");
-        self.flush_cache_file(&path, &self.cross_entropy_cache, key, config);
     }
 
     /// Persist the full flash_attention in-memory cache to `flash_attention.json`.
@@ -1915,425 +1862,6 @@ impl Tuner {
     }
 
     // =========================================================================
-    // Cross-Entropy Kernel Tuning (heuristic)
-    // =========================================================================
-
-    /// Tune the cross-entropy loss kernel for the given problem size.
-    ///
-    /// Cross-entropy over large vocabularies is dominated by the softmax
-    /// reduction. The threadgroup size controls parallelism of that reduction
-    /// sweep; larger threadgroups amortize overhead for wide vocabularies but
-    /// require more threadgroup memory on tighter devices.
-    ///
-    /// # Arguments
-    /// * `context` - Metal context
-    /// * `num_tokens` - Number of tokens in the batch
-    /// * `vocab_size` - Vocabulary size
-    ///
-    /// # Returns
-    /// Heuristically-selected optimal configuration for cross-entropy on this hardware.
-    pub fn tune_cross_entropy(
-        &self,
-        context: &MetalContext,
-        num_tokens: usize,
-        vocab_size: usize,
-    ) -> Result<CrossEntropyTunedConfig> {
-        let key = format!("cross_entropy:{}:{}", num_tokens, vocab_size);
-
-        // Check in-memory cache
-        {
-            let cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            if let Some(&config) = cache.get(&key) {
-                return Ok(config);
-            }
-        }
-
-        debug!(
-            "Selecting cross-entropy config for [T={}, V={}]",
-            num_tokens, vocab_size
-        );
-
-        let config = self.select_cross_entropy_config(context, vocab_size);
-
-        info!(
-            "Selected cross-entropy config: {:?} (heuristic, vocab={}, device tier: {:?})",
-            config,
-            vocab_size,
-            context.properties().device_tier
-        );
-
-        // Update in-memory cache
-        {
-            let mut cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            cache.insert(key.clone(), config);
-        }
-
-        // Write-through to disk
-        self.save_cross_entropy_to_disk(&key, &config);
-
-        Ok(config)
-    }
-
-    /// Select the best cross-entropy config using heuristics.
-    ///
-    /// Decision rationale:
-    /// - `threadgroup_size`: Larger vocabularies need more parallel threads to
-    ///   sweep the reduction without serialising too much. Cap at the device
-    ///   max_threads_per_threadgroup.
-    /// - `chunk_size`: Tile the vocabulary to fit output logits into cache.
-    ///   High-bandwidth devices have larger effective caches so larger tiles pay off.
-    fn select_cross_entropy_config(
-        &self,
-        context: &MetalContext,
-        vocab_size: usize,
-    ) -> CrossEntropyTunedConfig {
-        use crate::context::DeviceTier;
-
-        let props = context.properties();
-        let max_threads = props.max_threads_per_threadgroup as u32;
-
-        // Scale threadgroup size with vocab breadth:
-        //   < 32k  → 256 threads (most LLM tokenizers)
-        //   32k–128k → 512 threads (LLaMA-3, Mistral)
-        //   > 128k → 1024 threads (Llama-3 extended, Falcon-180B)
-        // Always clamp to the hardware maximum.
-        let threadgroup_size = if vocab_size < 32_768 {
-            256_u32
-        } else if vocab_size < 131_072 {
-            512_u32
-        } else {
-            1024_u32
-        }
-        .min(max_threads);
-
-        // chunk_size: vocabulary tile for the softmax sweep.
-        let chunk_size = match props.device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => 8192,
-            DeviceTier::Pro => 4096,
-            DeviceTier::Base => 2048,
-        };
-
-        CrossEntropyTunedConfig {
-            threadgroup_size,
-            chunk_size,
-        }
-    }
-
-    /// Tune the fused linear cross-entropy kernel for the given problem shape.
-    ///
-    /// This benchmarks the real hidden-state kernel instead of relying only on
-    /// vocabulary heuristics, so the selected configuration reflects hidden
-    /// width, dtype, and device tier on M1-M4 as well as Apple10/M5.
-    pub fn tune_fused_linear_cross_entropy(
-        &self,
-        context: &Arc<MetalContext>,
-        config: &FusedLinearCrossEntropyConfig,
-    ) -> Result<CrossEntropyTunedConfig> {
-        let props = context.properties();
-        let key = format!(
-            "fused_linear_ce:{}:{}:{}:{}:{}:{}",
-            props.name,
-            device_tier_key(props.device_tier),
-            if config.use_fp16 { "f16" } else { "f32" },
-            config.num_tokens,
-            config.hidden_size,
-            config.vocab_size
-        );
-
-        {
-            let cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            if let Some(&cached) = cache.get(&key) {
-                return Ok(cached);
-            }
-        }
-
-        debug!(
-            "Selecting fused linear CE config for [T={}, H={}, V={}, dtype={}]",
-            config.num_tokens,
-            config.hidden_size,
-            config.vocab_size,
-            if config.use_fp16 { "f16" } else { "f32" }
-        );
-
-        let heuristic = self.heuristic_fused_linear_cross_entropy_config(
-            props.device_tier,
-            config.hidden_size,
-            config.vocab_size,
-            props.max_threads_per_threadgroup as u32,
-        );
-        let candidates = self.candidate_fused_linear_cross_entropy_configs(
-            props.device_tier,
-            config.hidden_size,
-            config.vocab_size,
-            props.max_threads_per_threadgroup as u32,
-        );
-        let mut best_config = heuristic;
-        let mut best_time = f64::INFINITY;
-
-        info!(
-            "Tuning fused linear CE config for [T={}, H={}, V={}, dtype={}]...",
-            config.num_tokens,
-            config.hidden_size,
-            config.vocab_size,
-            if config.use_fp16 { "f16" } else { "f32" }
-        );
-
-        for candidate in candidates {
-            match self.benchmark_fused_linear_cross_entropy(context, config, candidate) {
-                Ok(elapsed) => {
-                    debug!(
-                        "Fused linear CE config {:?} took {:.3} ms",
-                        candidate,
-                        elapsed * 1000.0
-                    );
-                    if elapsed < best_time {
-                        best_time = elapsed;
-                        best_config = candidate;
-                    }
-                }
-                Err(error) => {
-                    debug!(
-                        "Fused linear CE config {:?} failed benchmarking: {}",
-                        candidate, error
-                    );
-                }
-            }
-        }
-
-        if best_time.is_finite() {
-            info!(
-                "Selected fused linear CE config: {:?} ({:.3} ms)",
-                best_config,
-                best_time * 1000.0
-            );
-        } else {
-            debug!(
-                "Falling back to heuristic fused linear CE config {:?} for [H={}, V={}] on {:?}",
-                best_config, config.hidden_size, config.vocab_size, props.device_tier
-            );
-        }
-
-        {
-            let mut cache = self
-                .cross_entropy_cache
-                .lock()
-                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            cache.insert(key.clone(), best_config);
-        }
-
-        self.save_cross_entropy_to_disk(&key, &best_config);
-
-        Ok(best_config)
-    }
-
-    fn heuristic_fused_linear_cross_entropy_config(
-        &self,
-        device_tier: DeviceTier,
-        hidden_size: usize,
-        vocab_size: usize,
-        max_threads_per_threadgroup: u32,
-    ) -> CrossEntropyTunedConfig {
-        let threadgroup_size = match device_tier {
-            DeviceTier::Base => {
-                if vocab_size < 32_768 {
-                    128
-                } else if vocab_size < 131_072 {
-                    256
-                } else {
-                    512
-                }
-            }
-            DeviceTier::Pro | DeviceTier::Max | DeviceTier::Ultra => {
-                if vocab_size < 32_768 {
-                    256
-                } else if vocab_size < 131_072 {
-                    512
-                } else {
-                    1024
-                }
-            }
-        };
-
-        let chunk_size = match device_tier {
-            DeviceTier::Base => {
-                if hidden_size >= 4096 {
-                    1024
-                } else {
-                    2048
-                }
-            }
-            DeviceTier::Pro => {
-                if hidden_size >= 8192 {
-                    2048
-                } else {
-                    4096
-                }
-            }
-            DeviceTier::Max | DeviceTier::Ultra => {
-                if hidden_size >= 8192 {
-                    4096
-                } else {
-                    8192
-                }
-            }
-        };
-
-        CrossEntropyTunedConfig {
-            threadgroup_size: sanitize_threads_per_token_candidate(
-                threadgroup_size,
-                max_threads_per_threadgroup,
-            ),
-            chunk_size: chunk_size.min(vocab_size.max(1) as u32),
-        }
-    }
-
-    fn candidate_fused_linear_cross_entropy_configs(
-        &self,
-        device_tier: DeviceTier,
-        hidden_size: usize,
-        vocab_size: usize,
-        max_threads_per_threadgroup: u32,
-    ) -> Vec<CrossEntropyTunedConfig> {
-        let heuristic = self.heuristic_fused_linear_cross_entropy_config(
-            device_tier,
-            hidden_size,
-            vocab_size,
-            max_threads_per_threadgroup,
-        );
-        let mut configs = vec![heuristic];
-
-        let thread_candidates: &[u32] = match device_tier {
-            DeviceTier::Base => &[128, 256, 512],
-            DeviceTier::Pro => &[128, 256, 512, 1024],
-            DeviceTier::Max | DeviceTier::Ultra => &[256, 512, 1024],
-        };
-        for &threadgroup_size in thread_candidates {
-            configs.push(CrossEntropyTunedConfig {
-                threadgroup_size: sanitize_threads_per_token_candidate(
-                    threadgroup_size,
-                    max_threads_per_threadgroup,
-                ),
-                chunk_size: heuristic.chunk_size,
-            });
-        }
-
-        let chunk_candidates: &[u32] = &[1024, 2048, 4096, 8192];
-        for &chunk_size in chunk_candidates {
-            configs.push(CrossEntropyTunedConfig {
-                threadgroup_size: heuristic.threadgroup_size,
-                chunk_size: chunk_size.min(vocab_size.max(1) as u32),
-            });
-        }
-
-        dedupe_cross_entropy_configs(configs)
-    }
-
-    fn benchmark_fused_linear_cross_entropy(
-        &self,
-        context: &Arc<MetalContext>,
-        config: &FusedLinearCrossEntropyConfig,
-        candidate: CrossEntropyTunedConfig,
-    ) -> Result<f64> {
-        let heuristic = self.heuristic_fused_linear_cross_entropy_config(
-            context.properties().device_tier,
-            config.hidden_size,
-            config.vocab_size,
-            context.properties().max_threads_per_threadgroup as u32,
-        );
-
-        let dtype_size = if config.use_fp16 {
-            std::mem::size_of::<f16>()
-        } else {
-            std::mem::size_of::<f32>()
-        };
-        let total_bytes = config
-            .num_tokens
-            .checked_mul(config.hidden_size)
-            .and_then(|x| x.checked_add(config.vocab_size.checked_mul(config.hidden_size)?))
-            .and_then(|x| x.checked_mul(dtype_size))
-            .and_then(|x| x.checked_add(config.num_tokens.checked_mul(std::mem::size_of::<i32>())?))
-            .and_then(|x| {
-                x.checked_add(
-                    config
-                        .num_tokens
-                        .checked_mul(2 * std::mem::size_of::<f32>())?,
-                )
-            })
-            .ok_or_else(|| {
-                MetalError::InvalidConfig("Fused linear CE benchmark size overflow".to_string())
-            })?;
-        let benchmark_budget = match context.properties().device_tier {
-            DeviceTier::Base => 256 * 1024 * 1024,
-            DeviceTier::Pro => 384 * 1024 * 1024,
-            DeviceTier::Max | DeviceTier::Ultra => 512 * 1024 * 1024,
-        };
-        if total_bytes > benchmark_budget {
-            return Ok(if candidate == heuristic { 1.0 } else { 10.0 });
-        }
-
-        let kernel = FusedLinearCrossEntropy::new_with_tuned_config(
-            Arc::clone(context),
-            config.clone(),
-            candidate,
-        )?;
-        let targets = MetalBuffer::<i32>::zeros(context, config.num_tokens, BufferUsage::Shared)?;
-
-        if config.use_fp16 {
-            let hidden_states = MetalBuffer::<f16>::zeros(
-                context,
-                config.num_tokens * config.hidden_size,
-                BufferUsage::Shared,
-            )?;
-            let lm_head_weight = MetalBuffer::<f16>::zeros(
-                context,
-                config.vocab_size * config.hidden_size,
-                BufferUsage::Shared,
-            )?;
-
-            kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
-
-            let iterations = 3;
-            let start = Instant::now();
-            for _ in 0..iterations {
-                let output = kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
-                std::hint::black_box(output);
-            }
-            return Ok(start.elapsed().as_secs_f64() / iterations as f64);
-        }
-
-        let hidden_states = MetalBuffer::<f32>::zeros(
-            context,
-            config.num_tokens * config.hidden_size,
-            BufferUsage::Shared,
-        )?;
-        let lm_head_weight = MetalBuffer::<f32>::zeros(
-            context,
-            config.vocab_size * config.hidden_size,
-            BufferUsage::Shared,
-        )?;
-
-        kernel.forward(&hidden_states, &lm_head_weight, &targets)?;
-
-        let iterations = 3;
-        let start = Instant::now();
-        for _ in 0..iterations {
-            let output = kernel.forward(&hidden_states, &lm_head_weight, &targets)?;
-            std::hint::black_box(output);
-        }
-
-        Ok(start.elapsed().as_secs_f64() / iterations as f64)
-    }
-
-    // =========================================================================
     // Norm+LoRA Fused Kernel Tuning (benchmarked)
     // =========================================================================
 
@@ -2662,13 +2190,6 @@ mod tests {
     }
 
     #[test]
-    fn cross_entropy_tuned_config_default() {
-        let c = CrossEntropyTunedConfig::default();
-        assert_eq!(c.threadgroup_size, 256);
-        assert_eq!(c.chunk_size, 4096);
-    }
-
-    #[test]
     fn norm_lora_tuned_config_default() {
         let c = NormLoraTunedConfig::default();
         assert_eq!(c.threads_per_token, 256);
@@ -2713,17 +2234,6 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: SwiGLUTunedConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(config, decoded);
-    }
-
-    #[test]
-    fn cross_entropy_tuned_config_serde_roundtrip() {
-        let config = CrossEntropyTunedConfig {
-            threadgroup_size: 512,
-            chunk_size: 8192,
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let decoded: CrossEntropyTunedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, decoded);
     }
 
@@ -2816,7 +2326,6 @@ mod tests {
         let tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -2860,7 +2369,6 @@ mod tests {
         let mut tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -2880,7 +2388,6 @@ mod tests {
         let tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -2920,7 +2427,6 @@ mod tests {
         let mut tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -2940,7 +2446,6 @@ mod tests {
         let tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -2984,7 +2489,6 @@ mod tests {
         let mut tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
@@ -3301,89 +2805,6 @@ mod tests {
         }));
     }
 
-    /// Verify threadgroup_size scales with vocab_size.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn cross_entropy_threadgroup_scales_with_vocab() {
-        let ctx = MetalContext::new().expect("Metal required");
-        let tuner = Tuner::new();
-
-        let c_small = tuner
-            .tune_cross_entropy(&ctx, 16, 8192)
-            .expect("cross_entropy small vocab");
-        let c_large = tuner
-            .tune_cross_entropy(&ctx, 16, 200_000)
-            .expect("cross_entropy large vocab");
-
-        assert!(
-            c_large.threadgroup_size >= c_small.threadgroup_size,
-            "Larger vocab should have >= threadgroup_size"
-        );
-    }
-
-    #[test]
-    fn fused_linear_cross_entropy_heuristic_tracks_tier_and_shape() {
-        let tuner = Tuner::new();
-        assert_eq!(
-            tuner.heuristic_fused_linear_cross_entropy_config(DeviceTier::Base, 2048, 16_384, 1024),
-            CrossEntropyTunedConfig {
-                threadgroup_size: 128,
-                chunk_size: 2048,
-            }
-        );
-        assert_eq!(
-            tuner.heuristic_fused_linear_cross_entropy_config(
-                DeviceTier::Base,
-                4096,
-                200_000,
-                1024,
-            ),
-            CrossEntropyTunedConfig {
-                threadgroup_size: 512,
-                chunk_size: 1024,
-            }
-        );
-        assert_eq!(
-            tuner
-                .heuristic_fused_linear_cross_entropy_config(DeviceTier::Max, 2048, 200_000, 1024,),
-            CrossEntropyTunedConfig {
-                threadgroup_size: 1024,
-                chunk_size: 8192,
-            }
-        );
-    }
-
-    #[test]
-    fn fused_linear_cross_entropy_candidates_cover_thread_and_chunk_options() {
-        let tuner = Tuner::new();
-        let candidates = tuner.candidate_fused_linear_cross_entropy_configs(
-            DeviceTier::Pro,
-            4096,
-            200_000,
-            1024,
-        );
-        assert!(candidates.contains(&CrossEntropyTunedConfig {
-            threadgroup_size: 512,
-            chunk_size: 4096,
-        }));
-        assert!(candidates.contains(&CrossEntropyTunedConfig {
-            threadgroup_size: 128,
-            chunk_size: 4096,
-        }));
-        assert!(candidates.contains(&CrossEntropyTunedConfig {
-            threadgroup_size: 1024,
-            chunk_size: 4096,
-        }));
-        assert!(candidates.contains(&CrossEntropyTunedConfig {
-            threadgroup_size: 1024,
-            chunk_size: 1024,
-        }));
-        assert!(candidates.contains(&CrossEntropyTunedConfig {
-            threadgroup_size: 1024,
-            chunk_size: 8192,
-        }));
-    }
-
     #[test]
     fn swiglu_heuristic_tracks_size_and_tier() {
         let tuner = Tuner::new();
@@ -3454,55 +2875,5 @@ mod tests {
         let first = tuner.tune_norm_lora(&ctx, 4, 2048, 2048, 16).unwrap();
         let second = tuner.tune_norm_lora(&ctx, 4, 2048, 2048, 16).unwrap();
         assert_eq!(first, second);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn fused_linear_cross_entropy_cache_hit_on_second_call() {
-        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
-        let tuner = Tuner::new();
-        let config = FusedLinearCrossEntropyConfig::new(64, 512, 8_192).with_fp16();
-
-        let first = tuner
-            .tune_fused_linear_cross_entropy(&ctx, &config)
-            .expect("first fused linear CE tune");
-        let second = tuner
-            .tune_fused_linear_cross_entropy(&ctx, &config)
-            .expect("second fused linear CE tune");
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn fused_linear_cross_entropy_tuning_keys_include_dtype_and_hidden_size() {
-        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
-        let tuner = Tuner::new();
-        let fp16 = FusedLinearCrossEntropyConfig::new(32, 512, 8_192).with_fp16();
-        let fp32 = FusedLinearCrossEntropyConfig::new(32, 512, 8_192);
-        let wider = FusedLinearCrossEntropyConfig::new(32, 1024, 8_192).with_fp16();
-
-        tuner
-            .tune_fused_linear_cross_entropy(&ctx, &fp16)
-            .expect("fp16 tune");
-        tuner
-            .tune_fused_linear_cross_entropy(&ctx, &fp32)
-            .expect("fp32 tune");
-        tuner
-            .tune_fused_linear_cross_entropy(&ctx, &wider)
-            .expect("wider tune");
-
-        let cache = tuner
-            .cross_entropy_cache
-            .lock()
-            .expect("cross_entropy cache");
-        let fused_entries = cache
-            .keys()
-            .filter(|key| key.starts_with("fused_linear_ce:"))
-            .count();
-        assert!(
-            fused_entries >= 3,
-            "expected distinct fused linear CE entries for dtype/shape, found {fused_entries}"
-        );
     }
 }

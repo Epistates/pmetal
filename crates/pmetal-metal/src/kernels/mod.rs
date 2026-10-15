@@ -8,7 +8,6 @@ pub mod batch_encoder;
 pub mod dispatch;
 pub mod dw_gemm;
 pub mod flash_attention;
-pub mod fused_cross_entropy;
 pub mod fused_lora;
 pub mod fused_moe;
 pub mod fused_norm_lora;
@@ -25,9 +24,6 @@ pub mod turboquant;
 
 #[cfg(has_metal4)]
 pub mod mpp_dw_gemm;
-#[cfg(has_metal4)]
-pub mod mpp_fused_cross_entropy;
-#[cfg(has_metal4)]
 #[cfg(has_metal4)]
 pub mod mpp_fused_lora;
 #[cfg(has_metal4)]
@@ -49,15 +45,6 @@ pub use flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
     FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
 };
-pub use fused_cross_entropy::{
-    FusedCrossEntropy,
-    FusedCrossEntropyConfig,
-    FusedCrossEntropyOutput,
-    // Chunked vocabulary optimization: fused linear + cross-entropy
-    FusedLinearCrossEntropy,
-    FusedLinearCrossEntropyConfig,
-    FusedLinearCrossEntropyOutput,
-};
 pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_moe::{ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig};
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
@@ -66,8 +53,7 @@ pub use fused_swiglu::{
     FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
 };
 pub use fused_training::{
-    AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, FusedCrossEntropyTraining,
-    FusedGradientClipping, ParamInfo,
+    AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, FusedGradientClipping, ParamInfo,
 };
 pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};
 pub use mpp_flash_attention::{

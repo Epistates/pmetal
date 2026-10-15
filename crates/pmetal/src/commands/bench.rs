@@ -11,9 +11,8 @@ use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
 use pmetal_metal::kernels::mpp_gemm::{MppGemm, MppGemmConfig};
 use pmetal_metal::tuna::MppGemmTuneRequest;
 use pmetal_metal::{
-    BufferUsage, FlashAttention, FlashAttentionConfig, FusedLinearCrossEntropy,
-    FusedLinearCrossEntropyConfig, FusedLora, FusedLoraConfig, FusedMLP, FusedNormLora,
-    FusedNormLoraConfig, FusedSwiGLUConfig, MetalBuffer, MetalContext,
+    BufferUsage, FlashAttention, FlashAttentionConfig, FusedLora, FusedLoraConfig, FusedMLP,
+    FusedNormLora, FusedNormLoraConfig, FusedSwiGLUConfig, MetalBuffer, MetalContext,
 };
 use pmetal_mlx::kernels::gated_delta_update_with_chunk_size_override;
 use pmetal_mlx::kv_cache::CacheMode;
@@ -502,7 +501,6 @@ enum KernelBenchmarkCase {
     FusedLora(FusedLoraCase),
     FusedMlp(FusedMlpCase),
     FusedNormLora(FusedNormLoraCase),
-    FusedLinearCrossEntropy(FusedLinearCrossEntropyCase),
     ModelMoe(ModelMoeCase),
     MppGemm(MppGemmCase),
 }
@@ -551,14 +549,6 @@ struct FusedNormLoraCase {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FusedLinearCrossEntropyCase {
-    name: &'static str,
-    num_tokens: usize,
-    hidden_size: usize,
-    vocab_size: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct ModelMoeCase {
     name: &'static str,
     family: ModelMoeFamily,
@@ -584,7 +574,6 @@ struct KernelBenchmarkTierProfile {
     fused_lora: FusedLoraCase,
     fused_mlp: FusedMlpCase,
     fused_norm_lora: FusedNormLoraCase,
-    fused_linear_cross_entropy: FusedLinearCrossEntropyCase,
     llama4_moe: ModelMoeCase,
     qwen3_moe: ModelMoeCase,
     deepseek_moe: ModelMoeCase,
@@ -3386,43 +3375,6 @@ fn run_kernel_benchmark_case(
 
             build_case_result(case.name, "fused_norm_lora", parameters, tuning, outcome)
         }
-        KernelBenchmarkCase::FusedLinearCrossEntropy(case) => {
-            let parameters = fused_linear_cross_entropy_parameters(*case);
-            let config = FusedLinearCrossEntropyConfig::new(
-                case.num_tokens,
-                case.hidden_size,
-                case.vocab_size,
-            )
-            .with_fp16();
-            let tuning = match ctx.tuner().tune_fused_linear_cross_entropy(ctx, &config) {
-                Ok(tuned) => btree_map([
-                    ("threadgroup_size", tuned.threadgroup_size.to_string()),
-                    ("chunk_size", tuned.chunk_size.to_string()),
-                ]),
-                Err(error) => btree_map([("selection_error", error.to_string())]),
-            };
-
-            let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
-                let kernel = FusedLinearCrossEntropy::new(ctx.clone(), config)?;
-                let hidden_states = alloc_f16_buffer(ctx, case.num_tokens * case.hidden_size)?;
-                let lm_head_weight = alloc_f16_buffer(ctx, case.vocab_size * case.hidden_size)?;
-                let targets = alloc_i32_targets(ctx, case.num_tokens, case.vocab_size)?;
-
-                benchmark_operation(warmup_iterations, benchmark_iterations, || {
-                    let output = kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
-                    std::hint::black_box(output);
-                    Ok(())
-                })
-            })();
-
-            build_case_result(
-                case.name,
-                "fused_linear_cross_entropy",
-                parameters,
-                tuning,
-                outcome,
-            )
-        }
         KernelBenchmarkCase::ModelMoe(case) => {
             let parameters = model_moe_parameters(*case);
             let tuning = btree_map([
@@ -3626,7 +3578,6 @@ fn build_benchmark_corpus_for_profile(
         KernelBenchmarkCase::FusedLora(profile.fused_lora),
         KernelBenchmarkCase::FusedMlp(profile.fused_mlp),
         KernelBenchmarkCase::FusedNormLora(profile.fused_norm_lora),
-        KernelBenchmarkCase::FusedLinearCrossEntropy(profile.fused_linear_cross_entropy),
         KernelBenchmarkCase::ModelMoe(profile.llama4_moe),
         KernelBenchmarkCase::ModelMoe(profile.qwen3_moe),
         KernelBenchmarkCase::ModelMoe(profile.deepseek_moe),
@@ -3665,12 +3616,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 hidden_size: 1024,
                 out_features: 1024,
                 rank: 8,
-            },
-            fused_linear_cross_entropy: FusedLinearCrossEntropyCase {
-                name: "fused_linear_cross_entropy",
-                num_tokens: 32 * scale,
-                hidden_size: 1024,
-                vocab_size: 32_768,
             },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
@@ -3738,12 +3683,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 out_features: 1536,
                 rank: 16,
             },
-            fused_linear_cross_entropy: FusedLinearCrossEntropyCase {
-                name: "fused_linear_cross_entropy",
-                num_tokens: 64 * scale,
-                hidden_size: 1536,
-                vocab_size: 32_768,
-            },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
                 family: ModelMoeFamily::Llama4,
@@ -3809,12 +3748,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 hidden_size: 2048,
                 out_features: 2048,
                 rank: 16,
-            },
-            fused_linear_cross_entropy: FusedLinearCrossEntropyCase {
-                name: "fused_linear_cross_entropy",
-                num_tokens: 64 * scale,
-                hidden_size: 2048,
-                vocab_size: 65_536,
             },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
@@ -3901,15 +3834,6 @@ fn alloc_f32_buffer(ctx: &Arc<MetalContext>, len: usize) -> anyhow::Result<Metal
     Ok(MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)?)
 }
 
-fn alloc_i32_targets(
-    ctx: &Arc<MetalContext>,
-    len: usize,
-    vocab_size: usize,
-) -> anyhow::Result<MetalBuffer<i32>> {
-    let data: Vec<i32> = (0..len).map(|i| (i % vocab_size.max(1)) as i32).collect();
-    Ok(MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)?)
-}
-
 fn deterministic_value(index: usize) -> f32 {
     (((index.wrapping_mul(1103515245).wrapping_add(12345) >> 16) & 1023) as f32 / 512.0) - 1.0
 }
@@ -3954,16 +3878,6 @@ fn fused_norm_lora_parameters(case: FusedNormLoraCase) -> BTreeMap<String, Strin
         ("hidden_size", case.hidden_size.to_string()),
         ("out_features", case.out_features.to_string()),
         ("rank", case.rank.to_string()),
-    ])
-}
-
-fn fused_linear_cross_entropy_parameters(
-    case: FusedLinearCrossEntropyCase,
-) -> BTreeMap<String, String> {
-    btree_map([
-        ("num_tokens", case.num_tokens.to_string()),
-        ("hidden_size", case.hidden_size.to_string()),
-        ("vocab_size", case.vocab_size.to_string()),
     ])
 }
 
@@ -4326,19 +4240,15 @@ mod tests {
     #[test]
     fn benchmark_corpus_has_expected_categories() {
         let cases = build_benchmark_corpus_for_profile(DeviceTier::Base, false, true);
-        assert_eq!(cases.len(), 9);
+        assert_eq!(cases.len(), 8);
         assert!(matches!(cases[0], KernelBenchmarkCase::FlashAttention(_)));
         assert!(matches!(cases[1], KernelBenchmarkCase::FusedLora(_)));
         assert!(matches!(cases[2], KernelBenchmarkCase::FusedMlp(_)));
         assert!(matches!(cases[3], KernelBenchmarkCase::FusedNormLora(_)));
-        assert!(matches!(
-            cases[4],
-            KernelBenchmarkCase::FusedLinearCrossEntropy(_)
-        ));
+        assert!(matches!(cases[4], KernelBenchmarkCase::ModelMoe(_)));
         assert!(matches!(cases[5], KernelBenchmarkCase::ModelMoe(_)));
         assert!(matches!(cases[6], KernelBenchmarkCase::ModelMoe(_)));
-        assert!(matches!(cases[7], KernelBenchmarkCase::ModelMoe(_)));
-        assert!(matches!(cases[8], KernelBenchmarkCase::MppGemm(_)));
+        assert!(matches!(cases[7], KernelBenchmarkCase::MppGemm(_)));
     }
 
     #[test]

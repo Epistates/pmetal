@@ -32,7 +32,6 @@
 //! This module provides:
 //! - [`FusedAdamW`]: All-parameter optimizer update in one dispatch
 //! - [`FusedGradientClipping`]: Global norm + scaling in two dispatches
-//! - `FusedCrossEntropy`: Loss + backward fused
 //! - [`BatchedCommandBuffer`]: Helper for batched execution
 //!
 //! # Performance Target
@@ -693,94 +692,6 @@ impl FusedGradientClipping {
             let scale = max_norm / norm;
             self.scale_gradients(batch, grads, scale)?;
         }
-
-        Ok(())
-    }
-}
-
-// =============================================================================
-// Fused Cross-Entropy
-// =============================================================================
-
-/// Fused cross-entropy loss with backward pass.
-///
-/// Computes both loss and gradients in a single kernel, avoiding
-/// multiple passes over the logits tensor.
-pub struct FusedCrossEntropyTraining {
-    ctx: Arc<MetalContext>,
-}
-
-impl FusedCrossEntropyTraining {
-    /// Create a new fused cross-entropy module.
-    pub fn new(ctx: Arc<MetalContext>) -> Self {
-        Self { ctx }
-    }
-
-    /// Queue fused forward + backward pass.
-    ///
-    /// # Arguments
-    /// * `batch` - Command buffer to queue into
-    /// * `logits` - Model outputs [N, vocab_size]
-    /// * `labels` - Target labels `[N]`
-    /// * `grad_logits` - Output gradients [N, vocab_size]
-    /// * `loss` - Scalar loss (atomically accumulated)
-    /// * `n` - Number of positions (batch * seq after shift)
-    /// * `vocab_size` - Vocabulary size
-    /// * `ignore_index` - Label to ignore (-100 typically)
-    #[allow(clippy::too_many_arguments)]
-    pub fn queue_forward_backward(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        logits: &MetalBuffer<f32>,
-        labels: &MetalBuffer<i32>,
-        grad_logits: &MetalBuffer<f32>,
-        loss: &MetalBuffer<f32>,
-        n: usize,
-        vocab_size: usize,
-        ignore_index: i32,
-    ) -> Result<()> {
-        let function_name = "fused_cross_entropy_forward_backward";
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
-        };
-
-        let encoder = batch.encoder_mut()?;
-        encoder.setComputePipelineState(&pipeline);
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(logits.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(labels.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(grad_logits.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(loss.metal_buffer()), 0, 3);
-
-            let n_u32 = n as u32;
-            let n_ptr = NonNull::from(&n_u32).cast();
-            encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<u32>(), 4);
-
-            let vocab_u32 = vocab_size as u32;
-            let vocab_ptr = NonNull::from(&vocab_u32).cast();
-            encoder.setBytes_length_atIndex(vocab_ptr, std::mem::size_of::<u32>(), 5);
-
-            let ignore_ptr = NonNull::from(&ignore_index).cast();
-            encoder.setBytes_length_atIndex(ignore_ptr, std::mem::size_of::<i32>(), 6);
-        }
-
-        // One threadgroup per position
-        let grid_size = MTLSize {
-            width: n,
-            height: 1,
-            depth: 1,
-        };
-
-        let threadgroup_size = MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        batch.add_dispatch();
 
         Ok(())
     }

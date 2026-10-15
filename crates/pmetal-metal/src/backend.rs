@@ -31,7 +31,6 @@ use crate::{
     error::Result,
     kernels::{
         flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
-        fused_cross_entropy::{FusedCrossEntropyConfig, FusedCrossEntropyOutput},
         fused_lora::{FusedLoraConfig, FusedLoraOutput},
         fused_moe::FusedMoeExpertConfig,
         fused_norm_lora::{FusedNormLoraConfig, FusedNormLoraOutput},
@@ -72,9 +71,6 @@ pub struct BackendCaps {
 
     /// Whether this backend provides fused AdamW optimizer.
     pub has_adamw: bool,
-
-    /// Whether this backend provides fused cross-entropy loss.
-    pub has_cross_entropy: bool,
 
     /// Whether this backend provides fused RoPE.
     pub has_rope: bool,
@@ -118,7 +114,6 @@ impl BackendCaps {
             has_mpp_flash_attention: false,
             has_swiglu: true,
             has_adamw: true,
-            has_cross_entropy: true,
             has_rope: true,
             has_moe: true,
             has_norm_lora: true,
@@ -144,7 +139,6 @@ impl BackendCaps {
     /// - `has_quantized_gemm`: `MppQuantizedGemm` via `fused_adamw_step_standalone`
     /// - `has_swiglu`: `MppFusedSwiGLU` (base and LoRA paths both use MPP kernels)
     /// - `has_adamw`: `MppFusedAdamW` via `fused_adamw_step_standalone`
-    /// - `has_cross_entropy`: `MppFusedCrossEntropy`
     /// - `has_rope`: `MppFusedRoPE`
     /// - `has_norm_lora`: `MppFusedNormLora`
     /// - `has_lora`: `MppFusedLora` (inference mode)
@@ -169,8 +163,6 @@ impl BackendCaps {
             has_swiglu: true,
             // Wired: MppFusedAdamW via fused_adamw_step_standalone().
             has_adamw: true,
-            // Wired: MppFusedCrossEntropy.
-            has_cross_entropy: true,
             // Wired: MppFusedRoPE.
             has_rope: true,
             // Fallback: quantized u32 weights in descriptor, MPP needs fp16.
@@ -607,17 +599,6 @@ pub trait KernelBackend: Send + Sync {
             "fused_adamw_step_standalone not implemented for this backend".into(),
         ))
     }
-
-    /// Fused cross-entropy loss forward pass.
-    ///
-    /// Returns per-token losses and cached logsumexp for backward.
-    fn fused_cross_entropy(
-        &self,
-        ctx: &Arc<MetalContext>,
-        config: &FusedCrossEntropyConfig,
-        logits: &dyn AsMetalBuffer,
-        targets: &MetalBuffer<i32>,
-    ) -> Result<FusedCrossEntropyOutput>;
 
     /// Fused RoPE: apply rotary position embeddings in-place to Q (and optionally K).
     ///
