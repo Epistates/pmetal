@@ -81,6 +81,12 @@ impl ActivationMessage {
             })
     }
 
+    /// The payload converted to dtype `to` (exact when widening), for a stage
+    /// that computes in a different dtype from the one on the wire.
+    pub fn into_dtype(self, to: DtypeTag) -> DistributedResult<Vec<u8>> {
+        crate::activation_codec::decode(&self.data, self.dtype, to)
+    }
+
     /// Validate that tensor metadata agrees with the payload length.
     pub fn validate_payload(&self) -> DistributedResult<()> {
         // `u32::MAX` is the pipeline result sentinel. The current result

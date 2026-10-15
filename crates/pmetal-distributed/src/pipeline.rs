@@ -22,7 +22,7 @@
 //! `send_and_await` dispatches a message and suspends until the matching response
 //! arrives; `register_handler` wires a one-shot callback for async dispatch.
 
-use crate::activation_codec::{ActivationCodec, compress_activation};
+use crate::activation_codec::{self, ActivationCodec};
 use crate::activation_transport::{ActivationMessage, DtypeTag, recv_activation, send_activation};
 use crate::error::{DistributedError, DistributedResult};
 use crate::topology::NodeProfile;
@@ -44,7 +44,9 @@ pub struct PipelineStageConfig {
     pub is_first: bool,
     /// Whether this is the last stage (owns norm + lm_head).
     pub is_last: bool,
-    /// Wire dtype for activation transfer.
+    /// The dtype of the tensors this stage hands to
+    /// [`PipelineStageRuntime::send_to_next`]. The codec may send them in
+    /// another (fp16 for f32); each message carries the dtype of its payload.
     pub wire_dtype: DtypeTag,
     /// Activation compression codec.
     pub codec: ActivationCodec,
@@ -113,18 +115,15 @@ impl PipelineStageRuntime {
             .as_mut()
             .ok_or_else(|| DistributedError::Protocol("no next stage to send to".into()))?;
 
-        let compressed = compress_activation(
-            data,
-            self.config.wire_dtype == DtypeTag::Float32,
-            self.config.codec,
-        );
+        let (payload, dtype) =
+            activation_codec::encode(data, self.config.wire_dtype, self.config.codec)?;
 
         let msg = ActivationMessage {
             nonce,
             layer_id,
             shape: shape.to_vec(),
-            dtype: self.config.wire_dtype,
-            data: compressed,
+            dtype,
+            data: payload,
         };
 
         send_activation(sender, &msg).await
@@ -595,6 +594,10 @@ impl Default for StreamMultiplexer {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_stage_tests.rs"]
+mod stage_tests;
 
 #[cfg(test)]
 mod generation_tests {
