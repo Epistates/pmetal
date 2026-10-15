@@ -2223,6 +2223,24 @@ impl Qwen3NextForCausalLM {
         self.lm_head_forward(&h)
     }
 
+    /// [`forward_with_cache`](Self::forward_with_cache) returning the last
+    /// position's logits only, `[B, 1, vocab]`: the head runs on one hidden
+    /// state per sequence instead of every prompt token's (a 248k vocabulary
+    /// against a prompt of thousands of tokens is gigabytes of logits that
+    /// whoever samples throws away but the last row of).
+    pub fn forward_with_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        let h = self
+            .model
+            .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        self.lm_head_forward(&pmetal_runtime::decode::last_token_hidden(&h))
+    }
+
     /// Forward pass with one rotary position per token; see
     /// [`Qwen3NextModel::forward_with_positions`].
     pub fn forward_with_positions(

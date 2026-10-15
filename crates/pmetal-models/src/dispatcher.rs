@@ -2086,6 +2086,26 @@ impl DynamicModel {
         }
     }
 
+    /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
+    /// the last position's logits, `[B, 1, vocab]`, for a caller that samples
+    /// from them alone: a prefill, or a decode step. Qwen 3.5 runs its head on
+    /// that one position; the other architectures compute every position's and
+    /// slice.
+    pub fn forward_with_hybrid_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        if let Self::Qwen3Next(m) = self {
+            return m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache);
+        }
+        let logits = self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        let (b, t, v) = (logits.dim(0), logits.dim(1), logits.dim(2));
+        Ok(logits.slice(&[0, t - 1, 0], &[b, t, v]))
+    }
+
     /// Whether this architecture has a fused `[N, 1]` batched-decode
     /// implementation. Continuous batching falls back to the per-slot
     /// serial path when this is `false`. Hybrid attn+recurrent archs

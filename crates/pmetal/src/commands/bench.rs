@@ -2413,8 +2413,12 @@ fn run_prefill_decode_pass(
     let mut mamba_cache = model.create_mamba_cache();
 
     let prefill_start = Instant::now();
-    let logits =
-        model.forward_with_hybrid_cache(&prompt, None, Some(&mut cache), mamba_cache.as_mut())?;
+    let logits = model.forward_with_hybrid_cache_last(
+        &prompt,
+        None,
+        Some(&mut cache),
+        mamba_cache.as_mut(),
+    )?;
     pmetal_runtime::compat::transforms::eval([&logits])?;
     let prefill_elapsed = prefill_start.elapsed();
 
@@ -2425,7 +2429,7 @@ fn run_prefill_decode_pass(
     let decode_start = Instant::now();
     for _ in 0..decode_steps {
         let decode_input = Array::from_slice(&[next_token], &[1, 1]);
-        let decode_logits = model.forward_with_hybrid_cache(
+        let decode_logits = model.forward_with_hybrid_cache_last(
             &decode_input,
             None,
             Some(&mut cache),

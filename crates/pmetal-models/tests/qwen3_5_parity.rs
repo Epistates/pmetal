@@ -277,6 +277,59 @@ fn dynamic_chunked_prefill(profile: &str) {
     assert_all_pass(&format!("{profile}: dynamic chunked prefill"), &reports);
 }
 
+/// A prefill or decode step that wants one position's logits gets `[B, 1,
+/// vocab]` from the head run on that position alone, equal to the last row of
+/// the full forward and to the reference's.
+fn dynamic_last_position_logits(profile: &str) {
+    let fx = checkpoint(profile);
+    let mut model = DynamicModel::load(fx.path()).expect("checkpoint loads");
+    let t = fx.seq_len();
+    let ids = fx.input_ids();
+    let want = rows(&fx.tensor("logits"), t - 1, t);
+
+    let mut kv = model.create_cache(t as usize + 1);
+    let mut mamba = model.create_mamba_cache().expect("GDN cache");
+    let last = model
+        .forward_with_hybrid_cache_last(&ids, None, Some(&mut kv), Some(&mut mamba))
+        .expect("last-position prefill");
+    drain_bridge("dynamic last-position prefill");
+    assert_eq!(last.dim(0), 1);
+    assert_eq!(last.dim(1), 1, "one position's logits");
+    assert_eq!(last.dim(2), want.dim(2));
+    let reports = vec![ParityReport::compute(
+        "last_logits",
+        &last,
+        &want,
+        PREFILL_TOL,
+    )];
+    assert_all_pass(&format!("{profile}: last-position logits"), &reports);
+
+    // The cache it leaves is the full forward's: the next token decodes alike.
+    let next = rows(&ids, t - 1, t);
+    let mut kv_full = model.create_cache(t as usize + 2);
+    let mut mamba_full = model.create_mamba_cache().expect("GDN cache");
+    model
+        .forward_with_hybrid_cache(&ids, None, Some(&mut kv_full), Some(&mut mamba_full))
+        .expect("full prefill");
+    let a = model
+        .forward_with_hybrid_cache_last(&next, None, Some(&mut kv), Some(&mut mamba))
+        .expect("decode after the last-position prefill");
+    let b = model
+        .forward_with_hybrid_cache(&next, None, Some(&mut kv_full), Some(&mut mamba_full))
+        .expect("decode after the full prefill");
+    drain_bridge("dynamic decode");
+    let reports = vec![ParityReport::compute(
+        "decode",
+        &a,
+        &b,
+        Tolerance::new(1e-6, 0.0),
+    )];
+    assert_all_pass(
+        &format!("{profile}: decode after last-position prefill"),
+        &reports,
+    );
+}
+
 fn dynamic_mtp(profile: &str) {
     let fx = checkpoint(profile);
     let config_text = std::fs::read_to_string(fx.path().join("config.json")).unwrap();
@@ -571,6 +624,18 @@ fn swish_native_chunked_prefill_matches_transformers() {
 #[serial]
 fn swish_dynamic_chunked_prefill_matches_transformers() {
     dynamic_chunked_prefill("swish");
+}
+
+#[test]
+#[serial]
+fn swish_dynamic_last_position_logits_are_the_last_row() {
+    dynamic_last_position_logits("swish");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_last_position_logits_are_the_last_row() {
+    dynamic_last_position_logits("moe");
 }
 
 #[test]

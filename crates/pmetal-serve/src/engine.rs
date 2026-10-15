@@ -1893,7 +1893,13 @@ impl InferenceEngine {
                 prefill_step_size,
                 |chunk| {
                     use_generation_stream();
-                    model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
+                    // Only the last chunk's last position is sampled from.
+                    model.forward_with_hybrid_cache_last(
+                        chunk,
+                        None,
+                        Some(cache),
+                        mamba_cache.as_mut(),
+                    )
                 },
             ),
             Some(media) => {
