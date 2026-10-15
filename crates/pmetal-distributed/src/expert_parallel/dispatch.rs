@@ -119,12 +119,17 @@ impl ExpertDispatcher {
         top_k: usize,
     ) -> Result<Routing, Exception> {
         let indices = read_ints(routing_indices)?;
-        let experts: Vec<usize> = indices
+        // A negative index marks an assignment capacity control dropped
+        // ([`super::capacity::apply_capacity`]): it contributes nothing.
+        let experts: Vec<Option<usize>> = indices
             .iter()
             .map(|&e| {
-                usize::try_from(e)
-                    .ok()
+                if e < 0 {
+                    return Ok(None);
+                }
+                Some(e as usize)
                     .filter(|&e| e < self.placement.total_experts)
+                    .map(Some)
                     .ok_or_else(|| {
                         Exception::custom(format!(
                             "dispatch: routing names expert {e} but there are {}",
@@ -269,8 +274,10 @@ impl ExpertDispatcher {
                 slot_of_row.extend_from_slice(slots);
             }
         }
-        let gathered = concat_rows(pieces.into_iter());
-        let mut row_of_slot = vec![0usize; tokens * top_k];
+        // A slot nobody computed (dropped for capacity) reads a zero row.
+        let zero_row = mlx_ops::zeros(&[1, dim as i32], dtype);
+        let gathered = concat_rows(pieces.into_iter().chain(std::iter::once(&zero_row)));
+        let mut row_of_slot = vec![slot_of_row.len(); tokens * top_k];
         for (row, &slot) in slot_of_row.iter().enumerate() {
             row_of_slot[slot] = row;
         }
@@ -446,7 +453,7 @@ fn ring_all_to_all(
 /// lists of the flat `(token, slot)` index (`token * top_k + slot`) and the
 /// expert it selected.
 fn classify_by_destination_rank(
-    experts: &[usize],
+    experts: &[Option<usize>],
     num_tokens: usize,
     top_k: usize,
     world_size: usize,
@@ -455,6 +462,9 @@ fn classify_by_destination_rank(
     let mut slots_for_rank: Vec<Vec<usize>> = vec![Vec::new(); world_size];
     let mut experts_for_rank: Vec<Vec<usize>> = vec![Vec::new(); world_size];
     for (slot, &expert) in experts.iter().enumerate().take(num_tokens * top_k) {
+        let Some(expert) = expert else {
+            continue; // dropped
+        };
         let dest = placement.rank_for_expert(expert);
         slots_for_rank[dest].push(slot);
         experts_for_rank[dest].push(expert);
@@ -484,7 +494,7 @@ mod tests {
         //   token 0 → experts [0, 3] → ranks [0, 1]
         //   token 1 → experts [2, 1] → ranks [1, 0]
         //   token 2 → experts [1, 2] → ranks [0, 1]
-        let experts = vec![0, 3, 2, 1, 1, 2];
+        let experts: Vec<Option<usize>> = [0, 3, 2, 1, 1, 2].into_iter().map(Some).collect();
         let placement = ExpertPlacement::uniform(4, 2, 2);
         let c = classify_by_destination_rank(&experts, 3, 2, 2, &placement);
 
@@ -499,7 +509,7 @@ mod tests {
     #[test]
     fn classify_preserves_insertion_order_per_rank() {
         // Single rank: slots stay in (token, k) nested-loop order.
-        let experts = vec![0, 0, 0, 0];
+        let experts: Vec<Option<usize>> = vec![Some(0); 4];
         let placement = ExpertPlacement::uniform(4, 1, 2);
         let c = classify_by_destination_rank(&experts, 2, 2, 1, &placement);
         assert_eq!(c.slots_for_rank[0], vec![0, 1, 2, 3]);

@@ -7,7 +7,9 @@
 
 mod common;
 
-use pmetal_distributed::expert_parallel::{ExpertDispatcher, ExpertPlacement};
+use pmetal_distributed::expert_parallel::{
+    CapacityConfig, DropPolicy, ExpertDispatcher, ExpertPlacement, apply_capacity,
+};
 use pmetal_distributed::mlx_dist::DistributedGroup;
 use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 use std::time::Duration;
@@ -45,16 +47,13 @@ fn expert_weights() -> Array {
 
 /// `tokens` tokens, their routing weights and the `TOP_K` distinct experts
 /// each picks (always from `allowed` when given).
-fn routing(
-    seed: u64,
-    tokens: usize,
-    allowed: Option<&[usize]>,
-) -> (Array, Array, Array, Vec<usize>) {
+fn routing(seed: u64, tokens: usize, allowed: Option<&[usize]>) -> (Array, Array, Array, Vec<i32>) {
     let mut rng = Rng(seed | 1);
     let data: Vec<f32> = (0..tokens as i32 * DIM).map(|_| rng.next() - 0.5).collect();
     let hidden = Array::from_f32_slice(&data, &[tokens as i32, DIM]);
     let pool: Vec<usize> = allowed.map_or_else(|| (0..EXPERTS).collect(), <[usize]>::to_vec);
-    let (mut weights, mut indices, mut flat) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut weights, mut indices, mut flat): (Vec<f32>, Vec<i32>, Vec<i32>) =
+        (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..tokens {
         let mut chosen = Vec::new();
         while chosen.len() < TOP_K {
@@ -66,7 +65,7 @@ fn routing(
         let w0 = 0.25 + 0.5 * rng.next();
         weights.extend([w0, 1.0 - w0]);
         indices.extend(chosen.iter().map(|&e| e as i32));
-        flat.extend(chosen);
+        flat.extend(chosen.iter().map(|&e| e as i32));
     }
     (
         hidden,
@@ -77,7 +76,8 @@ fn routing(
 }
 
 /// The layer on one device with every expert.
-fn reference(hidden: &Array, weights: &Array, experts_flat: &[usize], table: &Array) -> Vec<f32> {
+/// An expert index below zero is an assignment capacity control dropped.
+fn reference(hidden: &Array, weights: &Array, experts_flat: &[i32], table: &Array) -> Vec<f32> {
     let tokens = hidden.shape()[0] as usize;
     let h = read(hidden);
     let w = read(weights);
@@ -86,7 +86,9 @@ fn reference(hidden: &Array, weights: &Array, experts_flat: &[usize], table: &Ar
     let mut out = vec![0f32; tokens * d];
     for tok in 0..tokens {
         for k in 0..TOP_K {
-            let e = experts_flat[tok * TOP_K + k];
+            let Ok(e) = usize::try_from(experts_flat[tok * TOP_K + k]) else {
+                continue;
+            };
             for j in 0..d {
                 let y: f32 = (0..d)
                     .map(|i| h[tok * d + i] * t[e * d * d + i * d + j])
@@ -159,6 +161,44 @@ fn run(ranks: usize, name: &str) {
                 "rank {rank}/{size}, {case}, {dtype:?}: worst error {worst}"
             );
         }
+    }
+
+    // Capacity control drops assignments (index -1); the layer must treat them
+    // as contributing nothing, including when a whole rank's slots are gone.
+    for policy in [DropPolicy::Drop, DropPolicy::Redistribute] {
+        let tokens = 6 + rank;
+        let (hidden, weights, indices, _) = routing(500 + rank as u64, tokens, None);
+        let config = CapacityConfig {
+            capacity_factor: 0.5,
+            drop_policy: policy,
+        };
+        let (capped, _) = apply_capacity(&indices, &config, EXPERTS).expect("capacity");
+        let mut ints = capped.as_dtype(Dtype::Float32.as_i32());
+        ints.try_eval().expect("eval");
+        let n = ints.size();
+        let flat: Vec<i32> = ints
+            .to_f32_vec(n)
+            .expect("readback")
+            .into_iter()
+            .map(|x| x as i32)
+            .collect();
+        assert!(
+            flat.contains(&-1),
+            "the capacity should have dropped something"
+        );
+        let want = reference(&hidden, &weights, &flat, &table);
+        let got = dispatcher
+            .dispatch_and_compute(&hidden, &weights, &capped, &group, expert_fn)
+            .unwrap_or_else(|e| panic!("rank {rank} capped {policy:?}: {e}"));
+        let worst = read(&got)
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "rank {rank}/{size}, capped {policy:?}: worst error {worst}"
+        );
     }
 
     // The same tokens on every rank.

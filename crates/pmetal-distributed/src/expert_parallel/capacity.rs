@@ -50,8 +50,15 @@ impl CapacityConfig {
 
 /// Apply capacity constraints to routing indices.
 ///
+/// Slots are filled in order of preference, every token's first choice
+/// before any second choice, and tokens in order within a choice. An
+/// assignment to a full expert is dropped under [`DropPolicy::Drop`], or
+/// moved to the least-loaded expert with room that the token is not already
+/// using under [`DropPolicy::Redistribute`] (dropped if there is none).
+///
 /// Returns `(capped_indices, drop_mask)`:
-/// - `capped_indices`: Same shape as input, but excess assignments are set to -1
+/// - `capped_indices`: Same shape as input, but dropped assignments are set to
+///   -1, which [`super::ExpertDispatcher`] treats as contributing nothing
 /// - `drop_mask`: Boolean mask `[num_tokens, top_k]` where `true` = token is processed
 ///
 /// # Arguments
@@ -95,21 +102,44 @@ pub fn apply_capacity(
         }
     };
 
-    // Count assignments per expert and cap at capacity.
+    // Serve assignments in order of preference: every token's first choice
+    // before any second choice, and so on (GShard, Switch Transformer), tokens
+    // in order within a choice. An early token's second choice therefore
+    // never takes a slot a later token's first choice needs.
     let mut expert_counts = vec![0usize; total_experts];
-    let mut capped = vec![0i32; total_assignments];
+    let mut capped = vec![-1i32; total_assignments];
     let mut mask = vec![0.0f32; total_assignments]; // 1.0 = keep, 0.0 = drop
 
-    for i in 0..total_assignments {
-        let expert_id = idx_data[i] as usize;
-        if expert_id < total_experts && expert_counts[expert_id] < capacity {
-            expert_counts[expert_id] += 1;
-            capped[i] = expert_id as i32;
-            mask[i] = 1.0;
-        } else {
-            // Exceeds capacity — mark as dropped.
-            capped[i] = -1;
-            mask[i] = 0.0;
+    for k in 0..top_k {
+        for token in 0..num_tokens {
+            let i = token * top_k + k;
+            let Some(chosen) = usize::try_from(idx_data[i])
+                .ok()
+                .filter(|&e| e < total_experts)
+            else {
+                continue; // not an expert: nothing to keep or move
+            };
+            let expert = if expert_counts[chosen] < capacity {
+                Some(chosen)
+            } else if config.drop_policy == DropPolicy::Redistribute {
+                // The least-loaded expert with room that this token is not
+                // already using, the lowest id on a tie.
+                let row = &idx_data[token * top_k..(token + 1) * top_k];
+                (0..total_experts)
+                    .filter(|&e| {
+                        expert_counts[e] < capacity
+                            && !row.iter().any(|&r| usize::try_from(r) == Ok(e))
+                            && !capped[token * top_k..(token + 1) * top_k].contains(&(e as i32))
+                    })
+                    .min_by_key(|&e| (expert_counts[e], e))
+            } else {
+                None
+            };
+            if let Some(expert) = expert {
+                expert_counts[expert] += 1;
+                capped[i] = expert as i32;
+                mask[i] = 1.0;
+            }
         }
     }
 
@@ -241,6 +271,75 @@ mod tests {
         assert!(mask_data[1] > 0.5);
         assert!(mask_data[2] < 0.5);
         assert!(mask_data[3] < 0.5);
+    }
+
+    fn int_array(values: &[i32], shape: &[i32]) -> Array {
+        Array::from_i32_slice_shaped(values, shape)
+    }
+
+    fn ints(a: &Array) -> Vec<i32> {
+        let mut a = a.as_dtype(Dtype::Float32.as_i32());
+        a.eval();
+        let n = a.size();
+        a.to_f32_vec(n)
+            .unwrap()
+            .into_iter()
+            .map(|x| x as i32)
+            .collect()
+    }
+
+    /// Capacity is served in order of preference: every token's first
+    /// choice before any second choice, and so on. A token's best expert is
+    /// never refused to make room for another token's second choice.
+    #[test]
+    fn first_choices_are_served_before_second_choices() {
+        // Two tokens, top-2 over two experts, one slot per expert. Token 0
+        // wants (e0, e1), token 1 wants (e1, e0): each token's first choice
+        // is free, and both second choices collide with the other's first.
+        let indices = int_array(&[0, 1, 1, 0], &[2, 2]);
+        let config = CapacityConfig {
+            capacity_factor: 0.5,
+            drop_policy: DropPolicy::Drop,
+        };
+        let (capped, mask) = apply_capacity(&indices, &config, 2).unwrap();
+        assert_eq!(ints(&capped), vec![0, -1, 1, -1]);
+        assert_eq!(ints(&mask), vec![1, 0, 1, 0]);
+    }
+
+    /// Redistribution moves an overflowing assignment to the least-loaded
+    /// expert that still has room and that the token has not already chosen,
+    /// rather than quietly dropping it as the policy's name promised.
+    #[test]
+    fn redistribution_moves_overflow_to_the_least_loaded_expert() {
+        let indices = int_array(&[0, 0, 0, 0], &[4, 1]);
+        let config = CapacityConfig {
+            capacity_factor: 1.0,
+            drop_policy: DropPolicy::Redistribute,
+        };
+        let (capped, mask) = apply_capacity(&indices, &config, 2).unwrap();
+        assert_eq!(ints(&capped), vec![0, 0, 1, 1]);
+        assert_eq!(ints(&mask), vec![1, 1, 1, 1]);
+
+        // A token never gets the same expert twice, and no expert exceeds
+        // its capacity of ceil(6 / 3 * 0.5) = 1.
+        let indices = int_array(&[0, 1, 0, 1, 0, 1], &[3, 2]);
+        let config = CapacityConfig {
+            capacity_factor: 0.5,
+            drop_policy: DropPolicy::Redistribute,
+        };
+        let (capped, _) = apply_capacity(&indices, &config, 3).unwrap();
+        let capped = ints(&capped);
+        for token in capped.chunks(2) {
+            if token[0] >= 0 && token[1] >= 0 {
+                assert_ne!(token[0], token[1], "{capped:?}");
+            }
+        }
+        for e in 0..3 {
+            assert!(
+                capped.iter().filter(|&&x| x == e).count() <= 1,
+                "{capped:?}"
+            );
+        }
     }
 
     #[test]
