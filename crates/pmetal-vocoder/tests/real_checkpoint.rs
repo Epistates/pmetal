@@ -44,6 +44,53 @@ fn check(name: &str, max_diff: f32, min_snr_db: f32) {
     assert_runtime_ok();
 }
 
+/// The released discriminators (`mpd` / `mrd` entries of the training
+/// checkpoint, next to optimizer state) load and score audio like the reference.
+#[test]
+#[ignore = "needs a downloaded checkpoint (see the module docs)"]
+fn bigvgan_base_discriminators_match_reference() {
+    use pmetal_runtime::compat::Array;
+    use pmetal_vocoder::discriminator::{BigVGANDiscriminator, DiscriminatorConfig};
+
+    let Some(dir) = model_dir("base24") else {
+        eprintln!("BIGVGAN_CHECKPOINT_DIR/base24 not found; skipping");
+        return;
+    };
+    let checkpoint = dir.join("bigvgan_discriminator_optimizer.pt");
+    if !checkpoint.is_file() {
+        eprintln!("{} not found; skipping", checkpoint.display());
+        return;
+    }
+    let mut disc = BigVGANDiscriminator::new(&DiscriminatorConfig::default()).unwrap();
+    disc.load_checkpoint(&checkpoint)
+        .expect("load the released discriminators");
+    let fx = Fixture::load_path(&dir.join("ref_disc.safetensors"));
+
+    let nchw = |x: &Array| x.transpose_axes(&[0, 3, 1, 2]);
+    for (name, side, audio) in [("real", "real", "y"), ("fake", "fake", "yhat")] {
+        let (mpd, mrd) = disc.forward(&fx.array(audio)).unwrap();
+        for (bank, outputs) in [("mpd", &mpd), ("mrd", &mrd)] {
+            for (i, out) in outputs.iter().enumerate() {
+                let key = format!("{bank}.{side}.logits.{i}");
+                let worst = max_abs_diff(&to_vec(&out.logits), fx.values(&key));
+                let scale = fx.values(&key).iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                eprintln!("{name} {key}: max |diff| {worst:.2e} (scale {scale:.2})");
+                assert!(worst <= 1e-3 * scale.max(1.0), "{key}: {worst}");
+                for (j, feature) in out.features.iter().enumerate() {
+                    let key = format!("{bank}.{side}.fmap.{i}.{j}");
+                    let worst = max_abs_diff(&to_vec(&nchw(feature)), fx.values(&key));
+                    let scale = fx.values(&key).iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    assert!(
+                        worst <= 1e-3 * scale.max(1.0),
+                        "{key}: {worst} (scale {scale})"
+                    );
+                }
+            }
+        }
+    }
+    assert_runtime_ok();
+}
+
 #[test]
 #[ignore = "needs a downloaded checkpoint (see the module docs)"]
 fn bigvgan_base_24khz_matches_reference() {
