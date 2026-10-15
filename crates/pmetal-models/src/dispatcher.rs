@@ -1183,6 +1183,14 @@ impl DynamicModel {
                         "a multi-token-prediction layer: a draft head, not part of the trunk",
                     ));
                 }
+                // Only V3's bias-corrected routing selects on the bias; V2
+                // checkpoints do not carry one and the router never reads it.
+                if config.routing().method != pmetal_runtime::deepseek_native::TopkMethod::NoauxTc {
+                    policy.unloaded_params.push(Exemption::new(
+                        "*.mlp.gate.e_score_correction_bias",
+                        "this routing method selects experts on the scores alone, with no bias",
+                    ));
+                }
                 let mut model = DeepSeek::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(e.to_string()))?;
