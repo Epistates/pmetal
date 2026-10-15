@@ -740,16 +740,14 @@ fn try_gdn_metal_kernel(
     Ok(Some((y, new_state)))
 }
 
-/// Inference-only GDN dispatch with pre-computed g and beta.
+/// [`gated_delta_update`] from the gates, for a caller that needs them itself
+/// (a speculative verify records `g` and `beta` to replay the recurrence from).
 ///
-/// Tries the fused Metal kernel first (single kernel launch per layer),
-/// then falls back to the ops-based path. This is the preferred entry point
-/// for compiled decode closures that have already computed g and beta.
-///
-/// Unlike [`gated_delta_update`], this does NOT recompute g/beta internally
-/// and does NOT use a separately-compiled closure, making it safe to call
-/// inside an outer `mx.compile` closure without creating fusion barriers.
-pub fn gated_delta_inference_dispatch(
+/// `g` and `beta` are what [`gated_delta_update`] computes from its raw
+/// inputs: [`compute_g`] and `sigmoid(b)`. Everything else is the same, the
+/// choice of the fused kernel, the chunkwise algorithm or the sequential loop
+/// included (see `gated_delta_dispatch`).
+pub fn gated_delta_with_gates(
     q: &Array,
     k: &Array,
     v: &Array,
@@ -758,12 +756,7 @@ pub fn gated_delta_inference_dispatch(
     state: &Array,
     mask: Option<&Array>,
 ) -> Result<(Array, Array), Exception> {
-    // Try fused Metal kernel first (single dispatch per layer)
-    if let Some(result) = try_gdn_metal_kernel(q, k, v, g, beta, state, mask)? {
-        return Ok(result);
-    }
-    // Fallback to ops-based path
-    gated_delta_ops(q, k, v, g, beta, Some(state), mask)
+    gated_delta_dispatch(q, k, v, g, beta, state, mask, None)
 }
 
 /// Replay the GDN recurrence forward from a saved `initial_state`, returning

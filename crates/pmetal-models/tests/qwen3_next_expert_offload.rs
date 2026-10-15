@@ -244,7 +244,12 @@ fn models() -> Models {
     }
 }
 
-fn step(model: &mut DynamicModel, ids: &Array, kv: &mut pmetal_cache::kv_cache::KVCache, mamba: &mut pmetal_cache::kv_cache::MambaCache) -> Array {
+fn step(
+    model: &mut DynamicModel,
+    ids: &Array,
+    kv: &mut pmetal_cache::kv_cache::KVCache,
+    mamba: &mut pmetal_cache::kv_cache::MambaCache,
+) -> Array {
     let logits = model
         .forward_with_hybrid_cache(ids, None, Some(kv), Some(mamba))
         .expect("forward");

@@ -9,9 +9,7 @@
 //!
 //! Ported from the MLX reference implementation (Apple, 2025).
 
-use pmetal_runtime::compat::ops::{
-    select_axis, slice_axis, slice_axis_from, slice_last_from, slice_last_to,
-};
+use pmetal_runtime::compat::ops::{select_axis, slice_axis, slice_last_from, slice_last_to};
 use pmetal_runtime::compat::{
     Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param,
     VisitLinears, nn, ops,
@@ -36,7 +34,7 @@ use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
 use pmetal_runtime::native_weight::LayerWeight;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    gated_delta::gated_delta_update,
+    gated_delta::gated_delta_with_gates,
     moe_combine,
     rope::{RopePositions, rope_embedding},
 };
@@ -528,15 +526,72 @@ impl Qwen3NextForwardProfile {
     }
 }
 
-fn profile_array_section<F>(layer_profile: &mut Qwen3NextLayerProfile, name: &str, op: F) -> Array
-where
-    F: FnOnce() -> Array,
-{
-    let start = Instant::now();
-    let output = op();
-    output.eval();
-    layer_profile.push_section(name, start);
-    output
+/// What a section of a forward pass produced, evaluated so that its timing
+/// covers the work and not just the building of the graph.
+pub(crate) trait EvalAll {
+    fn eval_all(&self);
+}
+
+impl EvalAll for Array {
+    fn eval_all(&self) {
+        self.eval();
+    }
+}
+
+impl EvalAll for (Array, Array) {
+    fn eval_all(&self) {
+        self.0.eval();
+        self.1.eval();
+    }
+}
+
+impl EvalAll for (Array, Array, Array, Array) {
+    fn eval_all(&self) {
+        self.0.eval();
+        self.1.eval();
+        self.2.eval();
+        self.3.eval();
+    }
+}
+
+/// Whether a forward pass times its sections.
+///
+/// A layer is written once, as a series of named sections, and runs the same
+/// code with or without a profile: [`Probe::off`] runs each section's closure
+/// as it stands (the graph stays lazy), [`Probe::timing`] evaluates what it
+/// returns and records the elapsed time under the section's name.
+pub(crate) struct Probe<'a> {
+    layer: Option<&'a mut Qwen3NextLayerProfile>,
+}
+
+impl<'a> Probe<'a> {
+    pub(crate) fn off() -> Self {
+        Self { layer: None }
+    }
+
+    pub(crate) fn timing(layer: &'a mut Qwen3NextLayerProfile) -> Self {
+        Self { layer: Some(layer) }
+    }
+
+    /// The profile being filled, if any, for sections timed by hand.
+    pub(crate) fn layer_mut(&mut self) -> Option<&mut Qwen3NextLayerProfile> {
+        self.layer.as_deref_mut()
+    }
+
+    pub(crate) fn section<T: EvalAll>(
+        &mut self,
+        name: &str,
+        build: impl FnOnce() -> Result<T, Exception>,
+    ) -> Result<T, Exception> {
+        let Some(layer) = self.layer.as_deref_mut() else {
+            return build();
+        };
+        let start = Instant::now();
+        let out = build()?;
+        out.eval_all();
+        layer.push_section(name, start);
+        Ok(out)
+    }
 }
 
 // ============================================================================
@@ -564,65 +619,6 @@ impl_module_params!(Qwen3NextRMSNormGated; weight);
 /// type the native engine uses too, so the two read `output_gate_type` alike.
 pub use pmetal_runtime::qwen3_native::family::GdnGateActivation as GateActivation;
 
-#[cfg(test)]
-thread_local! {
-    /// How many times this thread ran the Rust body of the compiled swiglu.
-    static SWIGLU_TRACES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// `(silu(gate.f32()) * norm_out.f32()).as(norm_out.dtype)`, the reference's
-/// `_precise_swiglu`, which it compiles with `mx.compile(shapeless=True)`.
-fn precise_swiglu(norm_out: &Array, gate: &Array) -> Array {
-    let gate_f32 = nn::silu(&gate.cast(pmetal_runtime::compat::Dtype::Float32));
-    let norm_f32 = norm_out.cast(pmetal_runtime::compat::Dtype::Float32);
-    gate_f32.multiply(&norm_f32).as_dtype(norm_out.dtype_raw())
-}
-
-/// [`precise_swiglu`] traced once per thread through `mlx::core::compile`
-/// (shapeless, so decode and prefill share the trace; a new input dtype or
-/// rank retraces), which fuses its casts, sigmoid and multiplies into one
-/// kernel. The closure captures nothing, so the trace has no hidden inputs.
-/// Falls back to the op-by-op version if MLX refuses to compile it. The
-/// result is cast to `out_dtype` (the layer input's) when the norm promoted.
-fn compiled_precise_swiglu(
-    norm_out: &Array,
-    gate: &Array,
-    out_dtype: pmetal_runtime::compat::Dtype,
-) -> Result<Array, Exception> {
-    thread_local! {
-        // Never dropped: a compiled function destroyed during process
-        // teardown can outlive libmlx (see `pmetal_runtime::compile`).
-        static COMPILED: std::cell::RefCell<Option<std::mem::ManuallyDrop<pmetal_runtime::CompiledFn>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    let out = COMPILED.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = pmetal_runtime::CompiledFn::new(1, true, |inputs: &[Array]| {
-                #[cfg(test)]
-                SWIGLU_TRACES.with(|n| n.set(n.get() + 1));
-                vec![precise_swiglu(&inputs[0], &inputs[1])]
-            })
-            .ok()
-            .map(std::mem::ManuallyDrop::new);
-        }
-        match slot.as_mut() {
-            Some(compiled) => compiled
-                .call(&[norm_out, gate])
-                .map_err(|e| Exception::custom(e.to_string()))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| Exception::custom("compiled precise_swiglu returned nothing")),
-            None => Ok(precise_swiglu(norm_out, gate)),
-        }
-    })?;
-    Ok(if out.dtype() != out_dtype {
-        out.as_dtype(out_dtype.as_i32())
-    } else {
-        out
-    })
-}
-
 impl Qwen3NextRMSNormGated {
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
         let weight = Array::ones_f32(&[hidden_size]);
@@ -633,22 +629,25 @@ impl Qwen3NextRMSNormGated {
         })
     }
 
+    /// `act(gate) * rms_norm(x)`, the product taken in float32 and returned in
+    /// `x`'s dtype: the runtime's fused `_precise_swiglu` (compiled, one
+    /// kernel for the casts, the activation and the product), which the native
+    /// engine runs too.
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         let normed = pmetal_runtime::compat::fast::rms_norm(x, self.weight.as_ref(), self.eps);
-        match (gate, self.gate_activation) {
-            // `_precise_swiglu` through mlx::core::compile (shapeless).
-            // Fuses silu(gate.f32()) * norm.f32() → cast_back into 1 Metal dispatch
-            // instead of 6 separate dispatches (2 casts + silu(2 ops) + mul + cast).
-            (Some(g), GateActivation::Silu) => compiled_precise_swiglu(&normed, g, x.dtype()),
-            // Same f32 product, sigmoid in place of SiLU.
-            (Some(g), GateActivation::Sigmoid) => {
-                let gate_f32 = nn::sigmoid(&g.cast(Dtype::Float32));
-                Ok(gate_f32
-                    .multiply(&normed.cast(Dtype::Float32))
-                    .as_dtype(x.dtype().as_i32()))
-            }
-            (None, _) => Ok(normed),
-        }
+        let Some(gate) = gate else {
+            return Ok(normed);
+        };
+        let gated = match self.gate_activation {
+            GateActivation::Silu => Array::fused_precise_swiglu(&normed, gate),
+            GateActivation::Sigmoid => Array::precise_sigmoid_gate(&normed, gate),
+        };
+        // The norm promotes when its weight is wider than the activations.
+        Ok(if gated.dtype() != x.dtype() {
+            gated.as_dtype(x.dtype().as_i32())
+        } else {
+            gated
+        })
     }
 }
 
@@ -784,86 +783,7 @@ impl Qwen3NextAttention {
         cache: Option<(&mut KVCache, usize)>,
         positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let b = shape[0];
-        let l = shape[1];
-        let cache_active = cache.is_some();
-        let mut cache = cache;
-
-        // Project Q (with gate) and K, V
-        let q_proj_out = self.q_proj.forward(x);
-        // Reshape to [B, L, n_heads, head_dim * 2], split into queries and gate
-        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2]);
-        let queries = slice_last_to(&q_gate, self.head_dim);
-        let gate =
-            slice_last_from(&q_gate, self.head_dim).reshape(&[b, l, self.n_heads * self.head_dim]);
-
-        let keys = self.k_proj.forward(x);
-        let values = self.v_proj.forward(x);
-
-        // Reshape and apply Q/K norm
-        let mut queries = self.q_norm.forward(&queries);
-        let mut keys = self
-            .k_norm
-            .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim]));
-        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
-
-        // Transpose to [B, heads, L, head_dim]
-        queries = queries.transpose_axes(&[0, 2, 1, 3]);
-        keys = keys.transpose_axes(&[0, 2, 1, 3]);
-        let values = values.transpose_axes(&[0, 2, 1, 3]);
-
-        // Apply partial RoPE
-        let (queries, keys) = self.rotate(
-            &queries,
-            &keys,
-            positions,
-            cache
-                .as_ref()
-                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
-        )?;
-
-        // Fused SDPA with GQA
-        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-            .with_scale(self.scale)
-            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
-
-        if mask.is_none() {
-            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(output) = (*cache_ref).try_compressed_attention(
-                    *layer_idx,
-                    &queries,
-                    &keys,
-                    &values,
-                    &attn_config,
-                )? {
-                    let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
-                        b,
-                        l,
-                        self.n_heads * self.head_dim,
-                    ]);
-                    let gated = output.multiply(&nn::sigmoid(&gate));
-                    return Ok(self.o_proj.forward(&gated));
-                }
-            }
-        }
-
-        // Update KV cache
-        let (keys, values) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &keys, &values)?
-        } else {
-            (keys, values)
-        };
-
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
-        let output =
-            output
-                .transpose_axes(&[0, 2, 1, 3])
-                .reshape(&[b, l, self.n_heads * self.head_dim]);
-
-        // Gated output: o_proj(output * sigmoid(gate))
-        let gated = output.multiply(&nn::sigmoid(&gate));
-        Ok(self.o_proj.forward(&gated))
+        self.run(x, mask, cache, positions, &mut Probe::off())
     }
 
     pub fn forward_profiled(
@@ -874,99 +794,79 @@ impl Qwen3NextAttention {
         positions: Option<&Array>,
         layer_profile: &mut Qwen3NextLayerProfile,
     ) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let b = shape[0];
-        let l = shape[1];
-        let cache_active = cache.is_some();
-        let mut cache = cache;
+        self.run(x, mask, cache, positions, &mut Probe::timing(layer_profile))
+    }
 
-        let prep_start = Instant::now();
-        let q_proj_out = self.q_proj.forward(x);
-        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2]);
-        let queries = slice_last_to(&q_gate, self.head_dim);
-        let gate =
-            slice_last_from(&q_gate, self.head_dim).reshape(&[b, l, self.n_heads * self.head_dim]);
-        let keys = self.k_proj.forward(x);
-        let values = self.v_proj.forward(x);
-        let mut queries = self.q_norm.forward(&queries);
-        let mut keys = self
-            .k_norm
-            .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim]));
-        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
-        queries = queries.transpose_axes(&[0, 2, 1, 3]);
-        keys = keys.transpose_axes(&[0, 2, 1, 3]);
-        let values = values.transpose_axes(&[0, 2, 1, 3]);
-        queries.eval();
-        keys.eval();
-        values.eval();
-        layer_profile.push_section("attn_prepare_qkv", prep_start);
+    fn run(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
+        probe: &mut Probe<'_>,
+    ) -> Result<Array, Exception> {
+        let (b, l) = (x.dim(0), x.dim(1));
+        let width = self.n_heads * self.head_dim;
 
-        let rope_cache_start = Instant::now();
-        let (queries, keys) = self.rotate(
-            &queries,
-            &keys,
-            positions,
-            cache
-                .as_ref()
-                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
-        )?;
+        // The query projection holds the queries and the output gate, per head.
+        let (queries, keys, values, gate) = probe.section("attn_prepare_qkv", || {
+            let q_gate = self
+                .q_proj
+                .forward(x)
+                .reshape(&[b, l, self.n_heads, self.head_dim * 2]);
+            let queries = slice_last_to(&q_gate, self.head_dim);
+            let gate = slice_last_from(&q_gate, self.head_dim).reshape(&[b, l, width]);
+            let keys = self.k_proj.forward(x);
+            let values = self.v_proj.forward(x);
+
+            let queries = self.q_norm.forward(&queries);
+            let keys = self
+                .k_norm
+                .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim]));
+            let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
+
+            // To [B, heads, L, head_dim].
+            Ok((
+                queries.transpose_axes(&[0, 2, 1, 3]),
+                keys.transpose_axes(&[0, 2, 1, 3]),
+                values.transpose_axes(&[0, 2, 1, 3]),
+                gate,
+            ))
+        })?;
+
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
+        let (queries, keys) = probe.section("attn_rope", || {
+            self.rotate(&queries, &keys, positions, offset)
+        })?;
+
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
-            .with_mask_type(Self::mask_type_for_call(mask, cache_active, l));
-        if mask.is_none() {
-            let turbo_attn_start = Instant::now();
-            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(output) = (*cache_ref).try_compressed_attention(
-                    *layer_idx,
-                    &queries,
-                    &keys,
-                    &values,
-                    &attn_config,
-                )? {
-                    queries.eval();
-                    output.eval();
-                    layer_profile.push_section("attn_rope_cache", rope_cache_start);
-                    layer_profile.push_section("attn_sdpa", turbo_attn_start);
-
-                    let out_start = Instant::now();
-                    let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
-                        b,
-                        l,
-                        self.n_heads * self.head_dim,
-                    ]);
-                    let gated = output.multiply(&nn::sigmoid(&gate));
-                    let projected = self.o_proj.forward(&gated);
-                    projected.eval();
-                    layer_profile.push_section("attn_out_proj", out_start);
-                    return Ok(projected);
-                }
+            .with_mask_type(Self::mask_type(mask));
+        let attended = probe.section("attn_sdpa", || {
+            // A compressed (TurboQuant) cache attends over its own storage.
+            if mask.is_none()
+                && let Some((kv, layer)) = cache.as_mut()
+                && let Some(output) =
+                    kv.try_compressed_attention(*layer, &queries, &keys, &values, &attn_config)?
+            {
+                return Ok(output);
             }
-        }
-        let (keys, values) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &keys, &values)?
-        } else {
-            (keys, values)
-        };
-        queries.eval();
-        keys.eval();
-        values.eval();
-        layer_profile.push_section("attn_rope_cache", rope_cache_start);
+            let (keys, values) = match cache {
+                Some((kv, layer)) => kv.update_and_fetch(layer, &keys, &values)?,
+                None => (keys, values),
+            };
+            fused_sdpa(&queries, &keys, &values, &attn_config, mask)
+        })?;
 
-        let sdpa_start = Instant::now();
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
-        output.eval();
-        layer_profile.push_section("attn_sdpa", sdpa_start);
-
-        let out_start = Instant::now();
-        let output =
-            output
+        // Gated output: o_proj(attention * sigmoid(gate)).
+        probe.section("attn_out_proj", || {
+            let attended = attended
                 .transpose_axes(&[0, 2, 1, 3])
-                .reshape(&[b, l, self.n_heads * self.head_dim]);
-        let gated = output.multiply(&nn::sigmoid(&gate));
-        let projected = self.o_proj.forward(&gated);
-        projected.eval();
-        layer_profile.push_section("attn_out_proj", out_start);
-        Ok(projected)
+                .reshape(&[b, l, width]);
+            Ok(self.o_proj.forward(&attended.multiply(&nn::sigmoid(&gate))))
+        })
     }
 
     /// Rotate queries and keys `[B, heads, L, head_dim]`: one position per
@@ -991,12 +891,8 @@ impl Qwen3NextAttention {
         ))
     }
 
-    fn mask_type_for_call(
-        mask: Option<&Array>,
-        cache_active: bool,
-        query_len: i32,
-    ) -> AttentionMaskType {
-        let _ = (cache_active, query_len);
+    /// Causal unless the caller passes a mask of its own.
+    fn mask_type(mask: Option<&Array>) -> AttentionMaskType {
         if mask.is_some() {
             AttentionMaskType::None
         } else {
@@ -1008,6 +904,16 @@ impl Qwen3NextAttention {
 // ============================================================================
 // Qwen3Next Gated Delta Net (GDN) linear attention
 // ============================================================================
+
+/// The four input projections (`qkv`, `z`, `b`, `a`) as one `[total, hidden]`
+/// matrix, for a decode step, which multiplies by all four at once.
+#[derive(Debug)]
+struct FusedInputProjection {
+    weight: Array,
+    /// The ids of the four weights it was built from, so that a weight
+    /// replaced since (a merge, a reload, an optimizer step) rebuilds it.
+    built_from: [usize; 4],
+}
 
 #[derive(Debug)]
 pub struct Qwen3NextGatedDeltaNet {
@@ -1030,12 +936,7 @@ pub struct Qwen3NextGatedDeltaNet {
     pub value_dim: i32,
     pub conv_dim: i32,
     pub conv_kernel_size: i32,
-    pub combined_in_proj_weight: Option<Array>,
-    pub combined_in_proj_signature: Option<Vec<usize>>,
-    /// Cached qkvz combined weight (qkv + z concatenated, matching Python's in_proj_qkvz)
-    pub combined_qkvz_weight: Option<Array>,
-    /// Cached ba combined weight (b + a concatenated, matching Python's in_proj_ba)
-    pub combined_ba_weight: Option<Array>,
+    fused_input_projection: Option<FusedInputProjection>,
     /// Pre-computed rms_norm weight for Q normalization: ones * inv_scale²
     pub q_norm_weight: Array,
     /// Pre-computed rms_norm weight for K normalization: ones * inv_scale
@@ -1050,8 +951,10 @@ pub struct Qwen3NextGatedDeltaNet {
 impl_module_params!(Qwen3NextGatedDeltaNet; conv1d, in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, norm, out_proj, dt_bias, a_log);
 
 impl Qwen3NextGatedDeltaNet {
-    const COMBINED_INPUT_PROJ_MAX_HIDDEN: i32 = 2048;
-    const DECODE_FLATTEN_MAX_HIDDEN: i32 = 2048;
+    /// Widest model (hidden size) whose decode step multiplies by the fused
+    /// projection: past it the concatenated copy of the weights costs more
+    /// memory than the one fewer dispatch is worth.
+    const FUSED_PROJECTION_MAX_HIDDEN: i32 = 2048;
 
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
         let hidden_size = config.hidden_size;
@@ -1074,7 +977,7 @@ impl Qwen3NextGatedDeltaNet {
             .padding(0)
             .build()?;
 
-        // 4 separate projections matching HF weight format (qwen3_5.py)
+        // 4 separate projections matching the checkpoint's tensors.
         let in_proj_qkv = nn::LinearBuilder::new(hidden_size, key_dim * 2 + value_dim)
             .bias(false)
             .build()?;
@@ -1125,10 +1028,7 @@ impl Qwen3NextGatedDeltaNet {
             value_dim,
             conv_dim,
             conv_kernel_size,
-            combined_in_proj_weight: None,
-            combined_in_proj_signature: None,
-            combined_qkvz_weight: None,
-            combined_ba_weight: None,
+            fused_input_projection: None,
             q_norm_weight: {
                 let inv = (head_k_dim as f32).sqrt().recip();
                 Array::ones_f32(&[head_k_dim]).multiply(&Array::from_f32(inv * inv))
@@ -1143,582 +1043,95 @@ impl Qwen3NextGatedDeltaNet {
         })
     }
 
-    fn current_input_proj_signature(&self) -> Vec<usize> {
-        // Use `Array::id()` — stable across the array's lifetime and safe on
-        // lazy (unevaluated) weights. `data_ptr()` would dereference a null
-        // buffer on an unmaterialised array.
-        vec![
-            self.in_proj_qkv.weight.as_ref().id(),
-            self.in_proj_z.weight.as_ref().id(),
-            self.in_proj_b.weight.as_ref().id(),
-            self.in_proj_a.weight.as_ref().id(),
-        ]
-    }
-
-    fn ensure_combined_input_proj_weight(&mut self) -> Result<Array, Exception> {
-        let signature = self.current_input_proj_signature();
-        let needs_refresh = self.combined_in_proj_weight.is_none()
-            || self.combined_in_proj_signature.as_ref() != Some(&signature);
-
-        if needs_refresh {
-            let weights = [
-                dequantize_fp8_weight_for_compute(self.in_proj_qkv.weight.as_ref())?,
-                dequantize_fp8_weight_for_compute(self.in_proj_z.weight.as_ref())?,
-                dequantize_fp8_weight_for_compute(self.in_proj_b.weight.as_ref())?,
-                dequantize_fp8_weight_for_compute(self.in_proj_a.weight.as_ref())?,
-            ];
-            let weight_refs: Vec<&Array> = weights.iter().collect();
-            let combined = ops::concatenate_axis(&weight_refs, 0);
-            combined.eval();
-            self.combined_in_proj_weight = Some(combined);
-            self.combined_in_proj_signature = Some(signature);
-        }
-
-        Ok(self.combined_in_proj_weight.as_ref().unwrap().clone())
-    }
-
-    /// Cached qkvz weight = concat(qkv_w, z_w, axis=0).
-    /// Matches Python's `in_proj_qkvz` (key_dim*2 + value_dim*2 output dim).
-    pub fn ensure_combined_qkvz_weight(&mut self) -> Result<Array, Exception> {
-        if self.combined_qkvz_weight.is_none() {
-            let qkv = dequantize_fp8_weight_for_compute(self.in_proj_qkv.weight.as_ref())?;
-            let z = dequantize_fp8_weight_for_compute(self.in_proj_z.weight.as_ref())?;
-            let w = ops::concatenate_axis(&[&qkv, &z], 0);
-            w.eval();
-            self.combined_qkvz_weight = Some(w);
-        }
-        Ok(self.combined_qkvz_weight.as_ref().unwrap().clone())
-    }
-
-    /// Cached ba weight = concat(b_w, a_w, axis=0).
-    /// Matches Python's `in_proj_ba` (num_v_heads*2 output dim).
-    pub fn ensure_combined_ba_weight(&mut self) -> Result<Array, Exception> {
-        if self.combined_ba_weight.is_none() {
-            let b = dequantize_fp8_weight_for_compute(self.in_proj_b.weight.as_ref())?;
-            let a = dequantize_fp8_weight_for_compute(self.in_proj_a.weight.as_ref())?;
-            let w = ops::concatenate_axis(&[&b, &a], 0);
-            w.eval();
-            self.combined_ba_weight = Some(w);
-        }
-        Ok(self.combined_ba_weight.as_ref().unwrap().clone())
-    }
-
-    fn combined_input_projection(
-        &mut self,
-        inputs: &Array,
-    ) -> Result<(Array, Array, Array, Array), Exception> {
-        let shape = inputs.shape();
-        let b = shape[0];
-        let s = shape[1];
-        let combined_weight = self.ensure_combined_input_proj_weight()?;
-        let projected = if s == 1 {
-            let flat = inputs.reshape(&[b, self.hidden_size]);
-            ops::matmul(&flat, &combined_weight.t())
-        } else {
-            ops::matmul(inputs, &combined_weight.t())
-        };
-
-        let qkv_end = self.conv_dim;
-        let z_end = qkv_end + self.value_dim;
-        let b_end = z_end + self.num_v_heads;
-
-        let qkv = if s == 1 {
-            slice_last_to(&projected, qkv_end).reshape(&[b, s, self.conv_dim])
-        } else {
-            slice_last_to(&projected, qkv_end)
-        };
-        let z = slice_axis(&projected, -1, qkv_end, z_end).reshape(&[
-            b,
-            s,
-            self.num_v_heads,
-            self.head_v_dim,
-        ]);
-        let b_val = if s == 1 {
-            slice_axis(&projected, -1, z_end, b_end).reshape(&[b, s, self.num_v_heads])
-        } else {
-            slice_axis(&projected, -1, z_end, b_end)
-        };
-        let a = if s == 1 {
-            slice_last_from(&projected, b_end).reshape(&[b, s, self.num_v_heads])
-        } else {
-            slice_last_from(&projected, b_end)
-        };
-        Ok((qkv, z, b_val, a))
-    }
-
-    fn decode_linear_projection(
-        inputs: &Array,
-        weight: &Array,
-        output_dim: i32,
-    ) -> Result<Array, Exception> {
-        let batch = inputs.dim(0);
-        let hidden = inputs.dim(2);
-        let flat = inputs.reshape(&[batch, hidden]);
-        let weight = dequantize_fp8_weight_for_compute(weight)?;
-        let projected = ops::matmul(&flat, &weight.t());
-        Ok(projected.reshape(&[batch, 1, output_dim]))
-    }
-
-    fn decode_out_projection(&self, out: &Array, batch: i32) -> Result<Array, Exception> {
-        let flat = out.reshape(&[batch, self.value_dim]);
-        let weight = dequantize_fp8_weight_for_compute(self.out_proj.weight.as_ref())?;
-        let projected = ops::matmul(&flat, &weight.t());
-        Ok(projected.reshape(&[batch, 1, self.hidden_size]))
-    }
-
-    /// Whether every projection is a plain dense weight. The decode fast
-    /// paths multiply by the weights directly (concatenated, or flattened),
-    /// which would skip an adapter and misread a packed weight.
+    /// Whether every projection is a plain dense weight. The fused decode
+    /// projection multiplies by the weights directly, which would skip an
+    /// adapter and misread a packed weight.
     fn projections_are_plain(&self) -> bool {
         [
             &self.in_proj_qkv,
             &self.in_proj_z,
             &self.in_proj_b,
             &self.in_proj_a,
-            &self.out_proj,
         ]
         .iter()
         .all(|linear| linear.plain_weight().is_some())
     }
 
-    fn should_use_flattened_decode_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
-        mask.is_none()
+    /// The fused projection: the four input projections multiplied at once,
+    /// for the decode step of a small model with plain weights.
+    fn uses_fused_projection(&self, inputs: &Array, mask: Option<&Array>, cached: bool) -> bool {
+        cached
+            && mask.is_none()
             && inputs.dim(1) == 1
-            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+            && self.hidden_size <= Self::FUSED_PROJECTION_MAX_HIDDEN
             && self.projections_are_plain()
     }
 
-    fn should_use_combined_input_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
-        mask.is_none()
-            && inputs.dim(1) == 1
-            && self.hidden_size <= Self::COMBINED_INPUT_PROJ_MAX_HIDDEN
-            && self.projections_are_plain()
+    /// The concatenated `[qkv; z; b; a]` weight, rebuilt when any of the four
+    /// has been replaced. An FP8-stored weight is dequantized into it once.
+    fn fused_input_weight(&mut self) -> Result<Array, Exception> {
+        // `Array::id()` is stable for an array's lifetime and safe on lazy
+        // weights; `data_ptr()` would dereference an unmaterialised buffer.
+        let ids = [
+            self.in_proj_qkv.weight.as_ref().id(),
+            self.in_proj_z.weight.as_ref().id(),
+            self.in_proj_b.weight.as_ref().id(),
+            self.in_proj_a.weight.as_ref().id(),
+        ];
+        if self
+            .fused_input_projection
+            .as_ref()
+            .is_none_or(|fused| fused.built_from != ids)
+        {
+            let weights = [
+                dequantize_fp8_weight_for_compute(self.in_proj_qkv.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.in_proj_z.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.in_proj_b.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.in_proj_a.weight.as_ref())?,
+            ];
+            let refs: Vec<&Array> = weights.iter().collect();
+            let weight = ops::concatenate_axis(&refs, 0);
+            weight.eval();
+            self.fused_input_projection = Some(FusedInputProjection {
+                weight,
+                built_from: ids,
+            });
+        }
+        Ok(self
+            .fused_input_projection
+            .as_ref()
+            .map(|fused| fused.weight.clone())
+            .expect("the fused projection was just built"))
     }
 
-    /// Decode forward (T=1), op by op apart from the gated norm's compiled swiglu.
-    fn forward_cached_decode(
+    /// `(qkv, z, b, a)` for `inputs` `[B, S, hidden]`: `z` as `[B, S, Hv, Dv]`,
+    /// the rest as projected.
+    fn project(
         &mut self,
         inputs: &Array,
-        cache: &mut MambaCacheEntry,
-    ) -> Result<Array, Exception> {
-        let b = inputs.dim(0);
-
-        // Extract cache state as explicit arrays for the pure compiled closure
-        let conv_state = cache.conv_state.as_ref().cloned().unwrap_or_else(|| {
-            ops::zeros_dtype(
-                &[b, self.conv_kernel_size - 1, self.conv_dim],
-                inputs.dtype(),
-            )
-        });
-        let ssm_state = cache.ssm_state.take().unwrap_or_else(|| {
-            ops::zeros_dtype(
-                &[b, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                inputs.dtype(),
-            )
-        });
-
-        // Direct decode: uses Metal GDN kernel (1 dispatch for recurrence) +
-        // individually dispatched ops for projections/conv/norm.
-        // Not compiled: MLX dispatches these ops one by one.
-        let b_dim = inputs.dim(0);
-        let s = 1i32;
-
-        // 2 combined matmuls matching Python's in_proj_qkvz + in_proj_ba
-        let qkvz_w = self.ensure_combined_qkvz_weight()?;
-        let ba_w = self.ensure_combined_ba_weight()?;
-        let qkvz = ops::matmul(inputs, &qkvz_w.t());
-        let ba = ops::matmul(inputs, &ba_w.t());
-
-        // Split qkvz → qkv (conv_dim) + z (value_dim)
-        let qkv = slice_last_to(&qkvz, self.conv_dim);
-        let z = slice_last_from(&qkvz, self.conv_dim).reshape(&[
-            b_dim,
-            s,
-            self.num_v_heads,
-            self.head_v_dim,
-        ]);
-
-        // Split ba → b_val + a
-        let b_val = slice_last_to(&ba, self.num_v_heads);
-        let a = slice_last_from(&ba, self.num_v_heads);
-
-        // Conv: concat old state + new, apply conv1d + silu
-        let conv_input_arr = ops::concatenate_axis(&[&conv_state, &qkv], 1);
-        let new_conv = slice_axis_from(&conv_input_arr, 1, -(self.conv_kernel_size - 1));
-        let conv_out = nn::silu(&self.conv1d.forward(&conv_input_arr));
-
-        // Split conv output → q, k, v
-        let parts = ops::split_sections(&conv_out, &[self.key_dim, self.key_dim * 2], -1);
-        let q = parts[0].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim]);
-        let k = parts[1].reshape(&[b_dim, s, self.num_k_heads, self.head_k_dim]);
-        let v = parts[2].reshape(&[b_dim, s, self.num_v_heads, self.head_v_dim]);
-
-        // Q/K normalization (fused fast:: ops)
-        let q = pmetal_runtime::compat::fast::rms_norm(&q, &self.q_norm_weight, self.qk_norm_eps);
-        let k = pmetal_runtime::compat::fast::rms_norm(&k, &self.k_norm_weight, self.qk_norm_eps);
-
-        // GDN recurrence via Metal kernel (1 dispatch) or ops fallback
-        let (out, new_ssm) = gated_delta_update(
-            &q,
-            &k,
-            &v,
-            &a,
-            &b_val,
-            self.a_log.as_ref(),
-            self.dt_bias.as_ref(),
-            Some(&ssm_state),
-            None,
-        )?;
-
-        // Gated norm (f32 precision)
-        let out_n = self.norm.forward(&out, Some(&z))?;
-        let result = self.out_proj.forward(&out_n.reshape(&[b_dim, s, -1]));
-        let outputs = [result, new_conv, new_ssm];
-
-        cache.conv_state = Some(outputs[1].clone());
-        cache.ssm_state = Some(outputs[2].clone());
-
-        Ok(outputs[0].clone())
-    }
-
-    fn forward_cached_decode_profiled(
-        &mut self,
-        inputs: &Array,
-        cache: &mut MambaCacheEntry,
-        layer_profile: &mut Qwen3NextLayerProfile,
-    ) -> Result<Array, Exception> {
-        let shape = inputs.shape();
-        let b = shape[0];
-        let s = shape[1];
-
-        let input_proj_start = Instant::now();
-        let (qkv, z, b_val, a) = self.combined_input_projection(inputs)?;
-        qkv.eval();
-        z.eval();
-        b_val.eval();
-        a.eval();
-        layer_profile.push_section("gdn_input_proj", input_proj_start);
-
-        let conv_start = Instant::now();
-        let conv_input = cache.update_conv_state(&qkv, self.conv_kernel_size)?;
-        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?);
-        conv_out.eval();
-        layer_profile.push_section("gdn_conv", conv_start);
-
-        self.finish_forward_from_conv_out_profiled(
-            &conv_out,
-            b,
-            s,
-            &z,
-            &a,
-            &b_val,
-            None,
-            Some(cache),
-            layer_profile,
-        )
-    }
-
-    /// Same math as [`finish_forward_from_conv_out`] but writes
-    /// `(keys, values, g, beta, conv_input)` into the supplied
-    /// `SpecCapture` before running the recurrence, so a speculative
-    /// rollback can replay the state over the accepted prefix.
-    ///
-    /// `conv_input_qkv` is the pre-conv projection (the `qkv` local in
-    /// `forward_general_with_capture`) — that is the tensor
-    /// `MambaCacheEntry::rewind` needs to reconstruct the rolled-back
-    /// conv state.
-    #[allow(clippy::too_many_arguments)]
-    fn finish_forward_from_conv_out_capturing(
-        &mut self,
-        conv_out: &Array,
-        batch: i32,
-        seq_len: i32,
-        z: &Array,
-        a: &Array,
-        b_val: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut MambaCacheEntry>,
-        capture: Option<(usize, &mut pmetal_cache::speculative::SpecCapture)>,
-        conv_input_qkv: &Array,
-        conv_kernel_size: usize,
-    ) -> Result<Array, Exception> {
-        // Split / reshape / Q-K norm exactly like the non-capturing variant.
-        let splits = ops::split_sections(conv_out, &[self.key_dim, self.key_dim * 2], -1);
-        let (q_conv, k_conv, v_conv) = (&splits[0], &splits[1], &splits[2]);
-        let q_conv = q_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
-        let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
-        let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim]);
-        let q_normed =
-            pmetal_runtime::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
-        let k_normed =
-            pmetal_runtime::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
-
-        // Compute g and beta OUTSIDE gated_delta_update so we can stash
-        // them in the capture — the internal implementation derives them
-        // from (a, b_val, a_log, dt_bias) on every call.
-        let beta = b_val.sigmoid();
-        let g = pmetal_runtime::nn::compute_g(self.a_log.as_ref(), a, self.dt_bias.as_ref())?;
-
-        // Record the rollback inputs before advancing the state.
-        if let Some((layer_idx, buf)) = capture {
-            let rec = pmetal_cache::kv_cache::GdnVerifyInputs {
-                keys: k_normed.clone(),
-                values: v_conv.clone(),
-                g: g.clone(),
-                beta: beta.clone(),
-                conv_input: conv_input_qkv.clone(),
-                conv_kernel_size,
-            };
-            buf.record_gdn(layer_idx, rec);
+        fused: bool,
+    ) -> Result<(Array, Array, Array, Array), Exception> {
+        let (b, s) = (inputs.dim(0), inputs.dim(1));
+        let z_shape = [b, s, self.num_v_heads, self.head_v_dim];
+        if !fused {
+            return Ok((
+                self.in_proj_qkv.forward(inputs),
+                self.in_proj_z.forward(inputs).reshape(&z_shape),
+                self.in_proj_b.forward(inputs),
+                self.in_proj_a.forward(inputs),
+            ));
         }
-
-        let ssm_state_arr;
-        let ssm_state_ref: Option<&Array> = match cache.as_ref().and_then(|c| c.ssm_state.as_ref())
-        {
-            Some(s) => Some(s),
-            None => {
-                ssm_state_arr = pmetal_runtime::compat::ops::zeros_dtype(
-                    &[batch, self.num_v_heads, self.head_v_dim, self.head_k_dim],
-                    conv_out.dtype(),
-                );
-                Some(&ssm_state_arr)
-            }
-        };
-        let state_ref = ssm_state_ref.expect("ssm state ref initialized above");
-
-        // Use the inference dispatch with the pre-computed g/beta so the
-        // capture and the recurrence share the exact same tensors.
-        let (out, new_state) = pmetal_runtime::nn::gated_delta_inference_dispatch(
-            &q_normed, &k_normed, &v_conv, &g, &beta, state_ref, mask,
-        )?;
-        if let Some(cache) = cache {
-            cache.ssm_state = Some(new_state);
-        }
-        let out = self.norm.forward(&out, Some(z))?;
-        if mask.is_none()
-            && seq_len == 1
-            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
-            && self.projections_are_plain()
-        {
-            self.decode_out_projection(&out, batch)
-        } else {
-            Ok(self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])))
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the projections one forward pass splits into"
-    )]
-    fn finish_forward_from_conv_out(
-        &mut self,
-        conv_out: &Array,
-        batch: i32,
-        seq_len: i32,
-        z: &Array,
-        a: &Array,
-        b_val: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut MambaCacheEntry>,
-    ) -> Result<Array, Exception> {
-        // Split conv output into q, k, v using mx.split (1 op vs 3 index ops).
-        // Same as the reference: mx.split(conv_out, [...], -1)
-        let splits = ops::split_sections(conv_out, &[self.key_dim, self.key_dim * 2], -1);
-        let (q_conv, k_conv, v_conv) = (&splits[0], &splits[1], &splits[2]);
-
-        // Reshape to head dimensions.
-        // For T=1 decode, conv output seq_len already matches (no trim needed).
-        let q_conv = q_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
-        let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
-        let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim]);
-
-        // Q/K normalization: fast::rms_norm (fused Metal op) with pre-baked scale weights.
-        let q_normed =
-            pmetal_runtime::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
-        let k_normed =
-            pmetal_runtime::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
-
-        let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
-
-        // The recurrence picks its own path: the fused kernel has no VJP, so
-        // inputs under a gradient trace take the differentiable chunked or
-        // sequential path, and everything else keeps the kernel.
-        let (out, new_state) = gated_delta_update(
-            &q_normed,
-            &k_normed,
-            &v_conv,
-            a,
-            b_val,
-            self.a_log.as_ref(),
-            self.dt_bias.as_ref(),
-            ssm_state,
-            mask,
-        )?;
-
-        if let Some(cache) = cache {
-            cache.ssm_state = Some(new_state);
-        }
-
-        // Apply gated norm and output projection
-        let out = self.norm.forward(&out, Some(z))?;
-        if mask.is_none()
-            && seq_len == 1
-            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
-            && self.projections_are_plain()
-        {
-            self.decode_out_projection(&out, batch)
-        } else {
-            Ok(self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])))
-        }
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the projections one forward pass splits into"
-    )]
-    fn finish_forward_from_conv_out_profiled(
-        &mut self,
-        conv_out: &Array,
-        batch: i32,
-        seq_len: i32,
-        z: &Array,
-        a: &Array,
-        b_val: &Array,
-        mask: Option<&Array>,
-        cache: Option<&mut MambaCacheEntry>,
-        layer_profile: &mut Qwen3NextLayerProfile,
-    ) -> Result<Array, Exception> {
-        let recurrence_start = Instant::now();
-        let q_conv = slice_last_to(conv_out, self.key_dim);
-        let k_conv = slice_axis(conv_out, -1, self.key_dim, self.key_dim * 2);
-        let v_conv = slice_last_from(conv_out, self.key_dim * 2);
-        let out_len = q_conv.dim(1);
-        let q_conv = slice_axis_from(&q_conv, 1, out_len - seq_len).reshape(&[
-            batch,
-            seq_len,
-            self.num_k_heads,
-            self.head_k_dim,
-        ]);
-        let k_conv = slice_axis_from(&k_conv, 1, out_len - seq_len).reshape(&[
-            batch,
-            seq_len,
-            self.num_k_heads,
-            self.head_k_dim,
-        ]);
-        let v_conv = slice_axis_from(&v_conv, 1, out_len - seq_len).reshape(&[
-            batch,
-            seq_len,
-            self.num_v_heads,
-            self.head_v_dim,
-        ]);
-        // Q/K normalization: use fast::rms_norm (1 fused Metal op) instead of
-        // l2norm_last_dim (5 separate ops). Matches the reference exactly.
-        // Q/K normalization: fast::rms_norm (1 fused Metal op) with pre-baked
-        // scale factors. inv_scale = 1/sqrt(dk).
-        // q gets inv_scale² (because rms_norm divides by sqrt(mean) not sqrt(sum)),
-        // k gets inv_scale.
-        let q_normed =
-            pmetal_runtime::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, self.qk_norm_eps);
-        let k_normed =
-            pmetal_runtime::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, self.qk_norm_eps);
-        let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
-        let (out, new_state) = gated_delta_update(
-            &q_normed,
-            &k_normed,
-            &v_conv,
-            a,
-            b_val,
-            self.a_log.as_ref(),
-            self.dt_bias.as_ref(),
-            ssm_state,
-            mask,
-        )?;
-        out.eval();
-        layer_profile.push_section("gdn_recurrence", recurrence_start);
-
-        if let Some(cache) = cache {
-            cache.ssm_state = Some(new_state);
-        }
-
-        let out_proj_start = Instant::now();
-        let out = self.norm.forward(&out, Some(z))?;
-        let projected = if mask.is_none()
-            && seq_len == 1
-            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
-            && self.projections_are_plain()
-        {
-            self.decode_out_projection(&out, batch)?
-        } else {
-            self.out_proj.forward(&out.reshape(&[batch, seq_len, -1]))
-        };
-        projected.eval();
-        layer_profile.push_section("gdn_out_proj", out_proj_start);
-        Ok(projected)
-    }
-
-    fn forward_general(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        mut cache: Option<&mut MambaCacheEntry>,
-    ) -> Result<Array, Exception> {
-        let shape = inputs.shape();
-        let b = shape[0];
-        let s = shape[1];
-        let decode_linear = self.should_use_flattened_decode_proj(inputs, mask);
-
-        // 4 separate projections matching HF weight format (qwen3_5.py:136-139)
-        let qkv = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_qkv.weight.as_ref(), self.conv_dim)?
-        } else {
-            self.in_proj_qkv.forward(inputs)
-        };
-        let z = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_z.weight.as_ref(), self.value_dim)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
-        } else {
-            self.in_proj_z
-                .forward(inputs)
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
-        };
-        let b_val = if decode_linear {
-            Self::decode_linear_projection(
-                inputs,
-                self.in_proj_b.weight.as_ref(),
-                self.num_v_heads,
-            )?
-        } else {
-            self.in_proj_b.forward(inputs)
-        };
-        let a = if decode_linear {
-            Self::decode_linear_projection(
-                inputs,
-                self.in_proj_a.weight.as_ref(),
-                self.num_v_heads,
-            )?
-        } else {
-            self.in_proj_a.forward(inputs)
-        };
-        let qkv = if let Some(mask) = mask {
-            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1]);
-            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))
-        } else {
-            qkv
-        };
-
-        let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
-            let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
-        } else {
-            let conv_state = pmetal_runtime::compat::ops::zeros_dtype(
-                &[b, self.conv_kernel_size - 1, self.conv_dim],
-                qkv.dtype(),
-            );
-            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1);
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
-        };
-
-        self.finish_forward_from_conv_out(&conv_out, b, s, &z, &a, &b_val, mask, cache)
+        let weight = self.fused_input_weight()?;
+        let projected = ops::matmul(inputs, &weight.t());
+        let z_start = self.conv_dim;
+        let b_start = z_start + self.value_dim;
+        let a_start = b_start + self.num_v_heads;
+        Ok((
+            slice_last_to(&projected, z_start),
+            slice_axis(&projected, -1, z_start, b_start).reshape(&z_shape),
+            slice_axis(&projected, -1, b_start, a_start),
+            slice_last_from(&projected, a_start),
+        ))
     }
 
     pub fn forward(
@@ -1727,21 +1140,12 @@ impl Qwen3NextGatedDeltaNet {
         mask: Option<&Array>,
         cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
-        if self.should_use_combined_input_proj(inputs, mask)
-            && let Some(cache) = cache
-        {
-            return self.forward_cached_decode(inputs, cache);
-        }
-        self.forward_general(inputs, mask, cache)
+        self.run(inputs, mask, cache, &mut Probe::off(), None)
     }
 
     /// GDN forward that ALSO records the per-token inputs the GDN
     /// recurrence saw, so a speculative-decoding rollback can replay the
     /// state over a partially-accepted prefix.
-    ///
-    /// Always routes through the general (ops + Metal kernel) path — the
-    /// compiled decode fast-path (T=1) is not used during verify, which
-    /// by construction runs with `T = block_size >= 2`.
     pub fn forward_with_capture(
         &mut self,
         inputs: &Array,
@@ -1750,73 +1154,12 @@ impl Qwen3NextGatedDeltaNet {
         layer_idx: usize,
         capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
-        self.forward_general_with_capture(inputs, mask, cache, Some((layer_idx, capture)))
-    }
-
-    /// Internal helper: same math as `forward_general` but with an optional
-    /// capture slot. When `capture` is `None` this is a line-for-line copy
-    /// of `forward_general`; when it is `Some`, the per-token
-    /// `(keys, values, g, beta, conv_input)` tensors are stored into the
-    /// capture buffer immediately before `gated_delta_update` runs.
-    fn forward_general_with_capture(
-        &mut self,
-        inputs: &Array,
-        mask: Option<&Array>,
-        mut cache: Option<&mut MambaCacheEntry>,
-        capture: Option<(usize, &mut pmetal_cache::speculative::SpecCapture)>,
-    ) -> Result<Array, Exception> {
-        if capture.is_none() {
-            return self.forward_general(inputs, mask, cache);
-        }
-        let shape = inputs.shape();
-        let b = shape[0];
-        let s = shape[1];
-
-        // Projection phase — same as `forward_general`, minus the
-        // decode_linear fast-paths (capture only runs with T > 1).
-        let qkv = self.in_proj_qkv.forward(inputs);
-        let z = self
-            .in_proj_z
-            .forward(inputs)
-            .reshape(&[b, s, self.num_v_heads, self.head_v_dim]);
-        let b_val = self.in_proj_b.forward(inputs);
-        let a = self.in_proj_a.forward(inputs);
-        let qkv = if let Some(mask) = mask {
-            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1]);
-            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))
-        } else {
-            qkv
-        };
-
-        // `qkv_for_capture` is the pre-conv projection the caller will
-        // need to rebuild conv_state on rollback.
-        let qkv_for_capture = qkv.clone();
-        let conv_kernel_size = self.conv_kernel_size as usize;
-
-        let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
-            let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
-        } else {
-            let conv_state = pmetal_runtime::compat::ops::zeros_dtype(
-                &[b, self.conv_kernel_size - 1, self.conv_dim],
-                qkv.dtype(),
-            );
-            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1);
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
-        };
-
-        self.finish_forward_from_conv_out_capturing(
-            &conv_out,
-            b,
-            s,
-            &z,
-            &a,
-            &b_val,
+        self.run(
+            inputs,
             mask,
             cache,
-            capture,
-            &qkv_for_capture,
-            conv_kernel_size,
+            &mut Probe::off(),
+            Some((layer_idx, capture)),
         )
     }
 
@@ -1824,104 +1167,101 @@ impl Qwen3NextGatedDeltaNet {
         &mut self,
         inputs: &Array,
         mask: Option<&Array>,
-        mut cache: Option<&mut MambaCacheEntry>,
+        cache: Option<&mut MambaCacheEntry>,
         layer_profile: &mut Qwen3NextLayerProfile,
     ) -> Result<Array, Exception> {
-        if self.should_use_combined_input_proj(inputs, mask)
-            && let Some(cache) = cache
-        {
-            return self.forward_cached_decode_profiled(inputs, cache, layer_profile);
+        self.run(inputs, mask, cache, &mut Probe::timing(layer_profile), None)
+    }
+
+    /// The layer: projections, causal convolution over the cached window, the
+    /// q/k norm, the gated delta rule, the gated norm and the output
+    /// projection. One path for training (no cache, a gradient trace), prefill
+    /// and decode (a cache), a verify (`capture`) and a profile (`probe`).
+    fn run(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut MambaCacheEntry>,
+        probe: &mut Probe<'_>,
+        capture: Option<(usize, &mut pmetal_cache::speculative::SpecCapture)>,
+    ) -> Result<Array, Exception> {
+        let (b, s) = (inputs.dim(0), inputs.dim(1));
+        let fused = self.uses_fused_projection(inputs, mask, cache.is_some());
+        let (qkv, z, b_val, a) = probe.section("gdn_input_proj", || self.project(inputs, fused))?;
+
+        // Padding contributes nothing to the convolution or the recurrence.
+        let qkv = match mask {
+            Some(mask) => {
+                let mask = mask.reshape(&[mask.dim(0), mask.dim(1), 1]);
+                ops::r#where(&mask, &qkv, &Array::from_f32(0.0))
+            }
+            None => qkv,
+        };
+
+        // The last `kernel - 1` inputs of everything before this call (zeros
+        // for the start of a sequence) in front of this call's.
+        let conv_input = match cache.as_deref_mut() {
+            Some(entry) => entry.update_conv_state(&qkv, self.conv_kernel_size)?,
+            None => {
+                let history =
+                    ops::zeros_dtype(&[b, self.conv_kernel_size - 1, self.conv_dim], qkv.dtype());
+                ops::concatenate_axis(&[&history, &qkv], 1)
+            }
+        };
+        let conv_out = probe.section("gdn_conv", || {
+            Ok(nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?))
+        })?;
+
+        // Split to q, k, v by head, and normalize q and k: `rms_norm` with
+        // the pre-baked scales is transformers' L2 norm (and the 1/sqrt(Dk)
+        // query scale).
+        let parts = ops::split_sections(&conv_out, &[self.key_dim, self.key_dim * 2], -1);
+        let q = parts[0].reshape(&[b, s, self.num_k_heads, self.head_k_dim]);
+        let k = parts[1].reshape(&[b, s, self.num_k_heads, self.head_k_dim]);
+        let v = parts[2].reshape(&[b, s, self.num_v_heads, self.head_v_dim]);
+        let q = pmetal_runtime::compat::fast::rms_norm(&q, &self.q_norm_weight, self.qk_norm_eps);
+        let k = pmetal_runtime::compat::fast::rms_norm(&k, &self.k_norm_weight, self.qk_norm_eps);
+
+        // The recurrence's inputs, which a rollback replays from.
+        let beta = b_val.sigmoid();
+        let g = pmetal_runtime::nn::compute_g(self.a_log.as_ref(), &a, self.dt_bias.as_ref())?;
+        if let Some((layer_idx, capture)) = capture {
+            capture.record_gdn(
+                layer_idx,
+                pmetal_cache::kv_cache::GdnVerifyInputs {
+                    keys: k.clone(),
+                    values: v.clone(),
+                    g: g.clone(),
+                    beta: beta.clone(),
+                    conv_input: qkv.clone(),
+                    conv_kernel_size: self.conv_kernel_size as usize,
+                },
+            );
         }
 
-        let shape = inputs.shape();
-        let b = shape[0];
-        let s = shape[1];
-        let decode_linear = self.should_use_flattened_decode_proj(inputs, mask);
-
-        let qkv_start = Instant::now();
-        let qkv = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_qkv.weight.as_ref(), self.conv_dim)?
-        } else {
-            self.in_proj_qkv.forward(inputs)
+        // The state is float32 whatever the activations' dtype: it sums every
+        // token's update, and rounding it to bf16 each step would compound.
+        let state = match cache.as_deref().and_then(|entry| entry.ssm_state.clone()) {
+            Some(state) => state,
+            None => ops::zeros_dtype(
+                &[b, self.num_v_heads, self.head_v_dim, self.head_k_dim],
+                Dtype::Float32,
+            ),
         };
-        qkv.eval();
-        layer_profile.push_section("gdn_input_qkv", qkv_start);
+        let (out, new_state) = probe.section("gdn_recurrence", || {
+            // The fused kernel has no VJP, so inputs under a gradient trace
+            // take the differentiable chunked or sequential path, and
+            // everything else keeps the kernel.
+            gated_delta_with_gates(&q, &k, &v, &g, &beta, &state, mask)
+        })?;
+        if let Some(entry) = cache {
+            entry.ssm_state = Some(new_state);
+        }
 
-        let z_start = Instant::now();
-        let z = if decode_linear {
-            Self::decode_linear_projection(inputs, self.in_proj_z.weight.as_ref(), self.value_dim)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
-        } else {
-            self.in_proj_z
-                .forward(inputs)
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])
-        };
-        z.eval();
-        layer_profile.push_section("gdn_input_z", z_start);
-
-        let b_start = Instant::now();
-        let b_val = if decode_linear {
-            Self::decode_linear_projection(
-                inputs,
-                self.in_proj_b.weight.as_ref(),
-                self.num_v_heads,
-            )?
-        } else {
-            self.in_proj_b.forward(inputs)
-        };
-        b_val.eval();
-        layer_profile.push_section("gdn_input_b", b_start);
-
-        let a_start = Instant::now();
-        let a = if decode_linear {
-            Self::decode_linear_projection(
-                inputs,
-                self.in_proj_a.weight.as_ref(),
-                self.num_v_heads,
-            )?
-        } else {
-            self.in_proj_a.forward(inputs)
-        };
-        a.eval();
-        layer_profile.push_section("gdn_input_a", a_start);
-
-        let qkv = if let Some(mask) = mask {
-            let mask_start = Instant::now();
-            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1]);
-            let masked = ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0));
-            masked.eval();
-            layer_profile.push_section("gdn_input_mask", mask_start);
-            masked
-        } else {
-            qkv
-        };
-
-        let conv_start = Instant::now();
-        let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
-            let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
-        } else {
-            let conv_state = pmetal_runtime::compat::ops::zeros_dtype(
-                &[b, self.conv_kernel_size - 1, self.conv_dim],
-                qkv.dtype(),
-            );
-            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1);
-            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
-        };
-        conv_out.eval();
-        layer_profile.push_section("gdn_conv", conv_start);
-
-        self.finish_forward_from_conv_out_profiled(
-            &conv_out,
-            b,
-            s,
-            &z,
-            &a,
-            &b_val,
-            mask,
-            cache,
-            layer_profile,
-        )
+        probe.section("gdn_out_proj", || {
+            let out = self.norm.forward(&out, Some(&z))?;
+            Ok(self.out_proj.forward(&out.reshape(&[b, s, -1])))
+        })
     }
 }
 
@@ -2457,20 +1797,13 @@ impl Qwen3NextSparseMoeBlock {
         Ok(routed.add(&shared).reshape(shape))
     }
 
-    pub fn forward_profiled(
-        &mut self,
-        x: &Array,
-        layer_profile: &mut Qwen3NextLayerProfile,
-    ) -> Result<Array, Exception> {
+    /// [`forward`](Self::forward) with the sections of an offloaded layer
+    /// timed when `probe` times.
+    fn run(&mut self, x: &Array, probe: &mut Probe<'_>) -> Result<Array, Exception> {
         if self.offload_ctx.is_some() {
-            return self.forward_offloaded(x, Some(layer_profile));
+            return self.forward_offloaded(x, probe.layer_mut());
         }
-
-        let start = Instant::now();
-        let output = self.forward(x)?;
-        output.eval();
-        layer_profile.push_section("moe_resident", start);
-        Ok(output)
+        probe.section("moe_resident", || self.forward(x))
     }
 
     fn route_experts(&mut self, x_flat: &Array) -> Result<(Array, Vec<usize>, i32), Exception> {
@@ -3202,26 +2535,13 @@ impl ModuleParameters for Qwen3NextFeedForward {
 
 impl Qwen3NextFeedForward {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        match self {
-            Self::Dense(m) => m.forward(x),
-            Self::MoE(m) => m.forward(x),
-        }
+        self.run(x, &mut Probe::off())
     }
 
-    pub fn forward_profiled(
-        &mut self,
-        x: &Array,
-        layer_profile: &mut Qwen3NextLayerProfile,
-    ) -> Result<Array, Exception> {
+    fn run(&mut self, x: &Array, probe: &mut Probe<'_>) -> Result<Array, Exception> {
         match self {
-            Self::Dense(m) => {
-                let start = Instant::now();
-                let output = m.forward(x)?;
-                output.eval();
-                layer_profile.push_section("mlp_dense", start);
-                Ok(output)
-            }
-            Self::MoE(m) => m.forward_profiled(x, layer_profile),
+            Self::Dense(m) => probe.section("mlp_dense", || m.forward(x)),
+            Self::MoE(m) => m.run(x, probe),
         }
     }
 }
@@ -3338,22 +2658,14 @@ impl Qwen3NextDecoderLayer {
         positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
-        let normed = self.input_layernorm.forward(x);
-        let r = if self.is_linear {
-            self.linear_attn
-                .as_mut()
-                .expect("linear_attn must be Some for linear layers")
-                .forward(&normed, mask, mamba_cache)?
-        } else {
-            self.self_attn
-                .as_mut()
-                .expect("self_attn must be Some for attention layers")
-                .forward(&normed, mask, kv_cache, positions)?
-        };
-        let h = x.add(&r);
-        let mlp_in = self.post_attention_layernorm.forward(&h);
-        let mlp_out = self.mlp.forward(&mlp_in)?;
-        Ok(h.add(&mlp_out))
+        self.run(
+            x,
+            mask,
+            kv_cache,
+            positions,
+            mamba_cache,
+            LayerExtras::none(),
+        )
     }
 
     /// Speculative-verify forward: records GDN verify inputs into
@@ -3375,22 +2687,17 @@ impl Qwen3NextDecoderLayer {
         layer_idx: usize,
         capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
-        let normed = self.input_layernorm.forward(x);
-        let r = if self.is_linear {
-            self.linear_attn
-                .as_mut()
-                .expect("linear_attn must be Some for linear layers")
-                .forward_with_capture(&normed, mask, mamba_cache, layer_idx, capture)?
-        } else {
-            self.self_attn
-                .as_mut()
-                .expect("self_attn must be Some for attention layers")
-                .forward(&normed, mask, kv_cache, positions)?
-        };
-        let h = x.add(&r);
-        let mlp_in = self.post_attention_layernorm.forward(&h);
-        let mlp_out = self.mlp.forward(&mlp_in)?;
-        Ok(h.add(&mlp_out))
+        self.run(
+            x,
+            mask,
+            kv_cache,
+            positions,
+            mamba_cache,
+            LayerExtras {
+                capture: Some((layer_idx, capture)),
+                probe: Probe::off(),
+            },
+        )
     }
 
     pub fn forward_profiled(
@@ -3404,33 +2711,73 @@ impl Qwen3NextDecoderLayer {
     ) -> Result<(Array, Qwen3NextLayerProfile), Exception> {
         let layer_start = Instant::now();
         let mut profile = Qwen3NextLayerProfile::new(layer_idx, self.is_linear);
+        let out = self.run(
+            x,
+            mask,
+            kv_cache,
+            positions,
+            mamba_cache,
+            LayerExtras {
+                capture: None,
+                probe: Probe::timing(&mut profile),
+            },
+        )?;
+        profile.total_us = layer_start.elapsed().as_micros() as u64;
+        Ok((out, profile))
+    }
 
-        let normed = profile_array_section(&mut profile, "input_layernorm", || {
-            self.input_layernorm.forward(x)
-        });
-        let r = if self.is_linear {
+    /// The layer: the token mixer (GDN or full attention) and the feed-forward
+    /// block, each behind its norm and around a residual.
+    fn run(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
+        mamba_cache: Option<&mut MambaCacheEntry>,
+        extras: LayerExtras<'_, '_>,
+    ) -> Result<Array, Exception> {
+        let LayerExtras { capture, mut probe } = extras;
+        let normed = probe.section("input_layernorm", || Ok(self.input_layernorm.forward(x)))?;
+        let mixed = if self.is_linear {
             self.linear_attn
                 .as_mut()
                 .expect("linear_attn must be Some for linear layers")
-                .forward_profiled(&normed, mask, mamba_cache, &mut profile)?
+                .run(&normed, mask, mamba_cache, &mut probe, capture)?
         } else {
             self.self_attn
                 .as_mut()
                 .expect("self_attn must be Some for attention layers")
-                .forward_profiled(&normed, mask, kv_cache, positions, &mut profile)?
+                .run(&normed, mask, kv_cache, positions, &mut probe)?
         };
-        let h = profile_array_section(&mut profile, "attn_residual", || x.add(&r));
-        let mlp_in = profile_array_section(&mut profile, "post_attention_layernorm", || {
-            self.post_attention_layernorm.forward(&h)
-        });
+        let h = probe.section("attn_residual", || Ok(x.add(&mixed)))?;
+        let mlp_in = probe.section("post_attention_layernorm", || {
+            Ok(self.post_attention_layernorm.forward(&h))
+        })?;
+
         let mlp_start = Instant::now();
-        let mlp_out = self.mlp.forward_profiled(&mlp_in, &mut profile)?;
-        let mlp_out_eval = mlp_out.clone();
-        mlp_out_eval.eval();
-        profile.push_section("mlp", mlp_start);
-        let out = profile_array_section(&mut profile, "mlp_residual", || h.add(&mlp_out));
-        profile.total_us = layer_start.elapsed().as_micros() as u64;
-        Ok((out, profile))
+        let mlp_out = self.mlp.run(&mlp_in, &mut probe)?;
+        if let Some(layer) = probe.layer_mut() {
+            mlp_out.eval();
+            layer.push_section("mlp", mlp_start);
+        }
+        probe.section("mlp_residual", || Ok(h.add(&mlp_out)))
+    }
+}
+
+/// What a layer's forward leaves behind besides its output: the GDN inputs of
+/// a speculative verify, and the timing of each section.
+struct LayerExtras<'a, 'p> {
+    capture: Option<(usize, &'a mut pmetal_cache::speculative::SpecCapture)>,
+    probe: Probe<'p>,
+}
+
+impl LayerExtras<'_, '_> {
+    fn none() -> Self {
+        Self {
+            capture: None,
+            probe: Probe::off(),
+        }
     }
 }
 
@@ -3522,21 +2869,14 @@ impl Qwen3NextModel {
         self.forward_with_cache_and_capture(input_ids, mask, None, positions, None, None)
     }
 
-    /// Forward pass with optional hidden-state capture for speculative
-    /// decoding.
+    /// Forward pass with optional capture for speculative decoding.
     ///
-    /// Behaves identically to `forward_with_cache` when `capture` is
-    /// `None`. When a capture buffer is supplied, the post-layer hidden
-    /// state is cloned into `capture.hidden_states` for every layer index in
-    /// `capture.requested_hidden_layers`, without otherwise perturbing the
-    /// loop.
-    ///
-    /// GDN verify-input capture is intentionally *not* populated here. The
-    /// hybrid-attention rollback path needs the linear-layer `k,v,g,β` and
-    /// `conv_input` captured from inside the mixer; wiring that would touch
-    /// the compiled-decode hot path. Hidden-state capture alone is enough
-    /// for the Qwen3 DFlash path, and the Qwen3.5 path will add GDN
-    /// capture as a follow-up that plumbs through the mixer.
+    /// Behaves identically to `forward_with_cache` when `capture` is `None`.
+    /// With a capture buffer, the post-layer hidden state is cloned into
+    /// `capture.hidden_states` for every layer index the buffer asks for, and
+    /// each GDN layer records the per-token inputs of its recurrence
+    /// (`capture.gdn_inputs`), from which a rollback replays the layer's state
+    /// over the accepted prefix of a verify block.
     pub fn forward_with_cache_and_capture(
         &mut self,
         input_ids: &Array,
@@ -3563,20 +2903,70 @@ impl Qwen3NextModel {
     /// has three positions per token, passed as `[3, L]` `positions`.
     pub fn forward_embeddings_with_cache_and_capture(
         &mut self,
+        hidden: Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
+    ) -> Result<Array, Exception> {
+        self.run_layers(
+            hidden,
+            mask,
+            kv_cache,
+            positions,
+            mamba_cache,
+            capture,
+            None,
+        )
+    }
+
+    pub fn forward_with_cache_profiled(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        phase: impl Into<String>,
+    ) -> Result<(Array, Qwen3NextForwardProfile), Exception> {
+        let model_start = Instant::now();
+        let mut profile = Qwen3NextForwardProfile::new(phase, input_ids.shape().to_vec());
+
+        let embed_start = Instant::now();
+        let hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
+        hidden.eval();
+        profile.embedding_us = embed_start.elapsed().as_micros() as u64;
+
+        let hidden = self.run_layers(
+            hidden,
+            mask,
+            kv_cache,
+            None,
+            mamba_cache,
+            None,
+            Some(&mut profile),
+        )?;
+        profile.total_us = model_start.elapsed().as_micros() as u64;
+        Ok((hidden, profile))
+    }
+
+    /// The decoder stack and the final norm, over embeddings `hidden`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_layers(
+        &mut self,
         mut hidden: Array,
         mask: Option<&Array>,
         mut kv_cache: Option<&mut KVCache>,
         positions: Option<&Array>,
         mut mamba_cache: Option<&mut MambaCache>,
         mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
+        mut profile: Option<&mut Qwen3NextForwardProfile>,
     ) -> Result<Array, Exception> {
-        // Create separate masks for full attention vs GDN layers (matching MLX reference):
-        // - Full attention: uses the causal mask from the caller (or None for cached decode)
-        // - GDN (linear attention): uses None (no left-padding in our MambaCache impl)
-        // Passing a causal mask [1,1,T,T] to GDN layers causes garbage output because
-        // GDN interprets the mask as a token-validity boolean [B,T], not attention weights.
-        let fa_mask = mask;
-        let ssm_mask: Option<&Array> = None;
+        // The full-attention layers take the caller's mask (none for cached
+        // decode, which is causal by construction). The GDN layers take none:
+        // a `[1, 1, T, T]` attention mask would be read as a `[B, T]` validity
+        // mask and zero the wrong positions, and there is no left padding in
+        // this cache.
         let prefill_like = hidden.dim(1) > 1;
 
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
@@ -3585,13 +2975,14 @@ impl Qwen3NextModel {
             // sparse layer's reads is worth the extra predictor work. For
             // single-token decode, keep prefetch after the layer so we do not
             // serialize the hot path before the current layer runs.
-            if prefill_like
-                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
-            {
-                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
-                if search < self.moe_layer_indices.len() {
-                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
-                }
+            if prefill_like {
+                Self::prefetch_next_experts(
+                    &self.prefetcher,
+                    &self.offload_ctx,
+                    &self.moe_layer_indices,
+                    layer_idx,
+                    &hidden,
+                );
             }
 
             let kv = if !layer.is_linear {
@@ -3606,23 +2997,23 @@ impl Qwen3NextModel {
             } else {
                 None
             };
+            let layer_mask = if layer.is_linear { None } else { mask };
 
-            let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
-
-            // When a capture buffer is supplied we route the GDN layers
-            // through `forward_with_capture` so their per-token verify
-            // inputs end up in `capture.gdn_inputs`. Full-attention
-            // layers do not need the capture and just reuse `forward`.
-            hidden = if let Some(buf) = capture.as_deref_mut() {
-                if layer.is_linear {
-                    layer.forward_with_capture(
-                        &hidden, layer_mask, kv, positions, mamba, layer_idx, buf,
-                    )?
-                } else {
-                    layer.forward(&hidden, layer_mask, kv, positions, mamba)?
+            hidden = match profile.as_deref_mut() {
+                Some(profile) => {
+                    let (out, layer_profile) = layer
+                        .forward_profiled(&hidden, layer_mask, kv, positions, mamba, layer_idx)?;
+                    profile.layers.push(layer_profile);
+                    out
                 }
-            } else {
-                layer.forward(&hidden, layer_mask, kv, positions, mamba)?
+                None => match capture.as_deref_mut() {
+                    // The GDN layers record their recurrence inputs; the
+                    // attention layers' KV caches roll back by their offsets.
+                    Some(buf) if layer.is_linear => layer.forward_with_capture(
+                        &hidden, layer_mask, kv, positions, mamba, layer_idx, buf,
+                    )?,
+                    _ => layer.forward(&hidden, layer_mask, kv, positions, mamba)?,
+                },
             };
 
             if let Some(buf) = capture.as_deref_mut()
@@ -3631,90 +3022,44 @@ impl Qwen3NextModel {
                 buf.record_hidden(layer_idx, hidden.clone());
             }
 
-            if !prefill_like
-                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
-            {
-                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
-                if search < self.moe_layer_indices.len() {
-                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
-                }
+            if !prefill_like {
+                Self::prefetch_next_experts(
+                    &self.prefetcher,
+                    &self.offload_ctx,
+                    &self.moe_layer_indices,
+                    layer_idx,
+                    &hidden,
+                );
             }
         }
 
+        let norm_start = Instant::now();
         let hidden = self.norm.forward(&hidden);
+        if let Some(profile) = profile {
+            hidden.eval();
+            profile.final_norm_us = norm_start.elapsed().as_micros() as u64;
+        }
         if prefill_like && let Some(prefetcher) = &self.prefetcher {
             prefetcher.reset_pending();
         }
         Ok(hidden)
     }
 
-    pub fn forward_with_cache_profiled(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-        mut kv_cache: Option<&mut KVCache>,
-        mut mamba_cache: Option<&mut MambaCache>,
-        phase: impl Into<String>,
-    ) -> Result<(Array, Qwen3NextForwardProfile), Exception> {
-        let model_start = Instant::now();
-        let mut profile = Qwen3NextForwardProfile::new(phase, input_ids.shape().to_vec());
-
-        let embed_start = Instant::now();
-        let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
-        hidden.eval();
-        profile.embedding_us = embed_start.elapsed().as_micros() as u64;
-
-        let fa_mask = mask;
-        let ssm_mask: Option<&Array> = None;
-        let prefill_like = hidden.dim(1) > 1;
-
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            if prefill_like
-                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
-            {
-                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
-                if search < self.moe_layer_indices.len() {
-                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
-                }
-            }
-
-            let kv = if !layer.is_linear {
-                kv_cache.as_deref_mut().map(|c| (c, layer_idx))
-            } else {
-                None
-            };
-            let mamba = if layer.is_linear {
-                mamba_cache
-                    .as_deref_mut()
-                    .and_then(|c| c.get_mut(layer_idx))
-            } else {
-                None
-            };
-            let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
-            let (next_hidden, layer_profile) =
-                layer.forward_profiled(&hidden, layer_mask, kv, None, mamba, layer_idx)?;
-            hidden = next_hidden;
-            profile.layers.push(layer_profile);
-
-            if !prefill_like
-                && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
-            {
-                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
-                if search < self.moe_layer_indices.len() {
-                    prefetcher.predict_and_prefetch(self.moe_layer_indices[search], &hidden, ctx);
-                }
+    /// Start reading the experts the next sparse layer is predicted to route
+    /// to, from the hidden state entering (or leaving) layer `layer_idx`.
+    fn prefetch_next_experts(
+        prefetcher: &Option<Arc<ExpertPrefetcher>>,
+        ctx: &Option<Arc<ExpertOffloadContext>>,
+        moe_layer_indices: &[usize],
+        layer_idx: usize,
+        hidden: &Array,
+    ) {
+        if let (Some(prefetcher), Some(ctx)) = (prefetcher, ctx) {
+            let next = moe_layer_indices.partition_point(|&i| i <= layer_idx);
+            if let Some(&layer) = moe_layer_indices.get(next) {
+                prefetcher.predict_and_prefetch(layer, hidden, ctx);
             }
         }
-
-        let final_norm_start = Instant::now();
-        let hidden = self.norm.forward(&hidden);
-        hidden.eval();
-        profile.final_norm_us = final_norm_start.elapsed().as_micros() as u64;
-        if prefill_like && let Some(prefetcher) = &self.prefetcher {
-            prefetcher.reset_pending();
-        }
-        profile.total_us = model_start.elapsed().as_micros() as u64;
-        Ok((hidden, profile))
     }
 }
 
@@ -4132,38 +3477,40 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// The gated norm is `act(gate) * rms_norm(x)`, the product taken in float32
+    /// and rounded once: for either activation, in bf16, at decode and prefill
+    /// lengths.
     #[test]
-    fn the_gated_norm_swiglu_is_traced_once_and_replayed() {
-        // The compile wrapper this used to go through returned the closure
-        // unchanged, so its body ran op by op on every call.
-        std::thread::spawn(|| {
+    #[serial]
+    fn the_gated_norm_is_its_formula_in_f32_rounded_once() {
+        for activation in [GateActivation::Silu, GateActivation::Sigmoid] {
             for seq in [1, 7, 33] {
-                let shape = [1, seq, 64];
-                let norm = pmetal_runtime::compat::random::normal(&shape, Dtype::Bfloat16);
-                let gate = pmetal_runtime::compat::random::normal(&shape, Dtype::Bfloat16);
-                let got = compiled_precise_swiglu(&norm, &gate, Dtype::Bfloat16).unwrap();
-                let want = precise_swiglu(&norm, &gate);
+                let mut norm = Qwen3NextRMSNormGated::new(64, 1e-6).unwrap();
+                norm.gate_activation = activation;
+                let x = pmetal_runtime::compat::random::normal(&[1, seq, 64], Dtype::Bfloat16);
+                let gate = pmetal_runtime::compat::random::normal(&[1, seq, 64], Dtype::Bfloat16);
+                let got = norm.forward(&x, Some(&gate)).unwrap();
                 assert_eq!(got.dtype(), Dtype::Bfloat16);
-                let diff = got
-                    .as_dtype(Dtype::Float32.as_i32())
-                    .subtract(&want.as_dtype(Dtype::Float32.as_i32()))
-                    .abs()
-                    .max(None)
-                    .item_f32();
+
+                let f32s = |a: &Array| a.as_dtype(Dtype::Float32.as_i32());
+                let normed = f32s(&pmetal_runtime::compat::fast::rms_norm(
+                    &x,
+                    norm.weight.as_ref(),
+                    norm.eps,
+                ));
+                let act = match activation {
+                    GateActivation::Silu => nn::silu(&f32s(&gate)),
+                    GateActivation::Sigmoid => nn::sigmoid(&f32s(&gate)),
+                };
+                let want = act.multiply(&normed).as_dtype(Dtype::Bfloat16.as_i32());
+                let diff = f32s(&got).subtract(&f32s(&want)).abs().max(None).item_f32();
                 assert!(
                     diff <= 1e-2,
-                    "seq {seq}: compiled and op-by-op differ by {diff}"
+                    "{activation:?} at {seq} tokens differs from its formula by {diff}"
                 );
             }
-            assert_eq!(
-                SWIGLU_TRACES.with(|n| n.get()),
-                1,
-                "three sequence lengths share one shapeless trace"
-            );
-            pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
-        })
-        .join()
-        .unwrap();
+        }
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
     }
 
     fn tiny_config() -> Qwen3NextConfig {
@@ -4333,22 +3680,13 @@ mod tests {
     #[test]
     fn test_attention_mask_type_selection() {
         assert_eq!(
-            Qwen3NextAttention::mask_type_for_call(None, false, 4),
+            Qwen3NextAttention::mask_type(None),
             AttentionMaskType::Causal
         );
-        assert_eq!(
-            Qwen3NextAttention::mask_type_for_call(None, true, 1),
-            AttentionMaskType::Causal
-        );
-
         let custom_mask =
             pmetal_runtime::compat::ops::ones(&[1, 1, 1, 1], pmetal_runtime::compat::Dtype::Bool);
         assert_eq!(
-            Qwen3NextAttention::mask_type_for_call(Some(&custom_mask), false, 4),
-            AttentionMaskType::None
-        );
-        assert_eq!(
-            Qwen3NextAttention::mask_type_for_call(Some(&custom_mask), true, 1),
+            Qwen3NextAttention::mask_type(Some(&custom_mask)),
             AttentionMaskType::None
         );
     }
@@ -4494,76 +3832,21 @@ mod tests {
             pmetal_runtime::compat::Dtype::Float32,
         );
 
-        let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
-        let z_ref = gdn
-            .in_proj_z
-            .forward(&x)
-            .unwrap()
-            .reshape(&[1, 1, gdn.num_v_heads, gdn.head_v_dim])
-            .unwrap();
-        let b_ref = gdn.in_proj_b.forward(&x).unwrap();
-        let a_ref = gdn.in_proj_a.forward(&x).unwrap();
-
-        let (qkv, z, b_val, a) = gdn.combined_input_projection(&x).unwrap();
-
-        qkv.eval().unwrap();
-        z.eval().unwrap();
-        b_val.eval().unwrap();
-        a.eval().unwrap();
-        qkv_ref.eval().unwrap();
-        z_ref.eval().unwrap();
-        b_ref.eval().unwrap();
-        a_ref.eval().unwrap();
-
-        let max_qkv_diff = qkv
-            .subtract(&qkv_ref)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>();
-        let max_z_diff = z
-            .subtract(&z_ref)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>();
-        let max_b_diff = b_val
-            .subtract(&b_ref)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>();
-        let max_a_diff = a
-            .subtract(&a_ref)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>();
-
-        assert!(
-            max_qkv_diff < 1e-5,
-            "combined qkv projection diverged: {max_qkv_diff}"
-        );
-        assert!(
-            max_z_diff < 1e-5,
-            "combined z projection diverged: {max_z_diff}"
-        );
-        assert!(
-            max_b_diff < 1e-5,
-            "combined b projection diverged: {max_b_diff}"
-        );
-        assert!(
-            max_a_diff < 1e-5,
-            "combined a projection diverged: {max_a_diff}"
-        );
+        let separate = gdn.project(&x, false).unwrap();
+        let fused = gdn.project(&x, true).unwrap();
+        let max_diff = |a: &Array, b: &Array| {
+            assert_eq!(a.shape(), b.shape());
+            a.subtract(b).abs().max(None).item::<f32>()
+        };
+        for (name, fused, separate) in [
+            ("qkv", &fused.0, &separate.0),
+            ("z", &fused.1, &separate.1),
+            ("b", &fused.2, &separate.2),
+            ("a", &fused.3, &separate.3),
+        ] {
+            let diff = max_diff(fused, separate);
+            assert!(diff < 1e-5, "fused {name} projection diverged: {diff}");
+        }
     }
 
     #[test]
@@ -4574,13 +3857,15 @@ mod tests {
         let decode = Array::zeros_f32(&[1, 1, 2048]);
         let prefill = Array::zeros_f32(&[1, 2, 2048]);
 
-        assert!(gdn.should_use_combined_input_proj(&decode, None));
-        assert!(!gdn.should_use_combined_input_proj(&prefill, None));
+        // Only a decode step that has a cache to decode against fuses.
+        assert!(gdn.uses_fused_projection(&decode, None, true));
+        assert!(!gdn.uses_fused_projection(&decode, None, false));
+        assert!(!gdn.uses_fused_projection(&prefill, None, true));
 
         let mut large_config = config.clone();
         large_config.hidden_size = 4096;
         let large_gdn = Qwen3NextGatedDeltaNet::new(&large_config).unwrap();
-        assert!(!large_gdn.should_use_combined_input_proj(&decode, None));
+        assert!(!large_gdn.uses_fused_projection(&decode, None, true));
     }
 
     #[test]
@@ -4698,214 +3983,214 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_gdn_decode_linear_projection_matches_linear_forward() {
-        let mut config = tiny_config();
-        config.hidden_size = 4096;
-        let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let x = pmetal_runtime::compat::random::normal(
-            &[1, 1, 4096],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-
-        let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
-        let z_ref = gdn.in_proj_z.forward(&x).unwrap();
-        let b_ref = gdn.in_proj_b.forward(&x).unwrap();
-        let a_ref = gdn.in_proj_a.forward(&x).unwrap();
-
-        let qkv = Qwen3NextGatedDeltaNet::decode_linear_projection(
-            &x,
-            gdn.in_proj_qkv.weight.as_ref(),
-            gdn.conv_dim,
-        )
-        .unwrap();
-        let z = Qwen3NextGatedDeltaNet::decode_linear_projection(
-            &x,
-            gdn.in_proj_z.weight.as_ref(),
-            gdn.value_dim,
-        )
-        .unwrap();
-        let b_val = Qwen3NextGatedDeltaNet::decode_linear_projection(
-            &x,
-            gdn.in_proj_b.weight.as_ref(),
-            gdn.num_v_heads,
-        )
-        .unwrap();
-        let a = Qwen3NextGatedDeltaNet::decode_linear_projection(
-            &x,
-            gdn.in_proj_a.weight.as_ref(),
-            gdn.num_v_heads,
-        )
-        .unwrap();
-
-        qkv.eval().unwrap();
-        z.eval().unwrap();
-        b_val.eval().unwrap();
-        a.eval().unwrap();
-        qkv_ref.eval().unwrap();
-        z_ref.eval().unwrap();
-        b_ref.eval().unwrap();
-        a_ref.eval().unwrap();
-
-        assert!(
-            qkv.subtract(&qkv_ref)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .max(None)
-                .unwrap()
-                .item::<f32>()
-                < 1e-5
-        );
-        assert!(
-            z.subtract(&z_ref)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .max(None)
-                .unwrap()
-                .item::<f32>()
-                < 1e-5
-        );
-        assert!(
-            b_val
-                .subtract(&b_ref)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .max(None)
-                .unwrap()
-                .item::<f32>()
-                < 1e-5
-        );
-        assert!(
-            a.subtract(&a_ref)
-                .unwrap()
-                .abs()
-                .unwrap()
-                .max(None)
-                .unwrap()
-                .item::<f32>()
-                < 1e-5
-        );
-    }
-
-    #[test]
-    fn test_gdn_decode_flatten_fastpath_is_gated_by_hidden_size_and_decode_shape() {
-        let mut small_config = tiny_config();
-        small_config.hidden_size = 2048;
-        let small_gdn = Qwen3NextGatedDeltaNet::new(&small_config).unwrap();
-        let decode = pmetal_runtime::compat::random::normal(
-            &[1, 1, 2048],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-        let prefill = pmetal_runtime::compat::random::normal(
-            &[1, 2, 2048],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-        assert!(small_gdn.should_use_flattened_decode_proj(&decode, None));
-        assert!(!small_gdn.should_use_flattened_decode_proj(&prefill, None));
-
-        let mut large_config = tiny_config();
-        large_config.hidden_size = 4096;
-        let large_gdn = Qwen3NextGatedDeltaNet::new(&large_config).unwrap();
-        let large_decode = pmetal_runtime::compat::random::normal(
-            &[1, 1, 4096],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-        assert!(!large_gdn.should_use_flattened_decode_proj(&large_decode, None));
-    }
-
-    #[test]
-    fn test_gdn_decode_out_projection_matches_linear_forward() {
-        let config = tiny_config();
-        let gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let out = pmetal_runtime::compat::random::normal(
-            &[1, 1, gdn.num_v_heads, gdn.head_v_dim],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-        let reference = gdn
-            .out_proj
-            .forward(&out.reshape(&[1, 1, gdn.value_dim]).unwrap())
-            .unwrap();
-        let projected = gdn.decode_out_projection(&out, 1).unwrap();
-
-        reference.eval().unwrap();
-        projected.eval().unwrap();
-        let max_diff = reference
-            .subtract(&projected)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap()
-            .item::<f32>();
-        assert!(
-            max_diff < 1e-5,
-            "decode out projection diverged: {max_diff}"
-        );
-    }
-
+    /// A decode step through the cache is the last position of the whole
+    /// sequence run in one pass without one: output, convolution window and
+    /// recurrent state.
     #[test]
     #[serial]
-    fn test_gdn_cached_decode_matches_general_path() {
+    fn test_gdn_cached_decode_matches_the_whole_sequence() {
         let config = tiny_config();
         let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
-        let prefill = pmetal_runtime::compat::random::normal(
-            &[1, 3, 32],
+        let sequence = pmetal_runtime::compat::random::normal(
+            &[1, 4, 32],
             pmetal_runtime::compat::Dtype::Float32,
         );
-        let decode = pmetal_runtime::compat::random::normal(
-            &[1, 1, 32],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-        let mut cache_general = MambaCacheEntry::default();
-        let mut cache_fast = MambaCacheEntry::default();
+        let max_diff = |a: &Array, b: &Array| a.subtract(b).abs().max(None).item::<f32>();
 
-        let _ = gdn
-            .forward_general(&prefill, None, Some(&mut cache_general))
+        let mut whole_cache = MambaCacheEntry::default();
+        let whole = gdn
+            .forward(&sequence, None, Some(&mut whole_cache))
             .unwrap();
-        let _ = gdn.forward(&prefill, None, Some(&mut cache_fast)).unwrap();
 
-        let reference = gdn
-            .forward_general(&decode, None, Some(&mut cache_general))
+        let mut cache = MambaCacheEntry::default();
+        gdn.forward(&slice_axis(&sequence, 1, 0, 3), None, Some(&mut cache))
             .unwrap();
-        let optimized = gdn.forward(&decode, None, Some(&mut cache_fast)).unwrap();
+        let decoded = gdn
+            .forward(&slice_axis(&sequence, 1, 3, 4), None, Some(&mut cache))
+            .unwrap();
 
-        let output_diff = reference.subtract(&optimized).unwrap().abs().unwrap();
-        let max_output_diff = output_diff.max(None).unwrap().item::<f32>();
+        let output_diff = max_diff(&decoded, &slice_axis(&whole, 1, 3, 4));
         assert!(
-            max_output_diff < 1e-4,
-            "cached decode output diverged from general path: {max_output_diff}"
+            output_diff < 1e-4,
+            "cached decode output diverged from the whole sequence: {output_diff}"
         );
-
-        let conv_diff = cache_general
-            .conv_state
-            .as_ref()
-            .unwrap()
-            .subtract(cache_fast.conv_state.as_ref().unwrap())
-            .unwrap()
-            .abs()
-            .unwrap();
-        let max_conv_diff = conv_diff.max(None).unwrap().item::<f32>();
+        let conv_diff = max_diff(
+            cache.conv_state.as_ref().unwrap(),
+            whole_cache.conv_state.as_ref().unwrap(),
+        );
         assert!(
-            max_conv_diff < 1e-6,
-            "cached decode conv state diverged from general path: {max_conv_diff}"
+            conv_diff < 1e-6,
+            "cached decode conv state diverged: {conv_diff}"
         );
-
-        let ssm_diff = cache_general
-            .ssm_state
-            .as_ref()
-            .unwrap()
-            .subtract(cache_fast.ssm_state.as_ref().unwrap())
-            .unwrap()
-            .abs()
-            .unwrap();
-        let max_ssm_diff = ssm_diff.max(None).unwrap().item::<f32>();
+        let ssm_diff = max_diff(
+            cache.ssm_state.as_ref().unwrap(),
+            whole_cache.ssm_state.as_ref().unwrap(),
+        );
         assert!(
-            max_ssm_diff < 1e-4,
-            "cached decode SSM state diverged from general path: {max_ssm_diff}"
+            ssm_diff < 1e-4,
+            "cached decode SSM state diverged: {ssm_diff}"
         );
+    }
+
+    /// A GDN layer with its weights rounded to bf16, as a released checkpoint
+    /// loads them.
+    fn bf16_gdn(config: &Qwen3NextConfig) -> Qwen3NextGatedDeltaNet {
+        let mut gdn = Qwen3NextGatedDeltaNet::new(config).unwrap();
+        let to_bf16 = |w: &Array| w.as_dtype(Dtype::Bfloat16.as_i32());
+        for linear in [
+            &mut gdn.in_proj_qkv,
+            &mut gdn.in_proj_z,
+            &mut gdn.in_proj_b,
+            &mut gdn.in_proj_a,
+            &mut gdn.out_proj,
+        ] {
+            *linear.weight = to_bf16(linear.weight.as_ref());
+        }
+        *gdn.conv1d.weight = to_bf16(gdn.conv1d.weight.as_ref());
+        *gdn.norm.weight = to_bf16(gdn.norm.weight.as_ref());
+        *gdn.a_log = to_bf16(gdn.a_log.as_ref());
+        *gdn.dt_bias = to_bf16(gdn.dt_bias.as_ref());
+        gdn
+    }
+
+    /// The recurrent state is a running sum of rank-one updates over the whole
+    /// context: rounding it to the model's bf16 after every token loses a
+    /// little of every update, and the loss compounds. It is carried in
+    /// float32 whatever the activations' dtype; the conv state, a window of
+    /// the activations themselves, keeps theirs.
+    #[test]
+    #[serial]
+    fn the_recurrent_state_is_carried_in_f32_for_a_bf16_layer() {
+        let config = tiny_config();
+        let mut gdn = bf16_gdn(&config);
+        let bf16 = |shape: &[i32]| {
+            pmetal_runtime::compat::random::normal(shape, Dtype::Float32)
+                .as_dtype(Dtype::Bfloat16.as_i32())
+        };
+        let mut cache = MambaCacheEntry::default();
+
+        // A cached prefill, then a decode step (the fused projection path).
+        gdn.forward(&bf16(&[1, 5, 32]), None, Some(&mut cache))
+            .unwrap();
+        assert_eq!(
+            cache.ssm_state.as_ref().unwrap().dtype(),
+            Dtype::Float32,
+            "state after a prefill"
+        );
+        assert_eq!(cache.conv_state.as_ref().unwrap().dtype(), Dtype::Bfloat16);
+        gdn.forward(&bf16(&[1, 1, 32]), None, Some(&mut cache))
+            .unwrap();
+        assert_eq!(
+            cache.ssm_state.as_ref().unwrap().dtype(),
+            Dtype::Float32,
+            "state after a decode step"
+        );
+        assert_eq!(cache.conv_state.as_ref().unwrap().dtype(), Dtype::Bfloat16);
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    /// Weights replaced after a decode step (a merge, a reload, an optimizer
+    /// step) are the ones the next step multiplies by: the decode fast path
+    /// keeps a concatenated copy of the four input projections.
+    #[test]
+    #[serial]
+    fn a_decode_step_uses_the_weights_in_place_after_they_are_replaced() {
+        let config = tiny_config();
+        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let prefill = pmetal_runtime::compat::random::normal(&[1, 3, 32], Dtype::Float32);
+        let decode = pmetal_runtime::compat::random::normal(&[1, 1, 32], Dtype::Float32);
+        let mut cache = MambaCacheEntry::default();
+        gdn.forward(&prefill, None, Some(&mut cache)).unwrap();
+        // Populate the fast path's concatenated copy.
+        let mut warm = cache.clone();
+        gdn.forward(&decode, None, Some(&mut warm)).unwrap();
+
+        for linear in [
+            &mut gdn.in_proj_qkv,
+            &mut gdn.in_proj_z,
+            &mut gdn.in_proj_b,
+            &mut gdn.in_proj_a,
+        ] {
+            let shape = linear.weight.as_ref().shape().to_vec();
+            *linear.weight = pmetal_runtime::compat::random::normal(&shape, Dtype::Float32);
+        }
+
+        // The same layer, built fresh around the replaced weights.
+        let mut fresh = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        *fresh.in_proj_qkv.weight = gdn.in_proj_qkv.weight.as_ref().clone();
+        *fresh.in_proj_z.weight = gdn.in_proj_z.weight.as_ref().clone();
+        *fresh.in_proj_b.weight = gdn.in_proj_b.weight.as_ref().clone();
+        *fresh.in_proj_a.weight = gdn.in_proj_a.weight.as_ref().clone();
+        *fresh.out_proj.weight = gdn.out_proj.weight.as_ref().clone();
+        *fresh.conv1d.weight = gdn.conv1d.weight.as_ref().clone();
+        *fresh.norm.weight = gdn.norm.weight.as_ref().clone();
+        *fresh.a_log = gdn.a_log.as_ref().clone();
+        *fresh.dt_bias = gdn.dt_bias.as_ref().clone();
+
+        let mut fresh_cache = cache.clone();
+        let want = fresh
+            .forward(&decode, None, Some(&mut fresh_cache))
+            .unwrap();
+        let got = gdn.forward(&decode, None, Some(&mut cache)).unwrap();
+        let max_diff = want.subtract(&got).abs().max(None).item::<f32>();
+        assert!(
+            max_diff < 1e-4,
+            "a decode step after a weight replacement differs from a layer built on those weights by {max_diff}"
+        );
+    }
+
+    /// A prompt prefilled in passes of any size leaves the layer's state, and
+    /// produces the outputs, of one pass over the whole prompt: the passes cut
+    /// the convolution window (kernel 4) at every offset.
+    #[test]
+    #[serial]
+    fn passes_of_any_size_leave_the_state_of_one_pass() {
+        let config = tiny_config();
+        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let tokens = 11;
+        let x = pmetal_runtime::compat::random::normal(&[1, tokens, 32], Dtype::Float32);
+        let max_abs = |a: &Array, b: &Array| {
+            let d = a.subtract(b).unwrap().abs().unwrap();
+            d.max(None).unwrap().item::<f32>()
+        };
+
+        let mut whole_cache = MambaCacheEntry::default();
+        let whole = gdn.forward(&x, None, Some(&mut whole_cache)).unwrap();
+        for chunk in [1, 2, 3, 4, 5, 7] {
+            let mut cache = MambaCacheEntry::default();
+            let mut outputs = Vec::new();
+            let mut start = 0;
+            while start < tokens {
+                let end = (start + chunk).min(tokens);
+                outputs.push(
+                    gdn.forward(&slice_axis(&x, 1, start, end), None, Some(&mut cache))
+                        .unwrap(),
+                );
+                start = end;
+            }
+            let refs: Vec<&Array> = outputs.iter().collect();
+            let joined = ops::concatenate_axis(&refs, 1);
+            assert!(
+                max_abs(&joined, &whole) < 1e-4,
+                "chunk {chunk}: outputs differ by {}",
+                max_abs(&joined, &whole)
+            );
+            assert!(
+                max_abs(
+                    cache.conv_state.as_ref().unwrap(),
+                    whole_cache.conv_state.as_ref().unwrap()
+                ) < 1e-6,
+                "chunk {chunk}: conv state"
+            );
+            assert!(
+                max_abs(
+                    cache.ssm_state.as_ref().unwrap(),
+                    whole_cache.ssm_state.as_ref().unwrap()
+                ) < 1e-4,
+                "chunk {chunk}: recurrent state"
+            );
+        }
+        pmetal_runtime::check_unobserved_error().unwrap();
     }
 
     #[test]

@@ -264,12 +264,7 @@ fn dynamic_chunked_prefill(profile: &str) {
             start = end;
         }
         let step = model
-            .forward_with_hybrid_cache(
-                &rows(&ids, t - 1, t),
-                None,
-                Some(&mut kv),
-                Some(&mut mamba),
-            )
+            .forward_with_hybrid_cache(&rows(&ids, t - 1, t), None, Some(&mut kv), Some(&mut mamba))
             .expect("decode step");
         drain_bridge("dynamic decode after chunked prefill");
         reports.push(ParityReport::compute(
