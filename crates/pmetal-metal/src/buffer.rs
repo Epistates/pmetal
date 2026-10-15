@@ -8,7 +8,10 @@
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLDevice, MTLResourceOptions,
+};
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
@@ -17,6 +20,9 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
+
+/// The fewest bytes Metal will allocate for a buffer.
+const MIN_ALLOCATION: usize = 16;
 
 /// Trait for types that provide access to a Metal buffer.
 pub trait AsMetalBuffer {
@@ -35,9 +41,9 @@ pub trait AsMetalBuffer {
 /// Buffer usage flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferUsage {
-    /// Read-only from GPU, written by CPU.
+    /// Read by the GPU, written by the CPU. Allocated exactly as [`Shared`](Self::Shared).
     GpuReadOnly,
-    /// Write-only from GPU, read by CPU.
+    /// Written by the GPU, read by the CPU. Allocated exactly as [`Shared`](Self::Shared).
     GpuWriteOnly,
     /// Read-write from both CPU and GPU (default for unified memory).
     Shared,
@@ -125,9 +131,11 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
                 })?;
         let options = usage.to_metal_options();
 
+        // Metal cannot allocate zero bytes; an empty tensor holds the minimum.
+        let allocation = size.max(MIN_ALLOCATION);
         let buffer = ctx
             .device()
-            .newBufferWithLength_options(size, options)
+            .newBufferWithLength_options(allocation, options)
             .ok_or_else(|| MetalError::BufferCreation {
                 size,
                 reason: "Device returned null".to_string(),
@@ -142,16 +150,39 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
     }
 
     /// Create a new buffer initialized with zeros.
+    ///
+    /// A private buffer has no CPU access, so the GPU clears it.
     pub fn zeros(ctx: &MetalContext, len: usize, usage: BufferUsage) -> Result<Self> {
         let buffer = Self::new(ctx, len, usage)?;
 
-        if usage != BufferUsage::Private {
+        if usage == BufferUsage::Private {
+            buffer.clear_on_gpu(ctx)?;
+        } else {
             // Zero the buffer contents
             let slice = buffer.as_mut_slice_unchecked();
             slice.fill(T::new_zeroed());
         }
 
         Ok(buffer)
+    }
+
+    /// Fill the whole allocation with zero bytes on the GPU and wait for it.
+    fn clear_on_gpu(&self, ctx: &MetalContext) -> Result<()> {
+        let command_buffer = ctx
+            .command_queue()
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = command_buffer
+            .blitCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
+        encoder.fillBuffer_range_value(&self.buffer, (0..self.buffer.length()).into(), 0);
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        match command_buffer.error() {
+            Some(error) => Err(MetalError::ExecutionFailed(error.to_string())),
+            None => Ok(()),
+        }
     }
 
     /// Create a new buffer from existing data.
@@ -166,6 +197,10 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
             return Err(MetalError::InvalidConfig(
                 "Cannot create Private buffer from slice (no CPU access)".to_string(),
             ));
+        }
+
+        if data.is_empty() {
+            return Self::new(ctx, 0, usage);
         }
 
         let size = std::mem::size_of_val(data);
@@ -531,6 +566,54 @@ mod tests {
         buffer.copy_to_slice(&mut output).unwrap();
 
         assert_eq!(output, data);
+    }
+
+    /// A tensor with no elements is a valid thing to hold; Metal itself cannot
+    /// allocate zero bytes, so the buffer must not ask it to.
+    #[test]
+    fn an_empty_buffer_is_valid() {
+        let ctx = MetalContext::new().unwrap();
+
+        let fresh: MetalBuffer<f32> = MetalBuffer::new(&ctx, 0, BufferUsage::Shared).unwrap();
+        assert!(fresh.is_empty());
+        assert_eq!(fresh.size_bytes(), 0);
+        assert!(fresh.as_slice().is_empty());
+
+        let zeroed: MetalBuffer<f32> = MetalBuffer::zeros(&ctx, 0, BufferUsage::Shared).unwrap();
+        assert!(zeroed.to_vec().unwrap().is_empty());
+
+        let copied = MetalBuffer::<f32>::from_slice(&ctx, &[], BufferUsage::Shared).unwrap();
+        assert!(copied.is_empty());
+        assert!(copied.as_slice().is_empty());
+    }
+
+    /// `zeros` on a private buffer clears it too; it cannot be read from the CPU,
+    /// so the GPU copies it out to look.
+    #[test]
+    fn a_private_zeros_buffer_reads_back_as_zeros() {
+        let ctx = MetalContext::new().unwrap();
+        let len = 1 << 16;
+        let private: MetalBuffer<f32> =
+            MetalBuffer::zeros(&ctx, len, BufferUsage::Private).unwrap();
+        let readback: MetalBuffer<f32> =
+            MetalBuffer::from_slice(&ctx, &vec![f32::NAN; len], BufferUsage::Shared).unwrap();
+
+        let command_buffer = ctx.command_queue().commandBuffer().unwrap();
+        let blit = command_buffer.blitCommandEncoder().unwrap();
+        unsafe {
+            blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                private.metal_buffer(),
+                0,
+                readback.metal_buffer(),
+                0,
+                len * 4,
+            );
+        }
+        blit.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        assert!(readback.as_slice().iter().all(|&x| x == 0.0));
     }
 
     #[test]

@@ -147,7 +147,7 @@ objc2-foundation = { version = "0.3", features = ["NSData", "NSError", "NSProces
 objc2-metal = { version = "0.3", features = [
     "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder",
     "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary",
-    "MTLBuffer", "MTLResource",
+    "MTLBuffer", "MTLResource", "MTLBlitCommandEncoder",
 ] }
 dispatch2 = "0.3"
 

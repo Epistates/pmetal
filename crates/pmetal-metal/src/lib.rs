@@ -64,7 +64,6 @@
 pub mod accelerate;
 #[cfg(feature = "ane")]
 pub mod ane;
-pub mod bridge;
 pub mod buffer;
 pub(crate) mod chip;
 pub mod context;
@@ -75,8 +74,8 @@ pub(crate) mod msl_layout;
 pub mod neon_convert;
 pub mod pipeline;
 pub mod tuna;
+pub mod view;
 
-pub use bridge::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 pub use buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use error::{MetalError, Result};
@@ -112,6 +111,7 @@ pub use kernels::mpp_flash_attention::{
 pub use kernels::mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
 pub use kernels::turboquant::TurboQuantTransform;
 pub use pipeline::{FunctionConstant, PipelineCache};
+pub use view::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 
 /// Prelude for convenient imports.
 pub mod prelude {
