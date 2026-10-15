@@ -39,7 +39,7 @@ mod weights;
 pub use cache::{KvLayerCache, NativeCache};
 pub use experts::{GptOssExperts, glu};
 pub use forward::{benchmark_trial, forward_step, generate, prefill_first_token};
-pub use moe::route;
+pub use moe::{route, route_logits};
 pub use weights::{NativeWeights, load_model};
 
 // ============================================================================

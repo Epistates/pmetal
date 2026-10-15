@@ -34,7 +34,13 @@ pub fn route(
     b: &InlineArray,
     top_k: i32,
 ) -> (InlineArray, InlineArray) {
-    let logits = router.matmul_from(x_flat).add(b);
+    route_logits(&router.matmul_from(x_flat).add(b), top_k)
+}
+
+/// [`route`] from the biased router logits, `[rows, experts]`: the shared-path
+/// model computes them with its own router layer and selects here, so there is
+/// one top-k and one softmax.
+pub fn route_logits(logits: &InlineArray, top_k: i32) -> (InlineArray, InlineArray) {
     let (rows, n_experts) = (logits.dim(0), logits.dim(1));
     let inds = logits
         .argpartition(-top_k, -1)
