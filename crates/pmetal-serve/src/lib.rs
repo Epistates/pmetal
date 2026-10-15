@@ -25,7 +25,6 @@ pub mod decision;
 pub mod engine;
 pub mod error;
 pub mod media;
-pub mod prefix_cache;
 pub mod routes;
 pub mod server;
 pub(crate) mod sse;
@@ -42,7 +41,6 @@ pub use continuous_driver::{
 pub use continuous_pump::{ContinuousPump, Tick};
 pub use decision::DecisionEngine;
 pub use engine::{InferenceEngine, PreparedPrompt, RequestMetrics};
-pub use prefix_cache::ServePrefixCache;
 pub use routes::ServingMetrics;
 pub use server::ServeConfig;
 

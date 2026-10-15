@@ -253,50 +253,75 @@ impl FusedBatchKVCache {
             }
             pre_offsets.push(off);
         }
+        let mut seen = vec![false; self.max_slots];
+        for &idx in active_indices {
+            if std::mem::replace(&mut seen[idx], true) {
+                return Err(Exception::custom(format!(
+                    "FusedBatchKVCache: slot {idx} appears twice in active_indices",
+                )));
+            }
+        }
 
-        // Gather active rows: [N_active, heads, max_seq, D]
-        let active_i32: Vec<i32> = active_indices.iter().map(|&i| i as i32).collect();
-        let gather_idx = Array::from_i32_slice_shaped(&active_i32, &[n_active as i32]);
-        let k_full = &self.layer_keys[layer_idx];
-        let v_full = &self.layer_values[layer_idx];
-        let k_active = k_full.take_axis(&gather_idx, 0);
-        let v_active = v_full.take_axis(&gather_idx, 0);
-
-        // Write indices along axis 2: one position per slot, broadcast
-        // across heads / head_dim.
-        let pre_off_i32: Vec<i32> = pre_offsets.iter().map(|&o| o as i32).collect();
-        let write_pos = Array::from_i32_slice_shaped(&pre_off_i32, &[n_active as i32, 1, 1, 1]);
-        let write_idx_k = write_pos.broadcast_to(&[n_active as i32, heads, 1, d_k]);
-        let write_idx_v = write_pos.broadcast_to(&[n_active as i32, heads, 1, d_v]);
-
-        let k_written = ops::put_along_axis(&k_active, &write_idx_k, new_k, 2);
-        let v_written = ops::put_along_axis(&v_active, &write_idx_v, new_v, 2);
-
-        // Scatter back into persistent buffers along axis 0.
-        let scatter_pos = Array::from_i32_slice_shaped(&active_i32, &[n_active as i32, 1, 1, 1]);
-        let max_seq = self.config.max_seq_len as i32;
-        let scatter_idx_k = scatter_pos.broadcast_to(&[n_active as i32, heads, max_seq, d_k]);
-        let scatter_idx_v = scatter_pos.broadcast_to(&[n_active as i32, heads, max_seq, d_v]);
-
-        // k_written has axis-2 dim = max_seq (we gathered full rows and
-        // wrote one position), so the shapes align with scatter_idx.
-        self.layer_keys[layer_idx] = ops::put_along_axis(k_full, &scatter_idx_k, &k_written, 0);
-        self.layer_values[layer_idx] = ops::put_along_axis(v_full, &scatter_idx_v, &v_written, 0);
+        // Write each slot's token at its own offset, in place: one small
+        // slice update per slot into the persistent buffers, so a step costs
+        // the tokens it adds and not the cache. The buffers are taken out of
+        // `self` while they are written, which leaves each update the only
+        // holder of its input.
+        let placeholder = || Array::zeros(&[1], Dtype::Float32);
+        let mut k_full = std::mem::replace(&mut self.layer_keys[layer_idx], placeholder());
+        let mut v_full = std::mem::replace(&mut self.layer_values[layer_idx], placeholder());
+        let new_k = new_k.as_dtype(k_full.dtype_raw());
+        let new_v = new_v.as_dtype(v_full.dtype_raw());
+        for (row, (&slot, &off)) in active_indices.iter().zip(&pre_offsets).enumerate() {
+            let (row, slot, off) = (row as i32, slot as i32, off as i32);
+            let k_row = new_k.slice(&[row, 0, 0, 0], &[row + 1, heads, 1, d_k]);
+            let v_row = new_v.slice(&[row, 0, 0, 0], &[row + 1, heads, 1, d_v]);
+            k_full = k_full.slice_set(&k_row, &[slot, 0, off, 0], &[slot + 1, heads, off + 1, d_k]);
+            v_full = v_full.slice_set(&v_row, &[slot, 0, off, 0], &[slot + 1, heads, off + 1, d_v]);
+        }
 
         // Advance offsets for this layer only.
         for &idx in active_indices {
             self.offsets[layer_idx][idx] += 1;
         }
 
-        // Slice K/V to T_max, where T_max = max(new_offset) among active slots.
+        // The rows to attend over, as far as the longest of them reaches
+        // (T_max = max(new_offset) among active slots). Slots that are
+        // consecutive and in order are a view of the buffer; any other
+        // choice is gathered into a batch.
         let new_offsets: Vec<usize> = active_indices
             .iter()
             .map(|&i| self.offsets[layer_idx][i])
             .collect();
         let t_max = new_offsets.iter().copied().max().unwrap_or(0);
         let t_max_i32 = t_max as i32;
-        let k_out = k_written.slice(&[0, 0, 0, 0], &[n_active as i32, heads, t_max_i32, d_k]);
-        let v_out = v_written.slice(&[0, 0, 0, 0], &[n_active as i32, heads, t_max_i32, d_v]);
+        let first = active_indices[0];
+        let consecutive = active_indices
+            .iter()
+            .enumerate()
+            .all(|(row, &slot)| slot == first + row);
+        let rows = |buf: &Array, dim: i32| -> Array {
+            if consecutive {
+                buf.slice(
+                    &[first as i32, 0, 0, 0],
+                    &[(first + n_active) as i32, heads, t_max_i32, dim],
+                )
+            } else {
+                let gather = Array::from_i32_slice_shaped(
+                    &active_indices.iter().map(|&i| i as i32).collect::<Vec<_>>(),
+                    &[n_active as i32],
+                );
+                buf.slice(
+                    &[0, 0, 0, 0],
+                    &[self.max_slots as i32, heads, t_max_i32, dim],
+                )
+                .take_axis(&gather, 0)
+            }
+        };
+        let k_out = rows(&k_full, d_k);
+        let v_out = rows(&v_full, d_v);
+        self.layer_keys[layer_idx] = k_full;
+        self.layer_values[layer_idx] = v_full;
 
         // Build additive padding mask: mask[n, 0, 0, t] = 0 if t < new_offset[n] else -inf.
         let new_off_i32: Vec<i32> = new_offsets.iter().map(|&o| o as i32).collect();

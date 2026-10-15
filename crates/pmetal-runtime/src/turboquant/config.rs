@@ -9,8 +9,8 @@ pub enum TurboQuantTensorConfig {
         bits: u8,
     },
     /// A wider code for the coordinates that carry the most energy and a
-    /// narrower one for the rest. Not supported by the cache yet: building a
-    /// cache from it fails.
+    /// narrower one for the rest. Held by a [`MixedQuantizedKvCache`](super::MixedQuantizedKvCache);
+    /// a [`QuantizedKvCache`](super::QuantizedKvCache) refuses it.
     Mixed {
         /// Bits per coordinate of the regular channels.
         regular_bits: u8,
@@ -147,7 +147,16 @@ impl TurboQuantConfig {
         }
     }
 
-    /// Whether a cache can be built from this configuration.
+    /// Whether the keys or the values are mixed-precision, which a
+    /// [`MixedQuantizedKvCache`](super::MixedQuantizedKvCache) holds and a
+    /// [`QuantizedKvCache`](super::QuantizedKvCache) does not.
+    pub fn is_mixed(&self) -> bool {
+        matches!(self.keys, TurboQuantTensorConfig::Mixed { .. })
+            || matches!(self.values, TurboQuantTensorConfig::Mixed { .. })
+    }
+
+    /// Whether a [`QuantizedKvCache`](super::QuantizedKvCache) can be built
+    /// from this configuration.
     pub fn validate(&self) -> Result<(), String> {
         for (label, tensor) in [("keys", self.keys), ("values", self.values)] {
             match tensor {
@@ -159,7 +168,7 @@ impl TurboQuantConfig {
                 }
                 TurboQuantTensorConfig::Mixed { .. } => {
                     return Err(format!(
-                        "TurboQuant {label}: mixed-precision tensors are not supported yet"
+                        "TurboQuant {label}: a mixed-precision tensor needs a MixedQuantizedKvCache"
                     ));
                 }
             }

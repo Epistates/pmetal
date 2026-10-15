@@ -1775,7 +1775,7 @@ impl NemotronHMixer {
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
+                    (*cache_ref).try_compressed_attention(*layer_idx, &q, &k, &v, &attn_config)?
                 {
                     let output = output
                         .transpose_axes(&[0, 2, 1, 3])

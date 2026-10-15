@@ -135,6 +135,34 @@ impl QuantizedKvCache {
         self.dense = None;
     }
 
+    /// Take back the newest `n` tokens (all of them if fewer are cached) and
+    /// return how many went: the speculative-decoding rollback.
+    ///
+    /// The ring gives its tokens back exact; tokens already quantized stay
+    /// quantized, so after a deep cut the newest tokens are no longer the
+    /// exact ones. The sinks are only touched once everything after them is
+    /// gone.
+    pub fn truncate(&mut self, n: usize) -> usize {
+        let n = n.min(self.offset);
+        if n == self.offset {
+            self.reset();
+            return n;
+        }
+        let mut left = n;
+        if let Some(dense) = self.dense.as_mut() {
+            left -= dense.drop_newest_ring(left);
+        }
+        if let Some(cold) = self.cold.as_mut() {
+            left -= cold.drop_newest(left);
+        }
+        if let Some(dense) = self.dense.as_mut() {
+            left -= dense.drop_newest_sinks(left);
+        }
+        debug_assert_eq!(left, 0, "{n} tokens taken back from {} cached", self.offset);
+        self.offset -= n;
+        n
+    }
+
     /// An independent copy that shares storage with this cache until either
     /// side appends. MLX arrays are immutable values and every write makes a
     /// new one, so this costs a reference count per array, however long the

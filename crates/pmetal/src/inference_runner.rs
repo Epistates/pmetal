@@ -14,8 +14,7 @@ use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateKwargs, ChatTemplateType, Message, ToolDefinition};
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
 use pmetal_mlx::kv_cache::{
-    CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, TurboQuantTensorConfig,
-    sanitize_cache_mode_for_config,
+    CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, sanitize_cache_mode_for_config,
 };
 use pmetal_mlx::{Array, Dtype, Exception, ModuleParameters as _};
 use pmetal_models::architectures::qwen3_5_vision::Qwen3_5MultimodalConfig;
@@ -29,10 +28,6 @@ use pmetal_models::{
     Gemma4MtpConfig, GenerationOutput, Qwen3NextMtpConfig, generate_cached_async_streaming,
     generate_gemma4_mtp_streaming, generate_qwen3_native_mtp_streaming,
     generate_qwen3_next_mtp_streaming, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair,
-};
-use pmetal_runtime::turboquant::{
-    TurboQuantConfig as RuntimeTurboQuantConfig,
-    TurboQuantTensorConfig as RuntimeTurboQuantTensorConfig,
 };
 
 #[cfg(feature = "lora")]
@@ -248,7 +243,7 @@ pub struct InferenceGenState {
     qwen_mtp: Option<Qwen3NextMtpForCausalLM>,
     qwen_mtp_cache: Option<KVCache>,
     qwen_mtp_config: Option<Qwen3NextMtpConfig>,
-    native_turboquant: Option<RuntimeTurboQuantConfig>,
+    native_turboquant: Option<TurboQuantConfig>,
     /// Zero-overhead affine KV cache quantization config for native path
     native_quant_config: Option<pmetal_runtime::qwen3_native::QuantCacheConfig>,
     /// Model directory path — used for native InlineArray weight loading.
@@ -1399,9 +1394,7 @@ fn native_cache_mode_supported(
         CacheMode::Standard => true,
         // The native cache quantizes uniform widths only; a mixed-precision
         // preset runs on the shared model path's cache.
-        CacheMode::TurboQuant { config } => {
-            info.supports_turboquant && bridge_turboquant_config(config).validate().is_ok()
-        }
+        CacheMode::TurboQuant { config } => info.supports_turboquant && config.validate().is_ok(),
         // Zero-overhead quantized KV cache via quantized_matmul.
         // MLX supports 2, 3, 4, 5, 6, 8 bits for affine group quantization.
         CacheMode::Quantized { bits, .. } => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
@@ -1461,40 +1454,14 @@ fn mixed_bit_config_from_preset(
 fn turboquant_config_from_mode(
     info: crate::native_inference::NativeRuntimeInfo,
     mode: CacheMode,
-) -> Option<RuntimeTurboQuantConfig> {
+) -> Option<TurboQuantConfig> {
     if !info.supports_turboquant {
         return None;
     }
 
     match mode {
-        CacheMode::TurboQuant { config } => Some(bridge_turboquant_config(config)),
+        CacheMode::TurboQuant { config } => Some(config),
         _ => None,
-    }
-}
-
-/// The native cache's configuration for a shared-path one. The native cache
-/// quantizes keys with the MSE codebook alone (no QJL residual) and has no
-/// per-block outliers, pack modes or skip-list: those knobs belong to the
-/// other TurboQuant cache.
-fn bridge_turboquant_config(config: TurboQuantConfig) -> RuntimeTurboQuantConfig {
-    RuntimeTurboQuantConfig {
-        keys: bridge_turboquant_tensor_config(config.keys),
-        values: bridge_turboquant_tensor_config(config.values),
-        recent_window: config.recent_window,
-        ..RuntimeTurboQuantConfig::uniform(8, 8)
-    }
-}
-
-fn bridge_turboquant_tensor_config(
-    config: TurboQuantTensorConfig,
-) -> RuntimeTurboQuantTensorConfig {
-    match config {
-        TurboQuantTensorConfig::Uniform { bits } => RuntimeTurboQuantTensorConfig::uniform(bits),
-        TurboQuantTensorConfig::Mixed {
-            regular_bits,
-            outlier_bits,
-            outlier_count,
-        } => RuntimeTurboQuantTensorConfig::mixed(regular_bits, outlier_bits, outlier_count),
     }
 }
 
@@ -1720,11 +1687,7 @@ impl TurboQuantPreset {
         TurboQuantConfig {
             keys: key_config,
             values: value_config,
-            recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
-            qjl: Default::default(),
-            skiplist_threshold: None,
-            outliers: Default::default(),
-            pack_mode: Default::default(),
+            ..TurboQuantConfig::uniform(8, 8)
         }
     }
 }
@@ -2460,11 +2423,7 @@ mod tests {
         let expected = TurboQuantConfig {
             keys: TurboQuantConfig::preset_q2_5(256).keys,
             values: TurboQuantConfig::preset_q2_5(128).values,
-            recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
-            qjl: Default::default(),
-            skiplist_threshold: None,
-            outliers: Default::default(),
-            pack_mode: Default::default(),
+            ..TurboQuantConfig::uniform(8, 8)
         };
         assert_eq!(mode, CacheMode::TurboQuant { config: expected });
     }

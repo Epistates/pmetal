@@ -6347,7 +6347,6 @@ dependencies = [
  "pmetal-core",
  "pmetal-metal",
  "pmetal-runtime",
- "rand 0.10.3",
  "tracing",
 ]
 

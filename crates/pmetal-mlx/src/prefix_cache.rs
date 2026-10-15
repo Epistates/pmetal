@@ -1,262 +1,271 @@
-//! Prefix caching for efficient RL training.
+//! Prefix caching: reuse the KV state of a prompt prefix that was already
+//! prefilled.
 //!
-//! This module provides prefix caching functionality that stores KV cache states
-//! for prompt prefixes, enabling efficient generation of multiple completions
-//! from the same prompt without recomputing the prompt's forward pass each time.
+//! Chat clients resend the whole conversation every turn, an RL rollout
+//! samples many completions of one prompt, and tool-calling loops branch from
+//! a shared context. In each case the leading tokens of a request repeat
+//! tokens some earlier request already ran through the model; running them
+//! again discards work.
 //!
-//! ## Use Case: GRPO/DPO Training
+//! # What is stored and what a hit returns
 //!
-//! During RL training (GRPO, DPO), we often generate multiple completions from
-//! the same prompt. Without prefix caching:
+//! The cache keeps a bounded set of `(tokens, KV cache)` pairs. The KV cache
+//! is a [`KVCache::fork`]: MLX arrays are shared by handle, so a stored
+//! prefix costs the arrays the original already held, and a hit costs a
+//! handle per array however long the prefix is. A restored cache and the
+//! stored one are independent: appending to one never changes the other.
 //!
-//! ```text
-//! Prompt: "What is 2+2?"
-//! Completion 1: Full forward pass (prompt) + decode
-//! Completion 2: Full forward pass (prompt) + decode  // Redundant!
-//! Completion 3: Full forward pass (prompt) + decode  // Redundant!
-//! ```
+//! A request matches the entry that shares the most leading tokens with it
+//! (the longest common prefix, as a radix tree over token sequences
+//! gives), not only an entry that is a prefix of it: a request that
+//! diverges from a cached conversation after a shared system prompt reuses
+//! the system prompt. The restored cache is rolled back to the shared
+//! length ([`KVCache::rollback`]), so what it holds is exactly the keys and
+//! values a cold prefill of those tokens produces and the next token's
+//! logits are the uncached run's.
 //!
-//! With prefix caching:
+//! At least one token of the request is always left for the caller to run:
+//! a hit that covered every token would leave nothing to produce the
+//! logits the first sample is drawn from.
 //!
-//! ```text
-//! Prompt: "What is 2+2?"
-//! Completion 1: Full forward pass (prompt) + decode, cache KV
-//! Completion 2: Clone cached KV + decode  // 2-5x faster!
-//! Completion 3: Clone cached KV + decode
-//! ```
+//! # What can be reused
 //!
-//! ## Implementation
+//! - A dense cache can be cut at any token.
+//! - A sliding or rotating cache can be cut only where its window still
+//!   covers the cut; an entry that cannot be cut to the shared length is
+//!   skipped, and the entry is still used whole when the request extends it.
+//! - A quantized or TurboQuant cache can be cut anywhere. The history stays
+//!   quantized as it was, so the logits equal a cold run's within the
+//!   cache's quantization error, not bit for bit.
+//! - Models with recurrent state (Mamba, GDN) hold state that is not
+//!   per-token and cannot be cut: do not cache them here.
 //!
-//! The cache uses a hash of the prompt tokens as the key. When a prompt is
-//! processed, we save a snapshot of the KV cache state (all layer K and V tensors).
-//! For subsequent generations with the same prompt, we restore this snapshot
-//! to avoid recomputing the prompt's forward pass.
+//! # Eviction
 //!
-//! ## Memory Considerations
-//!
-//! The prefix cache stores full KV states which can be memory-intensive for:
-//! - Long prompts
-//! - Large models
-//! - Many cached prefixes
-//!
-//! Use `max_entries` to limit cache size and `clear()` to free memory when needed.
+//! Entries are evicted least-recently-used first once either the entry
+//! count or the byte budget is exceeded. Forks of one lineage that have
+//! since diverged do not share storage, and each entry is counted at the
+//! bytes its own arrays hold.
 
-use pmetal_runtime::compat::{Array, Exception};
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use pmetal_runtime::compat::Exception;
 
 use crate::kv_cache::{KVCache, KVCacheConfig};
 
-/// A snapshot of the KV cache state at a particular point.
+/// One cached prefix.
+struct Entry {
+    tokens: Vec<u32>,
+    cache: KVCache,
+    /// Monotonic counter; higher is more recently touched.
+    last_used: u64,
+    /// Memory held, measured once at insert.
+    bytes: usize,
+}
+
+/// The result of a prefix-cache lookup.
+#[derive(Debug)]
+pub struct PrefixHit {
+    /// Leading tokens of the request the restored cache already covers.
+    pub prefix_len: usize,
+    /// The restored cache, ready for the rest of the request. Its
+    /// `total_tokens` equals `prefix_len`.
+    pub restored_cache: KVCache,
+}
+
+/// Bounded prefix cache; see the module docs.
 ///
-/// This stores all the K and V tensors from each layer, allowing us to
-/// restore the cache to this exact state for subsequent generations.
-#[derive(Debug, Clone)]
-pub struct KVCacheSnapshot {
-    /// Cached keys per layer: Vec<[B, heads, seq, head_dim]>
-    keys: Vec<Array>,
-    /// Cached values per layer: Vec<[B, heads, seq, head_dim]>
-    values: Vec<Array>,
-    /// Sequence length at snapshot time.
-    seq_len: usize,
-}
-
-impl KVCacheSnapshot {
-    /// Create a snapshot from a KV cache.
-    pub fn from_cache(cache: &KVCache) -> Self {
-        let num_layers = cache.config().num_layers;
-        let mut keys = Vec::with_capacity(num_layers);
-        let mut values = Vec::with_capacity(num_layers);
-
-        for layer_idx in 0..num_layers {
-            if let Some((k, v)) = cache.get(layer_idx) {
-                keys.push(k.clone());
-                values.push(v.clone());
-            }
-        }
-
-        Self {
-            keys,
-            values,
-            seq_len: cache.seq_len(),
-        }
-    }
-
-    /// Restore a KV cache from this snapshot.
-    ///
-    /// Creates a new KV cache with the same configuration and restores
-    /// all the cached K/V tensors to match this snapshot's state.
-    pub fn restore(&self, config: KVCacheConfig) -> Result<KVCache, Exception> {
-        let mut cache = KVCache::new(config);
-
-        // Restore each layer's cache
-        for (layer_idx, (k, v)) in self.keys.iter().zip(self.values.iter()).enumerate() {
-            // We need to update the cache with these tensors
-            // Since update_and_fetch expects "new" tensors, we just pass the full cached tensors
-            // and reset first to clear any existing state
-            cache.update_and_fetch(layer_idx, k, v)?;
-        }
-
-        Ok(cache)
-    }
-
-    /// Get the sequence length of this snapshot.
-    pub fn seq_len(&self) -> usize {
-        self.seq_len
-    }
-
-    /// Get the number of layers in this snapshot.
-    pub fn num_layers(&self) -> usize {
-        self.keys.len()
-    }
-
-    /// Estimate memory usage in bytes.
-    pub fn memory_usage(&self) -> usize {
-        let mut total = 0;
-        for k in &self.keys {
-            let elements: usize = k.shape().iter().map(|&d| d as usize).product();
-            total += elements * 4; // Assume f32
-        }
-        for v in &self.values {
-            let elements: usize = v.shape().iter().map(|&d| d as usize).product();
-            total += elements * 4;
-        }
-        total
-    }
-}
-
-/// Hash function for prompt tokens.
-fn hash_tokens(tokens: &[u32]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
-    tokens.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Prefix cache for efficient RL training.
-///
-/// Caches KV states for prompt prefixes, enabling fast generation of multiple
-/// completions from the same prompt.
+/// Not internally synchronised: share it behind a `Mutex`.
 #[derive(Debug)]
 pub struct PrefixCache {
-    /// Cached snapshots keyed by prompt hash.
-    cache: HashMap<u64, KVCacheSnapshot>,
-    /// Maximum number of entries to keep.
+    entries: Vec<Entry>,
     max_entries: usize,
-    /// LRU order (most recently used at end).
-    lru_order: Vec<u64>,
-    /// Cache hit count.
-    hits: usize,
-    /// Cache miss count.
-    misses: usize,
+    max_bytes: usize,
+    current_bytes: usize,
+    clock: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("tokens", &self.tokens.len())
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+
+/// Leading tokens `a` and `b` share.
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 impl PrefixCache {
-    /// Create a new prefix cache with the given maximum entry count.
-    ///
-    /// # Arguments
-    /// * `max_entries` - Maximum number of unique prompts to cache
-    pub fn new(max_entries: usize) -> Self {
+    /// A cache holding at most `max_entries` prefixes (0 disables it) and,
+    /// when `max_bytes` is non-zero, at most that many bytes.
+    pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
-            cache: HashMap::new(),
+            entries: Vec::new(),
             max_entries,
-            lru_order: Vec::new(),
+            max_bytes,
+            current_bytes: 0,
+            clock: 0,
             hits: 0,
             misses: 0,
         }
     }
 
-    /// Check if a prompt prefix is cached.
-    pub fn contains(&self, tokens: &[u32]) -> bool {
-        let hash = hash_tokens(tokens);
-        self.cache.contains_key(&hash)
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
     }
 
-    /// Get a cached snapshot for a prompt, if available.
+    /// Find the entry sharing the most leading tokens with `incoming` and
+    /// restore a cache for that many of them.
     ///
-    /// Returns None if the prompt is not cached.
-    /// Updates LRU order on hit.
-    pub fn get(&mut self, tokens: &[u32]) -> Option<&KVCacheSnapshot> {
-        let hash = hash_tokens(tokens);
-
-        if let Some(snapshot) = self.cache.get(&hash) {
-            self.hits += 1;
-            // Update LRU order
-            self.lru_order.retain(|&h| h != hash);
-            self.lru_order.push(hash);
-            Some(snapshot)
-        } else {
-            self.misses += 1;
-            None
-        }
-    }
-
-    /// Get a KV cache restored from the cached snapshot.
-    ///
-    /// This creates a new KV cache with the prompt's cached state,
-    /// ready for continuation with new tokens.
-    pub fn get_cache(
+    /// The shared length is capped at `incoming.len() - 1`, so the caller
+    /// always has a token to run. Returns `None` when no entry shares a
+    /// leading token with the request, or none can be cut to the length it
+    /// shares. `kv_config` must be the configuration the entries were
+    /// built with.
+    pub fn find_longest_prefix(
         &mut self,
-        tokens: &[u32],
-        config: KVCacheConfig,
-    ) -> Result<Option<KVCache>, Exception> {
-        if let Some(snapshot) = self.get(tokens) {
-            Ok(Some(snapshot.restore(config)?))
-        } else {
-            Ok(None)
-        }
-    }
+        incoming: &[u32],
+        kv_config: &KVCacheConfig,
+    ) -> Result<Option<PrefixHit>, Exception> {
+        // Candidates by how many tokens they would serve, longest first.
+        let mut candidates: Vec<(usize, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                let usable =
+                    common_prefix(&entry.tokens, incoming).min(incoming.len().saturating_sub(1));
+                (usable > 0).then_some((usable, i))
+            })
+            .collect();
+        candidates.sort_by_key(|&(usable, _)| std::cmp::Reverse(usable));
 
-    /// Insert a prompt's KV cache state into the cache.
-    ///
-    /// If the cache is full, the least recently used entry is evicted.
-    pub fn insert(&mut self, tokens: &[u32], cache: &KVCache) {
-        let hash = hash_tokens(tokens);
-
-        // Evict LRU if at capacity
-        if self.cache.len() >= self.max_entries && !self.cache.contains_key(&hash) {
-            if let Some(lru_hash) = self.lru_order.first().copied() {
-                self.cache.remove(&lru_hash);
-                self.lru_order.remove(0);
+        for (usable, idx) in candidates {
+            let stored = &self.entries[idx];
+            let mut restored = stored.cache.fork();
+            if restored.config() != kv_config {
+                return Err(Exception::custom(
+                    "prefix-cache hit had a mismatched KVCacheConfig",
+                ));
             }
+            let cut = stored.tokens.len() - usable;
+            if cut > 0 && restored.rollback(cut) != cut {
+                // The cache cannot be cut that far back (a window moved
+                // past it): another entry may serve.
+                continue;
+            }
+            self.hits = self.hits.saturating_add(1);
+            let now = self.tick();
+            self.entries[idx].last_used = now;
+            return Ok(Some(PrefixHit {
+                prefix_len: usable,
+                restored_cache: restored,
+            }));
+        }
+        self.misses = self.misses.saturating_add(1);
+        Ok(None)
+    }
+
+    /// Store the KV state of a prefilled prefix.
+    ///
+    /// Forks `cache`, which must be at a clean end-of-prefill boundary
+    /// (`cache.total_tokens() == tokens.len()`): a cache that holds a
+    /// different number of tokens than it was given would restore with the
+    /// wrong RoPE offset and corrupt the next prefill, so it is skipped. An
+    /// entry with the same tokens is replaced, which refreshes it.
+    pub fn insert(&mut self, tokens: &[u32], cache: &KVCache) {
+        if tokens.is_empty() || self.max_entries == 0 {
+            return;
+        }
+        if cache.total_tokens() != tokens.len() {
+            tracing::debug!(
+                target = "pmetal_mlx::prefix_cache",
+                cache_tokens = cache.total_tokens(),
+                token_len = tokens.len(),
+                "skipping prefix save: the cache does not hold the tokens it was given"
+            );
+            return;
         }
 
-        // Insert new snapshot
-        let snapshot = KVCacheSnapshot::from_cache(cache);
-        self.cache.insert(hash, snapshot);
+        if let Some(pos) = self.entries.iter().position(|e| e.tokens == tokens) {
+            let old = self.entries.swap_remove(pos);
+            self.current_bytes = self.current_bytes.saturating_sub(old.bytes);
+        }
 
-        // Update LRU order
-        self.lru_order.retain(|&h| h != hash);
-        self.lru_order.push(hash);
+        let cached = cache.fork();
+        let bytes = cached.memory_usage();
+        let last_used = self.tick();
+        self.current_bytes = self.current_bytes.saturating_add(bytes);
+        self.entries.push(Entry {
+            tokens: tokens.to_vec(),
+            cache: cached,
+            last_used,
+            bytes,
+        });
+        self.evict_to_budget();
     }
 
-    /// Clear all cached entries.
+    fn evict_to_budget(&mut self) {
+        while self.entries.len() > self.max_entries
+            || (self.max_bytes > 0 && self.current_bytes > self.max_bytes)
+        {
+            let Some((oldest, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                break;
+            };
+            let removed = self.entries.swap_remove(oldest);
+            self.current_bytes = self.current_bytes.saturating_sub(removed.bytes);
+        }
+    }
+
+    /// Drop every entry (a model swap, say).
     pub fn clear(&mut self) {
-        self.cache.clear();
-        self.lru_order.clear();
+        self.entries.clear();
+        self.current_bytes = 0;
     }
 
-    /// Get the number of cached entries.
+    /// Change the limits, evicting down to them.
+    pub fn set_limits(&mut self, max_entries: usize, max_bytes: usize) {
+        self.max_entries = max_entries;
+        self.max_bytes = max_bytes;
+        self.evict_to_budget();
+    }
+
+    /// Number of cached prefixes.
     pub fn len(&self) -> usize {
-        self.cache.len()
+        self.entries.len()
     }
 
-    /// Check if the cache is empty.
+    /// True when nothing is cached.
     pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
+        self.entries.is_empty()
     }
 
-    /// Get cache hit count.
-    pub fn hits(&self) -> usize {
+    /// Bytes the cached prefixes hold.
+    pub fn bytes(&self) -> usize {
+        self.current_bytes
+    }
+
+    /// Lookups that found a prefix.
+    pub fn hits(&self) -> u64 {
         self.hits
     }
 
-    /// Get cache miss count.
-    pub fn misses(&self) -> usize {
+    /// Lookups that found none.
+    pub fn misses(&self) -> u64 {
         self.misses
     }
 
-    /// Get cache hit rate.
+    /// Hits over lookups, 0 before the first lookup.
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
         if total == 0 {
@@ -265,237 +274,256 @@ impl PrefixCache {
             self.hits as f64 / total as f64
         }
     }
-
-    /// Reset hit/miss counters.
-    pub fn reset_stats(&mut self) {
-        self.hits = 0;
-        self.misses = 0;
-    }
-
-    /// Estimate total memory usage in bytes.
-    pub fn memory_usage(&self) -> usize {
-        self.cache.values().map(|s| s.memory_usage()).sum()
-    }
-}
-
-/// Builder for prefix-cached generation.
-///
-/// This helper manages the workflow of:
-/// 1. Checking if a prompt is cached
-/// 2. Either restoring from cache or doing full forward pass
-/// 3. Caching the result for future use
-#[derive(Debug)]
-pub struct PrefixCachedGenerator {
-    /// The prefix cache.
-    cache: PrefixCache,
-    /// KV cache configuration for restoration.
-    kv_config: KVCacheConfig,
-}
-
-impl PrefixCachedGenerator {
-    /// Create a new prefix-cached generator.
-    pub fn new(max_cached_prompts: usize, kv_config: KVCacheConfig) -> Self {
-        Self {
-            cache: PrefixCache::new(max_cached_prompts),
-            kv_config,
-        }
-    }
-
-    /// Try to get a pre-filled KV cache for the given prompt.
-    ///
-    /// Returns `Some(cache)` if the prompt was cached, `None` otherwise.
-    /// The caller should then do a full forward pass if None is returned.
-    pub fn try_get_cache(&mut self, prompt_tokens: &[u32]) -> Result<Option<KVCache>, Exception> {
-        self.cache.get_cache(prompt_tokens, self.kv_config.clone())
-    }
-
-    /// Cache the KV state after processing a prompt.
-    ///
-    /// Call this after doing a full forward pass on a prompt to enable
-    /// future cache hits.
-    pub fn cache_prompt(&mut self, prompt_tokens: &[u32], kv_cache: &KVCache) {
-        self.cache.insert(prompt_tokens, kv_cache);
-    }
-
-    /// Clear all cached prompts.
-    pub fn clear(&mut self) {
-        self.cache.clear();
-    }
-
-    /// Get cache statistics.
-    pub fn stats(&self) -> (usize, usize, f64) {
-        (
-            self.cache.hits(),
-            self.cache.misses(),
-            self.cache.hit_rate(),
-        )
-    }
-
-    /// Get the underlying prefix cache for direct manipulation.
-    pub fn cache(&self) -> &PrefixCache {
-        &self.cache
-    }
-
-    /// Get mutable access to the underlying prefix cache.
-    pub fn cache_mut(&mut self) -> &mut PrefixCache {
-        &mut self.cache
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_runtime::compat::Array;
 
-    fn create_test_config() -> KVCacheConfig {
-        KVCacheConfig::new(2, 100, 4, 64)
+    fn config() -> KVCacheConfig {
+        KVCacheConfig::new(2, 128, 4, 64)
     }
 
-    #[test]
-    fn test_prefix_cache_basic() {
-        let mut cache = PrefixCache::new(10);
-
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
-
-        // Create a dummy KV cache with some data
-        let config = create_test_config();
-        let mut kv_cache = KVCache::new(config);
-
-        // Add some data to the cache
-        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
-        let values = Array::zeros_f32(&[1, 4, 10, 64]);
-        kv_cache.update_and_fetch(0, &keys, &values).unwrap();
-        kv_cache.update_and_fetch(1, &keys, &values).unwrap();
-
-        // Insert into prefix cache
-        let tokens = vec![1, 2, 3, 4, 5];
-        cache.insert(&tokens, &kv_cache);
-
-        assert!(!cache.is_empty());
-        assert_eq!(cache.len(), 1);
-        assert!(cache.contains(&tokens));
-        assert!(!cache.contains(&[1, 2, 3])); // Different tokens
-    }
-
-    #[test]
-    fn test_prefix_cache_hit_miss() {
-        let mut cache = PrefixCache::new(10);
-        let config = create_test_config();
-        let mut kv_cache = KVCache::new(config);
-
-        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
-        let values = Array::zeros_f32(&[1, 4, 10, 64]);
-        kv_cache.update_and_fetch(0, &keys, &values).unwrap();
-        kv_cache.update_and_fetch(1, &keys, &values).unwrap();
-
-        let tokens = vec![1, 2, 3];
-        cache.insert(&tokens, &kv_cache);
-
-        // Miss on different tokens
-        assert!(cache.get(&[4, 5, 6]).is_none());
-        assert_eq!(cache.misses(), 1);
-        assert_eq!(cache.hits(), 0);
-
-        // Hit on same tokens
-        assert!(cache.get(&tokens).is_some());
-        assert_eq!(cache.hits(), 1);
-        assert_eq!(cache.misses(), 1);
-
-        assert!((cache.hit_rate() - 0.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_prefix_cache_lru_eviction() {
-        let mut cache = PrefixCache::new(2); // Only 2 entries
-        let config = create_test_config();
-
-        // Create 3 different caches
-        for i in 0..3 {
-            let mut kv_cache = KVCache::new(config.clone());
-            let keys = Array::zeros_f32(&[1, 4, 10, 64]);
-            let values = Array::zeros_f32(&[1, 4, 10, 64]);
-            kv_cache.update_and_fetch(0, &keys, &values).unwrap();
-            kv_cache.update_and_fetch(1, &keys, &values).unwrap();
-
-            let tokens = vec![i as u32];
-            cache.insert(&tokens, &kv_cache);
+    fn cache_with_len(seq_len: usize) -> KVCache {
+        let mut cache = KVCache::new(config());
+        if seq_len > 0 {
+            let k = Array::zeros_f32(&[1, 4, seq_len as i32, 64]);
+            let v = Array::zeros_f32(&[1, 4, seq_len as i32, 64]);
+            cache.update_and_fetch(0, &k, &v).unwrap();
+            cache.update_and_fetch(1, &k, &v).unwrap();
         }
-
-        // Should have evicted the first entry
-        assert_eq!(cache.len(), 2);
-        assert!(!cache.contains(&[0])); // Evicted
-        assert!(cache.contains(&[1]));
-        assert!(cache.contains(&[2]));
+        cache
     }
 
     #[test]
-    fn test_prefix_cache_restore() {
-        let mut cache = PrefixCache::new(10);
-        let config = create_test_config();
-        let mut kv_cache = KVCache::new(config.clone());
-
-        // Add data with specific values
-        let keys = Array::ones_f32(&[1, 4, 10, 64]);
-        let values = Array::ones_f32(&[1, 4, 10, 64]);
-        kv_cache.update_and_fetch(0, &keys, &values).unwrap();
-        kv_cache.update_and_fetch(1, &keys, &values).unwrap();
-
-        let tokens = vec![10, 20, 30];
-        cache.insert(&tokens, &kv_cache);
-
-        // Restore from cache
-        let restored = cache.get_cache(&tokens, config.clone()).unwrap().unwrap();
-
-        // Verify restored cache has same state
-        assert_eq!(restored.seq_len(), 10);
-
-        let (k, v) = restored.get(0).unwrap();
-        assert_eq!(k.dim(2), 10); // seq_len
-        assert_eq!(v.dim(2), 10);
+    fn empty_cache_misses() {
+        let mut pc = PrefixCache::new(8, 0);
+        assert!(
+            pc.find_longest_prefix(&[1, 2, 3], &config())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!((pc.hits(), pc.misses()), (0, 1));
     }
 
     #[test]
-    fn test_kv_snapshot() {
-        let config = create_test_config();
-        let mut kv_cache = KVCache::new(config.clone());
-
-        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
-        let values = Array::zeros_f32(&[1, 4, 10, 64]);
-        kv_cache.update_and_fetch(0, &keys, &values).unwrap();
-        kv_cache.update_and_fetch(1, &keys, &values).unwrap();
-
-        let snapshot = KVCacheSnapshot::from_cache(&kv_cache);
-
-        assert_eq!(snapshot.seq_len(), 10);
-        assert_eq!(snapshot.num_layers(), 2);
-        assert!(snapshot.memory_usage() > 0);
+    fn a_request_extending_an_entry_reuses_all_of_it() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &cache_with_len(8));
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], &config())
+            .unwrap()
+            .expect("hit");
+        assert_eq!(hit.prefix_len, 8);
+        assert_eq!(hit.restored_cache.total_tokens(), 8);
+        assert_eq!(pc.hits(), 1);
     }
 
     #[test]
-    fn test_prefix_cached_generator() {
-        let config = create_test_config();
-        let mut generator = PrefixCachedGenerator::new(5, config.clone());
+    fn a_request_diverging_after_a_shared_prefix_reuses_the_shared_part() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3, 4, 5, 6], &cache_with_len(6));
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3, 9, 9], &config())
+            .unwrap()
+            .expect("the first three tokens are shared");
+        assert_eq!(hit.prefix_len, 3);
+        assert_eq!(hit.restored_cache.total_tokens(), 3);
+        assert_eq!(hit.restored_cache.rope_offset_for(0), 3);
+        assert_eq!(hit.restored_cache.rope_offset_for(1), 3);
+    }
 
-        // First generation - cache miss
-        let tokens = vec![100, 200, 300];
-        let cached = generator.try_get_cache(&tokens).unwrap();
-        assert!(cached.is_none());
+    #[test]
+    fn a_request_equal_to_an_entry_leaves_one_token_to_run() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3], &cache_with_len(3));
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3], &config())
+            .unwrap()
+            .expect("two of three tokens are reusable");
+        assert_eq!(hit.prefix_len, 2);
+        assert_eq!(hit.restored_cache.total_tokens(), 2);
+        // A single-token request has nothing to reuse.
+        assert!(pc.find_longest_prefix(&[1], &config()).unwrap().is_none());
+    }
 
-        // Simulate forward pass and cache
-        let mut kv_cache = KVCache::new(config.clone());
-        let keys = Array::zeros_f32(&[1, 4, 10, 64]);
-        let values = Array::zeros_f32(&[1, 4, 10, 64]);
-        kv_cache.update_and_fetch(0, &keys, &values).unwrap();
-        kv_cache.update_and_fetch(1, &keys, &values).unwrap();
-        generator.cache_prompt(&tokens, &kv_cache);
+    #[test]
+    fn the_entry_sharing_the_most_tokens_wins() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2], &cache_with_len(2));
+        pc.insert(&[1, 2, 3, 4], &cache_with_len(4));
+        pc.insert(&[1, 2, 3], &cache_with_len(3));
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 6], &config())
+            .unwrap()
+            .expect("hit");
+        assert_eq!(hit.prefix_len, 4);
+    }
 
-        // Second generation - cache hit
-        let cached = generator.try_get_cache(&tokens).unwrap();
-        assert!(cached.is_some());
+    #[test]
+    fn non_prefix_misses() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3], &cache_with_len(3));
+        assert!(
+            pc.find_longest_prefix(&[9, 8, 7, 6], &config())
+                .unwrap()
+                .is_none()
+        );
+    }
 
-        let (hits, misses, rate) = generator.stats();
-        assert_eq!(hits, 1);
-        assert_eq!(misses, 1);
-        assert!((rate - 0.5).abs() < 0.01);
+    #[test]
+    fn lru_eviction_drops_the_oldest() {
+        let mut pc = PrefixCache::new(2, 0);
+        let cache = cache_with_len(1);
+        pc.insert(&[1], &cache);
+        pc.insert(&[2], &cache);
+        pc.insert(&[3], &cache);
+        assert_eq!(pc.len(), 2);
+        assert!(
+            pc.find_longest_prefix(&[1, 99], &config())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pc.find_longest_prefix(&[3, 99], &config())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_lookup_refreshes_an_entry() {
+        let mut pc = PrefixCache::new(2, 0);
+        let cache = cache_with_len(1);
+        pc.insert(&[1], &cache);
+        pc.insert(&[2], &cache);
+        assert!(
+            pc.find_longest_prefix(&[1, 9], &config())
+                .unwrap()
+                .is_some()
+        );
+        pc.insert(&[3], &cache);
+        assert!(
+            pc.find_longest_prefix(&[1, 9], &config())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            pc.find_longest_prefix(&[2, 9], &config())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_evicts() {
+        let one = cache_with_len(8).memory_usage();
+        let mut pc = PrefixCache::new(100, one * 2 + one / 2);
+        for i in 0..4u32 {
+            pc.insert(&[i; 8], &cache_with_len(8));
+        }
+        assert!(pc.len() <= 2, "{} entries over the byte budget", pc.len());
+        assert!(pc.bytes() <= one * 2 + one / 2);
+    }
+
+    #[test]
+    fn hit_rate_tracks_lookups() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3], &cache_with_len(3));
+        let _ = pc.find_longest_prefix(&[1, 2, 3, 4], &config());
+        let _ = pc.find_longest_prefix(&[9, 9, 9], &config());
+        let _ = pc.find_longest_prefix(&[1, 2, 3, 5, 6], &config());
+        assert_eq!((pc.hits(), pc.misses()), (2, 1));
+        assert!((pc.hit_rate() - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_tokens_and_a_disabled_cache_store_nothing() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[], &cache_with_len(3));
+        assert!(pc.is_empty());
+        let mut off = PrefixCache::new(0, 0);
+        off.insert(&[1, 2, 3], &cache_with_len(3));
+        assert!(off.is_empty());
+    }
+
+    #[test]
+    fn a_cache_that_does_not_hold_its_tokens_is_skipped() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3], &cache_with_len(8));
+        assert!(pc.is_empty());
+    }
+
+    #[test]
+    fn a_restored_fork_diverges_without_changing_the_stored_prefix() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2], &cache_with_len(2));
+        let mut hit = pc
+            .find_longest_prefix(&[1, 2, 3], &config())
+            .unwrap()
+            .expect("hit");
+        let k = Array::zeros_f32(&[1, 4, 1, 64]);
+        hit.restored_cache.update_and_fetch(0, &k, &k).unwrap();
+        hit.restored_cache.update_and_fetch(1, &k, &k).unwrap();
+        assert_eq!(hit.restored_cache.seq_len(), 3);
+
+        let again = pc
+            .find_longest_prefix(&[1, 2, 4], &config())
+            .unwrap()
+            .expect("the stored prefix is intact");
+        assert_eq!(again.prefix_len, 2);
+        assert_eq!(again.restored_cache.seq_len(), 2);
+    }
+
+    #[test]
+    fn a_mismatched_config_is_an_error() {
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3], &cache_with_len(3));
+        let other = KVCacheConfig::new(2, 256, 4, 64);
+        assert!(pc.find_longest_prefix(&[1, 2, 3, 4], &other).is_err());
+    }
+
+    #[test]
+    fn set_limits_evicts_down_to_them() {
+        let mut pc = PrefixCache::new(8, 0);
+        let cache = cache_with_len(1);
+        for i in 0..5u32 {
+            pc.insert(&[i], &cache);
+        }
+        pc.set_limits(2, 0);
+        assert_eq!(pc.len(), 2);
+    }
+
+    #[test]
+    fn turboquant_caches_are_forked_whole() {
+        // The compressed history is part of the entry: a hit restores it
+        // as it was, not a dense copy.
+        use crate::kv_cache::{CacheMode, TurboQuantConfig};
+        let cfg = KVCacheConfig::new(2, 128, 4, 64).with_mode(CacheMode::TurboQuant {
+            // No recent window: the history is quantized as it arrives.
+            config: TurboQuantConfig::uniform(4, 3).with_recent_window(None),
+        });
+        let mut cache = KVCache::new(cfg.clone());
+        let k = Array::zeros_f32(&[1, 4, 8, 64]);
+        cache.update_and_fetch(0, &k, &k).unwrap();
+        cache.update_and_fetch(1, &k, &k).unwrap();
+        assert!(cache.turboquant_compression_active());
+
+        let mut pc = PrefixCache::new(8, 0);
+        pc.insert(&[1, 2, 3, 4, 5, 6, 7, 8], &cache);
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &cfg)
+            .unwrap()
+            .expect("hit");
+        assert_eq!(hit.prefix_len, 8);
+        assert!(hit.restored_cache.turboquant_compression_active());
+        // A shorter shared prefix cuts the compressed history.
+        let hit = pc
+            .find_longest_prefix(&[1, 2, 3, 4, 5, 0, 0], &cfg)
+            .unwrap()
+            .expect("hit");
+        assert_eq!(hit.prefix_len, 5);
+        assert_eq!(hit.restored_cache.total_tokens(), 5);
     }
 }

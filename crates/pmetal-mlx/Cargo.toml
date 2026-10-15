@@ -15,7 +15,6 @@ pmetal-metal = { workspace = true }
 pmetal-runtime = { workspace = true }
 tracing = { workspace = true }
 half = { workspace = true }
-rand = { workspace = true }
 
 [dev-dependencies]
 # Fail every test at the runtime op that throws (pmetal-runtime `strict-errors`).

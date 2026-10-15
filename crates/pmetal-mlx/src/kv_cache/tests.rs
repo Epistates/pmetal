@@ -1,7 +1,6 @@
 //! Tests for all KV cache types.
 
 use super::*;
-use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use crate::test_utils::{max_abs_diff, to_f32_vec_eval};
 use pmetal_runtime::compat::{Array, Dtype, ops};
 
@@ -19,14 +18,6 @@ fn patterned_tensor(batch: usize, heads: usize, seq: usize, dim: usize, phase: f
         })
         .collect();
     Array::from_f32_slice(&data, &[batch as i32, heads as i32, seq as i32, dim as i32])
-}
-
-fn manual_attention_output(queries: &Array, keys: &Array, values: &Array, scale: f32) -> Array {
-    let scores = queries
-        .matmul(&keys.transpose_axes(&[0, 1, 3, 2]))
-        .multiply(&Array::from_f32(scale));
-    let weights = ops::softmax_axis(&scores, -1);
-    weights.matmul(values)
 }
 
 #[test]
@@ -101,6 +92,63 @@ fn test_sanitize_cache_mode_adjusts_group_size_for_asymmetric_dims() {
 }
 
 #[test]
+fn test_sanitize_cache_mode_only_picks_group_sizes_mlx_can_quantize() {
+    // MLX's affine quantizer packs groups of 32, 64 or 128 and nothing else.
+    let mode = |bits, group_size| CacheMode::Quantized { bits, group_size };
+    for (dim, preferred, expected) in [
+        (128, 64, mode(4, 64)),
+        (128, 128, mode(4, 128)),
+        (96, 64, mode(4, 32)),
+        (64, 128, mode(4, 64)),
+        // Head dimensions no supported group divides cannot be quantized
+        // this way: the cache stays dense rather than throwing on the
+        // first token.
+        (80, 64, CacheMode::Standard),
+        (8, 64, CacheMode::Standard),
+        (72, 32, CacheMode::Standard),
+    ] {
+        let config = KVCacheConfig::new(1, 32, 2, dim);
+        assert_eq!(
+            sanitize_cache_mode_for_config(&config, mode(4, preferred)),
+            expected,
+            "head dim {dim}, preferred group {preferred}"
+        );
+    }
+    // The asymmetric mode follows the same rule, and so does a key/value
+    // pair whose dimensions share no group.
+    let config = KVCacheConfig::new(1, 32, 2, 96).with_value_head_dim(64);
+    assert_eq!(
+        sanitize_cache_mode_for_config(
+            &config,
+            CacheMode::AsymmetricQuantized {
+                key_bits: 8,
+                value_bits: 4,
+                group_size: 64
+            }
+        ),
+        CacheMode::AsymmetricQuantized {
+            key_bits: 8,
+            value_bits: 4,
+            group_size: 32
+        }
+    );
+    let config = KVCacheConfig::new(1, 32, 2, 96).with_value_head_dim(80);
+    assert_eq!(
+        sanitize_cache_mode_for_config(&config, mode(8, 64)),
+        CacheMode::Standard
+    );
+}
+
+#[test]
+fn test_quantized_cache_refuses_a_group_size_mlx_cannot_pack() {
+    // A cache built directly with a bad group is an error on the first
+    // update, not a throw inside the quantizer.
+    let mut cache = KVCache::new(KVCacheConfig::new(1, 32, 2, 16).with_quantized(4, 16));
+    let k = ops::ones(&[1, 2, 3, 16], Dtype::Float32);
+    assert!(cache.update_and_fetch(0, &k, &k).is_err());
+}
+
+#[test]
 fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
     let config = KVCacheConfig::new(1, 32, 2, 8).with_value_head_dim(4);
     let safe = sanitize_cache_mode_for_config(
@@ -109,11 +157,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
             config: TurboQuantConfig {
                 keys: TurboQuantTensorConfig::mixed(2, 4, 99),
                 values: TurboQuantTensorConfig::mixed(3, 5, 99),
-                recent_window: Some(DEFAULT_RECENT_WINDOW),
-                qjl: Default::default(),
-                skiplist_threshold: None,
-                outliers: Default::default(),
-                pack_mode: Default::default(),
+                ..TurboQuantConfig::uniform(2, 3)
             },
         },
     );
@@ -124,11 +168,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
             config: TurboQuantConfig {
                 keys: TurboQuantTensorConfig::mixed(2, 4, 7),
                 values: TurboQuantTensorConfig::mixed(3, 5, 3),
-                recent_window: Some(DEFAULT_RECENT_WINDOW),
-                qjl: Default::default(),
-                skiplist_threshold: None,
-                outliers: Default::default(),
-                pack_mode: Default::default(),
+                ..TurboQuantConfig::uniform(2, 3)
             }
         }
     );
@@ -170,16 +210,21 @@ fn test_kv_cache_sliding_window() {
 
     assert_eq!(cache.seq_len(), 15);
 
-    // Add 10 more - should trigger sliding window
+    // Add 10 more. The first of them still sees the 19 tokens before it, so
+    // all 25 keys come back even though the window is 20.
     let k2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
     let v2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
     let (cached_k, _) = cache.update_and_fetch(0, &k2, &v2).unwrap();
-
-    // Should be trimmed to window size of 20, seq is axis 2
-    assert_eq!(cached_k.dim(2), 20);
+    assert_eq!(cached_k.dim(2), 25);
     assert_eq!(cache.seq_len(), 20);
     // But total tokens should reflect actual count
     assert_eq!(cache.total_tokens(), 25);
+
+    // A single token attends to exactly the window.
+    let k3 = ops::ones(&[1, 4, 1, 64], Dtype::Float32);
+    let (cached_k, _) = cache.update_and_fetch(0, &k3, &k3).unwrap();
+    assert_eq!(cached_k.dim(2), 20);
+    assert_eq!(cache.total_tokens(), 26);
 }
 
 #[test]
@@ -374,16 +419,29 @@ fn test_kv_cache_rotating_window_preserves_keep_tokens() {
     let first = seq_tensor(0.0, 4);
     let second = seq_tensor(4.0, 4);
     let _ = cache.update_and_fetch(0, &first, &first).unwrap();
-    let (cached_k, cached_v) = cache.update_and_fetch(0, &second, &second).unwrap();
+    let (cached_k, _) = cache.update_and_fetch(0, &second, &second).unwrap();
 
     assert_eq!(cache.seq_len(), 6);
     assert_eq!(cache.total_tokens(), 8);
     assert_eq!(cache.rope_offset_for(0), 8);
+    // The chunk's first query still needs the three tokens before it.
+    assert_eq!(
+        to_f32_vec_eval(&cached_k),
+        vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    );
 
-    let k_vec = to_f32_vec_eval(&cached_k);
-    let v_vec = to_f32_vec_eval(&cached_v);
-    assert_eq!(k_vec, vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0]);
-    assert_eq!(v_vec, vec![0.0, 1.0, 4.0, 5.0, 6.0, 7.0]);
+    // One more token attends to the two sinks and the newest four.
+    let third = seq_tensor(8.0, 1);
+    let (cached_k, cached_v) = cache.update_and_fetch(0, &third, &third).unwrap();
+    assert_eq!(
+        to_f32_vec_eval(&cached_k),
+        vec![0.0, 1.0, 5.0, 6.0, 7.0, 8.0]
+    );
+    assert_eq!(
+        to_f32_vec_eval(&cached_v),
+        vec![0.0, 1.0, 5.0, 6.0, 7.0, 8.0]
+    );
+    assert_eq!(cache.rope_offset_for(0), 9);
 }
 
 #[test]
@@ -463,308 +521,6 @@ fn test_batch_kv_cache_reset_indices() {
     assert!(!batch_cache.caches[3].is_empty());
 }
 
-#[test]
-fn test_convenience_functions() {
-    let cache = create_kv_cache(32, 2048, 8, 128);
-    assert_eq!(cache.config().num_layers, 32);
-    assert_eq!(cache.config().mode, CacheMode::Standard);
-
-    let sliding_cache = create_sliding_window_cache(32, 512, 8, 128);
-    assert_eq!(
-        sliding_cache.config().mode,
-        CacheMode::SlidingWindow { window_size: 512 }
-    );
-}
-
-// =========================================================================
-// RotatingKVCache Tests
-// =========================================================================
-
-#[test]
-fn test_rotating_cache_basic() {
-    let mut cache = RotatingKVCache::new(100, 0);
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-    assert_eq!(cache.offset(), 0);
-
-    // First update - [B, heads, seq, head_dim] format
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert_eq!(cached_k.dim(2), 10);
-    assert_eq!(cached_v.dim(2), 10);
-    assert_eq!(cache.len(), 10);
-    assert_eq!(cache.offset(), 10);
-    assert!(!cache.is_empty());
-}
-
-#[test]
-fn test_rotating_cache_accumulation() {
-    let mut cache = RotatingKVCache::new(100, 0);
-
-    // First update: 10 tokens
-    let k1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&k1, &v1).unwrap();
-
-    assert_eq!(cache.len(), 10);
-
-    // Second update: 5 more tokens
-    let k2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let (cached_k, cached_v) = cache.update_and_fetch(&k2, &v2).unwrap();
-
-    assert_eq!(cached_k.dim(2), 15);
-    assert_eq!(cached_v.dim(2), 15);
-    assert_eq!(cache.len(), 15);
-}
-
-#[test]
-fn test_rotating_cache_rotation() {
-    let mut cache = RotatingKVCache::new(20, 0);
-
-    // Fill beyond max_size
-    let k1 = ops::ones(&[1, 4, 15, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 15, 64], Dtype::Float32);
-    cache.update_and_fetch(&k1, &v1).unwrap();
-
-    let k2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let (_cached_k, _) = cache.update_and_fetch(&k2, &v2).unwrap();
-
-    // The cache allows max_size + S - 1 to ensure every token gets at least max_size context
-    // So cache can grow to max_size + num_steps - 1 before trimming
-    // In this case: 20 + 10 - 1 = 29, then trimmed to ~20 region
-    // The key behavior is len() is capped at max_size, offset tracks total
-    assert!(cache.len() <= 25); // len() caps at max_size or slightly above during concat
-    assert_eq!(cache.offset(), 25); // Total tokens seen
-}
-
-#[test]
-fn test_rotating_cache_with_keep() {
-    let mut cache = RotatingKVCache::new(20, 4); // Keep first 4 tokens
-
-    // Fill cache
-    let k1 = ops::ones(&[1, 4, 15, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 15, 64], Dtype::Float32);
-    cache.update_and_fetch(&k1, &v1).unwrap();
-
-    assert_eq!(cache.len(), 15);
-
-    // Add more tokens
-    let k2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&k2, &v2).unwrap();
-
-    // Cache should have rotated but kept initial tokens
-    assert!(cache.len() <= 20);
-}
-
-#[test]
-fn test_rotating_cache_reset() {
-    let mut cache = RotatingKVCache::new(100, 0);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert!(!cache.is_empty());
-
-    cache.reset();
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-    assert_eq!(cache.offset(), 0);
-}
-
-#[test]
-fn test_rotating_cache_single_token_updates() {
-    let mut cache = RotatingKVCache::new(50, 0);
-
-    // Simulate autoregressive generation
-    for i in 0..30 {
-        let k = ops::ones(&[1, 4, 1, 64], Dtype::Float32);
-        let v = ops::ones(&[1, 4, 1, 64], Dtype::Float32);
-        let (cached_k, _) = cache.update_and_fetch(&k, &v).unwrap();
-
-        assert_eq!(cached_k.dim(2) as usize, (i + 1).min(50));
-    }
-
-    assert_eq!(cache.offset(), 30);
-    assert_eq!(cache.len(), 30);
-}
-
-#[test]
-fn test_rotating_cache_trimmable() {
-    let mut cache = RotatingKVCache::new(20, 0);
-
-    assert!(cache.is_trimmable()); // Empty cache is trimmable
-
-    let k = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&k, &v).unwrap();
-
-    assert!(cache.is_trimmable()); // Under max_size
-
-    // Fill to max
-    let k2 = ops::ones(&[1, 4, 15, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 15, 64], Dtype::Float32);
-    cache.update_and_fetch(&k2, &v2).unwrap();
-
-    assert!(!cache.is_trimmable()); // At or over max_size
-}
-
-#[test]
-fn test_rotating_cache_rope_offset() {
-    let mut cache = RotatingKVCache::new(100, 0);
-
-    assert_eq!(cache.rope_offset(), 0);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    // RoPE offset should be total tokens seen, not cache length
-    assert_eq!(cache.rope_offset(), 10);
-}
-
-// =========================================================================
-// QuantizedKVCache Tests
-// =========================================================================
-
-#[test]
-fn test_quantized_cache_basic() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-
-    // First update
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-
-    // Dequantized output should have correct shape
-    assert_eq!(cached_k.dim(2), 10);
-    assert_eq!(cached_v.dim(2), 10);
-    assert_eq!(cache.len(), 10);
-    assert!(!cache.is_empty());
-}
-
-#[test]
-fn test_quantized_cache_accumulation() {
-    let mut cache = QuantizedKVCache::new(4, 64);
-
-    // First update
-    let k1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&k1, &v1).unwrap();
-
-    // Second update
-    let k2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let (cached_k, cached_v) = cache.update_and_fetch(&k2, &v2).unwrap();
-
-    assert_eq!(cached_k.dim(2), 15);
-    assert_eq!(cached_v.dim(2), 15);
-    assert_eq!(cache.len(), 15);
-}
-
-#[test]
-fn test_quantized_cache_reset() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert!(!cache.is_empty());
-
-    cache.reset();
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-}
-
-#[test]
-fn test_quantized_cache_different_bits() {
-    // Test 8-bit
-    let cache_8bit = QuantizedKVCache::new(8, 64);
-    assert_eq!(cache_8bit.bits, 8);
-
-    // Test 4-bit
-    let cache_4bit = QuantizedKVCache::new(4, 64);
-    assert_eq!(cache_4bit.bits, 4);
-
-    // Test 2-bit
-    let cache_2bit = QuantizedKVCache::new(2, 64);
-    assert_eq!(cache_2bit.bits, 2);
-}
-
-#[test]
-#[should_panic(expected = "bits must be 2, 4, or 8")]
-fn test_quantized_cache_invalid_bits() {
-    let _ = QuantizedKVCache::new(3, 64); // Invalid
-}
-
-#[test]
-fn test_quantized_cache_memory_usage() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    assert_eq!(cache.memory_usage(), 0); // Empty
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    // Should have some memory usage now
-    assert!(cache.memory_usage() > 0);
-}
-
-#[test]
-fn test_quantized_cache_rope_offset() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    assert_eq!(cache.rope_offset(), 0);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert_eq!(cache.rope_offset(), 10);
-}
-
-// =========================================================================
-// Convenience Function Tests for New Cache Types
-// =========================================================================
-
-#[test]
-fn test_create_rotating_cache() {
-    let cache = create_rotating_cache(1024, 4);
-    assert_eq!(cache.max_size, 1024);
-    assert_eq!(cache.keep, 4);
-    assert!(cache.is_empty());
-}
-
-#[test]
-fn test_create_quantized_cache() {
-    let cache = create_quantized_cache(4, 32);
-    assert_eq!(cache.bits, 4);
-    assert_eq!(cache.group_size, 32);
-    assert!(cache.is_empty());
-}
-
-#[test]
-fn test_create_turboquant_cache() {
-    let cache = create_turboquant_cache(4, 3);
-    assert_eq!(cache.len(), 0);
-    assert!(cache.is_empty());
-}
-
 // =========================================================================
 // CacheMode Tests for New Modes
 // =========================================================================
@@ -820,281 +576,13 @@ fn test_cache_mode_turboquant_mixed() {
 }
 
 // =========================================================================
-// TurboQuantKvCache Tests
+// Memory footprint
 // =========================================================================
-
-#[test]
-fn test_turboquant_cache_basic() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert_eq!(cached_k.dim(2), 10);
-    assert_eq!(cached_v.dim(2), 10);
-    assert_eq!(cache.len(), 10);
-    assert!(!cache.is_empty());
-}
-
-#[test]
-fn test_turboquant_cache_accumulation() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let k1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&k1, &v1).unwrap();
-
-    let k2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let (cached_k, cached_v) = cache.update_and_fetch(&k2, &v2).unwrap();
-
-    assert_eq!(cached_k.dim(2), 15);
-    assert_eq!(cached_v.dim(2), 15);
-    assert_eq!(cache.len(), 15);
-}
-
-#[test]
-fn test_turboquant_cache_reset() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    cache.reset();
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-}
-
-#[test]
-fn test_turboquant_cache_rollback() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let keys = ops::ones(&[1, 2, 10, 32], Dtype::Float32);
-    let values = ops::ones(&[1, 2, 10, 32], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    cache.rollback(4);
-
-    assert_eq!(cache.len(), 6);
-    assert_eq!(cache.rope_offset(), 6);
-}
-
-#[test]
-fn test_turboquant_cache_memory_usage() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-    assert_eq!(cache.memory_usage(), 0);
-
-    let keys = ops::ones(&[1, 2, 8, 32], Dtype::Float32);
-    let values = ops::ones(&[1, 2, 8, 32], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert!(cache.memory_usage() > 0);
-}
-
-#[test]
-fn test_turboquant_cache_nonzero_inputs_stay_finite() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let data: Vec<f32> = (0..(2 * 16))
-        .map(|idx| ((idx as f32) * 0.1).sin())
-        .collect();
-    let keys = Array::from_f32_slice(&data, &[1, 1, 2, 16]);
-    let values = Array::from_f32_slice(&data, &[1, 1, 2, 16]);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-    let ck = cached_k.clone();
-    let cv = cached_v.clone();
-    ck.eval();
-    cv.eval();
-
-    assert!(to_f32_vec_eval(&cached_k).iter().all(|v| v.is_finite()));
-    assert!(to_f32_vec_eval(&cached_v).iter().all(|v| v.is_finite()));
-}
-
-#[test]
-fn test_turboquant_mixed_cache_nonzero_inputs_stay_finite() {
-    let mut cache = TurboQuantKvCache::new_with_config(TurboQuantConfig::preset_q2_5(16));
-
-    let data: Vec<f32> = (0..(4 * 16))
-        .map(|idx| ((idx as f32) * 0.07).cos())
-        .collect();
-    let keys = Array::from_f32_slice(&data, &[1, 1, 4, 16]);
-    let values = Array::from_f32_slice(&data, &[1, 1, 4, 16]);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-    let ck = cached_k.clone();
-    let cv = cached_v.clone();
-    ck.eval();
-    cv.eval();
-
-    assert_eq!(cache.len(), 4);
-    assert!(to_f32_vec_eval(&cached_k).iter().all(|v| v.is_finite()));
-    assert!(to_f32_vec_eval(&cached_v).iter().all(|v| v.is_finite()));
-}
-
-#[test]
-fn test_turboquant_direct_attention_matches_reference_uniform() {
-    let config = KVCacheConfig::new(1, 32, 2, 16).with_turboquant(4, 3);
-    let mut fast_cache = KVCache::new(config.clone());
-    let mut ref_cache = KVCache::new(config);
-
-    let prefill_k = patterned_tensor(1, 2, 3, 16, 0.2);
-    let prefill_v = patterned_tensor(1, 2, 3, 16, 0.7);
-    fast_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-    ref_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-
-    let queries = patterned_tensor(1, 4, 1, 16, 1.1);
-    let new_k = patterned_tensor(1, 2, 1, 16, 1.7);
-    let new_v = patterned_tensor(1, 2, 1, 16, 2.3);
-
-    let attn_config = FusedAttentionConfig::new(4, 2, 16)
-        .with_scale((16.0f32).sqrt().recip())
-        .with_mask_type(AttentionMaskType::Causal);
-
-    let fast_output = fast_cache
-        .try_turboquant_attention(0, &queries, &new_k, &new_v, &attn_config)
-        .unwrap()
-        .expect("TurboQuant direct attention should activate");
-    let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
-    let ref_output = fused_sdpa(&queries, &ref_keys, &ref_values, &attn_config, None).unwrap();
-
-    let fo = fast_output.clone();
-    let ro = ref_output.clone();
-    fo.eval();
-    ro.eval();
-
-    let diff = max_abs_diff(&fast_output, &ref_output);
-    assert_eq!(fast_cache.seq_len(), 4);
-    assert_eq!(fast_cache.total_tokens(), 4);
-    assert_eq!(fast_output.shape(), ref_output.shape());
-    assert!(diff < 1e-4, "uniform max_abs_diff={diff}");
-}
-
-#[test]
-fn test_turboquant_direct_attention_matches_reference_mixed_sliding_window() {
-    let config =
-        KVCacheConfig::new(1, 32, 2, 16).with_turboquant_config(TurboQuantConfig::preset_q2_5(16));
-    let mut fast_cache = KVCache::new(config.clone());
-    let mut ref_cache = KVCache::new(config);
-
-    let prefill_k = patterned_tensor(1, 2, 5, 16, 0.4);
-    let prefill_v = patterned_tensor(1, 2, 5, 16, 0.9);
-    fast_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-    ref_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-
-    let queries = patterned_tensor(1, 4, 1, 16, 1.5);
-    let new_k = patterned_tensor(1, 2, 1, 16, 2.1);
-    let new_v = patterned_tensor(1, 2, 1, 16, 2.7);
-
-    let attn_config = FusedAttentionConfig::new(4, 2, 16)
-        .with_scale((16.0f32).sqrt().recip())
-        .with_mask_type(AttentionMaskType::SlidingWindow(3));
-
-    let fast_output = fast_cache
-        .try_turboquant_attention(0, &queries, &new_k, &new_v, &attn_config)
-        .unwrap()
-        .expect("TurboQuant direct attention should activate");
-    let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
-    let ref_output = fused_sdpa(&queries, &ref_keys, &ref_values, &attn_config, None).unwrap();
-
-    let fo = fast_output.clone();
-    let ro = ref_output.clone();
-    fo.eval();
-    ro.eval();
-
-    let diff = max_abs_diff(&fast_output, &ref_output);
-    assert_eq!(fast_cache.seq_len(), 6);
-    assert_eq!(fast_cache.total_tokens(), 6);
-    assert_eq!(fast_output.shape(), ref_output.shape());
-    assert!(diff < 1e-4, "mixed max_abs_diff={diff}");
-}
-
-#[test]
-fn test_turboquant_direct_attention_matches_reference_asymmetric_value_dim() {
-    let config = KVCacheConfig::new(1, 32, 2, 16)
-        .with_value_head_dim(8)
-        .with_turboquant(4, 3);
-    let mut fast_cache = KVCache::new(config.clone());
-    let mut ref_cache = KVCache::new(config);
-
-    let prefill_k = patterned_tensor(1, 2, 3, 16, 0.3);
-    let prefill_v = patterned_tensor(1, 2, 3, 8, 0.8);
-    fast_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-    ref_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-
-    let queries = patterned_tensor(1, 2, 1, 16, 1.4);
-    let new_k = patterned_tensor(1, 2, 1, 16, 2.0);
-    let new_v = patterned_tensor(1, 2, 1, 8, 2.6);
-
-    let attn_config = FusedAttentionConfig::new(2, 2, 16)
-        .with_scale((16.0f32).sqrt().recip())
-        .with_mask_type(AttentionMaskType::Causal);
-
-    let fast_output = fast_cache
-        .try_turboquant_attention(0, &queries, &new_k, &new_v, &attn_config)
-        .unwrap()
-        .expect("TurboQuant direct attention should activate");
-    let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
-    let ref_output =
-        manual_attention_output(&queries, &ref_keys, &ref_values, (16.0f32).sqrt().recip());
-
-    let fo = fast_output.clone();
-    let ro = ref_output.clone();
-    fo.eval();
-    ro.eval();
-
-    let diff = max_abs_diff(&fast_output, &ref_output);
-    assert_eq!(fast_output.shape(), &[1, 2, 1, 8]);
-    assert_eq!(fast_output.shape(), ref_output.shape());
-    assert!(diff < 1e-4, "asymmetric max_abs_diff={diff}");
-}
-
-// =========================================================================
-// Eager Pre-Allocation Tests
-// =========================================================================
-
-#[test]
-fn test_kv_cache_eager_config() {
-    let config = KVCacheConfig::new(32, 4096, 8, 128)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float16);
-
-    assert!(config.eager_allocate);
-    assert_eq!(config.eager_batch_size, 1);
-    assert_eq!(config.max_seq_len, 4096);
-    assert_eq!(config.dtype, Dtype::Float16);
-}
-
-#[test]
-fn test_kv_cache_eager_config_batch_size() {
-    let config = KVCacheConfig::new(32, 2048, 8, 128).with_eager_allocate(4);
-
-    assert!(config.eager_allocate);
-    assert_eq!(config.eager_batch_size, 4);
-}
 
 #[test]
 fn test_kv_cache_memory_footprint() {
     // 32 layers × 2 (K+V) × 1 batch × 8 heads × 2048 seq × 128 dim × 2 bytes (fp16)
-    let config = KVCacheConfig::new(32, 2048, 8, 128)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float16);
+    let config = KVCacheConfig::new(32, 2048, 8, 128).with_dtype(Dtype::Float16);
 
     let expected = 32 * 2 * 8 * 2048 * 128 * 2; // layers * K+V * heads * seq * dim * sizeof(f16)
     assert_eq!(config.memory_footprint(), expected);
@@ -1103,30 +591,15 @@ fn test_kv_cache_memory_footprint() {
 #[test]
 fn test_kv_cache_memory_footprint_fp32() {
     // 16 layers × 2 (K+V) × 1 batch × 4 heads × 1024 seq × 64 dim × 4 bytes (fp32)
-    let config = KVCacheConfig::new(16, 1024, 4, 64)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(16, 1024, 4, 64).with_dtype(Dtype::Float32);
 
     let expected = 16 * 2 * 4 * 1024 * 64 * 4; // layers * K+V * heads * seq * dim * sizeof(f32)
     assert_eq!(config.memory_footprint(), expected);
 }
 
 #[test]
-fn test_kv_cache_memory_footprint_batch() {
-    // Test with batch_size > 1
-    let config = KVCacheConfig::new(8, 512, 4, 64)
-        .with_eager_allocate(4)
-        .with_dtype(Dtype::Float16);
-
-    let expected = 8 * 2 * 4 * 4 * 512 * 64 * 2;
-    assert_eq!(config.memory_footprint(), expected);
-}
-
-#[test]
 fn test_kv_cache_memory_footprint_human_bytes() {
-    let config = KVCacheConfig::new(1, 1, 1, 1)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(1, 1, 1, 1).with_dtype(Dtype::Float32);
 
     // 1 × 2 × 1 × 1 × 1 × 1 × 4 = 8 bytes
     assert_eq!(config.memory_footprint_human(), "8 bytes");
@@ -1134,9 +607,7 @@ fn test_kv_cache_memory_footprint_human_bytes() {
 
 #[test]
 fn test_kv_cache_memory_footprint_human_kb() {
-    let config = KVCacheConfig::new(1, 128, 1, 1)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(1, 128, 1, 1).with_dtype(Dtype::Float32);
 
     // 1 × 2 × 1 × 1 × 128 × 1 × 4 = 1024 bytes = 1 KB
     assert_eq!(config.memory_footprint_human(), "1.00 KB");
@@ -1144,9 +615,7 @@ fn test_kv_cache_memory_footprint_human_kb() {
 
 #[test]
 fn test_kv_cache_memory_footprint_human_mb() {
-    let config = KVCacheConfig::new(1, 2048, 8, 64)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float32);
+    let config = KVCacheConfig::new(1, 2048, 8, 64).with_dtype(Dtype::Float32);
 
     // 1 × 2 × 1 × 8 × 2048 × 64 × 4 = 8,388,608 bytes = 8 MB
     let human = config.memory_footprint_human();
@@ -1157,122 +626,10 @@ fn test_kv_cache_memory_footprint_human_mb() {
 fn test_kv_cache_memory_footprint_human_gb() {
     // Need to exceed 1 GB (1,073,741,824 bytes)
     // 32 layers × 2 × 1 batch × 8 heads × 8192 seq × 128 dim × 2 bytes = 1 GB
-    let config = KVCacheConfig::new(32, 8192, 8, 128)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float16);
+    let config = KVCacheConfig::new(32, 8192, 8, 128).with_dtype(Dtype::Float16);
 
     let human = config.memory_footprint_human();
     assert!(human.contains("GB"), "Expected GB, got: {}", human);
-}
-
-#[test]
-fn test_kv_cache_new_eager() {
-    let config = KVCacheConfig::new(2, 128, 4, 64)
-        .with_eager_allocate(1)
-        .with_dtype(Dtype::Float32);
-
-    let cache = KVCache::new_eager(config).expect("Should create eager cache");
-
-    assert!(cache.is_preallocated());
-    assert!(cache.is_empty()); // Pre-allocated but no data
-    assert_eq!(cache.seq_len(), 0);
-}
-
-#[test]
-fn test_kv_cache_new_eager_fallback() {
-    // When eager_allocate is false, new_eager should fall back to lazy
-    let config = KVCacheConfig::new(2, 128, 4, 64);
-
-    let cache = KVCache::new_eager(config).expect("Should create lazy cache");
-
-    assert!(!cache.is_preallocated());
-}
-
-#[test]
-fn test_kv_cache_eager_is_preallocated() {
-    // Eager cache should report as preallocated
-    let eager_config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
-    let eager_cache = KVCache::new_eager(eager_config).unwrap();
-    assert!(eager_cache.is_preallocated());
-
-    // Lazy cache should not report as preallocated
-    let lazy_config = KVCacheConfig::new(2, 64, 4, 32);
-    let lazy_cache = KVCache::new(lazy_config);
-    assert!(!lazy_cache.is_preallocated());
-}
-
-#[test]
-fn test_kv_cache_eager_is_empty() {
-    let config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
-    let mut cache = KVCache::new_eager(config).unwrap();
-
-    // Pre-allocated but empty (no data added)
-    assert!(cache.is_empty());
-
-    // Add some data
-    let keys = ops::zeros(&[1, 4, 10, 32], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 32], Dtype::Float32);
-    cache.update_and_fetch(0, &keys, &values).unwrap();
-
-    // Now not empty
-    assert!(!cache.is_empty());
-}
-
-#[test]
-fn test_kv_cache_eager_update() {
-    let config = KVCacheConfig::new(2, 128, 4, 64).with_eager_allocate(1);
-    let mut cache = KVCache::new_eager(config).unwrap();
-
-    // First update
-    let k1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let (cached_k, cached_v) = cache.update_and_fetch(0, &k1, &v1).unwrap();
-
-    assert_eq!(cached_k.dim(2), 10);
-    assert_eq!(cached_v.dim(2), 10);
-    assert_eq!(cache.seq_len(), 10);
-
-    // Second update (accumulation)
-    let k2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let (cached_k, cached_v) = cache.update_and_fetch(0, &k2, &v2).unwrap();
-
-    assert_eq!(cached_k.dim(2), 15);
-    assert_eq!(cached_v.dim(2), 15);
-    assert_eq!(cache.seq_len(), 15);
-}
-
-#[test]
-fn test_kv_cache_eager_reset_preserves_buffers() {
-    let config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
-    let mut cache = KVCache::new_eager(config).unwrap();
-
-    // Add some data
-    let keys = ops::zeros(&[1, 4, 10, 32], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 32], Dtype::Float32);
-    cache.update_and_fetch(0, &keys, &values).unwrap();
-    assert!(!cache.is_empty());
-
-    // Reset should preserve buffers in eager mode
-    cache.reset();
-
-    assert!(cache.is_empty()); // Offset reset
-    assert!(cache.is_preallocated()); // Buffers preserved
-    assert_eq!(cache.seq_len(), 0);
-}
-
-#[test]
-fn test_kv_cache_eager_reset_full_deallocates() {
-    let config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
-    let mut cache = KVCache::new_eager(config).unwrap();
-
-    assert!(cache.is_preallocated());
-
-    // reset_full should deallocate even in eager mode
-    cache.reset_full();
-
-    assert!(!cache.is_preallocated()); // Buffers deallocated
-    assert!(cache.is_empty());
 }
 
 #[test]

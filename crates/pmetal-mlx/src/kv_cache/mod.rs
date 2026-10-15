@@ -22,37 +22,61 @@
 //! This eliminates transpose overhead
 //! during cached generation. The sequence dimension is axis 2.
 //!
-//! ## Supported Modes
+//! ## Modes
 //!
-//! - **Standard KV cache**: Stores all past keys/values (best for short sequences)
-//! - **Sliding window cache**: Fixed-size window (constant memory, for long sequences)
+//! A [`KVCacheConfig`]'s [`CacheMode`] says how a layer stores its tokens:
+//!
+//! - **Standard**: every token, in the model's dtype, in a buffer written in
+//!   place and doubled as it fills.
+//! - **Sliding window / rotating**: the newest `window` tokens, and for a
+//!   rotating cache the first few as attention sinks. Memory is bounded by
+//!   the window; a call returns what its queries may attend to (see
+//!   [`KVCache::update_and_fetch`] and [`KVCache::window_mask`]).
+//! - **Quantized**: MLX affine groups of 32, 64 or 128 channels at 2 to 8
+//!   bits, attended on the packed rows (`quantized_matmul`) for a decode
+//!   step.
+//! - **TurboQuant**: the runtime's rotation-based quantizer, with the first
+//!   tokens and the newest ones kept exact; the 2.5- and 3.5-bit presets
+//!   are mixed-precision.
+//!
+//! A model asks a compressed cache to attend itself with
+//! [`KVCache::try_compressed_attention`] and falls back to
+//! [`KVCache::update_and_fetch`], which works for every mode.
+//!
+//! [`KVCache::rollback`] gives back the newest tokens (speculative decoding),
+//! [`KVCache::fork`] shares a cache's arrays with an independent copy (prefix
+//! reuse, see [`crate::prefix_cache`]).
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! let mut cache = KVCache::new(num_layers, max_len, num_kv_heads, head_dim);
+//! let mut cache = KVCache::new(KVCacheConfig::new(num_layers, max_len, num_kv_heads, head_dim));
 //! for step in 0..generation_length {
+//!     // Read the position before this layer's own update.
+//!     let offset = cache.rope_offset_for(layer_idx);
 //!     // Pass keys/values in [B, heads, seq, head_dim] format
-//!     let (keys, values) = cache.update_and_fetch(layer_idx, new_keys, new_values)?;
+//!     let (keys, values) = cache.update_and_fetch(layer_idx, &new_keys, &new_values)?;
 //!     // Use keys, values directly in attention (no transpose needed)
 //! }
 //! ```
 
+mod affine;
+mod dense;
 mod fused_batch;
 mod mamba;
-mod quantized;
-mod rotating;
+#[cfg(test)]
+mod reference_tests;
 mod standard;
 #[cfg(test)]
 mod tests;
-mod turboquant;
+mod turbo;
 
 pub use fused_batch::*;
 pub use mamba::*;
-pub use quantized::*;
-pub use rotating::*;
+pub use pmetal_runtime::turboquant::{
+    DEFAULT_RECENT_WINDOW, DEFAULT_SINK_TOKENS, TurboQuantConfig, TurboQuantTensorConfig,
+};
 pub use standard::*;
-pub use turboquant::*;
 
 use pmetal_runtime::compat::Dtype;
 
@@ -73,14 +97,6 @@ pub struct KVCacheConfig {
     pub dtype: Dtype,
     /// Cache mode.
     pub mode: CacheMode,
-    /// Whether to eagerly pre-allocate the full context window upfront.
-    /// When true, allocates memory for max_seq_len tokens at creation time.
-    /// This provides predictable memory usage but uses more memory initially.
-    /// Default: false (lazy allocation in 256-token chunks).
-    pub eager_allocate: bool,
-    /// Batch size for eager allocation (only used when eager_allocate=true).
-    /// Default: 1
-    pub eager_batch_size: usize,
 }
 
 /// KV cache mode.
@@ -89,15 +105,19 @@ pub enum CacheMode {
     /// Standard cache - stores all past tokens.
     #[default]
     Standard,
-    /// Sliding window cache with fixed size.
+    /// Sliding window cache: a query attends to the `window_size` newest
+    /// tokens, its own included. Memory is bounded by the window however
+    /// long the sequence runs.
     SlidingWindow {
-        /// Maximum number of past tokens to keep in cache.
+        /// Tokens a query attends to, its own included.
         window_size: usize,
     },
-    /// Rotating cache - circular buffer with fixed max size.
-    /// More memory-efficient than sliding window for long sequences.
+    /// Sliding window with attention sinks: a query attends to the first
+    /// `keep` tokens of the sequence and to the newest ones, `max_size` in
+    /// all. Keeping the first tokens keeps the softmax stable once the
+    /// window has moved past them (arXiv:2309.17453).
     Rotating {
-        /// Maximum number of tokens to keep.
+        /// Tokens a query attends to, the sinks and its own included.
         max_size: usize,
         /// Number of initial tokens to always keep (typically prompt tokens).
         keep: usize,
@@ -164,34 +184,31 @@ fn describe_turboquant_tensor(config: TurboQuantTensorConfig) -> String {
     }
 }
 
-/// Returns whether a quantized KV cache `group_size` cleanly divides both key
-/// and value head dimensions.
+/// Returns whether MLX can quantize K/V cache rows of these head dimensions
+/// in groups of `group_size`: a size its affine quantizer packs (32, 64 or
+/// 128) that divides both.
 pub fn group_size_supported_for_dims(
     key_head_dim: usize,
     value_head_dim: usize,
     group_size: usize,
 ) -> bool {
-    group_size > 0
+    affine::GROUP_SIZES.contains(&group_size)
         && (key_head_dim == 0 || key_head_dim % group_size == 0)
         && (value_head_dim == 0 || value_head_dim % group_size == 0)
 }
 
-/// Returns the best supported quantization group size for a K/V head-dimension
-/// pair, preferring larger group sizes first.
+/// The best supported quantization group size for a K/V head-dimension pair:
+/// `preferred` if it works, else the largest that does. `None` when no group
+/// MLX packs divides both dimensions (a head dimension of 80, say), in which
+/// case the cache cannot be affine-quantized.
 pub fn compatible_group_size_for_dims(
     key_head_dim: usize,
     value_head_dim: usize,
     preferred: usize,
-) -> usize {
-    if group_size_supported_for_dims(key_head_dim, value_head_dim, preferred) {
-        return preferred;
-    }
-    for candidate in [128, 64, 32, 16, 8, 4, 2, 1] {
-        if group_size_supported_for_dims(key_head_dim, value_head_dim, candidate) {
-            return candidate;
-        }
-    }
-    1
+) -> Option<usize> {
+    std::iter::once(preferred)
+        .chain(affine::GROUP_SIZES.into_iter().rev())
+        .find(|&g| group_size_supported_for_dims(key_head_dim, value_head_dim, g))
 }
 
 /// Sanitizes a TurboQuant tensor config for a specific head dimension.
@@ -233,11 +250,7 @@ pub fn sanitize_turboquant_config(
     TurboQuantConfig {
         keys: sanitize_turboquant_tensor_config(key_head_dim, config.keys),
         values: sanitize_turboquant_tensor_config(value_head_dim, config.values),
-        recent_window: config.recent_window,
-        qjl: config.qjl,
-        skiplist_threshold: config.skiplist_threshold,
-        outliers: config.outliers,
-        pack_mode: config.pack_mode,
+        ..config
     }
 }
 
@@ -250,32 +263,40 @@ pub fn sanitize_cache_mode_for_dims(
     value_head_dim: usize,
     mode: CacheMode,
 ) -> CacheMode {
+    let dense = |why: &str| {
+        tracing::warn!(
+            key_head_dim,
+            value_head_dim,
+            mode = %mode.describe(),
+            "KV cache: {why}; keeping the cache dense"
+        );
+        CacheMode::Standard
+    };
     match mode {
-        CacheMode::Quantized { bits, group_size }
-            if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) =>
-        {
-            CacheMode::Quantized {
-                bits,
-                group_size: compatible_group_size_for_dims(
-                    key_head_dim,
-                    value_head_dim,
-                    group_size,
-                ),
+        CacheMode::Quantized { bits, group_size } => {
+            if !affine::bits_supported(bits) {
+                return dense("MLX cannot pack that many bits");
+            }
+            match compatible_group_size_for_dims(key_head_dim, value_head_dim, group_size) {
+                Some(group_size) => CacheMode::Quantized { bits, group_size },
+                None => dense("no quantization group divides the head dimensions"),
             }
         }
         CacheMode::AsymmetricQuantized {
             key_bits,
             value_bits,
             group_size,
-        } if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) => {
-            CacheMode::AsymmetricQuantized {
-                key_bits,
-                value_bits,
-                group_size: compatible_group_size_for_dims(
-                    key_head_dim,
-                    value_head_dim,
+        } => {
+            if !affine::bits_supported(key_bits) || !affine::bits_supported(value_bits) {
+                return dense("MLX cannot pack that many bits");
+            }
+            match compatible_group_size_for_dims(key_head_dim, value_head_dim, group_size) {
+                Some(group_size) => CacheMode::AsymmetricQuantized {
+                    key_bits,
+                    value_bits,
                     group_size,
-                ),
+                },
+                None => dense("no quantization group divides the head dimensions"),
             }
         }
         CacheMode::TurboQuant { config } => CacheMode::TurboQuant {
@@ -306,8 +327,6 @@ impl KVCacheConfig {
             value_head_dim: head_dim,
             dtype: Dtype::Float32,
             mode: CacheMode::Standard,
-            eager_allocate: false,
-            eager_batch_size: 1,
         }
     }
 
@@ -427,85 +446,55 @@ impl KVCacheConfig {
         self
     }
 
-    /// Enable eager pre-allocation of the full context window.
-    ///
-    /// When enabled, the KV cache will allocate memory for the full `max_seq_len`
-    /// at creation time rather than growing dynamically. This provides:
-    /// - **Predictable memory usage**: Know exactly how much memory is needed upfront
-    /// - **No allocation during generation**: Faster token generation
-    /// - **Memory fragmentation prevention**: Single contiguous allocation
-    ///
-    /// Trade-off: Uses more memory initially even for short sequences.
-    ///
-    /// # Arguments
-    /// * `batch_size` - Batch size to pre-allocate for (typically 1 for inference)
-    ///
-    /// # Example
-    /// ```ignore
-    /// let config = KVCacheConfig::new(32, 4096, 8, 128)
-    ///     .with_eager_allocate(1);  // Pre-allocate for batch_size=1
-    /// let cache = KVCache::new(config);  // ~1GB allocated immediately
-    /// ```
-    pub fn with_eager_allocate(mut self, batch_size: usize) -> Self {
-        self.eager_allocate = true;
-        self.eager_batch_size = batch_size;
-        self
-    }
-
-    /// Calculate the memory footprint for this configuration in bytes.
+    /// Calculate the memory footprint for this configuration in bytes: the
+    /// cache full to `max_seq_len` tokens (a windowed mode, to its window),
+    /// batch size 1.
     ///
     /// Useful for understanding memory requirements before allocation.
     pub fn memory_footprint(&self) -> usize {
         let key_dim = self.head_dim;
         let value_dim = self.value_head_dim;
-        match self.mode {
+        let scalar = dtype_size(self.dtype);
+        // One affine-quantized row of `dim` channels: the packed words, plus
+        // a scale and a bias per group in the model's dtype.
+        let affine_row = |dim: usize, bits: u8, group_size: usize| {
+            4 * affine::packed_words(dim, bits) + 2 * scalar * dim.div_ceil(group_size)
+        };
+        let dense_row = (key_dim + value_dim) * scalar;
+        let per_head = match self.mode {
             CacheMode::Quantized { bits, group_size } => {
-                let el_per_int = 32 / bits as usize;
-                let k_packed = key_dim.div_ceil(el_per_int);
-                let v_packed = value_dim.div_ceil(el_per_int);
-                let k_groups = key_dim.div_ceil(group_size);
-                let v_groups = value_dim.div_ceil(group_size);
-                // packed u32 data + f16 scale + f16 bias per group
-                let k_per_token_bytes = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
-                let v_per_token_bytes = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
-                (k_per_token_bytes + v_per_token_bytes) * self.max_seq_len * self.num_layers
+                self.max_seq_len
+                    * (affine_row(key_dim, bits, group_size)
+                        + affine_row(value_dim, bits, group_size))
             }
             CacheMode::AsymmetricQuantized {
                 key_bits,
                 value_bits,
                 group_size,
             } => {
-                let k_el = 32 / key_bits as usize;
-                let v_el = 32 / value_bits as usize;
-                let k_packed = key_dim.div_ceil(k_el);
-                let v_packed = value_dim.div_ceil(v_el);
-                let k_groups = key_dim.div_ceil(group_size);
-                let v_groups = value_dim.div_ceil(group_size);
-                let k_per_token = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
-                let v_per_token = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
-                (k_per_token + v_per_token) * self.max_seq_len * self.num_layers
+                self.max_seq_len
+                    * (affine_row(key_dim, key_bits, group_size)
+                        + affine_row(value_dim, value_bits, group_size))
             }
             CacheMode::TurboQuant { config } => {
-                let rows_per_token = self.num_kv_heads;
-                let per_token_bytes = rows_per_token
-                    * (turboquant_key_row_bytes(config.keys, key_dim)
-                        + turboquant_value_row_bytes(config.values, value_dim));
-                per_token_bytes * self.max_seq_len * self.num_layers
+                // The sinks and the recent window stay dense; the rest of
+                // the sequence is packed (the ring also holds up to one
+                // eviction chunk more, which this does not count).
+                let dense_tokens =
+                    (config.sink_tokens + config.recent_window.unwrap_or(0)).min(self.max_seq_len);
+                let packed_row = turboquant_row_bytes(config.keys, key_dim)
+                    + turboquant_row_bytes(config.values, value_dim);
+                dense_tokens * dense_row + (self.max_seq_len - dense_tokens) * packed_row
             }
             _ => {
-                let bytes_per_element = match self.dtype {
-                    Dtype::Float32 => 4,
-                    Dtype::Float16 | Dtype::Bfloat16 => 2,
-                    _ => 4,
+                let tokens = match dense::Window::of(self.mode) {
+                    Some(window) => window.size().min(self.max_seq_len),
+                    None => self.max_seq_len,
                 };
-                self.eager_batch_size.max(1)
-                    * self.num_kv_heads
-                    * self.max_seq_len
-                    * (key_dim + value_dim)
-                    * bytes_per_element
-                    * self.num_layers
+                tokens * dense_row
             }
-        }
+        };
+        per_head * self.num_kv_heads * self.num_layers
     }
 
     /// Format the memory footprint as a human-readable string.
@@ -523,45 +512,19 @@ impl KVCacheConfig {
     }
 }
 
-fn turboquant_key_row_bytes(config: TurboQuantTensorConfig, head_dim: usize) -> usize {
+/// Bytes of one packed TurboQuant row of `dim` channels: the packed words and
+/// an f32 scale, for each of the two channel groups of a mixed tensor.
+fn turboquant_row_bytes(config: TurboQuantTensorConfig, dim: usize) -> usize {
+    let row = |dim: usize, bits: u8| 4 * pmetal_runtime::turboquant::words_per_row(dim, bits) + 4;
     match config {
-        TurboQuantTensorConfig::Uniform { bits } => {
-            let mse_bits = usize::from(bits.saturating_sub(1));
-            (head_dim * mse_bits).div_ceil(8)
-                + head_dim.div_ceil(8)
-                + (std::mem::size_of::<f32>() * 2)
-        }
+        TurboQuantTensorConfig::Uniform { bits } => row(dim, bits),
         TurboQuantTensorConfig::Mixed {
             regular_bits,
             outlier_bits,
             outlier_count,
         } => {
-            let regular_dim = head_dim - outlier_count;
-            (regular_dim * usize::from(regular_bits.saturating_sub(1))).div_ceil(8)
-                + regular_dim.div_ceil(8)
-                + (outlier_count * usize::from(outlier_bits.saturating_sub(1))).div_ceil(8)
-                + outlier_count.div_ceil(8)
-                + head_dim.div_ceil(8)
-                + (std::mem::size_of::<f32>() * 4)
-        }
-    }
-}
-
-fn turboquant_value_row_bytes(config: TurboQuantTensorConfig, head_dim: usize) -> usize {
-    match config {
-        TurboQuantTensorConfig::Uniform { bits } => {
-            (head_dim * usize::from(bits)).div_ceil(8) + std::mem::size_of::<f32>()
-        }
-        TurboQuantTensorConfig::Mixed {
-            regular_bits,
-            outlier_bits,
-            outlier_count,
-        } => {
-            let regular_dim = head_dim - outlier_count;
-            (regular_dim * usize::from(regular_bits)).div_ceil(8)
-                + (outlier_count * usize::from(outlier_bits)).div_ceil(8)
-                + head_dim.div_ceil(8)
-                + (std::mem::size_of::<f32>() * 2)
+            let outliers = outlier_count.min(dim);
+            row(outliers, outlier_bits) + row(dim - outliers, regular_bits)
         }
     }
 }
