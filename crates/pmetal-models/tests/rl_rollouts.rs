@@ -18,6 +18,9 @@ use serial_test::serial;
 const PROMPT: [u32; 5] = [7, 19, 3, 41, 12];
 
 fn tiny_model() -> Qwen3ForCausalLM {
+    // A fixed seed: some random draws give a model that repeats one token,
+    // which the greedy test rightly refuses as proving nothing.
+    pmetal_runtime::compat::random::seed(7);
     let config = Qwen3Config {
         hidden_size: 48,
         intermediate_size: 96,
