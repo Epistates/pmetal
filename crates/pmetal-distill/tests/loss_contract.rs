@@ -8,8 +8,9 @@
 //! * logits of any dtype are normalized in f32.
 
 use pmetal_distill::losses::{
-    DistillLoss, HingeRankingLoss, JensenShannonLoss, JsdSkewedLoss, KlDivergenceLoss,
-    LogisticRankingLoss, MiniLlmLoss, MseLoss, SoftCrossEntropyLoss, TvdLoss, UniversalLogitLoss,
+    DistillLoss, HiddenStateLoss, HingeRankingLoss, JensenShannonLoss, JsdSkewedLoss,
+    KlDivergenceLoss, LogisticRankingLoss, MiniLlmLoss, MseLoss, SoftCrossEntropyLoss, TvdLoss,
+    UniversalLogitLoss,
 };
 use pmetal_runtime::compat::nn::value_and_grad_explicit;
 use pmetal_runtime::compat::{Array, Dtype};
@@ -415,4 +416,210 @@ fn mse_distillation_is_independent_of_the_temperature() {
         (cold - hot).abs() <= 1e-5 * cold.abs(),
         "MSE at T=1 is {cold}, at T=4 is {hot}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hidden-state alignment
+// ---------------------------------------------------------------------------
+
+const HIDDEN: usize = 6;
+
+fn hidden(seed: f32, tokens: usize) -> Vec<f32> {
+    (0..tokens * HIDDEN)
+        .map(|i| 2.0 * ((i as f32) * 0.91 + seed).sin() + 0.1 * (i % 5) as f32)
+        .collect()
+}
+
+fn hidden_array(data: &[f32], dtype: Dtype) -> Array {
+    Array::from_f32_slice(data, &[1, (data.len() / HIDDEN) as i32, HIDDEN as i32])
+        .as_dtype(dtype.as_i32())
+}
+
+/// Cosine loss on a zero hidden vector (a padded position, or a layer
+/// that has not warmed up) must have a finite gradient. The norm was a bare
+/// `sqrt` of the squared sum, whose derivative at zero is infinite and whose
+/// product with the zero vector is NaN.
+#[test]
+#[serial]
+fn cosine_hidden_loss_has_a_finite_gradient_at_zero_vectors() {
+    let tokens = 3;
+    let teacher = hidden(0.2, tokens);
+    let mut student = hidden(1.4, tokens);
+    // The middle student token is all zeros, and so is the first teacher token.
+    student[HIDDEN..2 * HIDDEN].fill(0.0);
+    let mut teacher = teacher;
+    teacher[..HIDDEN].fill(0.0);
+
+    let loss = HiddenStateLoss::cosine();
+    let t = hidden_array(&teacher, Dtype::Float32);
+    let (value, mut grads) = value_and_grad_explicit(
+        |a: &[Array]| loss.compute(&t, &a[0]).unwrap(),
+        &[hidden_array(&student, Dtype::Float32)],
+        &[],
+    )
+    .unwrap();
+    value.eval();
+    grads[0].eval();
+    drain();
+    let grad = grads[0].to_f32_vec(student.len()).unwrap();
+    assert!(value.item::<f32>().is_finite());
+    assert!(
+        grad.iter().all(|g| g.is_finite()),
+        "gradient has non-finite entries: {grad:?}"
+    );
+}
+
+/// Padded positions must not move the loss: with a 0/1 token mask, the
+/// hidden-state losses average over the unmasked tokens only.
+#[test]
+#[serial]
+fn hidden_state_losses_respect_the_token_mask() {
+    let tokens = 4;
+    let teacher = hidden(0.2, tokens);
+    let student = hidden(1.4, tokens);
+    let mask = Array::from_f32_slice(&[1.0_f32, 1.0, 0.0, 0.0], &[1, 4]);
+
+    // The first two tokens only, as the reference.
+    let head = 2 * HIDDEN;
+    for (name, loss) in [
+        ("mse", HiddenStateLoss::mse()),
+        ("cosine", HiddenStateLoss::cosine()),
+        ("l1", HiddenStateLoss::l1()),
+    ] {
+        let reference = scalar(
+            &loss
+                .compute(
+                    &hidden_array(&teacher[..head], Dtype::Float32),
+                    &hidden_array(&student[..head], Dtype::Float32),
+                )
+                .unwrap(),
+        );
+        // Garbage in the padded positions.
+        let mut junk = student.clone();
+        junk[head..].fill(50.0);
+        let masked = scalar(
+            &loss
+                .compute_with_mask(
+                    &hidden_array(&teacher, Dtype::Float32),
+                    &hidden_array(&junk, Dtype::Float32),
+                    Some(&mask),
+                )
+                .unwrap(),
+        );
+        assert!(
+            (reference - masked).abs() <= 1e-5 * reference.abs().max(1e-3),
+            "{name}: first two tokens {reference}, masked {masked}"
+        );
+    }
+}
+
+/// Hidden states are reduced in f32: a bf16 tensor's mean is not rounded to
+/// bf16's three digits.
+#[test]
+#[serial]
+fn bf16_hidden_states_are_reduced_in_f32() {
+    let tokens = 64;
+    let (t, s) = (hidden(0.2, tokens), hidden(1.4, tokens));
+    let rounded = |x: &[f32]| -> Vec<f64> {
+        hidden_array(x, Dtype::Bfloat16)
+            .as_dtype(Dtype::Float32.as_i32())
+            .to_f32_vec(x.len())
+            .unwrap()
+            .into_iter()
+            .map(f64::from)
+            .collect()
+    };
+    let (t64, s64) = (rounded(&t), rounded(&s));
+    let mse: f64 = t64
+        .iter()
+        .zip(&s64)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>()
+        / t64.len() as f64;
+    let got = scalar(
+        &HiddenStateLoss::mse()
+            .compute(
+                &hidden_array(&t, Dtype::Bfloat16),
+                &hidden_array(&s, Dtype::Bfloat16),
+            )
+            .unwrap(),
+    ) as f64;
+    assert!(
+        (got - mse).abs() <= 1e-5 * mse,
+        "bf16 hidden MSE {got} vs float64 {mse}"
+    );
+}
+
+/// A layer pair beyond the layers the models returned is a configuration
+/// error, not a pair to skip quietly.
+#[test]
+#[serial]
+fn a_layer_pair_out_of_range_is_an_error() {
+    use pmetal_distill::losses::hidden_state::LayerDistillation;
+
+    let h = hidden_array(&hidden(0.2, 2), Dtype::Float32);
+    let distill = LayerDistillation::new(vec![(0, 0), (5, 1)], HiddenStateLoss::mse(), 1.0);
+    let err = distill
+        .compute(std::slice::from_ref(&h), &[h.clone(), h.clone()])
+        .expect_err("teacher layer 5 does not exist");
+    assert!(err.to_string().contains("out of range"), "{err}");
+}
+
+/// A hidden-state loss handed to the builder is the one that runs, whatever
+/// the config says; the config used to be consulted and the injected loss
+/// ignored.
+#[test]
+#[serial]
+fn the_injected_hidden_loss_is_the_one_used() {
+    use pmetal_distill::{
+        DistillConfig, DistillMethod, DistillerBuilder, HiddenStateConfig, HiddenStateLossType,
+        LossConfig,
+    };
+
+    let config = DistillConfig {
+        teacher: "t".to_string(),
+        student: "s".to_string(),
+        method: DistillMethod::Online,
+        loss: LossConfig {
+            hidden_state: Some(HiddenStateConfig {
+                layer_mapping: vec![(0, 0)],
+                loss_type: HiddenStateLossType::Mse,
+                weight: 1.0,
+                use_projection: false,
+            }),
+            ..LossConfig::default()
+        },
+        offline: None,
+        output_path: None,
+        training: Default::default(),
+    };
+    let distiller = DistillerBuilder::new()
+        .with_config(config)
+        .with_hidden_loss(HiddenStateLoss::l1())
+        .build()
+        .unwrap();
+
+    let (t, s) = (hidden(0.2, 2), hidden(1.4, 2));
+    let logits_t = array(&logits(0.3), Dtype::Float32);
+    let logits_s = array(&logits(1.9), Dtype::Float32);
+    let out = distiller
+        .compute_loss_with_hidden(
+            &logits_t,
+            &logits_s,
+            &[hidden_array(&t, Dtype::Float32)],
+            &[hidden_array(&s, Dtype::Float32)],
+            None,
+            None,
+            0,
+            1,
+        )
+        .unwrap();
+    let got = scalar(&out.hidden.expect("a hidden term")) as f64;
+    let l1: f64 = t
+        .iter()
+        .zip(&s)
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .sum::<f64>()
+        / t.len() as f64;
+    assert!((got - l1).abs() <= 1e-5 * l1, "hidden term {got}, L1 {l1}");
 }

@@ -11,7 +11,7 @@ use crate::{
     DistillConfig, DistillError, DistillMethod, LossType, Result,
     losses::{
         DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
-        SoftCrossEntropyLoss,
+        SoftCrossEntropyLoss, hidden_state::LayerDistillation,
     },
 };
 
@@ -124,10 +124,27 @@ impl DistillerBuilder {
             }
         });
 
+        // The hidden-state term: the config names the layer pairs and the
+        // weight; a loss handed to the builder replaces the config's loss type.
+        let layer_distill = match (&config.loss.hidden_state, self.hidden_loss) {
+            (Some(hidden), injected) => Some(LayerDistillation::new(
+                hidden.layer_mapping.clone(),
+                injected.unwrap_or_else(|| HiddenStateLoss::new(hidden.loss_type.clone())),
+                hidden.weight,
+            )),
+            (None, Some(_)) => {
+                return Err(DistillError::InvalidConfig(
+                    "a hidden-state loss needs `loss.hidden_state` to name the layer pairs to align"
+                        .to_string(),
+                ));
+            }
+            (None, None) => None,
+        };
+
         Ok(Distiller {
             config,
             loss,
-            hidden_loss: self.hidden_loss,
+            layer_distill,
         })
     }
 }
@@ -144,8 +161,8 @@ pub struct Distiller {
     config: DistillConfig,
     /// Primary loss function.
     loss: Box<dyn DistillLoss>,
-    /// Optional hidden state loss.
-    hidden_loss: Option<HiddenStateLoss>,
+    /// Hidden-state alignment across the configured layer pairs, if any.
+    layer_distill: Option<LayerDistillation>,
 }
 
 impl Distiller {
@@ -246,19 +263,13 @@ impl Distiller {
             total_steps,
         )?;
 
-        // Add hidden state loss if configured
-        if let Some(_hidden_loss) = &self.hidden_loss {
-            if let Some(hidden_config) = &self.config.loss.hidden_state {
-                let layer_distill = crate::losses::hidden_state::LayerDistillation::new(
-                    hidden_config.layer_mapping.clone(),
-                    HiddenStateLoss::new(hidden_config.loss_type.clone()),
-                    hidden_config.weight,
-                );
-
-                let hidden = layer_distill.compute(teacher_hiddens, student_hiddens)?;
-                output.total = output.total.add(&hidden);
-                output.hidden = Some(hidden);
-            }
+        // Add the hidden-state term when one is configured. The token weights
+        // that mask the logit loss mask the hidden states too.
+        if let Some(layer_distill) = &self.layer_distill {
+            let hidden =
+                layer_distill.compute_with_mask(teacher_hiddens, student_hiddens, weights)?;
+            output.total = output.total.add(&hidden);
+            output.hidden = Some(hidden);
         }
 
         Ok(output)
