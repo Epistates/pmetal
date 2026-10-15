@@ -53,10 +53,20 @@ pub struct GgufTokenizerData {
     pub unk_id: Option<u32>,
     /// Padding token id.
     pub pad_id: Option<u32>,
+    /// End-of-turn token id (`tokenizer.ggml.eot_token_id`): what a chat
+    /// model writes to close its reply when that differs from the EOS.
+    pub eot_id: Option<u32>,
+    /// End-of-message token id (`tokenizer.ggml.eom_token_id`): what a model
+    /// writes to hand a tool call back to its caller.
+    pub eom_id: Option<u32>,
     /// Whether the model prepends BOS by default.
     pub add_bos: Option<bool>,
     /// Whether the model appends EOS by default.
     pub add_eos: Option<bool>,
+    /// Whether SentencePiece text gets a leading `▁`
+    /// (`tokenizer.ggml.add_space_prefix`). Absent in older exports, which
+    /// prefix.
+    pub add_space_prefix: Option<bool>,
     /// Embedded chat template (`tokenizer.chat_template`), if any.
     pub chat_template: Option<String>,
 }
@@ -149,8 +159,11 @@ impl GgufContent {
             eos_id: get_u32(self, keys::TOKENIZER_EOS_TOKEN_ID),
             unk_id: get_u32(self, keys::TOKENIZER_UNK_TOKEN_ID),
             pad_id: get_u32(self, keys::TOKENIZER_PAD_TOKEN_ID),
+            eot_id: get_u32(self, keys::TOKENIZER_EOT_TOKEN_ID),
+            eom_id: get_u32(self, keys::TOKENIZER_EOM_TOKEN_ID),
             add_bos: self.get_bool(keys::TOKENIZER_ADD_BOS),
             add_eos: self.get_bool(keys::TOKENIZER_ADD_EOS),
+            add_space_prefix: self.get_bool(keys::TOKENIZER_ADD_SPACE_PREFIX),
             chat_template: get_string(self, keys::TOKENIZER_CHAT_TEMPLATE),
         })
     }
