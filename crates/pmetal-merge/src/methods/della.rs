@@ -42,7 +42,7 @@
 //!   Sampling" (Yu et al., 2024), arXiv:2406.11617.
 
 use super::MergeMethod;
-use crate::{MergeError, MergeParameters, Result, sign_consensus};
+use crate::{MergeError, MergeParameters, Result, SignElection, disjoint_merge};
 use pmetal_runtime::compat::{Array, Dtype};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -321,7 +321,12 @@ impl MergeMethod for DellaMerge {
 
         // Combine: optionally apply sign consensus, then weighted sum.
         let weighted_sum = if self.use_ties_consensus {
-            sign_consensus(&sparse_vectors, &weights)?
+            disjoint_merge(
+                &sparse_vectors,
+                &weights,
+                SignElection::Mass,
+                global_params.normalize(),
+            )?
         } else {
             let shape = task_vectors[0].shape();
             let mut acc = Array::zeros(shape, Dtype::Float32.as_i32());

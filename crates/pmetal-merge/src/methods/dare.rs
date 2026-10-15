@@ -18,7 +18,7 @@
 //! - When magnitude-based pruning removes important small-magnitude weights
 
 use super::MergeMethod;
-use crate::{MergeError, MergeParameters, Result, sign_consensus};
+use crate::{MergeError, MergeParameters, Result, SignElection, disjoint_merge};
 use pmetal_runtime::compat::{Array, Dtype};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -194,9 +194,14 @@ impl MergeMethod for DareMerge {
             .collect::<Result<Vec<_>>>()?;
 
         // Optionally apply sign consensus and compute the weighted sum.
-        // sign_consensus returns the weighted sum of agreeing contributions directly.
+        // Elect the sign by mass and take the disjoint mean of the agreeing entries.
         let weighted_sum = if self.use_ties_consensus {
-            sign_consensus(&sparse_vectors, &weights)?
+            disjoint_merge(
+                &sparse_vectors,
+                &weights,
+                SignElection::Mass,
+                global_params.normalize(),
+            )?
         } else {
             // Compute weighted sum without sign filtering.
             let mut acc = Array::zeros(task_vectors[0].shape(), Dtype::Float32.as_i32());
