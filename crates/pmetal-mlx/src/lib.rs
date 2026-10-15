@@ -26,6 +26,9 @@ pub mod speculative;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
+#[cfg(test)]
+mod f64_reference;
+
 mod array_ext;
 
 pub use array_ext::*;
