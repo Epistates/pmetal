@@ -323,6 +323,9 @@ impl GenerationConfig {
         if let Some(p) = json.get("top_p").and_then(|v| v.as_f64()) {
             config.top_p = p as f32;
         }
+        if let Some(p) = json.get("min_p").and_then(|v| v.as_f64()) {
+            config.min_p = p as f32;
+        }
         if let Some(rp) = json.get("repetition_penalty").and_then(|v| v.as_f64()) {
             config.repetition_penalty = rp as f32;
         }
@@ -1312,6 +1315,35 @@ mod tests {
             assert_eq!(fresh(&seeded).sample(&logits).item_u32(), first);
         }
         pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
+    }
+
+    /// A model's `generation_config.json` sets the defaults the sampler
+    /// uses: the filters a model card recommends, its stop tokens (one or
+    /// several), and a length.
+    #[test]
+    fn a_model_directory_sets_the_sampling_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0.02,
+                "repetition_penalty": 1.05, "do_sample": true,
+                "max_new_tokens": 99, "eos_token_id": [7, 8]}"#,
+        )
+        .unwrap();
+        let config = GenerationConfig::from_model_dir(dir.path());
+        assert_eq!(
+            (config.temperature, config.top_k, config.top_p, config.min_p),
+            (0.6, 20, 0.95, 0.02)
+        );
+        assert_eq!(config.repetition_penalty, 1.05);
+        assert_eq!(config.max_new_tokens, 99);
+        assert_eq!(config.stop_tokens, vec![7, 8]);
+        // No file, no change.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            GenerationConfig::from_model_dir(empty.path()).top_k,
+            GenerationConfig::default().top_k
+        );
     }
 
     #[test]
