@@ -208,10 +208,11 @@ struct InferenceWorkloadMetrics {
     session_prefill_tok_per_sec: Vec<f64>,
     session_decode_tok_per_sec: Vec<f64>,
     session_decode_ms_per_token: Vec<f64>,
-    prefetch_hits: Option<usize>,
-    prefetch_misses: Option<usize>,
-    prefetch_total: Option<usize>,
-    prefetch_hit_rate: Option<f64>,
+    /// Experts read from the packed expert files, when they are offloaded.
+    expert_reads: Option<u64>,
+    expert_read_bytes: Option<u64>,
+    /// Time spent reading them, milliseconds.
+    expert_read_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2052,9 +2053,9 @@ struct InferenceSessionMetrics {
     prefill_tok_sec_samples: Vec<f64>,
     decode_tok_sec_samples: Vec<f64>,
     decode_ms_per_token_samples: Vec<f64>,
-    prefetch_hits: Option<usize>,
-    prefetch_misses: Option<usize>,
-    prefetch_total: Option<usize>,
+    expert_reads: Option<u64>,
+    expert_read_bytes: Option<u64>,
+    expert_read_us: Option<u64>,
 }
 
 #[expect(
@@ -2113,10 +2114,10 @@ fn benchmark_real_inference(
     let mut session_prefill_tok_per_sec = Vec::with_capacity(session_runs);
     let mut session_decode_tok_per_sec = Vec::with_capacity(session_runs);
     let mut session_decode_ms_per_token = Vec::with_capacity(session_runs);
-    let mut prefetch_hits = 0usize;
-    let mut prefetch_misses = 0usize;
-    let mut prefetch_total = 0usize;
-    let mut saw_prefetch_stats = true;
+    let mut expert_reads = 0u64;
+    let mut expert_read_bytes = 0u64;
+    let mut expert_read_us = 0u64;
+    let mut saw_expert_reads = true;
 
     for session in sessions {
         total_prompt_tokens += session.prompt_tokens;
@@ -2149,16 +2150,16 @@ fn benchmark_real_inference(
         session_decode_ms_per_token.push(session_decode_ms);
 
         match (
-            session.prefetch_hits,
-            session.prefetch_misses,
-            session.prefetch_total,
+            session.expert_reads,
+            session.expert_read_bytes,
+            session.expert_read_us,
         ) {
-            (Some(hits), Some(misses), Some(total)) => {
-                prefetch_hits += hits;
-                prefetch_misses += misses;
-                prefetch_total += total;
+            (Some(reads), Some(bytes), Some(us)) => {
+                expert_reads += reads;
+                expert_read_bytes += bytes;
+                expert_read_us += us;
             }
-            _ => saw_prefetch_stats = false,
+            _ => saw_expert_reads = false,
         }
     }
 
@@ -2228,14 +2229,9 @@ fn benchmark_real_inference(
             session_prefill_tok_per_sec,
             session_decode_tok_per_sec,
             session_decode_ms_per_token,
-            prefetch_hits: saw_prefetch_stats.then_some(prefetch_hits),
-            prefetch_misses: saw_prefetch_stats.then_some(prefetch_misses),
-            prefetch_total: saw_prefetch_stats.then_some(prefetch_total),
-            prefetch_hit_rate: if saw_prefetch_stats && prefetch_total > 0 {
-                Some(prefetch_hits as f64 / prefetch_total as f64)
-            } else {
-                None
-            },
+            expert_reads: saw_expert_reads.then_some(expert_reads),
+            expert_read_bytes: saw_expert_reads.then_some(expert_read_bytes),
+            expert_read_ms: saw_expert_reads.then_some(expert_read_us as f64 / 1000.0),
         },
     ))
 }
@@ -2299,7 +2295,7 @@ fn benchmark_real_inference_session(
             let _ = run_prefill_decode_pass(&mut model, &warmup_ids, decode_steps, cache_mode)?;
         }
     }
-    model.reset_prefetch_stats();
+    model.reset_expert_read_stats();
 
     let inference_repeats = inference_repeats.max(1);
     let mut total_prompt_tokens = 0usize;
@@ -2353,7 +2349,7 @@ fn benchmark_real_inference_session(
         anyhow::bail!("all selected prompt samples tokenized to empty inputs");
     }
 
-    let prefetch_stats = model.prefetch_stats();
+    let expert_reads = model.expert_read_stats();
 
     Ok(InferenceSessionMetrics {
         prompt_samples: measured_samples,
@@ -2372,9 +2368,9 @@ fn benchmark_real_inference_session(
         prefill_tok_sec_samples: prefill_tok_sec,
         decode_tok_sec_samples: decode_tok_sec,
         decode_ms_per_token_samples: decode_ms_per_token,
-        prefetch_hits: prefetch_stats.as_ref().map(|stats| stats.hits),
-        prefetch_misses: prefetch_stats.as_ref().map(|stats| stats.misses),
-        prefetch_total: prefetch_stats.as_ref().map(|stats| stats.total),
+        expert_reads: expert_reads.map(|stats| stats.experts),
+        expert_read_bytes: expert_reads.map(|stats| stats.bytes),
+        expert_read_us: expert_reads.map(|stats| stats.read_us),
     })
 }
 
@@ -3906,10 +3902,9 @@ mod tests {
                 session_prefill_tok_per_sec: vec![40600.0, 40900.0, 40940.0],
                 session_decode_tok_per_sec: vec![3170.0, 3205.0, 3180.0],
                 session_decode_ms_per_token: vec![2.52, 2.50, 2.57],
-                prefetch_hits: None,
-                prefetch_misses: None,
-                prefetch_total: None,
-                prefetch_hit_rate: None,
+                expert_reads: None,
+                expert_read_bytes: None,
+                expert_read_ms: None,
             }),
             training: WorkloadBenchmarkSection::Completed(TrainingWorkloadMetrics {
                 train_samples: 8,

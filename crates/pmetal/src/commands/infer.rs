@@ -813,14 +813,17 @@ pub(crate) async fn run_inference(
         );
     }
 
-    // Print expert prefetch stats if offloading was active
+    // Print what the expert files were asked for if offloading was active
     if let Some(model) = runner.state.dynamic_model() {
-        if let Some(stats) = model.prefetch_stats() {
+        if let Some(stats) = model.expert_read_stats() {
             eprintln!(
-                "Expert prefetch: {:.1}% hit rate ({} hits / {} total)",
-                stats.hit_rate() * 100.0,
-                stats.hits,
-                stats.total,
+                "Expert reads: {} experts, {:.1} MB in {:.1} ms{}",
+                stats.experts,
+                stats.bytes as f64 / 1e6,
+                stats.read_us as f64 / 1000.0,
+                stats
+                    .bytes_per_second()
+                    .map_or(String::new(), |rate| format!(" ({:.2} GB/s)", rate / 1e9)),
             );
         }
     }

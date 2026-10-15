@@ -18,6 +18,9 @@
 //! applied to the wrong group or an expert read from the wrong slot moves the
 //! logits by O(1).
 
+// `set_var` is `unsafe`; the tests that set the slab size run one at a time.
+#![allow(unsafe_code)]
+
 mod common;
 
 use std::collections::HashMap;
@@ -28,6 +31,7 @@ use pmetal_cache::test_utils::{ParityReport, Tolerance};
 use pmetal_models::architectures::qwen3_next::Qwen3NextFeedForward;
 use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_models::expert_layout::{ExpertPackLayout, PackedBits};
+use pmetal_models::expert_offload::SLAB_BYTES_ENV_VAR;
 use pmetal_runtime::compat::{Array, Dtype, ops, ops::slice_axis};
 use serial_test::serial;
 
@@ -257,15 +261,24 @@ fn step(
     logits
 }
 
-#[test]
-#[serial]
-fn offloaded_experts_match_resident_experts() {
+/// Prefill, decode and a continuation of the offloaded model against the
+/// resident one, with the slab at `slab_bytes` (the default when `None`).
+fn compare(slab_bytes: Option<&str>) {
+    // SAFETY: serial tests; nothing else reads the environment meanwhile.
+    unsafe {
+        match slab_bytes {
+            Some(bytes) => std::env::set_var(SLAB_BYTES_ENV_VAR, bytes),
+            None => std::env::remove_var(SLAB_BYTES_ENV_VAR),
+        }
+    }
     let Models {
         mut resident,
         mut offloaded,
         ids,
         ..
     } = models();
+    // SAFETY: as above; the reader has read it by now.
+    unsafe { std::env::remove_var(SLAB_BYTES_ENV_VAR) };
     let t = ids.dim(1);
     let caches = |model: &DynamicModel| {
         (
@@ -277,8 +290,8 @@ fn offloaded_experts_match_resident_experts() {
     let (mut kv_o, mut mamba_o) = caches(&offloaded);
 
     let mut reports = Vec::new();
-    // Windowed prefill (more than one prefill window of tokens), then single
-    // tokens, then a multi-token continuation.
+    // Prefill (more tokens than one slab of a few experts reaches), then
+    // single tokens, then a multi-token continuation.
     let schedule: [(i32, i32); 4] = [(0, 21), (21, 22), (22, 23), (23, t)];
     for (start, end) in schedule {
         let chunk = slice_axis(&ids, 1, start, end);
@@ -299,4 +312,19 @@ fn offloaded_experts_match_resident_experts() {
         .map(|r| r.name.as_str())
         .collect();
     assert!(failed.is_empty(), "offloaded logits differ: {failed:?}");
+}
+
+#[test]
+#[serial]
+fn offloaded_experts_match_resident_experts() {
+    compare(None);
+}
+
+/// A slab that holds a token's experts and little more: every pass runs in
+/// small token windows, each reading its own experts, and the windows' outputs
+/// join to the same result.
+#[test]
+#[serial]
+fn offloaded_experts_in_small_slabs_match_resident_experts() {
+    compare(Some("1"));
 }

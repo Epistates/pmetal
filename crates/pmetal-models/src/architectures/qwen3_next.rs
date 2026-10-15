@@ -9,7 +9,7 @@
 //!
 //! Ported from the MLX reference implementation (Apple, 2025).
 
-use pmetal_runtime::compat::ops::{select_axis, slice_axis, slice_last_from, slice_last_to};
+use pmetal_runtime::compat::ops::{slice_axis, slice_last_from, slice_last_to};
 use pmetal_runtime::compat::{
     Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param,
     VisitLinears, nn, ops,
@@ -25,17 +25,14 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::expert_io::{ExpertOffloadContext, copy_as_f32};
-use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
+use crate::expert_offload::OffloadedExperts;
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
 use pmetal_cache::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
-use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
 use pmetal_runtime::native_weight::LayerWeight;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     gated_delta::gated_delta_with_gates,
-    moe_combine,
     rope::{RopePositions, rope_embedding},
 };
 
@@ -1269,73 +1266,40 @@ impl Qwen3NextGatedDeltaNet {
 // Sparse MoE Block
 // ============================================================================
 
-/// What [`attach_expert_offload`] wired into the MoE blocks, for the model to
-/// keep alive and to drive prefetching from its layer loop.
-#[derive(Debug)]
-pub(crate) struct ExpertOffloadAttachment {
-    pub(crate) ctx: Arc<ExpertOffloadContext>,
-    pub(crate) runtime: Arc<Qwen3NextOffloadRuntime>,
-    pub(crate) prefetcher: Arc<ExpertPrefetcher>,
-}
-
 /// Switch `blocks` (each with its decoder-layer index) to experts packed by
-/// `pmetal pack-experts` in `experts_dir`:
-///
-/// 1. Opens the packed expert files
-/// 2. Extracts gate weights to build the prefetch predictor
-/// 3. Wires offload context and prefetcher into each MoE block
-/// 4. Zeros stacked expert weight arrays to reclaim GPU memory
+/// `pmetal pack-experts` in `experts_dir`: opens the packed files, hands every
+/// block the shared reader and frees its stacked expert arrays, since the
+/// experts are read from the files as each layer routes.
 ///
 /// Shared by every architecture built on [`Qwen3NextSparseMoeBlock`].
 pub(crate) fn attach_expert_offload(
     experts_dir: &Path,
     blocks: &mut [(usize, &mut Qwen3NextSparseMoeBlock)],
-    num_experts: usize,
-    hidden_size: usize,
-    top_k: usize,
-) -> Result<ExpertOffloadAttachment, Exception> {
+) -> Result<(), Exception> {
     if blocks.is_empty() {
         return Err(Exception::custom("no MoE layers found to offload"));
     }
-    let ctx = Arc::new(
-        ExpertOffloadContext::new(experts_dir)
+    let experts = Arc::new(
+        OffloadedExperts::open(experts_dir)
             .map_err(|e| Exception::custom(format!("expert offload init: {e}")))?,
     );
-    let runtime = Arc::new(Qwen3NextOffloadRuntime::new(
-        &ctx,
-        top_k,
-        Qwen3NextSparseMoeBlock::configured_prefill_expert_window_tokens(),
-    ));
-
-    // Extract gate weights from each MoE layer for the prefetcher
-    let mut gate_weights: HashMap<usize, Vec<f32>> = HashMap::new();
     for (layer_idx, block) in blocks.iter_mut() {
-        // Enable offloading on the block (sets offload_ctx + layer_idx)
-        block.enable_offloading(ctx.clone(), *layer_idx, runtime.clone());
-
-        // Extract gate weight matrix for prefetch prediction
-        let w = block
-            .gate
-            .weight
-            .as_ref()
-            .cast(pmetal_runtime::compat::Dtype::Float32);
-        w.eval();
-        gate_weights.insert(*layer_idx, w.as_slice().to_vec());
-    }
-    let num_moe_layers = gate_weights.len();
-
-    let prefetcher = Arc::new(ExpertPrefetcher::new(
-        gate_weights,
-        num_experts,
-        hidden_size,
-        top_k,
-        runtime.buffer_pool.clone(),
-    ));
-
-    // Wire the prefetcher in, and zero the stacked expert arrays to reclaim
-    // GPU memory: the offloaded path loads weights from SSD.
-    for (_, block) in blocks.iter_mut() {
-        block.prefetcher = Some(prefetcher.clone());
+        if !experts.layout().moe_layer_indices.contains(layer_idx) {
+            return Err(Exception::custom(format!(
+                "layer {layer_idx} is a sparse layer, but the packed experts in {} have none for it",
+                experts_dir.display()
+            )));
+        }
+        if experts.layout().num_experts != block.num_experts as usize {
+            return Err(Exception::custom(format!(
+                "the packed experts hold {} experts per layer, the model has {}",
+                experts.layout().num_experts,
+                block.num_experts
+            )));
+        }
+        block.layer_idx = *layer_idx;
+        block.offloaded = Some(experts.clone());
+        // The experts come from the files from here on: free the stacks.
         *block.switch_mlp_gate_proj = Array::zeros_f32(&[1]);
         *block.switch_mlp_up_proj = Array::zeros_f32(&[1]);
         *block.switch_mlp_down_proj = Array::zeros_f32(&[1]);
@@ -1343,99 +1307,11 @@ pub(crate) fn attach_expert_offload(
     }
 
     tracing::info!(
-        moe_layers = num_moe_layers,
-        expert_size_mb = ctx.layout.expert_size as f64 / 1e6,
-        "Expert offloading enabled with prefetching"
+        moe_layers = blocks.len(),
+        expert_size_mb = experts.layout().expert_size as f64 / 1e6,
+        "Expert offloading enabled"
     );
-    Ok(ExpertOffloadAttachment {
-        ctx,
-        runtime,
-        prefetcher,
-    })
-}
-
-#[derive(Debug)]
-pub(crate) struct Qwen3NextOffloadRuntime {
-    buffer_pool: Option<Arc<ExpertBufferPool>>,
-    fused_expert: Option<pmetal_metal::FusedMoeExpert>,
-    expert_out_bufs: Vec<pmetal_metal::buffer::MetalBuffer<f32>>,
-    expert_intermediate: Option<pmetal_metal::buffer::MetalBuffer<f32>>,
-}
-
-impl Qwen3NextOffloadRuntime {
-    fn new(ctx: &Arc<ExpertOffloadContext>, top_k: usize, prefill_window_tokens: usize) -> Self {
-        let mut runtime = Self {
-            buffer_pool: None,
-            fused_expert: None,
-            expert_out_bufs: Vec::new(),
-            expert_intermediate: None,
-        };
-
-        let Ok(metal_ctx) = pmetal_metal::context::MetalContext::global() else {
-            return runtime;
-        };
-
-        let expert_size = ctx.layout.expert_size;
-        let total_pool_buffers =
-            Qwen3NextSparseMoeBlock::required_pool_buffers(top_k, prefill_window_tokens);
-        let k = total_pool_buffers.div_ceil(2);
-
-        match ExpertBufferPool::new(
-            &metal_ctx,
-            ExpertBufferPoolConfig {
-                buffer_size: expert_size,
-                k,
-            },
-        ) {
-            Ok(pool) => runtime.buffer_pool = Some(Arc::new(pool)),
-            Err(e) => {
-                tracing::warn!("ExpertBufferPool allocation failed, using legacy copy path: {e}")
-            }
-        }
-
-        let bits = match ctx.layout.bits {
-            crate::expert_layout::PackedBits::Four => pmetal_metal::ExpertBits::Four,
-            crate::expert_layout::PackedBits::Two => pmetal_metal::ExpertBits::Two,
-        };
-        match pmetal_metal::FusedMoeExpert::new(
-            metal_ctx.clone(),
-            pmetal_metal::FusedMoeExpertConfig {
-                hidden_dim: ctx.layout.hidden_dim as u32,
-                intermediate_dim: ctx.layout.intermediate_dim as u32,
-                group_size: ctx.layout.group_size as u32,
-                bits,
-            },
-        ) {
-            Ok(expert) => runtime.fused_expert = Some(expert),
-            Err(e) => tracing::warn!("FusedMoeExpert creation failed: {e}"),
-        }
-
-        let output_buffer_count =
-            Qwen3NextSparseMoeBlock::required_output_buffers(top_k, prefill_window_tokens);
-        let mut out_bufs = Vec::with_capacity(output_buffer_count);
-        for _ in 0..output_buffer_count {
-            if let Ok(buf) = pmetal_metal::buffer::MetalBuffer::<f32>::new(
-                &metal_ctx,
-                ctx.layout.hidden_dim,
-                pmetal_metal::buffer::BufferUsage::Shared,
-            ) {
-                out_bufs.push(buf);
-            }
-        }
-        if out_bufs.len() == output_buffer_count {
-            runtime.expert_out_bufs = out_bufs;
-        }
-
-        if let Ok(scratch) = pmetal_metal::buffer::MetalBuffer::<f32>::new(
-            &metal_ctx,
-            ctx.layout.intermediate_dim,
-            pmetal_metal::buffer::BufferUsage::Shared,
-        ) {
-            runtime.expert_intermediate = Some(scratch);
-        }
-
-        runtime
-    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1453,15 +1329,10 @@ pub struct Qwen3NextSparseMoeBlock {
     pub routed_experts_loaded: bool,
     /// Which transformer layer this block belongs to (used for expert file lookup).
     pub layer_idx: usize,
-    /// If set, routed expert weights are loaded on-demand from SSD instead of
-    /// residing in GPU memory.  `None` means the standard resident path is used.
-    pub offload_ctx: Option<Arc<ExpertOffloadContext>>,
-    /// If set, pre-gated prediction engine that prefetches experts in the background.
-    pub prefetcher: Option<Arc<ExpertPrefetcher>>,
-    /// Shared offloaded-MoE runtime resources used by every sparse layer.
-    offload_runtime: Option<Arc<Qwen3NextOffloadRuntime>>,
-    /// Token window size used by prompt-time exact-routing expert reuse.
-    pub prefill_expert_window_tokens: usize,
+    /// If set, routed expert weights are read from SSD as the layer routes
+    /// instead of residing in memory. `None` means the resident (or packed)
+    /// experts run.
+    pub offloaded: Option<Arc<OffloadedExperts>>,
     /// Cached concatenated [gate; up; shared_gate] projection weights for the shared expert path.
     pub shared_combined_in_proj_weight: Option<Array>,
     /// Weight pointer signature used to invalidate the shared projection cache.
@@ -1495,34 +1366,6 @@ impl std::fmt::Debug for PackedRoutedExperts {
 }
 
 impl Qwen3NextSparseMoeBlock {
-    const DEFAULT_PREFILL_EXPERT_WINDOW_TOKENS: usize = 8;
-    const PREFILL_EXPERT_WINDOW_TOKENS_ENV_VAR: &str = "PMETAL_PREFILL_EXPERT_WINDOW_TOKENS";
-
-    fn sanitize_prefill_expert_window_tokens(value: usize) -> usize {
-        value.clamp(1, 32)
-    }
-
-    fn configured_prefill_expert_window_tokens() -> usize {
-        std::env::var(Self::PREFILL_EXPERT_WINDOW_TOKENS_ENV_VAR)
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .map(Self::sanitize_prefill_expert_window_tokens)
-            .unwrap_or(Self::DEFAULT_PREFILL_EXPERT_WINDOW_TOKENS)
-    }
-
-    fn required_pool_buffers(top_k: usize, prefill_window_tokens: usize) -> usize {
-        top_k
-            .max(prefill_window_tokens.saturating_mul(top_k))
-            .max(1)
-    }
-
-    fn required_output_buffers(top_k: usize, prefill_window_tokens: usize) -> usize {
-        prefill_window_tokens
-            .saturating_mul(top_k)
-            .max(top_k)
-            .max(1)
-    }
-
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
         Self::new_with_routed_expert_mode(config, Qwen3NextRoutedExpertMode::Resident)
     }
@@ -1560,7 +1403,6 @@ impl Qwen3NextSparseMoeBlock {
         let shared_expert = Qwen3NextMLP::new(dim, config.shared_expert_intermediate_size)?;
 
         let shared_expert_gate = nn::LinearBuilder::new(dim, 1).bias(false).build()?;
-        let prefill_expert_window_tokens = Self::configured_prefill_expert_window_tokens();
 
         Ok(Self {
             gate,
@@ -1574,10 +1416,7 @@ impl Qwen3NextSparseMoeBlock {
             norm_topk_prob: config.norm_topk_prob,
             routed_experts_loaded,
             layer_idx: 0,
-            offload_ctx: None,
-            prefetcher: None,
-            offload_runtime: None,
-            prefill_expert_window_tokens,
+            offloaded: None,
             shared_combined_in_proj_weight: None,
             shared_combined_in_proj_signature: None,
             packed_experts: None,
@@ -1585,7 +1424,7 @@ impl Qwen3NextSparseMoeBlock {
     }
 
     fn current_shared_input_proj_signature(&self) -> Vec<usize> {
-        // Use `Array::id()` — same rationale as current_input_proj_signature.
+        // Use `Array::id()` — same rationale as the GDN layer's fused projection.
         vec![
             self.shared_expert.gate_proj.weight.as_ref().id(),
             self.shared_expert.up_proj.weight.as_ref().id(),
@@ -1663,800 +1502,112 @@ impl Qwen3NextSparseMoeBlock {
         Ok((shared_y, shared_gate_logit))
     }
 
-    /// Attach an offload context/runtime and record which layer this block lives in.
-    ///
-    /// After calling this the [`forward`] method will load routed-expert weights
-    /// from SSD rather than from resident GPU arrays.
-    fn enable_offloading(
-        &mut self,
-        ctx: Arc<ExpertOffloadContext>,
-        layer_idx: usize,
-        runtime: Arc<Qwen3NextOffloadRuntime>,
-    ) {
-        self.layer_idx = layer_idx;
-        self.offload_runtime = Some(runtime);
-        self.offload_ctx = Some(ctx);
-    }
-
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        // Dispatch to offloaded path when an ExpertOffloadContext is present.
-        if self.offload_ctx.is_some() {
-            return self.forward_offloaded(x, None);
-        }
-        if let Some(packed) = self.packed_experts.clone() {
-            return self.forward_packed(x, &packed);
-        }
-        if !self.routed_experts_loaded {
-            return Err(Exception::custom(
-                "routed expert weights are not resident; enable expert offloading with --experts-dir",
-            ));
-        }
-
-        let shape = x.shape();
-        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
-        let hidden = shape[shape.len() - 1];
-        let x_flat = x.reshape(&[batch_seq, hidden]);
-
-        // Compute routing probabilities
-        let gate_logits = self.gate.forward(&x_flat);
-        let gates = ops::softmax_axis(
-            &if gate_logits.dtype() != pmetal_runtime::compat::Dtype::Float32 {
-                gate_logits.cast(pmetal_runtime::compat::Dtype::Float32)
-            } else {
-                gate_logits
-            },
-            -1,
-        );
-
-        // Top-k selection + optional renormalisation via the shared helper.
-        // The earlier hand-rolled version here used the sign-flipped form
-        // `argpartition(-gates, -k, -1)[..., -k:]` which selects the k SMALLEST
-        // experts — an anti-top-k bug (see moe_routing::tests::
-        // sign_flipped_argpartition_is_anti_topk). Matches the
-        // reference, which uses the positive form.
-        let k = self.top_k;
-        let (top_indices, top_weights) =
-            crate::moe_routing::topk_normalize(&gates, k, self.norm_topk_prob)?;
-
-        // SwitchGLU forward using gather_mm — same as the reference SwitchGLU
-        // x_flat: [N, D], indices: [N, k]
-        let top_indices_i32 = top_indices.cast(pmetal_runtime::compat::Dtype::Int32);
-
-        // Reshape [N, D] → [N, 1, 1, D] — same as the reference expand_dims(-2, -3).
-        // Critical for gather_mm batch dimension semantics — without this,
-        // M=N gets preserved in output producing [N, k, N, out] instead of [N, k, 1, out].
-        let x_expanded = x_flat.reshape(&[batch_seq, 1, 1, hidden]);
-
-        // Weights are stored as [E, out, in] from checkpoint; gather_mm expects
-        // A[..., M, K] @ B[E, K, N], so we transpose the last two dims (like the reference
-        // SwitchLinear, which calls weight.swapaxes(-1, -2) at forward time).
-        let gate_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_gate_proj.as_ref())?;
-        let up_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_up_proj.as_ref())?;
-        let gate_w = gate_weight.swap_axes(-1, -2);
-        let up_w = up_weight.swap_axes(-1, -2);
-        let gate_out = x_expanded.gather_mm(&gate_w, None, Some(&top_indices_i32), false); // [N, k, 1, intermediate]
-        let up_out = x_expanded.gather_mm(&up_w, None, Some(&top_indices_i32), false); // [N, k, 1, intermediate]
-
-        let activated = nn::silu(&gate_out).multiply(&up_out);
-
-        // Down projection
-        let down_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_down_proj.as_ref())?;
-        let down_w = down_weight.swap_axes(-1, -2);
-        let down_out = activated.gather_mm(&down_w, None, Some(&top_indices_i32), false); // [N, k, 1, D]
-
-        // squeeze(-2) removes the size-1 dim: [N, k, 1, D] → [N, k, D]
-        let down_out = down_out.squeeze_axes(&[-2]);
-
-        // Shared expert forward + gate logit
-        let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
-
-        // Combine: weighted expert sum + sigmoid-gated shared expert. The
-        // decoder layer adds the residual.
-        // Pure MLX ops — all async on GPU, no synchronization barriers
-        let result = moe_combine(
-            &down_out,
-            &top_weights,
-            &shared_y,
-            &shared_gate_logit,
-            k,
-            batch_seq,
-        );
-        Ok(result?.reshape(shape))
+        self.forward_timed(x, None)
     }
 
-    /// [`forward`](Self::forward) with the routed experts on packed kernels:
-    /// the same router and shared expert, the experts through
-    /// `native_moe::switch_glu`, which applies each expert's tensor scale to
-    /// its product.
-    fn forward_packed(
+    /// [`forward`](Self::forward) with the sections of an offloaded layer
+    /// timed when `probe` times.
+    fn run(&mut self, x: &Array, probe: &mut Probe<'_>) -> Result<Array, Exception> {
+        if self.offloaded.is_some() {
+            return self.forward_timed(x, probe.layer_mut());
+        }
+        probe.section("moe_resident", || self.forward(x))
+    }
+
+    /// The router: softmax over the experts in float32, the top `k`, and with
+    /// `norm_topk_prob` their renormalization; then the weights in the
+    /// activations' dtype, which is where transformers casts them. The top-k
+    /// helper is the positive form of `argpartition`: the sign-flipped one
+    /// selects the `k` smallest experts (see
+    /// `moe_routing::tests::sign_flipped_argpartition_is_anti_topk`).
+    ///
+    /// Returns `(indices [N, k] as u32, weights [N, k])`.
+    fn route(&self, x_flat: &Array) -> Result<(Array, Array), Exception> {
+        let logits = self.gate.forward(x_flat).cast(Dtype::Float32);
+        let gates = ops::softmax_axis(&logits, -1);
+        let (indices, weights) =
+            crate::moe_routing::topk_normalize(&gates, self.top_k, self.norm_topk_prob)?;
+        Ok((
+            indices.cast(Dtype::Uint32),
+            weights.as_dtype(x_flat.dtype().as_i32()),
+        ))
+    }
+
+    /// The block: route, the routed experts (by `routed`, which is given the
+    /// tokens `[N, hidden]` and their routing), and the shared expert behind
+    /// its sigmoid gate. The decoder layer adds the residual.
+    fn combine(
         &mut self,
         x: &Array,
-        packed: &PackedRoutedExperts,
+        routed: impl FnOnce(&Array, &Array, &Array) -> Result<Array, Exception>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden = shape[shape.len() - 1];
         let x_flat = x.reshape(&[batch_seq, hidden]);
 
-        let gate_logits = self.gate.forward(&x_flat);
-        let gates = ops::softmax_axis(&gate_logits.cast(Dtype::Float32), -1);
-        let (top_indices, top_weights) =
-            crate::moe_routing::topk_normalize(&gates, self.top_k, self.norm_topk_prob)?;
-        let routed = pmetal_runtime::native_moe::switch_glu(
-            &x_flat,
-            &packed.gate,
-            &packed.up,
-            &packed.down,
-            &top_indices.cast(Dtype::Uint32),
-            &top_weights,
-            |gate, up| nn::silu(gate).multiply(up),
-        );
+        let (indices, weights) = self.route(&x_flat)?;
+        let routed = routed(&x_flat, &indices, &weights)?;
 
         let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
         let shared = nn::sigmoid(&shared_gate_logit).multiply(&shared_y);
         Ok(routed.add(&shared).reshape(shape))
     }
 
-    /// [`forward`](Self::forward) with the sections of an offloaded layer
-    /// timed when `probe` times.
-    fn run(&mut self, x: &Array, probe: &mut Probe<'_>) -> Result<Array, Exception> {
-        if self.offload_ctx.is_some() {
-            return self.forward_offloaded(x, probe.layer_mut());
-        }
-        probe.section("moe_resident", || self.forward(x))
-    }
-
-    fn route_experts(&mut self, x_flat: &Array) -> Result<(Array, Vec<usize>, i32), Exception> {
-        let gate_logits = self.gate.forward(x_flat);
-        let gates = ops::softmax_axis(
-            &if gate_logits.dtype() != pmetal_runtime::compat::Dtype::Float32 {
-                gate_logits.cast(pmetal_runtime::compat::Dtype::Float32)
-            } else {
-                gate_logits
-            },
-            -1,
-        );
-
-        // Shared top-k helper — see the note on the canonical `forward()` path
-        // for why the previous `argpartition(-gates, -k, -1)` form was wrong.
-        let k = self.top_k;
-        let (top_indices, top_weights) =
-            crate::moe_routing::topk_normalize(&gates, k, self.norm_topk_prob)?;
-
-        let top_indices_u32 = top_indices.cast(pmetal_runtime::compat::Dtype::Uint32);
-        top_indices_u32.eval();
-        let flat_u32: Vec<u32> = top_indices_u32.as_slice().to_vec();
-        let expert_indices: Vec<usize> = flat_u32.iter().map(|&i| i as usize).collect();
-
-        Ok((top_weights, expert_indices, k))
-    }
-
-    fn ordered_unique_experts(expert_indices: &[usize]) -> (Vec<usize>, HashMap<usize, usize>) {
-        let mut unique = Vec::new();
-        let mut index_map = HashMap::new();
-        for &expert_idx in expert_indices {
-            if let std::collections::hash_map::Entry::Vacant(entry) = index_map.entry(expert_idx) {
-                let slot = unique.len();
-                unique.push(expert_idx);
-                entry.insert(slot);
-            }
-        }
-        (unique, index_map)
-    }
-
-    /// Offloaded forward pass: routes to top-k experts whose weights are
-    /// read on-demand from packed SSD files and dispatched to Metal kernels.
-    ///
-    /// Two paths:
-    /// - **Aligned fast path**: prefetched hits are copied into AlignedBuffers,
-    ///   misses are pread into AlignedBuffers, then the Metal expert kernel reads
-    ///   component byte offsets directly
-    /// - **Legacy**: Vec<u8> buffers → parse_expert_weights → MetalBuffer copies
-    fn forward_offloaded(
+    fn forward_timed(
         &mut self,
         x: &Array,
-        mut layer_profile: Option<&mut Qwen3NextLayerProfile>,
+        layer_profile: Option<&mut Qwen3NextLayerProfile>,
     ) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
-        let hidden = shape[shape.len() - 1];
-        let x_flat = x.reshape(&[batch_seq, hidden]);
-
-        // The fused offloaded expert path is still single-token at the kernel
-        // level. For prompt prefill, process small token windows with exact
-        // routing, load each unique expert once per window, and then reuse
-        // those loaded experts across the tokens in the window.
-        if batch_seq > 1 {
-            let prefill_start = Instant::now();
-            let ctx = self.offload_ctx.as_ref().unwrap().clone();
+        let experts = if let Some(offloaded) = self.offloaded.clone() {
             let layer_idx = self.layer_idx;
-            let metal_ctx = pmetal_metal::context::MetalContext::global()
-                .map_err(|e| Exception::custom(e.to_string()))?;
-            let record = &ctx.layout.record;
-            let runtime = self.offload_runtime.clone().ok_or_else(|| {
-                Exception::custom("forward_offloaded: offload runtime not initialized")
-            })?;
-            let prefill_window_tokens = self.prefill_expert_window_tokens;
-
-            let mut window_outputs =
-                Vec::with_capacity(batch_seq as usize / prefill_window_tokens + 1);
-
-            for window_start in (0..batch_seq as usize).step_by(prefill_window_tokens) {
-                let window_end = (window_start + prefill_window_tokens).min(batch_seq as usize);
-                let window_len = (window_end - window_start) as i32;
-                let window_input = slice_axis(&x_flat, 0, window_start as i32, window_end as i32)
-                    .reshape(&[window_len, hidden]);
-
-                let route_start = Instant::now();
-                let (window_top_weights, window_expert_indices, k) =
-                    self.route_experts(&window_input)?;
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_prefill_route", route_start);
+            return self.combine(x, |x_flat, indices, weights| {
+                let (routed, timings) = offloaded.routed(layer_idx, x_flat, indices, weights)?;
+                if let Some(profile) = layer_profile {
+                    profile.sections.push(Qwen3NextProfileSection {
+                        name: "moe_expert_io".into(),
+                        elapsed_us: timings.read_us,
+                    });
                 }
-                let k_usize = k as usize;
-
-                let (unique_experts, unique_index_map) =
-                    Self::ordered_unique_experts(&window_expert_indices);
-                let prefetched = self
-                    .prefetcher
-                    .as_ref()
-                    .map(|p| p.try_get(layer_idx, &unique_experts))
-                    .unwrap_or_else(|| (0..unique_experts.len()).map(|_| None).collect());
-
-                let miss_plan = prefetched_miss_plan(&prefetched, &unique_experts);
-                let window_output_buffers = window_len as usize * k_usize;
-                let use_aligned = runtime.buffer_pool.is_some()
-                    && runtime.expert_out_bufs.len() >= window_output_buffers
-                    && runtime
-                        .buffer_pool
-                        .as_ref()
-                        .is_some_and(|pool| pool.total_buffers() >= unique_experts.len());
-                let mut aligned_release_bufs: Option<
-                    Vec<pmetal_metal::expert_buffer::AlignedBuffer>,
-                > = None;
-                let mut window_down_tokens = Vec::with_capacity(window_len as usize);
-
-                let cmd_buf = if use_aligned {
-                    let fused_expert = runtime.fused_expert.as_ref().ok_or_else(|| {
-                        Exception::custom("forward_offloaded: fused_expert not initialized")
-                    })?;
-                    let intermediate = runtime.expert_intermediate.as_ref().ok_or_else(|| {
-                        Exception::custom("forward_offloaded: expert_intermediate not initialized")
-                    })?;
-                    let pool = runtime.buffer_pool.as_ref().unwrap();
-                    let mut unique_bufs = acquire_prefetched_aligned_buffers(pool, prefetched)?;
-
-                    let io_start = Instant::now();
-                    if let Err(error) = load_missing_experts_into_aligned_buffers(
-                        &ctx,
-                        layer_idx,
-                        &miss_plan,
-                        &mut unique_bufs,
-                    ) {
-                        for buf in unique_bufs.drain(..) {
-                            pool.release(buf);
-                        }
-                        return Err(error);
-                    }
-                    if let Some(profile) = layer_profile.as_deref_mut() {
-                        profile.push_section("moe_prefill_io", io_start);
-                    }
-
-                    let encode_submit_start = Instant::now();
-                    let cmd_buf = fused_expert
-                        .create_command_buffer()
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                    for token_offset in 0..window_len as usize {
-                        let token_input = select_axis(&window_input, token_offset as i32, 0)
-                            .reshape(&[1, hidden]);
-                        let token_input_f32 =
-                            token_input.cast(pmetal_runtime::compat::Dtype::Float32);
-                        token_input_f32.eval();
-                        let input_buf = copy_as_f32(&metal_ctx, &token_input_f32)
-                            .map_err(|e| Exception::custom(e.to_string()))?;
-                        for slot in 0..k_usize {
-                            let expert_idx = window_expert_indices[token_offset * k_usize + slot];
-                            let unique_slot = *unique_index_map
-                                .get(&expert_idx)
-                                .expect("unique expert index must exist");
-                            let abuf = &unique_bufs[unique_slot];
-                            let output_slot = token_offset * k_usize + slot;
-                            fused_expert
-                                .encode_expert_aligned(
-                                    &cmd_buf,
-                                    &input_buf,
-                                    abuf.metal_buffer(),
-                                    record.gate_weight.offset,
-                                    record.gate_scales.offset,
-                                    record.gate_biases.offset,
-                                    record.up_weight.offset,
-                                    record.up_scales.offset,
-                                    record.up_biases.offset,
-                                    record.down_weight.offset,
-                                    record.down_scales.offset,
-                                    record.down_biases.offset,
-                                    &runtime.expert_out_bufs[output_slot],
-                                    intermediate,
-                                )
-                                .map_err(|e| Exception::custom(e.to_string()))?;
-                        }
-                    }
-
-                    fused_expert
-                        .submit(&cmd_buf)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                    if let Some(profile) = layer_profile.as_deref_mut() {
-                        profile
-                            .push_section("moe_prefill_expert_encode_submit", encode_submit_start);
-                    }
-                    aligned_release_bufs = Some(unique_bufs);
-                    cmd_buf
-                } else {
-                    let fused_expert = runtime.fused_expert.as_ref().ok_or_else(|| {
-                        Exception::custom("forward_offloaded: fused_expert not initialized")
-                    })?;
-                    let intermediate = runtime.expert_intermediate.as_ref().ok_or_else(|| {
-                        Exception::custom("forward_offloaded: expert_intermediate not initialized")
-                    })?;
-                    let miss_ids: Vec<usize> = miss_plan
-                        .iter()
-                        .map(|(_, expert_idx)| *expert_idx)
-                        .collect();
-                    let io_start = Instant::now();
-                    let miss_bufs = if !miss_ids.is_empty() {
-                        ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
-                            Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
-                        })?
-                    } else {
-                        vec![]
-                    };
-
-                    let unique_bufs = materialize_prefetched_raw_bytes(
-                        prefetched,
-                        ctx.layout.expert_size,
-                        miss_bufs,
-                    );
-                    if let Some(profile) = layer_profile.as_deref_mut() {
-                        profile.push_section("moe_prefill_io", io_start);
-                    }
-
-                    let encode_submit_start = Instant::now();
-                    let cmd_buf = fused_expert
-                        .create_command_buffer()
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                    for token_offset in 0..window_len as usize {
-                        let token_input = select_axis(&window_input, token_offset as i32, 0)
-                            .reshape(&[1, hidden]);
-                        let token_input_f32 =
-                            token_input.cast(pmetal_runtime::compat::Dtype::Float32);
-                        token_input_f32.eval();
-                        let input_buf = copy_as_f32(&metal_ctx, &token_input_f32)
-                            .map_err(|e| Exception::custom(e.to_string()))?;
-                        for slot in 0..k_usize {
-                            let expert_idx = window_expert_indices[token_offset * k_usize + slot];
-                            let unique_slot = *unique_index_map
-                                .get(&expert_idx)
-                                .expect("unique expert index must exist");
-                            let output_slot = token_offset * k_usize + slot;
-                            let weights = crate::expert_dequant::parse_expert_weights(
-                                &unique_bufs[unique_slot],
-                                record,
-                                &metal_ctx,
-                            )
-                            .map_err(Exception::custom)?;
-
-                            fused_expert
-                                .encode_into(
-                                    &cmd_buf,
-                                    &input_buf,
-                                    &weights,
-                                    &runtime.expert_out_bufs[output_slot],
-                                    intermediate,
-                                )
-                                .map_err(|e| Exception::custom(e.to_string()))?;
-                        }
-                    }
-
-                    fused_expert
-                        .submit(&cmd_buf)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                    if let Some(profile) = layer_profile.as_deref_mut() {
-                        profile
-                            .push_section("moe_prefill_expert_encode_submit", encode_submit_start);
-                    }
-                    cmd_buf
-                };
-
-                let shared_start = Instant::now();
-                let (shared_y, shared_gate_logit) =
-                    self.forward_shared_expert_and_gate(&window_input)?;
-                shared_y.eval();
-                shared_gate_logit.eval();
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_prefill_shared", shared_start);
-                }
-
-                let wait_start = Instant::now();
-                let fused_expert = runtime.fused_expert.as_ref().ok_or_else(|| {
-                    Exception::custom("forward_offloaded: fused_expert not initialized")
-                })?;
-                fused_expert
-                    .wait_for_completion(&cmd_buf)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_prefill_expert_wait", wait_start);
-                }
-
-                if let Some(unique_bufs) = aligned_release_bufs {
-                    let pool = runtime.buffer_pool.as_ref().unwrap();
-                    for buf in unique_bufs {
-                        pool.release(buf);
-                    }
-                }
-
-                let output_wrap_start = Instant::now();
-                for token_offset in 0..window_len as usize {
-                    let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
-                    for slot in 0..k_usize {
-                        let output_slot = token_offset * k_usize + slot;
-                        let slice = runtime.expert_out_bufs[output_slot].as_slice();
-                        expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
-                    }
-                    let down_out = ops::stack_axis(&expert_arrays, 1).reshape(&[k, hidden]);
-                    window_down_tokens.push(down_out);
-                }
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_prefill_output_wrap", output_wrap_start);
-                }
-
-                let combine_start = Instant::now();
-                let window_down_out =
-                    ops::stack_axis(&window_down_tokens, 0).reshape(&[window_len, k, hidden]);
-                let window_output = moe_combine(
-                    &window_down_out,
-                    &window_top_weights,
-                    &shared_y,
-                    &shared_gate_logit,
-                    k,
-                    window_len,
-                )?
-                .reshape(&[window_len, hidden]);
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_prefill_combine", combine_start);
-                }
-                window_outputs.push(window_output);
-            }
-            let window_refs: Vec<&Array> = window_outputs.iter().collect();
-            let stacked = ops::concatenate_axis(&window_refs, 0).reshape(shape);
-            stacked.eval();
-            if let Some(profile) = layer_profile.as_deref_mut() {
-                profile.push_section("moe_prefill_windowed", prefill_start);
-            }
-            return Ok(stacked);
-        }
-
-        // ---- Routing (identical to resident path) ----
-        let routing_start = Instant::now();
-        let (top_weights, expert_indices, k) = self.route_experts(&x_flat)?;
-        if let Some(profile) = layer_profile.as_deref_mut() {
-            profile.push_section("moe_route", routing_start);
-        }
-
-        // ---- Load expert weights from SSD ----
-        let ctx = self.offload_ctx.as_ref().unwrap().clone();
-        let layer_idx = self.layer_idx;
-
-        #[cfg(not(unix))]
-        return Err(Exception::custom(
-            "expert offloading requires a Unix platform (pread is not available)",
-        ));
-
-        #[cfg(unix)]
-        {
-            // ---- Prefetch-aware expert loading ----
-            let io_start = std::time::Instant::now();
-            let runtime = self.offload_runtime.clone().ok_or_else(|| {
-                Exception::custom("forward_offloaded: offload runtime not initialized")
-            })?;
-
-            let prefetched = self
-                .prefetcher
-                .as_ref()
-                .map(|p| p.try_get(layer_idx, &expert_indices))
-                .unwrap_or_else(|| (0..expert_indices.len()).map(|_| None).collect());
-
-            let miss_plan = prefetched_miss_plan(&prefetched, &expert_indices);
-            let miss_ids: Vec<usize> = miss_plan
-                .iter()
-                .map(|(_, expert_idx)| *expert_idx)
-                .collect();
-
-            let prefetch_hits = prefetched.iter().filter(|b| b.is_some()).count();
-
-            // ---- Dispatch: zero-copy aligned path or legacy copy path ----
-            let metal_ctx = pmetal_metal::context::MetalContext::global()
-                .map_err(|e| Exception::custom(e.to_string()))?;
-            let record = &ctx.layout.record;
-
-            // x_flat to Metal buffer (tiny for T=1 decode)
-            let x_flat_f32 = x_flat.cast(pmetal_runtime::compat::Dtype::Float32);
-            x_flat_f32.eval();
-            let input_buf = copy_as_f32(&metal_ctx, &x_flat_f32)
-                .map_err(|e| Exception::custom(e.to_string()))?;
-
-            let use_aligned = runtime.buffer_pool.is_some()
-                && runtime.expert_out_bufs.len() >= expert_indices.len();
-            let mut aligned_release_bufs: Option<Vec<pmetal_metal::expert_buffer::AlignedBuffer>> =
-                None;
-            let cmd_buf = if use_aligned {
-                let fused_expert = runtime.fused_expert.as_ref().ok_or_else(|| {
-                    Exception::custom("forward_offloaded: fused_expert not initialized")
-                })?;
-                let intermediate = runtime.expert_intermediate.as_ref().ok_or_else(|| {
-                    Exception::custom("forward_offloaded: expert_intermediate not initialized")
-                })?;
-                // ---- ALIGNED FAST PATH ----
-                // Prefetched aligned hits reuse their pooled buffers directly.
-                let pool = runtime.buffer_pool.as_ref().unwrap();
-                let mut aligned_bufs = acquire_prefetched_aligned_buffers(pool, prefetched)?;
-
-                let aligned_load = load_missing_experts_into_aligned_buffers(
-                    &ctx,
-                    layer_idx,
-                    &miss_plan,
-                    &mut aligned_bufs,
-                );
-
-                if let Err(error) = aligned_load {
-                    for buf in aligned_bufs.drain(..) {
-                        pool.release(buf);
-                    }
-                    return Err(error);
-                }
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_expert_io", io_start);
-                }
-
-                let io_us = io_start.elapsed().as_micros();
-                tracing::trace!(
-                    layer = layer_idx,
-                    io_ms = io_us as f64 / 1000.0,
-                    path = if prefetch_hits > 0 {
-                        "aligned-mixed"
-                    } else {
-                        "aligned-direct"
-                    },
-                    experts = expert_indices.len(),
-                    hits = prefetch_hits,
-                    misses = miss_ids.len(),
-                    "offloaded MoE I/O"
-                );
-
-                let encode_submit_start = Instant::now();
-                let cmd_buf = fused_expert
-                    .create_command_buffer()
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                for (i, abuf) in aligned_bufs.iter().enumerate() {
-                    fused_expert
-                        .encode_expert_aligned(
-                            &cmd_buf,
-                            &input_buf,
-                            abuf.metal_buffer(),
-                            record.gate_weight.offset,
-                            record.gate_scales.offset,
-                            record.gate_biases.offset,
-                            record.up_weight.offset,
-                            record.up_scales.offset,
-                            record.up_biases.offset,
-                            record.down_weight.offset,
-                            record.down_scales.offset,
-                            record.down_biases.offset,
-                            &runtime.expert_out_bufs[i],
-                            intermediate,
-                        )
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                }
-                fused_expert
-                    .submit(&cmd_buf)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_expert_encode_submit", encode_submit_start);
-                }
-                aligned_release_bufs = Some(aligned_bufs);
-                cmd_buf
-            } else {
-                let fused_expert = runtime.fused_expert.as_ref().ok_or_else(|| {
-                    Exception::custom("forward_offloaded: fused_expert not initialized")
-                })?;
-                let intermediate = runtime.expert_intermediate.as_ref().ok_or_else(|| {
-                    Exception::custom("forward_offloaded: expert_intermediate not initialized")
-                })?;
-                // ---- LEGACY COPY PATH ----
-                // Used when the aligned buffer pool is unavailable.
-                let cmd_buf = fused_expert
-                    .create_command_buffer()
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let miss_bufs = if !miss_ids.is_empty() {
-                    ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
-                        Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
-                    })?
-                } else {
-                    vec![]
-                };
-
-                let expert_bufs =
-                    materialize_prefetched_raw_bytes(prefetched, ctx.layout.expert_size, miss_bufs);
-
-                let io_us = io_start.elapsed().as_micros();
-                tracing::trace!(
-                    layer = layer_idx,
-                    io_ms = io_us as f64 / 1000.0,
-                    path = "legacy",
-                    hits = prefetch_hits,
-                    misses = miss_ids.len(),
-                    "offloaded MoE I/O"
-                );
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_expert_io", io_start);
-                }
-
-                let encode_submit_start = Instant::now();
-                for (i, raw_bytes) in expert_bufs.iter().enumerate() {
-                    let weights =
-                        crate::expert_dequant::parse_expert_weights(raw_bytes, record, &metal_ctx)
-                            .map_err(|e| Exception::custom(e))?;
-
-                    fused_expert
-                        .encode_into(
-                            &cmd_buf,
-                            &input_buf,
-                            &weights,
-                            &runtime.expert_out_bufs[i],
-                            intermediate,
-                        )
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-                }
-
-                fused_expert
-                    .submit(&cmd_buf)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                if let Some(profile) = layer_profile.as_deref_mut() {
-                    profile.push_section("moe_expert_encode_submit", encode_submit_start);
-                }
-                cmd_buf
-            };
-            let shared_start = Instant::now();
-            let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
-            shared_y.eval();
-            shared_gate_logit.eval();
-            if let Some(profile) = layer_profile.as_deref_mut() {
-                profile.push_section("moe_shared", shared_start);
-            }
-
-            let wait_start = Instant::now();
-            let fused_expert = runtime.fused_expert.as_ref().ok_or_else(|| {
-                Exception::custom("forward_offloaded: fused_expert not initialized")
-            })?;
-            fused_expert
-                .wait_for_completion(&cmd_buf)
-                .map_err(|e| Exception::custom(e.to_string()))?;
-            if let Some(profile) = layer_profile.as_deref_mut() {
-                profile.push_section("moe_expert_wait", wait_start);
-                profile.push_section("moe_expert_gpu", wait_start);
-            }
-
-            if let Some(aligned_bufs) = aligned_release_bufs {
-                let pool = runtime.buffer_pool.as_ref().unwrap();
-                for buf in aligned_bufs {
-                    pool.release(buf);
-                }
-            }
-
-            // ---- Combine: weighted sum + shared expert ----
-            let combine_start = Instant::now();
-            // Convert Metal output buffers to MLX arrays (zero-copy)
-            let output_wrap_start = Instant::now();
-            let k_usize = k as usize;
-            let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
-            for i in 0..expert_indices.len().min(runtime.expert_out_bufs.len()) {
-                let slice = runtime.expert_out_bufs[i].as_slice();
-                expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
-            }
-            let down_out = ops::stack_axis(&expert_arrays, 1);
-            let down_out = down_out.reshape(&[batch_seq, k, hidden]);
-            if let Some(profile) = layer_profile.as_deref_mut() {
-                profile.push_section("moe_output_wrap", output_wrap_start);
-            }
-
-            let result = moe_combine(
-                &down_out,
-                &top_weights,
-                &shared_y,
-                &shared_gate_logit,
-                k,
-                batch_seq,
-            )?;
-            let reshaped = result.reshape(shape);
-            reshaped.eval();
-            if let Some(profile) = layer_profile {
-                profile.push_section("moe_combine", combine_start);
-            }
-            Ok(reshaped)
-        }
-    }
-}
-
-fn prefetched_miss_plan<T>(
-    prefetched: &[Option<T>],
-    expert_indices: &[usize],
-) -> Vec<(usize, usize)> {
-    prefetched
-        .iter()
-        .enumerate()
-        .filter_map(|(slot_idx, hit)| {
-            hit.is_none()
-                .then_some((slot_idx, expert_indices[slot_idx]))
+                Ok(routed)
+            });
+        } else if let Some(packed) = &self.packed_experts {
+            packed.clone()
+        } else if self.routed_experts_loaded {
+            self.resident_experts()?
+        } else {
+            return Err(Exception::custom(
+                "routed expert weights are not resident; enable expert offloading with --experts-dir",
+            ));
+        };
+        self.combine(x, |x_flat, indices, weights| {
+            Ok(pmetal_runtime::native_moe::switch_glu(
+                x_flat,
+                &experts.gate,
+                &experts.up,
+                &experts.down,
+                indices,
+                weights,
+                |gate, up| nn::silu(gate).multiply(up),
+            ))
         })
-        .collect()
-}
-
-fn acquire_prefetched_aligned_buffers(
-    pool: &Arc<ExpertBufferPool>,
-    prefetched: Vec<Option<PrefetchedExpert>>,
-) -> Result<Vec<pmetal_metal::expert_buffer::AlignedBuffer>, Exception> {
-    let mut aligned_bufs = Vec::with_capacity(prefetched.len());
-    for hit in prefetched {
-        let aligned = match hit {
-            Some(PrefetchedExpert::Aligned(buf)) => buf.into_inner(),
-            Some(PrefetchedExpert::Raw(raw_bytes)) => {
-                let mut aligned = pool.acquire_blocking();
-                copy_prefetched_expert_into_aligned(&mut aligned, &raw_bytes)?;
-                aligned
-            }
-            None => pool.acquire_blocking(),
-        };
-        aligned_bufs.push(aligned);
     }
-    Ok(aligned_bufs)
-}
 
-fn materialize_prefetched_raw_bytes(
-    prefetched: Vec<Option<PrefetchedExpert>>,
-    expert_size: usize,
-    miss_bufs: Vec<Vec<u8>>,
-) -> Vec<Arc<Vec<u8>>> {
-    let mut expert_bufs = Vec::with_capacity(prefetched.len());
-    let mut miss_iter = miss_bufs.into_iter().map(Arc::new);
-    for hit in prefetched {
-        let buf = match hit {
-            Some(PrefetchedExpert::Raw(buf)) => Arc::new(buf),
-            Some(PrefetchedExpert::Aligned(buf)) => Arc::new(buf.to_vec(expert_size)),
-            None => miss_iter.next().unwrap(),
+    /// The resident stacks `[E, out, in]` as the dense weights the gather
+    /// kernels take, `[E, in, out]` (views: the transpose copies nothing).
+    fn resident_experts(&self) -> Result<PackedRoutedExperts, Exception> {
+        let dense = |stack: &Array| -> Result<LayerWeight, Exception> {
+            Ok(LayerWeight::Dense(
+                dequantize_fp8_weight_for_compute(stack)?.swap_axes(-1, -2),
+            ))
         };
-        expert_bufs.push(buf);
+        Ok(PackedRoutedExperts {
+            gate: dense(self.switch_mlp_gate_proj.as_ref())?,
+            up: dense(self.switch_mlp_up_proj.as_ref())?,
+            down: dense(self.switch_mlp_down_proj.as_ref())?,
+        })
     }
-    expert_bufs
-}
-
-fn copy_prefetched_expert_into_aligned(
-    aligned: &mut pmetal_metal::expert_buffer::AlignedBuffer,
-    raw_bytes: &[u8],
-) -> Result<(), Exception> {
-    aligned
-        .write_prefix(raw_bytes)
-        .map_err(|e| Exception::custom(e.to_string()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn load_missing_experts_into_aligned_buffers(
-    ctx: &ExpertOffloadContext,
-    layer_idx: usize,
-    miss_plan: &[(usize, usize)],
-    aligned_bufs: &mut [pmetal_metal::expert_buffer::AlignedBuffer],
-) -> Result<(), Exception> {
-    ctx.read_experts_aligned_with_plan(layer_idx, miss_plan, aligned_bufs)
-        .map_err(|e| Exception::custom(format!("expert aligned pread layer {layer_idx}: {e}")))
 }
 
 // ============================================================================
@@ -2791,14 +1942,6 @@ pub struct Qwen3NextModel {
     pub layers: Vec<Qwen3NextDecoderLayer>,
     pub norm: nn::RmsNorm,
     pub full_attention_interval: i32,
-    /// Shared expert offload context (set via `enable_expert_offloading`).
-    pub offload_ctx: Option<Arc<ExpertOffloadContext>>,
-    /// Pre-gated expert prediction engine (set via `enable_expert_offloading`).
-    pub prefetcher: Option<Arc<ExpertPrefetcher>>,
-    /// Shared runtime for offloaded sparse experts.
-    offload_runtime: Option<Arc<Qwen3NextOffloadRuntime>>,
-    /// Pre-computed indices of MoE layers for fast next-MoE lookup during prefetch.
-    pub moe_layer_indices: Vec<usize>,
 }
 impl_module_params!(Qwen3NextModel; embed_tokens, layers, norm);
 
@@ -2821,22 +1964,11 @@ impl Qwen3NextModel {
             .eps(config.rms_norm_eps)
             .build()?;
 
-        let moe_layer_indices: Vec<usize> = layers
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| matches!(l.mlp, Qwen3NextFeedForward::MoE(_)))
-            .map(|(i, _)| i)
-            .collect();
-
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             full_attention_interval: config.full_attention_interval,
-            offload_ctx: None,
-            prefetcher: None,
-            offload_runtime: None,
-            moe_layer_indices,
         })
     }
 
@@ -2967,24 +2099,7 @@ impl Qwen3NextModel {
         // a `[1, 1, T, T]` attention mask would be read as a `[B, T]` validity
         // mask and zero the wrong positions, and there is no left padding in
         // this cache.
-        let prefill_like = hidden.dim(1) > 1;
-
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            // Kick off prefetch for the next MoE layer using the current
-            // layer input only for prompt prefill, where overlapping the next
-            // sparse layer's reads is worth the extra predictor work. For
-            // single-token decode, keep prefetch after the layer so we do not
-            // serialize the hot path before the current layer runs.
-            if prefill_like {
-                Self::prefetch_next_experts(
-                    &self.prefetcher,
-                    &self.offload_ctx,
-                    &self.moe_layer_indices,
-                    layer_idx,
-                    &hidden,
-                );
-            }
-
             let kv = if !layer.is_linear {
                 kv_cache.as_deref_mut().map(|c| (c, layer_idx))
             } else {
@@ -3021,16 +2136,6 @@ impl Qwen3NextModel {
             {
                 buf.record_hidden(layer_idx, hidden.clone());
             }
-
-            if !prefill_like {
-                Self::prefetch_next_experts(
-                    &self.prefetcher,
-                    &self.offload_ctx,
-                    &self.moe_layer_indices,
-                    layer_idx,
-                    &hidden,
-                );
-            }
         }
 
         let norm_start = Instant::now();
@@ -3039,27 +2144,7 @@ impl Qwen3NextModel {
             hidden.eval();
             profile.final_norm_us = norm_start.elapsed().as_micros() as u64;
         }
-        if prefill_like && let Some(prefetcher) = &self.prefetcher {
-            prefetcher.reset_pending();
-        }
         Ok(hidden)
-    }
-
-    /// Start reading the experts the next sparse layer is predicted to route
-    /// to, from the hidden state entering (or leaving) layer `layer_idx`.
-    fn prefetch_next_experts(
-        prefetcher: &Option<Arc<ExpertPrefetcher>>,
-        ctx: &Option<Arc<ExpertOffloadContext>>,
-        moe_layer_indices: &[usize],
-        layer_idx: usize,
-        hidden: &Array,
-    ) {
-        if let (Some(prefetcher), Some(ctx)) = (prefetcher, ctx) {
-            let next = moe_layer_indices.partition_point(|&i| i <= layer_idx);
-            if let Some(&layer) = moe_layer_indices.get(next) {
-                prefetcher.predict_and_prefetch(layer, hidden, ctx);
-            }
-        }
     }
 }
 
@@ -3107,7 +2192,7 @@ impl Qwen3NextForCausalLM {
             matches!(
                 &layer.mlp,
                 Qwen3NextFeedForward::MoE(block)
-                    if !block.routed_experts_loaded && block.offload_ctx.is_none()
+                    if !block.routed_experts_loaded && block.offloaded.is_none()
             )
         })
     }
@@ -3281,12 +2366,20 @@ impl Qwen3NextForCausalLM {
         &self.config
     }
 
-    /// Enable SSD-offloaded MoE inference with expert prefetching.
+    /// The reader of the offloaded experts, once [`enable_expert_offloading`]
+    /// has run.
     ///
-    /// 1. Opens packed expert files from `experts_dir`
-    /// 2. Extracts gate weights to build the prefetch predictor
-    /// 3. Wires offload context and prefetcher into each MoE layer
-    /// 4. Zeros stacked expert weight arrays to reclaim GPU memory
+    /// [`enable_expert_offloading`]: Self::enable_expert_offloading
+    pub fn offloaded_experts(&self) -> Option<&Arc<OffloadedExperts>> {
+        self.model.layers.iter().find_map(|layer| match &layer.mlp {
+            Qwen3NextFeedForward::MoE(block) => block.offloaded.as_ref(),
+            Qwen3NextFeedForward::Dense(_) => None,
+        })
+    }
+
+    /// Enable SSD-offloaded MoE inference: each sparse layer reads the experts
+    /// its tokens route to from the packed files in `experts_dir` (written by
+    /// `pmetal pack-experts`), and the stacked expert arrays are freed.
     pub fn enable_expert_offloading(&mut self, experts_dir: &Path) -> Result<(), Exception> {
         let mut blocks: Vec<(usize, &mut Qwen3NextSparseMoeBlock)> = self
             .model
@@ -3298,31 +2391,7 @@ impl Qwen3NextForCausalLM {
                 Qwen3NextFeedForward::Dense(_) => None,
             })
             .collect();
-        let offload = attach_expert_offload(
-            experts_dir,
-            &mut blocks,
-            self.config.num_experts as usize,
-            self.config.hidden_size as usize,
-            self.config.num_experts_per_tok as usize,
-        )?;
-
-        // Store on model for use in forward_with_cache
-        self.model.offload_ctx = Some(offload.ctx);
-        self.model.offload_runtime = Some(offload.runtime);
-        self.model.prefetcher = Some(offload.prefetcher);
-        Ok(())
-    }
-
-    /// Get prefetch hit/miss statistics (if offloading is enabled).
-    pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
-        self.model.prefetcher.as_ref().map(|p| p.stats())
-    }
-
-    /// Reset prefetch hit/miss statistics.
-    pub fn reset_prefetch_stats(&self) {
-        if let Some(prefetcher) = self.model.prefetcher.as_ref() {
-            prefetcher.reset_stats();
-        }
+        attach_expert_offload(experts_dir, &mut blocks)
     }
 }
 
@@ -3743,46 +2812,6 @@ mod tests {
     }
 
     #[test]
-    fn test_prefetched_miss_plan_tracks_slots_and_experts() {
-        let prefetched = vec![Some(vec![1u8; 4]), None, Some(vec![2u8; 4]), None];
-        let expert_indices = vec![2usize, 3, 7, 11];
-        let miss_plan = prefetched_miss_plan(&prefetched, &expert_indices);
-        assert_eq!(miss_plan, vec![(1, 3), (3, 11)]);
-    }
-
-    #[test]
-    fn test_sparse_moe_required_pool_buffers_covers_prefill_window() {
-        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(0, 8), 1);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(4, 8), 32);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(8, 8), 64);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(4, 16), 64);
-    }
-
-    #[test]
-    fn test_sparse_moe_required_output_buffers_covers_prefill_window() {
-        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(0, 8), 1);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(4, 8), 32);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(8, 8), 64);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(4, 16), 64);
-    }
-
-    #[test]
-    fn test_prefill_expert_window_tokens_is_sanitized() {
-        assert_eq!(
-            Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(0),
-            1
-        );
-        assert_eq!(
-            Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(8),
-            8
-        );
-        assert_eq!(
-            Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(64),
-            32
-        );
-    }
-
-    #[test]
     fn test_sanitize_weights_keeps_legacy_norm_shift_when_needed() {
         let config = tiny_config();
         let mut weights = HashMap::from([
@@ -3809,17 +2838,6 @@ mod tests {
         shifted.eval();
         let shifted_vec: Vec<f32> = shifted.as_slice().to_vec();
         assert_eq!(shifted_vec, vec![1.25, 0.5, 2.0]);
-    }
-
-    #[test]
-    #[serial]
-    fn test_copy_prefetched_expert_into_aligned_buffer() {
-        let ctx = pmetal_metal::context::MetalContext::global().unwrap();
-        let mut aligned =
-            pmetal_metal::expert_buffer::AlignedBuffer::new(ctx.device(), 16).unwrap();
-        let payload = vec![9u8, 7, 5, 3, 1];
-        copy_prefetched_expert_into_aligned(&mut aligned, &payload).unwrap();
-        assert!(aligned.size() >= payload.len());
     }
 
     #[test]
@@ -3981,6 +2999,133 @@ mod tests {
             values.iter().all(|&v| v == 0.0),
             "zero-weight MoE block returned its input: {values:?}"
         );
+    }
+
+    /// A prefill sorts its (token, expert) pairs by expert before the gather
+    /// matmuls and a decode step does not; the two orders compute the same
+    /// block, values and gradients: tokens run alone (router order) against the
+    /// whole sequence in one pass (grouped), the expert weights' gradient
+    /// summed over the tokens against the whole sequence's.
+    #[test]
+    #[serial]
+    fn a_sequence_through_a_sparse_block_is_its_tokens_through_it() {
+        let config = Qwen3NextConfig {
+            num_experts: 8,
+            num_experts_per_tok: 2,
+            norm_topk_prob: true,
+            ..tiny_config()
+        };
+        let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
+        let randn = |shape: &[i32]| pmetal_runtime::compat::random::normal(shape, Dtype::Float32);
+        *moe.gate.weight = randn(&[8, 32]);
+        *moe.switch_mlp_gate_proj = randn(&[8, 16, 32]);
+        *moe.switch_mlp_up_proj = randn(&[8, 16, 32]);
+        *moe.switch_mlp_down_proj = randn(&[8, 32, 16]);
+        *moe.shared_expert.gate_proj.weight = randn(&[32, 32]);
+        *moe.shared_expert.up_proj.weight = randn(&[32, 32]);
+        *moe.shared_expert.down_proj.weight = randn(&[32, 32]);
+        *moe.shared_expert_gate.weight = randn(&[1, 32]);
+
+        // 40 tokens x 2 experts: past the 64-pair threshold only with a
+        // second row, so use two sequences' worth.
+        let tokens = 40;
+        let x = randn(&[2, tokens, 32]);
+        let max_diff = |a: &Array, b: &Array| a.subtract(b).abs().max(None).item::<f32>();
+
+        // Values: the whole batch against one token at a time.
+        let whole = moe.forward(&x).unwrap();
+        let mut rows = Vec::new();
+        for b in 0..2 {
+            for t in 0..tokens {
+                let token = slice_axis(&slice_axis(&x, 0, b, b + 1), 1, t, t + 1);
+                rows.push(moe.forward(&token).unwrap().reshape(&[1, 32]));
+            }
+        }
+        let rows_ref: Vec<&Array> = rows.iter().collect();
+        let alone = ops::concatenate_axis(&rows_ref, 0).reshape(&[2, tokens, 32]);
+        let value_scale = whole.abs().max(None).item::<f32>().max(1.0);
+        assert!(
+            max_diff(&whole, &alone) / value_scale < 1e-5,
+            "values differ by {} (scale {value_scale})",
+            max_diff(&whole, &alone)
+        );
+
+        // Gradient of sum(output) with respect to the gate expert stack.
+        let stack = moe.switch_mlp_gate_proj.as_ref().clone();
+        let mut grad_of = |input: &Array| {
+            let (_, grads) = pmetal_runtime::compat::nn::value_and_grad_explicit(
+                |arrays: &[Array]| {
+                    *moe.switch_mlp_gate_proj = arrays[0].clone();
+                    moe.forward(&arrays[1]).unwrap().sum(None)
+                },
+                &[stack.clone(), input.clone()],
+                &[],
+            )
+            .unwrap();
+            pmetal_runtime::check_unobserved_error().expect("no op failed under the trace");
+            grads
+        };
+        let whole_grads = grad_of(&x);
+        let mut summed: Option<Array> = None;
+        let mut dx_rows = Vec::new();
+        for b in 0..2 {
+            for t in 0..tokens {
+                let token = slice_axis(&slice_axis(&x, 0, b, b + 1), 1, t, t + 1);
+                let grads = grad_of(&token);
+                summed = Some(match summed {
+                    Some(acc) => acc.add(&grads[0]),
+                    None => grads[0].clone(),
+                });
+                dx_rows.push(grads[1].reshape(&[1, 32]));
+            }
+        }
+        let summed = summed.unwrap();
+        let dx_refs: Vec<&Array> = dx_rows.iter().collect();
+        let dx_alone = ops::concatenate_axis(&dx_refs, 0).reshape(&[2, tokens, 32]);
+        assert!(
+            whole_grads[0].abs().sum(None).item::<f32>() > 0.0,
+            "the stack's gradient is not zero"
+        );
+        let scale = summed.abs().max(None).item::<f32>().max(1.0);
+        assert!(
+            max_diff(&whole_grads[0], &summed) / scale < 1e-4,
+            "expert gradient differs by {} (scale {scale})",
+            max_diff(&whole_grads[0], &summed)
+        );
+        let dx_scale = dx_alone.abs().max(None).item::<f32>().max(1.0);
+        assert!(
+            max_diff(&whole_grads[1], &dx_alone) / dx_scale < 1e-4,
+            "input gradient differs by {} (scale {dx_scale})",
+            max_diff(&whole_grads[1], &dx_alone)
+        );
+    }
+
+    /// The routing weights are float32 (the softmax is), but the block
+    /// computes in the model's dtype: the weights are cast to it before they
+    /// scale the experts' outputs, as transformers does, so a bf16 model's
+    /// hidden state stays bf16 through a sparse layer.
+    #[test]
+    #[serial]
+    fn a_bf16_sparse_block_returns_bf16() {
+        use pmetal_runtime::compat::ModuleParametersExt;
+
+        let config = Qwen3NextConfig {
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            norm_topk_prob: true,
+            ..tiny_config()
+        };
+        let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
+        for (_, p) in moe.flatten_params_mut() {
+            let shape = p.shape().to_vec();
+            *p = pmetal_runtime::compat::random::normal(&shape, Dtype::Bfloat16);
+        }
+        let x =
+            pmetal_runtime::compat::random::normal(&[1, 3, config.hidden_size], Dtype::Bfloat16);
+        let y = moe.forward(&x).unwrap();
+        y.eval();
+        assert_eq!(y.dtype(), Dtype::Bfloat16);
+        pmetal_runtime::check_unobserved_error().unwrap();
     }
 
     /// A decode step through the cache is the last position of the whole

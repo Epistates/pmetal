@@ -61,8 +61,8 @@ use pmetal_runtime::nn::rope::{RopePositions, rope};
 use serde::{Deserialize, Serialize};
 
 use super::qwen3_next::{
-    ExpertOffloadAttachment, GateActivation, PackedRoutedExperts, Qwen3NextAttention,
-    Qwen3NextConfig, Qwen3NextGatedDeltaNet, Qwen3NextRoutedExpertMode, Qwen3NextSanitizeOptions,
+    GateActivation, PackedRoutedExperts, Qwen3NextAttention, Qwen3NextConfig,
+    Qwen3NextGatedDeltaNet, Qwen3NextRoutedExpertMode, Qwen3NextSanitizeOptions,
     Qwen3NextSparseMoeBlock, RopeParameters, attach_expert_offload, sanitize_weights,
 };
 use super::utils::LoadReport;
@@ -1494,8 +1494,7 @@ impl Qwen4ExpDecoderLayer {
         })
     }
 
-    /// `(output streams, MoE input)`; the MoE input feeds the expert
-    /// prefetcher's guess for the next layer.
+    /// The layer's output streams.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &mut self,
@@ -1505,7 +1504,7 @@ impl Qwen4ExpDecoderLayer {
         mut mamba_cache: Option<&mut MambaCache>,
         layer_idx: usize,
         layout: Qwen4ExpCacheLayout,
-    ) -> Result<(Array, Array), Exception> {
+    ) -> Result<Array, Exception> {
         let mut h = streams.clone();
         if let (Some(ple), Some(k)) = (&self.ple, self.ple_index) {
             let out = match mamba_cache.as_deref_mut() {
@@ -1554,7 +1553,7 @@ impl Qwen4ExpDecoderLayer {
         let (mixed, inject) = self.mlp_hyper_connection.mix(&h);
         let out = self.mlp.forward(&mixed)?;
         let inject = inject.expect("decoder hyper-connections inject");
-        Ok((self.mlp_hyper_connection.inject(&h, &out, &inject), mixed))
+        Ok(self.mlp_hyper_connection.inject(&h, &out, &inject))
     }
 }
 
@@ -1566,8 +1565,6 @@ pub struct Qwen4ExpModel {
     pub hyper_connection_mixer: Qwen4ExpGatedResidual,
     pub hc_count: i32,
     pub layout: Qwen4ExpCacheLayout,
-    /// SSD expert offloading, once enabled.
-    pub(crate) offload: Option<ExpertOffloadAttachment>,
 }
 impl_module_params!(Qwen4ExpModel; embed_tokens, layers, hyper_connection_mixer);
 
@@ -1589,7 +1586,6 @@ impl Qwen4ExpModel {
             hyper_connection_mixer: Qwen4ExpGatedResidual::new(config, false)?,
             hc_count: config.hc_count,
             layout: config.cache_layout(),
-            offload: None,
         })
     }
 
@@ -1655,9 +1651,8 @@ impl Qwen4ExpModel {
         }
         let mut h = embedded.tile(&[1, 1, self.hc_count]);
         let layout = self.layout;
-        let decode = input_ids.dim(input_ids.ndim() - 1) == 1;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let (next, moe_input) = layer.forward(
+            h = layer.forward(
                 &h,
                 &tokens,
                 kv_cache.as_deref_mut(),
@@ -1665,19 +1660,10 @@ impl Qwen4ExpModel {
                 layer_idx,
                 layout,
             )?;
-            h = next;
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(layer_idx)
             {
                 buf.record_hidden(layer_idx, h.clone());
-            }
-            // With experts on SSD, start reading the next layer's likely
-            // experts, guessed from this layer's MoE input, while the GPU
-            // works. Decode only: prefill routes too many tokens to guess.
-            if decode && let Some(offload) = &self.offload {
-                offload
-                    .prefetcher
-                    .predict_and_prefetch(layer_idx + 1, &moe_input, &offload.ctx);
             }
         }
         let (mixed, _) = self.hyper_connection_mixer.mix(&h);
@@ -1815,7 +1801,17 @@ impl Qwen4ExpForCausalLM {
         self.model
             .layers
             .iter()
-            .any(|l| !l.mlp.routed_experts_loaded && l.mlp.offload_ctx.is_none())
+            .any(|l| !l.mlp.routed_experts_loaded && l.mlp.offloaded.is_none())
+    }
+
+    /// The reader of the offloaded experts, once they are offloaded.
+    pub fn offloaded_experts(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::expert_offload::OffloadedExperts>> {
+        self.model
+            .layers
+            .iter()
+            .find_map(|layer| layer.mlp.offloaded.as_ref())
     }
 
     /// Serve routed experts from `experts_dir` (written by
@@ -1828,26 +1824,7 @@ impl Qwen4ExpForCausalLM {
             .enumerate()
             .map(|(layer_idx, layer)| (layer_idx, &mut layer.mlp))
             .collect();
-        let offload = attach_expert_offload(
-            experts_dir,
-            &mut blocks,
-            self.config.num_experts as usize,
-            self.config.hidden_size as usize,
-            self.config.num_experts_per_tok as usize,
-        )?;
-        self.model.offload = Some(offload);
-        Ok(())
-    }
-
-    /// Prefetch hit/miss statistics, when experts are offloaded.
-    pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
-        self.model.offload.as_ref().map(|o| o.prefetcher.stats())
-    }
-
-    pub fn reset_prefetch_stats(&self) {
-        if let Some(offload) = &self.model.offload {
-            offload.prefetcher.reset_stats();
-        }
+        attach_expert_offload(experts_dir, &mut blocks)
     }
 }
 

@@ -2310,7 +2310,8 @@ impl DynamicModel {
         }
     }
 
-    /// Enable SSD-offloaded MoE inference with expert prefetching.
+    /// Enable SSD-offloaded MoE inference: each sparse layer reads the experts
+    /// its tokens route to from `experts_dir`.
     ///
     /// Only supported for architectures built on the Qwen 3.5 MoE block
     /// (Qwen3Next, Qwen4Exp).
@@ -2325,29 +2326,34 @@ impl DynamicModel {
         }
     }
 
+    /// What the offloaded experts' files have been asked for since the last
+    /// [`reset_expert_read_stats`](Self::reset_expert_read_stats), if expert
+    /// offloading is enabled.
+    pub fn expert_read_stats(&self) -> Option<crate::expert_offload::ExpertReadStats> {
+        match self {
+            Self::Qwen3Next(m) => m.offloaded_experts().map(|e| e.stats()),
+            Self::Qwen4Exp(m) => m.offloaded_experts().map(|e| e.stats()),
+            _ => None,
+        }
+    }
+
+    /// Zero the expert read counters (if expert offloading is enabled).
+    pub fn reset_expert_read_stats(&self) {
+        let experts = match self {
+            Self::Qwen3Next(m) => m.offloaded_experts(),
+            Self::Qwen4Exp(m) => m.offloaded_experts(),
+            _ => None,
+        };
+        if let Some(experts) = experts {
+            experts.reset_stats();
+        }
+    }
+
     pub fn requires_expert_offloading(&self) -> bool {
         match self {
             Self::Qwen3Next(m) => m.requires_expert_offloading(),
             Self::Qwen4Exp(m) => m.requires_expert_offloading(),
             _ => false,
-        }
-    }
-
-    /// Get prefetch hit/miss statistics (if expert offloading is enabled).
-    pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
-        match self {
-            Self::Qwen3Next(m) => m.prefetch_stats(),
-            Self::Qwen4Exp(m) => m.prefetch_stats(),
-            _ => None,
-        }
-    }
-
-    /// Reset prefetch hit/miss statistics (if expert offloading is enabled).
-    pub fn reset_prefetch_stats(&self) {
-        match self {
-            Self::Qwen3Next(m) => m.reset_prefetch_stats(),
-            Self::Qwen4Exp(m) => m.reset_prefetch_stats(),
-            _ => {}
         }
     }
 }

@@ -9,7 +9,6 @@ This crate provides custom Metal shaders for the operations the tensor runtime h
 ## Features
 
 - **Fused AdamW**: one-dispatch optimizer update over every parameter
-- **Offloaded MoE experts**: single-expert gate/up/down on 4- and 2-bit weights read straight from a record buffer
 - **dW GEMM**: the f32 weight-gradient GEMM the ANE trainer batches into one command buffer
 
 ## Architecture
@@ -89,7 +88,6 @@ fn adamw_step() -> Result<()> {
 | Kernel | Memory | Description |
 |--------|--------|-------------|
 | `fused_training` | Same | One-dispatch AdamW over every parameter |
-| `fused_moe` | Same | Single-expert gate/up/down on 4- and 2-bit affine weights |
 | `dw_gemm` | Same | f32 weight-gradient GEMM for the ANE trainer |
 
 ## Requirements
