@@ -1096,6 +1096,7 @@ impl DynamicModel {
                 let load_options = if skip_routed_experts {
                     Qwen3NextLoadOptions {
                         skip_routed_experts: true,
+                        ..Default::default()
                     }
                 } else {
                     Qwen3NextLoadOptions::default()

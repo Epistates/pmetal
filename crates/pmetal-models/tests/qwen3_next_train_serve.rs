@@ -53,8 +53,10 @@ fn argmax(row: &Array) -> u32 {
 /// Logits of the last prompt position and of each decode step on the
 /// `DynamicModel` engine, with the greedy tokens it chose.
 fn dynamic_run(dir: &std::path::Path) -> (Vec<Array>, Vec<u32>) {
+    let started = std::time::Instant::now();
     let mut model = DynamicModel::load(dir).expect("dynamic engine loads");
     drain("dynamic load");
+    println!("dynamic engine loaded in {:.1?}", started.elapsed());
     let mut kv = model.create_cache(PROMPT.len() + DECODE_STEPS + 1);
     let mut mamba = model
         .create_mamba_cache()
@@ -70,6 +72,7 @@ fn dynamic_run(dir: &std::path::Path) -> (Vec<Array>, Vec<u32>) {
         drain("dynamic forward");
         let row = last_row(&logits);
         row.eval();
+        println!("dynamic step done at {:.1?}", started.elapsed());
         let next = argmax(&row);
         rows.push(row);
         tokens.push(next);
@@ -80,9 +83,11 @@ fn dynamic_run(dir: &std::path::Path) -> (Vec<Array>, Vec<u32>) {
 
 /// The same tokens through the native engine: the prompt, then `tokens`.
 fn native_run(dir: &std::path::Path, tokens: &[u32]) -> Vec<Array> {
+    let started = std::time::Instant::now();
     let config = load_config(dir).expect("native config parses");
     let weights = load_model(dir, &config).expect("native engine loads");
     drain("native load");
+    println!("native engine loaded in {:.1?}", started.elapsed());
     let mut cache = NativeCache::new_empty(&weights);
 
     let mut rows = Vec::new();

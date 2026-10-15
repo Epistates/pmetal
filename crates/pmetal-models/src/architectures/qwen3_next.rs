@@ -18,7 +18,7 @@ use pmetal_runtime::impl_module_params;
 use pmetal_runtime::qwen3_native::family::gdn_qk_rms_norm_eps;
 use pmetal_runtime::qwen3_native::mrope::MropeTables;
 use pmetal_runtime::rope::RotaryEmbedding;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::expert_offload::OffloadedExperts;
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
+use crate::loader::LoadError;
 use crate::traits::ModelConfig;
 use pmetal_cache::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_runtime::native_weight::LayerWeight;
@@ -703,15 +704,10 @@ pub struct Qwen3NextAttention {
     pub head_dim: i32,
     pub scale: f32,
     pub rope_dims: i32,
-    pub effective_base: f32,
-    pub rope_scale: f32,
     /// Rotary frequencies per position axis for a prompt with media.
     pub mrope_section: [usize; 3],
     /// The rotary embedding every position path rotates with.
     pub rope: RotaryEmbedding,
-    /// Set when the rotary embedding is scaled (YaRN), which the inline
-    /// decode path's `effective_base` / `rope_scale` cannot express.
-    pub scaled_rope: Option<RotaryEmbedding>,
 }
 impl_module_params!(Qwen3NextAttention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
@@ -728,9 +724,6 @@ impl Qwen3NextAttention {
         let n_kv_heads = config.get_num_kv_heads();
 
         let rope = RotaryEmbedding::new(config.rotary()?, false);
-        let (effective_base, rope_scale) =
-            rope.scalar().unwrap_or((rope.rotary().theta as f32, 1.0));
-        let scaled_rope = rope.scalar().is_none().then(|| rope.clone());
 
         // q_proj outputs 2x for gated output: n_heads * head_dim * 2
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim * 2)
@@ -765,11 +758,8 @@ impl Qwen3NextAttention {
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
             rope_dims: rope.dims(),
-            effective_base,
-            rope_scale,
             mrope_section: config.mrope_section(),
             rope,
-            scaled_rope,
         })
     }
 
@@ -1366,6 +1356,17 @@ impl std::fmt::Debug for PackedRoutedExperts {
 }
 
 impl Qwen3NextSparseMoeBlock {
+    /// Run the routed experts from `experts`, kept packed, instead of from the
+    /// stacked arrays, which become placeholders so nothing ever materializes
+    /// them.
+    pub fn use_packed_experts(&mut self, experts: PackedRoutedExperts) {
+        *self.switch_mlp_gate_proj = Array::zeros_f32(&[1]);
+        *self.switch_mlp_up_proj = Array::zeros_f32(&[1]);
+        *self.switch_mlp_down_proj = Array::zeros_f32(&[1]);
+        self.packed_experts = Some(experts);
+        self.routed_experts_loaded = true;
+    }
+
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
         Self::new_with_routed_expert_mode(config, Qwen3NextRoutedExpertMode::Resident)
     }
@@ -1608,6 +1609,90 @@ impl Qwen3NextSparseMoeBlock {
             down: dense(self.switch_mlp_down_proj.as_ref())?,
         })
     }
+}
+
+/// Lift ModelOpt-quantized routed experts out of `weights` and stack them,
+/// per layer and projection, onto MLX's packed kernels. Any other ModelOpt
+/// tensor goes back in dense, as the shared dequantizer would leave it.
+pub(crate) fn take_packed_experts(
+    weights: &mut HashMap<String, Array>,
+    num_experts: usize,
+) -> Result<HashMap<usize, PackedRoutedExperts>, LoadError> {
+    use pmetal_runtime::native_loader::take_modelopt_weights;
+    use pmetal_runtime::native_weight::detect_model_dtype;
+
+    if !weights
+        .keys()
+        .any(|k| k.contains(".mlp.experts.") && k.ends_with(".weight_scale"))
+    {
+        return Ok(HashMap::new());
+    }
+    let dtype = detect_model_dtype(|key| weights.get(key).map(|w| w.dtype_raw()));
+    let experts = num_experts;
+    let mut parts: HashMap<(usize, usize), Vec<Option<LayerWeight>>> = HashMap::new();
+    for (base, weight) in take_modelopt_weights(weights).map_err(LoadError::SafeTensors)? {
+        match routed_expert_module(&base) {
+            Some((layer, expert, proj)) if expert < experts => {
+                let packed = weight
+                    .into_native(dtype)
+                    .map_err(|e| LoadError::SafeTensors(format!("{base}: {e}")))?
+                    .into_layer_weight();
+                parts
+                    .entry((layer, proj))
+                    .or_insert_with(|| vec![None; experts])[expert] = Some(packed);
+            }
+            _ => {
+                let dense = weight
+                    .to_dense(dtype)
+                    .map_err(|e| LoadError::SafeTensors(format!("{base}: {e}")))?;
+                weights.insert(format!("{base}.weight"), dense);
+            }
+        }
+    }
+
+    let layers: HashSet<usize> = parts.keys().map(|&(layer, _)| layer).collect();
+    let mut packed = HashMap::new();
+    for layer in layers {
+        let mut stack = |proj: usize| -> Result<LayerWeight, LoadError> {
+            let name = ["gate_proj", "up_proj", "down_proj"][proj];
+            let experts = parts.remove(&(layer, proj)).ok_or_else(|| {
+                LoadError::MissingWeight(format!("layer {layer} packed experts' {name}"))
+            })?;
+            let experts = experts
+                .into_iter()
+                .enumerate()
+                .map(|(e, w)| {
+                    w.ok_or_else(|| {
+                        LoadError::MissingWeight(format!("layer {layer} expert {e} {name}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            LayerWeight::stack(experts)
+                .map_err(|e| LoadError::SafeTensors(format!("layer {layer} {name}: {e}")))
+        };
+        let experts = PackedRoutedExperts {
+            gate: stack(0)?,
+            up: stack(1)?,
+            down: stack(2)?,
+        };
+        packed.insert(layer, experts);
+    }
+    Ok(packed)
+}
+
+/// `(layer, expert, projection)` of a per-expert routed module path
+/// (`...layers.{l}.mlp.experts.{e}.{gate,up,down}_proj`).
+fn routed_expert_module(base: &str) -> Option<(usize, usize, usize)> {
+    let (head, tail) = base.split_once(".mlp.experts.")?;
+    let layer = head.rsplit('.').next()?.parse().ok()?;
+    let (expert, proj) = tail.split_once('.')?;
+    let proj = match proj {
+        "gate_proj" => 0,
+        "up_proj" => 1,
+        "down_proj" => 2,
+        _ => return None,
+    };
+    Some((layer, expert.parse().ok()?, proj))
 }
 
 // ============================================================================

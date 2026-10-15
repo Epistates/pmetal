@@ -61,14 +61,13 @@ use pmetal_runtime::nn::rope::{RopePositions, rope};
 use serde::{Deserialize, Serialize};
 
 use super::qwen3_next::{
-    GateActivation, PackedRoutedExperts, Qwen3NextAttention, Qwen3NextConfig,
-    Qwen3NextGatedDeltaNet, Qwen3NextRoutedExpertMode, Qwen3NextSanitizeOptions,
-    Qwen3NextSparseMoeBlock, RopeParameters, attach_expert_offload, sanitize_weights,
+    GateActivation, Qwen3NextAttention, Qwen3NextConfig, Qwen3NextGatedDeltaNet,
+    Qwen3NextRoutedExpertMode, Qwen3NextSanitizeOptions, Qwen3NextSparseMoeBlock, RopeParameters,
+    attach_expert_offload, sanitize_weights, take_packed_experts,
 };
 use super::utils::LoadReport;
 use crate::loader::LoadError;
 use crate::traits::ModelConfig;
-use pmetal_runtime::native_weight::LayerWeight;
 
 // ============================================================================
 // Configuration
@@ -2160,7 +2159,7 @@ pub fn assign_qwen4_exp_tensors(
     let packed = if options.unpack_quantized_experts {
         HashMap::new()
     } else {
-        take_packed_experts(&mut weights, &model.config)?
+        take_packed_experts(&mut weights, model.config.num_experts as usize)?
     };
     crate::loader::dequantize_sidecar_weights(&mut weights)?;
     let dtypes: HashMap<String, i32> = weights
@@ -2197,11 +2196,7 @@ pub fn assign_qwen4_exp_tensors(
                 LoadError::SafeTensors(format!("packed experts for missing layer {layer_idx}"))
             })?
             .mlp;
-        *block.switch_mlp_gate_proj = Array::zeros_f32(&[1]);
-        *block.switch_mlp_up_proj = Array::zeros_f32(&[1]);
-        *block.switch_mlp_down_proj = Array::zeros_f32(&[1]);
-        block.packed_experts = Some(experts.clone());
-        block.routed_experts_loaded = true;
+        block.use_packed_experts(experts.clone());
     }
     let packed_prefixes: Vec<String> = packed
         .keys()
@@ -2252,90 +2247,6 @@ pub fn assign_qwen4_exp_tensors(
         )));
     }
     Ok(loaded.len() + 3 * packed.len())
-}
-
-/// Lift ModelOpt-quantized routed experts out of `weights` and stack them,
-/// per layer and projection, onto MLX's packed kernels. Any other ModelOpt
-/// tensor goes back in dense, as the shared dequantizer would leave it.
-fn take_packed_experts(
-    weights: &mut HashMap<String, Array>,
-    config: &Qwen4ExpConfig,
-) -> Result<HashMap<usize, PackedRoutedExperts>, LoadError> {
-    use pmetal_runtime::native_loader::take_modelopt_weights;
-    use pmetal_runtime::native_weight::detect_model_dtype;
-
-    if !weights
-        .keys()
-        .any(|k| k.contains(".mlp.experts.") && k.ends_with(".weight_scale"))
-    {
-        return Ok(HashMap::new());
-    }
-    let dtype = detect_model_dtype(|key| weights.get(key).map(|w| w.dtype_raw()));
-    let experts = config.num_experts as usize;
-    let mut parts: HashMap<(usize, usize), Vec<Option<LayerWeight>>> = HashMap::new();
-    for (base, weight) in take_modelopt_weights(weights).map_err(LoadError::SafeTensors)? {
-        match routed_expert_module(&base) {
-            Some((layer, expert, proj)) if expert < experts => {
-                let packed = weight
-                    .into_native(dtype)
-                    .map_err(|e| LoadError::SafeTensors(format!("{base}: {e}")))?
-                    .into_layer_weight();
-                parts
-                    .entry((layer, proj))
-                    .or_insert_with(|| vec![None; experts])[expert] = Some(packed);
-            }
-            _ => {
-                let dense = weight
-                    .to_dense(dtype)
-                    .map_err(|e| LoadError::SafeTensors(format!("{base}: {e}")))?;
-                weights.insert(format!("{base}.weight"), dense);
-            }
-        }
-    }
-
-    let layers: HashSet<usize> = parts.keys().map(|&(layer, _)| layer).collect();
-    let mut packed = HashMap::new();
-    for layer in layers {
-        let mut stack = |proj: usize| -> Result<LayerWeight, LoadError> {
-            let name = ["gate_proj", "up_proj", "down_proj"][proj];
-            let experts = parts.remove(&(layer, proj)).ok_or_else(|| {
-                LoadError::MissingWeight(format!("layer {layer} packed experts' {name}"))
-            })?;
-            let experts = experts
-                .into_iter()
-                .enumerate()
-                .map(|(e, w)| {
-                    w.ok_or_else(|| {
-                        LoadError::MissingWeight(format!("layer {layer} expert {e} {name}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            LayerWeight::stack(experts)
-                .map_err(|e| LoadError::SafeTensors(format!("layer {layer} {name}: {e}")))
-        };
-        let experts = PackedRoutedExperts {
-            gate: stack(0)?,
-            up: stack(1)?,
-            down: stack(2)?,
-        };
-        packed.insert(layer, experts);
-    }
-    Ok(packed)
-}
-
-/// `(layer, expert, projection)` of a per-expert routed module path
-/// (`...layers.{l}.mlp.experts.{e}.{gate,up,down}_proj`).
-fn routed_expert_module(base: &str) -> Option<(usize, usize, usize)> {
-    let (head, tail) = base.split_once(".mlp.experts.")?;
-    let layer = head.rsplit('.').next()?.parse().ok()?;
-    let (expert, proj) = tail.split_once('.')?;
-    let proj = match proj {
-        "gate_proj" => 0,
-        "up_proj" => 1,
-        "down_proj" => 2,
-        _ => return None,
-    };
-    Some((layer, expert.parse().ok()?, proj))
 }
 
 /// Load a Qwen4-Exp checkpoint (the released `Qwen4ExpForConditionalGeneration`
