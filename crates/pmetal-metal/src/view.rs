@@ -1,9 +1,11 @@
 #![allow(unsafe_code)]
 
-//! Bridge for zero-copy interop between MLX arrays and Metal buffers.
+//! Zero-copy Metal views of memory that something else owns.
 //!
-//! On Apple Silicon, MLX and Metal share unified memory. This module provides
-//! utilities to pass data between them without copying.
+//! On Apple Silicon the CPU, the GPU and the runtime's arrays share unified
+//! memory. [`metal_buffer_from_ptr`] wraps such memory (typically a
+//! materialised runtime array) in a Metal buffer a kernel can bind, without
+//! copying it.
 
 use half::f16;
 use objc2::runtime::ProtocolObject;
@@ -19,7 +21,9 @@ use crate::error::{MetalError, Result};
 /// Create a Metal buffer from a raw pointer (zero-copy).
 ///
 /// This creates a Metal buffer that wraps existing memory WITHOUT copying.
-/// The memory must remain valid for the lifetime of the buffer.
+/// The memory must remain valid for the lifetime of the buffer. If Metal
+/// declines to alias the memory (it would have to copy it), this fails rather
+/// than hand back a buffer that silently diverges from its source.
 ///
 /// # Safety
 ///
@@ -34,23 +38,31 @@ use crate::error::{MetalError, Result};
 /// # Arguments
 ///
 /// * `ctx` - Metal context
-/// * `ptr` - Pointer to the data (must be from unified memory, e.g., MLX arrays)
+/// * `ptr` - Pointer to the data (must be from unified memory, e.g., a runtime array)
 /// * `len` - Number of elements of type T
 ///
 /// # Common Use Case
 ///
-/// This function is designed for zero-copy bridging from MLX arrays to Metal:
+/// Zero-copy views of runtime arrays:
 /// ```ignore
 /// array.eval(); // data_ptr() needs a materialised array
-/// let mlx_ptr = array.data_ptr() as *mut f32;
-/// let view = unsafe { metal_buffer_from_ptr(&ctx, mlx_ptr, array.size())? };
+/// let ptr = array.data_ptr() as *mut f32;
+/// let view = unsafe { metal_buffer_from_ptr(&ctx, ptr, array.size())? };
 /// ```
 pub unsafe fn metal_buffer_from_ptr<'src, T: Copy + FromBytes + IntoBytes>(
     ctx: &MetalContext,
     ptr: *mut T,
     len: usize,
 ) -> Result<MetalBufferView<'src, T>> {
-    let size = len * std::mem::size_of::<T>();
+    let size =
+        len.checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| MetalError::BufferCreation {
+                size: usize::MAX,
+                reason: format!(
+                    "view size overflows: {len} elements of {} bytes",
+                    std::mem::size_of::<T>()
+                ),
+            })?;
 
     let ptr_void =
         NonNull::new(ptr as *mut std::ffi::c_void).ok_or_else(|| MetalError::BufferCreation {
@@ -64,12 +76,29 @@ pub unsafe fn metal_buffer_from_ptr<'src, T: Copy + FromBytes + IntoBytes>(
     let options =
         MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeTracked;
 
+    // Metal cannot wrap zero bytes. A view of nothing is a small buffer of
+    // its own that no kernel will read past `len`.
+    if size == 0 {
+        let buffer = ctx
+            .device()
+            .newBufferWithLength_options(16, options)
+            .ok_or_else(|| MetalError::BufferCreation {
+                size,
+                reason: "Failed to create empty view".to_string(),
+            })?;
+        return Ok(MetalBufferView {
+            buffer,
+            len,
+            _lifetime: PhantomData,
+        });
+    }
+
     // SAFETY (internal):
     // 1. ptr_void is non-null (checked above)
     // 2. size is correctly computed from len and size_of::<T>()
     // 3. newBufferWithBytesNoCopy creates a view without copying data
     // 4. deallocator is None because we don't own the memory - the caller
-    //    (typically an MLX Array) is responsible for deallocation
+    //    (typically a runtime array) is responsible for deallocation
     // 5. The Copy + FromBytes + IntoBytes bounds ensure T has no padding or invariants
     // SAFETY: see above safety comment — all preconditions verified
     let buffer = unsafe {
@@ -81,6 +110,15 @@ pub unsafe fn metal_buffer_from_ptr<'src, T: Copy + FromBytes + IntoBytes>(
         reason: "Failed to create buffer view".to_string(),
     })?;
 
+    // A view that doesn't alias its source would take the kernels' writes
+    // into a private copy and lose them.
+    if buffer.contents() != ptr_void {
+        return Err(MetalError::BufferCreation {
+            size,
+            reason: "Metal copied the memory instead of aliasing it".to_string(),
+        });
+    }
+
     Ok(MetalBufferView {
         buffer,
         len,
@@ -91,7 +129,7 @@ pub unsafe fn metal_buffer_from_ptr<'src, T: Copy + FromBytes + IntoBytes>(
 /// A view into existing memory as a Metal buffer.
 ///
 /// Unlike `MetalBuffer`, this does not own its memory - it's a view into
-/// memory owned elsewhere (e.g., an MLX array).  The `'src` lifetime
+/// memory owned elsewhere (e.g., a runtime array).  The `'src` lifetime
 /// parameter ties this view to the source memory so the borrow checker
 /// enforces that the source outlives the view.
 pub struct MetalBufferView<'src, T: Copy + FromBytes + IntoBytes> {
@@ -141,10 +179,10 @@ impl<'src, T: Copy + FromBytes + IntoBytes> MetalBufferView<'src, T> {
 //
 // MetalBufferView wraps an MTLBuffer which is a thread-safe Objective-C object.
 // The view does not own the underlying memory - it just provides a Metal interface
-// to memory owned elsewhere (typically an MLX array).
+// to memory owned elsewhere (typically a runtime array).
 //
 // Thread safety requirements:
-// 1. The source memory (e.g., MLX array) must remain valid across all threads
+// 1. The source memory (e.g., a runtime array) must remain valid across all threads
 // 2. The source memory must not be modified while any thread holds this view
 // 3. GPU operations using this buffer must be properly synchronized
 unsafe impl<'src, T: Copy + FromBytes + IntoBytes> Send for MetalBufferView<'src, T> {}
@@ -180,5 +218,29 @@ mod tests {
 
         assert_eq!(view.len(), 4);
         assert_eq!(view.size_bytes(), 16);
+        // It is a view: the buffer's contents are the vector's memory.
+        assert_eq!(
+            view.metal_buffer().contents().as_ptr().cast_const(),
+            data.as_ptr().cast::<std::ffi::c_void>()
+        );
+    }
+
+    /// A length whose byte size overflows `usize` is an error, not a wrapped
+    /// (tiny) view that a kernel then reads past.
+    #[test]
+    fn a_view_whose_size_overflows_is_rejected() {
+        let ctx = MetalContext::new().unwrap();
+        let mut word = 0.0f32;
+        let result = unsafe { metal_buffer_from_ptr(&ctx, &mut word, usize::MAX / 2) };
+        assert!(matches!(result, Err(MetalError::BufferCreation { .. })));
+    }
+
+    #[test]
+    fn a_view_of_no_elements_is_valid() {
+        let ctx = MetalContext::new().unwrap();
+        let mut word = 0.0f32;
+        let view = unsafe { metal_buffer_from_ptr(&ctx, &mut word, 0) }.unwrap();
+        assert!(view.is_empty());
+        assert_eq!(view.size_bytes(), 0);
     }
 }

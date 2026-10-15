@@ -132,6 +132,19 @@ pub(crate) mod ffi {
     }
 }
 
+/// Stop before a raw vDSP or BLAS call reads or writes past a slice.
+///
+/// Every function here is safe to call but ends in an FFI call that trusts the
+/// shape it is given, so the slices are checked against it in every build, not
+/// only where debug assertions are on.
+#[track_caller]
+fn require_len(function: &str, got: usize, need: usize) {
+    assert!(
+        got >= need,
+        "{function}: a slice has {got} elements but the shape needs {need}"
+    );
+}
+
 // CBLAS constants
 const CBLAS_ROW_MAJOR: i32 = 101;
 const CBLAS_NO_TRANS: i32 = 111;
@@ -190,8 +203,8 @@ pub fn scale_inplace(data: &mut [f32], scale: f32) {
 /// Vector add: `out[i] = a[i] + b[i]`.
 pub fn vadd(a: &[f32], b: &[f32], out: &mut [f32]) {
     let n = a.len();
-    debug_assert_eq!(n, b.len());
-    debug_assert_eq!(n, out.len());
+    assert_eq!(n, b.len(), "vadd: slice length does not match the shape");
+    assert_eq!(n, out.len(), "vadd: slice length does not match the shape");
     if n == 0 {
         return;
     }
@@ -212,8 +225,8 @@ pub fn vadd(a: &[f32], b: &[f32], out: &mut [f32]) {
 /// Vector element-wise multiply: `out[i] = a[i] * b[i]`.
 pub fn vmul(a: &[f32], b: &[f32], out: &mut [f32]) {
     let n = a.len();
-    debug_assert_eq!(n, b.len());
-    debug_assert_eq!(n, out.len());
+    assert_eq!(n, b.len(), "vmul: slice length does not match the shape");
+    assert_eq!(n, out.len(), "vmul: slice length does not match the shape");
     if n == 0 {
         return;
     }
@@ -250,7 +263,22 @@ pub fn gemm(
     trans_a: bool,
     trans_b: bool,
 ) {
-    debug_assert_eq!(c.len(), m * n);
+    // op(A) is m x k and op(B) is k x n, stored as given whether or not they
+    // are transposed, so each needs m*k and k*n elements either way.
+    let element_count = |rows: usize, cols: usize| {
+        rows.checked_mul(cols)
+            .expect("gemm: matrix dimensions overflow")
+    };
+    require_len("gemm", a.len(), element_count(m, k));
+    require_len("gemm", b.len(), element_count(k, n));
+    require_len("gemm", c.len(), element_count(m, n));
+    // BLAS takes 32-bit dimensions.
+    for dimension in [m, n, k] {
+        assert!(
+            i32::try_from(dimension).is_ok(),
+            "gemm: dimension {dimension} exceeds the 32-bit range BLAS accepts"
+        );
+    }
 
     #[cfg(target_os = "macos")]
     {
@@ -307,8 +335,8 @@ pub fn gemm(
 ///
 /// `src` is `rows × cols` row-major, `dst` is `cols × rows` row-major.
 pub fn matrix_transpose(dst: &mut [f32], src: &[f32], rows: usize, cols: usize) {
-    debug_assert_eq!(src.len(), rows * cols);
-    debug_assert_eq!(dst.len(), rows * cols);
+    require_len("matrix_transpose", src.len(), rows * cols);
+    require_len("matrix_transpose", dst.len(), rows * cols);
 
     #[cfg(target_os = "macos")]
     unsafe {
@@ -334,9 +362,9 @@ pub fn matrix_transpose(dst: &mut [f32], src: &[f32], rows: usize, cols: usize) 
 ///
 /// This matches the ANE reference `rmsnorm()` implementation using vDSP.
 pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize, eps: f32) {
-    debug_assert_eq!(x.len(), dim * seq);
-    debug_assert_eq!(out.len(), dim * seq);
-    debug_assert_eq!(w.len(), dim);
+    require_len("rmsnorm", x.len(), dim * seq);
+    require_len("rmsnorm", out.len(), dim * seq);
+    require_len("rmsnorm", w.len(), dim);
 
     #[cfg(target_os = "macos")]
     {
@@ -414,11 +442,11 @@ pub fn rmsnorm_backward(
     seq: usize,
     eps: f32,
 ) {
-    debug_assert_eq!(x.len(), dim * seq);
-    debug_assert_eq!(dy.len(), dim * seq);
-    debug_assert_eq!(dx.len(), dim * seq);
-    debug_assert_eq!(w.len(), dim);
-    debug_assert_eq!(dw.len(), dim);
+    require_len("rmsnorm_backward", x.len(), dim * seq);
+    require_len("rmsnorm_backward", dy.len(), dim * seq);
+    require_len("rmsnorm_backward", dx.len(), dim * seq);
+    require_len("rmsnorm_backward", w.len(), dim);
+    require_len("rmsnorm_backward", dw.len(), dim);
 
     #[cfg(target_os = "macos")]
     {
@@ -579,9 +607,15 @@ pub fn cross_entropy_loss(
     vocab: usize,
     seq: usize,
 ) -> f32 {
-    debug_assert_eq!(logits.len(), vocab * seq);
-    debug_assert_eq!(dlogits.len(), vocab * seq);
-    debug_assert_eq!(targets.len(), seq);
+    require_len("cross_entropy_loss", logits.len(), vocab * seq);
+    require_len("cross_entropy_loss", dlogits.len(), vocab * seq);
+    require_len("cross_entropy_loss", targets.len(), seq);
+    assert!(
+        targets
+            .iter()
+            .all(|&t| t == IGNORE_INDEX || (t as usize) < vocab),
+        "cross_entropy_loss: a target is outside the vocabulary of {vocab}"
+    );
 
     let (n, inv_n) = counted_targets(targets);
     let mut total_loss = 0.0f32;
@@ -684,7 +718,7 @@ pub fn cross_entropy_loss(
 ///
 /// Computes softmax along the channel dimension for each sequence position.
 pub fn softmax_inplace(data: &mut [f32], dim: usize, seq: usize) {
-    debug_assert_eq!(data.len(), dim * seq);
+    require_len("softmax_inplace", data.len(), dim * seq);
 
     for t in 0..seq {
         // Find max
@@ -783,8 +817,8 @@ pub fn silu_inplace(data: &mut [f32]) {
 /// `embed` is `[vocab, dim]` row-major. Transposes from row-major embedding
 /// to channel-first output layout.
 pub fn embed_lookup(x: &mut [f32], embed: &[f32], tokens: &[u32], dim: usize, seq: usize) {
-    debug_assert_eq!(x.len(), dim * seq);
-    debug_assert_eq!(tokens.len(), seq);
+    require_len("embed_lookup", x.len(), dim * seq);
+    require_len("embed_lookup", tokens.len(), seq);
 
     for t in 0..seq {
         let tok = tokens[t] as usize;
@@ -798,8 +832,8 @@ pub fn embed_lookup(x: &mut [f32], embed: &[f32], tokens: &[u32], dim: usize, se
 ///
 /// `dx` is channel-first `[dim, seq]`, `d_embed` is `[vocab, dim]` row-major.
 pub fn embed_backward(d_embed: &mut [f32], dx: &[f32], tokens: &[u32], dim: usize, seq: usize) {
-    debug_assert_eq!(dx.len(), dim * seq);
-    debug_assert_eq!(tokens.len(), seq);
+    require_len("embed_backward", dx.len(), dim * seq);
+    require_len("embed_backward", tokens.len(), seq);
 
     for t in 0..seq {
         let tok = tokens[t] as usize;
@@ -1103,5 +1137,97 @@ mod tests {
             0.0
         );
         assert!(none.iter().all(|g| *g == 0.0));
+    }
+
+    // These wrappers are safe functions over raw vDSP and BLAS calls, so a
+    // slice that is shorter than the shape says must stop them in every build,
+    // not only where debug assertions are on.
+
+    #[test]
+    #[should_panic(expected = "gemm")]
+    fn gemm_rejects_a_short_left_operand() {
+        let (a, b) = (vec![0.0f32; 5], vec![0.0f32; 12]);
+        let mut c = vec![0.0f32; 8];
+        gemm(&a, &b, &mut c, 2, 4, 3, 1.0, 0.0, false, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "gemm")]
+    fn gemm_rejects_a_short_right_operand() {
+        let (a, b) = (vec![0.0f32; 6], vec![0.0f32; 11]);
+        let mut c = vec![0.0f32; 8];
+        gemm(&a, &b, &mut c, 2, 4, 3, 1.0, 0.0, false, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "gemm")]
+    fn gemm_rejects_a_short_output() {
+        let (a, b) = (vec![0.0f32; 6], vec![0.0f32; 12]);
+        let mut c = vec![0.0f32; 7];
+        gemm(&a, &b, &mut c, 2, 4, 3, 1.0, 0.0, false, false);
+    }
+
+    #[test]
+    fn gemm_accepts_exactly_sized_operands_in_every_transpose_mode() {
+        // a is 2x3, b is 3x4 (or their transposes stored as given).
+        let a: Vec<f32> = (0..6).map(|x| x as f32).collect();
+        let b: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut c = vec![0.0f32; 8];
+            gemm(&a, &b, &mut c, 2, 4, 3, 1.0, 0.0, ta, tb);
+            assert!(c.iter().all(|x| x.is_finite()));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "vadd")]
+    fn vadd_rejects_mismatched_lengths() {
+        let mut out = vec![0.0f32; 2];
+        vadd(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0], &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "vmul")]
+    fn vmul_rejects_mismatched_lengths() {
+        let mut out = vec![0.0f32; 3];
+        vmul(&[1.0, 2.0, 3.0], &[1.0, 2.0], &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "matrix_transpose")]
+    fn matrix_transpose_rejects_a_short_destination() {
+        let src = vec![0.0f32; 6];
+        let mut dst = vec![0.0f32; 5];
+        matrix_transpose(&mut dst, &src, 2, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "rmsnorm")]
+    fn rmsnorm_rejects_a_short_weight() {
+        let x = vec![1.0f32; 8];
+        let mut out = vec![0.0f32; 8];
+        rmsnorm(&mut out, &x, &[1.0; 3], 4, 2, 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "rmsnorm_backward")]
+    fn rmsnorm_backward_rejects_a_short_gradient() {
+        let x = vec![1.0f32; 8];
+        let (mut dx, mut dw) = (vec![0.0f32; 8], vec![0.0f32; 4]);
+        rmsnorm_backward(&mut dx, &mut dw, &[1.0; 7], &x, &[1.0; 4], 4, 2, 1e-6);
+    }
+
+    #[test]
+    #[should_panic(expected = "cross_entropy_loss")]
+    fn cross_entropy_rejects_a_short_logit_buffer() {
+        let mut grad = vec![0.0f32; 6];
+        cross_entropy_loss(&mut grad, &[0.0; 5], &[0, 1], 3, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "cross_entropy_loss")]
+    fn cross_entropy_rejects_a_target_outside_the_vocabulary() {
+        let mut grad = vec![0.0f32; 6];
+        cross_entropy_loss(&mut grad, &[0.0; 6], &[0, 3], 3, 2);
     }
 }

@@ -4,7 +4,6 @@
 //! with a focus on transformer attention mechanisms and efficient training
 //! operations.
 
-pub mod batch_encoder;
 pub mod dispatch;
 pub mod dw_gemm;
 pub mod flash_attention;
@@ -14,7 +13,6 @@ pub mod fused_norm_lora;
 pub mod fused_rope;
 pub mod fused_swiglu;
 pub mod fused_training;
-pub mod mpp_bench;
 pub mod mpp_dispatch;
 pub mod mpp_flash_attention;
 pub mod mpp_gemm;

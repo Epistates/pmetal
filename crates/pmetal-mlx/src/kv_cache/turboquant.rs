@@ -218,7 +218,7 @@ pub struct TurboQuantConfig {
     /// QJL residual mode. See [`TurboQuantQjlMode`].
     pub qjl: TurboQuantQjlMode,
     /// Cold-store length above which the 1-bit Hamming skip-list pre-filter
-    /// engages on the bridge side. `None` (default) keeps the full-cold
+    /// engages in the runtime. `None` (default) keeps the full-cold
     /// score path. This crate doesn't itself implement the pre-filter — it
     /// just propagates the threshold to `pmetal-runtime` via the FFI mirror
     /// so a single config object covers both backends.
@@ -678,13 +678,13 @@ impl TurboKeyStore {
 }
 
 /// Returns true when the active dim should use signed-FWHT instead of dense
-/// `[d×d]` matmul for rotation and QJL projection. Mirrors the bridge gate so
+/// `[d×d]` matmul for rotation and QJL projection. Mirrors the runtime's gate so
 /// both implementations make the same choice.
 fn dim_uses_fwht(dim: usize) -> bool {
     dim >= 4 && dim.is_power_of_two()
 }
 
-/// Local Rademacher (±1) sign sampler. Mirrors the bridge's logic but uses
+/// Local Rademacher (±1) sign sampler. Mirrors the runtime's logic but uses
 /// pmetal-mlx's resolved `rand` version to avoid the two-version FFI mismatch.
 fn local_rademacher_signs(dim: usize, rng: &mut StdRng) -> Vec<f32> {
     (0..dim)

@@ -16,13 +16,12 @@ use std::sync::Arc;
 
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
 };
 
 use crate::{
     buffer::MetalBuffer,
-    context::MetalContext,
+    context::{CommandQueueExt, MetalContext},
     error::{MetalError, Result},
 };
 
@@ -259,10 +258,7 @@ impl FusedMoeExpert {
     pub fn create_command_buffer(
         &self,
     ) -> Result<objc2::rc::Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
-        let command_queue = self.ctx.command_queue();
-        command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)
+        self.ctx.command_queue().new_command_buffer()
     }
 
     /// Submit a command buffer and wait for GPU completion.

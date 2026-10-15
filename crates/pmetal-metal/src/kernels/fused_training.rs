@@ -38,13 +38,11 @@ use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
-use crate::context::MetalContext;
+use crate::context::{CommandQueueExt, MetalContext};
 use crate::error::{MetalError, Result};
 
 // =============================================================================
@@ -79,10 +77,7 @@ pub struct BatchedCommandBuffer {
 impl BatchedCommandBuffer {
     /// Create a new batched command buffer.
     pub fn new(ctx: Arc<MetalContext>) -> Result<Self> {
-        let command_buffer = ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = ctx.command_queue().new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
