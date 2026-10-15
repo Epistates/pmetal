@@ -1,61 +1,35 @@
 //! Configuration types for PMetal.
+//!
+//! These are the sections of a training config file (`model`, `lora`,
+//! `training`, `dataset`) and the library types the trainers take. Every field
+//! here is one a trainer reads: a setting nothing honours is a setting that
+//! silently does nothing, so the sections reject unknown keys instead, and
+//! [`ConfigValidator`](crate::ConfigValidator) rejects the values (and the
+//! combinations) that cannot work. See [`crate::FullTrainingConfig`] for the
+//! file loader, which also keeps files written by earlier releases readable.
 
-use crate::{Device, Dtype, Quantization};
-use serde::{Deserialize, Serialize};
+use crate::defaults;
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Model loading configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Model identifier (HuggingFace repo ID or local path).
+    #[serde(default, alias = "name")]
     pub model_id: String,
-
-    /// Data type for model weights.
-    #[serde(default)]
-    pub dtype: Dtype,
-
-    /// Quantization scheme.
-    #[serde(default)]
-    pub quantization: Quantization,
-
-    /// Compute device.
-    #[serde(default)]
-    pub device: Device,
-
-    /// Maximum sequence length.
-    #[serde(default = "default_max_seq_len")]
-    pub max_seq_len: usize,
 
     /// Use flash attention if available.
     #[serde(default = "default_true")]
     pub use_flash_attention: bool,
-
-    /// Trust remote code (for custom model implementations).
-    #[serde(default)]
-    pub trust_remote_code: bool,
-
-    /// Revision/branch to use.
-    #[serde(default)]
-    pub revision: Option<String>,
-
-    /// HuggingFace token for private models.
-    /// Skipped during serialization to prevent accidental token leakage into
-    /// config snapshots, logs, or checkpoint metadata.
-    #[serde(default, skip_serializing)]
-    pub hf_token: Option<String>,
 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             model_id: String::new(),
-            dtype: Dtype::default(),
-            quantization: Quantization::default(),
-            device: Device::default(),
-            max_seq_len: default_max_seq_len(),
             use_flash_attention: true,
-            trust_remote_code: false,
-            revision: None,
-            hf_token: None,
         }
     }
 }
@@ -73,8 +47,121 @@ pub enum LoraBias {
     LoraOnly,
 }
 
+/// How a LoRA adapter's `A` and `B` matrices are initialised.
+///
+/// In a config file this is the `init_lora_weights` key: `true` (or
+/// `standard`) for the default, or a method's name. Only
+/// [`Standard`](Self::Standard) is implemented; the others parse so that a
+/// config naming one is refused with a clear error
+/// ([`ConfigValidator`](crate::ConfigValidator)) instead of being trained as
+/// something else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LoraInit {
+    /// `A` Kaiming-uniform, `B` zero: the adapter starts as the identity
+    /// (Hu et al., 2021).
+    #[default]
+    Standard,
+    /// `A` and `B` from the principal singular components of the base weight,
+    /// whose residual becomes the frozen base (Meng et al., 2024).
+    Pissa,
+    /// `A` and `B` from an SVD of the quantization residual, with the base
+    /// quantized alternately (Li et al., 2023). For QLoRA.
+    Loftq,
+}
+
+impl LoraInit {
+    /// Every method, implemented or not.
+    pub const ALL: [Self; 3] = [Self::Standard, Self::Pissa, Self::Loftq];
+
+    /// The name a config file uses.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Pissa => "pissa",
+            Self::Loftq => "loftq",
+        }
+    }
+
+    /// Whether the trainers can initialise an adapter this way.
+    #[must_use]
+    pub fn is_supported(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+}
+
+impl std::fmt::Display for LoraInit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LoraInit {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let wanted = s.trim().to_ascii_lowercase();
+        if wanted == "true" || wanted == "default" {
+            return Ok(Self::Standard);
+        }
+        Self::ALL
+            .into_iter()
+            .find(|init| init.as_str() == wanted)
+            .ok_or_else(|| {
+                let valid: Vec<_> = Self::ALL.iter().map(|i| i.as_str()).collect();
+                format!(
+                    "unknown LoRA initialisation '{s}'; valid: {}",
+                    valid.join(", ")
+                )
+            })
+    }
+}
+
+impl Serialize for LoraInit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // The spelling files written by earlier releases carry.
+            Self::Standard => serializer.serialize_bool(true),
+            other => serializer.serialize_str(other.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LoraInit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct InitVisitor;
+
+        impl Visitor<'_> for InitVisitor {
+            type Value = LoraInit;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("`true` or the name of a LoRA initialisation (standard, pissa, loftq)")
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<LoraInit, E> {
+                if v {
+                    Ok(LoraInit::Standard)
+                } else {
+                    Err(E::custom(
+                        "init_lora_weights: false (a randomly initialised `B`, which starts the \
+                         adapter away from the base model) is not supported; use `true` or a \
+                         named initialisation",
+                    ))
+                }
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<LoraInit, E> {
+                v.parse().map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(InitVisitor)
+    }
+}
+
 /// LoRA configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoraConfig {
     /// LoRA rank (r).
     #[serde(default = "default_lora_r")]
@@ -89,8 +176,8 @@ pub struct LoraConfig {
     pub dropout: f32,
 
     /// Projections to adapt, by name (`q_proj`, `gate_proj`, ...). Empty
-    /// adapts every linear layer except the output layer (the LM head), as
-    /// PEFT's `all-linear` does; name `lm_head` to adapt the head.
+    /// adapts every linear layer except the output layer (the LM head); name
+    /// `lm_head` to adapt the head.
     #[serde(default = "default_target_modules")]
     pub target_modules: Vec<String>,
 
@@ -102,13 +189,14 @@ pub struct LoraConfig {
     #[serde(default)]
     pub use_dora: bool,
 
-    /// Bias handling mode.
+    /// Bias handling mode. Only [`LoraBias::None`] is implemented.
     #[serde(default)]
     pub bias: LoraBias,
 
-    /// Initialize LoRA B to zero (recommended).
-    #[serde(default = "default_true")]
-    pub init_lora_weights: bool,
+    /// How the adapter matrices start out. Written `init_lora_weights` in a
+    /// config file. Only [`LoraInit::Standard`] is implemented.
+    #[serde(default)]
+    pub init_lora_weights: LoraInit,
 
     /// LoRA+ learning rate ratio for B matrices (Hayou et al., ICML 2024).
     ///
@@ -131,7 +219,7 @@ impl Default for LoraConfig {
             use_rslora: false,
             use_dora: false,
             bias: LoraBias::default(),
-            init_lora_weights: true,
+            init_lora_weights: LoraInit::default(),
             loraplus_lr_ratio: None,
         }
     }
@@ -155,6 +243,7 @@ impl LoraConfig {
 
 /// Training configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrainingConfig {
     /// Learning rate.
     #[serde(default = "default_lr")]
@@ -175,7 +264,7 @@ pub struct TrainingConfig {
     pub gradient_accumulation_steps: usize,
 
     /// Number of training epochs.
-    #[serde(default = "default_epochs")]
+    #[serde(default = "default_epochs", alias = "epochs")]
     pub num_epochs: usize,
 
     /// Maximum training steps (overrides epochs if set).
@@ -200,7 +289,7 @@ pub struct TrainingConfig {
     pub max_grad_norm: f64,
 
     /// Learning rate scheduler type.
-    #[serde(default)]
+    #[serde(default, alias = "lr_schedule")]
     pub lr_scheduler: LrSchedulerType,
 
     /// Minimum learning rate floor (absolute). Applied across all decay schedulers.
@@ -216,8 +305,10 @@ pub struct TrainingConfig {
     #[serde(default)]
     pub wsd_decay_style: Option<WsdDecayStyle>,
 
-    /// Cosine restart count for CosineWithRestarts scheduler (default 1).
-    #[serde(default)]
+    /// Cosine cycles for the CosineWithRestarts scheduler (default 1, which
+    /// is a single cosine; `n` cycles restart `n - 1` times). transformers
+    /// calls this `num_cycles`.
+    #[serde(default, alias = "cosine_num_cycles")]
     pub cosine_num_restarts: Option<usize>,
 
     /// Polynomial decay exponent (default 1.0 = linear, 2.0 = quadratic).
@@ -252,7 +343,7 @@ pub struct TrainingConfig {
     #[serde(default = "default_true")]
     pub use_packing: bool,
 
-    /// Maximum sequence length.
+    /// Maximum sequence length; 0 takes it from the model's config.
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
 }
@@ -308,6 +399,52 @@ pub enum LrSchedulerType {
     Wsd,
 }
 
+impl LrSchedulerType {
+    /// Every schedule, in the order the CLI lists them.
+    pub const ALL: [Self; 6] = [
+        Self::Cosine,
+        Self::Linear,
+        Self::Constant,
+        Self::CosineWithRestarts,
+        Self::Polynomial,
+        Self::Wsd,
+    ];
+
+    /// The name the CLI, job specs and YAML configs use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Constant => "constant",
+            Self::Linear => "linear",
+            Self::Cosine => "cosine",
+            Self::CosineWithRestarts => "cosine_with_restarts",
+            Self::Polynomial => "polynomial",
+            Self::Wsd => "wsd",
+        }
+    }
+}
+
+impl std::fmt::Display for LrSchedulerType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for LrSchedulerType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let wanted = normalized_name(s);
+        Self::ALL
+            .into_iter()
+            .find(|kind| normalized_name(kind.as_str()) == wanted)
+            .ok_or_else(|| {
+                let valid: Vec<_> = Self::ALL.iter().map(|k| k.as_str()).collect();
+                format!("unknown LR schedule '{s}'; valid: {}", valid.join(", "))
+            })
+    }
+}
+
 /// Shape of the WSD schedule's final decay phase.
 ///
 /// Hägele et al. (2024, "Scaling Laws and Compute-Optimal Training Beyond
@@ -347,6 +484,11 @@ impl WsdDecayStyle {
 /// learning rate and weight decay do not carry over between kinds: the Lion
 /// paper recommends a learning rate 3-10x smaller and a weight decay 3-10x
 /// larger than AdamW's.
+///
+/// [`SUPPORTED`](Self::SUPPORTED) lists the kinds a trainer runs today. The
+/// rest parse, so a config naming one gets a clear refusal from
+/// [`ConfigValidator`](crate::ConfigValidator) rather than an "unknown
+/// optimizer".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OptimizerType {
@@ -360,11 +502,35 @@ pub enum OptimizerType {
     Adafactor,
     /// Lion (sign of an interpolated momentum).
     Lion,
+    /// Muon on the hidden weight matrices (momentum, then Newton-Schulz
+    /// orthogonalization; Jordan et al., 2024) and AdamW on everything else
+    /// (embeddings, output head, norms, biases), the recipe it is meant to be
+    /// trained with.
+    Muon,
+    /// Schedule-free AdamW (Defazio et al., 2024): iterate averaging in place
+    /// of a decaying learning-rate schedule.
+    #[serde(rename = "adamw_schedule_free", alias = "schedule_free_adamw")]
+    AdamWScheduleFree,
+    /// AdamW with its two moment buffers blockwise-quantized to 8 bits
+    /// (Dettmers et al., 2022).
+    #[serde(rename = "adamw_8bit", alias = "adamw8bit")]
+    AdamW8bit,
 }
 
 impl OptimizerType {
     /// Every kind, in the order the CLI lists them.
-    pub const ALL: [Self; 4] = [Self::AdamW, Self::Sgd, Self::Lion, Self::Adafactor];
+    pub const ALL: [Self; 7] = [
+        Self::AdamW,
+        Self::Sgd,
+        Self::Lion,
+        Self::Adafactor,
+        Self::Muon,
+        Self::AdamWScheduleFree,
+        Self::AdamW8bit,
+    ];
+
+    /// The kinds a trainer runs today, in the order the CLI lists them.
+    pub const SUPPORTED: [Self; 4] = [Self::AdamW, Self::Sgd, Self::Lion, Self::Adafactor];
 
     /// The name the CLI, job specs and YAML configs use.
     pub fn as_str(self) -> &'static str {
@@ -373,6 +539,20 @@ impl OptimizerType {
             Self::Sgd => "sgd",
             Self::Lion => "lion",
             Self::Adafactor => "adafactor",
+            Self::Muon => "muon",
+            Self::AdamWScheduleFree => "adamw_schedule_free",
+            Self::AdamW8bit => "adamw_8bit",
+        }
+    }
+
+    /// Whether a trainer can run this optimizer. Flip a kind's arm here when
+    /// the trainer learns to build it; every surface that lists optimizers
+    /// follows [`SUPPORTED`](Self::SUPPORTED).
+    #[must_use]
+    pub fn is_supported(self) -> bool {
+        match self {
+            Self::AdamW | Self::Sgd | Self::Lion | Self::Adafactor => true,
+            Self::Muon | Self::AdamWScheduleFree | Self::AdamW8bit => false,
         }
     }
 }
@@ -387,15 +567,24 @@ impl std::str::FromStr for OptimizerType {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        let wanted = s.trim().to_ascii_lowercase().replace(['_', '-'], "");
+        let wanted = normalized_name(s);
+        let wanted = match wanted.as_str() {
+            "schedulefreeadamw" => "adamwschedulefree".to_string(),
+            _ => wanted,
+        };
         Self::ALL
             .into_iter()
-            .find(|kind| kind.as_str() == wanted)
+            .find(|kind| normalized_name(kind.as_str()) == wanted)
             .ok_or_else(|| {
                 let valid: Vec<_> = Self::ALL.iter().map(|k| k.as_str()).collect();
                 format!("unknown optimizer '{s}'; valid: {}", valid.join(", "))
             })
     }
+}
+
+/// A name with case, `_` and `-` removed, for matching user spellings.
+fn normalized_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace(['_', '-'], "")
 }
 
 /// Compression strategy for distributed gradient synchronization.
@@ -415,6 +604,7 @@ pub enum DistributedCompression {
 
 /// Configuration for distributed training across multiple Apple Silicon devices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DistributedTrainingConfig {
     /// Manual peer addresses (ip:port). If empty, uses auto-discovery.
     #[serde(default)]
@@ -464,40 +654,22 @@ fn default_topk_ratio() -> f32 {
 
 /// Dataset configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatasetConfig {
     /// Dataset identifier (HuggingFace or local path).
+    #[serde(default, alias = "path")]
     pub dataset_id: String,
-
-    /// Dataset split to use.
-    #[serde(default = "default_split")]
-    pub split: String,
-
-    /// Column containing input text.
-    #[serde(default = "default_text_column")]
-    pub text_column: String,
-
-    /// Maximum samples to use (None for all).
-    #[serde(default)]
-    pub max_samples: Option<usize>,
 
     /// Shuffle the dataset.
     #[serde(default = "default_true")]
     pub shuffle: bool,
-
-    /// Random seed for shuffling.
-    #[serde(default = "default_seed")]
-    pub seed: u64,
 }
 
 impl Default for DatasetConfig {
     fn default() -> Self {
         Self {
             dataset_id: String::new(),
-            split: default_split(),
-            text_column: default_text_column(),
-            max_samples: None,
             shuffle: true,
-            seed: default_seed(),
         }
     }
 }
@@ -510,10 +682,10 @@ fn default_true() -> bool {
     true
 }
 fn default_lora_r() -> usize {
-    16
+    defaults::LORA_R
 }
 fn default_lora_alpha() -> f32 {
-    32.0
+    defaults::LORA_ALPHA
 }
 fn default_target_modules() -> Vec<String> {
     vec![
@@ -524,28 +696,28 @@ fn default_target_modules() -> Vec<String> {
     ]
 }
 fn default_lr() -> f64 {
-    2e-4
+    defaults::LEARNING_RATE
 }
 fn default_batch_size() -> usize {
-    1
+    defaults::CLI_BATCH_SIZE
 }
 fn default_gradient_accumulation_steps() -> usize {
-    4
+    defaults::GRADIENT_ACCUMULATION_STEPS
 }
 fn default_epochs() -> usize {
-    3
+    defaults::EPOCHS
 }
 fn default_warmup() -> usize {
     0
 }
 fn default_weight_decay() -> f64 {
-    0.01
+    defaults::WEIGHT_DECAY
 }
 fn default_grad_clip() -> f64 {
-    1.0
+    defaults::MAX_GRAD_NORM
 }
 fn default_seed() -> u64 {
-    42
+    defaults::SEED
 }
 fn default_logging_steps() -> usize {
     10
@@ -554,16 +726,10 @@ fn default_logging_steps() -> usize {
 fn default_output_dir() -> String {
     "./output".into()
 }
-fn default_split() -> String {
-    "train".into()
-}
-fn default_text_column() -> String {
-    "text".into()
-}
 
 #[cfg(test)]
 mod tests {
-    use super::LoraConfig;
+    use super::*;
 
     #[test]
     fn lora_scaling_is_zero_for_zero_rank() {
@@ -578,7 +744,6 @@ mod tests {
 
     #[test]
     fn optimizer_names_round_trip_through_the_cli_and_yaml() {
-        use super::{OptimizerType, TrainingConfig};
         for kind in OptimizerType::ALL {
             assert_eq!(kind.as_str().parse::<OptimizerType>(), Ok(kind));
             let yaml = serde_saphyr::to_string(&kind).unwrap();
@@ -588,10 +753,83 @@ mod tests {
         }
         assert_eq!("AdamW".parse::<OptimizerType>(), Ok(OptimizerType::AdamW));
         assert_eq!("adam_w".parse::<OptimizerType>(), Ok(OptimizerType::AdamW));
+        assert_eq!(
+            "schedule-free-adamw".parse::<OptimizerType>(),
+            Ok(OptimizerType::AdamWScheduleFree)
+        );
+        assert_eq!(
+            "adamw8bit".parse::<OptimizerType>(),
+            Ok(OptimizerType::AdamW8bit)
+        );
         assert!("adam".parse::<OptimizerType>().is_err());
         let config: TrainingConfig = serde_saphyr::from_str("optimizer: adam_w").unwrap();
         assert_eq!(config.optimizer, OptimizerType::AdamW);
         let config: TrainingConfig = serde_saphyr::from_str("optimizer: lion").unwrap();
         assert_eq!(config.optimizer, OptimizerType::Lion);
+    }
+
+    #[test]
+    fn supported_optimizers_are_the_ones_marked_supported() {
+        let marked: Vec<_> = OptimizerType::ALL
+            .into_iter()
+            .filter(|k| k.is_supported())
+            .collect();
+        assert_eq!(marked, OptimizerType::SUPPORTED);
+    }
+
+    #[test]
+    fn schedule_names_round_trip_and_unknown_names_are_errors() {
+        for kind in LrSchedulerType::ALL {
+            assert_eq!(kind.as_str().parse::<LrSchedulerType>(), Ok(kind));
+            let yaml = serde_saphyr::to_string(&kind).unwrap();
+            assert_eq!(yaml.trim(), kind.as_str());
+        }
+        assert_eq!(
+            "Cosine-With-Restarts".parse::<LrSchedulerType>(),
+            Ok(LrSchedulerType::CosineWithRestarts)
+        );
+        let err = "cosin".parse::<LrSchedulerType>().unwrap_err();
+        assert!(err.contains("cosin") && err.contains("wsd"), "{err}");
+    }
+
+    #[test]
+    fn lora_init_reads_true_or_a_method_name() {
+        let init = |text: &str| -> Result<LoraConfig, _> {
+            serde_saphyr::from_str(&format!("init_lora_weights: {text}"))
+        };
+        assert_eq!(init("true").unwrap().init_lora_weights, LoraInit::Standard);
+        assert_eq!(init("pissa").unwrap().init_lora_weights, LoraInit::Pissa);
+        assert_eq!(init("loftq").unwrap().init_lora_weights, LoraInit::Loftq);
+        assert!(init("false").is_err(), "random B is not a PMetal mode");
+        assert!(init("gaussian").is_err());
+        // The default serializes the way files from earlier releases spell it.
+        let yaml = serde_saphyr::to_string(&LoraConfig::default()).unwrap();
+        assert!(yaml.contains("init_lora_weights: true"), "{yaml}");
+        let back: LoraConfig = serde_saphyr::from_str(&yaml).unwrap();
+        assert_eq!(back.init_lora_weights, LoraInit::Standard);
+    }
+
+    #[test]
+    fn sections_reject_keys_they_do_not_have() {
+        // A misspelt key used to be dropped, leaving the default in force.
+        let err = serde_saphyr::from_str::<TrainingConfig>("learning_rat: 1e-4")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("learning_rat"), "{err}");
+        assert!(serde_saphyr::from_str::<LoraConfig>("rank: 8").is_err());
+        assert!(serde_saphyr::from_str::<DatasetConfig>("max_samples: 10").is_err());
+    }
+
+    #[test]
+    fn documented_spellings_are_accepted() {
+        let training: TrainingConfig =
+            serde_saphyr::from_str("epochs: 5\nlr_schedule: wsd\ncosine_num_cycles: 3").unwrap();
+        assert_eq!(training.num_epochs, 5);
+        assert_eq!(training.lr_scheduler, LrSchedulerType::Wsd);
+        assert_eq!(training.cosine_num_restarts, Some(3));
+        let model: ModelConfig = serde_saphyr::from_str("name: org/model").unwrap();
+        assert_eq!(model.model_id, "org/model");
+        let dataset: DatasetConfig = serde_saphyr::from_str("path: ./train.jsonl").unwrap();
+        assert_eq!(dataset.dataset_id, "./train.jsonl");
     }
 }

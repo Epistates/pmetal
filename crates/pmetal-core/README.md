@@ -1,17 +1,29 @@
 # pmetal-core
 
-Core abstractions and types for the PMetal framework.
+Configuration, job specs, events and shared types for the PMetal framework.
 
 ## Overview
 
-This crate provides the foundational types, traits, and configurations used throughout the PMetal ecosystem. It defines the contracts that all other crates depend on.
+Every other crate in the workspace speaks this one's types: the sections of a
+training config file, the job specs the CLI, TUI, GUI, MCP server and Python
+bindings all build jobs from, the events a job streams back, and the learning
+rate schedules.
 
 ## Features
 
-- **Configuration Types**: `ModelConfig`, `LoraConfig`, `TrainingConfig`, `DatasetConfig`
-- **Core Traits**: `Model`, `Trainer`, `Quantizer`, `LLMModel`
-- **Common Types**: `Dtype`, `Device`, `QuantizationType`
-- **Secret Handling**: `SecretString` for secure token/credential storage
+- **Configuration**: `ModelConfig`, `LoraConfig`, `TrainingConfig`,
+  `DatasetConfig`, and `FullTrainingConfig`, the strict loader for a config
+  file (unknown keys are errors; files from earlier releases still load).
+- **Validation**: `ConfigValidator` is implemented for every config type and
+  reports every problem with its dotted key, instead of clamping or ignoring.
+- **Schedules**: `LearningRateScheduler` for constant, linear, cosine, cosine
+  with restarts, polynomial and WSD (linear, cosine or `1 - sqrt` cooldown)
+  schedules, checked against the reference formulas.
+- **Job specs and events**: `jobs::*Spec` (one per `pmetal` subcommand, derived
+  with `#[derive(JobSpec)]`) and `JobEvent` with its JSONL codec.
+- **Training callbacks and metrics**: `TrainingCallback`, `StepMetrics`,
+  `EvalMetrics`.
+- **Secret Handling**: `SecretString` for tokens and credentials.
 
 ## Usage
 
@@ -32,15 +44,24 @@ let training_config = TrainingConfig {
     num_epochs: 1,
     ..Default::default()
 };
+
+lora_config.validate().unwrap();
+training_config.validate().unwrap();
+
+let loaded = FullTrainingConfig::from_yaml("training:\n  learning_rate: 1e-4\n").unwrap();
+assert_eq!(loaded.config.training.learning_rate, 1e-4);
 ```
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| `config` | Configuration structures for models, training, and data |
-| `traits` | Core trait definitions for models and trainers |
-| `types` | Common type definitions and enums |
+| `config` | Configuration structures for models, LoRA, training and data |
+| `scheduler` | Learning rate schedules |
+| `jobs` | The job spec for each `pmetal` subcommand |
+| `events` | `JobEvent`, sinks and the JSONL codec |
+| `traits` | `TrainingCallback`, `ConfigValidator` and shared defaults |
+| `types` | Metric and state types |
 | `error` | Error types and handling |
 | `secrets` | Secure string handling for credentials |
 

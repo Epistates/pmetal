@@ -4,7 +4,7 @@
 //! used across all trainers. Use these instead of implementing schedulers
 //! in individual trainer modules.
 
-use crate::{LrSchedulerType, Result, WsdDecayStyle};
+use crate::{LrSchedulerType, WsdDecayStyle};
 use std::f64::consts::PI;
 
 /// Learning rate scheduler that computes LR based on training progress.
@@ -61,6 +61,11 @@ impl LearningRateScheduler {
     /// steps: its scheduler type, warmup (`warmup_ratio` of the total when
     /// set, else `warmup_steps`), `min_lr`, restarts, WSD stable share and
     /// polynomial power.
+    ///
+    /// The knobs are taken as given, not clamped: a config that has not passed
+    /// [`ConfigValidator::validate`](crate::ConfigValidator::validate) (a
+    /// stable ratio of 3, a power of -1) gets the schedule those numbers
+    /// describe, not a corrected one.
     pub fn for_training(config: &crate::TrainingConfig, total_steps: usize) -> Self {
         let mut scheduler = Self::new(
             config.learning_rate,
@@ -96,7 +101,8 @@ impl LearningRateScheduler {
         self
     }
 
-    /// Set number of restarts for cosine with restarts.
+    /// Set the number of cosine cycles for cosine with restarts (1 is a
+    /// single cosine; `n` cycles restart `n - 1` times).
     pub fn with_num_restarts(mut self, num_restarts: usize) -> Self {
         self.num_restarts = num_restarts;
         self
@@ -104,13 +110,13 @@ impl LearningRateScheduler {
 
     /// Set stable phase ratio for WSD scheduler (default 0.7).
     pub fn with_stable_ratio(mut self, ratio: f64) -> Self {
-        self.stable_ratio = ratio.clamp(0.0, 1.0);
+        self.stable_ratio = ratio;
         self
     }
 
     /// Set polynomial decay exponent (default 1.0 = linear, 2.0 = quadratic).
     pub fn with_polynomial_power(mut self, power: f64) -> Self {
-        self.polynomial_power = power.max(0.1); // clamp to positive
+        self.polynomial_power = power;
         self
     }
 
@@ -247,118 +253,6 @@ pub fn total_training_steps(
     total.max(1)
 }
 
-/// Builder for `LearningRateScheduler`.
-#[derive(Debug, Clone)]
-pub struct SchedulerBuilder {
-    base_lr: f64,
-    min_lr: f64,
-    total_steps: usize,
-    warmup_steps: usize,
-    warmup_ratio: Option<f64>,
-    scheduler_type: LrSchedulerType,
-    num_restarts: usize,
-    stable_ratio: f64,
-    polynomial_power: f64,
-}
-
-impl Default for SchedulerBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SchedulerBuilder {
-    /// Create a new scheduler builder.
-    pub fn new() -> Self {
-        Self {
-            base_lr: crate::defaults::LEARNING_RATE,
-            min_lr: 0.0,
-            total_steps: 1000,
-            warmup_steps: crate::defaults::WARMUP_STEPS,
-            warmup_ratio: None,
-            scheduler_type: LrSchedulerType::Cosine,
-            num_restarts: 1,
-            stable_ratio: 0.7,
-            polynomial_power: 1.0,
-        }
-    }
-
-    /// Set polynomial decay exponent (default 1.0 = linear).
-    pub fn polynomial_power(mut self, power: f64) -> Self {
-        self.polynomial_power = power;
-        self
-    }
-
-    /// Set base learning rate.
-    pub fn base_lr(mut self, lr: f64) -> Self {
-        self.base_lr = lr;
-        self
-    }
-
-    /// Set minimum learning rate.
-    pub fn min_lr(mut self, lr: f64) -> Self {
-        self.min_lr = lr;
-        self
-    }
-
-    /// Set total training steps.
-    pub fn total_steps(mut self, steps: usize) -> Self {
-        self.total_steps = steps;
-        self
-    }
-
-    /// Set warmup steps.
-    pub fn warmup_steps(mut self, steps: usize) -> Self {
-        self.warmup_steps = steps;
-        self.warmup_ratio = None;
-        self
-    }
-
-    /// Set warmup ratio (alternative to warmup_steps).
-    pub fn warmup_ratio(mut self, ratio: f64) -> Self {
-        self.warmup_ratio = Some(ratio);
-        self
-    }
-
-    /// Set scheduler type.
-    pub fn scheduler_type(mut self, scheduler: LrSchedulerType) -> Self {
-        self.scheduler_type = scheduler;
-        self
-    }
-
-    /// Set number of restarts for cosine with restarts.
-    pub fn num_restarts(mut self, restarts: usize) -> Self {
-        self.num_restarts = restarts;
-        self
-    }
-
-    /// Set WSD stable phase ratio (fraction of post-warmup at peak LR).
-    pub fn stable_ratio(mut self, ratio: f64) -> Self {
-        self.stable_ratio = ratio;
-        self
-    }
-
-    /// Build the scheduler.
-    pub fn build(self) -> Result<LearningRateScheduler> {
-        let warmup_steps = if let Some(ratio) = self.warmup_ratio {
-            (self.total_steps as f64 * ratio).ceil() as usize
-        } else {
-            self.warmup_steps
-        };
-
-        Ok(LearningRateScheduler::new(
-            self.base_lr,
-            self.total_steps,
-            warmup_steps,
-            self.scheduler_type,
-        )
-        .with_min_lr(self.min_lr)
-        .with_num_restarts(self.num_restarts)
-        .with_stable_ratio(self.stable_ratio)
-        .with_polynomial_power(self.polynomial_power))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,20 +348,6 @@ mod tests {
         };
         let s = LearningRateScheduler::for_training(&wsd, 100);
         assert!(s.get_lr(50) < 0.6e-3, "no stable phase: decays from step 0");
-    }
-
-    #[test]
-    fn test_builder() {
-        let scheduler = SchedulerBuilder::new()
-            .base_lr(2e-4)
-            .warmup_ratio(0.1)
-            .total_steps(1000)
-            .scheduler_type(LrSchedulerType::Cosine)
-            .build()
-            .unwrap();
-
-        // Warmup should be 10% of total steps = 100
-        assert!(scheduler.get_lr(50) < scheduler.get_lr(99));
     }
 
     #[test]

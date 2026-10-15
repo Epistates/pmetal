@@ -43,7 +43,7 @@ fn small_lora_config() -> LoraConfig {
             "o_proj".to_string(),
         ],
         bias: pmetal_core::LoraBias::None,
-        init_lora_weights: true,
+        init_lora_weights: pmetal_core::LoraInit::Standard,
         loraplus_lr_ratio: None,
         use_dora: false,
     }

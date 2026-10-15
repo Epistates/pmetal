@@ -4140,7 +4140,6 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
     let config = FullTrainingConfig {
         model: ModelConfig {
             model_id: "meta-llama/Llama-3.2-1B".to_string(),
-            max_seq_len: 2048,
             ..Default::default()
         },
         lora: LoraConfig {

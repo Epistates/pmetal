@@ -65,36 +65,6 @@ impl Dtype {
     }
 }
 
-/// Compute device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Device {
-    /// CPU computation.
-    Cpu,
-    /// GPU computation (Metal on macOS).
-    #[cfg_attr(not(feature = "ane"), default)]
-    Gpu,
-    /// Apple Neural Engine (ANE) computation.
-    #[cfg(feature = "ane")]
-    #[cfg_attr(feature = "ane", default)]
-    Ane,
-}
-
-impl Device {
-    /// Returns true if this device targets the Apple Neural Engine.
-    #[inline]
-    pub fn is_ane(&self) -> bool {
-        #[cfg(feature = "ane")]
-        {
-            matches!(self, Self::Ane)
-        }
-        #[cfg(not(feature = "ane"))]
-        {
-            false
-        }
-    }
-}
-
 /// Quantization scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -175,19 +145,6 @@ impl MemoryStats {
     pub fn available_gb(&self) -> f64 {
         self.total_bytes.saturating_sub(self.used_bytes) as f64 / (1024.0 * 1024.0 * 1024.0)
     }
-}
-
-/// Model output from forward pass.
-#[derive(Debug, Clone)]
-pub struct ModelOutput<T> {
-    /// Logits tensor.
-    pub logits: T,
-    /// Hidden states (optional).
-    pub hidden_states: Option<Vec<T>>,
-    /// Attention weights (optional).
-    pub attentions: Option<Vec<T>>,
-    /// Past key-value cache (optional).
-    pub past_key_values: Option<Vec<(T, T)>>,
 }
 
 /// Evaluation metrics.

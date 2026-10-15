@@ -11,7 +11,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingCallback, TrainingConfig};
+/// The sections of a training config file, loaded and checked by `pmetal-core`.
+pub use pmetal_core::FullTrainingConfig;
+use pmetal_core::{ConfigValidator, LoraConfig, TrainingCallback, TrainingConfig};
 use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
     TrainingDataset, resolve_dataset_source,
@@ -264,6 +266,9 @@ fn merge_training_overrides(target: &mut TrainingConfig, overrides: &TrainingCon
     if overrides.wsd_stable_ratio != defaults.wsd_stable_ratio {
         target.wsd_stable_ratio = overrides.wsd_stable_ratio;
     }
+    if overrides.wsd_decay_style != defaults.wsd_decay_style {
+        target.wsd_decay_style = overrides.wsd_decay_style;
+    }
     if overrides.cosine_num_restarts != defaults.cosine_num_restarts {
         target.cosine_num_restarts = overrides.cosine_num_restarts;
     }
@@ -402,8 +407,11 @@ pub async fn run_training(
     // -----------------------------------------------------------------------
     let has_config_file = config.config_path.is_some();
     let mut full_config = if let Some(ref path) = config.config_path {
-        let content = std::fs::read_to_string(path)?;
-        serde_saphyr::from_str(&content)?
+        let loaded = FullTrainingConfig::from_yaml_file(path)?;
+        for note in &loaded.notes {
+            tracing::warn!("{path}: {note}");
+        }
+        loaded.config
     } else {
         FullTrainingConfig::default()
     };
@@ -416,6 +424,10 @@ pub async fn run_training(
         full_config.lora = config.lora.clone();
         full_config.training = config.training.clone();
     }
+
+    // The merged config is what runs: a file that was valid alone can still
+    // contradict the command line (a warmup ratio against `--warmup-steps`).
+    full_config.validate()?;
 
     // Validate required fields after the YAML file has had a chance to provide them.
     if full_config.model.model_id.is_empty() {
@@ -1900,23 +1912,6 @@ pub fn format_param_count(count: usize) -> String {
     } else {
         format!("{}", count)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Internal: YAML config wrapper (moved from CLI)
-// ---------------------------------------------------------------------------
-
-/// Full training config loaded from YAML.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct FullTrainingConfig {
-    #[serde(default)]
-    pub model: ModelConfig,
-    #[serde(default)]
-    pub lora: LoraConfig,
-    #[serde(default)]
-    pub training: TrainingConfig,
-    #[serde(default)]
-    pub dataset: DatasetConfig,
 }
 
 #[cfg(test)]

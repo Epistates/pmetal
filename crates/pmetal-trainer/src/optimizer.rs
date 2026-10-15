@@ -69,6 +69,12 @@ impl TrainOptimizer {
             OptimizerType::Sgd => Self::Sgd(MomentumSgd::new(lr, weight_decay)),
             OptimizerType::Lion => Self::Lion(Lion::new(lr, weight_decay)),
             OptimizerType::Adafactor => Self::Adafactor(Adafactor::new(lr, weight_decay)),
+            OptimizerType::Muon | OptimizerType::AdamWScheduleFree | OptimizerType::AdamW8bit => {
+                panic!(
+                    "the {kind} optimizer is not built by this trainer yet; \
+                     TrainingConfig::validate refuses it, so a validated config never gets here"
+                )
+            }
         }
     }
 

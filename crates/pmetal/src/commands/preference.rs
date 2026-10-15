@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn the_spec_optimizer_is_the_one_the_trainer_gets() {
-        for kind in pmetal_core::OptimizerType::ALL {
+        for kind in pmetal_core::OptimizerType::SUPPORTED {
             let spec = PreferenceSpec {
                 optimizer: kind.to_string(),
                 ..Default::default()
