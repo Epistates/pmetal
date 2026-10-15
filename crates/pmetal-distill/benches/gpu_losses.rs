@@ -46,10 +46,13 @@ fn logits(tokens: usize, vocab: usize, seed: f32, dtype: Dtype) -> Array {
         .as_dtype(dtype.as_i32())
 }
 
-/// One timed configuration: student logits in, `(loss, gradient)` out.
+/// Student logits in, `(loss, gradient)` out.
+type Step = Box<dyn Fn(&Array) -> (Array, Array)>;
+
+/// One timed configuration.
 struct Case {
     name: &'static str,
-    run: Box<dyn Fn(&Array) -> (Array, Array)>,
+    run: Step,
 }
 
 impl Case {
