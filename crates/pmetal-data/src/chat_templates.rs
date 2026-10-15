@@ -1064,6 +1064,29 @@ impl ChatTemplate {
         self.render_jinja(src, messages, true, tools, kwargs)
     }
 
+    /// Render a conversation through the chat template, as transformers'
+    /// `apply_chat_template(messages, tools=tools,
+    /// add_generation_prompt=add_generation_prompt, tokenize=False,
+    /// **kwargs)` renders it.
+    ///
+    /// An `Err` is the template refusing the conversation (its own
+    /// `raise_exception`, such as roles that do not alternate) or failing to
+    /// compile.
+    pub fn render(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        kwargs: &ChatTemplateKwargs,
+        add_generation_prompt: bool,
+    ) -> Result<String, String> {
+        kwargs.check_reserved()?;
+        let src = self
+            .jinja_source
+            .as_deref()
+            .ok_or("the model ships no chat template")?;
+        self.render_jinja(src, messages, add_generation_prompt, tools, kwargs)
+    }
+
     /// Render the upstream Jinja template.
     fn render_jinja(
         &self,
@@ -1073,7 +1096,12 @@ impl ChatTemplate {
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
     ) -> Result<String, String> {
-        let split_thinking = self.reads_kwarg("reasoning_content");
+        // Raw `<think>…</think>` text in an assistant message moves to
+        // `reasoning_content` only for a template that renders that field as
+        // a `<think>` block. Gemma 4's reads the field too, but writes its
+        // thinking as a thought channel, so a `<think>` in the content is
+        // just content there.
+        let split_thinking = self.reads_kwarg("reasoning_content") && src.contains("</think>");
 
         // Map pmetal's internal Message into the shape HF Jinja templates
         // expect. We carry tool_calls / tool_call_id through verbatim.

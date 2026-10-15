@@ -41,6 +41,8 @@
 use minijinja::value::{Kwargs, Serde, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, Value};
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 /// Context names `apply_chat_template` binds itself. A template kwarg of the
 /// same name is a `TypeError` there ("got multiple values for keyword
@@ -124,27 +126,36 @@ pub struct JinjaRenderOptions {
     pub template_kwargs: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Render a HuggingFace chat-template Jinja string into a prompt.
-///
-/// Returns the rendered string on success, or an error containing the
-/// Jinja error chain on failure. The caller is responsible for tokenizing
-/// the result (pmetal's `Tokenizer::encode` handles the embedded special
-/// tokens correctly — see the Gemma 4 investigation).
-pub fn render_chat_template(
-    jinja_src: &str,
-    messages: &[JinjaMessage],
-    options: &JinjaRenderOptions,
-) -> Result<String, String> {
-    if let Some(key) = options
-        .template_kwargs
-        .keys()
-        .find(|key| RESERVED_TEMPLATE_KWARGS.contains(&key.as_str()))
-    {
-        return Err(format!(
-            "template kwarg `{key}` is not allowed: the renderer sets it itself"
-        ));
-    }
+/// The name a chat template is registered under in its environment.
+const TEMPLATE_NAME: &str = "chat_template";
 
+/// The environments built so far, by template source. Compiling a template
+/// costs far more than rendering one conversation with it, and a dataset
+/// renders the same template for every row.
+static ENVIRONMENTS: LazyLock<Mutex<HashMap<Arc<str>, Arc<Environment<'static>>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Most distinct templates kept compiled; a process that renders more starts
+/// over rather than growing.
+const MAX_CACHED_TEMPLATES: usize = 32;
+
+/// The environment holding `jinja_src`, compiled once and shared.
+fn environment_for(jinja_src: &str) -> Result<Arc<Environment<'static>>, String> {
+    let mut cache = ENVIRONMENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(env) = cache.get(jinja_src) {
+        return Ok(Arc::clone(env));
+    }
+    let env = Arc::new(build_environment(jinja_src)?);
+    if cache.len() >= MAX_CACHED_TEMPLATES {
+        cache.clear();
+    }
+    cache.insert(Arc::from(jinja_src), Arc::clone(&env));
+    Ok(env)
+}
+
+/// An environment configured the way transformers compiles chat templates,
+/// with `jinja_src` registered in it.
+fn build_environment(jinja_src: &str) -> Result<Environment<'static>, String> {
     let mut env = Environment::new();
     // transformers compiles chat templates with `trim_blocks=True,
     // lstrip_blocks=True`: the newline after a block tag and the whitespace
@@ -182,14 +193,35 @@ pub fn render_chat_template(
         now_strftime(&fmt).map_err(|e| Error::new(ErrorKind::InvalidOperation, e))
     });
 
-    // Register the template under a stable name. minijinja requires the
-    // source to live for the lifetime of the environment, so clone it.
-    let template_name = "chat_template";
-    env.add_template_owned(template_name, jinja_src.to_owned())
+    env.add_template_owned(TEMPLATE_NAME, jinja_src.to_owned())
         .map_err(|e| format!("compile: {e}"))?;
+    Ok(env)
+}
 
+/// Render a HuggingFace chat-template Jinja string into a prompt.
+///
+/// Returns the rendered string on success, or an error containing the
+/// Jinja error chain on failure. The caller is responsible for tokenizing
+/// the result (pmetal's `Tokenizer::encode` handles the embedded special
+/// tokens correctly — see the Gemma 4 investigation).
+pub fn render_chat_template(
+    jinja_src: &str,
+    messages: &[JinjaMessage],
+    options: &JinjaRenderOptions,
+) -> Result<String, String> {
+    if let Some(key) = options
+        .template_kwargs
+        .keys()
+        .find(|key| RESERVED_TEMPLATE_KWARGS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "template kwarg `{key}` is not allowed: the renderer sets it itself"
+        ));
+    }
+
+    let env = environment_for(jinja_src)?;
     let tmpl = env
-        .get_template(template_name)
+        .get_template(TEMPLATE_NAME)
         .map_err(|e| format!("lookup: {e}"))?;
 
     // Build the context the way `apply_chat_template` does: the special
