@@ -852,3 +852,86 @@ fn test_gdn_rollback_zero_accepted_equals_snapshot() {
         "zero-accepted rewind must be verbatim snapshot"
     );
 }
+
+/// A one-row cache repeated into a batch holds the same tokens in every
+/// row, each row then grows on its own, and the cache it came from is left
+/// as it was: the layout a prompt prefilled once needs to serve a group of
+/// completions that decode together.
+fn check_repeat_batch(config: KVCacheConfig, tolerance: f32) {
+    let (heads, dim) = (config.num_kv_heads, config.head_dim);
+    let mut cache = KVCache::new(config);
+    let (k, v) = (
+        patterned_tensor(1, heads, 7, dim, 1.0),
+        patterned_tensor(1, heads, 7, dim, 2.0),
+    );
+    cache.update_and_fetch(0, &k, &v).unwrap();
+    let rows = 3;
+    let mut batched = cache.repeat_batch(rows).unwrap();
+    assert_eq!(batched.seq_len(), cache.seq_len());
+    assert_eq!(batched.total_tokens(), cache.total_tokens());
+
+    // Row r's next token is its own.
+    let next_k = Array::from_f32_slice(
+        &(0..rows * heads * dim)
+            .map(|i| (i / (heads * dim)) as f32 + 0.25)
+            .collect::<Vec<_>>(),
+        &[rows as i32, heads as i32, 1, dim as i32],
+    );
+    let (fk, fv) = batched.update_and_fetch(0, &next_k, &next_k).unwrap();
+    assert_eq!(fk.shape(), &[rows as i32, heads as i32, 8, dim as i32]);
+    assert_eq!(fv.shape(), fk.shape());
+    for row in 0..rows {
+        let history = fk.slice(
+            &[row as i32, 0, 0, 0],
+            &[row as i32 + 1, heads as i32, 7, dim as i32],
+        );
+        assert!(max_abs_diff(&history, &k) <= tolerance, "row {row} history");
+        let last = fk.slice(
+            &[row as i32, 0, 7, 0],
+            &[row as i32 + 1, heads as i32, 8, dim as i32],
+        );
+        let want = Array::from_f32_slice(
+            &vec![row as f32 + 0.25; heads * dim],
+            &[1, heads as i32, 1, dim as i32],
+        );
+        assert!(max_abs_diff(&last, &want) <= tolerance, "row {row} token");
+    }
+    pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
+
+    // The source cache did not move, and still takes its own next token.
+    assert_eq!(cache.seq_len(), 7);
+    let one = patterned_tensor(1, heads, 1, dim, 9.0);
+    let (sk, _) = cache.update_and_fetch(0, &one, &one).unwrap();
+    assert_eq!(sk.shape(), &[1, heads as i32, 8, dim as i32]);
+
+    // A batch cannot be repeated again, nor a cache into no rows.
+    assert!(batched.repeat_batch(2).is_err());
+    assert!(cache.repeat_batch(0).is_err());
+}
+
+#[test]
+fn a_one_row_cache_repeats_into_a_batch() {
+    check_repeat_batch(KVCacheConfig::new(1, 64, 2, 32), 0.0);
+}
+
+#[test]
+fn a_sliding_window_cache_repeats_into_a_batch() {
+    check_repeat_batch(
+        KVCacheConfig::new(1, 64, 2, 32).with_sliding_window(16),
+        0.0,
+    );
+}
+
+#[test]
+fn a_quantized_cache_repeats_into_a_batch() {
+    // The history comes back dequantized, within the quantizer's step of
+    // what went in; the new token is exact.
+    check_repeat_batch(KVCacheConfig::new(1, 64, 2, 64).with_quantized(8, 64), 0.05);
+}
+
+#[test]
+fn a_turboquant_cache_does_not_repeat_into_a_batch() {
+    let config = KVCacheConfig::new(1, 64, 2, 64).with_turboquant(4, 4);
+    let cache = KVCache::new(config);
+    assert!(cache.repeat_batch(2).is_err());
+}

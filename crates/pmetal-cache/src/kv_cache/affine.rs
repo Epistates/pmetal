@@ -93,6 +93,34 @@ impl Side {
             .slice_set(&biases, &start, &stop(biases.dim(3)));
     }
 
+    /// This side for a batch of `n` identical rows.
+    fn repeat_batch(&self, n: usize) -> Result<Self, Exception> {
+        let tuple = match &self.tuple {
+            None => None,
+            Some(t) => {
+                let repeat = |a: &Array| -> Result<Array, Exception> {
+                    if a.dim(0) != 1 {
+                        return Err(Exception::custom(format!(
+                            "quantized KV cache: only a one-row cache repeats into a batch, \
+                             this holds {} rows",
+                            a.dim(0)
+                        )));
+                    }
+                    Ok(a.broadcast_to(&[n as i32, a.dim(1), a.dim(2), a.dim(3)]))
+                };
+                Some(QuantizedTuple {
+                    packed: repeat(&t.packed)?,
+                    scales: repeat(&t.scales)?,
+                    biases: repeat(&t.biases)?,
+                })
+            }
+        };
+        Ok(Self {
+            bits: self.bits,
+            tuple,
+        })
+    }
+
     /// Slots `from..to` of the three buffers.
     fn rows(&self, from: usize, to: usize) -> (Array, Array, Array) {
         let t = self.tuple.as_ref().expect("rows of an empty side");
@@ -167,6 +195,15 @@ impl AffineLayer {
 
     pub(super) fn nbytes(&self) -> usize {
         self.keys.nbytes() + self.values.nbytes()
+    }
+
+    /// This layer for a batch of `n` identical rows.
+    pub(super) fn repeat_batch(&self, n: usize) -> Result<Self, Exception> {
+        Ok(Self {
+            keys: self.keys.repeat_batch(n)?,
+            values: self.values.repeat_batch(n)?,
+            ..self.clone()
+        })
     }
 
     pub(super) fn reset(&mut self) {
