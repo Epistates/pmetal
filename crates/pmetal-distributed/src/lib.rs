@@ -7,11 +7,13 @@
 //! # Core Features
 //!
 //! - **Zero-Configuration Discovery**: Automatically finds peers using mDNS/Bonjour
-//! - **Ring All-Reduce**: Bandwidth-optimal gradient synchronization
+//! - **Authenticated, Encrypted Links**: A Noise handshake keyed by a 256-bit
+//!   [`ClusterSecret`] (`~/.pmetal/cluster_secret`); see [`transport`]
+//! - **Ring Collectives**: All-reduce, reduce-scatter, all-gather and broadcast
+//!   ([`collective`]), bandwidth-optimal and bit-reproducible
 //! - **Persistent Identity**: Ed25519 keypairs stored at `~/.pmetal/node_keypair`
 //! - **Topology Awareness**: Graph-based cluster management with petgraph
 //! - **Gradient Compression**: TopK, quantization, and error feedback
-//! - **Network Isolation**: PSK-based namespace isolation
 //! - **Observability**: Comprehensive metrics and tracing
 //!
 //! # Advanced Features (feature-gated)
@@ -40,7 +42,7 @@
 //! let ctx = DistributedContext::new(Box::new(backend));
 //!
 //! // Synchronize gradients across cluster
-//! ctx.all_reduce(&mut gradient_buffer).await?;
+//! ctx.all_reduce_f32(&mut gradient_buffer, ReduceOp::Mean).await?;
 //! ```
 //!
 //! # Manual Configuration
@@ -74,7 +76,7 @@
 //! │                           ▼                                      │
 //! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
 //! │  │ Compression  │  │   Metrics    │  │  Namespace   │           │
-//! │  │  (TopK/Quant)│  │ (Observ.)    │  │  (PSK)       │           │
+//! │  │  (TopK/Quant)│  │ (Observ.)    │  │ (discovery)  │           │
 //! │  └──────────────┘  └──────────────┘  └──────────────┘           │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```

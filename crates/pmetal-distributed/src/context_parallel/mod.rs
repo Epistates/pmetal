@@ -10,7 +10,7 @@
 //!   K/V blocks around the ring. Partial attention is computed at each step
 //!   and merged with an online softmax, so the result is exactly full
 //!   attention. Causal masking works from token positions, and the zig-zag
-//!   [`SequenceLayout`] keeps the causal work even across ranks.
+//!   [`SequenceLayout`](crate::context_parallel::SequenceLayout) keeps the causal work even across ranks.
 //!
 //! - **Pass-Q** (short queries over a long cache): query blocks travel, with
 //!   their partial outputs, and arrive home after visiting every rank.

@@ -16,7 +16,7 @@ use crate::expert_shard::expert_range;
 /// on its tokens.
 #[derive(Debug, Clone)]
 pub struct ExpertPlacement {
-    /// experts_per_rank[rank] = list of expert IDs owned by that rank.
+    /// `experts_per_rank[rank]` = list of expert IDs owned by that rank.
     pub experts_per_rank: Vec<Vec<usize>>,
     /// Total number of experts across all ranks.
     pub total_experts: usize,

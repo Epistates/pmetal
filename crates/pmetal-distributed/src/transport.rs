@@ -12,7 +12,7 @@
 //! exactly one). Fresh ephemeral keys per connection mean a secret that leaks
 //! later does not expose traffic recorded earlier.
 //!
-//! The handshake also carries a [`Hello`] naming the channel, the world size,
+//! The handshake also carries a `Hello` naming the channel, the world size,
 //! the sender's rank and a digest of the ring membership. Two machines that
 //! disagree about who is in the ring fail the handshake with that reason
 //! instead of exchanging gradients that were never meant to meet.

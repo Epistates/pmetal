@@ -13,7 +13,7 @@
 //!   and W (weight gradient). W has no cross-stage dependency so it can fill
 //!   bubble slots: a third of 1F1B's idle time at the same in-flight memory.
 //!
-//! [`simulate`] runs any schedule against its neighbours' on a model clock,
+//! [`simulate`](crate::pipeline_training::simulate) runs any schedule against its neighbours' on a model clock,
 //! reporting a deadlock or the real timeline, so a schedule is checked and
 //! its bubble measured rather than assumed.
 //!

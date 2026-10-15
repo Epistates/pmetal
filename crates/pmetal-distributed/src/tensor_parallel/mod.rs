@@ -19,7 +19,7 @@
 //!
 //! # Architecture Support
 //!
-//! The [`plan`] module provides architecture-agnostic plan builders
+//! The [`plan`](crate::tensor_parallel::plan) module provides architecture-agnostic plan builders
 //! that read `config.json` to produce sharding plans for:
 //! - Standard transformer attention (Llama, Mistral, etc.)
 //! - SwiGLU FFN blocks
