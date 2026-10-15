@@ -313,14 +313,13 @@ fn is_targeted(path: &str, targets: &[String], output: Option<&str>) -> bool {
 /// their weights directly, so an adapter on one is never applied (GPT-OSS's
 /// experts are named `gate_proj`, so targeting the MLP would have adapted
 /// them). A router's adapter is not reliably applied either, and its argmax
-/// picks which computation runs at all. DeepSeek's router keeps its `Linear`
-/// in a field named `weight`, so its path ends `mlp.weight`, Granite 4's in
-/// one named `layer`, so its path ends `router.layer`, and Gemma 4's (and
+/// picks which computation runs at all. DeepSeek's router is a bare matrix, not
+/// a `Linear`, so it is never visited; Granite 4's keeps its `Linear` in a
+/// field named `layer`, so its path ends `router.layer`, and Gemma 4's (and
 /// DiffusionGemma's) in one named `proj`, so its path ends `router.proj`.
 pub(crate) fn moe_role(path: &str) -> Option<&'static str> {
     let name = path.rsplit('.').next().unwrap_or(path);
     if matches!(name, "gate" | "router" | "shared_expert_gate")
-        || path.ends_with(".mlp.weight")
         || path.ends_with(".router.layer")
         || path.ends_with(".router.proj")
     {
