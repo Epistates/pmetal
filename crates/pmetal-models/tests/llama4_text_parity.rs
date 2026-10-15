@@ -217,6 +217,41 @@ fn check_native(variant: &str) {
         graph_vs_ops <= 1e-5,
         "{variant}: the compiled decode graph drifted from the per-op path by {graph_vs_ops:e}"
     );
+
+    // The prompt prefilled in passes through the last-row forward, as
+    // generation does for a long prompt: the logits of the final position and
+    // no other row's, with passes that start inside and past an attention
+    // chunk.
+    let prompt: Vec<u32> = {
+        ids.eval();
+        ids.as_slice::<i32>().iter().map(|&t| t as u32).collect()
+    };
+    for chunk in [4, 5, usize::MAX] {
+        let mut cache = NativeCache::new_empty(&weights);
+        let last = pmetal_runtime::decode::prefill_last_logits(
+            &weights,
+            &mut cache,
+            &prompt,
+            chunk,
+            pmetal_runtime::llama4_native::forward_step_last,
+        );
+        drain_bridge("last-row prefill");
+        assert_eq!(last.dim(0), 1);
+        assert_eq!(
+            last.dim(1),
+            want.dim(2),
+            "one row of logits, not one per token"
+        );
+        assert_all_pass(
+            &format!("{variant}: native last-row prefill in passes of {chunk}"),
+            &[ParityReport::compute(
+                "last_logits",
+                &last.expand_dims(1),
+                &rows(&want, t - 1, t),
+                TOL,
+            )],
+        );
+    }
 }
 
 /// Dense layers only: rotation, QK-norm and temperature at the cache's

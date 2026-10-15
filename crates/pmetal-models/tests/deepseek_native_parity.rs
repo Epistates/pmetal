@@ -28,8 +28,9 @@ use common::{fixture_path, load_shard, ref_tensor};
 use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_runtime::InlineArray;
 use pmetal_runtime::compat::{Array, ops::slice_axis};
+use pmetal_runtime::decode::prefill_last_logits;
 use pmetal_runtime::deepseek_native::{
-    NativeCache, NativeWeights, forward_step, load_config, load_model,
+    NativeCache, NativeWeights, forward_step, forward_step_last, load_config, load_model,
 };
 use serial_test::serial;
 
@@ -146,6 +147,35 @@ fn check(variant: &str, weights_file: &str) {
             })
             .collect();
         assert_all_pass(&format!("{variant}: {title}"), &reports);
+    }
+
+    // The prompt prefilled in passes through the last-row forward, as
+    // generation does for a long prompt: the logits of the final position,
+    // and no other row's.
+    let prompt: Vec<u32> = {
+        let ids = fx.tensor("input_ids");
+        ids.eval();
+        ids.as_slice::<i32>().iter().map(|&t| t as u32).collect()
+    };
+    for chunk in [5, 4, usize::MAX] {
+        let mut cache = NativeCache::new_empty(&fx.weights);
+        let last = prefill_last_logits(&fx.weights, &mut cache, &prompt, chunk, forward_step_last);
+        drain_bridge("last-row prefill");
+        assert_eq!(last.dim(0), 1);
+        assert_eq!(
+            last.dim(1),
+            want.dim(2),
+            "one row of logits, not one per token"
+        );
+        assert_all_pass(
+            &format!("{variant}: last-row prefill in passes of {chunk}"),
+            &[ParityReport::compute(
+                "last_logits",
+                &last.expand_dims(1),
+                &rows(&want, t - 1, t),
+                TOL,
+            )],
+        );
     }
 }
 

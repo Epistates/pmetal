@@ -9,15 +9,15 @@ use super::moe::{mlp_forward, moe_forward};
 use super::weights::Ffn;
 use super::weights::NativeWeights;
 
-/// Run one forward step — works for both T=1 decode and T=N prefill.
-///
-/// `token_ids` must be shape `[B, T]` int32. Returns logits `[B, T, vocab]`.
+/// The decoder layers over `token_ids` (`[B, T]` int32), advancing `cache`:
+/// the final hidden states `[B, T, hidden]`, before the final norm. Works for
+/// both T=1 decode and T=N prefill.
 ///
 /// Implements iRoPE exactly as the Python reference:
 /// - Local layers (use_rope=true): chunked causal attention with RoPE + QK-norm
 /// - Global layers (use_rope=false): full causal attention with NoPE and
 ///   attention temperature tuning
-pub fn forward_step(
+fn decoder_trunk(
     weights: &NativeWeights,
     token_ids: &InlineArray, // [B, T]
     cache: &mut NativeCache,
@@ -88,13 +88,41 @@ pub fn forward_step(
 
     // Advance position counter.
     cache.rope_offset += s;
+    hidden
+}
 
-    // Final norm + LM head.
+/// Final norm and LM head over `hidden` (`[B, T, hidden]`).
+fn lm_head(weights: &NativeWeights, hidden: &InlineArray) -> InlineArray {
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
     match &weights.lm_head_w {
         Some(head) => head.matmul_from(&hidden),
         None => weights.embed_w.as_linear(&hidden),
     }
+}
+
+/// Run one forward step — works for both T=1 decode and T=N prefill.
+///
+/// `token_ids` must be shape `[B, T]` int32. Returns logits `[B, T, vocab]`.
+pub fn forward_step(
+    weights: &NativeWeights,
+    token_ids: &InlineArray, // [B, T]
+    cache: &mut NativeCache,
+) -> InlineArray {
+    lm_head(weights, &decoder_trunk(weights, token_ids, cache))
+}
+
+/// [`forward_step`]'s logits for the last position alone, `[B, vocab]`.
+///
+/// The LM head runs over one row instead of `T`: over a 202k-token vocabulary
+/// the logits of a long prompt are gigabytes, and all but the last row are
+/// discarded by whoever samples.
+pub fn forward_step_last(
+    weights: &NativeWeights,
+    token_ids: &InlineArray, // [B, T]
+    cache: &mut NativeCache,
+) -> InlineArray {
+    let hidden = decoder_trunk(weights, token_ids, cache);
+    lm_head(weights, &crate::decode::last_token_hidden(&hidden)).squeeze(1)
 }
 
 // ============================================================================
@@ -103,13 +131,23 @@ pub fn forward_step(
 
 /// Run prompt prefill and return the first sampled token and the
 /// generation's sampler.
+///
+/// The prompt goes through in [`PREFILL_CHUNK`](crate::decode::PREFILL_CHUNK)
+/// passes and only the last position's logits are computed.
 pub fn prefill_first_token(
     weights: &NativeWeights,
     cache: &mut NativeCache,
     input_ids: &[u32],
     params: crate::decode::SamplingParams,
 ) -> (u32, crate::decode::DecodeSampler) {
-    crate::decode::prefill_first_token(weights, cache, input_ids, params, forward_step)
+    crate::decode::prefill_first_token_chunked(
+        weights,
+        cache,
+        input_ids,
+        params,
+        crate::decode::PREFILL_CHUNK,
+        forward_step_last,
+    )
 }
 
 fn prepare_generation_cache(cache: &mut NativeCache) {
