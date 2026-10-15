@@ -75,6 +75,20 @@ fn run(model_dir: &str, input_tokens: &[u32]) -> Result<Vec<u32>, Exception> {
 }
 ```
 
+## Loading Checkpoints
+
+`DynamicModel::load` reads safetensors (single file or sharded), PyTorch pickles
+(`pytorch_model.bin`, through the restricted reader in `pmetal_hub::torch`) and GGUF, and
+unpacks quantized checkpoints to dense tensors as it reads them: MLX affine and float modes
+(mxfp4, nvfp4, mxfp8, per-module widths included), NVIDIA ModelOpt and block-scaled FP8.
+
+A load must account for the whole model. It fails, naming the tensors and parameters, when a
+checkpoint tensor reaches no parameter or when a parameter is never filled; the only
+exceptions are named in `ModelArchitecture::load_policy` with the reason each is safe
+(buffers the runtime computes itself, a tied head's spare copy, Cohere's bias-free
+LayerNorm, Llama 4's parameter-free QK norm). A checkpoint quantized with a method pmetal
+cannot read (GPTQ, AWQ, bitsandbytes and similar) is reported as that, not as noise.
+
 ## Architecture Detection
 
 The `DynamicModel` automatically detects model architecture:
@@ -108,7 +122,9 @@ fn detect(model_dir: &str) -> Result<ModelArchitecture, Exception> {
 | `decision` | Decision models (Clef): record encoding, the joint schema head, `/v1/systemone` |
 | `dispatcher` | Dynamic model loading and dispatch |
 | `generation` | Token generation with sampling |
-| `loader` | HuggingFace model loading |
+| `loader` | Reading checkpoints, unpacking quantization, assigning and auditing weights |
+| `pooling` | Sentence-embedding pooling over hidden states |
+| `weight_format` | GGUF weight loading and tensor-name mapping |
 | `sampling/` | Sampling strategy implementations |
 | `traits` | `CausalLMModel` and `ModelConfig` |
 

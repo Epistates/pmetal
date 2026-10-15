@@ -582,49 +582,6 @@ impl GgufModelConfig {
             ..Default::default()
         }
     }
-
-    /// Convert to Gemma config.
-    pub fn to_gemma_config(&self) -> crate::architectures::gemma::GemmaConfig {
-        crate::architectures::gemma::GemmaConfig {
-            vocab_size: self.vocab_size,
-            hidden_size: self.hidden_size,
-            intermediate_size: self.intermediate_size,
-            num_hidden_layers: self.num_hidden_layers,
-            num_attention_heads: self.num_attention_heads,
-            num_key_value_heads: self.num_kv_heads,
-            head_dim: self.head_dim,
-            max_position_embeddings: self.max_position_embeddings,
-            rms_norm_eps: self.rms_norm_eps,
-            rope_theta: self.rope_theta,
-            ..Default::default()
-        }
-    }
-
-    /// Convert to Phi config.
-    pub fn to_phi_config(&self) -> crate::architectures::phi::PhiConfig {
-        use crate::architectures::phi::{LayerNormType, PhiActivation, PhiConfig};
-
-        PhiConfig {
-            model_type: "phi3".to_string(),
-            vocab_size: self.vocab_size,
-            hidden_size: self.hidden_size,
-            intermediate_size: self.intermediate_size,
-            num_hidden_layers: self.num_hidden_layers,
-            num_attention_heads: self.num_attention_heads,
-            num_key_value_heads: self.num_kv_heads.unwrap_or(self.num_attention_heads),
-            max_position_embeddings: self.max_position_embeddings,
-            rope_theta: self.rope_theta,
-            partial_rotary_factor: 0.5, // Default for Phi-3
-            rms_norm_eps: self.rms_norm_eps,
-            qkv_bias: false, // Default, Phi-4 uses true
-            hidden_act: PhiActivation::SwiGLU,
-            sliding_window: None,
-            layer_norm_type: LayerNormType::RmsNorm,
-            original_max_position_embeddings: None,
-            rope_scaling: None,
-            tie_word_embeddings: false,
-        }
-    }
 }
 
 /// Undo the GGUF converter's row permutation of a Llama-architecture

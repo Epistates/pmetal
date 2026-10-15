@@ -4,16 +4,20 @@
 //!
 //! ## Causal LM (dispatched via [`DynamicModel`])
 //!
-//! - Llama (2, 3, 3.1, 3.2, 3.3), Llama 4
-//! - Qwen (2, 2.5, 3, 3-MoE)
-//! - DeepSeek (V3)
+//! - Llama (2, 3, 3.1, 3.2, 3.3), Llama 4, Llama 3.2 Vision (Mllama)
+//! - Qwen (2, 2.5, 3, 3-MoE, 3.5 / 3.6 / 3.8 hybrids, Qwen4-Exp)
+//! - DeepSeek (V2, V3)
 //! - Mistral / Mixtral
-//! - Gemma (2, 3, 4)
+//! - Gemma (2, 3, 4), DiffusionGemma
 //! - Phi (3, 4)
 //! - Cohere (Command R)
 //! - Granite (3.x dense and MoE, 4.0 and 4.0-H Mamba+Attention hybrids, 4.1, 4.2)
 //! - NemotronH (Mamba+Attention hybrid)
 //! - GPT-OSS
+//! - BERT (encoder, for embeddings)
+//!
+//! Checkpoints load through [`loader`], which fails unless the checkpoint and the
+//! model account for each other.
 //!
 //! ## Diffusion (pipeline components available)
 //!
