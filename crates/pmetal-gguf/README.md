@@ -1,17 +1,23 @@
 # pmetal-gguf
 
-GGUF file format support for llama.cpp and Ollama compatibility.
-
-## Overview
-
-This crate provides reading and writing support for the GGUF (GPT-Generated Unified Format) file format, enabling compatibility with llama.cpp, Ollama, and other GGUF-compatible inference engines.
+Reading, writing, dequantizing and quantizing GGUF files, the single-file format for GGML-family
+inference runtimes. Implements the GGUF specification (versions 1 to 3) and the ggml block formats.
 
 ## Features
 
-- **GGUF Reading**: Parse GGUF files and extract metadata/tensors
-- **GGUF Writing**: Create GGUF files from SafeTensors/PyTorch models
-- **Tensor Dequantization**: Convert quantized tensors to full precision
-- **Metadata Handling**: Read/write model metadata and tokenizer info
+- **Reading**: a parser that checks every count and length against the bytes the file has left and
+  every tensor against the file size and alignment, so a hostile or truncated file is an error, not
+  an allocation or a panic. `GgufModel` memory-maps a model, including **split** sets
+  (`name-00001-of-00003.gguf`), and serves tensor bytes as slices of the mapping.
+- **Dequantization**: every tensor type a file can carry (F32/F16/BF16, the integer types,
+  Q4_0 to Q8_1, Q2_K to Q8_K, IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, TQ1_0/TQ2_0, MXFP4,
+  NVFP4, Q1_0), bit-exact against the reference decoder and parallel over blocks.
+- **Quantization**: the legacy and K-quant formats, IQ4_NL/IQ4_XS, the ternary, 1-bit and 4-bit
+  float formats, with optional per-channel importance (an imatrix) steering the scale search.
+- **Writing**: `GgufBuilder` for small files, `GgufStreamWriter` / `GgufFileWriter` to stream a
+  multi-gigabyte model tensor by tensor, atomically.
+- **Metadata**: tokenizer and `config.json` extraction from `tokenizer.ggml.*` and
+  `<arch>.*` keys.
 
 ## Usage
 
@@ -24,7 +30,7 @@ fn inspect(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let gguf = GgufContent::from_file(path)?;
 
     println!("Architecture: {:?}", gguf.architecture());
-    println!("Context length: {:?}", gguf.get_metadata("llama.context_length"));
+    println!("Context length: {:?}", gguf.get_u64("llama.context_length"));
 
     for name in gguf.tensor_names() {
         if let Some(info) = gguf.get_tensor_info(name) {
@@ -35,71 +41,82 @@ fn inspect(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Dequantizing Tensors
+### Loading a model, split or not
 
-`dequantize` takes the raw tensor bytes plus the type and shape the header recorded.
+`GgufModel` opens any shard of a split set, presents one tensor namespace and borrows tensor bytes
+from the mapping; `dequantize_into` decodes straight into your buffer.
 
 ```rust,no_run
-use std::fs::File;
+use pmetal_gguf::{GgufModel, dequant};
 
-use pmetal_gguf::{GgufContent, dequant};
-
-fn dequantize_one(path: &str, name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let mut file = File::open(path)?;
-    let gguf = GgufContent::from_file(path)?;
-
-    let info = gguf
-        .get_tensor_info(name)
-        .ok_or("tensor not present in this file")?;
+fn load(path: &str, name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let model = GgufModel::open(path)?;
+    let info = model.tensor_info(name).ok_or("tensor not present in this model")?;
     let shape: Vec<i32> = info.dimensions.iter().map(|&d| d as i32).collect();
-    let dtype = info.dtype;
 
-    let bytes = gguf.read_tensor_data(&mut file, name)?;
-    Ok(dequant::dequantize(&bytes, dtype, &shape)?)
+    let mut weights = vec![0.0f32; info.n_elements()];
+    dequant::dequantize_into(model.tensor_data(name)?, info.dtype, &shape, &mut weights)?;
+    Ok(weights)
 }
 ```
 
-### Converting to GGUF
+### Writing a quantized model
+
+Declare the tensors, then supply them one at a time; the file appears atomically when finished.
 
 ```rust,no_run
-use std::fs::File;
+use std::collections::BTreeMap;
 
-use pmetal_gguf::GgufBuilder;
+use pmetal_gguf::{GgmlType, GgufFileWriter, MetadataValue, TensorInfo, quantize};
 
-fn write(path: &str, embeddings: Vec<f32>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut builder = GgufBuilder::with_model("llama", "My Model");
-    builder.add_u32("llama.context_length", 4096);
-    builder.add_f32_tensor("token_embd.weight", vec![4096, 32000], embeddings);
+fn write(path: &str, weights: &[f32], rows: usize, cols: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("general.architecture".to_string(), MetadataValue::String("llama".into()));
 
-    let mut file = File::create(path)?;
-    builder.write(&mut file)?;
+    // `importance` is optional: one weight per input channel (column).
+    let quantized = quantize::quantize_tensor(weights, GgmlType::Q4K, cols, None)?;
+
+    let tensors = vec![TensorInfo::new("blk.0.ffn_up.weight", vec![rows as u64, cols as u64], GgmlType::Q4K)];
+    let mut file = GgufFileWriter::create(path, &metadata, tensors, 32)?;
+    file.write_tensor("blk.0.ffn_up.weight", &quantized)?;
+    file.finish()?;
     Ok(())
 }
 ```
 
-## Supported Quantization Types
+For small files `GgufBuilder::with_model(..)` collects everything in memory and writes it with
+`write_file` (atomic) or `build_to_bytes`.
 
-| Type | Bits | Description |
-|------|------|-------------|
-| F32 | 32 | Full precision |
-| F16 | 16 | Half precision |
-| Q8_0 | 8 | 8-bit quantization |
-| Q4_0 | 4 | 4-bit quantization |
-| Q4_K | 4 | K-quant (higher quality) |
-| Q5_K | 5 | K-quant |
-| Q6_K | 6 | K-quant |
+## Tensor types
+
+All types decode. "Encode" lists what `quantize::quantize_tensor` writes; the rest are read-only
+(a quantizer for the IQ1/IQ2/IQ3 grid formats needs the reference's grid-neighbour search).
+
+| Family | Types | Bits/weight | Encode |
+|--------|-------|-------------|--------|
+| Float / integer | F32, F16, BF16, F64, I8..I64 | 8 to 64 | F32, F16, BF16 |
+| Legacy | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1 | 4.5 to 9 | all |
+| K-quants | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K | 2.6 to 9.1 | all |
+| IQ | IQ4_NL, IQ4_XS | 4.5, 4.25 | both |
+| IQ | IQ1_S, IQ1_M, IQ2_XXS/XS/S, IQ3_XXS/S | 1.6 to 3.4 | no |
+| Ternary / 1-bit | TQ1_0, TQ2_0, Q1_0 | 1.1 to 2.1 | all |
+| 4-bit float | MXFP4, NVFP4 | 4.25, 4.5 | both |
+
+The repacked layouts (`Q4_0_4_4` and friends) interleave rows for a particular kernel and are not
+decoded.
 
 ## Modules
 
 | Module | Description |
 |--------|-------------|
-| `reader` | GGUF file parsing |
-| `quantize` | GGUF file creation and quantization |
+| `reader` | GGUF header parsing and validation (`GgufContent`) |
+| `GgufModel` | Memory-mapped model, split sets |
 | `dequant` | Tensor dequantization |
-| `dynamic` | Dynamic quantization |
-| `imatrix` | Importance matrix support |
-| `k_quants` | K-quant implementations |
-| `iq_quants` | IQ-quant implementations |
+| `quantize` | Quantization, importance weighting, row-length fallbacks |
+| `dynamic` | Per-tensor type selection and bit-budget allocation |
+| `imatrix` | Importance matrix (legacy `.dat` and GGUF) |
+| `k_quants`, `iq_quants` | Block formats |
+| `tokenizer`, `config` | Metadata extraction |
 
 ## License
 

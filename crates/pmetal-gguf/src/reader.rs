@@ -329,6 +329,26 @@ impl GgufContent {
         self.metadata.get(key)
     }
 
+    /// A metadata value as an unsigned integer ([`MetadataValue::as_u64`]).
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.metadata.get(key)?.as_u64()
+    }
+
+    /// A metadata value as a float ([`MetadataValue::as_f64`]).
+    pub fn get_f64(&self, key: &str) -> Option<f64> {
+        self.metadata.get(key)?.as_f64()
+    }
+
+    /// A metadata value as a string.
+    pub fn get_str(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key)?.as_str()
+    }
+
+    /// A metadata value as a bool.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.metadata.get(key)?.as_bool()
+    }
+
     /// Get tensor info by name.
     pub fn get_tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         self.tensor_infos.get(name)

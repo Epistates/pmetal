@@ -328,6 +328,73 @@ impl MetadataValue {
         }
     }
 
+    /// The value as an unsigned integer, if it is an integer type holding a
+    /// non-negative value that fits.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Uint8(v) => Some(u64::from(*v)),
+            Self::Uint16(v) => Some(u64::from(*v)),
+            Self::Uint32(v) => Some(u64::from(*v)),
+            Self::Uint64(v) => Some(*v),
+            Self::Int8(v) => u64::try_from(*v).ok(),
+            Self::Int16(v) => u64::try_from(*v).ok(),
+            Self::Int32(v) => u64::try_from(*v).ok(),
+            Self::Int64(v) => u64::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    /// The value as a signed integer, if it is an integer type that fits.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Int8(v) => Some(i64::from(*v)),
+            Self::Int16(v) => Some(i64::from(*v)),
+            Self::Int32(v) => Some(i64::from(*v)),
+            Self::Int64(v) => Some(*v),
+            Self::Uint8(v) => Some(i64::from(*v)),
+            Self::Uint16(v) => Some(i64::from(*v)),
+            Self::Uint32(v) => Some(i64::from(*v)),
+            Self::Uint64(v) => i64::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    /// The value as a float: a float type, or an integer (converted).
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float32(v) => Some(f64::from(*v)),
+            Self::Float64(v) => Some(*v),
+            other => other
+                .as_i64()
+                .map(|v| v as f64)
+                .or_else(|| other.as_u64().map(|v| v as f64)),
+        }
+    }
+
+    /// The value as a string slice.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The value as a bool.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// The value as an array.
+    pub fn as_array(&self) -> Option<&[MetadataValue]> {
+        match self {
+            Self::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+
     /// Get the element type for arrays.
     pub fn array_element_type(&self) -> Option<MetadataValueType> {
         match self {
@@ -654,5 +721,24 @@ mod tests {
         assert_eq!(GgmlType::Nvfp4.type_size(), 36);
         assert_eq!(GgmlType::Q1_0.block_size(), 128);
         assert_eq!(GgmlType::Q1_0.type_size(), 18);
+    }
+
+    #[test]
+    fn metadata_accessors_convert_only_when_lossless() {
+        use super::MetadataValue as V;
+        assert_eq!(V::Uint8(7).as_u64(), Some(7));
+        assert_eq!(V::Int32(-1).as_u64(), None);
+        assert_eq!(V::Int32(-1).as_i64(), Some(-1));
+        assert_eq!(V::Uint64(u64::MAX).as_i64(), None);
+        assert_eq!(V::Uint32(3).as_f64(), Some(3.0));
+        assert_eq!(V::Int16(-2).as_f64(), Some(-2.0));
+        assert_eq!(V::Float32(0.5).as_f64(), Some(0.5));
+        assert_eq!(V::String("x".into()).as_u64(), None);
+        assert_eq!(V::String("x".into()).as_str(), Some("x"));
+        assert_eq!(V::Bool(true).as_bool(), Some(true));
+        assert_eq!(
+            V::Array(vec![V::Uint8(1)]).as_array().map(<[_]>::len),
+            Some(1)
+        );
     }
 }

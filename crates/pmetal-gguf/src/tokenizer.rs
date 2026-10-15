@@ -80,28 +80,11 @@ impl GgufTokenizerData {
 }
 
 fn get_u32(content: &GgufContent, key: &str) -> Option<u32> {
-    match content.get_metadata(key)? {
-        MetadataValue::Uint32(v) => Some(*v),
-        MetadataValue::Int32(v) => u32::try_from(*v).ok(),
-        MetadataValue::Uint64(v) => u32::try_from(*v).ok(),
-        MetadataValue::Int64(v) => u32::try_from(*v).ok(),
-        MetadataValue::Uint16(v) => Some(*v as u32),
-        _ => None,
-    }
-}
-
-fn get_bool(content: &GgufContent, key: &str) -> Option<bool> {
-    match content.get_metadata(key)? {
-        MetadataValue::Bool(v) => Some(*v),
-        _ => None,
-    }
+    u32::try_from(content.get_u64(key)?).ok()
 }
 
 fn get_string(content: &GgufContent, key: &str) -> Option<String> {
-    match content.get_metadata(key)? {
-        MetadataValue::String(s) => Some(s.clone()),
-        _ => None,
-    }
+    content.get_str(key).map(str::to_string)
 }
 
 fn string_array(content: &GgufContent, key: &str) -> Vec<String> {
@@ -166,8 +149,8 @@ impl GgufContent {
             eos_id: get_u32(self, keys::TOKENIZER_EOS_TOKEN_ID),
             unk_id: get_u32(self, keys::TOKENIZER_UNK_TOKEN_ID),
             pad_id: get_u32(self, keys::TOKENIZER_PAD_TOKEN_ID),
-            add_bos: get_bool(self, keys::TOKENIZER_ADD_BOS),
-            add_eos: get_bool(self, keys::TOKENIZER_ADD_EOS),
+            add_bos: self.get_bool(keys::TOKENIZER_ADD_BOS),
+            add_eos: self.get_bool(keys::TOKENIZER_ADD_EOS),
             chat_template: get_string(self, keys::TOKENIZER_CHAT_TEMPLATE),
         })
     }
