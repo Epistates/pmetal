@@ -241,6 +241,33 @@ impl<T: AsRef<U>, U> AsRef<U> for Param<T> {
     }
 }
 
+// ── Buffer ───────────────────────────────────────────────────────────────────
+
+/// A tensor a model carries and a checkpoint stores that no optimizer trains,
+/// such as DeepSeek's router `e_score_correction_bias`: a load-balancing
+/// offset the routing reads, updated by a rule of its own, never by a
+/// gradient.
+///
+/// It is in [`ModuleParameters::parameters`] (a checkpoint loads it and saves
+/// it, a load that finds no tensor for it is visible) and absent from
+/// [`ModuleParameters::trainable_parameters`] (the optimizer is never handed
+/// it, so weight decay cannot erode it).
+#[derive(Debug, Clone)]
+pub struct Buffer(pub Array);
+
+impl std::ops::Deref for Buffer {
+    type Target = Array;
+    fn deref(&self) -> &Array {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Buffer {
+    fn deref_mut(&mut self) -> &mut Array {
+        &mut self.0
+    }
+}
+
 // ── Module parameter tree types ───────────────────────────────────────────────
 
 /// Nested parameter value.

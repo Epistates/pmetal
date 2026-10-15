@@ -32,7 +32,7 @@ mod weights;
 
 pub use cache::{MlaLayerCache, NativeCache};
 pub use forward::{benchmark_trial, forward_step, generate, prefill_first_token};
-pub use moe::{ScoringFunc, TopkMethod};
+pub use moe::{DeepseekRouting, ScoringFunc, TopkMethod};
 pub use weights::{NativeWeights, load_model};
 
 // ============================================================================
@@ -209,28 +209,16 @@ impl DeepSeekConfig {
         li >= self.first_k_dense_replace && li % self.moe_layer_freq == 0
     }
 
-    /// Whether this is a V2-family config (softmax routing unless it says
-    /// otherwise).
-    fn is_v2(&self) -> bool {
-        self.model_type == "deepseek_v2"
-    }
-
     /// How expert scores are computed.
     pub fn scoring(&self) -> ScoringFunc {
-        self.scoring_func.unwrap_or(if self.is_v2() {
-            ScoringFunc::Softmax
-        } else {
-            ScoringFunc::Sigmoid
-        })
+        self.scoring_func
+            .unwrap_or_else(|| ScoringFunc::default_for(&self.model_type))
     }
 
     /// How the top-k experts are chosen.
     pub fn topk(&self) -> TopkMethod {
-        self.topk_method.unwrap_or(if self.is_v2() {
-            TopkMethod::Greedy
-        } else {
-            TopkMethod::NoauxTc
-        })
+        self.topk_method
+            .unwrap_or_else(|| TopkMethod::default_for(&self.model_type))
     }
 
     /// Expert groups (1 when the config has none).
@@ -267,29 +255,17 @@ impl DeepSeekConfig {
         let Some(experts) = self.n_routed_experts else {
             return Ok(());
         };
-        let (groups, kept, top_k) = (self.n_group(), self.topk_group(), self.num_experts_per_tok);
-        if experts < 1 || top_k < 1 || top_k > experts {
-            return bad(format!(
-                "num_experts_per_tok {top_k} does not fit n_routed_experts {experts}"
-            ));
+        DeepseekRouting {
+            scoring: self.scoring(),
+            method: self.topk(),
+            n_group: self.n_group(),
+            topk_group: self.topk_group(),
+            top_k: self.num_experts_per_tok,
+            routed_scaling_factor: self.routed_scaling_factor,
+            norm_topk_prob: self.norm_topk_prob,
         }
-        if self.topk() != TopkMethod::Greedy {
-            if groups < 1 || experts % groups != 0 {
-                return bad(format!(
-                    "n_routed_experts {experts} does not divide into n_group {groups}"
-                ));
-            }
-            if kept < 1 || kept > groups {
-                return bad(format!("topk_group {kept} is not within n_group {groups}"));
-            }
-            if top_k > kept * (experts / groups) {
-                return bad(format!(
-                    "num_experts_per_tok {top_k} exceeds the {} experts of the {kept} kept groups",
-                    kept * (experts / groups)
-                ));
-            }
-        }
-        Ok(())
+        .validate(experts)
+        .map_err(|e| format!("deepseek config: {e}"))
     }
 }
 

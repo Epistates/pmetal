@@ -20,7 +20,7 @@ use crate::native_checkpoint::Checkpoint;
 use crate::native_weight::{EmbeddingWeight, LayerWeight, copy_fresh_arr};
 
 use super::DeepSeekConfig;
-use super::moe::Router;
+use super::moe::{DeepseekRouting, Router};
 
 /// One gated MLP: the dense layers' and the shared expert's.
 pub(super) struct Mlp {
@@ -337,13 +337,15 @@ pub fn load_model(
                 router: Router {
                     weight: load_gate(&mut ckpt, &format!("{mlp}.gate"))?,
                     bias: bias.map(|b| b.as_dtype(dtype::F32)),
-                    scoring: config.scoring(),
-                    method,
-                    n_group: config.n_group(),
-                    topk_group: config.topk_group(),
-                    top_k: config.num_experts_per_tok,
-                    routed_scaling_factor: config.routed_scaling_factor,
-                    norm_topk_prob: config.norm_topk_prob,
+                    routing: DeepseekRouting {
+                        scoring: config.scoring(),
+                        method,
+                        n_group: config.n_group(),
+                        topk_group: config.topk_group(),
+                        top_k: config.num_experts_per_tok,
+                        routed_scaling_factor: config.routed_scaling_factor,
+                        norm_topk_prob: config.norm_topk_prob,
+                    },
                 },
                 gate,
                 up,
