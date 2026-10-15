@@ -101,9 +101,14 @@ impl TrainingLoop {
                 }
             }
 
-            // Create dataloader for this epoch
+            // Create dataloader for this epoch. A loader's order is a function
+            // of its seed, so each epoch needs its own: a fresh loader on the
+            // configured seed would serve the same order every epoch.
             let mut dataloader =
                 DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
+            if epoch > 0 {
+                dataloader.reset(Some(self.config.dataloader.seed + epoch as u64));
+            }
 
             // Double-buffered batch prefetch: overlap CPU data prep with GPU compute.
             let mut prefetched_batch = dataloader
@@ -210,8 +215,6 @@ impl TrainingLoop {
                     return Ok(());
                 }
             }
-
-            dataloader.reset(Some(self.config.dataloader.seed + epoch as u64 + 1));
         }
 
         tracing::info!(
