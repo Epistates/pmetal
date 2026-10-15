@@ -254,6 +254,47 @@ pub fn find_cached_dataset(repo_id: &str) -> Option<PathBuf> {
     })
 }
 
+/// Where a path sits in a Hub cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheLocation {
+    /// The cache directory (the one holding `models--owner--name`, the shared
+    /// `blobs/` store and `.locks`).
+    pub cache_root: PathBuf,
+    /// The repository folder (`models--owner--name`) the path is inside.
+    pub repo_dir: PathBuf,
+}
+
+impl CacheLocation {
+    /// Whether `file` is stored by this cache: inside the repository folder,
+    /// or in the cache-wide blob store that `huggingface_hub` shares between
+    /// repositories so a file is kept once however many repositories hold it.
+    ///
+    /// Both paths should be canonical: a snapshot file is a symlink into
+    /// `blobs/`, and it is what the link points at that has to be checked.
+    pub fn stores(&self, file: &Path) -> bool {
+        file.starts_with(&self.repo_dir) || file.starts_with(self.cache_root.join("blobs"))
+    }
+}
+
+/// The Hub cache a path lies in, if it lies in one: the nearest ancestor named
+/// like a cache repository folder (`models--…`, `datasets--…`, `spaces--…`)
+/// and the cache directory above it.
+///
+/// Purely lexical: the path is not touched, so canonicalise it first to see
+/// through symlinks.
+pub fn locate_in_cache(path: &Path) -> Option<CacheLocation> {
+    path.ancestors().find_map(|dir| {
+        let name = dir.file_name()?.to_str()?;
+        let is_repo = ["models--", "datasets--", "spaces--"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+        is_repo.then(|| CacheLocation {
+            cache_root: dir.parent().map(Path::to_path_buf).unwrap_or_default(),
+            repo_dir: dir.to_path_buf(),
+        })
+    })
+}
+
 /// The top-level entries of a Hub cache directory that belong to the cache:
 /// repository folders and the lock directory.
 fn is_cache_entry(name: &str) -> bool {
@@ -478,5 +519,26 @@ mod tests {
     #[test]
     fn clearing_a_missing_cache_is_fine() {
         clear_cache_in(Path::new("/definitely/not/here")).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_path_locates_its_repository_and_cache() {
+        let snap = Path::new("/data/hub/models--o--m/snapshots/abc");
+        let location = locate_in_cache(snap).unwrap();
+        assert_eq!(location.cache_root, Path::new("/data/hub"));
+        assert_eq!(location.repo_dir, Path::new("/data/hub/models--o--m"));
+        assert!(locate_in_cache(Path::new("/data/plain/model")).is_none());
+    }
+
+    #[test]
+    fn a_location_stores_its_own_blobs_and_the_shared_store_but_nothing_else() {
+        let location = locate_in_cache(Path::new("/data/hub/models--o--m/snapshots/abc")).unwrap();
+        assert!(location.stores(Path::new("/data/hub/models--o--m/blobs/1234")));
+        assert!(location.stores(Path::new("/data/hub/blobs/ab/1234")));
+        // Another repository's own blobs are not this one's.
+        assert!(!location.stores(Path::new("/data/hub/models--x--y/blobs/1234")));
+        assert!(!location.stores(Path::new("/etc/passwd")));
+        // A sibling that merely shares a name prefix is not the repository.
+        assert!(!location.stores(Path::new("/data/hub/models--o--m2/blobs/1234")));
     }
 }
