@@ -67,6 +67,12 @@ impl Discriminator for MultiResolutionDiscriminator {
         }
         Ok(())
     }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (i, d) in self.discriminators.iter().enumerate() {
+            d.save_state(&join_key(prefix, &format!("discriminators.{i}")), out);
+        }
+    }
 }
 
 impl_module_params!(MultiResolutionDiscriminator; discriminators);
@@ -163,6 +169,14 @@ impl ResolutionDiscriminator {
         }
         self.conv_post
             .load_state(sd, &join_key(prefix, "conv_post"))
+    }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (i, c) in self.convs.iter().enumerate() {
+            c.save_state(&join_key(prefix, &format!("convs.{i}")), out);
+        }
+        self.conv_post
+            .save_state(&join_key(prefix, "conv_post"), out);
     }
 }
 

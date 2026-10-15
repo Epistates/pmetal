@@ -211,6 +211,25 @@ impl StateDict {
         }
     }
 
+    /// Move every tensor under `prefix.` out into a new state dict, with the
+    /// prefix stripped (for a checkpoint holding several models' states).
+    pub fn split_prefix(&mut self, prefix: &str) -> StateDict {
+        let want = format!("{prefix}.");
+        let keys: Vec<String> = self
+            .tensors
+            .keys()
+            .filter(|k| k.starts_with(&want))
+            .cloned()
+            .collect();
+        let mut tensors = HashMap::with_capacity(keys.len());
+        for key in keys {
+            if let Some(t) = self.tensors.remove(&key) {
+                tensors.insert(key[want.len()..].to_owned(), t);
+            }
+        }
+        StateDict::new(tensors)
+    }
+
     /// Whether `key` is present.
     pub fn contains(&self, key: &str) -> bool {
         self.tensors.contains_key(key)

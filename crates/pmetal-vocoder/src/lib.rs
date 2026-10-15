@@ -35,6 +35,7 @@ pub mod error;
 pub mod generator;
 pub mod loss;
 pub mod nn;
+pub mod train;
 
 pub use config::*;
 pub use error::*;

@@ -7,10 +7,10 @@
 //! not level.
 
 use super::{Discriminator, DiscriminatorOutput, conv_act, conv2d, flatten_logits};
-use crate::audio::{PadMode, StftConfig, Window, stft_parts};
+use crate::audio::{PadMode, StftConfig, Window, hann_window, stft_parts};
 use crate::error::{Result, VocoderError};
 use crate::nn::{Conv2d, StateDict, join_key};
-use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 use pmetal_runtime::impl_module_params;
 
 /// The five frequency bands as fractions of the spectrum.
@@ -67,6 +67,12 @@ impl Discriminator for MultiBandDiscriminator {
             d.load_state(sd, &join_key(prefix, &format!("discriminators.{i}")))?;
         }
         Ok(())
+    }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (i, d) in self.discriminators.iter().enumerate() {
+            d.save_state(&join_key(prefix, &format!("discriminators.{i}")), out);
+        }
     }
 }
 
@@ -179,7 +185,37 @@ impl BandDiscriminator {
             }
         }
         self.conv_post
-            .load_state(sd, &join_key(prefix, "conv_post"))
+            .load_state(sd, &join_key(prefix, "conv_post"))?;
+        // The reference keeps the STFT window as a buffer. It is the periodic
+        // Hann window by construction, so check rather than load it.
+        let window_key = join_key(prefix, "spec_fn.window");
+        if let Some(window) = sd.take_opt(&window_key) {
+            let ours = hann_window(self.stft.n_fft, true)?;
+            let same = window.shape() == ours.shape()
+                && window
+                    .as_dtype(Dtype::Float32)
+                    .as_slice::<f32>()
+                    .iter()
+                    .zip(ours.as_slice::<f32>())
+                    .all(|(a, b)| (a - b).abs() <= 1e-6);
+            if !same {
+                return Err(VocoderError::WeightLoad(format!(
+                    "`{window_key}` is not the periodic Hann window of {} samples",
+                    self.stft.n_fft
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (b, stack) in self.band_convs.iter().enumerate() {
+            for (i, c) in stack.iter().enumerate() {
+                c.save_state(&join_key(prefix, &format!("band_convs.{b}.{i}")), out);
+            }
+        }
+        self.conv_post
+            .save_state(&join_key(prefix, "conv_post"), out);
     }
 }
 

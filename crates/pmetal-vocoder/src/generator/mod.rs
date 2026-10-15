@@ -206,6 +206,21 @@ impl BigVGAN {
         self.activation_post.prepare_inference();
     }
 
+    /// Undo [`prepare_for_inference`](Self::prepare_for_inference) so the model
+    /// can be trained: the activations return to differentiable ops and
+    /// weight normalisation is re-imposed on any fused convolution (`g` starts
+    /// at the weight's norm, so the function is unchanged).
+    pub fn prepare_for_training(&mut self) {
+        self.conv_pre.normalize();
+        self.ups.iter_mut().for_each(ConvTranspose1d::normalize);
+        self.resblocks.iter_mut().for_each(|b| {
+            b.normalize();
+            b.unprepare_inference();
+        });
+        self.activation_post.unprepare();
+        self.conv_post.normalize();
+    }
+
     /// Cast every parameter to `dtype`. The periodic activations always
     /// compute in float32 internally; convolutions run in `dtype`.
     pub fn to_dtype(&mut self, dtype: Dtype) {

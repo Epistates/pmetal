@@ -140,11 +140,24 @@ impl AMPBlock {
         self.convs2.iter_mut().for_each(Conv1d::fuse);
     }
 
+    /// Re-impose weight normalisation on fused convolutions (to train).
+    pub fn normalize(&mut self) {
+        self.convs1.iter_mut().for_each(Conv1d::normalize);
+        self.convs2.iter_mut().for_each(Conv1d::normalize);
+    }
+
     /// Switch every activation to the fused inference kernel (no gradient).
     pub fn prepare_inference(&mut self) {
         self.activations
             .iter_mut()
             .for_each(Activation1d::prepare_inference);
+    }
+
+    /// Return every activation to the differentiable op path.
+    pub fn unprepare_inference(&mut self) {
+        self.activations
+            .iter_mut()
+            .for_each(Activation1d::unprepare);
     }
 
     /// Cast parameters to `dtype`.

@@ -48,6 +48,10 @@ pub trait Discriminator: ModuleParameters {
     /// Load PyTorch-layout tensors under `prefix` (the reference's
     /// `mpd` / `mrd` state dicts).
     fn load_state(&mut self, sd: &mut StateDict, prefix: &str) -> Result<()>;
+
+    /// Append the learned tensors under `prefix` in the reference's naming and
+    /// PyTorch layout, the inverse of [`load_state`](Self::load_state).
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>);
 }
 
 /// Which spectral discriminator accompanies the MPD.
@@ -356,6 +360,15 @@ impl SpectralDiscriminator {
             Self::Resolution(d) => d.load_state(sd, prefix),
             Self::MultiBand(d) => d.load_state(sd, prefix),
             Self::Cqt(d) => d.load_state(sd, prefix),
+        }
+    }
+
+    /// Append the learned tensors under `prefix` in PyTorch layout.
+    pub fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        match self {
+            Self::Resolution(d) => d.save_state(prefix, out),
+            Self::MultiBand(d) => d.save_state(prefix, out),
+            Self::Cqt(d) => d.save_state(prefix, out),
         }
     }
 }

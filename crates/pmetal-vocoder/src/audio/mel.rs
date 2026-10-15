@@ -213,14 +213,24 @@ pub struct MelFrontEnd {
 const MAGNITUDE_EPS: f32 = 1e-9;
 
 impl MelFrontEnd {
-    /// The front end for a model configuration.
+    /// The front end a model is conditioned on (the configuration's `fmax`).
     pub fn new(config: &BigVGANConfig) -> Result<Self> {
+        Self::with_fmax(config, config.fmax)
+    }
+
+    /// The front end of the single-scale mel loss, which uses the
+    /// configuration's `fmax_for_loss` instead of `fmax`.
+    pub fn for_loss(config: &BigVGANConfig) -> Result<Self> {
+        Self::with_fmax(config, config.fmax_for_loss)
+    }
+
+    fn with_fmax(config: &BigVGANConfig, fmax: Option<i32>) -> Result<Self> {
         let mel = MelConfig {
             sr: config.sampling_rate,
             n_fft: config.n_fft,
             n_mels: config.num_mels,
             fmin: config.fmin as f32,
-            fmax: config.fmax.map(|f| f as f32),
+            fmax: fmax.map(|f| f as f32),
             htk: false,
             norm: MelNorm::Slaney,
         };

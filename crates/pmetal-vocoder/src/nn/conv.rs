@@ -255,6 +255,11 @@ impl Conv1d {
         self.weight.fuse();
     }
 
+    /// Re-impose weight normalisation on a fused weight (to train from one).
+    pub fn normalize(&mut self) {
+        self.weight.normalize();
+    }
+
     /// Cast parameters to `dtype`.
     pub fn cast(&mut self, dtype: Dtype) {
         self.weight.cast(dtype);
@@ -396,6 +401,11 @@ impl ConvTranspose1d {
     /// Fold weight normalisation into the weight (inference).
     pub fn fuse(&mut self) {
         self.weight.fuse();
+    }
+
+    /// Re-impose weight normalisation on a fused weight (to train from one).
+    pub fn normalize(&mut self) {
+        self.weight.normalize();
     }
 
     /// Cast parameters to `dtype`.
@@ -568,6 +578,11 @@ impl Conv2d {
     /// Fold weight normalisation into the weight (inference).
     pub fn fuse(&mut self) {
         self.weight.fuse();
+    }
+
+    /// Re-impose weight normalisation on a fused weight (to train from one).
+    pub fn normalize(&mut self) {
+        self.weight.normalize();
     }
 
     /// Cast parameters to `dtype`.

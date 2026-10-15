@@ -32,8 +32,11 @@ fn build(name: &str, fx: &Fixture) -> Box<dyn DiscriminatorDyn> {
                 m["channel_mult"].as_f64().unwrap() as f32,
             )
             .unwrap();
-            d.load_state(&mut fx.state_dict(&format!("{name}.state")), "")
-                .unwrap();
+            let mut sd = fx.state_dict(&format!("{name}.state"));
+            d.load_state(&mut sd, "").unwrap();
+            // Every tensor of the reference module is a parameter we load or a
+            // buffer we check; nothing is left over.
+            sd.finish().unwrap();
             Box::new(d)
         }
         "mrd" => {
@@ -55,8 +58,11 @@ fn build(name: &str, fx: &Fixture) -> Box<dyn DiscriminatorDyn> {
                 m["channel_mult"].as_f64().unwrap() as f32,
             )
             .unwrap();
-            d.load_state(&mut fx.state_dict(&format!("{name}.state")), "")
-                .unwrap();
+            let mut sd = fx.state_dict(&format!("{name}.state"));
+            d.load_state(&mut sd, "").unwrap();
+            // Every tensor of the reference module is a parameter we load or a
+            // buffer we check; nothing is left over.
+            sd.finish().unwrap();
             Box::new(d)
         }
         "mbd" => {
@@ -69,8 +75,11 @@ fn build(name: &str, fx: &Fixture) -> Box<dyn DiscriminatorDyn> {
             let mut d =
                 MultiBandDiscriminator::new(&windows, m["channels"].as_i64().unwrap() as i32)
                     .unwrap();
-            d.load_state(&mut fx.state_dict(&format!("{name}.state")), "")
-                .unwrap();
+            let mut sd = fx.state_dict(&format!("{name}.state"));
+            d.load_state(&mut sd, "").unwrap();
+            // Every tensor of the reference module is a parameter we load or a
+            // buffer we check; nothing is left over.
+            sd.finish().unwrap();
             Box::new(d)
         }
         _ => unreachable!(),
@@ -80,11 +89,43 @@ fn build(name: &str, fx: &Fixture) -> Box<dyn DiscriminatorDyn> {
 /// Object-safe view of the discriminators for the shared test body.
 trait DiscriminatorDyn {
     fn run(&self, audio: &Array) -> Vec<DiscriminatorOutput>;
+    fn saved(&self) -> Vec<(String, Array)>;
 }
 
 impl<D: Discriminator> DiscriminatorDyn for D {
     fn run(&self, audio: &Array) -> Vec<DiscriminatorOutput> {
         self.discriminate(audio).unwrap()
+    }
+
+    fn saved(&self) -> Vec<(String, Array)> {
+        let mut out = Vec::new();
+        self.save_state("", &mut out);
+        out
+    }
+}
+
+#[test]
+fn saved_state_has_the_reference_names_values_and_layout() {
+    let fx = Fixture::load("discriminators");
+    for name in ["mpd", "mrd", "mbd"] {
+        let saved = build(name, &fx).saved();
+        let prefix = format!("{name}.state.");
+        // The reference's derived buffers (the MBD's STFT window) are checked
+        // on load but not part of what is saved.
+        let mut expected: Vec<&str> = fx
+            .keys()
+            .filter_map(|k| k.strip_prefix(prefix.as_str()))
+            .filter(|k| !k.ends_with("spec_fn.window"))
+            .collect();
+        let mut got: Vec<&str> = saved.iter().map(|(k, _)| k.as_str()).collect();
+        expected.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, expected, "{name}: tensor names");
+        for (key, tensor) in &saved {
+            let full = format!("{prefix}{key}");
+            assert_eq!(tensor.shape(), fx.shape(&full), "{full}");
+            assert_close_slice(&to_vec(tensor), fx.values(&full), 0.0, 1e-7, &full);
+        }
     }
 }
 
