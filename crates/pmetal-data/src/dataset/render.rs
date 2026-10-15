@@ -98,14 +98,22 @@ impl TextSample {
 }
 
 /// Render an example to text and the bytes of it the loss covers.
+///
+/// Usually one sample. A conversation whose chat template renders an earlier
+/// assistant turn differently in context than alone (see
+/// [`render_templated`]) yields one more for each such turn: the
+/// conversation up to that turn, with the turn as the answer, which is
+/// exactly how the template renders it for generation.
 pub(crate) fn render(
     example: Example,
     template: Option<&ChatTemplate>,
     loss: AssistantLoss,
-) -> TextSample {
+) -> Vec<TextSample> {
     match example {
-        Example::Text(text) => TextSample::document(text),
-        Example::Completion { prompt, completion } => TextSample::completion(prompt, &completion),
+        Example::Text(text) => vec![TextSample::document(text)],
+        Example::Completion { prompt, completion } => {
+            vec![TextSample::completion(prompt, &completion)]
+        }
         Example::Chat(conversation) => render_chat(&conversation, template, loss),
     }
 }
@@ -137,11 +145,11 @@ fn render_chat(
     conversation: &Conversation,
     template: Option<&ChatTemplate>,
     loss: AssistantLoss,
-) -> TextSample {
+) -> Vec<TextSample> {
     let trained = trained_messages(conversation, loss);
     match template {
         Some(template) => render_templated(conversation, template, &trained),
-        None => render_plain(&conversation.messages, &trained),
+        None => vec![render_plain(&conversation.messages, &trained)],
     }
 }
 
@@ -151,34 +159,43 @@ fn render_chat(
 /// ([`FormattedChat::response_start`](crate::chat_templates::FormattedChat)),
 /// so assistant turn `i` is found by rendering the conversation up to it: its
 /// text runs from there to the end of that rendering. That holds in the full
-/// conversation only if the rendering is a prefix of it; a template that
-/// rewrites earlier turns (dropping old reasoning, say) breaks that, and a
-/// turn it breaks is left out of the loss, since its bytes cannot be
-/// located, rather than trained on guesses.
+/// conversation only if the rendering is a prefix of it. A template that
+/// rewrites earlier turns (Qwen3's drops the reasoning of turns before the
+/// last question) breaks that, and the turn's bytes in the full text cannot
+/// be told from guesses; rather than train on guesses or lose the turn, it is
+/// rendered as a sample of its own, the conversation up to it, which is how
+/// the template renders it when asked to generate it.
 fn render_templated(
     conversation: &Conversation,
     template: &ChatTemplate,
     trained: &[usize],
-) -> TextSample {
+) -> Vec<TextSample> {
     let tools = (!conversation.tools.is_empty()).then_some(conversation.tools.as_slice());
     let messages = &conversation.messages;
     let full = template.apply_with_tools(messages, tools);
 
     let mut spans: Vec<Range<usize>> = Vec::with_capacity(trained.len());
+    let mut separate: Vec<TextSample> = Vec::new();
     for &i in trained {
         let (start, end) = if i + 1 == messages.len() {
             (full.response_start, full.text.len())
         } else {
             let upto = template.apply_with_tools(&messages[..=i], tools);
             if !full.text.starts_with(&upto.text) {
-                static WARN: Once = Once::new();
-                WARN.call_once(|| {
-                    tracing::warn!(
-                        "the chat template does not render a conversation's earlier turns \
-                         as it renders them alone; those assistant turns are left out of \
-                         the loss (train on the last turn only to silence this)"
+                static NOTE: Once = Once::new();
+                NOTE.call_once(|| {
+                    tracing::info!(
+                        "the chat template does not render a conversation's earlier turns as \
+                         it renders them alone; each such assistant turn becomes a sample of \
+                         its own (train on the last turn only to avoid the extra samples)"
                     );
                 });
+                if upto.response_start < upto.text.len()
+                    && upto.text.is_char_boundary(upto.response_start)
+                {
+                    let span = upto.response_start..upto.text.len();
+                    separate.push(TextSample::with_spans(upto.text, vec![span], true));
+                }
                 continue;
             }
             (upto.response_start, upto.text.len())
@@ -187,7 +204,12 @@ fn render_templated(
             spans.push(start..end);
         }
     }
-    TextSample::with_spans(full.text, spans, true)
+    let mut samples = Vec::with_capacity(1 + separate.len());
+    if !spans.is_empty() || separate.is_empty() {
+        samples.push(TextSample::with_spans(full.text, spans, true));
+    }
+    samples.extend(separate);
+    samples
 }
 
 /// Without a chat template: `Role: content` blocks, the assistant's content
@@ -239,7 +261,12 @@ pub(crate) fn tokenize_messages(
         tools: Vec::new(),
         trained: vec![None; messages.len()],
     };
-    let sample = render_chat(&conversation, Some(template), loss);
+    // The first sample holds the turns the template lets us locate in place:
+    // all of them under `LastTurn`, which is what this is for.
+    let sample = render_chat(&conversation, Some(template), loss)
+        .into_iter()
+        .next()
+        .ok_or_else(|| PMetalError::InvalidArgument("a conversation with no messages".into()))?;
     let tokenized = tokenize(tokenizer, &sample, max_length)?;
     Ok((tokenized.input_ids, tokenized.labels))
 }

@@ -229,10 +229,12 @@ fn every_assistant_turn_of_a_conversation_is_trained() {
 /// A template that writes the last assistant turn differently from earlier
 /// ones (an empty reasoning block only on the turn being answered, as
 /// reasoning models' templates do) cannot have its earlier turns located by
-/// rendering them alone. They are left out of the loss, not trained at the
-/// wrong bytes; the final turn trains.
+/// rendering them alone. Each becomes a sample of its own, the conversation up
+/// to it rendered as the template renders it for generation, rather than
+/// being trained at the wrong bytes or lost; the final turn trains in the
+/// first sample, and `LastTurn` makes no extra ones.
 #[test]
-fn a_template_that_rewrites_earlier_turns_trains_only_the_turn_it_can_locate() {
+fn a_template_that_rewrites_earlier_turns_renders_each_as_its_own_sample() {
     let tokenizer = char_tokenizer(None);
     let mut template = ChatTemplate::chatml();
     template.jinja_source = Some(
@@ -248,9 +250,35 @@ fn a_template_that_rewrites_earlier_turns_trains_only_the_turn_it_can_locate() {
         DatasetFormat::OpenAi,
         Some(&template),
     );
-    let trained = trained_text(ds.get(0).unwrap(), &tokenizer);
-    assert!(trained.ends_with("a2<|im_end|>\n"), "{trained:?}");
-    assert!(!trained.contains("a1"), "{trained:?}");
+    assert_eq!(ds.len(), 2);
+    assert_eq!(
+        trained_text(ds.get(0).unwrap(), &tokenizer),
+        "a2<|im_end|>\n"
+    );
+    // The first turn, as the template renders it when asked to answer it (its
+    // empty reasoning block is part of the generation prompt, so it is
+    // context): the conversation stops there.
+    assert_eq!(
+        trained_text(ds.get(1).unwrap(), &tokenizer),
+        "a1<|im_end|>\n"
+    );
+    let second = full_text(ds.get(1).unwrap(), &tokenizer);
+    assert!(second.contains("<think>\n\n</think>\n\na1"), "{second}");
+    assert!(!second.contains("a2"), "{second}");
+
+    use pmetal_data::{AssistantLoss, DatasetLoadOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("data.jsonl");
+    write_jsonl(&path, &[two_turns()]);
+    let last = TrainingDataset::load(
+        &path,
+        &tokenizer,
+        &DatasetLoadOptions::new(4096)
+            .template(Some(&template))
+            .assistant_loss(AssistantLoss::LastTurn),
+    )
+    .unwrap();
+    assert_eq!(last.len(), 1);
 }
 
 #[test]

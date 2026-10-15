@@ -243,20 +243,24 @@ impl TrainingDataset {
             options.columns,
             |format, row| {
                 let example = format.parse(row)?;
-                let text = render::render(example, options.template, options.assistant_loss);
-                render::tokenize(tokenizer, &text, options.max_length)
+                render::render(example, options.template, options.assistant_loss)
+                    .iter()
+                    .map(|text| render::tokenize(tokenizer, text, options.max_length))
+                    .collect::<Result<Vec<_>>>()
             },
-            |tokenized| {
-                if !tokenized.has_trained_tokens() {
-                    dropped += 1;
-                    return Ok(());
+            |row_samples| {
+                for tokenized in row_samples {
+                    if !tokenized.has_trained_tokens() {
+                        dropped += 1;
+                        continue;
+                    }
+                    original_lengths.push(tokenized.original_len);
+                    samples.push(Sample {
+                        input_ids: tokenized.input_ids,
+                        labels: Some(tokenized.labels),
+                        images: None,
+                    });
                 }
-                original_lengths.push(tokenized.original_len);
-                samples.push(Sample {
-                    input_ids: tokenized.input_ids,
-                    labels: Some(tokenized.labels),
-                    images: None,
-                });
                 Ok(())
             },
         )?;
@@ -372,8 +376,8 @@ impl TrainingDataset {
                     AssistantLoss::default(),
                 ))
             },
-            |sample| {
-                out.push(sample);
+            |row_samples| {
+                out.extend(row_samples);
                 Ok(())
             },
         )?;
