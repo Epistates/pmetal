@@ -38,7 +38,7 @@ use crate::ane::scratch::{
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
-use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM};
+use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
 use crate::kernels::fused_training::{AdamWConfig, BatchedCommandBuffer};
 
 /// Configuration for the dynamic ANE trainer.
@@ -462,10 +462,10 @@ pub struct DynamicAneTrainer {
     compile_count: usize,
     /// GPU dW GEMM dispatcher (None if dim < GPU_DW_MIN_DIM or Metal init fails).
     gpu_dw: Option<DwGemm>,
-    /// Pre-allocated scratch buffers for activation copies (A and B operands).
-    /// Sized to max(h*s, d*s, qd*s, v*s) to fit any per-layer activation.
-    scratch_a: Option<MetalBuffer<f32>>,
-    scratch_b: Option<MetalBuffer<f32>>,
+    /// Staging buffers for the activation copies (A and B operands) of the
+    /// step's dW GEMMs. Every GEMM queued into the step's command buffer gets
+    /// its own pair, reset once the buffer has executed.
+    dw_scratch: Option<ScratchPool>,
     /// Metal context for GPU dW path.
     metal_ctx: Option<Arc<MetalContext>>,
     /// Latest step timings.
@@ -521,8 +521,7 @@ pub struct DynamicAneTrainer {
 #[allow(clippy::too_many_arguments)]
 fn encode_dw_gemm(
     gpu_dw: Option<&DwGemm>,
-    scratch_a: Option<&MetalBuffer<f32>>,
-    scratch_b: Option<&MetalBuffer<f32>>,
+    scratch: Option<&ScratchPool>,
     batch: Option<&mut BatchedCommandBuffer>,
     a_data: &[f32],
     b_data: &[f32],
@@ -531,12 +530,10 @@ fn encode_dw_gemm(
     n: usize,
     k: usize,
 ) {
-    if let (Some(dw), Some(sa), Some(sb), Some(batch)) = (gpu_dw, scratch_a, scratch_b, batch) {
-        // GPU path: copy activations to scratch, encode GEMM.
-        // MetalBuffer has interior mutability via unified memory (as_mut_slice_unchecked).
-        sa.as_mut_slice_unchecked()[..a_data.len()].copy_from_slice(a_data);
-        sb.as_mut_slice_unchecked()[..b_data.len()].copy_from_slice(b_data);
-        dw.queue_gemm_accum(batch, sa, sb, c_buf, m, n, k, 1.0, 1.0)
+    if let (Some(dw), Some(scratch), Some(batch)) = (gpu_dw, scratch, batch) {
+        // GPU path: stage the activations in buffers of their own (the batch
+        // runs after every one of its GEMMs has been encoded), encode the GEMM.
+        dw.queue_gemm_accum_staged(batch, scratch, a_data, b_data, c_buf, m, n, k, 1.0, 1.0)
             .unwrap();
     } else {
         // CPU cblas fallback
@@ -573,42 +570,25 @@ impl DynamicAneTrainer {
         };
 
         // Try to initialize Metal GPU dW path
-        let (metal_ctx, gpu_dw, scratch_a, scratch_b) = if d >= GPU_DW_MIN_DIM {
+        let (metal_ctx, gpu_dw, dw_scratch) = if d >= GPU_DW_MIN_DIM {
             match MetalContext::new() {
                 Ok(ctx) => {
                     let ctx = Arc::new(ctx);
                     match DwGemm::new(ctx.clone()) {
                         Ok(dw) => {
-                            // Pre-allocate two scratch buffers sized to the largest activation
-                            let qd_val = config.n_heads * hd;
-                            let max_scratch = [d * s, h * s, qd_val * s].into_iter().max().unwrap();
-                            match (
-                                MetalBuffer::new(&ctx, max_scratch, BufferUsage::Shared),
-                                MetalBuffer::new(&ctx, max_scratch, BufferUsage::Shared),
-                            ) {
-                                (Ok(sa), Ok(sb)) => {
-                                    info!(
-                                        dim = d,
-                                        scratch_size = max_scratch,
-                                        "GPU dW path enabled (Metal GEMM)"
-                                    );
-                                    (Some(ctx.clone()), Some(dw), Some(sa), Some(sb))
-                                }
-                                _ => {
-                                    info!("Scratch buffer alloc failed, falling back to cblas");
-                                    (None, None, None, None)
-                                }
-                            }
+                            info!(dim = d, "GPU dW path enabled (Metal GEMM)");
+                            let scratch = ScratchPool::new(ctx.clone());
+                            (Some(ctx), Some(dw), Some(scratch))
                         }
                         Err(e) => {
                             info!("GPU dW init failed, falling back to cblas: {e}");
-                            (None, None, None, None)
+                            (None, None, None)
                         }
                     }
                 }
                 Err(e) => {
                     info!("MetalContext init failed, falling back to cblas: {e}");
-                    (None, None, None, None)
+                    (None, None, None)
                 }
             }
         } else {
@@ -617,7 +597,7 @@ impl DynamicAneTrainer {
                 threshold = GPU_DW_MIN_DIM,
                 "dim below GPU dW threshold, using cblas"
             );
-            (None, None, None, None)
+            (None, None, None)
         };
 
         let mut layer_weights = Vec::with_capacity(nl);
@@ -727,8 +707,7 @@ impl DynamicAneTrainer {
             adam_t: 0,
             compile_count: 0,
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             metal_ctx,
             last_timings: StepTimings::default(),
             bwd_scratch: None,
@@ -1613,8 +1592,7 @@ impl DynamicAneTrainer {
 
         // GPU dW references (immutable borrows of Option fields)
         let gpu_dw = self.gpu_dw.as_ref();
-        let scratch_a = self.scratch_a.as_ref();
-        let scratch_b = self.scratch_b.as_ref();
+        let dw_scratch = self.dw_scratch.as_ref();
 
         let scratch = self
             .bwd_scratch
@@ -1640,8 +1618,7 @@ impl DynamicAneTrainer {
         // 2. dW2 = dx @ silu_out^T
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             &dx[..d * s],
             &self.layer_acts[l].silu_out,
@@ -1676,8 +1653,7 @@ impl DynamicAneTrainer {
         // dW1, dW3
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dh1),
             &self.layer_acts[l].x2norm,
@@ -1688,8 +1664,7 @@ impl DynamicAneTrainer {
         );
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dh3),
             &self.layer_acts[l].x2norm,
@@ -1768,8 +1743,7 @@ impl DynamicAneTrainer {
             // dWo
             encode_dw_gemm(
                 gpu_dw,
-                scratch_a,
-                scratch_b,
+                dw_scratch,
                 batch.as_mut(),
                 scratch.get(ids.dx_ffn_norm),
                 &self.layer_acts[l].attn_out,
@@ -1955,8 +1929,7 @@ impl DynamicAneTrainer {
             // dWo
             encode_dw_gemm(
                 gpu_dw,
-                scratch_a,
-                scratch_b,
+                dw_scratch,
                 batch.as_mut(),
                 scratch.get(ids.dx_ffn_norm),
                 &self.layer_acts[l].attn_out,
@@ -1997,8 +1970,7 @@ impl DynamicAneTrainer {
         // dWq, dWk, dWv
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dq),
             &self.layer_acts[l].xnorm,
@@ -2009,8 +1981,7 @@ impl DynamicAneTrainer {
         );
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dk),
             &self.layer_acts[l].xnorm,
@@ -2021,8 +1992,7 @@ impl DynamicAneTrainer {
         );
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dv),
             &self.layer_acts[l].xnorm,
@@ -2292,6 +2262,12 @@ impl DynamicAneTrainer {
         let mut total_loss = 0.0f32;
 
         for (input, target) in data.iter().take(steps) {
+            // The previous step's batch has executed (or was dropped unrun), so
+            // the operands staged for it are free to be overwritten.
+            if let Some(scratch) = &self.dw_scratch {
+                scratch.reset();
+            }
+
             // Create a BatchedCommandBuffer for this step's dW GEMMs (GPU path).
             // CPU fallback: batch stays None, dispatch_dw runs cblas inline.
             let mut batch = if let Some(ref ctx) = self.metal_ctx {
@@ -2750,6 +2726,74 @@ mod tests {
         };
         let trainer = DynamicAneTrainer::new(config);
         assert_eq!(trainer.compile_count(), 0);
+    }
+
+    // ======== GPU dW Tests ========
+
+    /// A step's dW GEMMs share one command buffer that runs after every
+    /// operand has been copied in, so each GEMM must read the operands that
+    /// were copied for it, not the last ones copied. The trainer once
+    /// reused one pair of scratch buffers for all of them, which handed
+    /// every GEMM in the step the final pair.
+    #[test]
+    fn gpu_dw_gemms_in_one_step_each_read_their_own_operands() {
+        let Ok(ctx) = MetalContext::new() else {
+            return; // no Metal device
+        };
+        let ctx = Arc::new(ctx);
+        let gemm = DwGemm::new(ctx.clone()).unwrap();
+        let pool = ScratchPool::new(ctx.clone());
+
+        // Shapes like a layer's backward: a few GEMMs of different sizes,
+        // two of them with operands of equal length.
+        let shapes = [
+            (64usize, 96usize, 48usize),
+            (96, 64, 48),
+            (64, 64, 48),
+            (32, 80, 48),
+        ];
+        let data = |len: usize, seed: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| (((i * 31 + seed * 17) % 97) as f32 - 48.0) / 48.0)
+                .collect()
+        };
+        let mut batch = BatchedCommandBuffer::new(ctx.clone()).unwrap();
+        let mut outputs = Vec::new();
+        let mut expected = Vec::new();
+        for (i, &(m, n, k)) in shapes.iter().enumerate() {
+            let a = data(m * k, 2 * i + 1);
+            let b = data(n * k, 2 * i + 2);
+            let c = MetalBuffer::<f32>::zeros(&ctx, m * n, BufferUsage::Shared).unwrap();
+            encode_dw_gemm(
+                Some(&gemm),
+                Some(&pool),
+                Some(&mut batch),
+                &a,
+                &b,
+                &c,
+                m,
+                n,
+                k,
+            );
+            let mut want = vec![0.0f32; m * n];
+            accelerate::gemm(&a, &b, &mut want, m, n, k, 1.0, 0.0, false, true);
+            outputs.push(c);
+            expected.push(want);
+        }
+        batch.execute().unwrap();
+
+        for (i, (c, want)) in outputs.iter().zip(&expected).enumerate() {
+            let (m, n, k) = shapes[i];
+            let worst = c
+                .as_slice()
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |w, (got, want)| w.max((got - want).abs()));
+            assert!(
+                worst < 1e-3,
+                "GEMM {i} ({m} x {n} x {k}) read someone else's operands: worst error {worst}"
+            );
+        }
     }
 
     // ======== Vocab Compaction Tests ========
