@@ -61,10 +61,10 @@ pub use error::{DistillError, Result};
 pub use losses::{
     AttentionTransferLoss, DistillLoss, GkdLoss, GreedySampler, HiddenStateLoss, HingeRankingLoss,
     JensenShannonLoss, JsdSkewedLoss, KlDivergenceLoss, LogisticRankingLoss, MiniLlmLoss,
-    MiniLlmOutput, MseLoss, OnPolicySampler, SkewKlLoss, SoftCrossEntropyLoss, TemperatureSampler,
-    TvdLoss, UniversalLogitLoss,
+    MiniLlmOutput, MseLoss, OnPolicySampler, SkewKlLoss, SoftCrossEntropyLoss, SparseKlLoss,
+    TemperatureSampler, TvdLoss, UniversalLogitLoss,
 };
-pub use offline::{LogitCache, LogitCompressor};
+pub use offline::{CacheMetadata, CompressedLogits, LogitCache, LogitCompressor, SparseLogits};
 pub use reasoning::RationaleLoss;
 pub use taid::{TaidConfig, TaidDistiller, TaidError, TaidLossOutput};
 

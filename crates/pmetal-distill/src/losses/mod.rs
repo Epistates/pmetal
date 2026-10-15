@@ -36,6 +36,7 @@ mod minillm;
 mod mse;
 mod skew_kl;
 mod soft_cross_entropy;
+mod sparse_kl;
 mod tvd;
 mod universal_logit;
 
@@ -51,6 +52,7 @@ pub use minillm::{MiniLlmLoss, MiniLlmOutput};
 pub use mse::MseLoss;
 pub use skew_kl::SkewKlLoss;
 pub use soft_cross_entropy::SoftCrossEntropyLoss;
+pub use sparse_kl::SparseKlLoss;
 pub use tvd::TvdLoss;
 pub use universal_logit::UniversalLogitLoss;
 
