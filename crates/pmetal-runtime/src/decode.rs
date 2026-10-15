@@ -203,9 +203,10 @@ impl SamplingParams {
 /// `logsumexp`). A `temperature` at or below 0 is taken as 1; greedy
 /// decoding doesn't come here ([`sample_token`]).
 ///
-/// Every sampler in the crate graph draws from this: [`sample_token`] for
-/// the native engines, and `pmetal_models`' `Sampler` and
-/// `sampling_log_probs`, which speculative decoding verifies against.
+/// Every sampler in the workspace draws from this, through
+/// [`DecodeSampler`]: the native engines, the dynamic models, the serving
+/// engine, and the speculative decoders, which verify against the
+/// distribution [`DecodeSampler::log_probs`] reports.
 pub fn filtered_log_probs(logits_2d: &InlineArray, params: &SamplingParams) -> InlineArray {
     let mut scores = logits_2d.as_dtype(crate::compat::Dtype::Float32.as_i32());
     if params.temperature > 0.0 && params.temperature != 1.0 {

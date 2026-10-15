@@ -9,7 +9,7 @@
 //!
 //! This module is pure CPU. The outputs (node_token_ids, visibility,
 //! position_ids, attention mask) are built in Rust using
-//! `std::collections::BinaryHeap` and handed off to the native bridge
+//! `std::collections::BinaryHeap` and handed off to the native runtime
 //! as `InlineArray`s for the target forward.
 //!
 //! The algorithm matches DDTree's `build_ddtree_tree` / `compile_ddtree_tree`
