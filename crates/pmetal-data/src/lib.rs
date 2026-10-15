@@ -5,14 +5,12 @@
 //!   instruction, prompt/completion and text layouts ([`rows`], [`dataset`])
 //! - DataLoader for creating training batches, sharded and resumable
 //! - Sequence packing for efficient training
-//! - Data collation and batching
 //! - Tokenizer integration
 //! - Chat template system with response masking
 
 #![warn(missing_docs)]
 
 pub mod chat_templates;
-pub mod collator;
 pub mod dataloader;
 pub mod dataset;
 pub mod gguf_tokenizer;
@@ -28,7 +26,6 @@ pub mod streaming;
 pub mod tokenizer;
 pub mod vocab_compact;
 
-pub use collator::*;
 pub use dataloader::*;
 pub use dataset::*;
 pub use image_processing::*;

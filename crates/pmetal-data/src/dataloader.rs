@@ -28,6 +28,14 @@ pub enum DataLoaderError {
         /// Index of the sample missing image data.
         sample_index: usize,
     },
+    /// The fixed-size image path takes one image per sample.
+    #[error("sample {sample_index} has {count} images; a batch takes one per sample")]
+    TooManyImages {
+        /// Index of the sample within the batch.
+        sample_index: usize,
+        /// How many images it has.
+        count: usize,
+    },
     /// A sample's labels are not one per token, so padding them would shift
     /// every label after the first missing one onto the wrong token.
     #[error("sample {sample_index} has {labels} labels for {tokens} tokens")]
@@ -466,6 +474,15 @@ impl DataLoader {
                 for (idx, sample) in samples.iter().enumerate() {
                     match &sample.images {
                         Some(images) if !images.is_empty() => {
+                            // One image per sample: the batch holds one pixel
+                            // tensor per sample, so a second image would be
+                            // dropped while its placeholder stayed in the text.
+                            if images.len() > 1 {
+                                return Err(DataLoaderError::TooManyImages {
+                                    sample_index: idx,
+                                    count: images.len(),
+                                });
+                            }
                             let path = &images[0];
                             match processor.preprocess(path) {
                                 Ok(tensor) => pixel_tensors.push(tensor),
@@ -831,6 +848,29 @@ mod tests {
         let mut resumed = make();
         resumed.restore(state).unwrap();
         assert_eq!(served(&mut resumed), rest);
+    }
+
+    /// A second image would be dropped while its placeholder stayed in the
+    /// text; that is an error, not a silent truncation.
+    #[test]
+    fn a_sample_with_two_images_is_refused_by_the_single_image_loader() {
+        use crate::image_processing::{FixedSizeImageProcessor, FixedSizeImageProcessorConfig};
+        let sample = Sample::with_images(
+            vec![1, 2],
+            vec![1, 2],
+            vec!["a.png".into(), "b.png".into()],
+        );
+        let mut l = DataLoader::new(
+            TrainingDataset::from_samples(vec![sample]),
+            DataLoaderConfig::default(),
+            Some(Arc::new(FixedSizeImageProcessor::new(
+                FixedSizeImageProcessorConfig::default(),
+            ))),
+        );
+        assert!(matches!(
+            l.try_next_batch(),
+            Err(DataLoaderError::TooManyImages { count: 2, .. })
+        ));
     }
 
     /// Labels that don't line up with the tokens would shift every label

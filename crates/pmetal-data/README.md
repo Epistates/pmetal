@@ -176,7 +176,6 @@ fn format(model_dir: &Path) -> String {
 | `streaming` | Pretraining shards: tokenize a corpus, read it back resumably |
 | `chat_templates` | Conversation formatting |
 | `tokenizer` | Tokenizer integration |
-| `collator` | Batch collation |
 
 ## License
 
