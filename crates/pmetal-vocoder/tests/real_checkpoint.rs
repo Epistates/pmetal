@@ -179,8 +179,9 @@ fn fine_tune_smoke(name: &str) {
         history.push(trainer.step(&mel, &wav).expect("training step"));
     }
     eprintln!(
-        "{name}: {:.2} s per step; mel error {:?}",
+        "{name}: {:.2} s per step; peak {} MB; mel error {:?}",
         started.elapsed().as_secs_f64() / 3.0,
+        pmetal_runtime::inline_array::get_peak_memory() / 1_000_000,
         history.iter().map(|m| m.mel_error).collect::<Vec<_>>()
     );
     for m in &history {
