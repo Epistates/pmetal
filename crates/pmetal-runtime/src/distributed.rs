@@ -27,6 +27,11 @@ bridge_extern! {
     fn mlx_inline_distributed_group_size(group: *const c_void) -> i32;
     fn mlx_inline_distributed_group_free(group: *mut c_void);
     fn mlx_inline_distributed_all_sum(dst: *mut RawBuf, x: *const RawBuf, group: *const c_void);
+    fn mlx_inline_distributed_sum_gradients(
+        dst: *mut RawBuf,
+        x: *const RawBuf,
+        group: *const c_void,
+    );
     fn mlx_inline_distributed_all_gather(dst: *mut RawBuf, x: *const RawBuf, group: *const c_void);
     fn mlx_inline_distributed_all_max(dst: *mut RawBuf, x: *const RawBuf, group: *const c_void);
     fn mlx_inline_distributed_all_min(dst: *mut RawBuf, x: *const RawBuf, group: *const c_void);
@@ -147,6 +152,20 @@ fn checked(op: impl FnOnce(*mut RawBuf)) -> RuntimeResult<InlineArray> {
 pub fn all_sum(x: &InlineArray, group: Option<&Group>) -> RuntimeResult<InlineArray> {
     // SAFETY: valid array and group handles; `dst` is written by the callee.
     checked(|dst| unsafe { mlx_inline_distributed_all_sum(dst, &x.raw, group_ptr(group)) })
+}
+
+/// `x` unchanged, whose gradient is summed over the group in the backward
+/// pass.
+///
+/// For the input of a column-parallel (output-sharded) layer: every rank's
+/// weight shard sees all of `x`, so `x`'s true gradient is the sum of what each
+/// rank computes from its own shard. MLX's [`all_sum`] differentiates as the
+/// identity, so it cannot stand in for this: it adds a collective to the
+/// forward pass and leaves each rank with only its own partial gradient. A
+/// group of one returns `x`.
+pub fn sum_gradients(x: &InlineArray, group: Option<&Group>) -> RuntimeResult<InlineArray> {
+    // SAFETY: as in `all_sum`.
+    checked(|dst| unsafe { mlx_inline_distributed_sum_gradients(dst, &x.raw, group_ptr(group)) })
 }
 
 /// Every rank's `x` concatenated along the first axis, rank 0 first.
@@ -346,6 +365,31 @@ mod tests {
         average_gradients(&mut grads, Some(&group), DEFAULT_BUCKET_BYTES).expect("average");
         let mut w = grads["w"].clone();
         assert_eq!(w.to_f32_vec(2).expect("eval"), vec![1.0, 2.0]);
+    }
+
+    /// With nobody to sum with, `sum_gradients` is the identity in both
+    /// directions. (What it does across ranks is checked by the
+    /// tensor-parallel tests in pmetal-distributed, which need real ranks.)
+    #[test]
+    fn sum_gradients_is_the_identity_for_a_group_of_one() {
+        let group = Group::init(false).expect("init");
+        let x = InlineArray::from_f32_slice(&[1.0, -2.0, 3.0], &[3]);
+        let mut y = sum_gradients(&x, Some(&group)).expect("sum_gradients");
+        assert_eq!(y.to_f32_vec(3).expect("eval"), vec![1.0, -2.0, 3.0]);
+
+        let (_, grads) = crate::inline_array::value_and_grad(
+            |a| {
+                sum_gradients(&a[0], Some(&group))
+                    .expect("op")
+                    .mul_scalar(2.0)
+                    .sum_all()
+            },
+            std::slice::from_ref(&x),
+            &[],
+        );
+        let mut dx = grads[0].clone();
+        assert_eq!(dx.to_f32_vec(3).expect("eval"), vec![2.0, 2.0, 2.0]);
+        check_unobserved_error().expect("no bridge op failed");
     }
 
     /// A process launched without a distributed configuration is a group of
