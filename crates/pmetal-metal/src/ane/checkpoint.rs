@@ -11,7 +11,7 @@
 //! load anyway and compute a different function with no error (#34), as did
 //! one whose tensors failed to convert or had the wrong size.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::error::{MetalError, Result};
@@ -280,51 +280,6 @@ pub(crate) fn check_model_type(
     }
 }
 
-/// Copies checkpoint tensors into an engine's buffers, refusing anything it
-/// would otherwise have to guess at, and records what it loaded.
-#[derive(Default)]
-pub(crate) struct StrictLoader {
-    loaded: HashSet<String>,
-}
-
-impl StrictLoader {
-    /// Copy `name` into `dst`, which must have room for `expected` elements.
-    /// `data` is the tensor's f32 conversion: an unsupported dtype (such as a
-    /// packed quantized weight) or a size other than `expected` is an error.
-    pub(crate) fn copy<E: std::fmt::Display>(
-        &mut self,
-        name: &str,
-        data: &std::result::Result<Vec<f32>, E>,
-        dst: &mut [f32],
-        expected: usize,
-    ) -> Result<()> {
-        let src = data.as_ref().map_err(|why| {
-            MetalError::InvalidConfig(format!(
-                "{name}: {why} (the ANE engines read f32, f16 and bf16 weights only)"
-            ))
-        })?;
-        if src.len() != expected || dst.len() < expected {
-            return Err(MetalError::InvalidConfig(format!(
-                "{name} has {} elements; the ANE engine expects {expected}",
-                src.len()
-            )));
-        }
-        dst[..expected].copy_from_slice(src);
-        self.loaded.insert(name.to_string());
-        Ok(())
-    }
-
-    /// Fail unless every tensor in `required` was loaded.
-    pub(crate) fn require(&self, required: impl IntoIterator<Item = String>) -> Result<()> {
-        missing_tensors(
-            required
-                .into_iter()
-                .filter(|name| !self.loaded.contains(name))
-                .collect(),
-        )
-    }
-}
-
 /// `Ok` for no missing tensors, else the error naming the first few.
 fn missing_tensors(missing: Vec<String>) -> Result<()> {
     if missing.is_empty() {
@@ -534,35 +489,5 @@ mod tests {
             err.contains("2 tensor(s)") && err.contains("model.norm.weight"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn the_loader_refuses_bad_dtype_wrong_size_and_missing_tensors() {
-        let mut loader = StrictLoader::default();
-        let mut dst = vec![0.0f32; 4];
-
-        let unsupported: std::result::Result<Vec<f32>, &str> = Err("dtype U32");
-        assert!(loader.copy("a", &unsupported, &mut dst, 4).is_err());
-
-        let short: std::result::Result<Vec<f32>, &str> = Ok(vec![1.0; 3]);
-        assert!(loader.copy("b", &short, &mut dst, 4).is_err());
-        assert_eq!(
-            dst,
-            vec![0.0; 4],
-            "a rejected tensor must not be half-copied"
-        );
-
-        let good: std::result::Result<Vec<f32>, &str> = Ok(vec![1.0, 2.0, 3.0, 4.0]);
-        loader.copy("c", &good, &mut dst, 4).unwrap();
-        assert_eq!(dst, vec![1.0, 2.0, 3.0, 4.0]);
-
-        assert!(loader.require(["c".to_string()]).is_ok());
-        let err = loader
-            .require([
-                "c".to_string(),
-                "model.layers.0.self_attn.q_norm.weight".to_string(),
-            ])
-            .unwrap_err();
-        assert!(err.to_string().contains("q_norm"));
     }
 }

@@ -24,12 +24,10 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::accelerate;
+use crate::ane::checkpoint::{self, Checkpoint};
 use crate::ane::dynamic_kernel::{self, DynamicKernelConfig, DynamicKernelOutput};
 use crate::ane::iosurface::IoSurface;
 use crate::ane::kernel::{self, TransformerKernelConfig};
-/// A target [`DynamicAneTrainer::train_batch`] leaves out of the loss:
-/// padding, and prompt tokens a dataset masks with `-100`.
-pub const IGNORE_TARGET: u16 = u16::MAX;
 use crate::ane::loss::{AneTrainingLoss, CrossEntropyLoss, IGNORE_INDEX};
 use crate::ane::runtime::{AneModel, AneRuntime};
 use crate::ane::scratch::{
@@ -41,6 +39,10 @@ use crate::error::{MetalError, Result};
 use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM};
 use crate::kernels::fused_training::{AdamWConfig, BatchedCommandBuffer};
 use pmetal_core::{LearningRateScheduler, LrSchedulerType};
+
+/// A target [`DynamicAneTrainer::train_batch`] leaves out of the loss:
+/// padding, and prompt tokens a dataset masks with `-100`.
+pub const IGNORE_TARGET: u16 = u16::MAX;
 
 /// Configuration for the dynamic ANE trainer.
 ///
@@ -2585,7 +2587,18 @@ impl DynamicAneTrainer {
             })
             .collect::<Result<Vec<_>>>()?;
         let metadata = std::collections::HashMap::from([("format".to_string(), "pt".to_string())]);
-        safetensors::serialize_to_file(views, Some(metadata), path).map_err(|e| {
+        // Written beside the destination and renamed over it, so a run killed
+        // mid-write (or a full disk) leaves the previous checkpoint intact.
+        let name = path.file_name().map_or_else(
+            || "checkpoint".into(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let partial = path.with_file_name(format!(".{name}.partial"));
+        let written = safetensors::serialize_to_file(views, Some(metadata), &partial)
+            .map_err(|e| e.to_string())
+            .and_then(|()| std::fs::rename(&partial, path).map_err(|e| e.to_string()));
+        written.map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
             MetalError::InvalidConfig(format!("Failed to write {}: {e}", path.display()))
         })
     }
@@ -2613,120 +2626,42 @@ impl DynamicAneTrainer {
         out
     }
 
-    /// Load weights from SafeTensors files on disk.
+    /// Load weights from a safetensors checkpoint: one file, or the shards a
+    /// directory's `model.safetensors.index.json` names. Every tensor the
+    /// engine uses must be there, with the size the config gives it and a
+    /// dtype it reads (f32, f16, bf16); one that isn't is an error naming it.
     pub fn load_weights_safetensors(&mut self, path: &std::path::Path) -> Result<()> {
-        use memmap2::Mmap;
-        use safetensors::SafeTensors;
-
-        let d = self.config.dim;
-        let h = self.config.hidden_dim;
-
-        let files = if path.is_file() {
-            vec![path.to_path_buf()]
-        } else {
-            let index_path = path.join("model.safetensors.index.json");
-            if index_path.exists() {
-                let index_text = std::fs::read_to_string(&index_path).map_err(|e| {
-                    MetalError::InvalidConfig(format!("Failed to read index.json: {e}"))
-                })?;
-                let index: serde_json::Value = serde_json::from_str(&index_text).map_err(|e| {
-                    MetalError::InvalidConfig(format!("Failed to parse index.json: {e}"))
-                })?;
-                let weight_map = index["weight_map"]
-                    .as_object()
-                    .ok_or_else(|| MetalError::InvalidConfig("Missing weight_map".into()))?;
-                let mut unique_files: Vec<String> = weight_map
-                    .values()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                unique_files.sort();
-                unique_files.dedup();
-                unique_files.iter().map(|f| path.join(f)).collect()
-            } else {
-                let single = path.join("model.safetensors");
-                if single.exists() {
-                    vec![single]
-                } else {
-                    return Err(MetalError::InvalidConfig(
-                        "No safetensors files found".into(),
-                    ));
-                }
-            }
-        };
-
-        let mut loader = super::checkpoint::StrictLoader::default();
-        for file_path in &files {
-            let file = std::fs::File::open(file_path).map_err(|e| {
-                MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path))
-            })?;
-            #[allow(unsafe_code)]
-            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-                MetalError::InvalidConfig(format!("Failed to mmap {:?}: {e}", file_path))
-            })?;
-            let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
-                MetalError::InvalidConfig(format!("Failed to parse safetensors: {e}"))
-            })?;
-
-            for (name, tensor) in tensors.tensors() {
-                // An unsupported dtype is an error only for a tensor we use.
-                let data = super::checkpoint::tensor_to_f32(&tensor);
-
-                if name == "model.embed_tokens.weight" {
-                    let expected = self.config.vocab_size * d;
-                    loader.copy(&name, &data, &mut self.embed_weights, expected)?;
-                    continue;
-                }
-                if name == "model.norm.weight" {
-                    loader.copy(&name, &data, &mut self.rms_final, d)?;
-                    continue;
-                }
-
-                if let Some(rest) = name.strip_prefix("model.layers.") {
-                    let parts: Vec<&str> = rest.splitn(2, '.').collect();
-                    if parts.len() < 2 {
-                        continue;
-                    }
-                    let layer_idx: usize = match parts[0].parse() {
-                        Ok(i) => i,
-                        Err(_) => continue,
-                    };
-                    if layer_idx >= self.config.n_layers {
-                        continue;
-                    }
-
-                    let qd = self.kernel_config.q_dim();
-                    let kvd = self.kernel_config.kv_dim();
-                    let lw = &mut self.layer_weights[layer_idx];
-                    let (dst, expected): (&mut [f32], usize) = match parts[1] {
-                        "self_attn.q_proj.weight" => (&mut lw.wq, qd * d),
-                        "self_attn.k_proj.weight" => (&mut lw.wk, kvd * d),
-                        "self_attn.v_proj.weight" => (&mut lw.wv, kvd * d),
-                        "self_attn.o_proj.weight" => (&mut lw.wo, d * qd),
-                        "mlp.gate_proj.weight" => (&mut lw.w1, h * d),
-                        "mlp.down_proj.weight" => (&mut lw.w2, d * h),
-                        "mlp.up_proj.weight" => (&mut lw.w3, h * d),
-                        "input_layernorm.weight" => (&mut lw.rms_att, d),
-                        "post_attention_layernorm.weight" => (&mut lw.rms_ffn, d),
-                        _ => continue,
-                    };
-                    loader.copy(&name, &data, dst, expected)?;
-                }
-            }
-        }
-
-        loader.require(
+        let ckpt = Checkpoint::open(path)?;
+        ckpt.require(
             ["model.embed_tokens.weight", "model.norm.weight"]
                 .map(String::from)
                 .into_iter()
-                .chain(super::checkpoint::layer_tensors(
+                .chain(checkpoint::layer_tensors(
                     self.config.n_layers,
                     &TRAINER_LAYER_TENSORS,
                 )),
         )?;
 
-        // Initialize transposed weights
+        // One tensor in memory at a time besides the weights themselves.
+        let load = |name: &str, dst: &mut [f32]| -> Result<()> {
+            dst.copy_from_slice(&ckpt.f32(name, dst.len())?);
+            Ok(())
+        };
+        load("model.embed_tokens.weight", &mut self.embed_weights)?;
+        load("model.norm.weight", &mut self.rms_final)?;
+        for (l, lw) in self.layer_weights.iter_mut().enumerate() {
+            let at = |name: &str| format!("model.layers.{l}.{name}");
+            load(&at("self_attn.q_proj.weight"), &mut lw.wq)?;
+            load(&at("self_attn.k_proj.weight"), &mut lw.wk)?;
+            load(&at("self_attn.v_proj.weight"), &mut lw.wv)?;
+            load(&at("self_attn.o_proj.weight"), &mut lw.wo)?;
+            load(&at("mlp.gate_proj.weight"), &mut lw.w1)?;
+            load(&at("mlp.down_proj.weight"), &mut lw.w2)?;
+            load(&at("mlp.up_proj.weight"), &mut lw.w3)?;
+            load(&at("input_layernorm.weight"), &mut lw.rms_att)?;
+            load(&at("post_attention_layernorm.weight"), &mut lw.rms_ffn)?;
+        }
         self.refresh_transposed_weights();
-
         Ok(())
     }
 }
@@ -2896,6 +2831,122 @@ mod tests {
         let mut reloaded = DynamicAneTrainer::new(config);
         reloaded.load_weights_safetensors(&path).unwrap();
         assert_eq!(reloaded.export_weights_flat(), weights);
+    }
+
+    fn small_trainer_with_weights() -> (DynamicAneTrainerConfig, DynamicAneTrainer, Vec<f32>) {
+        let config = DynamicAneTrainerConfig {
+            dim: 16,
+            hidden_dim: 32,
+            n_heads: 4,
+            n_kv_heads: 2,
+            n_layers: 2,
+            vocab_size: 50,
+            seq_len: 4,
+            ..Default::default()
+        };
+        let mut trainer = DynamicAneTrainer::new(config.clone());
+        let n = trainer.export_weights_flat().len();
+        let weights: Vec<f32> = (0..n).map(|i| (i % 89) as f32 * 0.002 - 0.08).collect();
+        trainer.load_weights_flat(&weights);
+        (config, trainer, weights)
+    }
+
+    /// A model split over shards named in an index loads the same as one
+    /// file, and one tensor short of a full set is refused by name instead of
+    /// training with a layer of zeros.
+    #[test]
+    fn a_sharded_checkpoint_loads_and_a_missing_tensor_is_refused() {
+        use safetensors::{Dtype, tensor::TensorView};
+        let (config, trainer, weights) = small_trainer_with_weights();
+        let dir = tempfile::tempdir().unwrap();
+        let whole = dir.path().join("whole.safetensors");
+        trainer.save_safetensors(&whole).unwrap();
+
+        // Re-split by layer: shard 0 holds layer 0 and the embeddings,
+        // shard 1 the rest.
+        let bytes = std::fs::read(&whole).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut shards: [Vec<(String, TensorView<'_>)>; 2] = [Vec::new(), Vec::new()];
+        let mut weight_map = serde_json::Map::new();
+        for (name, view) in tensors.tensors() {
+            let shard =
+                usize::from(name.starts_with("model.layers.1.") || name == "model.norm.weight");
+            let file = format!("shard-{shard}.safetensors");
+            weight_map.insert(name.clone(), serde_json::json!(file));
+            shards[shard].push((
+                name,
+                TensorView::new(Dtype::F32, view.shape().to_vec(), view.data()).unwrap(),
+            ));
+        }
+        let split = dir.path().join("split");
+        std::fs::create_dir(&split).unwrap();
+        for (i, shard) in shards.into_iter().enumerate() {
+            safetensors::serialize_to_file(
+                shard,
+                None,
+                &split.join(format!("shard-{i}.safetensors")),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            split.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map": weight_map}).to_string(),
+        )
+        .unwrap();
+
+        let mut reloaded = DynamicAneTrainer::new(config.clone());
+        reloaded.load_weights_safetensors(&split).unwrap();
+        assert_eq!(reloaded.export_weights_flat(), weights);
+
+        // Layer 1 without its down projection.
+        let short = dir.path().join("short");
+        std::fs::create_dir(&short).unwrap();
+        let kept: Vec<_> = tensors
+            .tensors()
+            .into_iter()
+            .filter(|(name, _)| name != "model.layers.1.mlp.down_proj.weight")
+            .map(|(name, view)| {
+                let view = TensorView::new(Dtype::F32, view.shape().to_vec(), view.data()).unwrap();
+                (name, view)
+            })
+            .collect();
+        safetensors::serialize_to_file(kept, None, &short.join("model.safetensors")).unwrap();
+        let err = DynamicAneTrainer::new(config)
+            .load_weights_safetensors(&short)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model.layers.1.mlp.down_proj.weight"), "{err}");
+    }
+
+    /// A save replaces the file whole or not at all: a run killed while
+    /// writing a periodic checkpoint must leave the previous one readable.
+    #[test]
+    fn a_save_leaves_no_partial_file_and_replaces_the_old_one() {
+        let (config, mut trainer, weights) = small_trainer_with_weights();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        trainer.save_safetensors(&path).unwrap();
+
+        let changed: Vec<f32> = weights.iter().map(|w| w + 0.5).collect();
+        trainer.load_weights_flat(&changed);
+        trainer.save_safetensors(&path).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            ["model.safetensors"],
+            "no temporary file left behind"
+        );
+        let mut reloaded = DynamicAneTrainer::new(config);
+        reloaded.load_weights_safetensors(&path).unwrap();
+        assert_eq!(reloaded.export_weights_flat(), changed);
+
+        // A destination that can't be written fails and leaves nothing.
+        let missing = dir.path().join("no-such-dir").join("model.safetensors");
+        assert!(trainer.save_safetensors(&missing).is_err());
+        assert!(!dir.path().join("no-such-dir").exists());
     }
 
     #[test]
