@@ -820,7 +820,7 @@ where
 ///   `[1, vocab]` logits of the next one.
 /// * `on_token(token, logits)` sees each token with the `[1, vocab]` logits
 ///   it was sampled from (before the sampler's constraints, for log-probability
-///   reporting) and returns [`ControlFlow::Break`] to end the decode, which it
+///   reporting) and returns [`ControlFlow::Break`](std::ops::ControlFlow::Break) to end the decode, which it
 ///   does without the token being sampled past. One forward past the last
 ///   token read has been queued by then, so the cache holds a token the caller
 ///   has not seen; a caller that reuses the cache must account for it.

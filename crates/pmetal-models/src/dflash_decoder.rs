@@ -10,7 +10,7 @@
 //! The target runs one forward pass over the whole proposed block and draws
 //! its own token at every position of it, exactly as plain decoding would
 //! draw them one at a time: through the generation's
-//! [`DecodeSampler`](pmetal_runtime::decode::DecodeSampler) (temperature,
+//! [`DecodeSampler`] (temperature,
 //! top-k, top-p, min-p, penalties, bias, and the seed's `n`-th key for the
 //! `n`-th token). The drafts that equal the target's tokens are kept, the
 //! first one that doesn't is replaced by the target's token, and a block
