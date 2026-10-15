@@ -98,9 +98,16 @@ pub struct TreeBuildResult {
     pub visibility: Vec<Vec<bool>>,
 }
 
-/// Extract top-k logits and their indices from a `[horizon, vocab]`
-/// draft_logits tensor. Both outputs live on CPU as f32/i32 vecs so
-/// the subsequent heap beam search does not have to touch the GPU.
+/// Extract top-k log-probabilities and their token ids from a
+/// `[horizon, vocab]` draft_logits tensor, each row sorted by descending
+/// log-probability (ties by ascending token id), on the CPU so the beam
+/// search over the tree does not have to touch the GPU.
+///
+/// The k best of each row are picked on the device (a partition, not a sort
+/// of the whole vocabulary) and only `[horizon, k]` values come back: a draft
+/// round over a 152k vocabulary used to sort and transfer 18 MB of
+/// `[horizon, vocab]` log-probabilities and indices to use a few dozen of
+/// them.
 fn extract_top_k_cpu(
     draft_logits: &Array,
     budget: usize,
@@ -116,36 +123,34 @@ fn extract_top_k_cpu(
     let vocab = shape[1] as usize;
     let k = budget.min(vocab).max(1);
 
-    // Compute softmax log-probs in f32 for determinism. `logsumexp`
-    // returns an f32 [horizon] array; we subtract before pulling top-k.
+    // Softmax log-probs in f32 for determinism.
     let logits_f32 = draft_logits.as_dtype(Dtype::Float32.as_i32());
     let lse = logits_f32.logsumexp(-1, true); // [horizon, 1]
     let log_probs = logits_f32.subtract(&lse); // [horizon, vocab]
 
-    // MLX argsort on the negated log-probs gives a descending-by-
-    // log-prob permutation. Materialise it and the gathered log-probs
-    // as FULL [horizon, vocab] tensors — slicing to [horizon, k] and
-    // then calling `as_slice` returns a strided view whose flat data
-    // is still the full buffer, so we'd silently read the wrong
-    // columns. Instead we pull the full rows onto the CPU and take
-    // the first `k` per row ourselves.
+    // The first k columns of a partition of the negated log-probs at k - 1
+    // are the k largest log-probs, in no order.
     let neg = ops::negative(&log_probs);
-    let sorted_idx = ops::argsort_axis(&neg, -1); // [horizon, vocab] int32
-    let sorted_logp = ops::take_along_axis(&log_probs, &sorted_idx, -1);
-    let _ = sorted_idx.eval();
-    let _ = sorted_logp.eval();
+    let partitioned = ops::argpartition_axis(&neg, k as i32 - 1, -1);
+    let top_idx = partitioned.slice(&[0, 0], &[horizon as i32, k as i32]);
+    let top_logp = ops::take_along_axis(&log_probs, &top_idx, -1);
+    let _ = top_idx.eval();
+    let _ = top_logp.eval();
 
-    let idx_flat = sorted_idx.as_slice::<i32>();
-    let logp_flat = sorted_logp.as_slice::<f32>();
+    let idx_flat = top_idx.as_slice::<u32>();
+    let logp_flat = top_logp.as_slice::<f32>();
 
-    let mut top_logp = Vec::with_capacity(horizon);
-    let mut top_ids = Vec::with_capacity(horizon);
+    let mut rows_logp = Vec::with_capacity(horizon);
+    let mut rows_ids = Vec::with_capacity(horizon);
     for row in 0..horizon {
-        let row_base = row * vocab;
-        top_logp.push(logp_flat[row_base..row_base + k].to_vec());
-        top_ids.push(idx_flat[row_base..row_base + k].to_vec());
+        let mut pairs: Vec<(f32, i32)> = (0..k)
+            .map(|j| (logp_flat[row * k + j], idx_flat[row * k + j] as i32))
+            .collect();
+        pairs.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        rows_logp.push(pairs.iter().map(|p| p.0).collect());
+        rows_ids.push(pairs.iter().map(|p| p.1).collect());
     }
-    (horizon, k, top_logp, top_ids)
+    (horizon, k, rows_logp, rows_ids)
 }
 
 /// Build a DDTree-style draft tree from the draft model's logits.
@@ -436,6 +441,58 @@ mod tests {
         assert!(tree.visibility[2][0]);
         assert!(tree.visibility[2][1]);
         assert!(tree.visibility[2][2]);
+    }
+
+    /// The k best of each row, sorted, are what a full sort of the row
+    /// gives, ties included, over a vocabulary far larger than k.
+    #[test]
+    fn top_k_extraction_matches_a_full_sort() {
+        let vocab = 400usize;
+        let rows: Vec<Vec<f32>> = (0..3)
+            .map(|r| {
+                (0..vocab)
+                    // Many exact ties (a coarse grid) and a few standouts.
+                    .map(|t| {
+                        (((t * 37 + r * 11) % 17) as f32) * 0.25 + f32::from(t == 7 * (r + 1)) * 6.0
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[f32]> = rows.iter().map(Vec::as_slice).collect();
+        let logits = make_logits(&refs);
+        let k = 9;
+        let (horizon, got_k, logp, ids) = extract_top_k_cpu(&logits, k);
+        assert_eq!((horizon, got_k), (3, k));
+        for (r, row) in rows.iter().enumerate() {
+            let lse = row.iter().map(|&x| f64::from(x).exp()).sum::<f64>().ln() as f32;
+            let mut want: Vec<(f32, i32)> = row
+                .iter()
+                .enumerate()
+                .map(|(t, &x)| (x - lse, t as i32))
+                .collect();
+            want.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            for j in 0..k {
+                assert!((logp[r][j] - want[j].0).abs() < 1e-4, "row {r} rank {j}");
+                // The token at a rank is the full sort's wherever the rank
+                // is not inside a tie.
+                let tied = want
+                    .iter()
+                    .filter(|w| (w.0 - want[j].0).abs() < 1e-6)
+                    .count()
+                    > 1;
+                if !tied {
+                    assert_eq!(ids[r][j], want[j].1, "row {r} rank {j}");
+                }
+            }
+            // Every id is distinct and carries the value it was ranked by.
+            let mut seen = std::collections::HashSet::new();
+            for j in 0..k {
+                assert!(seen.insert(ids[r][j]), "row {r}: repeated id");
+                let direct = row[ids[r][j] as usize] - lse;
+                assert!((direct - logp[r][j]).abs() < 1e-4);
+            }
+        }
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
     }
 
     #[test]
