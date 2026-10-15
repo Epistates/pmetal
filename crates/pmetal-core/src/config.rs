@@ -212,6 +212,10 @@ pub struct TrainingConfig {
     #[serde(default)]
     pub wsd_stable_ratio: Option<f64>,
 
+    /// Shape of the WSD decay phase (default linear).
+    #[serde(default)]
+    pub wsd_decay_style: Option<WsdDecayStyle>,
+
     /// Cosine restart count for CosineWithRestarts scheduler (default 1).
     #[serde(default)]
     pub cosine_num_restarts: Option<usize>,
@@ -269,6 +273,7 @@ impl Default for TrainingConfig {
             lr_scheduler: LrSchedulerType::default(),
             min_lr: None,
             wsd_stable_ratio: None,
+            wsd_decay_style: None,
             cosine_num_restarts: None,
             polynomial_power: None,
             optimizer: OptimizerType::default(),
@@ -301,6 +306,38 @@ pub enum LrSchedulerType {
     /// Warmup-Stable-Decay: linear warmup → constant plateau → linear decay.
     /// Modern default for LLM training. Stable phase ratio defaults to 0.7.
     Wsd,
+}
+
+/// Shape of the WSD schedule's final decay phase.
+///
+/// Hägele et al. (2024, "Scaling Laws and Compute-Optimal Training Beyond
+/// Fixed Training Durations") find `1 - sqrt` cooldowns reach a lower loss than
+/// linear ones at equal length; `Linear` stays the default so existing runs
+/// keep their curve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WsdDecayStyle {
+    /// `1 - p`.
+    #[default]
+    Linear,
+    /// `0.5 * (1 + cos(pi * p))`.
+    Cosine,
+    /// `1 - sqrt(p)`.
+    #[serde(alias = "1-sqrt", alias = "1_sqrt", alias = "sqrt")]
+    OneMinusSqrt,
+}
+
+impl WsdDecayStyle {
+    /// The decay factor, 1 at the start of the phase and 0 at its end, for
+    /// progress `p` through it (0 to 1).
+    #[must_use]
+    pub fn factor(self, p: f64) -> f64 {
+        match self {
+            Self::Linear => 1.0 - p,
+            Self::Cosine => 0.5 * (1.0 + (std::f64::consts::PI * p).cos()),
+            Self::OneMinusSqrt => 1.0 - p.sqrt(),
+        }
+    }
 }
 
 /// Optimizer type.

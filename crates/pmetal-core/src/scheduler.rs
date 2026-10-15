@@ -4,7 +4,7 @@
 //! used across all trainers. Use these instead of implementing schedulers
 //! in individual trainer modules.
 
-use crate::{LrSchedulerType, Result};
+use crate::{LrSchedulerType, Result, WsdDecayStyle};
 use std::f64::consts::PI;
 
 /// Learning rate scheduler that computes LR based on training progress.
@@ -27,6 +27,8 @@ pub struct LearningRateScheduler {
     num_restarts: usize,
     /// Fraction of post-warmup steps at stable (peak) LR for WSD (0.0-1.0).
     stable_ratio: f64,
+    /// Shape of the WSD decay phase.
+    wsd_decay_style: WsdDecayStyle,
     /// Exponent for polynomial decay (default 1.0 = linear).
     polynomial_power: f64,
     /// Current step.
@@ -49,6 +51,7 @@ impl LearningRateScheduler {
             scheduler_type,
             num_restarts: 1,
             stable_ratio: 0.7,
+            wsd_decay_style: WsdDecayStyle::default(),
             polynomial_power: 1.0,
             current_step: 0,
         }
@@ -72,10 +75,19 @@ impl LearningRateScheduler {
         if let Some(ratio) = config.wsd_stable_ratio {
             scheduler = scheduler.with_stable_ratio(ratio);
         }
+        if let Some(style) = config.wsd_decay_style {
+            scheduler = scheduler.with_wsd_decay_style(style);
+        }
         if let Some(power) = config.polynomial_power {
             scheduler = scheduler.with_polynomial_power(power);
         }
         scheduler
+    }
+
+    /// Set the shape of the WSD decay phase (default linear).
+    pub fn with_wsd_decay_style(mut self, style: WsdDecayStyle) -> Self {
+        self.wsd_decay_style = style;
+        self
     }
 
     /// Set minimum learning rate.
@@ -165,7 +177,8 @@ impl LearningRateScheduler {
                     } else {
                         1.0
                     };
-                    self.min_lr + (self.base_lr - self.min_lr) * (1.0 - decay_progress)
+                    self.min_lr
+                        + (self.base_lr - self.min_lr) * self.wsd_decay_style.factor(decay_progress)
                 }
             }
         }
@@ -573,6 +586,44 @@ mod tests {
                         s.get_lr(step)
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn wsd_decay_styles_match_the_reference_schedule() {
+        // transformers' `_get_wsd_scheduler_lambda`, with min_lr_ratio 0.1.
+        let (peak, ratio) = (2.0, 0.1);
+        let (warmup, total, stable_ratio) = (10usize, 110usize, 0.5);
+        let decay_span = total - warmup;
+        let stable = (decay_span as f64 * stable_ratio) as usize;
+        let decay = decay_span - stable;
+        for (style, factor) in [
+            (WsdDecayStyle::Linear, (|p: f64| 1.0 - p) as fn(f64) -> f64),
+            (WsdDecayStyle::Cosine, |p| 0.5 * (1.0 + (PI * p).cos())),
+            (WsdDecayStyle::OneMinusSqrt, |p| 1.0 - p.sqrt()),
+        ] {
+            let s = LearningRateScheduler::new(peak, total, warmup, LrSchedulerType::Wsd)
+                .with_min_lr(peak * ratio)
+                .with_stable_ratio(stable_ratio)
+                .with_wsd_decay_style(style);
+            for step in 0..=total {
+                let want = if step < warmup {
+                    let p = step as f64 / warmup as f64;
+                    p * (1.0 - ratio) + ratio
+                } else if step < warmup + stable {
+                    1.0
+                } else if step < warmup + stable + decay {
+                    let p = (step - warmup - stable) as f64 / decay as f64;
+                    factor(p) * (1.0 - ratio) + ratio
+                } else {
+                    ratio
+                } * peak;
+                assert!(
+                    (s.get_lr(step) - want).abs() < 1e-12,
+                    "{style:?} step={step}: got {}, want {want}",
+                    s.get_lr(step)
+                );
             }
         }
     }
