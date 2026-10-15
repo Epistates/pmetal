@@ -377,13 +377,24 @@ pub fn gated_delta_ops(
 /// `Γ[i,i] = 1`, and `Γ[i,j] = 0` for `i < j`.
 ///
 /// Uses cumulative sum in log-space: `Γ[i,j] = exp(cumsum[i] - cumsum[j])`.
+/// The upper triangle is sent to `-inf` before the exponential rather than
+/// zeroed after it: there `cumsum[i] - cumsum[j]` is the *positive* total
+/// decay between the two positions, which passes `ln(f32::MAX)` = 88 as soon
+/// as a chunk forgets quickly (64 steps of a decay of 0.25), and an `inf`
+/// masked by a `where` afterwards still turns the backward pass into
+/// `0 · inf = NaN`.
 fn chunk_decay_matrix(log_g: &Array) -> Result<Array, Exception> {
+    let chunk = log_g.dim(-1);
     let cs = log_g.cumsum(-1);
     let cs_i = ops::expand_dims(&cs, -1); // [*, C, 1]
     let cs_j = ops::expand_dims(&cs, -2); // [*, 1, C]
     let log_decay = cs_i.subtract(&cs_j); // [*, C, C]
-    let decay = log_decay.exp();
-    Ok(ops::tril(&decay, 0)) // zero upper triangle; diagonal = exp(0) = 1
+    let lower = Array::tri(chunk, chunk, 0, Dtype::Float32.as_i32());
+    let zero = Array::from_f32(0.0);
+    let upper_to_neg_inf = lower
+        .equal(&zero)
+        .where_cond(&Array::from_f32(f32::NEG_INFINITY), &zero);
+    Ok(log_decay.add(&upper_to_neg_inf).exp()) // diagonal = exp(0) = 1
 }
 
 /// The inverse of `m = I + A`, `A` strictly lower triangular, for a batch of

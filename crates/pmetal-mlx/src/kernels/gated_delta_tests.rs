@@ -464,6 +464,30 @@ fn the_chunked_gradients_are_the_rules() {
     check_gradients("chunked", &c, &chunk_impl(16), 2e-4);
 }
 
+/// A head that nearly forgets at every step (a decay of 0.005 to 0.05): over
+/// a chunk the log-decay sums past what `exp` holds in f32 (`ln(f32::MAX)` is
+/// 88), so the decay matrix's upper triangle, which the mask zeroes, is `inf`
+/// before it is masked. Forward values and every gradient stay finite and the
+/// rule's.
+#[test]
+#[serial]
+fn a_forgetful_head_keeps_the_chunked_path_finite() {
+    let mut c = case(Spec::new(1, 80, 2, 8, 2, 8), 17);
+    let mut rng = Rng(5);
+    c.g.iter_mut()
+        .for_each(|g| *g = round32(0.005 + 0.045 * rng.uniform()));
+    for chunk in [16, 64] {
+        check_values(
+            &format!("chunk {chunk}"),
+            &c,
+            &chunk_impl(chunk),
+            None,
+            5e-4,
+        );
+        check_gradients(&format!("chunk {chunk}"), &c, &chunk_impl(chunk), 5e-4);
+    }
+}
+
 /// Round to bf16 and back.
 fn round_bf16(x: f64) -> f64 {
     half::bf16::from_f64(x).to_f64()

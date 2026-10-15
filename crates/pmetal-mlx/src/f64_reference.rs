@@ -68,6 +68,10 @@ pub(crate) fn max_abs(x: &[f64]) -> f64 {
 
 pub(crate) fn assert_close(what: &str, got: &[f64], want: &[f64], rel: f64) {
     assert_eq!(got.len(), want.len(), "{what}: length");
+    // `f64::max` skips a NaN, so a NaN would pass the comparison below.
+    if let Some(bad) = got.iter().position(|v| !v.is_finite()) {
+        panic!("{what}: element {bad} is {}", got[bad]);
+    }
     let scale = max_abs(want).max(1e-3);
     let worst = got
         .iter()
@@ -105,6 +109,11 @@ pub(crate) fn check_gradient(
     let mut problems = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let g = vec_of(&grads[i]);
+        // A NaN would slip through every comparison below.
+        if let Some(bad) = g.iter().position(|v| !v.is_finite()) {
+            problems.push(format!("d/d{name}[{bad}] is {}", g[bad]));
+            continue;
+        }
         let scale = max_abs(&g).max(1e-3);
         let mut coords: Vec<usize> = (0..RANDOM_COORDS)
             .map(|_| (rng.next_u64() % g.len() as u64) as usize)
