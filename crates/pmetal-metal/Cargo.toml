@@ -49,6 +49,9 @@ parking_lot = { workspace = true }
 cc = { workspace = true }
 
 [dev-dependencies]
+# The tensor runtime is the numeric oracle and the speed baseline every kernel
+# here has to beat; tests fail at the runtime op that throws (`strict-errors`).
+pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 criterion = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
@@ -62,4 +65,8 @@ harness = false
 
 [[bench]]
 name = "kernel_dispatch"
+harness = false
+
+[[bench]]
+name = "vs_runtime"
 harness = false

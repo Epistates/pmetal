@@ -32,7 +32,7 @@ pmetal bench-ffi
 
 ### bench-corpus
 
-Run the structured kernel benchmark corpus for the current Apple Silicon tier and emit a JSON artifact. This corpus covers standard-Metal hot paths on M1-M4, includes fused-merge plus initial model-family coverage for Llama 4 MoE, Qwen3-MoE, Qwen3Next, and NemotronH hybrid layers, and adds MPP GEMM coverage on Apple10/M5 when NAX is available.
+Run the structured kernel benchmark corpus for the current Apple Silicon tier and emit a JSON artifact. This corpus covers standard-Metal hot paths on M1-M4, includes fused-merge plus initial model-family coverage for Llama 4 MoE, Qwen3-MoE, Qwen3Next, and NemotronH hybrid layers.
 
 ```bash
 pmetal bench-corpus --quick --output bench_corpus.json

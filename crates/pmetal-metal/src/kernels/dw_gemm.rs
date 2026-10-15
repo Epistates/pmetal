@@ -9,13 +9,17 @@
 //! Kernel: `dw_gemm_accum` — `C = alpha * A @ B^T + beta * C`
 //!
 //! At 579M params (d=1024, h=2816, s=512): 20 layers × 7 GEMMs = 140 dispatches,
-//! ~230 GFLOP total. Projected 5.5× speedup over cblas on CPU.
+//! ~230 GFLOP total.
+//!
+//! The kernel is a 64 × 64 × 16 tiled SGEMM on `simdgroup_matrix` fragments. It
+//! zero-fills partial tiles, so M, N and K may be anything, and with
+//! `beta == 0` it never reads `C`, so a fresh buffer is fine as the output.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+use parking_lot::Mutex;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
@@ -43,9 +47,10 @@ crate::msl_layout::msl_layout!(DwGemmParams, size = 20, {
     beta: 16,
 });
 
-/// Tile dimensions — must match `dw_gemm.metal` constants.
+/// Tile dimensions and threads per threadgroup — must match `dw_gemm.metal`.
 const BM: usize = 64;
 const BN: usize = 64;
+const THREADS_PER_GROUP: usize = 128;
 
 /// Minimum model dimension to use GPU path. Below this threshold the
 /// Metal dispatch overhead exceeds the compute win over cblas.
@@ -141,10 +146,10 @@ impl DwGemm {
             depth: 1,
         };
 
-        // 16×16 = 256 threads per threadgroup
+        // Four simdgroups, 2 x 2 over the 64 x 64 tile.
         let threadgroup_size = MTLSize {
-            width: 16,
-            height: 16,
+            width: THREADS_PER_GROUP,
+            height: 1,
             depth: 1,
         };
 
@@ -153,22 +158,57 @@ impl DwGemm {
 
         Ok(())
     }
+
+    /// Stage host operands in `pool` and encode `C = alpha * A @ B^T + beta * C`
+    /// into `batch`.
+    ///
+    /// `a` is `[M, K]` and `b` is `[N, K]`, row-major, copied into buffers of
+    /// their own that stay untouched until `pool` is reset, so any number of
+    /// these can share one batch and each reads its own operands. Reset the
+    /// pool only after the batch has executed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn queue_gemm_accum_staged(
+        &self,
+        batch: &mut BatchedCommandBuffer,
+        pool: &ScratchPool,
+        a: &[f32],
+        b: &[f32],
+        c: &MetalBuffer<f32>,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<()> {
+        let a = pool.stage(&a[..m * k])?;
+        let b = pool.stage(&b[..n * k])?;
+        self.queue_gemm_accum(batch, &a, &b, c, m, n, k, alpha, beta)
+    }
 }
 
 // =============================================================================
-// Scratch Pool — size-bucketed MetalBuffer pool for activation copies
+// Scratch Pool — staging buffers for host operands
 // =============================================================================
 
-/// A pool of reusable `MetalBuffer<f32>` scratch buffers, bucketed by size.
+/// Staging buffers for the host-side operands of GPU GEMMs.
 ///
-/// Avoids per-dispatch allocation of temporary GPU buffers for activation
-/// operands. Buffers are allocated once at the largest required size per bucket
-/// and reused across training steps.
+/// A command buffer runs only when it is executed, long after the operand
+/// slices passed to [`DwGemm::queue_gemm_accum_staged`] were copied, so every
+/// GEMM queued into it needs a buffer of its own: [`stage`](Self::stage) hands
+/// out a different one on every call until [`reset`](Self::reset). The buffers
+/// are kept and reused by position, so a step that stages the same sequence of
+/// operands as the last one allocates nothing.
 pub struct ScratchPool {
     ctx: Arc<MetalContext>,
-    /// Cached buffers keyed by element count. Each key maps to a single buffer
-    /// that is reused whenever a buffer of that exact size is requested.
-    cache: HashMap<usize, MetalBuffer<f32>>,
+    state: Mutex<PoolState>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Every buffer ever handed out, in the order it was first handed out.
+    buffers: Vec<MetalBuffer<f32>>,
+    /// Index of the next buffer to hand out.
+    next: usize,
 }
 
 impl ScratchPool {
@@ -176,43 +216,37 @@ impl ScratchPool {
     pub fn new(ctx: Arc<MetalContext>) -> Self {
         Self {
             ctx,
-            cache: HashMap::new(),
+            state: Mutex::new(PoolState::default()),
         }
     }
 
-    /// Get or create a shared MetalBuffer of exactly `len` elements,
-    /// and copy `data` into it.
+    /// Copy `data` into a buffer no earlier call has returned since the last
+    /// [`reset`](Self::reset), and return it.
     ///
-    /// Returns a reference to the cached buffer. The buffer is valid until
-    /// the next call to `get()` with the same `len`, or until `reset()`.
-    pub fn get(&mut self, data: &[f32]) -> Result<&MetalBuffer<f32>> {
-        let len = data.len();
-        // Get or create buffer of this size
-        if !self.cache.contains_key(&len) {
-            let buf = MetalBuffer::new(&self.ctx, len, BufferUsage::Shared)?;
-            self.cache.insert(len, buf);
+    /// The buffer holds at least `data.len()` elements (a reused one may hold
+    /// more) and stays untouched until the next `reset`.
+    pub fn stage(&self, data: &[f32]) -> Result<MetalBuffer<f32>> {
+        let mut state = self.state.lock();
+        let slot = state.next;
+        if slot == state.buffers.len() {
+            let buffer = MetalBuffer::new(&self.ctx, data.len(), BufferUsage::Shared)?;
+            state.buffers.push(buffer);
+        } else if state.buffers[slot].len() < data.len() {
+            state.buffers[slot] = MetalBuffer::new(&self.ctx, data.len(), BufferUsage::Shared)?;
         }
-        let buf = self.cache.get_mut(&len).unwrap();
-        // Copy activation data into the GPU-visible buffer
-        buf.as_mut_slice_unchecked().copy_from_slice(data);
-        // Return immutable ref — the data is now GPU-visible
-        Ok(self.cache.get(&len).unwrap())
+        state.next = slot + 1;
+        let buffer = state.buffers[slot].clone();
+        // The GPU is not using this buffer: it was not handed out since the
+        // last reset, and a reset is only valid once the work has finished.
+        buffer.as_mut_slice_unchecked()[..data.len()].copy_from_slice(data);
+        Ok(buffer)
     }
 
-    /// Pre-warm the pool with known sizes to avoid first-dispatch allocation.
-    pub fn prewarm(&mut self, sizes: &[usize]) -> Result<()> {
-        for &len in sizes {
-            if !self.cache.contains_key(&len) {
-                let buf = MetalBuffer::new(&self.ctx, len, BufferUsage::Shared)?;
-                self.cache.insert(len, buf);
-            }
-        }
-        Ok(())
-    }
-
-    /// Drop all cached buffers.
-    pub fn reset(&mut self) {
-        self.cache.clear();
+    /// Make every buffer available again.
+    ///
+    /// Call this once the batches that use the staged operands have executed.
+    pub fn reset(&self) {
+        self.state.lock().next = 0;
     }
 }
 
@@ -349,23 +383,19 @@ mod tests {
             Err(_) => return,
         };
 
-        let mut pool = ScratchPool::new(ctx);
-        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let pool = ScratchPool::new(ctx);
+        let first = pool.stage(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+        // The same length twice in a row must not share a buffer.
+        let second = pool.stage(&[5.0, 6.0, 7.0, 8.0]).unwrap();
+        let third = pool.stage(&[9.0, 10.0]).unwrap();
+        assert_eq!(&first.as_slice()[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&second.as_slice()[..4], &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(&third.as_slice()[..2], &[9.0, 10.0]);
 
-        // First get allocates
-        let buf = pool.get(&data).unwrap();
-        assert_eq!(buf.as_slice(), &data);
-
-        // Second get with same size reuses
-        let data2 = vec![5.0f32, 6.0, 7.0, 8.0];
-        let buf2 = pool.get(&data2).unwrap();
-        assert_eq!(buf2.as_slice(), &data2);
-        assert_eq!(buf2.len(), 4); // same bucket
-
-        // Different size creates new entry
-        let data3 = vec![9.0f32, 10.0];
-        let buf3 = pool.get(&data3).unwrap();
-        assert_eq!(buf3.as_slice(), &data3);
-        assert_eq!(buf3.len(), 2);
+        // After a reset the same positions are reused, grown when too small.
+        pool.reset();
+        let again = pool.stage(&[1.5; 6]).unwrap();
+        assert!(again.len() >= 6);
+        assert_eq!(&again.as_slice()[..6], &[1.5; 6]);
     }
 }

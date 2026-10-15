@@ -26,7 +26,6 @@ pub struct DeviceInfo {
     pub has_nax: bool,
     pub supports_ane: bool,
     pub batch_size_multiplier: usize,
-    pub tile_size: (u32, u32, u32),
     pub architecture_gen: u32,
     pub memory_bandwidth_gbps: f64,
     pub gpu_core_count: u32,
@@ -55,7 +54,6 @@ impl DeviceInfo {
             has_nax: props.has_nax,
             supports_ane: ctx.supports_neural_engine(),
             batch_size_multiplier: props.batch_size_multiplier(),
-            tile_size: props.recommended_tile_size(),
             architecture_gen: props.architecture_gen,
             memory_bandwidth_gbps: props.memory_bandwidth_gbps,
             gpu_core_count: props.gpu_core_count,
@@ -281,17 +279,6 @@ impl DeviceTab {
             ])
             .render(row, buf);
         }
-
-        let y_offset = y_offset + 1;
-        if inner.y + y_offset < inner.y + inner.height {
-            let row = Rect::new(inner.x, inner.y + y_offset, inner.width, 1);
-            let (m, n, k) = dev.tile_size;
-            Line::from(vec![
-                Span::styled("   Tile Size MNK: ", THEME.kv_key),
-                Span::styled(format!("{m}x{n}x{k}"), THEME.kv_value),
-            ])
-            .render(row, buf);
-        }
     }
 
     fn render_memory(&self, area: Rect, buf: &mut Buffer) {
@@ -353,42 +340,14 @@ impl DeviceTab {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let Some(dev) = &self.device else {
+        if self.device.is_none() {
             return;
-        };
-
-        let tier = &dev.device_tier;
+        }
 
         let lines = vec![
             Line::from(vec![
-                Span::styled("FlashAttention (d=128): ", THEME.kv_key),
-                Span::styled(
-                    match tier.as_str() {
-                        "Max" | "Ultra" => "64x64",
-                        _ => "32x32",
-                    },
-                    THEME.kv_value,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Fused NormLora TG:      ", THEME.kv_key),
-                Span::styled(
-                    match tier.as_str() {
-                        "Max" | "Ultra" => "256",
-                        _ => "128",
-                    },
-                    THEME.kv_value,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Fused SwiGLU TG:        ", THEME.kv_key),
-                Span::styled(
-                    match tier.as_str() {
-                        "Max" | "Ultra" => "512",
-                        _ => "256",
-                    },
-                    THEME.kv_value,
-                ),
+                Span::styled("Attention, GEMM, RoPE, MLP, LoRA: ", THEME.kv_key),
+                Span::styled("tensor runtime", THEME.kv_value),
             ]),
             Line::from(""),
             Line::from(vec![Span::styled(
