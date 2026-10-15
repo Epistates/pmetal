@@ -81,15 +81,12 @@ impl DistillerBuilder {
                     Box::new(crate::reasoning::OutcomeSupervisedRationaleLoss::new(
                         config.loss.rationale_weight,
                     ))
-                } else if let (Some(start), Some(end)) =
-                    (&config.loss.start_marker, &config.loss.end_marker)
-                {
-                    Box::new(crate::reasoning::RationaleLoss::with_markers(
-                        config.loss.rationale_weight,
-                        start,
-                        end,
-                    ))
                 } else {
+                    // Explicit reasoning markers (`start_marker`/`end_marker`)
+                    // are token strings; turning them into a per-token mask
+                    // needs the tokenizer, so the training loop does it
+                    // (`reasoning::generate_reasoning_mask`) and passes the
+                    // mask as the per-token weights.
                     Box::new(crate::reasoning::RationaleLoss::new(
                         config.loss.rationale_weight,
                     ))
