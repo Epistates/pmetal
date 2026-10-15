@@ -47,6 +47,7 @@ use crate::config::DistributedConfig;
 use crate::error::DistributedError;
 use crate::secret::ClusterSecret;
 use anyhow::Result;
+use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
 use snow::{Builder, StatelessTransportState};
 use std::net::SocketAddr;
@@ -85,12 +86,13 @@ const NOISE_PROLOGUE: &[u8] = b"pmetal-distributed/wire/1";
 const TAG_LEN: usize = 16;
 /// Largest frame body: the Noise message limit.
 const MAX_FRAME_BODY: usize = 65_535;
-/// Frames are encrypted into one buffer and written together; this is the
-/// size at which the buffer is flushed (bounded work per write, large enough
-/// to amortise the syscall).
-const WRITE_BATCH_BYTES: usize = 1 << 20;
 /// Receive-side read buffer.
 const READ_BUFFER_BYTES: usize = 1 << 19;
+/// Frames sealed or opened together (about 1 MiB).
+const FRAMES_PER_BATCH: usize = 16;
+/// Fewest frames in a batch for which sealing or opening them on several
+/// cores pays for the hand-off.
+const PARALLEL_MIN_FRAMES: usize = 4;
 
 /// Which logical stream a connection carries. A mismatch fails the handshake
 /// so, for example, an activation link can never be wired to a gradient ring.
@@ -342,6 +344,89 @@ impl Protection {
     }
 }
 
+impl Protection {
+    /// Seal `plains` as consecutive frames, nonces counting up from
+    /// `first_nonce`, into `out`, which holds exactly their frames: a 2-byte
+    /// length, then the sealed body, for each. Large batches are sealed on
+    /// several cores: every frame has its own nonce, so the frames are
+    /// independent.
+    fn seal_many(
+        &self,
+        first_nonce: u64,
+        plains: &[&[u8]],
+        out: &mut [u8],
+    ) -> Result<(), DistributedError> {
+        let tag = self.tag_len();
+        let mut regions: Vec<&mut [u8]> = Vec::with_capacity(plains.len());
+        let mut rest = out;
+        for plain in plains {
+            let (region, tail) = rest.split_at_mut(2 + plain.len() + tag);
+            regions.push(region);
+            rest = tail;
+        }
+        debug_assert!(rest.is_empty());
+        let seal_one = |(i, (region, plain)): (usize, (&mut [u8], &&[u8]))| {
+            let n = self.seal(first_nonce + i as u64, plain, &mut region[2..])?;
+            region[..2].copy_from_slice(&(n as u16).to_le_bytes());
+            Ok(())
+        };
+        if worth_parallelising(plains.len()) {
+            regions
+                .into_par_iter()
+                .zip(plains.par_iter())
+                .enumerate()
+                .try_for_each(seal_one)
+        } else {
+            regions
+                .into_iter()
+                .zip(plains)
+                .enumerate()
+                .try_for_each(seal_one)
+        }
+    }
+
+    /// Open `bodies` as consecutive frames, nonces counting up from
+    /// `first_nonce`, writing their plaintexts back to back into `out`, which
+    /// holds exactly their total. The counterpart of [`Self::seal_many`].
+    fn open_many(
+        &self,
+        first_nonce: u64,
+        bodies: &[&[u8]],
+        out: &mut [u8],
+    ) -> Result<(), DistributedError> {
+        let tag = self.tag_len();
+        let mut regions: Vec<&mut [u8]> = Vec::with_capacity(bodies.len());
+        let mut rest = out;
+        for body in bodies {
+            let (region, tail) = rest.split_at_mut(body.len() - tag);
+            regions.push(region);
+            rest = tail;
+        }
+        debug_assert!(rest.is_empty());
+        let open_one = |(i, (region, body)): (usize, (&mut [u8], &&[u8]))| {
+            self.open(first_nonce + i as u64, body, region).map(|_| ())
+        };
+        if worth_parallelising(bodies.len()) {
+            regions
+                .into_par_iter()
+                .zip(bodies.par_iter())
+                .enumerate()
+                .try_for_each(open_one)
+        } else {
+            regions
+                .into_iter()
+                .zip(bodies)
+                .enumerate()
+                .try_for_each(open_one)
+        }
+    }
+}
+
+/// Whether a batch of frames is big enough to be worth fanning out to threads.
+fn worth_parallelising(frames: usize) -> bool {
+    frames >= PARALLEL_MIN_FRAMES
+}
+
 /// Sender half of the transport.
 pub struct TransportSender {
     inner: TransportSenderInner,
@@ -376,9 +461,33 @@ struct TcpReader {
     stream: BufReader<OwnedReadHalf>,
     protection: Protection,
     nonce: u64,
+    /// Frame headers and the first frame's body.
     body: Vec<u8>,
     scratch: Vec<u8>,
+    /// The bodies of the frames of one batch, back to back.
+    batch_bodies: Vec<u8>,
+    /// The length of each body in `batch_bodies`.
+    batch_lens: Vec<usize>,
     poisoned: bool,
+}
+
+/// The outcome of a timed `read_exact`, with a peer that vanished or went
+/// quiet named as such.
+fn read_outcome(
+    outcome: Result<std::io::Result<usize>, tokio::time::error::Elapsed>,
+) -> Result<(), DistributedError> {
+    match outcome {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(DistributedError::Protocol(
+                "peer closed the connection (it exited, crashed, or was cut off)".into(),
+            ))
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => Err(DistributedError::Protocol(format!(
+            "no data from peer for {IO_IDLE_TIMEOUT:?}; peer presumed dead"
+        ))),
+    }
 }
 
 impl TcpWriter {
@@ -387,7 +496,7 @@ impl TcpWriter {
             stream,
             protection,
             nonce: 0,
-            batch: Vec::with_capacity(WRITE_BATCH_BYTES + MAX_FRAME_BODY + 2),
+            batch: Vec::with_capacity(FRAMES_PER_BATCH * (MAX_FRAME_BODY + 2)),
             first: Vec::with_capacity(MAX_FRAME_BODY),
             poisoned: false,
         }
@@ -412,29 +521,47 @@ impl TcpWriter {
         first.clear();
         first.extend_from_slice(&(data.len() as u64).to_le_bytes());
         first.extend_from_slice(&data[..head]);
-        let sealed = self.seal_frame(&first);
-        self.first = first;
-        sealed?;
 
-        for chunk in data[head..].chunks(max_chunk) {
-            self.seal_frame(chunk)?;
-            if self.batch.len() >= WRITE_BATCH_BYTES {
-                self.flush().await?;
-            }
-        }
-        self.flush().await
+        let outcome = self
+            .send_frames(&first, data[head..].chunks(max_chunk))
+            .await;
+        self.first = first;
+        outcome
     }
 
-    fn seal_frame(&mut self, plain: &[u8]) -> Result<(), DistributedError> {
+    /// Seal and write `first` and then `rest`, as frames, a batch at a time.
+    async fn send_frames<'a>(
+        &mut self,
+        first: &[u8],
+        mut rest: impl Iterator<Item = &'a [u8]>,
+    ) -> Result<(), DistributedError> {
+        let mut frames: Vec<&[u8]> = Vec::with_capacity(FRAMES_PER_BATCH);
+        frames.push(first);
+        loop {
+            while frames.len() < FRAMES_PER_BATCH {
+                match rest.next() {
+                    Some(chunk) => frames.push(chunk),
+                    None => break,
+                }
+            }
+            self.seal_batch(&frames)?;
+            self.flush().await?;
+            if frames.len() < FRAMES_PER_BATCH {
+                return Ok(());
+            }
+            frames.clear();
+        }
+    }
+
+    /// Append `plains`, sealed as consecutive frames, to the batch buffer.
+    fn seal_batch(&mut self, plains: &[&[u8]]) -> Result<(), DistributedError> {
+        let tag = self.protection.tag_len();
         let at = self.batch.len();
-        self.batch
-            .resize(at + 2 + plain.len() + self.protection.tag_len(), 0);
-        let n = self
-            .protection
-            .seal(self.nonce, plain, &mut self.batch[at + 2..])?;
-        self.batch[at..at + 2].copy_from_slice(&(n as u16).to_le_bytes());
-        self.batch.truncate(at + 2 + n);
-        self.nonce += 1;
+        let total: usize = plains.iter().map(|p| 2 + p.len() + tag).sum();
+        self.batch.resize(at + total, 0);
+        self.protection
+            .seal_many(self.nonce, plains, &mut self.batch[at..])?;
+        self.nonce += plains.len() as u64;
         Ok(())
     }
 
@@ -459,6 +586,8 @@ impl TcpReader {
             nonce: 0,
             body: vec![0u8; MAX_FRAME_BODY],
             scratch: vec![0u8; MAX_FRAME_BODY],
+            batch_bodies: vec![0u8; FRAMES_PER_BATCH * MAX_FRAME_BODY],
+            batch_lens: Vec::with_capacity(FRAMES_PER_BATCH),
             poisoned: false,
         }
     }
@@ -467,18 +596,7 @@ impl TcpReader {
     /// and bodies alike).
     async fn read_exact(&mut self, len: usize) -> Result<(), DistributedError> {
         let read = self.stream.read_exact(&mut self.body[..len]);
-        match timeout(IO_IDLE_TIMEOUT, read).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                Err(DistributedError::Protocol(
-                    "peer closed the connection (it exited, crashed, or was cut off)".into(),
-                ))
-            }
-            Ok(Err(e)) => Err(e.into()),
-            Err(_) => Err(DistributedError::Protocol(format!(
-                "no data from peer for {IO_IDLE_TIMEOUT:?}; peer presumed dead"
-            ))),
-        }
+        read_outcome(timeout(IO_IDLE_TIMEOUT, read).await)
     }
 
     /// Read one frame's body into `self.body`; returns its length.
@@ -514,6 +632,56 @@ impl TcpReader {
         Ok((total, n - 8))
     }
 
+    /// Read the continuation frames of a message into `dst[filled..]`, a batch
+    /// at a time: the frames of a batch are read off the socket in order,
+    /// then opened together (on several cores when the batch is large).
+    ///
+    /// A peer's declared lengths are checked before anything is written: a
+    /// frame that would run past the end of `dst` is an error.
+    async fn fill(&mut self, dst: &mut [u8], mut filled: usize) -> Result<(), DistributedError> {
+        let tag = self.protection.tag_len();
+        while filled < dst.len() {
+            self.batch_lens.clear();
+            let (mut stored, mut planned) = (0usize, 0usize);
+            while self.batch_lens.len() < FRAMES_PER_BATCH && filled + planned < dst.len() {
+                self.read_exact(2).await?;
+                let len = u16::from_le_bytes([self.body[0], self.body[1]]) as usize;
+                if len <= tag {
+                    return Err(DistributedError::Protocol(
+                        "empty continuation frame".into(),
+                    ));
+                }
+                if filled + planned + (len - tag) > dst.len() {
+                    return Err(DistributedError::Protocol(
+                        "frame overruns the message".into(),
+                    ));
+                }
+                self.read_body(stored, len).await?;
+                self.batch_lens.push(len);
+                stored += len;
+                planned += len - tag;
+            }
+
+            let mut bodies: Vec<&[u8]> = Vec::with_capacity(self.batch_lens.len());
+            let mut at = 0;
+            for &len in &self.batch_lens {
+                bodies.push(&self.batch_bodies[at..at + len]);
+                at += len;
+            }
+            self.protection
+                .open_many(self.nonce, &bodies, &mut dst[filled..filled + planned])?;
+            self.nonce += bodies.len() as u64;
+            filled += planned;
+        }
+        Ok(())
+    }
+
+    /// Read a frame body of `len` bytes into `batch_bodies` at `at`.
+    async fn read_body(&mut self, at: usize, len: usize) -> Result<(), DistributedError> {
+        let read = self.stream.read_exact(&mut self.batch_bodies[at..at + len]);
+        read_outcome(timeout(IO_IDLE_TIMEOUT, read).await)
+    }
+
     /// Receive a message of exactly `buffer.len()` bytes into `buffer`.
     async fn recv(&mut self, buffer: &mut [u8]) -> Result<(), DistributedError> {
         if self.poisoned {
@@ -540,22 +708,7 @@ impl TcpReader {
             ));
         }
         buffer[..head].copy_from_slice(&self.scratch[..head]);
-        let mut filled = head;
-        while filled < buffer.len() {
-            let len = self.read_frame().await?;
-            let body = &self.body[..len];
-            let n = self
-                .protection
-                .open(self.nonce, body, &mut buffer[filled..])?;
-            self.nonce += 1;
-            if n == 0 {
-                return Err(DistributedError::Protocol(
-                    "empty continuation frame".into(),
-                ));
-            }
-            filled += n;
-        }
-        Ok(())
+        self.fill(buffer, head).await
     }
 
     async fn recv_vec(&mut self) -> Result<Vec<u8>, DistributedError> {
@@ -583,21 +736,7 @@ impl TcpReader {
             ));
         }
         data[..head].copy_from_slice(&self.scratch[..head]);
-        let mut filled = head;
-        while filled < data.len() {
-            let len = self.read_frame().await?;
-            let body = &self.body[..len];
-            let n = self
-                .protection
-                .open(self.nonce, body, &mut data[filled..])?;
-            self.nonce += 1;
-            if n == 0 {
-                return Err(DistributedError::Protocol(
-                    "empty continuation frame".into(),
-                ));
-            }
-            filled += n;
-        }
+        self.fill(&mut data, head).await?;
         Ok(data)
     }
 }

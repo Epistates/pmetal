@@ -197,6 +197,9 @@ async fn a_channel_mismatch_is_refused() {
 #[derive(Clone, Copy, Debug)]
 enum Attack {
     FlipBit,
+    /// Damage the frame at this index of a long message, deep inside a batch
+    /// that is opened on several cores.
+    FlipBitInFrame(usize),
     ReplayFrame,
     ReorderFrames,
     DropFrame,
@@ -271,6 +274,11 @@ async fn attack(attack: Attack, messages: &[Vec<u8>]) -> Vec<Result<Vec<u8>, Str
                 let last = frame.len() - 1;
                 frame[last] ^= 0x01;
             }
+            Attack::FlipBitInFrame(index) => {
+                let frame = &mut frames[index];
+                let middle = frame.len() / 2;
+                frame[middle] ^= 0x80;
+            }
             Attack::ReplayFrame => {
                 let first = frames[0].clone();
                 frames.insert(1, first);
@@ -327,6 +335,27 @@ async fn a_modified_frame_is_detected() {
             .expect_err("poisoned")
             .contains("poisoned")
     );
+}
+
+/// A frame damaged in the middle of a long message, sealed and opened in
+/// parallel batches, is as detected as one in a short message, and nothing
+/// from before the damage is lost to the next message (the stream is
+/// poisoned instead).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_damaged_deep_in_a_long_message_is_detected() {
+    let messages = vec![pattern(1_500_000, 1), pattern(64, 2)];
+    for index in [1, 7, 15, 16, 20] {
+        let results = attack(Attack::FlipBitInFrame(index), &messages).await;
+        let err = results[0].as_ref().expect_err("tampering must be caught");
+        assert!(err.contains("authentication"), "frame {index}: {err}");
+        assert!(
+            results[1]
+                .as_ref()
+                .expect_err("poisoned")
+                .contains("poisoned"),
+            "frame {index}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -5274,6 +5274,7 @@ dependencies = [
  "petgraph",
  "pmetal-runtime",
  "rand 0.10.3",
+ "rayon",
  "secrecy",
  "serde",
  "serde_json",

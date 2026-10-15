@@ -66,6 +66,8 @@ snow = { workspace = true, features = ["ring-accelerated"] }
 secrecy = { workspace = true }
 rand = { workspace = true }
 parking_lot = { workspace = true }
+# Seals and opens a batch of frames on several cores.
+rayon = { workspace = true }
 half = { workspace = true }
 ordered-float = { workspace = true }
 

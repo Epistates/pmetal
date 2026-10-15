@@ -6202,6 +6202,7 @@ dependencies = [
  "parking_lot",
  "petgraph",
  "rand 0.10.3",
+ "rayon",
  "secrecy",
  "serde",
  "serde_json",
