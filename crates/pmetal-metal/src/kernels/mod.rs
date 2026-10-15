@@ -18,7 +18,6 @@ pub mod mpp_bench;
 pub mod mpp_dispatch;
 pub mod mpp_flash_attention;
 pub mod mpp_gemm;
-pub mod turboquant;
 
 #[cfg(has_metal4)]
 pub mod mpp_dw_gemm;
@@ -48,4 +47,3 @@ pub use fused_training::{AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedA
 pub use mpp_flash_attention::{
     MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
 };
-pub use turboquant::TurboQuantTransform;

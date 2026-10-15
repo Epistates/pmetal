@@ -5,17 +5,15 @@
 //! - keys use the paper's two-stage inner-product quantizer
 //! - values use the MSE-optimized scalar codebook path
 //!
-//! The implementation keeps the paper's data flow and storage layout while
-//! batching the dense rotation and QJL transforms through Metal when available.
-//! CPU fallback remains in place for unsupported dimensions or runtime Metal
-//! failures, so the cache stays usable end-to-end across environments.
+//! The implementation keeps the paper's data flow and storage layout. A
+//! power-of-two head dimension rotates with a signed fast Walsh-Hadamard
+//! transform; any other dimension applies its dense rotation and QJL matrices
+//! as one Accelerate SGEMM over all the rows.
 
 use std::{f32::consts::PI, sync::Arc};
 
-use pmetal_metal::{MetalContext, TurboQuantTransform};
 use pmetal_runtime::compat::{Array, Dtype, Exception};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use tracing::debug;
 
 use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 
@@ -679,48 +677,6 @@ impl TurboKeyStore {
     }
 }
 
-#[derive(Clone)]
-struct TurboQuantMetalCore {
-    rotation: TurboQuantTransform,
-    inverse_rotation: TurboQuantTransform,
-    qjl_projection: TurboQuantTransform,
-    inverse_qjl_projection: TurboQuantTransform,
-}
-
-impl std::fmt::Debug for TurboQuantMetalCore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TurboQuantMetalCore")
-            .field("dim", &self.rotation.dim())
-            .finish()
-    }
-}
-
-impl TurboQuantMetalCore {
-    fn new(
-        ctx: Arc<MetalContext>,
-        dim: usize,
-        rotation: &[f32],
-        inverse_rotation: &[f32],
-        qjl_projection: &[f32],
-        inverse_qjl_projection: &[f32],
-    ) -> pmetal_metal::Result<Self> {
-        Ok(Self {
-            rotation: TurboQuantTransform::with_context(ctx.clone(), rotation, dim)?,
-            inverse_rotation: TurboQuantTransform::with_context(
-                ctx.clone(),
-                inverse_rotation,
-                dim,
-            )?,
-            qjl_projection: TurboQuantTransform::with_context(ctx.clone(), qjl_projection, dim)?,
-            inverse_qjl_projection: TurboQuantTransform::with_context(
-                ctx,
-                inverse_qjl_projection,
-                dim,
-            )?,
-        })
-    }
-}
-
 /// Returns true when the active dim should use signed-FWHT instead of dense
 /// `[d×d]` matmul for rotation and QJL projection. Mirrors the bridge gate so
 /// both implementations make the same choice.
@@ -749,7 +705,6 @@ pub(crate) struct TurboQuantCore {
     qjl_wht_left_signs: Option<Vec<f32>>,
     qjl_wht_right_signs: Option<Vec<f32>>,
     codebooks: Vec<Vec<f32>>,
-    metal: Option<TurboQuantMetalCore>,
 }
 
 impl std::fmt::Debug for TurboQuantCore {
@@ -757,7 +712,6 @@ impl std::fmt::Debug for TurboQuantCore {
         f.debug_struct("TurboQuantCore")
             .field("dim", &self.dim)
             .field("codebook_bits", &(self.codebooks.len().saturating_sub(1)))
-            .field("metal_enabled", &self.metal.is_some())
             .finish()
     }
 }
@@ -801,32 +755,6 @@ impl TurboQuantCore {
                 (*pmetal_runtime::turboquant::beta_codebook(dim, bits)).clone();
         }
 
-        // Metal-side pre-built rotation matrices are only useful for the
-        // non-FWHT path; FWHT runs in CPU-side `signed_fwht_forward`.
-        let metal = if use_fwht {
-            None
-        } else {
-            match MetalContext::global().and_then(|ctx| {
-                TurboQuantMetalCore::new(
-                    ctx,
-                    dim,
-                    &rotation,
-                    &inverse_rotation,
-                    &qjl_projection,
-                    &inverse_qjl_projection,
-                )
-            }) {
-                Ok(metal) => Some(metal),
-                Err(error) => {
-                    debug!(
-                        dim,
-                        "TurboQuant Metal backend unavailable, using CPU fallback: {error}"
-                    );
-                    None
-                }
-            }
-        };
-
         Self {
             dim,
             rotation,
@@ -838,7 +766,6 @@ impl TurboQuantCore {
             qjl_wht_left_signs,
             qjl_wht_right_signs,
             codebooks,
-            metal,
         }
     }
 
@@ -852,12 +779,7 @@ impl TurboQuantCore {
         if let Some(out) = self.try_fwht_rows(input, &self.wht_right_signs, &self.wht_left_signs) {
             return out;
         }
-        self.apply_rows(
-            "rotation",
-            &self.rotation,
-            self.metal.as_ref().map(|m| &m.rotation),
-            input,
-        )
+        matmul_rows(&self.rotation, self.dim, input)
     }
 
     fn inverse_rotate_rows(&self, input: &[f32]) -> Vec<f32> {
@@ -865,12 +787,7 @@ impl TurboQuantCore {
         if let Some(out) = self.try_fwht_rows(input, &self.wht_left_signs, &self.wht_right_signs) {
             return out;
         }
-        self.apply_rows(
-            "inverse-rotation",
-            &self.inverse_rotation,
-            self.metal.as_ref().map(|m| &m.inverse_rotation),
-            input,
-        )
+        matmul_rows(&self.inverse_rotation, self.dim, input)
     }
 
     fn project_rows(&self, input: &[f32]) -> Vec<f32> {
@@ -879,12 +796,7 @@ impl TurboQuantCore {
         {
             return out;
         }
-        self.apply_rows(
-            "qjl-projection",
-            &self.qjl_projection,
-            self.metal.as_ref().map(|m| &m.qjl_projection),
-            input,
-        )
+        matmul_rows(&self.qjl_projection, self.dim, input)
     }
 
     fn inverse_project_rows(&self, input: &[f32]) -> Vec<f32> {
@@ -893,12 +805,7 @@ impl TurboQuantCore {
         {
             return out;
         }
-        self.apply_rows(
-            "inverse-qjl-projection",
-            &self.inverse_qjl_projection,
-            self.metal.as_ref().map(|m| &m.inverse_qjl_projection),
-            input,
-        )
+        matmul_rows(&self.inverse_qjl_projection, self.dim, input)
     }
 
     /// Apply the signed-FWHT rotation row-by-row. Returns `None` when sign
@@ -920,32 +827,6 @@ impl TurboQuantCore {
             pmetal_runtime::turboquant::signed_fwht_forward(row, post, pre);
         }
         Some(output)
-    }
-
-    fn apply_rows(
-        &self,
-        stage: &'static str,
-        matrix: &[f32],
-        metal: Option<&TurboQuantTransform>,
-        input: &[f32],
-    ) -> Vec<f32> {
-        if input.is_empty() {
-            return Vec::new();
-        }
-        if let Some(transform) = metal {
-            match transform.apply_rows(input) {
-                Ok(output) => return output,
-                Err(error) => {
-                    debug!(
-                        stage,
-                        dim = self.dim,
-                        rows = input.len() / self.dim,
-                        "TurboQuant Metal transform failed, falling back to CPU: {error}"
-                    );
-                }
-            }
-        }
-        matmul_rows(matrix, self.dim, input)
     }
 }
 
@@ -3031,21 +2912,25 @@ fn transpose_square_matrix(matrix: &[f32], dim: usize) -> Vec<f32> {
     transposed
 }
 
+/// `rows` (`[n, dim]`) times `matrixᵀ` for a row-major `[dim, dim]` matrix: each
+/// row transformed by the matrix, as one SGEMM.
 fn matmul_rows(matrix: &[f32], dim: usize, rows: &[f32]) -> Vec<f32> {
-    let num_rows = rows.len() / dim;
-    let mut output = vec![0.0f32; rows.len()];
-    for row_idx in 0..num_rows {
-        let src = &rows[row_idx * dim..(row_idx + 1) * dim];
-        let dst = &mut output[row_idx * dim..(row_idx + 1) * dim];
-        for out_dim in 0..dim {
-            let matrix_row = &matrix[out_dim * dim..(out_dim + 1) * dim];
-            let mut acc = 0.0f32;
-            for (weight, value) in matrix_row.iter().zip(src.iter()) {
-                acc += weight * value;
-            }
-            dst[out_dim] = acc;
-        }
+    if rows.is_empty() {
+        return Vec::new();
     }
+    let mut output = vec![0.0f32; rows.len()];
+    pmetal_metal::accelerate::gemm(
+        rows,
+        matrix,
+        &mut output,
+        rows.len() / dim,
+        dim,
+        dim,
+        1.0,
+        0.0,
+        false,
+        true,
+    );
     output
 }
 
@@ -3412,11 +3297,61 @@ mod tests {
             assert!(core.inverse_rotation.is_empty());
             assert!(core.qjl_projection.is_empty());
             assert!(core.inverse_qjl_projection.is_empty());
-            assert!(
-                core.metal.is_none(),
-                "dim={dim} pre-built Metal matrices leaked"
-            );
             assert!(core.wht_left_signs.is_some());
         }
+    }
+
+    /// A head dimension that is not a power of two rotates and projects with
+    /// dense matrices: each row through the matrix, in f64 as the reference,
+    /// and the inverse transforms undo the forward ones.
+    #[test]
+    fn dense_transforms_match_a_float64_product_and_invert() {
+        let dim = 96usize;
+        let core = super::TurboQuantCore::new(dim, 4);
+        assert!(core.wht_left_signs.is_none());
+        assert_eq!(core.rotation.len(), dim * dim);
+
+        let rows = 33usize;
+        let input: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.02)
+            .collect();
+        let product = |matrix: &[f32], x: &[f32]| -> Vec<f64> {
+            (0..rows)
+                .flat_map(|r| {
+                    (0..dim).map(move |o| {
+                        (0..dim)
+                            .map(|c| f64::from(matrix[o * dim + c]) * f64::from(x[r * dim + c]))
+                            .sum::<f64>()
+                    })
+                })
+                .collect()
+        };
+        let close = |got: &[f32], want: &[f64], what: &str| {
+            for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (f64::from(g) - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                    "{what} element {i}: got {g}, want {w}"
+                );
+            }
+        };
+
+        let rotated = core.rotate_rows(&input);
+        close(&rotated, &product(&core.rotation, &input), "rotation");
+        let projected = core.project_rows(&input);
+        close(
+            &projected,
+            &product(&core.qjl_projection, &input),
+            "projection",
+        );
+
+        let widened: Vec<f64> = input.iter().map(|&x| f64::from(x)).collect();
+        close(
+            &core.inverse_rotate_rows(&rotated),
+            &widened,
+            "inverse rotation",
+        );
+        let unprojected = core.inverse_project_rows(&projected);
+        let want = product(&core.inverse_qjl_projection, &projected);
+        close(&unprojected, &want, "inverse projection");
     }
 }
