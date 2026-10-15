@@ -92,6 +92,7 @@ pub enum ReduceOp {
 }
 
 // Core modules
+pub mod apportion;
 pub mod auto;
 pub mod cluster_runtime;
 pub mod collective;
