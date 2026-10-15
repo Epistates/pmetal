@@ -514,6 +514,20 @@ impl<R> JobStatus<R> {
         }
     }
 
+    /// [`apply_event`](Self::apply_event), and on [`JobEvent::Completed`] flip
+    /// to `Completed` with the result `on_completed` builds from its summary,
+    /// so a surface does not have to watch for the event itself.
+    pub fn apply_event_with(
+        &mut self,
+        event: &JobEvent,
+        on_completed: impl FnOnce(&CompletionSummary) -> R,
+    ) {
+        match event {
+            JobEvent::Completed { summary, .. } => self.complete(on_completed(summary)),
+            other => self.apply_event(other),
+        }
+    }
+
     /// Flip to `Completed { result }`. Use after observing [`JobEvent::Completed`]
     /// when the surface has constructed its `R`.
     pub fn complete(&mut self, result: R) {
@@ -566,8 +580,13 @@ impl<S: JobEventSink + ?Sized> JobEventSink for Box<S> {
 ///
 /// Used by the CLI's `--log-events <path>` flag and by subprocess fallbacks
 /// in TUI/MCP. The matching reader is [`parse_event`].
+///
+/// [`JobEventSink::emit`] cannot fail, so a write that does (a full disk, a
+/// closed pipe) is kept instead of lost: [`take_error`](Self::take_error)
+/// returns the first one, for the caller to report when the job ends.
 pub struct JsonlSink<W: Write + Send + Sync> {
     inner: std::sync::Mutex<W>,
+    first_error: std::sync::Mutex<Option<io::Error>>,
 }
 
 impl<W: Write + Send + Sync> JsonlSink<W> {
@@ -575,14 +594,31 @@ impl<W: Write + Send + Sync> JsonlSink<W> {
     pub fn new(writer: W) -> Self {
         Self {
             inner: std::sync::Mutex::new(writer),
+            first_error: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The first error a write returned, if any, leaving none behind.
+    pub fn take_error(&self) -> Option<io::Error> {
+        self.first_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
 impl<W: Write + Send + Sync> JobEventSink for JsonlSink<W> {
     fn emit(&self, event: JobEvent) {
-        if let Ok(mut w) = self.inner.lock() {
-            let _ = write_event(&mut *w, &event);
+        // A writer that panicked mid-event leaves a usable writer behind.
+        let mut w = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = write_event(&mut *w, &event) {
+            self.first_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(e);
         }
     }
 }
@@ -626,10 +662,16 @@ impl JobEventSink for BroadcastSink {
 // ---------------------------------------------------------------------------
 
 /// Write one event as a single-line JSON record terminated by `\n`.
+///
+/// The record is assembled first and handed to the writer in one `write_all`,
+/// so an unbuffered file or pipe sees one system call per event rather than
+/// one per token of JSON, and a reader tailing the stream never sees half a
+/// line.
 pub fn write_event(w: &mut impl Write, event: &JobEvent) -> io::Result<()> {
-    serde_json::to_writer(&mut *w, event)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    w.write_all(b"\n")
+    let mut record =
+        serde_json::to_vec(event).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    record.push(b'\n');
+    w.write_all(&record)
 }
 
 /// Parse one event from a single line of JSON.
@@ -846,6 +888,42 @@ mod tests {
         }
     }
 
+    /// Counts the `write` calls it receives.
+    struct CountingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_event_is_one_write() {
+        // Consumers tail the stream, and several processes can share a pipe:
+        // a record written in pieces can be cut or interleaved, one written
+        // in a single call (under the pipe's atomic size) cannot.
+        let mut out = CountingWriter { writes: Vec::new() };
+        write_event(
+            &mut out,
+            &JobEvent::Log {
+                job_id: "j".into(),
+                level: LogLevel::Info,
+                line: "step 1".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(out.writes.len(), 1, "{:?}", out.writes);
+        let line = std::str::from_utf8(&out.writes[0]).unwrap();
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+        assert_eq!(parse_event(line).unwrap().job_id(), "j");
+    }
+
     #[test]
     fn jsonl_codec() {
         let ev = JobEvent::Token {
@@ -914,10 +992,58 @@ mod tests {
     }
 
     #[test]
+    fn a_completed_event_completes_the_status() {
+        let mut status: JobStatus<Option<f64>> = JobStatus::Idle;
+        let events = [
+            JobEvent::started("j", JobKind::Train),
+            JobEvent::Metric {
+                job_id: "j".into(),
+                payload: MetricPayload::Step(StepMetrics::default()),
+            },
+            JobEvent::Completed {
+                job_id: "j".into(),
+                summary: CompletionSummary {
+                    final_loss: Some(0.5),
+                    ..Default::default()
+                },
+                ts: 0,
+            },
+        ];
+        for event in &events {
+            status.apply_event_with(event, |summary| summary.final_loss);
+        }
+        assert!(matches!(
+            status,
+            JobStatus::Completed { result: Some(loss) } if loss == 0.5
+        ));
+    }
+
+    #[test]
     fn null_sink_drops() {
         let sink = NullSink;
         sink.emit(JobEvent::started("j", JobKind::Train));
         assert!(!sink.is_cancelled());
+    }
+
+    #[test]
+    fn jsonl_sink_keeps_the_first_write_error() {
+        struct Failing(u32);
+        impl Write for Failing {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.0 += 1;
+                Err(io::Error::other(format!("write {}", self.0)))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = JsonlSink::new(Failing(0));
+        assert!(sink.take_error().is_none());
+        sink.emit(JobEvent::started("j", JobKind::Train));
+        sink.emit(JobEvent::failed("j", "boom"));
+        let first = sink.take_error().expect("the failure is kept");
+        assert_eq!(first.to_string(), "write 1");
+        assert!(sink.take_error().is_none(), "taking it clears it");
     }
 
     #[test]
