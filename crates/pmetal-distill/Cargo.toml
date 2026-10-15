@@ -23,7 +23,6 @@ bitcode = { workspace = true }
 # Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tempfile = { workspace = true }
-criterion = { workspace = true }
 serial_test = { workspace = true }
 
 [[bench]]

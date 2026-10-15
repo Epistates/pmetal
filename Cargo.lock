@@ -5245,7 +5245,6 @@ name = "pmetal-distill"
 version = "0.6.0"
 dependencies = [
  "bitcode",
- "criterion",
  "pmetal-runtime",
  "safetensors",
  "serde",
