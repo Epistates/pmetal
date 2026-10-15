@@ -876,7 +876,6 @@ mod tests {
     fn labels_that_do_not_match_the_tokens_are_an_error() {
         let bad = Sample {
             input_ids: vec![1, 2, 3],
-            attention_mask: vec![1, 1, 1],
             labels: Some(vec![1, 2]),
             images: None,
         };

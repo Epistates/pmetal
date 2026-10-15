@@ -38,12 +38,14 @@ pub const IGNORE_INDEX: i64 = -100;
 const CHUNK_ROWS: usize = 2048;
 
 /// A training sample.
+///
+/// Every token attends: a sample carries no attention mask of its own (a
+/// stored mask of ones cost four bytes a token, as much again as the ids),
+/// and the loaders build the batch's mask from the lengths.
 #[derive(Debug, Clone)]
 pub struct Sample {
     /// Input token IDs.
     pub input_ids: Vec<u32>,
-    /// Attention mask.
-    pub attention_mask: Vec<u32>,
     /// Labels (for supervised training). Use -100 for tokens to ignore in loss.
     pub labels: Option<Vec<i64>>,
     /// Image paths (for multimodal training).
@@ -53,10 +55,8 @@ pub struct Sample {
 impl Sample {
     /// Create a new sample with input_ids only.
     pub fn new(input_ids: Vec<u32>) -> Self {
-        let len = input_ids.len();
         Self {
             input_ids,
-            attention_mask: vec![1; len],
             labels: None,
             images: None,
         }
@@ -64,10 +64,8 @@ impl Sample {
 
     /// Create a sample with input_ids and labels.
     pub fn with_labels(input_ids: Vec<u32>, labels: Vec<i64>) -> Self {
-        let len = input_ids.len();
         Self {
             input_ids,
-            attention_mask: vec![1; len],
             labels: Some(labels),
             images: None,
         }
@@ -75,10 +73,8 @@ impl Sample {
 
     /// Create a sample with input_ids, labels, and images.
     pub fn with_images(input_ids: Vec<u32>, labels: Vec<i64>, images: Vec<PathBuf>) -> Self {
-        let len = input_ids.len();
         Self {
             input_ids,
-            attention_mask: vec![1; len],
             labels: Some(labels),
             images: Some(images),
         }
@@ -257,7 +253,6 @@ impl TrainingDataset {
                 }
                 original_lengths.push(tokenized.original_len);
                 samples.push(Sample {
-                    attention_mask: vec![1; tokenized.input_ids.len()],
                     input_ids: tokenized.input_ids,
                     labels: Some(tokenized.labels),
                     images: None,
@@ -700,7 +695,6 @@ mod tests {
     fn test_sample_creation() {
         let sample = Sample::new(vec![1, 2, 3, 4]);
         assert_eq!(sample.input_ids, vec![1, 2, 3, 4]);
-        assert_eq!(sample.attention_mask, vec![1, 1, 1, 1]);
         assert!(sample.labels.is_none());
     }
 

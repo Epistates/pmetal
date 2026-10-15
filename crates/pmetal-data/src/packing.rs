@@ -928,10 +928,8 @@ mod tests {
     use super::*;
 
     fn make_sample(ids: Vec<u32>, labels: Option<Vec<i64>>) -> Sample {
-        let len = ids.len();
         Sample {
             input_ids: ids,
-            attention_mask: vec![1; len],
             labels,
             images: None,
         }

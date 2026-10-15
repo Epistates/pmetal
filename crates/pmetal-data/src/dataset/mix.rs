@@ -281,7 +281,6 @@ mod tests {
     fn dedup_drops_exact_repeats_and_keeps_the_first() {
         let sample = |ids: &[u32], labels: Option<&[i64]>| Sample {
             input_ids: ids.to_vec(),
-            attention_mask: vec![1; ids.len()],
             labels: labels.map(<[i64]>::to_vec),
             images: None,
         };
