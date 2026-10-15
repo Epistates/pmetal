@@ -185,8 +185,18 @@ pub fn run_merge(config: &MergeConfig) -> Result<PathBuf> {
     let target_dtype = crate::loader::parse_dtype(&config.dtype)?;
     let mut writer = open_writer(config, &output_path, target_dtype)?;
 
+    // Gradient-valued parameters need the layer count: the highest layer
+    // index seen, plus one.
+    let mut parameters = config.parameters.clone();
+    parameters.layer_count = tensor_names
+        .iter()
+        .filter_map(|n| extract_layer_index(n))
+        .max()
+        .map(|last| last + 1);
+
     let flat = FlatMerge {
         config,
+        parameters: &parameters,
         method: &*method,
         loaders: &loaders,
         base_loader: base_loader.as_ref(),
@@ -492,6 +502,8 @@ fn collect_tensor_names(
 /// The inputs of a flat merge, tensor by tensor.
 struct FlatMerge<'a> {
     config: &'a MergeConfig,
+    /// The global parameters, with the layer count filled in.
+    parameters: &'a MergeParameters,
     method: &'a dyn MergeMethod,
     loaders: &'a [SafetensorsLoader],
     base_loader: Option<&'a SafetensorsLoader>,
@@ -578,7 +590,7 @@ impl FlatMerge<'_> {
             &tensors,
             base_tensor.as_ref(),
             &params,
-            &self.config.parameters,
+            self.parameters,
         )?;
         Ok((merged, vocab_rows))
     }
@@ -843,7 +855,8 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<PathBuf> {
         let method = create_merge_method(effective_method_cfg);
 
         // Effective parameters: global → slice-level (slice wins)
-        let effective_params = config.parameters.merge_with(&slice.parameters);
+        let mut effective_params = config.parameters.merge_with(&slice.parameters);
+        effective_params.layer_count = Some(total_output_layers);
 
         // Effective base model: global → slice-level override
         let slice_base_loader: Option<SafetensorsLoader> = match &slice.base_model {

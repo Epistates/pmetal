@@ -97,3 +97,34 @@ fn slerp_t_filter_applies_per_tensor() {
     assert_close(&read_tensor(&out, ATTN), &[2.0, 4.0], 1e-6);
     assert_close(&read_tensor(&out, MLP), &[4.0, 8.0], 1e-6);
 }
+
+/// A list-valued `t` is a gradient over the layers: SLERP of parallel vectors
+/// is linear interpolation of their magnitudes, so the layer-wise t shows up
+/// directly in the output.
+#[test]
+fn slerp_t_gradient_ramps_over_the_layers() {
+    let work = tempfile::tempdir().unwrap();
+    let (a, b, out) = (
+        work.path().join("a"),
+        work.path().join("b"),
+        work.path().join("out"),
+    );
+    let layer = |n: usize| format!("model.layers.{n}.mlp.up_proj.weight");
+    let names: Vec<String> = (0..3).map(layer).collect();
+    let specs = |scale: f32| -> Vec<common::Spec<'_>> {
+        names
+            .iter()
+            .map(|n| (n.as_str(), vec![scale, 2.0 * scale], vec![2]))
+            .collect()
+    };
+    write_model(&a, &specs(1.0), Dtype::F32);
+    write_model(&b, &specs(2.0), Dtype::F32);
+
+    let cfg = config(MergeMethodConfig::Slerp, &a, &b, &out, "  t: [0.0, 1.0]\n");
+    run_merge(&cfg).unwrap();
+
+    // Layers 0, 1, 2 of 3 take t = 0, 0.5, 1: A, the midpoint, B.
+    assert_close(&read_tensor(&out, &layer(0)), &[1.0, 2.0], 1e-5);
+    assert_close(&read_tensor(&out, &layer(1)), &[1.5, 3.0], 1e-5);
+    assert_close(&read_tensor(&out, &layer(2)), &[2.0, 4.0], 1e-5);
+}

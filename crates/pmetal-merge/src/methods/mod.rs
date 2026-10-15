@@ -91,7 +91,10 @@ pub trait MergeMethod: Send + Sync {
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
-        let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
+        let params: Vec<MergeParameters> = params
+            .iter()
+            .map(|p| p.resolved_in(name, global_params.layer_count))
+            .collect();
         self.merge(tensors, base_tensor, &params, &global_params.resolved(name))
     }
 }

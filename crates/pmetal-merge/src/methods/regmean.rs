@@ -315,7 +315,10 @@ impl MergeMethod for RegMeanMerge {
                 actual: 0,
             });
         }
-        let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
+        let params: Vec<MergeParameters> = params
+            .iter()
+            .map(|p| p.resolved_in(name, global_params.layer_count))
+            .collect();
         let global_params = &global_params.resolved(name);
         // RegMean's closed form only applies to 2-D weight matrices; route
         // anything else to the plain mean fallback.

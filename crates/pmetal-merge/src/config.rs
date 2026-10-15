@@ -64,13 +64,63 @@ use std::path::PathBuf;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConditionalParam {
-    /// The numeric parameter value.
-    pub value: f32,
+    /// The parameter value: a number, or a list of numbers that is spread
+    /// linearly over the model's layers (a gradient; see [`ParamValue`]).
+    pub value: ParamValue,
 
     /// Substring filter on tensor names.  When `None` (or `"*"`), this entry
     /// acts as a catch-all default.  The first matching entry wins.
     #[serde(default)]
     pub filter: Option<String>,
+}
+
+/// The value of a [`ConditionalParam`] entry.
+///
+/// A list is a **gradient** over the layers: its entries are anchors spread
+/// evenly from the first layer to the last, and a layer takes the linear
+/// interpolation between the two nearest anchors. `[0, 1]` ramps from 0 at the
+/// first layer to 1 at the last; `[0, 0.5, 0, 1]` has three segments. A
+/// gradient only applies to tensors with a layer index (`...layers.N...`), and
+/// only once the merge knows the layer count; other tensors skip the entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ParamValue {
+    /// One value for every matching tensor.
+    Scalar(f32),
+    /// Anchors interpolated over the layers.
+    Gradient(Vec<f32>),
+}
+
+impl From<f32> for ParamValue {
+    fn from(v: f32) -> Self {
+        ParamValue::Scalar(v)
+    }
+}
+
+impl ParamValue {
+    /// The value for a tensor in layer `layer` of `layers`, or `None` for a
+    /// gradient that cannot be placed.
+    fn at(&self, layer: Option<(usize, usize)>) -> Option<f32> {
+        match self {
+            ParamValue::Scalar(v) => Some(*v),
+            ParamValue::Gradient(anchors) => {
+                let (layer, layers) = layer?;
+                match anchors.as_slice() {
+                    [] => None,
+                    [only] => Some(*only),
+                    _ if layers <= 1 => Some(anchors[0]),
+                    _ => {
+                        let position = layer.min(layers - 1) as f32 / (layers - 1) as f32
+                            * (anchors.len() - 1) as f32;
+                        let low = position.floor() as usize;
+                        let high = (low + 1).min(anchors.len() - 1);
+                        let frac = position - low as f32;
+                        Some(anchors[low] * (1.0 - frac) + anchors[high] * frac)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A parameter value that is either a bare scalar or a list of conditional
@@ -91,6 +141,9 @@ pub enum ParameterSetting {
     Scalar(f32),
     /// An ordered list of conditional entries; the first matching entry wins.
     Conditional(Vec<ConditionalParam>),
+    /// A gradient over the layers (see [`ParamValue`]) for every tensor that
+    /// has a layer index.
+    Gradient(Vec<f32>),
 }
 
 impl ParameterSetting {
@@ -101,6 +154,13 @@ impl ParameterSetting {
     /// of `tensor_name` (or whose `filter` is `None` / `"*"`) is returned.
     /// Returns `None` if no entry matches.
     pub fn resolve(&self, tensor_name: &str) -> Option<f32> {
+        self.resolve_in(tensor_name, None)
+    }
+
+    /// [`resolve`](Self::resolve) for a model of `layers` layers, which lets
+    /// gradient values (lists) be placed on the tensor's layer.
+    pub fn resolve_in(&self, tensor_name: &str, layers: Option<usize>) -> Option<f32> {
+        let layer = crate::merge::extract_layer_index(tensor_name).zip(layers);
         match self {
             ParameterSetting::Scalar(v) => Some(*v),
             ParameterSetting::Conditional(entries) => {
@@ -111,11 +171,14 @@ impl ParameterSetting {
                         Some(f) => tensor_name.contains(f.as_str()),
                     };
                     if matches {
-                        return Some(entry.value);
+                        if let Some(value) = entry.value.at(layer) {
+                            return Some(value);
+                        }
                     }
                 }
                 None
             }
+            ParameterSetting::Gradient(anchors) => ParamValue::Gradient(anchors.clone()).at(layer),
         }
     }
 
@@ -426,6 +489,12 @@ pub struct MergeParameters {
     #[serde(default)]
     pub min_tasks: Option<u32>,
 
+    /// Number of transformer layers of the model being merged, which places
+    /// gradient values on a tensor's layer. Set by the pipeline; not part of
+    /// the configuration file.
+    #[serde(skip)]
+    pub layer_count: Option<usize>,
+
     /// Seed for the stochastic methods (DARE, DELLA). Each tensor and each
     /// model draws its own independent mask from it, so a merge is
     /// reproducible and no two task vectors share a drop pattern. Defaults
@@ -530,9 +599,16 @@ impl MergeParameters {
     /// applies). The merge pipelines call this once per tensor, so the
     /// methods only ever see scalars.
     pub fn resolved(&self, tensor_name: &str) -> MergeParameters {
+        self.resolved_in(tensor_name, self.layer_count)
+    }
+
+    /// [`resolved`](Self::resolved) for a model of `layers` layers, so that
+    /// gradient values land on the tensor's layer. Per-model parameters carry
+    /// no layer count of their own and take the global one.
+    pub fn resolved_in(&self, tensor_name: &str, layers: Option<usize>) -> MergeParameters {
         let resolve = |s: &Option<ParameterSetting>| {
             s.as_ref()
-                .and_then(|s| s.resolve(tensor_name))
+                .and_then(|s| s.resolve_in(tensor_name, layers))
                 .map(ParameterSetting::Scalar)
         };
         MergeParameters {
@@ -559,6 +635,7 @@ impl MergeParameters {
             gamma: other.gamma.or(self.gamma),
             tall_lambda: other.tall_lambda.or(self.tall_lambda),
             min_tasks: other.min_tasks.or(self.min_tasks),
+            layer_count: other.layer_count.or(self.layer_count),
             seed: other.seed.or(self.seed),
         }
     }
@@ -1021,6 +1098,55 @@ parameters:
         assert_eq!(default.max_shard_size, None);
     }
 
+    #[test]
+    fn gradients_interpolate_linearly_over_the_layers() {
+        let layer = |n: usize| format!("model.layers.{n}.mlp.up_proj.weight");
+        // [0, 1] over 5 layers: 0, .25, .5, .75, 1
+        let ramp = ParameterSetting::Gradient(vec![0.0, 1.0]);
+        for (n, want) in [(0, 0.0), (1, 0.25), (2, 0.5), (4, 1.0)] {
+            assert_eq!(ramp.resolve_in(&layer(n), Some(5)), Some(want), "layer {n}");
+        }
+        // [0, 0.5, 0, 1] has three segments over 4 layers... anchors at layers 0..3.
+        let wave = ParameterSetting::Gradient(vec![0.0, 0.5, 0.0, 1.0]);
+        let at = |n| wave.resolve_in(&layer(n), Some(4)).unwrap();
+        assert!((at(0) - 0.0).abs() < 1e-6 && (at(1) - 0.5).abs() < 1e-6);
+        assert!((at(2) - 0.0).abs() < 1e-6 && (at(3) - 1.0).abs() < 1e-6);
+        // Between anchors: 7 layers put layer 1 a third of the way from the
+        // first anchor to the second.
+        let third = ParameterSetting::Gradient(vec![0.0, 0.6, 0.0])
+            .resolve_in(&layer(1), Some(7))
+            .unwrap();
+        assert!((third - 0.2).abs() < 1e-6, "{third}");
+        // No layer index, or no layer count: a gradient does not apply.
+        assert_eq!(ramp.resolve_in("model.embed_tokens.weight", Some(5)), None);
+        assert_eq!(ramp.resolve_in(&layer(1), None), None);
+    }
+
+    #[test]
+    fn a_filtered_gradient_falls_through_to_the_default_for_other_tensors() {
+        let yaml = r#"
+- value: [0.0, 1.0]
+  filter: self_attn
+- value: 0.5
+"#;
+        let setting: ParameterSetting = serde_saphyr::from_str(yaml).unwrap();
+        let attn = "model.layers.2.self_attn.q_proj.weight";
+        assert_eq!(setting.resolve_in(attn, Some(3)), Some(1.0));
+        assert_eq!(
+            setting.resolve_in("model.layers.0.self_attn.q_proj.weight", Some(3)),
+            Some(0.0)
+        );
+        // MLP tensors, and non-layer ones, take the default entry.
+        assert_eq!(
+            setting.resolve_in("model.layers.2.mlp.up_proj.weight", Some(3)),
+            Some(0.5)
+        );
+        assert_eq!(setting.resolve_in("lm_head.weight", Some(3)), Some(0.5));
+        // A bare list is a gradient too.
+        let bare: ParameterSetting = serde_saphyr::from_str("[0.0, 1.0]").unwrap();
+        assert!(matches!(bare, ParameterSetting::Gradient(_)));
+    }
+
     // -------------------------------------------------------------------------
     // ConditionalParam / ParameterSetting tests
     // -------------------------------------------------------------------------
@@ -1042,15 +1168,15 @@ parameters:
     fn test_parameter_setting_conditional_filter() {
         let setting = ParameterSetting::Conditional(vec![
             ConditionalParam {
-                value: 0.8,
+                value: 0.8.into(),
                 filter: Some("self_attn".to_string()),
             },
             ConditionalParam {
-                value: 0.3,
+                value: 0.3.into(),
                 filter: Some("mlp".to_string()),
             },
             ConditionalParam {
-                value: 0.5,
+                value: 0.5.into(),
                 filter: None,
             },
         ]);
@@ -1070,7 +1196,7 @@ parameters:
     #[test]
     fn test_parameter_setting_conditional_wildcard() {
         let setting = ParameterSetting::Conditional(vec![ConditionalParam {
-            value: 0.6,
+            value: 0.6.into(),
             filter: Some("*".to_string()),
         }]);
         assert_eq!(setting.resolve("anything"), Some(0.6));
@@ -1079,7 +1205,7 @@ parameters:
     #[test]
     fn test_parameter_setting_no_match_returns_none() {
         let setting = ParameterSetting::Conditional(vec![ConditionalParam {
-            value: 0.8,
+            value: 0.8.into(),
             filter: Some("self_attn".to_string()),
         }]);
         assert_eq!(setting.resolve("model.lm_head.weight"), None);
@@ -1315,11 +1441,11 @@ slices:
         let per_model = MergeParameters {
             weight: Some(ParameterSetting::Conditional(vec![
                 ConditionalParam {
-                    value: 0.9,
+                    value: 0.9.into(),
                     filter: Some("attn".to_string()),
                 },
                 ConditionalParam {
-                    value: 0.4,
+                    value: 0.4.into(),
                     filter: None,
                 },
             ])),

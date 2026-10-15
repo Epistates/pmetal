@@ -197,7 +197,10 @@ impl MergeMethod for FisherMerge {
                 actual: 0,
             });
         }
-        let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
+        let params: Vec<MergeParameters> = params
+            .iter()
+            .map(|p| p.resolved_in(name, global_params.layer_count))
+            .collect();
         let global_params = &global_params.resolved(name);
         match self.try_load_fisher(name)? {
             Some(fishers) => {
