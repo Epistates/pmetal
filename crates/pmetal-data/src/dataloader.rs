@@ -245,8 +245,9 @@ impl Default for DataLoaderConfig {
 /// `config.world_size`) each rank serves an equal, disjoint share of every
 /// epoch.
 pub struct DataLoader {
-    /// The dataset.
-    dataset: TrainingDataset,
+    /// The dataset, shared: a loader per epoch (or per evaluation) over one
+    /// dataset reads it without copying it.
+    dataset: Arc<TrainingDataset>,
     /// Configuration.
     config: DataLoaderConfig,
     /// This rank's samples for the current epoch, in serving order.
@@ -273,13 +274,16 @@ struct BatchComponents {
 
 impl DataLoader {
     /// Create a new DataLoader, its first epoch ordered by `config.seed`.
+    ///
+    /// `dataset` is a [`TrainingDataset`] or an `Arc` of one; with an `Arc`
+    /// (cloned per loader) the samples are not copied.
     pub fn new(
-        dataset: TrainingDataset,
+        dataset: impl Into<Arc<TrainingDataset>>,
         config: DataLoaderConfig,
         image_processor: Option<Arc<FixedSizeImageProcessor>>,
     ) -> Self {
         let mut loader = Self {
-            dataset,
+            dataset: dataset.into(),
             epoch_seed: config.seed,
             length_grouping: None,
             config,
@@ -757,6 +761,16 @@ mod tests {
         assert!(l.restore(at(11)).is_err(), "past the end");
         assert!(l.restore(at(3)).is_err(), "not on a batch boundary");
         assert!(l.restore(at(8)).is_ok());
+    }
+
+    /// Loaders over one `Arc` share the samples; none copies them.
+    #[test]
+    fn loaders_over_an_arc_share_the_dataset() {
+        let shared = Arc::new(numbered(10));
+        let a = DataLoader::new(Arc::clone(&shared), DataLoaderConfig::default(), None);
+        let b = DataLoader::new(Arc::clone(&shared), DataLoaderConfig::default(), None);
+        assert_eq!(Arc::strong_count(&shared), 3);
+        assert_eq!((a.len(), b.len()), (10, 10));
     }
 
     fn variable_length_dataset(n: usize) -> TrainingDataset {
