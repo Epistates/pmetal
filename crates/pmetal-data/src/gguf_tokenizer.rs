@@ -9,7 +9,7 @@
 //! - **`gpt2`** (Llama 3, Qwen, GLM, gpt-oss, DeepSeek, …) and **`gemma4`**:
 //!   byte-pair encoding with the vocabulary and the ordered `merges`.
 //!   `tokenizer.ggml.pre` names how text is cut into pieces first (a list of
-//!   patterns, see [`pre_table`]); a name this does not know is an error
+//!   patterns); a name this does not know is an error
 //!   rather than a guess, since tokenizing with the wrong cuts changes the ids
 //!   of ordinary text. Pieces are mapped to the byte-level alphabet, except
 //!   for Gemma 4, which works on raw characters with a `▁` for the space and

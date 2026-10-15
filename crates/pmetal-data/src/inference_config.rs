@@ -1037,7 +1037,11 @@ mod tests {
         use crate::tokenizer::testing::word_level;
         let tokenizer = word_level(
             &["<unk>", "a", "b"],
-            &[("<|im_end|>", true), ("<|eot_id|>", true), ("<|fim|>", true)],
+            &[
+                ("<|im_end|>", true),
+                ("<|eot_id|>", true),
+                ("<|fim|>", true),
+            ],
         );
         let id = |t: &str| tokenizer.inner().token_to_id(t).unwrap();
 

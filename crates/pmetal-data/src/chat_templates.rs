@@ -1156,7 +1156,7 @@ impl ChatTemplate {
     /// **kwargs)` renders it.
     ///
     /// The template is the model's own when it ships one, else the built-in
-    /// format of [`template_type`](Self::template_type) (see [`builtin`]).
+    /// format of [`template_type`](Self::template_type) (the formats of `chat_templates/builtin.rs`).
     ///
     /// An `Err` is the template refusing the conversation (its own
     /// `raise_exception`, such as roles that do not alternate), failing to
