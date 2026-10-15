@@ -22,10 +22,10 @@ use std::rc::Rc;
 
 use common::{SEQ_LEN, cases, every_projection_lora, input_ids};
 use pmetal_lora::AdaptedModel;
-use pmetal_mlx::kernels::with_training_mode;
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::{Array, Dtype, random};
 use pmetal_runtime::inline_array::value_and_grad;
+use pmetal_runtime::nn::with_training_mode;
 
 /// Positions whose logits enter the loss. A few, so the loss stays O(1) and a
 /// finite difference resolves its derivative in f32.

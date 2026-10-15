@@ -174,7 +174,7 @@ pub fn resolve_activation(name: &str) -> Option<Activation> {
 /// regardless of the model's dtype, so any code path that hands a mask straight
 /// to `Array::sdpa_with_mask` has to coerce it first.
 ///
-/// `pmetal_mlx::kernels::fused_sdpa` does this internally; this is for the
+/// `pmetal_runtime::nn::fused_sdpa` does this internally; this is for the
 /// callers that go to the bridge directly.
 pub fn coerce_mask_dtype(query: &Array, mask: Option<&Array>) -> Option<Array> {
     mask.map(|mask| {

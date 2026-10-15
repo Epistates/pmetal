@@ -695,7 +695,7 @@ impl LmHead {
         targets: &Array,
         ignore_index: i32,
     ) -> Result<Array, Exception> {
-        use pmetal_mlx::kernels::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
+        use pmetal_runtime::nn::loss::{CutCrossEntropy, CutCrossEntropyConfig};
 
         let width = hidden.dim(-1);
         let flat = hidden.reshape(&[-1, width]);

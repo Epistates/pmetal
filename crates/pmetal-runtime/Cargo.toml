@@ -24,6 +24,7 @@ strict-errors = []
 
 [dependencies]
 half = { workspace = true }
+tracing = { workspace = true }
 memmap2 = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
@@ -37,6 +38,7 @@ tempfile = { workspace = true }
 # version, so publishing drops it instead of resolving the crate against
 # itself on the registry.
 pmetal-runtime = { path = ".", features = ["strict-errors"] }
+serial_test = { workspace = true }
 
 [build-dependencies]
 cc = { workspace = true }

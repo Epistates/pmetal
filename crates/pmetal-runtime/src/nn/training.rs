@@ -6,13 +6,13 @@
 //!
 //! It does not choose the attention kernel. Attention that a gradient flows
 //! through goes through MLX's SDPA, whose VJP is part of MLX's autodiff;
-//! [`fused_sdpa`](super::fused_attention::fused_sdpa) decides that from the
+//! [`fused_sdpa`](super::attention::fused_sdpa) decides that from the
 //! inputs themselves, so a forward differentiated outside training mode is
 //! covered too.
 
 use std::cell::Cell;
 
-use pmetal_runtime::compat::Exception;
+use crate::compat::Exception;
 
 thread_local! {
     static TRAINING: Cell<bool> = const { Cell::new(false) };

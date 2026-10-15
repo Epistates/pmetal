@@ -438,7 +438,7 @@ pub async fn run_training(
     // Log MLX's default memory configuration for diagnostics.
     // We do NOT override MLX's defaults — it auto-configures based on
     // the Metal device's recommendedMaxWorkingSetSize.
-    pmetal_mlx::memory::log_memory_stats();
+    pmetal_runtime::memory::log_memory_stats();
 
     // -----------------------------------------------------------------------
     // Phase 1: Load or create YAML configuration and merge with job config
@@ -869,16 +869,16 @@ pub async fn run_training(
                 "Training crashed (internal panic)".to_string()
             };
             // Model + optimizer already dropped (catch_unwind closure ended).
-            pmetal_mlx::memory::clear_cache();
-            pmetal_mlx::memory::log_memory_stats();
+            pmetal_runtime::inline_array::clear_cache();
+            pmetal_runtime::memory::log_memory_stats();
             anyhow::bail!(msg);
         }
     };
 
     // For success/error paths, clear cache after extracting the result
     // (model dropped when catch_unwind closure returned).
-    pmetal_mlx::memory::clear_cache();
-    pmetal_mlx::memory::log_memory_stats();
+    pmetal_runtime::inline_array::clear_cache();
+    pmetal_runtime::memory::log_memory_stats();
 
     let (final_loss, final_step, total_tokens) = training_outcome?;
 
@@ -1040,7 +1040,7 @@ fn run_lora_path(
         "Trainable parameters: {}",
         format_param_count(model.num_trainable_params())
     );
-    pmetal_mlx::memory::log_memory_stats();
+    pmetal_runtime::memory::log_memory_stats();
 
     if config.dispatch.gradient_checkpointing {
         if model.supports_gradient_checkpointing() {

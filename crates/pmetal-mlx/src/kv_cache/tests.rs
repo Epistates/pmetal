@@ -771,7 +771,7 @@ fn test_gdn_rollback_matches_never_went_there() {
     let v_trunc = slice_time(&v_full, accepted as i32);
     let g_trunc = slice_time(&g_full, accepted as i32);
     let beta_trunc = slice_time(&beta_full, accepted as i32);
-    let expected_state = crate::kernels::gated_delta_state_advance(
+    let expected_state = pmetal_runtime::nn::gated_delta_state_advance(
         &initial_state,
         &k_trunc,
         &v_trunc,
@@ -788,7 +788,7 @@ fn test_gdn_rollback_matches_never_went_there() {
     let snapshot = entry.snapshot();
 
     // Simulate verify advancing through all K tokens
-    let post_verify = crate::kernels::gated_delta_state_advance(
+    let post_verify = pmetal_runtime::nn::gated_delta_state_advance(
         &initial_state,
         &k_full,
         &v_full,
@@ -831,7 +831,7 @@ fn test_gdn_rollback_zero_accepted_equals_snapshot() {
 
     // Advance state through some verify work
     let (k, v, g, beta) = gdn_random_inputs(1, 3, 2, 8, 4, 5.0);
-    let post = crate::kernels::gated_delta_state_advance(&state, &k, &v, &g, &beta).unwrap();
+    let post = pmetal_runtime::nn::gated_delta_state_advance(&state, &k, &v, &g, &beta).unwrap();
     entry.ssm_state = Some(post);
 
     let conv_input = ops::zeros(&[1, 3, 2], Dtype::Float32);

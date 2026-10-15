@@ -103,7 +103,7 @@ pub fn use_generation_stream() {
 /// Release the Metal buffers MLX's allocator holds for reuse.
 #[inline]
 pub fn clear_generation_caches() {
-    pmetal_mlx::memory::clear_cache();
+    pmetal_runtime::inline_array::clear_cache();
 }
 
 /// Most attention one prefill chunk computes: its length times the depth it
@@ -179,7 +179,7 @@ where
         let logits = forward(&chunk_input)?;
         if end < input_ids.len() {
             logits.eval();
-            pmetal_mlx::memory::clear_cache();
+            pmetal_runtime::inline_array::clear_cache();
         } else {
             last_logits = Some(logits);
         }

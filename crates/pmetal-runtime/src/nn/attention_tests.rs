@@ -493,8 +493,8 @@ fn ops_attention(
 #[test]
 #[serial]
 fn long_sequence_gradients_match_plain_attention() {
-    use pmetal_runtime::compat::nn::value_and_grad_explicit;
-    use pmetal_runtime::compat::random;
+    use crate::compat::nn::value_and_grad_explicit;
+    use crate::compat::random;
     let (heads, kv_heads, head_dim, len) = (4, 2, 128, 1024);
     random::seed(3);
     let draw =
@@ -563,9 +563,9 @@ fn long_sequence_gradients_match_plain_attention() {
 #[serial]
 #[ignore = "benchmark"]
 fn sink_attention_step_against_plain_ops() {
-    use crate::memory::{get_peak_memory, reset_peak_memory};
-    use pmetal_runtime::compat::nn::value_and_grad_explicit;
-    use pmetal_runtime::compat::random;
+    use crate::compat::nn::value_and_grad_explicit;
+    use crate::compat::random;
+    use crate::inline_array::{get_peak_memory, reset_peak_memory};
     use std::time::Instant;
 
     let (heads, kv_heads, head_dim) = (64, 8, 64);
@@ -618,9 +618,9 @@ fn sink_attention_step_against_plain_ops() {
 #[serial]
 #[ignore = "benchmark"]
 fn softcapped_attention_step_against_plain_ops() {
-    use crate::memory::{get_peak_memory, reset_peak_memory};
-    use pmetal_runtime::compat::nn::value_and_grad_explicit;
-    use pmetal_runtime::compat::random;
+    use crate::compat::nn::value_and_grad_explicit;
+    use crate::compat::random;
+    use crate::inline_array::{get_peak_memory, reset_peak_memory};
     use std::time::Instant;
 
     let (heads, kv_heads, head_dim) = (16, 8, 256);

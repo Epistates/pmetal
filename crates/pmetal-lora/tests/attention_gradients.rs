@@ -21,10 +21,10 @@ use std::rc::Rc;
 
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, QLoraConfig, TrainableModel, quantize_base};
-use pmetal_mlx::kernels::with_training_mode;
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::{Array, Dtype, random};
 use pmetal_runtime::inline_array::value_and_grad;
+use pmetal_runtime::nn::with_training_mode;
 
 const SEQ_LEN: i32 = 2048;
 const VOCAB: i32 = 64;

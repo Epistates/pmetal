@@ -110,43 +110,6 @@ pub enum Quantization {
     Q8K,
 }
 
-/// Memory statistics.
-#[derive(Debug, Clone, Default)]
-pub struct MemoryStats {
-    /// Total memory in bytes.
-    pub total_bytes: u64,
-    /// Used memory in bytes.
-    pub used_bytes: u64,
-    /// Peak memory usage in bytes.
-    pub peak_bytes: u64,
-}
-
-impl MemoryStats {
-    /// Used memory in gigabytes.
-    #[must_use]
-    pub fn used_gb(&self) -> f64 {
-        self.used_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    }
-
-    /// Total memory in gigabytes.
-    #[must_use]
-    pub fn total_gb(&self) -> f64 {
-        self.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    }
-
-    /// Peak memory in gigabytes.
-    #[must_use]
-    pub fn peak_gb(&self) -> f64 {
-        self.peak_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-    }
-
-    /// Available memory in gigabytes.
-    #[must_use]
-    pub fn available_gb(&self) -> f64 {
-        self.total_bytes.saturating_sub(self.used_bytes) as f64 / (1024.0 * 1024.0 * 1024.0)
-    }
-}
-
 /// Evaluation metrics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]

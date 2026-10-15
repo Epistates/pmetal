@@ -6,7 +6,7 @@ pub(crate) async fn run_info(json_output: bool) -> anyhow::Result<()> {
         let mut obj = match ctx_result {
             Ok(ctx) => {
                 let props = ctx.properties();
-                build_info_json(props, pmetal_mlx::memory::get_system_memory())
+                build_info_json(props, pmetal_runtime::memory::get_system_memory())
             }
             Err(e) => serde_json::json!({
                 "metal_available": false,
@@ -28,7 +28,7 @@ pub(crate) async fn run_info(json_output: bool) -> anyhow::Result<()> {
         match ctx_result {
             Ok(ctx) => {
                 let props = ctx.properties();
-                for line in build_info_lines(props, pmetal_mlx::memory::get_system_memory()) {
+                for line in build_info_lines(props, pmetal_runtime::memory::get_system_memory()) {
                     println!("{line}");
                 }
             }

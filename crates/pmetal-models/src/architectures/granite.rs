@@ -23,11 +23,11 @@
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn};
 use pmetal_runtime::impl_module_params;
 
-use pmetal_mlx::kernels::{
+use pmetal_mlx::kv_cache::{KVCache, MambaCache};
+use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope},
 };
-use pmetal_mlx::kv_cache::{KVCache, MambaCache};
 
 use serde::{Deserialize, Serialize};
 

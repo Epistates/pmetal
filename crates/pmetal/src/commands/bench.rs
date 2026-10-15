@@ -8,7 +8,6 @@ use pmetal_data::{DatasetColumnConfig, DatasetFormat, TextSample, Tokenizer, Tra
 use pmetal_lora::AdaptedModel;
 use pmetal_metal::MetalContext;
 use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
-use pmetal_mlx::kernels::gated_delta_update_with_chunk_size_override;
 use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
 use pmetal_models::architectures::llama::LlamaConfig;
@@ -18,6 +17,7 @@ use pmetal_models::architectures::qwen3_next::Qwen3NextGatedDeltaNet;
 use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_runtime::compat::module::ModuleParameters as _;
 use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::nn::gated_delta_update_with_chunk_size_override;
 use pmetal_trainer::orchestrator::{FullTrainingConfig, run_training};
 use pmetal_trainer::{DispatchConfig, TrainingJobConfig};
 use serde::{Deserialize, Serialize};
@@ -101,7 +101,7 @@ pub(crate) async fn run_benchmark(
     println!("  Avg Time:       {:.2} ms/iteration", avg_ms);
     println!("  Throughput:     {:.0} tokens/sec", tokens_per_sec);
 
-    let stats = pmetal_mlx::memory::get_memory_stats();
+    let stats = pmetal_runtime::memory::get_memory_stats();
     println!("  Memory Used:    {:.2} GB", stats.used_gb());
     println!("  Peak Memory:    {:.2} GB", stats.peak_gb());
 

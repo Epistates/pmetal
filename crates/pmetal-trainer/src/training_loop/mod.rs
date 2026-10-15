@@ -63,7 +63,7 @@ use pmetal_data::{
     compute_pack_seq_len,
 };
 use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::with_training_mode;
+use pmetal_runtime::nn::with_training_mode;
 
 use crate::mlx_metal_optimizer::{MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available};
 use crate::step_check::{check_grad_norm, check_step};
@@ -1060,8 +1060,8 @@ impl TrainingLoop {
         loss.eval();
         let micro_batch_loss = check_step(self.step + 1, loss.item::<f32>())?;
         if self.step <= 3 {
-            let active = pmetal_mlx::memory::get_active_memory();
-            let cache = pmetal_mlx::memory::get_cache_memory();
+            let active = pmetal_runtime::inline_array::get_active_memory();
+            let cache = pmetal_runtime::inline_array::get_cache_memory();
             tracing::info!(
                 step = self.step,
                 loss = micro_batch_loss,

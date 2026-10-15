@@ -35,7 +35,7 @@
 //! - beta: `[B, T, Hv]`
 //! - state: `[B, Hv, Dv, Dk]`
 
-use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
+use crate::compat::{Array, Dtype, Exception, ops};
 
 /// Default chunk size for the chunkwise parallel GDN algorithm: sequences
 /// longer than this take the chunk path.
@@ -724,7 +724,7 @@ fn try_gdn_metal_kernel(
     }
     // It is a custom kernel with no VJP: under a gradient trace it fails, and
     // the step with it. The ops path differentiates.
-    if super::utils::any_traced(&[q, k, v, g, beta, state]) {
+    if super::any_traced(&[q, k, v, g, beta, state]) {
         return Ok(None);
     }
     let dk = q.dim(3) as usize;

@@ -51,11 +51,11 @@ use pmetal_runtime::compat::{Array, Exception, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
-use pmetal_mlx::kernels::{
+use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope, rope_with_periods},
 };
-use pmetal_mlx::kv_cache::KVCache;
 
 /// Apply Gemma 4 partial rotary embedding to a `[B, H, L, head_dim]` tensor.
 ///

@@ -18,22 +18,15 @@
 #![warn(missing_docs)]
 
 pub mod bridge;
-pub mod kernels;
 pub mod kv_cache;
-pub mod memory;
-pub mod moe;
 pub mod prefix_cache;
 pub mod speculative;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 
-#[cfg(test)]
-mod f64_reference;
-
 pub use bridge::MlxMetalBridge;
 pub use kv_cache::*;
-pub use moe::*;
 pub use prefix_cache::*;
 pub use speculative::*;
 
@@ -45,10 +38,7 @@ pub type Result<T> = std::result::Result<T, Exception>;
 
 /// Prelude module for convenient imports.
 pub mod prelude {
-    pub use crate::kernels::*;
     pub use crate::kv_cache::*;
-    pub use crate::memory::*;
-    pub use crate::moe::*;
     pub use crate::prefix_cache::*;
     pub use crate::speculative::*;
     pub use pmetal_runtime::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};

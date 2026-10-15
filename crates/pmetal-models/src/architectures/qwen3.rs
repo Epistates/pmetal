@@ -17,11 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
-use pmetal_mlx::kernels::{
+use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
 };
-use pmetal_mlx::kv_cache::KVCache;
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 
 fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> nn::Linear {

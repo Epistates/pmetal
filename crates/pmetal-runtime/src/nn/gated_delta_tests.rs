@@ -16,8 +16,8 @@
 //! to about 1e-9, far inside the f32 paths' own error.
 
 use super::*;
+use crate::compat::nn::value_and_grad_explicit;
 use crate::f64_reference::*;
-use pmetal_runtime::compat::nn::value_and_grad_explicit;
 use serial_test::serial;
 
 // ---------------------------------------------------------------------------
@@ -940,13 +940,13 @@ fn the_state_advance_replays_a_prefix() {
 #[serial]
 #[ignore = "benchmark"]
 fn chunked_training_step_against_sequential() {
-    use crate::memory::{get_peak_memory, reset_peak_memory};
+    use crate::inline_array::{get_peak_memory, reset_peak_memory};
     use std::time::Instant;
 
     let (hk, hv, dk, dv) = (16, 32, 128, 128);
     for t in [256_i32, 1024, 4096] {
         let rng_inputs = |shape: &[i32]| {
-            pmetal_runtime::compat::random::normal(shape, Dtype::Float32)
+            crate::compat::random::normal(shape, Dtype::Float32)
                 .multiply(&Array::from_f32(0.5))
                 .as_dtype(Dtype::Bfloat16.as_i32())
         };

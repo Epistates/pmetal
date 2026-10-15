@@ -49,7 +49,6 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pmetal_mlx::kernels::rope::{RopePositions, rope};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_runtime::compat::ops::{slice_axis, slice_axis_from, slice_last_from, slice_last_to};
@@ -58,6 +57,7 @@ use pmetal_runtime::compat::{
     Param, Parameter, VisitLinears, child_path, fast, nn, ops,
 };
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::nn::rope::{RopePositions, rope};
 use serde::{Deserialize, Serialize};
 
 use super::qwen3_next::{

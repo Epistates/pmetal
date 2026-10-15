@@ -30,12 +30,12 @@ use pmetal_runtime::gpt_oss_native::GptOssExperts;
 
 /// gpt-oss's GLU slope, `gate · σ(1.702 · gate)`.
 const SWIGLU_ALPHA: f32 = 1.702;
-use pmetal_mlx::kernels::{
+use pmetal_mlx::kv_cache::KVCache;
+use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig,
     rope::{RopePositions, rope_embedding},
     sink_sdpa,
 };
-use pmetal_mlx::kv_cache::KVCache;
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 

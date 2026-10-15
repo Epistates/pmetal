@@ -4,13 +4,13 @@
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, is_training,
-    rope::{RopePositions, rope_embedding},
-};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception, Module, nn};
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::nn::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, is_training,
+    rope::{RopePositions, rope_embedding},
+};
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 

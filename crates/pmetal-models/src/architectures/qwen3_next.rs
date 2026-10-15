@@ -32,15 +32,14 @@ use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig,
-    fused_moe::moe_combine_mlx,
-    fused_sdpa,
-    gated_delta::gated_delta_update,
-    rope::{RopePositions, rope_embedding},
-};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
 use pmetal_runtime::native_weight::LayerWeight;
+use pmetal_runtime::nn::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    gated_delta::gated_delta_update,
+    moe_combine,
+    rope::{RopePositions, rope_embedding},
+};
 
 // ============================================================================
 // Configuration
@@ -1458,7 +1457,7 @@ impl Qwen3NextGatedDeltaNet {
         // them in the capture — the internal implementation derives them
         // from (a, b_val, a_log, dt_bias) on every call.
         let beta = b_val.sigmoid();
-        let g = pmetal_mlx::kernels::compute_g(self.a_log.as_ref(), a, self.dt_bias.as_ref())?;
+        let g = pmetal_runtime::nn::compute_g(self.a_log.as_ref(), a, self.dt_bias.as_ref())?;
 
         // Record the rollback inputs before advancing the state.
         if let Some((layer_idx, buf)) = capture {
@@ -1489,7 +1488,7 @@ impl Qwen3NextGatedDeltaNet {
 
         // Use the inference dispatch with the pre-computed g/beta so the
         // capture and the recurrence share the exact same tensors.
-        let (out, new_state) = pmetal_mlx::kernels::gated_delta_inference_dispatch(
+        let (out, new_state) = pmetal_runtime::nn::gated_delta_inference_dispatch(
             &q_normed, &k_normed, &v_conv, &g, &beta, state_ref, mask,
         )?;
         if let Some(cache) = cache {
@@ -2414,7 +2413,7 @@ impl Qwen3NextSparseMoeBlock {
         // Combine: weighted expert sum + sigmoid-gated shared expert. The
         // decoder layer adds the residual.
         // Pure MLX ops — all async on GPU, no synchronization barriers
-        let result = moe_combine_mlx(
+        let result = moe_combine(
             &down_out,
             &top_weights,
             &shared_y,
@@ -2786,7 +2785,7 @@ impl Qwen3NextSparseMoeBlock {
                 let combine_start = Instant::now();
                 let window_down_out =
                     ops::stack_axis(&window_down_tokens, 0).reshape(&[window_len, k, hidden]);
-                let window_output = moe_combine_mlx(
+                let window_output = moe_combine(
                     &window_down_out,
                     &window_top_weights,
                     &shared_y,
@@ -3043,7 +3042,7 @@ impl Qwen3NextSparseMoeBlock {
                 profile.push_section("moe_output_wrap", output_wrap_start);
             }
 
-            let result = moe_combine_mlx(
+            let result = moe_combine(
                 &down_out,
                 &top_weights,
                 &shared_y,

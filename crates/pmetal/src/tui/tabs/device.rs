@@ -75,7 +75,7 @@ pub struct MemorySnapshot {
 
 impl MemorySnapshot {
     pub fn query() -> Self {
-        let stats = pmetal_mlx::memory::get_memory_stats();
+        let stats = pmetal_runtime::memory::get_memory_stats();
         Self {
             total_gb: stats.total_gb(),
             used_gb: stats.used_gb(),

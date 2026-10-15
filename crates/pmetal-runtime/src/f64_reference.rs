@@ -6,8 +6,8 @@
 //! it computes (written in plain loops in the test), not against another f32
 //! path that may share its mistakes.
 
-use pmetal_runtime::compat::nn::value_and_grad_explicit;
-use pmetal_runtime::compat::{Array, Dtype};
+use crate::compat::nn::value_and_grad_explicit;
+use crate::compat::{Array, Dtype};
 
 // Deterministic data
 
@@ -57,7 +57,7 @@ pub(crate) fn vec_of(a: &Array) -> Vec<f64> {
 }
 
 pub(crate) fn drain() {
-    if let Err(e) = pmetal_runtime::check_unobserved_error() {
+    if let Err(e) = crate::check_unobserved_error() {
         panic!("a runtime op threw: {e}");
     }
 }

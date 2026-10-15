@@ -17,7 +17,7 @@
 //! right, so a query shorter than its keys (the continuation of a cached
 //! prompt, or one decoded token) sees the most recent keys.
 
-use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
+use crate::compat::{Array, Dtype, Exception, ops};
 
 /// Attention mask type for fused attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -377,5 +377,5 @@ pub fn create_sliding_window_mask(
 }
 
 #[cfg(test)]
-#[path = "fused_attention_tests.rs"]
+#[path = "attention_tests.rs"]
 mod tests;

@@ -1,23 +1,55 @@
-//! Memory statistics for Apple Silicon.
-//!
-//! The allocator's own counters come from `pmetal-runtime` (re-exported
-//! below for the callers that already reach them here); this module adds the
-//! process-level figures, the installed RAM as the device reports it, and the
+//! Memory figures for Apple Silicon: the allocator's counters, the process's
+//! resident size, the installed RAM as the device reports it, and the
 //! estimates the trainers use to size a run.
-
-#![allow(unsafe_code)]
+//!
+//! The allocator's own counters (`get_active_memory`, `get_peak_memory`,
+//! `clear_cache`, ...) are in [`crate::inline_array`]; this module adds what
+//! is built on them.
 
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
-use pmetal_core::MemoryStats;
-
-pub use pmetal_runtime::inline_array::{
-    clear_cache, get_active_memory, get_cache_memory, get_peak_memory, reset_peak_memory,
-};
+use crate::inline_array::{get_active_memory, get_cache_memory, get_peak_memory};
 
 #[cfg(target_os = "macos")]
 static SYSTEM_MEMORY_BYTES: OnceLock<Option<u64>> = OnceLock::new();
+
+/// Memory statistics.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryStats {
+    /// Total memory in bytes.
+    pub total_bytes: u64,
+    /// Used memory in bytes.
+    pub used_bytes: u64,
+    /// Peak memory usage in bytes.
+    pub peak_bytes: u64,
+}
+
+impl MemoryStats {
+    /// Used memory in gigabytes.
+    #[must_use]
+    pub fn used_gb(&self) -> f64 {
+        self.used_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Total memory in gigabytes.
+    #[must_use]
+    pub fn total_gb(&self) -> f64 {
+        self.total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Peak memory in gigabytes.
+    #[must_use]
+    pub fn peak_gb(&self) -> f64 {
+        self.peak_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Available memory in gigabytes.
+    #[must_use]
+    pub fn available_gb(&self) -> f64 {
+        self.total_bytes.saturating_sub(self.used_bytes) as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Diagnostics
@@ -30,8 +62,8 @@ pub fn log_memory_stats() {
         format_bytes(get_active_memory() as u64),
         format_bytes(get_cache_memory() as u64),
         format_bytes(get_peak_memory() as u64),
-        format_bytes(pmetal_runtime::inline_array::get_memory_limit() as u64),
-        format_bytes(pmetal_runtime::inline_array::get_max_recommended_size() as u64),
+        format_bytes(crate::inline_array::get_memory_limit() as u64),
+        format_bytes(crate::inline_array::get_max_recommended_size() as u64),
     );
 }
 
@@ -122,7 +154,7 @@ pub fn get_system_memory() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         *SYSTEM_MEMORY_BYTES.get_or_init(|| {
-            pmetal_runtime::inline_array::device_info()
+            crate::inline_array::device_info()
                 .ok()
                 .map(|device| device.memory_size)
         })
@@ -222,7 +254,7 @@ mod tests {
     /// and free concurrently, so only a lower bound is stable.)
     #[test]
     fn the_stats_follow_the_allocator() {
-        use pmetal_runtime::compat::{Dtype, ops};
+        use crate::compat::{Dtype, ops};
         let x = ops::ones(&[1024, 1024], Dtype::Float32);
         x.eval();
         let stats = get_memory_stats();

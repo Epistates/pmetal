@@ -94,7 +94,7 @@ impl InlineArray {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     // TODO(gdn): candidate entry point for Qwen3Next GDN; current code calls
-    // the fused kernel directly via `pmetal_mlx::kernels::gated_delta`. Keep
+    // the fused kernel directly via `pmetal_runtime::nn::gated_delta`. Keep
     // until the bridge-level wrapper is chosen as the canonical surface.
     pub fn gdn_update(
         q: &Self,

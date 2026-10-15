@@ -1872,7 +1872,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Memory { json } => {
-            let stats = pmetal_mlx::memory::get_memory_stats();
+            let stats = pmetal_runtime::memory::get_memory_stats();
             if json {
                 let obj = serde_json::json!({
                     "total_gb": stats.total_gb(),

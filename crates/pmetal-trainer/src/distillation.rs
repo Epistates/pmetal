@@ -6,8 +6,8 @@
 use pmetal_data::{DataLoader, TrainingBatch, TrainingDataset};
 use pmetal_distill::{DistillLossOutput, Distiller, LogitCache};
 use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::with_training_mode;
 use pmetal_runtime::compat::{Array, Dtype, Exception, nn, optimizers::Optimizer};
+use pmetal_runtime::nn::with_training_mode;
 
 use crate::{
     AdaptiveAction, CheckpointManager, CheckpointMetadata, Result, SftError, StepStats,

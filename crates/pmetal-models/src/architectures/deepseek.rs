@@ -11,16 +11,16 @@
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, rope_embedding},
-};
 use pmetal_mlx::kv_cache::KVCache;
-use pmetal_mlx::moe::Expert;
 use pmetal_runtime::compat::{
     Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn, ops,
 };
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::nn::Expert;
+use pmetal_runtime::nn::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopePositions, rope_embedding},
+};
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 use serde::{Deserialize, Serialize};
 

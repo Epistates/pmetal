@@ -2,7 +2,7 @@
 
 use pmetal_runtime::compat::{Array, Exception};
 
-use crate::kernels::FusedAttentionConfig;
+use pmetal_runtime::nn::FusedAttentionConfig;
 
 use super::affine::AffineLayer;
 use super::dense::{DenseLayer, Window};
@@ -302,7 +302,7 @@ impl KVCache {
                 layer_idx, self.config.num_layers
             )));
         }
-        use crate::kernels::AttentionMaskType;
+        use pmetal_runtime::nn::AttentionMaskType;
         let single_token = queries.ndim() == 4
             && queries.dim(2) == 1
             && new_keys.ndim() == 4

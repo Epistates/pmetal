@@ -11,7 +11,11 @@
 //!
 //! The `compat` module builds the model-facing API on top of it (`Array`,
 //! `Dtype`, `Module`, `ModuleParameters`, optimizers, layers, etc.), so model
-//! code never touches the FFI directly.
+//! code never touches the FFI directly. The `nn` module holds the operations
+//! a model's forward and loss are built from (attention, the gated delta rule,
+//! the cut cross-entropy loss, rotary embeddings at explicit positions, the
+//! mixture-of-experts combine), and `memory` the allocator and system memory
+//! figures.
 
 #[macro_use]
 mod bridge_extern;
@@ -44,6 +48,8 @@ pub mod distributed;
 pub mod optimizer;
 pub use optimizer::{AdamW, ParamClass, ParamSet};
 
+pub mod memory;
+pub mod nn;
 pub mod rope;
 
 pub mod mlx_quant;
@@ -63,3 +69,6 @@ pub mod gemma4_native;
 pub mod gpt_oss_native;
 pub mod llama4_native;
 pub mod qwen3_native;
+
+#[cfg(test)]
+mod f64_reference;

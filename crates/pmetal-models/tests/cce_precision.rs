@@ -16,12 +16,12 @@
 
 use std::time::Instant;
 
-use pmetal_mlx::kernels::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
 use pmetal_models::dispatcher::{DynamicModel, LmHead};
 use pmetal_runtime::compat::{Array, Dtype, ops};
 use pmetal_runtime::inline_array::{
     clear_cache, get_active_memory, get_peak_memory, reset_peak_memory, value_and_grad,
 };
+use pmetal_runtime::nn::loss::{CutCrossEntropy, CutCrossEntropyConfig};
 
 const TEST_NAME: &str = "cut_cross_entropy_precision_on_a_real_checkpoint";
 

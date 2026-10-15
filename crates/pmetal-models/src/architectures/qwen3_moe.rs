@@ -6,17 +6,17 @@
 //! - RMSNorm applied to Q and K before RoPE (q_norm, k_norm)
 //! - SwitchGLU-style expert MLP with gather_mm
 
-use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopePositions, rope_embedding},
-};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_runtime::compat::{
     Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn,
 };
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::nn::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopePositions, rope_embedding},
+};
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
-// MoE block uses pmetal_mlx::moe::Expert directly for individual expert MLPs
+// MoE block uses pmetal_runtime::nn::Expert directly for individual expert MLPs
 use serde::{Deserialize, Serialize};
 
 use crate::checkpointing::checkpointed_layer;
@@ -398,7 +398,7 @@ pub struct Qwen3MoEBlock {
     /// Gate projection (routes to experts).
     pub gate: nn::Linear,
     /// Expert MLPs.
-    pub experts: Vec<pmetal_mlx::moe::Expert>,
+    pub experts: Vec<pmetal_runtime::nn::Expert>,
     /// Stacked gate projection weights `[num_experts, hidden, intermediate]`.
     pub stacked_gate_proj: Option<Array>,
     /// Stacked up projection weights `[num_experts, hidden, intermediate]`.
@@ -421,7 +421,7 @@ impl Qwen3MoEBlock {
             .build()?;
 
         let experts = (0..num_experts)
-            .map(|_| pmetal_mlx::moe::Expert::new(config.hidden_size, moe_intermediate))
+            .map(|_| pmetal_runtime::nn::Expert::new(config.hidden_size, moe_intermediate))
             .collect();
 
         Ok(Self {

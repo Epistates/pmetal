@@ -13,9 +13,9 @@
 
 use std::time::Instant;
 
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, TurboQuantConfig};
 use pmetal_runtime::compat::{Array, Dtype};
+use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 
 const LAYERS: usize = 8;
 const HQ: i32 = 32;

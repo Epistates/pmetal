@@ -66,7 +66,7 @@ pub fn device_info() -> DeviceInfo {
 fn get_memory_info() -> (f64, f64) {
     #[cfg(feature = "mlx")]
     {
-        let stats = pmetal_mlx::memory::get_memory_stats();
+        let stats = pmetal_runtime::memory::get_memory_stats();
         let total_gb = stats.total_gb();
         let available_gb = total_gb - stats.used_gb();
         (total_gb, available_gb.max(0.0))

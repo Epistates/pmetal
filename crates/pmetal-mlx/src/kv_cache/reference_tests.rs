@@ -775,7 +775,7 @@ fn quantized_cache_elements_are_within_half_a_step() {
 
 #[test]
 fn quantized_decode_attention_matches_attention_over_the_dequantized_cache() {
-    use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
+    use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
     for (key_bits, value_bits) in [(8u8, 8u8), (4, 4), (8, 4), (4, 2)] {
         for window in [None, Some(9)] {
             let config = cache_config().with_asymmetric_quantized(key_bits, value_bits, 32);
@@ -817,7 +817,7 @@ fn quantized_decode_attention_matches_attention_over_the_dequantized_cache() {
 
 #[test]
 fn quantized_attention_declines_what_it_cannot_serve() {
-    use crate::kernels::FusedAttentionConfig;
+    use pmetal_runtime::nn::FusedAttentionConfig;
     let mut cache = KVCache::new(quantized_config(4));
     let mut rng = Rng::new(51);
     let prompt = array(&rng.normals(HKV * 8 * DIM, 1.0), &[1, HKV, 8, DIM]);
@@ -989,7 +989,7 @@ fn turboquant_rollback_matches_the_accepted_sequence() {
 
 #[test]
 fn turboquant_packed_attention_matches_attention_over_the_dequantized_cache() {
-    use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
+    use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
     // A 6-token window leaves most of 60 tokens packed.
     let config = TurboQuantConfig::uniform(4, 4)
         .with_recent_window(Some(6))
@@ -1009,7 +1009,7 @@ fn turboquant_packed_attention_matches_attention_over_the_dequantized_cache() {
         let mask_type = window.map_or(AttentionMaskType::Causal, |w| {
             AttentionMaskType::SlidingWindow(w)
         });
-        let attn = crate::kernels::FusedAttentionConfig::new(HQ as i32, HKV as i32, DIM as i32)
+        let attn = pmetal_runtime::nn::FusedAttentionConfig::new(HQ as i32, HKV as i32, DIM as i32)
             .with_scale(scale())
             .with_mask_type(mask_type);
         let out = fast
@@ -1030,7 +1030,7 @@ fn turboquant_packed_attention_matches_attention_over_the_dequantized_cache() {
 
 #[test]
 fn turboquant_mixed_precision_attends_through_dequantization() {
-    use crate::kernels::FusedAttentionConfig;
+    use pmetal_runtime::nn::FusedAttentionConfig;
     let mut cache = KVCache::new(turbo(TurboQuantConfig::preset_q2_5(DIM)));
     let mut rng = Rng::new(72);
     let prompt = array(&rng.normals(HKV * 20 * DIM, 1.0), &[1, HKV, 20, DIM]);
