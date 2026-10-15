@@ -2726,6 +2726,76 @@ mod argv_roundtrip {
 
     #[cfg(feature = "trainer")]
     #[test]
+    fn train_mtp_draft_and_diffusion_specs_round_trip() {
+        use pmetal_core::jobs::{TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec};
+        for family in ["auto", "qwen3-next", "gemma4"] {
+            let spec = TrainMtpSpec {
+                model: "m".into(),
+                family: family.into(),
+                shards: vec!["a.bin".into(), "b.bin".into()],
+                lr_schedule: "wsd".into(),
+                init_mtp: Some("mtp".into()),
+                ..Default::default()
+            };
+            let parsed = try_parse("train-mtp", spec.to_argv())
+                .unwrap_or_else(|e| panic!("family {family}: {e}"));
+            let Commands::TrainMtp(args) = parsed else {
+                panic!("not train-mtp")
+            };
+            assert_eq!(args.shards, ["a.bin", "b.bin"]);
+            assert_eq!(args.lr_schedule, pmetal_core::LrSchedulerType::Wsd);
+        }
+        let spec = TrainDraftSpec {
+            target: "t".into(),
+            draft_config: Some("c.json".into()),
+            shards: vec!["a.bin".into()],
+            ..Default::default()
+        };
+        let Commands::TrainDraft(args) = try_parse("train-draft", spec.to_argv()).unwrap() else {
+            panic!("not train-draft")
+        };
+        assert_eq!(args.draft_config.as_deref(), Some("c.json"));
+        for quantization in ["none", "nf4", "fp4", "int8"] {
+            let spec = TrainDiffusionSpec {
+                model: "m".into(),
+                dataset: "d".into(),
+                quantization: quantization.into(),
+                double_quant: quantization == "nf4",
+                ..Default::default()
+            };
+            let parsed = try_parse("train-diffusion", spec.to_argv())
+                .unwrap_or_else(|e| panic!("quantization {quantization}: {e}"));
+            let Commands::TrainDiffusion(args) = parsed else {
+                panic!("not train-diffusion")
+            };
+            assert_eq!(args.lora_targets, ["q_proj", "k_proj", "v_proj", "o_proj"]);
+        }
+    }
+
+    #[cfg(feature = "trainer")]
+    #[test]
+    fn train_diffusion_corrupted_only_can_be_turned_off() {
+        // `--corrupted-only` defaults to true and used to be a set-true flag,
+        // so the documented "when false, average over the whole canvas" mode
+        // could not be selected.
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<String> = ["--model", "m", "--dataset", "d"]
+                .map(String::from)
+                .to_vec();
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            match try_parse("train-diffusion", argv) {
+                Ok(Commands::TrainDiffusion(args)) => args.corrupted_only,
+                Ok(_) => panic!("not train-diffusion"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert!(parse(&[]));
+        assert!(parse(&["--corrupted-only", "true"]));
+        assert!(!parse(&["--corrupted-only", "false"]));
+    }
+
+    #[cfg(feature = "trainer")]
+    #[test]
     fn a_schedule_the_trainer_supports_reaches_it_and_a_typo_is_refused() {
         // `train-mtp` and `train-draft` used to read any name but constant
         // and linear as cosine, so `wsd` trained on the wrong curve.

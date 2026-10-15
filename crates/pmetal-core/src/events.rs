@@ -33,6 +33,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum JobKind {
     /// Supervised fine-tuning / LoRA / QLoRA.
     Train,
+    /// Gemma 4 assistant or Qwen3-Next MTP predictor training.
+    TrainMtp,
+    /// DFlash block-diffusion draft model training.
+    TrainDraft,
+    /// DiffusionGemma block-diffusion LoRA fine-tuning.
+    TrainDiffusion,
     /// Knowledge distillation.
     Distill,
     /// Group Relative Policy Optimization.

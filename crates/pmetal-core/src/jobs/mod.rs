@@ -34,6 +34,9 @@ pub mod rlkd;
 pub mod serve;
 pub mod tokenize;
 pub mod train;
+pub mod train_diffusion;
+pub mod train_draft;
+pub mod train_mtp;
 
 pub use bench::BenchSpec;
 pub use decide::DecideSpec;
@@ -53,6 +56,9 @@ pub use rlkd::RlkdSpec;
 pub use serve::ServeSpec;
 pub use tokenize::TokenizeSpec;
 pub use train::TrainSpec;
+pub use train_diffusion::TrainDiffusionSpec;
+pub use train_draft::TrainDraftSpec;
+pub use train_mtp::TrainMtpSpec;
 
 /// Default of every spec's `optimizer` field.
 pub(crate) fn default_optimizer() -> String {
