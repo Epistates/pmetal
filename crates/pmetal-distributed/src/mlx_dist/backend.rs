@@ -68,70 +68,54 @@ impl DistributedBackend for MlxDistributedBackend {
         self.group.size() as usize
     }
 
-    async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()> {
-        // Reinterpret the byte buffer as f32 values (same alignment requirement
-        // as the TCP ring backend).
-        if !buffer.len().is_multiple_of(4) {
-            anyhow::bail!(
-                "MlxDistributedBackend::all_reduce: buffer length {} is not a multiple of 4",
-                buffer.len()
-            );
-        }
-
-        let num_elements = buffer.len() / 4;
-        #[allow(unsafe_code)]
-        let f32_slice = unsafe {
-            // SAFETY: buffer is valid, properly aligned for f32 (caller
-            // guarantees gradient buffers are f32-aligned), and length
-            // was verified to be a multiple of 4 above.
-            std::slice::from_raw_parts(buffer.as_ptr().cast::<f32>(), num_elements)
-        };
-
-        // Create an MLX array from the buffer.
-        let shape = [num_elements as i32];
-        let arr = Array::from_f32_slice(f32_slice, &shape);
-
-        // Perform all_sum using MLX native collectives.
-        let reduced = ops::all_sum(&arr, Some(&self.group))
-            .map_err(|e| anyhow::anyhow!("mlx all_sum failed: {e}"))?;
-
-        // If Mean reduction, divide by world_size.
-        let result = match op {
-            ReduceOp::Sum => reduced,
-            ReduceOp::Mean => {
-                let divisor = Array::from_f32_slice(&[self.group.size() as f32], &[1]);
-                reduced.divide(&divisor)
+    async fn all_reduce_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<()> {
+        // MLX array shapes are `i32`, so a buffer past 2^31 elements goes in
+        // pieces (each rank cuts at the same places: lengths agree).
+        const MAX_ELEMS: usize = 1 << 30;
+        let size = self.group.size() as f32;
+        blocking(|| {
+            for part in data.chunks_mut(MAX_ELEMS) {
+                let arr = Array::from_f32_slice(part, &[part.len() as i32]);
+                let reduced = ops::all_sum(&arr, Some(&self.group))
+                    .map_err(|e| anyhow::anyhow!("mlx all_sum failed: {e}"))?;
+                let mut result = match op {
+                    ReduceOp::Sum => reduced,
+                    ReduceOp::Mean => reduced.divide(&Array::from_f32_slice(&[size], &[1])),
+                };
+                result
+                    .try_eval()
+                    .map_err(|e| anyhow::anyhow!("mlx all_reduce failed: {e}"))?;
+                let values = result
+                    .to_f32_vec(part.len())
+                    .ok_or_else(|| anyhow::anyhow!("mlx all_reduce: could not read the result"))?;
+                part.copy_from_slice(&values);
             }
-        };
-
-        // Evaluate the computation graph.
-        let mut result = result;
-        result.eval();
-
-        // Copy the result back into the caller's buffer.
-        let result_data = result
-            .to_f32_vec(num_elements)
-            .ok_or_else(|| anyhow::anyhow!("mlx eval failed: could not extract f32 data"))?;
-
-        #[allow(unsafe_code)]
-        let out_f32 = unsafe {
-            // SAFETY: buffer is valid for writes, properly aligned for f32,
-            // and length was verified above.
-            std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<f32>(), num_elements)
-        };
-        out_f32.copy_from_slice(&result_data[..num_elements]);
-
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn barrier(&self) -> Result<()> {
-        // MLX doesn't have an explicit barrier. Use all_sum of a zero scalar
-        // as a synchronization point — all ranks must participate.
-        let zero = Array::from_f32_slice(&[0.0f32], &[1]);
-        let result = ops::all_sum(&zero, Some(&self.group))
-            .map_err(|e| anyhow::anyhow!("mlx barrier (all_sum) failed: {e}"))?;
-        result.eval();
-        Ok(())
+        // MLX has no explicit barrier; an all_sum of a scalar needs every rank.
+        blocking(|| {
+            let zero = Array::from_f32_slice(&[0.0f32], &[1]);
+            let result = ops::all_sum(&zero, Some(&self.group))
+                .map_err(|e| anyhow::anyhow!("mlx barrier (all_sum) failed: {e}"))?;
+            result
+                .try_eval()
+                .map_err(|e| anyhow::anyhow!("mlx barrier failed: {e}"))?;
+            Ok(())
+        })
+    }
+}
+
+/// Run a blocking MLX collective without stalling the async executor's
+/// other tasks: on a multi-threaded runtime the worker is handed off, on a
+/// single-threaded one there is nothing to hand off to.
+fn blocking<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
     }
 }
 

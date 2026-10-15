@@ -31,6 +31,23 @@ pub enum ClusterSubcommand {
     /// transport + result loopback work correctly across machines.
     /// (The model integration is wired separately in the inference engine.)
     PipelineBench(PipelineBenchArgs),
+
+    /// Create the cluster secret. Every link between ranks is authenticated
+    /// and encrypted with keys derived from it, so every machine in the
+    /// cluster needs the same one and no other machine can join.
+    Keygen(KeygenArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct KeygenArgs {
+    /// Where to write the secret (default: ~/.pmetal/cluster_secret).
+    #[arg(long, value_name = "PATH")]
+    pub output: Option<std::path::PathBuf>,
+
+    /// Replace an existing secret. Machines still holding the old one can
+    /// no longer join the cluster.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]

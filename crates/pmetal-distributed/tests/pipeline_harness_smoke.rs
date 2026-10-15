@@ -70,6 +70,9 @@ async fn run_worker() {
         codec: ActivationCodec::None,
         connection_timeout_ms: 30_000,
         max_retries: 60,
+        // Both ranks find the cluster secret in their environment.
+        secret: None,
+        allow_plaintext: false,
     };
 
     let harness = PipelineHarness::start_explicit(peer_addrs, profiles, rank, cfg)
@@ -177,8 +180,13 @@ fn pipeline_harness_two_process_smoke() {
 
     eprintln!("parent: spawning ranks (act0={port_0}, act1={port_1}, result={result_port})");
 
+    // One secret for the whole cluster, handed to both ranks the way an
+    // operator would: through the environment.
+    let secret = pmetal_distributed::ClusterSecret::generate().to_hex();
+
     let mut child_0 = std::process::Command::new(&bin)
         .env(ENV_RANK, "0")
+        .env(pmetal_distributed::secret::ENV_VAR, &secret)
         .env(ENV_ACT0, port_0.to_string())
         .env(ENV_ACT1, port_1.to_string())
         .env(ENV_RESULT, result_port.to_string())
@@ -190,6 +198,7 @@ fn pipeline_harness_two_process_smoke() {
 
     let mut child_1 = std::process::Command::new(&bin)
         .env(ENV_RANK, "1")
+        .env(pmetal_distributed::secret::ENV_VAR, &secret)
         .env(ENV_ACT0, port_0.to_string())
         .env(ENV_ACT1, port_1.to_string())
         .env(ENV_RESULT, result_port.to_string())

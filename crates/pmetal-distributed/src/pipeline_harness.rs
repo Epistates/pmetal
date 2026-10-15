@@ -29,8 +29,11 @@ use crate::auto::AutoDiscoveryBackend;
 use crate::config::DistributedConfig;
 use crate::error::{DistributedError, DistributedResult};
 use crate::pipeline::{PipelineStageConfig, PipelineStageRuntime, solve_layer_assignment};
+use crate::secret::ClusterSecret;
 use crate::topology::NodeProfile;
-use crate::transport::TcpTransport;
+use crate::transport::{
+    Channel, LinkParams, LinkSecurity, RingMembership, TcpTransport, accept_authenticated,
+};
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::sync::Arc;
@@ -62,6 +65,12 @@ pub struct PipelineHarnessConfig {
     pub connection_timeout_ms: u64,
     /// Maximum connection retries.
     pub max_retries: u32,
+    /// The cluster secret that authenticates and encrypts the links. Left
+    /// unset it is looked up as [`ClusterSecret::resolve`] does.
+    pub secret: Option<ClusterSecret>,
+    /// Run the links unauthenticated and unencrypted when no secret exists.
+    /// For local experiments only.
+    pub allow_plaintext: bool,
 }
 
 impl Default for PipelineHarnessConfig {
@@ -74,6 +83,8 @@ impl Default for PipelineHarnessConfig {
             codec: ActivationCodec::Float16,
             connection_timeout_ms: 30_000,
             max_retries: 50,
+            secret: None,
+            allow_plaintext: false,
         }
     }
 }
@@ -116,7 +127,7 @@ impl PipelineHarness {
         backend: Arc<AutoDiscoveryBackend>,
         cfg: PipelineHarnessConfig,
     ) -> DistributedResult<Self> {
-        let (peer_addrs, profiles, local_rank, _world_size) = {
+        let (peer_addrs, profiles, local_rank, membership) = {
             let topo = backend.topology();
             let topo = topo.read();
             let order = topo.ring_order();
@@ -140,10 +151,14 @@ impl PipelineHarness {
                 })
                 .collect();
             let profiles: Vec<NodeProfile> = order.iter().map(|n| n.profile.clone()).collect();
-            (peer_addrs, profiles, local_rank, world_size)
+            // Each machine reaches its peers at different, fabric-specific
+            // addresses, so the ring is identified by who is in it.
+            let ids: Vec<Vec<u8>> = order.iter().map(|n| n.peer_id.to_bytes()).collect();
+            let membership = RingMembership::from_ids(local_rank, &ids);
+            (peer_addrs, profiles, local_rank, membership)
         };
 
-        Self::start_explicit(peer_addrs, profiles, local_rank, cfg).await
+        Self::start_with_membership(peer_addrs, profiles, local_rank, cfg, Some(membership)).await
     }
 
     /// Stand up the pipeline ring directly from explicit peer addresses
@@ -154,6 +169,16 @@ impl PipelineHarness {
         profiles: Vec<NodeProfile>,
         local_rank: usize,
         cfg: PipelineHarnessConfig,
+    ) -> DistributedResult<Self> {
+        Self::start_with_membership(peer_addrs, profiles, local_rank, cfg, None).await
+    }
+
+    async fn start_with_membership(
+        peer_addrs: Vec<Vec<SocketAddr>>,
+        profiles: Vec<NodeProfile>,
+        local_rank: usize,
+        cfg: PipelineHarnessConfig,
+        membership: Option<RingMembership>,
     ) -> DistributedResult<Self> {
         let world_size = peer_addrs.len();
         if world_size < 2 {
@@ -206,10 +231,20 @@ impl PipelineHarness {
             rank: local_rank,
             connection_timeout_ms: cfg.connection_timeout_ms,
             max_retries: cfg.max_retries,
+            secret: cfg.secret.clone(),
+            allow_plaintext: cfg.allow_plaintext,
         };
-        let (next_sender, prev_receiver) = TcpTransport::connect(&dist_cfg)
-            .await
-            .map_err(|e| DistributedError::Protocol(format!("activation ring connect: {e}")))?;
+        let security = LinkSecurity::from_config(&dist_cfg)?;
+        let membership = membership.unwrap_or_else(|| RingMembership::from_config(&dist_cfg));
+        let (next_sender, prev_receiver) = TcpTransport::connect_ring(
+            &dist_cfg,
+            security.clone(),
+            membership.clone(),
+            None,
+            Channel::Activations,
+        )
+        .await
+        .map_err(|e| DistributedError::Protocol(format!("activation ring connect: {e}")))?;
 
         // Now stand up the result loopback channel: last → first only.
         // We piggy-back on a second TCP transport pair, but in degenerate
@@ -224,20 +259,20 @@ impl PipelineHarness {
                 .await
                 .map_err(|e| DistributedError::Protocol(format!("bind result_port: {e}")))?;
             let timeout = std::time::Duration::from_millis(cfg.connection_timeout_ms);
-            let (stream, _from) = tokio::time::timeout(timeout, listener.accept())
+            let params = LinkParams {
+                security: security.clone(),
+                channel: Channel::Results,
+                membership: membership.clone(),
+                peer_rank: world_size - 1,
+            };
+            let link = tokio::time::timeout(timeout, accept_authenticated(&listener, &params))
                 .await
                 .map_err(|_| {
                     DistributedError::Protocol(
                         "timeout waiting for last-rank result connection".into(),
                     )
-                })?
-                .map_err(|e| DistributedError::Protocol(format!("accept result: {e}")))?;
-            let _ = stream.set_nodelay(true);
-            let (read, _write) = stream.into_split();
-            (
-                None,
-                Some(crate::transport::TransportReceiver::from_owned_read(read)),
-            )
+                })??;
+            (None, Some(link.receiver))
         } else if local_rank == world_size - 1 {
             // Last rank: connect to first rank's result_port.
             // Use the rank-0 peer's primary IP.
@@ -247,32 +282,17 @@ impl PipelineHarness {
                 .ok_or_else(|| DistributedError::Protocol("no rank-0 address known".into()))?
                 .ip();
             let result_addr: SocketAddr = SocketAddr::new(first_ip, cfg.result_port);
+            let params = LinkParams {
+                security: security.clone(),
+                channel: Channel::Results,
+                membership: membership.clone(),
+                peer_rank: 0,
+            };
             // Retry until rank 0's listener is up.
-            let mut stream_opt = None;
-            let mut delay_ms = 100u64;
-            for _ in 0..cfg.max_retries {
-                match tokio::net::TcpStream::connect(result_addr).await {
-                    Ok(s) => {
-                        stream_opt = Some(s);
-                        break;
-                    }
-                    Err(_) => {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        delay_ms = (delay_ms * 2).min(2000);
-                    }
-                }
-            }
-            let stream = stream_opt.ok_or_else(|| {
-                DistributedError::Protocol(format!(
-                    "could not connect to first-rank result port at {result_addr}"
-                ))
-            })?;
-            let _ = stream.set_nodelay(true);
-            let (_read, write) = stream.into_split();
-            (
-                Some(crate::transport::TransportSender::from_owned_write(write)),
-                None,
-            )
+            let link =
+                TcpTransport::connect_with_fallback(0, &[result_addr], cfg.max_retries, &params)
+                    .await?;
+            (Some(link.sender), None)
         } else {
             (None, None)
         };

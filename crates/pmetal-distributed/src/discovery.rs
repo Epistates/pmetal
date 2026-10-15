@@ -19,6 +19,7 @@
 use crate::error::DistributedError;
 use crate::identity::NodeIdentity;
 use crate::namespace::{NetworkNamespace, validate_peer_namespace};
+use crate::secret::ClusterSecret;
 use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{
@@ -152,6 +153,9 @@ pub struct DiscoveryService {
     event_tx: mpsc::Sender<DiscoveryEvent>,
     /// Port for listening.
     listen_port: u16,
+    /// When set, a peer counts as a cluster member only once it proves it
+    /// holds this secret (see [`attestation_token`]).
+    secret: Option<ClusterSecret>,
 }
 
 impl DiscoveryService {
@@ -174,7 +178,20 @@ impl DiscoveryService {
             state: Arc::new(RwLock::new(DiscoveryState::default())),
             event_tx,
             listen_port,
+            secret: None,
         }
+    }
+
+    /// Admit only peers that prove they hold `secret`.
+    ///
+    /// The namespace is public (it is derived from the version string), so
+    /// without this any machine on the LAN that speaks the protocol joins the
+    /// topology, and the ring formed from it. With it, a peer that does not
+    /// carry a valid attestation in its identify message is disconnected,
+    /// never reported as connected, and never counted as a member.
+    pub fn with_secret(mut self, secret: ClusterSecret) -> Self {
+        self.secret = Some(secret);
+        self
     }
 
     /// Get a handle to the shared discovery state.
@@ -204,6 +221,9 @@ impl DiscoveryService {
         let topic = gossipsub::IdentTopic::new(self.namespace.gossipsub_topic("gradients"));
         swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
+        // Connections whose identify message has not yet proved membership.
+        let mut unattested: HashMap<PeerId, Option<SocketAddr>> = HashMap::new();
+
         // Event loop
         loop {
             match swarm.select_next_some().await {
@@ -214,7 +234,8 @@ impl DiscoveryService {
                     self.handle_gossipsub_event(event).await;
                 }
                 SwarmEvent::Behaviour(PMetalBehaviourEvent::Identify(event)) => {
-                    self.handle_identify_event(&mut swarm, event).await;
+                    self.handle_identify_event(&mut swarm, event, &mut unattested)
+                        .await;
                 }
                 SwarmEvent::Behaviour(PMetalBehaviourEvent::Ping(event)) => {
                     trace!("Ping event: {:?}", event);
@@ -224,33 +245,20 @@ impl DiscoveryService {
                 } => {
                     let addr = endpoint.get_remote_address();
                     info!("Connection established with {} at {}", peer_id, addr);
-
-                    // Extract socket address
                     let socket_addr = multiaddr_to_socket_addr(addr);
-
-                    {
-                        let mut state = self.state.write();
-                        if let Some(peer) = state.peers.get_mut(&peer_id) {
-                            peer.connected = true;
-                            peer.socket_addr = socket_addr;
-                        }
-                        if !state.connected_order.contains(&peer_id) {
-                            state.connected_order.push(peer_id);
-                        }
-                    }
-
-                    if let Some(addr) = socket_addr {
-                        let _ = self
-                            .event_tx
-                            .send(DiscoveryEvent::PeerConnected {
-                                peer_id,
-                                address: addr,
-                            })
-                            .await;
+                    if self.secret.is_some() {
+                        // Not a member until its identify message attests.
+                        unattested.insert(peer_id, socket_addr);
+                    } else {
+                        self.mark_connected(peer_id, socket_addr).await;
                     }
                 }
                 SwarmEvent::ConnectionClosed { peer_id, .. } => {
                     info!("Connection closed with {}", peer_id);
+                    if unattested.remove(&peer_id).is_some() {
+                        // Never admitted, so nothing to retract.
+                        continue;
+                    }
 
                     {
                         let mut state = self.state.write();
@@ -296,10 +304,13 @@ impl DiscoveryService {
         .map_err(|e| DistributedError::Config(format!("Gossipsub error: {}", e)))?;
 
         // Create identify behaviour
-        let identify = identify::Behaviour::new(identify::Config::new(
-            self.namespace.protocol_id(),
-            self.identity.keypair().public(),
-        ));
+        let identify = identify::Behaviour::new(
+            identify::Config::new(
+                self.namespace.protocol_id(),
+                self.identity.keypair().public(),
+            )
+            .with_agent_version(agent_version(self.secret.as_ref(), self.identity.peer_id())),
+        );
 
         // Create ping behaviour
         let ping = ping::Behaviour::new(
@@ -415,11 +426,36 @@ impl DiscoveryService {
         }
     }
 
+    /// Record a peer as connected and tell the backend.
+    async fn mark_connected(&self, peer_id: PeerId, socket_addr: Option<SocketAddr>) {
+        {
+            let mut state = self.state.write();
+            if let Some(peer) = state.peers.get_mut(&peer_id) {
+                peer.connected = true;
+                peer.socket_addr = socket_addr;
+            }
+            if !state.connected_order.contains(&peer_id) {
+                state.connected_order.push(peer_id);
+            }
+        }
+
+        if let Some(addr) = socket_addr {
+            let _ = self
+                .event_tx
+                .send(DiscoveryEvent::PeerConnected {
+                    peer_id,
+                    address: addr,
+                })
+                .await;
+        }
+    }
+
     /// Handle identify events.
     async fn handle_identify_event(
         &self,
         swarm: &mut Swarm<PMetalBehaviour>,
         event: identify::Event,
+        unattested: &mut HashMap<PeerId, Option<SocketAddr>>,
     ) {
         if let identify::Event::Received { peer_id, info, .. } = event {
             debug!(
@@ -433,9 +469,72 @@ impl DiscoveryService {
                     peer_id, info.protocol_version
                 );
                 let _ = swarm.disconnect_peer_id(peer_id);
+                return;
+            }
+
+            if let Some(secret) = &self.secret {
+                if !attestation_is_valid(secret, &peer_id, &info.agent_version) {
+                    warn!(
+                        "Peer {} did not prove it holds this cluster's secret, disconnecting",
+                        peer_id
+                    );
+                    unattested.remove(&peer_id);
+                    let _ = swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
+                if let Some(socket_addr) = unattested.remove(&peer_id) {
+                    self.mark_connected(peer_id, socket_addr).await;
+                }
             }
         }
     }
+}
+
+/// Prefix of the identify agent version a peer advertises.
+const AGENT_PREFIX: &str = "pmetal";
+
+/// Key in the agent version carrying a peer's attestation.
+const ATTEST_KEY: &str = "attest=";
+
+/// The agent version a node advertises: its name and, when the cluster has a
+/// secret, a keyed hash of its own peer id. Only a holder of the secret can
+/// compute it, and it is bound to one peer id, so it cannot be lifted from
+/// one machine and presented by another.
+fn agent_version(secret: Option<&ClusterSecret>, peer_id: &PeerId) -> String {
+    let mut out = format!("{AGENT_PREFIX}/{}", env!("CARGO_PKG_VERSION"));
+    if let Some(secret) = secret {
+        out.push(' ');
+        out.push_str(ATTEST_KEY);
+        out.push_str(&agent_version_token(secret, peer_id));
+    }
+    out
+}
+
+/// Whether `agent_version` carries a valid attestation for `peer_id`.
+fn attestation_is_valid(secret: &ClusterSecret, peer_id: &PeerId, agent_version: &str) -> bool {
+    let expected = agent_version_token(secret, peer_id);
+    agent_version
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix(ATTEST_KEY))
+        .any(|got| {
+            got.len() == expected.len()
+                && got
+                    .bytes()
+                    .zip(expected.bytes())
+                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                    == 0
+        })
+}
+
+fn agent_version_token(secret: &ClusterSecret, peer_id: &PeerId) -> String {
+    use std::fmt::Write as _;
+    secret
+        .attest(&peer_id.to_bytes())
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// Extract socket address from multiaddr.

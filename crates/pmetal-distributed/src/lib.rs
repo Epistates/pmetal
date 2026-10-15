@@ -80,6 +80,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::ops::Range;
 
 /// Reduction operation for `all_reduce`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,12 +94,14 @@ pub enum ReduceOp {
 // Core modules
 pub mod auto;
 pub mod cluster_runtime;
+pub mod collective;
 pub mod config;
 pub mod discovery;
 pub mod error;
 pub mod fabric;
 pub mod identity;
 pub mod ring;
+pub mod secret;
 pub mod topology;
 pub mod transport;
 
@@ -146,6 +149,9 @@ pub mod zero;
 #[cfg(feature = "pipeline-training")]
 pub mod pipeline_training;
 
+#[cfg(test)]
+mod testing;
+
 // Re-exports for convenience
 pub use activation_codec::ActivationCodec;
 pub use activation_transport::{ActivationMessage, DtypeTag};
@@ -165,6 +171,7 @@ pub use pipeline::{
     PipelineGenerationLoop, PipelineStageConfig, PipelineStageRuntime, StreamMultiplexer,
 };
 pub use ring::RingBackend;
+pub use secret::ClusterSecret;
 pub use topology::{ClusterTopology, ConnectionProfile, NodeProfile, SharedTopology};
 pub use ultrafusion::{
     DEFAULT_LOCAL_CHANNEL_CAPACITY, DEFAULT_ULTRAFUSION_INTERCONNECT_BYTES_PER_SEC,
@@ -201,16 +208,76 @@ pub trait DistributedBackend: Send + Sync {
     /// Get the total number of nodes.
     fn world_size(&self) -> usize;
 
-    /// Perform an all-reduce operation on a buffer.
+    /// Reduce `data` across all nodes, in place.
     ///
-    /// The input buffer contains the local gradients encoded as little-endian
-    /// `f32` values.  On return, all nodes hold the same result:
+    /// On return every node holds the same result, bit for bit:
     /// - `ReduceOp::Sum`  – element-wise sum across all nodes.
     /// - `ReduceOp::Mean` – element-wise sum divided by `world_size`.
-    async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()>;
+    ///
+    /// Every node must call it with a buffer of the same length.
+    async fn all_reduce_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<()>;
+
+    /// [`all_reduce_f32`](Self::all_reduce_f32) on a buffer of little-endian
+    /// `f32` bytes.
+    ///
+    /// A `Vec<u8>` carries no alignment guarantee, so a buffer that cannot be
+    /// viewed as `f32` in place is decoded to a temporary and written back.
+    /// Prefer `all_reduce_f32`.
+    async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()> {
+        if !buffer.len().is_multiple_of(4) {
+            return Err(DistributedError::Protocol(format!(
+                "Buffer length {} is not a multiple of 4 (f32 size)",
+                buffer.len()
+            ))
+            .into());
+        }
+        if let Some(data) = collective::bytes_as_f32_mut(buffer) {
+            return self.all_reduce_f32(data, op).await;
+        }
+        let mut data: Vec<f32> = buffer
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        self.all_reduce_f32(&mut data, op).await?;
+        for (dst, x) in buffer.as_chunks_mut::<4>().0.iter_mut().zip(&data) {
+            *dst = x.to_le_bytes();
+        }
+        Ok(())
+    }
+
+    /// Sum (or average) `data` across nodes, leaving this node with only its
+    /// own chunk (`collective::chunk_range(len, world_size, rank)`) reduced;
+    /// the rest of `data` is then meaningless. Returns the reduced range.
+    /// Half the traffic of an all-reduce, for sharded optimizers.
+    async fn reduce_scatter_f32(&self, _data: &mut [f32], _op: ReduceOp) -> Result<Range<usize>> {
+        Err(unsupported("reduce_scatter_f32"))
+    }
+
+    /// Complete `data` on every node, given that each node's own chunk is
+    /// final (the other half of [`reduce_scatter_f32`](Self::reduce_scatter_f32)).
+    async fn all_gather_f32_in_place(&self, _data: &mut [f32]) -> Result<()> {
+        Err(unsupported("all_gather_f32_in_place"))
+    }
+
+    /// Collect every node's `local` bytes (lengths may differ): element `r` of
+    /// the result is node `r`'s contribution.
+    async fn all_gather_bytes(&self, _local: &[u8]) -> Result<Vec<Vec<u8>>> {
+        Err(unsupported("all_gather_bytes"))
+    }
+
+    /// Copy `buffer` from node `root` to every node.
+    async fn broadcast(&self, _buffer: &mut [u8], _root: usize) -> Result<()> {
+        Err(unsupported("broadcast"))
+    }
 
     /// Barrier synchronization.
     async fn barrier(&self) -> Result<()>;
+}
+
+fn unsupported(op: &str) -> anyhow::Error {
+    DistributedError::Protocol(format!("this backend does not implement {op}")).into()
 }
 
 /// A handle to the distributed runtime.
@@ -246,26 +313,58 @@ impl DistributedContext {
         self.backend.world_size()
     }
 
-    /// Perform an all-reduce operation on the buffer.
+    /// Perform an all-reduce operation on a buffer of little-endian `f32`
+    /// bytes.
     ///
     /// After this call, all nodes will have the same values in their buffers.
-    /// `op` controls whether the result is a sum or mean across nodes.
+    /// `op` controls whether the result is a sum or mean across nodes. Prefer
+    /// [`all_reduce_f32`](Self::all_reduce_f32), which needs no byte view.
     pub async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()> {
-        let start = std::time::Instant::now();
+        let bytes = buffer.len();
         let result = self.backend.all_reduce(buffer, op).await;
+        self.observe(|m| &m.all_reduce, bytes, std::time::Instant::now(), &result);
+        result
+    }
 
-        if let Some(ref metrics) = self.metrics {
-            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-            metrics.all_reduce.duration_ms.observe(duration_ms);
-            metrics.all_reduce.bytes_processed.add(buffer.len() as u64);
+    /// Reduce `data` (sum or mean) across all nodes, in place.
+    pub async fn all_reduce_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<()> {
+        let start = std::time::Instant::now();
+        let result = self.backend.all_reduce_f32(data, op).await;
+        self.observe(|m| &m.all_reduce, data.len() * 4, start, &result);
+        result
+    }
 
-            if result.is_ok() {
-                metrics.all_reduce.completed.inc();
-            } else {
-                metrics.all_reduce.failed.inc();
-            }
-        }
+    /// Reduce `data` across all nodes, leaving this node with only its own
+    /// chunk reduced; returns that chunk's range.
+    pub async fn reduce_scatter_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<Range<usize>> {
+        let start = std::time::Instant::now();
+        let result = self.backend.reduce_scatter_f32(data, op).await;
+        self.observe(|m| &m.reduce, data.len() * 4, start, &result);
+        result
+    }
 
+    /// Complete `data` on every node from each node's own final chunk.
+    pub async fn all_gather_f32_in_place(&self, data: &mut [f32]) -> Result<()> {
+        let start = std::time::Instant::now();
+        let result = self.backend.all_gather_f32_in_place(data).await;
+        self.observe(|m| &m.reduce, data.len() * 4, start, &result);
+        result
+    }
+
+    /// Collect every node's `local` bytes; element `r` is node `r`'s.
+    pub async fn all_gather_bytes(&self, local: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let start = std::time::Instant::now();
+        let result = self.backend.all_gather_bytes(local).await;
+        self.observe(|m| &m.reduce, local.len(), start, &result);
+        result
+    }
+
+    /// Copy `buffer` from node `root` to every node.
+    pub async fn broadcast(&self, buffer: &mut [u8], root: usize) -> Result<()> {
+        let bytes = buffer.len();
+        let start = std::time::Instant::now();
+        let result = self.backend.broadcast(buffer, root).await;
+        self.observe(|m| &m.broadcast, bytes, start, &result);
         result
     }
 
@@ -275,19 +374,28 @@ impl DistributedContext {
     pub async fn barrier(&self) -> Result<()> {
         let start = std::time::Instant::now();
         let result = self.backend.barrier().await;
+        self.observe(|m| &m.barrier, 0, start, &result);
+        result
+    }
 
+    fn observe<T>(
+        &self,
+        select: impl Fn(&DistributedMetrics) -> &metrics::OperationMetrics,
+        bytes: usize,
+        start: std::time::Instant,
+        result: &Result<T>,
+    ) {
         if let Some(ref metrics) = self.metrics {
-            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-            metrics.barrier.duration_ms.observe(duration_ms);
-
+            let op = select(metrics);
+            op.duration_ms
+                .observe(start.elapsed().as_secs_f64() * 1000.0);
+            op.bytes_processed.add(bytes as u64);
             if result.is_ok() {
-                metrics.barrier.completed.inc();
+                op.completed.inc();
             } else {
-                metrics.barrier.failed.inc();
+                op.failed.inc();
             }
         }
-
-        result
     }
 
     /// Check if this is the master node (rank 0).

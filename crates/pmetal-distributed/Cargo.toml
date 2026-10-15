@@ -59,6 +59,10 @@ petgraph = { workspace = true }
 # Utilities
 dirs = { workspace = true }
 sha3 = { workspace = true }
+# Authenticated, encrypted links (Noise) and the secret that keys them.
+snow = { workspace = true }
+secrecy = { workspace = true }
+rand = { workspace = true }
 parking_lot = { workspace = true }
 half = { workspace = true }
 ordered-float = { workspace = true }

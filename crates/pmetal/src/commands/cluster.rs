@@ -19,7 +19,9 @@ use pmetal_distributed::topology::NodeProfile;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cli::cluster::{BenchArgs, ClusterSubcommand, PipelineBenchArgs, StatusArgs, UpArgs};
+use crate::cli::cluster::{
+    BenchArgs, ClusterSubcommand, KeygenArgs, PipelineBenchArgs, StatusArgs, UpArgs,
+};
 
 pub async fn run(cmd: ClusterSubcommand) -> Result<()> {
     match cmd {
@@ -27,7 +29,35 @@ pub async fn run(cmd: ClusterSubcommand) -> Result<()> {
         ClusterSubcommand::Status(args) => run_status(args).await,
         ClusterSubcommand::Bench(args) => run_bench(args).await,
         ClusterSubcommand::PipelineBench(args) => run_pipeline_bench(args).await,
+        ClusterSubcommand::Keygen(args) => run_keygen(args),
     }
+}
+
+/// Create the cluster secret that authenticates and encrypts the ring.
+fn run_keygen(args: KeygenArgs) -> Result<()> {
+    use pmetal_distributed::ClusterSecret;
+
+    let path = match args.output {
+        Some(path) => path,
+        None => ClusterSecret::default_path().context("cannot locate the default secret path")?,
+    };
+    if args.force && path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("cannot replace {}", path.display()))?;
+    }
+    ClusterSecret::generate().save_new(&path).with_context(|| {
+        format!(
+            "cannot create the cluster secret (use --force to replace an existing one at {})",
+            path.display()
+        )
+    })?;
+    println!("Wrote a new cluster secret to {}", path.display());
+    println!(
+        "Copy that file to ~/.pmetal/cluster_secret (mode 600) on every machine in the\n\
+         cluster, over a channel you trust (scp, a password manager), or export its\n\
+         contents as PMETAL_CLUSTER_SECRET. Machines without it cannot join the ring."
+    );
+    Ok(())
 }
 
 async fn run_up(args: UpArgs) -> Result<()> {
@@ -37,6 +67,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         min_peers: args.min_peers,
         peer_timeout: Duration::from_secs(args.timeout_secs),
         profile: NodeProfile::default(),
+        ..AutoDiscoveryConfig::default()
     };
 
     println!(
@@ -156,6 +187,7 @@ async fn run_status(args: StatusArgs) -> Result<()> {
         min_peers: 0,
         peer_timeout: Duration::from_secs(args.wait_secs),
         profile: NodeProfile::default(),
+        ..AutoDiscoveryConfig::default()
     };
 
     let backend = Arc::new(AutoDiscoveryBackend::with_config(cfg).await?);
@@ -177,6 +209,7 @@ async fn run_bench(args: BenchArgs) -> Result<()> {
         min_peers: args.min_peers,
         peer_timeout: Duration::from_secs(args.timeout_secs),
         profile: NodeProfile::default(),
+        ..AutoDiscoveryConfig::default()
     };
 
     println!(
@@ -261,6 +294,7 @@ async fn run_pipeline_bench(args: PipelineBenchArgs) -> Result<()> {
         min_peers: args.min_peers,
         peer_timeout: Duration::from_secs(args.timeout_secs),
         profile: NodeProfile::default(),
+        ..AutoDiscoveryConfig::default()
     };
 
     println!(
@@ -285,6 +319,7 @@ async fn run_pipeline_bench(args: PipelineBenchArgs) -> Result<()> {
         codec: ActivationCodec::None,
         connection_timeout_ms: 30_000,
         max_retries: 60,
+        ..PipelineHarnessConfig::default()
     };
 
     let harness = PipelineHarness::start(backend.clone(), harness_cfg)
