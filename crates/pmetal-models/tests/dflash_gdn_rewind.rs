@@ -103,3 +103,65 @@ fn rewinding_a_verify_matches_running_the_kept_prefix() {
         );
     }
 }
+
+/// The same contract on the `DynamicModel` Qwen3.5 target the MTP decode runs
+/// on when the native engine can't: a verify records each GDN layer's
+/// recurrence inputs, a partial accept replays them over the kept prefix from
+/// the pre-verify snapshot, and the KV caches roll back by their offsets.
+#[test]
+#[serial]
+fn rewinding_a_dynamic_verify_matches_running_the_kept_prefix() {
+    use pmetal_models::DynamicModel;
+    use pmetal_models::mtp::MtpTarget;
+    use pmetal_models::qwen3_next_mtp::Qwen3NextMtpVerifier;
+
+    let ck = checkpoint();
+    let mut model = DynamicModel::load(ck._dir.path()).expect("checkpoint loads");
+    drain("load");
+    let tokens = |from: i32, to: i32| -> Vec<u32> {
+        pmetal_cache::test_utils::to_f32_vec_eval(&slice_axis(&ck.ids, 1, from, to))
+            .into_iter()
+            .map(|v| v as u32)
+            .collect()
+    };
+    let prompt = tokens(0, PROMPT);
+    let block = tokens(PROMPT, PROMPT + BLOCK);
+
+    // `first`, then optionally a verified block cut back to `kept`, then
+    // `next`: the logits of `next`.
+    let mut run = |first: &[u32], verified: Option<(&[u32], usize)>, next: &[u32]| {
+        let mut kv = model.create_cache(128);
+        let mut mamba = model
+            .create_mamba_cache()
+            .expect("hybrid model has a GDN cache");
+        let target = model.as_qwen3_next_mut().expect("Qwen3Next");
+        let mut verifier = Qwen3NextMtpVerifier::new(target, &mut kv, &mut mamba);
+        verifier.forward(first).expect("prompt");
+        if let Some((block, kept)) = verified {
+            verifier.verify(block).expect("verify");
+            verifier.keep(kept).expect("keep");
+        }
+        let (_, logits) = verifier.forward(next).expect("next token");
+        drain("dynamic rewind");
+        logits
+    };
+
+    for kept in [1usize, 3, 7, BLOCK as usize] {
+        let next = tokens(PROMPT + kept as i32, PROMPT + kept as i32 + 1);
+        let rewound = run(&prompt, Some((&block, kept)), &next);
+        let mut straight_prefix = prompt.clone();
+        straight_prefix.extend_from_slice(&block[..kept]);
+        let straight = run(&straight_prefix, None, &next);
+
+        let report = ParityReport::compute(&format!("kept {kept}"), &rewound, &straight, TOL);
+        println!(
+            "dynamic: kept {kept} of {BLOCK}: max |diff| {:.3e}",
+            report.max_abs_diff
+        );
+        assert!(
+            report.passed(),
+            "dynamic: kept {kept} of {BLOCK}: next-token logits differ by {:.3e}",
+            report.max_abs_diff
+        );
+    }
+}
