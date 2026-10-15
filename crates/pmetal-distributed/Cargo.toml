@@ -20,8 +20,10 @@ context-parallel = ["mlx-collectives"]
 zero = []
 # 1F1B and zero-bubble pipeline training schedules (pure Rust)
 pipeline-training = []
+# DiLoCo low-communication training: one synchronisation per H inner steps
+diloco = []
 # Enable all distributed capabilities
-full = ["mlx-collectives", "tensor-parallel", "expert-parallel", "context-parallel", "zero", "pipeline-training"]
+full = ["mlx-collectives", "tensor-parallel", "expert-parallel", "context-parallel", "zero", "pipeline-training", "diloco"]
 
 [dependencies]
 # Use workspace versions for consistency
@@ -59,18 +61,24 @@ petgraph = { workspace = true }
 # Utilities
 dirs = { workspace = true }
 sha3 = { workspace = true }
+# Authenticated, encrypted links (Noise) and the secret that keys them.
+snow = { workspace = true, features = ["ring-accelerated"] }
+secrecy = { workspace = true }
+rand = { workspace = true }
 parking_lot = { workspace = true }
+# Seals and opens a batch of frames on several cores.
+rayon = { workspace = true }
 half = { workspace = true }
 ordered-float = { workspace = true }
 
 # Local NIC enumeration for fabric detection (Thunderbolt / Ethernet / WiFi).
 if-addrs = { workspace = true }
 
-# MLX bridge (optional — gated behind mlx-collectives feature)
+# MLX runtime (optional — gated behind mlx-collectives feature)
 pmetal-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+# Fail every test at the runtime op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tempfile = { workspace = true }
 

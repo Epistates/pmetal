@@ -16,7 +16,7 @@ use crate::expert_shard::expert_range;
 /// on its tokens.
 #[derive(Debug, Clone)]
 pub struct ExpertPlacement {
-    /// experts_per_rank[rank] = list of expert IDs owned by that rank.
+    /// `experts_per_rank[rank]` = list of expert IDs owned by that rank.
     pub experts_per_rank: Vec<Vec<usize>>,
     /// Total number of experts across all ranks.
     pub total_experts: usize,
@@ -61,30 +61,20 @@ impl ExpertPlacement {
     /// of total cluster RAM.
     pub fn weighted(total_experts: usize, node_ram: &[u64], top_k: usize) -> Self {
         let world_size = node_ram.len();
-        let total_ram: u64 = node_ram.iter().sum();
-
-        if total_ram == 0 {
+        if node_ram.iter().sum::<u64>() == 0 {
             return Self::uniform(total_experts, world_size, top_k);
         }
 
+        // Largest-remainder apportionment: every expert has exactly one owner
+        // and no rank is more than one expert from its fair share.
+        let counts = crate::apportion::largest_remainder(total_experts, node_ram);
         let mut experts_per_rank = Vec::with_capacity(world_size);
         let mut rank_for_expert = vec![0usize; total_experts];
         let mut assigned = 0;
-
-        for (rank, &ram) in node_ram.iter().enumerate() {
-            let count = if rank == world_size - 1 {
-                // Last rank gets all remaining to avoid rounding errors.
-                total_experts - assigned
-            } else {
-                let proportion = ram as f64 / total_ram as f64;
-                (proportion * total_experts as f64).round() as usize
-            };
-
+        for (rank, &count) in counts.iter().enumerate() {
             let experts: Vec<usize> = (assigned..assigned + count).collect();
             for &eid in &experts {
-                if eid < total_experts {
-                    rank_for_expert[eid] = rank;
-                }
+                rank_for_expert[eid] = rank;
             }
             experts_per_rank.push(experts);
             assigned += count;
@@ -133,66 +123,6 @@ impl ExpertPlacement {
     /// Check if a given expert is local to this rank.
     pub fn is_local(&self, expert_id: usize, rank: usize) -> bool {
         self.rank_for_expert[expert_id] == rank
-    }
-
-    /// Build a ZeRO param-name → rank assignment that keeps each expert's
-    /// optimizer state on the same rank that owns its forward weights.
-    ///
-    /// The input `stacked_param_names` are keys like
-    /// `"model.layers.3.mlp.switch_mlp.gate_proj.weight"` whose leading
-    /// tensor axis is the expert dim. Each such param is assigned as a
-    /// whole to rank 0 — a limitation of parameter-granularity ZeRO. If
-    /// you want per-expert ownership of optimizer state, pair this with
-    /// `ExpertSharded` weight sharding so the param stored on each rank
-    /// only contains *that rank's* experts, and ZeRO Stage 1 will
-    /// partition the already-sharded tensor normally.
-    ///
-    /// For non-expert-stacked params, caller should fall back to
-    /// [`crate::zero::ZeROPartitioner::new`]'s round-robin assignment.
-    ///
-    /// # Note
-    ///
-    /// This helper exists so ZeRO and expert-parallel cannot drift apart:
-    /// if you change the expert-ID → rank mapping, both modules go
-    /// through [`crate::expert_shard::expert_range`].
-    pub fn zero_stacked_assignment(
-        &self,
-        stacked_param_names: impl IntoIterator<Item = String>,
-    ) -> std::collections::HashMap<String, usize> {
-        let mut map = std::collections::HashMap::new();
-        for name in stacked_param_names {
-            // The tensor has already been expert-sharded on each rank;
-            // every rank owns "its slice" — but in a parameter-granular
-            // ZeRO map the whole stacked param is one logical unit.
-            // Assigning to rank 0 lets the standard ZeRO path skip
-            // re-partitioning MoE tensors (they're already sharded by
-            // `ExpertSharded`). Callers that want per-expert ownership
-            // should use `per_rank_stacked_assignment` instead.
-            map.insert(name, 0);
-        }
-        map
-    }
-
-    /// Build a ZeRO assignment where each stacked expert param is
-    /// "virtually" split by expert and each rank claims optimizer state
-    /// only for its owned experts.
-    ///
-    /// Returned keys are of the form `"{base}#expert={eid}"` — intended
-    /// for an optimizer that expands a stacked tensor into per-expert
-    /// sub-groups. If your optimizer does not support that expansion,
-    /// prefer [`Self::zero_stacked_assignment`].
-    pub fn per_rank_stacked_assignment(
-        &self,
-        stacked_param_names: impl IntoIterator<Item = String>,
-    ) -> std::collections::HashMap<String, usize> {
-        let mut map = std::collections::HashMap::new();
-        for name in stacked_param_names {
-            for eid in 0..self.total_experts {
-                let owner = self.rank_for_expert[eid];
-                map.insert(format!("{name}#expert={eid}"), owner);
-            }
-        }
-        map
     }
 }
 
@@ -298,19 +228,42 @@ mod tests {
         }
     }
 
+    /// Whatever the weights, every expert gets exactly one owner and the
+    /// shares follow the weights. Rounding each share on its own (and giving
+    /// the last rank the rest) over-allocates when many shares round up:
+    /// six equal ranks and three experts asked the last rank for `3 - 5`.
     #[test]
-    fn per_rank_stacked_assignment_follows_expert_ownership() {
-        let p = ExpertPlacement::uniform(8, 2, 2);
-        let map =
-            p.per_rank_stacked_assignment(["layer.0.switch_mlp.gate_proj.weight".to_string()]);
-        // Rank 0 owns experts 0..4, rank 1 owns 4..8.
-        for eid in 0..4 {
-            let key = format!("layer.0.switch_mlp.gate_proj.weight#expert={eid}");
-            assert_eq!(map[&key], 0);
-        }
-        for eid in 4..8 {
-            let key = format!("layer.0.switch_mlp.gate_proj.weight#expert={eid}");
-            assert_eq!(map[&key], 1);
+    fn weighted_placement_assigns_every_expert_exactly_once() {
+        let cases: Vec<(usize, Vec<u64>)> = vec![
+            (3, vec![1; 6]),
+            (10, vec![3, 3, 3, 3]),
+            (7, vec![1, 1, 1, 1]),
+            (8, vec![10, 10, 1]),
+            (5, vec![0, 4, 0, 4]),
+            (1, vec![5, 5]),
+            (64, vec![16, 32, 8, 8]),
+        ];
+        for (experts, ram) in cases {
+            let p = ExpertPlacement::weighted(experts, &ram, 2);
+            let mut seen = vec![0u32; experts];
+            for rank in 0..ram.len() {
+                for &e in p.local_expert_ids(rank) {
+                    seen[e] += 1;
+                    assert_eq!(p.rank_for_expert(e), rank);
+                }
+            }
+            assert!(
+                seen.iter().all(|&n| n == 1),
+                "{experts} experts over {ram:?}: {seen:?}"
+            );
+            for (rank, &r) in ram.iter().enumerate() {
+                let share = experts as f64 * r as f64 / ram.iter().sum::<u64>() as f64;
+                let got = p.num_local_experts(rank) as f64;
+                assert!(
+                    (got - share).abs() < 1.0,
+                    "{experts} experts over {ram:?}: rank {rank} got {got}, fair share {share}"
+                );
+            }
         }
     }
 }

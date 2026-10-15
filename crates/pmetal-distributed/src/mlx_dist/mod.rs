@@ -5,7 +5,7 @@
 //! - **Ring**: TCP-based ring communication
 //!
 //! These wrap [`pmetal_runtime::distributed`], which calls MLX's C++
-//! distributed API (`mlx/distributed/`) in the libmlx the bridge links.
+//! distributed API (`mlx/distributed/`) in the libmlx the runtime links.
 //!
 //! # Environment Variables
 //!
@@ -32,6 +32,7 @@
 //! ```
 
 pub mod backend;
+pub mod exchange;
 pub mod group;
 pub mod ops;
 

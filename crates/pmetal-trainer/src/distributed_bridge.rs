@@ -54,7 +54,13 @@ impl DistributedGradientSync {
         let compressor = if matches!(strategy, CompressionStrategy::None) {
             None
         } else {
-            Some(GradientCompressor::new(strategy, config.error_feedback))
+            // Each rank draws its own random masks; ranks sharing one would
+            // all send the same coordinates.
+            Some(GradientCompressor::with_seed(
+                strategy,
+                config.error_feedback,
+                ctx.rank() as u64,
+            ))
         };
 
         Self {
@@ -169,50 +175,25 @@ impl DistributedGradientSync {
         // Flatten MLX Arrays into contiguous f32 buffer
         self.flatten_grads(grads)?;
 
-        // All-reduce with optional compression
-        if let Some(ref mut compressor) = self.compressor {
-            // Compressed path: compress → serialize → all_reduce → deserialize → decompress
-            let compressed = compressor.compress(&self.buffer);
-            let mut serialized = pmetal_distributed::compression::serialize_compressed(&compressed);
-            self.ctx
-                .all_reduce(&mut serialized, ReduceOp::Mean)
-                .await
-                .map_err(|e| {
-                    SftError::Mlx(Exception::custom(format!(
-                        "distributed all_reduce failed: {e}"
-                    )))
-                })?;
-            if let Some(decompressed) =
-                pmetal_distributed::compression::deserialize_compressed(&serialized)
-            {
-                let result = compressor.decompress(&decompressed);
-                self.buffer[..result.len()].copy_from_slice(&result);
+        // All-reduce (mean), compressed when a strategy is configured. The
+        // compressor's error feedback is for exactly this buffer.
+        let reduced = match self.compressor {
+            Some(ref mut compressor) => {
+                self.ctx
+                    .all_reduce_compressed(compressor, &mut self.buffer, ReduceOp::Mean)
+                    .await
             }
-        } else {
-            // Uncompressed path: reinterpret the f32 Vec as a &mut [u8] slice.
-            // Vec<f32> is guaranteed to have alignment >= 4, satisfying the
-            // ring backend's alignment check for f32 operations.
-            let len = self.buffer.len();
-            let byte_len = len.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
-                SftError::Mlx(Exception::custom(
-                    "distributed gradient buffer byte length overflow",
-                ))
-            })?;
-            let byte_ptr = self.buffer.as_mut_ptr().cast::<u8>();
-            // SAFETY: Vec<f32> guarantees 4-byte alignment and contiguous layout.
-            // The slice borrows self.buffer mutably for the duration of all_reduce.
-            // No other access to self.buffer occurs during this call.
-            #[allow(unsafe_code)]
-            let byte_buf = unsafe { std::slice::from_raw_parts_mut(byte_ptr, byte_len) };
-            self.ctx
-                .all_reduce(byte_buf, ReduceOp::Mean)
-                .await
-                .map_err(|e| {
-                    SftError::Mlx(Exception::custom(format!(
-                        "distributed all_reduce failed: {e}"
-                    )))
-                })?;
-        }
+            None => {
+                self.ctx
+                    .all_reduce_f32(&mut self.buffer, ReduceOp::Mean)
+                    .await
+            }
+        };
+        reduced.map_err(|e| {
+            SftError::Mlx(Exception::custom(format!(
+                "distributed all_reduce failed: {e}"
+            )))
+        })?;
 
         // Scatter back into FlattenedModuleParam
         self.scatter_grads(grads)?;
@@ -222,21 +203,16 @@ impl DistributedGradientSync {
 
     /// Reduce a scalar loss across all nodes (mean).
     pub async fn sync_loss(&self, loss: f32) -> Result<f32> {
-        // Use a Vec<f32> for guaranteed 4-byte alignment (ring backend requires it).
-        let mut aligned = vec![loss];
-        let byte_len = std::mem::size_of::<f32>();
-        let byte_ptr = aligned.as_mut_ptr().cast::<u8>();
-        #[allow(unsafe_code)]
-        let buf = unsafe { std::slice::from_raw_parts_mut(byte_ptr, byte_len) };
+        let mut value = [loss];
         self.ctx
-            .all_reduce(buf, ReduceOp::Mean)
+            .all_reduce_f32(&mut value, ReduceOp::Mean)
             .await
             .map_err(|e| {
                 SftError::Mlx(Exception::custom(format!(
                     "distributed loss sync failed: {e}"
                 )))
             })?;
-        Ok(aligned[0])
+        Ok(value[0])
     }
 
     /// Barrier synchronization — all nodes must reach this point before any proceed.

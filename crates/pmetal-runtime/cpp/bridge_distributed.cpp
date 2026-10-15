@@ -82,6 +82,36 @@ void mlx_inline_distributed_all_sum(
         new (dst->buf) array(dist::all_sum(as_arr(x), group_or_default(g))));
 }
 
+// Identity in the forward pass; all_sum of the cotangent in the backward.
+//
+// A tensor-parallel layer whose input is replicated across ranks (the input
+// of a column-parallel projection) lets each rank's shard of the weights see
+// the whole input, so the input's true gradient is the sum of the gradients
+// every rank computes from its shard. MLX's own all_sum is the identity in
+// backward, so this has to be a custom_vjp. A group of one has nothing to sum.
+void mlx_inline_distributed_sum_gradients(
+    mlx_inline_array* dst, const mlx_inline_array* x, const pmetal_dist_group* g) {
+    BRIDGE_TRY_DST("distributed_sum_gradients", dst, {
+        auto group = group_or_default(g);
+        if (!group) {
+            group = dist::init(false);
+        }
+        if (group->size() == 1) {
+            new (dst->buf) array(as_arr(x));
+        } else {
+            auto fwd = [](const std::vector<array>& primals) {
+                return std::vector<array>{primals[0]};
+            };
+            auto vjp = [group](const std::vector<array>&,
+                               const std::vector<array>& cotangents,
+                               const std::vector<array>&) {
+                return std::vector<array>{dist::all_sum(cotangents[0], group)};
+            };
+            new (dst->buf) array(mlx::core::custom_vjp(fwd, vjp)({as_arr(x)})[0]);
+        }
+    });
+}
+
 void mlx_inline_distributed_all_gather(
     mlx_inline_array* dst, const mlx_inline_array* x, const pmetal_dist_group* g) {
     BRIDGE_TRY_DST("distributed_all_gather", dst,

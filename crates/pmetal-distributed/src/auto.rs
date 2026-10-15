@@ -19,24 +19,26 @@
 //! ctx.all_reduce(&mut gradients).await?;
 //! ```
 
+use crate::collective::RingCollective;
 use crate::discovery::{DiscoveryEvent, DiscoveryService};
 use crate::error::DistributedError;
 use crate::fabric::{InterfaceKind, LocalFabric, probe_local_fabric};
 use crate::identity::NodeIdentity;
 use crate::namespace::NetworkNamespace;
+use crate::secret::ClusterSecret;
 use crate::topology::{NodeProfile, SharedTopology, new_shared_topology};
-use crate::transport::{TcpTransport, TransportReceiver, TransportSender};
+use crate::transport::{Channel, LinkSecurity, RingMembership, TcpTransport};
 use crate::{DistributedBackend, ReduceOp};
 use anyhow::Result;
 use async_trait::async_trait;
 use libp2p::PeerId;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, warn};
-use zerocopy::{FromBytes, IntoBytes};
 
 /// Default port for gradient exchange.
 const DEFAULT_GRADIENT_PORT: u16 = 52416;
@@ -57,6 +59,14 @@ pub struct AutoDiscoveryConfig {
     pub peer_timeout: Duration,
     /// Local node profile (for topology awareness).
     pub profile: NodeProfile,
+    /// The cluster secret that admits machines to the ring and encrypts its
+    /// traffic. Left unset it is looked up as [`ClusterSecret::resolve`]
+    /// does (`PMETAL_CLUSTER_SECRET`, then `~/.pmetal/cluster_secret`).
+    pub secret: Option<ClusterSecret>,
+    /// Allow an unauthenticated, unencrypted ring when no secret exists.
+    /// Anyone on the network can then read gradients and inject their own;
+    /// for local experiments only.
+    pub allow_plaintext: bool,
 }
 
 impl Default for AutoDiscoveryConfig {
@@ -67,6 +77,8 @@ impl Default for AutoDiscoveryConfig {
             min_peers: 1,
             peer_timeout: Duration::from_secs(60),
             profile: NodeProfile::default(),
+            secret: None,
+            allow_plaintext: false,
         }
     }
 }
@@ -78,8 +90,6 @@ impl Default for AutoDiscoveryConfig {
 pub struct AutoDiscoveryBackend {
     /// Our node identity.
     identity: NodeIdentity,
-    /// Namespace used to isolate discovery and raw TCP gradient exchange.
-    namespace: NetworkNamespace,
     /// Configuration.
     config: AutoDiscoveryConfig,
     /// Local network fabric snapshot (Thunderbolt / Ethernet / Wi-Fi NICs).
@@ -89,14 +99,15 @@ pub struct AutoDiscoveryBackend {
     topology: SharedTopology,
     /// Discovery state.
     discovery_state: Arc<RwLock<crate::discovery::DiscoveryState>>,
-    /// Ring connections (sender to next, receiver from prev).
-    ring_connections: Mutex<Option<(TransportSender, TransportReceiver)>>,
+    /// How the ring's links are protected.
+    security: LinkSecurity,
+    /// The formed ring. Set exactly once, even under concurrent
+    /// `establish_ring` calls, and only on success so a failed attempt can be
+    /// retried. Its rank and world size are fixed from here on, whatever
+    /// discovery later reports.
+    ring: OnceCell<RingCollective>,
     /// Event receiver from discovery service.
     event_rx: Mutex<mpsc::Receiver<DiscoveryEvent>>,
-    /// Ensures `establish_ring_inner` runs exactly once, even under concurrent
-    /// calls.  Replaces the former `AtomicBool` which had a TOCTOU race:
-    /// two callers could both observe `false` and both attempt to connect.
-    ring_init: OnceCell<()>,
 }
 
 impl AutoDiscoveryBackend {
@@ -107,6 +118,11 @@ impl AutoDiscoveryBackend {
 
     /// Create a new auto-discovery backend with custom configuration.
     pub async fn with_config(config: AutoDiscoveryConfig) -> Result<Self> {
+        let security = LinkSecurity::from_config(&crate::config::DistributedConfig {
+            secret: config.secret.clone(),
+            allow_plaintext: config.allow_plaintext,
+            ..crate::config::DistributedConfig::new(Vec::new(), 0)
+        })?;
         let identity = NodeIdentity::load_or_generate()?;
         let namespace = NetworkNamespace::default();
         let fabric = Arc::new(probe_local_fabric());
@@ -126,12 +142,17 @@ impl AutoDiscoveryBackend {
 
         let (event_tx, event_rx) = mpsc::channel(256);
 
-        let discovery = DiscoveryService::new(
+        let mut discovery = DiscoveryService::new(
             identity.clone(),
             namespace.clone(),
             config.discovery_port,
             event_tx,
         );
+        // Peers prove they hold the cluster secret before they count as
+        // members; without that, any machine on the LAN joins the topology.
+        if let LinkSecurity::Authenticated(secret) = &security {
+            discovery = discovery.with_secret(secret.clone());
+        }
         let discovery_state = discovery.state();
 
         tokio::spawn(async move {
@@ -155,14 +176,13 @@ impl AutoDiscoveryBackend {
 
         Ok(Self {
             identity,
-            namespace,
             config,
             fabric,
             topology,
             discovery_state,
-            ring_connections: Mutex::new(None),
+            security,
+            ring: OnceCell::new(),
             event_rx: Mutex::new(event_rx),
-            ring_init: OnceCell::new(),
         })
     }
 
@@ -290,10 +310,10 @@ impl AutoDiscoveryBackend {
 
     /// Internal ring setup — performs the actual TCP connection work.
     ///
-    /// Called at most once via `ring_init.get_or_init(...)`.
-    async fn establish_ring_inner(&self) -> Result<()> {
+    /// Called at most once successfully, via `ring.get_or_try_init(...)`.
+    async fn establish_ring_inner(&self) -> Result<RingCollective> {
         // Collect all needed data from topology while holding the lock
-        let (local_rank, world_size, endpoints, peer_ids) = {
+        let (local_rank, world_size, endpoints, peer_ids, peer_id_bytes) = {
             let topology = self.topology.read();
 
             if !topology.can_form_ring() {
@@ -323,8 +343,10 @@ impl AutoDiscoveryBackend {
 
             // Collect peer IDs for logging
             let peer_ids: Vec<String> = ring_order.iter().map(|n| n.peer_id.to_base58()).collect();
+            let peer_id_bytes: Vec<Vec<u8>> =
+                ring_order.iter().map(|n| n.peer_id.to_bytes()).collect();
 
-            (local_rank, world_size, endpoints, peer_ids)
+            (local_rank, world_size, endpoints, peer_ids, peer_id_bytes)
         }; // topology lock released here
 
         info!(
@@ -356,16 +378,27 @@ impl AutoDiscoveryBackend {
             rank: local_rank,
             connection_timeout_ms: 30000,
             max_retries: 50,
+            secret: None,
+            allow_plaintext: false,
         };
 
-        // Establish ring connections
-        let (sender, receiver) =
-            TcpTransport::connect_with_namespace(&config, Some(*self.namespace.psk())).await?;
-
-        *self.ring_connections.lock().await = Some((sender, receiver));
+        // Every rank must agree on who is in the ring, and that is a fact
+        // about peer identities, not about addresses (each machine sees its
+        // peers at different, fabric-specific ones).
+        let membership = RingMembership::from_ids(local_rank, &peer_id_bytes);
+        let (sender, receiver) = TcpTransport::connect_ring(
+            &config,
+            self.security.clone(),
+            membership,
+            None,
+            Channel::Ring,
+        )
+        .await?;
 
         info!("Ring established successfully");
-        Ok(())
+        Ok(RingCollective::new(
+            local_rank, world_size, sender, receiver,
+        ))
     }
 
     /// Ensure the ring is established, initialising it exactly once.
@@ -375,10 +408,13 @@ impl AutoDiscoveryBackend {
     /// If the connection attempt fails the cell remains unset, allowing the
     /// caller to retry on the next all-reduce.
     pub async fn establish_ring(&self) -> Result<()> {
-        self.ring_init
-            .get_or_try_init(|| async { self.establish_ring_inner().await })
-            .await?;
-        Ok(())
+        self.ring().await.map(|_| ())
+    }
+
+    async fn ring(&self) -> Result<&RingCollective> {
+        self.ring
+            .get_or_try_init(|| self.establish_ring_inner())
+            .await
     }
 
     /// Check if the ring has been successfully established.
@@ -386,148 +422,53 @@ impl AutoDiscoveryBackend {
     /// Returns `true` iff `establish_ring` has completed successfully at least
     /// once.  This is a cheap non-blocking check suitable for logging.
     pub fn is_ring_ready(&self) -> bool {
-        self.ring_init.initialized()
+        self.ring.initialized()
     }
 }
 
 #[async_trait]
 impl DistributedBackend for AutoDiscoveryBackend {
     fn rank(&self) -> usize {
-        self.topology.read().local_rank()
+        match self.ring.get() {
+            Some(ring) => ring.rank(),
+            None => self.topology.read().local_rank(),
+        }
     }
 
     fn world_size(&self) -> usize {
-        self.topology.read().node_count()
+        match self.ring.get() {
+            Some(ring) => ring.world_size(),
+            None => self.topology.read().node_count(),
+        }
     }
 
-    async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()> {
-        // establish_ring is idempotent — a no-op after the first successful call.
-        self.establish_ring().await?;
+    async fn all_reduce_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<()> {
+        // `ring` is idempotent: it forms the ring on first use only.
+        self.ring().await?.all_reduce(data, op).await
+    }
 
-        // Validate buffer
-        if !buffer.len().is_multiple_of(4) {
-            return Err(DistributedError::Protocol(format!(
-                "Buffer length {} is not a multiple of 4 (f32 size)",
-                buffer.len()
-            ))
-            .into());
-        }
+    async fn reduce_scatter_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<Range<usize>> {
+        self.ring().await?.reduce_scatter(data, op).await
+    }
 
-        if !(buffer.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
-            return Err(DistributedError::Protocol(
-                "Buffer is not properly aligned for f32 operations".into(),
-            )
-            .into());
-        }
+    async fn all_gather_f32_in_place(&self, data: &mut [f32]) -> Result<()> {
+        self.ring().await?.all_gather_in_place(data).await
+    }
 
-        let floats: &mut [f32] = <[f32]>::mut_from_bytes(buffer)
-            .map_err(|e| DistributedError::Protocol(format!("Buffer cast failed: {e}")))?;
-        let len = floats.len();
-        let world_size = self.world_size();
-        let rank = self.rank();
+    async fn all_gather_bytes(&self, local: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.ring().await?.all_gather_bytes(local).await
+    }
 
-        if world_size < 2 {
-            return Ok(()); // Nothing to reduce
-        }
-
-        let chunk_size = len / world_size;
-        let remainder = len % world_size;
-
-        let get_chunk_range = |idx: usize| -> (usize, usize) {
-            let start = idx * chunk_size + idx.min(remainder);
-            let end = start + chunk_size + (if idx < remainder { 1 } else { 0 });
-            (start, end)
-        };
-
-        let mut connections = self.ring_connections.lock().await;
-        let (sender, receiver) = connections
-            .as_mut()
-            .ok_or_else(|| DistributedError::Protocol("Ring not established".into()))?;
-
-        // === SCATTER-REDUCE PHASE ===
-        for step in 0..(world_size - 1) {
-            let send_idx = (rank + world_size - step) % world_size;
-            let recv_idx = (rank + world_size - step - 1) % world_size;
-
-            let (send_start, send_end) = get_chunk_range(send_idx);
-            let (recv_start, recv_end) = get_chunk_range(recv_idx);
-
-            let recv_bytes_len = (recv_end - recv_start) * 4;
-
-            // Copy data to send buffer
-            let send_buf = floats[send_start..send_end].as_bytes().to_vec();
-
-            // Send and receive concurrently
-            let mut recv_buf = vec![0u8; recv_bytes_len];
-            tokio::try_join!(sender.send(&send_buf), receiver.recv(&mut recv_buf))?;
-
-            // Reduce received data into local buffer
-            let recv_floats =
-                <[f32]>::ref_from_bytes(&recv_buf).expect("recv buffer aligned for f32");
-            for (i, &val) in recv_floats.iter().enumerate() {
-                floats[recv_start + i] += val;
-            }
-        }
-
-        // === ALL-GATHER PHASE ===
-        // After scatter-reduce, rank r owns the fully reduced chunk
-        // (r + 1) % world_size. Send that first, then forward the chunk
-        // received in the prior step.
-        let mut send_idx = (rank + 1) % world_size;
-        let mut recv_idx = rank;
-        for _ in 0..(world_size - 1) {
-            let (send_start, send_end) = get_chunk_range(send_idx);
-            let (recv_start, recv_end) = get_chunk_range(recv_idx);
-
-            let recv_bytes_len = (recv_end - recv_start) * 4;
-
-            let send_buf: &[u8] = floats[send_start..send_end].as_bytes();
-
-            let mut recv_buf = vec![0u8; recv_bytes_len];
-            tokio::try_join!(sender.send(send_buf), receiver.recv(&mut recv_buf))?;
-
-            // Copy received data to local buffer
-            let recv_floats =
-                <[f32]>::ref_from_bytes(&recv_buf).expect("recv buffer aligned for f32");
-            floats[recv_start..recv_end].copy_from_slice(recv_floats);
-
-            send_idx = recv_idx;
-            recv_idx = (recv_idx + world_size - 1) % world_size;
-        }
-
-        // Apply mean reduction after the ring has summed all contributions.
-        if op == ReduceOp::Mean {
-            let divisor = world_size as f32;
-            for f in floats.iter_mut() {
-                *f /= divisor;
-            }
-        }
-
-        Ok(())
+    async fn broadcast(&self, buffer: &mut [u8], root: usize) -> Result<()> {
+        self.ring().await?.broadcast(buffer, root).await
     }
 
     async fn barrier(&self) -> Result<()> {
-        self.establish_ring().await?;
+        self.ring().await?.barrier().await
+    }
 
-        let world_size = self.world_size();
-        if world_size < 2 {
-            return Ok(());
-        }
-
-        let mut connections = self.ring_connections.lock().await;
-        let (sender, receiver) = connections
-            .as_mut()
-            .ok_or_else(|| DistributedError::Protocol("Ring not established".into()))?;
-
-        // Simple barrier: send a token around the ring
-        let token = [0u8; 4];
-
-        for _ in 0..(world_size - 1) {
-            let mut recv_buf = [0u8; 4];
-            tokio::try_join!(sender.send(&token), receiver.recv(&mut recv_buf))?;
-        }
-
-        Ok(())
+    fn traffic(&self) -> Option<(u64, u64)> {
+        self.ring.get().map(RingCollective::traffic)
     }
 }
 

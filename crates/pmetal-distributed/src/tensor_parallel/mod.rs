@@ -7,7 +7,8 @@
 //!
 //! # Sharding Pattern
 //!
-//! Following the Megatron-LM convention used by MLX:
+//! Following the column/row split of Shoeybi et al. (2019), "Megatron-LM: Training
+//! Multi-Billion Parameter Language Models Using Model Parallelism":
 //!
 //! - **AllToSharded** (column parallel): Weight `[output/N, input]`.
 //!   Each rank computes a slice of the output. No communication needed
@@ -19,7 +20,7 @@
 //!
 //! # Architecture Support
 //!
-//! The [`plan`] module provides architecture-agnostic plan builders
+//! The [`plan`](crate::tensor_parallel::plan) module provides architecture-agnostic plan builders
 //! that read `config.json` to produce sharding plans for:
 //! - Standard transformer attention (Llama, Mistral, etc.)
 //! - SwiGLU FFN blocks

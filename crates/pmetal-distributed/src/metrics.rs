@@ -90,9 +90,13 @@ impl Gauge {
         self.value.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Decrement the gauge.
+    /// Decrement the gauge, stopping at zero: it counts things (connected
+    /// peers), and a disconnect reported twice must not wrap it around to
+    /// 2^64 - 1.
     pub fn dec(&self) {
-        self.value.fetch_sub(1, Ordering::Relaxed);
+        let _ = self
+            .value
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
     }
 
     /// Get the current value.
@@ -393,6 +397,21 @@ impl<'a> Drop for TimingGuard<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gauge counts things; decrementing past zero must not wrap it around
+    /// to 2^64 - 1.
+    #[test]
+    fn a_gauge_stops_at_zero() {
+        let g = Gauge::default();
+        g.dec();
+        assert_eq!(g.get(), 0);
+        g.inc();
+        g.inc();
+        g.dec();
+        g.dec();
+        g.dec();
+        assert_eq!(g.get(), 0);
+    }
 
     #[test]
     fn test_counter() {

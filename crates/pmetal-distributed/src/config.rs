@@ -1,4 +1,5 @@
 use crate::error::DistributedError;
+use crate::secret::ClusterSecret;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -29,6 +30,19 @@ pub struct DistributedConfig {
     /// Maximum connection retry attempts (default: 50).
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+
+    /// The cluster secret that authenticates and encrypts every link. Left
+    /// unset, it is looked up as [`ClusterSecret::resolve`] does (the
+    /// `PMETAL_CLUSTER_SECRET` variable, then `~/.pmetal/cluster_secret`).
+    /// Never serialized.
+    #[serde(skip)]
+    pub secret: Option<ClusterSecret>,
+
+    /// Run the links unauthenticated and unencrypted when no secret is
+    /// available. For tests and throwaway local runs only: anyone on the
+    /// network can then read gradients and inject their own.
+    #[serde(default)]
+    pub allow_plaintext: bool,
 }
 
 fn default_connection_timeout_ms() -> u64 {
@@ -48,6 +62,8 @@ impl DistributedConfig {
             rank,
             connection_timeout_ms: default_connection_timeout_ms(),
             max_retries: default_max_retries(),
+            secret: None,
+            allow_plaintext: false,
         }
     }
 
@@ -72,7 +88,23 @@ impl DistributedConfig {
             rank,
             connection_timeout_ms: default_connection_timeout_ms(),
             max_retries: default_max_retries(),
+            secret: None,
+            allow_plaintext: false,
         }
+    }
+
+    /// Authenticate and encrypt the links with `secret` rather than the
+    /// machine's own.
+    pub fn with_secret(mut self, secret: ClusterSecret) -> Self {
+        self.secret = Some(secret);
+        self
+    }
+
+    /// Permit unauthenticated, unencrypted links when no secret is
+    /// available. See [`Self::allow_plaintext`].
+    pub fn with_plaintext_allowed(mut self) -> Self {
+        self.allow_plaintext = true;
+        self
     }
 
     /// All addresses to try for rank `r`, in priority order

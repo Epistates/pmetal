@@ -42,6 +42,18 @@ pub fn all_sum(x: &Array, g: Option<&DistributedGroup>) -> Result<Array, Excepti
     distributed::all_sum(x, group(g)).map_err(|e| exception("all_sum", e))
 }
 
+/// `x` unchanged, with its gradient summed over the group in the backward
+/// pass.
+///
+/// This is the operator tensor parallelism (Shoeybi et al., 2019, "Megatron-LM")
+/// puts on the replicated input of a column-parallel layer: each rank's shard of the
+/// weights sees all of `x`, so the true gradient of `x` is the sum of the
+/// gradients the ranks compute. Nothing is communicated in the forward pass.
+/// ([`all_sum`] differentiates as the identity, so it is not a substitute.)
+pub fn sum_gradients(x: &Array, g: Option<&DistributedGroup>) -> Result<Array, Exception> {
+    distributed::sum_gradients(x, group(g)).map_err(|e| exception("sum_gradients", e))
+}
+
 /// Gather tensors from all ranks, concatenating along the first axis.
 ///
 /// If each rank has a tensor of shape `[N, ...]`, the result has shape

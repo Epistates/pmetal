@@ -188,26 +188,18 @@ pub async fn run_allreduce_bench(
     iters: usize,
 ) -> Result<Vec<BenchSample>> {
     let bytes = payload_mb * 1024 * 1024;
-    // Allocate as Vec<f32> so the buffer is f32-aligned for all_reduce.
     let mut buf = vec![1.0_f32; bytes / 4];
     let world_size = backend.world_size();
 
     let mut samples = Vec::with_capacity(iters);
     for i in 0..iters {
         // Reset to ones so each iteration measures the same workload.
-        for f in buf.iter_mut() {
-            *f = 1.0;
-        }
-        let bytes_view = {
-            let p = buf.as_mut_ptr().cast::<u8>();
-            #[allow(unsafe_code)]
-            unsafe {
-                std::slice::from_raw_parts_mut(p, buf.len() * 4)
-            }
-        };
+        buf.fill(1.0);
 
         let start = std::time::Instant::now();
-        backend.all_reduce(bytes_view, crate::ReduceOp::Sum).await?;
+        backend
+            .all_reduce_f32(&mut buf, crate::ReduceOp::Sum)
+            .await?;
         let elapsed = start.elapsed();
 
         let raw_bytes_per_sec = bytes as f64 / elapsed.as_secs_f64();

@@ -73,16 +73,10 @@ mod inner {
             _ => panic!("unexpected rank {rank}"),
         };
 
-        // Reinterpret as bytes for all_reduce (Vec<f32> guarantees 4-byte
-        // alignment — the same pattern used in distributed_bridge.rs).
         let mut buf: Vec<f32> = gradients.to_vec();
-        let byte_len = buf.len() * 4;
-        let byte_ptr = buf.as_mut_ptr().cast::<u8>();
-        #[allow(unsafe_code)]
-        let byte_buf = unsafe { std::slice::from_raw_parts_mut(byte_ptr, byte_len) };
 
         backend
-            .all_reduce(byte_buf, ReduceOp::Mean)
+            .all_reduce_f32(&mut buf, ReduceOp::Mean)
             .await
             .unwrap_or_else(|e| panic!("all_reduce failed (rank {rank}): {e}"));
 
@@ -115,9 +109,14 @@ mod inner {
         // `cargo test` sets the test binary as the current executable.
         let bin = std::env::current_exe().expect("current_exe");
 
+        // One cluster secret for both ranks, handed over the way an operator
+        // would: through the environment.
+        let secret = pmetal_distributed::ClusterSecret::generate().to_hex();
+
         // Spawn rank 0.
         let mut child_0 = std::process::Command::new(&bin)
             .env(ENV_RANK, "0")
+            .env(pmetal_distributed::secret::ENV_VAR, &secret)
             .env(ENV_PORT_0, port_0.to_string())
             .env(ENV_PORT_1, port_1.to_string())
             // Tell the test harness to run only this function in the child.
@@ -130,6 +129,7 @@ mod inner {
         // Spawn rank 1.
         let mut child_1 = std::process::Command::new(&bin)
             .env(ENV_RANK, "1")
+            .env(pmetal_distributed::secret::ENV_VAR, &secret)
             .env(ENV_PORT_0, port_0.to_string())
             .env(ENV_PORT_1, port_1.to_string())
             .arg("distributed_smoke_worker")

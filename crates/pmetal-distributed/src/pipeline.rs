@@ -22,7 +22,7 @@
 //! `send_and_await` dispatches a message and suspends until the matching response
 //! arrives; `register_handler` wires a one-shot callback for async dispatch.
 
-use crate::activation_codec::{ActivationCodec, compress_activation};
+use crate::activation_codec::{self, ActivationCodec};
 use crate::activation_transport::{ActivationMessage, DtypeTag, recv_activation, send_activation};
 use crate::error::{DistributedError, DistributedResult};
 use crate::topology::NodeProfile;
@@ -44,7 +44,9 @@ pub struct PipelineStageConfig {
     pub is_first: bool,
     /// Whether this is the last stage (owns norm + lm_head).
     pub is_last: bool,
-    /// Wire dtype for activation transfer.
+    /// The dtype of the tensors this stage hands to
+    /// [`PipelineStageRuntime::send_to_next`]. The codec may send them in
+    /// another (fp16 for f32); each message carries the dtype of its payload.
     pub wire_dtype: DtypeTag,
     /// Activation compression codec.
     pub codec: ActivationCodec,
@@ -113,18 +115,15 @@ impl PipelineStageRuntime {
             .as_mut()
             .ok_or_else(|| DistributedError::Protocol("no next stage to send to".into()))?;
 
-        let compressed = compress_activation(
-            data,
-            self.config.wire_dtype == DtypeTag::Float32,
-            self.config.codec,
-        );
+        let (payload, dtype) =
+            activation_codec::encode(data, self.config.wire_dtype, self.config.codec)?;
 
         let msg = ActivationMessage {
             nonce,
             layer_id,
             shape: shape.to_vec(),
-            dtype: self.config.wire_dtype,
-            data: compressed,
+            dtype,
+            data: payload,
         };
 
         send_activation(sender, &msg).await
@@ -180,12 +179,12 @@ impl PipelineStageRuntime {
 pub fn solve_layer_assignment(
     num_layers: usize,
     profiles: &[NodeProfile],
-) -> Vec<PipelineStageConfig> {
+) -> DistributedResult<Vec<PipelineStageConfig>> {
     let available_ram: Vec<u64> = profiles.iter().map(|p| p.available_ram).collect();
-    let ranges = crate::layer_assignment::assign_layers_proportional(num_layers, &available_ram);
+    let ranges = crate::layer_assignment::assign_layers_proportional(num_layers, &available_ram)?;
 
     let world_size = profiles.len();
-    ranges
+    Ok(ranges
         .into_iter()
         .enumerate()
         .map(|(rank, range)| PipelineStageConfig {
@@ -197,7 +196,7 @@ pub fn solve_layer_assignment(
             wire_dtype: DtypeTag::Float16,
             codec: ActivationCodec::Float16,
         })
-        .collect()
+        .collect())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,8 +227,7 @@ pub fn solve_layer_assignment(
 /// token = argmax(logits[0, -1, :])
 /// ```
 ///
-/// This is the standard greedy decode step identical to what dnet's `generate_stream`
-/// loop does when `temperature=0`.
+/// This is the standard greedy decode step (temperature 0).
 ///
 /// [`generate_first_shard`]: PipelineGenerationLoop::generate_first_shard
 /// [`run_shard_loop`]: PipelineGenerationLoop::run_shard_loop
@@ -595,6 +593,10 @@ impl Default for StreamMultiplexer {
         Self::new()
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_stage_tests.rs"]
+mod stage_tests;
 
 #[cfg(test)]
 mod generation_tests {

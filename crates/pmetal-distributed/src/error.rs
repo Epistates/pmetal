@@ -97,6 +97,21 @@ pub enum DistributedError {
     #[error("Namespace mismatch: expected {expected}, got {actual}")]
     NamespaceMismatch { expected: String, actual: String },
 
+    /// A peer failed to prove it holds the cluster secret, or a frame failed
+    /// authentication (altered, replayed, reordered, or keyed differently).
+    #[error("Authentication failed: {0}")]
+    Auth(String),
+
+    /// An authenticated peer disagrees about the cluster: its world size,
+    /// rank, ring membership or channel is not what this end was told.
+    #[error("Cluster configuration mismatch: {0}")]
+    ClusterMismatch(String),
+
+    /// A previous failure left this stream at an unknown position; it cannot
+    /// be used again and the ring must be re-formed.
+    #[error("Channel poisoned by an earlier failure; re-form the ring")]
+    ChannelPoisoned,
+
     // === Configuration Errors ===
     #[error("Configuration error: {0}")]
     Config(String),
@@ -147,6 +162,8 @@ impl DistributedError {
                 | Self::Cancelled
                 | Self::VersionMismatch { .. }
                 | Self::NamespaceMismatch { .. }
+                | Self::Auth(_)
+                | Self::ClusterMismatch(_)
         )
     }
 

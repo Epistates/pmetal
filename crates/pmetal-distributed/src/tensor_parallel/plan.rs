@@ -17,6 +17,7 @@
 //! source for hybrid GDN+Attention+MoE tensor parallelism.
 
 use super::sharding::{ShardingDirective, ShardingPlan};
+use crate::error::DistributedError;
 use anyhow::Result;
 
 /// Build a TP plan for a standard multi-head attention block.
@@ -43,10 +44,11 @@ use anyhow::Result;
 /// # GQA
 ///
 /// When `n_kv_heads < n_heads`, the KV projections have
-/// `out_features = n_kv_heads * head_dim`. As long as
-/// `world_size <= n_kv_heads` the split stays aligned. When
-/// `world_size > n_kv_heads` the caller must replicate KV heads before
-/// sharding (MLX's standard GQA handling).
+/// `out_features = n_kv_heads * head_dim`. The split keeps whole heads on
+/// each rank only when `n_kv_heads` (and `n_heads`) divide by `world_size`;
+/// [`build_plan`] refuses a world size for which they do not. Sharing a KV head
+/// between ranks would need replicated KV projections, which this plan does not
+/// express.
 pub fn plan_attention(
     prefix: &str,
     _n_heads: usize,
@@ -274,7 +276,7 @@ pub fn plan_gdn(
 /// 2. **No `shared_expert_gate`** — DeepSeek's shared branch is always
 ///    mixed in without a gating scalar.
 /// 3. **Stacked routed experts live under `switch_mlp.*`** (the
-///    pmetal bridge loader rewrites `experts.{e}.{m}.weight` into
+///    pmetal runtime loader rewrites `experts.{e}.{m}.weight` into
 ///    `switch_mlp.{m}.weight` with leading axis 0 = expert). The plan
 ///    targets these stacked names so the expert dimension aligns with
 ///    [`ShardingDirective::ExpertSharded`].
@@ -477,15 +479,19 @@ pub fn build_plan(
         return Ok(ShardingPlan::new());
     }
 
-    let num_layers = config
-        .get("num_hidden_layers")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(32) as usize;
-
-    let n_heads = config
-        .get("num_attention_heads")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(32) as usize;
+    // A model's size is not something to guess: a plan for the wrong depth or
+    // head count loads and silently shards the wrong tensors.
+    let required = |key: &str| -> Result<usize> {
+        config
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .ok_or_else(|| {
+                DistributedError::Config(format!("the model config has no `{key}`")).into()
+            })
+    };
+    let num_layers = required("num_hidden_layers")?;
+    let n_heads = required("num_attention_heads")?;
 
     let n_kv_heads = config
         .get("num_key_value_heads")
@@ -606,6 +612,30 @@ pub fn build_plan(
             hybrid_layer_types.as_ref().unwrap().len(),
             num_layers
         );
+    }
+
+    // Column-sharding splits a projection's rows evenly, and attention needs
+    // whole heads on each rank, so the head counts must divide.
+    if n_heads % world_size != 0 {
+        return Err(DistributedError::Config(format!(
+            "{n_heads} attention heads cannot be split across {world_size} ranks: \
+             each rank needs whole heads"
+        ))
+        .into());
+    }
+    if !is_deepseek && n_kv_heads % world_size != 0 {
+        return Err(DistributedError::Config(format!(
+            "{n_kv_heads} key/value heads cannot be split across {world_size} ranks: \
+             each rank needs whole heads (replicating KV heads across ranks is not supported)"
+        ))
+        .into());
+    }
+    if num_experts > 0 && world_size > num_experts {
+        return Err(DistributedError::Config(format!(
+            "{num_experts} experts cannot be spread over {world_size} ranks: \
+             every rank needs at least one"
+        ))
+        .into());
     }
 
     let mut plan = ShardingPlan::new();
@@ -1019,6 +1049,52 @@ mod tests {
                 .iter()
                 .all(|(n, _)| !n.contains("shared_experts"))
         );
+    }
+
+    /// Column-sharding a projection splits its rows evenly, but attention
+    /// needs whole heads on each rank. A plan whose shards cut through a head
+    /// loads without complaint and computes the wrong attention.
+    #[test]
+    fn build_plan_rejects_ranks_that_would_split_a_head() {
+        let config = |heads: u64, kv: u64| {
+            serde_json::json!({
+                "num_hidden_layers": 2,
+                "num_attention_heads": heads,
+                "num_key_value_heads": kv,
+            })
+        };
+        // 32 heads over 3 ranks, and 8 KV heads over 3 ranks.
+        let err = build_plan("llama", &config(32, 8), 3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("attention heads"), "{err}");
+        // More ranks than KV heads: a KV head would be shared across ranks.
+        let err = build_plan("llama", &config(32, 8), 16)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key/value heads"), "{err}");
+        // Divisible: fine.
+        assert!(build_plan("llama", &config(32, 8), 4).is_ok());
+        assert!(build_plan("llama", &config(32, 32), 8).is_ok());
+    }
+
+    #[test]
+    fn build_plan_rejects_more_ranks_than_experts_and_missing_dimensions() {
+        let moe = serde_json::json!({
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 4,
+        });
+        let err = build_plan("qwen2_moe", &moe, 8).unwrap_err().to_string();
+        assert!(err.contains("experts"), "{err}");
+        assert!(build_plan("qwen2_moe", &moe, 4).is_ok());
+
+        // Silent defaults used to invent a 32-layer, 32-head model.
+        let err = build_plan("llama", &serde_json::json!({}), 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("num_hidden_layers"), "{err}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Distributed linear layer operations for tensor parallelism.
 //!
-//! Implements the two fundamental distributed linear patterns from Megatron-LM:
+//! Implements the two fundamental distributed linear patterns of Shoeybi et al. (2019):
 //!
 //! - **AllToSharded**: Column-parallel. Weight `[output/N, input]`.
 //!   Forward: `sum_gradients` → local matmul → sharded output.
@@ -24,9 +24,9 @@ use pmetal_runtime::compat::{Array, Exception};
 /// is replicated across all ranks. Each rank computes its local slice
 /// of the output independently — no communication needed in forward.
 ///
-/// For correct gradient computation, `sum_gradients` must be inserted
-/// before the matmul in the backward pass (handled by MLX autograd
-/// when using `all_sum` as a gradient barrier).
+/// In the backward pass the gradient of `x` is summed over the ranks
+/// ([`ops::sum_gradients`]), since each rank only sees the part of it that
+/// flows through its own shard of the weights.
 ///
 /// # Arguments
 ///
@@ -44,16 +44,10 @@ pub fn all_to_sharded_forward(
     bias: Option<&Array>,
     group: &DistributedGroup,
 ) -> Result<Array, Exception> {
-    // sum_gradients barrier: ensures gradients are properly accumulated
-    // across ranks before this layer's backward pass. This is a no-op in
-    // the forward direction — it only affects the backward graph.
-    //
-    // Implementation: all_sum(x) / world_size makes the backward pass
-    // automatically aggregate gradients from all ranks.
-    let world_size = group.size() as f32;
-    let x_synced = ops::all_sum(x, Some(group))?;
-    let divisor = Array::from_f32_slice(&[world_size], &[1]);
-    let x_barrier = x_synced.divide(&divisor);
+    // Every rank's shard sees all of `x`, so `x`'s gradient is the sum of the
+    // gradients the ranks compute from their shards: identity here, an
+    // all-reduce of the cotangent in backward. Nothing is sent in forward.
+    let x_barrier = ops::sum_gradients(x, Some(group))?;
 
     // Local matmul: x_barrier @ weight.T
     let wt = weight.t();

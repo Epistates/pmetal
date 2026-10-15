@@ -82,6 +82,8 @@ libp2p = "0.57"
 petgraph = "0.8"
 if-addrs = "0.15"
 sha3 = "0.12"
+# Noise handshake and AEAD framing of the ring's TCP links (pmetal-distributed)
+snow = "0.10"
 
 # Terminal dashboard
 ratatui = "0.30"

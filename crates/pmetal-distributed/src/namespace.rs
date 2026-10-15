@@ -1,8 +1,12 @@
-//! Network namespace isolation via pre-shared keys.
+//! Discovery namespacing: keeps clusters and versions from seeing each other.
 //!
-//! Provides cryptographic isolation between different clusters or versions
-//! to prevent cross-talk. Uses SHA3-256 hash of the namespace string to
-//! generate a consistent PSK across all nodes in the same namespace.
+//! The namespace names the libp2p protocol and gossip topics, so nodes of
+//! different clusters or different pmetal versions ignore one another.
+//!
+//! **It is not a security boundary.** The namespace is derived from the version
+//! string and an optional cluster name, both of which anyone on the network
+//! can learn or guess; membership is proved by the [`ClusterSecret`](crate::secret::ClusterSecret),
+//! which keys the transport handshake and the attestation discovery requires.
 //!
 //! # Usage
 //!
@@ -92,7 +96,9 @@ impl NetworkNamespace {
         psk
     }
 
-    /// Get the pre-shared key.
+    /// A hash of the namespace string. Anyone who knows the version and cluster
+    /// name can compute it, so it identifies a namespace and proves nothing;
+    /// authentication is the [`ClusterSecret`](crate::secret::ClusterSecret)'s job.
     pub fn psk(&self) -> &[u8; 32] {
         &self.psk
     }

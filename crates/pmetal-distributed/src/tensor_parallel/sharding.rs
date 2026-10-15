@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// Slice a contiguous range along `axis` using `take_axis`.
 ///
 /// Equivalent to `x[..., start:start+len, ...]`. There is no `narrow` method
-/// in the bridge compat layer; this helper builds the index array and calls
+/// in the runtime compat layer; this helper builds the index array and calls
 /// `take_axis`.
 fn narrow(x: &Array, axis: i32, start: i32, len: i32) -> Result<Array, Exception> {
     let indices: Vec<i32> = (start..start + len).collect();

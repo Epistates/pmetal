@@ -39,14 +39,30 @@ impl NodeIdentity {
     /// The keypair is stored at `~/.pmetal/node_keypair`.
     /// If the file doesn't exist, a new keypair is generated and saved.
     pub fn load_or_generate() -> Result<Self> {
-        let keypair_path = Self::keypair_path()?;
+        Self::load_or_generate_at(&Self::keypair_path()?)
+    }
 
+    /// [`load_or_generate`](Self::load_or_generate) with the keypair file at
+    /// `keypair_path`.
+    ///
+    /// Safe to call from several processes at once (two ranks starting
+    /// together on one machine): the file is created exclusively, and the
+    /// loser of the race loads what the winner wrote instead of failing.
+    pub fn load_or_generate_at(keypair_path: &PathBuf) -> Result<Self> {
         let keypair = if keypair_path.exists() {
-            Self::load_keypair(&keypair_path)?
+            Self::load_keypair(keypair_path)?
         } else {
-            let kp = Self::generate_and_save(&keypair_path)?;
-            info!("Generated new node identity");
-            kp
+            match Self::generate_and_save(keypair_path) {
+                Ok(kp) => {
+                    info!("Generated new node identity");
+                    kp
+                }
+                Err(e) if keypair_path.exists() => {
+                    debug!("Lost the race to create the node identity ({e}); loading it");
+                    Self::load_keypair(keypair_path)?
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         let peer_id = PeerId::from(keypair.public());
@@ -99,6 +115,22 @@ impl NodeIdentity {
 
     /// Load a keypair from a file.
     fn load_keypair(path: &PathBuf) -> Result<Keypair> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(path)
+                .map_err(|e| DistributedError::Config(format!("Failed to stat keypair file: {e}")))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(DistributedError::Config(format!(
+                    "node keypair {} is accessible to other users (mode {:o}); run `chmod 600` on it",
+                    path.display(),
+                    mode & 0o777
+                ))
+                .into());
+            }
+        }
         let mut file = File::open(path)
             .map_err(|e| DistributedError::Config(format!("Failed to open keypair file: {}", e)))?;
 
@@ -134,37 +166,37 @@ impl NodeIdentity {
         let secret = ed25519_keypair.secret();
         let secret_bytes = secret.as_ref();
 
-        // Create file atomically with correct permissions from the start.
-        // O_CREAT | O_EXCL (via create_new) prevents TOCTOU: if the file
-        // already exists this errors rather than silently overwriting.
-        // Mode 0o600 means only the owner can read/write — no race window
-        // where the key is world-readable.
+        // Write the key to a private temporary file, then link it into place:
+        // `hard_link` fails if the destination exists, so the file appears
+        // whole and owner-only or not at all. Creating the destination
+        // directly would let a second process starting at the same moment
+        // read it before the key was written.
+        let temporary = path.with_extension(format!(
+            "tmp.{}.{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
         #[cfg(unix)]
-        let mut file = {
+        {
             use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .mode(0o600)
-                .create_new(true)
-                .write(true)
-                .open(path)
-                .map_err(|e| {
-                    DistributedError::Config(format!("Failed to create keypair file: {}", e))
-                })?
+            options.mode(0o600);
+        }
+        let write = || -> std::io::Result<()> {
+            let mut file = options.open(&temporary)?;
+            file.write_all(secret_bytes)?;
+            file.sync_all()?;
+            fs::hard_link(&temporary, path)
         };
-
-        #[cfg(not(unix))]
-        let mut file = {
-            std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path)
-                .map_err(|e| {
-                    DistributedError::Config(format!("Failed to create keypair file: {}", e))
-                })?
-        };
-
-        file.write_all(secret_bytes)
-            .map_err(|e| DistributedError::Config(format!("Failed to write keypair: {}", e)))?;
+        let outcome = write();
+        let _ = fs::remove_file(&temporary);
+        outcome.map_err(|e| {
+            DistributedError::Config(format!(
+                "Failed to create keypair file {}: {e}",
+                path.display()
+            ))
+        })?;
 
         debug!("Saved keypair to {}", path.display());
         Ok(keypair)
@@ -182,6 +214,48 @@ impl std::fmt::Debug for NodeIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two ranks starting together on one machine both find a keypair, and
+    /// the same one: neither fails, and neither reads a half-written file.
+    #[test]
+    fn concurrent_first_runs_agree_on_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_keypair");
+        let ids: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    scope.spawn(move || {
+                        NodeIdentity::load_or_generate_at(&path)
+                            .expect("load or generate")
+                            .peer_id_string()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "{ids:?}");
+        // No temporary files are left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_keypair_is_owner_only_and_a_loose_one_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_keypair");
+        NodeIdentity::load_or_generate_at(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = NodeIdentity::load_or_generate_at(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("accessible to other users"), "{err}");
+    }
 
     #[test]
     fn test_ephemeral_identity() {
