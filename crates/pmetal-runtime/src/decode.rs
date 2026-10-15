@@ -623,6 +623,28 @@ pub fn quantized_sdpa(
     bits: i32,
     sinks: Option<&InlineArray>,
 ) -> InlineArray {
+    quantized_sdpa_kv(
+        queries, q_keys, q_values, scale, query_len, n_q_heads, n_kv_heads, group_size, bits,
+        bits, sinks,
+    )
+}
+
+/// [`quantized_sdpa`] with keys and values quantized at different widths
+/// (`key_bits`, `value_bits`).
+#[allow(clippy::too_many_arguments)]
+pub fn quantized_sdpa_kv(
+    queries: &InlineArray,
+    q_keys: (&InlineArray, &InlineArray, &InlineArray),
+    q_values: (&InlineArray, &InlineArray, &InlineArray),
+    scale: f32,
+    query_len: i32,
+    n_q_heads: i32,
+    n_kv_heads: i32,
+    group_size: i32,
+    key_bits: i32,
+    value_bits: i32,
+    sinks: Option<&InlineArray>,
+) -> InlineArray {
     let b = queries.dim(0);
     let l = queries.dim(2);
     let d = queries.dim(3);
@@ -663,7 +685,7 @@ pub fn quantized_sdpa(
         Some(&k_biases),
         true, // transpose=true for Q @ K^T
         group_size,
-        bits,
+        key_bits,
     );
 
     // Apply causal mask for prefill, no mask for decode
@@ -720,7 +742,7 @@ pub fn quantized_sdpa(
         Some(&v_biases),
         false, // transpose=false for weights @ V
         group_size,
-        bits,
+        value_bits,
     );
 
     // Reshape back for GQA

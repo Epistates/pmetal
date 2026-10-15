@@ -535,6 +535,271 @@ fn memory_accounting_follows_the_stored_dtype() {
 }
 
 // ---------------------------------------------------------------------------
+// Quantized cache
+// ---------------------------------------------------------------------------
+
+fn quantized_config(bits: u8) -> KVCacheConfig {
+    cache_config().with_quantized(bits, 32)
+}
+
+/// The largest logit difference of a quantized cache from the uncached run,
+/// over the tokens after the prompt.
+fn quantized_decode_error(bits: u8) -> (f32, f32) {
+    let toy = Toy::new(30);
+    let toks = tokens(80, 31);
+    let reference = toy.reference(&toks, Visibility::default());
+    let mut chunks = vec![50];
+    chunks.extend(std::iter::repeat_n(1, 30));
+    let mut cache = KVCache::new(quantized_config(bits));
+    let cached = toy.cached(&mut cache, &toks, &chunks, Visibility::default());
+    (
+        max_diff(&cached[..50 * VOCAB], &reference[..50 * VOCAB]),
+        max_diff(&cached[50 * VOCAB..], &reference[50 * VOCAB..]),
+    )
+}
+
+#[test]
+fn quantized_prefill_attends_to_exact_keys() {
+    // The prompt's own attention must not see its quantization error.
+    for bits in [2u8, 4, 8] {
+        let (prompt, _) = quantized_decode_error(bits);
+        assert!(prompt < 2e-4, "{bits}-bit prompt logits differ by {prompt}");
+    }
+}
+
+#[test]
+fn quantized_decode_error_follows_the_bit_width() {
+    let errors: Vec<(u8, f32)> = [8u8, 6, 5, 4, 3, 2]
+        .into_iter()
+        .map(|bits| (bits, quantized_decode_error(bits).1))
+        .collect();
+    // The model's random keys give logits a spread of 1.6; the worst of 30
+    // decode steps over the whole vocabulary is off by this much at each
+    // width (measured: 0.11, 0.50, 1.0, 1.8, 3.0, 4.6), with margin.
+    for (bits, bound) in [
+        (8u8, 0.16f32),
+        (6, 0.75),
+        (5, 1.5),
+        (4, 2.7),
+        (3, 4.5),
+        (2, 7.0),
+    ] {
+        let got = errors.iter().find(|(b, _)| *b == bits).unwrap().1;
+        assert!(
+            got < bound,
+            "{bits}-bit decode logits off by {got} (bound {bound})"
+        );
+    }
+    assert!(
+        errors.first().unwrap().1 < errors.last().unwrap().1,
+        "8-bit should beat 2-bit: {errors:?}"
+    );
+}
+
+#[test]
+fn quantized_cache_elements_are_within_half_a_step() {
+    for bits in [2u8, 3, 4, 8] {
+        let group = 32usize;
+        let mut rng = Rng::new(40 + u64::from(bits));
+        let data = rng.normals(HKV * 12 * DIM, 2.0);
+        let keys = array(&data, &[1, HKV, 12, DIM]);
+        let mut cache = KVCache::new(quantized_config(bits));
+        cache.update_and_fetch(0, &keys, &keys).unwrap();
+        // The next call hands the first tokens back dequantized.
+        let next = array(&rng.normals(HKV * DIM, 1.0), &[1, HKV, 1, DIM]);
+        let (back, _) = cache.update_and_fetch(0, &next, &next).unwrap();
+        let back = to_f32_vec_eval(&back);
+
+        let levels = ((1u32 << bits) - 1) as f32;
+        for head in 0..HKV {
+            for token in 0..12 {
+                let row = |buf: &[f32], stride: usize| {
+                    let at = (head * stride + token) * DIM;
+                    buf[at..at + DIM].to_vec()
+                };
+                let (original, restored) = (row(&data, 12), row(&back, 13));
+                for g in 0..DIM / group {
+                    let span = &original[g * group..(g + 1) * group];
+                    let (lo, hi) = span
+                        .iter()
+                        .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+                    // Half a step for a plain min-max map; MLX aligns the
+                    // group's larger edge to a level, which moves the levels
+                    // by up to half a step and clips what falls past the
+                    // last one: within one step in all.
+                    let step = (hi - lo) / levels;
+                    for i in 0..group {
+                        let err = (span[i] - restored[g * group + i]).abs();
+                        assert!(
+                            err <= step + 1e-5,
+                            "{bits}-bit element off by {err}, step {step}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn quantized_decode_attention_matches_attention_over_the_dequantized_cache() {
+    use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
+    for (key_bits, value_bits) in [(8u8, 8u8), (4, 4), (8, 4), (4, 2)] {
+        for window in [None, Some(9)] {
+            let config = cache_config().with_asymmetric_quantized(key_bits, value_bits, 32);
+            let mut fast = KVCache::new(config.clone());
+            let mut dense = KVCache::new(config);
+            let mut rng = Rng::new(50);
+            let prompt_k = array(&rng.normals(HKV * 30 * DIM, 1.0), &[1, HKV, 30, DIM]);
+            let prompt_v = array(&rng.normals(HKV * 30 * DIM, 1.0), &[1, HKV, 30, DIM]);
+            fast.update_and_fetch(0, &prompt_k, &prompt_v).unwrap();
+            dense.update_and_fetch(0, &prompt_k, &prompt_v).unwrap();
+
+            let queries = array(&rng.normals(HQ * DIM, 1.0), &[1, HQ, 1, DIM]);
+            let (k, v) = one_token(60);
+            let mask_type = window.map_or(AttentionMaskType::Causal, |w| {
+                AttentionMaskType::SlidingWindow(w)
+            });
+            let attn = FusedAttentionConfig::new(HQ as i32, HKV as i32, DIM as i32)
+                .with_scale(scale())
+                .with_mask_type(mask_type);
+
+            let out = fast
+                .try_compressed_attention(0, &queries, &k, &v, &attn)
+                .unwrap()
+                .expect("a quantized cache attends to its packed rows");
+            // The same cache read the long way: dequantize everything it
+            // holds (the new token included), then attend.
+            dense.update_and_fetch(0, &k, &v).unwrap();
+            let (all_k, all_v) = dense.dequantized(0).expect("layer 0 is quantized");
+            let expected = fused_sdpa(&queries, &all_k, &all_v, &attn, None).unwrap();
+            let diff = crate::test_utils::max_abs_diff(&out, &expected);
+            assert!(
+                diff < 2e-3,
+                "K{key_bits}/V{value_bits} window {window:?}: packed vs dequantized attention differ by {diff}"
+            );
+            assert_eq!(fast.rope_offset_for(0), 31);
+        }
+    }
+}
+
+#[test]
+fn quantized_attention_declines_what_it_cannot_serve() {
+    use crate::kernels::FusedAttentionConfig;
+    let mut cache = KVCache::new(quantized_config(4));
+    let mut rng = Rng::new(51);
+    let prompt = array(&rng.normals(HKV * 8 * DIM, 1.0), &[1, HKV, 8, DIM]);
+    cache.update_and_fetch(0, &prompt, &prompt).unwrap();
+    let attn = FusedAttentionConfig::new(HQ as i32, HKV as i32, DIM as i32);
+
+    // Several queries, or a softcap, leave the cache untouched.
+    let queries = array(&rng.normals(HQ * 3 * DIM, 1.0), &[1, HQ, 3, DIM]);
+    let chunk = array(&rng.normals(HKV * 3 * DIM, 1.0), &[1, HKV, 3, DIM]);
+    assert!(
+        cache
+            .try_compressed_attention(0, &queries, &chunk, &chunk, &attn)
+            .unwrap()
+            .is_none()
+    );
+    let (k, v) = one_token(61);
+    let q1 = array(&rng.normals(HQ * DIM, 1.0), &[1, HQ, 1, DIM]);
+    let capped = attn.clone().with_logit_softcapping(30.0);
+    assert!(
+        cache
+            .try_compressed_attention(0, &q1, &k, &v, &capped)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(cache.rope_offset_for(0), 8);
+}
+
+#[test]
+fn quantized_rollback_matches_the_accepted_sequence() {
+    let toy = Toy::new(32);
+    let accepted = tokens(40, 33);
+    let drafted = tokens(6, 34);
+    let alternative = tokens(4, 35);
+    let mut cache = KVCache::new(quantized_config(8));
+    toy.cached_chunk(&mut cache, &accepted, Visibility::default());
+    toy.cached_chunk(&mut cache, &drafted, Visibility::default());
+    assert_eq!(cache.rollback(4), 4);
+    assert_eq!(cache.rope_offset_for(0), 42);
+    let after = toy.cached_chunk(&mut cache, &alternative, Visibility::default());
+
+    let mut full = accepted.clone();
+    full.extend(&drafted[..2]);
+    full.extend(&alternative);
+    let reference = toy.reference(&full, Visibility::default());
+    let diff = max_diff(&after, rows(&reference, 42, 46));
+    assert!(diff < 0.08, "8-bit cache after rollback: max diff {diff}");
+}
+
+#[test]
+fn quantized_cache_is_a_fraction_of_the_dense_one() {
+    let held = |mode: Option<u8>| {
+        let config = match mode {
+            Some(bits) => quantized_config(bits),
+            None => cache_config(),
+        };
+        let mut cache = KVCache::new(config);
+        let mut rng = Rng::new(52);
+        let k = array(&rng.normals(HKV * 300 * DIM, 1.0), &[1, HKV, 300, DIM]);
+        let k = k.as_dtype(Dtype::Bfloat16.as_i32());
+        cache.update_and_fetch(0, &k, &k).unwrap();
+        cache.memory_usage()
+    };
+    let dense = held(None);
+    assert!(
+        held(Some(4)) * 3 < dense,
+        "4-bit: {} of {dense}",
+        held(Some(4))
+    );
+    assert!(
+        held(Some(8)) * 5 < dense * 3,
+        "8-bit: {} of {dense}",
+        held(Some(8))
+    );
+}
+
+#[test]
+fn memory_footprint_matches_the_bytes_a_full_cache_holds() {
+    // A cache filled to max_seq_len in one call holds exactly its footprint.
+    let modes: [(&str, Option<(u8, u8)>); 6] = [
+        ("dense", None),
+        ("q8", Some((8, 8))),
+        ("q6", Some((6, 6))),
+        ("q4", Some((4, 4))),
+        ("q3", Some((3, 3))),
+        ("k8v4", Some((8, 4))),
+    ];
+    for dtype in [Dtype::Bfloat16, Dtype::Float32] {
+        for (name, bits) in modes {
+            let base = KVCacheConfig::new(1, 256, HKV, DIM).with_dtype(dtype);
+            let config = match bits {
+                None => base,
+                Some((k, v)) => base.with_asymmetric_quantized(k, v, 32),
+            };
+            let footprint = config.memory_footprint();
+            let mut cache = KVCache::new(config);
+            let data = ops::zeros(&[1, HKV as i32, 256, DIM as i32], dtype);
+            cache.update_and_fetch(0, &data, &data).unwrap();
+            assert_eq!(
+                cache.memory_usage(),
+                footprint,
+                "{name} {dtype:?}: the cache holds what the config says"
+            );
+        }
+    }
+}
+
+#[test]
+fn windowed_footprint_is_the_window_not_the_context() {
+    let dense = KVCacheConfig::new(2, 8192, HKV, DIM).with_dtype(Dtype::Bfloat16);
+    let windowed = dense.clone().with_rotating(512, 4);
+    assert_eq!(windowed.memory_footprint() * 16, dense.memory_footprint());
+}
+
+// ---------------------------------------------------------------------------
 // Cost: writes land in the existing buffer
 // ---------------------------------------------------------------------------
 

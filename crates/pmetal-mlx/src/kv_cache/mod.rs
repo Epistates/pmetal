@@ -38,10 +38,10 @@
 //! }
 //! ```
 
+mod affine;
 mod dense;
 mod fused_batch;
 mod mamba;
-mod quantized;
 #[cfg(test)]
 mod reference_tests;
 mod standard;
@@ -51,7 +51,6 @@ mod turboquant;
 
 pub use fused_batch::*;
 pub use mamba::*;
-pub use quantized::*;
 pub use standard::*;
 pub use turboquant::*;
 
@@ -422,59 +421,43 @@ impl KVCacheConfig {
         self
     }
 
-    /// Calculate the memory footprint for this configuration in bytes.
+    /// Calculate the memory footprint for this configuration in bytes: the
+    /// cache full to `max_seq_len` tokens (a windowed mode, to its window),
+    /// batch size 1.
     ///
     /// Useful for understanding memory requirements before allocation.
     pub fn memory_footprint(&self) -> usize {
         let key_dim = self.head_dim;
         let value_dim = self.value_head_dim;
-        match self.mode {
+        let scalar = dtype_size(self.dtype);
+        // One affine-quantized row of `dim` channels: the packed words, plus
+        // a scale and a bias per group in the model's dtype.
+        let affine_row = |dim: usize, bits: u8, group_size: usize| {
+            4 * affine::packed_words(dim, bits) + 2 * scalar * dim.div_ceil(group_size)
+        };
+        let per_token_per_head = match self.mode {
             CacheMode::Quantized { bits, group_size } => {
-                let el_per_int = 32 / bits as usize;
-                let k_packed = key_dim.div_ceil(el_per_int);
-                let v_packed = value_dim.div_ceil(el_per_int);
-                let k_groups = key_dim.div_ceil(group_size);
-                let v_groups = value_dim.div_ceil(group_size);
-                // packed u32 data + f16 scale + f16 bias per group
-                let k_per_token_bytes = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
-                let v_per_token_bytes = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
-                (k_per_token_bytes + v_per_token_bytes) * self.max_seq_len * self.num_layers
+                affine_row(key_dim, bits, group_size) + affine_row(value_dim, bits, group_size)
             }
             CacheMode::AsymmetricQuantized {
                 key_bits,
                 value_bits,
                 group_size,
             } => {
-                let k_el = 32 / key_bits as usize;
-                let v_el = 32 / value_bits as usize;
-                let k_packed = key_dim.div_ceil(k_el);
-                let v_packed = value_dim.div_ceil(v_el);
-                let k_groups = key_dim.div_ceil(group_size);
-                let v_groups = value_dim.div_ceil(group_size);
-                let k_per_token = (k_packed * 4 + k_groups * 4) * self.num_kv_heads;
-                let v_per_token = (v_packed * 4 + v_groups * 4) * self.num_kv_heads;
-                (k_per_token + v_per_token) * self.max_seq_len * self.num_layers
+                affine_row(key_dim, key_bits, group_size)
+                    + affine_row(value_dim, value_bits, group_size)
             }
             CacheMode::TurboQuant { config } => {
-                let rows_per_token = self.num_kv_heads;
-                let per_token_bytes = rows_per_token
-                    * (turboquant_key_row_bytes(config.keys, key_dim)
-                        + turboquant_value_row_bytes(config.values, value_dim));
-                per_token_bytes * self.max_seq_len * self.num_layers
+                turboquant_key_row_bytes(config.keys, key_dim)
+                    + turboquant_value_row_bytes(config.values, value_dim)
             }
-            _ => {
-                let bytes_per_element = match self.dtype {
-                    Dtype::Float32 => 4,
-                    Dtype::Float16 | Dtype::Bfloat16 => 2,
-                    _ => 4,
-                };
-                self.num_kv_heads
-                    * self.max_seq_len
-                    * (key_dim + value_dim)
-                    * bytes_per_element
-                    * self.num_layers
-            }
-        }
+            _ => (key_dim + value_dim) * scalar,
+        };
+        let tokens = match dense::Window::of(self.mode) {
+            Some(window) => window.size().min(self.max_seq_len),
+            None => self.max_seq_len,
+        };
+        per_token_per_head * self.num_kv_heads * tokens * self.num_layers
     }
 
     /// Format the memory footprint as a human-readable string.

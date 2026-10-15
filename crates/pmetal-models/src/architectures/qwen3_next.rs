@@ -834,13 +834,11 @@ impl Qwen3NextAttention {
 
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(output) = (*cache_ref).try_turboquant_attention(
-                    *layer_idx,
-                    &queries,
-                    &keys,
-                    &values,
-                    &attn_config,
-                )? {
+                if let Some(output) = (*cache_ref).try_compressed_attention(*layer_idx,
+                &queries,
+                &keys,
+                &values,
+                &attn_config,)? {
                     let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
                         b,
                         l,
@@ -920,13 +918,11 @@ impl Qwen3NextAttention {
         if mask.is_none() {
             let turbo_attn_start = Instant::now();
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(output) = (*cache_ref).try_turboquant_attention(
-                    *layer_idx,
-                    &queries,
-                    &keys,
-                    &values,
-                    &attn_config,
-                )? {
+                if let Some(output) = (*cache_ref).try_compressed_attention(*layer_idx,
+                &queries,
+                &keys,
+                &values,
+                &attn_config,)? {
                     queries.eval();
                     output.eval();
                     layer_profile.push_section("attn_rope_cache", rope_cache_start);

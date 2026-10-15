@@ -482,113 +482,6 @@ fn test_batch_kv_cache_reset_indices() {
 }
 
 // =========================================================================
-// QuantizedKVCache Tests
-// =========================================================================
-
-#[test]
-fn test_quantized_cache_basic() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-
-    // First update
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-
-    // Dequantized output should have correct shape
-    assert_eq!(cached_k.dim(2), 10);
-    assert_eq!(cached_v.dim(2), 10);
-    assert_eq!(cache.len(), 10);
-    assert!(!cache.is_empty());
-}
-
-#[test]
-fn test_quantized_cache_accumulation() {
-    let mut cache = QuantizedKVCache::new(4, 64);
-
-    // First update
-    let k1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&k1, &v1).unwrap();
-
-    // Second update
-    let k2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let (cached_k, cached_v) = cache.update_and_fetch(&k2, &v2).unwrap();
-
-    assert_eq!(cached_k.dim(2), 15);
-    assert_eq!(cached_v.dim(2), 15);
-    assert_eq!(cache.len(), 15);
-}
-
-#[test]
-fn test_quantized_cache_reset() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert!(!cache.is_empty());
-
-    cache.reset();
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-}
-
-#[test]
-fn test_quantized_cache_different_bits() {
-    // Test 8-bit
-    let cache_8bit = QuantizedKVCache::new(8, 64);
-    assert_eq!(cache_8bit.bits, 8);
-
-    // Test 4-bit
-    let cache_4bit = QuantizedKVCache::new(4, 64);
-    assert_eq!(cache_4bit.bits, 4);
-
-    // Test 2-bit
-    let cache_2bit = QuantizedKVCache::new(2, 64);
-    assert_eq!(cache_2bit.bits, 2);
-}
-
-#[test]
-#[should_panic(expected = "bits must be 2, 4, or 8")]
-fn test_quantized_cache_invalid_bits() {
-    let _ = QuantizedKVCache::new(3, 64); // Invalid
-}
-
-#[test]
-fn test_quantized_cache_memory_usage() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    assert_eq!(cache.memory_usage(), 0); // Empty
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    // Should have some memory usage now
-    assert!(cache.memory_usage() > 0);
-}
-
-#[test]
-fn test_quantized_cache_rope_offset() {
-    let mut cache = QuantizedKVCache::new(8, 64);
-
-    assert_eq!(cache.rope_offset(), 0);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert_eq!(cache.rope_offset(), 10);
-}
-
-// =========================================================================
 // CacheMode Tests for New Modes
 // =========================================================================
 
@@ -783,7 +676,7 @@ fn test_turboquant_direct_attention_matches_reference_uniform() {
         .with_mask_type(AttentionMaskType::Causal);
 
     let fast_output = fast_cache
-        .try_turboquant_attention(0, &queries, &new_k, &new_v, &attn_config)
+        .try_compressed_attention(0, &queries, &new_k, &new_v, &attn_config)
         .unwrap()
         .expect("TurboQuant direct attention should activate");
     let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
@@ -826,7 +719,7 @@ fn test_turboquant_direct_attention_matches_reference_mixed_sliding_window() {
         .with_mask_type(AttentionMaskType::SlidingWindow(3));
 
     let fast_output = fast_cache
-        .try_turboquant_attention(0, &queries, &new_k, &new_v, &attn_config)
+        .try_compressed_attention(0, &queries, &new_k, &new_v, &attn_config)
         .unwrap()
         .expect("TurboQuant direct attention should activate");
     let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
@@ -870,7 +763,7 @@ fn test_turboquant_direct_attention_matches_reference_asymmetric_value_dim() {
         .with_mask_type(AttentionMaskType::Causal);
 
     let fast_output = fast_cache
-        .try_turboquant_attention(0, &queries, &new_k, &new_v, &attn_config)
+        .try_compressed_attention(0, &queries, &new_k, &new_v, &attn_config)
         .unwrap()
         .expect("TurboQuant direct attention should activate");
     let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();

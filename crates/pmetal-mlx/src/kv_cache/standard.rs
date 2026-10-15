@@ -4,11 +4,9 @@ use pmetal_runtime::compat::{Array, Exception};
 
 use crate::kernels::FusedAttentionConfig;
 
+use super::affine::AffineLayer;
 use super::dense::{DenseLayer, Window};
-use super::{
-    CacheMode, KVCacheConfig, QuantizedKVCache, TurboQuantKvCache, create_turboquant_runtime,
-    dtype_size,
-};
+use super::{CacheMode, KVCacheConfig, TurboQuantKvCache, create_turboquant_runtime};
 
 /// Key-Value cache for transformer inference.
 ///
@@ -25,7 +23,7 @@ pub struct KVCache {
     /// Per-layer dense entries.
     layer_caches: Vec<DenseLayer>,
     /// Quantized per-layer caches (used when mode is Quantized or AsymmetricQuantized).
-    quantized_layers: Option<Vec<QuantizedKVCache>>,
+    quantized_layers: Option<Vec<AffineLayer>>,
     /// TurboQuant per-layer caches.
     turboquant_layers: Option<Vec<TurboQuantKvCache>>,
     /// Total number of tokens processed.
@@ -43,7 +41,7 @@ impl KVCache {
         let quantized_layers = match config.mode {
             CacheMode::Quantized { bits, group_size } => Some(
                 (0..config.num_layers)
-                    .map(|_| QuantizedKVCache::new(bits, group_size))
+                    .map(|_| AffineLayer::new(bits, bits, group_size))
                     .collect(),
             ),
             CacheMode::AsymmetricQuantized {
@@ -52,7 +50,7 @@ impl KVCache {
                 group_size,
             } => Some(
                 (0..config.num_layers)
-                    .map(|_| QuantizedKVCache::new_asymmetric(key_bits, value_bits, group_size))
+                    .map(|_| AffineLayer::new(key_bits, value_bits, group_size))
                     .collect(),
             ),
             _ => None,
@@ -246,7 +244,7 @@ impl KVCache {
             if layer_idx == 0 {
                 self.total_tokens += new_keys.dim(2) as usize;
             }
-            return q_layers[layer_idx].update_and_fetch(new_keys, new_values);
+            return q_layers[layer_idx].update(new_keys, new_values);
         }
         if let Some(ref mut tq_layers) = self.turboquant_layers {
             if layer_idx == 0 {
@@ -281,11 +279,17 @@ impl KVCache {
             .window_mask(self.window, new_len)
     }
 
-    /// Try the TurboQuant direct-attention path for single-token decode.
+    /// Attend a single decode token straight to a compressed cache.
     ///
-    /// Returns `Ok(Some(output))` when the active cache mode is TurboQuant and
-    /// the inputs satisfy the decode-only fast-path constraints.
-    pub fn try_turboquant_attention(
+    /// Returns `Ok(Some(output))` `[B, Hq, 1, Dv]` when the cache stores its
+    /// tokens quantized and the call is one the packed attention kernels
+    /// serve: one new token, causal attention or a sliding window, no logit
+    /// softcapping. The new token is appended in the process, so the caller
+    /// must not also call [`update_and_fetch`](Self::update_and_fetch) for
+    /// it. Returns `Ok(None)`, leaving the cache untouched, for everything
+    /// else: the caller then takes the [`update_and_fetch`] path, which
+    /// works for every mode.
+    pub fn try_compressed_attention(
         &mut self,
         layer_idx: usize,
         queries: &Array,
@@ -299,26 +303,48 @@ impl KVCache {
                 layer_idx, self.config.num_layers
             )));
         }
+        use crate::kernels::AttentionMaskType;
+        let single_token = queries.ndim() == 4
+            && queries.dim(2) == 1
+            && new_keys.ndim() == 4
+            && new_keys.dim(2) == 1
+            && new_values.dim(2) == 1;
+        let window = match attn_config.mask_type {
+            AttentionMaskType::None | AttentionMaskType::Causal => None,
+            AttentionMaskType::SlidingWindow(w) => Some(w.max(1) as usize),
+        };
+        if !single_token || attn_config.logit_softcapping.is_some() {
+            return Ok(None);
+        }
 
-        let Some(tq_layers) = self.turboquant_layers.as_mut() else {
+        let output = if let Some(q_layers) = self.quantized_layers.as_mut() {
+            q_layers[layer_idx].attend(queries, new_keys, new_values, attn_config.scale, window)?
+        } else if let Some(tq_layers) = self.turboquant_layers.as_mut() {
+            let layer = &mut tq_layers[layer_idx];
+            if !layer.can_direct_attention(queries, new_keys, new_values, attn_config) {
+                return Ok(None);
+            }
+            layer.append_and_compute_attention(queries, new_keys, new_values, attn_config)?
+        } else {
             return Ok(None);
         };
-        if !tq_layers[layer_idx].can_direct_attention(queries, new_keys, new_values, attn_config) {
-            return Ok(None);
-        }
-
         if layer_idx == 0 {
-            self.total_tokens += new_keys.dim(2) as usize;
+            self.total_tokens += 1;
         }
-        tq_layers[layer_idx]
-            .append_and_compute_attention(queries, new_keys, new_values, attn_config)
-            .map(Some)
+        Ok(Some(output))
     }
 
     /// The cached keys and values of a layer as a single-token step would
     /// see them, or `None` while the layer is empty.
     pub fn get(&self, layer_idx: usize) -> Option<(Array, Array)> {
         self.layer_caches.get(layer_idx)?.current(self.window)
+    }
+
+    /// A quantized layer's whole content, dequantized, for tests.
+    #[cfg(test)]
+    pub(super) fn dequantized(&self, layer_idx: usize) -> Option<(Array, Array)> {
+        let layer = self.quantized_layers.as_ref()?.get(layer_idx)?;
+        layer.dequantized(pmetal_runtime::compat::Dtype::Float32.as_i32())
     }
 
     /// The dense key buffer of a layer, for tests that watch where it lives.
@@ -358,7 +384,7 @@ impl KVCache {
     /// in, buffer slack included.
     pub fn memory_usage(&self) -> usize {
         if let Some(ref q_layers) = self.quantized_layers {
-            return q_layers.iter().map(|c| c.memory_usage()).sum();
+            return q_layers.iter().map(AffineLayer::nbytes).sum();
         }
         if let Some(ref tq_layers) = self.turboquant_layers {
             return tq_layers.iter().map(|c| c.memory_usage()).sum();
@@ -368,24 +394,7 @@ impl KVCache {
 
     /// Estimate maximum memory usage for the configured cache.
     pub fn max_memory_usage(&self) -> usize {
-        // For quantized modes, use the config's memory_footprint calculation
-        match self.config.mode {
-            CacheMode::Quantized { .. }
-            | CacheMode::AsymmetricQuantized { .. }
-            | CacheMode::TurboQuant { .. } => {
-                return self.config.memory_footprint();
-            }
-            _ => {}
-        }
-        let seq_len = match self.config.mode {
-            CacheMode::SlidingWindow { window_size } => window_size,
-            CacheMode::Rotating { max_size, .. } => max_size,
-            _ => self.config.max_seq_len,
-        };
-        let key_elements = seq_len * self.config.num_kv_heads * self.config.head_dim;
-        let value_elements = seq_len * self.config.num_kv_heads * self.config.value_head_dim;
-        let bytes_per_layer = (key_elements + value_elements) * dtype_size(self.config.dtype);
-        self.config.num_layers * bytes_per_layer
+        self.config.memory_footprint()
     }
 
     /// Fetch cached keys/values for a layer, for a decode path that keeps
