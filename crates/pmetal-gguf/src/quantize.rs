@@ -1,700 +1,421 @@
-//! K-Quant quantization utilities.
+//! Quantization of `f32` tensors to GGUF tensor types.
 //!
-//! Helper functions for quantizing f32 data to K-quant block formats.
-//! Follows the llama.cpp/GGML reference implementation.
+//! [`quantize_tensor`] is the entry point: it takes a tensor's values in
+//! row-major order together with the length of its rows and, optionally, an
+//! importance vector, and returns the bytes of the quantized tensor.
+//!
+//! # Rows, blocks and importance
+//!
+//! Quantized formats store whole blocks (32, 64, 128 or 256 weights) and a
+//! block never straddles a row, so `n_per_row` must be a multiple of the
+//! type's block size. The optional importance vector has one weight per input
+//! channel (per column of the weight matrix), typically the mean squared
+//! activation from a calibration run (see [`crate::imatrix::IMatrix`]). Where
+//! a format supports it the quantizer minimises the *importance-weighted*
+//! reconstruction error instead of the plain one, which spends the format's
+//! few levels where the activations are large. A tensor made of several
+//! slices stacked along its outer dimension (the experts of a mixture-of-
+//! experts layer) takes one importance vector per slice, concatenated.
+//!
+//! # Algorithms
+//!
+//! The block layouts are those of the ggml reference and the algorithms its
+//! reference quantizers use: per-sub-block scale (and minimum) search by
+//! weighted least squares over a grid of candidate scales, a joint
+//! re-quantization of the sub-block scales for the K-quants, and the
+//! non-linear nearest-value search for IQ4. The output is deterministic and
+//! independent of the number of threads (rows and blocks are independent and
+//! processed in parallel).
+//!
+//! `x * (1/d)` rather than `x / d` and round-half-to-even `nearest_int` are
+//! used exactly where the reference uses them, so legacy formats match its
+//! output bit for bit.
+
+// The quantizers follow the reference algorithms index for index; rewriting their
+// loops as iterator chains over several parallel arrays would obscure that.
+#![allow(clippy::needless_range_loop)]
 
 use crate::fp4::{best_index_mxfp4, e8m0_to_fp32_half, fp32_to_ue4m3, ue4m3_to_fp32};
-use crate::k_quants::{
-    quantize_q2k, quantize_q3k, quantize_q4k, quantize_q5k, quantize_q6k, quantize_q8k,
-};
+use crate::k_quants as kq;
 use crate::types::GgmlType;
+use half::f16;
 use pmetal_core::{PMetalError, Result};
-use zerocopy::IntoBytes;
+use rayon::prelude::*;
+
+/// Smallest magnitude treated as non-zero when scaling a group.
+pub(crate) const GROUP_MAX_EPS: f32 = 1e-15;
+
+/// Blocks a parallel work item handles at minimum.
+const BLOCKS_PER_TASK: usize = 64;
+
+/// Signature of a per-row quantizer: `x` holds whole blocks, `qw` the
+/// importance of the same columns, `sigma2` the row-wide mean square of the
+/// *whole* row (some formats weight by it), and `out` the bytes for `x`.
+type RowFn = fn(x: &[f32], qw: Option<&[f32]>, sigma2: f32, out: &mut [u8]);
 
 /// Quantize a float slice to the specified GGUF type.
 ///
-/// This is the main entry point for quantization.
+/// The slice is treated as one row, so its length must be a multiple of the
+/// type's block size. Use [`quantize_tensor`] to quantize a matrix with an
+/// importance vector.
 pub fn quantize(data: &[f32], dtype: GgmlType) -> Result<Vec<u8>> {
+    quantize_tensor(data, dtype, data.len().max(1), None)
+}
+
+/// Whether [`quantize_tensor`] can produce `dtype`.
+pub fn can_quantize(dtype: GgmlType) -> bool {
+    matches!(dtype, GgmlType::F32 | GgmlType::F16 | GgmlType::Bf16)
+        || row_quantizer(dtype).is_some()
+}
+
+/// The type to store rows of `n_per_row` values in when `dtype` was wanted.
+///
+/// A block never straddles a row, so a type whose block size does not divide
+/// the row cannot hold the tensor. The reference falls back to a 32-element
+/// type of similar size (Q2_K, Q3_K, IQ4_XS and the IQ1/2/3 types to IQ4_NL,
+/// Q4_K to Q5_0, Q5_K to Q5_1, Q6_K and Q8_K to Q8_0, the ternary types to
+/// Q4_0), and to F16 when even 32 does not divide the row. Returns `dtype`
+/// itself when it fits.
+pub fn fit_to_row_length(dtype: GgmlType, n_per_row: usize) -> GgmlType {
+    if n_per_row % dtype.block_size() == 0 {
+        return dtype;
+    }
+    let fallback = match dtype {
+        GgmlType::Tq1_0 | GgmlType::Tq2_0 => GgmlType::Q4_0,
+        GgmlType::Iq2Xxs
+        | GgmlType::Iq2Xs
+        | GgmlType::Iq2S
+        | GgmlType::Iq3Xxs
+        | GgmlType::Iq3S
+        | GgmlType::Iq1S
+        | GgmlType::Iq1M
+        | GgmlType::Q2K
+        | GgmlType::Q3K
+        | GgmlType::Iq4Xs => GgmlType::Iq4Nl,
+        GgmlType::Q4K => GgmlType::Q5_0,
+        GgmlType::Q5K => GgmlType::Q5_1,
+        GgmlType::Q6K | GgmlType::Q8K => GgmlType::Q8_0,
+        _ => GgmlType::F16,
+    };
+    if n_per_row % fallback.block_size() == 0 {
+        fallback
+    } else {
+        GgmlType::F16
+    }
+}
+
+/// Whether `dtype` uses the importance vector. The others ignore it.
+pub fn uses_importance(dtype: GgmlType) -> bool {
+    matches!(
+        dtype,
+        GgmlType::Q4_0
+            | GgmlType::Q4_1
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::Q2K
+            | GgmlType::Q3K
+            | GgmlType::Q4K
+            | GgmlType::Q5K
+            | GgmlType::Q6K
+            | GgmlType::Iq4Nl
+            | GgmlType::Iq4Xs
+    )
+}
+
+/// Quantize a tensor given as `data` (row-major) with rows of `n_per_row`
+/// elements.
+///
+/// `importance`, when given, holds one non-negative weight per input channel:
+/// `n_per_row` values, or a multiple of that for a tensor of equally sized
+/// slices stacked along its outer dimension (one vector per slice, in order).
+/// Types that cannot use it ignore it ([`uses_importance`]).
+///
+/// # Errors
+///
+/// - the type has no quantizer (the repacked layouts and the integer types);
+/// - `data.len()` is not a multiple of `n_per_row`, or `n_per_row` is not a
+///   multiple of the type's block size;
+/// - the importance vector has an incompatible length.
+pub fn quantize_tensor(
+    data: &[f32],
+    dtype: GgmlType,
+    n_per_row: usize,
+    importance: Option<&[f32]>,
+) -> Result<Vec<u8>> {
     match dtype {
-        GgmlType::F32 => {
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            Ok(bytes)
-        }
+        GgmlType::F32 => return Ok(data.iter().flat_map(|f| f.to_le_bytes()).collect()),
         GgmlType::F16 => {
-            let bytes: Vec<u8> = data
+            return Ok(data
                 .iter()
-                .map(|&f| half::f16::from_f32(f))
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
-            Ok(bytes)
+                .flat_map(|&f| f16::from_f32(f).to_le_bytes())
+                .collect());
         }
         GgmlType::Bf16 => {
-            let bytes: Vec<u8> = data
+            return Ok(data
                 .iter()
-                .map(|&f| half::bf16::from_f32(f))
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
-            Ok(bytes)
+                .flat_map(|&f| half::bf16::from_f32(f).to_le_bytes())
+                .collect());
         }
-        GgmlType::Q4_0 => {
-            let bytes = quantize_q4_0(data);
-            Ok(bytes)
-        }
-        GgmlType::Q4_1 => Ok(quantize_q4_1(data)),
-        GgmlType::Q5_0 => Ok(quantize_q5_0(data)),
-        GgmlType::Q5_1 => Ok(quantize_q5_1(data)),
-        GgmlType::Q8_0 => {
-            // Q8_0: 32-element blocks with f16 scale + 32 i8 values (34 bytes/block).
-            // Must NOT reuse Q8K which has 256-element blocks with different layout.
-            let blocks = quantize_q8_0(data);
-            Ok(blocks_to_bytes(&blocks))
-        }
-        GgmlType::Q8_1 => Ok(quantize_q8_1(data)),
-        GgmlType::Q1_0 => Ok(quantize_q1_0(data)),
-        GgmlType::Tq1_0 => Ok(quantize_tq1_0(data)),
-        GgmlType::Tq2_0 => Ok(quantize_tq2_0(data)),
-        GgmlType::Mxfp4 => Ok(quantize_mxfp4(data)),
-        GgmlType::Nvfp4 => Ok(quantize_nvfp4(data)),
-        GgmlType::Q8K => {
-            let blocks = quantize_q8k(data);
-            Ok(blocks_to_bytes(&blocks))
-        }
-        GgmlType::Q4K => {
-            let blocks = quantize_q4k(data);
-            Ok(blocks_to_bytes(&blocks))
-        }
-        GgmlType::Q5K => {
-            let blocks = quantize_q5k(data);
-            Ok(blocks_to_bytes(&blocks))
-        }
-        GgmlType::Q6K => {
-            let blocks = quantize_q6k(data);
-            Ok(blocks_to_bytes(&blocks))
-        }
-        GgmlType::Q3K => {
-            let blocks = quantize_q3k(data);
-            Ok(blocks_to_bytes(&blocks))
-        }
-        GgmlType::Q2K => {
-            let blocks = quantize_q2k(data);
-            Ok(blocks_to_bytes(&blocks))
-        }
-        _ => Err(PMetalError::Quantization(format!(
-            "Quantization to {:?} not yet implemented",
-            dtype
-        ))),
+        _ => {}
     }
-}
+    let (block_size, type_size, quantize_row) = row_quantizer(dtype).ok_or_else(|| {
+        PMetalError::Quantization(format!("Quantization to {dtype:?} is not supported"))
+    })?;
 
-/// Quantize f32 data to Q4_0 format.
-///
-/// Q4_0 stores one f16 scale and 32 signed 4-bit values per block. GGML packs
-/// elements 0..16 in the low nibbles and elements 16..32 in the high nibbles.
-fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
-    const QK4_0: usize = 32;
-    let n_blocks = data.len().div_ceil(QK4_0);
-    let mut output = Vec::with_capacity(n_blocks * 18);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK4_0;
-        let end = (start + QK4_0).min(data.len());
-        let block_data = &data[start..end];
-
-        let mut max = 0.0f32;
-        let mut amax = 0.0f32;
-        for &x in block_data {
-            let ax = x.abs();
-            if ax > amax {
-                amax = ax;
-                max = x;
-            }
-        }
-
-        let scale = max / -8.0;
-        let iscale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
-        output.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-
-        for i in 0..16 {
-            let x0 = block_data.get(i).copied().unwrap_or(0.0);
-            let x1 = block_data.get(i + 16).copied().unwrap_or(0.0);
-            let q0 = nearest_int(x0 * iscale + 8.5).clamp(0, 15) as u8;
-            let q1 = nearest_int(x1 * iscale + 8.5).clamp(0, 15) as u8;
-            output.push(q0 | (q1 << 4));
-        }
-    }
-
-    output
-}
-
-/// Quantize f32 data to Q4_1 format.
-fn quantize_q4_1(data: &[f32]) -> Vec<u8> {
-    const QK4_1: usize = 32;
-    let n_blocks = data.len().div_ceil(QK4_1);
-    let mut output = Vec::with_capacity(n_blocks * 20);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK4_1;
-        let end = (start + QK4_1).min(data.len());
-        let block_data = &data[start..end];
-
-        let (min, max) = block_min_max(block_data);
-        let scale = (max - min) / 15.0;
-        let iscale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
-
-        output.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-        output.extend_from_slice(&half::f16::from_f32(min).to_le_bytes());
-
-        for i in 0..16 {
-            let x0 = block_data.get(i).copied().unwrap_or(0.0);
-            let x1 = block_data.get(i + 16).copied().unwrap_or(0.0);
-            let q0 = nearest_int((x0 - min) * iscale).clamp(0, 15) as u8;
-            let q1 = nearest_int((x1 - min) * iscale).clamp(0, 15) as u8;
-            output.push(q0 | (q1 << 4));
-        }
-    }
-
-    output
-}
-
-fn quantize_q5_0(data: &[f32]) -> Vec<u8> {
-    const QK5_0: usize = 32;
-    let n_blocks = data.len().div_ceil(QK5_0);
-    let mut output = Vec::with_capacity(n_blocks * 22);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK5_0;
-        let end = (start + QK5_0).min(data.len());
-        let block_data = &data[start..end];
-
-        let (max, _) = signed_absmax(block_data);
-        let scale = max / -16.0;
-        let iscale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
-        let mut qh = 0u32;
-        let mut qs = [0u8; QK5_0 / 2];
-
-        for (i, qs_byte) in qs.iter_mut().enumerate() {
-            let x0 = block_data.get(i).copied().unwrap_or(0.0);
-            let x1 = block_data.get(i + 16).copied().unwrap_or(0.0);
-            let q0 = nearest_int(x0 * iscale + 16.5).clamp(0, 31) as u8;
-            let q1 = nearest_int(x1 * iscale + 16.5).clamp(0, 31) as u8;
-            *qs_byte = (q0 & 0x0f) | ((q1 & 0x0f) << 4);
-            qh |= u32::from((q0 & 0x10) >> 4) << i;
-            qh |= u32::from((q1 & 0x10) >> 4) << (i + 16);
-        }
-
-        output.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-        output.extend_from_slice(&qh.to_le_bytes());
-        output.extend_from_slice(&qs);
-    }
-
-    output
-}
-
-fn quantize_q5_1(data: &[f32]) -> Vec<u8> {
-    const QK5_1: usize = 32;
-    let n_blocks = data.len().div_ceil(QK5_1);
-    let mut output = Vec::with_capacity(n_blocks * 24);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK5_1;
-        let end = (start + QK5_1).min(data.len());
-        let block_data = &data[start..end];
-
-        let (min, max) = block_min_max(block_data);
-        let scale = (max - min) / 31.0;
-        let iscale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
-        let mut qh = 0u32;
-        let mut qs = [0u8; QK5_1 / 2];
-
-        for (i, qs_byte) in qs.iter_mut().enumerate() {
-            let x0 = block_data.get(i).copied().unwrap_or(0.0);
-            let x1 = block_data.get(i + 16).copied().unwrap_or(0.0);
-            let q0 = nearest_int((x0 - min) * iscale).clamp(0, 31) as u8;
-            let q1 = nearest_int((x1 - min) * iscale).clamp(0, 31) as u8;
-            *qs_byte = (q0 & 0x0f) | ((q1 & 0x0f) << 4);
-            qh |= u32::from((q0 & 0x10) >> 4) << i;
-            qh |= u32::from((q1 & 0x10) >> 4) << (i + 16);
-        }
-
-        output.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-        output.extend_from_slice(&half::f16::from_f32(min).to_le_bytes());
-        output.extend_from_slice(&qh.to_le_bytes());
-        output.extend_from_slice(&qs);
-    }
-
-    output
-}
-
-/// Quantize f32 data to Q1_0 format.
-///
-/// Q1_0 stores one f16 mean-absolute scale and 128 sign bits per block.
-fn quantize_q1_0(data: &[f32]) -> Vec<u8> {
-    const QK1_0: usize = 128;
-    let n_blocks = data.len().div_ceil(QK1_0);
-    let mut output = Vec::with_capacity(n_blocks * 18);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK1_0;
-        let end = (start + QK1_0).min(data.len());
-        let block_data = &data[start..end];
-
-        let sum_abs = block_data.iter().fold(0.0f32, |sum, value| {
-            if value.is_finite() {
-                sum + value.abs()
-            } else {
-                sum
-            }
-        });
-        let scale = sum_abs / QK1_0 as f32;
-        output.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-
-        let mut qs = [0u8; QK1_0 / 8];
-        for i in 0..QK1_0 {
-            let value = block_data.get(i).copied().unwrap_or(0.0);
-            if value >= 0.0 {
-                qs[i / 8] |= 1 << (i % 8);
-            }
-        }
-        output.extend_from_slice(&qs);
-    }
-
-    output
-}
-
-/// Quantize f32 data to Q8_0 format.
-///
-/// Q8_0: 32-element blocks, each with an f16 scale and 32 i8 quantized values.
-/// Block size: 34 bytes (2 bytes scale + 32 bytes data).
-fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
-    const QK8_0: usize = 32;
-    let n_blocks = data.len().div_ceil(QK8_0);
-    let mut output = Vec::with_capacity(n_blocks * 34);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK8_0;
-        let end = (start + QK8_0).min(data.len());
-        let block_data = &data[start..end];
-
-        // Find max absolute value for scale
-        let amax = block_data.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
-
-        let scale = amax / 127.0;
-        let iscale = if amax == 0.0 { 0.0 } else { 127.0 / amax };
-
-        // Write f16 scale
-        let scale_f16 = half::f16::from_f32(scale);
-        output.extend_from_slice(&scale_f16.to_le_bytes());
-
-        // Quantize and write i8 values
-        for i in 0..QK8_0 {
-            let val = if i < block_data.len() {
-                nearest_int(block_data[i] * iscale).clamp(-127, 127) as i8
-            } else {
-                0i8 // zero-pad partial last block
-            };
-            output.push(val as u8);
-        }
-    }
-
-    output
-}
-
-fn quantize_q8_1(data: &[f32]) -> Vec<u8> {
-    const QK8_1: usize = 32;
-    let n_blocks = data.len().div_ceil(QK8_1);
-    let mut output = Vec::with_capacity(n_blocks * 36);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK8_1;
-        let end = (start + QK8_1).min(data.len());
-        let block_data = &data[start..end];
-
-        let amax = block_data.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
-        let scale = amax / 127.0;
-        let iscale = if amax == 0.0 { 0.0 } else { 127.0 / amax };
-        let mut qs = [0i8; QK8_1];
-        let mut sum = 0i32;
-
-        for (i, quant) in qs.iter_mut().enumerate() {
-            let value = block_data.get(i).copied().unwrap_or(0.0);
-            *quant = nearest_int(value * iscale).clamp(-127, 127) as i8;
-            sum += i32::from(*quant);
-        }
-
-        output.extend_from_slice(&half::f16::from_f32(scale).to_le_bytes());
-        output.extend_from_slice(&half::f16::from_f32(sum as f32 * scale).to_le_bytes());
-        output.extend(qs.iter().map(|value| *value as u8));
-    }
-
-    output
-}
-
-fn signed_absmax(data: &[f32]) -> (f32, f32) {
-    let mut signed = 0.0f32;
-    let mut absmax = 0.0f32;
-    for &value in data {
-        if value.is_finite() && value.abs() > absmax {
-            absmax = value.abs();
-            signed = value;
-        }
-    }
-    (signed, absmax)
-}
-
-fn block_min_max(data: &[f32]) -> (f32, f32) {
     if data.is_empty() {
-        return (0.0, 0.0);
+        return Ok(Vec::new());
     }
-    let (min, max) = data
-        .iter()
-        .filter(|value| value.is_finite())
-        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), &value| {
-            (min.min(value), max.max(value))
-        });
-    if min.is_finite() && max.is_finite() {
-        (min, max)
-    } else {
-        (0.0, 0.0)
+    if n_per_row == 0 || data.len() % n_per_row != 0 {
+        return Err(PMetalError::Quantization(format!(
+            "{} values do not divide into rows of {n_per_row}",
+            data.len()
+        )));
     }
-}
+    if n_per_row % block_size != 0 {
+        return Err(PMetalError::Quantization(format!(
+            "rows of {n_per_row} values are not a whole number of {dtype:?} blocks ({block_size} values)"
+        )));
+    }
+    let n_rows = data.len() / n_per_row;
 
-fn quantize_mxfp4(data: &[f32]) -> Vec<u8> {
-    const QK_MXFP4: usize = 32;
-    let n_blocks = data.len().div_ceil(QK_MXFP4);
-    let mut output = Vec::with_capacity(n_blocks * 17);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK_MXFP4;
-        let end = (start + QK_MXFP4).min(data.len());
-        let block_data = &data[start..end];
-        let amax = block_data.iter().fold(0.0f32, |max, value| {
-            if value.is_finite() {
-                max.max(value.abs())
-            } else {
-                max
+    // Which slice of the importance vector a row uses.
+    let (slices, rows_per_slice) = match importance {
+        Some(_) if !uses_importance(dtype) => (0, 0),
+        Some(w) => {
+            if w.is_empty() || w.len() % n_per_row != 0 {
+                return Err(PMetalError::Quantization(format!(
+                    "importance has {} values, not a multiple of the row length {n_per_row}",
+                    w.len()
+                )));
             }
-        });
-        let scale_exp = if amax > 0.0 {
-            (amax.log2().floor() - 2.0 + 127.0).clamp(0.0, 255.0) as u8
-        } else {
-            0
-        };
-        let scale = e8m0_to_fp32_half(scale_exp);
-        output.push(scale_exp);
-
-        for i in 0..16 {
-            let x0 = block_data.get(i).copied().unwrap_or(0.0);
-            let x1 = block_data.get(i + 16).copied().unwrap_or(0.0);
-            let q0 = best_index_mxfp4(x0, scale);
-            let q1 = best_index_mxfp4(x1, scale);
-            output.push(q0 | (q1 << 4));
+            let slices = w.len() / n_per_row;
+            if n_rows % slices != 0 {
+                return Err(PMetalError::Quantization(format!(
+                    "{n_rows} rows do not divide into the {slices} importance slices"
+                )));
+            }
+            (slices, n_rows / slices)
+        }
+        None => (0, 0),
+    };
+    let importance = importance.filter(|_| slices > 0);
+    if let Some(w) = importance {
+        if w.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(PMetalError::Quantization(
+                "importance weights must be finite and non-negative".into(),
+            ));
         }
     }
 
-    output
-}
+    let blocks_per_row = n_per_row / block_size;
+    let row_bytes = blocks_per_row * type_size;
+    let task_blocks = blocks_per_row.clamp(1, BLOCKS_PER_TASK);
+    let mut out = vec![0u8; n_rows * row_bytes];
 
-fn quantize_nvfp4(data: &[f32]) -> Vec<u8> {
-    const QK_NVFP4: usize = 64;
-    const QK_NVFP4_SUB: usize = 16;
-    const N_SUB_BLOCKS: usize = QK_NVFP4 / QK_NVFP4_SUB;
-    let n_blocks = data.len().div_ceil(QK_NVFP4);
-    let mut output = Vec::with_capacity(n_blocks * 36);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK_NVFP4;
-        let block_start = output.len();
-        output.extend_from_slice(&[0u8; 36]);
-
-        for sub in 0..N_SUB_BLOCKS {
-            let sub_start = start + sub * QK_NVFP4_SUB;
-            let sub_end = (sub_start + QK_NVFP4_SUB).min(data.len());
-            let sub_data = if sub_start < data.len() {
-                &data[sub_start..sub_end]
-            } else {
-                &[]
-            };
-            let amax = sub_data.iter().fold(0.0f32, |max, value| {
-                if value.is_finite() {
-                    max.max(value.abs())
-                } else {
-                    max
-                }
+    out.par_chunks_mut(row_bytes)
+        .zip(data.par_chunks(n_per_row))
+        .enumerate()
+        .for_each(|(row, (out_row, x_row))| {
+            let qw_row = importance.map(|w| {
+                let slice = row / rows_per_slice;
+                &w[slice * n_per_row..(slice + 1) * n_per_row]
             });
-            let scale_byte = fp32_to_ue4m3(amax / 6.0);
-            let scale = ue4m3_to_fp32(scale_byte);
-            output[block_start + sub] = scale_byte;
-
-            for i in 0..QK_NVFP4_SUB / 2 {
-                let x0 = sub_data.get(i).copied().unwrap_or(0.0);
-                let x1 = sub_data.get(i + QK_NVFP4_SUB / 2).copied().unwrap_or(0.0);
-                let q0 = best_index_mxfp4(x0, scale);
-                let q1 = best_index_mxfp4(x1, scale);
-                output[block_start + 4 + sub * (QK_NVFP4_SUB / 2) + i] = q0 | (q1 << 4);
-            }
-        }
-    }
-
-    output
-}
-
-#[inline]
-fn ternary_quant(value: f32, inverse_scale: f32) -> u8 {
-    let quant = (value * inverse_scale).round().clamp(-1.0, 1.0) as i32;
-    (quant + 1) as u8
-}
-
-#[inline]
-fn encode_five_trits(mut q: u8) -> u8 {
-    q = q.saturating_mul(3);
-    (u16::from(q) * 256).div_ceil(243) as u8
-}
-
-fn quantize_tq1_0(data: &[f32]) -> Vec<u8> {
-    const QK_K: usize = 256;
-    const QS_BYTES: usize = 48;
-    const QH_BYTES: usize = 4;
-    let n_blocks = data.len().div_ceil(QK_K);
-    let mut output = Vec::with_capacity(n_blocks * 54);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK_K;
-        let end = (start + QK_K).min(data.len());
-        let block_data = &data[start..end];
-        let amax = block_data.iter().fold(0.0f32, |max, value| {
-            if value.is_finite() {
-                max.max(value.abs())
+            let sigma2 = if qw_row.is_some() {
+                x_row.iter().map(|v| v * v).sum::<f32>() / n_per_row as f32
             } else {
-                max
-            }
+                0.0
+            };
+            out_row
+                .par_chunks_mut(task_blocks * type_size)
+                .zip(x_row.par_chunks(task_blocks * block_size))
+                .enumerate()
+                .for_each(|(task, (o, x))| {
+                    let qw = qw_row.map(|w| {
+                        let start = task * task_blocks * block_size;
+                        &w[start..start + x.len()]
+                    });
+                    quantize_row(x, qw, sigma2, o);
+                });
         });
-        let inverse_scale = if amax > 0.0 { 1.0 / amax } else { 0.0 };
-        let mut qs = [0u8; QS_BYTES];
-        let mut qh = [0u8; QH_BYTES];
-        let mut base = 0usize;
-
-        for j in (0..QS_BYTES - QS_BYTES % 32).step_by(32) {
-            for m in 0..32 {
-                let mut q = 0u8;
-                for n in 0..5 {
-                    let value = block_data.get(base + m + n * 32).copied().unwrap_or(0.0);
-                    q = q * 3 + ternary_quant(value, inverse_scale);
-                }
-                qs[j + m] = (u16::from(q) * 256).div_ceil(243) as u8;
-            }
-            base += 5 * 32;
-        }
-
-        for j in (QS_BYTES - QS_BYTES % 32..QS_BYTES).step_by(16) {
-            for m in 0..16 {
-                let mut q = 0u8;
-                for n in 0..5 {
-                    let value = block_data.get(base + m + n * 16).copied().unwrap_or(0.0);
-                    q = q * 3 + ternary_quant(value, inverse_scale);
-                }
-                qs[j + m] = (u16::from(q) * 256).div_ceil(243) as u8;
-            }
-            base += 5 * 16;
-        }
-
-        for (j, qh_byte) in qh.iter_mut().enumerate() {
-            let mut q = 0u8;
-            for m in 0..4 {
-                let value = block_data
-                    .get(base + j + m * QH_BYTES)
-                    .copied()
-                    .unwrap_or(0.0);
-                q = q * 3 + ternary_quant(value, inverse_scale);
-            }
-            *qh_byte = encode_five_trits(q);
-        }
-
-        output.extend_from_slice(&qs);
-        output.extend_from_slice(&qh);
-        output.extend_from_slice(&half::f16::from_f32(amax).to_le_bytes());
-    }
-
-    output
+    Ok(out)
 }
 
-fn quantize_tq2_0(data: &[f32]) -> Vec<u8> {
-    const QK_K: usize = 256;
-    const QS_BYTES: usize = 64;
-    let n_blocks = data.len().div_ceil(QK_K);
-    let mut output = Vec::with_capacity(n_blocks * 66);
-
-    for block_idx in 0..n_blocks {
-        let start = block_idx * QK_K;
-        let end = (start + QK_K).min(data.len());
-        let block_data = &data[start..end];
-        let amax = block_data.iter().fold(0.0f32, |max, value| {
-            if value.is_finite() {
-                max.max(value.abs())
-            } else {
-                max
-            }
-        });
-        let inverse_scale = if amax > 0.0 { 1.0 / amax } else { 0.0 };
-        let mut qs = [0u8; QS_BYTES];
-        let mut base = 0usize;
-
-        for j in (0..QS_BYTES).step_by(32) {
-            for m in 0..32 {
-                let mut q = 0u8;
-                for n in 0..4 {
-                    let value = block_data.get(base + m + n * 32).copied().unwrap_or(0.0);
-                    let xi = ternary_quant(value, inverse_scale);
-                    q |= (xi & 3) << (2 * n);
-                }
-                qs[j + m] = q;
-            }
-            base += 4 * 32;
-        }
-
-        output.extend_from_slice(&qs);
-        output.extend_from_slice(&half::f16::from_f32(amax).to_le_bytes());
-    }
-
-    output
+/// `(block size in elements, bytes per block, per-row function)`.
+fn row_quantizer(dtype: GgmlType) -> Option<(usize, usize, RowFn)> {
+    let f: RowFn = match dtype {
+        GgmlType::Q4_0 => quantize_q4_0,
+        GgmlType::Q4_1 => quantize_q4_1,
+        GgmlType::Q5_0 => quantize_q5_0,
+        GgmlType::Q5_1 => quantize_q5_1,
+        GgmlType::Q8_0 => quantize_q8_0,
+        GgmlType::Q8_1 => quantize_q8_1,
+        GgmlType::Q1_0 => quantize_q1_0,
+        GgmlType::Tq1_0 => quantize_tq1_0,
+        GgmlType::Tq2_0 => quantize_tq2_0,
+        GgmlType::Mxfp4 => quantize_mxfp4,
+        GgmlType::Nvfp4 => quantize_nvfp4,
+        GgmlType::Q2K => kq::quantize_q2_k,
+        GgmlType::Q3K => kq::quantize_q3_k,
+        GgmlType::Q4K => kq::quantize_q4_k,
+        GgmlType::Q5K => kq::quantize_q5_k,
+        GgmlType::Q6K => kq::quantize_q6_k,
+        GgmlType::Q8K => kq::quantize_q8_k,
+        GgmlType::Iq4Nl => crate::iq_quants::quantize_iq4_nl,
+        GgmlType::Iq4Xs => crate::iq_quants::quantize_iq4_xs,
+        _ => return None,
+    };
+    Some((dtype.block_size(), dtype.type_size(), f))
 }
 
-/// Convert a slice of any block type to raw bytes.
-fn blocks_to_bytes<T: zerocopy::IntoBytes + zerocopy::Immutable>(blocks: &[T]) -> Vec<u8> {
-    blocks.as_bytes().to_vec()
+// =============================================================================
+// Shared numeric helpers (the reference quantizers' building blocks)
+// =============================================================================
+
+/// Round to nearest, ties to even (the reference's `nearest_int`).
+#[inline(always)]
+pub(crate) fn nearest_int(v: f32) -> i32 {
+    v.round_ties_even() as i32
 }
 
-/// Round to nearest integer.
-#[inline]
-pub fn nearest_int(v: f32) -> i32 {
+/// Round half away from zero (C's `roundf`).
+#[inline(always)]
+fn roundf(v: f32) -> i32 {
     v.round() as i32
 }
 
-/// Compute scale and minimum for quantization with range optimization.
+/// Scale for a symmetric quantization with levels `-nmax..nmax-1` (stored
+/// biased by `nmax` in `l`), found by weighted least squares over a small
+/// neighbourhood of candidate scales.
 ///
-/// Used by Q2K, Q4K, Q5K quantization.
-///
-/// # Arguments
-/// * `nmax` - Maximum quantized value (e.g., 3 for Q2K, 15 for Q4K, 31 for Q5K)
-/// * `ntry` - Number of optimization iterations
-/// * `x` - Input float slice to quantize
-///
-/// # Returns
-/// Tuple of (scale, min) for dequantization: `output = scale * q - min`
-pub fn make_qkx1_quants(nmax: i32, ntry: usize, x: &[f32]) -> (f32, f32) {
+/// `rmse_type` selects the weights when `qw` is `None`: 1 is `x^2`, 2 is
+/// uniform, 3 is `|x|`, anything else `sqrt(|x|)`; a negative value returns
+/// early with a blend of the two scale estimates. 0 skips the search.
+pub(crate) fn make_qx_quants(
+    nmax: i32,
+    x: &[f32],
+    l: &mut [i8],
+    rmse_type: i32,
+    qw: Option<&[f32]>,
+) -> f32 {
     let n = x.len();
-    let mut l = vec![0u8; n];
-
-    // Get min/max
-    let min = *x
-        .iter()
-        .take(n)
-        .min_by(|a, b| a.total_cmp(b))
-        .unwrap_or(&x[0]);
-    let max = *x.iter().max_by(|a, b| a.total_cmp(b)).unwrap_or(&x[0]);
-
-    // If min == max, all values are the same
-    if max == min {
-        return (0.0, 0.0);
-    }
-
-    // Ensure min <= 0.0
-    let mut min = min.min(0.0);
-
-    // Compute scale and inverse scale
-    let mut iscale = nmax as f32 / (max - min);
-    let mut scale = 1.0 / iscale;
-
-    for _ in 0..ntry {
-        let mut sumlx = 0.0;
-        let mut suml2 = 0i32;
-        let mut did_change = false;
-
-        for (i, value) in x.iter().enumerate().take(n) {
-            let li = nearest_int(iscale * (value - min)).clamp(0, nmax);
-            let clamped_li = li as u8;
-            if clamped_li != l[i] {
-                l[i] = clamped_li;
-                did_change = true;
-            }
-            sumlx += (value - min) * li as f32;
-            suml2 += li * li;
-        }
-        if suml2 == 0 {
-            break; // All quantized values are zero; no further refinement possible
-        }
-        scale = sumlx / suml2 as f32;
-
-        let sum: f32 = x
-            .iter()
-            .take(n)
-            .zip(l.iter().take(n))
-            .map(|(xi, &li)| xi - scale * li as f32)
-            .sum();
-
-        min = sum / n as f32;
-        if min > 0.0 {
-            min = 0.0;
-        }
-        iscale = 1.0 / scale;
-        if !did_change {
-            break;
-        }
-    }
-    (scale, -min)
-}
-
-/// Compute scale for Q3K-style quantization with RMSE optimization.
-///
-/// # Arguments
-/// * `x` - Input float slice to quantize
-/// * `nmax` - Maximum absolute quantized value (typically 4)
-/// * `do_rmse` - Whether to use RMSE-based optimization
-///
-/// # Returns
-/// Scale factor for dequantization
-pub fn make_q3_quants(x: &[f32], nmax: i32, do_rmse: bool) -> f32 {
-    let n = x.len();
-    let mut l = vec![0i8; n];
-
     let mut max = 0.0f32;
     let mut amax = 0.0f32;
-    for &xi in x.iter().take(n) {
-        let ax = xi.abs();
+    for &v in x {
+        let ax = v.abs();
         if ax > amax {
             amax = ax;
-            max = xi;
+            max = v;
         }
     }
-
-    if amax == 0.0 {
+    if amax < GROUP_MAX_EPS {
+        l[..n].fill(0);
         return 0.0;
     }
+    let mut iscale = -(nmax as f32) / max;
+    if rmse_type == 0 {
+        for i in 0..n {
+            let q = nearest_int(iscale * x[i]);
+            l[i] = (nmax + q.clamp(-nmax, nmax - 1)) as i8;
+        }
+        return 1.0 / iscale;
+    }
+    let (rmse_type, return_early) = if rmse_type < 0 {
+        (-rmse_type, true)
+    } else {
+        (rmse_type, false)
+    };
+    let weight = |i: usize| -> f32 {
+        if let Some(qw) = qw {
+            qw[i]
+        } else {
+            match rmse_type {
+                1 => x[i] * x[i],
+                2 => 1.0,
+                3 => x[i].abs(),
+                _ => x[i].abs().sqrt(),
+            }
+        }
+    };
+    let mut sumlx = 0.0f32;
+    let mut suml2 = 0.0f32;
+    for i in 0..n {
+        let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+        l[i] = (q + nmax) as i8;
+        let w = weight(i);
+        sumlx += w * x[i] * q as f32;
+        suml2 += w * (q * q) as f32;
+    }
+    let mut scale = if suml2 != 0.0 { sumlx / suml2 } else { 0.0 };
+    if return_early {
+        return if suml2 > 0.0 {
+            0.5 * (scale + 1.0 / iscale)
+        } else {
+            1.0 / iscale
+        };
+    }
+    let mut best = scale * sumlx;
+    for is in -9..=9 {
+        if is == 0 {
+            continue;
+        }
+        iscale = -(nmax as f32 + 0.1 * is as f32) / max;
+        sumlx = 0.0;
+        suml2 = 0.0;
+        for i in 0..n {
+            let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+            let w = weight(i);
+            sumlx += w * x[i] * q as f32;
+            suml2 += w * (q * q) as f32;
+        }
+        if suml2 > 0.0 && sumlx * sumlx > best * suml2 {
+            for i in 0..n {
+                let q = nearest_int(iscale * x[i]);
+                l[i] = (nmax + q.clamp(-nmax, nmax - 1)) as i8;
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    scale
+}
 
+/// Scale for Q3_K's 3-bit sub-blocks (`l` is stored biased by `nmax`).
+pub(crate) fn make_q3_quants(nmax: i32, x: &[f32], l: &mut [i8], do_rmse: bool) -> f32 {
+    let n = x.len();
+    let mut max = 0.0f32;
+    let mut amax = 0.0f32;
+    for &v in x {
+        let ax = v.abs();
+        if ax > amax {
+            amax = ax;
+            max = v;
+        }
+    }
+    if amax < GROUP_MAX_EPS {
+        l[..n].fill(0);
+        return 0.0;
+    }
     let iscale = -(nmax as f32) / max;
-
     if do_rmse {
         let mut sumlx = 0.0f32;
         let mut suml2 = 0.0f32;
         for i in 0..n {
-            let li = (iscale * x[i]).round() as i32;
-            let li = li.clamp(-nmax, nmax - 1);
-            l[i] = li as i8;
+            let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+            l[i] = q as i8;
             let w = x[i] * x[i];
-            sumlx += w * x[i] * li as f32;
-            suml2 += w * (li * li) as f32;
+            sumlx += w * x[i] * q as f32;
+            suml2 += w * (q * q) as f32;
         }
-
-        // RMSE optimization iterations
         for _ in 0..5 {
             let mut n_changed = 0;
             for i in 0..n {
                 let w = x[i] * x[i];
-                let mut slx = sumlx - w * x[i] * l[i] as f32;
+                let li = i32::from(l[i]);
+                let mut slx = sumlx - w * x[i] * li as f32;
                 if slx > 0.0 {
-                    let mut sl2 = suml2 - w * (l[i] as i32 * l[i] as i32) as f32;
-                    let mut new_l = (x[i] * sl2 / slx).round() as i32;
-                    new_l = new_l.clamp(-nmax, nmax - 1);
-                    if new_l != l[i] as i32 {
+                    let mut sl2 = suml2 - w * (li * li) as f32;
+                    let new_l = nearest_int(x[i] * sl2 / slx).clamp(-nmax, nmax - 1);
+                    if new_l != li {
                         slx += w * x[i] * new_l as f32;
                         sl2 += w * (new_l * new_l) as f32;
                         if sl2 > 0.0 && slx * slx * suml2 > sumlx * sumlx * sl2 {
@@ -710,123 +431,192 @@ pub fn make_q3_quants(x: &[f32], nmax: i32, do_rmse: bool) -> f32 {
                 break;
             }
         }
-
-        for li in l.iter_mut() {
-            *li += nmax as i8;
+        for v in l[..n].iter_mut() {
+            *v += nmax as i8;
         }
         return sumlx / suml2;
     }
-
-    // Simple quantization without RMSE optimization
     for i in 0..n {
-        let li = (iscale * x[i]).round() as i32;
-        l[i] = (li.clamp(-nmax, nmax - 1) + nmax) as i8;
+        let q = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
+        l[i] = (q + nmax) as i8;
     }
     1.0 / iscale
 }
 
-/// Compute scale for Q6K-style symmetric quantization.
-///
-/// # Arguments
-/// * `n` - Number of elements
-/// * `nmax` - Maximum quantized value (typically 32)
-/// * `x` - Input float slice
-/// * `rmse_type` - RMSE optimization type (0 = none, 1 = weight by x^2)
-///
-/// # Returns
-/// Scale factor for dequantization
-pub fn make_qx_quants(n: usize, nmax: i32, x: &[f32], rmse_type: i32) -> (f32, Vec<i8>) {
-    let mut ls = vec![0i8; n];
+/// How [`make_qkx2_quants`] searches for the best scale: `nstep + 1`
+/// candidates `(rmin + rdelta * k + nmax) / range`, scored by squared error
+/// or, with `use_mad`, absolute error.
+#[derive(Clone, Copy)]
+pub(crate) struct ScaleSearch {
+    pub rmin: f32,
+    pub rdelta: f32,
+    pub nstep: i32,
+    pub use_mad: bool,
+}
 
-    // Find max absolute value
-    let mut max = 0.0f32;
-    let mut amax = 0.0f32;
-    for &xi in x.iter().take(n) {
-        let ax = xi.abs();
-        if ax > amax {
-            amax = ax;
-            max = xi;
+impl ScaleSearch {
+    /// The finer search the reference uses when an importance vector is given.
+    pub const IMPORTANCE: Self = Self {
+        rmin: -0.9,
+        rdelta: 0.05,
+        nstep: 36,
+        use_mad: false,
+    };
+}
+
+/// Scale and minimum for an unsigned `0..=nmax` quantization with an offset:
+/// `x ~ scale * l - min_out`. Searches `nstep + 1` candidate scales from
+/// `rmin` in steps of `rdelta` (relative to `nmax`) and keeps the one with the
+/// least weighted error (squared, or absolute with `use_mad`).
+///
+/// Returns `(scale, min_out)`; `l` receives the quantized values and `laux`
+/// is scratch of the same length.
+pub(crate) fn make_qkx2_quants(
+    nmax: i32,
+    x: &[f32],
+    weights: &[f32],
+    l: &mut [u8],
+    laux: &mut [u8],
+    search: ScaleSearch,
+) -> (f32, f32) {
+    let ScaleSearch {
+        rmin,
+        rdelta,
+        nstep,
+        use_mad,
+    } = search;
+    let n = x.len();
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
         }
+        if x[i] > max {
+            max = x[i];
+        }
+        sum_w += weights[i];
+        sum_x += weights[i] * x[i];
     }
-
-    if amax == 0.0 {
-        return (0.0, ls);
+    if min > 0.0 {
+        min = 0.0;
     }
-
-    let iscale = -(nmax as f32) / max;
-
-    if rmse_type == 0 {
+    if max <= min {
+        l[..n].fill(0);
+        return (0.0, -min);
+    }
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let err = |diff: f32| if use_mad { diff.abs() } else { diff * diff };
+    let mut best_mad = 0.0f32;
+    for i in 0..n {
+        let q = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+        l[i] = q as u8;
+        best_mad += weights[i] * err(scale * q as f32 + min - x[i]);
+    }
+    if nstep < 1 {
+        return (scale, -min);
+    }
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_xl = 0.0f32;
         for i in 0..n {
-            let l = nearest_int(iscale * x[i]);
-            ls[i] = (nmax + l.clamp(-nmax, nmax - 1)) as i8;
+            let q = nearest_int(iscale * (x[i] - min)).clamp(0, nmax);
+            laux[i] = q as u8;
+            let w = weights[i];
+            sum_l += w * q as f32;
+            sum_l2 += w * (q * q) as f32;
+            sum_xl += w * q as f32 * x[i];
         }
-        return (1.0 / iscale, ls);
+        let d = sum_w * sum_l2 - sum_l * sum_l;
+        if d > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut mad = 0.0f32;
+            for i in 0..n {
+                mad += weights[i] * err(this_scale * f32::from(laux[i]) + this_min - x[i]);
+            }
+            if mad < best_mad {
+                l[..n].copy_from_slice(&laux[..n]);
+                best_mad = mad;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
     }
+    (scale, -min)
+}
 
-    let weight_type = rmse_type % 2;
+/// Quantize non-negative values `x` (the sub-block scales or minimums of a
+/// K-quant super-block) to `0..=nmax` with a shared scale, weighting each
+/// by `quant_weights`; returns the scale.
+pub(crate) fn make_qp_quants(nmax: i32, x: &[f32], l: &mut [u8], quant_weights: &[f32]) -> f32 {
+    let n = x.len();
+    let max = x.iter().fold(0.0f32, |m, &v| m.max(v));
+    if max == 0.0 {
+        l[..n].fill(0);
+        return 0.0;
+    }
+    let mut iscale = nmax as f32 / max;
+    for i in 0..n {
+        l[i] = nearest_int(iscale * x[i]) as u8;
+    }
+    let mut scale = 1.0 / iscale;
+    let mut best_mse = 0.0f32;
+    for i in 0..n {
+        let diff = x[i] - scale * f32::from(l[i]);
+        best_mse += quant_weights[i] * diff * diff;
+    }
+    for is in -4..=4 {
+        if is == 0 {
+            continue;
+        }
+        let iscale_is = (0.1 * is as f32 + nmax as f32) / max;
+        let scale_is = 1.0 / iscale_is;
+        let mut mse = 0.0f32;
+        for i in 0..n {
+            let q = nearest_int(iscale_is * x[i]).min(nmax);
+            let diff = x[i] - scale_is * q as f32;
+            mse += quant_weights[i] * diff * diff;
+        }
+        if mse < best_mse {
+            best_mse = mse;
+            iscale = iscale_is;
+        }
+    }
     let mut sumlx = 0.0f32;
     let mut suml2 = 0.0f32;
-
     for i in 0..n {
-        let l = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
-        ls[i] = (l + nmax) as i8;
-        let w = if weight_type == 1 { x[i] * x[i] } else { 1.0 };
-        sumlx += w * x[i] * l as f32;
-        suml2 += w * (l * l) as f32;
+        let q = nearest_int(iscale * x[i]).min(nmax);
+        l[i] = q as u8;
+        let w = quant_weights[i];
+        sumlx += w * x[i] * q as f32;
+        suml2 += w * (q * q) as f32;
     }
-
-    let mut scale = sumlx / suml2;
-    let mut best = scale * sumlx;
-
-    // Optimization iterations
-    for _ in 0..3 {
-        let iscale = 1.0 / scale;
-        let mut slx = 0.0f32;
-        let mut sl2 = 0.0f32;
-        let mut changed = false;
-
-        for i in 0..n {
-            let l = nearest_int(iscale * x[i]).clamp(-nmax, nmax - 1);
-            if l + nmax != ls[i] as i32 {
-                changed = true;
-            }
-            let w = if weight_type == 1 { x[i] * x[i] } else { 1.0 };
-            slx += w * x[i] * l as f32;
-            sl2 += w * (l * l) as f32;
-        }
-
-        if !changed || sl2 == 0.0 || slx * slx <= best * sl2 {
-            break;
-        }
-
-        for i in 0..n {
-            let l = nearest_int(iscale * x[i]);
-            ls[i] = (nmax + l.clamp(-nmax, nmax - 1)) as i8;
-        }
-        sumlx = slx;
-        suml2 = sl2;
-        scale = sumlx / suml2;
-        best = scale * sumlx;
-    }
-
-    // Fine-tuning iterations
     for _ in 0..5 {
         let mut n_changed = 0;
         for i in 0..n {
-            let w = if weight_type == 1 { x[i] * x[i] } else { 1.0 };
-            let l = ls[i] as i32 - nmax;
-            let mut slx = sumlx - w * x[i] * l as f32;
-            if slx > 0.0 {
-                let mut sl2 = suml2 - w * (l * l) as f32;
-                let new_l = nearest_int(x[i] * sl2 / slx).clamp(-nmax, nmax - 1);
-                if new_l != l {
+            let w = quant_weights[i];
+            let li = i32::from(l[i]);
+            let mut slx = sumlx - w * x[i] * li as f32;
+            let mut sl2 = suml2 - w * (li * li) as f32;
+            if slx > 0.0 && sl2 > 0.0 {
+                let new_l = nearest_int(x[i] * sl2 / slx).min(nmax);
+                if new_l != li {
                     slx += w * x[i] * new_l as f32;
                     sl2 += w * (new_l * new_l) as f32;
-                    if sl2 > 0.0 && slx * slx * suml2 > sumlx * sumlx * sl2 {
-                        ls[i] = (nmax + new_l) as i8;
+                    if slx * slx * suml2 > sumlx * sumlx * sl2 {
+                        l[i] = new_l as u8;
                         sumlx = slx;
                         suml2 = sl2;
-                        scale = sumlx / suml2;
                         n_changed += 1;
                     }
                 }
@@ -836,213 +626,679 @@ pub fn make_qx_quants(n: usize, nmax: i32, x: &[f32], rmse_type: i32) -> (f32, V
             break;
         }
     }
-
-    (scale, ls)
+    scale = if suml2 > 0.0 { sumlx / suml2 } else { scale };
+    scale
 }
 
-/// Extract scale and min from packed Q4K/Q5K scales array.
-#[inline]
-pub fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
-    if j < 4 {
-        let d = q[j] & 63;
-        let m = q[j + 4] & 63;
-        (d, m)
+/// Index of the value in the ascending table `values` nearest to `x`.
+pub(crate) fn best_index_int8(values: &[i8], x: f32) -> usize {
+    let n = values.len();
+    if x <= f32::from(values[0]) {
+        return 0;
+    }
+    if x >= f32::from(values[n - 1]) {
+        return n - 1;
+    }
+    let (mut ml, mut mu) = (0, n - 1);
+    while mu - ml > 1 {
+        let mav = (ml + mu) / 2;
+        if x < f32::from(values[mav]) {
+            mu = mav;
+        } else {
+            ml = mav;
+        }
+    }
+    if x - f32::from(values[mu - 1]) < f32::from(values[mu]) - x {
+        mu - 1
     } else {
-        let d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        let m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
-        (d, m)
+        mu
+    }
+}
+
+#[inline]
+fn put_f16(out: &mut [u8], at: usize, v: f32) {
+    out[at..at + 2].copy_from_slice(&f16::from_f32(v).to_le_bytes());
+}
+
+/// The weights an importance-aware legacy quantizer minimises: the column's
+/// importance times `sqrt(sigma2 + x^2)`.
+#[inline]
+fn weighted(qw: &[f32], x: &[f32], sigma2: f32, weight: &mut [f32]) {
+    for ((w, &q), &v) in weight.iter_mut().zip(qw).zip(x) {
+        *w = q * (sigma2 + v * v).sqrt();
+    }
+}
+
+// =============================================================================
+// Legacy 32-element formats
+// =============================================================================
+
+/// Q4_0: `d: f16`, 16 nibble bytes.
+fn quantize_q4_0(x: &[f32], qw: Option<&[f32]>, sigma2: f32, out: &mut [u8]) {
+    for (b, (xb, ob)) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<18>().0.iter_mut())
+        .enumerate()
+    {
+        if let Some(qw) = qw {
+            let mut weight = [0.0f32; 32];
+            weighted(&qw[32 * b..32 * b + 32], xb, sigma2, &mut weight);
+            let mut l = [0i8; 32];
+            let d = make_qx_quants(8, xb, &mut l, 1, Some(&weight));
+            put_f16(ob, 0, d);
+            for j in 0..16 {
+                ob[2 + j] = (l[j] as u8) | ((l[j + 16] as u8) << 4);
+            }
+            continue;
+        }
+        let mut amax = 0.0f32;
+        let mut max = 0.0f32;
+        for &v in xb {
+            if amax < v.abs() {
+                amax = v.abs();
+                max = v;
+            }
+        }
+        let d = max / -8.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        put_f16(ob, 0, d);
+        for j in 0..16 {
+            let x0 = xb[j] * id;
+            let x1 = xb[j + 16] * id;
+            let xi0 = ((x0 + 8.5) as i32).clamp(0, 15) as u8;
+            let xi1 = ((x1 + 8.5) as i32).clamp(0, 15) as u8;
+            ob[2 + j] = xi0 | (xi1 << 4);
+        }
+    }
+}
+
+/// Q4_1: `d: f16`, `m: f16`, 16 nibble bytes.
+fn quantize_q4_1(x: &[f32], qw: Option<&[f32]>, sigma2: f32, out: &mut [u8]) {
+    for (b, (xb, ob)) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<20>().0.iter_mut())
+        .enumerate()
+    {
+        if let Some(qw) = qw {
+            let mut weight = [0.0f32; 32];
+            weighted(&qw[32 * b..32 * b + 32], xb, sigma2, &mut weight);
+            let (mut l, mut laux) = ([0u8; 32], [0u8; 32]);
+            let (d, m) =
+                make_qkx2_quants(15, xb, &weight, &mut l, &mut laux, ScaleSearch::IMPORTANCE);
+            put_f16(ob, 0, d);
+            put_f16(ob, 2, -m);
+            for j in 0..16 {
+                ob[4 + j] = l[j] | (l[j + 16] << 4);
+            }
+            continue;
+        }
+        let min = xb.iter().fold(f32::MAX, |m, &v| m.min(v));
+        let max = xb.iter().fold(f32::MIN, |m, &v| m.max(v));
+        let d = (max - min) / 15.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        put_f16(ob, 0, d);
+        put_f16(ob, 2, min);
+        for j in 0..16 {
+            let x0 = (xb[j] - min) * id;
+            let x1 = (xb[j + 16] - min) * id;
+            let xi0 = ((x0 + 0.5) as i32).clamp(0, 15) as u8;
+            let xi1 = ((x1 + 0.5) as i32).clamp(0, 15) as u8;
+            ob[4 + j] = xi0 | (xi1 << 4);
+        }
+    }
+}
+
+/// Pack 32 five-bit values: the low nibbles into 16 bytes (element `j` low,
+/// `j + 16` high) and the fifth bits into a `u32`.
+#[inline]
+fn pack_q5(q: &[u8; 32], qh_out: &mut [u8], qs_out: &mut [u8]) {
+    let mut qh = 0u32;
+    for j in 0..16 {
+        qs_out[j] = (q[j] & 0x0f) | ((q[j + 16] & 0x0f) << 4);
+        qh |= u32::from((q[j] & 0x10) >> 4) << j;
+        qh |= u32::from((q[j + 16] & 0x10) >> 4) << (j + 16);
+    }
+    qh_out.copy_from_slice(&qh.to_le_bytes());
+}
+
+/// Q5_0: `d: f16`, `qh: u32`, 16 nibble bytes.
+fn quantize_q5_0(x: &[f32], qw: Option<&[f32]>, sigma2: f32, out: &mut [u8]) {
+    for (b, (xb, ob)) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<22>().0.iter_mut())
+        .enumerate()
+    {
+        let mut q = [0u8; 32];
+        if let Some(qw) = qw {
+            let mut weight = [0.0f32; 32];
+            weighted(&qw[32 * b..32 * b + 32], xb, sigma2, &mut weight);
+            let mut l = [0i8; 32];
+            let d = make_qx_quants(16, xb, &mut l, 1, Some(&weight));
+            put_f16(ob, 0, d);
+            for j in 0..32 {
+                q[j] = l[j] as u8;
+            }
+        } else {
+            let mut amax = 0.0f32;
+            let mut max = 0.0f32;
+            for &v in xb {
+                if amax < v.abs() {
+                    amax = v.abs();
+                    max = v;
+                }
+            }
+            let d = max / -16.0;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+            put_f16(ob, 0, d);
+            for j in 0..32 {
+                q[j] = ((xb[j] * id + 16.5) as i32).clamp(0, 31) as u8;
+            }
+        }
+        let (head, rest) = ob.split_at_mut(6);
+        pack_q5(&q, &mut head[2..6], rest);
+    }
+}
+
+/// Q5_1: `d: f16`, `m: f16`, `qh: u32`, 16 nibble bytes.
+fn quantize_q5_1(x: &[f32], qw: Option<&[f32]>, sigma2: f32, out: &mut [u8]) {
+    for (b, (xb, ob)) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<24>().0.iter_mut())
+        .enumerate()
+    {
+        let mut q = [0u8; 32];
+        if let Some(qw) = qw {
+            let mut weight = [0.0f32; 32];
+            weighted(&qw[32 * b..32 * b + 32], xb, sigma2, &mut weight);
+            let mut laux = [0u8; 32];
+            let (d, m) =
+                make_qkx2_quants(31, xb, &weight, &mut q, &mut laux, ScaleSearch::IMPORTANCE);
+            put_f16(ob, 0, d);
+            put_f16(ob, 2, -m);
+        } else {
+            let min = xb.iter().fold(f32::MAX, |m, &v| m.min(v));
+            let max = xb.iter().fold(f32::MIN, |m, &v| m.max(v));
+            let d = (max - min) / 31.0;
+            let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+            put_f16(ob, 0, d);
+            put_f16(ob, 2, min);
+            for j in 0..32 {
+                q[j] = (((xb[j] - min) * id + 0.5) as i32).clamp(0, 31) as u8;
+            }
+        }
+        let (head, rest) = ob.split_at_mut(8);
+        pack_q5(&q, &mut head[4..8], rest);
+    }
+}
+
+/// Q8_0: `d: f16`, 32 signed bytes.
+fn quantize_q8_0(x: &[f32], _qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    for (xb, ob) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<34>().0.iter_mut())
+    {
+        let amax = xb.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        put_f16(ob, 0, d);
+        for j in 0..32 {
+            ob[2 + j] = roundf(xb[j] * id).clamp(-127, 127) as i8 as u8;
+        }
+    }
+}
+
+/// Q8_1: `d: f16`, `s: f16` (`d` times the sum of the quants), 32 signed
+/// bytes.
+fn quantize_q8_1(x: &[f32], _qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    for (xb, ob) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<36>().0.iter_mut())
+    {
+        let amax = xb.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        put_f16(ob, 0, d);
+        let mut sum = 0i32;
+        for j in 0..32 {
+            let q = roundf(xb[j] * id).clamp(-127, 127);
+            ob[4 + j] = q as i8 as u8;
+            sum += q;
+        }
+        put_f16(ob, 2, sum as f32 * d);
+    }
+}
+
+// =============================================================================
+// 1-bit, ternary and 4-bit float formats
+// =============================================================================
+
+/// Q1_0: `d: f16` (mean magnitude), 128 sign bits.
+fn quantize_q1_0(x: &[f32], _qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    for (xb, ob) in x
+        .as_chunks::<128>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<18>().0.iter_mut())
+    {
+        let sum_abs: f32 = xb.iter().filter(|v| v.is_finite()).map(|v| v.abs()).sum();
+        put_f16(ob, 0, sum_abs / 128.0);
+        ob[2..].fill(0);
+        for (i, &v) in xb.iter().enumerate() {
+            if v >= 0.0 {
+                ob[2 + i / 8] |= 1 << (i % 8);
+            }
+        }
+    }
+}
+
+#[inline]
+fn amax_finite(x: &[f32]) -> f32 {
+    x.iter()
+        .filter(|v| v.is_finite())
+        .fold(0.0f32, |m, v| m.max(v.abs()))
+}
+
+/// A ternary digit in `0..=2` for `v * id` rounded to `-1, 0, 1`.
+#[inline]
+fn trit(v: f32, id: f32) -> u8 {
+    (roundf(v * id).clamp(-1, 1) + 1) as u8
+}
+
+/// TQ1_0: five trits per byte in `qs[48]`, four per byte in `qh[4]`, `d`.
+fn quantize_tq1_0(x: &[f32], _qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    for (xb, ob) in x
+        .as_chunks::<256>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<54>().0.iter_mut())
+    {
+        let d = amax_finite(xb);
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let mut pos = 0;
+        let mut j = 0;
+        // 32-byte groups, then the 16-byte remainder of qs.
+        for (width, groups) in [(32usize, 1usize), (16, 1)] {
+            for _ in 0..groups {
+                for m in 0..width {
+                    let mut q = 0u16;
+                    for n in 0..5 {
+                        q = q * 3 + u16::from(trit(xb[pos + m + n * width], id));
+                    }
+                    ob[j + m] = (q * 256).div_ceil(243) as u8;
+                }
+                pos += 5 * width;
+                j += width;
+            }
+        }
+        for m in 0..4 {
+            let mut q = 0u16;
+            for k in 0..4 {
+                q = q * 3 + u16::from(trit(xb[pos + m + k * 4], id));
+            }
+            q *= 3;
+            ob[48 + m] = (q * 256).div_ceil(243) as u8;
+        }
+        put_f16(ob, 52, d);
+    }
+}
+
+/// TQ2_0: four 2-bit trits per byte in `qs[64]`, `d`.
+fn quantize_tq2_0(x: &[f32], _qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    for (xb, ob) in x
+        .as_chunks::<256>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<66>().0.iter_mut())
+    {
+        let d = amax_finite(xb);
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        for j in 0..2 {
+            for m in 0..32 {
+                let mut q = 0u8;
+                for n in 0..4 {
+                    q |= (trit(xb[128 * j + m + n * 32], id) & 3) << (2 * n);
+                }
+                ob[32 * j + m] = q;
+            }
+        }
+        put_f16(ob, 64, d);
+    }
+}
+
+/// MXFP4: one E8M0 exponent, 16 bytes of E2M1 nibbles.
+fn quantize_mxfp4(x: &[f32], _qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    for (xb, ob) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<17>().0.iter_mut())
+    {
+        let amax = amax_finite(xb);
+        let e = if amax > 0.0 {
+            (amax.log2().floor() - 2.0 + 127.0).clamp(0.0, 255.0) as u8
+        } else {
+            0
+        };
+        let d = e8m0_to_fp32_half(e);
+        ob[0] = e;
+        for j in 0..16 {
+            let q0 = best_index_mxfp4(xb[j], d);
+            let q1 = best_index_mxfp4(xb[j + 16], d);
+            ob[1 + j] = q0 | (q1 << 4);
+        }
+    }
+}
+
+/// NVFP4: four UE4M3 scales (one per 16 values), 32 bytes of E2M1 nibbles.
+fn quantize_nvfp4(x: &[f32], _qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    for (xb, ob) in x
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<36>().0.iter_mut())
+    {
+        for s in 0..4 {
+            let sub = &xb[16 * s..16 * s + 16];
+            let ue = fp32_to_ue4m3(amax_finite(sub) / 6.0);
+            let d = ue4m3_to_fp32(ue);
+            ob[s] = ue;
+            for j in 0..8 {
+                let q0 = best_index_mxfp4(sub[j], d);
+                let q1 = best_index_mxfp4(sub[j + 8], d);
+                ob[4 + 8 * s + j] = q0 | (q1 << 4);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dequant::dequantize;
 
+    /// The deterministic test signal of the reference quantization tests:
+    /// `0.1 + 2 cos(i)`.
+    fn reference_signal(n: usize) -> Vec<f32> {
+        (0..n).map(|i| 0.1 + 2.0 * (i as f32).cos()).collect()
+    }
+
+    /// Error measure of the reference quantization tests:
+    /// `sqrt(sum (a - b)^2) / n`.
+    fn total_error(a: &[f32], b: &[f32]) -> f32 {
+        let sum: f64 = a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+        (sum.sqrt() / a.len() as f64) as f32
+    }
+
+    fn round_trip_error(data: &[f32], dtype: GgmlType) -> f32 {
+        let bytes = quantize(data, dtype).unwrap();
+        assert_eq!(bytes.len(), dtype.tensor_size(data.len()));
+        let back = dequantize(&bytes, dtype, &[data.len() as i32]).unwrap();
+        total_error(data, &back)
+    }
+
+    /// The error bounds the reference implementation's own quantization tests
+    /// hold each format to on this signal (4096 values).
     #[test]
-    fn test_nearest_int() {
-        assert_eq!(nearest_int(0.5), 1);
-        assert_eq!(nearest_int(0.4), 0);
-        assert_eq!(nearest_int(-0.5), -1); // Rust rounds .5 away from zero
-        assert_eq!(nearest_int(-0.6), -1);
-        assert_eq!(nearest_int(1.5), 2);
+    fn round_trip_error_is_within_the_reference_bound_for_every_format() {
+        let data = reference_signal(4096);
+        let bounds: &[(GgmlType, f32)] = &[
+            (GgmlType::Q4_0, 0.002),
+            (GgmlType::Q4_1, 0.002),
+            (GgmlType::Q5_0, 0.002),
+            (GgmlType::Q5_1, 0.002),
+            (GgmlType::Q8_0, 0.002),
+            (GgmlType::Q8_1, 0.002),
+            (GgmlType::Q2K, 0.0075),
+            (GgmlType::Q3K, 0.0040),
+            (GgmlType::Q4K, 0.002),
+            (GgmlType::Q5K, 0.002),
+            (GgmlType::Q6K, 0.002),
+            (GgmlType::Q8K, 0.002),
+            (GgmlType::Iq4Nl, 0.002),
+            (GgmlType::Iq4Xs, 0.002),
+            (GgmlType::Tq1_0, 0.01),
+            (GgmlType::Tq2_0, 0.01),
+            (GgmlType::Mxfp4, 0.0030),
+            (GgmlType::Nvfp4, 0.0030),
+        ];
+        for &(dtype, bound) in bounds {
+            let err = round_trip_error(&data, dtype);
+            assert!(err < bound, "{dtype:?}: error {err} exceeds {bound}");
+        }
     }
 
     #[test]
-    fn test_quantize_q4_0_round_trip_layout() {
-        let input: Vec<f32> = (-16..16).map(|i| i as f32 / 2.0).collect();
-        let bytes = quantize(&input, GgmlType::Q4_0).unwrap();
-        assert_eq!(bytes.len(), 18);
+    fn bits_buy_accuracy() {
+        // Within a family, more bits must not be worse.
+        let data = reference_signal(4096);
+        let e = |t| round_trip_error(&data, t);
+        assert!(e(GgmlType::Q8_0) < e(GgmlType::Q6K));
+        assert!(e(GgmlType::Q6K) < e(GgmlType::Q5K));
+        assert!(e(GgmlType::Q5K) < e(GgmlType::Q4K));
+        assert!(e(GgmlType::Q4K) < e(GgmlType::Q3K));
+        assert!(e(GgmlType::Q3K) < e(GgmlType::Q2K));
+        assert!(e(GgmlType::Q5_0) < e(GgmlType::Q4_0));
+        assert!(e(GgmlType::Q5_1) < e(GgmlType::Q4_1));
+    }
 
-        let restored = crate::dequant::dequantize(&bytes, GgmlType::Q4_0, &[32]).unwrap();
-        assert_eq!(restored.len(), input.len());
-        for (actual, expected) in restored.iter().zip(input.iter()) {
+    #[test]
+    fn unaligned_lengths_are_errors_not_padding() {
+        assert!(quantize(&[1.0; 33], GgmlType::Q4_0).is_err());
+        assert!(quantize(&[1.0; 255], GgmlType::Q4K).is_err());
+        // Rows must be whole blocks even when the total is.
+        assert!(quantize_tensor(&[1.0; 128], GgmlType::Q4_0, 48, None).is_err());
+        assert!(quantize_tensor(&[1.0; 96], GgmlType::Q4_0, 48, None).is_err());
+        assert!(quantize_tensor(&[1.0; 128], GgmlType::Q4_0, 64, None).is_ok());
+        assert_eq!(quantize(&[], GgmlType::Q4_0).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn incompatible_row_lengths_fall_back_like_the_reference() {
+        // A row that fits keeps its type.
+        assert_eq!(fit_to_row_length(GgmlType::Q4K, 4096), GgmlType::Q4K);
+        // 4,160 = 130 x 32 but not a multiple of 256.
+        assert_eq!(fit_to_row_length(GgmlType::Q4K, 4160), GgmlType::Q5_0);
+        assert_eq!(fit_to_row_length(GgmlType::Q5K, 4160), GgmlType::Q5_1);
+        assert_eq!(fit_to_row_length(GgmlType::Q6K, 4160), GgmlType::Q8_0);
+        assert_eq!(fit_to_row_length(GgmlType::Q3K, 4160), GgmlType::Iq4Nl);
+        assert_eq!(fit_to_row_length(GgmlType::Iq2Xxs, 4160), GgmlType::Iq4Nl);
+        assert_eq!(fit_to_row_length(GgmlType::Tq2_0, 4160), GgmlType::Q4_0);
+        // Not even 32 divides it.
+        assert_eq!(fit_to_row_length(GgmlType::Q4K, 100), GgmlType::F16);
+        assert_eq!(fit_to_row_length(GgmlType::Q8_0, 100), GgmlType::F16);
+        // The fallback is always something the rows can be stored in.
+        for t in [GgmlType::Q4K, GgmlType::Q2K, GgmlType::Q6K, GgmlType::Mxfp4] {
+            for n in [32usize, 96, 100, 4160] {
+                let f = fit_to_row_length(t, n);
+                assert_eq!(n % f.block_size(), 0, "{t:?} {n} -> {f:?}");
+                assert!(can_quantize(f));
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_types_are_errors() {
+        for t in [
+            GgmlType::Iq2Xxs,
+            GgmlType::Iq1S,
+            GgmlType::Q4_0_4_4,
+            GgmlType::I8,
+        ] {
+            assert!(quantize(&[0.0; 256], t).is_err(), "{t:?}");
+            assert!(!can_quantize(t), "{t:?}");
+        }
+        assert!(can_quantize(GgmlType::Q4K));
+        assert!(can_quantize(GgmlType::F16));
+    }
+
+    #[test]
+    fn all_zero_and_constant_blocks_are_stable() {
+        for dtype in [
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q8_0,
+            GgmlType::Q2K,
+            GgmlType::Q3K,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Q8K,
+            GgmlType::Iq4Nl,
+            GgmlType::Iq4Xs,
+            GgmlType::Tq2_0,
+            GgmlType::Mxfp4,
+            GgmlType::Nvfp4,
+        ] {
+            let n = 512;
+            for value in [0.0f32, 1.5, -1.5] {
+                let data = vec![value; n];
+                let bytes = quantize(&data, dtype).unwrap();
+                let back = dequantize(&bytes, dtype, &[n as i32]).unwrap();
+                assert!(back.iter().all(|v| v.is_finite()), "{dtype:?} {value}");
+                if value == 0.0 {
+                    assert!(back.iter().all(|v| *v == 0.0), "{dtype:?} zeros");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn output_is_deterministic_and_independent_of_threading() {
+        let data = reference_signal(256 * 64);
+        for dtype in [
+            GgmlType::Q4K,
+            GgmlType::Q6K,
+            GgmlType::Iq4Xs,
+            GgmlType::Q4_0,
+        ] {
+            let a = quantize_tensor(&data, dtype, 256 * 4, None).unwrap();
+            let b = quantize_tensor(&data, dtype, 256 * 4, None).unwrap();
+            assert_eq!(a, b, "{dtype:?}");
+            // One row quantized whole equals the same data split into rows:
+            // blocks are independent.
+            let c = quantize_tensor(&data, dtype, 256, None).unwrap();
+            assert_eq!(a, c, "{dtype:?}");
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let single = pool.install(|| quantize(&data, GgmlType::Q5K).unwrap());
+        assert_eq!(single, quantize(&data, GgmlType::Q5K).unwrap());
+    }
+
+    #[test]
+    fn importance_steers_the_error_to_the_unimportant_columns() {
+        // A row where a quarter of the columns matter 1000x more: the weighted error
+        // on the important half must drop, at the expense of the other half.
+        let n = 256 * 4;
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 2.0)
+            .collect();
+        let importance: Vec<f32> = (0..n)
+            .map(|i| {
+                if (i * 2654435761usize) >> 7 & 3 == 0 {
+                    1000.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        for dtype in [
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q2K,
+            GgmlType::Q3K,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Iq4Nl,
+            GgmlType::Iq4Xs,
+        ] {
+            let plain = quantize_tensor(&data, dtype, n, None).unwrap();
+            let weighted = quantize_tensor(&data, dtype, n, Some(&importance)).unwrap();
+            let decode = |b: &[u8]| dequantize(b, dtype, &[n as i32]).unwrap();
+            let werr = |back: &[f32]| -> f64 {
+                data.iter()
+                    .zip(back)
+                    .zip(&importance)
+                    .map(|((a, b), w)| f64::from(*w) * f64::from(a - b).powi(2))
+                    .sum()
+            };
+            let (e_plain, e_weighted) = (werr(&decode(&plain)), werr(&decode(&weighted)));
             assert!(
-                (actual - expected).abs() <= 1.1,
-                "actual={actual}, expected={expected}"
+                e_weighted <= e_plain * 1.001,
+                "{dtype:?}: importance-weighted error {e_weighted} > unweighted {e_plain}"
             );
         }
     }
 
     #[test]
-    fn test_quantize_legacy_formats_round_trip_layouts() {
-        let input: Vec<f32> = (-16..16).map(|i| i as f32 / 4.0).collect();
+    fn importance_that_cannot_apply_is_ignored_or_rejected() {
+        let data = reference_signal(512);
+        // Formats without an importance mode produce the same bytes.
+        let w = vec![1.0f32; 512];
+        assert_eq!(
+            quantize_tensor(&data, GgmlType::Q8_0, 512, Some(&w)).unwrap(),
+            quantize_tensor(&data, GgmlType::Q8_0, 512, None).unwrap()
+        );
+        // Wrong length, negative or non-finite weights are errors.
+        assert!(quantize_tensor(&data, GgmlType::Q4K, 512, Some(&w[..100])).is_err());
+        let mut bad = w.clone();
+        bad[3] = -1.0;
+        assert!(quantize_tensor(&data, GgmlType::Q4K, 512, Some(&bad)).is_err());
+        bad[3] = f32::NAN;
+        assert!(quantize_tensor(&data, GgmlType::Q4K, 512, Some(&bad)).is_err());
+        // Stacked slices: two slices of one row each.
+        let two = vec![1.0f32; 512];
+        assert!(quantize_tensor(&data, GgmlType::Q4K, 256, Some(&two)).is_ok());
+        assert!(quantize_tensor(&data, GgmlType::Q4K, 256, Some(&vec![1.0; 768])).is_err());
+    }
 
-        let q4_1 = quantize(&input, GgmlType::Q4_1).unwrap();
-        assert_eq!(q4_1.len(), 20);
-        let restored = crate::dequant::dequantize(&q4_1, GgmlType::Q4_1, &[32]).unwrap();
-        for (actual, expected) in restored.iter().zip(input.iter()) {
-            assert!((actual - expected).abs() <= 0.3);
+    #[test]
+    fn non_finite_input_does_not_panic() {
+        let mut data = reference_signal(512);
+        data[3] = f32::NAN;
+        data[100] = f32::INFINITY;
+        data[200] = f32::NEG_INFINITY;
+        for dtype in [
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q8_0,
+            GgmlType::Q8_1,
+            GgmlType::Q2K,
+            GgmlType::Q3K,
+            GgmlType::Q4K,
+            GgmlType::Q5K,
+            GgmlType::Q6K,
+            GgmlType::Q8K,
+            GgmlType::Iq4Nl,
+            GgmlType::Iq4Xs,
+            GgmlType::Q1_0,
+            GgmlType::Tq1_0,
+            GgmlType::Tq2_0,
+            GgmlType::Mxfp4,
+            GgmlType::Nvfp4,
+        ] {
+            let _ = quantize(&data, dtype).unwrap();
         }
-
-        let q5_0 = quantize(&input, GgmlType::Q5_0).unwrap();
-        assert_eq!(q5_0.len(), 22);
-        let restored = crate::dequant::dequantize(&q5_0, GgmlType::Q5_0, &[32]).unwrap();
-        for (actual, expected) in restored.iter().zip(input.iter()) {
-            assert!((actual - expected).abs() <= 0.25);
-        }
-
-        let q5_1 = quantize(&input, GgmlType::Q5_1).unwrap();
-        assert_eq!(q5_1.len(), 24);
-        let restored = crate::dequant::dequantize(&q5_1, GgmlType::Q5_1, &[32]).unwrap();
-        for (actual, expected) in restored.iter().zip(input.iter()) {
-            assert!((actual - expected).abs() <= 0.25);
-        }
-
-        let q8_1 = quantize(&input, GgmlType::Q8_1).unwrap();
-        assert_eq!(q8_1.len(), 36);
-        let restored = crate::dequant::dequantize(&q8_1, GgmlType::Q8_1, &[32]).unwrap();
-        for (actual, expected) in restored.iter().zip(input.iter()) {
-            assert!((actual - expected).abs() <= 0.04);
-        }
-    }
-
-    #[test]
-    fn test_quantize_bf16_round_trip_layout() {
-        let input = [1.0f32, -2.5, 3.25];
-        let bytes = quantize(&input, GgmlType::Bf16).unwrap();
-        assert_eq!(bytes.len(), 6);
-
-        let restored = crate::dequant::dequantize(&bytes, GgmlType::Bf16, &[3]).unwrap();
-        for (actual, expected) in restored.iter().zip(input.iter()) {
-            assert!((actual - expected).abs() < 0.01);
-        }
-    }
-
-    #[test]
-    fn test_quantize_current_low_bit_formats_round_trip_layouts() {
-        let q1_input: Vec<f32> = (0..128)
-            .map(|i| if i % 2 == 0 { -0.25 } else { 0.25 })
-            .collect();
-        let q1_bytes = quantize(&q1_input, GgmlType::Q1_0).unwrap();
-        assert_eq!(q1_bytes.len(), 18);
-        let q1_restored = crate::dequant::dequantize(&q1_bytes, GgmlType::Q1_0, &[128]).unwrap();
-        assert!(q1_restored[0] < 0.0);
-        assert!(q1_restored[1] > 0.0);
-
-        let ternary_input: Vec<f32> = (0..256)
-            .map(|i| match i % 3 {
-                0 => -3.0,
-                1 => 0.0,
-                _ => 3.0,
-            })
-            .collect();
-        let tq1_bytes = quantize(&ternary_input, GgmlType::Tq1_0).unwrap();
-        assert_eq!(tq1_bytes.len(), 54);
-        let tq1_restored = crate::dequant::dequantize(&tq1_bytes, GgmlType::Tq1_0, &[256]).unwrap();
-        assert!((tq1_restored[0] + 3.0).abs() < 0.01);
-        assert!(tq1_restored[1].abs() < 0.01);
-        assert!((tq1_restored[2] - 3.0).abs() < 0.01);
-
-        let tq2_bytes = quantize(&ternary_input, GgmlType::Tq2_0).unwrap();
-        assert_eq!(tq2_bytes.len(), 66);
-        let tq2_restored = crate::dequant::dequantize(&tq2_bytes, GgmlType::Tq2_0, &[256]).unwrap();
-        assert!((tq2_restored[0] + 3.0).abs() < 0.01);
-        assert!(tq2_restored[1].abs() < 0.01);
-        assert!((tq2_restored[2] - 3.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_quantize_fp4_formats_round_trip_layouts() {
-        let mxfp4_input: Vec<f32> = (0..32)
-            .map(|i| match i % 4 {
-                0 => -12.0,
-                1 => -1.0,
-                2 => 1.0,
-                _ => 12.0,
-            })
-            .collect();
-        let mxfp4_bytes = quantize(&mxfp4_input, GgmlType::Mxfp4).unwrap();
-        assert_eq!(mxfp4_bytes.len(), 17);
-        let mxfp4_restored =
-            crate::dequant::dequantize(&mxfp4_bytes, GgmlType::Mxfp4, &[32]).unwrap();
-        assert!((mxfp4_restored[0] + 12.0).abs() < 0.01);
-        assert!((mxfp4_restored[3] - 12.0).abs() < 0.01);
-
-        let nvfp4_input: Vec<f32> = (0..64)
-            .map(|i| match i % 4 {
-                0 => -6.0,
-                1 => -1.0,
-                2 => 1.0,
-                _ => 6.0,
-            })
-            .collect();
-        let nvfp4_bytes = quantize(&nvfp4_input, GgmlType::Nvfp4).unwrap();
-        assert_eq!(nvfp4_bytes.len(), 36);
-        let nvfp4_restored =
-            crate::dequant::dequantize(&nvfp4_bytes, GgmlType::Nvfp4, &[64]).unwrap();
-        assert!((nvfp4_restored[0] + 6.0).abs() < 0.01);
-        assert!((nvfp4_restored[3] - 6.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_make_qkx1_quants_uniform() {
-        // Test with uniform values
-        let x = [1.0f32; 32];
-        let (scale, min) = make_qkx1_quants(15, 5, &x);
-        // All values same, so scale should be 0
-        assert_eq!(scale, 0.0);
-        assert_eq!(min, 0.0);
-    }
-
-    #[test]
-    fn test_make_qkx1_quants_range() {
-        // Test with range [0, 15]
-        let x: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        let (scale, min) = make_qkx1_quants(15, 5, &x);
-
-        // Scale should be approximately 1.0
-        assert!(scale > 0.5 && scale < 2.0, "scale: {}", scale);
-        // Min should be approximately 0
-        assert!(min.abs() < 1.0, "min: {}", min);
-    }
-
-    #[test]
-    fn test_make_q3_quants_zero() {
-        let x = [0.0f32; 16];
-        let scale = make_q3_quants(&x, 4, true);
-        assert_eq!(scale, 0.0);
-    }
-
-    #[test]
-    fn test_make_q3_quants_symmetric() {
-        // Symmetric range around 0
-        let x: Vec<f32> = (-4..4).map(|i| i as f32).collect();
-        let scale = make_q3_quants(&x, 4, true);
-        assert!(scale.abs() > 0.0, "scale should be non-zero");
-    }
-
-    #[test]
-    fn test_get_scale_min_k4() {
-        // Test first 4 scales (simple extraction)
-        let scales = [63u8, 63, 63, 63, 63, 63, 63, 63, 0, 0, 0, 0];
-        let (s0, m0) = get_scale_min_k4(0, &scales);
-        assert_eq!(s0, 63);
-        assert_eq!(m0, 63);
-
-        // Test with upper bits
-        let scales2 = [0xC0u8, 0, 0, 0, 0, 0, 0, 0, 0x03, 0, 0, 0];
-        let (s4, _m4) = get_scale_min_k4(4, &scales2);
-        // Upper 2 bits from scales[0] = 0xC0 >> 6 = 3, combined with lower 4 from scales[8] = 0x03
-        assert!(s4 > 0);
     }
 }

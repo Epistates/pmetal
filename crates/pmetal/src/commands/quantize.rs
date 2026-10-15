@@ -1174,7 +1174,7 @@ pub(crate) async fn run_quantization(
             CalibrationMap, DynamicQuantizationConfig, DynamicQuantizer, KlCalibrationConfig,
         },
         imatrix::IMatrix,
-        quantize::quantize,
+        quantize::{fit_to_row_length, quantize_tensor},
     };
 
     println!("========================================");
@@ -1373,13 +1373,18 @@ pub(crate) async fn run_quantization(
             proposed_type,
         );
 
+        // A block never straddles a row: fall back to a type whose block
+        // divides the row, as the reference does.
+        let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
+        let target_type = fit_to_row_length(target_type, n_per_row);
+
         tracing::info!(
             "Quantizing stacked expert tensor {} ({} experts) to {:?}",
             gguf_name,
             group.len(),
             target_type
         );
-        let quantized_data = quantize(&data_f32, target_type)
+        let quantized_data = quantize_tensor(&data_f32, target_type, n_per_row, None)
             .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", gguf_name, e))?;
         builder.add_raw_tensor(gguf_name, shape_u64, target_type, quantized_data);
     }
@@ -1424,8 +1429,11 @@ pub(crate) async fn run_quantization(
             target_type,
         );
 
+        let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
+        let target_type = fit_to_row_length(target_type, n_per_row);
+
         tracing::info!("Quantizing {} ({}) to {:?}", name, gguf_name, target_type);
-        let quantized_data = quantize(&data_f32, target_type)
+        let quantized_data = quantize_tensor(&data_f32, target_type, n_per_row, None)
             .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", name, e))?;
 
         builder.add_raw_tensor(gguf_name, shape_u64, target_type, quantized_data);

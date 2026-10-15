@@ -24,9 +24,14 @@
 //! are formed in the same order as the reference so that the f32 results match
 //! to the last bit.
 
+// The quantizers follow the reference algorithms index for index; rewriting their
+// loops as iterator chains over several parallel arrays would obscure that.
+#![allow(clippy::needless_range_loop)]
+
 use half::f16;
 
 use crate::iq_grids::{IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID};
+use crate::quantize::{GROUP_MAX_EPS, best_index_int8, nearest_int};
 
 /// Block size for IQ4_NL (32 elements per block, like Q4_0).
 pub const QK4_NL: usize = 32;
@@ -297,6 +302,164 @@ pub(crate) fn dequantize_block_iq1_m(block: &[u8; 56], y: &mut [f32; 256]) {
                 y[32 * ib + 8 * l + j] = dl * (f32::from(grid[j] as i8) + delta[l]);
             }
         }
+    }
+}
+
+// =============================================================================
+// Quantization (IQ4_NL, IQ4_XS)
+// =============================================================================
+
+/// Quantize one super-block of `sb` values (32 for IQ4_NL, 256 for IQ4_XS) in
+/// sub-blocks of `bs` to the non-linear 4-bit table.
+///
+/// Each sub-block's scale is found by trying `2 * ntry + 1` scales around the
+/// one that maps its largest value to the end of the table and keeping the
+/// least (importance-weighted) error; for IQ4_XS the sub-block scales are then
+/// quantized to 6 bits against a shared `f16` scale, and the values
+/// re-assigned under the quantized scales. Returns the `f16` scale; `q4`
+/// receives the nibbles, `scales_h` / `scales_l` the packed 6-bit scales.
+fn quantize_iq4_block(
+    sb: usize,
+    bs: usize,
+    x: &[f32],
+    qw: Option<&[f32]>,
+    ntry: i32,
+    q4: &mut [u8],
+) -> (f16, u16, [u8; 4]) {
+    let values = &KVALUES_IQ4NL;
+    let mut scales_h = 0u16;
+    let mut scales_l = [0u8; 4];
+    let sigma2 = 2.0 * x.iter().map(|v| v * v).sum::<f32>() / sb as f32;
+    let nb = sb / bs;
+    let mut l = [0u8; QK_K];
+    let mut scales = [0.0f32; QK_K / 32];
+    let mut weight = [0.0f32; 32];
+    let mut max_scale = 0.0f32;
+    let mut amax_scale = 0.0f32;
+
+    for ib in 0..nb {
+        let xb = &x[ib * bs..(ib + 1) * bs];
+        for j in 0..bs {
+            weight[j] = match qw {
+                Some(qw) => qw[ib * bs + j] * (sigma2 + xb[j] * xb[j]).sqrt(),
+                None => xb[j] * xb[j],
+            };
+        }
+        let mut amax = 0.0f32;
+        let mut max = 0.0f32;
+        for &v in xb {
+            if v.abs() > amax {
+                amax = v.abs();
+                max = v;
+            }
+        }
+        if amax < GROUP_MAX_EPS {
+            scales[ib] = 0.0;
+            continue;
+        }
+        let v0 = f32::from(values[0]);
+        let mut d = if ntry > 0 { -max / v0 } else { max / v0 };
+        let mut id = 1.0 / d;
+        let mut sumqx = 0.0f32;
+        let mut sumq2 = 0.0f32;
+        for j in 0..bs {
+            let idx = best_index_int8(values, id * xb[j]);
+            l[ib * bs + j] = idx as u8;
+            let q = f32::from(values[idx]);
+            sumqx += weight[j] * q * xb[j];
+            sumq2 += weight[j] * q * q;
+        }
+        d = sumqx / sumq2;
+        let mut best = d * sumqx;
+        for itry in -ntry..=ntry {
+            id = (itry as f32 + v0) / max;
+            sumqx = 0.0;
+            sumq2 = 0.0;
+            for j in 0..bs {
+                let q = f32::from(values[best_index_int8(values, id * xb[j])]);
+                sumqx += weight[j] * q * xb[j];
+                sumq2 += weight[j] * q * q;
+            }
+            if sumq2 > 0.0 && sumqx * sumqx > best * sumq2 {
+                d = sumqx / sumq2;
+                best = d * sumqx;
+            }
+        }
+        scales[ib] = d;
+        if d.abs() > amax_scale {
+            amax_scale = d.abs();
+            max_scale = d;
+        }
+    }
+
+    let dh;
+    if nb > 1 {
+        let d = -max_scale / 32.0;
+        dh = d;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        for ib in 0..nb {
+            let q = nearest_int(id * scales[ib]).clamp(-32, 31);
+            let dl = d * q as f32;
+            let idl = if dl != 0.0 { 1.0 / dl } else { 0.0 };
+            for j in 0..bs {
+                l[ib * bs + j] = best_index_int8(values, idl * x[ib * bs + j]) as u8;
+            }
+            let biased = (q + 32) as u8;
+            if ib % 2 == 0 {
+                scales_l[ib / 2] = biased & 0xf;
+            } else {
+                scales_l[ib / 2] |= (biased & 0xf) << 4;
+            }
+            scales_h |= u16::from(biased >> 4) << (2 * (ib % 8));
+        }
+    } else {
+        dh = scales[0];
+        if ntry > 0 {
+            let id = if scales[0] != 0.0 {
+                1.0 / scales[0]
+            } else {
+                0.0
+            };
+            for j in 0..sb {
+                l[j] = best_index_int8(values, id * x[j]) as u8;
+            }
+        }
+    }
+    for i in 0..sb / 32 {
+        for j in 0..16 {
+            q4[16 * i + j] = l[32 * i + j] | (l[32 * i + 16 + j] << 4);
+        }
+    }
+    (f16::from_f32(dh), scales_h, scales_l)
+}
+
+/// Quantize to IQ4_NL.
+pub(crate) fn quantize_iq4_nl(x: &[f32], qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    let blocks = x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<18>().0.iter_mut());
+    for (b, (xb, ob)) in blocks.enumerate() {
+        let qwb = qw.map(|w| &w[32 * b..32 * b + 32]);
+        let (d, _, _) = quantize_iq4_block(32, 32, xb, qwb, 7, &mut ob[2..]);
+        ob[0..2].copy_from_slice(&d.to_le_bytes());
+    }
+}
+
+/// Quantize to IQ4_XS.
+pub(crate) fn quantize_iq4_xs(x: &[f32], qw: Option<&[f32]>, _sigma2: f32, out: &mut [u8]) {
+    let blocks = x
+        .as_chunks::<QK_K>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<136>().0.iter_mut());
+    for (b, (xb, ob)) in blocks.enumerate() {
+        let qwb = qw.map(|w| &w[QK_K * b..QK_K * (b + 1)]);
+        let (d, scales_h, scales_l) = quantize_iq4_block(QK_K, 32, xb, qwb, 7, &mut ob[8..]);
+        ob[0..2].copy_from_slice(&d.to_le_bytes());
+        ob[2..4].copy_from_slice(&scales_h.to_le_bytes());
+        ob[4..8].copy_from_slice(&scales_l);
     }
 }
 
