@@ -550,6 +550,44 @@ fn a_sample_truncated_to_its_prompt_is_dropped() {
     assert!(trained_text(ds.get(0).unwrap(), &tokenizer).starts_with("kept"));
 }
 
+// -- a real byte-level BPE tokenizer ---------------------------------------------
+
+/// The masks above, read off a real byte-level BPE tokenizer (offsets trimmed,
+/// digits split, multi-byte characters across token boundaries). Set
+/// `PMETAL_SFT_TOKENIZER_DIR` to a model directory with a `tokenizer.json`
+/// that has the ChatML markers.
+#[test]
+#[ignore = "needs a real tokenizer"]
+fn a_real_bpe_tokenizer_masks_exactly_the_assistant_turns() {
+    let dir = std::env::var_os("PMETAL_SFT_TOKENIZER_DIR").expect("PMETAL_SFT_TOKENIZER_DIR");
+    let tokenizer = Tokenizer::from_model_dir(dir).unwrap();
+    let template = ChatTemplate::chatml();
+    let first = |rows: &[Value]| {
+        let ds = load(rows, &tokenizer, DatasetFormat::Auto, Some(&template));
+        trained_text(ds.get(0).unwrap(), &tokenizer)
+    };
+    let trained = [
+        first(&[json!({"messages": [
+            {"role": "user", "content": "Wie geht's? 日本語 ✓ 12345"},
+            {"role": "assistant", "content": "  Gut, danke!\n\nUnd dir? 🙂 x²"},
+            {"role": "user", "content": "Gut."},
+            {"role": "assistant", "content": "Prima."}]})]),
+        first(&[alpaca("Say hi \u{e9}", " Hello  wörld")]),
+        first(&[json!({"prompt": "2+2=", "completion": " 4"})]),
+    ];
+    println!("{trained:#?}");
+    // The answer starts with two spaces, and the tokenizer joins the first to
+    // the header's newline ("\n " is one token, which starts in the prompt), so
+    // that token is prompt and one space is not trained: the model is shown
+    // the header alone, and could not produce that joined token anyway.
+    assert_eq!(
+        trained[0],
+        " Gut, danke!\n\nUnd dir? 🙂 x²<|im_end|>\nPrima.<|im_end|>\n"
+    );
+    assert_eq!(trained[1], " Hello  wörld<|endoftext|>");
+    assert_eq!(trained[2], " 4<|endoftext|>");
+}
+
 // -- offsets, truncation and options -------------------------------------------
 
 /// The mask is cut in bytes of the text: a multi-byte character in the prompt
