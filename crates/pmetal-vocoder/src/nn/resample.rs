@@ -141,21 +141,23 @@ impl UpSample1d {
 
     /// `[batch, time, channels]` -> `[batch, time * ratio, channels]`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        if self.ratio == 1 {
-            return Ok(x.clone());
-        }
         let (batch, time, channels) = (x.dim(0), x.dim(1), x.dim(2));
         let r = self.ratio;
         let padded = pad_time(x, self.pad, self.pad);
         let padded_len = time + 2 * self.pad;
 
-        // Zero-stuff: [B, T, C] -> [B, T * r, C] with r - 1 zeros after each sample.
-        let zeros = Array::zeros(&[batch, padded_len, r - 1, channels], x.dtype());
-        let stuffed = ops::concatenate_axis(&[&padded.expand_dims(2), &zeros], 2).reshape(&[
-            batch,
-            padded_len * r,
-            channels,
-        ]);
+        // Zero-stuff: [B, T, C] -> [B, T * r, C] with r - 1 zeros after each
+        // sample. (Ratio 1 still filters, as in the reference.)
+        let stuffed = if r == 1 {
+            padded
+        } else {
+            let zeros = Array::zeros(&[batch, padded_len, r - 1, channels], x.dtype());
+            ops::concatenate_axis(&[&padded.expand_dims(2), &zeros], 2).reshape(&[
+                batch,
+                padded_len * r,
+                channels,
+            ])
+        };
 
         // out[n] = sum_i f[i] z[n + pad_left - i]; as a correlation with the
         // reversed filter the window starts at pad_left - (k - 1).
@@ -237,9 +239,6 @@ impl DownSample1d {
     /// `[batch, time, channels]` -> `[batch, ceil(time / ratio), channels]` (for
     /// the reference's kernel sizes, exactly `time / ratio`).
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        if self.ratio == 1 {
-            return Ok(x.clone());
-        }
         let padded = pad_time(x, self.pad_left, self.pad_right);
         let weight = self.weight.as_dtype(x.dtype());
         Ok(padded.conv1d(&weight, self.ratio, 0, 1, self.channels))

@@ -23,7 +23,7 @@ fn ncl(x: &Array) -> Array {
 #[test]
 fn kaiser_sinc_filters_match_reference() {
     let fx = Fixture::load("activation");
-    for (ratio, ks) in [(2, 12usize), (2, 11), (3, 18), (4, 24)] {
+    for (ratio, ks) in [(2, 12usize), (2, 11), (3, 18), (4, 24), (1, 6)] {
         let taps = kaiser_sinc_filter(0.5 / f64::from(ratio), 0.6 / f64::from(ratio), ks).unwrap();
         let key = format!("filter_r{ratio}_k{ks}");
         assert_close_slice(&taps, fx.values(&key), 1e-5, 1e-6, &key);
@@ -93,7 +93,8 @@ fn snakebeta_zero_beta_is_finite_like_the_reference() {
 fn upsample_matches_reference() {
     let fx = Fixture::load("activation");
     let x = nlc(&fx.array("x"));
-    for (ratio, ks) in [(2, 12), (2, 11), (3, 18)] {
+    // Ratio 1 is not an identity: the reference still low-pass filters.
+    for (ratio, ks) in [(2, 12), (2, 11), (3, 18), (1, 6)] {
         let up = UpSample1d::new(ratio, ks, C).unwrap();
         let y = ncl(&up.forward(&x).unwrap());
         let key = format!("up_r{ratio}_k{ks}.y");
@@ -105,7 +106,7 @@ fn upsample_matches_reference() {
 fn downsample_matches_reference() {
     let fx = Fixture::load("activation");
     let x = nlc(&fx.array("x"));
-    for (ratio, ks) in [(2, 12), (2, 11), (3, 18)] {
+    for (ratio, ks) in [(2, 12), (2, 11), (3, 18), (1, 6)] {
         let down = DownSample1d::new(ratio, ks, C).unwrap();
         let y = ncl(&down.forward(&x).unwrap());
         let key = format!("down_r{ratio}_k{ks}.y");
