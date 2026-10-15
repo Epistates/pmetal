@@ -21,7 +21,7 @@ use pmetal_models::architectures::{
 };
 use pmetal_models::{Gemma4MtpKvSources, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair};
 use pmetal_runtime::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
+    Array, Exception, ModuleParameters, ModuleParametersExt, Param, nn, ops,
     optimizers::{AdamW, AdamWBuilder, Optimizer},
 };
 use serde::{Deserialize, Serialize};
