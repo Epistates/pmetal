@@ -602,6 +602,46 @@ pub enum DistributedCompression {
     Random,
 }
 
+impl DistributedCompression {
+    /// Every strategy, in the order the CLI lists them.
+    pub const ALL: [Self; 4] = [Self::None, Self::TopK, Self::Fp16, Self::Random];
+
+    /// The name the CLI, job specs and YAML configs use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::TopK => "topk",
+            Self::Fp16 => "fp16",
+            Self::Random => "random",
+        }
+    }
+}
+
+impl std::fmt::Display for DistributedCompression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DistributedCompression {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let wanted = normalized_name(s);
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == wanted)
+            .ok_or_else(|| {
+                let valid: Vec<_> = Self::ALL.iter().map(|k| k.as_str()).collect();
+                format!(
+                    "unknown compression strategy '{s}'; valid: {}",
+                    valid.join(", ")
+                )
+            })
+    }
+}
+
 /// Configuration for distributed training across multiple Apple Silicon devices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

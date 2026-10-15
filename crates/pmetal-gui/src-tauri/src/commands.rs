@@ -1085,7 +1085,11 @@ pub async fn start_training(
     let state_arc = state.training_runs.clone();
     let event_tx = state.event_tx.clone();
     let cancel_flags = state.cancel_flags.clone();
-    let optimizer = pmetal::core::jobs::parse_optimizer(&spec.optimizer).map_err(AppError)?;
+    let training_config = pmetal::core::TrainingConfig {
+        output_dir: output_dir.clone(),
+        ..spec.training_config().map_err(AppError)?
+    };
+    let distributed = spec.distributed_config().map_err(AppError)?;
 
     // Write training_info.json before spawning so the adapter scanner can
     // find base_model + dataset even if training is still running.
@@ -1139,36 +1143,6 @@ pub async fn start_training(
             None
         };
 
-        let distributed = {
-            let peers = spec
-                .distributed_peers
-                .as_deref()
-                .map(|s| {
-                    s.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if !peers.is_empty() || spec.distributed_auto {
-                let compression = match spec.compression_strategy.as_str() {
-                    "topk" => pmetal::core::DistributedCompression::TopK,
-                    "fp16" => pmetal::core::DistributedCompression::Fp16,
-                    "random" => pmetal::core::DistributedCompression::Random,
-                    _ => pmetal::core::DistributedCompression::None,
-                };
-                Some(pmetal::core::DistributedTrainingConfig {
-                    peers,
-                    auto_discover: spec.distributed_auto,
-                    compression,
-                    ..Default::default()
-                })
-            } else {
-                None
-            }
-        };
-
         let columns = {
             let text_column = spec.text_column.clone();
             let text_columns = spec
@@ -1195,37 +1169,14 @@ pub async fn start_training(
             }
         };
 
-        let lr_scheduler =
-            pmetal::core::jobs::parse_lr_scheduler(&spec.lr_schedule).map_err(AppError)?;
-
         let job_config = pmetal::trainer::TrainingJobConfig {
             model_id: spec.model.clone(),
             dataset: resolved_dataset.to_string_lossy().into_owned(),
             eval_dataset: spec.eval_dataset.clone(),
             output_dir: output_dir.clone(),
-            lora: pmetal::core::LoraConfig {
-                r: spec.lora_r,
-                alpha: spec.lora_alpha,
-                ..Default::default()
-            },
+            lora: spec.lora_config(),
             qlora,
-            training: pmetal::core::TrainingConfig {
-                learning_rate: spec.learning_rate,
-                batch_size: spec.batch_size,
-                num_epochs: spec.epochs,
-                max_seq_len: spec.max_seq_len,
-                gradient_accumulation_steps: spec.gradient_accumulation_steps,
-                weight_decay: spec.weight_decay,
-                optimizer,
-                max_grad_norm: spec.max_grad_norm,
-                warmup_steps: spec.warmup_steps,
-                logging_steps: 10,
-                save_steps: None,
-                lr_scheduler,
-                output_dir: output_dir.clone(),
-                embedding_learning_rate: spec.embedding_lr,
-                ..Default::default()
-            },
+            training: training_config,
             columns,
             dispatch: pmetal::trainer::DispatchConfig {
                 flash_attention: !spec.no_flash_attention,
