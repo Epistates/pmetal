@@ -1,17 +1,16 @@
 //! Dataset handling and preprocessing for PMetal.
 //!
 //! This crate provides:
-//! - Dataset loading from various formats (JSONL, Alpaca, ShareGPT)
-//! - DataLoader for creating training batches
+//! - Dataset loading from JSONL, JSON, Parquet, Arrow and CSV, in chat,
+//!   instruction, prompt/completion and text layouts ([`rows`], [`dataset`])
+//! - DataLoader for creating training batches, sharded and resumable
 //! - Sequence packing for efficient training
-//! - Data collation and batching
 //! - Tokenizer integration
 //! - Chat template system with response masking
 
 #![warn(missing_docs)]
 
 pub mod chat_templates;
-pub mod collator;
 pub mod dataloader;
 pub mod dataset;
 pub mod gguf_tokenizer;
@@ -21,11 +20,11 @@ pub mod jinja_chat;
 pub mod packing;
 pub mod pillow_resample;
 pub mod qwen_vl_processing;
+pub mod rows;
 pub mod stream_format;
 pub mod streaming;
 pub mod tokenizer;
 
-pub use collator::*;
 pub use dataloader::*;
 pub use dataset::*;
 pub use image_processing::*;

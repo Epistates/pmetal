@@ -915,41 +915,14 @@ pub struct DatasetPeek {
 
 #[tauri::command]
 pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<DatasetPeek> {
-    use std::io::{BufRead, BufReader};
     let sample_limit = limit.unwrap_or(100);
 
     let p = std::path::PathBuf::from(&path);
-    let resolved = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&p).unwrap_or(p);
+    let columns = pmetal::data::peek_columns(&p).map_err(|e| AppError(e.to_string()))?;
 
-    let columns = pmetal::data::peek_columns(&resolved).map_err(|e| AppError(e.to_string()))?;
-
-    // Sample first 100 rows for length estimates
-    let mut char_lengths: Vec<usize> = Vec::new();
-    if let Ok(file) = std::fs::File::open(&resolved) {
-        let reader = BufReader::new(file);
-        let iter: Box<dyn Iterator<Item = _>> = if sample_limit > 0 {
-            Box::new(reader.lines().take(sample_limit))
-        } else {
-            Box::new(reader.lines()) // scan all
-        };
-        for line in iter.flatten() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            // Sum all string-valued fields as a rough content length
-            if let Ok(obj) =
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed)
-            {
-                let total_chars: usize = obj
-                    .values()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| s.len())
-                    .sum();
-                char_lengths.push(total_chars);
-            }
-        }
-    }
+    // Sample the first rows (any container: JSONL, Parquet, ...) for length
+    // estimates; 0 scans them all.
+    let char_lengths = pmetal::data::sample_row_chars(&p, sample_limit).unwrap_or_default();
 
     let rows_sampled = char_lengths.len();
     // Rough estimate: 1 token ≈ 4 characters for English text
@@ -3081,33 +3054,6 @@ async fn finalize_grpo_run(
     }
 }
 
-/// Scan a directory (up to 3 levels deep) for .parquet files.
-fn find_parquet_in_dir(dir: &Path) -> Option<PathBuf> {
-    fn scan(dir: &Path, depth: usize) -> Option<PathBuf> {
-        if depth > 3 {
-            return None;
-        }
-        let entries = std::fs::read_dir(dir).ok()?;
-        let mut dirs = Vec::new();
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() && p.extension().is_some_and(|e| e == "parquet") {
-                return Some(p);
-            }
-            if p.is_dir() {
-                dirs.push(p);
-            }
-        }
-        for d in dirs {
-            if let Some(p) = scan(&d, depth + 1) {
-                return Some(p);
-            }
-        }
-        None
-    }
-    scan(dir, 0)
-}
-
 async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
     pmetal::hub::resolve_model_path(model_id, None, None)
         .await
@@ -3128,18 +3074,21 @@ async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
             if let Ok(path) = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&dir) {
                 return Ok(path);
             }
-            // Scan cached directory for parquet files (no network call)
-            if let Some(pf) = find_parquet_in_dir(&dir) {
-                return Ok(pf);
-            }
             // Last resort: HF API (slow, network call)
             let parquet_paths = pmetal::hub::download_dataset_parquet(&id, "train", None, None)
                 .await
                 .map_err(|e| AppError(e.to_string()))?;
-            parquet_paths
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError(format!("No dataset files found for {id}")))
+            match parquet_paths.as_slice() {
+                [] => Err(AppError(format!("No dataset files found for {id}"))),
+                [only] => Ok(only.clone()),
+                // Shards of one split are read together, from their directory.
+                [first, rest @ ..] => match first.parent() {
+                    Some(parent) if rest.iter().all(|p| p.parent() == Some(parent)) => {
+                        Ok(parent.to_path_buf())
+                    }
+                    _ => Ok(first.clone()),
+                },
+            }
         }
     }
 }
@@ -3189,35 +3138,15 @@ async fn run_distillation_in_process(
         }
     };
 
-    let train_dataset = if dataset_path.extension().is_some_and(|ext| ext == "parquet") {
-        pmetal::data::TrainingDataset::from_parquet_tokenized(
-            &dataset_path,
-            &tokenizer,
-            "text",
-            max_seq_len,
-            None,
-        )
-        .or_else(|_| {
-            pmetal::data::TrainingDataset::from_parquet_tokenized(
-                &dataset_path,
-                &tokenizer,
-                "content",
-                max_seq_len,
-                None,
-            )
-        })
-        .map_err(|e| AppError(e.to_string()))?
-    } else {
-        pmetal::data::TrainingDataset::from_jsonl_tokenized(
-            &dataset_path,
-            &tokenizer,
-            pmetal::data::DatasetFormat::Auto,
-            max_seq_len,
-            Some(&chat_template),
-            col_cfg.as_ref(),
-        )
-        .map_err(|e| AppError(e.to_string()))?
-    };
+    let train_dataset = pmetal::data::TrainingDataset::from_jsonl_tokenized(
+        &dataset_path,
+        &tokenizer,
+        pmetal::data::DatasetFormat::Auto,
+        max_seq_len,
+        Some(&chat_template),
+        col_cfg.as_ref(),
+    )
+    .map_err(|e| AppError(e.to_string()))?;
 
     let mut teacher_model =
         pmetal::models::DynamicModel::load(&teacher_path).map_err(|e| AppError(e.to_string()))?;
@@ -3390,35 +3319,15 @@ async fn run_grpo_in_process(
         }
     };
 
-    let dataset = if dataset_path.extension().is_some_and(|ext| ext == "parquet") {
-        pmetal::data::TrainingDataset::from_parquet_tokenized(
-            &dataset_path,
-            &tokenizer,
-            "text",
-            max_seq_len,
-            None,
-        )
-        .or_else(|_| {
-            pmetal::data::TrainingDataset::from_parquet_tokenized(
-                &dataset_path,
-                &tokenizer,
-                "content",
-                max_seq_len,
-                None,
-            )
-        })
-        .map_err(|e| AppError(e.to_string()))?
-    } else {
-        pmetal::data::TrainingDataset::from_jsonl_tokenized(
-            &dataset_path,
-            &tokenizer,
-            pmetal::data::DatasetFormat::Auto,
-            max_seq_len,
-            Some(&chat_template),
-            col_cfg.as_ref(),
-        )
-        .map_err(|e| AppError(e.to_string()))?
-    };
+    let dataset = pmetal::data::TrainingDataset::from_jsonl_tokenized(
+        &dataset_path,
+        &tokenizer,
+        pmetal::data::DatasetFormat::Auto,
+        max_seq_len,
+        Some(&chat_template),
+        col_cfg.as_ref(),
+    )
+    .map_err(|e| AppError(e.to_string()))?;
 
     let lora_config = pmetal::core::LoraConfig {
         r: spec.lora_r,

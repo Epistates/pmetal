@@ -456,7 +456,7 @@ fn load_images(image_paths: &[std::path::PathBuf], max_size: usize) -> GrpoResul
         let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
 
         // Delegate normalization to the existing processor (rescale + CLIP stats).
-        let arr = processor.process_image(resized).map_err(GrpoError::Mlx)?;
+        let arr = processor.process_image(&resized).map_err(GrpoError::Mlx)?;
 
         images.push(arr);
     }

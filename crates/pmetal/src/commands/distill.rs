@@ -212,7 +212,7 @@ pub(crate) async fn run_distillation_cli(
     use pmetal_distill::{DistillConfig, Distiller, LogitCache, LossConfig};
     use pmetal_lora::DynamicLoraModel;
     use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig, generate_teacher_logit_cache};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     // The data loader takes `seed` too; this one covers MLX's own key, which
     // initialises the student's LoRA weights.
@@ -271,74 +271,28 @@ pub(crate) async fn run_distillation_cli(
         pmetal_data::chat_templates::detect_chat_template(&student_path, student_id);
 
     tracing::info!("Loading dataset: {}", dataset_path);
-    let is_parquet = Path::new(dataset_path)
-        .extension()
-        .is_some_and(|ext| ext == "parquet");
-    let train_dataset = if is_parquet {
-        tracing::info!("Detected Parquet format");
-        let result = TrainingDataset::from_parquet_tokenized(
-            dataset_path,
-            &tokenizer,
-            "text",
-            max_seq_len,
-            None,
-        );
-        match result {
-            Ok(ds) => ds,
-            Err(_) => TrainingDataset::from_parquet_tokenized(
-                dataset_path,
-                &tokenizer,
-                "content",
-                max_seq_len,
-                None,
-            )?,
-        }
-    } else {
-        TrainingDataset::from_jsonl_tokenized(
-            dataset_path,
-            &tokenizer,
-            DatasetFormat::Auto,
-            max_seq_len,
-            Some(&chat_template),
-            column_cfg.as_ref(),
-        )?
-    };
+    let train_dataset = TrainingDataset::from_jsonl_tokenized(
+        dataset_path,
+        &tokenizer,
+        DatasetFormat::Auto,
+        max_seq_len,
+        Some(&chat_template),
+        column_cfg.as_ref(),
+    )?;
     tracing::info!(
         "Distillation dataset loaded: {} samples",
         train_dataset.len()
     );
     let eval_dataset = if let Some(ref eval_path) = eval_dataset_path {
         tracing::info!("Loading distillation eval dataset: {}", eval_path);
-        let eval_is_parquet = Path::new(eval_path)
-            .extension()
-            .is_some_and(|ext| ext == "parquet");
-        let ds = if eval_is_parquet {
-            TrainingDataset::from_parquet_tokenized(
-                eval_path,
-                &tokenizer,
-                "text",
-                max_seq_len,
-                None,
-            )
-            .or_else(|_| {
-                TrainingDataset::from_parquet_tokenized(
-                    eval_path,
-                    &tokenizer,
-                    "content",
-                    max_seq_len,
-                    None,
-                )
-            })?
-        } else {
-            TrainingDataset::from_jsonl_tokenized(
-                eval_path,
-                &tokenizer,
-                DatasetFormat::Auto,
-                max_seq_len,
-                Some(&chat_template),
-                column_cfg.as_ref(),
-            )?
-        };
+        let ds = TrainingDataset::from_jsonl_tokenized(
+            eval_path,
+            &tokenizer,
+            DatasetFormat::Auto,
+            max_seq_len,
+            Some(&chat_template),
+            column_cfg.as_ref(),
+        )?;
         tracing::info!("Distillation eval dataset loaded: {} samples", ds.len());
         Some(ds)
     } else {

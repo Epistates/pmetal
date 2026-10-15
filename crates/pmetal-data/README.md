@@ -8,19 +8,30 @@ This crate provides data loading, preprocessing, and batching utilities optimize
 
 ## Supported Formats
 
+The format is detected from a row's columns (structured layouts first) or
+named explicitly; custom columns override both.
+
 | Format | Description | Example |
 |--------|-------------|---------|
+| **Messages** | Chat format (content parts, tool calls, `tools`, per-message `weight`) | `{"messages": [...]}` |
 | **ShareGPT** | Conversation format | `{"conversations": [...]}` |
-| **Alpaca** | Instruction format | `{"instruction": ..., "output": ...}` |
-| **Messages** | Chat format | `{"messages": [...]}` |
-| **Text** | Raw text | `{"text": "..."}` |
+| **Alpaca** | Instruction format | `{"instruction": ..., "input": ..., "output": ...}` |
+| **Prompt/completion** | Strings or message lists; only the completion trains | `{"prompt": ..., "completion": ...}` |
+| **Reasoning** | Problem, thinking, solution | `{"problem": ..., "thinking": ..., "solution": ...}` |
+| **Text** | Raw text, trained whole | `{"text": "..."}` |
+
+Rows come from JSONL, JSON, Parquet, Arrow (IPC file or stream) and CSV/TSV
+files, or from a directory: a Hugging Face dataset repository's `train` split,
+every shard in order (`rows::RowReader`).
 
 ## Features
 
-- **Sequence Packing**: Pack multiple sequences for efficient training
+- **Sequence Packing**: First-fit / best-fit decreasing, block-diagonal masks, per-document positions, padding
 - **Chat Templates**: Apply model-specific conversation formatting
-- **Response Masking**: Mask prompt tokens in loss computation
-- **Streaming Loading**: Memory-efficient loading of large datasets
+- **Response Masking**: The loss covers the assistant's turns (or the completion) only, cut from token offsets
+- **Resumable Loading**: Epoch order is a function of the seed; `state()` / `restore()` resume mid-epoch; ranks shard equally
+- **Length-Grouped Batching, Mixing, Deduplication**: `DataLoader::with_length_grouping`, `TrainingDataset::mix`, `dedup`
+- **Streaming Corpora**: `streaming::tokenize_corpus` and a resumable shard reader for pretraining
 - **Tokenizer Integration**: HuggingFace tokenizers support
 
 ## Usage
@@ -56,6 +67,27 @@ fn load(model_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
         let _ = batch.seq_len;
     }
     Ok(())
+}
+```
+
+### Loading With Options
+
+```rust,no_run
+use pmetal_data::chat_templates::detect_chat_template;
+use pmetal_data::{AssistantLoss, DatasetLoadOptions, Tokenizer, TrainingDataset};
+
+fn load(model_dir: &str) -> Result<TrainingDataset, Box<dyn std::error::Error>> {
+    let tokenizer = Tokenizer::from_model_dir(model_dir)?;
+    let template = detect_chat_template(std::path::Path::new(model_dir), "Qwen/Qwen3-0.6B");
+
+    // A file, or a directory of shards; any container; format detected.
+    Ok(TrainingDataset::load(
+        "data/",
+        &tokenizer,
+        &DatasetLoadOptions::new(2048)
+            .template(Some(&template))
+            .assistant_loss(AssistantLoss::AllTurns),
+    )?)
 }
 ```
 
@@ -142,12 +174,13 @@ A tokenizer also reports the span of the text each token covers
 
 | Module | Description |
 |--------|-------------|
-| `dataset` | Dataset abstractions and loading |
-| `dataloader` | Batching and iteration |
+| `dataset` | Dataset abstractions, loading, mixing and deduplication |
+| `rows` | Rows of any dataset container (JSONL, JSON, Parquet, Arrow, CSV, shard directories) |
+| `dataloader` | Batching, sharding, resumable epochs |
 | `packing` | Sequence packing utilities |
+| `streaming` | Pretraining shards: tokenize a corpus, read it back resumably |
 | `chat_templates` | Conversation formatting |
 | `tokenizer` | Tokenizer integration |
-| `collator` | Batch collation |
 
 ## License
 

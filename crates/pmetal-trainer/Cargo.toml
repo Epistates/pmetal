@@ -42,8 +42,6 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 serde-saphyr = { workspace = true }
 anyhow = { workspace = true }
-arrow = { workspace = true }
-parquet = { workspace = true }
 image = { workspace = true }
 
 # TensorBoard event files

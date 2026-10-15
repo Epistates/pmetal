@@ -1,7 +1,8 @@
 //! Loading preference datasets.
 //!
-//! Rows come from JSONL, a JSON array, or Parquet (so a Hugging Face dataset
-//! resolved by `resolve_dataset_path` loads directly). Two shapes are read:
+//! Rows come from JSONL, a JSON array, Parquet, Arrow or CSV, or a directory
+//! of shards (so a Hugging Face dataset resolved by `resolve_dataset_path`
+//! loads directly). Two shapes are read:
 //!
 //! - **Paired**: `prompt`, `chosen`, `rejected`.
 //! - **Unpaired** (KTO): `prompt`, `completion`, `label` (a boolean, a number
@@ -20,7 +21,6 @@
 //! included, exactly as supervised fine-tuning renders it. Without one, prompt
 //! and completion are tokenized as plain text and the completion ends in EOS.
 
-use std::io::BufRead;
 use std::path::Path;
 
 use pmetal_data::Tokenizer;
@@ -46,60 +46,12 @@ const REJECTED_FIELDS: &[&str] = &[
 const COMPLETION_FIELDS: &[&str] = &["completion", "response", "output", "answer"];
 const LABEL_FIELDS: &[&str] = &["label", "desirable", "rating", "thumbs_up"];
 
-/// Read every row of a JSONL, JSON-array or Parquet file as a JSON object.
+/// Read every row of a dataset (JSONL, JSON, Parquet, Arrow, CSV, or a
+/// directory of shards; see [`pmetal_data::rows`]) as a JSON object.
 pub fn read_rows(path: impl AsRef<Path>) -> anyhow::Result<Vec<Value>> {
-    let path = path.as_ref();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if ext == "parquet" {
-        return read_parquet_rows(path);
-    }
-    let file = std::fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("can't open {}: {e}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut first = String::new();
-    while first.trim().is_empty() {
-        if reader.read_line(&mut first)? == 0 {
-            return Ok(Vec::new());
-        }
-    }
-    if first.trim_start().starts_with('[') {
-        let mut rest = String::new();
-        std::io::Read::read_to_string(&mut reader, &mut rest)?;
-        first.push_str(&rest);
-        return Ok(serde_json::from_str(&first)?);
-    }
-    let mut rows = vec![serde_json::from_str(first.trim())?];
-    for (n, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        rows.push(
-            serde_json::from_str(&line)
-                .map_err(|e| anyhow::anyhow!("{} line {}: {e}", path.display(), n + 2))?,
-        );
-    }
-    Ok(rows)
-}
-
-fn read_parquet_rows(path: &Path) -> anyhow::Result<Vec<Value>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    let file = std::fs::File::open(path)?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)?.build()?;
-    let mut writer = arrow::json::ArrayWriter::new(Vec::new());
-    for batch in reader {
-        writer.write(&batch?)?;
-    }
-    writer.finish()?;
-    let bytes = writer.into_inner();
-    if bytes.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(serde_json::from_slice(&bytes)?)
+    pmetal_data::rows::RowReader::open(path)?
+        .map(|row| Ok(Value::Object(row?)))
+        .collect()
 }
 
 /// A field's value: plain text, or a list of chat messages.

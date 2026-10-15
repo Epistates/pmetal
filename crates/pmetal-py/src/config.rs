@@ -442,6 +442,8 @@ pub enum PyDatasetFormat {
     Alpaca,
     ShareGpt,
     OpenAi,
+    Reasoning,
+    PromptCompletion,
     Auto,
 }
 
@@ -452,6 +454,8 @@ impl From<PyDatasetFormat> for pmetal_data::DatasetFormat {
             PyDatasetFormat::Alpaca => Self::Alpaca,
             PyDatasetFormat::ShareGpt => Self::ShareGpt,
             PyDatasetFormat::OpenAi => Self::OpenAi,
+            PyDatasetFormat::Reasoning => Self::Reasoning,
+            PyDatasetFormat::PromptCompletion => Self::PromptCompletion,
             PyDatasetFormat::Auto => Self::Auto,
         }
     }

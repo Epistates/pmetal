@@ -254,3 +254,207 @@ fn test_stream_position_equality() {
     assert_eq!(p1, p2);
     assert_ne!(p1, p3);
 }
+
+// ─── Corruption ───────────────────────────────────────────────────────────────
+
+/// A shard cut short mid-record (an interrupted tokenization run, a partial
+/// copy) is an error. It used to read as the end of the shard, so training
+/// quietly dropped the tail of the corpus.
+#[test]
+fn test_a_truncated_shard_is_an_error() {
+    use pmetal_data::streaming::StreamError;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cut.bin");
+    write_shard(&path, &[&[1u32, 2, 3], &[4, 5, 6, 7]]).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    // Cut the last record's final token in half.
+    std::fs::write(&path, &bytes[..bytes.len() - 2]).unwrap();
+
+    let mut r = reader(vec![path], 16, 1);
+    match r.try_next_batch() {
+        Err(StreamError::TruncatedRecord {
+            claimed, available, ..
+        }) => {
+            assert_eq!(claimed, 4);
+            assert_eq!(available, 14);
+        }
+        other => panic!("expected a truncated-record error, got {other:?}"),
+    }
+}
+
+/// A shard that ends in half a header is the same fault.
+#[test]
+fn test_a_cut_header_is_an_error() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cut.bin");
+    write_shard(&path, &[&[1u32, 2]]).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[7, 0]);
+    std::fs::write(&path, &bytes).unwrap();
+    let mut r = reader(vec![path], 16, 1);
+    assert!(r.try_next_batch().is_err());
+}
+
+/// `write_shard` leaves nothing behind but the finished shard, and an
+/// unwritable one leaves nothing at all.
+#[test]
+fn test_write_shard_leaves_no_partial_file() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("ok.bin");
+    write_shard(&path, &[&[1u32, 2, 3]]).unwrap();
+    let names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["ok.bin"]);
+
+    let missing = dir.path().join("no_such_dir").join("x.bin");
+    assert!(write_shard(&missing, &[&[1u32]]).is_err());
+}
+
+// ─── Tokenizing a corpus into shards ──────────────────────────────────────────
+
+fn word_tokenizer() -> pmetal_data::Tokenizer {
+    pmetal_data::tokenizer::testing::word_level(&["[UNK]", "a", "b", "c", "d"], &[])
+}
+
+/// A corpus becomes shards a reader reads back: bad lines, rows without the
+/// column and empty documents are skipped and counted.
+#[test]
+fn test_tokenize_corpus_writes_readable_shards() {
+    use pmetal_data::streaming::tokenize_corpus;
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("corpus.jsonl");
+    std::fs::write(
+        &input,
+        "{\"text\": \"a b\"}\nnot json\n{\"text\": \"\"}\n{\"other\": 1}\n{\"text\": \"c d a\"}\n",
+    )
+    .unwrap();
+    let out = dir.path().join("shards");
+    let tok = word_tokenizer();
+    let mut seen = Vec::new();
+    let stats = tokenize_corpus(&input, &out, tok.inner(), "text", 1, |n| seen.push(n)).unwrap();
+    assert_eq!(
+        (stats.documents, stats.tokens, stats.shards, stats.skipped),
+        (2, 5, 2, 3)
+    );
+    assert_eq!(seen.last(), Some(&5), "progress counts rows read");
+
+    let mut r = reader(
+        vec![out.join("shard_00000.bin"), out.join("shard_00001.bin")],
+        6,
+        1,
+    );
+    let (batch, _) = r.next().unwrap();
+    // a b | EOS | c d a | EOS(pad): ids a=1 b=2 c=3 d=4, EOS=0.
+    assert_eq!(batch[0], [1, 2, 0, 3, 4, 1]);
+}
+
+/// A corpus in Parquet is tokenized like one in JSONL, and a corpus with no
+/// usable document is an error rather than an empty output directory.
+#[test]
+fn test_tokenize_corpus_reads_parquet_and_rejects_an_empty_corpus() {
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use pmetal_data::streaming::tokenize_corpus;
+    use std::sync::Arc;
+
+    let dir = TempDir::new().unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "content",
+        DataType::Utf8,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![Some("a b c"), None, Some("d")])) as ArrayRef],
+    )
+    .unwrap();
+    let path = dir.path().join("c.parquet");
+    let mut writer =
+        parquet::arrow::ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, None)
+            .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let tok = word_tokenizer();
+    let stats = tokenize_corpus(
+        &path,
+        &dir.path().join("out"),
+        tok.inner(),
+        "content",
+        10,
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!((stats.documents, stats.tokens, stats.skipped), (2, 4, 1));
+
+    assert!(
+        tokenize_corpus(
+            &path,
+            &dir.path().join("none"),
+            tok.inner(),
+            "missing",
+            10,
+            |_| {}
+        )
+        .is_err()
+    );
+}
+
+// ─── Document boundaries ──────────────────────────────────────────────────────
+
+/// The per-row document lengths tile the row, each counting its own
+/// separator, and the tokens are those of the plain batch.
+#[test]
+fn test_rows_report_where_each_document_sits() {
+    let dir = TempDir::new().unwrap();
+    // Documents of 3, 4, 2 and 6 tokens, EOS 0, rows of 5.
+    let path = make_shards(
+        &dir,
+        &[&[
+            &[1u32, 2, 3],
+            &[4, 5, 6, 7],
+            &[8, 9],
+            &[10, 11, 12, 13, 14, 15],
+        ]],
+    )
+    .remove(0);
+
+    let mut plain = reader(vec![path.clone()], 5, 2);
+    let mut rows_reader = reader(vec![path], 5, 2);
+    for _ in 0..4 {
+        let (batch, plain_pos) = plain.try_next_batch().unwrap().unwrap();
+        let (rows, pos) = rows_reader.try_next_rows().unwrap().unwrap();
+        assert_eq!(plain_pos, pos);
+        for (tokens, row) in batch.iter().zip(&rows) {
+            assert_eq!(&row.tokens, tokens);
+            assert_eq!(row.doc_lengths.iter().sum::<usize>(), 5, "{row:?}");
+            assert!(row.doc_lengths.iter().all(|&l| l > 0), "{row:?}");
+        }
+    }
+
+    // [1 2 3 0 4] [5 6 7 0 8] [9 0 10 11 12] [13 14 15 0 1]:
+    // a document, its separator, and the start of the next.
+    let mut r = reader(
+        vec![
+            make_shards(
+                &dir,
+                &[&[
+                    &[1u32, 2, 3],
+                    &[4, 5, 6, 7],
+                    &[8, 9],
+                    &[10, 11, 12, 13, 14, 15],
+                ]],
+            )
+            .remove(0),
+        ],
+        5,
+        1,
+    );
+    let lens: Vec<Vec<usize>> = (0..3)
+        .map(|_| r.try_next_rows().unwrap().unwrap().0.remove(0).doc_lengths)
+        .collect();
+    assert_eq!(lens, [vec![4, 1], vec![4, 1], vec![2, 3]]);
+}

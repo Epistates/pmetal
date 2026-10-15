@@ -33,6 +33,7 @@
 //! centre.
 
 use image::RgbImage;
+use rayon::prelude::*;
 
 /// Bits of fractional precision in the fixed-point accumulator.
 ///
@@ -278,39 +279,42 @@ fn horizontal_pass(
     c: &AxisCoeffs,
 ) -> Vec<u8> {
     let mut out = vec![0u8; out_w * src_h * 3];
-    for y in 0..src_h {
-        let row = &src[y * src_w * 3..(y + 1) * src_w * 3];
-        for x in 0..out_w {
-            let (first, taps) = c.taps_for(x);
-            let dst = (y * out_w + x) * 3;
-            for ch in 0..3 {
-                let mut acc = c.round_bias();
-                for (i, &tap) in taps.iter().enumerate() {
-                    acc += row[(first + i) * 3 + ch] as i64 * tap;
+    // Rows are independent and the arithmetic is integer, so splitting them
+    // across threads changes nothing in the result.
+    out.par_chunks_mut(out_w * 3)
+        .zip(src.par_chunks(src_w * 3))
+        .for_each(|(dst_row, row)| {
+            for x in 0..out_w {
+                let (first, taps) = c.taps_for(x);
+                for ch in 0..3 {
+                    let mut acc = c.round_bias();
+                    for (i, &tap) in taps.iter().enumerate() {
+                        acc += row[(first + i) * 3 + ch] as i64 * tap;
+                    }
+                    dst_row[x * 3 + ch] = c.clip8(acc);
                 }
-                out[dst + ch] = c.clip8(acc);
             }
-        }
-    }
+        });
     out
 }
 
 /// Resample along y: `[src_h, width, 3]` → `[out_h, width, 3]`, interleaved RGB.
 fn vertical_pass(src: &[u8], width: usize, out_h: usize, c: &AxisCoeffs) -> Vec<u8> {
     let mut out = vec![0u8; width * out_h * 3];
-    for y in 0..out_h {
-        let (first, taps) = c.taps_for(y);
-        for x in 0..width {
-            let dst = (y * width + x) * 3;
-            for ch in 0..3 {
-                let mut acc = c.round_bias();
-                for (i, &tap) in taps.iter().enumerate() {
-                    acc += src[((first + i) * width + x) * 3 + ch] as i64 * tap;
+    out.par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, dst_row)| {
+            let (first, taps) = c.taps_for(y);
+            for x in 0..width {
+                for ch in 0..3 {
+                    let mut acc = c.round_bias();
+                    for (i, &tap) in taps.iter().enumerate() {
+                        acc += src[((first + i) * width + x) * 3 + ch] as i64 * tap;
+                    }
+                    dst_row[x * 3 + ch] = c.clip8(acc);
                 }
-                out[dst + ch] = c.clip8(acc);
             }
-        }
-    }
+        });
     out
 }
 
@@ -355,17 +359,19 @@ fn resize_rgb8_quantized(
         return src.clone();
     }
 
-    let mut buffer = src.as_raw().clone();
-    let mut buffer_w = src_w;
-    if out_w != src_w {
+    // The first pass reads the source in place; a copy of it is made only if
+    // neither axis changes size, which returned above.
+    let horizontal = (out_w != src_w).then(|| {
         let coeffs = precompute_coeffs(src_w, out_w, filter, quantization);
-        buffer = horizontal_pass(&buffer, buffer_w, src_h, out_w, &coeffs);
-        buffer_w = out_w;
-    }
-    if out_h != src_h {
+        horizontal_pass(src.as_raw(), src_w, src_h, out_w, &coeffs)
+    });
+    let after_horizontal: &[u8] = horizontal.as_deref().unwrap_or(src.as_raw());
+    let buffer = if out_h != src_h {
         let coeffs = precompute_coeffs(src_h, out_h, filter, quantization);
-        buffer = vertical_pass(&buffer, buffer_w, out_h, &coeffs);
-    }
+        vertical_pass(after_horizontal, out_w, out_h, &coeffs)
+    } else {
+        after_horizontal.to_vec()
+    };
 
     RgbImage::from_raw(width, height, buffer).expect("resampled buffer matches the output size")
 }

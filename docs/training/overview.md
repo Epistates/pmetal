@@ -67,16 +67,20 @@ group's rate together, keeping the ratios.
 
 ## Dataset Formats
 
-Auto-detected:
+Auto-detected from a row's columns, structured layouts first:
 
 | Format | Structure |
 |--------|-----------|
+| OpenAI/Messages | `{"messages": [{"role": "user", "content": "..."}]}` (content parts, `tool_calls`, `tools`, per-message `weight`) |
 | ShareGPT | `{"conversations": [{"from": "human", "value": "..."}]}` |
 | Alpaca | `{"instruction": "...", "input": "...", "output": "..."}` |
-| OpenAI/Messages | `{"messages": [{"role": "user", "content": "..."}]}` |
+| Prompt/completion | `{"prompt": "...", "completion": "..."}` (strings or message lists; only the completion trains) |
 | Reasoning | `{"problem": "...", "thinking": "...", "solution": "..."}` |
 | Simple | `{"text": "..."}` |
-| Parquet | Standard text columns or reasoning formats |
+
+Any of these can be in JSONL, JSON, Parquet, Arrow or CSV files, or in a
+directory (a Hugging Face dataset's `train` split, every shard). Every
+assistant turn of a conversation trains; plain-text completions end in an EOS.
 
 ## See Also
 
