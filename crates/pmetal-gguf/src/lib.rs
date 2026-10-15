@@ -47,7 +47,7 @@ pub mod tokenizer;
 mod types;
 mod writer;
 
-pub use model::GgufModel;
+pub use model::{GgufModel, first_shard_path};
 pub use reader::{
     GgufContent, GgufReadError, GgufVersion, MAX_ARRAY_LENGTH, MAX_METADATA_COUNT,
     MAX_STRING_LENGTH, MAX_TENSOR_COUNT, MAX_TENSOR_DIMS,

@@ -103,15 +103,30 @@ fn split_keys(content: &GgufContent) -> Result<Option<(u64, u64, Option<i64>)>, 
     Ok(Some((no, count, total)))
 }
 
-/// Split `dir/<prefix>-<no>-of-<count>.gguf` into its prefix and widths.
-fn split_file_name(path: &Path) -> Option<(String, usize)> {
+/// Split `<prefix>-<no>-of-<count>.gguf` into `(prefix, no, count)` as written
+/// (the numbers keep their zero padding).
+fn split_file_parts(path: &Path) -> Option<(&str, &str, &str)> {
     let stem = path.file_name()?.to_str()?.strip_suffix(".gguf")?;
     let (head, count) = stem.rsplit_once("-of-")?;
     let (prefix, no) = head.rsplit_once('-')?;
-    if no.len() != count.len() || !no.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (no.len() == count.len() && digits(no) && digits(count)).then_some((prefix, no, count))
+}
+
+/// Split `dir/<prefix>-<no>-of-<count>.gguf` into its prefix and number width.
+fn split_file_name(path: &Path) -> Option<(String, usize)> {
+    let (prefix, _, count) = split_file_parts(path)?;
     Some((prefix.to_string(), count.len()))
+}
+
+/// If `path` names a shard of a split model (`<name>-00002-of-00005.gguf`),
+/// the path of the set's first shard in the same directory; `None` for a file
+/// that is not named like a shard. Directory scans use this to treat a split
+/// model as the one model it is.
+pub fn first_shard_path(path: &Path) -> Option<PathBuf> {
+    let (prefix, no, count) = split_file_parts(path)?;
+    let first = format!("{prefix}-{:0>width$}-of-{count}.gguf", 1, width = no.len());
+    Some(path.with_file_name(first))
 }
 
 impl GgufModel {
@@ -399,6 +414,17 @@ mod tests {
             GgufModel::open(&first),
             Err(GgufReadError::DuplicateTensorName(_))
         ));
+    }
+
+    #[test]
+    fn the_first_shard_is_found_from_any_shard() {
+        let p = Path::new("/x/Model-UD-Q4-00003-of-00005.gguf");
+        assert_eq!(
+            first_shard_path(p),
+            Some(PathBuf::from("/x/Model-UD-Q4-00001-of-00005.gguf"))
+        );
+        assert_eq!(first_shard_path(Path::new("/x/model.gguf")), None);
+        assert_eq!(first_shard_path(Path::new("/x/m-1-of-0003.gguf")), None);
     }
 
     #[test]

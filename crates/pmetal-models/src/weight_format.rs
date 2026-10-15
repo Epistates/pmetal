@@ -110,7 +110,21 @@ fn find_gguf_file_in_dir(path: &Path) -> Result<PathBuf, WeightFormatError> {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
         })
         .collect();
+    // Multimodal projector files sit next to the language model but are not
+    // it; the shards of a split model are one model, named by its first shard.
+    matches.retain(|path| {
+        !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("mmproj"))
+    });
+    for path in &mut matches {
+        if let Some(first) = pmetal_gguf::first_shard_path(path) {
+            *path = first;
+        }
+    }
     matches.sort();
+    matches.dedup();
 
     if let Some(model_gguf) = matches
         .iter()
@@ -261,20 +275,22 @@ impl WeightLoader {
 
         let gguf_path = resolve_gguf_path(path)?;
 
-        // Read GGUF content
-        let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
+        // Map the model (any shard of a split set opens the whole set); tensor
+        // bytes are borrowed from the mapping rather than read into buffers.
+        let model = pmetal_gguf::GgufModel::open(&gguf_path)
             .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
-
-        // Open file for tensor data reading
-        let mut file = std::fs::File::open(&gguf_path)?;
 
         let mut weights = HashMap::new();
 
-        // Load and dequantize each tensor
-        let tensor_names: Vec<String> = content.tensor_names().map(String::from).collect();
+        // Load and dequantize each tensor, in on-disk order
+        let tensor_names: Vec<String> = model
+            .tensors_in_disk_order()
+            .into_iter()
+            .map(|info| info.name.clone())
+            .collect();
 
         for tensor_name in tensor_names {
-            let tensor_info = content.get_tensor_info(&tensor_name).ok_or_else(|| {
+            let tensor_info = model.tensor_info(&tensor_name).ok_or_else(|| {
                 WeightFormatError::Gguf(format!("Tensor not found: {}", tensor_name))
             })?;
 
@@ -291,13 +307,12 @@ impl WeightLoader {
             // Get shape for dequantization
             let shape = gguf_shape_to_i32(&tensor_info.dimensions, &tensor_name)?;
 
-            // Read tensor data
-            let data = content
-                .read_tensor_data(&mut file, &tensor_name)
+            let data = model
+                .tensor_data(&tensor_name)
                 .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
 
             // Dequantize to f32
-            let floats = pmetal_gguf::dequant::dequantize(&data, tensor_info.dtype, &shape)
+            let floats = pmetal_gguf::dequant::dequantize(data, tensor_info.dtype, &shape)
                 .map_err(|e| WeightFormatError::Dequant(e.to_string()))?;
 
             // Create MLX array
@@ -527,9 +542,9 @@ impl GgufModelConfig {
     /// so callers (e.g. the inference dispatcher) need only a path.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, WeightFormatError> {
         let gguf_path = resolve_gguf_path(path.as_ref())?;
-        let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
+        let model = pmetal_gguf::GgufModel::open(&gguf_path)
             .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
-        Self::from_gguf(&content)
+        Self::from_gguf(model.metadata_content())
     }
 
     /// Extract config from GGUF metadata.
@@ -742,10 +757,10 @@ pub fn get_gguf_architecture(path: impl AsRef<Path>) -> Result<Option<String>, W
 
     let gguf_path = resolve_gguf_path(path)?;
 
-    let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
+    let model = pmetal_gguf::GgufModel::open(&gguf_path)
         .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
 
-    Ok(content.architecture().map(String::from))
+    Ok(model.architecture().map(String::from))
 }
 
 #[cfg(test)]
@@ -971,5 +986,26 @@ mod tests {
             find_gguf_file_in_dir(dir.path()).unwrap(),
             dir.path().join("model.gguf")
         );
+    }
+
+    #[test]
+    fn a_directory_with_a_split_model_and_a_projector_is_one_model() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "Model-Q4-00001-of-00003.gguf",
+            "Model-Q4-00002-of-00003.gguf",
+            "Model-Q4-00003-of-00003.gguf",
+            "mmproj-F16.gguf",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert_eq!(
+            find_gguf_file_in_dir(dir.path()).unwrap(),
+            dir.path().join("Model-Q4-00001-of-00003.gguf")
+        );
+
+        // Two different models are still ambiguous.
+        std::fs::write(dir.path().join("Other-Q8_0.gguf"), b"x").unwrap();
+        assert!(find_gguf_file_in_dir(dir.path()).is_err());
     }
 }
