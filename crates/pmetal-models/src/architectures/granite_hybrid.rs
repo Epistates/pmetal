@@ -11,7 +11,7 @@
 //! The Mamba-2 scan itself is not reimplemented here: it is the SSD form in
 //! [`super::nemotron_h`] ([`ssm_attention`] for a sequence, [`ssm_update_single`]
 //! for one cached token), and the conv / SSM state lives in the shared
-//! [`MambaCache`](pmetal_mlx::kv_cache::MambaCache). What differs from
+//! [`MambaCache`](pmetal_cache::kv_cache::MambaCache). What differs from
 //! Nemotron-H is around the scan: Granite normalizes the gated output over the
 //! whole intermediate width (not per group), and runs the scan in float32 the
 //! way the reference's chunked path does.
@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use pmetal_mlx::kv_cache::MambaCacheEntry;
+use pmetal_cache::kv_cache::MambaCacheEntry;
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParametersExt, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
 

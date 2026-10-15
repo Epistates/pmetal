@@ -27,12 +27,12 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::expert_io::ExpertOffloadContext;
+use crate::expert_io::{ExpertOffloadContext, copy_as_f32};
 use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
+use pmetal_cache::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
-use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
 use pmetal_runtime::native_weight::LayerWeight;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
@@ -1438,7 +1438,7 @@ impl Qwen3NextGatedDeltaNet {
         b_val: &Array,
         mask: Option<&Array>,
         cache: Option<&mut MambaCacheEntry>,
-        capture: Option<(usize, &mut pmetal_mlx::speculative::SpecCapture)>,
+        capture: Option<(usize, &mut pmetal_cache::speculative::SpecCapture)>,
         conv_input_qkv: &Array,
         conv_kernel_size: usize,
     ) -> Result<Array, Exception> {
@@ -1461,7 +1461,7 @@ impl Qwen3NextGatedDeltaNet {
 
         // Record the rollback inputs before advancing the state.
         if let Some((layer_idx, buf)) = capture {
-            let rec = pmetal_mlx::kv_cache::GdnVerifyInputs {
+            let rec = pmetal_cache::kv_cache::GdnVerifyInputs {
                 keys: k_normed.clone(),
                 values: v_conv.clone(),
                 g: g.clone(),
@@ -1748,7 +1748,7 @@ impl Qwen3NextGatedDeltaNet {
         mask: Option<&Array>,
         cache: Option<&mut MambaCacheEntry>,
         layer_idx: usize,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         self.forward_general_with_capture(inputs, mask, cache, Some((layer_idx, capture)))
     }
@@ -1763,7 +1763,7 @@ impl Qwen3NextGatedDeltaNet {
         inputs: &Array,
         mask: Option<&Array>,
         mut cache: Option<&mut MambaCacheEntry>,
-        capture: Option<(usize, &mut pmetal_mlx::speculative::SpecCapture)>,
+        capture: Option<(usize, &mut pmetal_cache::speculative::SpecCapture)>,
     ) -> Result<Array, Exception> {
         if capture.is_none() {
             return self.forward_general(inputs, mask, cache);
@@ -2619,11 +2619,8 @@ impl Qwen3NextSparseMoeBlock {
                         let token_input_f32 =
                             token_input.cast(pmetal_runtime::compat::Dtype::Float32);
                         token_input_f32.eval();
-                        let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
-                            &metal_ctx,
-                            &token_input_f32,
-                        )
-                        .map_err(|e| Exception::custom(e.to_string()))?;
+                        let input_buf = copy_as_f32(&metal_ctx, &token_input_f32)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
                         for slot in 0..k_usize {
                             let expert_idx = window_expert_indices[token_offset * k_usize + slot];
                             let unique_slot = *unique_index_map
@@ -2700,11 +2697,8 @@ impl Qwen3NextSparseMoeBlock {
                         let token_input_f32 =
                             token_input.cast(pmetal_runtime::compat::Dtype::Float32);
                         token_input_f32.eval();
-                        let input_buf = pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(
-                            &metal_ctx,
-                            &token_input_f32,
-                        )
-                        .map_err(|e| Exception::custom(e.to_string()))?;
+                        let input_buf = copy_as_f32(&metal_ctx, &token_input_f32)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
                         for slot in 0..k_usize {
                             let expert_idx = window_expert_indices[token_offset * k_usize + slot];
                             let unique_slot = *unique_index_map
@@ -2854,9 +2848,8 @@ impl Qwen3NextSparseMoeBlock {
             // x_flat to Metal buffer (tiny for T=1 decode)
             let x_flat_f32 = x_flat.cast(pmetal_runtime::compat::Dtype::Float32);
             x_flat_f32.eval();
-            let input_buf =
-                pmetal_mlx::bridge::MlxMetalBridge::copy_as_f32(&metal_ctx, &x_flat_f32)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
+            let input_buf = copy_as_f32(&metal_ctx, &x_flat_f32)
+                .map_err(|e| Exception::custom(e.to_string()))?;
 
             let use_aligned = runtime.buffer_pool.is_some()
                 && runtime.expert_out_bufs.len() >= expert_indices.len();
@@ -3380,7 +3373,7 @@ impl Qwen3NextDecoderLayer {
         positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCacheEntry>,
         layer_idx: usize,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x);
         let r = if self.is_linear {
@@ -3551,7 +3544,7 @@ impl Qwen3NextModel {
         kv_cache: Option<&mut KVCache>,
         positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCache>,
-        capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
         self.forward_embeddings_with_cache_and_capture(
@@ -3575,7 +3568,7 @@ impl Qwen3NextModel {
         mut kv_cache: Option<&mut KVCache>,
         positions: Option<&Array>,
         mut mamba_cache: Option<&mut MambaCache>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // Create separate masks for full attention vs GDN layers (matching MLX reference):
         // - Full attention: uses the causal mask from the caller (or None for cached decode)
@@ -3983,7 +3976,7 @@ impl Qwen3NextForCausalLM {
         mask: Option<&Array>,
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let h = self.model.forward_with_cache_and_capture(
             input_ids,
@@ -4007,7 +4000,7 @@ impl Qwen3NextForCausalLM {
         mask: Option<&Array>,
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<(Array, Array), Exception> {
         let h = self.model.forward_with_cache_and_capture(
             input_ids,

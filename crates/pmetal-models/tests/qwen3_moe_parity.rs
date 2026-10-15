@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::test_utils::{
+use pmetal_cache::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
 use pmetal_runtime::compat::{Array, ops::slice_axis};

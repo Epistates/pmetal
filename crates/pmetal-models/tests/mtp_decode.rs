@@ -21,8 +21,8 @@
 //! attention layers, a bundled `mtp.*` predictor), on both the dynamic model
 //! and the native engine. Gemma 4 runs on a tiny random target and assistant.
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
-use pmetal_mlx::test_utils::max_abs_diff;
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache};
+use pmetal_cache::test_utils::max_abs_diff;
 use pmetal_models::architectures::{
     Gemma4AssistantConfig, Gemma4AssistantForCausalLM, Gemma4AssistantSharedKvStates, Gemma4Config,
     Gemma4ForCausalLM, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM, load_qwen3_next_mtp_from_dir,

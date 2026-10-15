@@ -3,20 +3,20 @@
 use crate::continuous_pump::ContinuousPump;
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
+use pmetal_cache::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
 use pmetal_data::image_processing::{
     MllamaImageProcessor, MllamaImageProcessorConfig, mllama_cross_attention_mask,
 };
 use pmetal_data::inference_config::collect_all_stop_tokens;
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor, RgbImage};
-use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
-use pmetal_mlx::{Array, Dtype, ModuleParameters as _};
 use pmetal_models::architectures::mllama::{CrossAttentionInputs, MllamaVisionInputs};
 use pmetal_models::architectures::qwen3_5_vision::{Qwen3_5MultimodalConfig, Qwen3_5Vision};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
 use pmetal_models::model_thread::{Background, ModelThread, ModelThreadStartError};
 use pmetal_models::{GenerationOutput, generate_cached_ane_streaming, is_ane_inference_compatible};
+use pmetal_runtime::compat::{Array, Dtype, ModuleParameters as _};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -480,7 +480,7 @@ pub struct InferenceEngine {
     /// safely snapshot-truncated) and for every request where the
     /// engine is also running the ANE backend.
     /// Its entries are only touched on the model thread.
-    prefix_cache: Arc<Mutex<pmetal_mlx::prefix_cache::PrefixCache>>,
+    prefix_cache: Arc<Mutex<pmetal_cache::prefix_cache::PrefixCache>>,
     /// The continuous-batching pump while it is enabled (`None` by
     /// default). The model thread drives it; this handle is for
     /// [`continuous_batching_depth`](Self::continuous_batching_depth).
@@ -534,7 +534,7 @@ impl Vision {
         if model_type == "qwen3_5" {
             let vision = Qwen3_5MultimodalConfig::from_config_value(&config).and_then(|config| {
                 let processor = QwenVlProcessor::from_model_dir(model_path)
-                    .map_err(|e| pmetal_mlx::Exception::custom(e.to_string()))?;
+                    .map_err(|e| pmetal_runtime::compat::Exception::custom(e.to_string()))?;
                 Ok(Self::Qwen3_5 {
                     processor: Box::new(processor),
                     config: Box::new(config),
@@ -705,7 +705,7 @@ struct GpuRequestContext {
     max_seq_len: usize,
     cache_mode_override: Option<CacheMode>,
     tokenizer: Arc<pmetal_data::Tokenizer>,
-    prefix_cache: Arc<Mutex<pmetal_mlx::prefix_cache::PrefixCache>>,
+    prefix_cache: Arc<Mutex<pmetal_cache::prefix_cache::PrefixCache>>,
 }
 
 /// One GPU generation request, run on the model thread.
@@ -858,7 +858,7 @@ impl InferenceEngine {
             stop_token_ids,
             created_at: chrono::Utc::now().timestamp(),
             cache_mode_override: None,
-            prefix_cache: Arc::new(Mutex::new(pmetal_mlx::prefix_cache::PrefixCache::new(
+            prefix_cache: Arc::new(Mutex::new(pmetal_cache::prefix_cache::PrefixCache::new(
                 DEFAULT_PREFIX_CACHE_ENTRIES,
                 DEFAULT_PREFIX_CACHE_BYTES,
             ))),
@@ -885,7 +885,7 @@ impl InferenceEngine {
     /// unbounded.
     pub fn set_prefix_cache_limits(&self, max_entries: usize, max_bytes: usize) {
         if let Ok(mut pc) = self.prefix_cache.lock() {
-            *pc = pmetal_mlx::prefix_cache::PrefixCache::new(max_entries, max_bytes);
+            *pc = pmetal_cache::prefix_cache::PrefixCache::new(max_entries, max_bytes);
         }
     }
 
@@ -1810,7 +1810,7 @@ impl InferenceEngine {
         stop_sequences: &[String],
         logprobs_top_n: Option<usize>,
         prefill_step_size: usize,
-        prefix_cache: Option<&Arc<Mutex<pmetal_mlx::prefix_cache::PrefixCache>>>,
+        prefix_cache: Option<&Arc<Mutex<pmetal_cache::prefix_cache::PrefixCache>>>,
         media: Option<&MediaForward>,
         start: Instant,
         mut on_token: E,
@@ -2699,7 +2699,7 @@ mod tests {
     #[test]
     fn continuous_cache_config_honors_cache_mode_override() {
         let override_mode = CacheMode::TurboQuant {
-            config: pmetal_mlx::kv_cache::TurboQuantConfig::uniform(4, 4),
+            config: pmetal_cache::kv_cache::TurboQuantConfig::uniform(4, 4),
         };
         let engine = InferenceEngine::new_with_backend(
             || {

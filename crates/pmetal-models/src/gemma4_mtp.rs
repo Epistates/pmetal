@@ -5,7 +5,7 @@
 //! cache of its own: it attends to the target's KV cache, and every step of a
 //! round runs at the pending token's position.
 
-use pmetal_mlx::{kv_cache::KVCache, speculative::SpecCapture};
+use pmetal_cache::{kv_cache::KVCache, speculative::SpecCapture};
 use pmetal_runtime::compat::{Array, Exception, ops::concatenate_axis};
 use pmetal_runtime::decode::prompt_tokens_to_input;
 

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_runtime::compat::{Array, ops::slice_axis};
 use serial_test::serial;
 
@@ -146,7 +146,7 @@ fn dynamic_qwen3_yarn_matches_transformers() {
 #[test]
 #[serial]
 fn native_qwen3_yarn_chunked_prefill_matches_transformers() {
-    use pmetal_mlx::test_utils::to_f32_vec_eval;
+    use pmetal_cache::test_utils::to_f32_vec_eval;
     use pmetal_runtime::decode::{prefill_last_logits, prompt_tokens_to_input};
     use pmetal_runtime::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
 

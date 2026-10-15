@@ -10,7 +10,7 @@ use crate::loader::{
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
-use pmetal_mlx::kv_cache::{
+use pmetal_cache::kv_cache::{
     CacheMode, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache,
     sanitize_cache_mode_for_config,
 };

@@ -19,8 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
+use pmetal_cache::test_utils::{load_shard, to_f32_vec_eval};
 use pmetal_data::qwen_vl_processing::load_image_source;
-use pmetal_mlx::test_utils::{load_shard, to_f32_vec_eval};
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::qwen3_5_vision::Qwen3_5Vision;
 use pmetal_runtime::compat::{Array, Module, ops::slice_axis};

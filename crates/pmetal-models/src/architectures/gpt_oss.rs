@@ -30,7 +30,7 @@ use pmetal_runtime::gpt_oss_native::GptOssExperts;
 
 /// gpt-oss's GLU slope, `gate · σ(1.702 · gate)`.
 const SWIGLU_ALPHA: f32 = 1.702;
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig,
     rope::{RopePositions, rope_embedding},
@@ -1225,7 +1225,7 @@ impl GptOssModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
         positions: Option<&Array>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut hidden = self.embed_tokens.forward(input_ids);
 
@@ -1335,7 +1335,7 @@ impl GptOssForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let hidden =
             self.model

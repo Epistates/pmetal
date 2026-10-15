@@ -18,7 +18,7 @@ mod common;
 use std::collections::HashMap;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, print_report_table};
 use pmetal_models::dflash_decoder::DFlashDraftQuant;
 use pmetal_models::dflash_drafts::{DFlashDraft, load_dflash_draft};
 use pmetal_runtime::compat::{Array, Dtype, ops};

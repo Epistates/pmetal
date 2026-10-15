@@ -21,7 +21,7 @@ audit-as-crate-author = true
 [policy.pmetal-metal]
 audit-as-crate-author = true
 
-[policy.pmetal-mlx]
+[policy.pmetal-cache]
 audit-as-crate-author = true
 
 [policy.pmetal-models]

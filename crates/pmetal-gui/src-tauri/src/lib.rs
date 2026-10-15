@@ -321,7 +321,7 @@ fn log_dir() -> std::path::PathBuf {
 fn init_logging(component: &str) -> Option<std::path::PathBuf> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(
-            "pmetal_gui=info,pmetal_trainer=info,pmetal_mlx=info,pmetal_lora=info,pmetal_models=info,pmetal=info",
+            "pmetal_gui=info,pmetal_trainer=info,pmetal_runtime=info,pmetal_cache=info,pmetal_lora=info,pmetal_models=info,pmetal=info",
         )
     });
 

@@ -23,7 +23,7 @@
 use pmetal_runtime::compat::{Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn};
 use pmetal_runtime::impl_module_params;
 
-use pmetal_mlx::kv_cache::{KVCache, MambaCache};
+use pmetal_cache::kv_cache::{KVCache, MambaCache};
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope},
@@ -803,7 +803,7 @@ impl MlpModule for GraniteMLP {
 }
 
 /// The per-layer recurrent state a Mamba layer reads and advances, or none.
-type MambaSlot<'a> = Option<&'a mut pmetal_mlx::kv_cache::MambaCacheEntry>;
+type MambaSlot<'a> = Option<&'a mut pmetal_cache::kv_cache::MambaCacheEntry>;
 
 /// Granite decoder layer.
 ///
@@ -1217,7 +1217,7 @@ impl GraniteForCausalLM {
     /// Create a fresh KV cache sized for this model. Mamba layers leave their
     /// slots empty, which keeps slot indices equal to layer indices.
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
-        use pmetal_mlx::kv_cache::KVCacheConfig;
+        use pmetal_cache::kv_cache::KVCacheConfig;
         KVCache::new(KVCacheConfig::new(
             self.config.num_hidden_layers as usize,
             max_seq_len,
@@ -1250,7 +1250,7 @@ impl GraniteForCausalLM {
         &mut self,
         input_ids: &Array,
         active_indices: &[usize],
-        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+        cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
         use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
 

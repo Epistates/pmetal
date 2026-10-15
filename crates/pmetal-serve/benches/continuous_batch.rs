@@ -10,7 +10,7 @@
 //! 1. **Serial** — `N_active` independent `forward_with_cache` calls
 //!    against per-slot `KVCache`s, mirroring the Phase-1 fallback.
 //! 2. **Fused** — one `forward_batched_impl` call against a shared
-//!    [`pmetal_mlx::kv_cache::FusedBatchKVCache`].
+//!    [`pmetal_cache::kv_cache::FusedBatchKVCache`].
 //!
 //! The decode-token sample size is intentionally small (synthetic Llama
 //! weights, tiny hidden + few layers) to keep the bench self-contained
@@ -24,7 +24,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 
-use pmetal_mlx::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
+use pmetal_cache::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
 use pmetal_runtime::compat::Array;
 

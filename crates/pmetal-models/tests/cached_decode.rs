@@ -340,7 +340,7 @@ fn a_cached_decode_reproduces_the_uncached_prefix() {
 /// the error of an 8-bit code.
 #[test]
 fn a_compressed_cache_decodes_what_it_recomputes() {
-    use pmetal_mlx::kv_cache::{CacheMode, TurboQuantConfig};
+    use pmetal_cache::kv_cache::{CacheMode, TurboQuantConfig};
 
     let modes: [(&str, CacheMode, f32); 3] = [
         (

@@ -38,7 +38,7 @@
 //! A full `pmetal train-draft` CLI command can be implemented on top of
 //! [`dflash_train_step`] without touching any other module.
 
-use pmetal_mlx::speculative::SpecCapture;
+use pmetal_cache::speculative::SpecCapture;
 use pmetal_models::architectures::dflash_draft::DFlashDraftModel;
 use pmetal_models::architectures::qwen3::Qwen3ForCausalLM;
 use pmetal_models::dflash_decoder::DFlashTarget;

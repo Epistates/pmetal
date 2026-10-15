@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use pmetal_mlx::{
+use pmetal_cache::{
     kv_cache::{GdnVerifyInputs, KVCache, MambaCache, MambaSnapshot},
     speculative::SpecCapture,
 };
@@ -416,7 +416,7 @@ mod tests {
     /// predictor. With `disturb`, every emitted token also draws from the
     /// thread's MLX key, as another stream sharing the thread would.
     fn sampled_mtp_tokens(seed: Option<u64>, disturb: bool) -> Vec<u32> {
-        use pmetal_mlx::kv_cache::KVCacheConfig;
+        use pmetal_cache::kv_cache::KVCacheConfig;
         use pmetal_runtime::compat::{Dtype, random};
 
         let config = crate::architectures::Qwen3NextConfig {

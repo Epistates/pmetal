@@ -11,7 +11,7 @@
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{
     Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn, ops,
 };
@@ -1238,7 +1238,7 @@ impl DeepSeekModel {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
         positions: Option<&Array>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array> {
         let mut h = self.embed_tokens.forward(input_ids);
         // Hoisted: the loop below borrows `self.layers` mutably.
@@ -1409,7 +1409,7 @@ impl DeepSeek {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array> {
         let hidden =
             self.model
@@ -1419,7 +1419,7 @@ impl DeepSeek {
 
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
         KVCache::new(
-            pmetal_mlx::kv_cache::KVCacheConfig::new(
+            pmetal_cache::kv_cache::KVCacheConfig::new(
                 self.config.num_hidden_layers as usize,
                 max_seq_len,
                 self.config.num_attention_heads as usize,

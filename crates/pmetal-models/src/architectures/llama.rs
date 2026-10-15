@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception, Module, nn};
 use pmetal_runtime::impl_module_params;
 use pmetal_runtime::nn::{
@@ -562,7 +562,7 @@ impl LlamaModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
         positions: Option<&Array>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // Get embeddings
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
@@ -715,7 +715,7 @@ impl LlamaForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let hidden_states =
             self.model
@@ -732,7 +732,7 @@ impl LlamaForCausalLM {
         &mut self,
         input_ids: &Array,
         active_indices: &[usize],
-        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+        cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
         use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
 
@@ -779,7 +779,7 @@ impl LlamaForCausalLM {
     /// # Returns
     /// A new KV cache configured for this model
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
-        use pmetal_mlx::kv_cache::KVCacheConfig;
+        use pmetal_cache::kv_cache::KVCacheConfig;
 
         let config = &self.model.config;
         KVCache::new(KVCacheConfig::new(

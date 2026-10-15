@@ -10,13 +10,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use pmetal_cache::kv_cache::{
+    CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, sanitize_cache_mode_for_config,
+};
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateKwargs, ChatTemplateType, Message, ToolDefinition};
 use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor};
-use pmetal_mlx::kv_cache::{
-    CacheMode, KVCache, KVCacheConfig, MambaCache, TurboQuantConfig, sanitize_cache_mode_for_config,
-};
-use pmetal_mlx::{Array, Dtype, Exception, ModuleParameters as _};
 use pmetal_models::architectures::qwen3_5_vision::Qwen3_5MultimodalConfig;
 use pmetal_models::architectures::{
     Gemma4AssistantForCausalLM, Qwen3NextConfig, Qwen3NextMtpForCausalLM,
@@ -29,6 +28,7 @@ use pmetal_models::{
     generate_gemma4_mtp_streaming, generate_qwen3_native_mtp_streaming,
     generate_qwen3_next_mtp_streaming, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair,
 };
+use pmetal_runtime::compat::{Array, Dtype, Exception, ModuleParameters as _};
 
 #[cfg(feature = "lora")]
 use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
@@ -2038,7 +2038,7 @@ fn build_cache_from_base_config(base_cache_config: &KVCacheConfig, mode: CacheMo
 fn build_native_placeholder_cache(base_cache_config: &KVCacheConfig) -> KVCache {
     // Bridge-native inference owns its own KV/TurboQuant cache implementation.
     // Keep the runner's structural cache in the simplest mode so the native
-    // path does not instantiate the shared pmetal-mlx TurboQuant stack.
+    // path does not instantiate the shared pmetal-cache TurboQuant stack.
     KVCache::new(base_cache_config.clone().with_mode(CacheMode::Standard))
 }
 

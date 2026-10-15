@@ -47,7 +47,7 @@
 //! # Decode path selection
 //!
 //! Phase 2 introduces a **fused `[N_active, 1]` batched decode** built on
-//! `pmetal_mlx::kv_cache::FusedBatchKVCache` and per-arch
+//! `pmetal_cache::kv_cache::FusedBatchKVCache` and per-arch
 //! `forward_batched_impl` methods. The driver routes a request through the
 //! fused path when
 //! [`pmetal_models::dispatcher::DynamicModel::supports_fused_batched`]

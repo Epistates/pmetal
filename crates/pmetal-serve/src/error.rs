@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
     #[error("model error: {0}")]
-    Model(#[from] pmetal_mlx::Exception),
+    Model(#[from] pmetal_runtime::compat::Exception),
 
     #[error("tokenizer error: {0}")]
     Tokenizer(String),

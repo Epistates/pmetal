@@ -14,9 +14,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use pmetal_cache::test_utils::max_abs_diff;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, TrainableModel, save_safetensors_map};
-use pmetal_mlx::test_utils::max_abs_diff;
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::optimizers::{AdamW, Optimizer};
 use pmetal_runtime::compat::{Array, Dtype, ModuleParametersExt, eval, random};

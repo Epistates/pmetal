@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::test_utils::max_abs_diff;
+use pmetal_cache::test_utils::max_abs_diff;
 use pmetal_runtime::compat::{Array, ops};
 use pmetal_runtime::qwen3_native::{NativeCache, forward_step, load_config, load_model};
 use pmetal_runtime::{InlineArray, QuantizedMode};

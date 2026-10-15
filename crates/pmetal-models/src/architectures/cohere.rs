@@ -12,7 +12,7 @@
 use pmetal_runtime::compat::{Array, Exception, Module, nn};
 use pmetal_runtime::impl_module_params;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
@@ -651,7 +651,7 @@ impl CohereForCausalLM {
 
     /// Create a fresh KV cache sized for this model.
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
-        use pmetal_mlx::kv_cache::KVCacheConfig;
+        use pmetal_cache::kv_cache::KVCacheConfig;
         KVCache::new(KVCacheConfig::new(
             self.config.num_hidden_layers as usize,
             max_seq_len,
@@ -674,7 +674,7 @@ impl CohereForCausalLM {
         &mut self,
         input_ids: &Array,
         active_indices: &[usize],
-        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+        cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
         use crate::common::{BatchedGqaAttnCfg, batched_parallel_block};
 

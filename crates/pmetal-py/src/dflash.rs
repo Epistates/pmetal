@@ -8,10 +8,10 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use pmetal_mlx::Array;
 use pmetal_models::DynamicModel;
 use pmetal_models::dflash_decoder::{DFlashConfig, DFlashDecoder, DFlashDraftQuant, DFlashOutput};
 use pmetal_models::dflash_drafts::load_dflash_draft;
+use pmetal_runtime::compat::Array;
 
 use crate::error::runtime_err;
 use crate::hub::is_hf_model_id;

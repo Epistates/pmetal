@@ -36,7 +36,7 @@
 //! tokens at roughly the cost of one full forward pass (the verify pass dominates).
 use pmetal_runtime::compat::{Array, Exception};
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig};
 
 use crate::shard::ShardableModel;
 

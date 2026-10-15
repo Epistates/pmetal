@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception};
 use pmetal_runtime::native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 

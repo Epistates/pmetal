@@ -9,11 +9,11 @@
 
 use std::path::{Path, PathBuf};
 
-use pmetal_core::{LearningRateScheduler, LrSchedulerType};
-use pmetal_mlx::{
+use pmetal_cache::{
     kv_cache::{KVCache, KVCacheConfig},
     speculative::SpecCapture,
 };
+use pmetal_core::{LearningRateScheduler, LrSchedulerType};
 use pmetal_models::architectures::{
     DFlashDraftModel, Gemma4AssistantConfig, Gemma4AssistantForCausalLM,
     Gemma4AssistantGenerationConfig, Gemma4Config, Gemma4ForCausalLM, Qwen3ForCausalLM,

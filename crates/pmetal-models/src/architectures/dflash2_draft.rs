@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception, ModuleParametersExt, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
 

@@ -25,7 +25,7 @@ mod common;
 use std::collections::HashMap;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_runtime::InlineArray;
 use pmetal_runtime::compat::{Array, ops::slice_axis};
 use pmetal_runtime::deepseek_native::{

@@ -12,7 +12,7 @@ categories.workspace = true
 [dependencies]
 pmetal-core = { workspace = true }
 pmetal-runtime = { workspace = true }
-pmetal-mlx = { workspace = true }
+pmetal-cache = { workspace = true }
 pmetal-models = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,10 +23,10 @@ tracing = { workspace = true }
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
-# Pull in pmetal-mlx's `test-utils` feature so `base_parity` can reach the
+# Pull in pmetal-cache's `test-utils` feature so `base_parity` can reach the
 # shared comparison helpers (`ParityReport`, `Tolerance`, …). The feature is
 # empty in production builds, so there's no runtime impact.
-pmetal-mlx = { workspace = true, features = ["test-utils"] }
+pmetal-cache = { workspace = true, features = ["test-utils"] }
 
 
 [lints]

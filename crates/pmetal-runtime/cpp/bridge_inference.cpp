@@ -220,7 +220,7 @@ void mlx_inline_gather_qmm(mlx_inline_array* dst,
 }
 
 // GDN Metal kernel source — fuses the entire recurrence into one Metal dispatch.
-// Matches the Rust GDN_KERNEL_SOURCE from pmetal-mlx/src/kernels/gated_delta.rs.
+// Matches the Rust GDN_KERNEL_SOURCE from pmetal-runtime/src/nn/gated_delta.rs.
 
 void mlx_inline_take_axis(mlx_inline_array* dst, const mlx_inline_array* a,
     const mlx_inline_array* indices, int axis) {

@@ -27,7 +27,7 @@
 //! ship incrementally arch-by-arch.
 
 use crate::continuous_batch::SlotId;
-use pmetal_mlx::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache};
+use pmetal_cache::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::generation::Sampler;
 use pmetal_runtime::compat::{Array, Exception};
 use pmetal_runtime::decode::DecodePenalties;
@@ -835,7 +835,7 @@ mod tests {
     /// state it was handed was empty, and which sequence that state was;
     /// then marks the state used, as a hybrid model's forward would.
     struct RecurrentStub {
-        seen: Vec<(u32, bool, pmetal_mlx::kv_cache::SequenceKey)>,
+        seen: Vec<(u32, bool, pmetal_cache::kv_cache::SequenceKey)>,
     }
 
     impl SlotForward for RecurrentStub {

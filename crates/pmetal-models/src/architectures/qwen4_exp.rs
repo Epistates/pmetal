@@ -49,8 +49,8 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
-use pmetal_mlx::speculative::SpecCapture;
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
+use pmetal_cache::speculative::SpecCapture;
 use pmetal_runtime::compat::ops::{slice_axis, slice_axis_from, slice_last_from, slice_last_to};
 use pmetal_runtime::compat::{
     Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt,

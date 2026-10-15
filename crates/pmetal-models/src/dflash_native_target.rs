@@ -19,9 +19,9 @@
 
 use std::path::Path;
 
-use pmetal_mlx::kv_cache::{KVCache, MambaCache};
-use pmetal_mlx::speculative::SpecCapture;
-use pmetal_mlx::{Array, Exception};
+use pmetal_cache::kv_cache::{KVCache, MambaCache};
+use pmetal_cache::speculative::SpecCapture;
+use pmetal_runtime::compat::{Array, Exception};
 use pmetal_runtime::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 
 use crate::dflash_decoder::DFlashTarget;

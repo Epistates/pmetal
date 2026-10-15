@@ -39,8 +39,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::speculative::SpecCapture;
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_cache::speculative::SpecCapture;
+use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::qwen3_next_mtp::load_qwen3_next_mtp_from_dir;
 use pmetal_runtime::compat::{Array, ops::slice_axis};
@@ -320,7 +320,7 @@ fn native_prefill_and_decode(profile: &str) {
 /// (a GDN layer's recurrent state included) for the decode that follows, must
 /// be `transformers`'.
 fn native_chunked_prefill(profile: &str) {
-    use pmetal_mlx::test_utils::to_f32_vec_eval;
+    use pmetal_cache::test_utils::to_f32_vec_eval;
     use pmetal_runtime::decode::{prefill_last_logits, prompt_tokens_to_input};
     use pmetal_runtime::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
 
@@ -373,7 +373,7 @@ fn native_chunked_prefill(profile: &str) {
 #[test]
 #[serial]
 fn swish_native_forked_prefix_continues_to_the_whole_prompts_logits() {
-    use pmetal_mlx::test_utils::to_f32_vec_eval;
+    use pmetal_cache::test_utils::to_f32_vec_eval;
     use pmetal_runtime::decode::prefill_last_logits;
     use pmetal_runtime::qwen3_native::{NativeCache, forward_step_last, load_config, load_model};
 
@@ -415,7 +415,7 @@ fn swish_native_forked_prefix_continues_to_the_whole_prompts_logits() {
 #[test]
 #[serial]
 fn swish_native_quantized_kv_prefill_does_not_depend_on_the_passes() {
-    use pmetal_mlx::test_utils::{max_abs_diff, to_f32_vec_eval};
+    use pmetal_cache::test_utils::{max_abs_diff, to_f32_vec_eval};
     use pmetal_runtime::decode::{prefill_last_logits, prompt_tokens_to_input};
     use pmetal_runtime::qwen3_native::{
         NativeCache, QuantCacheConfig, forward_step_last, load_config, load_model,

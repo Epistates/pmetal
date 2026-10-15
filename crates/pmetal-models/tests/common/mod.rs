@@ -3,7 +3,7 @@
 //! Every `*_parity.rs` integration test loads a committed safetensors fixture
 //! (reference activations + the raw weights that produced them) and diffs the
 //! Rust forward pass against it. Shard loading and keyed tensor lookup are
-//! crate-agnostic, so they live in [`pmetal_mlx::test_utils`] alongside the
+//! crate-agnostic, so they live in [`pmetal_cache::test_utils`] alongside the
 //! numerical primitives (`ParityReport`, `Tolerance`, `print_report_table`) and
 //! are re-exported here for the test files' `use common::{…}` imports.
 //!
@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-pub use pmetal_mlx::test_utils::{load_shard, ref_tensor};
+pub use pmetal_cache::test_utils::{load_shard, ref_tensor};
 
 /// Resolve `tests/fixtures/<name>` relative to this crate.
 pub fn fixture_path(name: &str) -> PathBuf {

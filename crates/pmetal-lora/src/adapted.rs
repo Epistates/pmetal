@@ -283,7 +283,7 @@ impl AdaptedModel {
     }
 
     /// A KV cache sized for this architecture.
-    pub fn create_cache(&self, max_seq_len: usize) -> pmetal_mlx::kv_cache::KVCache {
+    pub fn create_cache(&self, max_seq_len: usize) -> pmetal_cache::kv_cache::KVCache {
         self.model.create_cache(max_seq_len)
     }
 }
@@ -377,7 +377,7 @@ impl crate::TrainableModel for AdaptedModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
-        cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
+        cache: Option<&mut pmetal_cache::kv_cache::KVCache>,
     ) -> Result<Array, LoraError> {
         self.model
             .forward_with_cache(input_ids, mask, cache)
@@ -442,7 +442,7 @@ impl crate::TrainableModel for AdaptedModel {
         true
     }
 
-    fn create_cache(&self, max_seq_len: usize) -> Option<pmetal_mlx::kv_cache::KVCache> {
+    fn create_cache(&self, max_seq_len: usize) -> Option<pmetal_cache::kv_cache::KVCache> {
         Some(AdaptedModel::create_cache(self, max_seq_len))
     }
 

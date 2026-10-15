@@ -17,7 +17,7 @@
 //! - Uses pmetal_runtime::compat::random::categorical for GPU-native categorical sampling
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::ops::{
     argmax_axis, async_eval, logsumexp_axis_keepdims, select_axis, take_along_axis,
 };

@@ -89,7 +89,8 @@ rest come in transitively.
 | `gguf` | `pmetal-gguf` | yes* | GGUF format with imatrix quantization |
 | `metal` | `pmetal-metal` | yes* | Custom Metal GPU kernels + ANE runtime |
 | `hub` | `pmetal-hub` | yes* | HuggingFace Hub integration |
-| `mlx` | `pmetal-mlx` | yes* | MLX backend (KV cache, RoPE, ops) |
+| `runtime` | `pmetal-runtime` | yes* | Tensor runtime: arrays, ops, attention, RoPE, native engines |
+| `cache` | `pmetal-cache` | yes* | KV caches, prefix reuse, speculative-decoding state |
 | `models` | `pmetal-models` | yes* | LLM architectures (Llama, Qwen, DeepSeek, ...) |
 | `lora` | `pmetal-lora` | yes | LoRA/QLoRA training |
 | `trainer` | `pmetal-trainer` | yes | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, DAPO, RLKD, Embedding, PPO, GSPO, Online DPO, Diffusion) — enables `data` + `distill` |
@@ -99,7 +100,7 @@ rest come in transitively.
 | `distributed` | `pmetal-distributed` | yes | Distributed training (mDNS, Ring All-Reduce) and the `cluster` subcommand |
 | `ane` | `pmetal-metal` | yes | Apple Neural Engine direct programming |
 | `dashboard` | — | yes | TUI control center |
-| `native-only` | `pmetal-runtime` | no | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
+| `native-only` | `pmetal-runtime` | no | Bridge-only build, without `pmetal-cache` or `pmetal-models` |
 | `vocoder` | `pmetal-vocoder` | no | BigVGAN neural vocoder |
 | `mhc` | `pmetal-mhc` | no | Manifold-Constrained Hyper-Connections |
 | `serve` | `pmetal-serve` | no | OpenAI-compatible inference server (`pmetal serve`) |
@@ -143,14 +144,15 @@ cargo run -p pmetal --example finetune_ane -- \
 All sub-crates are available as modules:
 
 ```rust
+use pmetal::cache; // pmetal-cache
 use pmetal::core; // pmetal-core
 use pmetal::gguf; // pmetal-gguf
 use pmetal::hub; // pmetal-hub
 use pmetal::lora; // pmetal-lora
 use pmetal::metal; // pmetal-metal
-use pmetal::mlx; // pmetal-mlx
 use pmetal::models; // pmetal-models
 use pmetal::prelude::*; // commonly used types from all crates
+use pmetal::runtime; // pmetal-runtime
 use pmetal::trainer; // pmetal-trainer
 ```
 

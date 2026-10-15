@@ -10,7 +10,7 @@ use pmetal_runtime::InlineArray;
 use pmetal_runtime::compat::{Array, Dtype, Exception};
 
 use super::qwen3_next::Qwen3NextForCausalLM;
-use pmetal_mlx::kv_cache::{KVCache, MambaCache};
+use pmetal_cache::kv_cache::{KVCache, MambaCache};
 
 // Interop helpers — COLD PATH ONLY (weight init, cache bootstrap).
 

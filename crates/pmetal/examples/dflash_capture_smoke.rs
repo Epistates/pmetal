@@ -20,8 +20,8 @@ use std::time::Instant;
 use pmetal::hub::resolve_model_path;
 use pmetal::models::DynamicModel;
 use pmetal::models::dflash_decoder::DFlashTarget;
-use pmetal_mlx::Array;
-use pmetal_mlx::speculative::SpecCapture;
+use pmetal_cache::speculative::SpecCapture;
+use pmetal_runtime::compat::Array;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let snaps = mamba.snapshot();
         // Build per-layer verify inputs in cache layer order.
         let num_layers = mamba.num_layers();
-        let mut per_layer: Vec<Option<pmetal_mlx::kv_cache::GdnVerifyInputs>> =
+        let mut per_layer: Vec<Option<pmetal_cache::kv_cache::GdnVerifyInputs>> =
             Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             per_layer.push(capture.gdn_inputs.get(&layer_idx).cloned());

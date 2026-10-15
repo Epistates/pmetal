@@ -18,7 +18,7 @@ use pmetal_runtime::compat::{Array, Dtype, Exception, Module, Param, nn};
 use pmetal_runtime::impl_module_params;
 use std::collections::HashMap;
 
-use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
+use pmetal_cache::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use serde::{Deserialize, Serialize};
 

@@ -64,7 +64,7 @@ pub fn device_info() -> DeviceInfo {
 
 /// Get total and available memory in GB.
 fn get_memory_info() -> (f64, f64) {
-    #[cfg(feature = "mlx")]
+    #[cfg(feature = "runtime")]
     {
         let stats = pmetal_runtime::memory::get_memory_stats();
         let total_gb = stats.total_gb();
@@ -72,15 +72,15 @@ fn get_memory_info() -> (f64, f64) {
         (total_gb, available_gb.max(0.0))
     }
 
-    #[cfg(not(feature = "mlx"))]
+    #[cfg(not(feature = "runtime"))]
     {
         let total = get_system_memory_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0);
-        (total, 0.0) // Without MLX, we can't determine available memory
+        (total, 0.0) // Without the runtime, we can't determine available memory
     }
 }
 
-/// Fallback system memory query (used when mlx feature is disabled).
-#[cfg(not(feature = "mlx"))]
+/// Fallback system memory query (used when the runtime feature is disabled).
+#[cfg(not(feature = "runtime"))]
 fn get_system_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {

@@ -29,17 +29,18 @@ hub = ["dep:pmetal-hub", "core"]
 distributed = ["dep:pmetal-distributed", "pmetal-trainer?/distributed"]
 mhc = ["dep:pmetal-mhc"]
 
-# MLX-dependent crates
-mlx = ["dep:pmetal-mlx", "core", "metal"]
-models = ["dep:pmetal-models", "dep:pmetal-runtime", "core", "gguf", "metal", "mlx"]
-# Native-only: inference through pmetal-runtime alone, without pmetal-mlx or pmetal-models
-native-only = ["dep:pmetal-runtime", "core", "metal"]
-lora = ["dep:pmetal-lora", "core", "gguf", "metal", "mlx", "models"]
-data = ["dep:pmetal-data", "core", "mlx"]
-trainer = ["dep:pmetal-trainer", "core", "mlx", "metal", "lora", "models", "data", "distill"]
-distill = ["dep:pmetal-distill", "core", "mlx", "metal"]
-merge = ["dep:pmetal-merge", "core", "mlx"]
-vocoder = ["dep:pmetal-vocoder", "core", "mlx"]
+# Runtime-dependent crates
+runtime = ["dep:pmetal-runtime", "core", "metal"]
+cache = ["dep:pmetal-cache", "runtime"]
+models = ["dep:pmetal-models", "core", "gguf", "metal", "runtime", "cache"]
+# Native-only: inference through pmetal-runtime alone, without pmetal-cache or pmetal-models
+native-only = ["runtime"]
+lora = ["dep:pmetal-lora", "core", "gguf", "metal", "runtime", "cache", "models"]
+data = ["dep:pmetal-data", "core", "runtime"]
+trainer = ["dep:pmetal-trainer", "core", "runtime", "cache", "metal", "lora", "models", "data", "distill"]
+distill = ["dep:pmetal-distill", "core", "runtime", "metal"]
+merge = ["dep:pmetal-merge", "core", "runtime"]
+vocoder = ["dep:pmetal-vocoder", "core", "runtime"]
 
 # ANE: Apple Neural Engine direct programming
 ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane", "pmetal-trainer?/ane", "pmetal-models?/ane"]
@@ -47,13 +48,13 @@ ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane", "pmetal-trainer?/ane", "p
 # Everything (sub-crate deps only, no CLI-only deps)
 full = [
     "core", "gguf", "metal", "hub", "distributed", "mhc",
-    "mlx", "models", "lora", "data", "trainer",
+    "runtime", "cache", "models", "lora", "data", "trainer",
     "distill", "merge", "vocoder", "ane",
 ]
 
 # CLI: adds the pmetal binary + all CLI-specific dependencies
 cli = [
-    "core", "gguf", "metal", "hub", "mlx", "models", "data",
+    "core", "gguf", "metal", "hub", "runtime", "cache", "models", "data",
     "dep:clap", "dep:tokio", "dep:tracing-subscriber",
     "dep:serde", "dep:serde-saphyr", "dep:indicatif", "dep:anyhow",
     "dep:safetensors", "dep:dirs", "dep:chrono",
@@ -79,7 +80,7 @@ pmetal-metal = { workspace = true, optional = true }
 pmetal-hub = { workspace = true, optional = true }
 pmetal-distributed = { workspace = true, optional = true }
 pmetal-mhc = { workspace = true, optional = true }
-pmetal-mlx = { workspace = true, optional = true }
+pmetal-cache = { workspace = true, optional = true }
 pmetal-models = { workspace = true, optional = true }
 pmetal-runtime = { workspace = true, optional = true }
 pmetal-lora = { workspace = true, optional = true }

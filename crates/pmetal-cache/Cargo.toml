@@ -1,6 +1,6 @@
 [package]
-name = "pmetal-mlx"
-description = "Model-side operations, KV caches and decoding state over the PMetal runtime"
+name = "pmetal-cache"
+description = "KV caches, prefix reuse and speculative-decoding state for PMetal's decoder models"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,20 +10,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-pmetal-core = { workspace = true }
-pmetal-metal = { workspace = true }
 pmetal-runtime = { workspace = true }
 tracing = { workspace = true }
-half = { workspace = true }
 
 [dev-dependencies]
 # Fail every test at the runtime op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
-serde_json = { workspace = true }
-serial_test = { workspace = true }
 
 [features]
-# Enables `pmetal_mlx::test_utils` for cross-crate parity tests. Empty
+# Enables `pmetal_cache::test_utils` for cross-crate parity tests. Empty
 # (no extra deps) — production builds never see it. Integration tests in
 # downstream crates that need shared parity helpers add this feature in
 # their own `[dev-dependencies]`.

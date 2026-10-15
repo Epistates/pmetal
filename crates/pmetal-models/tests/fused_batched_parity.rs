@@ -13,7 +13,7 @@
 //! cache write/read, mask construction, or projection reshape would
 //! surface as a divergence on the very first decode token.
 
-use pmetal_mlx::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
+use pmetal_cache::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
 use pmetal_runtime::compat::Array;
 
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
@@ -129,7 +129,7 @@ fn q_proj_stable_across_calls() {
 
 #[test]
 fn attn_layer0_matches_at_position_zero() {
-    use pmetal_mlx::kv_cache::FusedBatchKVCache as FBC;
+    use pmetal_cache::kv_cache::FusedBatchKVCache as FBC;
     use pmetal_models::common::{BatchedGqaAttnCfg, batched_gqa_attn};
     use pmetal_runtime::compat::Module;
 

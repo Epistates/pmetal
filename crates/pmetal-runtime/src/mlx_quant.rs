@@ -789,7 +789,7 @@ mod tests {
     /// pmetal's own loaders use, so the two can't drift apart.
     #[test]
     fn config_overrides_are_mlx_module_keys() {
-        let dir = std::env::temp_dir().join(format!("pmetal-mlx-quant-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pmetal-quant-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("source.json");
         std::fs::write(&source, r#"{"model_type": "qwen3"}"#).unwrap();

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::Array;
 use pmetal_runtime::compat::ModuleParameters;
 
@@ -166,7 +166,7 @@ pub trait TrainableModel: ModuleParameters {
 
     /// Create a KV cache with a specific quantization mode.
     ///
-    /// Builds a cache configured with the given [`pmetal_mlx::kv_cache::CacheMode`],
+    /// Builds a cache configured with the given [`pmetal_cache::kv_cache::CacheMode`],
     /// enabling quantized KV storage (e.g., 4-bit or 8-bit) to reduce memory during
     /// generation.  Falls back to the standard mode when the model does not support
     /// caching.
@@ -181,7 +181,7 @@ pub trait TrainableModel: ModuleParameters {
     fn create_cache_with_mode(
         &self,
         max_seq_len: usize,
-        mode: pmetal_mlx::kv_cache::CacheMode,
+        mode: pmetal_cache::kv_cache::CacheMode,
     ) -> Option<KVCache> {
         self.create_cache(max_seq_len).map(|c| {
             let config = c.config().clone().with_mode(mode);

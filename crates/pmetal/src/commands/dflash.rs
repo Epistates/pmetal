@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use pmetal_data::chat_templates::{Message, detect_chat_template};
-use pmetal_mlx::Array;
 use pmetal_models::DynamicModel;
 use pmetal_models::dflash_decoder::{
     DFlashConfig, DFlashDecoder, DFlashDraftQuant, DFlashOutput, DFlashTarget,
 };
 use pmetal_models::dflash_drafts::load_dflash_draft;
 use pmetal_models::dflash_native_target::NativeQwen3Target;
+use pmetal_runtime::compat::Array;
 
 /// Run DFlash speculative decoding against a Qwen3 target.
 #[allow(clippy::too_many_arguments)]

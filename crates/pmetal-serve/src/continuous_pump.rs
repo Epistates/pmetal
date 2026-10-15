@@ -59,8 +59,8 @@ use crate::continuous_driver::{
     ContinuousEngineState, SlotForward, drive_decode_step, drive_prefill_step,
 };
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
-use pmetal_mlx::prefix_cache::PrefixCache;
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache};
+use pmetal_cache::prefix_cache::PrefixCache;
 use pmetal_models::generation::{GenerationConfig, Sampler, token_logprobs};
 use pmetal_runtime::compat::{Array, Exception};
 use std::collections::HashMap;
@@ -669,7 +669,7 @@ impl ContinuousPump {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_mlx::kv_cache::{KVCache, MambaCache};
+    use pmetal_cache::kv_cache::{KVCache, MambaCache};
     use pmetal_runtime::compat::Array;
 
     fn cache_cfg() -> KVCacheConfig {

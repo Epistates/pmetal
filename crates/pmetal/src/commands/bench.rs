@@ -1,6 +1,7 @@
 use crate::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext};
 use anyhow::Context;
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
+use pmetal_cache::kv_cache::CacheMode;
 use pmetal_core::{
     DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig,
 };
@@ -8,7 +9,6 @@ use pmetal_data::{DatasetColumnConfig, DatasetFormat, TextSample, Tokenizer, Tra
 use pmetal_lora::AdaptedModel;
 use pmetal_metal::MetalContext;
 use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
-use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::llama4::{Llama4MoE, Llama4TextConfig};

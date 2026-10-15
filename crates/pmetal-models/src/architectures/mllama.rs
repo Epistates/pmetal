@@ -35,7 +35,7 @@ use pmetal_runtime::impl_module_params;
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::llama::{LlamaAttention, LlamaConfig, LlamaMLP};

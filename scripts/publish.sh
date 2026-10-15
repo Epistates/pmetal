@@ -50,7 +50,7 @@ CRATES=(
     pmetal-metal         #  4. depends on: core
     pmetal-hub           #  5. depends on: core
     pmetal-data          #  6. depends on: core, mlx
-    pmetal-mlx           #  7. depends on: core, metal
+    pmetal-cache         #  7. depends on: runtime
     pmetal-mhc           #  8. depends on: core, metal
     pmetal-models        #  9. depends on: core, gguf, metal, mlx
     pmetal-vocoder       # 10. depends on: core, mlx

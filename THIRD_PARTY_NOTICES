@@ -66,7 +66,7 @@ implementations.
 
 Source: https://github.com/ml-explore/mlx-lm
 License: MIT
-Files: crates/pmetal-mlx/src/kernels/gated_delta.rs,
+Files: crates/pmetal-runtime/src/nn/gated_delta.rs,
        crates/pmetal-models/src/architectures/qwen3_next.rs,
        crates/pmetal-models/src/architectures/nemotron_h.rs
 
@@ -101,7 +101,7 @@ The implementation and comments in `gated_delta.rs` retain that attribution.
 Source: https://github.com/fla-org/flash-linear-attention
 License: MIT
 Reference: Gated Delta Networks: Improving Mamba2 with Delta Rule (https://arxiv.org/abs/2412.06464)
-File: crates/pmetal-mlx/src/kernels/gated_delta.rs
+File: crates/pmetal-runtime/src/nn/gated_delta.rs
 
 
 4. llama.cpp / GGML

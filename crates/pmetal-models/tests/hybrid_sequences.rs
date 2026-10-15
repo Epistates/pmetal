@@ -9,7 +9,7 @@
 //!
 //! Tiny random-init model through `DynamicModel`, the path serving takes.
 
-use pmetal_mlx::kv_cache::{KVCache, MambaCache};
+use pmetal_cache::kv_cache::{KVCache, MambaCache};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::Array;
 

@@ -26,7 +26,7 @@
 //! path relies on (`apply_rope(Q, ..., offset)` matched by
 //! `apply_rope(K, ..., offset)` before the cache write).
 
-use pmetal_mlx::kv_cache::FusedBatchKVCache;
+use pmetal_cache::kv_cache::FusedBatchKVCache;
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope_with_per_batch_positions,

@@ -13,8 +13,8 @@
 mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::speculative::SpecCapture;
-use pmetal_mlx::test_utils::{ParityReport, Tolerance};
+use pmetal_cache::speculative::SpecCapture;
+use pmetal_cache::test_utils::{ParityReport, Tolerance};
 use pmetal_models::dflash_decoder::DFlashTarget;
 use pmetal_models::dflash_native_target::NativeQwen3Target;
 use pmetal_runtime::compat::{Array, ops::slice_axis};

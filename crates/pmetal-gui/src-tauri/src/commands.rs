@@ -1225,7 +1225,7 @@ pub async fn start_training(
         .await;
 
         // Release MLX Metal buffer cache after training ends (success, error, or cancel).
-        pmetal::mlx::memory::clear_cache();
+        pmetal_runtime::inline_array::clear_cache();
         tracing::info!("Training cleanup: MLX cache cleared");
 
         cancel_flags.write().await.remove(&run_id_task);
@@ -3457,7 +3457,7 @@ fn run_fuse_in_process(
     let lora_file_str = lora_file
         .to_str()
         .ok_or_else(|| AppError(format!("non-UTF-8 LoRA path: {}", lora_file.display())))?;
-    let lora_weights: HashMap<String, pmetal::mlx::Array> =
+    let lora_weights: HashMap<String, pmetal_runtime::compat::Array> =
         pmetal_runtime::inline_array::load_safetensors_shard(lora_file_str)
             .map(|pairs| pairs.into_iter().collect())
             .ok_or_else(|| {
@@ -3498,8 +3498,8 @@ fn run_fuse_in_process(
         .unwrap_or(rank as f32);
     let scale = alpha / rank as f32;
 
-    let mut lora_a_map: HashMap<String, &pmetal::mlx::Array> = HashMap::new();
-    let mut lora_b_map: HashMap<String, &pmetal::mlx::Array> = HashMap::new();
+    let mut lora_a_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
+    let mut lora_b_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
     for (name, array) in &lora_weights {
         if let Some(base_name) = name.strip_suffix(".lora_a") {
             lora_a_map.insert(base_name.to_string(), array);
@@ -3523,7 +3523,7 @@ fn run_fuse_in_process(
 
         let base_dtype = base_weight.dtype_raw();
         let delta = ops::matmul(lora_b, lora_a);
-        let scaled_delta = ops::multiply(&delta, &pmetal::mlx::Array::from_f32(scale));
+        let scaled_delta = ops::multiply(&delta, &pmetal_runtime::compat::Array::from_f32(scale));
         let fused = ops::add(base_weight, &scaled_delta);
         // Cast back to base dtype (LoRA is f32, base is typically bf16/f16 —
         // without this cast the fused model is 2x larger than necessary)
@@ -3559,11 +3559,11 @@ fn run_fuse_in_process(
     let output_file_str = output_file
         .to_str()
         .ok_or_else(|| AppError(format!("non-UTF-8 output path: {}", output_file.display())))?;
-    let entries: Vec<(&str, &pmetal::mlx::Array)> = base_weights
+    let entries: Vec<(&str, &pmetal_runtime::compat::Array)> = base_weights
         .iter()
         .map(|(key, value)| (key.as_str(), value))
         .collect();
-    pmetal::mlx::Array::save_safetensors(output_file_str, &entries)
+    pmetal_runtime::compat::Array::save_safetensors(output_file_str, &entries)
         .map_err(|e| AppError(e.to_string()))?;
 
     // Generate model.safetensors.index.json (required by many model loaders)

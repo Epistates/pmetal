@@ -32,8 +32,8 @@
 //! 5. **Speculative Decoding**: Layer-split draft/verify for 2-4x generation speedup
 use pmetal_runtime::compat::{Array, Exception, ops};
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
-use pmetal_mlx::prefix_cache::PrefixCache;
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_cache::prefix_cache::PrefixCache;
 
 use crate::generation::{GenerationConfig, Sampler};
 

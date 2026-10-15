@@ -51,7 +51,7 @@ use pmetal_runtime::compat::{Array, Exception, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope, rope_with_periods},
@@ -1551,7 +1551,7 @@ impl Gemma4Model {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
         positions: Option<&Array>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // `mul_scalar` casts the scalar to the embedding's dtype first. A bare
         // f32 here promotes a bf16 checkpoint's residual stream to f32 and
@@ -1711,7 +1711,7 @@ impl Gemma4ForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let (_hidden, logits) =
             self.forward_hidden_with_capture(input_ids, mask, cache, capture)?;
@@ -1728,7 +1728,7 @@ impl Gemma4ForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<(Array, Array), Exception> {
         let hidden =
             self.model

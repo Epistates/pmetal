@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use anyhow::Context;
-use pmetal_mlx::{Array, Exception};
 use pmetal_models::{
     DynamicModel,
     architectures::{Qwen3NextForwardProfile, Qwen3NextLayerProfile},
 };
+use pmetal_runtime::compat::{Array, Exception};
 use std::collections::BTreeMap;
 
 use pmetal::response_parser::{extract_final_response, extract_thinking_content};

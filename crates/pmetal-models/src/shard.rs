@@ -4,7 +4,7 @@
 //! discrete stages (embed → layers → normalize → lm_head) so that
 //! different pipeline stages can be assigned to different nodes.
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception};
 use std::ops::Range;
 

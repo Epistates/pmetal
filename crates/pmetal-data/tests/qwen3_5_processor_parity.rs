@@ -27,12 +27,12 @@ use std::collections::HashMap;
 
 use common::{fixture_path, load_shard, ref_tensor};
 use image::RgbImage;
+use pmetal_cache::test_utils::to_f32_vec_eval;
 use pmetal_data::pillow_resample::{ResampleFilter, resize_rgb8_torchvision};
 use pmetal_data::qwen_vl_processing::{
     PixelBudget, ProcessedMedia, QwenVlProcessor, QwenVlProcessorConfig, VideoFrames,
     expand_placeholders, smart_resize, smart_resize_video, video_frame_paths,
 };
-use pmetal_mlx::test_utils::to_f32_vec_eval;
 use pmetal_runtime::compat::Array;
 use serde_json::Value;
 

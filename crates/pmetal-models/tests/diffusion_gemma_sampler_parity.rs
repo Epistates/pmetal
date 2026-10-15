@@ -12,7 +12,7 @@ mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
 
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table, to_f32_vec_eval};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, print_report_table, to_f32_vec_eval};
 use pmetal_runtime::compat::Array;
 
 use pmetal_models::architectures::diffusion_gemma::{

@@ -32,11 +32,11 @@ use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
 use image::RgbImage;
+use pmetal_cache::test_utils::{
+    ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
+};
 use pmetal_data::qwen_vl_processing::{
     ProcessedMedia, QwenVlProcessor, QwenVlProcessorConfig, VideoFrames,
-};
-use pmetal_mlx::test_utils::{
-    ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::qwen3_5_vision::{

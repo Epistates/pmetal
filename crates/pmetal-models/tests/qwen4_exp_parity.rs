@@ -24,8 +24,8 @@ mod common;
 
 use common::{fixture_path, load_shard, ref_tensor};
 
-use pmetal_mlx::speculative::SpecCapture;
-use pmetal_mlx::test_utils::{
+use pmetal_cache::speculative::SpecCapture;
+use pmetal_cache::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
 use pmetal_models::architectures::qwen3_next::Qwen3NextRoutedExpertMode;

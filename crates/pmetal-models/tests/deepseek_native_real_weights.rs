@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use pmetal_mlx::test_utils::{argmax_last_axis, load_shard, ref_tensor};
+use pmetal_cache::test_utils::{argmax_last_axis, load_shard, ref_tensor};
 use pmetal_runtime::compat::Array;
 use pmetal_runtime::compat::ops::slice_axis;
 use pmetal_runtime::deepseek_native::{NativeCache, forward_step, load_config, load_model};

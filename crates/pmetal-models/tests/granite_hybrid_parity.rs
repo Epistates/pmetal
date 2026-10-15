@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use common::{fixture_path, load_shard, ref_tensor};
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_models::DynamicModel;
 use pmetal_runtime::compat::{Array, Module, ops::slice_axis};
 use serial_test::serial;

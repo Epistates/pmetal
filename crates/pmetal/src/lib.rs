@@ -7,7 +7,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! pmetal = "0.3"           # default features: core, gguf, metal, hub, mlx, models, data, ane
+//! pmetal = "0.3"           # default features: core, gguf, metal, hub, runtime, cache, models, data, ane
 //! pmetal = { version = "0.3", features = ["full"] }  # everything
 //! ```
 //!
@@ -19,7 +19,8 @@
 //! | `gguf` | `pmetal-gguf` | yes | GGUF format support |
 //! | `metal` | `pmetal-metal` | yes | Metal GPU kernels |
 //! | `hub` | `pmetal-hub` | yes | HuggingFace Hub integration + model resolution |
-//! | `mlx` | `pmetal-mlx` | yes | MLX backend |
+//! | `runtime` | `pmetal-runtime` | yes | Tensor runtime: arrays, ops, native engines |
+//! | `cache` | `pmetal-cache` | yes | KV caches, prefix reuse, speculative-decoding state |
 //! | `models` | `pmetal-models` | yes | LLM architectures |
 //! | `lora` | `pmetal-lora` | no | LoRA/QLoRA training |
 //! | `trainer` | `pmetal-trainer` | no | Training loops (enables `data` + `distill`) |
@@ -95,8 +96,11 @@ pub use pmetal_distributed as distributed;
 #[cfg(feature = "mhc")]
 pub use pmetal_mhc as mhc;
 
-#[cfg(feature = "mlx")]
-pub use pmetal_mlx as mlx;
+#[cfg(feature = "runtime")]
+pub use pmetal_runtime as runtime;
+
+#[cfg(feature = "cache")]
+pub use pmetal_cache as cache;
 
 #[cfg(feature = "models")]
 pub use pmetal_models as models;
@@ -135,11 +139,11 @@ pub mod prelude {
         BufferUsage, MetalBuffer, MetalContext, MetalError, PipelineCache,
     };
 
-    // MLX prelude minus Dtype (use mlx::Dtype explicitly to avoid ambiguity with core::Dtype)
-    #[cfg(feature = "mlx")]
-    pub use pmetal_mlx::Builder;
-    #[cfg(feature = "mlx")]
-    pub use pmetal_mlx::prelude::{Array, Module, ModuleParameters, Param};
+    // Runtime prelude minus Dtype (use runtime::compat::Dtype explicitly to avoid ambiguity with core::Dtype)
+    #[cfg(feature = "runtime")]
+    pub use pmetal_runtime::compat::builder::Builder;
+    #[cfg(feature = "runtime")]
+    pub use pmetal_runtime::compat::{Array, Module, ModuleParameters, Param};
 
     #[cfg(feature = "distributed")]
     pub use pmetal_distributed::prelude::*;

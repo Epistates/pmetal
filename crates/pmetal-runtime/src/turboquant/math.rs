@@ -2,8 +2,7 @@
 //!
 //! No external dependencies beyond `rand` and InlineArray marshalling —
 //! every function here is deterministic in its inputs so
-//! call sites can rely on byte-identical results across crates (notably
-//! `pmetal-mlx` mirrors several of these).
+//! call sites can rely on byte-identical results across crates.
 
 use std::collections::HashMap;
 use std::f32::consts::PI;
@@ -38,8 +37,7 @@ const LLOYD_SUPPORT_SIGMAS: f64 = 9.0;
 ///
 /// Memoized across calls — Lloyd-Max with 8192-pt grid × 64 iterations is
 /// deterministic in `(dim, bits)`, so we cache the result and reuse it for
-/// every TurboQuant core that shares the same head dim and bit-width. This
-/// also lets `pmetal-mlx` reuse the bridge's tables instead of recomputing.
+/// every TurboQuant core that shares the same head dim and bit-width.
 pub fn beta_codebook(dim: usize, bits: u8) -> Arc<Vec<f32>> {
     static CACHE: OnceLock<BetaCodebookCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -258,7 +256,7 @@ fn dot_f64(lhs: &[f64], rhs: &[f64]) -> f64 {
 ///
 /// Used to randomize the signed-FWHT rotation so it matches the statistical
 /// guarantees of a Haar-random orthogonal matrix in `O(d log d)` time. Exposed
-/// publicly so `pmetal-mlx` can build identical sign vectors for its own
+/// publicly so other crates can build identical sign vectors for their own
 /// TurboQuant core (deterministic seed → byte-identical signs across crates).
 pub fn generate_rademacher_signs(dim: usize, rng: &mut StdRng) -> Vec<f32> {
     (0..dim)

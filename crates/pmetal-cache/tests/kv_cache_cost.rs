@@ -4,7 +4,7 @@
 //! quiet machine:
 //!
 //! ```text
-//! cargo test -p pmetal-mlx --release --test kv_cache_cost -- --ignored --nocapture
+//! cargo test -p pmetal-cache --release --test kv_cache_cost -- --ignored --nocapture
 //! ```
 //!
 //! One decode step is, for each of 8 layers, a cache update and attention of
@@ -13,7 +13,7 @@
 
 use std::time::Instant;
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, TurboQuantConfig};
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, TurboQuantConfig};
 use pmetal_runtime::compat::{Array, Dtype};
 use pmetal_runtime::nn::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 

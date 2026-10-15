@@ -26,10 +26,10 @@ use std::collections::HashMap;
 
 use common::{fixture_path, load_shard, ref_tensor};
 use image::{DynamicImage, RgbImage};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, print_report_table, to_f32_vec_eval};
 use pmetal_data::image_processing::{
     MllamaImageProcessor, MllamaImageProcessorConfig, supported_aspect_ratios,
 };
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table, to_f32_vec_eval};
 use pmetal_runtime::compat::Array;
 
 const FIXTURE: &str = "mllama_image_reference.safetensors";

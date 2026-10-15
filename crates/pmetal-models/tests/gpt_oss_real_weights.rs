@@ -25,7 +25,7 @@
 
 use std::path::PathBuf;
 
-use pmetal_mlx::test_utils::{argmax_last_axis, load_shard, ref_tensor};
+use pmetal_cache::test_utils::{argmax_last_axis, load_shard, ref_tensor};
 use pmetal_runtime::compat::{Array, ops::slice_axis};
 use serial_test::serial;
 

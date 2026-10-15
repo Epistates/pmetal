@@ -36,8 +36,8 @@ use std::path::Path;
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, ops};
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
-use pmetal_mlx::speculative::SpecCapture;
+use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache};
+use pmetal_cache::speculative::SpecCapture;
 
 use crate::architectures::dflash_draft::{DFlashDraftConfig, DFlashDraftModel};
 use crate::dflash_drafts::DFlashDraft;
@@ -329,8 +329,8 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         // the cache. Refuse to run if the cache window is smaller than the
         // block size we may need to rewind.
         let cache_window = match target_cache.config().mode {
-            pmetal_mlx::kv_cache::CacheMode::SlidingWindow { window_size } => Some(window_size),
-            pmetal_mlx::kv_cache::CacheMode::Rotating { max_size, .. } => Some(max_size),
+            pmetal_cache::kv_cache::CacheMode::SlidingWindow { window_size } => Some(window_size),
+            pmetal_cache::kv_cache::CacheMode::Rotating { max_size, .. } => Some(max_size),
             _ => None,
         };
         if let Some(window) = cache_window
@@ -404,7 +404,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             // rollback can replay the GDN recurrence through only the
             // accepted prefix. Pure-attention targets (Qwen3) have no
             // mamba_cache and this is a no-op.
-            let mamba_snapshot: Option<Vec<pmetal_mlx::kv_cache::MambaSnapshot>> =
+            let mamba_snapshot: Option<Vec<pmetal_cache::kv_cache::MambaSnapshot>> =
                 mamba_cache.as_ref().map(|c| c.snapshot());
 
             // Verify: one target forward pass over the whole block.
@@ -449,7 +449,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
                     // `rewind_from_snapshots` can replay each GDN layer
                     // forward through the accepted prefix.
                     let num_layers = mamba.num_layers();
-                    let mut per_layer: Vec<Option<pmetal_mlx::kv_cache::GdnVerifyInputs>> =
+                    let mut per_layer: Vec<Option<pmetal_cache::kv_cache::GdnVerifyInputs>> =
                         Vec::with_capacity(num_layers);
                     for layer_idx in 0..num_layers {
                         per_layer.push(capture.gdn_inputs.remove(&layer_idx));

@@ -19,7 +19,7 @@
 //!    compares it against the Rust forward of the same model. Tolerances
 //!    loosened for 60-layer bf16 cumulative drift.
 //!
-//! Both profiles use the same helper functions from `pmetal_mlx::test_utils`.
+//! Both profiles use the same helper functions from `pmetal_cache::test_utils`.
 
 mod common;
 
@@ -28,8 +28,8 @@ use common::{fixture_path, load_shard, ref_tensor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use pmetal_mlx::speculative::SpecCapture;
-use pmetal_mlx::test_utils::{
+use pmetal_cache::speculative::SpecCapture;
+use pmetal_cache::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
 };
 use pmetal_runtime::compat::{Array, ops};

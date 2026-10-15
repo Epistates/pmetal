@@ -48,7 +48,7 @@
 //!   hand-rolled forward (but still implement the [`DecoderLayer`]
 //!   trait so generation code can dispatch uniformly).
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception, Module, nn};
 
 /// A self-attention module that supports an optional KV cache.

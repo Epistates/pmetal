@@ -13,7 +13,7 @@
 use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
 use pmetal_runtime::impl_module_params;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},

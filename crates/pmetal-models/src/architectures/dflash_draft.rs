@@ -34,7 +34,7 @@ use pmetal_runtime::compat::{Array, Exception, Param, nn, ops};
 use pmetal_runtime::impl_module_params;
 use serde::{Deserialize, Serialize};
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
 
 // ----------------------------------------------------------------------------
@@ -149,7 +149,7 @@ pub struct DFlashDraftConfig {
 
 impl DFlashDraftConfig {
     /// Target layer indices as `usize` — the form needed by
-    /// [`pmetal_mlx::speculative::SpecCapture::with_layers`].
+    /// [`pmetal_cache::speculative::SpecCapture::with_layers`].
     pub fn target_layer_ids(&self) -> Vec<usize> {
         self.dflash_config
             .target_layer_ids
@@ -707,7 +707,7 @@ impl DFlashDraftModel {
 pub fn make_context_cache(config: &DFlashDraftConfig, context: usize) -> Vec<KVCache> {
     (0..config.num_hidden_layers as usize)
         .map(|layer| {
-            let kv = pmetal_mlx::kv_cache::KVCacheConfig::new(
+            let kv = pmetal_cache::kv_cache::KVCacheConfig::new(
                 1,
                 context.max(1),
                 config.num_key_value_heads as usize,

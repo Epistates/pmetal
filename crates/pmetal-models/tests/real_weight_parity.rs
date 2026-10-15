@@ -74,7 +74,7 @@ use std::path::{Path, PathBuf};
 use pmetal_runtime::compat::Array;
 // Not via `common`: that module's `fixture_path` keys off `tests/fixtures/`,
 // and every path here comes from `PMETAL_REAL_WEIGHTS` instead.
-use pmetal_mlx::test_utils::{
+use pmetal_cache::test_utils::{
     ParityReport, Tolerance, load_shard, print_report_table, ref_tensor, to_f32_vec_eval,
 };
 use pmetal_models::dispatcher::{DynamicModel, ModelArchitecture};

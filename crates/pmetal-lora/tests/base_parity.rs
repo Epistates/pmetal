@@ -34,11 +34,11 @@ use std::path::Path;
 use std::rc::Rc;
 
 use common::{ArchCase, SEQ_LEN, cases, config_int, every_projection, input_ids, stage};
-use pmetal_core::LoraConfig;
-use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel};
-use pmetal_mlx::test_utils::{
+use pmetal_cache::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, max_abs_diff, max_abs_value, print_report_table,
 };
+use pmetal_core::LoraConfig;
+use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::{Array, ModuleParametersExt};
 

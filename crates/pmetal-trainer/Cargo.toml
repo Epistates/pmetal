@@ -19,7 +19,7 @@ distributed = ["dep:pmetal-distributed"]
 
 [dependencies]
 pmetal-core = { workspace = true }
-pmetal-mlx = { workspace = true }
+pmetal-cache = { workspace = true }
 pmetal-lora = { workspace = true }
 pmetal-data = { workspace = true }
 pmetal-models = { workspace = true }

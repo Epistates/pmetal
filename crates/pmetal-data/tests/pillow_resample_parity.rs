@@ -24,8 +24,8 @@ use std::collections::HashMap;
 
 use common::{fixture_path, load_shard, ref_tensor};
 use image::RgbImage;
+use pmetal_cache::test_utils::to_f32_vec_eval;
 use pmetal_data::pillow_resample::{ResampleFilter, resize_rgb8};
-use pmetal_mlx::test_utils::to_f32_vec_eval;
 use pmetal_runtime::compat::Array;
 
 const FIXTURE: &str = "pillow_resample_reference.safetensors";

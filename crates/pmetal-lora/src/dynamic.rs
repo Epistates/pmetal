@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_core::LoraConfig;
-use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_models::{ModelArchitecture, WeightFormatError};
 use pmetal_runtime::compat::Array;
@@ -185,7 +185,7 @@ impl DynamicLoraModel {
     }
 
     /// The recurrent state cache for hybrid architectures, or `None`.
-    pub fn create_mamba_cache(&self) -> Option<pmetal_mlx::kv_cache::MambaCache> {
+    pub fn create_mamba_cache(&self) -> Option<pmetal_cache::kv_cache::MambaCache> {
         self.inner.model().create_mamba_cache()
     }
 
@@ -212,7 +212,7 @@ impl DynamicLoraModel {
         input_ids: &Array,
         mask: Option<&Array>,
         kv_cache: Option<&mut KVCache>,
-        mamba_cache: Option<&mut pmetal_mlx::kv_cache::MambaCache>,
+        mamba_cache: Option<&mut pmetal_cache::kv_cache::MambaCache>,
     ) -> Result<Array, LoraError> {
         self.inner
             .model_mut()

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
@@ -805,7 +805,7 @@ impl Qwen3Model {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
         positions: Option<&Array>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         if capture.is_none() {
             return self.forward_inner(input_ids, mask, cache, positions);
@@ -937,7 +937,7 @@ impl Qwen3ForCausalLM {
         &mut self,
         input_ids: &Array,
         active_indices: &[usize],
-        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+        cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
         use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
 
@@ -984,7 +984,7 @@ impl Qwen3ForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let h = self
             .model
@@ -1257,7 +1257,7 @@ mod tests {
 
         // Request hidden states for layer 0 and the final layer
         let mut capture =
-            pmetal_mlx::speculative::SpecCapture::with_layers(vec![0, num_layers - 1]);
+            pmetal_cache::speculative::SpecCapture::with_layers(vec![0, num_layers - 1]);
         let captured_logits = model_capture
             .forward_with_capture(&input_ids, None, None, &mut capture)
             .unwrap();

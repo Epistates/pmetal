@@ -9,9 +9,9 @@
 mod common;
 
 use common::{cases, config_int, input_ids};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, max_abs_diff, print_report_table};
 use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, QLoraConfig, QLoraScheme, TrainableModel, quantize_base};
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, max_abs_diff, print_report_table};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_runtime::compat::optimizers::AdamW;
 use pmetal_runtime::compat::{Dtype, VisitLinears, random};

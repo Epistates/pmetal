@@ -6,7 +6,7 @@ members = [
     "crates/pmetal-core",
     "crates/pmetal-core-derive",
     "crates/pmetal-metal",
-    "crates/pmetal-mlx",
+    "crates/pmetal-cache",
     "crates/pmetal-models",
     "crates/pmetal-lora",
     "crates/pmetal-data",
@@ -39,7 +39,7 @@ pmetal-runtime = { path = "crates/pmetal-runtime", version = "0.6.0" }
 pmetal-core = { path = "crates/pmetal-core", version = "0.6.0", default-features = false }
 pmetal-core-derive = { path = "crates/pmetal-core-derive", version = "0.6.0" }
 pmetal-metal = { path = "crates/pmetal-metal", version = "0.6.0", default-features = false }
-pmetal-mlx = { path = "crates/pmetal-mlx", version = "0.6.0" }
+pmetal-cache = { path = "crates/pmetal-cache", version = "0.6.0" }
 pmetal-models = { path = "crates/pmetal-models", version = "0.6.0" }
 pmetal-lora = { path = "crates/pmetal-lora", version = "0.6.0" }
 pmetal-data = { path = "crates/pmetal-data", version = "0.6.0" }

@@ -15,7 +15,7 @@ pmetal-core = { workspace = true }
 pmetal-data = { workspace = true }
 pmetal-gguf = { workspace = true }
 pmetal-metal = { workspace = true }
-pmetal-mlx = { workspace = true }
+pmetal-cache = { workspace = true }
 serde = { workspace = true }
 # `preserve_order`: a decision request's questions are encoded, and answered, in
 # the order the client wrote them. `float_roundtrip`: a float in a request is
@@ -39,10 +39,10 @@ serial_test = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
 tempfile = { workspace = true }
-# Pull in pmetal-mlx's `test-utils` feature so integration tests can reach
+# Pull in pmetal-cache's `test-utils` feature so integration tests can reach
 # the shared parity helpers (`test_utils::*`). The feature is empty in
 # production builds, so there's no runtime impact.
-pmetal-mlx = { workspace = true, features = ["test-utils"] }
+pmetal-cache = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = ["ane"]

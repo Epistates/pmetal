@@ -22,7 +22,7 @@ use pmetal_runtime::compat::nn::{Embedding, Linear};
 use pmetal_runtime::compat::{Array, Exception, Module, Param, nn};
 use pmetal_runtime::impl_module_params;
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopePositions, rope_embedding},
@@ -695,7 +695,7 @@ impl PhiModel {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
         positions: Option<&Array>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut hidden = self.embed_tokens.forward(input_ids);
 
@@ -815,7 +815,7 @@ impl PhiForCausalLM {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let hidden =
             self.model
@@ -825,7 +825,7 @@ impl PhiForCausalLM {
 
     /// Create a KV cache for this model.
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
-        use pmetal_mlx::kv_cache::KVCacheConfig;
+        use pmetal_cache::kv_cache::KVCacheConfig;
         let config = &self.model.config;
         KVCache::new(KVCacheConfig::new(
             config.num_hidden_layers as usize,
@@ -852,7 +852,7 @@ impl PhiForCausalLM {
     /// Fused batched-decode forward.
     ///
     /// Runs one `[N_active, 1]` forward across every active slot against a
-    /// shared [`pmetal_mlx::kv_cache::FusedBatchKVCache`]. Phi uses partial
+    /// shared [`pmetal_cache::kv_cache::FusedBatchKVCache`]. Phi uses partial
     /// RoPE (`partial_rotary_factor < 1.0`); routed through
     /// [`crate::common::BatchedGqaAttnCfg::with_rope_dims`].
     ///
@@ -863,7 +863,7 @@ impl PhiForCausalLM {
         &mut self,
         input_ids: &Array,
         active_indices: &[usize],
-        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+        cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
         use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
         use pmetal_runtime::compat::Module;

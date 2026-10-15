@@ -1237,7 +1237,7 @@ impl GrpoTrainer {
 
         let max_len = self.config.max_prompt_length + self.config.max_completion_length;
         let cache = if let Some(bits) = self.config.kv_cache_bits {
-            let mode = pmetal_mlx::kv_cache::CacheMode::Quantized {
+            let mode = pmetal_cache::kv_cache::CacheMode::Quantized {
                 bits,
                 group_size: 64,
             };

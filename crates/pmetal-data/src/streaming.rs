@@ -2,7 +2,7 @@
 // memmap2::Mmap::map is inherently unsafe (external file can be modified while
 // mapped). This is an accepted trade-off for mmap-based I/O; all other code in
 // this file is safe. The workspace `unsafe_code = "deny"` lint is overridden
-// here following the established pattern in pmetal-mlx/src/bridge.rs.
+// here.
 #![allow(unsafe_code)]
 //!
 //! # Shard format

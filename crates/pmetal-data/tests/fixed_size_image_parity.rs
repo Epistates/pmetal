@@ -21,11 +21,11 @@ use std::collections::HashMap;
 
 use common::{fixture_path, load_shard, ref_tensor};
 use image::{DynamicImage, GrayImage, RgbImage, RgbaImage};
+use pmetal_cache::test_utils::{ParityReport, Tolerance, print_report_table, to_f32_vec_eval};
 use pmetal_data::image_processing::{
     FixedSizeImageProcessor, FixedSizeImageProcessorConfig, SiglipImageProcessor,
 };
 use pmetal_data::pillow_resample::ResampleFilter;
-use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table, to_f32_vec_eval};
 use pmetal_runtime::compat::Array;
 
 const FIXTURE: &str = "fixed_size_image_reference.safetensors";

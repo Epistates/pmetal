@@ -6,7 +6,7 @@
 //! - RMSNorm applied to Q and K before RoPE (q_norm, k_norm)
 //! - SwitchGLU-style expert MLP with gather_mm
 
-use pmetal_mlx::kv_cache::KVCache;
+use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{
     Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, VisitLinears, nn,
 };
@@ -940,7 +940,7 @@ impl Qwen3MoEModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
         positions: Option<&Array>,
-        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+        mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(input_ids);
 
@@ -1081,7 +1081,7 @@ impl Qwen3MoE {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
-        capture: &mut pmetal_mlx::speculative::SpecCapture,
+        capture: &mut pmetal_cache::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
         let hidden_states =
             self.model
@@ -1110,7 +1110,7 @@ impl Qwen3MoE {
         &mut self,
         input_ids: &Array,
         active_indices: &[usize],
-        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+        cache: &mut pmetal_cache::kv_cache::FusedBatchKVCache,
     ) -> Result<Array, Exception> {
         use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
 

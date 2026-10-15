@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use pmetal_mlx::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype};
 use sha2::{Digest, Sha256};
 
 const TOKEN_TYPE_NORMAL: i32 = 1;

@@ -6095,6 +6095,7 @@ dependencies = [
  "indicatif",
  "libc",
  "parquet",
+ "pmetal-cache",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
@@ -6105,7 +6106,6 @@ dependencies = [
  "pmetal-merge",
  "pmetal-metal",
  "pmetal-mhc",
- "pmetal-mlx",
  "pmetal-models",
  "pmetal-runtime",
  "pmetal-trainer",
@@ -6125,6 +6125,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "walkdir",
+]
+
+[[package]]
+name = "pmetal-cache"
+version = "0.6.0"
+dependencies = [
+ "pmetal-runtime",
+ "tracing",
 ]
 
 [[package]]
@@ -6278,8 +6286,8 @@ dependencies = [
 name = "pmetal-lora"
 version = "0.6.0"
 dependencies = [
+ "pmetal-cache",
  "pmetal-core",
- "pmetal-mlx",
  "pmetal-models",
  "pmetal-runtime",
  "serde_json",
@@ -6340,28 +6348,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "pmetal-mlx"
-version = "0.6.0"
-dependencies = [
- "half",
- "pmetal-core",
- "pmetal-metal",
- "pmetal-runtime",
- "tracing",
-]
-
-[[package]]
 name = "pmetal-models"
 version = "0.6.0"
 dependencies = [
  "json5",
  "objc2",
  "objc2-metal",
+ "pmetal-cache",
  "pmetal-core",
  "pmetal-data",
  "pmetal-gguf",
  "pmetal-metal",
- "pmetal-mlx",
  "pmetal-runtime",
  "safetensors",
  "serde",
@@ -6384,6 +6381,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -6396,6 +6394,7 @@ dependencies = [
  "dirs 7.0.0",
  "image",
  "indicatif",
+ "pmetal-cache",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
@@ -6404,7 +6403,6 @@ dependencies = [
  "pmetal-lora",
  "pmetal-merge",
  "pmetal-metal",
- "pmetal-mlx",
  "pmetal-models",
  "pmetal-runtime",
  "prost",

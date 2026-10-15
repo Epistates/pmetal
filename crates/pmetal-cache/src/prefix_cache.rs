@@ -184,7 +184,7 @@ impl PrefixCache {
         }
         if cache.total_tokens() != tokens.len() {
             tracing::debug!(
-                target = "pmetal_mlx::prefix_cache",
+                target = "pmetal_cache::prefix_cache",
                 cache_tokens = cache.total_tokens(),
                 token_len = tokens.len(),
                 "skipping prefix save: the cache does not hold the tokens it was given"
