@@ -63,7 +63,7 @@ async fn a_real_model_downloads_verifies_and_is_found_offline() {
 #[ignore = "network, downloads about 300 MB"]
 async fn one_gguf_quantization_comes_out_of_a_multi_quant_repo() {
     let hub = options().hub;
-    let variants = pmetal_hub::search::list_gguf_variants("unsloth/Qwen3-0.6B-GGUF", &hub)
+    let variants = pmetal_hub::search::list_gguf_variants("bartowski/Qwen_Qwen3-0.6B-GGUF", &hub)
         .await
         .unwrap();
     assert!(variants.len() > 5, "{variants:?}");
@@ -77,9 +77,10 @@ async fn one_gguf_quantization_comes_out_of_a_multi_quant_repo() {
         .find(|v| v.quant == "Q2_K")
         .expect("a Q2_K quantization");
 
-    let dir = pmetal_hub::resolve_model_path_with("unsloth/Qwen3-0.6B-GGUF:Q2_K", &options())
-        .await
-        .unwrap();
+    let dir =
+        pmetal_hub::resolve_model_path_with("bartowski/Qwen_Qwen3-0.6B-GGUF:Q2_K", &options())
+            .await
+            .unwrap();
 
     let report = verify_model_dir(&dir);
     assert!(report.is_complete(), "{:?}", report.problems);

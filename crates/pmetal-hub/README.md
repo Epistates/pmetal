@@ -80,9 +80,9 @@ async fn pull_one_quant() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     // What would be fetched, and how big is it?
-    let plan = plan_model_download("unsloth/Qwen3-0.6B-GGUF", &options).await?;
+    let plan = plan_model_download("bartowski/Qwen_Qwen3-0.6B-GGUF", &options).await?;
     println!("{} files, {} bytes", plan.model.files.len(), plan.model.total_bytes());
-    let dir = download_model_with("unsloth/Qwen3-0.6B-GGUF", &options).await?;
+    let dir = download_model_with("bartowski/Qwen_Qwen3-0.6B-GGUF", &options).await?;
     println!("{}", dir.display());
     Ok(())
 }

@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn a_gguf_repository_has_parameters_but_no_weight_size() {
         let body = json!([{
-            "id": "unsloth/Qwen3-0.6B-GGUF",
+            "id": "bartowski/Qwen_Qwen3-0.6B-GGUF",
             "gated": "manual",
             "gguf": {"total": 596049920u64, "architecture": "qwen3", "context_length": 40960,
                      "chat_template": "{{ long template }}"},

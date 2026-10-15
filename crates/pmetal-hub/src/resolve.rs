@@ -79,8 +79,8 @@ mod tests {
     #[test]
     fn a_quant_selector_is_split_off_a_hub_id() {
         assert_eq!(
-            split_quant_selector("unsloth/Qwen3-0.6B-GGUF:Q4_K_M"),
-            ("unsloth/Qwen3-0.6B-GGUF", Some("Q4_K_M"))
+            split_quant_selector("bartowski/Qwen_Qwen3-0.6B-GGUF:Q4_K_M"),
+            ("bartowski/Qwen_Qwen3-0.6B-GGUF", Some("Q4_K_M"))
         );
         assert_eq!(split_quant_selector("org/model"), ("org/model", None));
         // Not selectors: a path with a colon, an empty tail, a bare name.
