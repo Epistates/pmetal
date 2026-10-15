@@ -28,12 +28,19 @@ pmetal fuse \
   --accurate
 ```
 
-## Modes
+## What is folded
+
+Both modes use the same streaming fold: the base model is memory-mapped and each adapted weight
+becomes `W + s·B·A` in f64, with `s = alpha / r` (`alpha / sqrt(r)` for rsLoRA adapters). DoRA
+adapters renormalize each output row to their magnitude vector, MLX-quantized bases are
+dequantized, folded and quantized again, and adapters from `pmetal train` and from PEFT are both
+read. The scale comes from the adapter's `adapter_config.json`; `--alpha` and `--rank` override it.
+An adapter whose modules do not match the base model is an error.
 
 | Mode | Description |
 |------|-------------|
-| Standard | Fast fusing with standard precision |
-| Accurate | Higher precision fusing for sensitive weights |
+| Standard | Whole matrices folded at once |
+| Accurate (`--accurate`, `--low-memory`) | The same fold; `--low-memory` tiles it to bound memory |
 
 ## See Also
 
