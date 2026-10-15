@@ -39,6 +39,8 @@ pub use fast::PadMode;
 mod gather;
 mod gdn_methods;
 mod interop;
+mod metal_kernel;
+pub use metal_kernel::{MetalKernel, TemplateArg};
 mod ops;
 mod quantized;
 pub use quantized::QuantizedMode;

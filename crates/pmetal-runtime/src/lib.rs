@@ -19,7 +19,7 @@ mod bridge_extern;
 mod callback;
 
 pub mod inline_array;
-pub use inline_array::{InlineArray, QuantizedMode};
+pub use inline_array::{InlineArray, MetalKernel, QuantizedMode, TemplateArg};
 
 pub mod metallib;
 
