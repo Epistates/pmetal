@@ -79,58 +79,29 @@ These are accessed via Metal 4.0 (`-std=metal4.0`) kernels. MLX upstream has pro
 
 ## Kernel Tuning by Tier
 
-### Matrix Tile Size (standard GEMM, LoRA forward)
+Dense GEMM, attention, RoPE, SwiGLU and LoRA run as tensor-runtime ops (the runtime uses MLX's own NAX kernels on Apple10/M5), so there are no per-tier tile tables for them: the hand-written kernels that used to cover them measured slower than those ops and were removed.
 
-| Tier | Apple7–9 | Apple10 (M5+, NAX) |
-|------|----------|-------------------|
-| Base | 32×32×32 | 64×32×32 |
-| Pro | 64×32×32 | 64×64×32 |
-| Max | 64×64×32 | 128×64×32 |
-| Ultra | 64×64×32 | 128×64×32 |
+### Fused Linear Cross-Entropy (`fused_cross_entropy.rs`)
 
-These tier tables apply to the standard Metal GEMM/LoRA kernels. On Apple10/M5 hardware, the Metal 4 / MPP dispatcher now auto-tunes and persists among `32×32` / `1`-simdgroup, `64×32` / `2`-simdgroup, `32×64` / `2`-simdgroup, and `64×64` / `4`-simdgroup kernel variants, plus Morton-vs-linear tile walk order. Aligned full tiles use static extents, and the dispatcher exposes an async command-buffer API for overlap. Apple7-9 continue to use the standard Metal kernels.
-
-### FlashAttention (`flash_attention.rs`)
-
-Block size selection per head dimension:
-
-| Head Dim | Base | Pro | Max | Ultra |
-|----------|------|-----|-----|-------|
-| 64 | 64×32 | 64×64 | 64×64 | 64×64 |
-| 80 | 32×32 | 64×32 | 64×32 | 64×32 |
-| 96 | 32×32 | 64×32 | 64×32 | 64×32 |
-| 128 | 32×32 | 32×32 | 64×32 | 64×32 |
-| 256 | 16×16 | 16×16 | 32×16 | 32×16 |
-
-### Fused RMSNorm + LoRA (`fused_norm_lora.rs`)
-
-Tuna now benchmarks and persists the effective specialization for this kernel per problem shape, and the Metal shader is compiled with the matching `THREADS_PER_TOKEN` constant instead of relying on dead host-side heuristics.
-
-Heuristic seed values before benchmark candidate generation:
-
-| Tier | Threads / Token | Tiled Path |
-|------|-----------------|-----------|
-| Base | 128 | `out_features > 256` |
-| Pro | 256 | `out_features > 256` |
-| Max | 512 | `out_features > 256` |
-| Ultra | 512 | `out_features > 256` |
-
-If the caller disables tiling explicitly, PMetal respects that and stays on the non-tiled path.
-
-### Fused SwiGLU (`fused_swiglu.rs`)
-
-Tuna now benchmarks and persists the effective specialization for standard-Metal `fused_swiglu` / `fused_mlp`, and the shader is compiled with matching `THREADS_PER_TOKEN` and `SWIGLU_CHUNK_SIZE` function constants.
+The fused linear CE path now benchmarks and persists both its `CE_THREADS_PER_TOKEN` specialization and default vocabulary chunk size per device, dtype, and problem shape. The MLX CutCrossEntropy fallback uses the same resolved default chunk size when the caller leaves the chunk size at the default, so M1-M4 and M5 share the measured chunk choice instead of drifting apart.
 
 Heuristic seed values before benchmark candidate generation:
 
 | Tier | Threads / Token | Chunk Size |
 |------|-----------------|-----------|
-| Base | 128 or 256 | 1024 or 2048 |
-| Pro | 256 | 2048 or 4096 |
-| Max | 512 | 2048 or 4096 |
-| Ultra | 512 | 2048 or 4096 |
+| Base | 128 / 256 / 512 | 1024 or 2048 |
+| Pro | 256 / 512 / 1024 | 2048 or 4096 |
+| Max | 256 / 512 / 1024 | 4096 or 8192 |
+| Ultra | 256 / 512 / 1024 | 4096 or 8192 |
 
-The lower Base-tier values apply to smaller `intermediate_size` shapes; higher values apply to larger MLPs.
+Thread count seeds still scale with vocabulary size and clamp to the device maximum:
+- Base-tier: `< 32k vocab` → `128`, `32k..128k` → `256`, `> 128k` → `512`
+- Pro / Max / Ultra: `< 32k vocab` → `256`, `32k..128k` → `512`, `> 128k` → `1024`
+
+Chunk-size seeds still narrow for wider hidden states:
+- Base: `1024` once `hidden_size >= 4096`
+- Pro: `2048` once `hidden_size >= 8192`
+- Max / Ultra: `4096` once `hidden_size >= 8192`
 
 ### Batch Size Multiplier
 
@@ -156,7 +127,6 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 - [x] Benchmark and persist MLX vs MPP backend choice for 4-bit affine quantized linear inference on Apple10/M5
 - [x] Tier-aware MPP dispatcher tuning across `32×32`, `64×32`, `32×64`, and `64×64` MPP tile variants on Apple10/M5
 - [ ] Track upstream MLX NAX API changes and update `pmetal-runtime` bindings as needed
-- [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference shapes, including softcapped configs
 
 ### P1 — UltraFusion-aware distributed
 
@@ -172,10 +142,7 @@ Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS.
 
 Replace hardcoded tier-based parameters with runtime optimization:
 
-- [x] Persist hot-path inference backend benchmarks across launches (FlashAttention vs MLX SDPA, MPP vs MLX matmul)
-- [x] Benchmark and persist standard Metal FlashAttention block-size selection for supported head dimensions
-- [x] Wire broader standard-Metal fused kernels through persisted Tuna specialization (`fused_swiglu`, `fused_mlp`, `fused_norm_lora`)
-- [x] Benchmark and persist standard-Metal `fused_swiglu`, `fused_mlp`, and `fused_norm_lora` kernel specialization choices
+- [x] Persist hot-path inference backend benchmarks across launches (MPP vs MLX matmul for quantized linears)
 - [x] Add a structured `pmetal bench-corpus` kernel benchmark command for comparable per-tier measurements on M1-M4 and M5, including initial MoE/model-family cases
 - [x] Add a real `pmetal bench-workload` command for fast end-to-end Qwen3/dataset regression runs on local Apple Silicon, and record the selected inference KV cache mode in the report
 - [x] Auto-select fp16 vs q8 KV cache for inference based on model/context fit instead of hardcoding q8 as the default on Apple7-Apple9

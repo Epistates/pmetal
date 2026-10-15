@@ -24,12 +24,10 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::accelerate;
+use crate::ane::checkpoint::{self, Checkpoint};
 use crate::ane::dynamic_kernel::{self, DynamicKernelConfig, DynamicKernelOutput};
 use crate::ane::iosurface::IoSurface;
 use crate::ane::kernel::{self, TransformerKernelConfig};
-/// A target [`DynamicAneTrainer::train_batch`] leaves out of the loss:
-/// padding, and prompt tokens a dataset masks with `-100`.
-pub const IGNORE_TARGET: u16 = u16::MAX;
 use crate::ane::loss::{AneTrainingLoss, CrossEntropyLoss, IGNORE_INDEX};
 use crate::ane::runtime::{AneModel, AneRuntime};
 use crate::ane::scratch::{
@@ -38,8 +36,13 @@ use crate::ane::scratch::{
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
-use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM};
+use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
 use crate::kernels::fused_training::{AdamWConfig, BatchedCommandBuffer};
+use pmetal_core::{LearningRateScheduler, LrSchedulerType};
+
+/// A target [`DynamicAneTrainer::train_batch`] leaves out of the loss:
+/// padding, and prompt tokens a dataset masks with `-100`.
+pub const IGNORE_TARGET: u16 = u16::MAX;
 
 /// Configuration for the dynamic ANE trainer.
 ///
@@ -257,6 +260,48 @@ impl DynamicAneTrainerConfig {
         super::checkpoint::check_model_type(config_json, &["llama", "mistral"], "training")?;
         super::checkpoint::check_shared_limits(config_json, "training")
     }
+
+    /// The model-shape fields of a Hugging Face `config.json` (dimensions,
+    /// head layout, layer and vocabulary counts, RMSNorm epsilon and RoPE
+    /// base), the rest at their defaults, once the model passes
+    /// [`is_ane_trainable`](Self::is_ane_trainable).
+    ///
+    /// `rope_theta` is read from the key of that name or from
+    /// `rope_parameters`, where newer Transformers write it; a config that
+    /// names none gets Llama's and Mistral's default, 10 000. Reading only
+    /// the old key rotated every position of a model that wrote the new one
+    /// at the wrong frequency.
+    pub fn from_model_config(config_json: &serde_json::Value) -> std::result::Result<Self, String> {
+        Self::is_ane_trainable(config_json)?;
+        let int = |key: &str| -> std::result::Result<Option<usize>, String> {
+            match config_json.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .map(|v| Some(v as usize))
+                    .ok_or_else(|| format!("config.json: '{key}' is not a count")),
+            }
+        };
+        let need = |key: &str| -> std::result::Result<usize, String> {
+            int(key)?.ok_or_else(|| format!("config.json missing '{key}'"))
+        };
+        let n_heads = need("num_attention_heads")?;
+        Ok(Self {
+            dim: need("hidden_size")?,
+            hidden_dim: need("intermediate_size")?,
+            n_heads,
+            n_kv_heads: int("num_key_value_heads")?.unwrap_or(n_heads),
+            head_dim: int("head_dim")?,
+            n_layers: need("num_hidden_layers")?,
+            vocab_size: need("vocab_size")?,
+            rms_norm_eps: config_json
+                .get("rms_norm_eps")
+                .and_then(|v| v.as_f64())
+                .map_or(1e-6, |v| v as f32),
+            rope_theta: super::checkpoint::rope_theta(config_json).map_or(10_000.0, |v| v as f32),
+            ..Self::default()
+        })
+    }
 }
 
 /// Per-layer weight storage (f32, row-major).
@@ -462,10 +507,10 @@ pub struct DynamicAneTrainer {
     compile_count: usize,
     /// GPU dW GEMM dispatcher (None if dim < GPU_DW_MIN_DIM or Metal init fails).
     gpu_dw: Option<DwGemm>,
-    /// Pre-allocated scratch buffers for activation copies (A and B operands).
-    /// Sized to max(h*s, d*s, qd*s, v*s) to fit any per-layer activation.
-    scratch_a: Option<MetalBuffer<f32>>,
-    scratch_b: Option<MetalBuffer<f32>>,
+    /// Staging buffers for the activation copies (A and B operands) of the
+    /// step's dW GEMMs. Every GEMM queued into the step's command buffer gets
+    /// its own pair, reset once the buffer has executed.
+    dw_scratch: Option<ScratchPool>,
     /// Metal context for GPU dW path.
     metal_ctx: Option<Arc<MetalContext>>,
     /// Latest step timings.
@@ -521,8 +566,7 @@ pub struct DynamicAneTrainer {
 #[allow(clippy::too_many_arguments)]
 fn encode_dw_gemm(
     gpu_dw: Option<&DwGemm>,
-    scratch_a: Option<&MetalBuffer<f32>>,
-    scratch_b: Option<&MetalBuffer<f32>>,
+    scratch: Option<&ScratchPool>,
     batch: Option<&mut BatchedCommandBuffer>,
     a_data: &[f32],
     b_data: &[f32],
@@ -531,12 +575,10 @@ fn encode_dw_gemm(
     n: usize,
     k: usize,
 ) {
-    if let (Some(dw), Some(sa), Some(sb), Some(batch)) = (gpu_dw, scratch_a, scratch_b, batch) {
-        // GPU path: copy activations to scratch, encode GEMM.
-        // MetalBuffer has interior mutability via unified memory (as_mut_slice_unchecked).
-        sa.as_mut_slice_unchecked()[..a_data.len()].copy_from_slice(a_data);
-        sb.as_mut_slice_unchecked()[..b_data.len()].copy_from_slice(b_data);
-        dw.queue_gemm_accum(batch, sa, sb, c_buf, m, n, k, 1.0, 1.0)
+    if let (Some(dw), Some(scratch), Some(batch)) = (gpu_dw, scratch, batch) {
+        // GPU path: stage the activations in buffers of their own (the batch
+        // runs after every one of its GEMMs has been encoded), encode the GEMM.
+        dw.queue_gemm_accum_staged(batch, scratch, a_data, b_data, c_buf, m, n, k, 1.0, 1.0)
             .unwrap();
     } else {
         // CPU cblas fallback
@@ -573,42 +615,25 @@ impl DynamicAneTrainer {
         };
 
         // Try to initialize Metal GPU dW path
-        let (metal_ctx, gpu_dw, scratch_a, scratch_b) = if d >= GPU_DW_MIN_DIM {
+        let (metal_ctx, gpu_dw, dw_scratch) = if d >= GPU_DW_MIN_DIM {
             match MetalContext::new() {
                 Ok(ctx) => {
                     let ctx = Arc::new(ctx);
                     match DwGemm::new(ctx.clone()) {
                         Ok(dw) => {
-                            // Pre-allocate two scratch buffers sized to the largest activation
-                            let qd_val = config.n_heads * hd;
-                            let max_scratch = [d * s, h * s, qd_val * s].into_iter().max().unwrap();
-                            match (
-                                MetalBuffer::new(&ctx, max_scratch, BufferUsage::Shared),
-                                MetalBuffer::new(&ctx, max_scratch, BufferUsage::Shared),
-                            ) {
-                                (Ok(sa), Ok(sb)) => {
-                                    info!(
-                                        dim = d,
-                                        scratch_size = max_scratch,
-                                        "GPU dW path enabled (Metal GEMM)"
-                                    );
-                                    (Some(ctx.clone()), Some(dw), Some(sa), Some(sb))
-                                }
-                                _ => {
-                                    info!("Scratch buffer alloc failed, falling back to cblas");
-                                    (None, None, None, None)
-                                }
-                            }
+                            info!(dim = d, "GPU dW path enabled (Metal GEMM)");
+                            let scratch = ScratchPool::new(ctx.clone());
+                            (Some(ctx), Some(dw), Some(scratch))
                         }
                         Err(e) => {
                             info!("GPU dW init failed, falling back to cblas: {e}");
-                            (None, None, None, None)
+                            (None, None, None)
                         }
                     }
                 }
                 Err(e) => {
                     info!("MetalContext init failed, falling back to cblas: {e}");
-                    (None, None, None, None)
+                    (None, None, None)
                 }
             }
         } else {
@@ -617,7 +642,7 @@ impl DynamicAneTrainer {
                 threshold = GPU_DW_MIN_DIM,
                 "dim below GPU dW threshold, using cblas"
             );
-            (None, None, None, None)
+            (None, None, None)
         };
 
         let mut layer_weights = Vec::with_capacity(nl);
@@ -727,8 +752,7 @@ impl DynamicAneTrainer {
             adam_t: 0,
             compile_count: 0,
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             metal_ctx,
             last_timings: StepTimings::default(),
             bwd_scratch: None,
@@ -1613,8 +1637,7 @@ impl DynamicAneTrainer {
 
         // GPU dW references (immutable borrows of Option fields)
         let gpu_dw = self.gpu_dw.as_ref();
-        let scratch_a = self.scratch_a.as_ref();
-        let scratch_b = self.scratch_b.as_ref();
+        let dw_scratch = self.dw_scratch.as_ref();
 
         let scratch = self
             .bwd_scratch
@@ -1640,8 +1663,7 @@ impl DynamicAneTrainer {
         // 2. dW2 = dx @ silu_out^T
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             &dx[..d * s],
             &self.layer_acts[l].silu_out,
@@ -1676,8 +1698,7 @@ impl DynamicAneTrainer {
         // dW1, dW3
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dh1),
             &self.layer_acts[l].x2norm,
@@ -1688,8 +1709,7 @@ impl DynamicAneTrainer {
         );
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dh3),
             &self.layer_acts[l].x2norm,
@@ -1768,8 +1788,7 @@ impl DynamicAneTrainer {
             // dWo
             encode_dw_gemm(
                 gpu_dw,
-                scratch_a,
-                scratch_b,
+                dw_scratch,
                 batch.as_mut(),
                 scratch.get(ids.dx_ffn_norm),
                 &self.layer_acts[l].attn_out,
@@ -1955,8 +1974,7 @@ impl DynamicAneTrainer {
             // dWo
             encode_dw_gemm(
                 gpu_dw,
-                scratch_a,
-                scratch_b,
+                dw_scratch,
                 batch.as_mut(),
                 scratch.get(ids.dx_ffn_norm),
                 &self.layer_acts[l].attn_out,
@@ -1997,8 +2015,7 @@ impl DynamicAneTrainer {
         // dWq, dWk, dWv
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dq),
             &self.layer_acts[l].xnorm,
@@ -2009,8 +2026,7 @@ impl DynamicAneTrainer {
         );
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dk),
             &self.layer_acts[l].xnorm,
@@ -2021,8 +2037,7 @@ impl DynamicAneTrainer {
         );
         encode_dw_gemm(
             gpu_dw,
-            scratch_a,
-            scratch_b,
+            dw_scratch,
             batch.as_mut(),
             scratch.get(ids.dv),
             &self.layer_acts[l].xnorm,
@@ -2245,7 +2260,6 @@ impl DynamicAneTrainer {
         Ok(loss)
     }
 
-    /// Compute learning rate with warmup + cosine decay.
     /// The factor the gradient carries through the backward pass, undone on
     /// the f32 weight gradients after it. The loss is a mean over the
     /// sequence, so each position's gradient is 1/seq of a sum's; at 1024
@@ -2256,19 +2270,19 @@ impl DynamicAneTrainer {
         self.config.loss_scale * self.config.seq_len as f32
     }
 
+    /// Learning rate at optimizer `step` of a `max_steps` run: linear warmup,
+    /// then cosine to `learning_rate * min_lr_ratio`, which it holds past the
+    /// last step. The schedule is `pmetal_core`'s, the one every trainer uses.
     fn get_lr(&self, step: usize, max_steps: usize) -> f32 {
-        let base_lr = self.config.learning_rate;
-        let warmup = self.config.warmup_steps;
-        let min_lr = base_lr * self.config.min_lr_ratio;
-
-        if step < warmup {
-            base_lr * (step as f32 / warmup as f32)
-        } else if max_steps > warmup {
-            let progress = (step - warmup) as f32 / (max_steps - warmup) as f32;
-            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
-        } else {
-            base_lr
-        }
+        let base_lr = f64::from(self.config.learning_rate);
+        LearningRateScheduler::new(
+            base_lr,
+            max_steps,
+            self.config.warmup_steps,
+            LrSchedulerType::Cosine,
+        )
+        .with_min_lr(base_lr * f64::from(self.config.min_lr_ratio))
+        .get_lr(step) as f32
     }
 
     /// Run a complete training batch (accumulate + Adam update).
@@ -2292,6 +2306,12 @@ impl DynamicAneTrainer {
         let mut total_loss = 0.0f32;
 
         for (input, target) in data.iter().take(steps) {
+            // The previous step's batch has executed (or was dropped unrun), so
+            // the operands staged for it are free to be overwritten.
+            if let Some(scratch) = &self.dw_scratch {
+                scratch.reset();
+            }
+
             // Create a BatchedCommandBuffer for this step's dW GEMMs (GPU path).
             // CPU fallback: batch stays None, dispatch_dw runs cblas inline.
             let mut batch = if let Some(ref ctx) = self.metal_ctx {
@@ -2543,7 +2563,18 @@ impl DynamicAneTrainer {
             })
             .collect::<Result<Vec<_>>>()?;
         let metadata = std::collections::HashMap::from([("format".to_string(), "pt".to_string())]);
-        safetensors::serialize_to_file(views, Some(metadata), path).map_err(|e| {
+        // Written beside the destination and renamed over it, so a run killed
+        // mid-write (or a full disk) leaves the previous checkpoint intact.
+        let name = path.file_name().map_or_else(
+            || "checkpoint".into(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let partial = path.with_file_name(format!(".{name}.partial"));
+        let written = safetensors::serialize_to_file(views, Some(metadata), &partial)
+            .map_err(|e| e.to_string())
+            .and_then(|()| std::fs::rename(&partial, path).map_err(|e| e.to_string()));
+        written.map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
             MetalError::InvalidConfig(format!("Failed to write {}: {e}", path.display()))
         })
     }
@@ -2571,120 +2602,42 @@ impl DynamicAneTrainer {
         out
     }
 
-    /// Load weights from SafeTensors files on disk.
+    /// Load weights from a safetensors checkpoint: one file, or the shards a
+    /// directory's `model.safetensors.index.json` names. Every tensor the
+    /// engine uses must be there, with the size the config gives it and a
+    /// dtype it reads (f32, f16, bf16); one that isn't is an error naming it.
     pub fn load_weights_safetensors(&mut self, path: &std::path::Path) -> Result<()> {
-        use memmap2::Mmap;
-        use safetensors::SafeTensors;
-
-        let d = self.config.dim;
-        let h = self.config.hidden_dim;
-
-        let files = if path.is_file() {
-            vec![path.to_path_buf()]
-        } else {
-            let index_path = path.join("model.safetensors.index.json");
-            if index_path.exists() {
-                let index_text = std::fs::read_to_string(&index_path).map_err(|e| {
-                    MetalError::InvalidConfig(format!("Failed to read index.json: {e}"))
-                })?;
-                let index: serde_json::Value = serde_json::from_str(&index_text).map_err(|e| {
-                    MetalError::InvalidConfig(format!("Failed to parse index.json: {e}"))
-                })?;
-                let weight_map = index["weight_map"]
-                    .as_object()
-                    .ok_or_else(|| MetalError::InvalidConfig("Missing weight_map".into()))?;
-                let mut unique_files: Vec<String> = weight_map
-                    .values()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                unique_files.sort();
-                unique_files.dedup();
-                unique_files.iter().map(|f| path.join(f)).collect()
-            } else {
-                let single = path.join("model.safetensors");
-                if single.exists() {
-                    vec![single]
-                } else {
-                    return Err(MetalError::InvalidConfig(
-                        "No safetensors files found".into(),
-                    ));
-                }
-            }
-        };
-
-        let mut loader = super::checkpoint::StrictLoader::default();
-        for file_path in &files {
-            let file = std::fs::File::open(file_path).map_err(|e| {
-                MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path))
-            })?;
-            #[allow(unsafe_code)]
-            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-                MetalError::InvalidConfig(format!("Failed to mmap {:?}: {e}", file_path))
-            })?;
-            let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
-                MetalError::InvalidConfig(format!("Failed to parse safetensors: {e}"))
-            })?;
-
-            for (name, tensor) in tensors.tensors() {
-                // An unsupported dtype is an error only for a tensor we use.
-                let data = super::checkpoint::tensor_to_f32(&tensor);
-
-                if name == "model.embed_tokens.weight" {
-                    let expected = self.config.vocab_size * d;
-                    loader.copy(&name, &data, &mut self.embed_weights, expected)?;
-                    continue;
-                }
-                if name == "model.norm.weight" {
-                    loader.copy(&name, &data, &mut self.rms_final, d)?;
-                    continue;
-                }
-
-                if let Some(rest) = name.strip_prefix("model.layers.") {
-                    let parts: Vec<&str> = rest.splitn(2, '.').collect();
-                    if parts.len() < 2 {
-                        continue;
-                    }
-                    let layer_idx: usize = match parts[0].parse() {
-                        Ok(i) => i,
-                        Err(_) => continue,
-                    };
-                    if layer_idx >= self.config.n_layers {
-                        continue;
-                    }
-
-                    let qd = self.kernel_config.q_dim();
-                    let kvd = self.kernel_config.kv_dim();
-                    let lw = &mut self.layer_weights[layer_idx];
-                    let (dst, expected): (&mut [f32], usize) = match parts[1] {
-                        "self_attn.q_proj.weight" => (&mut lw.wq, qd * d),
-                        "self_attn.k_proj.weight" => (&mut lw.wk, kvd * d),
-                        "self_attn.v_proj.weight" => (&mut lw.wv, kvd * d),
-                        "self_attn.o_proj.weight" => (&mut lw.wo, d * qd),
-                        "mlp.gate_proj.weight" => (&mut lw.w1, h * d),
-                        "mlp.down_proj.weight" => (&mut lw.w2, d * h),
-                        "mlp.up_proj.weight" => (&mut lw.w3, h * d),
-                        "input_layernorm.weight" => (&mut lw.rms_att, d),
-                        "post_attention_layernorm.weight" => (&mut lw.rms_ffn, d),
-                        _ => continue,
-                    };
-                    loader.copy(&name, &data, dst, expected)?;
-                }
-            }
-        }
-
-        loader.require(
+        let ckpt = Checkpoint::open(path)?;
+        ckpt.require(
             ["model.embed_tokens.weight", "model.norm.weight"]
                 .map(String::from)
                 .into_iter()
-                .chain(super::checkpoint::layer_tensors(
+                .chain(checkpoint::layer_tensors(
                     self.config.n_layers,
                     &TRAINER_LAYER_TENSORS,
                 )),
         )?;
 
-        // Initialize transposed weights
+        // One tensor in memory at a time besides the weights themselves.
+        let load = |name: &str, dst: &mut [f32]| -> Result<()> {
+            dst.copy_from_slice(&ckpt.f32(name, dst.len())?);
+            Ok(())
+        };
+        load("model.embed_tokens.weight", &mut self.embed_weights)?;
+        load("model.norm.weight", &mut self.rms_final)?;
+        for (l, lw) in self.layer_weights.iter_mut().enumerate() {
+            let at = |name: &str| format!("model.layers.{l}.{name}");
+            load(&at("self_attn.q_proj.weight"), &mut lw.wq)?;
+            load(&at("self_attn.k_proj.weight"), &mut lw.wk)?;
+            load(&at("self_attn.v_proj.weight"), &mut lw.wv)?;
+            load(&at("self_attn.o_proj.weight"), &mut lw.wo)?;
+            load(&at("mlp.gate_proj.weight"), &mut lw.w1)?;
+            load(&at("mlp.down_proj.weight"), &mut lw.w2)?;
+            load(&at("mlp.up_proj.weight"), &mut lw.w3)?;
+            load(&at("input_layernorm.weight"), &mut lw.rms_att)?;
+            load(&at("post_attention_layernorm.weight"), &mut lw.rms_ffn)?;
+        }
         self.refresh_transposed_weights();
-
         Ok(())
     }
 }
@@ -2716,6 +2669,39 @@ mod tests {
         assert_eq!(trainer.adam_t(), 0);
         assert_eq!(trainer.compile_count(), 0);
         assert_eq!(trainer.config().n_layers, 2);
+    }
+
+    /// Warmup to the base rate, cosine down to the floor by the last step,
+    /// and the floor after it: a run that overshoots `max_steps` (a resumed
+    /// run, a caller counting differently) must not see the rate climb back
+    /// up the cosine's next arch.
+    #[test]
+    fn the_schedule_warms_up_decays_and_holds_its_floor() {
+        let trainer = DynamicAneTrainer::new(DynamicAneTrainerConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            n_kv_heads: 4,
+            n_layers: 1,
+            vocab_size: 100,
+            seq_len: 16,
+            learning_rate: 1e-3,
+            warmup_steps: 4,
+            min_lr_ratio: 0.1,
+            ..Default::default()
+        });
+        let lr = |step| trainer.get_lr(step, 20);
+        assert!(lr(1) < lr(2) && lr(2) < lr(3), "warmup rises");
+        assert!((lr(4) - 1e-3).abs() < 1e-9, "base rate when warmup ends");
+        assert!(lr(12) < lr(4) && lr(12) > lr(20), "cosine decays");
+        assert!((lr(20) - 1e-4).abs() < 1e-9, "floor at the last step");
+        for step in [21, 35, 60, 1000] {
+            assert!(
+                (lr(step) - 1e-4).abs() < 1e-9,
+                "step {step}: {} should still be the floor",
+                lr(step)
+            );
+        }
     }
 
     #[test]
@@ -2750,6 +2736,74 @@ mod tests {
         };
         let trainer = DynamicAneTrainer::new(config);
         assert_eq!(trainer.compile_count(), 0);
+    }
+
+    // ======== GPU dW Tests ========
+
+    /// A step's dW GEMMs share one command buffer that runs after every
+    /// operand has been copied in, so each GEMM must read the operands that
+    /// were copied for it, not the last ones copied. The trainer once
+    /// reused one pair of scratch buffers for all of them, which handed
+    /// every GEMM in the step the final pair.
+    #[test]
+    fn gpu_dw_gemms_in_one_step_each_read_their_own_operands() {
+        let Ok(ctx) = MetalContext::new() else {
+            return; // no Metal device
+        };
+        let ctx = Arc::new(ctx);
+        let gemm = DwGemm::new(ctx.clone()).unwrap();
+        let pool = ScratchPool::new(ctx.clone());
+
+        // Shapes like a layer's backward: a few GEMMs of different sizes,
+        // two of them with operands of equal length.
+        let shapes = [
+            (64usize, 96usize, 48usize),
+            (96, 64, 48),
+            (64, 64, 48),
+            (32, 80, 48),
+        ];
+        let data = |len: usize, seed: usize| -> Vec<f32> {
+            (0..len)
+                .map(|i| (((i * 31 + seed * 17) % 97) as f32 - 48.0) / 48.0)
+                .collect()
+        };
+        let mut batch = BatchedCommandBuffer::new(ctx.clone()).unwrap();
+        let mut outputs = Vec::new();
+        let mut expected = Vec::new();
+        for (i, &(m, n, k)) in shapes.iter().enumerate() {
+            let a = data(m * k, 2 * i + 1);
+            let b = data(n * k, 2 * i + 2);
+            let c = MetalBuffer::<f32>::zeros(&ctx, m * n, BufferUsage::Shared).unwrap();
+            encode_dw_gemm(
+                Some(&gemm),
+                Some(&pool),
+                Some(&mut batch),
+                &a,
+                &b,
+                &c,
+                m,
+                n,
+                k,
+            );
+            let mut want = vec![0.0f32; m * n];
+            accelerate::gemm(&a, &b, &mut want, m, n, k, 1.0, 0.0, false, true);
+            outputs.push(c);
+            expected.push(want);
+        }
+        batch.execute().unwrap();
+
+        for (i, (c, want)) in outputs.iter().zip(&expected).enumerate() {
+            let (m, n, k) = shapes[i];
+            let worst = c
+                .as_slice()
+                .iter()
+                .zip(want)
+                .fold(0.0f32, |w, (got, want)| w.max((got - want).abs()));
+            assert!(
+                worst < 1e-3,
+                "GEMM {i} ({m} x {n} x {k}) read someone else's operands: worst error {worst}"
+            );
+        }
     }
 
     // ======== Vocab Compaction Tests ========
@@ -2823,6 +2877,122 @@ mod tests {
         assert_eq!(reloaded.export_weights_flat(), weights);
     }
 
+    fn small_trainer_with_weights() -> (DynamicAneTrainerConfig, DynamicAneTrainer, Vec<f32>) {
+        let config = DynamicAneTrainerConfig {
+            dim: 16,
+            hidden_dim: 32,
+            n_heads: 4,
+            n_kv_heads: 2,
+            n_layers: 2,
+            vocab_size: 50,
+            seq_len: 4,
+            ..Default::default()
+        };
+        let mut trainer = DynamicAneTrainer::new(config.clone());
+        let n = trainer.export_weights_flat().len();
+        let weights: Vec<f32> = (0..n).map(|i| (i % 89) as f32 * 0.002 - 0.08).collect();
+        trainer.load_weights_flat(&weights);
+        (config, trainer, weights)
+    }
+
+    /// A model split over shards named in an index loads the same as one
+    /// file, and one tensor short of a full set is refused by name instead of
+    /// training with a layer of zeros.
+    #[test]
+    fn a_sharded_checkpoint_loads_and_a_missing_tensor_is_refused() {
+        use safetensors::{Dtype, tensor::TensorView};
+        let (config, trainer, weights) = small_trainer_with_weights();
+        let dir = tempfile::tempdir().unwrap();
+        let whole = dir.path().join("whole.safetensors");
+        trainer.save_safetensors(&whole).unwrap();
+
+        // Re-split by layer: shard 0 holds layer 0 and the embeddings,
+        // shard 1 the rest.
+        let bytes = std::fs::read(&whole).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let mut shards: [Vec<(String, TensorView<'_>)>; 2] = [Vec::new(), Vec::new()];
+        let mut weight_map = serde_json::Map::new();
+        for (name, view) in tensors.tensors() {
+            let shard =
+                usize::from(name.starts_with("model.layers.1.") || name == "model.norm.weight");
+            let file = format!("shard-{shard}.safetensors");
+            weight_map.insert(name.clone(), serde_json::json!(file));
+            shards[shard].push((
+                name,
+                TensorView::new(Dtype::F32, view.shape().to_vec(), view.data()).unwrap(),
+            ));
+        }
+        let split = dir.path().join("split");
+        std::fs::create_dir(&split).unwrap();
+        for (i, shard) in shards.into_iter().enumerate() {
+            safetensors::serialize_to_file(
+                shard,
+                None,
+                &split.join(format!("shard-{i}.safetensors")),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            split.join("model.safetensors.index.json"),
+            serde_json::json!({"weight_map": weight_map}).to_string(),
+        )
+        .unwrap();
+
+        let mut reloaded = DynamicAneTrainer::new(config.clone());
+        reloaded.load_weights_safetensors(&split).unwrap();
+        assert_eq!(reloaded.export_weights_flat(), weights);
+
+        // Layer 1 without its down projection.
+        let short = dir.path().join("short");
+        std::fs::create_dir(&short).unwrap();
+        let kept: Vec<_> = tensors
+            .tensors()
+            .into_iter()
+            .filter(|(name, _)| name != "model.layers.1.mlp.down_proj.weight")
+            .map(|(name, view)| {
+                let view = TensorView::new(Dtype::F32, view.shape().to_vec(), view.data()).unwrap();
+                (name, view)
+            })
+            .collect();
+        safetensors::serialize_to_file(kept, None, &short.join("model.safetensors")).unwrap();
+        let err = DynamicAneTrainer::new(config)
+            .load_weights_safetensors(&short)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model.layers.1.mlp.down_proj.weight"), "{err}");
+    }
+
+    /// A save replaces the file whole or not at all: a run killed while
+    /// writing a periodic checkpoint must leave the previous one readable.
+    #[test]
+    fn a_save_leaves_no_partial_file_and_replaces_the_old_one() {
+        let (config, mut trainer, weights) = small_trainer_with_weights();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        trainer.save_safetensors(&path).unwrap();
+
+        let changed: Vec<f32> = weights.iter().map(|w| w + 0.5).collect();
+        trainer.load_weights_flat(&changed);
+        trainer.save_safetensors(&path).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            entries,
+            ["model.safetensors"],
+            "no temporary file left behind"
+        );
+        let mut reloaded = DynamicAneTrainer::new(config);
+        reloaded.load_weights_safetensors(&path).unwrap();
+        assert_eq!(reloaded.export_weights_flat(), changed);
+
+        // A destination that can't be written fails and leaves nothing.
+        let missing = dir.path().join("no-such-dir").join("model.safetensors");
+        assert!(trainer.save_safetensors(&missing).is_err());
+        assert!(!dir.path().join("no-such-dir").exists());
+    }
+
     #[test]
     fn test_vocab_compaction_install() {
         let config = DynamicAneTrainerConfig {
@@ -2889,6 +3059,57 @@ mod tests {
                 "{model_type:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn the_model_shape_comes_from_config_json_in_either_rope_layout() {
+        let mut config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 576,
+            "intermediate_size": 1536,
+            "num_attention_heads": 9,
+            "num_key_value_heads": 3,
+            "num_hidden_layers": 30,
+            "vocab_size": 49152,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 100000.0,
+        });
+        let c = DynamicAneTrainerConfig::from_model_config(&config).unwrap();
+        assert_eq!(
+            (
+                c.dim,
+                c.hidden_dim,
+                c.n_heads,
+                c.n_kv_heads,
+                c.n_layers,
+                c.vocab_size
+            ),
+            (576, 1536, 9, 3, 30, 49152)
+        );
+        assert_eq!(
+            (c.head_dim, c.rms_norm_eps, c.rope_theta),
+            (None, 1e-5, 100000.0)
+        );
+
+        // The layout newer Transformers write, and a config naming neither.
+        config.as_object_mut().unwrap().remove("rope_theta");
+        config["rope_parameters"] =
+            serde_json::json!({"rope_type": "default", "rope_theta": 500000.0});
+        config["head_dim"] = serde_json::json!(64);
+        let c = DynamicAneTrainerConfig::from_model_config(&config).unwrap();
+        assert_eq!((c.rope_theta, c.head_dim), (500000.0, Some(64)));
+        config.as_object_mut().unwrap().remove("rope_parameters");
+        let c = DynamicAneTrainerConfig::from_model_config(&config).unwrap();
+        assert_eq!(c.rope_theta, 10_000.0, "Llama's default");
+
+        // Missing keys name themselves, and a model that isn't trainable is
+        // refused before any of that.
+        config.as_object_mut().unwrap().remove("num_hidden_layers");
+        let err = DynamicAneTrainerConfig::from_model_config(&config).unwrap_err();
+        assert!(err.contains("num_hidden_layers"), "{err}");
+        config["model_type"] = serde_json::json!("qwen3");
+        let err = DynamicAneTrainerConfig::from_model_config(&config).unwrap_err();
+        assert!(err.contains("qwen3"), "{err}");
     }
 
     #[test]

@@ -14,7 +14,6 @@ pub mod fused_attention;
 pub mod fused_moe;
 pub mod gated_delta;
 pub mod metal_swiglu;
-mod persistent_cache;
 pub mod rms_norm;
 pub mod rope;
 pub mod training_context;

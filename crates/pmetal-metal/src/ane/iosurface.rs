@@ -168,7 +168,7 @@ impl IoSurface {
     /// Uses NEON 8-wide vectorized conversion.
     pub fn write_f32_as_fp16(&self, data: &[f32], channels: usize, spatial: usize) {
         let n = channels * spatial;
-        debug_assert!(n * 2 <= self.size_bytes);
+        assert!(n * 2 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -191,7 +191,7 @@ impl IoSurface {
     ) {
         let n = channels * spatial;
         let offset = ch_offset * spatial;
-        debug_assert!((offset + n) * 2 <= self.size_bytes);
+        assert!((offset + n) * 2 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -215,8 +215,8 @@ impl IoSurface {
     ) {
         let n = channels * spatial;
         let offset = ch_offset * spatial;
-        debug_assert_eq!(dst.len(), n);
-        debug_assert!((offset + n) * 2 <= self.size_bytes);
+        assert_eq!(dst.len(), n);
+        assert!((offset + n) * 2 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(
@@ -243,8 +243,8 @@ impl IoSurface {
     pub fn write_f32_at(&self, ch_offset: usize, data: &[f32], channels: usize, spatial: usize) {
         let n = channels * spatial;
         let offset = ch_offset * spatial;
-        debug_assert_eq!(data.len(), n);
-        debug_assert!((offset + n) * 4 <= self.size_bytes);
+        assert_eq!(data.len(), n);
+        assert!((offset + n) * 4 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -273,8 +273,8 @@ impl IoSurface {
         act_cols: usize,
         stride_sp: usize,
     ) {
-        debug_assert_eq!(data.len(), channels * act_cols);
-        debug_assert!((ch_offset + channels) * stride_sp * 4 <= self.size_bytes);
+        assert_eq!(data.len(), channels * act_cols);
+        assert!((ch_offset + channels) * stride_sp * 4 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -308,9 +308,9 @@ impl IoSurface {
         col_offset: usize,
         stride_sp: usize,
     ) {
-        debug_assert_eq!(data.len(), channels * data_cols);
-        debug_assert!((ch_offset + channels) * stride_sp * 4 <= self.size_bytes);
-        debug_assert!(col_offset + data_cols <= stride_sp);
+        assert_eq!(data.len(), channels * data_cols);
+        assert!((ch_offset + channels) * stride_sp * 4 <= self.size_bytes);
+        assert!(col_offset + data_cols <= stride_sp);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -334,7 +334,7 @@ impl IoSurface {
     pub fn zero_channel_range_f32(&self, ch_offset: usize, channels: usize, stride_sp: usize) {
         let n = channels * stride_sp;
         let offset = ch_offset * stride_sp;
-        debug_assert!((offset + n) * 4 <= self.size_bytes);
+        assert!((offset + n) * 4 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -367,8 +367,8 @@ impl IoSurface {
     ) {
         let total_weight_cols: usize = weights.iter().map(|(_, c)| *c).sum();
         let sp = seq + total_weight_cols;
-        debug_assert!(ic * sp * 4 <= self.size_bytes);
-        debug_assert_eq!(act.len(), ic * seq);
+        assert!(ic * sp * 4 <= self.size_bytes);
+        assert_eq!(act.len(), ic * seq);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -381,7 +381,7 @@ impl IoSurface {
                 // Copy weight rows at spatial offsets
                 let mut w_off = seq;
                 for &(w_data, w_cols) in weights {
-                    debug_assert_eq!(w_data.len(), ic * w_cols);
+                    assert_eq!(w_data.len(), ic * w_cols);
                     std::ptr::copy_nonoverlapping(
                         w_data.as_ptr().add(ch * w_cols),
                         base.add(ch * sp + w_off),
@@ -411,7 +411,7 @@ impl IoSurface {
         let total_act_cols: usize = acts.iter().map(|(_, c)| *c).sum();
         let total_weight_cols: usize = weights.iter().map(|(_, c)| *c).sum();
         let sp = total_act_cols + total_weight_cols;
-        debug_assert!(ic * sp * 4 <= self.size_bytes);
+        assert!(ic * sp * 4 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -422,7 +422,7 @@ impl IoSurface {
 
                 // Copy activation rows
                 for &(a_data, a_cols) in acts {
-                    debug_assert_eq!(a_data.len(), ic * a_cols);
+                    assert_eq!(a_data.len(), ic * a_cols);
                     std::ptr::copy_nonoverlapping(
                         a_data.as_ptr().add(ch * a_cols),
                         base.add(ch * sp + off),
@@ -433,7 +433,7 @@ impl IoSurface {
 
                 // Copy weight rows
                 for &(w_data, w_cols) in weights {
-                    debug_assert_eq!(w_data.len(), ic * w_cols);
+                    assert_eq!(w_data.len(), ic * w_cols);
                     std::ptr::copy_nonoverlapping(
                         w_data.as_ptr().add(ch * w_cols),
                         base.add(ch * sp + off),
@@ -454,8 +454,8 @@ impl IoSurface {
     pub fn read_f32(&self, dst: &mut [f32], ch_offset: usize, channels: usize, spatial: usize) {
         let n = channels * spatial;
         let offset = ch_offset * spatial;
-        debug_assert_eq!(dst.len(), n);
-        debug_assert!((offset + n) * 4 <= self.size_bytes);
+        assert_eq!(dst.len(), n);
+        assert!((offset + n) * 4 <= self.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(
@@ -490,8 +490,8 @@ impl IoSurface {
         let src_off = src_ch_offset * spatial;
         let bytes = n * 2; // fp16 = 2 bytes
 
-        debug_assert!((dst_off + n) * 2 <= self.size_bytes);
-        debug_assert!((src_off + n) * 2 <= src.size_bytes);
+        assert!((dst_off + n) * 2 <= self.size_bytes);
+        assert!((src_off + n) * 2 <= src.size_bytes);
 
         unsafe {
             ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
@@ -532,11 +532,9 @@ impl Drop for IoSurface {
 
 /// Create an IOSurface with flat 1D layout via CoreFoundation dictionary.
 unsafe fn create_surface(size_bytes: usize) -> *mut c_void {
-    use objc2::msg_send;
-    use objc2_foundation::{NSNumber, NSString};
+    use objc2_foundation::{NSDictionary, NSNumber, NSString};
 
-    // Build the properties dictionary using Foundation types
-    // Keys are the IOSurface property constants
+    // The IOSurface property keys, as strings.
     let keys = [
         NSString::from_str("IOSurfaceWidth"),
         NSString::from_str("IOSurfaceHeight"),
@@ -545,7 +543,7 @@ unsafe fn create_surface(size_bytes: usize) -> *mut c_void {
         NSString::from_str("IOSurfaceAllocSize"),
         NSString::from_str("IOSurfacePixelFormat"),
     ];
-    let values = [
+    let values = vec![
         NSNumber::new_usize(size_bytes),
         NSNumber::new_usize(1),
         NSNumber::new_usize(1),
@@ -553,14 +551,10 @@ unsafe fn create_surface(size_bytes: usize) -> *mut c_void {
         NSNumber::new_usize(size_bytes),
         NSNumber::new_usize(0),
     ];
-
-    let dict_cls = objc2::runtime::AnyClass::get(c"NSMutableDictionary").unwrap();
-    let dict: *mut objc2::runtime::AnyObject = msg_send![dict_cls, new];
-    for (k, v) in keys.iter().zip(values.iter()) {
-        let _: () = msg_send![dict, setObject: &**v, forKey: &**k];
-    }
-
-    unsafe { ffi::IOSurfaceCreate(dict as *const c_void) }
+    // Owned, and released here once IOSurfaceCreate has copied what it
+    // needs. (The dictionary used to be a raw `new` that nothing released.)
+    let properties = NSDictionary::from_retained_objects(&keys.each_ref().map(|k| &**k), &values);
+    unsafe { ffi::IOSurfaceCreate(std::ptr::from_ref(&*properties).cast()) }
 }
 
 #[cfg(test)]
@@ -606,6 +600,33 @@ mod tests {
                 "Mismatch at {i}: orig={orig}, read={read}, expected={expected}"
             );
         }
+    }
+
+    /// The accessors build slices over the surface's memory, so a shape that
+    /// doesn't fit has to stop them in release builds too, not overrun.
+    #[test]
+    fn a_shape_past_the_surface_is_refused() {
+        let surface = IoSurface::for_tensor(4, 8).unwrap();
+        let refused =
+            |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+        assert!(refused(&|| surface.write_f32_as_fp16(&[0.0; 5 * 8], 5, 8)));
+        assert!(refused(&|| surface.write_f32_as_fp16_at(
+            1,
+            &[0.0; 4 * 8],
+            4,
+            8
+        )));
+        assert!(refused(&|| surface.read_fp16_as_f32(
+            &mut [0.0; 5 * 8],
+            0,
+            5,
+            8
+        )));
+        assert!(refused(&|| {
+            let other = IoSurface::for_tensor(2, 8).unwrap();
+            surface.copy_from(0, &other, 0, 4, 8);
+        }));
+        assert!(!refused(&|| surface.write_f32_as_fp16(&[0.0; 4 * 8], 4, 8)));
     }
 
     #[test]

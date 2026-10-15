@@ -1,46 +1,18 @@
 //! GPU compute kernels for ML operations.
 //!
-//! This module contains optimized Metal kernels for machine learning operations,
-//! with a focus on transformer attention mechanisms and efficient training
-//! operations.
+//! Dense attention, RoPE, SwiGLU, LoRA and GEMM are not here: the tensor
+//! runtime's own ops run them inside the lazy graph, with autodiff, faster
+//! than any kernel this crate carried for them, and so do the loss, the MoE
+//! expert dispatch, the quantized matmuls, merging and the KV-cache transforms.
+//! What remains is the fused AdamW update, the single-expert MoE MLP the
+//! offloaded Qwen3-Next forward runs straight out of a read buffer, and the
+//! weight-gradient GEMM the ANE trainer batches into its own command buffer.
 
 pub mod dw_gemm;
-pub mod flash_attention;
-pub mod fused_lora;
 pub mod fused_moe;
-pub mod fused_norm_lora;
-pub mod fused_rope;
-pub mod fused_swiglu;
 pub mod fused_training;
-pub mod mpp_dispatch;
-pub mod mpp_flash_attention;
-pub mod mpp_gemm;
-
-#[cfg(has_metal4)]
-pub mod mpp_dw_gemm;
-#[cfg(has_metal4)]
-pub mod mpp_fused_lora;
-#[cfg(has_metal4)]
-pub mod mpp_fused_norm_lora;
-#[cfg(has_metal4)]
-pub mod mpp_fused_rope;
-#[cfg(has_metal4)]
-pub mod mpp_fused_swiglu;
 
 // Re-export main types
 pub use dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
-pub use flash_attention::{
-    FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
-    FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
-};
-pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_moe::{ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig};
-pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
-pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
-pub use fused_swiglu::{
-    FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
-};
 pub use fused_training::{AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, ParamInfo};
-pub use mpp_flash_attention::{
-    MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
-};

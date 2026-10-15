@@ -4,18 +4,13 @@ High-performance Metal GPU kernels for Apple Silicon.
 
 ## Overview
 
-This crate provides custom Metal shaders that accelerate LLM training and inference on Apple Silicon. These kernels are the foundation of PMetal's performance advantages over Python-based frameworks.
+This crate provides custom Metal shaders for the operations the tensor runtime has no op for. Dense attention, RoPE, SwiGLU, LoRA and GEMM are deliberately not here: the runtime runs them in its lazy graph, with autodiff, and a hand-written kernel for any of them measured slower than the runtime op.
 
 ## Features
 
-- **FlashAttention**: O(n) memory attention with fused softmax (forward + backward)
-- **Fused LoRA**: Combined base + adapter forward pass (~2x speedup)
-- **Fused RoPE**: Rotary position embeddings computed in-kernel
-- **Fused SwiGLU**: MLP activation fusion
-- **Fused Norm+LoRA**: Combined layer norm and adapter application
-- **Fused GDN**: Gated Delta Network recurrence (Metal shader, 32-thread SIMD)
-- **Fused AdamW**: One-dispatch optimizer update over every parameter
-- **Offloaded MoE experts**: Single-expert gate/up/down on 4- and 2-bit weights read straight from a record buffer
+- **Fused AdamW**: one-dispatch optimizer update over every parameter
+- **Offloaded MoE experts**: single-expert gate/up/down on 4- and 2-bit weights read straight from a record buffer
+- **dW GEMM**: the f32 weight-gradient GEMM the ANE trainer batches into one command buffer
 
 ## Architecture
 
@@ -39,8 +34,7 @@ pmetal-metal/
 │       ├── dynamic_kernel.rs # Dynamic weight kernel generators (training)
 │       ├── dynamic_trainer.rs# Compile-once training loop
 │       ├── extend.rs         # Multi-layer prefill/decode/verify kernels over an IOSurface KV cache
-│       ├── lm.rs             # ANE text generation from a Hugging Face checkpoint
-│       └── inference_hybrid.rs # CPU decode engine for Qwen3.5 hybrid models
+│       └── lm.rs             # ANE text generation from a Hugging Face checkpoint
 ```
 
 ### ANE Dynamic Weight Pipeline
@@ -65,42 +59,38 @@ The ANE module provides a complete training and inference pipeline using Apple's
 queue and pipeline cache are shared.
 
 ```rust,no_run
-use half::f16;
-use pmetal_metal::{
-    FlashAttention, FlashAttentionConfig, MetalBuffer, MetalContext, Result,
-};
+use pmetal_metal::kernels::{AdamWConfig, FusedAdamW};
+use pmetal_metal::{BufferUsage, MetalBuffer, MetalContext, Result};
 
-fn attend(
-    queries: &MetalBuffer<f16>,
-    keys: &MetalBuffer<f16>,
-    values: &MetalBuffer<f16>,
-) -> Result<()> {
+fn adamw_step() -> Result<()> {
     let ctx = MetalContext::global()?;
 
-    let config = FlashAttentionConfig {
-        batch_size: 1,
-        num_heads: 32,
-        num_kv_heads: 8, // GQA; set equal to num_heads for standard MHA
-        query_seq_len: 512,
-        kv_seq_len: 512,
-        head_dim: 128,
-        is_causal: true,
-        ..Default::default()
-    };
+    // Two parameters, flattened into one buffer each for the weights, the
+    // gradients and the two moments.
+    let sizes = [4096, 1024];
+    let total: usize = sizes.iter().sum();
+    let buffer = || MetalBuffer::<f32>::zeros(&ctx, total, BufferUsage::Shared);
+    let (params, grads, m, v) = (buffer()?, buffer()?, buffer()?, buffer()?);
 
-    let attention = FlashAttention::new(ctx, config)?;
-    let _output = attention.forward(queries, keys, values)?;
-    Ok(())
+    let adamw = FusedAdamW::new(ctx.clone(), &sizes)?;
+    let info = MetalBuffer::from_slice(
+        &ctx,
+        &FusedAdamW::build_param_info(&sizes),
+        BufferUsage::Shared,
+    )?;
+    // One set of scalars per parameter group; step 1 of a 1e-4 run.
+    let groups = [AdamWConfig::default().scalars()?];
+    adamw.execute_update(&params, &grads, &m, &v, &info, &groups)
 }
 ```
 
 ## Kernels
 
-| Kernel | Speedup | Memory | Description |
-|--------|---------|--------|-------------|
-| `flash_attention` | 1.5-2x | O(n) vs O(n²) | Memory-efficient attention |
-| `fused_lora` | ~2x | Same | Combined base+adapter forward |
-| `fused_rope` | 1.2x | Same | In-kernel position encoding |
+| Kernel | Memory | Description |
+|--------|--------|-------------|
+| `fused_training` | Same | One-dispatch AdamW over every parameter |
+| `fused_moe` | Same | Single-expert gate/up/down on 4- and 2-bit affine weights |
+| `dw_gemm` | Same | f32 weight-gradient GEMM for the ANE trainer |
 
 ## Requirements
 

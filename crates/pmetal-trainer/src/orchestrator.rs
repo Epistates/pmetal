@@ -1245,27 +1245,11 @@ async fn attempt_ane_training(
     let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
     let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
 
-    if let Err(reason) = DynamicAneTrainerConfig::is_ane_trainable(&config_json) {
-        anyhow::bail!("{}", reason);
-    }
-
-    let get_usize = |key: &str| -> anyhow::Result<usize> {
-        config_json
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .ok_or_else(|| anyhow::anyhow!("config.json missing '{key}'"))
-    };
-    let dim = get_usize("hidden_size")?;
-    let hidden_dim = get_usize("intermediate_size")?;
-    let n_heads = get_usize("num_attention_heads")?;
-    let n_kv_heads = config_json
-        .get("num_key_value_heads")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(n_heads);
-    let n_layers = get_usize("num_hidden_layers")?;
-    let vocab_size = get_usize("vocab_size")?;
+    // The model's shape, RMSNorm epsilon and RoPE base come from the engine's
+    // own reading of config.json, which also refuses what it can't train.
+    let model_config =
+        DynamicAneTrainerConfig::from_model_config(&config_json).map_err(|e| anyhow::anyhow!(e))?;
+    let vocab_size = model_config.vocab_size;
 
     // ANE projection kernels scale linearly with seq_len (IOSurface dimensions).
     // The O(seq²) attention is decomposed to CPU BLAS, so there's no hard cap,
@@ -1415,33 +1399,7 @@ async fn attempt_ane_training(
     // -----------------------------------------------------------------------
     // Build ANE trainer config — wire all applicable training hyperparams
     // -----------------------------------------------------------------------
-    let head_dim = config_json
-        .get("head_dim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-
-    let rms_norm_eps = config_json
-        .get("rms_norm_eps")
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32)
-        .unwrap_or(1e-6);
-    // The config default is 1e6 (Qwen's). Llama 2 uses 1e4 and Llama 3 5e5, so
-    // leaving it at the default rotated every Llama's positions wrongly (#34).
-    // 1e4 is the Hugging Face default when the key is absent.
-    let rope_theta = config_json
-        .get("rope_theta")
-        .and_then(|v| v.as_f64())
-        .map(|v| v as f32)
-        .unwrap_or(10_000.0);
-
     let trainer_config = DynamicAneTrainerConfig {
-        dim,
-        hidden_dim,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        n_layers,
-        vocab_size,
         seq_len: max_seq_len,
         // Full-parameter training wants about a tenth of LoRA's learning
         // rate: TRL's reference is 2e-5 for full fine-tuning against 2e-4
@@ -1465,15 +1423,13 @@ async fn attempt_ane_training(
         accum_steps: gradient_accumulation_steps.max(1),
         warmup_steps: full_config.training.warmup_steps.max(50),
         gradient_clip_norm: full_config.training.max_grad_norm as f32,
-        rms_norm_eps,
-        rope_theta,
         loss_scale: config.dispatch.loss_scale,
         embedding_lr: full_config
             .training
             .embedding_learning_rate
             .map(|v| v as f32),
         weight_decay: full_config.training.weight_decay as f32,
-        ..Default::default()
+        ..model_config
     };
 
     // Ensure output directory exists

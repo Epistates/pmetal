@@ -41,13 +41,11 @@
 //!   family for prefill, decode and speculative verification
 //! - [`lm`]: Text generation from a Hugging Face checkpoint on the extend
 //!   kernels
-//! - [`inference_hybrid`]: CPU decode engine for Qwen3.5 hybrid models
 
 pub(crate) mod checkpoint;
 pub mod dynamic_kernel;
 pub mod dynamic_trainer;
 pub mod extend;
-pub mod inference_hybrid;
 pub mod iosurface;
 pub mod kernel;
 pub mod lm;

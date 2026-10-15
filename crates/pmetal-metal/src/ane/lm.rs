@@ -199,26 +199,53 @@ pub struct AneLm {
     /// `[vocab, dim]` fp16.
     embed: Vec<half::f16>,
     taps: Vec<usize>,
+    /// Positions the last [`step`](AneLm::step) ran, whose logits the head
+    /// surfaces hold.
+    last_n: usize,
 }
 
-impl AneLm {
-    /// Load and compile the model in `dir`.
-    pub fn load(dir: &Path, opts: &AneLmOptions) -> Result<Self> {
-        let config: serde_json::Value = {
-            let text = std::fs::read_to_string(dir.join("config.json"))
-                .map_err(|e| MetalError::InvalidConfig(format!("config.json: {e}")))?;
-            serde_json::from_str(&text)
-                .map_err(|e| MetalError::InvalidConfig(format!("config.json: {e}")))?
-        };
-        check_supported(&config).map_err(MetalError::InvalidConfig)?;
+/// The tensors one layer reads, under `model.layers.{i}.`.
+const LAYER_TENSORS: [&str; 11] = [
+    "input_layernorm.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+    "post_attention_layernorm.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "mlp.down_proj.weight",
+];
+
+/// What a `config.json` says about the model, checked against what the
+/// engine implements and the options it's built with.
+#[derive(Debug)]
+struct ModelShape {
+    cfg: ExtendConfig,
+    n_layers: usize,
+    vocab: usize,
+    rope_theta: f32,
+    /// Whether the logits come from the embedding table.
+    tied: bool,
+}
+
+impl ModelShape {
+    fn from_config(config: &serde_json::Value, opts: &AneLmOptions) -> Result<Self> {
+        let invalid = |why: String| MetalError::InvalidConfig(why);
+        check_supported(config).map_err(invalid)?;
         let get = |key: &str| -> Result<usize> {
             config
                 .get(key)
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
-                .ok_or_else(|| MetalError::InvalidConfig(format!("config.json has no {key}")))
+                .ok_or_else(|| invalid(format!("config.json has no {key}")))
         };
         let (dim, n_heads) = (get("hidden_size")?, get("num_attention_heads")?);
+        if n_heads == 0 {
+            return Err(invalid("config.json: num_attention_heads is 0".into()));
+        }
         let cfg = ExtendConfig {
             dim,
             hidden_dim: get("intermediate_size")?,
@@ -231,21 +258,98 @@ impl AneLm {
             weights: opts.weights,
         };
         let n_layers = get("num_hidden_layers")?;
-        let vocab = get("vocab_size")?;
-        let rope_theta = config["rope_theta"].as_f64().unwrap_or(1e6) as f32;
-        let tied = config["tie_word_embeddings"].as_bool().unwrap_or(true);
+        if !opts.taps.is_sorted_by(|a, b| a < b) || opts.taps.last().is_some_and(|&t| t >= n_layers)
+        {
+            return Err(invalid(format!(
+                "taps {:?} must ascend within the model's {n_layers} layers",
+                opts.taps
+            )));
+        }
+        // A cache longer than the context the model was trained for would
+        // attend to positions it has never seen.
+        if let Some(trained) = config
+            .get("max_position_embeddings")
+            .and_then(|v| v.as_u64())
+        {
+            if opts.capacity as u64 > trained {
+                return Err(invalid(format!(
+                    "KV capacity {} is past the model's {trained}-token context \
+                     (max_position_embeddings)",
+                    opts.capacity
+                )));
+            }
+        }
+        Ok(Self {
+            cfg,
+            n_layers,
+            vocab: get("vocab_size")?,
+            // The Hugging Face default for Qwen3 when a config names none.
+            rope_theta: checkpoint::rope_theta(config).unwrap_or(1e6) as f32,
+            // Hugging Face defaults tie_word_embeddings to true.
+            tied: config
+                .get("tie_word_embeddings")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        })
+    }
+}
+
+/// The tensor the logits are computed from, which a checkpoint must have.
+fn head_tensor(tied: bool, has_lm_head: bool) -> Result<&'static str> {
+    match (tied, has_lm_head) {
+        (true, _) => Ok("model.embed_tokens.weight"),
+        (false, true) => Ok("lm_head.weight"),
+        // Falling back to the embedding table would run a different model.
+        (false, false) => Err(MetalError::InvalidConfig(
+            "config.json says tie_word_embeddings is false, but the checkpoint has no \
+             lm_head.weight"
+                .into(),
+        )),
+    }
+}
+
+impl AneLm {
+    /// Load and compile the model in `dir`.
+    pub fn load(dir: &Path, opts: &AneLmOptions) -> Result<Self> {
+        let config: serde_json::Value = {
+            let text = std::fs::read_to_string(dir.join("config.json"))
+                .map_err(|e| MetalError::InvalidConfig(format!("config.json: {e}")))?;
+            serde_json::from_str(&text)
+                .map_err(|e| MetalError::InvalidConfig(format!("config.json: {e}")))?
+        };
+        let ModelShape {
+            cfg,
+            n_layers,
+            vocab,
+            rope_theta,
+            tied,
+        } = ModelShape::from_config(&config, opts)?;
 
         let ckpt = Checkpoint::open(dir)?;
-        let (d, h, qd, kvd, hd) = (dim, cfg.hidden_dim, cfg.q_dim(), cfg.kv_dim(), cfg.head_dim);
+        let (d, h, qd, kvd, hd) = (
+            cfg.dim,
+            cfg.hidden_dim,
+            cfg.q_dim(),
+            cfg.kv_dim(),
+            cfg.head_dim,
+        );
+        // Every tensor, before the first (slow) compile.
+        let head_name = head_tensor(tied, ckpt.contains("lm_head.weight"))?;
+        ckpt.require(
+            ["model.embed_tokens.weight", "model.norm.weight", head_name]
+                .map(String::from)
+                .into_iter()
+                .chain(checkpoint::layer_tensors(n_layers, &LAYER_TENSORS)),
+        )?;
 
         // Embedding table, final norm and LM head.
         let embed_f32 = ckpt.f32("model.embed_tokens.weight", vocab * d)?;
         let embed: Vec<half::f16> = embed_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
-        let head_weight = if tied || !ckpt.contains("lm_head.weight") {
+        let head_weight = if tied {
             embed_f32
         } else {
             drop(embed_f32);
-            ckpt.f32("lm_head.weight", vocab * d)?
+            ckpt.f32(head_name, vocab * d)?
         };
         let final_norm = ckpt.f32("model.norm.weight", d)?;
         let rt = AneRuntime::global()?;
@@ -304,6 +408,7 @@ impl AneLm {
             head,
             embed,
             taps: opts.taps.clone(),
+            last_n: 0,
         })
     }
 
@@ -360,13 +465,19 @@ impl AneLm {
         self.head_in.write_f32_as_fp16(&padded, d, w);
         let outputs: Vec<_> = self.head_out.iter().map(IoSurface::as_ptr).collect();
         self.head.evaluate(&[self.head_in.as_ptr()], &outputs)?;
-        Ok(Logits {
+        self.last_n = n;
+        Ok(self.logits())
+    }
+
+    /// The logits of the last [`step`](Self::step).
+    fn logits(&self) -> Logits<'_> {
+        Logits {
             pieces: &self.head_out,
             dim: self.cfg.dim,
             vocab: self.vocab,
-            width: w,
-            n,
-        })
+            width: self.cfg.width,
+            n: self.last_n,
+        }
     }
 
     /// Generate after `prompt`, starting from an empty cache, until
@@ -386,95 +497,172 @@ impl AneLm {
         opts: &GenerateOptions,
         sampler: &mut dyn TokenSampler,
         drafter: &mut dyn Drafter,
-        mut on_token: impl FnMut(u32) -> bool,
+        on_token: impl FnMut(u32) -> bool,
     ) -> Result<(Vec<u32>, GenerationStats)> {
-        if prompt.is_empty() {
-            return Err(MetalError::InvalidConfig("empty prompt".into()));
-        }
-        drafter.reset();
-        // The drafter reads tapped layers only if the model was built with
-        // exactly those.
-        let tapping = !drafter.taps().is_empty();
-        if tapping && drafter.taps() != self.taps.as_slice() {
-            return Err(MetalError::InvalidConfig(format!(
-                "the drafter reads layers {:?}; the model was built tapping {:?}",
-                drafter.taps(),
-                self.taps
-            )));
-        }
-        let max_new = opts
-            .max_new
-            .min(self.capacity().saturating_sub(prompt.len()));
-        self.truncate(0);
-        let mut stats = GenerationStats {
-            prompt_tokens: prompt.len(),
-            ..Default::default()
-        };
-
-        let started = Instant::now();
-        let chunks: Vec<&[u32]> = prompt.chunks(self.width()).collect();
-        let mut next = 0;
-        for (i, chunk) in chunks.iter().enumerate() {
-            let logits = self.step(chunk)?;
-            if i + 1 == chunks.len() {
-                next = sampler.sample(&logits.row(chunk.len() - 1))?;
-            }
-            if tapping {
-                drafter.observe(&self.layers.tapped(0..chunk.len()), chunk.len())?;
-            }
-        }
-        stats.prefill_secs = started.elapsed().as_secs_f64();
-
-        let started = Instant::now();
-        let mut context = prompt.to_vec();
-        let mut out = Vec::with_capacity(max_new);
-        'decode: loop {
-            // `next` is decided; emit it.
-            out.push(next);
-            context.push(next);
-            if opts.stop.contains(&next) || !on_token(next) || out.len() >= max_new {
-                break;
-            }
-
-            // Verify `next` and up to width - 1 guesses in one pass. The
-            // cache has room for every token fed, so a guess can't push the
-            // output past max_new.
-            let room = (max_new - out.len()).min(self.capacity() - self.position() - 1);
-            let mut feed = vec![next];
-            let drafting = Instant::now();
-            feed.extend(drafter.draft(&context, room.min(self.width() - 1))?);
-            stats.draft_secs += drafting.elapsed().as_secs_f64();
-            let start = self.position();
-            let logits = self.step(&feed)?;
-            stats.passes += 1;
-            stats.drafted_tokens += feed.len() - 1;
-            // The sampler decides the position after `next`, then, while it
-            // agrees with the guess there, the one after that guess.
-            let mut kept = 0;
-            next = sampler.sample(&logits.row(0))?;
-            while kept + 1 < feed.len() && next == feed[kept + 1] {
-                kept += 1;
-                next = sampler.sample(&logits.row(kept))?;
-            }
-            self.truncate(start + 1 + kept);
-            stats.accepted_tokens += kept;
-            if tapping {
-                let observing = Instant::now();
-                drafter.observe(&self.layers.tapped(0..kept + 1), kept + 1)?;
-                stats.draft_secs += observing.elapsed().as_secs_f64();
-            }
-            for &token in &feed[1..=kept] {
-                out.push(token);
-                context.push(token);
-                if opts.stop.contains(&token) || !on_token(token) || out.len() >= max_new {
-                    break 'decode;
-                }
-            }
-        }
-        stats.decode_secs = started.elapsed().as_secs_f64();
-        stats.generated_tokens = out.len();
-        Ok((out, stats))
+        generate_loop(self, prompt, opts, sampler, drafter, on_token)
     }
+}
+
+/// What the generation loop asks of a model: [`AneLm`], or a stand-in the
+/// loop's tests can run on the CPU.
+trait Pass {
+    /// Tokens per pass.
+    fn width(&self) -> usize;
+    /// KV cache slots.
+    fn capacity(&self) -> usize;
+    /// Tokens in the KV cache.
+    fn position(&self) -> usize;
+    /// Forget the cache from `pos` on.
+    fn truncate(&mut self, pos: usize);
+    /// The layers whose output the model keeps for a drafter.
+    fn taps(&self) -> &[usize];
+    /// Run `tokens` at the next positions, keeping their logits for
+    /// [`row`](Self::row) and tapped output for [`tapped`](Self::tapped).
+    fn run(&mut self, tokens: &[u32]) -> Result<()>;
+    /// Position `t`'s logits from the last [`run`](Self::run), `[vocab]`.
+    fn row(&self, t: usize) -> Vec<f32>;
+    /// The tapped output for `tokens` of the last run, token-major.
+    fn tapped(&self, tokens: std::ops::Range<usize>) -> Vec<f32>;
+}
+
+impl Pass for AneLm {
+    fn width(&self) -> usize {
+        self.cfg.width
+    }
+    fn capacity(&self) -> usize {
+        self.cfg.capacity
+    }
+    fn position(&self) -> usize {
+        self.layers.position()
+    }
+    fn truncate(&mut self, pos: usize) {
+        self.layers.truncate(pos);
+    }
+    fn taps(&self) -> &[usize] {
+        &self.taps
+    }
+    fn run(&mut self, tokens: &[u32]) -> Result<()> {
+        self.step(tokens).map(|_| ())
+    }
+    fn row(&self, t: usize) -> Vec<f32> {
+        self.logits().row(t)
+    }
+    fn tapped(&self, tokens: std::ops::Range<usize>) -> Vec<f32> {
+        self.layers.tapped(tokens)
+    }
+}
+
+/// [`AneLm::generate`] over any [`Pass`].
+fn generate_loop<P: Pass>(
+    pass: &mut P,
+    prompt: &[u32],
+    opts: &GenerateOptions,
+    sampler: &mut dyn TokenSampler,
+    drafter: &mut dyn Drafter,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Result<(Vec<u32>, GenerationStats)> {
+    if prompt.is_empty() {
+        return Err(MetalError::InvalidConfig("empty prompt".into()));
+    }
+    if prompt.len() > pass.capacity() {
+        return Err(MetalError::InvalidConfig(format!(
+            "the prompt is {} tokens; the KV cache holds {}",
+            prompt.len(),
+            pass.capacity()
+        )));
+    }
+    drafter.reset();
+    // The drafter reads tapped layers only if the model was built with
+    // exactly those.
+    let tapping = !drafter.taps().is_empty();
+    if tapping && drafter.taps() != pass.taps() {
+        return Err(MetalError::InvalidConfig(format!(
+            "the drafter reads layers {:?}; the model was built tapping {:?}",
+            drafter.taps(),
+            pass.taps()
+        )));
+    }
+    let mut stats = GenerationStats {
+        prompt_tokens: prompt.len(),
+        ..Default::default()
+    };
+    let max_new = opts.max_new.min(pass.capacity() - prompt.len());
+    pass.truncate(0);
+    if max_new == 0 {
+        return Ok((Vec::new(), stats));
+    }
+
+    let started = Instant::now();
+    let chunks: Vec<&[u32]> = prompt.chunks(pass.width()).collect();
+    let mut next = 0;
+    for (i, chunk) in chunks.iter().enumerate() {
+        pass.run(chunk)?;
+        if i + 1 == chunks.len() {
+            next = sampler.sample(&pass.row(chunk.len() - 1))?;
+        }
+        if tapping {
+            drafter.observe(&pass.tapped(0..chunk.len()), chunk.len())?;
+        }
+    }
+    stats.prefill_secs = started.elapsed().as_secs_f64();
+
+    let started = Instant::now();
+    let mut context = prompt.to_vec();
+    let mut out = Vec::with_capacity(max_new);
+    'decode: loop {
+        // `next` is decided; emit it.
+        out.push(next);
+        context.push(next);
+        if opts.stop.contains(&next) || !on_token(next) || out.len() >= max_new {
+            break;
+        }
+
+        // Verify `next` and up to width - 1 guesses in one pass. The
+        // cache has room for every token fed, so a guess can't push the
+        // output past max_new.
+        let room = (max_new - out.len()).min(pass.capacity() - pass.position() - 1);
+        let mut feed = vec![next];
+        let drafting = Instant::now();
+        let max_guesses = room.min(pass.width() - 1);
+        // A drafter asked for `max_guesses` may return more; the pass takes
+        // no more than that.
+        feed.extend(
+            drafter
+                .draft(&context, max_guesses)?
+                .into_iter()
+                .take(max_guesses),
+        );
+        stats.draft_secs += drafting.elapsed().as_secs_f64();
+        let start = pass.position();
+        pass.run(&feed)?;
+        stats.passes += 1;
+        stats.drafted_tokens += feed.len() - 1;
+        // The sampler decides the position after `next`, then, while it
+        // agrees with the guess there, the one after that guess.
+        let mut kept = 0;
+        next = sampler.sample(&pass.row(0))?;
+        while kept + 1 < feed.len() && next == feed[kept + 1] {
+            kept += 1;
+            next = sampler.sample(&pass.row(kept))?;
+        }
+        pass.truncate(start + 1 + kept);
+        stats.accepted_tokens += kept;
+        if tapping {
+            let observing = Instant::now();
+            drafter.observe(&pass.tapped(0..kept + 1), kept + 1)?;
+            stats.draft_secs += observing.elapsed().as_secs_f64();
+        }
+        for &token in &feed[1..=kept] {
+            out.push(token);
+            context.push(token);
+            if opts.stop.contains(&token) || !on_token(token) || out.len() >= max_new {
+                break 'decode;
+            }
+        }
+    }
+    stats.decode_secs = started.elapsed().as_secs_f64();
+    stats.generated_tokens = out.len();
+    Ok((out, stats))
 }
 
 /// Index of the largest value; the first one on a tie.
@@ -540,5 +728,552 @@ mod tests {
             2
         );
         assert_eq!(greedy.sample(&[0.0; 100]).unwrap(), 0);
+    }
+
+    // ---- The generation loop, on a model that runs on the CPU ----------
+
+    const VOCAB: u32 = 50;
+
+    /// The token a context leads to: a function of its last two tokens, so a
+    /// model that has seen a different token before a position reads a
+    /// different answer there.
+    fn successor(context: &[u32]) -> u32 {
+        let last = context[context.len() - 1];
+        let before = context.len().checked_sub(2).map_or(0, |i| context[i]);
+        (last * 31 + before * 7 + 3) % VOCAB
+    }
+
+    /// A [`Pass`] whose logits peak at [`successor`] of the tokens in its
+    /// cache and fall off with distance from it, and whose tapped output for
+    /// a token is its position.
+    struct FakeLm {
+        width: usize,
+        capacity: usize,
+        taps: Vec<usize>,
+        cache: Vec<u32>,
+        rows: Vec<Vec<f32>>,
+        first_new: usize,
+    }
+
+    impl FakeLm {
+        fn new(width: usize, capacity: usize, taps: Vec<usize>) -> Self {
+            Self {
+                width,
+                capacity,
+                taps,
+                cache: Vec::new(),
+                rows: Vec::new(),
+                first_new: 0,
+            }
+        }
+    }
+
+    impl Pass for FakeLm {
+        fn width(&self) -> usize {
+            self.width
+        }
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+        fn position(&self) -> usize {
+            self.cache.len()
+        }
+        fn truncate(&mut self, pos: usize) {
+            self.cache.truncate(pos);
+        }
+        fn taps(&self) -> &[usize] {
+            &self.taps
+        }
+        fn run(&mut self, tokens: &[u32]) -> Result<()> {
+            assert!(!tokens.is_empty() && tokens.len() <= self.width);
+            if self.cache.len() + tokens.len() > self.capacity {
+                return Err(MetalError::InvalidConfig("KV cache full".into()));
+            }
+            self.first_new = self.cache.len();
+            self.cache.extend_from_slice(tokens);
+            self.rows = (0..tokens.len())
+                .map(|i| {
+                    let best = successor(&self.cache[..self.first_new + i + 1]);
+                    (0..VOCAB)
+                        .map(|j| -(j as f32 - best as f32).abs())
+                        .collect()
+                })
+                .collect();
+            Ok(())
+        }
+        fn row(&self, t: usize) -> Vec<f32> {
+            self.rows[t].clone()
+        }
+        fn tapped(&self, tokens: std::ops::Range<usize>) -> Vec<f32> {
+            tokens.map(|t| (self.first_new + t) as f32).collect()
+        }
+    }
+
+    /// Decides by the logits, avoiding the tokens it returned last: a
+    /// sampler whose decision reads its own history, as a repetition
+    /// penalty does. It also checks the contract that the tokens it has
+    /// returned are exactly the tokens before the position it is asked
+    /// about, which the model's logits encode.
+    struct Avoiding {
+        prompt: Vec<u32>,
+        returned: Vec<u32>,
+        window: usize,
+    }
+
+    impl Avoiding {
+        fn new(prompt: &[u32], window: usize) -> Self {
+            Self {
+                prompt: prompt.to_vec(),
+                returned: Vec::new(),
+                window,
+            }
+        }
+    }
+
+    impl TokenSampler for Avoiding {
+        fn sample(&mut self, logits: &[f32]) -> Result<u32> {
+            let context: Vec<u32> = self.prompt.iter().chain(&self.returned).copied().collect();
+            let model_saw = argmax(logits);
+            assert_eq!(
+                model_saw,
+                successor(&context),
+                "the sampler was shown a position that doesn't follow its own tokens"
+            );
+            let recent = &self.returned[self.returned.len().saturating_sub(self.window)..];
+            let mut best: Option<(f32, u32)> = None;
+            for (token, &logit) in logits.iter().enumerate() {
+                let token = token as u32;
+                if recent.contains(&token) {
+                    continue;
+                }
+                if best.is_none_or(|(b, _)| logit > b) {
+                    best = Some((logit, token));
+                }
+            }
+            let token = best.unwrap().1;
+            self.returned.push(token);
+            Ok(token)
+        }
+    }
+
+    /// Guesses from a closure `(context, max)`.
+    struct Guesses<F: FnMut(&[u32], usize) -> Vec<u32>>(F);
+
+    impl<F: FnMut(&[u32], usize) -> Vec<u32>> Drafter for Guesses<F> {
+        fn draft(&mut self, context: &[u32], max: usize) -> Result<Vec<u32>> {
+            Ok((self.0)(context, max))
+        }
+    }
+
+    /// A drafter reading tap 0 (each token's position) that guesses via
+    /// `inner` and records what it was shown.
+    struct Watching<D: Drafter> {
+        inner: D,
+        seen: Vec<f32>,
+        resets: usize,
+    }
+
+    impl<D: Drafter> Drafter for Watching<D> {
+        fn taps(&self) -> &[usize] {
+            &[0]
+        }
+        fn reset(&mut self) {
+            self.resets += 1;
+            self.seen.clear();
+        }
+        fn observe(&mut self, hidden: &[f32], n: usize) -> Result<()> {
+            assert_eq!(hidden.len(), n);
+            self.seen.extend_from_slice(hidden);
+            Ok(())
+        }
+        fn draft(&mut self, context: &[u32], max: usize) -> Result<Vec<u32>> {
+            self.inner.draft(context, max)
+        }
+    }
+
+    /// The continuation the model would produce, one token at a time.
+    fn walk(prompt: &[u32], n: usize) -> Vec<u32> {
+        let mut context = prompt.to_vec();
+        for _ in 0..n {
+            context.push(successor(&context));
+        }
+        context[prompt.len()..].to_vec()
+    }
+
+    fn settings(max_new: usize) -> GenerateOptions {
+        GenerateOptions {
+            max_new,
+            stop: Vec::new(),
+        }
+    }
+
+    const PROMPT: [u32; 5] = [4, 17, 9, 33, 21];
+
+    fn run_with(
+        lm: &mut FakeLm,
+        opts: &GenerateOptions,
+        drafter: &mut dyn Drafter,
+    ) -> (Vec<u32>, GenerationStats) {
+        generate_loop(lm, &PROMPT, opts, &mut Greedy, drafter, |_| true).unwrap()
+    }
+
+    /// Guesses that are right, wrong, partly right, and (against the trait's
+    /// word) more than asked for.
+    fn drafters() -> Vec<(&'static str, Box<dyn Drafter>)> {
+        let oracle = |context: &[u32], max: usize| walk(context, max);
+        let wrong = |context: &[u32], max: usize| {
+            walk(context, max)
+                .into_iter()
+                .map(|t| (t + 1) % VOCAB)
+                .collect()
+        };
+        let partly = |context: &[u32], max: usize| {
+            let mut guesses = walk(context, max);
+            if let Some(g) = guesses.get_mut(2) {
+                *g = (*g + 1) % VOCAB;
+            }
+            guesses
+        };
+        let too_many = |context: &[u32], max: usize| walk(context, max + 40);
+        vec![
+            ("none", Box::new(NoDraft)),
+            ("prompt lookup", Box::new(PromptLookup::default())),
+            ("oracle", Box::new(Guesses(oracle))),
+            ("wrong", Box::new(Guesses(wrong))),
+            ("partly right", Box::new(Guesses(partly))),
+            ("too many", Box::new(Guesses(too_many))),
+        ]
+    }
+
+    #[test]
+    fn guesses_change_the_speed_not_the_tokens() {
+        for width in [1, 2, 4, 16] {
+            for max_new in [0, 1, 2, 3, 5, 15, 16, 17, 40] {
+                let want = walk(&PROMPT, max_new);
+                for (name, mut drafter) in drafters() {
+                    let mut lm = FakeLm::new(width, 128, Vec::new());
+                    let (got, stats) = run_with(&mut lm, &settings(max_new), drafter.as_mut());
+                    assert_eq!(got, want, "width {width}, max_new {max_new}, {name}");
+                    assert_eq!(stats.generated_tokens, want.len());
+                    assert!(stats.accepted_tokens <= stats.drafted_tokens);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn right_guesses_cut_the_passes_and_wrong_ones_cost_nothing_but_the_pass() {
+        let mut lm = FakeLm::new(8, 256, Vec::new());
+        let mut oracle = Guesses(|context: &[u32], max| walk(context, max));
+        let (out, stats) = run_with(&mut lm, &settings(64), &mut oracle);
+        assert_eq!(out.len(), 64);
+        assert_eq!(stats.accepted_tokens, stats.drafted_tokens);
+        // 1 token + 7 guesses per pass, after the one from the prompt.
+        assert!(stats.passes <= 9, "{} passes", stats.passes);
+
+        let mut lm = FakeLm::new(8, 256, Vec::new());
+        let mut wrong = Guesses(|context: &[u32], max| {
+            walk(context, max)
+                .into_iter()
+                .map(|t| (t + 1) % VOCAB)
+                .collect()
+        });
+        let (_, stats) = run_with(&mut lm, &settings(64), &mut wrong);
+        assert_eq!(stats.accepted_tokens, 0);
+        assert_eq!(stats.passes, 63, "one pass per token");
+    }
+
+    #[test]
+    fn a_stateful_sampler_sees_only_positions_that_follow_its_own_tokens() {
+        let reference = {
+            let mut lm = FakeLm::new(1, 128, Vec::new());
+            let mut sampler = Avoiding::new(&PROMPT, 3);
+            generate_loop(
+                &mut lm,
+                &PROMPT,
+                &settings(40),
+                &mut sampler,
+                &mut NoDraft,
+                |_| true,
+            )
+            .unwrap()
+            .0
+        };
+        assert_ne!(
+            reference,
+            walk(&PROMPT, 40),
+            "the sampler changes the tokens"
+        );
+        for width in [2, 4, 16] {
+            for (name, mut drafter) in drafters() {
+                let mut lm = FakeLm::new(width, 128, Vec::new());
+                let mut sampler = Avoiding::new(&PROMPT, 3);
+                let (got, _) = generate_loop(
+                    &mut lm,
+                    &PROMPT,
+                    &settings(40),
+                    &mut sampler,
+                    drafter.as_mut(),
+                    |_| true,
+                )
+                .unwrap();
+                assert_eq!(got, reference, "width {width}, {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn generation_stops_at_a_stop_token_and_when_the_caller_says() {
+        let all = walk(&PROMPT, 40);
+        let stop_at = 9;
+        // A token that first appears at `stop_at`, so nothing earlier ends it.
+        let stop = all[stop_at];
+        let first = all.iter().position(|&t| t == stop).unwrap();
+        for (name, mut drafter) in drafters() {
+            let mut lm = FakeLm::new(8, 128, Vec::new());
+            let opts = GenerateOptions {
+                max_new: 40,
+                stop: vec![stop],
+            };
+            let (got, stats) = run_with(&mut lm, &opts, drafter.as_mut());
+            assert_eq!(got, all[..=first], "stop token, {name}");
+            assert_eq!(stats.generated_tokens, first + 1);
+
+            let mut lm = FakeLm::new(8, 128, Vec::new());
+            let mut asked = 0;
+            let (got, _) = generate_loop(
+                &mut lm,
+                &PROMPT,
+                &settings(40),
+                &mut Greedy,
+                drafter.as_mut(),
+                |_| {
+                    asked += 1;
+                    asked < 6
+                },
+            )
+            .unwrap();
+            assert_eq!(got, all[..6], "on_token returning false, {name}");
+        }
+    }
+
+    #[test]
+    fn the_cache_bounds_the_output_and_a_prompt_that_does_not_fit_is_refused() {
+        let room = 10;
+        for (name, mut drafter) in drafters() {
+            let mut lm = FakeLm::new(8, PROMPT.len() + room, Vec::new());
+            let (got, _) = run_with(&mut lm, &settings(1000), drafter.as_mut());
+            assert_eq!(got, walk(&PROMPT, room), "{name}");
+            assert!(lm.position() <= lm.capacity());
+        }
+        // A cache the prompt fills exactly leaves nothing to generate.
+        let mut lm = FakeLm::new(8, PROMPT.len(), Vec::new());
+        let (got, stats) = run_with(&mut lm, &settings(8), &mut NoDraft);
+        assert!(got.is_empty());
+        assert_eq!(stats.generated_tokens, 0);
+
+        // And one that doesn't fit is refused before any pass runs.
+        let mut lm = FakeLm::new(8, PROMPT.len() - 1, Vec::new());
+        let err = generate_loop(
+            &mut lm,
+            &PROMPT,
+            &settings(8),
+            &mut Greedy,
+            &mut NoDraft,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("KV cache holds"), "{err}");
+        assert_eq!(lm.position(), 0, "nothing ran");
+    }
+
+    #[test]
+    fn a_tapping_drafter_sees_every_fed_token_once_in_order() {
+        for width in [1, 3, 16] {
+            for max_new in [1, 2, 7, 33] {
+                for (name, inner) in drafters() {
+                    let mut lm = FakeLm::new(width, 128, vec![0]);
+                    let mut watching = Watching {
+                        inner: BoxedDrafter(inner),
+                        seen: Vec::new(),
+                        resets: 0,
+                    };
+                    let (out, _) = run_with(&mut lm, &settings(max_new), &mut watching);
+                    let in_order: Vec<f32> = (0..watching.seen.len()).map(|i| i as f32).collect();
+                    assert_eq!(
+                        watching.seen, in_order,
+                        "width {width}, max_new {max_new}, {name}: positions seen"
+                    );
+                    // Every context token but the last one emitted.
+                    assert!(
+                        watching.seen.len() >= PROMPT.len() + out.len() - 1,
+                        "width {width}, max_new {max_new}, {name}: only {} seen",
+                        watching.seen.len()
+                    );
+                    assert_eq!(watching.resets, 1);
+                }
+            }
+        }
+    }
+
+    /// A boxed drafter, so the list above can be wrapped.
+    struct BoxedDrafter(Box<dyn Drafter>);
+
+    impl Drafter for BoxedDrafter {
+        fn draft(&mut self, context: &[u32], max: usize) -> Result<Vec<u32>> {
+            self.0.draft(context, max)
+        }
+    }
+
+    #[test]
+    fn a_drafter_reading_other_layers_than_the_model_taps_is_refused() {
+        let mut lm = FakeLm::new(4, 64, vec![1, 2]);
+        let mut watching = Watching {
+            inner: NoDraft,
+            seen: Vec::new(),
+            resets: 0,
+        };
+        let err = generate_loop(
+            &mut lm,
+            &PROMPT,
+            &settings(4),
+            &mut Greedy,
+            &mut watching,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tapping"), "{err}");
+    }
+
+    #[test]
+    fn prompt_lookup_guesses_what_followed_the_last_occurrence() {
+        let mut lookup = PromptLookup::default();
+        // "5 6 7 8 | 1 5 6 7": the tail "5 6 7" occurred before, followed by 8.
+        let context = [5, 6, 7, 8, 1, 5, 6, 7];
+        assert_eq!(lookup.draft(&context, 3).unwrap(), vec![8, 1, 5]);
+        assert_eq!(lookup.draft(&context, 1).unwrap(), vec![8]);
+        assert!(lookup.draft(&context, 0).unwrap().is_empty());
+        // Nothing earlier matches a 2-gram of fresh tokens.
+        assert!(lookup.draft(&[1, 2, 3, 4, 5, 6], 4).unwrap().is_empty());
+        // The most recent earlier occurrence wins.
+        let context = [1, 2, 9, 1, 2, 8, 1, 2];
+        assert_eq!(lookup.draft(&context, 1).unwrap(), vec![8]);
+    }
+
+    // ---- config.json ----------------------------------------------------
+
+    fn qwen3_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 64,
+            "intermediate_size": 192,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 32,
+            "num_hidden_layers": 6,
+            "vocab_size": 1000,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1000000,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": true,
+        })
+    }
+
+    #[test]
+    fn the_shape_comes_from_config_json() {
+        let opts = AneLmOptions {
+            capacity: 256,
+            ..AneLmOptions::default()
+        };
+        let shape = ModelShape::from_config(&qwen3_config(), &opts).unwrap();
+        assert_eq!((shape.n_layers, shape.vocab), (6, 1000));
+        assert_eq!(
+            (
+                shape.cfg.dim,
+                shape.cfg.n_heads,
+                shape.cfg.n_kv_heads,
+                shape.cfg.head_dim
+            ),
+            (64, 4, 2, 32)
+        );
+        assert_eq!((shape.cfg.width, shape.cfg.capacity), (16, 256));
+        assert_eq!(shape.rope_theta, 1e6);
+        assert!(shape.tied);
+
+        // transformers' newer layout, and an untied head.
+        let mut config = qwen3_config();
+        config["rope_theta"] = serde_json::Value::Null;
+        config["rope_parameters"] = serde_json::json!({"rope_type": "default", "rope_theta": 5e6});
+        config["tie_word_embeddings"] = serde_json::json!(false);
+        let shape = ModelShape::from_config(&config, &opts).unwrap();
+        assert_eq!(shape.rope_theta, 5e6);
+        assert!(!shape.tied);
+    }
+
+    #[test]
+    fn a_config_the_engine_would_misread_is_refused_up_front() {
+        let opts = AneLmOptions {
+            capacity: 256,
+            ..AneLmOptions::default()
+        };
+        let refused = |edit: &dyn Fn(&mut serde_json::Value), opts: &AneLmOptions| {
+            let mut config = qwen3_config();
+            edit(&mut config);
+            ModelShape::from_config(&config, opts)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(refused(&|c| c["model_type"] = "llama".into(), &opts).contains("llama"));
+        assert!(
+            refused(
+                &|c| c["rope_parameters"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0}),
+                &opts
+            )
+            .contains("yarn")
+        );
+        assert!(
+            refused(
+                &|c| {
+                    c.as_object_mut().unwrap().remove("hidden_size");
+                },
+                &opts
+            )
+            .contains("hidden_size")
+        );
+        assert!(
+            refused(&|c| c["num_attention_heads"] = 0.into(), &opts)
+                .contains("num_attention_heads")
+        );
+        let past = AneLmOptions {
+            capacity: 8192,
+            ..AneLmOptions::default()
+        };
+        assert!(refused(&|_| {}, &past).contains("max_position_embeddings"));
+        let taps = AneLmOptions {
+            capacity: 256,
+            taps: vec![2, 6],
+            ..AneLmOptions::default()
+        };
+        assert!(refused(&|_| {}, &taps).contains("taps"));
+        let unsorted = AneLmOptions {
+            taps: vec![3, 1],
+            ..taps
+        };
+        assert!(refused(&|_| {}, &unsorted).contains("taps"));
+    }
+
+    #[test]
+    fn an_untied_head_must_be_in_the_checkpoint() {
+        assert_eq!(
+            head_tensor(true, false).unwrap(),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            head_tensor(true, true).unwrap(),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(head_tensor(false, true).unwrap(), "lm_head.weight");
+        let err = head_tensor(false, false).unwrap_err().to_string();
+        assert!(err.contains("lm_head.weight"), "{err}");
     }
 }

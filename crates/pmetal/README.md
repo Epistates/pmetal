@@ -117,7 +117,7 @@ PMetal auto-detects Apple Silicon capabilities and tunes kernel parameters per d
 - **NAX** (Neural Accelerators in GPU) on M5/Apple10
 - **ANE** (Apple Neural Engine) with CPU RMSNorm workaround for fp16 stability
 - **UltraFusion** multi-die topology detection
-- **Tier-based tuning**: FlashAttention block sizes, GEMM tile sizes, threadgroup sizes, batch multipliers
+- **Tier-based tuning**: threadgroup sizes, chunk sizes, batch multipliers
 
 ## Examples
 

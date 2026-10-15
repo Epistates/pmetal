@@ -50,15 +50,14 @@ fn main() {
     let compiler_id = compiler_identity();
 
     // Compile Metal 3 shaders (always)
-    let mut fingerprint_sources: Vec<PathBuf> = Vec::new();
     if shaders_dir.exists() {
-        fingerprint_sources.push(compile_metal_shaders(
+        compile_metal_shaders(
             &shaders_dir,
             &out_dir,
             "air64-apple-macos14.0",
             "pmetal_kernels",
             &compiler_id,
-        ));
+        );
     } else {
         println!(
             "cargo:warning=No metal shaders directory found at {:?}",
@@ -69,28 +68,18 @@ fn main() {
     // Compile Metal 4 / MPP shaders (conditional on toolchain support)
     let has_metal4 = metal_version >= 400 && sdk_version >= 26.0;
     if has_metal4 && metal4_dir.exists() && metal_sources(&metal4_dir).next().is_some() {
-        fingerprint_sources.push(compile_metal_shaders(
+        compile_metal_shaders(
             &metal4_dir,
             &out_dir,
             "air64-apple-macos26.0",
             "pmetal_kernels_metal4",
             &compiler_id,
-        ));
+        );
         println!("cargo:rustc-cfg=has_metal4");
         println!(
             "cargo:warning=Metal 4 / MPP shaders compiled (Metal version {metal_version}, SDK {sdk_version})"
         );
     }
-
-    // A digest of the compiled libraries. Cached tuning results are scoped to
-    // it, so a result measured with one build of a kernel is never reused for
-    // another.
-    let mut digest = FNV_OFFSET;
-    for library in &fingerprint_sources {
-        let bytes = fs::read(library).expect("Failed to read compiled metallib");
-        digest = fnv1a(digest, &bytes);
-    }
-    println!("cargo:rustc-env=PMETAL_KERNEL_FINGERPRINT={digest:016x}");
 
     // Link against Accelerate.framework for vDSP vector operations
     println!("cargo:rustc-link-lib=framework=Accelerate");
@@ -101,15 +90,6 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         // AppleNeuralEngine.framework is loaded at runtime via dlopen, not linked here
     }
-}
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// FNV-1a, 64-bit.
-fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
-    bytes.iter().fold(seed, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
 }
 
 /// Run `xcrun -sdk macosx metal <args>`, feeding `stdin` if given.
