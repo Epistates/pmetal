@@ -2,8 +2,9 @@
 //!
 //! - `gdn_metal_step` / `gdn_metal_state_update` dispatch to the fused Metal
 //!   kernel (used during inference for Qwen3Next-style hybrid archs).
-//! - `gdn_update` is the bridge-level wrapper that falls back to an ops-based
-//!   loop when the fused kernel cannot run.
+//!
+//! The gated delta rule's dispatcher, with its ops-based sequential and
+//! chunkwise forms, is [`crate::nn::gated_delta`].
 
 use std::mem::MaybeUninit;
 
@@ -81,56 +82,6 @@ impl InlineArray {
             Self {
                 raw: dst_state.assume_init(),
             }
-        }
-    }
-
-    // ── GDN recurrence ────────────────────────────────────────────────────
-
-    /// GDN recurrence step (gated delta network) — dispatches to the fused
-    /// Metal kernel when possible (inference, `Dk % 32 == 0`, `Dk <= 256`),
-    /// otherwise falls back to an ops-based sequential loop.
-    ///
-    /// Returns `(y, new_state)`.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    // TODO(gdn): candidate entry point for Qwen3Next GDN; current code calls
-    // the fused kernel directly via `pmetal_runtime::nn::gated_delta`. Keep
-    // until the bridge-level wrapper is chosen as the canonical surface.
-    pub fn gdn_update(
-        q: &Self,
-        k: &Self,
-        v: &Self,
-        a: &Self,
-        b: &Self,
-        a_log: &Self,
-        dt_bias: &Self,
-        state: &Self,
-        training: bool,
-    ) -> (Self, Self) {
-        let mut dst_y = MaybeUninit::<RawBuf>::uninit();
-        let mut dst_state = MaybeUninit::<RawBuf>::uninit();
-        unsafe {
-            mlx_inline_gdn_update(
-                dst_y.as_mut_ptr(),
-                dst_state.as_mut_ptr(),
-                &q.raw,
-                &k.raw,
-                &v.raw,
-                &a.raw,
-                &b.raw,
-                &a_log.raw,
-                &dt_bias.raw,
-                &state.raw,
-                training,
-            );
-            (
-                Self {
-                    raw: dst_y.assume_init(),
-                },
-                Self {
-                    raw: dst_state.assume_init(),
-                },
-            )
         }
     }
 }

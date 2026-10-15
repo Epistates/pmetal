@@ -177,20 +177,6 @@ bridge_extern! {
     pub(super) fn mlx_inline_array_size() -> usize;
     pub(super) fn mlx_inline_array_align() -> usize;
 
-    pub(super) fn mlx_inline_gdn_update(
-        dst_y: *mut RawBuf,
-        dst_state: *mut RawBuf,
-        q: *const RawBuf,
-        k: *const RawBuf,
-        v: *const RawBuf,
-        a: *const RawBuf,
-        b: *const RawBuf,
-        a_log: *const RawBuf,
-        dt_bias: *const RawBuf,
-        state_in: *const RawBuf,
-        training: bool,
-    ) -> i32;
-
     pub(super) fn mlx_inline_set_wired_limit(limit: usize) -> usize;
     pub(super) fn mlx_inline_get_max_recommended_size() -> usize;
     pub(super) fn mlx_inline_new_stream() -> i32;

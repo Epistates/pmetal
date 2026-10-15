@@ -18,7 +18,7 @@
 #include "bridge/fast.h"          // rms_norm/rope/sdpa/conv/tri_inv/svd/layer_norm
 #include "bridge/compiled.h"      // fused compiled ops + generic compile wrapper
 #include "bridge/quantized.h"     // dequantize/quantized_matmul/gather_qmm/quantize
-#include "bridge/gdn.h"           // gdn_update / gdn_metal_step / state_update
+#include "bridge/gdn.h"           // gdn_metal_step / state_update
 #include "bridge/turboquant.h"    // TurboQuant encode/decode/score/pack/attention
 #include "bridge/diagnostics.h"   // graph/metal capture/memory/stream helpers
 #include "bridge/safetensors.h"   // load/save safetensors, random_seed

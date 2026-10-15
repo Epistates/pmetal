@@ -10,24 +10,6 @@
 extern "C" {
 #endif
 
-// GDN recurrence step — calls the Metal kernel for single-dispatch recurrence.
-// q, k: [B, T, Hk, Dk], v: [B, T, Hv, Dv], g: [B, T, Hv], beta: [B, T, Hv]
-// state_in: [B, Hv, Dv, Dk]
-// Returns y → dst_y [B, T, Hv, Dv], new_state → dst_state [B, Hv, Dv, Dk]
-// Returns 0 on success, 1 if Metal kernel not available (caller should use ops fallback).
-int mlx_inline_gdn_update(
-    mlx_inline_array* dst_y,
-    mlx_inline_array* dst_state,
-    const mlx_inline_array* q,
-    const mlx_inline_array* k,
-    const mlx_inline_array* v,
-    const mlx_inline_array* a,
-    const mlx_inline_array* b,
-    const mlx_inline_array* a_log,
-    const mlx_inline_array* dt_bias,
-    const mlx_inline_array* state_in,
-    bool training);
-
 // GDN Metal kernel step with pre-computed g and beta.
 // q, k: [B, T, Hk, Dk], v: [B, T, Hv, Dv], g: [B, T, Hv], beta: [B, T, Hv]
 // state_in: [B, Hv, Dv, Dk], T: sequence length (usually 1 for decode)
