@@ -1046,8 +1046,14 @@ impl InferenceGenState {
             LoadedModel::Standard(ref mut model) => {
                 let mamba = &mut self.mamba_cache;
                 generate_cached_async_streaming(
+                    // Sampling reads the last position's logits alone.
                     |input, cache| {
-                        model.forward_with_hybrid_cache(input, None, Some(cache), mamba.as_mut())
+                        model.forward_with_hybrid_cache_last(
+                            input,
+                            None,
+                            Some(cache),
+                            mamba.as_mut(),
+                        )
                     },
                     &self.input_ids,
                     self.gen_config.clone(),

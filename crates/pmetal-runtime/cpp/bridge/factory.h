@@ -37,6 +37,14 @@ void mlx_inline_from_u8_slice(mlx_inline_array* dst, const uint8_t* data, const 
 void mlx_inline_from_u16_bits_slice(mlx_inline_array* dst, const uint16_t* data, const int* shape, int ndim, int dtype);
 void mlx_inline_from_i32_slice(mlx_inline_array* dst, const int32_t* data, int len);
 
+// An array over memory the caller owns, with no copy (MLX wraps it in a Metal
+// buffer when `data` is page-aligned and `product(shape) * itemsize` is a
+// multiple of the page size, and copies it otherwise). `release(ctx)` runs
+// exactly once, when MLX drops the last reference to the array, or at once if
+// the array could not be built.
+void mlx_inline_from_external(mlx_inline_array* dst, void* data, const int* shape, int ndim,
+                              int dtype, void (*release)(void* ctx), void* ctx);
+
 // Copy evaluated f32 data out of an array into a caller-provided buffer.
 // Array is cast to float32 and eval'd. n must equal the total element count.
 // Returns 0 on success, -1 on size mismatch.

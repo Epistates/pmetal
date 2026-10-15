@@ -1,14 +1,16 @@
-//! Expert I/O infrastructure for SSD-offloaded MoE inference.
+//! Expert I/O for SSD-offloaded MoE inference.
 //!
-//! Implements high-performance parallel `pread()` I/O for loading individual expert
-//! weights from packed binary files. Key design decisions:
+//! Parallel `pread()` of individual experts from the packed per-layer files
+//! (see [`crate::expert_layout`]) into memory the caller provides. Design:
 //!
-//! - **pread() over mmap()**: 5x faster for cold reads (DMA controller optimization)
-//! - **No custom caching**: OS page cache provides 38% better performance
-//! - **Persistent thread pool**: Workers spawned once, live until Drop — eliminates
-//!   thread creation overhead per layer (was thread::scope per call)
-//!
-//! # Architecture
+//! - **`pread()` over `mmap()`**: cold reads are several times faster (the DMA
+//!   controller streams them), and no page of a file sits mapped into the
+//!   process to be faulted in under the GPU's feet.
+//! - **No cache of our own**: the OS page cache holds what was read recently
+//!   and does it better than any cache layered over it (a hit rate near 70% at
+//!   no cost to GPU memory). What is read twice is served from it.
+//! - **A persistent thread pool**: workers are spawned once and live until
+//!   `Drop`, so a layer pays no thread creation.
 //!
 //! ```text
 //! ExpertOffloadContext
@@ -16,7 +18,6 @@
 //!   └── ExpertIoPool       — persistent N-thread pread pool (channel-based)
 //! ```
 
-use std::collections::HashSet;
 use std::fs::File;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -24,13 +25,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-
-use pmetal_metal::{
-    buffer::{BufferUsage, MetalBuffer},
-    context::MetalContext,
-    error::MetalError,
-};
-use pmetal_runtime::compat::Array;
 
 use crate::expert_layout::ExpertPackLayout;
 
@@ -45,58 +39,28 @@ fn io_thread_count() -> usize {
     }
 }
 
-/// A pread task sent to a worker thread.
-struct IoWork {
-    /// Byte offset in the file.
+/// A pread task sent to a worker thread: `size` bytes at `offset` of `file`
+/// into the memory at `dst_addr`.
+struct ReadTask {
+    file: Arc<File>,
     offset: u64,
-    /// Number of bytes to read.
     size: usize,
-    /// Index into the results vec (for ordering).
-    result_idx: usize,
-}
-
-/// Result from a worker thread.
-struct IoResult {
-    /// Index into the results vec.
-    result_idx: usize,
-    /// The completed task payload, or an error.
-    data: std::io::Result<IoPayload>,
-}
-
-struct BytesIoTask {
-    work: IoWork,
-    file: Arc<File>,
-    result_tx: mpsc::Sender<IoResult>,
-}
-
-#[cfg(unix)]
-struct FillIoTask {
-    work: IoWork,
-    file: Arc<File>,
     dst_addr: usize,
-    result_tx: mpsc::Sender<IoResult>,
-}
-
-enum IoPayload {
-    Bytes(Vec<u8>),
-    Filled,
-}
-
-#[cfg(unix)]
-enum IoTask {
-    Bytes(BytesIoTask),
-    Fill(FillIoTask),
+    /// Index of the task in its batch, for error messages.
+    index: usize,
+    result_tx: mpsc::Sender<(usize, std::io::Result<()>)>,
 }
 
 /// Persistent thread pool for parallel pread() operations.
 ///
 /// Workers are spawned once at construction and live until `Drop`.
 /// Uses `std::sync::mpsc` channels for work dispatch and result collection.
-/// Each worker does `FileExt::read_at()` (safe Rust wrapper for `pread(2)`)
-/// which allows concurrent positional reads without seeking or locking.
+/// Each worker does `FileExt::read_exact_at` (safe Rust wrapper for
+/// `pread(2)`) which allows concurrent positional reads without seeking or
+/// locking.
 pub struct ExpertIoPool {
     workers: Vec<JoinHandle<()>>,
-    task_tx: mpsc::Sender<IoTask>,
+    task_tx: mpsc::Sender<ReadTask>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -108,7 +72,7 @@ impl ExpertIoPool {
 
     /// Create with a specific number of threads.
     pub fn with_threads(num_threads: usize) -> Self {
-        let (task_tx, task_rx) = mpsc::channel::<IoTask>();
+        let (task_tx, task_rx) = mpsc::channel::<ReadTask>();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Wrap task_rx in an Arc<Mutex<>> so multiple workers can share it
@@ -128,35 +92,12 @@ impl ExpertIoPool {
                             let rx = task_rx.lock().unwrap();
                             rx.recv()
                         };
-
-                        match task {
-                            Ok(IoTask::Bytes(task)) => {
-                                let data = Self::do_pread_bytes(
-                                    &task.file,
-                                    task.work.offset,
-                                    task.work.size,
-                                )
-                                .map(IoPayload::Bytes);
-                                let _ = task.result_tx.send(IoResult {
-                                    result_idx: task.work.result_idx,
-                                    data,
-                                });
-                            }
-                            Ok(IoTask::Fill(task)) => {
-                                let data = Self::do_pread_into(
-                                    &task.file,
-                                    task.work.offset,
-                                    task.work.size,
-                                    task.dst_addr,
-                                )
-                                .map(|()| IoPayload::Filled);
-                                let _ = task.result_tx.send(IoResult {
-                                    result_idx: task.work.result_idx,
-                                    data,
-                                });
-                            }
-                            Err(_) => break, // Channel closed
-                        }
+                        let Ok(task) = task else {
+                            break; // Channel closed
+                        };
+                        let result =
+                            Self::do_pread_into(&task.file, task.offset, task.size, task.dst_addr);
+                        let _ = task.result_tx.send((task.index, result));
                     }
                 })
                 .expect("Failed to spawn expert-io thread");
@@ -171,14 +112,6 @@ impl ExpertIoPool {
         }
     }
 
-    /// Read bytes at a given offset using pread (no seek, no lock).
-    #[cfg(unix)]
-    fn do_pread_bytes(file: &File, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; size];
-        file.read_exact_at(&mut buf, offset)?;
-        Ok(buf)
-    }
-
     /// Read bytes directly into a caller-provided mutable region.
     #[cfg(unix)]
     #[allow(unsafe_code)]
@@ -188,147 +121,34 @@ impl ExpertIoPool {
         size: usize,
         dst_addr: usize,
     ) -> std::io::Result<()> {
-        // SAFETY: `parallel_read_into_slices` only submits pointers derived from
-        // unique `&mut [u8]` slices that remain alive until all worker results
-        // have been collected.
+        // SAFETY: `parallel_read_into_addrs` only submits addresses its caller
+        // vouches for as unique writable regions of at least `size` bytes that
+        // stay alive until all results have been collected.
         let dst = unsafe { std::slice::from_raw_parts_mut(dst_addr as *mut u8, size) };
-        file.read_exact_at(dst, offset)?;
-        Ok(())
+        file.read_exact_at(dst, offset)
     }
 
     #[cfg(not(unix))]
-    fn do_pread_bytes(_file: &File, _offset: u64, _size: usize) -> std::io::Result<Vec<u8>> {
+    fn do_pread_into(
+        _file: &File,
+        _offset: u64,
+        _size: usize,
+        _dst_addr: usize,
+    ) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "pread is not available on this platform",
         ))
     }
 
-    /// Read multiple expert chunks from a file in parallel.
+    /// Read `size` bytes at each of `offsets` of `file` into the regions at
+    /// `dst_addrs`, in parallel, and return once every read has finished.
     ///
-    /// Dispatches `offsets.len()` pread tasks to the worker pool and collects
-    /// results in order. Each task reads `size` bytes at the given offset.
-    ///
-    /// Returns one `Vec<u8>` per offset, in the same order as the input.
-    pub fn parallel_read(
-        &self,
-        file: &Arc<File>,
-        offsets: &[u64],
-        size: usize,
-    ) -> std::io::Result<Vec<Vec<u8>>> {
-        let n = offsets.len();
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-
-        // For a single task, skip the channel overhead
-        if n == 1 {
-            let data = Self::do_pread_bytes(file, offsets[0], size);
-            return Ok(vec![data?]);
-        }
-
-        // Dispatch all tasks
-        let (result_tx, result_rx) = mpsc::channel::<IoResult>();
-        for (i, &offset) in offsets.iter().enumerate() {
-            let work = IoWork {
-                offset,
-                size,
-                result_idx: i,
-            };
-            self.task_tx
-                .send(IoTask::Bytes(BytesIoTask {
-                    work,
-                    file: file.clone(),
-                    result_tx: result_tx.clone(),
-                }))
-                .map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
-                })?;
-        }
-        drop(result_tx);
-
-        // Collect all results
-        let mut results: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
-        for _ in 0..n {
-            let result = result_rx.recv().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "IO pool result channel closed",
-                )
-            })?;
-            match result.data {
-                Ok(IoPayload::Bytes(data)) => {
-                    results[result.result_idx] = Some(data);
-                }
-                Ok(IoPayload::Filled) => {
-                    return Err(std::io::Error::other(format!(
-                        "unexpected fill completion for byte task {}",
-                        result.result_idx
-                    )));
-                }
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("pread failed for task {}: {}", result.result_idx, e),
-                    ));
-                }
-            }
-        }
-
-        // Unwrap all results (all should be Some at this point)
-        Ok(results.into_iter().map(|r| r.unwrap()).collect())
-    }
-
-    /// Read multiple expert chunks directly into caller-owned mutable slices.
-    ///
-    /// The slices remain owned by the caller; the pool only uses raw pointers
-    /// for the lifetime of this call and waits for all completions before
-    /// returning.
-    #[cfg(unix)]
-    pub fn parallel_read_into_slices(
-        &self,
-        file: &Arc<File>,
-        offsets: &[u64],
-        targets: &mut [&mut [u8]],
-        size: usize,
-    ) -> std::io::Result<()> {
-        let n = offsets.len();
-        if n != targets.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("offsets.len()={} != targets.len()={}", n, targets.len()),
-            ));
-        }
-        if n == 0 {
-            return Ok(());
-        }
-        for (i, target) in targets.iter().enumerate() {
-            if target.len() < size {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "target {} too small for read: len={} < size={}",
-                        i,
-                        target.len(),
-                        size
-                    ),
-                ));
-            }
-        }
-
-        let dst_addrs: Vec<usize> = targets
-            .iter_mut()
-            .map(|target| target.as_mut_ptr() as usize)
-            .collect();
-        self.parallel_read_into_addrs(file, offsets, &dst_addrs, size)
-    }
-
-    /// Read multiple expert chunks directly into caller-owned mutable regions.
-    ///
+    /// # Safety
     /// Each address must point to a unique writable region of at least `size`
-    /// bytes that stays alive until this call returns.
-    #[cfg(unix)]
-    pub fn parallel_read_into_addrs(
+    /// bytes that stays alive, and is not read, until this call returns.
+    #[allow(unsafe_code)]
+    pub unsafe fn parallel_read_into_addrs(
         &self,
         file: &Arc<File>,
         offsets: &[u64],
@@ -345,56 +165,93 @@ impl ExpertIoPool {
         if n == 0 {
             return Ok(());
         }
-
+        // One read needs no hand-off.
         if n == 1 {
             return Self::do_pread_into(file, offsets[0], size, dst_addrs[0]);
         }
 
-        let (result_tx, result_rx) = mpsc::channel::<IoResult>();
-        for (i, (&offset, &dst_addr)) in offsets.iter().zip(dst_addrs.iter()).enumerate() {
-            let work = IoWork {
-                offset,
-                size,
-                result_idx: i,
-            };
+        let (result_tx, result_rx) = mpsc::channel();
+        for (index, (&offset, &dst_addr)) in offsets.iter().zip(dst_addrs).enumerate() {
             self.task_tx
-                .send(IoTask::Fill(FillIoTask {
-                    work,
+                .send(ReadTask {
                     file: file.clone(),
+                    offset,
+                    size,
                     dst_addr,
+                    index,
                     result_tx: result_tx.clone(),
-                }))
+                })
                 .map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
                 })?;
         }
         drop(result_tx);
 
+        // Every read must finish before this returns, failed or not: a worker
+        // still writing into the caller's memory after an early return would be
+        // a use after free.
+        let mut first_error = None;
         for _ in 0..n {
-            let result = result_rx.recv().map_err(|_| {
+            let (index, result) = result_rx.recv().map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "IO pool result channel closed",
                 )
             })?;
-            match result.data {
-                Ok(IoPayload::Filled) => {}
-                Ok(IoPayload::Bytes(_)) => {
-                    return Err(std::io::Error::other(format!(
-                        "unexpected byte payload for fill task {}",
-                        result.result_idx
-                    )));
-                }
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        e.kind(),
-                        format!("pread failed for task {}: {}", result.result_idx, e),
-                    ));
-                }
+            if let Err(e) = result
+                && first_error.is_none()
+            {
+                first_error = Some(std::io::Error::new(
+                    e.kind(),
+                    format!("pread failed for task {index}: {e}"),
+                ));
             }
         }
+        first_error.map_or(Ok(()), Err)
+    }
 
-        Ok(())
+    /// [`parallel_read_into_addrs`](Self::parallel_read_into_addrs) over
+    /// caller-owned slices, which the borrow checker keeps alive and unique.
+    pub fn parallel_read_into_slices(
+        &self,
+        file: &Arc<File>,
+        offsets: &[u64],
+        targets: &mut [&mut [u8]],
+        size: usize,
+    ) -> std::io::Result<()> {
+        if offsets.len() != targets.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "offsets.len()={} != targets.len()={}",
+                    offsets.len(),
+                    targets.len()
+                ),
+            ));
+        }
+        for (i, target) in targets.iter().enumerate() {
+            if target.len() < size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "target {} too small for read: len={} < size={}",
+                        i,
+                        target.len(),
+                        size
+                    ),
+                ));
+            }
+        }
+        let dst_addrs: Vec<usize> = targets
+            .iter_mut()
+            .map(|target| target.as_mut_ptr() as usize)
+            .collect();
+        // SAFETY: the addresses come from unique `&mut [u8]` of at least `size`
+        // bytes, borrowed for this whole call.
+        #[allow(unsafe_code)]
+        unsafe {
+            self.parallel_read_into_addrs(file, offsets, &dst_addrs, size)
+        }
     }
 }
 
@@ -509,14 +366,19 @@ impl ExpertOffloadContext {
         })
     }
 
-    /// Read `k` expert weight buffers for a given layer in parallel.
+    /// Read the records of `expert_indices` of `layer_idx` into the memory at
+    /// `dst`, expert `i` at `dst + i * expert_size`, in parallel.
     ///
-    /// Returns `k` byte vectors, each containing the raw expert weight data.
-    pub fn read_experts(
+    /// # Safety
+    /// `dst` must be writable for `expert_indices.len() * expert_size` bytes,
+    /// and nothing else may touch them until this returns.
+    #[allow(unsafe_code)]
+    pub unsafe fn read_experts_into(
         &self,
         layer_idx: usize,
         expert_indices: &[usize],
-    ) -> std::io::Result<Vec<Vec<u8>>> {
+        dst: *mut u8,
+    ) -> std::io::Result<()> {
         let file = self.file_manager.file_for_layer(layer_idx).ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -525,267 +387,95 @@ impl ExpertOffloadContext {
         })?;
 
         let expert_size = self.file_manager.expert_size();
-        let offsets: Vec<u64> = expert_indices
-            .iter()
-            .map(|&idx| self.file_manager.expert_offset(idx))
-            .collect();
-
-        self.io_pool.parallel_read(file, &offsets, expert_size)
-    }
-    /// Read experts directly into pre-allocated AlignedBuffers (zero-copy path).
-    ///
-    /// Each `AlignedBuffer` is filled via `pread()` directly into GPU-visible
-    /// memory. The buffers can be passed straight to the Metal encoder with
-    /// component offsets from `ExpertRecord` — no intermediate copies.
-    ///
-    /// # Arguments
-    /// * `layer_idx` - Transformer layer index
-    /// * `expert_indices` - Which experts to load
-    /// * `buffers` - Pre-acquired AlignedBuffers from ExpertBufferPool (one per expert)
-    #[cfg(unix)]
-    pub fn read_experts_aligned(
-        &self,
-        layer_idx: usize,
-        expert_indices: &[usize],
-        buffers: &mut [pmetal_metal::expert_buffer::AlignedBuffer],
-    ) -> std::io::Result<()> {
-        if expert_indices.len() != buffers.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "expert_indices.len()={} != buffers.len()={}",
-                    expert_indices.len(),
-                    buffers.len()
-                ),
-            ));
-        }
-
-        let plan: Vec<(usize, usize)> = expert_indices
-            .iter()
-            .enumerate()
-            .map(|(slot_idx, &expert_idx)| (slot_idx, expert_idx))
-            .collect();
-        self.read_experts_aligned_with_plan(layer_idx, &plan, buffers)
-    }
-
-    /// Read experts directly into selected aligned-buffer slots.
-    ///
-    /// `plan` entries are `(slot_idx, expert_idx)` pairs. This is used by the
-    /// mixed prefetched-hit / synchronous-miss path so it can fill only the
-    /// missing buffer slots while still reusing the same persistent I/O pool as
-    /// the full aligned load path.
-    #[cfg(unix)]
-    pub fn read_experts_aligned_with_plan(
-        &self,
-        layer_idx: usize,
-        plan: &[(usize, usize)],
-        buffers: &mut [pmetal_metal::expert_buffer::AlignedBuffer],
-    ) -> std::io::Result<()> {
-        if plan.is_empty() {
-            return Ok(());
-        }
-
-        let file = self.file_manager.file_for_layer(layer_idx).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Layer {} has no MoE expert file", layer_idx),
-            )
-        })?;
-
-        let expert_size = self.file_manager.expert_size();
-        let buffer_count = buffers.len();
-        let mut offsets = Vec::with_capacity(plan.len());
-        let mut dst_addrs = Vec::with_capacity(plan.len());
-        let mut used_slots = HashSet::with_capacity(plan.len());
-        for &(slot_idx, expert_idx) in plan {
-            if !used_slots.insert(slot_idx) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("duplicate aligned buffer slot {} in read plan", slot_idx),
-                ));
-            }
-            let buf = buffers.get_mut(slot_idx).ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "plan slot {} out of bounds for {} aligned buffers",
-                        slot_idx, buffer_count
-                    ),
-                )
-            })?;
-            if buf.size() < expert_size {
+        let mut offsets = Vec::with_capacity(expert_indices.len());
+        let mut dst_addrs = Vec::with_capacity(expert_indices.len());
+        for (slot, &expert_idx) in expert_indices.iter().enumerate() {
+            if expert_idx >= self.layout.num_experts {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "aligned buffer {} too small: size={} < expert_size={}",
-                        slot_idx,
-                        buf.size(),
-                        expert_size
+                        "expert {expert_idx} out of range for {} experts",
+                        self.layout.num_experts
                     ),
                 ));
             }
-            let slice = buf
-                .prefix_mut(expert_size)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
             offsets.push(self.file_manager.expert_offset(expert_idx));
-            dst_addrs.push(slice.as_mut_ptr() as usize);
+            dst_addrs.push(dst as usize + slot * expert_size);
         }
-
-        self.io_pool
-            .parallel_read_into_addrs(file, &offsets, &dst_addrs, expert_size)
+        // SAFETY: the caller vouches for `dst`; the slots are disjoint.
+        unsafe {
+            self.io_pool
+                .parallel_read_into_addrs(file, &offsets, &dst_addrs, expert_size)
+        }
     }
-}
-
-/// Copy an array into a new f32 Metal buffer, converting the dtype if needed.
-/// The array is evaluated first.
-///
-/// This is how the offloaded-expert path hands a token's hidden state to the
-/// Metal expert kernels. The buffer owns its data, so the array may be dropped
-/// or reused; the copy is for small inputs (a decode step's hidden state), not
-/// weights.
-pub(crate) fn copy_as_f32(
-    ctx: &MetalContext,
-    array: &Array,
-) -> Result<MetalBuffer<f32>, MetalError> {
-    let data = array
-        .clone()
-        .to_f32_vec(array.size())
-        .ok_or_else(|| MetalError::InvalidConfig("array could not be read as f32".into()))?;
-    MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_runtime::compat::Dtype;
     use std::io::Write;
 
-    #[test]
-    fn a_copy_holds_the_values_in_f32() {
-        let ctx = MetalContext::new().unwrap();
-        let values = [1.0f32, -2.5, 3.25, 0.0, 7.0, 8.0];
-        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
-            let array = Array::from_f32_slice(&values, &[2, 3]).as_dtype(dtype.as_i32());
-            let buffer = copy_as_f32(&ctx, &array).unwrap();
-            assert_eq!(buffer.len(), values.len());
-            assert_eq!(buffer.as_slice(), &values, "{dtype:?}");
+    fn file_with(chunks: &[&[u8]]) -> (tempfile::TempDir, Arc<File>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.bin");
+        let mut file = File::create(&path).unwrap();
+        for chunk in chunks {
+            file.write_all(chunk).unwrap();
         }
-    }
-
-    #[test]
-    fn a_copy_outlives_the_array_it_came_from() {
-        let ctx = MetalContext::new().unwrap();
-        let array = Array::from_f32_slice(&[4.0, 5.0], &[2]);
-        let buffer = copy_as_f32(&ctx, &array).unwrap();
-        drop(array);
-        assert_eq!(buffer.as_slice(), &[4.0, 5.0]);
-    }
-
-    #[test]
-    fn test_io_pool_basic() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.bin");
-
-        // Write test data
-        let mut file = File::create(&path).unwrap();
-        let data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
-        file.write_all(&data).unwrap();
         drop(file);
-
-        // Read back with pool
-        let file = Arc::new(File::open(&path).unwrap());
-
-        let pool = ExpertIoPool::new();
-        let offsets = vec![0u64, 512];
-        let results = pool.parallel_read(&file, &offsets, 512).unwrap();
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].len(), 512);
-        assert_eq!(results[1].len(), 512);
-        assert_eq!(results[0][0], 0);
-        assert_eq!(results[1][0], 0); // 512 % 256 = 0
+        (dir, Arc::new(File::open(&path).unwrap()))
     }
 
     #[test]
-    fn test_io_pool_single_task() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.bin");
-
-        let mut file = File::create(&path).unwrap();
-        file.write_all(&[42u8; 128]).unwrap();
-        drop(file);
-
-        let file = Arc::new(File::open(&path).unwrap());
+    fn reads_land_in_the_slot_their_offset_names() {
+        let data: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let (_dir, file) = file_with(&[&data]);
         let pool = ExpertIoPool::new();
-        let results = pool.parallel_read(&file, &[0], 128).unwrap();
-        assert_eq!(results[0], vec![42u8; 128]);
+
+        let mut a = vec![0u8; 512];
+        let mut b = vec![0u8; 512];
+        let mut targets: Vec<&mut [u8]> = vec![a.as_mut_slice(), b.as_mut_slice()];
+        pool.parallel_read_into_slices(&file, &[512, 0], &mut targets, 512)
+            .unwrap();
+        assert_eq!(a, &data[512..]);
+        assert_eq!(b, &data[..512]);
     }
 
     #[test]
-    fn test_io_pool_empty() {
+    fn a_single_read_and_an_empty_batch() {
+        let (_dir, file) = file_with(&[&[42u8; 128]]);
         let pool = ExpertIoPool::new();
-        let file = Arc::new(tempfile::tempfile().unwrap());
-        let results = pool.parallel_read(&file, &[], 0).unwrap();
-        assert!(results.is_empty());
+        let mut one = vec![0u8; 128];
+        pool.parallel_read_into_slices(&file, &[0], &mut [one.as_mut_slice()], 128)
+            .unwrap();
+        assert_eq!(one, vec![42u8; 128]);
+        pool.parallel_read_into_slices(&file, &[], &mut [], 0)
+            .unwrap();
     }
 
     #[test]
-    fn test_io_pool_parallel_read_is_safe_for_concurrent_callers() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.bin");
-
-        let mut file = File::create(&path).unwrap();
-        file.write_all(&[1u8; 256]).unwrap();
-        file.write_all(&[2u8; 256]).unwrap();
-        drop(file);
-
-        let file = Arc::new(File::open(&path).unwrap());
+    fn concurrent_callers_each_get_their_own_reads() {
+        let (_dir, file) = file_with(&[&[1u8; 256], &[2u8; 256]]);
         let pool = Arc::new(ExpertIoPool::with_threads(2));
 
-        let file_a = file.clone();
-        let pool_a = pool.clone();
-        let t1 = std::thread::spawn(move || pool_a.parallel_read(&file_a, &[0, 256], 256).unwrap());
-
-        let file_b = file.clone();
-        let pool_b = pool.clone();
-        let t2 = std::thread::spawn(move || pool_b.parallel_read(&file_b, &[256, 0], 256).unwrap());
-
-        let r1 = t1.join().unwrap();
-        let r2 = t2.join().unwrap();
-
-        assert_eq!(r1.len(), 2);
-        assert_eq!(r2.len(), 2);
-        assert_eq!(r1[0][0], 1);
-        assert_eq!(r1[1][0], 2);
-        assert_eq!(r2[0][0], 2);
-        assert_eq!(r2[1][0], 1);
+        let read = |pool: Arc<ExpertIoPool>, file: Arc<File>, offsets: [u64; 2]| {
+            std::thread::spawn(move || {
+                let mut a = vec![0u8; 256];
+                let mut b = vec![0u8; 256];
+                let mut targets: Vec<&mut [u8]> = vec![a.as_mut_slice(), b.as_mut_slice()];
+                pool.parallel_read_into_slices(&file, &offsets, &mut targets, 256)
+                    .unwrap();
+                (a[0], b[0])
+            })
+        };
+        let t1 = read(pool.clone(), file.clone(), [0, 256]);
+        let t2 = read(pool, file, [256, 0]);
+        assert_eq!(t1.join().unwrap(), (1, 2));
+        assert_eq!(t2.join().unwrap(), (2, 1));
     }
 
     #[test]
-    fn test_io_pool_parallel_read_into_slices() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.bin");
-
-        let mut file = File::create(&path).unwrap();
-        file.write_all(&[7u8; 128]).unwrap();
-        file.write_all(&[9u8; 128]).unwrap();
-        drop(file);
-
-        let file = Arc::new(File::open(&path).unwrap());
-        let pool = ExpertIoPool::with_threads(2);
-
-        let mut a = vec![0u8; 128];
-        let mut b = vec![0u8; 128];
-        let mut targets: Vec<&mut [u8]> = vec![a.as_mut_slice(), b.as_mut_slice()];
-        pool.parallel_read_into_slices(&file, &[0, 128], &mut targets, 128)
-            .unwrap();
-
-        assert_eq!(a, vec![7u8; 128]);
-        assert_eq!(b, vec![9u8; 128]);
-    }
-
-    #[test]
-    fn test_io_pool_parallel_read_into_slices_rejects_short_target() {
+    fn a_short_target_is_refused() {
         let file = Arc::new(tempfile::tempfile().unwrap());
         let pool = ExpertIoPool::with_threads(1);
 
@@ -796,5 +486,24 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn a_failed_read_is_an_error_after_every_read_has_finished() {
+        // One expert past the end of the file: its read fails; the others must
+        // still have completed before the error is returned.
+        let (_dir, file) = file_with(&[&[9u8; 256]]);
+        let pool = ExpertIoPool::with_threads(2);
+        let mut a = vec![0u8; 128];
+        let mut b = vec![0u8; 128];
+        let mut c = vec![0u8; 128];
+        let mut targets: Vec<&mut [u8]> =
+            vec![a.as_mut_slice(), b.as_mut_slice(), c.as_mut_slice()];
+        let err = pool
+            .parallel_read_into_slices(&file, &[0, 4096, 128], &mut targets, 128)
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(a, vec![9u8; 128]);
+        assert_eq!(c, vec![9u8; 128]);
     }
 }

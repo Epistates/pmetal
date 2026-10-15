@@ -6,8 +6,9 @@
 //! recurrent state. So the verify records each GDN layer's recurrence inputs
 //! ([`GdnReplay`]), and [`rewind_verify`] replays them over the kept prefix
 //! from the state the block started at, as the reference implementation of
-//! block drafting does. The replay runs the same kernel as the verify, and
-//! the convolution state is the last inputs of the kept prefix.
+//! block drafting does. The replay is [`gated_delta_state_advance`], the
+//! state-only form of the recurrence the verify ran (no queries, no outputs),
+//! and the convolution state is the last inputs of the kept prefix.
 
 use crate::InlineArray;
 
@@ -17,8 +18,6 @@ use super::forward::rollback_cache;
 /// One GDN layer's recurrence inputs over a verified block.
 #[derive(Clone)]
 pub struct GdnReplay {
-    /// `[B, T, Hk, Dk]`, normed and scaled.
-    pub queries: InlineArray,
     /// `[B, T, Hk, Dk]`, normed.
     pub keys: InlineArray,
     /// `[B, T, Hv, Dv]`.
@@ -72,16 +71,14 @@ pub fn rewind_verify(
         layer.ssm_state = Some(if accepted == 0 {
             replay.initial_state.clone()
         } else {
-            InlineArray::gdn_metal_step(
-                &prefix(&replay.queries),
+            crate::nn::gated_delta_state_advance(
+                &replay.initial_state,
                 &prefix(&replay.keys),
                 &prefix(&replay.values),
                 &prefix(&replay.g),
                 &prefix(&replay.beta),
-                &replay.initial_state,
-                accepted,
             )
-            .1
+            .map_err(|e| format!("rewind_verify: {e}"))?
         });
         let (b, cd) = (replay.conv_input.dim(0), replay.conv_input.dim(2));
         layer.conv_state = Some(replay.conv_input.slice(

@@ -158,6 +158,47 @@ impl InlineArray {
         }
     }
 
+    /// An array over `data`, with no copy: `shape` and `dtype` describe
+    /// `product(shape) * itemsize` bytes at `data`, which `owner` keeps alive
+    /// and which MLX reads (a lazy graph and the GPU included) until it drops
+    /// the array's last reference, at which point `owner` is dropped.
+    ///
+    /// The memory should be page-aligned and a whole number of pages long:
+    /// MLX then wraps it in a Metal buffer in place. Anything else is copied
+    /// at once, which is correct but is the copy this exists to avoid.
+    ///
+    /// # Safety
+    /// `data` must point at that many readable bytes for as long as `owner` is
+    /// alive, and nothing may write to them while the array, or any array
+    /// computed from it, can still be evaluated.
+    pub unsafe fn from_external<O: Send + 'static>(
+        data: *mut u8,
+        shape: &[i32],
+        dtype: impl IntoDtype,
+        owner: O,
+    ) -> Self {
+        unsafe extern "C" fn release<O>(ctx: *mut std::ffi::c_void) {
+            drop(unsafe { Box::from_raw(ctx.cast::<O>()) });
+        }
+        let dtype = dtype.dtype_code();
+        let ctx = Box::into_raw(Box::new(owner)).cast::<std::ffi::c_void>();
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_from_external(
+                dst.as_mut_ptr(),
+                data.cast(),
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype,
+                release::<O>,
+                ctx,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
     pub fn from_u16_bits_slice(data: &[u16], shape: &[i32], dtype: impl IntoDtype) -> Self {
         let dtype = dtype.dtype_code();
         check_slice_covers("from_u16_bits_slice", data.len(), shape);
