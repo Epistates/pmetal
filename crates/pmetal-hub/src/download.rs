@@ -90,6 +90,10 @@ impl DownloadOptions {
     }
 }
 
+/// The most a weight index (`*.index.json`) may be; real ones are well under a
+/// few megabytes.
+const MAX_INDEX_BYTES: usize = 64 * 1024 * 1024;
+
 /// What a model download would fetch: the commit, the files, their size.
 #[derive(Debug, Clone)]
 pub struct DownloadPlan {
@@ -250,7 +254,7 @@ async fn plan_for(
     let mut indexes = std::collections::HashMap::new();
     for path in index_files_to_read(&files, options.weights) {
         let bytes = repo
-            .read_file(&commit, &path)
+            .read_file(&commit, &path, MAX_INDEX_BYTES)
             .await
             .map_err(PlanError::Failed)?;
         let shards = shards_in_index(&bytes)

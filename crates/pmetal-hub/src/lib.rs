@@ -13,6 +13,7 @@
 
 #![warn(missing_docs)]
 
+mod api;
 mod auth;
 mod cache;
 mod client;

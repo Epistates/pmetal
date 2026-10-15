@@ -40,7 +40,7 @@ pub struct Recorded {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Kind {
     Model,
     Dataset,
@@ -341,7 +341,7 @@ fn handle(
             }
             let mut r = Response::error(fault.status, "Injected", "injected fault");
             if fault.status == 429 {
-                r.headers.push(("Retry-After".into(), "7".into()));
+                r.headers.push(("Retry-After".into(), "1".into()));
             }
             return r;
         }
@@ -352,6 +352,53 @@ fn handle(
         .map(percent_decode)
         .collect();
     let seg: Vec<&str> = segments.iter().map(String::as_str).collect();
+
+    // /api/models?search=…&limit=…&filter=…&pipeline_tag=…
+    if seg == ["api", "models"] {
+        let params: Vec<(String, String)> = query
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (k, v) = p.split_once('=').unwrap_or((p, ""));
+                (percent_decode(k), percent_decode(v))
+            })
+            .collect();
+        let get = |k: &str| params.iter().find(|(a, _)| a == k).map(|(_, v)| v.as_str());
+        let filters: Vec<&str> = params
+            .iter()
+            .filter(|(k, _)| k == "filter")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        let search = get("search").unwrap_or("").to_lowercase();
+        let limit: usize = get("limit").and_then(|l| l.parse().ok()).unwrap_or(1000);
+        let mut ids: Vec<&(Kind, String)> = inner
+            .repos
+            .keys()
+            .filter(|(k, _)| *k == Kind::Model)
+            .collect();
+        ids.sort();
+        let mut out = Vec::new();
+        for key in ids {
+            let repo = &inner.repos[key];
+            let mut entry = json!({ "id": key.1 });
+            if let (Some(extra), Some(obj)) = (repo.info_extra.as_object(), entry.as_object_mut()) {
+                obj.extend(extra.clone());
+            }
+            let tags: Vec<&str> = entry["tags"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let matches = key.1.to_lowercase().contains(&search)
+                && filters.iter().all(|f| tags.contains(f))
+                && get("pipeline_tag").is_none_or(|p| entry["pipeline_tag"] == p)
+                && get("author").is_none_or(|a| key.1.starts_with(&format!("{a}/")));
+            if matches {
+                out.push(entry);
+            }
+        }
+        out.truncate(limit);
+        return Response::json(200, Value::Array(out));
+    }
 
     // /api/{models|datasets}/{owner}/{name}[/revision/{rev}|/tree/{rev}[/dir]]
     if seg.first() == Some(&"api") && seg.len() >= 4 {

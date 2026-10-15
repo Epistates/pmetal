@@ -146,16 +146,36 @@ impl RepoHandle {
         }
     }
 
-    /// The bytes of one file at `commit`, read into memory (indexes, configs).
-    pub(crate) async fn read_file(&self, commit: &str, path: &str) -> Result<Vec<u8>> {
-        on_repo!(self, r => r
-            .download_file_to_bytes()
-            .filename(path)
-            .revision(commit)
-            .send()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(|e| self.err(&e)))
+    /// The bytes of one file at `commit`, read into memory (indexes, configs,
+    /// the README) without storing it in the cache. A file larger than
+    /// `max_bytes` is an error, not an allocation.
+    pub(crate) async fn read_file(
+        &self,
+        commit: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        on_repo!(self, r => {
+            let (_, mut stream) = r
+                .download_file_stream()
+                .filename(path)
+                .revision(commit)
+                .send()
+                .await
+                .map_err(|e| self.err(&e))?;
+            let mut body = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| self.err(&e))?;
+                if body.len() + chunk.as_ref().len() > max_bytes {
+                    return Err(PMetalError::Hub(format!(
+                        "{path} in {} is larger than {max_bytes} bytes; refusing to read it",
+                        self.id
+                    )));
+                }
+                body.extend_from_slice(chunk.as_ref());
+            }
+            Ok(body)
+        })
     }
 
     /// Download one file of `commit` into the cache; its snapshot path.

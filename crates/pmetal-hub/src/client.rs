@@ -43,6 +43,8 @@ const DEFAULT_RETRIES: usize = 4;
 const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long to wait for a connection to be established.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// The Hub's address when nothing says otherwise.
+const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
 
 impl HubOptions {
     /// Options carrying only the token a free function was handed.
@@ -66,6 +68,20 @@ impl HubOptions {
             .unwrap_or_else(|| offline_from(std::env::var("HF_HUB_OFFLINE").ok().as_deref()))
     }
 
+    /// The Hub's base URL without a trailing slash: the explicit endpoint,
+    /// else `HF_ENDPOINT`, else `https://huggingface.co`.
+    pub fn resolved_endpoint(&self) -> String {
+        self.endpoint
+            .clone()
+            .filter(|e| !e.trim().is_empty())
+            .or_else(|| std::env::var("HF_ENDPOINT").ok())
+            .filter(|e| !e.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned())
+            .trim()
+            .trim_end_matches('/')
+            .to_owned()
+    }
+
     /// The Hub client for these options.
     ///
     /// The token is always resolved here (see [`resolve_token`]) and handed to
@@ -75,22 +91,18 @@ impl HubOptions {
         let mut builder = HFClient::builder()
             .cache_dir(self.resolved_cache_dir())
             .retry_max_attempts(self.max_retries.unwrap_or(DEFAULT_RETRIES))
+            .endpoint(self.resolved_endpoint())
             .client(self.http_client()?);
         if let Some(token) = resolve_token(self.token.as_ref()) {
             builder = builder.token(token.expose_secret());
         }
-        if let Some(endpoint) = self.endpoint.as_deref().filter(|e| !e.trim().is_empty()) {
-            builder = builder.endpoint(endpoint.trim());
-        }
         builder.build().map_err(|e| hub_error(&e))
     }
-}
 
-impl HubOptions {
     /// The HTTP client every request goes through. Without timeouts a stalled
     /// connection would hang a download forever; this one gives up on a
     /// connection that goes silent, however large the file.
-    fn http_client(&self) -> Result<reqwest::Client> {
+    pub(crate) fn http_client(&self) -> Result<reqwest::Client> {
         let mut agent = format!("pmetal/{}", env!("CARGO_PKG_VERSION"));
         if let Ok(origin) = std::env::var("HF_HUB_USER_AGENT_ORIGIN") {
             agent.push_str("; ");
@@ -102,6 +114,11 @@ impl HubOptions {
             .read_timeout(self.stall_timeout.unwrap_or(DEFAULT_STALL_TIMEOUT))
             .build()
             .map_err(|e| PMetalError::Hub(format!("could not create the HTTP client: {e}")))
+    }
+
+    /// Retries for this connection.
+    pub(crate) fn retries(&self) -> usize {
+        self.max_retries.unwrap_or(DEFAULT_RETRIES)
     }
 }
 
@@ -129,22 +146,47 @@ pub(crate) fn hub_error_in(repo: &str, e: &HFError) -> PMetalError {
 }
 
 fn hub_error_for(repo: Option<&str>, e: &HFError) -> PMetalError {
-    let of = repo.map(|r| format!(" for '{r}'")).unwrap_or_default();
     // Listing endpoints report every failure as a bare HTTP status; the
-    // statuses that mean "who are you" and "you may not" read the same as
-    // their dedicated variants.
-    let status = match e {
-        HFError::Http { context } => Some(context.status.as_u16()),
-        HFError::AuthRequired { .. } => Some(401),
-        HFError::Forbidden { .. } => Some(403),
-        _ => None,
+    // statuses that mean "who are you", "you may not" and "slow down" read the
+    // same as their dedicated variants.
+    let (status, retry_after) = match e {
+        HFError::Http { context } => (Some(context.status.as_u16()), None),
+        HFError::AuthRequired { .. } => (Some(401), None),
+        HFError::Forbidden { .. } => (Some(403), None),
+        HFError::RateLimited { retry_after, .. } => (Some(429), *retry_after),
+        _ => (None, None),
     };
-    let message = match (e, status) {
-        (_, Some(401)) => format!(
+    let message = status
+        .and_then(|s| status_message(s, repo, retry_after, &e.to_string()))
+        .unwrap_or_else(|| match e {
+            HFError::RepoNotFound { repo_id, .. } => format!(
+                "repository '{repo_id}' was not found: check the name, or supply a token if it \
+                 is private (the Hub answers 404 for private repositories without access)"
+            ),
+            HFError::LocalEntryNotFound { path } => format!(
+                "'{path}' is not in the local cache and the network is off (offline mode); \
+                 download it once online first"
+            ),
+            other => other.to_string(),
+        });
+    PMetalError::Hub(redact_secrets(&message))
+}
+
+/// What a 401, 403 or 429 from the Hub means and what to do about it; `None`
+/// for any other status. `detail` is the lower layer's own description.
+pub(crate) fn status_message(
+    status: u16,
+    repo: Option<&str>,
+    retry_after: Option<Duration>,
+    detail: &str,
+) -> Option<String> {
+    let of = repo.map(|r| format!(" for '{r}'")).unwrap_or_default();
+    Some(match status {
+        401 => format!(
             "authentication required{of}, or the token was rejected: set HF_TOKEN, run \
-             `hf auth login`, or pass a valid access token ({e})"
+             `hf auth login`, or pass a valid access token ({detail})"
         ),
-        (_, Some(403)) => {
+        403 => {
             let gated = repo
                 .map(|r| {
                     format!(
@@ -155,33 +197,20 @@ fn hub_error_for(repo: Option<&str>, e: &HFError) -> PMetalError {
                 .unwrap_or_default();
             format!(
                 "access denied{of}: the token is valid but not allowed to do this{gated} \
-                 (a fine-grained token also needs read access to the repository) ({e})"
+                 (a fine-grained token also needs read access to the repository) ({detail})"
             )
         }
-        (HFError::RepoNotFound { repo_id, .. }, _) => format!(
-            "repository '{repo_id}' was not found: check the name, or supply a token if it is \
-             private (the Hub answers 404 for private repositories without access)"
-        ),
-        (HFError::RateLimited { .. }, _) | (_, Some(429)) => {
-            let wait = match e {
-                HFError::RateLimited {
-                    retry_after: Some(d),
-                    ..
-                } => format!(" Retry in {}s.", d.as_secs().max(1)),
-                _ => String::new(),
-            };
+        429 => {
+            let wait = retry_after
+                .map(|d| format!(" Retry in {}s.", d.as_secs().max(1)))
+                .unwrap_or_default();
             format!(
                 "the Hub is rate limiting requests{of}.{wait} A token raises the limits \
-                 (HF_TOKEN) ({e})"
+                 (HF_TOKEN) ({detail})"
             )
         }
-        (HFError::LocalEntryNotFound { path }, _) => format!(
-            "'{path}' is not in the local cache and the network is off (offline mode); \
-             download it once online first"
-        ),
-        (other, _) => other.to_string(),
-    };
-    PMetalError::Hub(redact_secrets(&message))
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -223,6 +252,15 @@ mod tests {
     }
 
     #[test]
+    fn the_endpoint_is_explicit_first_and_has_no_trailing_slash() {
+        let options = HubOptions {
+            endpoint: Some(" http://mirror.example/ ".into()),
+            ..Default::default()
+        };
+        assert_eq!(options.resolved_endpoint(), "http://mirror.example");
+    }
+
+    #[test]
     fn errors_for_a_missing_local_entry_say_the_network_is_off() {
         let err = hub_error_in(
             "o/m",
@@ -231,5 +269,19 @@ mod tests {
             },
         );
         assert!(err.to_string().contains("offline"), "{err}");
+    }
+
+    #[test]
+    fn auth_statuses_explain_themselves_and_others_do_not() {
+        let gated = status_message(403, Some("o/m"), None, "x").unwrap();
+        assert!(gated.contains("https://huggingface.co/o/m"), "{gated}");
+        assert!(
+            status_message(401, None, None, "x")
+                .unwrap()
+                .contains("HF_TOKEN")
+        );
+        let limited = status_message(429, None, Some(Duration::from_secs(9)), "x").unwrap();
+        assert!(limited.contains("Retry in 9s"), "{limited}");
+        assert!(status_message(500, None, None, "x").is_none());
     }
 }

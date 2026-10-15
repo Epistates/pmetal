@@ -189,7 +189,7 @@ async fn a_rate_limit_is_reported_with_the_wait() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("rate limiting"), "{err}");
-    assert!(err.contains("7s"), "{err}");
+    assert!(err.contains("Retry in 1s"), "{err}");
     // Bounded: one request, no retry loop.
     assert_eq!(hub.requests_to("/api/models/o/m").len(), 1);
 }
