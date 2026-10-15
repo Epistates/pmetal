@@ -14,7 +14,6 @@ pub mod fused_norm_lora;
 pub mod fused_rope;
 pub mod fused_swiglu;
 pub mod fused_training;
-pub mod moe;
 pub mod mpp_bench;
 pub mod mpp_dispatch;
 pub mod mpp_flash_attention;
@@ -27,8 +26,6 @@ pub mod mpp_dw_gemm;
 #[cfg(has_metal4)]
 pub mod mpp_fused_lora;
 #[cfg(has_metal4)]
-pub mod mpp_fused_moe;
-#[cfg(has_metal4)]
 pub mod mpp_fused_norm_lora;
 #[cfg(has_metal4)]
 pub mod mpp_fused_rope;
@@ -36,8 +33,6 @@ pub mod mpp_fused_rope;
 pub mod mpp_fused_swiglu;
 #[cfg(has_metal4)]
 pub mod mpp_fused_training;
-#[cfg(has_metal4)]
-pub mod mpp_grouped_gemm;
 
 // Re-export main types
 pub use dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
@@ -55,7 +50,6 @@ pub use fused_swiglu::{
 pub use fused_training::{
     AdamWConfig, AdamWScalars, BatchedCommandBuffer, FusedAdamW, FusedGradientClipping, ParamInfo,
 };
-pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};
 pub use mpp_flash_attention::{
     MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
 };
