@@ -12,7 +12,7 @@ use pmetal_runtime::compat::Array;
 use safetensors::Dtype;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
@@ -671,10 +671,16 @@ struct ShardEntry {
     end: u64,
 }
 
-/// The shard being written: payloads stream into a data file as tensors
-/// arrive, and the header is added when the shard closes.
+/// Bytes reserved at the start of every shard for the length prefix and the
+/// header. Payloads stream in behind it, and the header (space-padded to the
+/// reserved size, which the format allows) is written over it when the shard
+/// closes; a shard whose header outgrows the reserve is copied once instead.
+const HEADER_RESERVE: u64 = 1024 * 1024;
+
+/// The shard being written: payloads stream into the partial file, behind the
+/// reserved header region, as tensors arrive.
 struct OpenShard {
-    data_path: PathBuf,
+    partial_path: PathBuf,
     data: BufWriter<File>,
     entries: Vec<ShardEntry>,
     size: u64,
@@ -791,13 +797,21 @@ impl TensorWriter {
         }
         if self.open.is_none() {
             let index = self.closed.len() + 1;
-            let data_path = self
+            let partial_path = self
                 .output_path
-                .join(format!(".merge-shard-{index:05}.data"));
-            let file = File::create(&data_path)?;
+                .join(format!(".merge-shard-{index:05}.safetensors.partial"));
+            // Read access too, for the copy when the header outgrows the reserve.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&partial_path)?;
+            let mut data = BufWriter::with_capacity(8 * 1024 * 1024, file);
+            data.seek(SeekFrom::Start(HEADER_RESERVE))?;
             self.open = Some(OpenShard {
-                data_path,
-                data: BufWriter::with_capacity(8 * 1024 * 1024, file),
+                partial_path,
+                data,
                 entries: Vec::new(),
                 size: 0,
             });
@@ -817,16 +831,11 @@ impl TensorWriter {
     /// Close the open shard: assemble header and payloads into a partial
     /// file next to the output.
     fn close_shard(&mut self) -> Result<()> {
-        let Some(mut shard) = self.open.take() else {
+        let Some(shard) = self.open.take() else {
             return Ok(());
         };
-        shard.data.flush()?;
-        drop(shard.data);
-
         let index = self.closed.len() + 1;
-        let partial_path = self
-            .output_path
-            .join(format!(".merge-shard-{index:05}.safetensors.partial"));
+        let partial_path = shard.partial_path.clone();
 
         let mut header: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         header.insert(
@@ -844,36 +853,67 @@ impl TensorWriter {
             );
         }
         let mut header_bytes = serde_json::to_vec(&header)?;
-        // Pad to a multiple of 8 so the data section stays 8-byte aligned.
-        while header_bytes.len() % 8 != 0 {
-            header_bytes.push(b' ');
+        let fits = 8 + header_bytes.len() as u64 <= HEADER_RESERVE;
+        if fits {
+            header_bytes.resize((HEADER_RESERVE - 8) as usize, b' ');
+        } else {
+            // Pad to a multiple of 8 so the data section stays 8-byte aligned.
+            while header_bytes.len() % 8 != 0 {
+                header_bytes.push(b' ');
+            }
         }
 
-        let result = (|| -> std::io::Result<()> {
-            let mut out = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&partial_path)?);
+        let finish = |shard_data: BufWriter<File>| -> std::io::Result<Option<PathBuf>> {
+            let mut file = shard_data.into_inner().map_err(|e| e.into_error())?;
+            if fits {
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
+                file.write_all(&header_bytes)?;
+                file.sync_all()?;
+                return Ok(None);
+            }
+            // The header outgrew the reserve: copy the payloads behind it.
+            let wide = partial_path.with_extension("partial.wide");
+            let mut out = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&wide)?);
             out.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
             out.write_all(&header_bytes)?;
-            let mut data = File::open(&shard.data_path)?;
-            std::io::copy(&mut data, &mut out)?;
+            file.seek(SeekFrom::Start(HEADER_RESERVE))?;
+            std::io::copy(&mut file, &mut out)?;
             out.flush()?;
-            out.into_inner().map_err(|e| e.into_error())?.sync_all()
-        })();
-        let _ = std::fs::remove_file(&shard.data_path);
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&partial_path);
-            return Err(e.into());
-        }
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+            Ok(Some(wide))
+        };
+        let (data, size, names) = (
+            shard.data,
+            shard.size,
+            shard
+                .entries
+                .into_iter()
+                .map(|e| e.name)
+                .collect::<Vec<_>>(),
+        );
+        let partial_path = match finish(data) {
+            Ok(None) => partial_path,
+            Ok(Some(wide)) => {
+                let _ = std::fs::remove_file(&partial_path);
+                std::fs::rename(&wide, &partial_path)?;
+                partial_path
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&partial_path);
+                return Err(e.into());
+            }
+        };
 
         info!(
-            "Wrote shard {index}: {} tensors, {} bytes (dtype={:?})",
-            shard.entries.len(),
-            shard.size,
+            "Wrote shard {index}: {} tensors, {size} bytes (dtype={:?})",
+            names.len(),
             self.target_dtype
         );
         self.closed.push(ClosedShard {
             partial_path,
-            names: shard.entries.into_iter().map(|e| e.name).collect(),
-            size: shard.size,
+            names,
+            size,
         });
         Ok(())
     }
@@ -946,7 +986,7 @@ impl Drop for TensorWriter {
         }
         if let Some(shard) = self.open.take() {
             drop(shard.data);
-            let _ = std::fs::remove_file(shard.data_path);
+            let _ = std::fs::remove_file(shard.partial_path);
         }
         for shard in &self.closed {
             let _ = std::fs::remove_file(&shard.partial_path);
@@ -1119,9 +1159,16 @@ mod tests {
     #[test]
     fn hidden_files_next_to_the_weights_are_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        write_safetensors(&dir.path().join("model.safetensors"), &[("x", &[1.0], &[1])]);
+        write_safetensors(
+            &dir.path().join("model.safetensors"),
+            &[("x", &[1.0], &[1])],
+        );
         // The AppleDouble stub macOS leaves on non-native volumes.
-        std::fs::write(dir.path().join("._model.safetensors"), b"\x00\x05\x16\x07stub").unwrap();
+        std::fs::write(
+            dir.path().join("._model.safetensors"),
+            b"\x00\x05\x16\x07stub",
+        )
+        .unwrap();
         let loader = SafetensorsLoader::new(dir.path()).unwrap();
         assert_eq!(loader.tensor_names(), vec!["x"]);
     }
@@ -1226,6 +1273,36 @@ mod tests {
             &[4.0, 0.5],
             0.0,
         );
+    }
+
+    /// A header too large for the reserved region (a shard of tens of
+    /// thousands of tensors) takes the copying path and still reads back.
+    #[test]
+    fn a_shard_whose_header_outgrows_the_reserve_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = TensorWriter::with_dtype(dir.path(), Dtype::F32).unwrap();
+        let count = 20_000;
+        for i in 0..count {
+            writer
+                .write_tensor(&format!("t{i:05}"), &arr(&[i as f32], &[1]))
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+        let file = dir.path().join("model.safetensors");
+        let len = std::fs::metadata(&file).unwrap().len();
+        assert!(
+            len > HEADER_RESERVE,
+            "header should exceed the reserve: {len}"
+        );
+        let loader = SafetensorsLoader::new(dir.path()).unwrap();
+        assert_eq!(loader.tensor_names().len(), count);
+        assert_close(
+            &values(&loader.load_tensor("t19999").unwrap()),
+            &[19999.0],
+            0.0,
+        );
+        assert_close(&values(&loader.load_tensor("t00007").unwrap()), &[7.0], 0.0);
+        assert_eq!(list(dir.path()), vec!["model.safetensors"]);
     }
 
     #[test]
