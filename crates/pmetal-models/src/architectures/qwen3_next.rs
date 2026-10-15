@@ -32,17 +32,14 @@ use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
-use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
-use pmetal_mlx::{
-    gather_mm,
-    kernels::{
-        AttentionMaskType, FusedAttentionConfig,
-        fused_moe::moe_combine_mlx,
-        fused_sdpa,
-        gated_delta::gated_delta_update,
-        rope::{RopePositions, rope_embedding},
-    },
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig,
+    fused_moe::moe_combine_mlx,
+    fused_sdpa,
+    gated_delta::gated_delta_update,
+    rope::{RopePositions, rope_embedding},
 };
+use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
 use pmetal_runtime::native_weight::LayerWeight;
 
 // ============================================================================
@@ -1372,7 +1369,6 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             Some(&ssm_state),
             None,
-            false,
         )?;
 
         // Gated norm (f32 precision)
@@ -1545,12 +1541,9 @@ impl Qwen3NextGatedDeltaNet {
 
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
-        // An uncached forward is a training (or scoring) pass, which needs the
-        // differentiable ops path: the fused GDN Metal kernel has no VJP, so
-        // under value_and_grad it failed ("Primitive::vjp Not implemented
-        // for CustomKernel") and the loss came out NaN. Same rule as
-        // qwen3_next_qlora. Cached prefill and decode keep the kernel.
-        let training = cache.is_none();
+        // The recurrence picks its own path: the fused kernel has no VJP, so
+        // inputs under a gradient trace take the differentiable chunked or
+        // sequential path, and everything else keeps the kernel.
         let (out, new_state) = gated_delta_update(
             &q_normed,
             &k_normed,
@@ -1561,7 +1554,6 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
-            training,
         )?;
 
         if let Some(cache) = cache {
@@ -1641,7 +1633,6 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
-            false,
         )?;
         out.eval();
         layer_profile.push_section("gdn_recurrence", recurrence_start);
@@ -2404,15 +2395,15 @@ impl Qwen3NextSparseMoeBlock {
         let up_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_up_proj.as_ref())?;
         let gate_w = gate_weight.swap_axes(-1, -2);
         let up_w = up_weight.swap_axes(-1, -2);
-        let gate_out = gather_mm(&x_expanded, &gate_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
-        let up_out = gather_mm(&x_expanded, &up_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
+        let gate_out = x_expanded.gather_mm(&gate_w, None, Some(&top_indices_i32), false); // [N, k, 1, intermediate]
+        let up_out = x_expanded.gather_mm(&up_w, None, Some(&top_indices_i32), false); // [N, k, 1, intermediate]
 
         let activated = nn::silu(&gate_out).multiply(&up_out);
 
         // Down projection
         let down_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_down_proj.as_ref())?;
         let down_w = down_weight.swap_axes(-1, -2);
-        let down_out = gather_mm(&activated, &down_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, D]
+        let down_out = activated.gather_mm(&down_w, None, Some(&top_indices_i32), false); // [N, k, 1, D]
 
         // squeeze(-2) removes the size-1 dim: [N, k, 1, D] → [N, k, D]
         let down_out = down_out.squeeze_axes(&[-2]);

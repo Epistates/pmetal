@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa, get_training_context,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, is_training,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_mlx::kv_cache::KVCache;
@@ -284,11 +284,7 @@ impl LlamaAttention {
             });
 
         // Check if training mode is enabled for efficient backward pass
-        let is_training = get_training_context()
-            .map(|ctx| ctx.lock().map(|c| c.is_training()).unwrap_or(false))
-            .unwrap_or(false);
-
-        if !is_training && mask.is_none() {
+        if !is_training() && mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
                 if let Some(output) = (*cache_ref).try_turboquant_attention(
                     *layer_idx,

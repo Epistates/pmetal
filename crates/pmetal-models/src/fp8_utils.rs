@@ -17,8 +17,7 @@
 //!
 //! After quantisation the parameter arrays are stored as `uint8` (E4M3 format)
 //! in-place.  Inference code that reads these parameters must call
-//! `pmetal_runtime::compat::ops::from_fp8` to dequantise before computation — this matches the
-//! semantics already used by `pmetal_mlx::fp8_quantization`.
+//! `pmetal_runtime::compat::ops::from_fp8` to dequantise before computation.
 
 use pmetal_runtime::compat::ops::{from_fp8, to_fp8};
 use pmetal_runtime::compat::{Array, Dtype, Exception, ModuleParameters, ModuleParametersExt};

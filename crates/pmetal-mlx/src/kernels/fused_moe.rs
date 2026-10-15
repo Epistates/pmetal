@@ -51,94 +51,70 @@ pub fn moe_combine_mlx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_runtime::compat::{Dtype, random};
-    use serial_test::serial;
+    use crate::f64_reference::{Rng, arr, assert_close, drain, round32, vec_of};
 
-    #[test]
-    #[serial]
-    fn test_moe_combine_mlx_basic() {
-        let dim = 64i32;
-        let k = 4i32;
-        let batch_seq = 1i32;
-
-        let expert_outs = random::normal(&[batch_seq, k, dim], Dtype::Float32);
-        let expert_weights = Array::from_f32_slice(&[0.3f32, 0.25, 0.25, 0.2], &[batch_seq, k]);
-        let shared_out = random::normal(&[batch_seq, dim], Dtype::Float32);
-        let shared_gate_logit = Array::from_f32(0.5);
-
-        let result = moe_combine_mlx(
-            &expert_outs,
-            &expert_weights,
-            &shared_out,
-            &shared_gate_logit,
-            k,
-            batch_seq,
-        )
-        .unwrap();
-
-        result.eval();
-        assert_eq!(result.shape(), &[batch_seq, dim]);
-
-        // Verify no NaN
-        let data: Vec<f32> = result.as_slice().to_vec();
-        for (i, &v) in data.iter().enumerate() {
-            assert!(v.is_finite(), "NaN at index {}", i);
+    /// The combine in f64: `sum_k w_k e_k + sigmoid(g) s` per token.
+    fn reference(
+        outs: &[f64],
+        weights: &[f64],
+        shared: &[f64],
+        gate: &[f64],
+        (tokens, k, dim): (usize, usize, usize),
+    ) -> Vec<f64> {
+        let mut y = vec![0.0; tokens * dim];
+        for t in 0..tokens {
+            let g = 1.0 / (1.0 + (-gate[t % gate.len()]).exp());
+            for d in 0..dim {
+                let routed: f64 = (0..k)
+                    .map(|j| weights[t * k + j] * outs[(t * k + j) * dim + d])
+                    .sum();
+                y[t * dim + d] = routed + g * shared[t * dim + d];
+            }
         }
+        y
     }
 
+    /// The block's output is the weighted expert sum plus the gated shared
+    /// expert, for a gate per token and for one scalar gate, and carries no
+    /// residual (the decoder layer adds its own: adding the block's input here
+    /// as well counted the normalized hidden state twice).
     #[test]
-    #[serial]
-    fn test_moe_combine_mlx_batched() {
-        let dim = 32i32;
-        let k = 2i32;
-        let batch_seq = 4i32;
+    fn the_combine_is_the_weighted_sum_plus_the_gated_shared_expert() {
+        let (tokens, k, dim) = (5usize, 3usize, 8usize);
+        let mut rng = Rng(3);
+        let mut draw = |n: usize| (0..n).map(|_| round32(rng.normal())).collect::<Vec<_>>();
+        let outs = draw(tokens * k * dim);
+        let weights = draw(tokens * k);
+        let shared = draw(tokens * dim);
+        for (what, gate, gate_shape) in [
+            ("per-token gate", draw(tokens), vec![tokens, 1]),
+            ("scalar gate", draw(1), vec![]),
+        ] {
+            let got = moe_combine_mlx(
+                &arr(&outs, &[tokens, k, dim]),
+                &arr(&weights, &[tokens, k]),
+                &arr(&shared, &[tokens, dim]),
+                &arr(&gate, &gate_shape),
+                k as i32,
+                tokens as i32,
+            )
+            .unwrap();
+            drain();
+            let want = reference(&outs, &weights, &shared, &gate, (tokens, k, dim));
+            assert_close(what, &vec_of(&got), &want, 1e-5);
+        }
 
-        let expert_outs = random::normal(&[batch_seq, k, dim], Dtype::Float32);
-        let expert_weights = random::normal(&[batch_seq, k], Dtype::Float32);
-        let shared_out = random::normal(&[batch_seq, dim], Dtype::Float32);
-        let shared_gate_logit = random::normal(&[batch_seq, 1], Dtype::Float32);
-
-        let result = moe_combine_mlx(
-            &expert_outs,
-            &expert_weights,
-            &shared_out,
-            &shared_gate_logit,
-            k,
-            batch_seq,
+        // Silent experts give nothing: no residual leaks in.
+        let zeros = vec![0.0; tokens * dim];
+        let got = moe_combine_mlx(
+            &arr(&vec![0.0; tokens * k * dim], &[tokens, k, dim]),
+            &arr(&weights, &[tokens, k]),
+            &arr(&zeros, &[tokens, dim]),
+            &arr(&vec![0.0; tokens], &[tokens, 1]),
+            k as i32,
+            tokens as i32,
         )
         .unwrap();
-
-        result.eval();
-        assert_eq!(result.shape(), &[batch_seq, dim]);
-    }
-
-    /// The combine is the MoE block's output, not the layer's: the decoder adds
-    /// the residual, so with silent experts and a silent shared expert nothing
-    /// comes out. It used to add the block input back, which a decoder layer
-    /// then added a second time.
-    #[test]
-    #[serial]
-    fn test_moe_combine_mlx_adds_no_residual() {
-        let (dim, k, batch_seq) = (8i32, 2i32, 3i32);
-        let expert_outs = Array::zeros_f32(&[batch_seq, k, dim]);
-        let expert_weights = Array::from_f32_slice(&[0.5f32; 6], &[batch_seq, k]);
-        let shared_out = Array::zeros_f32(&[batch_seq, dim]);
-        let shared_gate_logit = Array::zeros_f32(&[batch_seq, 1]);
-
-        let result = moe_combine_mlx(
-            &expert_outs,
-            &expert_weights,
-            &shared_out,
-            &shared_gate_logit,
-            k,
-            batch_seq,
-        )
-        .unwrap();
-        result.eval();
-        let data: Vec<f32> = result.as_slice().to_vec();
-        assert!(
-            data.iter().all(|&v| v == 0.0),
-            "combine leaked a residual: {data:?}"
-        );
+        assert!(vec_of(&got).iter().all(|&v| v == 0.0));
     }
 }

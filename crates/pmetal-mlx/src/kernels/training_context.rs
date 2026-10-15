@@ -1,9 +1,8 @@
 //! Training-mode flag shared by the trainers and the model forwards.
 //!
 //! The training loops wrap each gradient step in [`with_training_mode`], and
-//! forwards read it back through [`get_training_context`] to skip paths that
-//! only make sense for generation (the TurboQuant KV-cache attention, for
-//! example).
+//! forwards read it back through [`is_training`] to skip paths that only make
+//! sense for generation (the TurboQuant KV-cache attention, for example).
 //!
 //! It does not choose the attention kernel. Attention that a gradient flows
 //! through goes through MLX's SDPA, whose VJP is part of MLX's autodiff;
@@ -11,64 +10,21 @@
 //! inputs themselves, so a forward differentiated outside training mode is
 //! covered too.
 
-use pmetal_metal::MetalContext;
-use std::sync::{Arc, Mutex};
+use std::cell::Cell;
 
-use super::utils::Result;
-use crate::error::MlxError;
+use pmetal_runtime::compat::Exception;
 
-/// Whether the current thread is running a training step.
-pub struct TrainingContext {
-    training: bool,
-}
-
-impl TrainingContext {
-    /// Create a new training context.
-    ///
-    /// Fails when no Metal device is available; the training loops use that
-    /// to report whether the Metal kernels can run at all.
-    pub fn new() -> Result<Self> {
-        MetalContext::global().map_err(|e| MlxError::Metal(e.to_string()))?;
-        Ok(Self { training: false })
-    }
-
-    /// Enable training mode.
-    pub fn enable_training(&mut self) {
-        self.training = true;
-    }
-
-    /// Disable training mode.
-    pub fn disable_training(&mut self) {
-        self.training = false;
-    }
-
-    /// Check if training mode is enabled.
-    pub fn is_training(&self) -> bool {
-        self.training
-    }
-}
-
-// Thread-local training context for easy access.
 thread_local! {
-    static TRAINING_CONTEXT: std::cell::RefCell<Option<Arc<Mutex<TrainingContext>>>> =
-        const { std::cell::RefCell::new(None) };
+    static TRAINING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Initialize the thread's training context.
-pub fn init_training_context() -> Result<Arc<Mutex<TrainingContext>>> {
-    let ctx = Arc::new(Mutex::new(TrainingContext::new()?));
-    TRAINING_CONTEXT.with(|c| {
-        *c.borrow_mut() = Some(ctx.clone());
-    });
-    Ok(ctx)
+/// Whether the current thread is inside [`with_training_mode`].
+pub fn is_training() -> bool {
+    TRAINING.with(Cell::get)
 }
 
-/// Get the thread's training context.
-pub fn get_training_context() -> Option<Arc<Mutex<TrainingContext>>> {
-    TRAINING_CONTEXT.with(|c| c.borrow().clone())
-}
-
-/// Run `f` with training mode enabled, and disable it again afterwards.
+/// Run `f` with training mode on, and put the mode back as it was afterwards
+/// (also if `f` panics), so calls nest.
 ///
 /// # Example
 ///
@@ -79,31 +35,15 @@ pub fn get_training_context() -> Option<Arc<Mutex<TrainingContext>>> {
 ///     Ok(loss)
 /// })
 /// ```
-pub fn with_training_mode<F, T>(f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T>,
-{
-    let ctx = get_training_context()
-        .map(Ok)
-        .unwrap_or_else(init_training_context)?;
-
-    {
-        let mut ctx_guard = ctx
-            .lock()
-            .map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
-        ctx_guard.enable_training();
+pub fn with_training_mode<T>(f: impl FnOnce() -> Result<T, Exception>) -> Result<T, Exception> {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TRAINING.with(|flag| flag.set(self.0));
+        }
     }
-
-    let result = f();
-
-    {
-        let mut ctx_guard = ctx
-            .lock()
-            .map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
-        ctx_guard.disable_training();
-    }
-
-    result
+    let _restore = Restore(TRAINING.with(|flag| flag.replace(true)));
+    f()
 }
 
 #[cfg(test)]
@@ -111,31 +51,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_training_context_mode() {
-        let mut ctx = TrainingContext::new().unwrap();
-        assert!(!ctx.is_training());
-
-        ctx.enable_training();
-        assert!(ctx.is_training());
-
-        ctx.disable_training();
-        assert!(!ctx.is_training());
+    fn the_mode_is_on_inside_and_restored_after() {
+        assert!(!is_training());
+        let seen = with_training_mode(|| Ok(is_training())).unwrap();
+        assert!(seen);
+        assert!(!is_training());
     }
 
     #[test]
-    fn test_with_training_mode() {
-        let result = with_training_mode(|| {
-            let ctx = get_training_context().unwrap();
-            let ctx_guard = ctx.lock().unwrap();
-            assert!(ctx_guard.is_training());
-            Ok(42)
+    fn calls_nest_and_an_error_restores_the_mode() {
+        with_training_mode(|| {
+            let _ = with_training_mode(|| Err::<(), _>(Exception::custom("boom")));
+            assert!(is_training(), "the inner call left the outer mode on");
+            Ok(())
+        })
+        .unwrap();
+        assert!(!is_training());
+    }
+
+    #[test]
+    fn a_panic_restores_the_mode() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = with_training_mode::<()>(|| panic!("inside"));
         });
+        assert!(result.is_err());
+        assert!(!is_training());
+    }
 
-        assert_eq!(result.unwrap(), 42);
-
-        if let Some(ctx) = get_training_context() {
-            let ctx_guard = ctx.lock().unwrap();
-            assert!(!ctx_guard.is_training());
-        }
+    #[test]
+    fn the_mode_is_per_thread() {
+        with_training_mode(|| {
+            assert!(!std::thread::spawn(is_training).join().unwrap());
+            Ok(())
+        })
+        .unwrap();
     }
 }
