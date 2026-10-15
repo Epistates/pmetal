@@ -226,6 +226,33 @@ fn every_assistant_turn_of_a_conversation_is_trained() {
     );
 }
 
+/// A template that writes the last assistant turn differently from earlier
+/// ones (an empty reasoning block only on the turn being answered, as
+/// reasoning models' templates do) cannot have its earlier turns located by
+/// rendering them alone. They are left out of the loss, not trained at the
+/// wrong bytes; the final turn trains.
+#[test]
+fn a_template_that_rewrites_earlier_turns_trains_only_the_turn_it_can_locate() {
+    let tokenizer = char_tokenizer(None);
+    let mut template = ChatTemplate::chatml();
+    template.jinja_source = Some(
+        "{% for m in messages %}<|im_start|>{{ m.role }}\n\
+         {% if m.role == 'assistant' and loop.last %}<think>\n\n</think>\n\n{% endif %}\
+         {{ m.content }}<|im_end|>\n{% endfor %}\
+         {% if add_generation_prompt %}<|im_start|>assistant\n<think>\n\n</think>\n\n{% endif %}"
+            .to_string(),
+    );
+    let ds = load(
+        &[two_turns()],
+        &tokenizer,
+        DatasetFormat::OpenAi,
+        Some(&template),
+    );
+    let trained = trained_text(ds.get(0).unwrap(), &tokenizer);
+    assert!(trained.ends_with("a2<|im_end|>\n"), "{trained:?}");
+    assert!(!trained.contains("a1"), "{trained:?}");
+}
+
 #[test]
 fn sharegpt_turns_train_like_openai_turns() {
     let tokenizer = char_tokenizer(None);
