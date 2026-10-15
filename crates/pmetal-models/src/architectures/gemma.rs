@@ -1429,6 +1429,67 @@ mod tests {
         }
     }
 
+    /// Cached decode far past the sliding window gives the logits of the
+    /// whole sequence run at once: prefill in two passes, then one token at a
+    /// time, for Gemma 2 (alternating layers) and Gemma 3 (five local layers
+    /// in six, a second RoPE base on those).
+    #[test]
+    #[serial]
+    fn cached_decode_past_the_window_matches_the_full_forward() {
+        use pmetal_runtime::compat::{Dtype, ModuleParametersExt, random};
+        let gemma2 = GemmaConfig {
+            model_type: "gemma2".into(),
+            is_gemma2: true,
+            attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
+            query_pre_attn_scalar: Some(16),
+            sliding_window: Some(4),
+            ..small_config()
+        };
+        let gemma3 = GemmaConfig {
+            model_type: "gemma3".into(),
+            is_gemma3: true,
+            num_hidden_layers: 3,
+            sliding_window: Some(4),
+            sliding_window_pattern: 3,
+            rope_theta: 1_000_000.0,
+            rope_local_base_freq: Some(10_000.0),
+            ..small_config()
+        };
+        for (label, config) in [("gemma2", gemma2), ("gemma3", gemma3)] {
+            random::seed(3);
+            let mut model = GemmaForCausalLM::new(config).unwrap();
+            for (_, p) in model.flatten_params_mut() {
+                *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
+            }
+            let tokens: Vec<i32> = (0..24).map(|i| (i * 37 + 11) % 1000).collect();
+            let all = Array::from_slice(&tokens, &[1, 24]);
+            let mut want = model.forward(&all, None).unwrap();
+            let want = want.to_f32_vec(24 * 1000).unwrap();
+
+            let mut cache = model.create_cache(32);
+            let mut got = Vec::new();
+            for (start, stop) in [(0, 9), (9, 11)]
+                .into_iter()
+                .chain((11..24).map(|i| (i, i + 1)))
+            {
+                let ids = Array::from_slice(&tokens[start..stop], &[1, (stop - start) as i32]);
+                let mut logits = model
+                    .forward_with_cache(&ids, None, Some(&mut cache))
+                    .unwrap();
+                got.extend(logits.to_f32_vec((stop - start) * 1000).unwrap());
+            }
+            pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+            assert_eq!(got.len(), want.len());
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, |m, d| if d.is_nan() { f32::NAN } else { m.max(d) });
+            assert!(worst < 1e-3, "{label}: cached decode is off by {worst}");
+        }
+    }
+
     #[test]
     fn test_gemma_config_defaults() {
         let config = GemmaConfig::default();

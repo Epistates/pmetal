@@ -568,6 +568,74 @@ fn run_native_synthetic_parity(
     );
 }
 
+/// The module-based port's cached decode, far past the sliding window (8), is
+/// the whole sequence run at once: the same logits at every position, through
+/// a prefill in two passes and then one token at a time. This is the path the
+/// generic engines and every speculative decoder run Gemma 4 on; the native
+/// engine has its own check above. The shared-KV fixture covers layers that
+/// read an earlier layer's cache, the MoE one routing per pass.
+#[test]
+fn gemma4_module_port_cached_decode_matches_the_full_forward() {
+    use pmetal_cache::kv_cache::{KVCache, KVCacheConfig};
+
+    for (label, config_json, weights, reference) in [
+        (
+            "dense",
+            synthetic_config_json(),
+            "gemma4_synth_weights.safetensors",
+            "gemma4_synth_reference.safetensors",
+        ),
+        (
+            "shared-KV",
+            shared_synthetic_config_json(),
+            "gemma4_shared_synth_weights.safetensors",
+            "gemma4_shared_synth_reference.safetensors",
+        ),
+        (
+            "MoE",
+            moe_synthetic_config_json(),
+            "gemma4_moe_synth_weights.safetensors",
+            "gemma4_moe_synth_reference.safetensors",
+        ),
+    ] {
+        let ids = input_ids_from_shard(&load_shard(&fixture_path(reference)));
+        let tokens: Vec<i32> = to_f32_vec_eval(&ids).into_iter().map(|v| v as i32).collect();
+        let t = tokens.len();
+        let mut model = build_model(config_json, weights);
+        let want = model.forward(&ids, None).expect("full forward");
+
+        let mut cache = KVCache::new(KVCacheConfig::new(
+            model.config.num_hidden_layers as usize,
+            t + 8,
+            model.config.num_key_value_heads as usize,
+            model.config.head_dim as usize,
+        ));
+        let chunks = [(0, 5.min(t)), (5.min(t), 9.min(t))]
+            .into_iter()
+            .chain((9.min(t)..t).map(|i| (i, i + 1)));
+        let mut rows = Vec::new();
+        for (start, stop) in chunks {
+            let chunk = Array::from_slice(&tokens[start..stop], &[1, (stop - start) as i32]);
+            rows.push(
+                model
+                    .forward_with_cache(&chunk, None, Some(&mut cache))
+                    .expect("cached forward"),
+            );
+        }
+        let got = ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1);
+        pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+        let report = ParityReport::compute_with_per_position(
+            "logits",
+            &got,
+            &want,
+            Tolerance::new(2e-5, 0.0),
+        );
+        println!("\n== Gemma 4 module port cached decode, {label} ==");
+        print_report_table(std::slice::from_ref(&report));
+        assert!(report.passed(), "{label}: cached decode is off the full forward");
+    }
+}
+
 fn run_synthetic_parity(
     label: &str,
     config_json: &str,
