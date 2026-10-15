@@ -13,7 +13,7 @@
 //! and [`gated_delta_update`] chooses between them:
 //!
 //! - the fused Metal kernel, for inference where it fits (it has no VJP);
-//! - [`gated_delta_chunk_ops_impl`], the chunkwise parallel algorithm of
+//! - the chunkwise parallel algorithm of
 //!   Yang et al., "Parallelizing Linear Transformers with the Delta Rule over
 //!   Sequence Length" (NeurIPS 2024): the WY representation turns each chunk
 //!   of `C = 64` tokens into a few batched matmuls and leaves only the

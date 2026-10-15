@@ -34,6 +34,17 @@
 //! only its inputs and outputs and rebuilds the chunk during the backward
 //! pass. The fallback is taken with a warning, once per process.
 //!
+//! # Label smoothing and the z-loss
+//!
+//! Both are terms of the runtime's [`CrossEntropy`], which defines the loss of
+//! a row from its statistics: `(1 − ε)(lse − z_y) + ε(lse − mean z) + λ·lse²`.
+//! The z-loss needs only the `logsumexp` the kernels return. Smoothing needs
+//! the mean logit, which the kernels do not produce; without a softcap it is
+//! `scale · (h · mean_rows(W) + mean(b))`, computed with ordinary ops (so
+//! autograd differentiates it for the hidden states, the head and the bias),
+//! and with a softcap the loss takes the chunked path, which sums each chunk's
+//! logits as it goes.
+//!
 //! # Precision
 //!
 //! As in the reference implementation: the logits come out of the GEMM in the
@@ -46,7 +57,10 @@
 use std::sync::Once;
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
-use pmetal_runtime::inline_array::{FusedCceParams, checkpoint_apply, cut_cross_entropy_fused};
+use pmetal_runtime::inline_array::{
+    FusedCceParams, LogitRowStats, checkpoint_apply, cut_cross_entropy_fused,
+};
+use pmetal_runtime::training::CrossEntropy;
 
 /// Configuration for [`CutCrossEntropy`].
 #[derive(Debug, Clone)]
@@ -62,6 +76,20 @@ pub struct CutCrossEntropyConfig {
     pub softcap: f32,
     /// Multiplies the logits (Cohere, Granite); 1 disables it.
     pub logit_scale: f32,
+    /// Label smoothing `ε` in `[0, 1)`: the target keeps `1 − ε` of its mass
+    /// and `ε` goes to the uniform distribution over the vocabulary, as
+    /// PyTorch's `label_smoothing` defines it. It needs the mean logit of each
+    /// token, which the fused kernels do not produce. Without a softcap that
+    /// mean is linear in the hidden state (`h · mean_rows(W) + mean(b)`) and
+    /// costs one `[tokens, hidden] × [hidden]` product, differentiated by
+    /// ordinary autograd; with a softcap the loss is computed a vocabulary
+    /// chunk at a time instead.
+    pub label_smoothing: f32,
+    /// Weight `λ` of the auxiliary z-loss `λ · logsumexp(logits)²` (PaLM,
+    /// Chowdhery et al. 2022), which keeps the softmax normalizer near 1. It
+    /// is a function of the logsumexp the kernels already return, so it costs
+    /// nothing on either path.
+    pub z_loss: f32,
     /// Gradient filtering, which trades gradient precision for backward
     /// speed: the fused backward leaves out a tile of the vocabulary for a
     /// group of eight tokens when the softmax there is below this for each
@@ -87,6 +115,8 @@ impl Default for CutCrossEntropyConfig {
             ignore_index: -100,
             softcap: 0.0,
             logit_scale: 1.0,
+            label_smoothing: 0.0,
+            z_loss: 0.0,
             filter_eps: None,
         }
     }
@@ -119,6 +149,32 @@ impl CutCrossEntropyConfig {
     /// Scale the logits.
     pub fn with_logit_scale(mut self, scale: f32) -> Self {
         self.logit_scale = scale;
+        self
+    }
+
+    /// Smooth the target toward the uniform distribution by `epsilon`.
+    ///
+    /// # Panics
+    /// If `epsilon` is not in `[0, 1)`.
+    pub fn with_label_smoothing(mut self, epsilon: f32) -> Self {
+        assert!(
+            (0.0..1.0).contains(&epsilon),
+            "label smoothing must be in [0, 1), got {epsilon}"
+        );
+        self.label_smoothing = epsilon;
+        self
+    }
+
+    /// Add `weight · logsumexp²` to each token's loss.
+    ///
+    /// # Panics
+    /// If `weight` is negative or not finite.
+    pub fn with_z_loss(mut self, weight: f32) -> Self {
+        assert!(
+            weight.is_finite() && weight >= 0.0,
+            "z-loss weight must be finite and non-negative, got {weight}"
+        );
+        self.z_loss = weight;
         self
     }
 
@@ -186,11 +242,8 @@ impl CutCrossEntropy {
     ) -> Result<Array, Exception> {
         self.check_shapes(hidden, weight)?;
         let targets = Self::labels(targets);
-        let (lse, target) = match self.fused(hidden, weight, &targets, bias)? {
-            Some(terms) => terms,
-            None => self.chunked(hidden, weight, bias, &targets)?,
-        };
-        Ok(self.mean(&lse, &target, &targets))
+        let stats = self.row_stats(hidden, weight, &targets, bias)?;
+        Ok(self.mean(&stats, &targets, weight.dim(0)))
     }
 
     /// [`forward`](Self::forward) by the chunked fallback, whatever the
@@ -204,8 +257,58 @@ impl CutCrossEntropy {
     ) -> Result<Array, Exception> {
         self.check_shapes(hidden, weight)?;
         let targets = Self::labels(targets);
-        let (lse, target) = self.chunked(hidden, weight, bias, &targets)?;
-        Ok(self.mean(&lse, &target, &targets))
+        let stats = self.chunked(hidden, weight, bias, &targets)?;
+        Ok(self.mean(&stats, &targets, weight.dim(0)))
+    }
+
+    /// What the loss needs of each token's row of logits: by the fused
+    /// kernels where they can run, else a chunk at a time.
+    fn row_stats(
+        &self,
+        hidden: &Array,
+        weight: &Array,
+        targets: &Array,
+        bias: Option<&Array>,
+    ) -> Result<LogitRowStats, Exception> {
+        // The row sum a smoothed loss needs has no closed form through a
+        // softcap, and the kernels do not produce it.
+        let needs_sum = self.config.label_smoothing > 0.0;
+        if !(needs_sum && self.config.softcap > 0.0)
+            && let Some((lse, target_logit)) = self.fused(hidden, weight, targets, bias)?
+        {
+            let logit_sum = if needs_sum {
+                self.linear_logit_sum(hidden, weight, bias)
+            } else {
+                Array::from_f32(0.0)
+            };
+            return Ok(LogitRowStats {
+                lse,
+                target_logit,
+                logit_sum,
+            });
+        }
+        self.chunked(hidden, weight, bias, targets)
+    }
+
+    /// The sum over the vocabulary of each token's logits, `[tokens]` in f32,
+    /// for logits without a softcap:
+    /// `V · scale · (h · mean_rows(W) + mean(b))`.
+    ///
+    /// Plain ops, so autograd differentiates it for the hidden states, the
+    /// head and the bias. The mean row of the head is taken in the head's
+    /// dtype, rounded once, as a logit is.
+    fn linear_logit_sum(&self, hidden: &Array, weight: &Array, bias: Option<&Array>) -> Array {
+        let f32_ = Dtype::Float32.as_i32();
+        let width = weight.dim(1);
+        let mean_row = weight
+            .mean_axis(0, false)
+            .as_dtype(f32_)
+            .reshape(&[width, 1]);
+        let mut mean = hidden.as_dtype(f32_).matmul(&mean_row).squeeze_axes(&[-1]);
+        if let Some(bias) = bias {
+            mean = mean.add(&bias.as_dtype(f32_).mean_all());
+        }
+        mean.mul_scalar(self.config.logit_scale * weight.dim(0) as f32)
     }
 
     fn check_shapes(&self, hidden: &Array, weight: &Array) -> Result<(), Exception> {
@@ -225,14 +328,19 @@ impl CutCrossEntropy {
         targets.as_dtype(Dtype::Int32.as_i32()).stop_gradient()
     }
 
-    /// The mean of `lse - target` over the targets that aren't ignored.
-    fn mean(&self, lse: &Array, target: &Array, targets: &Array) -> Array {
-        let valid = targets
-            .not_equal(&Array::from_i32(self.config.ignore_index))
-            .as_dtype(Dtype::Float32.as_i32());
-        let per_token = lse.subtract(target).multiply(&valid);
-        let count = valid.sum_all().maximum(&Array::from_f32(1.0));
-        per_token.sum_all().divide(&count)
+    /// The loss's definition: the runtime's cross-entropy with this
+    /// configuration's ignore index, smoothing and z-loss, so the one formula
+    /// serves the dense and the fused loss.
+    fn loss(&self) -> CrossEntropy {
+        CrossEntropy::new()
+            .with_ignore_index(self.config.ignore_index)
+            .with_label_smoothing(self.config.label_smoothing)
+            .with_z_loss(self.config.z_loss)
+    }
+
+    /// The mean loss over the targets that aren't ignored.
+    fn mean(&self, stats: &LogitRowStats, targets: &Array, vocab: i32) -> Array {
+        self.loss().mean_from_row_stats(stats, targets, vocab)
     }
 
     /// Each token's `logsumexp` and target logit from the fused kernels, or
@@ -269,9 +377,9 @@ impl CutCrossEntropy {
         }
     }
 
-    /// Each token's `logsumexp` and target logit, both `[tokens]` in f32, a
-    /// chunk of the vocabulary at a time and each chunk rebuilt for its
-    /// backward pass.
+    /// Each token's `logsumexp`, target logit and (when the loss smooths its
+    /// labels) logit sum, all `[tokens]` in f32, a chunk of the vocabulary at
+    /// a time and each chunk rebuilt for its backward pass.
     ///
     /// The target logit is read out of the chunk that holds it, as the
     /// reference implementation's forward kernel does, rather than gathered
@@ -284,7 +392,8 @@ impl CutCrossEntropy {
         weight: &Array,
         bias: Option<&Array>,
         targets: &Array,
-    ) -> Result<(Array, Array), Exception> {
+    ) -> Result<LogitRowStats, Exception> {
+        let needs_sum = self.config.label_smoothing > 0.0;
         let transform = Transform {
             scale: self.config.logit_scale,
             softcap: self.config.softcap,
@@ -317,6 +426,7 @@ impl CutCrossEntropy {
         let f32_ = Dtype::Float32.as_i32();
         let mut lse = Array::from_f32(f32::NEG_INFINITY).broadcast_to(&[n]);
         let mut target = ops::zeros(&[n], Dtype::Float32);
+        let mut logit_sum = ops::zeros(&[n], Dtype::Float32);
         let mut h = hidden.clone();
         let mut start = 0;
         for (i, w) in weights.into_iter().enumerate() {
@@ -335,32 +445,42 @@ impl CutCrossEntropy {
                 .expand_dims(-1);
             start += len;
 
-            let mut inputs = vec![h, w, lse, target];
+            // h, w, lse, target, logit_sum, then the chunk's bias.
+            let mut inputs = vec![h, w, lse, target, logit_sum];
             if let Some(biases) = &biases {
                 inputs.push(biases[i].clone());
             }
             let out = checkpoint_apply(&inputs, move |a| {
                 let mut z = a[0].matmul(&a[1].t());
-                if let Some(b) = a.get(4) {
+                if let Some(b) = a.get(5) {
                     z = z.add(&b.as_dtype(z.dtype().as_i32()));
                 }
                 let z = transform.apply(z);
                 let picked = z.take_along_axis(&local, -1).squeeze_axes(&[-1]);
                 let lse = a[2].logaddexp(&z.logsumexp(-1, false));
+                let logit_sum = if needs_sum {
+                    a[4].add(&z.sum_axis(-1, false))
+                } else {
+                    a[4].clone()
+                };
                 let h = a[0].add(
                     &lse.expand_dims(-1)
                         .multiply(&Array::from_f32(0.0))
                         .as_dtype(a[0].dtype().as_i32()),
                 );
-                vec![lse, a[3].add(&picked.multiply(&inside)), h]
+                vec![lse, a[3].add(&picked.multiply(&inside)), logit_sum, h]
             });
             pmetal_runtime::check_unobserved_error()
                 .map_err(|e| Exception::custom(format!("cut cross-entropy chunk {i}: {e}")))?;
-            [lse, target, h] = out.try_into().map_err(|_| {
+            [lse, target, logit_sum, h] = out.try_into().map_err(|_| {
                 Exception::custom("cut cross-entropy: a chunk returned the wrong outputs")
             })?;
         }
-        Ok((lse, target))
+        Ok(LogitRowStats {
+            lse,
+            target_logit: target,
+            logit_sum,
+        })
     }
 }
 
@@ -424,11 +544,16 @@ mod tests {
         match path {
             Path::Fused => {
                 let labels = CutCrossEntropy::labels(targets);
-                let (lse, target) = cce
-                    .fused(hidden, weight, &labels, bias)
-                    .unwrap()
-                    .expect("the fused kernels run on a Metal GPU");
-                cce.mean(&lse, &target, &labels)
+                // A smoothed loss through a softcap has no fused form and
+                // takes the chunked path by design.
+                if !(cce.config.label_smoothing > 0.0 && cce.config.softcap > 0.0) {
+                    assert!(
+                        cce.fused(hidden, weight, &labels, bias).unwrap().is_some(),
+                        "the fused kernels run on a Metal GPU"
+                    );
+                }
+                let stats = cce.row_stats(hidden, weight, &labels, bias).unwrap();
+                cce.mean(&stats, &labels, weight.dim(0))
             }
             Path::Chunked => cce.forward_chunked(hidden, weight, targets, bias).unwrap(),
         }
@@ -494,17 +619,19 @@ mod tests {
         bias: Option<&Array>,
     ) -> (f32, Vec<Array>) {
         with_grads(
-            |h, w, b| {
-                pmetal_runtime::training::cross_entropy_loss(
-                    &full_logits(config, h, w, b),
-                    targets,
-                    config.ignore_index,
-                )
-            },
+            |h, w, b| dense_loss(config).mean(&full_logits(config, h, w, b), targets),
             hidden,
             weight,
             bias,
         )
+    }
+
+    /// The runtime's dense cross-entropy with the configuration's terms.
+    fn dense_loss(config: &CutCrossEntropyConfig) -> CrossEntropy {
+        CrossEntropy::new()
+            .with_ignore_index(config.ignore_index)
+            .with_label_smoothing(config.label_smoothing)
+            .with_z_loss(config.z_loss)
     }
 
     /// Problems with `got` against `want`, each gradient within `tol` of the
@@ -573,6 +700,23 @@ mod tests {
             ("plain", base()),
             ("scaled", base().with_logit_scale(0.7)),
             ("softcapped", base().with_logit_scale(1.3).with_softcap(5.0)),
+            (
+                "smoothed",
+                base().with_logit_scale(0.7).with_label_smoothing(0.1),
+            ),
+            ("z-loss", base().with_z_loss(2e-2)),
+            (
+                "smoothed, z-loss",
+                base().with_label_smoothing(0.2).with_z_loss(1e-2),
+            ),
+            (
+                "smoothed, softcapped, z-loss",
+                base()
+                    .with_logit_scale(1.3)
+                    .with_softcap(5.0)
+                    .with_label_smoothing(0.15)
+                    .with_z_loss(1e-2),
+            ),
         ]
     }
 
@@ -863,6 +1007,194 @@ mod tests {
         let got = by_path(Path::Fused, &config, &hidden, &weight, &targets, None);
         let problems = compare("tiny", &got, &want, 2e-5);
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The mean loss in f64 from the values the arrays hold, by the
+    /// definition: `(1 − ε)(lse − z_y) + ε(lse − mean z) + λ·lse²` per token.
+    fn host_loss(config: &CutCrossEntropyConfig, case: &Case, bias: Option<&Array>) -> f64 {
+        let read = |a: &Array| -> Vec<f64> {
+            let mut a = f32_(a);
+            a.eval();
+            a.to_f32_vec(a.size())
+                .unwrap()
+                .into_iter()
+                .map(f64::from)
+                .collect()
+        };
+        let (n, width, vocab) = (case.hidden.dim(0), case.hidden.dim(1), case.weight.dim(0));
+        let (h, w) = (read(&case.hidden), read(&case.weight));
+        let b = bias.map(read);
+        let targets: Vec<i32> = read(&case.targets).into_iter().map(|t| t as i32).collect();
+        let (eps, z_weight) = (f64::from(config.label_smoothing), f64::from(config.z_loss));
+        let (mut total, mut counted) = (0.0_f64, 0.0_f64);
+        for (t, &target) in targets.iter().enumerate().take(n as usize) {
+            if target == config.ignore_index {
+                continue;
+            }
+            let row: Vec<f64> = (0..vocab as usize)
+                .map(|j| {
+                    let dot: f64 = (0..width as usize)
+                        .map(|c| h[t * width as usize + c] * w[j * width as usize + c])
+                        .sum();
+                    let z =
+                        f64::from(config.logit_scale) * (dot + b.as_ref().map_or(0.0, |b| b[j]));
+                    if config.softcap > 0.0 {
+                        let cap = f64::from(config.softcap);
+                        cap * (z / cap).tanh()
+                    } else {
+                        z
+                    }
+                })
+                .collect();
+            let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let lse = max + row.iter().map(|z| (z - max).exp()).sum::<f64>().ln();
+            let mean_z = row.iter().sum::<f64>() / row.len() as f64;
+            total += (1.0 - eps) * (lse - row[target as usize])
+                + eps * (lse - mean_z)
+                + z_weight * lse * lse;
+            counted += 1.0;
+        }
+        total / counted.max(1.0)
+    }
+
+    /// Label smoothing and the z-loss are what the definition says, in f64,
+    /// on both paths, with and without a bias, a scale and a softcap, over
+    /// ragged tiles and ignored targets.
+    #[test]
+    fn the_loss_is_the_definition_in_f64() {
+        let case = ragged_case(Dtype::Float32);
+        let mut problems = Vec::new();
+        for (name, config) in transforms() {
+            for bias in [None, Some(&case.bias)] {
+                let want = host_loss(&config, &case, bias);
+                for path in [Path::Fused, Path::Chunked] {
+                    let cce = CutCrossEntropy::new(config.clone());
+                    let got = f64::from(
+                        loss_by(path, &cce, &case.hidden, &case.weight, &case.targets, bias)
+                            .item_f32(),
+                    );
+                    drain();
+                    if got.is_nan() || (got - want).abs() > 5e-5 * want.abs().max(1.0) {
+                        problems.push(format!(
+                            "{path:?} {name} bias={}: loss {got} vs {want}",
+                            bias.is_some()
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// A smoothed loss is not the plain loss: the smoothing moves the value
+    /// and the gradient, so a configuration that ignored it would fail here.
+    #[test]
+    fn smoothing_and_z_loss_change_the_loss() {
+        let case = ragged_case(Dtype::Float32);
+        let loss_of = |config: CutCrossEntropyConfig| {
+            let cce = CutCrossEntropy::new(config);
+            let l = cce
+                .forward(&case.hidden, &case.weight, &case.targets, None)
+                .unwrap()
+                .item_f32();
+            drain();
+            l
+        };
+        let plain = loss_of(CutCrossEntropyConfig::new());
+        let smoothed = loss_of(CutCrossEntropyConfig::new().with_label_smoothing(0.1));
+        let z = loss_of(CutCrossEntropyConfig::new().with_z_loss(1e-2));
+        assert!((smoothed - plain).abs() > 1e-2, "{smoothed} vs {plain}");
+        assert!(z > plain + 1e-2, "{z} vs {plain}");
+    }
+
+    /// On a bf16 head the smoothed loss is the bf16 logits' loss, to bf16's
+    /// precision: the mean row of the head is rounded once, as a logit is.
+    #[test]
+    fn a_bf16_head_smooths_like_its_logits() {
+        let case = ragged_case(Dtype::Bfloat16);
+        let mut problems = Vec::new();
+        for (name, config) in transforms() {
+            let want = by_full_logits(
+                &config,
+                &case.hidden,
+                &case.weight,
+                &case.targets,
+                Some(&case.bias),
+            );
+            for path in [Path::Fused, Path::Chunked] {
+                let got = by_path(
+                    path,
+                    &config,
+                    &case.hidden,
+                    &case.weight,
+                    &case.targets,
+                    Some(&case.bias),
+                );
+                problems.extend(compare(&format!("{path:?} {name}"), &got, &want, 1e-2));
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    /// The smoothing term over a large bf16 vocabulary: the mean logit comes
+    /// out of a reduction over 100,000 rows, which accumulated in bf16 would
+    /// lose most of its digits.
+    #[test]
+    fn the_mean_logit_of_a_large_bf16_head_is_accurate() {
+        random::seed(23);
+        let (n, h, v) = (8, 32, 100_000);
+        let bf16 = Dtype::Bfloat16.as_i32();
+        // A head whose rows share a common offset, so the mean row is not
+        // noise around zero.
+        let weight = random::normal(&[v, h], Dtype::Float32)
+            .multiply(&Array::from_f32(0.5))
+            .add(&Array::from_f32(0.3))
+            .as_dtype(bf16);
+        let hidden = random::normal(&[n, h], Dtype::Float32).as_dtype(bf16);
+        let cce = CutCrossEntropy::new(CutCrossEntropyConfig::new().with_label_smoothing(0.1));
+        let got = cce.linear_logit_sum(&hidden, &weight, None);
+        let want = f32_(&hidden).matmul(&f32_(&weight).sum_axis(0, false).reshape(&[h, 1]));
+        let (got, want) = (got.reshape(&[n]), want.reshape(&[n]));
+        let scale = max_abs(&want);
+        let diff = max_abs(&got.subtract(&want));
+        drain();
+        assert!(
+            diff <= 5e-3 * scale,
+            "logit sum off by {diff} against {scale}"
+        );
+    }
+
+    /// Smoothing and the z-loss are checked when they are configured, and a
+    /// batch of nothing but ignored targets stays a zero loss with them on.
+    #[test]
+    fn the_new_terms_are_validated_and_respect_ignoring() {
+        for bad in [-0.1, 1.0, f32::NAN] {
+            assert!(
+                std::panic::catch_unwind(|| CutCrossEntropyConfig::new().with_label_smoothing(bad))
+                    .is_err(),
+                "smoothing {bad}"
+            );
+        }
+        for bad in [-1e-3, f32::INFINITY, f32::NAN] {
+            assert!(
+                std::panic::catch_unwind(|| CutCrossEntropyConfig::new().with_z_loss(bad)).is_err(),
+                "z-loss {bad}"
+            );
+        }
+        random::seed(5);
+        let hidden = random::normal(&[4, 8], Dtype::Float32);
+        let weight = random::normal(&[16, 8], Dtype::Float32);
+        let none = Array::from_i32_slice(&[-100, -100, -100, -100]);
+        let config = CutCrossEntropyConfig::new()
+            .with_vocab_chunk_size(4)
+            .with_label_smoothing(0.1)
+            .with_z_loss(1e-2);
+        for path in [Path::Fused, Path::Chunked] {
+            let (loss, grads) = by_path(path, &config, &hidden, &weight, &none, None);
+            assert_eq!(loss, 0.0, "{path:?}");
+            assert_eq!(max_abs(&grads[0]), 0.0, "{path:?}");
+            assert_eq!(max_abs(&grads[1]), 0.0, "{path:?}");
+        }
     }
 
     /// A second derivative (the gradient of a function of the hidden states'
