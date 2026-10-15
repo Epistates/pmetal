@@ -462,12 +462,12 @@ impl ModelFamily {
             }
             (Self::Qwen3 | Self::Qwen3Instruct2507, _) => (0.7, 0.8, 20, 0.0),
             (Self::Qwen3Thinking2507, _) => (0.6, 0.95, 20, 0.0),
-            // Qwen3.5 card. Thinking-general's presence penalty is 1.5 on the
-            // card; pmetal keeps 0.0, which ended thinking chains early less
-            // often and which the Qwen3.6 and 3.8 cards adopted.
-            (Self::Qwen3_5, ThinkingGeneral) => (1.0, 0.95, 20, 0.0),
+            // Qwen3.5 card: thinking for text 1.0/0.95/20 with presence
+            // penalty 1.5, thinking for VL or coding 0.6/0.95/20, non-thinking
+            // for text 1.0/1.0/20 with penalty 2.0, for VL 0.7/0.8/20 with 1.5.
+            (Self::Qwen3_5, ThinkingGeneral) => (1.0, 0.95, 20, 1.5),
             (Self::Qwen3_5, ThinkingCoding) => (0.6, 0.95, 20, 0.0),
-            (Self::Qwen3_5, InstructReasoning) => (1.0, 1.0, 40, 2.0),
+            (Self::Qwen3_5, InstructReasoning) => (1.0, 1.0, 20, 2.0),
             (Self::Qwen3_5, _) => (0.7, 0.8, 20, 1.5),
             // Qwen3.6 card.
             (Self::Qwen3_6, ThinkingGeneral) => (1.0, 0.95, 20, 0.0),
@@ -938,6 +938,9 @@ mod tests {
         // A mode the card has no row for falls back to its general one.
         assert_eq!(p(Qwen3_8, ThinkingCoding), (1.0, 0.95, 20, 0.0));
         assert_eq!(p(Qwen3_6, ThinkingCoding), (0.6, 0.95, 20, 0.0));
+        // Qwen3.5's card: presence penalty 1.5 when thinking, 2.0 for non-thinking text.
+        assert_eq!(p(Qwen3_5, ThinkingGeneral), (1.0, 0.95, 20, 1.5));
+        assert_eq!(p(Qwen3_5, InstructReasoning), (1.0, 1.0, 20, 2.0));
         assert_eq!(p(Qwen3, ThinkingGeneral), (0.6, 0.95, 20, 0.0));
         assert_eq!(p(Qwen3, InstructGeneral), (0.7, 0.8, 20, 0.0));
         assert_eq!(p(Gemma4, ThinkingGeneral), (1.0, 0.95, 64, 0.0));
