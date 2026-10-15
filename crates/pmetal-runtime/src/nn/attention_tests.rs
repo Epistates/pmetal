@@ -4,6 +4,7 @@
 //! values and sinks against central finite differences.
 
 use super::*;
+use crate::compat::ops;
 use crate::f64_reference::*;
 use serial_test::serial;
 

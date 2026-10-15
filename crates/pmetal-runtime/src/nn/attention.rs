@@ -17,7 +17,7 @@
 //! right, so a query shorter than its keys (the continuation of a cached
 //! prompt, or one decoded token) sees the most recent keys.
 
-use crate::compat::{Array, Dtype, Exception, ops};
+use crate::compat::{Array, Dtype, Exception};
 
 /// Attention mask type for fused attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -215,11 +215,7 @@ fn softcapped_sdpa(
         .transpose_axes(&[0, 1, 2, 4, 3]);
     let mut scores = q.matmul(&k_t).multiply(&Array::from_f32(scale));
 
-    // `tanh` the primitive: expanded as (exp(2x) - 1) / (exp(2x) + 1) it
-    // overflows to inf / inf = NaN once x / cap passes about 44, and softcapping
-    // exists to tame outlier scores, not to blow up on them.
-    let cap = Array::from_f32(cap);
-    scores = ops::tanh(&scores.divide(&cap)).multiply(&cap);
+    scores = super::softcap(&scores, cap);
 
     let mask = match (&masking.array, masking.mode) {
         (Some(mask), _) if mask.dtype() == Dtype::Bool => {

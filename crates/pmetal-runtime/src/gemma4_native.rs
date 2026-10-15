@@ -463,9 +463,6 @@ pub struct NativeWeights {
     /// cast its weights per-op. Owned here so the forward step can reuse
     /// it without per-step construction.
     pub embed_scale_scalar: InlineArray,
-    /// `final_logit_softcapping` pre-cast to `model_dtype` (only set when
-    /// the config opts in). Same reasoning as `embed_scale_scalar`.
-    pub softcap_scalar: Option<InlineArray>,
 }
 
 /// Slots a sliding layer's decode buffer holds beyond the window it keeps, so
@@ -1552,9 +1549,6 @@ pub fn load_model(
     // Pre-cast scalars once so the forward step never constructs an
     // f32 broadcast and quietly promotes the bf16 residual stream.
     let embed_scale_scalar = InlineArray::scalar_with_dtype(config.embed_scale(), model_dtype);
-    let softcap_scalar = config
-        .final_logit_softcapping
-        .map(|cap| InlineArray::scalar_with_dtype(cap, model_dtype));
 
     let weights = NativeWeights {
         embed_w,
@@ -1565,7 +1559,6 @@ pub fn load_model(
         model_dtype,
         config: config.clone(),
         embed_scale_scalar,
-        softcap_scalar,
     };
 
     // Eagerly evaluate so load-time cost is paid here instead of on first
@@ -1959,13 +1952,8 @@ fn logits_from_hidden(weights: &NativeWeights, normed: &InlineArray) -> InlineAr
         // runs a quantized matmul against the packed rows otherwise.
         None => weights.embed_w.as_linear(normed),
     };
-    match weights.softcap_scalar.as_ref() {
-        Some(cap_arr) => {
-            use crate::compat::ops;
-            let scaled = raw_logits.divide(cap_arr);
-            let t = ops::tanh(&scaled);
-            t.multiply(cap_arr)
-        }
+    match weights.config.final_logit_softcapping {
+        Some(cap) => crate::nn::softcap(&raw_logits, cap),
         None => raw_logits,
     }
 }
@@ -2399,7 +2387,6 @@ mod tests {
             model_dtype: Dtype::Float32.as_i32(),
             config,
             embed_scale_scalar: InlineArray::scalar_with_dtype(2.0, Dtype::Float32.as_i32()),
-            softcap_scalar: None,
         };
         let input_ids = InlineArray::from_i32_slice_shaped(&[1, 2], &[1, 2]);
         let inputs_embeds = InlineArray::zeros(&[1, 2, 4], Dtype::Float32.as_i32());

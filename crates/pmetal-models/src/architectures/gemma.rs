@@ -1071,10 +1071,7 @@ impl GemmaForCausalLM {
         // Gemma always ties embeddings.
         let logits = self.model.embed_tokens.as_linear(hidden_states);
         match self.model.config.final_logit_softcapping {
-            Some(cap) if cap != 0.0 => {
-                let cap_arr = Array::from_f32(cap);
-                pmetal_runtime::compat::ops::tanh(&logits.divide(&cap_arr)).multiply(&cap_arr)
-            }
+            Some(cap) if cap != 0.0 => pmetal_runtime::nn::softcap(&logits, cap),
             _ => logits,
         }
     }
@@ -1388,6 +1385,48 @@ mod tests {
             ..config
         };
         assert_eq!(gemma2.rotary(true).unwrap().scalar(), Some((1e6, 0.125)));
+    }
+
+    /// A bf16 model's activations and logits stay bf16 for every generation:
+    /// the embedding scale, the norms, the attention softcap and the final
+    /// logit softcap each carry a constant that promotes to f32 if it is built
+    /// as an f32 array, and the f32 logits of a 256k vocabulary are the
+    /// largest tensor in a training step.
+    #[test]
+    #[serial]
+    fn bf16_model_stays_bf16() {
+        use pmetal_runtime::compat::{Dtype, ModuleParametersExt, random};
+        let bf16 = Dtype::Bfloat16.as_i32();
+        let gemma2 = GemmaConfig {
+            model_type: "gemma2".into(),
+            is_gemma2: true,
+            attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
+            query_pre_attn_scalar: Some(16),
+            sliding_window: Some(4),
+            ..small_config()
+        };
+        let gemma3 = GemmaConfig {
+            model_type: "gemma3".into(),
+            is_gemma3: true,
+            sliding_window: Some(4),
+            sliding_window_pattern: 2,
+            rope_local_base_freq: Some(10_000.0),
+            ..small_config()
+        };
+        for (label, config) in [("gemma", small_config()), ("gemma2", gemma2), ("gemma3", gemma3)] {
+            let mut model = GemmaForCausalLM::new(config).unwrap();
+            for (_, p) in model.flatten_params_mut() {
+                let w = random::uniform_range(-0.3, 0.3, p.shape(), Dtype::Float32);
+                *p = w.as_dtype(bf16);
+            }
+            let ids = Array::from_slice(&[1_i32, 2, 3, 4, 5, 6], &[1, 6]);
+            let hidden = model.model.forward(&ids, None).unwrap();
+            let logits = model.forward(&ids, None).unwrap();
+            pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+            assert_eq!(hidden.dtype_raw(), bf16, "{label}: trunk output dtype");
+            assert_eq!(logits.dtype_raw(), bf16, "{label}: logits dtype");
+        }
     }
 
     #[test]

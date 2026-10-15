@@ -1677,11 +1677,9 @@ impl Gemma4ForCausalLM {
     }
 
     fn logit_softcap(&self, logits: &Array) -> Array {
-        if let Some(cap) = self.config.final_logit_softcapping {
-            // Scalar cast to the logits' dtype, so a bf16 model stays bf16.
-            ops::tanh(&logits.div_scalar(cap)).mul_scalar(cap)
-        } else {
-            logits.clone()
+        match self.config.final_logit_softcapping {
+            Some(cap) => pmetal_runtime::nn::softcap(logits, cap),
+            None => logits.clone(),
         }
     }
 
