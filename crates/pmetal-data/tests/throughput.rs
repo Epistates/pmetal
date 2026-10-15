@@ -76,6 +76,53 @@ fn write_parquet(jsonl: &Path, path: &Path) {
     writer.close().unwrap();
 }
 
+/// Resizing a photo-sized image with the Pillow-exact resampler.
+#[test]
+#[ignore = "benchmark"]
+fn image_resize_throughput() {
+    use image::{DynamicImage, RgbImage};
+    use pmetal_data::image_processing::{FixedSizeImageProcessor, FixedSizeImageProcessorConfig};
+    use pmetal_data::pillow_resample::{ResampleFilter, resize_rgb8, resize_rgb8_torchvision};
+
+    let source = RgbImage::from_fn(4000, 3000, |x, y| {
+        image::Rgb([
+            (x * 7 % 256) as u8,
+            (y * 11 % 256) as u8,
+            ((x + y) * 3 % 256) as u8,
+        ])
+    });
+    let time = |name: &str, f: &dyn Fn()| {
+        f(); // warm up
+        let start = Instant::now();
+        for _ in 0..5 {
+            f();
+        }
+        println!(
+            "{name}: {:.1} ms per 4000x3000 image",
+            start.elapsed().as_secs_f64() * 1e3 / 5.0
+        );
+    };
+    time("pillow bicubic -> 560x560", &|| {
+        std::hint::black_box(resize_rgb8(&source, 560, 560, ResampleFilter::Bicubic));
+    });
+    time("pillow bilinear -> 560x560", &|| {
+        std::hint::black_box(resize_rgb8(&source, 560, 560, ResampleFilter::Bilinear));
+    });
+    time("torchvision bicubic -> 1008x756", &|| {
+        std::hint::black_box(resize_rgb8_torchvision(
+            &source,
+            1008,
+            756,
+            ResampleFilter::Bicubic,
+        ));
+    });
+    let processor = FixedSizeImageProcessor::new(FixedSizeImageProcessorConfig::default());
+    let image = DynamicImage::ImageRgb8(source.clone());
+    time("fixed-size processor -> 560x560", &|| {
+        std::hint::black_box(processor.process_image(&image).unwrap());
+    });
+}
+
 #[test]
 #[ignore = "benchmark"]
 fn reading_and_loading_throughput() {
