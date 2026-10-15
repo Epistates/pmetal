@@ -4180,7 +4180,7 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Benchmark FFI overhead of the Rust bridge against Python MLX.
+/// Benchmark FFI overhead of the Rust runtime against Python MLX.
 ///
 /// Python baseline: ~7420 argmax ops/sec (~0.135ms per op) on Qwen3 vocab size.
 pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {

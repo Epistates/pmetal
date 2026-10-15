@@ -455,7 +455,7 @@ fn test_qlora_training_step() {
     let stats = training_loop
         .train_step(&mut model, &batch, &mut optimizer)
         .expect("QLoRA training step should succeed");
-    pmetal_runtime::check_unobserved_error().expect("no bridge error");
+    pmetal_runtime::check_unobserved_error().expect("no runtime error");
 
     assert!(stats.loss > 0.0, "QLoRA loss should be positive");
     assert_eq!(stats.step, 1, "Step should be 1");
@@ -493,7 +493,7 @@ fn test_qlora_loss_decreases_for_every_scheme() {
                 .expect("step");
             losses.push(stats.loss);
         }
-        pmetal_runtime::check_unobserved_error().expect("no bridge error");
+        pmetal_runtime::check_unobserved_error().expect("no runtime error");
         assert!(losses.iter().all(|l| l.is_finite()), "{scheme}: {losses:?}");
         assert!(
             losses[9] < losses[0] - 0.1,

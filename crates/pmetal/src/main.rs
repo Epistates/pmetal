@@ -1176,7 +1176,7 @@ fn main() -> anyhow::Result<()> {
     if cli.command.uses_mlx() {
         ensure_metallib();
         // Load the library now: if MLX can't, the command would otherwise fail
-        // later, possibly by aborting from a bridge call with no error guard.
+        // later, possibly by aborting from a runtime call with no error guard.
         pmetal_runtime::inline_array::init_device().map_err(|e| {
             anyhow::anyhow!(
                 "MLX could not load its Metal library: {e}\n\

@@ -2414,7 +2414,7 @@ async fn run_inference_streaming(
     let ttft_ms = first_token_time.map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
     let decode_ms = ttft_ms.map(|ttft| total_ms - ttft);
 
-    // For native paths, prefer the bridge's own decode metrics (measured inside the decode loop,
+    // For native paths, prefer the runtime's own decode metrics (measured inside the decode loop,
     // skipping the first 10 steps and excluding stop-token overhead) over wall-clock estimation.
     // Fall back to wall-clock calculation for non-native paths.
     let (tok_per_sec, avg_step_ms, p50_step_ms) = if let Some(m) = runner.state.last_decode_metrics

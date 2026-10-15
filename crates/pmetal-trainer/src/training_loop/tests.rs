@@ -1049,7 +1049,7 @@ fn an_epoch_based_run_decays_to_the_end_and_max_steps_counts_optimizer_steps() {
 enum Fault {
     /// The loss comes out NaN, as an overflow would leave it.
     NanLoss,
-    /// A bridge op throws inside the gradient trace. The bridge records it and
+    /// A runtime op throws inside the gradient trace. The runtime records it and
     /// hands back an empty array, and nothing unwinds.
     RuntimeError,
 }
@@ -1228,7 +1228,7 @@ fn cut_cross_entropy_trains_an_adapter_on_the_lm_head() {
     let before = full.0.lora_parameters();
     jit_training_step_inner(&mut full, (&input_ids, &labels), None).unwrap();
     jit_training_step_cce(&mut cut, (&input_ids, &labels)).unwrap();
-    pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
 
     let (full, cut) = (full.0.lora_parameters(), cut.0.lora_parameters());
     for name in ["lm_head.lora_b", "layers.0.self_attn.q_proj.lora_b"] {
@@ -1304,7 +1304,7 @@ fn a_packed_cut_cross_entropy_step_matches_the_full_logits_step() {
 
     let want = jit_training_step_packed(&mut full, &batch, 0.0).unwrap();
     let got = jit_training_step_packed_cce(&mut cut, &batch, 0.0).unwrap();
-    pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
     let (want, got) = (want.item_f32(), got.item_f32());
     assert!(
         (want - got).abs() <= 1e-5 * want.abs(),
@@ -1502,6 +1502,6 @@ fn the_fused_and_standard_loops_train_the_same_parameter_groups() {
         trainable,
         "the fused optimizer holds state for the trainable parameters only"
     );
-    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+    pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
     println!("fused vs standard loop over 4 steps: {diff:.2e} (adapters moved {moved:.2e})");
 }
