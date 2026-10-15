@@ -9,8 +9,8 @@ use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
-    MTLDevice, MTLResourceOptions,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLDevice,
+    MTLResourceOptions,
 };
 use std::marker::PhantomData;
 use std::mem;
@@ -18,7 +18,7 @@ use std::ptr::NonNull;
 use std::slice;
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::context::MetalContext;
+use crate::context::{CommandQueueExt, MetalContext};
 use crate::error::{MetalError, Result};
 
 /// The fewest bytes Metal will allocate for a buffer.
@@ -168,10 +168,7 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
 
     /// Fill the whole allocation with zero bytes on the GPU and wait for it.
     fn clear_on_gpu(&self, ctx: &MetalContext) -> Result<()> {
-        let command_buffer = ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = ctx.command_queue().new_command_buffer()?;
         let encoder = command_buffer
             .blitCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;
@@ -598,7 +595,7 @@ mod tests {
         let readback: MetalBuffer<f32> =
             MetalBuffer::from_slice(&ctx, &vec![f32::NAN; len], BufferUsage::Shared).unwrap();
 
-        let command_buffer = ctx.command_queue().commandBuffer().unwrap();
+        let command_buffer = ctx.command_queue().new_command_buffer().unwrap();
         let blit = command_buffer.blitCommandEncoder().unwrap();
         unsafe {
             blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(

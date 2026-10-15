@@ -41,13 +41,13 @@ use std::time::Instant;
 use half::f16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLResourceOptions, MTLSize,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
-use crate::context::{DeviceProperties, DeviceTier, MetalContext};
+use crate::context::{CommandQueueExt, DeviceProperties, DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
 use crate::kernels::flash_attention::{FlashAttention, FlashAttentionConfig};
 use crate::kernels::fused_cross_entropy::{FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig};
@@ -1676,9 +1676,7 @@ impl Tuner {
         out_features: usize,
     ) -> Result<()> {
         let queue = context.command_queue();
-        let buffer = queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandQueueCreation)?;
+        let buffer = queue.new_command_buffer()?;
         let encoder = buffer
             .computeCommandEncoder()
             .ok_or(MetalError::CommandQueueCreation)?;
@@ -1976,9 +1974,7 @@ impl Tuner {
         num_elements: usize,
     ) -> Result<()> {
         let queue = context.command_queue();
-        let buffer = queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandQueueCreation)?;
+        let buffer = queue.new_command_buffer()?;
         let encoder = buffer
             .computeCommandEncoder()
             .ok_or(MetalError::CommandQueueCreation)?;

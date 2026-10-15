@@ -274,6 +274,30 @@ impl DeviceProperties {
     }
 }
 
+/// Creating a command buffer without leaking it.
+///
+/// Metal returns a command buffer autoreleased. A Rust thread has no
+/// autorelease pool of its own, so `queue.commandBuffer()` called directly
+/// leaves the buffer (and the encoders and resources it retains) alive until
+/// the thread exits: about 1.8 KiB per dispatch, without bound. This creates
+/// the buffer inside a pool and returns an owned handle, which is all the
+/// caller needs.
+pub trait CommandQueueExt {
+    /// A new command buffer on this queue.
+    ///
+    /// # Errors
+    ///
+    /// [`MetalError::CommandBufferCreation`] if the queue declines.
+    fn new_command_buffer(&self) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>>;
+}
+
+impl CommandQueueExt for ProtocolObject<dyn MTLCommandQueue> {
+    fn new_command_buffer(&self) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        objc2::rc::autoreleasepool(|_| self.commandBuffer())
+            .ok_or(MetalError::CommandBufferCreation)
+    }
+}
+
 /// The GPU family the device reports supporting, highest first.
 fn gpu_family_of(device: &ProtocolObject<dyn MTLDevice>) -> AppleGPUFamily {
     [
@@ -439,9 +463,7 @@ fn measure_gpu_copy_bandwidth_gbps(
     let copy = |src: &Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
                 dst: &Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>|
      -> Result<f64> {
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;
@@ -876,6 +898,41 @@ mod tests {
 
         // Should be the same instance
         assert!(Arc::ptr_eq(&ctx1, &ctx2));
+    }
+
+    /// Resident memory of this process, in KiB.
+    fn resident_kib() -> i64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ps prints a number")
+    }
+
+    /// Command buffers made through the queue extension do not pile up on a
+    /// thread with no autorelease pool; made with `queue.commandBuffer()`
+    /// directly, 10,000 of them held about 18 MiB.
+    #[test]
+    fn new_command_buffers_do_not_accumulate() {
+        let ctx = MetalContext::new().unwrap();
+        let run = || {
+            for _ in 0..10_000 {
+                let command_buffer = ctx.command_queue().new_command_buffer().unwrap();
+                command_buffer.commit();
+                command_buffer.waitUntilCompleted();
+            }
+        };
+        run();
+        let before = resident_kib();
+        run();
+        let growth_kib = resident_kib() - before;
+        assert!(
+            growth_kib < 6 * 1024,
+            "10k command buffers grew resident memory by {growth_kib} KiB"
+        );
     }
 
     #[test]

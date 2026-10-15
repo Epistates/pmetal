@@ -32,11 +32,11 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use half::f16;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::{BufferUsage, MetalBuffer},
-    context::MetalContext,
+    context::{CommandQueueExt, MetalContext},
     error::{MetalError, Result},
     pipeline::FunctionConstant,
     tuna::CrossEntropyTunedConfig,
@@ -277,9 +277,7 @@ impl FusedCrossEntropy {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -341,9 +339,7 @@ impl FusedCrossEntropy {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -406,9 +402,7 @@ impl FusedCrossEntropy {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -477,9 +471,7 @@ impl FusedCrossEntropy {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -875,9 +867,7 @@ impl FusedLinearCrossEntropy {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -947,9 +937,7 @@ impl FusedLinearCrossEntropy {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()

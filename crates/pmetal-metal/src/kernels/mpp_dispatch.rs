@@ -21,10 +21,10 @@ use std::collections::HashMap;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 
 use crate::{
-    context::MetalContext,
+    context::{CommandQueueExt, MetalContext},
     error::{MetalError, Result},
 };
 
@@ -73,10 +73,7 @@ pub(crate) fn encode_mpp_kernel(
     // encoding ends rather than when the calling thread exits. The returned
     // command buffer is retained, so it outlives the pool.
     objc2::rc::autoreleasepool(|_| {
-        let command_buffer = ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = ctx.command_queue().new_command_buffer()?;
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;

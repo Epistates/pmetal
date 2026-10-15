@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     buffer::{AsMetalBuffer, MetalBuffer},
-    context::MetalContext,
+    context::{CommandQueueExt, MetalContext},
     error::{MetalError, Result},
     pipeline::FunctionConstant,
     tuna::{MppGemmTuneRequest, MppGemmTunedConfig},
@@ -336,9 +336,7 @@ impl MppGemm {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()

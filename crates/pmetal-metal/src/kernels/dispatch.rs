@@ -36,11 +36,11 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLSize,
 };
 
-use crate::context::MetalContext;
+use crate::context::{CommandQueueExt, MetalContext};
 use crate::error::{MetalError, Result};
 
 /// Alias for the widely-used Metal buffer protocol object — every kernel
@@ -102,10 +102,7 @@ fn dispatch_in_pool(
 
     // (b) Command buffer + (c) encoder — use the typed Metal errors so
     // callers get a structured failure instead of the legacy `None.unwrap()`.
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .ok_or(MetalError::CommandBufferCreation)?;
+    let command_buffer = ctx.command_queue().new_command_buffer()?;
     let encoder = command_buffer
         .computeCommandEncoder()
         .ok_or(MetalError::EncoderCreation)?;
