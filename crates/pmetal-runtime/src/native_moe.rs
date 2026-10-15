@@ -30,20 +30,48 @@ pub fn route_top_k(
     norm_topk_prob: bool,
     out_dtype: i32,
 ) -> (InlineArray, InlineArray) {
-    let (rows, experts) = (router_logits.dim(0), router_logits.dim(1));
     let probs = router_logits
         .as_dtype(crate::compat::Dtype::Float32.as_i32())
         .softmax_precise(-1);
+    let (inds, weights) = top_k_scores(&probs, top_k, norm_topk_prob);
+    (inds, weights.as_dtype(out_dtype))
+}
+
+/// Each row's `top_k` largest scores: `([S, top_k] indices, [S, top_k]
+/// weights)`, the weights being the scores themselves, or with
+/// `norm_topk_prob` renormalized to sum to one (the sum floored at `1e-8`, so
+/// a row whose chosen scores all underflow yields zeros and not NaNs).
+///
+/// This is the selection every plain top-k router shares; what differs is the
+/// activation that makes the scores (softmax, sigmoid) and the dtype it runs
+/// in, which are the caller's. The indices are `argpartition`'s, in no
+/// particular order, and carry no gradient.
+///
+/// # Panics
+///
+/// If `top_k` is not in `1..=experts`.
+pub fn top_k_scores(
+    scores: &InlineArray,
+    top_k: i32,
+    norm_topk_prob: bool,
+) -> (InlineArray, InlineArray) {
+    let (rows, experts) = (scores.dim(0), scores.dim(1));
+    assert!(
+        (1..=experts).contains(&top_k),
+        "top_k {top_k} is not within the {experts} experts"
+    );
     // `argpartition` puts the `top_k` largest in the last `top_k` slots.
-    let inds = probs
+    let inds = scores
         .argpartition(-top_k, -1)
         .slice(&[0, experts - top_k], &[rows, experts])
         .stop_gradient();
-    let mut weights = probs.take_along_axis(&inds, -1);
+    let mut weights = scores.take_along_axis(&inds, -1);
     if norm_topk_prob {
-        weights = weights.divide(&weights.sum_axis(-1, true));
+        let total = weights.sum_axis(-1, true);
+        let floor = InlineArray::scalar_like(1e-8, &total);
+        weights = weights.divide(&crate::compat::ops::maximum(&total, &floor));
     }
-    (inds, weights.as_dtype(out_dtype))
+    (inds, weights)
 }
 
 /// `[S, hidden]` to the `[S, 1, 1, hidden]` layout `gather_mm` expects.
@@ -567,12 +595,18 @@ mod tests {
             &scores,
             InlineArray::fused_swiglu,
         );
-        let in_router_order =
-            per_expert_in_router_order(&x, &gate, &up, &down, &inds, &|g, u, _| {
-                InlineArray::fused_swiglu(g, u)
-            })
-            .multiply(&scores.reshape(&[tokens as i32, 2, 1]))
-            .sum_axis(-2, false);
+        let in_router_order = per_expert_in_router_order(
+            &x,
+            &GateUp::Split {
+                gate: &gate,
+                up: &up,
+            },
+            &down,
+            &inds,
+            &|g, u, _| InlineArray::fused_swiglu(g, u),
+        )
+        .multiply(&scores.reshape(&[tokens as i32, 2, 1]))
+        .sum_axis(-2, false);
         crate::check_unobserved_error().expect("packed switch_glu");
 
         let n = tokens * hidden;
@@ -774,5 +808,165 @@ mod dispatch_tests {
         check(21, 3); // 63 pairs: still per-row
         check(22, 3); // 66 pairs: grouped
         check(41, 2); // 82 pairs, other top_k: grouped
+    }
+
+    /// Expert ids that differ within a row and across rows.
+    fn routes(s: i32, top_k: i32, e: i32) -> InlineArray {
+        let ids: Vec<i32> = (0..s)
+            .flat_map(|r| (0..top_k).map(move |j| (r * 7 + j * 3 + (r % 3)) % e))
+            .collect();
+        InlineArray::from_i32_slice(&ids).reshape(&[s, top_k])
+    }
+
+    /// A fused `[E, hidden, 2 * intermediate]` gate-up weight (gate first) gives
+    /// the split projections' result, on both sides of the grouping threshold:
+    /// a swapped half would not.
+    #[test]
+    fn a_fused_gate_up_weight_equals_the_split_projections() {
+        let (e, h, i, top_k) = (8, 12, 20, 2);
+        let (gate_w, up_w, down_w) = (
+            array(&[e, h, i], 2),
+            array(&[e, h, i], 3),
+            array(&[e, i, h], 4),
+        );
+        let fused = LayerWeight::Dense(gate_w.concatenate_2(&up_w, 2));
+        let (gate, up, down) = (
+            LayerWeight::Dense(gate_w),
+            LayerWeight::Dense(up_w),
+            LayerWeight::Dense(down_w),
+        );
+        for s in [6, 50] {
+            let (x, scores) = (array(&[s, h], 1), array(&[s, top_k], 7));
+            let inds = routes(s, top_k, e);
+            let split = switch_glu(
+                &x,
+                &gate,
+                &up,
+                &down,
+                &inds,
+                &scores,
+                InlineArray::fused_swiglu,
+            );
+            let both =
+                switch_glu_fused(&x, &fused, &down, &inds, &scores, InlineArray::fused_swiglu);
+            crate::check_unobserved_error().expect("bridge ops succeeded");
+            let worst = to_vec(&split)
+                .iter()
+                .zip(to_vec(&both))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(worst < 1e-5, "s={s}: fused and split differ by {worst:e}");
+        }
+    }
+
+    /// Llama 4's gate scales an expert's input, not its output: the dispatch
+    /// equals one expert at a time run on `x * gate`, summed unnormalised, and
+    /// differs from gating the output (the expert is not linear).
+    #[test]
+    fn the_gate_scales_the_experts_input() {
+        let (e, h, i, top_k, s) = (6, 12, 20, 2, 9);
+        let x = array(&[s, h], 1);
+        let (gate_w, up_w, down_w) = (
+            array(&[e, h, i], 2),
+            array(&[e, h, i], 3),
+            array(&[e, i, h], 4),
+        );
+        let (gate, up, down) = (
+            LayerWeight::Dense(gate_w.clone()),
+            LayerWeight::Dense(up_w.clone()),
+            LayerWeight::Dense(down_w.clone()),
+        );
+        let inds = routes(s, top_k, e);
+        let gates = array(&[s, top_k], 9).add(&InlineArray::scalar_like(1.0, &x));
+        let got = switch_glu_gated_input(
+            &x,
+            GateUp::Split {
+                gate: &gate,
+                up: &up,
+            },
+            &down,
+            &inds,
+            &gates,
+            InlineArray::fused_swiglu,
+        );
+        crate::check_unobserved_error().expect("bridge ops succeeded");
+
+        let (mut want_in, mut want_out) =
+            (vec![0f32; (s * h) as usize], vec![0f32; (s * h) as usize]);
+        let id_values: Vec<i32> = {
+            let a = inds.as_dtype(crate::dtype::I32);
+            a.eval();
+            a.as_slice::<i32>().to_vec()
+        };
+        let gate_values = to_vec(&gates);
+        for r in 0..s {
+            let xr = x.slice(&[r, 0], &[r + 1, h]);
+            for j in 0..top_k {
+                let ex = id_values[(r * top_k + j) as usize];
+                let w = |a: &InlineArray, rows: i32, cols: i32| {
+                    a.slice(&[ex, 0, 0], &[ex + 1, rows, cols])
+                        .reshape(&[rows, cols])
+                };
+                let g = gate_values[(r * top_k + j) as usize];
+                let expert = |input: &InlineArray| {
+                    InlineArray::fused_swiglu(
+                        &input.matmul(&w(&gate_w, h, i)),
+                        &input.matmul(&w(&up_w, h, i)),
+                    )
+                    .matmul(&w(&down_w, i, h))
+                };
+                let gated_in = to_vec(&expert(&xr.multiply(&InlineArray::scalar_like(g, &xr))));
+                let gated_out = to_vec(&expert(&xr));
+                for c in 0..h as usize {
+                    want_in[(r * h) as usize + c] += gated_in[c];
+                    want_out[(r * h) as usize + c] += g * gated_out[c];
+                }
+            }
+        }
+        let got = to_vec(&got);
+        let diff = |want: &[f32]| {
+            got.iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+        };
+        assert!(diff(&want_in) < 1e-4, "input-gated: {:e}", diff(&want_in));
+        assert!(
+            diff(&want_out) > 1e-2,
+            "gating the output would give the same result: the test cannot tell"
+        );
+    }
+
+    /// The shared selection picks each row's largest scores and renormalizes
+    /// them on request.
+    #[test]
+    fn top_k_scores_picks_the_largest() {
+        // Scores are probabilities or sigmoids: positive.
+        let scores = array(&[7, 9], 11).add(&InlineArray::scalar_like(0.6, &array(&[1], 1)));
+        let (inds, weights) = top_k_scores(&scores, 3, true);
+        crate::check_unobserved_error().expect("bridge ops succeeded");
+        let host = to_vec(&scores);
+        let inds = {
+            let a = inds.as_dtype(crate::dtype::I32);
+            a.eval();
+            a.as_slice::<i32>().to_vec()
+        };
+        let weights = to_vec(&weights);
+        for r in 0..7usize {
+            let row = &host[r * 9..(r + 1) * 9];
+            let mut order: Vec<usize> = (0..9).collect();
+            order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+            let kept: f32 = order[..3].iter().map(|&e| row[e]).sum();
+            for slot in 0..3 {
+                let e = inds[r * 3 + slot] as usize;
+                assert!(order[..3].contains(&e), "row {r}: expert {e} is not top-3");
+                assert!(
+                    (weights[r * 3 + slot] - row[e] / kept).abs() < 1e-5,
+                    "row {r} slot {slot} e {e}: got {} want {} (kept {kept}, row {row:?})",
+                    weights[r * 3 + slot],
+                    row[e] / kept
+                );
+            }
+        }
     }
 }

@@ -25,12 +25,8 @@
 //! implementation for the shared path and the native engine; GPT-OSS's (softmax
 //! over the chosen logits) is `pmetal_runtime::gpt_oss_native::route_logits`.
 
-use pmetal_runtime::compat::{Array, Exception, ops};
-
-/// Numerical floor for the `sum(top_weights)` denominator when
-/// `norm_topk_prob` is true. Matches the value used in-line across pmetal
-/// MoE blocks.
-const TOPK_NORM_EPS: f32 = 1e-8;
+use pmetal_runtime::compat::{Array, Exception};
+use pmetal_runtime::native_moe;
 
 /// Top-k selection + optional renormalisation, shared across MoE variants.
 ///
@@ -51,34 +47,19 @@ pub fn topk_normalize(
     top_k: i32,
     norm_topk_prob: bool,
 ) -> Result<(Array, Array), Exception> {
-    if top_k <= 0 {
+    let experts = scores.dim(-1);
+    if top_k <= 0 || top_k > experts || scores.ndim() != 2 {
         return Err(Exception::custom(format!(
-            "topk_normalize: top_k must be positive, got {top_k}"
+            "topk_normalize: top_k must be within 1..={experts} for scores of shape [N, experts], \
+             got top_k {top_k} for {:?}",
+            scores.shape()
         )));
     }
-    let neg_k = -top_k;
-
-    // argpartition with negative pivot places the k largest values at the
-    // tail of the axis. We then slice them and cast to the i32 index
-    // dtype expected by `take_along_axis`.
-    let part_indices = ops::argpartition_axis(scores, neg_k, -1);
-    // MLX >= 0.32 raises "[gather] Cannot calculate VJP with respect to
-    // indices" when routing indices sit downstream of differentiable scores
-    // inside a grad trace — cut it here so gradients flow only through the
-    // gathered weights, never the index path.
-    let top_indices =
-        ops::stop_gradient(&ops::slice_last_from(&part_indices, neg_k).as_type::<i32>());
-    let top_weights = scores.take_along_axis(&top_indices, -1);
-
-    let normalized_weights = if norm_topk_prob {
-        let weight_sum = top_weights.sum_axis(-1, true);
-        let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(TOPK_NORM_EPS));
-        top_weights.divide(&safe_sum)
-    } else {
-        top_weights
-    };
-
-    Ok((top_indices, normalized_weights))
+    // The selection every plain top-k router shares, with the indices cut
+    // from the gradient (MLX >= 0.32 refuses a gather's VJP with respect to
+    // indices) and as the `i32` this module's callers expect.
+    let (top_indices, weights) = native_moe::top_k_scores(scores, top_k, norm_topk_prob);
+    Ok((top_indices.as_type::<i32>(), weights))
 }
 
 #[cfg(test)]
@@ -117,7 +98,7 @@ mod tests {
     #[test]
     fn topk_normalize_when_requested() {
         let scores = Array::from_slice(&[0.2, 0.3, 0.1, 0.4], &[1, 4]);
-        let (_, weights) = topk_normalize(&scores, 2, true).unwrap();
+        let (_, mut weights) = topk_normalize(&scores, 2, true).unwrap();
         let mut w = weights.clone();
         let sel = w.to_f32_vec(2).unwrap();
         let sum: f32 = sel.iter().sum();
@@ -180,6 +161,63 @@ mod tests {
             (correct - 0.7).abs() < 1e-5,
             "correct top-k sum = {correct} (expected 0.7 = 0.4+0.3)"
         );
+    }
+
+    /// Every row's chosen experts and weights against a host sort, for
+    /// distinct random scores, with and without renormalisation.
+    #[test]
+    fn topk_matches_a_host_sort() {
+        let (rows, experts, k) = (6usize, 10usize, 3usize);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let scores: Vec<f32> = (0..rows * experts)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 40) as f32 / (1u64 << 24) as f32
+            })
+            .collect();
+        let array = Array::from_slice(&scores, &[rows as i32, experts as i32]);
+        for norm in [false, true] {
+            let (inds, mut weights) = topk_normalize(&array, k as i32, norm).unwrap();
+            let (inds, weights) = (
+                inds.as_type::<f32>().to_f32_vec(rows * k).unwrap(),
+                weights.to_f32_vec(rows * k).unwrap(),
+            );
+            for r in 0..rows {
+                let row = &scores[r * experts..(r + 1) * experts];
+                let mut order: Vec<usize> = (0..experts).collect();
+                order.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+                let kept: f32 = order[..k].iter().map(|&e| row[e]).sum();
+                for slot in 0..k {
+                    let e = inds[r * k + slot] as usize;
+                    assert!(
+                        order[..k].contains(&e),
+                        "row {r}: expert {e} is not top-{k}"
+                    );
+                    let want = if norm { row[e] / kept } else { row[e] };
+                    assert!(
+                        (weights[r * k + slot] - want).abs() < 1e-6,
+                        "row {r} expert {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalising_scores_that_all_underflow_gives_zeros_not_nan() {
+        let scores = Array::from_slice(&[0.0f32, 0.0, 0.0, 0.0], &[1, 4]);
+        let (_, mut weights) = topk_normalize(&scores, 2, true).unwrap();
+        for w in weights.to_f32_vec(2).unwrap() {
+            assert_eq!(w, 0.0);
+        }
+    }
+
+    #[test]
+    fn rejects_a_top_k_beyond_the_experts() {
+        let scores = Array::from_slice(&[0.1, 0.2], &[1, 2]);
+        assert!(topk_normalize(&scores, 3, false).is_err());
     }
 
     #[test]
