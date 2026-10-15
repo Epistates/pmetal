@@ -1,37 +1,8 @@
 use super::*;
 use crate::collective::chunk_range;
 use crate::ring::RingBackend;
-use crate::testing::{fresh_security, tcp_ring};
+use crate::testing::{fresh_security, noise, ring_mean, tcp_ring};
 use crate::zero::ZeroLayout;
-
-fn noise(seed: u64, len: usize) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
-        })
-        .collect()
-}
-
-/// The mean the ring computes, element by element, in the ring's order.
-fn ring_mean(inputs: &[Vec<f32>]) -> Vec<f32> {
-    let n = inputs.len();
-    let len = inputs[0].len();
-    let mut out = vec![0f32; len];
-    for c in 0..n {
-        for i in chunk_range(len, n, c) {
-            let mut acc = inputs[(c + 1) % n][i];
-            for j in 2..=n {
-                acc += inputs[(c + j) % n][i];
-            }
-            out[i] = acc / n as f32;
-        }
-    }
-    out
-}
 
 fn named_params() -> Vec<(String, usize)> {
     vec![

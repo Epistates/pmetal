@@ -20,8 +20,10 @@ context-parallel = ["mlx-collectives"]
 zero = []
 # 1F1B and zero-bubble pipeline training schedules (pure Rust)
 pipeline-training = []
+# DiLoCo low-communication training: one synchronisation per H inner steps
+diloco = []
 # Enable all distributed capabilities
-full = ["mlx-collectives", "tensor-parallel", "expert-parallel", "context-parallel", "zero", "pipeline-training"]
+full = ["mlx-collectives", "tensor-parallel", "expert-parallel", "context-parallel", "zero", "pipeline-training", "diloco"]
 
 [dependencies]
 # Use workspace versions for consistency

@@ -1,6 +1,6 @@
 //! Loopback rings for tests. Nothing here leaves 127.0.0.1.
 
-use crate::collective::RingCollective;
+use crate::collective::{RingCollective, chunk_range};
 use crate::config::DistributedConfig;
 use crate::secret::ClusterSecret;
 use crate::transport::{
@@ -87,4 +87,36 @@ pub(crate) async fn tcp_link_pair(security: LinkSecurity) -> (Link, Link) {
     let stream = TcpStream::connect(addr).await.expect("connect");
     let dialer = client_handshake(stream, &dial).await.expect("handshake");
     (dialer, accepting.await.expect("accept task"))
+}
+
+/// Deterministic noise in `[-1, 1)`, a different stream for each seed.
+pub(crate) fn noise(seed: u64, len: usize) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0
+        })
+        .collect()
+}
+
+/// The mean a ring all-reduce computes, element by element, adding the ranks'
+/// values in the order the ring does (chunk `c` is summed starting at rank
+/// `c + 1`), so a test can demand the very same bits.
+pub(crate) fn ring_mean(inputs: &[Vec<f32>]) -> Vec<f32> {
+    let n = inputs.len();
+    let len = inputs[0].len();
+    let mut out = vec![0f32; len];
+    for c in 0..n {
+        for i in chunk_range(len, n, c) {
+            let mut acc = inputs[(c + 1) % n][i];
+            for j in 2..=n {
+                acc += inputs[(c + j) % n][i];
+            }
+            out[i] = acc / n as f32;
+        }
+    }
+    out
 }

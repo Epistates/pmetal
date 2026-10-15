@@ -22,6 +22,7 @@
 //! - **`context-parallel`**: Ring attention, KV cache sharding for long-context inference
 //! - **`zero`**: ZeRO optimizer state/gradient sharding for memory-efficient training
 //! - **`pipeline-training`**: 1F1B and zero-bubble pipeline training schedules
+//! - **`diloco`**: DiLoCo low-communication training (one sync per H steps)
 //!
 //! # Quick Start (Auto-Discovery)
 //!
@@ -150,6 +151,10 @@ pub mod zero;
 #[cfg(feature = "pipeline-training")]
 pub mod pipeline_training;
 
+/// DiLoCo: low-communication training with an outer optimizer (pure Rust).
+#[cfg(feature = "diloco")]
+pub mod diloco;
+
 #[cfg(test)]
 mod testing;
 
@@ -201,6 +206,9 @@ pub use zero::{ShardOptimizer, ShardedAdamW, ZeROStage, ZeroLayout, ZeroOptimize
 
 #[cfg(feature = "pipeline-training")]
 pub use pipeline_training::{MicroBatchAction, ZBAction, schedule_1f1b, schedule_zero_bubble};
+
+#[cfg(feature = "diloco")]
+pub use diloco::{DiLoCo, DiLoCoConfig};
 
 /// Interface for distributed operations.
 #[async_trait]
