@@ -26,6 +26,7 @@ pub mod resolve;
 pub mod search;
 pub mod select;
 pub mod tensors;
+pub mod torch;
 mod upload;
 mod verify;
 

@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pmetal_core::SecretString;
+use pmetal_hub::torch::testing::{CheckpointLayout, FixtureTensor, checkpoint};
+use pmetal_hub::verify_model_dir;
 use pmetal_hub::{
     DownloadOptions, HubOptions, TransferProgress, Verification, WeightFormat,
     download_dataset_with, download_model_with, find_cached_model_in, plan_model_download,
@@ -299,29 +301,99 @@ async fn a_colon_suffix_selects_the_quantization_when_resolving() {
 }
 
 #[tokio::test]
-async fn a_repository_with_only_pytorch_weights_is_refused_not_half_downloaded() {
+async fn a_repository_with_only_pickles_comes_back_as_safetensors() {
     isolate_env();
     let hub = FakeHub::start().await;
     let cache = tempfile::tempdir().unwrap();
+    let weights = checkpoint(
+        &[
+            FixtureTensor::f32("embed.weight", &[2, 2], &[1.0, 2.0, 3.0, 4.0]),
+            FixtureTensor::f32("head.weight", &[2], &[5.0, 6.0]),
+        ],
+        &CheckpointLayout::default(),
+    );
     hub.add_model(
         "o/old",
-        Repo::with_files(&[("config.json", CONFIG), ("pytorch_model.bin", b"pickle")]),
+        Repo::with_files(&[("config.json", CONFIG), ("pytorch_model.bin", &weights)]),
     );
     let opts = options(&hub, cache.path());
 
-    let err = download_model_with("o/old", &opts)
+    let dir = download_model_with("o/old", &opts).await.unwrap();
+
+    // The pickles came down, and what loads is the safetensors beside them.
+    assert!(dir.join("pytorch_model.bin").exists());
+    let report = verify_model_dir(&dir);
+    assert!(report.is_complete(), "{:?}", report.problems);
+    assert_eq!(report.format, Some(WeightFormat::Safetensors));
+    assert_eq!(report.safetensors.unwrap().tensors, 2);
+
+    // A later call is served from the cache, converted, with no requests.
+    hub.clear_log();
+    let again = download_model_with("o/old", &opts).await.unwrap();
+    assert_eq!(again, dir);
+    assert!(hub.log().is_empty());
+}
+
+#[tokio::test]
+async fn a_pickle_snapshot_from_another_tool_is_converted_on_first_use() {
+    isolate_env();
+    let hub = FakeHub::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    let weights = checkpoint(
+        &[FixtureTensor::f32("w", &[2], &[1.0, 2.0])],
+        &CheckpointLayout::default(),
+    );
+    hub.add_model(
+        "o/old",
+        Repo::with_files(&[("config.json", CONFIG), ("pytorch_model.bin", &weights)]),
+    );
+    let mut opts = options(&hub, cache.path());
+    // Offline, the cache answers: first a snapshot that only has the pickles.
+    let dir = download_model_with("o/old", &opts).await.unwrap();
+    std::fs::remove_file(dir.join("model.safetensors")).unwrap();
+    assert_eq!(verify_model_dir(&dir).format, Some(WeightFormat::PyTorch));
+
+    opts.hub.offline = Some(true);
+    let again = download_model_with("o/old", &opts).await.unwrap();
+
+    assert_eq!(
+        verify_model_dir(&again).format,
+        Some(WeightFormat::Safetensors)
+    );
+}
+
+#[tokio::test]
+async fn a_malicious_pickle_is_an_error_and_runs_nothing() {
+    isolate_env();
+    let hub = FakeHub::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    let marker = cache.path().join("pwned");
+    let mut pickle = vec![0x80, 2];
+    pickle.extend_from_slice(b"cos\nsystem\n");
+    let command = format!("touch {}", marker.display());
+    pickle.push(b'X');
+    pickle.extend_from_slice(&(command.len() as u32).to_le_bytes());
+    pickle.extend_from_slice(command.as_bytes());
+    pickle.extend_from_slice(&[0x85, b'R', b'.']);
+    let evil = pmetal_hub::torch::testing::stored_zip(
+        &[
+            ("archive/data.pkl", &pickle),
+            ("archive/byteorder", b"little"),
+        ],
+        false,
+    );
+    hub.add_model(
+        "o/evil",
+        Repo::with_files(&[("config.json", CONFIG), ("pytorch_model.bin", &evil)]),
+    );
+
+    let err = download_model_with("o/evil", &options(&hub, cache.path()))
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("PyTorch"), "{err}");
-    assert!(hub.downloaded().is_empty(), "nothing should be fetched");
 
-    // Asked for explicitly, the pickles are fetched (and the directory then
-    // reports what it holds).
-    let mut opts = opts;
-    opts.weights = WeightFormat::PyTorch;
-    let dir = download_model_with("o/old", &opts).await.unwrap();
-    assert!(dir.join("pytorch_model.bin").exists());
+    assert!(err.contains("os.system"), "{err}");
+    assert!(!marker.exists());
 }
 
 #[tokio::test]

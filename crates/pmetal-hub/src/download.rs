@@ -133,7 +133,42 @@ pub async fn download_model(
 /// served without a request when no revision is named; a named branch is
 /// resolved first, and if the Hub cannot be reached the copy last cached for
 /// that name is used.
+///
+/// A model published only as PyTorch pickles is converted to safetensors in
+/// the snapshot directory (see [`crate::torch`]), so the directory returned
+/// always holds weights that load.
 pub async fn download_model_with(model_id: &str, options: &DownloadOptions) -> Result<PathBuf> {
+    let snapshot = fetch_model(model_id, options).await?;
+    ensure_loadable(snapshot).await
+}
+
+/// If `snapshot` holds PyTorch pickles and no safetensors, write the
+/// safetensors (a no-op when they are already there).
+async fn ensure_loadable(snapshot: PathBuf) -> Result<PathBuf> {
+    if verify_model_dir(&snapshot).format != Some(WeightFormat::PyTorch) {
+        return Ok(snapshot);
+    }
+    tracing::info!(
+        "Converting PyTorch weights in {} to safetensors",
+        snapshot.display()
+    );
+    let dir = snapshot.clone();
+    tokio::task::spawn_blocking(move || crate::torch::convert_pytorch_dir(&dir))
+        .await
+        .map_err(|e| PMetalError::Hub(format!("the weight conversion was interrupted: {e}")))??;
+    let report = verify_model_dir(&snapshot);
+    if report.is_complete() {
+        Ok(snapshot)
+    } else {
+        Err(PMetalError::Hub(format!(
+            "converted the PyTorch weights in {} but the result is not a complete model: {}",
+            snapshot.display(),
+            report.problems.join("; ")
+        )))
+    }
+}
+
+async fn fetch_model(model_id: &str, options: &DownloadOptions) -> Result<PathBuf> {
     crate::repo::validate_repo_id(model_id)?;
     let cache_root = options.hub.resolved_cache_dir();
     let revision = options.revision.as_deref();

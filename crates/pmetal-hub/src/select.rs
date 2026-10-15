@@ -45,9 +45,8 @@ impl RepoFile {
 /// Which weight format a download should fetch.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WeightFormat {
-    /// Safetensors when the repository has them, else GGUF. A repository that
-    /// publishes only PyTorch pickles is an error under `Auto`: nothing here
-    /// loads them, and saying so beats a "successful" download of no weights.
+    /// Safetensors when the repository has them, else GGUF, else PyTorch
+    /// pickles.
     #[default]
     Auto,
     /// Safetensors only.
@@ -56,7 +55,9 @@ pub enum WeightFormat {
     ///
     /// [`DownloadOptions::gguf_quant`]: crate::DownloadOptions::gguf_quant
     Gguf,
-    /// PyTorch `pytorch_model*.bin` pickles.
+    /// PyTorch `pytorch_model*.bin` pickles. After the download they are read
+    /// with a restricted unpickler (no code in them runs) and written as
+    /// safetensors next to them, which is what loads.
     PyTorch,
 }
 
@@ -257,14 +258,7 @@ pub fn plan_model(
         WeightFormat::PyTorch => WeightFormat::PyTorch,
         WeightFormat::Auto if has_safetensors => WeightFormat::Safetensors,
         WeightFormat::Auto if has_gguf => WeightFormat::Gguf,
-        WeightFormat::Auto if has_pytorch => {
-            return Err(PMetalError::Hub(
-                "this repository publishes only PyTorch pickle weights (pytorch_model*.bin), \
-                 which pmetal does not load directly; ask for the PyTorch format explicitly, or \
-                 look for a safetensors or GGUF conversion of the model"
-                    .into(),
-            ));
-        }
+        WeightFormat::Auto if has_pytorch => WeightFormat::PyTorch,
         WeightFormat::Auto => {
             return Err(PMetalError::Hub(
                 "this repository has no model weights (no .safetensors, .gguf or pytorch_model*.bin)"
@@ -723,18 +717,21 @@ mod tests {
     }
 
     #[test]
-    fn pytorch_only_is_an_explicit_error_unless_asked_for() {
+    fn pickles_are_the_last_resort_and_training_state_is_not_weights() {
         let mut files = aux();
         files.push(f("pytorch_model.bin", 1000));
         files.push(f("training_args.bin", 10));
-        let err = plan_model(&files, &HashMap::new(), WeightFormat::Auto, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("PyTorch"), "{err}");
-        let plan = plan_model(&files, &HashMap::new(), WeightFormat::PyTorch, None).unwrap();
-        assert_eq!(plan.weights, SelectedWeights::PyTorch);
-        assert!(paths(&plan).contains(&"pytorch_model.bin"));
-        assert!(!paths(&plan).contains(&"training_args.bin"));
+        for format in [WeightFormat::Auto, WeightFormat::PyTorch] {
+            let plan = plan_model(&files, &HashMap::new(), format, None).unwrap();
+            assert_eq!(plan.weights, SelectedWeights::PyTorch);
+            assert!(paths(&plan).contains(&"pytorch_model.bin"));
+            assert!(!paths(&plan).contains(&"training_args.bin"));
+        }
+        // With safetensors beside them, the pickles are skipped.
+        files.push(f("model.safetensors", 900));
+        let plan = plan_model(&files, &HashMap::new(), WeightFormat::Auto, None).unwrap();
+        assert_eq!(plan.weights, SelectedWeights::Safetensors);
+        assert!(!paths(&plan).contains(&"pytorch_model.bin"));
     }
 
     #[test]

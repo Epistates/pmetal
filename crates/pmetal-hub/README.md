@@ -8,8 +8,9 @@ HuggingFace Hub integration for PMetal: download, verify, search, size for this 
   once, and exactly the files the model needs are fetched concurrently into the standard Hub cache
   (`models--owner--name/{blobs,refs,snapshots}`), shared with the Hub's own tools.
 - **Only what the model needs.** Configs and tokenizer files plus one set of weights: safetensors
-  (exactly the shards the index names), or one GGUF quantization (split models come whole), or
-  PyTorch pickles on request. A repository with only pickles is refused, not half-downloaded.
+  (exactly the shards the index names), or one GGUF quantization (split models come whole), or, as
+  a last resort, PyTorch pickles. Pickles are read with a restricted unpickler that cannot run
+  code (`torch`) and written as safetensors next to them, so what comes back always loads.
 - **Verified.** Every file is checked against the size the Hub lists (optionally its SHA-256), and
   the result must pass [`verify_model_dir`], which reads headers only: safetensors files exactly as
   long as their headers say, GGUF sets complete.
@@ -190,6 +191,7 @@ fn manage() -> Result<(), Box<dyn std::error::Error>> {
 | `search` | Model search, metadata, model cards, GGUF variants |
 | `fit` | Memory and decode-speed estimates for a device |
 | `tensors` | Safetensors header summaries |
+| `torch` | Memory-mapped, restricted reading of PyTorch checkpoints; conversion to safetensors |
 | `cache` | Local cache management |
 | `upload` | Publishing a model directory |
 
