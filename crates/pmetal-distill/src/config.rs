@@ -80,10 +80,14 @@ pub struct LossConfig {
     #[serde(default)]
     pub outcome_supervised: bool,
 
-    /// Start marker for explicit reasoning (e.g., `<think>`).
+    /// Start marker for explicit reasoning (e.g., `<think>`). Validated here
+    /// and left to the training loop, which owns the tokenizer: it resolves the
+    /// markers to token ids and passes
+    /// [`generate_reasoning_mask`](crate::reasoning::generate_reasoning_mask)
+    /// (scaled as it likes) as the per-token weights of the loss.
     pub start_marker: Option<String>,
 
-    /// End marker for explicit reasoning (e.g., `</think>`).
+    /// End marker for explicit reasoning (e.g., `</think>`); see `start_marker`.
     pub end_marker: Option<String>,
 
     /// Hidden state distillation configuration.

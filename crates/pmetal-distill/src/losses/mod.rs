@@ -87,7 +87,8 @@ pub trait DistillLoss: Send + Sync {
     ///
     /// The teacher logits arrive already detached from the autodiff graph:
     /// treat them as constants. `weights` is one entry per token; the result
-    /// is `sum(loss * w) / sum(w)`, which [`reduce_per_token`] computes.
+    /// is `sum(loss * w) / sum(w)` (a mean without weights, and zero when every
+    /// weight is zero).
     fn weighted_loss(
         &self,
         teacher_logits: &Array,
