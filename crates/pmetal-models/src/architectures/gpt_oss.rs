@@ -1094,8 +1094,9 @@ impl GptOssModel {
 pub struct GptOssForCausalLM {
     /// Base model.
     pub model: GptOssModel,
-    /// Language model head.
-    pub lm_head: nn::Linear,
+    /// Language model head; `None` when `tie_word_embeddings` ties it to the
+    /// token embedding.
+    pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(GptOssForCausalLM; model, lm_head);
 
@@ -1104,11 +1105,26 @@ impl GptOssForCausalLM {
     pub fn new(config: GptOssConfig) -> Result<Self, Exception> {
         let model = GptOssModel::new(config.clone())?;
 
-        let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-            .bias(false)
-            .build()?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
+        };
 
         Ok(Self { model, lm_head })
+    }
+
+    /// Project hidden states to vocabulary logits, through the LM head when
+    /// the checkpoint has one and the tied embedding otherwise.
+    pub fn lm_head_forward(&self, hidden: &Array) -> Array {
+        match &self.lm_head {
+            Some(lm_head) => lm_head.forward(hidden),
+            None => self.model.embed_tokens.as_linear(hidden),
+        }
     }
 
     /// Forward pass returning logits.
@@ -1119,7 +1135,7 @@ impl GptOssForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(input_ids, mask, cache)?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Forward pass with one rotary position per token; see
@@ -1133,7 +1149,7 @@ impl GptOssForCausalLM {
         let hidden = self
             .model
             .forward_with_positions(input_ids, mask, positions)?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Forward pass that records hidden states into a DFlash capture
@@ -1148,7 +1164,7 @@ impl GptOssForCausalLM {
         let hidden =
             self.model
                 .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Eagerly build stacked expert caches for all MoE layers.
@@ -1473,6 +1489,26 @@ mod tests {
             max_diff.item::<f32>() < 1e-4,
             "gpt-oss stacked cache failed to refresh after weight change"
         );
+    }
+
+    /// A config that ties the head to the embedding builds no head, and the
+    /// logits are the hidden states against the embedding table.
+    #[test]
+    #[serial]
+    fn test_gpt_oss_tied_head_projects_through_the_embedding() {
+        let mut model = GptOssForCausalLM::new(GptOssConfig {
+            tie_word_embeddings: true,
+            ..tiny_gpt_oss_config()
+        })
+        .unwrap();
+        assert!(model.lm_head.is_none());
+        let ids = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+        let hidden = model.model.forward(&ids, None, None).unwrap();
+        let want = hidden.matmul(&model.model.embed_tokens.weight.value.t());
+        let got = model.forward(&ids, None, None).unwrap();
+        let diff = got.subtract(&want).abs().max(None);
+        diff.eval();
+        assert!(diff.item::<f32>() < 1e-5);
     }
 
     #[test]

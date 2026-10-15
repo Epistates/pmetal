@@ -1816,10 +1816,10 @@ impl DynamicModel {
             Self::Qwen4Exp(m) => m.lm_head.as_ref(),
             Self::Mistral(m) => m.lm_head.as_ref(),
             Self::Phi(m) | Self::Phi4(m) => m.lm_head.as_ref(),
-            Self::DeepSeek(m) => Some(&m.lm_head),
+            Self::DeepSeek(m) => m.lm_head.as_ref(),
             Self::Cohere(m) => m.lm_head.as_ref(),
             Self::Granite(m) => m.lm_head.as_ref(),
-            Self::GptOss(m) => Some(&m.lm_head),
+            Self::GptOss(m) => m.lm_head.as_ref(),
             Self::NemotronH(m) => m.lm_head.as_ref(),
             Self::Mllama(m) => Some(&m.lm_head),
             Self::Gemma(_)

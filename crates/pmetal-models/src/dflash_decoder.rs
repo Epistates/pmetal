@@ -1307,7 +1307,7 @@ impl DFlashTarget for DynamicModel {
             // Phi-4-mini ties, so a direct `lm_head` projection here draws on
             // a head the checkpoint never filled.
             Self::Phi(m) | Self::Phi4(m) => m.project_logits(hidden),
-            Self::DeepSeek(m) => Ok(Module::forward(&mut m.lm_head, hidden)?),
+            Self::DeepSeek(m) => Ok(m.lm_head_forward(hidden)),
             Self::Qwen3MoE(m) => match &mut m.lm_head {
                 Some(lm) => Ok(Module::forward(lm, hidden)?),
                 None => {

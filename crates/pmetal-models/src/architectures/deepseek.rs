@@ -1261,7 +1261,9 @@ impl DeepSeekMTPModule {
 pub struct DeepSeek {
     pub config: DeepSeekConfig,
     pub model: DeepSeekModel,
-    pub lm_head: nn::Linear,
+    /// `None` when `tie_word_embeddings` ties the head to the token
+    /// embedding.
+    pub lm_head: Option<nn::Linear>,
     pub mtp_modules: Vec<DeepSeekMTPModule>,
 }
 impl_module_params!(DeepSeek; model, lm_head, mtp_modules);
@@ -1277,9 +1279,15 @@ impl DeepSeek {
                 )?);
             }
         }
-        let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-            .bias(false)
-            .build()?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
+        };
         let config_clone = config.clone();
         Ok(Self {
             config,
@@ -1288,9 +1296,29 @@ impl DeepSeek {
             mtp_modules,
         })
     }
+
+    /// Project hidden states to vocabulary logits, through the LM head when
+    /// the checkpoint has one and the tied embedding otherwise.
+    pub fn lm_head_forward(&self, hidden: &Array) -> Array {
+        Self::project(&self.lm_head, &self.model.embed_tokens, hidden)
+    }
+
+    /// [`Self::lm_head_forward`] over the fields it reads, for callers that
+    /// hold another field of the model mutably.
+    fn project(
+        lm_head: &Option<nn::Linear>,
+        embed_tokens: &nn::Embedding,
+        hidden: &Array,
+    ) -> Array {
+        match lm_head {
+            Some(lm_head) => lm_head.forward(hidden),
+            None => embed_tokens.as_linear(hidden),
+        }
+    }
+
     pub fn forward_mtp(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Vec<Array>> {
         let (hidden_final, _) = self.model.forward_with_hidden(input_ids, mask)?;
-        let mut all_logits = vec![self.lm_head.forward(&hidden_final)];
+        let mut all_logits = vec![self.lm_head_forward(&hidden_final)];
         if !self.config.use_mtp {
             return Ok(all_logits);
         }
@@ -1306,7 +1334,11 @@ impl DeepSeek {
                 1,
             );
             h_prev = mtp_module.forward(&h_prev, &e_curr_padded, mask)?;
-            all_logits.push(self.lm_head.forward(&h_prev));
+            all_logits.push(Self::project(
+                &self.lm_head,
+                &self.model.embed_tokens,
+                &h_prev,
+            ));
         }
         Ok(all_logits)
     }
@@ -1316,9 +1348,8 @@ impl DeepSeek {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array> {
-        Ok(self
-            .lm_head
-            .forward(&self.model.forward(input_ids, mask, cache)?))
+        let hidden = self.model.forward(input_ids, mask, cache)?;
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Forward pass with one rotary position per token; see
@@ -1332,7 +1363,7 @@ impl DeepSeek {
         let hidden = self
             .model
             .forward_with_positions(input_ids, mask, positions)?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     /// Forward pass that records hidden states into a DFlash capture
@@ -1347,7 +1378,7 @@ impl DeepSeek {
         let hidden =
             self.model
                 .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
-        Ok(self.lm_head.forward(&hidden))
+        Ok(self.lm_head_forward(&hidden))
     }
 
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
@@ -1530,6 +1561,27 @@ mod tests {
             max_diff.item::<f32>() < 1e-4,
             "deepseek full model drifted after stacked init"
         );
+    }
+
+    /// A config that ties the head to the embedding builds no head, and the
+    /// logits are the hidden states against the embedding table: a model that
+    /// built one anyway would answer with a head no checkpoint fills.
+    #[test]
+    #[serial]
+    fn test_deepseek_tied_head_projects_through_the_embedding() {
+        let mut model = DeepSeek::new(DeepSeekConfig {
+            tie_word_embeddings: true,
+            ..tiny_deepseek_moe_config()
+        })
+        .unwrap();
+        assert!(model.lm_head.is_none());
+        let ids = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+        let hidden = model.model.forward(&ids, None, None).unwrap();
+        let want = hidden.matmul(&model.model.embed_tokens.weight.value.t());
+        let got = model.forward(&ids, None, None).unwrap();
+        let diff = got.subtract(&want).abs().max(None);
+        diff.eval();
+        assert!(diff.item::<f32>() < 1e-5);
     }
 
     #[test]
