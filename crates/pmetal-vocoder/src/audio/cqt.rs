@@ -60,9 +60,13 @@ pub struct Cqt {
     n_filters: i32,
     /// Window of the kernels, a power of two.
     fft_len: i32,
-    /// Kernels as one convolution weight `[2 * n_filters, fft_len, 1]`: the
-    /// real parts, then the negated imaginary parts.
-    kernels: Array,
+    /// The kernels row-major `[2 * n_filters, fft_len]`: the real parts, then
+    /// the negated imaginary parts (the transform correlates with the
+    /// conjugate), kept on the host for checking checkpoint buffers.
+    kernel_rows: Vec<f32>,
+    /// The same kernels as a matrix `[fft_len, 2 * n_filters]` that frames of
+    /// the signal multiply.
+    kernel_matrix: Array,
     /// Per-bin `sqrt(length)` normalisation, `[n_bins]`, times the early
     /// downsampling factor.
     scale: Array,
@@ -174,11 +178,18 @@ impl Cqt {
                 imag[at] = (im / l1) as f32;
             }
         }
-        // One convolution gives [real, -imag]: the transform correlates with
-        // the conjugate of the kernel.
-        let mut weights = real;
-        weights.extend(imag.iter().map(|v| -v));
-        let kernels = Array::from_f32_slice(&weights, &[2 * n_filters, fft_len, 1]);
+        // One product gives [real, -imag]: the transform correlates with the
+        // conjugate of the kernel.
+        let mut kernel_rows = real;
+        kernel_rows.extend(imag.iter().map(|v| -v));
+        let outputs = 2 * n_filters as usize;
+        let mut transposed = vec![0.0f32; kernel_rows.len()];
+        for o in 0..outputs {
+            for j in 0..width {
+                transposed[j * outputs + o] = kernel_rows[o * width + j];
+            }
+        }
+        let kernel_matrix = Array::from_f32_slice(&transposed, &[fft_len, 2 * n_filters]);
 
         // Normalisation as librosa: sqrt of each bin's window length, with the
         // lengths computed at the (possibly downsampled) rate for all bins.
@@ -197,7 +208,8 @@ impl Cqt {
             n_octaves,
             n_filters,
             fft_len,
-            kernels,
+            kernel_rows,
+            kernel_matrix,
             scale: Array::from_f32_slice(&scale, &[config.n_bins]),
             lowpass,
             early,
@@ -227,9 +239,8 @@ impl Cqt {
     /// convolutions without complaint and produce garbage. Absent buffers are
     /// skipped.
     pub fn check_buffers(&self, sd: &mut StateDict, prefix: &str) -> Result<()> {
-        let weights = self.kernels.as_slice::<f32>();
-        let half = weights.len() / 2;
-        let (real, neg_imag) = weights.split_at(half);
+        let half = self.kernel_rows.len() / 2;
+        let (real, neg_imag) = self.kernel_rows.split_at(half);
         let imag: Vec<f32> = neg_imag.iter().map(|v| -v).collect();
         let lowpass = self.lowpass.as_slice::<f32>().to_vec();
         let early = self
@@ -282,10 +293,27 @@ impl Cqt {
 
     /// One octave: zero-pad by half a kernel and correlate with the bank,
     /// giving `[batch, frames, 2 * n_filters]` (real parts then imaginary).
+    ///
+    /// Done as frames times a matrix rather than a strided convolution with
+    /// 512 to 4096-tap kernels: the convolution's backward pass materialises
+    /// an im2col buffer thousands of times the signal's size (gigabytes for a
+    /// third of a second of audio), while the gathered frames are only
+    /// `fft_len / hop` times the signal.
     fn octave(&self, x: &Array, hop: i32) -> Array {
-        let pad = self.fft_len / 2;
-        let x = ops::pad(x, &[(0, 0), (pad, pad), (0, 0)], None, None);
-        x.conv1d(&self.kernels, hop, 0, 1, 1)
+        let (batch, samples) = (x.dim(0), x.dim(1));
+        let (pad, n) = (self.fft_len / 2, self.fft_len);
+        let padded = ops::pad(
+            &x.reshape(&[batch, samples]),
+            &[(0, 0), (pad, pad)],
+            None,
+            None,
+        );
+        let frames = (samples + 2 * pad - n) / hop + 1;
+        let index: Vec<i32> = (0..frames)
+            .flat_map(|f| (0..n).map(move |j| f * hop + j))
+            .collect();
+        let index = Array::from_i32_slice_shaped(&index, &[frames, n]);
+        padded.take_axis(&index, 1).matmul(&self.kernel_matrix)
     }
 
     /// The complex CQT of `signal` (`[batch, samples]` or `[samples]`) as

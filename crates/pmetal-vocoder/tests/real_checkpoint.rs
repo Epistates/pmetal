@@ -9,7 +9,7 @@
 mod common;
 
 use common::{Fixture, assert_runtime_ok, max_abs_diff, to_vec};
-use pmetal_runtime::compat::Dtype;
+use pmetal_runtime::compat::{Array, Dtype};
 use pmetal_vocoder::BigVGAN;
 use std::path::PathBuf;
 
@@ -152,10 +152,21 @@ fn fine_tune_smoke(name: &str) {
     let generator = BigVGAN::from_dir(&dir).expect("load the released generator");
     let mut trainer = GanTrainer::new(generator, discriminator, training).unwrap();
 
-    // 8192 samples of the reference signal and their mel.
+    // A segment of the reference signal and its mel: 32 frames by default;
+    // BIGVGAN_SMOKE_FRAMES raises it (the release trains on 65536 samples).
     let fx = Fixture::load_path(&dir.join("ref.safetensors"));
-    let samples = 32 * model_config.hop_size;
-    let wav = ops::slice_axis(&fx.array("signal"), 1, 0, samples);
+    let frames: i32 = std::env::var("BIGVGAN_SMOKE_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let signal = fx.array("signal");
+    assert!(
+        frames * model_config.hop_size <= signal.dim(1),
+        "the reference signal has {} samples",
+        signal.dim(1)
+    );
+    let samples = frames * model_config.hop_size;
+    let wav = ops::slice_axis(&signal, 1, 0, samples);
     let mel = MelFrontEnd::new(&model_config)
         .unwrap()
         .forward(&wav)
@@ -212,6 +223,59 @@ fn from_pretrained_downloads_and_loads_a_release() {
     let audio = model.forward(&fx.array("mel")).unwrap();
     let diff = max_abs_diff(&to_vec(&audio), fx.values("audio"));
     assert!(diff < 2e-4, "max |diff| {diff}");
+}
+
+/// Streaming and chunked synthesis of a released model reproduce its one-shot
+/// output: the receptive field computed from the architecture is large enough
+/// for the real dilations and kernels.
+#[test]
+#[ignore = "needs a downloaded checkpoint (see the module docs)"]
+fn released_models_stream_exactly() {
+    for name in ["base24", "v2_24"] {
+        let Some(dir) = model_dir(name) else {
+            eprintln!("BIGVGAN_CHECKPOINT_DIR/{name} not found; skipping");
+            continue;
+        };
+        let model = BigVGAN::from_dir(&dir).unwrap();
+        let fx = Fixture::load_path(&dir.join("ref.safetensors"));
+        let mel = fx.array("mel");
+        let full = to_vec(&model.forward(&mel).unwrap());
+        let frames = model.receptive_radius_frames();
+
+        // How far does one mel frame really reach? Perturb the middle one.
+        let bump_at = mel.dim(2) / 2;
+        let mut bump = vec![0.0f32; (mel.dim(1) * mel.dim(2)) as usize];
+        for m in 0..mel.dim(1) {
+            bump[(m * mel.dim(2) + bump_at) as usize] = 3.0;
+        }
+        let bumped = mel.add(&Array::from_f32_slice(&bump, mel.shape()));
+        let changed = to_vec(&model.forward(&bumped).unwrap());
+        let centre = bump_at as usize * model.hop_size() as usize;
+        let reach = changed
+            .iter()
+            .zip(&full)
+            .enumerate()
+            .filter(|(_, (a, b))| (*a - *b).abs() > 1e-6)
+            .map(|(n, _)| n.abs_diff(centre))
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "{name}: one frame reaches {reach} samples; the computed radius is {}",
+            model.receptive_radius_samples()
+        );
+        assert!(reach <= model.receptive_radius_samples() as usize);
+
+        for chunk in [7, 30] {
+            let chunked = to_vec(&model.synthesize_chunked(&mel, chunk).unwrap());
+            let diff = max_abs_diff(&chunked, &full);
+            eprintln!(
+                "{name}: receptive radius {} samples ({frames} frames), chunk {chunk}: max |diff| {diff:.2e}",
+                model.receptive_radius_samples()
+            );
+            assert!(diff < 1e-4, "{name}: chunk {chunk} differs by {diff}");
+        }
+    }
+    assert_runtime_ok();
 }
 
 #[test]
