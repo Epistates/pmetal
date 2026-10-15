@@ -28,7 +28,8 @@ use crate::chat_templates::ChatTemplateType;
 /// Collect all stop tokens from every available source.
 ///
 /// Merges tokens from:
-/// 1. `generation_config.json` — the model's declared `eos_token_id` (single or array)
+/// 1. `generation_config.json` — the model's declared `eos_token_id` (single or array),
+///    or for a GGUF its end-of-text, end-of-turn and end-of-message ids
 /// 2. Chat template EOS — the template-specific end token (e.g. `<|im_end|>` for ChatML)
 /// 3. Tokenizer's `eos_token_id` — resolved from special_tokens_map / heuristics
 /// 4. Well-known special tokens — if they exist in the vocabulary as single tokens,
@@ -44,33 +45,22 @@ pub fn collect_all_stop_tokens(
     let mut tokens = Vec::new();
 
     // 1. generation_config.json
-    let config_path = model_path.join("generation_config.json");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(eos) = config.get("eos_token_id") {
-                    if let Some(arr) = eos.as_array() {
-                        for v in arr {
-                            if let Some(id) = v.as_u64() {
-                                tokens.push(id as u32);
-                            }
-                        }
-                    } else if let Some(id) = eos.as_u64() {
-                        tokens.push(id as u32);
-                    }
-                }
-            }
+    if let Some(eos) = read_json(&model_path.join("generation_config.json"))
+        .as_ref()
+        .and_then(|config| config.get("eos_token_id"))
+    {
+        match eos.as_array() {
+            Some(ids) => tokens.extend(ids.iter().filter_map(|v| v.as_u64()).map(|id| id as u32)),
+            None => tokens.extend(eos.as_u64().map(|id| id as u32)),
         }
     }
 
+    // 1b. A GGUF names the ends of a message, a turn and the text itself.
+    tokens.extend(crate::tokenizer::gguf_stop_token_ids(model_path));
+
     // 2. Chat template EOS (if template type is known)
     if let Some(tt) = template_type {
-        let eos_str = tt.eos_token();
-        if let Ok(encoded) = tokenizer.encode(eos_str) {
-            if encoded.len() == 1 {
-                tokens.push(encoded[0]);
-            }
-        }
+        tokens.extend(tokenizer.inner().token_to_id(tt.eos_token()));
     }
 
     // 3. Tokenizer's resolved eos_token_id
@@ -79,8 +69,8 @@ pub fn collect_all_stop_tokens(
     }
 
     // 4. Well-known special tokens — probe the vocabulary for common EOS tokens.
-    //    Only add tokens that encode to exactly 1 token (i.e. they're real special tokens,
-    //    not subword sequences).
+    //    Only a string that is itself a token counts: encoding it would give an
+    //    unknown-token id for a vocabulary that has an unknown token and lacks it.
     let candidates = [
         "<|im_end|>",
         "<|eot_id|>",
@@ -104,21 +94,12 @@ pub fn collect_all_stop_tokens(
         if harmony && *candidate == "<|end|>" {
             continue;
         }
-        if let Ok(encoded) = tokenizer.encode(candidate) {
-            if encoded.len() == 1 {
-                tokens.push(encoded[0]);
-            }
-        }
+        tokens.extend(tokenizer.inner().token_to_id(candidate));
     }
 
     // Deduplicate
     tokens.sort_unstable();
     tokens.dedup();
-
-    // Final fallback
-    if tokens.is_empty() {
-        tokens.push(2);
-    }
 
     tracing::debug!("Collected stop tokens: {:?}", tokens);
     tokens
@@ -1043,6 +1024,54 @@ mod tests {
         ]);
         let gemma = load_sampling_defaults(dir.path(), SamplingMode::Auto, true);
         assert_eq!((gemma.temperature, gemma.top_k), (1.0, 64));
+    }
+
+    /// A model stops on every end it declares and every end-of-turn token its
+    /// vocabulary has; one that declares none stops on nothing, where an
+    /// arbitrary token id (2) used to be added.
+    #[test]
+    fn stop_tokens_are_the_declared_ends_and_the_vocabulary_s_turn_ends() {
+        use crate::tokenizer::testing::word_level;
+        let tokenizer = word_level(
+            &["<unk>", "a", "b"],
+            &[("<|im_end|>", true), ("<|eot_id|>", true), ("<|fim|>", true)],
+        );
+        let id = |t: &str| tokenizer.inner().token_to_id(t).unwrap();
+
+        let dir = model_dir(&[("generation_config.json", r#"{"eos_token_id": [1, 2]}"#)]);
+        let mut stops = collect_all_stop_tokens(dir.path(), &tokenizer, None);
+        stops.sort_unstable();
+        assert_eq!(stops, vec![1, 2, id("<|im_end|>"), id("<|eot_id|>")]);
+
+        // Nothing declared and no turn-end token in the vocabulary.
+        let bare = word_level(&["<unk>", "a"], &[]);
+        let dir = model_dir(&[]);
+        assert!(collect_all_stop_tokens(dir.path(), &bare, None).is_empty());
+    }
+
+    #[test]
+    fn a_gguf_names_its_own_stop_tokens() {
+        use crate::tokenizer::testing::word_level;
+        use pmetal_gguf::{GgufBuilder, MetadataValue};
+        let mut b = GgufBuilder::with_model("llama", "stops");
+        b.add_string("tokenizer.ggml.model", "gpt2");
+        b.add_string_array(
+            "tokenizer.ggml.tokens",
+            (0..8).map(|i| format!("t{i}")).collect(),
+        );
+        b.add_metadata(
+            "tokenizer.ggml.token_type",
+            MetadataValue::Array((0..8).map(|_| MetadataValue::Int32(1)).collect()),
+        );
+        b.add_u32("tokenizer.ggml.eos_token_id", 5);
+        b.add_u32("tokenizer.ggml.eot_token_id", 6);
+        b.add_u32("tokenizer.ggml.eom_token_id", 7);
+        let dir = model_dir(&[]);
+        std::fs::write(dir.path().join("m.gguf"), b.build_to_bytes().unwrap()).unwrap();
+        let tokenizer = word_level(&["<unk>"], &[]);
+        let mut stops = collect_all_stop_tokens(&dir.path().join("m.gguf"), &tokenizer, None);
+        stops.sort_unstable();
+        assert_eq!(stops, vec![5, 6, 7]);
     }
 
     #[test]

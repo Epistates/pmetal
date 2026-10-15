@@ -154,6 +154,24 @@ pub(crate) fn gguf_chat_template(path: &Path) -> Option<GgufChatTemplate> {
     })
 }
 
+/// The ids a GGUF at `path` (a `.gguf` file, or a directory holding one)
+/// says end a generation: end of text, end of turn, end of message.
+pub(crate) fn gguf_stop_token_ids(path: &Path) -> Vec<u32> {
+    let Some(gguf) = resolve_gguf_path(path) else {
+        return Vec::new();
+    };
+    let Some(data) = GgufContent::from_file(gguf)
+        .ok()
+        .and_then(|content| content.tokenizer_data())
+    else {
+        return Vec::new();
+    };
+    [data.eos_id, data.eot_id, data.eom_id]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
 /// Wrapper around the tokenizers library.
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
