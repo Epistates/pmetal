@@ -1,14 +1,14 @@
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-/// Tokenize a JSONL corpus into binary shards for pretraining.
+/// Tokenize a corpus into binary shards for pretraining.
 ///
-/// Each output shard is a flat binary file in the format expected by
-/// `pmetal_data::streaming`: `[u32 doc_len][u32 token_0 .. u32 token_N-1]`
-/// repeated for every document, little-endian byte order.
+/// The corpus is anything `pmetal_data::rows` reads (JSONL, JSON, Parquet,
+/// Arrow, CSV, or a directory of shards). Each output shard is a flat binary
+/// file in the format expected by `pmetal_data::streaming`:
+/// `[u32 doc_len][u32 token_0 .. u32 token_N-1]` repeated for every document,
+/// little-endian byte order.
 pub(crate) async fn run_tokenize(
     input: &str,
     output_dir: &str,
@@ -27,119 +27,35 @@ pub(crate) async fn run_tokenize(
     //                                        local cache path automatically)
     let tokenizer = load_tokenizer(tokenizer_id)?;
 
-    // --- Output directory ----------------------------------------------------
-    let out_dir = Path::new(output_dir);
-    std::fs::create_dir_all(out_dir)?;
-
-    // --- Count lines for progress bar ----------------------------------------
-    let total_lines = {
-        let f = File::open(input)
-            .map_err(|e| anyhow::anyhow!("Cannot open input file '{}': {e}", input))?;
-        BufReader::new(f).lines().count()
-    };
-
-    let bar = ProgressBar::new(total_lines as u64);
+    let bar = ProgressBar::new_spinner();
     bar.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} docs ({per_sec})",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] {pos} rows ({per_sec})")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
 
-    // --- Main tokenization loop ----------------------------------------------
-    let reader = {
-        let f = File::open(input)
-            .map_err(|e| anyhow::anyhow!("Cannot open input file '{}': {e}", input))?;
-        BufReader::new(f)
-    };
-
-    let mut shard_index: usize = 0;
-    let mut shard_docs: Vec<Vec<u32>> = Vec::with_capacity(docs_per_shard);
-    let mut total_docs: u64 = 0;
-    let mut total_tokens: u64 = 0;
-    let mut skipped: u64 = 0;
-
-    for (line_num, line_result) in reader.lines().enumerate() {
-        let line =
-            line_result.map_err(|e| anyhow::anyhow!("Read error at line {}: {e}", line_num + 1))?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Parse JSON object and extract text field.
-        let value: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("Skipping line {}: JSON parse error: {e}", line_num + 1);
-                skipped += 1;
-                bar.inc(1);
-                continue;
-            }
-        };
-
-        let text = match value.get(text_column).and_then(|v| v.as_str()) {
-            Some(t) if !t.is_empty() => t.to_owned(),
-            _ => {
-                tracing::warn!(
-                    "Skipping line {}: missing or empty column '{text_column}'",
-                    line_num + 1
-                );
-                skipped += 1;
-                bar.inc(1);
-                continue;
-            }
-        };
-
-        // Tokenize — encode without special tokens; pretraining loops handle
-        // BOS/EOS insertion at the sequence packing stage.
-        let encoding = tokenizer
-            .encode(text.as_str(), false)
-            .map_err(|e| anyhow::anyhow!("Tokenization error at line {}: {e}", line_num + 1))?;
-
-        let ids: Vec<u32> = encoding.get_ids().to_vec();
-        if ids.is_empty() {
-            skipped += 1;
-            bar.inc(1);
-            continue;
-        }
-
-        total_tokens += ids.len() as u64;
-        shard_docs.push(ids);
-        total_docs += 1;
-        bar.inc(1);
-
-        // Flush shard when full.
-        if shard_docs.len() >= docs_per_shard {
-            flush_shard(out_dir, shard_index, &shard_docs)?;
-            shard_index += 1;
-            shard_docs.clear();
-        }
-    }
-
-    // Flush any remaining documents.
-    if !shard_docs.is_empty() {
-        flush_shard(out_dir, shard_index, &shard_docs)?;
-        shard_index += 1;
-    }
-
+    let stats = pmetal_data::streaming::tokenize_corpus(
+        input,
+        Path::new(output_dir),
+        &tokenizer,
+        text_column,
+        docs_per_shard,
+        |rows| bar.set_position(rows),
+    );
     bar.finish_and_clear();
+    let stats = stats?;
 
-    let shards_written = shard_index;
-    println!("Done. {total_docs} documents, {shards_written} shards, {total_tokens} total tokens.");
-    if skipped > 0 {
-        println!("  ({skipped} lines skipped — missing column or parse errors)");
+    println!(
+        "Done. {} documents, {} shards, {} total tokens.",
+        stats.documents, stats.shards, stats.tokens
+    );
+    if stats.skipped > 0 {
+        println!(
+            "  ({} rows skipped — missing or empty column '{text_column}', or unreadable)",
+            stats.skipped
+        );
     }
 
     Ok(())
-}
-
-/// Flush a batch of documents to a numbered shard file via `pmetal_data::streaming::write_shard`.
-fn flush_shard(out_dir: &Path, index: usize, docs: &[Vec<u32>]) -> anyhow::Result<()> {
-    let path = out_dir.join(format!("shard_{index:05}.bin"));
-    let refs: Vec<&[u32]> = docs.iter().map(Vec::as_slice).collect();
-    pmetal_data::streaming::write_shard(&path, &refs)
-        .map_err(|e| anyhow::anyhow!("Failed to write shard {}: {e}", path.display()))
 }
 
 /// Resolve and load a tokenizer from a local path or a cached HuggingFace model

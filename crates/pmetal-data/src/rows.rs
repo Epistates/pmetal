@@ -271,9 +271,13 @@ type RowIter = Box<dyn Iterator<Item = Result<Row>> + Send>;
 /// Streams the rows of a dataset file or directory; see the [module
 /// docs](self).
 ///
-/// Yields `Err` once, then ends, for a file that cannot be opened or a row
-/// that cannot be read; the message names the file and, for text formats, the
-/// line.
+/// Yields `Err` for a file that cannot be opened or a row that cannot be
+/// read; the message names the file and, for text formats, the line. A file
+/// that cannot be opened ends the stream. A JSONL line that is not a JSON
+/// object is reported and skipped over, so a caller that tolerates a few bad
+/// lines in a web-scale corpus can call `next` again, and one that does not
+/// stops at the first `Err`. Failing to read a file (invalid UTF-8, I/O) or
+/// decode a record batch ends that file.
 pub struct RowReader {
     files: VecDeque<PathBuf>,
     all_files: Vec<PathBuf>,
@@ -323,11 +327,7 @@ impl Iterator for RowReader {
                 }
             }
             match self.current.as_mut()?.next() {
-                Some(Ok(row)) => return Some(Ok(row)),
-                Some(Err(e)) => {
-                    self.failed = true;
-                    return Some(Err(e));
-                }
+                Some(item) => return Some(item),
                 None => self.current = None,
             }
         }
@@ -390,6 +390,7 @@ struct JsonlRows {
     reader: Box<dyn BufRead + Send>,
     buf: String,
     line: usize,
+    done: bool,
 }
 
 impl JsonlRows {
@@ -404,6 +405,7 @@ impl JsonlRows {
             reader,
             buf: String::new(),
             line: 0,
+            done: false,
         }
     }
 }
@@ -413,14 +415,21 @@ impl Iterator for JsonlRows {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            if self.done {
+                return None;
+            }
             self.buf.clear();
             match self.reader.read_line(&mut self.buf) {
                 Ok(0) => return None,
                 Ok(_) => {}
                 Err(e) => {
+                    // A line that is not UTF-8 has been consumed; reading on
+                    // is safe. Any other failure may repeat, so the file ends.
+                    self.line += 1;
+                    self.done = e.kind() != std::io::ErrorKind::InvalidData;
                     return Some(Err(io_error(
                         &self.path,
-                        &format!("read line {} of", self.line + 1),
+                        &format!("read line {} of", self.line),
                         e,
                     )));
                 }
@@ -532,6 +541,7 @@ struct BatchRows {
     location: String,
     batches: Box<dyn Iterator<Item = std::result::Result<RecordBatch, String>> + Send>,
     pending: VecDeque<Row>,
+    done: bool,
 }
 
 impl BatchRows {
@@ -544,6 +554,7 @@ impl BatchRows {
             location: path.display().to_string(),
             batches: Box::new(batches.map(|b| b.map_err(|e| e.to_string()))),
             pending: VecDeque::new(),
+            done: false,
         }
     }
 }
@@ -553,13 +564,20 @@ impl Iterator for BatchRows {
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.pending.is_empty() {
+            if self.done {
+                return None;
+            }
             match self.batches.next()? {
                 Ok(batch) => {
                     if let Err(e) = push_batch_rows(&batch, &self.location, &mut self.pending) {
                         return Some(Err(e));
                     }
                 }
-                Err(e) => return Some(Err(invalid_data(format!("{}: {e}", self.location)))),
+                Err(e) => {
+                    // The file's reader is not trusted to go on after this.
+                    self.done = true;
+                    return Some(Err(invalid_data(format!("{}: {e}", self.location))));
+                }
             }
         }
         self.pending.pop_front().map(Ok)
@@ -697,7 +715,9 @@ mod tests {
         assert!(reader.next().unwrap().is_ok());
         let err = reader.next().unwrap().unwrap_err().to_string();
         assert!(err.contains("a.jsonl:3"), "{err}");
-        assert!(reader.next().is_none(), "a reader stops at its first error");
+        // A bad line is skipped over for a caller that tolerates it.
+        assert_eq!(reader.next().unwrap().unwrap()["a"], json!(3));
+        assert!(reader.next().is_none());
 
         let path = write(dir.path(), "b.jsonl", "[1, 2]\n");
         let err = RowReader::open(&path).unwrap().next().unwrap().unwrap_err();
