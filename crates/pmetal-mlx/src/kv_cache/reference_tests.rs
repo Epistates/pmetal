@@ -761,6 +761,224 @@ fn quantized_cache_is_a_fraction_of_the_dense_one() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// TurboQuant cache
+// ---------------------------------------------------------------------------
+
+fn turbo(config: TurboQuantConfig) -> KVCacheConfig {
+    cache_config().with_turboquant_config(config)
+}
+
+/// The two configurations the shared path runs: uniform widths (packed
+/// attention) and a mixed-precision preset (dequantized attention).
+fn turbo_configs() -> [(&'static str, TurboQuantConfig); 2] {
+    [
+        ("uniform 4/4", TurboQuantConfig::uniform(4, 4)),
+        ("mixed 2.5", TurboQuantConfig::preset_q2_5(DIM)),
+    ]
+}
+
+#[test]
+fn turboquant_keeps_recent_tokens_exact_so_short_runs_match_uncached() {
+    // Within the recent window nothing is quantized: the logits are the
+    // uncached ones, through the same path that quantizes a long run. This
+    // is what catches a mixed cache putting a channel in the wrong place.
+    let toy = Toy::new(60);
+    let toks = tokens(70, 61);
+    let reference = toy.reference(&toks, Visibility::default());
+    let mut chunks = vec![40, 3];
+    chunks.extend(std::iter::repeat_n(1, 27));
+    for (name, config) in turbo_configs() {
+        let mut cache = KVCache::new(turbo(config));
+        let cached = toy.cached(&mut cache, &toks, &chunks, Visibility::default());
+        let diff = max_diff(&cached, &reference);
+        assert!(diff < 3e-4, "{name}: max diff {diff}");
+        assert!(!cache.turboquant_compression_active());
+        for layer in 0..LAYERS {
+            assert_eq!(cache.rope_offset_for(layer), 70);
+        }
+    }
+}
+
+#[test]
+fn turboquant_history_error_follows_the_width() {
+    // A 16-token window over 100 tokens: most of the history is packed.
+    let toy = Toy::new(62);
+    let toks = tokens(100, 63);
+    let reference = toy.reference(&toks, Visibility::default());
+    let mut chunks = vec![60];
+    chunks.extend(std::iter::repeat_n(1, 40));
+    let error = |config: TurboQuantConfig| {
+        let config = config.with_recent_window(Some(16)).with_sink_tokens(4);
+        let mut cache = KVCache::new(turbo(config));
+        let cached = toy.cached(&mut cache, &toks, &chunks, Visibility::default());
+        assert!(cache.turboquant_compression_active());
+        max_diff(&cached[60 * VOCAB..], &reference[60 * VOCAB..])
+    };
+    let (u8_, u4, u2) = (
+        error(TurboQuantConfig::uniform(8, 8)),
+        error(TurboQuantConfig::uniform(4, 4)),
+        error(TurboQuantConfig::uniform(2, 2)),
+    );
+    let m = error(TurboQuantConfig::preset_q2_5(DIM));
+    assert!(u8_ < 0.35, "8-bit: {u8_}");
+    assert!(
+        u8_ < u4 && u4 < u2,
+        "errors by width: 8 {u8_}, 4 {u4}, 2 {u2}"
+    );
+    assert!(m.is_finite(), "2.5-bit: {m}");
+}
+
+#[test]
+fn turboquant_rollback_matches_the_accepted_sequence() {
+    let toy = Toy::new(64);
+    let accepted = tokens(40, 65);
+    let drafted = tokens(6, 66);
+    let alternative = tokens(4, 67);
+    let mut full = accepted.clone();
+    full.extend(&drafted[..2]);
+    full.extend(&alternative);
+    let reference = toy.reference(&full, Visibility::default());
+
+    for (name, config) in turbo_configs() {
+        let mut cache = KVCache::new(turbo(config));
+        toy.cached_chunk(&mut cache, &accepted, Visibility::default());
+        toy.cached_chunk(&mut cache, &drafted, Visibility::default());
+        assert_eq!(cache.rollback(4), 4, "{name}");
+        assert_eq!(cache.total_tokens(), 42);
+        for layer in 0..LAYERS {
+            assert_eq!(cache.rope_offset_for(layer), 42, "{name}");
+        }
+        let after = toy.cached_chunk(&mut cache, &alternative, Visibility::default());
+        let diff = max_diff(&after, rows(&reference, 42, 46));
+        assert!(diff < 3e-4, "{name} after rollback: max diff {diff}");
+    }
+}
+
+#[test]
+fn turboquant_packed_attention_matches_attention_over_the_dequantized_cache() {
+    use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
+    // A 6-token window leaves most of 60 tokens packed.
+    let config = TurboQuantConfig::uniform(4, 4)
+        .with_recent_window(Some(6))
+        .with_sink_tokens(2);
+    for window in [None, Some(10)] {
+        let mut fast = KVCache::new(turbo(config));
+        let mut dense = KVCache::new(turbo(config));
+        let mut rng = Rng::new(70);
+        let prompt_k = array(&rng.normals(HKV * 60 * DIM, 1.0), &[1, HKV, 60, DIM]);
+        let prompt_v = array(&rng.normals(HKV * 60 * DIM, 1.0), &[1, HKV, 60, DIM]);
+        fast.update_and_fetch(0, &prompt_k, &prompt_v).unwrap();
+        dense.update_and_fetch(0, &prompt_k, &prompt_v).unwrap();
+        assert!(fast.turboquant_compression_active());
+
+        let queries = array(&rng.normals(HQ * DIM, 1.0), &[1, HQ, 1, DIM]);
+        let (k, v) = one_token(71);
+        let mask_type = window.map_or(AttentionMaskType::Causal, |w| {
+            AttentionMaskType::SlidingWindow(w)
+        });
+        let attn = crate::kernels::FusedAttentionConfig::new(HQ as i32, HKV as i32, DIM as i32)
+            .with_scale(scale())
+            .with_mask_type(mask_type);
+        let out = fast
+            .try_compressed_attention(0, &queries, &k, &v, &attn)
+            .unwrap()
+            .expect("a uniform TurboQuant cache attends to its packed rows");
+        let (all_k, all_v) = dense.update_and_fetch(0, &k, &v).unwrap();
+        let expected = fused_sdpa(&queries, &all_k, &all_v, &attn, None).unwrap();
+        let diff = crate::test_utils::max_abs_diff(&out, &expected);
+        assert!(
+            diff < 5e-3,
+            "window {window:?}: packed vs dequantized differ by {diff}"
+        );
+        assert_eq!(fast.rope_offset_for(0), 61);
+        let _: Option<FusedAttentionConfig> = None;
+    }
+}
+
+#[test]
+fn turboquant_mixed_precision_attends_through_dequantization() {
+    use crate::kernels::FusedAttentionConfig;
+    let mut cache = KVCache::new(turbo(TurboQuantConfig::preset_q2_5(DIM)));
+    let mut rng = Rng::new(72);
+    let prompt = array(&rng.normals(HKV * 20 * DIM, 1.0), &[1, HKV, 20, DIM]);
+    cache.update_and_fetch(0, &prompt, &prompt).unwrap();
+    let (k, v) = one_token(73);
+    let q = array(&rng.normals(HQ * DIM, 1.0), &[1, HQ, 1, DIM]);
+    let attn = FusedAttentionConfig::new(HQ as i32, HKV as i32, DIM as i32);
+    assert!(
+        cache
+            .try_compressed_attention(0, &q, &k, &v, &attn)
+            .unwrap()
+            .is_none()
+    );
+    // Nothing was appended by the refusal.
+    assert_eq!(cache.rope_offset_for(0), 20);
+}
+
+#[test]
+fn turboquant_memory_is_a_fraction_of_the_dense_cache() {
+    // Head dimension 128: at 32 the mixed layout's second scale costs as
+    // much as the bits it saves.
+    let dim = 128;
+    let held = |config: Option<TurboQuantConfig>| {
+        let base = KVCacheConfig::new(1, 512, HKV, dim);
+        let mut cache = match config {
+            Some(c) => KVCache::new(
+                base.with_turboquant_config(c.with_recent_window(Some(32)).with_sink_tokens(4)),
+            ),
+            None => KVCache::new(base),
+        };
+        let mut rng = Rng::new(74);
+        let k = array(&rng.normals(HKV * 500 * dim, 1.0), &[1, HKV, 500, dim]);
+        let k = k.as_dtype(Dtype::Bfloat16.as_i32());
+        cache.update_and_fetch(0, &k, &k).unwrap();
+        cache.memory_usage()
+    };
+    let dense = held(None);
+    let (u4, m) = (
+        held(Some(TurboQuantConfig::uniform(4, 4))),
+        held(Some(TurboQuantConfig::preset_q2_5(dim))),
+    );
+    assert!(u4 * 2 < dense, "4-bit TurboQuant holds {u4} of {dense}");
+    assert!(m < u4, "2.5-bit holds {m}, 4-bit {u4}");
+}
+
+#[test]
+fn turboquant_footprint_estimates_what_a_long_cache_holds() {
+    let config = TurboQuantConfig::uniform(4, 4)
+        .with_recent_window(Some(32))
+        .with_sink_tokens(4);
+    let base = KVCacheConfig::new(1, 2048, HKV, DIM)
+        .with_dtype(Dtype::Bfloat16)
+        .with_turboquant_config(config);
+    let estimate = base.memory_footprint();
+    let mut cache = KVCache::new(base);
+    let mut rng = Rng::new(75);
+    let k = array(&rng.normals(HKV * 2000 * DIM, 1.0), &[1, HKV, 2000, DIM]);
+    let k = k.as_dtype(Dtype::Bfloat16.as_i32());
+    cache.update_and_fetch(0, &k, &k).unwrap();
+    let held = cache.memory_usage();
+    assert!(
+        held >= estimate && held < estimate * 2,
+        "estimate {estimate}, held {held}"
+    );
+}
+
+#[test]
+fn a_turboquant_configuration_that_cannot_be_built_is_an_error() {
+    // 9 bits is not a width; a mixed split needs a head dimension of 8.
+    for (config, dim) in [
+        (TurboQuantConfig::uniform(9, 4), DIM),
+        (TurboQuantConfig::preset_q2_5(6), 6),
+    ] {
+        let mut cache =
+            KVCache::new(KVCacheConfig::new(1, 64, HKV, dim).with_turboquant_config(config));
+        let k = array(&vec![0.5; HKV * 4 * dim], &[1, HKV, 4, dim]);
+        assert!(cache.update_and_fetch(0, &k, &k).is_err());
+    }
+}
+
 #[test]
 fn memory_footprint_matches_the_bytes_a_full_cache_holds() {
     // A cache filled to max_seq_len in one call holds exactly its footprint.

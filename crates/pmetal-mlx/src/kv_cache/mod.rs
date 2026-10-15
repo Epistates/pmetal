@@ -47,12 +47,14 @@ mod reference_tests;
 mod standard;
 #[cfg(test)]
 mod tests;
-mod turboquant;
+mod turbo;
 
 pub use fused_batch::*;
 pub use mamba::*;
+pub use pmetal_runtime::turboquant::{
+    DEFAULT_RECENT_WINDOW, DEFAULT_SINK_TOKENS, TurboQuantConfig, TurboQuantTensorConfig,
+};
 pub use standard::*;
-pub use turboquant::*;
 
 use pmetal_runtime::compat::Dtype;
 
@@ -229,11 +231,7 @@ pub fn sanitize_turboquant_config(
     TurboQuantConfig {
         keys: sanitize_turboquant_tensor_config(key_head_dim, config.keys),
         values: sanitize_turboquant_tensor_config(value_head_dim, config.values),
-        recent_window: config.recent_window,
-        qjl: config.qjl,
-        skiplist_threshold: config.skiplist_threshold,
-        outliers: config.outliers,
-        pack_mode: config.pack_mode,
+        ..config
     }
 }
 
@@ -435,29 +433,41 @@ impl KVCacheConfig {
         let affine_row = |dim: usize, bits: u8, group_size: usize| {
             4 * affine::packed_words(dim, bits) + 2 * scalar * dim.div_ceil(group_size)
         };
-        let per_token_per_head = match self.mode {
+        let dense_row = (key_dim + value_dim) * scalar;
+        let per_head = match self.mode {
             CacheMode::Quantized { bits, group_size } => {
-                affine_row(key_dim, bits, group_size) + affine_row(value_dim, bits, group_size)
+                self.max_seq_len
+                    * (affine_row(key_dim, bits, group_size)
+                        + affine_row(value_dim, bits, group_size))
             }
             CacheMode::AsymmetricQuantized {
                 key_bits,
                 value_bits,
                 group_size,
             } => {
-                affine_row(key_dim, key_bits, group_size)
-                    + affine_row(value_dim, value_bits, group_size)
+                self.max_seq_len
+                    * (affine_row(key_dim, key_bits, group_size)
+                        + affine_row(value_dim, value_bits, group_size))
             }
             CacheMode::TurboQuant { config } => {
-                turboquant_key_row_bytes(config.keys, key_dim)
-                    + turboquant_value_row_bytes(config.values, value_dim)
+                // The sinks and the recent window stay dense; the rest of
+                // the sequence is packed (the ring also holds up to one
+                // eviction chunk more, which this does not count).
+                let dense_tokens =
+                    (config.sink_tokens + config.recent_window.unwrap_or(0)).min(self.max_seq_len);
+                let packed_row = turboquant_row_bytes(config.keys, key_dim)
+                    + turboquant_row_bytes(config.values, value_dim);
+                dense_tokens * dense_row + (self.max_seq_len - dense_tokens) * packed_row
             }
-            _ => (key_dim + value_dim) * scalar,
+            _ => {
+                let tokens = match dense::Window::of(self.mode) {
+                    Some(window) => window.size().min(self.max_seq_len),
+                    None => self.max_seq_len,
+                };
+                tokens * dense_row
+            }
         };
-        let tokens = match dense::Window::of(self.mode) {
-            Some(window) => window.size().min(self.max_seq_len),
-            None => self.max_seq_len,
-        };
-        per_token_per_head * self.num_kv_heads * tokens * self.num_layers
+        per_head * self.num_kv_heads * self.num_layers
     }
 
     /// Format the memory footprint as a human-readable string.
@@ -475,45 +485,19 @@ impl KVCacheConfig {
     }
 }
 
-fn turboquant_key_row_bytes(config: TurboQuantTensorConfig, head_dim: usize) -> usize {
+/// Bytes of one packed TurboQuant row of `dim` channels: the packed words and
+/// an f32 scale, for each of the two channel groups of a mixed tensor.
+fn turboquant_row_bytes(config: TurboQuantTensorConfig, dim: usize) -> usize {
+    let row = |dim: usize, bits: u8| 4 * pmetal_runtime::turboquant::words_per_row(dim, bits) + 4;
     match config {
-        TurboQuantTensorConfig::Uniform { bits } => {
-            let mse_bits = usize::from(bits.saturating_sub(1));
-            (head_dim * mse_bits).div_ceil(8)
-                + head_dim.div_ceil(8)
-                + (std::mem::size_of::<f32>() * 2)
-        }
+        TurboQuantTensorConfig::Uniform { bits } => row(dim, bits),
         TurboQuantTensorConfig::Mixed {
             regular_bits,
             outlier_bits,
             outlier_count,
         } => {
-            let regular_dim = head_dim - outlier_count;
-            (regular_dim * usize::from(regular_bits.saturating_sub(1))).div_ceil(8)
-                + regular_dim.div_ceil(8)
-                + (outlier_count * usize::from(outlier_bits.saturating_sub(1))).div_ceil(8)
-                + outlier_count.div_ceil(8)
-                + head_dim.div_ceil(8)
-                + (std::mem::size_of::<f32>() * 4)
-        }
-    }
-}
-
-fn turboquant_value_row_bytes(config: TurboQuantTensorConfig, head_dim: usize) -> usize {
-    match config {
-        TurboQuantTensorConfig::Uniform { bits } => {
-            (head_dim * usize::from(bits)).div_ceil(8) + std::mem::size_of::<f32>()
-        }
-        TurboQuantTensorConfig::Mixed {
-            regular_bits,
-            outlier_bits,
-            outlier_count,
-        } => {
-            let regular_dim = head_dim - outlier_count;
-            (regular_dim * usize::from(regular_bits)).div_ceil(8)
-                + (outlier_count * usize::from(outlier_bits)).div_ceil(8)
-                + head_dim.div_ceil(8)
-                + (std::mem::size_of::<f32>() * 2)
+            let outliers = outlier_count.min(dim);
+            row(outliers, outlier_bits) + row(dim - outliers, regular_bits)
         }
     }
 }

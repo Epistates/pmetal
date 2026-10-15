@@ -6,7 +6,8 @@ use crate::kernels::FusedAttentionConfig;
 
 use super::affine::AffineLayer;
 use super::dense::{DenseLayer, Window};
-use super::{CacheMode, KVCacheConfig, TurboQuantKvCache, create_turboquant_runtime};
+use super::turbo::{TurboLayer, TurboShared};
+use super::{CacheMode, KVCacheConfig};
 
 /// Key-Value cache for transformer inference.
 ///
@@ -25,7 +26,7 @@ pub struct KVCache {
     /// Quantized per-layer caches (used when mode is Quantized or AsymmetricQuantized).
     quantized_layers: Option<Vec<AffineLayer>>,
     /// TurboQuant per-layer caches.
-    turboquant_layers: Option<Vec<TurboQuantKvCache>>,
+    turboquant_layers: Option<Vec<TurboLayer>>,
     /// Total number of tokens processed.
     total_tokens: usize,
 }
@@ -57,13 +58,11 @@ impl KVCache {
         };
         let turboquant_layers = match config.mode {
             CacheMode::TurboQuant { config: turboquant } => {
-                let shared_runtime =
-                    create_turboquant_runtime(config.head_dim, config.value_head_dim, turboquant);
+                // One set of rotations and codebooks for every layer.
+                let shared = TurboShared::new(config.head_dim, config.value_head_dim, turboquant);
                 Some(
                     (0..config.num_layers)
-                        .map(|_| {
-                            TurboQuantKvCache::new_with_runtime(turboquant, shared_runtime.clone())
-                        })
+                        .map(|_| TurboLayer::new(turboquant, &shared))
                         .collect(),
                 )
             }
@@ -92,7 +91,7 @@ impl KVCache {
             return false;
         }
         match self.turboquant_layers.as_ref() {
-            Some(layers) => layers.iter().any(|layer| !layer.is_empty()),
+            Some(layers) => layers.iter().any(|layer| layer.cold_len() > 0),
             None => false,
         }
     }
@@ -186,7 +185,7 @@ impl KVCache {
             }
         } else if let Some(ref mut tq_layers) = self.turboquant_layers {
             for cache in tq_layers {
-                cache.rollback(trimmed);
+                cache.truncate(trimmed);
             }
         } else {
             if let Some(window) = self.window {
@@ -239,7 +238,7 @@ impl KVCache {
             )));
         }
 
-        // Quantized path: delegate to per-layer QuantizedKVCache
+        // Quantized path: delegate to the per-layer affine cache
         if let Some(ref mut q_layers) = self.quantized_layers {
             if layer_idx == 0 {
                 self.total_tokens += new_keys.dim(2) as usize;
@@ -250,7 +249,7 @@ impl KVCache {
             if layer_idx == 0 {
                 self.total_tokens += new_keys.dim(2) as usize;
             }
-            return tq_layers[layer_idx].update_and_fetch(new_keys, new_values);
+            return tq_layers[layer_idx].update(new_keys, new_values);
         }
 
         let fetched = self.layer_caches[layer_idx].update(
@@ -321,10 +320,12 @@ impl KVCache {
             q_layers[layer_idx].attend(queries, new_keys, new_values, attn_config.scale, window)?
         } else if let Some(tq_layers) = self.turboquant_layers.as_mut() {
             let layer = &mut tq_layers[layer_idx];
-            if !layer.can_direct_attention(queries, new_keys, new_values, attn_config) {
+            // A TurboQuant layer scores `Hq` query heads against `Hkv`
+            // cached ones.
+            if !layer.attends_packed() || queries.dim(1) % new_keys.dim(1) != 0 {
                 return Ok(None);
             }
-            layer.append_and_compute_attention(queries, new_keys, new_values, attn_config)?
+            layer.attend(queries, new_keys, new_values, attn_config.scale, window)?
         } else {
             return Ok(None);
         };
@@ -387,7 +388,7 @@ impl KVCache {
             return q_layers.iter().map(AffineLayer::nbytes).sum();
         }
         if let Some(ref tq_layers) = self.turboquant_layers {
-            return tq_layers.iter().map(|c| c.memory_usage()).sum();
+            return tq_layers.iter().map(TurboLayer::nbytes).sum();
         }
         self.layer_caches.iter().map(DenseLayer::nbytes).sum()
     }

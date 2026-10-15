@@ -1,7 +1,6 @@
 //! Tests for all KV cache types.
 
 use super::*;
-use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use crate::test_utils::{max_abs_diff, to_f32_vec_eval};
 use pmetal_runtime::compat::{Array, Dtype, ops};
 
@@ -19,14 +18,6 @@ fn patterned_tensor(batch: usize, heads: usize, seq: usize, dim: usize, phase: f
         })
         .collect();
     Array::from_f32_slice(&data, &[batch as i32, heads as i32, seq as i32, dim as i32])
-}
-
-fn manual_attention_output(queries: &Array, keys: &Array, values: &Array, scale: f32) -> Array {
-    let scores = queries
-        .matmul(&keys.transpose_axes(&[0, 1, 3, 2]))
-        .multiply(&Array::from_f32(scale));
-    let weights = ops::softmax_axis(&scores, -1);
-    weights.matmul(values)
 }
 
 #[test]
@@ -109,11 +100,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
             config: TurboQuantConfig {
                 keys: TurboQuantTensorConfig::mixed(2, 4, 99),
                 values: TurboQuantTensorConfig::mixed(3, 5, 99),
-                recent_window: Some(DEFAULT_RECENT_WINDOW),
-                qjl: Default::default(),
-                skiplist_threshold: None,
-                outliers: Default::default(),
-                pack_mode: Default::default(),
+                ..TurboQuantConfig::uniform(2, 3)
             },
         },
     );
@@ -124,11 +111,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
             config: TurboQuantConfig {
                 keys: TurboQuantTensorConfig::mixed(2, 4, 7),
                 values: TurboQuantTensorConfig::mixed(3, 5, 3),
-                recent_window: Some(DEFAULT_RECENT_WINDOW),
-                qjl: Default::default(),
-                skiplist_threshold: None,
-                outliers: Default::default(),
-                pack_mode: Default::default(),
+                ..TurboQuantConfig::uniform(2, 3)
             }
         }
     );
@@ -533,252 +516,6 @@ fn test_cache_mode_turboquant_mixed() {
             config: TurboQuantConfig::mixed(2, 4, 32, 3, 5, 32)
         }
     );
-}
-
-// =========================================================================
-// TurboQuantKvCache Tests
-// =========================================================================
-
-#[test]
-fn test_turboquant_cache_basic() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert_eq!(cached_k.dim(2), 10);
-    assert_eq!(cached_v.dim(2), 10);
-    assert_eq!(cache.len(), 10);
-    assert!(!cache.is_empty());
-}
-
-#[test]
-fn test_turboquant_cache_accumulation() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let k1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    let v1 = ops::ones(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&k1, &v1).unwrap();
-
-    let k2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let v2 = ops::ones(&[1, 4, 5, 64], Dtype::Float32);
-    let (cached_k, cached_v) = cache.update_and_fetch(&k2, &v2).unwrap();
-
-    assert_eq!(cached_k.dim(2), 15);
-    assert_eq!(cached_v.dim(2), 15);
-    assert_eq!(cache.len(), 15);
-}
-
-#[test]
-fn test_turboquant_cache_reset() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    cache.reset();
-
-    assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
-}
-
-#[test]
-fn test_turboquant_cache_rollback() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let keys = ops::ones(&[1, 2, 10, 32], Dtype::Float32);
-    let values = ops::ones(&[1, 2, 10, 32], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    cache.rollback(4);
-
-    assert_eq!(cache.len(), 6);
-    assert_eq!(cache.rope_offset(), 6);
-}
-
-#[test]
-fn test_turboquant_cache_memory_usage() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-    assert_eq!(cache.memory_usage(), 0);
-
-    let keys = ops::ones(&[1, 2, 8, 32], Dtype::Float32);
-    let values = ops::ones(&[1, 2, 8, 32], Dtype::Float32);
-    cache.update_and_fetch(&keys, &values).unwrap();
-
-    assert!(cache.memory_usage() > 0);
-}
-
-#[test]
-fn test_turboquant_cache_nonzero_inputs_stay_finite() {
-    let mut cache = TurboQuantKvCache::new(4, 3);
-
-    let data: Vec<f32> = (0..(2 * 16))
-        .map(|idx| ((idx as f32) * 0.1).sin())
-        .collect();
-    let keys = Array::from_f32_slice(&data, &[1, 1, 2, 16]);
-    let values = Array::from_f32_slice(&data, &[1, 1, 2, 16]);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-    let ck = cached_k.clone();
-    let cv = cached_v.clone();
-    ck.eval();
-    cv.eval();
-
-    assert!(to_f32_vec_eval(&cached_k).iter().all(|v| v.is_finite()));
-    assert!(to_f32_vec_eval(&cached_v).iter().all(|v| v.is_finite()));
-}
-
-#[test]
-fn test_turboquant_mixed_cache_nonzero_inputs_stay_finite() {
-    let mut cache = TurboQuantKvCache::new_with_config(TurboQuantConfig::preset_q2_5(16));
-
-    let data: Vec<f32> = (0..(4 * 16))
-        .map(|idx| ((idx as f32) * 0.07).cos())
-        .collect();
-    let keys = Array::from_f32_slice(&data, &[1, 1, 4, 16]);
-    let values = Array::from_f32_slice(&data, &[1, 1, 4, 16]);
-
-    let (cached_k, cached_v) = cache.update_and_fetch(&keys, &values).unwrap();
-    let ck = cached_k.clone();
-    let cv = cached_v.clone();
-    ck.eval();
-    cv.eval();
-
-    assert_eq!(cache.len(), 4);
-    assert!(to_f32_vec_eval(&cached_k).iter().all(|v| v.is_finite()));
-    assert!(to_f32_vec_eval(&cached_v).iter().all(|v| v.is_finite()));
-}
-
-#[test]
-fn test_turboquant_direct_attention_matches_reference_uniform() {
-    let config = KVCacheConfig::new(1, 32, 2, 16).with_turboquant(4, 3);
-    let mut fast_cache = KVCache::new(config.clone());
-    let mut ref_cache = KVCache::new(config);
-
-    let prefill_k = patterned_tensor(1, 2, 3, 16, 0.2);
-    let prefill_v = patterned_tensor(1, 2, 3, 16, 0.7);
-    fast_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-    ref_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-
-    let queries = patterned_tensor(1, 4, 1, 16, 1.1);
-    let new_k = patterned_tensor(1, 2, 1, 16, 1.7);
-    let new_v = patterned_tensor(1, 2, 1, 16, 2.3);
-
-    let attn_config = FusedAttentionConfig::new(4, 2, 16)
-        .with_scale((16.0f32).sqrt().recip())
-        .with_mask_type(AttentionMaskType::Causal);
-
-    let fast_output = fast_cache
-        .try_compressed_attention(0, &queries, &new_k, &new_v, &attn_config)
-        .unwrap()
-        .expect("TurboQuant direct attention should activate");
-    let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
-    let ref_output = fused_sdpa(&queries, &ref_keys, &ref_values, &attn_config, None).unwrap();
-
-    let fo = fast_output.clone();
-    let ro = ref_output.clone();
-    fo.eval();
-    ro.eval();
-
-    let diff = max_abs_diff(&fast_output, &ref_output);
-    assert_eq!(fast_cache.seq_len(), 4);
-    assert_eq!(fast_cache.total_tokens(), 4);
-    assert_eq!(fast_output.shape(), ref_output.shape());
-    assert!(diff < 1e-4, "uniform max_abs_diff={diff}");
-}
-
-#[test]
-fn test_turboquant_direct_attention_matches_reference_mixed_sliding_window() {
-    let config =
-        KVCacheConfig::new(1, 32, 2, 16).with_turboquant_config(TurboQuantConfig::preset_q2_5(16));
-    let mut fast_cache = KVCache::new(config.clone());
-    let mut ref_cache = KVCache::new(config);
-
-    let prefill_k = patterned_tensor(1, 2, 5, 16, 0.4);
-    let prefill_v = patterned_tensor(1, 2, 5, 16, 0.9);
-    fast_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-    ref_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-
-    let queries = patterned_tensor(1, 4, 1, 16, 1.5);
-    let new_k = patterned_tensor(1, 2, 1, 16, 2.1);
-    let new_v = patterned_tensor(1, 2, 1, 16, 2.7);
-
-    let attn_config = FusedAttentionConfig::new(4, 2, 16)
-        .with_scale((16.0f32).sqrt().recip())
-        .with_mask_type(AttentionMaskType::SlidingWindow(3));
-
-    let fast_output = fast_cache
-        .try_compressed_attention(0, &queries, &new_k, &new_v, &attn_config)
-        .unwrap()
-        .expect("TurboQuant direct attention should activate");
-    let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
-    let ref_output = fused_sdpa(&queries, &ref_keys, &ref_values, &attn_config, None).unwrap();
-
-    let fo = fast_output.clone();
-    let ro = ref_output.clone();
-    fo.eval();
-    ro.eval();
-
-    let diff = max_abs_diff(&fast_output, &ref_output);
-    assert_eq!(fast_cache.seq_len(), 6);
-    assert_eq!(fast_cache.total_tokens(), 6);
-    assert_eq!(fast_output.shape(), ref_output.shape());
-    assert!(diff < 1e-4, "mixed max_abs_diff={diff}");
-}
-
-#[test]
-fn test_turboquant_direct_attention_matches_reference_asymmetric_value_dim() {
-    let config = KVCacheConfig::new(1, 32, 2, 16)
-        .with_value_head_dim(8)
-        .with_turboquant(4, 3);
-    let mut fast_cache = KVCache::new(config.clone());
-    let mut ref_cache = KVCache::new(config);
-
-    let prefill_k = patterned_tensor(1, 2, 3, 16, 0.3);
-    let prefill_v = patterned_tensor(1, 2, 3, 8, 0.8);
-    fast_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-    ref_cache
-        .update_and_fetch(0, &prefill_k, &prefill_v)
-        .unwrap();
-
-    let queries = patterned_tensor(1, 2, 1, 16, 1.4);
-    let new_k = patterned_tensor(1, 2, 1, 16, 2.0);
-    let new_v = patterned_tensor(1, 2, 1, 8, 2.6);
-
-    let attn_config = FusedAttentionConfig::new(2, 2, 16)
-        .with_scale((16.0f32).sqrt().recip())
-        .with_mask_type(AttentionMaskType::Causal);
-
-    let fast_output = fast_cache
-        .try_compressed_attention(0, &queries, &new_k, &new_v, &attn_config)
-        .unwrap()
-        .expect("TurboQuant direct attention should activate");
-    let (ref_keys, ref_values) = ref_cache.update_and_fetch(0, &new_k, &new_v).unwrap();
-    let ref_output =
-        manual_attention_output(&queries, &ref_keys, &ref_values, (16.0f32).sqrt().recip());
-
-    let fo = fast_output.clone();
-    let ro = ref_output.clone();
-    fo.eval();
-    ro.eval();
-
-    let diff = max_abs_diff(&fast_output, &ref_output);
-    assert_eq!(fast_output.shape(), &[1, 2, 1, 8]);
-    assert_eq!(fast_output.shape(), ref_output.shape());
-    assert!(diff < 1e-4, "asymmetric max_abs_diff={diff}");
 }
 
 // =========================================================================

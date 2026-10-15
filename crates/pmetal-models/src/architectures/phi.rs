@@ -451,11 +451,13 @@ impl PhiAttention {
 
         if mask.is_none() {
             if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(attn_output) = (*cache_ref).try_compressed_attention(*layer_idx,
-                &q,
-                &k_transposed,
-                &v_transposed,
-                &attn_config,)? {
+                if let Some(attn_output) = (*cache_ref).try_compressed_attention(
+                    *layer_idx,
+                    &q,
+                    &k_transposed,
+                    &v_transposed,
+                    &attn_config,
+                )? {
                     let attn_output = attn_output.transpose_axes(&[0, 2, 1, 3]);
                     let attn_output =
                         attn_output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
