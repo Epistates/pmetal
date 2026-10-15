@@ -217,31 +217,38 @@ fn build_generation_config_from_parts(
     config
 }
 
+/// How many of the newest generated tokens a stop sequence ends in, when the
+/// generated text now ends with one of `stop_sequences` (the longest, if
+/// several): those tokens are stripped from the output.
+///
+/// A stop sequence need not start where a token does (`END` can arrive as
+/// ` E` and `ND`), so the tokens counted are all those that overlap it; the
+/// text before it in the first of them goes with the token. Only the tail of
+/// the generation is decoded, as many tokens as the longest stop sequence
+/// has bytes (every token decodes to at least one), because this runs after
+/// every token and decoding all of it would make a long generation quadratic.
 pub(crate) fn detect_stop_sequence_suffix(
     tokenizer: &pmetal_data::Tokenizer,
     generated: &[u32],
     stop_sequences: &[String],
 ) -> Option<usize> {
-    if generated.is_empty() || stop_sequences.is_empty() {
+    let longest = stop_sequences.iter().map(String::len).max().unwrap_or(0);
+    if generated.is_empty() || longest == 0 {
         return None;
     }
+    let tail = &generated[generated.len().saturating_sub(longest + 4)..];
 
-    let decoded = tokenizer.decode(generated).unwrap_or_default();
+    let decoded = tokenizer.decode(tail).unwrap_or_default();
     let matched = stop_sequences
         .iter()
         .filter(|seq| !seq.is_empty() && decoded.ends_with(seq.as_str()))
         .max_by_key(|seq| seq.len())?;
 
-    for strip_tokens in 1..=generated.len() {
-        let suffix = tokenizer
-            .decode(&generated[generated.len() - strip_tokens..])
-            .unwrap_or_default();
-        if suffix == *matched {
-            return Some(strip_tokens);
-        }
-    }
-
-    None
+    (1..=tail.len()).find(|&strip_tokens| {
+        tokenizer
+            .decode(&tail[tail.len() - strip_tokens..])
+            .is_ok_and(|suffix| suffix.ends_with(matched.as_str()))
+    })
 }
 
 fn estimate_parameter_count(config_json: &serde_json::Value) -> Option<u64> {
@@ -2916,6 +2923,71 @@ mod tests {
             detect_stop_sequence_suffix(&tokenizer, &generated, &["beta gamma".to_string()]);
 
         assert_eq!(stripped, Some(2));
+    }
+
+    /// A tokenizer whose tokens are pieces of words and whose decoding
+    /// joins them with nothing between, as a byte-level BPE's does.
+    fn subword_tokenizer() -> pmetal_data::Tokenizer {
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("<unk>".to_string(), 0),
+                    ("so".to_string(), 1),
+                    (" E".to_string(), 2),
+                    ("ND".to_string(), 3),
+                    (" END".to_string(), 4),
+                    ("ne".to_string(), 5),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("<unk>".to_string())
+            .build()
+            .expect("wordlevel");
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_decoder(Some(tokenizers::decoders::fuse::Fuse::new()));
+        let json = tokenizer.to_string(false).expect("serialize tokenizer");
+        pmetal_data::Tokenizer::from_bytes(json.as_bytes()).expect("wrapper tokenizer")
+    }
+
+    /// A stop sequence that starts in the middle of a token is still a stop:
+    /// `END` arriving as ` E` then `ND` used to match nothing (no run of
+    /// whole tokens decodes to exactly `END`) and the generation went on.
+    #[test]
+    fn detect_stop_sequence_suffix_matches_a_sequence_that_starts_mid_token() {
+        let tokenizer = subword_tokenizer();
+        let stop = ["END".to_string()];
+        assert_eq!(
+            detect_stop_sequence_suffix(&tokenizer, &[1, 2, 3], &stop),
+            Some(2)
+        );
+        // A token that holds the whole of it, space included.
+        assert_eq!(
+            detect_stop_sequence_suffix(&tokenizer, &[1, 5, 4], &stop),
+            Some(1)
+        );
+        // Not there yet, or already past.
+        assert_eq!(
+            detect_stop_sequence_suffix(&tokenizer, &[1, 2], &stop),
+            None
+        );
+        assert_eq!(
+            detect_stop_sequence_suffix(&tokenizer, &[1, 2, 3, 5], &stop),
+            None
+        );
+    }
+
+    /// Only the tail is decoded, so a long generation is not decoded in
+    /// full at every token, and a stop sequence at its end is still found.
+    #[test]
+    fn detect_stop_sequence_suffix_finds_a_match_at_the_end_of_a_long_generation() {
+        let tokenizer = subword_tokenizer();
+        let mut generated = vec![1u32, 5].repeat(5000);
+        generated.extend([2, 3]);
+        assert_eq!(
+            detect_stop_sequence_suffix(&tokenizer, &generated, &["END".to_string()]),
+            Some(2)
+        );
     }
 
     #[test]
