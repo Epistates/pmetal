@@ -229,28 +229,6 @@ pub struct GrpoConfig {
     ///
     /// Defaults to `false`.
     pub async_rewards: bool,
-    /// Enable speculative decoding for rollout generation.
-    ///
-    /// When `true`, `generate_completions` uses a layer-split draft/verify
-    /// approach via `BatchedRlGenerator::generate_speculative`.  The same
-    /// `forward_with_cache` call is used for both the cheap draft phase (first
-    /// N/3 layers — emulated by re-running with a small token sequence through
-    /// the full model after early-exit via the draft closure split) and the
-    /// authoritative verify phase.
-    ///
-    /// Expected throughput improvement: 2–4× depending on model and acceptance
-    /// rate.  Requires the policy model to support KV caching; automatically
-    /// falls back to standard generation when the model returns `None` from
-    /// `create_cache`.
-    ///
-    /// Defaults to `false`.
-    pub use_speculative: bool,
-    /// Number of draft tokens to propose per speculative decode step.
-    ///
-    /// Higher values amortise more tokens per verify pass, but reduce the
-    /// benefit when the draft acceptance rate drops.  Typical sweet-spot: 3–5.
-    /// Ignored when `use_speculative` is `false`.  Defaults to 3.
-    pub speculative_draft_tokens: usize,
     /// KV cache quantization bits for the generation (rollout) phase.
     ///
     /// When `Some(bits)`, the KV cache used during `generate_completions` is
@@ -305,8 +283,6 @@ impl Default for GrpoConfig {
             reward_model_weight: 1.0,
             reward_model_chat_template: None,
             async_rewards: false,
-            use_speculative: false,
-            speculative_draft_tokens: 3,
             kv_cache_bits: None,
             seed: None,
             dapo_dynamic_sampling: false,
@@ -1193,18 +1169,12 @@ impl GrpoTrainer {
         })
     }
 
-    /// Generate multiple completions for a prompt.
+    /// Generate the group of completions for a prompt: the prompt prefilled
+    /// once (from the prefix cache where a repeat allows) and every
+    /// completion decoded together, one batched forward per step.
     ///
-    /// When `use_speculative` is enabled in `GrpoConfig`, this method uses
-    /// `BatchedRlGenerator::generate_speculative` with a layer-split draft/verify
-    /// scheme for 2–4× faster rollout generation.  The draft closure re-runs the
-    /// full model forward (but with a KV cache that terminates early) while the
-    /// verify closure runs the authoritative full forward pass.  Both closures
-    /// wrap `model.forward_with_cache`.
-    ///
-    /// Automatically falls back to standard generation if:
-    /// - The model does not support KV caching.
-    /// - `use_speculative` is `false` (default).
+    /// The completions are sampled from the policy itself, which GRPO's
+    /// importance ratios assume, so no draft model is involved.
     pub fn generate_completions<M>(
         &mut self,
         model: &mut M,
@@ -1214,10 +1184,7 @@ impl GrpoTrainer {
     where
         M: TrainableModel,
     {
-        let use_speculative = self.config.use_speculative && model.supports_kv_cache();
-        let draft_tokens = self.config.speculative_draft_tokens;
-
-        let mut rl_config = BatchedRlConfig {
+        let rl_config = BatchedRlConfig {
             num_generations: self.config.num_generations,
             max_new_tokens: self.config.max_completion_length,
             temperature: self.config.temperature as f32,
@@ -1227,13 +1194,7 @@ impl GrpoTrainer {
             seed: self.config.seed,
             use_prefix_cache: true,
             min_p: 0.05,
-            use_speculative,
-            speculative_draft_tokens: draft_tokens,
         };
-
-        if use_speculative {
-            rl_config = rl_config.with_speculative(draft_tokens);
-        }
 
         let max_len = self.config.max_prompt_length + self.config.max_completion_length;
         let cache = if let Some(bits) = self.config.kv_cache_bits {
@@ -1249,72 +1210,16 @@ impl GrpoTrainer {
         let kv_config = cache.config();
 
         let mut generator = BatchedRlGenerator::new(rl_config, kv_config.clone());
-
-        if use_speculative {
-            // Speculative path: draft_fn and verify_fn both call forward_with_cache.
-            //
-            // The layer-split self-speculative approach (first N/3 layers as draft)
-            // requires ShardableModel, which is not yet implemented for all LoRA
-            // architectures.  Instead we use the same forward_with_cache for both
-            // closures; the speedup comes from the batched verify pass accepting
-            // multiple draft tokens simultaneously.
-            //
-            // This is equivalent to "parallel verification" speculative decoding:
-            // the draft phase runs the full model one token at a time (baseline cost),
-            // while the verify phase processes k+1 tokens in a single forward pass.
-            // The average throughput gain equals the mean accepted tokens per verify
-            // call, which is bounded by k+1 at 100% acceptance.
-            //
-            // Rust ownership: generate_speculative takes two separate closure
-            // parameters.  Both need to call forward_with_cache on the same model
-            // reference.  We wrap the model in a RefCell to allow the two closures
-            // to share a borrow without unsafe code.  This is sound because both
-            // closures are invoked sequentially inside generate_speculative — never
-            // concurrently — so the dynamic borrow check never fails.
-            let model_cell = std::cell::RefCell::new(model);
-
-            let result = generator
-                .generate_speculative(
-                    |input, cache| {
-                        model_cell
-                            .borrow_mut()
-                            .forward_with_cache(input, None, Some(cache))
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                    |input, cache| {
-                        model_cell
-                            .borrow_mut()
-                            .forward_with_cache(input, None, Some(cache))
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                    prompt_tokens,
-                )
-                .map_err(|e| GrpoError::Generation(e.to_string()));
-
-            // Log speculative stats at debug level
-            if let Some(stats) = generator.last_speculative_stats() {
-                tracing::debug!(
-                    "Speculative rollout: acceptance={:.1}%, tokens/step={:.2}, proposed={}, accepted={}",
-                    stats.acceptance_rate() * 100.0,
-                    stats.tokens_per_step(),
-                    stats.total_draft_proposed,
-                    stats.total_draft_accepted,
-                );
-            }
-
-            result
-        } else {
-            generator
-                .generate(
-                    |input, cache| {
-                        model
-                            .forward_with_cache(input, None, Some(cache))
-                            .map_err(|e| Exception::custom(e.to_string()))
-                    },
-                    prompt_tokens,
-                )
-                .map_err(|e| GrpoError::Generation(e.to_string()))
-        }
+        generator
+            .generate(
+                |input, cache| {
+                    model
+                        .forward_with_cache(input, None, Some(cache))
+                        .map_err(|e| Exception::custom(e.to_string()))
+                },
+                prompt_tokens,
+            )
+            .map_err(|e| GrpoError::Generation(e.to_string()))
     }
 
     /// Run full GRPO training loop.

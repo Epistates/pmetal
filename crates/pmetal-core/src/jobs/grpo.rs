@@ -250,27 +250,6 @@ pub struct GrpoSpec {
     pub reward_model_template: Option<String>,
 
     #[job(
-        label = "Speculative Decoding",
-        group = "Compute",
-        argv = "--speculative",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub speculative: bool,
-
-    #[job(
-        label = "Speculative Draft Tokens",
-        group = "Compute",
-        argv = "--speculative-draft-tokens",
-        min = 1,
-        max = 64,
-        default_int = 3
-    )]
-    #[serde(default = "default_speculative_draft")]
-    pub speculative_draft_tokens: usize,
-
-    #[job(
         label = "Async Rewards",
         group = "Reward",
         argv = "--async-rewards",
@@ -349,8 +328,6 @@ impl Default for GrpoSpec {
             reward_model_max_length: default_reward_model_max_length(),
             reward_model_weight: default_reward_model_weight(),
             reward_model_template: None,
-            speculative: false,
-            speculative_draft_tokens: default_speculative_draft(),
             async_rewards: false,
             text_column: None,
             text_columns: None,
@@ -414,9 +391,6 @@ fn default_reward_model_max_length() -> usize {
 }
 fn default_reward_model_weight() -> f64 {
     1.0
-}
-fn default_speculative_draft() -> usize {
-    3
 }
 
 #[cfg(test)]

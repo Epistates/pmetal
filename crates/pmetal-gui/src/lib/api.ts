@@ -212,8 +212,6 @@ export interface GrpoSpec {
   reward_model_max_length?: number;
   reward_model_weight?: number;
   reward_model_template?: string | null;
-  speculative?: boolean;
-  speculative_draft_tokens?: number;
   async_rewards?: boolean;
   text_column?: string | null;
   text_columns?: string | null;

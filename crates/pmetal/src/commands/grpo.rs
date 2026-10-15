@@ -33,8 +33,6 @@ pub(crate) async fn run_grpo_cli(
     reward_model_weight: f64,
     reward_model_template: Option<String>,
     async_rewards: bool,
-    use_speculative: bool,
-    speculative_draft_tokens: usize,
     kv_cache_bits: Option<u8>,
     _log_metrics: Option<String>,
     emit_console_output: bool,
@@ -148,17 +146,8 @@ pub(crate) async fn run_grpo_cli(
     grpo_config.reward_model_weight = reward_model_weight;
     grpo_config.reward_model_chat_template = reward_model_template.clone();
     grpo_config.async_rewards = async_rewards;
-    grpo_config.use_speculative = use_speculative;
-    grpo_config.speculative_draft_tokens = speculative_draft_tokens;
     grpo_config.kv_cache_bits = kv_cache_bits;
     grpo_config.seed = Some(seed);
-
-    if use_speculative && emit_console_output {
-        println!(
-            "Speculative decoding: enabled (draft_tokens={})",
-            speculative_draft_tokens
-        );
-    }
 
     if dapo {
         grpo_config = grpo_config.for_dapo();
