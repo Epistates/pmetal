@@ -129,6 +129,31 @@ impl TokenizedText {
     }
 }
 
+/// The chat template a GGUF embeds, with the strings of its BOS and EOS
+/// tokens.
+pub(crate) struct GgufChatTemplate {
+    /// `tokenizer.chat_template`.
+    pub template: String,
+    /// The BOS token's string.
+    pub bos_token: Option<String>,
+    /// The EOS token's string.
+    pub eos_token: Option<String>,
+}
+
+/// The chat template embedded in the GGUF at `path` (a `.gguf` file, or a
+/// directory holding one), if it has any.
+pub(crate) fn gguf_chat_template(path: &Path) -> Option<GgufChatTemplate> {
+    let content = GgufContent::from_file(resolve_gguf_path(path)?).ok()?;
+    let data = content.tokenizer_data()?;
+    let template = data.chat_template.filter(|t| !t.trim().is_empty())?;
+    let token = |id: Option<u32>| id.and_then(|i| data.tokens.get(i as usize).cloned());
+    Some(GgufChatTemplate {
+        template,
+        bos_token: token(data.bos_id),
+        eos_token: token(data.eos_id),
+    })
+}
+
 /// Wrapper around the tokenizers library.
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
@@ -237,12 +262,14 @@ impl Tokenizer {
     /// post-processor adds its own BOS / EOS around it.
     ///
     /// Use it for plain text (a pre-training document, a raw prompt). Text a
-    /// chat template rendered already carries its BOS, so it goes through
-    /// [`encode`](Self::encode); encoding it here would start it with two.
+    /// chat template rendered already carries its BOS and goes through
+    /// [`encode`](Self::encode); text that opens with the BOS token anyway is
+    /// not given a second one, as a model trained on one BOS never saw two.
     pub fn encode_with_special_tokens(&self, text: &str) -> Result<Vec<u32>> {
+        let add = !self.opens_with_bos(text);
         let encoding = self
             .inner
-            .encode_fast(text, true)
+            .encode_fast(text, add)
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
         Ok(encoding.get_ids().to_vec())
     }
@@ -259,9 +286,10 @@ impl Tokenizer {
         text: &str,
         add_special_tokens: bool,
     ) -> Result<TokenizedText> {
+        let add = add_special_tokens && !self.opens_with_bos(text);
         let encoding = self
             .inner
-            .encode(text, add_special_tokens)
+            .encode(text, add)
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
         Ok(TokenizedText::from_encoding(&encoding))
     }
@@ -279,10 +307,20 @@ impl Tokenizer {
             .iter()
             .map(|t| tokenizers::EncodeInput::Single(t.as_ref().into()))
             .collect();
-        let encodings = self
+        let mut encodings = self
             .inner
             .encode_batch(inputs, add_special_tokens)
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
+        if add_special_tokens {
+            for (encoding, text) in encodings.iter_mut().zip(texts) {
+                if self.opens_with_bos(text.as_ref()) {
+                    *encoding = self
+                        .inner
+                        .encode(text.as_ref(), false)
+                        .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
+                }
+            }
+        }
         Ok(encodings.iter().map(TokenizedText::from_encoding).collect())
     }
 
@@ -297,11 +335,29 @@ impl Tokenizer {
             .iter()
             .map(|t| tokenizers::EncodeInput::Single(t.as_ref().into()))
             .collect();
-        let encodings = self
+        let mut encodings = self
             .inner
             .encode_batch_fast(inputs, add_special_tokens)
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
+        if add_special_tokens {
+            for (encoding, text) in encodings.iter_mut().zip(texts) {
+                if self.opens_with_bos(text.as_ref()) {
+                    *encoding = self
+                        .inner
+                        .encode_fast(text.as_ref(), false)
+                        .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
+                }
+            }
+        }
         Ok(encodings.iter().map(|e| e.get_ids().to_vec()).collect())
+    }
+
+    /// Whether `text` starts with the BOS token's own string, which a
+    /// post-processor would put a second one in front of.
+    fn opens_with_bos(&self, text: &str) -> bool {
+        self.bos_token_id()
+            .and_then(|id| self.inner.id_to_token(id))
+            .is_some_and(|bos| text.starts_with(&bos))
     }
 
     /// Decode token IDs to text.
@@ -670,14 +726,29 @@ mod tests {
         let rendered = "<s><|im_start|>hi";
         let ids = tk.encode(rendered).unwrap();
         assert_eq!(ids.iter().filter(|&&i| i == bos).count(), 1);
-        // The post-processor path adds one in front, as `tokenizer(text)` does.
-        let ids = tk.encode_with_special_tokens(rendered).unwrap();
-        assert_eq!(ids.iter().filter(|&&i| i == bos).count(), 2);
+        // The post-processor path adds one in front of plain text, as
+        // `tokenizer(text)` does, and none in front of text that has one.
+        let ids = tk.encode_with_special_tokens("hi").unwrap();
+        assert_eq!(ids.iter().filter(|&&i| i == bos).count(), 1);
+        assert_eq!(ids[0], bos);
+        assert_eq!(
+            tk.encode_with_special_tokens(rendered).unwrap(),
+            tk.encode(rendered).unwrap()
+        );
         // Offsets: the added BOS covers nothing, the one in the text covers its text.
-        let enc = tk.encode_with_offsets(rendered, true).unwrap();
+        let enc = tk.encode_with_offsets("hi", true).unwrap();
         assert_eq!(enc.offsets[0], (0, 0));
         assert!(enc.special_tokens_mask[0]);
-        assert_eq!(enc.offsets[1], (0, 3));
+        let enc = tk.encode_with_offsets(rendered, true).unwrap();
+        assert_eq!(enc.offsets[0], (0, 3));
+        assert_eq!(enc.ids, tk.encode(rendered).unwrap());
+        // ...and the same holds a batch at a time.
+        let texts = ["hi", rendered];
+        let batch = tk.encode_batch(&texts, true).unwrap();
+        assert_eq!(batch[0], tk.encode_with_special_tokens("hi").unwrap());
+        assert_eq!(batch[1], tk.encode(rendered).unwrap());
+        let batch = tk.encode_batch_with_offsets(&texts, true).unwrap();
+        assert_eq!(batch[1].ids, tk.encode(rendered).unwrap());
     }
 
     #[test]
