@@ -14,7 +14,7 @@ use super::{CacheMode, KVCacheConfig};
 /// Stores computed key and value tensors across generation steps,
 /// enabling efficient autoregressive generation. The mode in the
 /// [`KVCacheConfig`] picks how: every token in the model's dtype, a sliding
-/// window with attention sinks (see [`DenseLayer`]), or a quantized store.
+/// window with attention sinks, or a quantized store.
 #[derive(Debug, Clone)]
 pub struct KVCache {
     /// Configuration.
@@ -286,7 +286,7 @@ impl KVCache {
     /// softcapping. The new token is appended in the process, so the caller
     /// must not also call [`update_and_fetch`](Self::update_and_fetch) for
     /// it. Returns `Ok(None)`, leaving the cache untouched, for everything
-    /// else: the caller then takes the [`update_and_fetch`] path, which
+    /// else: the caller then takes the [`update_and_fetch`](Self::update_and_fetch) path, which
     /// works for every mode.
     pub fn try_compressed_attention(
         &mut self,
@@ -337,15 +337,16 @@ impl KVCache {
 
     /// The cached keys and values of a layer as a single-token step would
     /// see them, or `None` while the layer is empty.
+    ///
+    /// A quantized layer's history comes back dequantized.
     pub fn get(&self, layer_idx: usize) -> Option<(Array, Array)> {
+        if let Some(q_layers) = &self.quantized_layers {
+            return q_layers.get(layer_idx)?.dequantized();
+        }
+        if let Some(tq_layers) = &self.turboquant_layers {
+            return tq_layers.get(layer_idx)?.current();
+        }
         self.layer_caches.get(layer_idx)?.current(self.window)
-    }
-
-    /// A quantized layer's whole content, dequantized, for tests.
-    #[cfg(test)]
-    pub(super) fn dequantized(&self, layer_idx: usize) -> Option<(Array, Array)> {
-        let layer = self.quantized_layers.as_ref()?.get(layer_idx)?;
-        layer.dequantized(pmetal_runtime::compat::Dtype::Float32.as_i32())
     }
 
     /// The dense key buffer of a layer, for tests that watch where it lives.

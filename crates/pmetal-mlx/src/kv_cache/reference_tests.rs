@@ -803,7 +803,7 @@ fn quantized_decode_attention_matches_attention_over_the_dequantized_cache() {
             // The same cache read the long way: dequantize everything it
             // holds (the new token included), then attend.
             dense.update_and_fetch(0, &k, &v).unwrap();
-            let (all_k, all_v) = dense.dequantized(0).expect("layer 0 is quantized");
+            let (all_k, all_v) = dense.get(0).expect("layer 0 holds tokens");
             let expected = fused_sdpa(&queries, &all_k, &all_v, &attn, None).unwrap();
             let diff = crate::test_utils::max_abs_diff(&out, &expected);
             assert!(

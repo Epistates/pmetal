@@ -15,9 +15,16 @@ use pmetal_runtime::turboquant::{
     TurboQuantState,
 };
 
-/// The quantizers a model's layers share.
+/// The quantizers a model's layers share, built for one head geometry.
 #[derive(Debug, Clone)]
-pub(super) enum TurboShared {
+pub(super) struct TurboShared {
+    /// The key and value head dimensions the quantizers were built for.
+    dims: (usize, usize),
+    state: SharedState,
+}
+
+#[derive(Debug, Clone)]
+enum SharedState {
     Uniform(Arc<TurboQuantState>),
     Mixed(Arc<MixedTurboQuantState>),
     /// The configuration cannot be built; every append says why.
@@ -26,21 +33,46 @@ pub(super) enum TurboShared {
 
 impl TurboShared {
     pub(super) fn new(key_dim: usize, value_dim: usize, config: TurboQuantConfig) -> Self {
-        if config.is_mixed() {
+        let state = if config.is_mixed() {
             MixedTurboQuantState::new(key_dim, value_dim, config)
-                .map_or(Self::Refused, |s| Self::Mixed(Arc::new(s)))
+                .map_or(SharedState::Refused, |s| SharedState::Mixed(Arc::new(s)))
         } else {
             TurboQuantState::new(key_dim, value_dim, config)
-                .map_or(Self::Refused, |s| Self::Uniform(Arc::new(s)))
+                .map_or(SharedState::Refused, |s| SharedState::Uniform(Arc::new(s)))
+        };
+        Self {
+            dims: (key_dim, value_dim),
+            state,
+        }
+    }
+}
+
+/// The cache behind a layer.
+#[derive(Debug, Clone)]
+enum Cache {
+    Uniform(Box<QuantizedKvCache>),
+    Mixed(Box<MixedQuantizedKvCache>),
+}
+
+impl Cache {
+    /// A cache that builds its own quantizers on the first append.
+    fn unshared(config: TurboQuantConfig) -> Self {
+        if config.is_mixed() {
+            Self::Mixed(Box::new(MixedQuantizedKvCache::new(config)))
+        } else {
+            Self::Uniform(Box::new(QuantizedKvCache::new(config)))
         }
     }
 }
 
 /// One layer's compressed keys and values.
 #[derive(Debug, Clone)]
-pub(super) enum TurboLayer {
-    Uniform(Box<QuantizedKvCache>),
-    Mixed(Box<MixedQuantizedKvCache>),
+pub(super) struct TurboLayer {
+    config: TurboQuantConfig,
+    /// The head dimensions the shared quantizers fit, `None` once the layer
+    /// has built its own.
+    shared_dims: Option<(usize, usize)>,
+    cache: Cache,
 }
 
 fn failure(err: String) -> Exception {
@@ -49,27 +81,28 @@ fn failure(err: String) -> Exception {
 
 impl TurboLayer {
     pub(super) fn new(config: TurboQuantConfig, shared: &TurboShared) -> Self {
-        match shared {
-            TurboShared::Uniform(state) => Self::Uniform(Box::new(QuantizedKvCache::with_state(
-                config,
-                Arc::clone(state),
-            ))),
-            TurboShared::Mixed(state) => Self::Mixed(Box::new(MixedQuantizedKvCache::with_state(
-                config,
-                Arc::clone(state),
-            ))),
-            // Built on the first append, which reports what is wrong.
-            TurboShared::Refused if config.is_mixed() => {
-                Self::Mixed(Box::new(MixedQuantizedKvCache::new(config)))
-            }
-            TurboShared::Refused => Self::Uniform(Box::new(QuantizedKvCache::new(config))),
+        let cache =
+            match &shared.state {
+                SharedState::Uniform(state) => Cache::Uniform(Box::new(
+                    QuantizedKvCache::with_state(config, Arc::clone(state)),
+                )),
+                SharedState::Mixed(state) => Cache::Mixed(Box::new(
+                    MixedQuantizedKvCache::with_state(config, Arc::clone(state)),
+                )),
+                // Built on the first append, which reports what is wrong.
+                SharedState::Refused => Cache::unshared(config),
+            };
+        Self {
+            config,
+            shared_dims: Some(shared.dims),
+            cache,
         }
     }
 
     pub(super) fn len(&self) -> usize {
-        match self {
-            Self::Uniform(c) => c.len(),
-            Self::Mixed(c) => c.len(),
+        match &self.cache {
+            Cache::Uniform(c) => c.len(),
+            Cache::Mixed(c) => c.len(),
         }
     }
 
@@ -79,37 +112,55 @@ impl TurboLayer {
 
     /// Tokens held quantized.
     pub(super) fn cold_len(&self) -> usize {
-        match self {
-            Self::Uniform(c) => c.cold_len(),
-            Self::Mixed(c) => c.cold_len(),
+        match &self.cache {
+            Cache::Uniform(c) => c.cold_len(),
+            Cache::Mixed(c) => c.cold_len(),
         }
     }
 
     pub(super) fn nbytes(&self) -> usize {
-        match self {
-            Self::Uniform(c) => c.nbytes(),
-            Self::Mixed(c) => c.nbytes(),
+        match &self.cache {
+            Cache::Uniform(c) => c.nbytes(),
+            Cache::Mixed(c) => c.nbytes(),
         }
     }
 
     pub(super) fn reset(&mut self) {
-        match self {
-            Self::Uniform(c) => c.reset(),
-            Self::Mixed(c) => c.reset(),
+        match &mut self.cache {
+            Cache::Uniform(c) => c.reset(),
+            Cache::Mixed(c) => c.reset(),
         }
     }
 
     pub(super) fn truncate(&mut self, n: usize) -> usize {
-        match self {
-            Self::Uniform(c) => c.truncate(n),
-            Self::Mixed(c) => c.truncate(n),
+        match &mut self.cache {
+            Cache::Uniform(c) => c.truncate(n),
+            Cache::Mixed(c) => c.truncate(n),
+        }
+    }
+
+    /// A layer whose head geometry differs from the one the model's shared
+    /// quantizers were built for (a model with global and local attention
+    /// layers of different head dimensions) builds quantizers of its own.
+    fn fit_geometry(&mut self, keys: &Array, values: &Array) {
+        let Some(dims) = self.shared_dims else {
+            return;
+        };
+        if keys.ndim() != 4 || values.ndim() != 4 {
+            return;
+        }
+        let given = (keys.dim(3) as usize, values.dim(3) as usize);
+        if self.is_empty() && given != dims {
+            self.cache = Cache::unshared(self.config);
+            self.shared_dims = None;
         }
     }
 
     fn append(&mut self, keys: &Array, values: &Array) -> Result<(), Exception> {
-        match self {
-            Self::Uniform(c) => c.append(keys, values),
-            Self::Mixed(c) => c.append(keys, values),
+        self.fit_geometry(keys, values);
+        match &mut self.cache {
+            Cache::Uniform(c) => c.append(keys, values),
+            Cache::Mixed(c) => c.append(keys, values),
         }
         .map_err(failure)
     }
@@ -122,24 +173,32 @@ impl TurboLayer {
         values: &Array,
     ) -> Result<(Array, Array), Exception> {
         self.append(keys, values)?;
-        let (k, v) = match self {
-            Self::Uniform(c) => (c.dequantize_keys(), c.dequantize_values()),
-            Self::Mixed(c) => (c.dequantize_keys(), c.dequantize_values()),
+        let (k, v) = match &self.cache {
+            Cache::Uniform(c) => (c.dequantize_keys(), c.dequantize_values()),
+            Cache::Mixed(c) => (c.dequantize_keys(), c.dequantize_values()),
         };
         k.zip(v)
             .ok_or_else(|| Exception::custom("TurboQuant: nothing cached after an append"))
+    }
+
+    /// Every key and value now cached, dequantized; `None` while empty.
+    pub(super) fn current(&self) -> Option<(Array, Array)> {
+        match &self.cache {
+            Cache::Uniform(c) => c.dequantize_keys().zip(c.dequantize_values()),
+            Cache::Mixed(c) => c.dequantize_keys().zip(c.dequantize_values()),
+        }
     }
 
     /// Whether [`Self::attend`] serves this layer: the packed-attention
     /// kernels score a vector against one cache, so only a uniform layer has
     /// them.
     pub(super) fn attends_packed(&self) -> bool {
-        matches!(self, Self::Uniform(_))
+        matches!(self.cache, Cache::Uniform(_))
     }
 
     /// Store one new token and attend `queries` `[B, Hq, 1, D]` to the whole
-    /// cache without dequantizing it. `first_token` is the absolute position
-    /// of the oldest token the query may see.
+    /// cache without dequantizing it. `window` limits the keys to the newest
+    /// ones.
     pub(super) fn attend(
         &mut self,
         queries: &Array,
@@ -148,7 +207,8 @@ impl TurboLayer {
         scale: f32,
         window: Option<usize>,
     ) -> Result<Array, Exception> {
-        let Self::Uniform(cache) = self else {
+        self.fit_geometry(keys, values);
+        let Cache::Uniform(cache) = &mut self.cache else {
             return Err(Exception::custom(
                 "TurboQuant: a mixed-precision cache attends through dequantization",
             ));

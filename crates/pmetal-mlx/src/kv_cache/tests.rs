@@ -92,6 +92,63 @@ fn test_sanitize_cache_mode_adjusts_group_size_for_asymmetric_dims() {
 }
 
 #[test]
+fn test_sanitize_cache_mode_only_picks_group_sizes_mlx_can_quantize() {
+    // MLX's affine quantizer packs groups of 32, 64 or 128 and nothing else.
+    let mode = |bits, group_size| CacheMode::Quantized { bits, group_size };
+    for (dim, preferred, expected) in [
+        (128, 64, mode(4, 64)),
+        (128, 128, mode(4, 128)),
+        (96, 64, mode(4, 32)),
+        (64, 128, mode(4, 64)),
+        // Head dimensions no supported group divides cannot be quantized
+        // this way: the cache stays dense rather than throwing on the
+        // first token.
+        (80, 64, CacheMode::Standard),
+        (8, 64, CacheMode::Standard),
+        (72, 32, CacheMode::Standard),
+    ] {
+        let config = KVCacheConfig::new(1, 32, 2, dim);
+        assert_eq!(
+            sanitize_cache_mode_for_config(&config, mode(4, preferred)),
+            expected,
+            "head dim {dim}, preferred group {preferred}"
+        );
+    }
+    // The asymmetric mode follows the same rule, and so does a key/value
+    // pair whose dimensions share no group.
+    let config = KVCacheConfig::new(1, 32, 2, 96).with_value_head_dim(64);
+    assert_eq!(
+        sanitize_cache_mode_for_config(
+            &config,
+            CacheMode::AsymmetricQuantized {
+                key_bits: 8,
+                value_bits: 4,
+                group_size: 64
+            }
+        ),
+        CacheMode::AsymmetricQuantized {
+            key_bits: 8,
+            value_bits: 4,
+            group_size: 32
+        }
+    );
+    let config = KVCacheConfig::new(1, 32, 2, 96).with_value_head_dim(80);
+    assert_eq!(
+        sanitize_cache_mode_for_config(&config, mode(8, 64)),
+        CacheMode::Standard
+    );
+}
+
+#[test]
+fn test_quantized_cache_refuses_a_group_size_mlx_cannot_pack() {
+    // A cache built directly with a bad group is an error on the first
+    // update, not a throw inside the quantizer.
+    let mut cache = KVCache::new(KVCacheConfig::new(1, 32, 2, 16).with_quantized(4, 16));
+    let k = ops::ones(&[1, 2, 3, 16], Dtype::Float32);
+    assert!(cache.update_and_fetch(0, &k, &k).is_err());
+}
+
+#[test]
 fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
     let config = KVCacheConfig::new(1, 32, 2, 8).with_value_head_dim(4);
     let safe = sanitize_cache_mode_for_config(

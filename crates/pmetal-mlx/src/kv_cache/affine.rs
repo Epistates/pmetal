@@ -36,6 +36,9 @@ use pmetal_runtime::qwen3_native::QuantizedTuple;
 /// Bit widths MLX's affine quantizer packs.
 pub(super) const SUPPORTED_BITS: [u8; 6] = [2, 3, 4, 5, 6, 8];
 
+/// Group sizes MLX's affine quantizer packs.
+pub(super) const GROUP_SIZES: [usize; 3] = [32, 64, 128];
+
 /// Whether `bits` is a width MLX's affine quantizer packs.
 pub(super) fn bits_supported(bits: u8) -> bool {
     SUPPORTED_BITS.contains(&bits)
@@ -122,6 +125,8 @@ pub(super) struct AffineLayer {
     values: Side,
     /// Tokens held.
     offset: usize,
+    /// The dtype the tokens arrived in, which they are dequantized to.
+    dtype: i32,
 }
 
 impl fmt::Debug for AffineLayer {
@@ -137,10 +142,6 @@ impl fmt::Debug for AffineLayer {
 
 impl AffineLayer {
     pub(super) fn new(key_bits: u8, value_bits: u8, group_size: usize) -> Self {
-        assert!(
-            bits_supported(key_bits) && bits_supported(value_bits),
-            "KV cache quantization supports {SUPPORTED_BITS:?} bits, got {key_bits} and {value_bits}"
-        );
         Self {
             group_size,
             keys: Side {
@@ -152,6 +153,7 @@ impl AffineLayer {
                 tuple: None,
             },
             offset: 0,
+            dtype: Dtype::Float32.as_i32(),
         }
     }
 
@@ -185,6 +187,20 @@ impl AffineLayer {
     }
 
     fn check(&self, keys: &Array, values: &Array) -> Result<(), Exception> {
+        // MLX's quantizer throws on anything else, which would come back as
+        // a placeholder array and not as an error.
+        if !bits_supported(self.keys.bits) || !bits_supported(self.values.bits) {
+            return Err(Exception::custom(format!(
+                "quantized KV cache: MLX packs {SUPPORTED_BITS:?} bits, not {} and {}",
+                self.keys.bits, self.values.bits
+            )));
+        }
+        if !GROUP_SIZES.contains(&self.group_size) {
+            return Err(Exception::custom(format!(
+                "quantized KV cache: MLX quantizes in groups of {GROUP_SIZES:?}, not {}",
+                self.group_size
+            )));
+        }
         if keys.ndim() != 4 || values.ndim() != 4 || keys.dim(2) != values.dim(2) {
             return Err(Exception::custom(format!(
                 "quantized KV cache: expected [B, heads, seq, dim] keys {:?} and values {:?} of equal length",
@@ -215,6 +231,9 @@ impl AffineLayer {
 
     /// Quantize and store `keys` `[B, H, S, Dk]` and `values`.
     fn append(&mut self, keys: &Array, values: &Array) {
+        if self.offset == 0 {
+            self.dtype = keys.dtype_raw();
+        }
         self.keys.append(keys, self.offset, self.group_size);
         self.values.append(values, self.offset, self.group_size);
         self.offset += keys.dim(2) as usize;
@@ -240,14 +259,14 @@ impl AffineLayer {
         Ok((join(&self.keys, keys), join(&self.values, values)))
     }
 
-    /// Everything held, dequantized, in `dtype`.
-    #[cfg(test)]
-    pub(super) fn dequantized(&self, dtype: i32) -> Option<(Array, Array)> {
+    /// Everything held, dequantized to the dtype it arrived in.
+    pub(super) fn dequantized(&self) -> Option<(Array, Array)> {
         (self.offset > 0).then(|| {
             (
-                self.keys.dequantize(0, self.offset, self.group_size, dtype),
+                self.keys
+                    .dequantize(0, self.offset, self.group_size, self.dtype),
                 self.values
-                    .dequantize(0, self.offset, self.group_size, dtype),
+                    .dequantize(0, self.offset, self.group_size, self.dtype),
             )
         })
     }

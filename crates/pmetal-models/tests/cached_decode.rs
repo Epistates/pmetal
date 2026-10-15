@@ -326,3 +326,81 @@ fn a_cached_decode_reproduces_the_uncached_prefix() {
         }
     }
 }
+
+/// A compressed cache has to decode what the uncached model computes, up to
+/// what its quantizer loses.
+///
+/// Every architecture, three compressed modes. A TurboQuant cache keeps the
+/// newest tokens (and the first few) exact, so over a short prefix nothing is
+/// quantized and its two flavours, uniform and mixed-precision, must match
+/// the uncached recompute to rounding: that is the plumbing (the packed
+/// attention path an architecture asks the cache for, the channel
+/// permutation of the mixed cache) with no quantization error to hide
+/// behind. The 8-bit affine cache does quantize its history; it is held to
+/// the error of an 8-bit code.
+#[test]
+fn a_compressed_cache_decodes_what_it_recomputes() {
+    use pmetal_mlx::kv_cache::{CacheMode, TurboQuantConfig};
+
+    let modes: [(&str, CacheMode, f32); 3] = [
+        (
+            "turboquant 8-bit",
+            CacheMode::TurboQuant {
+                config: TurboQuantConfig::uniform(8, 8),
+            },
+            1e-3,
+        ),
+        (
+            "turboquant 2.5-bit",
+            CacheMode::TurboQuant {
+                config: TurboQuantConfig::preset_q2_5(8),
+            },
+            1e-3,
+        ),
+        (
+            "affine 8-bit",
+            CacheMode::Quantized {
+                bits: 8,
+                group_size: 8,
+            },
+            0.1,
+        ),
+    ];
+    for (name, config_json) in CASES {
+        for (mode_name, mode, tolerance) in modes {
+            let mut model =
+                DynamicModel::from_config(config_json).expect("architecture should build");
+            let mut cache = model.create_cache_with_mode(PROMPT.len() + STEPS + 1, mode);
+
+            let mut prefix = PROMPT.to_vec();
+            let prefill = model
+                .forward_with_cache(&ids(&prefix), None, Some(&mut cache))
+                .unwrap_or_else(|e| panic!("{name} / {mode_name}: prefill failed: {e}"));
+            let mut cached_row = last_row(&prefill);
+
+            for step in 0..STEPS {
+                let fresh = model.forward(&ids(&prefix), None).expect("recompute");
+                let fresh_row = last_row(&fresh);
+                let scale = fresh_row
+                    .iter()
+                    .fold(0.0f32, |worst, v| worst.max(v.abs()))
+                    .max(1e-6);
+                let diff = max_abs_diff(&cached_row, &fresh_row) / scale;
+                assert!(
+                    diff < tolerance,
+                    "{name} / {mode_name} step {step}: the cached decode is {diff:e} from the \
+                     uncached recompute of the same {} tokens (limit {tolerance:e})",
+                    prefix.len()
+                );
+                let next = argmax(&fresh_row) as i32;
+                prefix.push(next);
+                let stepped = model
+                    .forward_with_cache(&ids(&[next]), None, Some(&mut cache))
+                    .unwrap_or_else(|e| panic!("{name} / {mode_name}: decode step failed: {e}"));
+                cached_row = last_row(&stepped);
+            }
+            pmetal_runtime::check_unobserved_error()
+                .unwrap_or_else(|e| panic!("{name} / {mode_name}: {e}"));
+        }
+    }
+}

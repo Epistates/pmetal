@@ -22,18 +22,40 @@
 //! This eliminates transpose overhead
 //! during cached generation. The sequence dimension is axis 2.
 //!
-//! ## Supported Modes
+//! ## Modes
 //!
-//! - **Standard KV cache**: Stores all past keys/values (best for short sequences)
-//! - **Sliding window cache**: Fixed-size window (constant memory, for long sequences)
+//! A [`KVCacheConfig`]'s [`CacheMode`] says how a layer stores its tokens:
+//!
+//! - **Standard**: every token, in the model's dtype, in a buffer written in
+//!   place and doubled as it fills.
+//! - **Sliding window / rotating**: the newest `window` tokens, and for a
+//!   rotating cache the first few as attention sinks. Memory is bounded by
+//!   the window; a call returns what its queries may attend to (see
+//!   [`KVCache::update_and_fetch`] and [`KVCache::window_mask`]).
+//! - **Quantized**: MLX affine groups of 32, 64 or 128 channels at 2 to 8
+//!   bits, attended on the packed rows (`quantized_matmul`) for a decode
+//!   step.
+//! - **TurboQuant**: the runtime's rotation-based quantizer, with the first
+//!   tokens and the newest ones kept exact; the 2.5- and 3.5-bit presets
+//!   are mixed-precision.
+//!
+//! A model asks a compressed cache to attend itself with
+//! [`KVCache::try_compressed_attention`] and falls back to
+//! [`KVCache::update_and_fetch`], which works for every mode.
+//!
+//! [`KVCache::rollback`] gives back the newest tokens (speculative decoding),
+//! [`KVCache::fork`] shares a cache's arrays with an independent copy (prefix
+//! reuse, see [`crate::prefix_cache`]).
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! let mut cache = KVCache::new(num_layers, max_len, num_kv_heads, head_dim);
+//! let mut cache = KVCache::new(KVCacheConfig::new(num_layers, max_len, num_kv_heads, head_dim));
 //! for step in 0..generation_length {
+//!     // Read the position before this layer's own update.
+//!     let offset = cache.rope_offset_for(layer_idx);
 //!     // Pass keys/values in [B, heads, seq, head_dim] format
-//!     let (keys, values) = cache.update_and_fetch(layer_idx, new_keys, new_values)?;
+//!     let (keys, values) = cache.update_and_fetch(layer_idx, &new_keys, &new_values)?;
 //!     // Use keys, values directly in attention (no transpose needed)
 //! }
 //! ```
@@ -162,34 +184,31 @@ fn describe_turboquant_tensor(config: TurboQuantTensorConfig) -> String {
     }
 }
 
-/// Returns whether a quantized KV cache `group_size` cleanly divides both key
-/// and value head dimensions.
+/// Returns whether MLX can quantize K/V cache rows of these head dimensions
+/// in groups of `group_size`: a size its affine quantizer packs (32, 64 or
+/// 128) that divides both.
 pub fn group_size_supported_for_dims(
     key_head_dim: usize,
     value_head_dim: usize,
     group_size: usize,
 ) -> bool {
-    group_size > 0
+    affine::GROUP_SIZES.contains(&group_size)
         && (key_head_dim == 0 || key_head_dim % group_size == 0)
         && (value_head_dim == 0 || value_head_dim % group_size == 0)
 }
 
-/// Returns the best supported quantization group size for a K/V head-dimension
-/// pair, preferring larger group sizes first.
+/// The best supported quantization group size for a K/V head-dimension pair:
+/// `preferred` if it works, else the largest that does. `None` when no group
+/// MLX packs divides both dimensions (a head dimension of 80, say), in which
+/// case the cache cannot be affine-quantized.
 pub fn compatible_group_size_for_dims(
     key_head_dim: usize,
     value_head_dim: usize,
     preferred: usize,
-) -> usize {
-    if group_size_supported_for_dims(key_head_dim, value_head_dim, preferred) {
-        return preferred;
-    }
-    for candidate in [128, 64, 32, 16, 8, 4, 2, 1] {
-        if group_size_supported_for_dims(key_head_dim, value_head_dim, candidate) {
-            return candidate;
-        }
-    }
-    1
+) -> Option<usize> {
+    std::iter::once(preferred)
+        .chain(affine::GROUP_SIZES.into_iter().rev())
+        .find(|&g| group_size_supported_for_dims(key_head_dim, value_head_dim, g))
 }
 
 /// Sanitizes a TurboQuant tensor config for a specific head dimension.
@@ -244,32 +263,40 @@ pub fn sanitize_cache_mode_for_dims(
     value_head_dim: usize,
     mode: CacheMode,
 ) -> CacheMode {
+    let dense = |why: &str| {
+        tracing::warn!(
+            key_head_dim,
+            value_head_dim,
+            mode = %mode.describe(),
+            "KV cache: {why}; keeping the cache dense"
+        );
+        CacheMode::Standard
+    };
     match mode {
-        CacheMode::Quantized { bits, group_size }
-            if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) =>
-        {
-            CacheMode::Quantized {
-                bits,
-                group_size: compatible_group_size_for_dims(
-                    key_head_dim,
-                    value_head_dim,
-                    group_size,
-                ),
+        CacheMode::Quantized { bits, group_size } => {
+            if !affine::bits_supported(bits) {
+                return dense("MLX cannot pack that many bits");
+            }
+            match compatible_group_size_for_dims(key_head_dim, value_head_dim, group_size) {
+                Some(group_size) => CacheMode::Quantized { bits, group_size },
+                None => dense("no quantization group divides the head dimensions"),
             }
         }
         CacheMode::AsymmetricQuantized {
             key_bits,
             value_bits,
             group_size,
-        } if !group_size_supported_for_dims(key_head_dim, value_head_dim, group_size) => {
-            CacheMode::AsymmetricQuantized {
-                key_bits,
-                value_bits,
-                group_size: compatible_group_size_for_dims(
-                    key_head_dim,
-                    value_head_dim,
+        } => {
+            if !affine::bits_supported(key_bits) || !affine::bits_supported(value_bits) {
+                return dense("MLX cannot pack that many bits");
+            }
+            match compatible_group_size_for_dims(key_head_dim, value_head_dim, group_size) {
+                Some(group_size) => CacheMode::AsymmetricQuantized {
+                    key_bits,
+                    value_bits,
                     group_size,
-                ),
+                },
+                None => dense("no quantization group divides the head dimensions"),
             }
         }
         CacheMode::TurboQuant { config } => CacheMode::TurboQuant {
