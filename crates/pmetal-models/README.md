@@ -110,7 +110,7 @@ fn detect(model_dir: &str) -> Result<ModelArchitecture, Exception> {
 | `generation` | Token generation with sampling |
 | `loader` | HuggingFace model loading |
 | `sampling/` | Sampling strategy implementations |
-| `traits` | `CausalLMModel`, `Quantizable` traits |
+| `traits` | `CausalLMModel` and `ModelConfig` |
 
 ## License
 

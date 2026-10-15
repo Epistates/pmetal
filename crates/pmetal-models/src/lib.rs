@@ -61,7 +61,6 @@ pub mod ollama;
 pub mod pipelines;
 pub mod pooling;
 pub mod qwen3_next_mtp;
-pub mod registry;
 pub mod rl_generation;
 pub mod sampling;
 pub mod shard;
@@ -75,12 +74,11 @@ pub use gemma4_mtp::*;
 pub use generation::*;
 pub use loader::*;
 pub use qwen3_next_mtp::*;
-pub use registry::*;
 pub use rl_generation::{
     BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator, generate_rl_completions,
 };
 pub use speculative::{SpeculativeConfig, SpeculativeDecoder, SpeculativeStats};
-pub use traits::{CausalLMModel, LoraCapable, ModelConfig, Quantizable, QuantizationType};
+pub use traits::{CausalLMModel, ModelConfig};
 pub use weight_format::{GgufModelConfig, WeightFormat, WeightFormatError, WeightLoader};
 
 /// Compiles the code blocks in `README.md` as doctests, so the crate's front

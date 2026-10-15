@@ -1,22 +1,10 @@
-//! Unified weight loading for multiple formats.
+//! GGUF weight loading and the format detection that routes to it.
 //!
-//! This module provides format-agnostic weight loading, supporting:
-//! - **Safetensors** (HuggingFace format) with automatic BF16→F32 conversion
-//! - **GGUF** (llama.cpp format) with dequantization and tensor name mapping
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use pmetal_models::weight_format::{WeightLoader, WeightFormat};
-//!
-//! // Auto-detect format and load
-//! let weights = WeightLoader::load("./model");
-//!
-//! // Or load specific format
-//! let weights = WeightLoader::load_gguf("./model.gguf");
-//! ```
+//! Safetensors checkpoints are read by [`crate::loader`]; this module owns the
+//! GGUF side: tensor-name mapping, dequantization and the model config GGUF
+//! carries in its metadata.
 
-use pmetal_runtime::compat::{Array, Dtype};
+use pmetal_runtime::compat::Array;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -170,103 +158,6 @@ fn gguf_shape_to_i32(dimensions: &[u64], tensor_name: &str) -> Result<Vec<i32>, 
 pub struct WeightLoader;
 
 impl WeightLoader {
-    /// Load weights from a path, auto-detecting the format.
-    ///
-    /// For directories, looks for safetensors or GGUF files.
-    /// For files, uses the file extension to determine format.
-    ///
-    /// # Arguments
-    /// * `path` - Path to model directory or weight file
-    ///
-    /// # Returns
-    /// HashMap of weight name (in HuggingFace format) to Array
-    pub fn load(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, WeightFormatError> {
-        let path = path.as_ref();
-
-        match WeightFormat::detect(path) {
-            Some(WeightFormat::Safetensors) => Self::load_safetensors(path),
-            Some(WeightFormat::Gguf) => Self::load_gguf(path),
-            None => Err(WeightFormatError::UnsupportedFormat(format!(
-                "Could not detect weight format for: {}",
-                path.display()
-            ))),
-        }
-    }
-
-    /// Load weights from safetensors format.
-    ///
-    /// Handles both single-file and sharded models.
-    /// Automatically converts BF16 weights to F32 for training compatibility.
-    pub fn load_safetensors(
-        path: impl AsRef<Path>,
-    ) -> Result<HashMap<String, Array>, WeightFormatError> {
-        let path = path.as_ref();
-        let mut weights = HashMap::new();
-
-        if path.is_file() {
-            // Single file
-            let path_str = path.to_str().unwrap_or_default();
-            if let Some(pairs) = pmetal_runtime::inline_array::load_safetensors_shard(path_str) {
-                for (name, array) in pairs {
-                    weights.insert(name, Self::convert_dtype_for_training(array)?);
-                }
-            }
-        } else if path.is_dir() {
-            // Directory - check for single file or sharded
-            let single_file = path.join("model.safetensors");
-            if single_file.exists() {
-                let path_str = single_file.to_str().unwrap_or_default();
-                if let Some(pairs) = pmetal_runtime::inline_array::load_safetensors_shard(path_str)
-                {
-                    for (name, array) in pairs {
-                        weights.insert(name, Self::convert_dtype_for_training(array)?);
-                    }
-                }
-            } else {
-                // Load sharded model
-                let index_path = path.join("model.safetensors.index.json");
-                if !index_path.exists() {
-                    return Err(WeightFormatError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "No model.safetensors or model.safetensors.index.json found",
-                    )));
-                }
-
-                #[derive(serde::Deserialize)]
-                struct WeightIndex {
-                    weight_map: HashMap<String, String>,
-                }
-
-                let index_content = std::fs::read_to_string(&index_path)?;
-                let index: WeightIndex = serde_json::from_str(&index_content)?;
-
-                // Get unique shard files
-                let shard_files: std::collections::HashSet<&String> =
-                    index.weight_map.values().collect();
-
-                // Load each shard
-                for shard_file in shard_files {
-                    let shard_path = path.join(shard_file);
-                    let path_str = shard_path.to_str().unwrap_or_default();
-                    if let Some(pairs) =
-                        pmetal_runtime::inline_array::load_safetensors_shard(path_str)
-                    {
-                        for (name, array) in pairs {
-                            weights.insert(name, Self::convert_dtype_for_training(array)?);
-                        }
-                    }
-                }
-            }
-        } else {
-            return Err(WeightFormatError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("Path not found: {}", path.display()),
-            )));
-        }
-
-        Ok(weights)
-    }
-
     /// Load weights from GGUF format.
     ///
     /// Dequantizes all tensors to F32 and maps tensor names to HuggingFace format.
@@ -324,21 +215,6 @@ impl WeightLoader {
         }
 
         Ok(weights)
-    }
-
-    /// Convert array dtype for training compatibility.
-    ///
-    /// BF16 is converted to F32 since MLX training works better with F32.
-    /// F16 is kept as-is (MLX handles F16 well).
-    fn convert_dtype_for_training(array: Array) -> Result<Array, WeightFormatError> {
-        match array.dtype() {
-            Dtype::Bfloat16 => {
-                // Convert BF16 to F32 for training compatibility
-                Ok(array.as_dtype(Dtype::Float32.as_i32()))
-            }
-            // Keep other dtypes as-is
-            _ => Ok(array),
-        }
     }
 
     /// Map GGUF tensor name to HuggingFace format.
