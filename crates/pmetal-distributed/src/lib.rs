@@ -334,6 +334,29 @@ impl DistributedContext {
         result
     }
 
+    /// Reduce `data` across all nodes through `compressor`: the nodes
+    /// exchange compressed gradients and every node sums what they decode to
+    /// (see [`compression::all_reduce_compressed`]). The compressor's error
+    /// feedback carries what was not sent into the next call, so give each
+    /// buffer its own compressor and call it once per step.
+    pub async fn all_reduce_compressed(
+        &self,
+        compressor: &mut GradientCompressor,
+        data: &mut [f32],
+        op: ReduceOp,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        let result =
+            compression::all_reduce_compressed(self.backend.as_ref(), compressor, data, op).await;
+        let sent = result.as_ref().map_or(0, |sent| *sent);
+        if let Some(ref metrics) = self.metrics {
+            metrics.compression.bytes_before.add(data.len() as u64 * 4);
+            metrics.compression.bytes_after.add(sent as u64);
+        }
+        self.observe(|m| &m.all_reduce, sent, start, &result);
+        result.map(|_| ())
+    }
+
     /// Reduce `data` across all nodes, leaving this node with only its own
     /// chunk reduced; returns that chunk's range.
     pub async fn reduce_scatter_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<Range<usize>> {
