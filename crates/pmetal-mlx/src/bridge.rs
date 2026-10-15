@@ -21,7 +21,6 @@ use pmetal_metal::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result as MetalResult},
-    kernels::dequant::DequantKernels,
 };
 use pmetal_runtime::compat::{Array, Dtype};
 
@@ -58,50 +57,6 @@ impl MlxMetalBridge {
         }
 
         Ok(())
-    }
-
-    /// Dequantize Q4_0 data directly into an MLX Array (Metal-accelerated).
-    pub fn dequantize_q4_0(
-        ctx: &MetalContext,
-        data: &[u8],
-        n_elements: usize,
-        shape: &[i32],
-    ) -> MetalResult<Array> {
-        Self::validate_shape_elements(shape, n_elements)?;
-        let dequant = DequantKernels::new(ctx)?;
-        let in_buf = MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)?;
-        let out_buf = MetalBuffer::<f32>::new(ctx, n_elements, BufferUsage::Shared)?;
-
-        dequant.dequantize_q4_0(
-            ctx,
-            &in_buf.as_retained(),
-            &out_buf.as_retained(),
-            n_elements,
-        )?;
-
-        Self::buffer_into_array_f32(out_buf, shape)
-    }
-
-    /// Dequantize IQ4_XS data directly into an MLX Array (Metal-accelerated).
-    pub fn dequantize_iq4_xs(
-        ctx: &MetalContext,
-        data: &[u8],
-        n_elements: usize,
-        shape: &[i32],
-    ) -> MetalResult<Array> {
-        Self::validate_shape_elements(shape, n_elements)?;
-        let dequant = DequantKernels::new(ctx)?;
-        let in_buf = MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)?;
-        let out_buf = MetalBuffer::<f32>::new(ctx, n_elements, BufferUsage::Shared)?;
-
-        dequant.dequantize_iq4_xs(
-            ctx,
-            &in_buf.as_retained(),
-            &out_buf.as_retained(),
-            n_elements,
-        )?;
-
-        Self::buffer_into_array_f32(out_buf, shape)
     }
 
     /// Create a zero-copy buffer view from an f32 MLX array.

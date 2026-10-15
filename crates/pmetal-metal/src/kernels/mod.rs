@@ -5,11 +5,9 @@
 //! operations.
 
 pub mod batch_encoder;
-pub mod dequant;
 pub mod dispatch;
 pub mod dw_gemm;
 pub mod flash_attention;
-pub mod fp8_training;
 pub mod fused_cross_entropy;
 pub mod fused_lora;
 pub mod fused_moe;
@@ -50,9 +48,6 @@ pub use dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
 pub use flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
     FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
-};
-pub use fp8_training::{
-    Fp8DynamicScale, Fp8Format, Fp8GemmOutput, Fp8QuantOutput, Fp8TrainingConfig, Fp8TrainingKernel,
 };
 pub use fused_cross_entropy::{
     FusedCrossEntropy,

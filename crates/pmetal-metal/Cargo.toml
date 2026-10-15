@@ -59,7 +59,3 @@ workspace = true
 [[bench]]
 name = "ane_kernels"
 harness = false
-
-[[bench]]
-name = "kernel_dispatch"
-harness = false
