@@ -287,8 +287,7 @@ impl AdamWScalars {
     };
 }
 
-// `AdamWScalars` in `metal/fused_training.metal` and
-// `metal4/mpp_fused_training.metal`.
+// `AdamWScalars` in `metal/fused_training.metal`.
 crate::msl_layout::msl_layout!(AdamWScalars, size = 28, {
     decay: 0,
     one_minus_beta1: 4,

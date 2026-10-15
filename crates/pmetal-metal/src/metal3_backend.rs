@@ -8,9 +8,6 @@
 //!
 //! All `todo!()` stubs have been closed:
 //!
-//! - **`quantized_gemm`**: returns `Err(InvalidConfig)` — Metal 3 has no quantized
-//!   GEMM path (`BackendCaps::metal3()` reports `has_quantized_gemm: false`).
-//!
 //! - **`fused_lora_forward`** and **`fused_adamw_step`**: wired directly, with param-info extraction from
 //!   the `AdamWDescriptor` for AdamW.
 
@@ -19,12 +16,10 @@ use std::sync::Arc;
 use half::f16;
 
 use crate::{
-    backend::{
-        AdamWDescriptor, BackendCaps, GemmDescriptor, KernelBackend, QuantizedGemmDescriptor,
-    },
+    backend::{AdamWDescriptor, BackendCaps, GemmDescriptor, KernelBackend},
     buffer::{AsMetalBuffer, MetalBuffer},
     context::MetalContext,
-    error::{MetalError, Result},
+    error::Result,
     kernels::{
         dw_gemm::DwGemm,
         flash_attention::{FlashAttention, FlashAttentionConfig, FlashAttentionOutput},
@@ -107,31 +102,6 @@ impl KernelBackend for Metal3Backend {
         config.use_fp16 = desc.use_fp16;
         let kernel = MppGemm::new(self.ctx.clone(), config);
         kernel.execute(a, b, c_or_d)
-    }
-
-    /// Quantized GEMM — not available on Metal 3.
-    ///
-    /// `BackendCaps::metal3()` sets `has_quantized_gemm: false`; the dispatch
-    /// layer must never route here. Calling this is a programming error.
-    fn quantized_gemm(
-        &self,
-        _ctx: &Arc<MetalContext>,
-        _desc: &QuantizedGemmDescriptor,
-        _x: &dyn AsMetalBuffer,
-        _w_q: &dyn AsMetalBuffer,
-        _scales: &dyn AsMetalBuffer,
-        _biases: Option<&dyn AsMetalBuffer>,
-        _output: &dyn AsMetalBuffer,
-    ) -> Result<()> {
-        // Metal 3 has no quantized GEMM kernel. BackendCaps::metal3() reports
-        // has_quantized_gemm: false, so the dispatch layer must never route here.
-        // Return a proper error instead of panicking so the process can recover.
-        Err(MetalError::InvalidConfig(
-            "quantized_gemm is not available on the Metal 3 backend \
-             (BackendCaps::metal3() has_quantized_gemm=false); \
-             route quantized GEMM to Metal 4 or the MLX compute graph path"
-                .into(),
-        ))
     }
 
     /// Depthwise GEMM accumulate via [`DwGemm::queue_gemm_accum`].

@@ -18,7 +18,6 @@ pub mod mpp_bench;
 pub mod mpp_dispatch;
 pub mod mpp_flash_attention;
 pub mod mpp_gemm;
-pub mod mpp_quantized;
 pub mod turboquant;
 
 #[cfg(has_metal4)]
@@ -31,8 +30,6 @@ pub mod mpp_fused_norm_lora;
 pub mod mpp_fused_rope;
 #[cfg(has_metal4)]
 pub mod mpp_fused_swiglu;
-#[cfg(has_metal4)]
-pub mod mpp_fused_training;
 
 // Re-export main types
 pub use dw_gemm::{DwGemm, GPU_DW_MIN_DIM, ScratchPool};
@@ -53,5 +50,4 @@ pub use fused_training::{
 pub use mpp_flash_attention::{
     MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
 };
-pub use mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
 pub use turboquant::TurboQuantTransform;

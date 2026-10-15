@@ -101,7 +101,6 @@ pub use kernels::fused_swiglu::{
 pub use kernels::mpp_flash_attention::{
     MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
 };
-pub use kernels::mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
 pub use kernels::turboquant::TurboQuantTransform;
 pub use pipeline::{FunctionConstant, PipelineCache};
 

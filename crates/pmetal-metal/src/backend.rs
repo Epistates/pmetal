@@ -55,9 +55,6 @@ pub struct BackendCaps {
     /// Whether this backend can execute GEMM operations.
     pub has_gemm: bool,
 
-    /// Whether this backend has a quantized GEMM path.
-    pub has_quantized_gemm: bool,
-
     /// Whether this backend provides flash attention.
     pub has_flash_attention: bool,
 
@@ -101,7 +98,6 @@ impl BackendCaps {
         Self {
             name: "Metal3",
             has_gemm: true,
-            has_quantized_gemm: false,
             has_flash_attention: true,
             has_mpp_flash_attention: false,
             has_swiglu: true,
@@ -126,9 +122,7 @@ impl BackendCaps {
     /// in [`Metal4Backend`](crate::metal4::Metal4Backend) now dispatch through MPP kernel structs:
     ///
     /// - `has_gemm`: `MppGemm` (large prefill / training shapes)
-    /// - `has_quantized_gemm`: `MppQuantizedGemm` via `fused_adamw_step_standalone`
     /// - `has_swiglu`: `MppFusedSwiGLU` (base and LoRA paths both use MPP kernels)
-    /// - `has_adamw`: `MppFusedAdamW` via `fused_adamw_step_standalone`
     /// - `has_rope`: `MppFusedRoPE`
     /// - `has_norm_lora`: `MppFusedNormLora`
     /// - `has_lora`: `MppFusedLora` (inference mode)
@@ -137,15 +131,12 @@ impl BackendCaps {
         Self {
             name: "Metal4",
             has_gemm: true,
-            // Wired: MppQuantizedGemm dispatched directly from quantized_gemm().
-            has_quantized_gemm: true,
             // Wired: MPP forward (MppFlashAttention) and backward (MppFlashAttentionBackward).
             // D=128 causal backward uses native MPP kernels; other dims fall back to Metal 3.
             has_flash_attention: true,
             has_mpp_flash_attention: true,
             // Wired: MppFusedSwiGLU (LoRA path now uses MPP variant).
             has_swiglu: true,
-            // Wired: MppFusedAdamW via fused_adamw_step_standalone().
             has_adamw: true,
             // Wired: MppFusedRoPE.
             has_rope: true,
@@ -195,34 +186,6 @@ impl GemmDescriptor {
             beta: 0.0,
             batch_size: 1,
             use_fp16: true,
-        }
-    }
-}
-
-/// Descriptor for a quantized GEMM: `Y[M,N]` = `X[M,K]` @ `W_q[N,K]^T`
-#[derive(Debug, Clone)]
-pub struct QuantizedGemmDescriptor {
-    /// Output rows.
-    pub m: usize,
-    /// Output columns.
-    pub n: usize,
-    /// Reduction dimension.
-    pub k: usize,
-    /// Quantization group size (typically 64).
-    pub group_size: usize,
-    /// Quantization bits (2 or 4).
-    pub bits: u8,
-}
-
-impl QuantizedGemmDescriptor {
-    /// Create a 4-bit group-64 descriptor.
-    pub fn new(m: usize, n: usize, k: usize) -> Self {
-        Self {
-            m,
-            n,
-            k,
-            group_size: 64,
-            bits: 4,
         }
     }
 }
@@ -300,22 +263,6 @@ pub trait KernelBackend: Send + Sync {
         a: &dyn AsMetalBuffer,
         b: &dyn AsMetalBuffer,
         c_or_d: &dyn AsMetalBuffer,
-    ) -> Result<()>;
-
-    /// Execute quantized GEMM: Y = X @ W_q^T (dequant on the fly).
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "mirrors the kernel's buffers one-to-one"
-    )]
-    fn quantized_gemm(
-        &self,
-        ctx: &Arc<MetalContext>,
-        desc: &QuantizedGemmDescriptor,
-        x: &dyn AsMetalBuffer,
-        w_q: &dyn AsMetalBuffer,
-        scales: &dyn AsMetalBuffer,
-        biases: Option<&dyn AsMetalBuffer>,
-        output: &dyn AsMetalBuffer,
     ) -> Result<()>;
 
     /// Encode a weight-gradient GEMM into an existing batched command buffer.

@@ -11,12 +11,10 @@ use half::f16;
 use objc2_metal::MTLCommandBuffer;
 
 use crate::{
-    backend::{
-        AdamWDescriptor, BackendCaps, GemmDescriptor, KernelBackend, QuantizedGemmDescriptor,
-    },
+    backend::{AdamWDescriptor, BackendCaps, GemmDescriptor, KernelBackend},
     buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},
     context::MetalContext,
-    error::{MetalError, Result},
+    error::Result,
     kernels::{
         flash_attention::{FlashAttentionConfig, FlashAttentionOutput},
         fused_lora::{FusedLoraConfig, FusedLoraOutput},
@@ -30,8 +28,6 @@ use crate::{
         mpp_fused_norm_lora::{MppFusedNormLora, MppFusedNormLoraConfig},
         mpp_fused_rope::{MppFusedRoPE, MppFusedRoPEConfig},
         mpp_fused_swiglu::{MppFusedMLP, MppFusedMLPConfig, MppFusedSwiGLU, MppFusedSwiGLUConfig},
-        mpp_fused_training::{MppFusedAdamW, MppFusedAdamWConfig, MppParamInfo},
-        mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig},
     },
     metal3_backend::Metal3Backend,
     metal4::{allocator_pool::CommandAllocatorPool, residency::ResidencyManager},
@@ -46,10 +42,6 @@ use crate::{
 /// Most operations are dispatched through the dedicated MPP kernel structs
 /// defined in `crates/pmetal-metal/src/kernels/mpp_*.rs`; the rest keep the
 /// [`Metal3Backend`] fallback.
-///
-/// Previously falling back: `fused_adamw_step` now routes through
-/// `fused_adamw_step_standalone` which dispatches `MppFusedAdamW` directly.
-/// Quantized GEMM is now wired to `MppQuantizedGemm`.
 pub struct Metal4Backend {
     ctx: Arc<MetalContext>,
     caps: BackendCaps,
@@ -129,34 +121,6 @@ impl KernelBackend for Metal4Backend {
     ) -> Result<()> {
         // MPP GEMM is handled by mpp_gemm.rs, wired in Task 11.
         self.fallback.gemm(ctx, desc, a, b, c_or_d)
-    }
-
-    fn quantized_gemm(
-        &self,
-        ctx: &Arc<MetalContext>,
-        desc: &QuantizedGemmDescriptor,
-        x: &dyn AsMetalBuffer,
-        w_q: &dyn AsMetalBuffer,
-        scales: &dyn AsMetalBuffer,
-        biases: Option<&dyn AsMetalBuffer>,
-        output: &dyn AsMetalBuffer,
-    ) -> Result<()> {
-        let mpp_config = MppQuantizedGemmConfig {
-            m: desc.m,
-            n: desc.n,
-            k: desc.k,
-            group_size: desc.group_size,
-            bits: desc.bits,
-        };
-        let dispatcher = MppQuantizedGemm::new(self.ctx.clone(), mpp_config);
-
-        if !dispatcher.is_available() {
-            return self
-                .fallback
-                .quantized_gemm(ctx, desc, x, w_q, scales, biases, output);
-        }
-
-        dispatcher.execute(x, w_q, scales, biases, output)
     }
 
     fn dw_gemm_accum(
@@ -429,73 +393,18 @@ impl KernelBackend for Metal4Backend {
 
     fn fused_adamw_step(
         &self,
-        _batch: &mut BatchedCommandBuffer,
+        batch: &mut BatchedCommandBuffer,
         desc: &AdamWDescriptor<'_>,
     ) -> Result<()> {
-        // MppFusedAdamW creates its own command buffer and cannot encode into
-        // an existing BatchedCommandBuffer. Delegate to the standalone path,
-        // which executes synchronously and satisfies the caller's intent.
-        self.fused_adamw_step_standalone(&self.ctx.clone(), desc)
+        self.fallback.fused_adamw_step(batch, desc)
     }
 
     fn fused_adamw_step_standalone(
         &self,
-        _ctx: &Arc<MetalContext>,
+        ctx: &Arc<MetalContext>,
         desc: &AdamWDescriptor<'_>,
     ) -> Result<()> {
-        // Derive num_params and max_param_elements from the param_info buffer.
-        let param_infos = desc.param_info.as_slice();
-        let num_params = param_infos.len();
-        let max_param_elements = param_infos
-            .iter()
-            .map(|p| p.size as usize)
-            .max()
-            .unwrap_or(0);
-
-        let mpp_config = MppFusedAdamWConfig {
-            num_params,
-            max_param_elements,
-            use_fp16: false,
-        };
-
-        // The MPP kernel has one set of scalars for every parameter.
-        if let Some(p) = param_infos.iter().find(|p| p.group != 0) {
-            return Err(MetalError::InvalidConfig(format!(
-                "AdamWDescriptor carries one parameter group, but the parameter at \
-                 offset {} is in group {}",
-                p.offset, p.group
-            )));
-        }
-        // Convert ParamInfo → MppParamInfo: offset, size and moment offsets,
-        // into a buffer laid out as the MPP kernel reads it.
-        let mpp_param_infos: Vec<MppParamInfo> = param_infos
-            .iter()
-            .map(|p| MppParamInfo {
-                offset: p.offset,
-                size: p.size,
-                m_offset: p.m_offset,
-                v_offset: p.v_offset,
-            })
-            .collect();
-
-        let dispatcher = MppFusedAdamW::new(self.ctx.clone(), mpp_config);
-
-        if !dispatcher.is_available() {
-            // NAX not present — fall back to Metal 3 path via a temporary batch.
-            return self.fallback.fused_adamw_step_standalone(_ctx, desc);
-        }
-
-        let mpp_info_buf =
-            MetalBuffer::from_slice(&self.ctx, &mpp_param_infos, BufferUsage::Shared)?;
-        dispatcher.execute(
-            desc.params,
-            desc.grads,
-            desc.m,
-            desc.v,
-            &mpp_param_infos,
-            &mpp_info_buf,
-            &desc.config,
-        )
+        self.fallback.fused_adamw_step_standalone(ctx, desc)
     }
 
     fn fused_rope(
