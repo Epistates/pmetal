@@ -5,7 +5,8 @@
 
 use std::path::PathBuf;
 
-use pmetal_runtime::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype};
+use pmetal_runtime::training::CrossEntropy;
 
 use crate::{
     DistillConfig, DistillError, DistillMethod, LossType, Result,
@@ -381,44 +382,16 @@ impl DistillLossOutput {
 /// Compute hard cross-entropy loss with labels, masking positions whose label
 /// equals `ignore_index` (PyTorch convention: `-100`).
 ///
-/// All ops stay in the MLX graph so gradients flow correctly. The mask is the
-/// indicator `labels != ignore_index`; ignored positions contribute zero loss
-/// and are excluded from the divisor. This matches `torch.nn.functional.cross_entropy(reduction='mean')`.
+/// The runtime's fused cross-entropy evaluates in f32 whatever the logits'
+/// dtype (a bf16 normalizer over a large vocabulary is off by tenths of a
+/// nat), keeps the labels out of the gradient trace, and ignores the masked
+/// positions in both the sum and the divisor, as
+/// `torch.nn.functional.cross_entropy(reduction='mean')` does. An all-ignored
+/// batch gives zero.
 fn compute_hard_loss(logits: &Array, labels: &Array, ignore_index: i32) -> Result<Array> {
-    // Log-softmax for numerical stability
-    let log_probs = logits.log_softmax(-1);
-
-    // Flatten to [batch*seq, vocab] for gather
-    let vocab_size = logits.dim(-1);
-    let log_probs_flat = log_probs.reshape(&[-1, vocab_size]);
-    let labels_flat = labels.reshape(&[-1]);
-
-    // Build ignore mask: 1 where label != ignore_index, else 0.
-    let ignore_arr = Array::from_i32(ignore_index);
-    let valid_mask = labels_flat
-        .not_equal(&ignore_arr)
-        .as_dtype(Dtype::Float32.as_i32());
-
-    // Clamp labels to a safe gather range. Ignored positions get `0` for the
-    // gather lookup; their contribution is zeroed by `valid_mask` afterwards.
-    // Negative labels (e.g. -100) would otherwise crash gather.
-    let zero_i = Array::from_i32(0);
-    let upper = Array::from_i32(vocab_size - 1);
-    let labels_clamped = ops::minimum(&ops::maximum(&labels_flat, &zero_i), &upper)
-        .as_dtype(Dtype::Int32.as_i32())
-        .reshape(&[-1, 1]);
-
-    // Gather log-probs at label positions using take_along_axis (stays in graph)
-    let gathered = log_probs_flat.take_along_axis(&labels_clamped, -1);
-    let gathered = gathered.squeeze(-1);
-
-    // Apply mask: only count non-ignored tokens
-    let neg_log_probs = gathered.negative().multiply(&valid_mask);
-
-    // Mean over valid tokens (avoid division by zero)
-    let num_valid = valid_mask.sum_all();
-    let safe_num = ops::maximum(&num_valid, &Array::from_f32(1.0));
-    Ok(neg_log_probs.sum_all().divide(&safe_num))
+    Ok(CrossEntropy::new()
+        .with_ignore_index(ignore_index)
+        .mean(logits, labels))
 }
 
 #[cfg(test)]

@@ -418,6 +418,65 @@ fn mse_distillation_is_independent_of_the_temperature() {
     );
 }
 
+/// The hard-label term is the cross-entropy of f32 log-probabilities: bf16
+/// logits are not normalized, or gathered, in bf16.
+#[test]
+#[serial]
+fn hard_label_loss_is_computed_in_f32() {
+    use pmetal_distill::{DistillConfig, DistillMethod, Distiller, LossConfig};
+
+    let vocab = 61;
+    let tokens = 5;
+    let data: Vec<f32> = (0..tokens * vocab)
+        .map(|i| 7.0 * ((i as f32) * 0.37).sin() + 0.05 * (i % vocab) as f32)
+        .collect();
+    let student = Array::from_f32_slice(&data, &[1, tokens as i32, vocab as i32])
+        .as_dtype(Dtype::Bfloat16.as_i32());
+    let teacher = student.clone();
+    let label_ids = [3_i32, 40, -100, 17, 60];
+    let labels = Array::from_i32_slice_shaped(&label_ids, &[1, tokens as i32]);
+
+    let distiller = Distiller::new(DistillConfig {
+        teacher: "t".to_string(),
+        student: "s".to_string(),
+        method: DistillMethod::Online,
+        loss: LossConfig::default(),
+        offline: None,
+        output_path: None,
+        training: Default::default(),
+    })
+    .unwrap();
+    let out = distiller
+        .compute_loss(&teacher, &student, Some(&labels), None, 0, 1)
+        .unwrap();
+    let got = scalar(&out.hard.expect("a hard term")) as f64;
+
+    let rounded: Vec<f64> = student
+        .as_dtype(Dtype::Float32.as_i32())
+        .to_f32_vec(data.len())
+        .unwrap()
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    let mut sum = 0.0;
+    let mut count = 0.0;
+    for (t, id) in label_ids.iter().enumerate() {
+        if *id < 0 {
+            continue;
+        }
+        let row = &rounded[t * vocab..(t + 1) * vocab];
+        let max = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let lse = max + row.iter().map(|x| (x - max).exp()).sum::<f64>().ln();
+        sum += lse - row[*id as usize];
+        count += 1.0;
+    }
+    let want = sum / count;
+    assert!(
+        (got - want).abs() <= 1e-5 * want,
+        "hard loss {got}, float64 reference {want}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Hidden-state alignment
 // ---------------------------------------------------------------------------
