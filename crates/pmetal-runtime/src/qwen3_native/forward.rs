@@ -260,6 +260,11 @@ pub fn lm_head(weights: &NativeWeights, hidden: &InlineArray) -> InlineArray {
 /// With `gdn_replays`, which it clears first, each GDN layer appends its
 /// recurrence inputs, from which [`super::rewind_verify`] can undo any tail
 /// of `token_ids`.
+///
+/// The logits are `[B, S, vocab]`, or `[B, 1, vocab]` for the last position
+/// alone with `last_logits_only`: a prompt's prefill needs one row, and the
+/// LM head over every position of a long prompt is gigabytes of logits no
+/// one reads.
 pub fn forward_step_with_capture(
     weights: &NativeWeights,
     token_ids: &InlineArray,
@@ -267,6 +272,7 @@ pub fn forward_step_with_capture(
     tap_layers: &[usize],
     captured: &mut Vec<InlineArray>,
     mut gdn_replays: Option<&mut Vec<GdnReplay>>,
+    last_logits_only: bool,
 ) -> InlineArray {
     captured.clear();
     if let Some(replays) = gdn_replays.as_deref_mut() {
@@ -326,6 +332,9 @@ pub fn forward_step_with_capture(
 
     cache.rope_offset += s;
 
+    if last_logits_only {
+        hidden = crate::decode::last_token_hidden(&hidden);
+    }
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
     lm_head(weights, &hidden)
 }

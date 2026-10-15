@@ -8,10 +8,9 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use pmetal_models::DynamicModel;
-use pmetal_models::dflash_decoder::{DFlashConfig, DFlashDecoder, DFlashDraftQuant, DFlashOutput};
-use pmetal_models::dflash_drafts::load_dflash_draft;
-use pmetal_runtime::compat::Array;
+use pmetal_models::dflash_decoder::{DFlashConfig, DFlashDecoder, DFlashOutput};
+use pmetal_models::dflash_drafts::{DFlashDraftQuant, load_dflash_draft};
+use pmetal_models::{DynamicModel, GenerationConfig};
 
 use crate::error::runtime_err;
 use crate::hub::is_hf_model_id;
@@ -80,15 +79,26 @@ impl PyDFlashGenerator {
 
     /// Run speculative generation.
     ///
+    /// The draft only changes the speed: the tokens are the target's own,
+    /// as plain decoding draws them.
+    ///
     /// Args:
-    ///     prompt_ids: Python list of i32 token ids.
+    ///     prompt_ids: Python list of token ids.
     ///     max_new_tokens: Upper bound on tokens to emit after the prompt.
-    ///     temperature: 0.0 (greedy) is bit-identical to baseline decoding.
-    ///     stop_tokens: Optional list of token ids that terminate generation.
+    ///     temperature: 0.0 is greedy; above it each token is drawn at this
+    ///         temperature, after top_k, top_p and min_p.
+    ///     stop_tokens: Optional list of token ids that terminate generation
+    ///         (not part of the output).
     ///     speculative_tokens: Override the draft block size.
+    ///     top_k: Keep the k likeliest tokens (0 keeps all).
+    ///     top_p: Keep the smallest set of likeliest tokens whose
+    ///         probabilities sum to at least top_p (1.0 keeps all).
+    ///     min_p: Drop tokens less than min_p times as likely as the likeliest
+    ///         (0.0 keeps all).
+    ///     seed: Seeds the draws; the same seed gives the same tokens.
     ///
     /// Returns a `(tokens, metrics)` tuple where `tokens` is a Python list
-    /// of i32 ids (prompt + generated) and `metrics` is a dict with
+    /// of ids (prompt + generated) and `metrics` is a dict with
     /// acceptance statistics.
     #[pyo3(signature = (
         prompt_ids,
@@ -96,15 +106,24 @@ impl PyDFlashGenerator {
         temperature = 0.0,
         stop_tokens = None,
         speculative_tokens = None,
+        top_k = 0,
+        top_p = 1.0,
+        min_p = 0.0,
+        seed = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn generate<'py>(
         &mut self,
         py: Python<'py>,
-        prompt_ids: Vec<i32>,
+        prompt_ids: Vec<u32>,
         max_new_tokens: usize,
         temperature: f32,
-        stop_tokens: Option<Vec<i32>>,
+        stop_tokens: Option<Vec<u32>>,
         speculative_tokens: Option<usize>,
+        top_k: usize,
+        top_p: f32,
+        min_p: f32,
+        seed: Option<u64>,
     ) -> PyResult<(Bound<'py, PyList>, Bound<'py, pyo3::types::PyDict>)> {
         if prompt_ids.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -112,19 +131,27 @@ impl PyDFlashGenerator {
             ));
         }
 
-        let prompt_len = prompt_ids.len();
-        let prompt = Array::from_slice(prompt_ids.as_slice(), &[1, prompt_len as i32]);
-
+        let mut generation = if temperature > 0.0 {
+            GenerationConfig::sampling(max_new_tokens, temperature)
+                .with_top_k(top_k)
+                .with_top_p(top_p)
+                .with_min_p(min_p)
+                .with_repetition_penalty(1.0)
+        } else {
+            GenerationConfig::greedy(max_new_tokens)
+        }
+        .with_stop_tokens(stop_tokens.unwrap_or_default());
+        if let Some(seed) = seed {
+            generation = generation.with_seed(seed);
+        }
         let config = DFlashConfig {
-            max_new_tokens,
-            temperature,
-            stop_tokens: stop_tokens.unwrap_or_default(),
             speculative_tokens,
+            ..DFlashConfig::new(generation)
         };
 
         let output: DFlashOutput = self
             .decoder
-            .generate(&prompt, &config)
+            .generate(&prompt_ids, &config)
             .map_err(runtime_err)?;
 
         let token_list = PyList::new(py, output.tokens.iter())?;

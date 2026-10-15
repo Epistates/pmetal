@@ -726,7 +726,7 @@ mod tests {
         save_dflash_draft_checkpoint(dir.path(), &model, &optimizer, &meta).unwrap();
 
         let (loaded, report) =
-            pmetal_models::dflash_decoder::load_dflash_draft_from_dir(dir.path()).unwrap();
+            pmetal_models::dflash_drafts::load_dflash_draft_from_dir(dir.path()).unwrap();
         assert_eq!(loaded.block_size(), 4);
         assert!(report.loaded > 0);
     }

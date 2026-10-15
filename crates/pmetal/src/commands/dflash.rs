@@ -12,12 +12,10 @@ use std::time::{Duration, Instant};
 
 use pmetal_data::chat_templates::{Message, detect_chat_template};
 use pmetal_models::DynamicModel;
-use pmetal_models::dflash_decoder::{
-    DFlashConfig, DFlashDecoder, DFlashDraftQuant, DFlashOutput, DFlashTarget,
-};
-use pmetal_models::dflash_drafts::load_dflash_draft;
+use pmetal_models::GenerationConfig;
+use pmetal_models::dflash_decoder::{DFlashConfig, DFlashDecoder, DFlashOutput, DFlashTarget};
+use pmetal_models::dflash_drafts::{DFlashDraftQuant, load_dflash_draft};
 use pmetal_models::dflash_native_target::NativeQwen3Target;
-use pmetal_runtime::compat::Array;
 
 /// Run DFlash speculative decoding against a Qwen3 target.
 #[allow(clippy::too_many_arguments)]
@@ -66,12 +64,6 @@ pub async fn run_dflash(
         draft.block_size(),
         draft.mask_token_id(),
     );
-    if temperature > 0.0 {
-        eprintln!(
-            "[dflash] note: the draft/verify loop decodes greedily; --temperature is ignored"
-        );
-    }
-
     let tokenizer = pmetal_data::Tokenizer::from_model_dir(&target_path)
         .context("loading tokenizer from target model dir")?;
 
@@ -81,13 +73,8 @@ pub async fn run_dflash(
     // acceptance to ~0. Always
     // apply the model's chat template unless the caller explicitly
     // opts out with --no-chat.
-    let prompt_ids: Vec<i32> = if no_chat {
-        tokenizer
-            .encode(prompt)
-            .context("encoding prompt")?
-            .into_iter()
-            .map(|t| t as i32)
-            .collect()
+    let prompt_ids: Vec<u32> = if no_chat {
+        tokenizer.encode(prompt).context("encoding prompt")?
     } else {
         let template = detect_chat_template(&target_path, &target_path.to_string_lossy());
         let messages = [Message::user(prompt)];
@@ -102,9 +89,6 @@ pub async fn run_dflash(
         tokenizer
             .encode(&rendered)
             .map_err(|e| anyhow::anyhow!("encoding chat-templated prompt: {e}"))?
-            .into_iter()
-            .map(|t| t as i32)
-            .collect()
     };
     if prompt_ids.is_empty() {
         anyhow::bail!("tokenizer returned 0 tokens for prompt");
@@ -115,18 +99,28 @@ pub async fn run_dflash(
         if no_chat { "raw" } else { "chat-templated" }
     );
 
-    let stop_tokens: Vec<i32> = tokenizer
-        .eos_token_id()
-        .into_iter()
-        .map(|t| t as i32)
-        .collect();
+    let stop_tokens: Vec<u32> = tokenizer.eos_token_id().into_iter().collect();
 
-    let prompt_arr = Array::from_slice(prompt_ids.as_slice(), &[1, prompt_ids.len() as i32]);
+    // The draft decides how fast the tokens come, never which: they are the
+    // target's own, greedy or drawn at `temperature`. A comparison against
+    // plain decoding draws both runs from one seed, so a sampled run can be
+    // told apart from plain decoding's only by its speed.
+    let mut generation = if temperature > 0.0 {
+        GenerationConfig::sampling(max_new_tokens, temperature)
+            .with_top_k(0)
+            .with_top_p(1.0)
+            .with_min_p(0.0)
+            .with_repetition_penalty(1.0)
+    } else {
+        GenerationConfig::greedy(max_new_tokens)
+    }
+    .with_stop_tokens(stop_tokens);
+    if temperature > 0.0 && compare_greedy {
+        generation = generation.with_seed(0x5eed);
+    }
     let config = DFlashConfig {
-        max_new_tokens,
-        temperature,
-        stop_tokens,
         speculative_tokens,
+        ..DFlashConfig::new(generation)
     };
 
     let use_tree = tree_budget > 0;
@@ -151,7 +145,7 @@ pub async fn run_dflash(
     );
 
     let run = Run {
-        prompt: &prompt_arr,
+        prompt: &prompt_ids,
         config: &config,
         tree_budget,
         compare_greedy,
@@ -184,12 +178,8 @@ pub async fn run_dflash(
     let (output, elapsed) = (&decoded.dflash.0, decoded.dflash.1);
 
     let prompt_len = prompt_ids.len();
-    let generated: Vec<u32> = output.tokens[prompt_len..]
-        .iter()
-        .map(|&i| i as u32)
-        .collect();
     let text = tokenizer
-        .decode(&generated)
+        .decode(&output.tokens[prompt_len..])
         .context("decoding generated tokens")?;
     let tok_per_sec = rate(output, elapsed);
 
@@ -285,12 +275,12 @@ struct Comparison {
 struct Divergence {
     /// Generated position.
     at: usize,
-    dflash_token: i32,
-    greedy_token: i32,
+    dflash_token: u32,
+    greedy_token: u32,
     /// The target's two likeliest tokens there and their logits, from one
     /// forward over the shared prefix: a near tie means the two runs'
     /// differently shaped forwards rounded it differently.
-    top_two: [(i32, f32); 2],
+    top_two: [(u32, f32); 2],
 }
 
 impl Comparison {
@@ -305,7 +295,7 @@ impl Comparison {
 
 /// One prompt to decode, and how.
 struct Run<'a> {
-    prompt: &'a Array,
+    prompt: &'a [u32],
     config: &'a DFlashConfig,
     tree_budget: usize,
     compare_greedy: bool,
@@ -331,17 +321,15 @@ impl Run<'_> {
         };
         let greedy = |decoder: &mut DFlashDecoder<T>, config: &DFlashConfig| {
             decoder
-                .generate_greedy(self.prompt, config)
-                .map_err(|e| anyhow::anyhow!("greedy decode: {e}"))
+                .generate_plain(self.prompt, config)
+                .map_err(|e| anyhow::anyhow!("plain decode: {e}"))
         };
         if self.compare_greedy {
             // Both build kernels on first use; warm them so neither timed
             // run pays for that.
-            let warm = DFlashConfig {
-                max_new_tokens: 16,
-                stop_tokens: Vec::new(),
-                ..self.config.clone()
-            };
+            let mut warm = self.config.clone();
+            warm.generation.max_new_tokens = 16;
+            warm.generation.stop_tokens.clear();
             dflash(&mut decoder, &warm)?;
             greedy(&mut decoder, &warm)?;
         }
@@ -372,7 +360,7 @@ impl Run<'_> {
         dflash: &DFlashOutput,
         greedy: &DFlashOutput,
     ) -> Result<Option<Divergence>> {
-        let prompt_len = self.prompt.dim(1) as usize;
+        let prompt_len = self.prompt.len();
         let Some(at) = dflash.tokens[prompt_len..]
             .iter()
             .zip(&greedy.tokens[prompt_len..])
@@ -381,9 +369,8 @@ impl Run<'_> {
             return Ok(None);
         };
         let end = prompt_len + at;
-        let prefix = Array::from_slice(&greedy.tokens[..end], &[1, end as i32]);
         let top_two = decoder
-            .next_token_top_two(&prefix)
+            .next_token_top_two(&greedy.tokens[..end])
             .map_err(|e| anyhow::anyhow!("top two: {e}"))?;
         Ok(Some(Divergence {
             at,

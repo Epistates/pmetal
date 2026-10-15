@@ -21,7 +21,8 @@ pub struct DflashArgs {
     #[arg(long = "max-new-tokens", default_value = "128")]
     pub max_new_tokens: usize,
 
-    /// Sampling temperature (0 = greedy, bit-identical to baseline).
+    /// Sampling temperature (0 = greedy). The draft only changes the speed:
+    /// the tokens are the target's own, greedy or drawn at this temperature.
     #[arg(long = "temperature", default_value = "0.0")]
     pub temperature: f32,
 
