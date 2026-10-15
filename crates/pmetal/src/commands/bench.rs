@@ -8,14 +8,12 @@ use pmetal_core::{
 use pmetal_data::{DatasetColumnConfig, DatasetFormat, TextSample, Tokenizer, TrainingDataset};
 use pmetal_lora::AdaptedModel;
 use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
-use pmetal_metal::kernels::BatchedCommandBuffer;
 use pmetal_metal::kernels::mpp_gemm::{MppGemm, MppGemmConfig};
 use pmetal_metal::tuna::MppGemmTuneRequest;
 use pmetal_metal::{
     BufferUsage, FlashAttention, FlashAttentionConfig, FusedLinearCrossEntropy,
-    FusedLinearCrossEntropyConfig, FusedLora, FusedLoraConfig, FusedMLP, FusedMergeMetal,
-    FusedNormLora, FusedNormLoraConfig, FusedSwiGLUConfig, MetalBuffer, MetalContext,
-    build_merge_config, build_tensor_info,
+    FusedLinearCrossEntropyConfig, FusedLora, FusedLoraConfig, FusedMLP, FusedNormLora,
+    FusedNormLoraConfig, FusedSwiGLUConfig, MetalBuffer, MetalContext,
 };
 use pmetal_mlx::kernels::gated_delta_update_with_chunk_size_override;
 use pmetal_mlx::kv_cache::CacheMode;
@@ -505,7 +503,6 @@ enum KernelBenchmarkCase {
     FusedMlp(FusedMlpCase),
     FusedNormLora(FusedNormLoraCase),
     FusedLinearCrossEntropy(FusedLinearCrossEntropyCase),
-    FusedMerge(FusedMergeCase),
     ModelMoe(ModelMoeCase),
     MppGemm(MppGemmCase),
 }
@@ -562,13 +559,6 @@ struct FusedLinearCrossEntropyCase {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FusedMergeCase {
-    name: &'static str,
-    num_models: usize,
-    elements_per_model: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
 struct ModelMoeCase {
     name: &'static str,
     family: ModelMoeFamily,
@@ -595,7 +585,6 @@ struct KernelBenchmarkTierProfile {
     fused_mlp: FusedMlpCase,
     fused_norm_lora: FusedNormLoraCase,
     fused_linear_cross_entropy: FusedLinearCrossEntropyCase,
-    fused_merge: FusedMergeCase,
     llama4_moe: ModelMoeCase,
     qwen3_moe: ModelMoeCase,
     deepseek_moe: ModelMoeCase,
@@ -3434,45 +3423,6 @@ fn run_kernel_benchmark_case(
                 outcome,
             )
         }
-        KernelBenchmarkCase::FusedMerge(case) => {
-            let parameters = fused_merge_parameters(*case);
-            let total_elements = case.num_models * case.elements_per_model;
-            let mut kernel = FusedMergeMetal::new(ctx.clone());
-            let tuning = match kernel.tune_for_problem_size(total_elements, case.num_models) {
-                Ok(tuned) => btree_map([
-                    ("threads_per_group", tuned.threads_per_group.to_string()),
-                    ("elements_per_thread", tuned.elements_per_thread.to_string()),
-                    ("use_simd", tuned.use_simd.to_string()),
-                ]),
-                Err(error) => btree_map([("selection_error", error.to_string())]),
-            };
-
-            let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
-                let sizes = vec![case.elements_per_model; case.num_models];
-                let densities = vec![0.5; case.num_models];
-                let tensor_info = build_tensor_info(&sizes, &densities);
-                let config = build_merge_config(&tensor_info, 1e-8);
-                let input = alloc_f32_buffer(ctx, total_elements)?;
-                let output = MetalBuffer::zeros(ctx, total_elements, BufferUsage::Shared)?;
-                let tensor_info_buffer =
-                    MetalBuffer::from_slice(ctx, &tensor_info, BufferUsage::Shared)?;
-
-                benchmark_operation(warmup_iterations, benchmark_iterations, || {
-                    let mut batch = BatchedCommandBuffer::new(ctx.clone())?;
-                    kernel.queue_compute_magnitudes(
-                        &mut batch,
-                        &input,
-                        &output,
-                        &tensor_info_buffer,
-                        &config,
-                    )?;
-                    batch.execute()?;
-                    Ok(())
-                })
-            })();
-
-            build_case_result(case.name, "fused_merge", parameters, tuning, outcome)
-        }
         KernelBenchmarkCase::ModelMoe(case) => {
             let parameters = model_moe_parameters(*case);
             let tuning = btree_map([
@@ -3677,7 +3627,6 @@ fn build_benchmark_corpus_for_profile(
         KernelBenchmarkCase::FusedMlp(profile.fused_mlp),
         KernelBenchmarkCase::FusedNormLora(profile.fused_norm_lora),
         KernelBenchmarkCase::FusedLinearCrossEntropy(profile.fused_linear_cross_entropy),
-        KernelBenchmarkCase::FusedMerge(profile.fused_merge),
         KernelBenchmarkCase::ModelMoe(profile.llama4_moe),
         KernelBenchmarkCase::ModelMoe(profile.qwen3_moe),
         KernelBenchmarkCase::ModelMoe(profile.deepseek_moe),
@@ -3722,11 +3671,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 num_tokens: 32 * scale,
                 hidden_size: 1024,
                 vocab_size: 32_768,
-            },
-            fused_merge: FusedMergeCase {
-                name: "fused_merge_magnitudes",
-                num_models: 4,
-                elements_per_model: 65_536 * scale,
             },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
@@ -3800,11 +3744,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 hidden_size: 1536,
                 vocab_size: 32_768,
             },
-            fused_merge: FusedMergeCase {
-                name: "fused_merge_magnitudes",
-                num_models: 6,
-                elements_per_model: 65_536 * scale,
-            },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
                 family: ModelMoeFamily::Llama4,
@@ -3876,11 +3815,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
                 num_tokens: 64 * scale,
                 hidden_size: 2048,
                 vocab_size: 65_536,
-            },
-            fused_merge: FusedMergeCase {
-                name: "fused_merge_magnitudes",
-                num_models: 8,
-                elements_per_model: 131_072 * scale,
             },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
@@ -4030,17 +3964,6 @@ fn fused_linear_cross_entropy_parameters(
         ("num_tokens", case.num_tokens.to_string()),
         ("hidden_size", case.hidden_size.to_string()),
         ("vocab_size", case.vocab_size.to_string()),
-    ])
-}
-
-fn fused_merge_parameters(case: FusedMergeCase) -> BTreeMap<String, String> {
-    btree_map([
-        ("num_models", case.num_models.to_string()),
-        ("elements_per_model", case.elements_per_model.to_string()),
-        (
-            "total_elements",
-            (case.num_models * case.elements_per_model).to_string(),
-        ),
     ])
 }
 
@@ -4403,7 +4326,7 @@ mod tests {
     #[test]
     fn benchmark_corpus_has_expected_categories() {
         let cases = build_benchmark_corpus_for_profile(DeviceTier::Base, false, true);
-        assert_eq!(cases.len(), 10);
+        assert_eq!(cases.len(), 9);
         assert!(matches!(cases[0], KernelBenchmarkCase::FlashAttention(_)));
         assert!(matches!(cases[1], KernelBenchmarkCase::FusedLora(_)));
         assert!(matches!(cases[2], KernelBenchmarkCase::FusedMlp(_)));
@@ -4412,11 +4335,10 @@ mod tests {
             cases[4],
             KernelBenchmarkCase::FusedLinearCrossEntropy(_)
         ));
-        assert!(matches!(cases[5], KernelBenchmarkCase::FusedMerge(_)));
+        assert!(matches!(cases[5], KernelBenchmarkCase::ModelMoe(_)));
         assert!(matches!(cases[6], KernelBenchmarkCase::ModelMoe(_)));
         assert!(matches!(cases[7], KernelBenchmarkCase::ModelMoe(_)));
-        assert!(matches!(cases[8], KernelBenchmarkCase::ModelMoe(_)));
-        assert!(matches!(cases[9], KernelBenchmarkCase::MppGemm(_)));
+        assert!(matches!(cases[8], KernelBenchmarkCase::MppGemm(_)));
     }
 
     #[test]

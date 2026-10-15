@@ -52,7 +52,6 @@ use crate::error::{MetalError, Result};
 use crate::kernels::flash_attention::{FlashAttention, FlashAttentionConfig};
 use crate::kernels::fused_cross_entropy::{FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig};
 use crate::kernels::fused_lora::{FusedLoraConfig, FusedLoraParams};
-use crate::kernels::fused_merge::{MergeConfig, TensorInfo};
 use crate::kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig};
 use crate::kernels::fused_swiglu::{FusedMLP, FusedSwiGLUConfig};
 use crate::kernels::mpp_gemm::{MppGemm, MppGemmConfig, MppGemmKernelVariant};
@@ -79,27 +78,6 @@ impl Default for TunedConfig {
             tile_m: 32,
             tile_n: 32,
             tile_k: 32,
-        }
-    }
-}
-
-/// Configuration for tuned merge kernels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MergeTunedConfig {
-    /// Threads per threadgroup for element-wise ops.
-    pub threads_per_group: u32,
-    /// Elements processed per thread (vectorization factor).
-    pub elements_per_thread: u32,
-    /// Use SIMD-optimized path.
-    pub use_simd: bool,
-}
-
-impl Default for MergeTunedConfig {
-    fn default() -> Self {
-        Self {
-            threads_per_group: 256,
-            elements_per_thread: 4,
-            use_simd: true,
         }
     }
 }
@@ -461,15 +439,6 @@ fn lora_forward_cache_key(
     )
 }
 
-fn merge_cache_key(props: &DeviceProperties, num_elements: usize, num_models: usize) -> String {
-    format!(
-        "merge:{}:{}:{}",
-        device_cache_identity(props),
-        num_elements,
-        num_models
-    )
-}
-
 // ============================================================================
 // Tuner
 // ============================================================================
@@ -479,10 +448,6 @@ pub struct Tuner {
     /// Cache of best configurations for matrix ops.
     /// Key: "kernel_name:M:N:K" (problem size hash)
     cache: Mutex<HashMap<String, TunedConfig>>,
-
-    /// Cache of best configurations for merge ops.
-    /// Key: "merge:device_name:device_tier:architecture_gen:gpu_core_count:num_elements:num_models"
-    merge_cache: Mutex<HashMap<String, MergeTunedConfig>>,
 
     /// Cache of best configurations for SwiGLU kernels.
     /// Key: "swiglu:batch:hidden:intermediate"
@@ -520,7 +485,6 @@ impl Tuner {
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
@@ -539,7 +503,6 @@ impl Tuner {
 
         let mut tuner = Self {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
@@ -571,7 +534,6 @@ impl Tuner {
         };
 
         load_disk_cache_file::<TunedConfig>(&dir.join("lora_forward.json"), &self.cache);
-        load_disk_cache_file::<MergeTunedConfig>(&dir.join("merge.json"), &self.merge_cache);
         load_disk_cache_file::<SwiGLUTunedConfig>(&dir.join("swiglu.json"), &self.swiglu_cache);
         load_disk_cache_file::<CrossEntropyTunedConfig>(
             &dir.join("cross_entropy.json"),
@@ -620,15 +582,6 @@ impl Tuner {
         };
         let path = dir.join("swiglu.json");
         self.flush_cache_file(&path, &self.swiglu_cache, key, config);
-    }
-
-    /// Persist the full merge in-memory cache to `merge.json`.
-    fn save_merge_to_disk(&self, key: &str, config: &MergeTunedConfig) {
-        let Some(dir) = self.ensure_cache_dir() else {
-            return;
-        };
-        let path = dir.join("merge.json");
-        self.flush_cache_file(&path, &self.merge_cache, key, config);
     }
 
     /// Persist the full cross-entropy in-memory cache to `cross_entropy.json`.
@@ -717,36 +670,6 @@ impl Tuner {
                     snapshot.len(),
                     path.display()
                 );
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Public cache accessors (merge)
-    // -------------------------------------------------------------------------
-
-    /// Get a cached merge configuration if available.
-    pub fn get_merge_config(&self, key: &str) -> Option<MergeTunedConfig> {
-        let cache = self
-            .merge_cache
-            .lock()
-            .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))
-            .ok()?;
-        cache.get(key).copied()
-    }
-
-    /// Store a merge configuration in the cache.
-    pub fn set_merge_config(&self, key: String, config: MergeTunedConfig) {
-        match self
-            .merge_cache
-            .lock()
-            .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))
-        {
-            Ok(mut cache) => {
-                cache.insert(key, config);
-            }
-            Err(e) => {
-                tracing::error!("Failed to acquire merge_cache lock: {}", e);
             }
         }
     }
@@ -1705,308 +1628,6 @@ impl Tuner {
         let threadgroup_size = MTLSize {
             width: config.tile_n as usize,
             height: (config.tile_m as usize) / 32, // SIMD_SIZE is 32
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-
-        buffer.commit();
-        buffer.waitUntilCompleted();
-
-        Ok(())
-    }
-
-    // =========================================================================
-    // Merge Kernel Tuning (benchmarked)
-    // =========================================================================
-
-    /// Tune merge kernels (sparsification, TIES, etc.) for the given problem size.
-    ///
-    /// # Arguments
-    /// * `context` - Metal context
-    /// * `num_elements` - Total number of elements to process
-    /// * `num_models` - Number of models being merged (for TIES)
-    ///
-    /// # Returns
-    /// Optimal configuration for merge operations on this hardware.
-    pub fn tune_merge(
-        &self,
-        context: &MetalContext,
-        num_elements: usize,
-        num_models: usize,
-    ) -> Result<MergeTunedConfig> {
-        let key = merge_cache_key(context.properties(), num_elements, num_models);
-
-        // Check cache
-        if let Some(config) = self.get_merge_config(&key) {
-            return Ok(config);
-        }
-
-        info!(
-            "Tuning merge kernel for {} elements, {} models...",
-            num_elements, num_models
-        );
-
-        // Generate candidates based on device tier
-        let candidates = self.generate_merge_candidates(context);
-        debug!("Generated {} merge candidates for device", candidates.len());
-
-        let mut best_config = MergeTunedConfig::default();
-        let mut best_time = f64::INFINITY;
-
-        // Benchmark each candidate
-        for config in candidates {
-            match self.benchmark_merge(context, config, num_elements) {
-                Ok(time) => {
-                    debug!("Merge config {:?} took {:.3} ms", config, time * 1000.0);
-                    if time < best_time {
-                        best_time = time;
-                        best_config = config;
-                    }
-                }
-                Err(e) => {
-                    debug!("Merge config {:?} failed: {}", config, e);
-                }
-            }
-        }
-
-        info!(
-            "Best merge config: {:?} ({:.3} ms)",
-            best_config,
-            best_time * 1000.0
-        );
-
-        // Cache result
-        self.set_merge_config(key.clone(), best_config);
-        self.save_merge_to_disk(&key, &best_config);
-
-        Ok(best_config)
-    }
-
-    /// Generate candidate configurations for merge kernels.
-    fn generate_merge_candidates(&self, context: &MetalContext) -> Vec<MergeTunedConfig> {
-        use crate::context::DeviceTier;
-
-        let props = context.properties();
-        let max_threads = props.max_threads_per_threadgroup as u32;
-
-        // Device tier-aware candidate ordering
-        let base_candidates: Vec<MergeTunedConfig> = match props.device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => vec![
-                // High-end: larger threadgroups, more elements per thread
-                MergeTunedConfig {
-                    threads_per_group: 512,
-                    elements_per_thread: 8,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 256,
-                    elements_per_thread: 8,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 512,
-                    elements_per_thread: 4,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 256,
-                    elements_per_thread: 4,
-                    use_simd: true,
-                },
-            ],
-            DeviceTier::Pro => vec![
-                MergeTunedConfig {
-                    threads_per_group: 256,
-                    elements_per_thread: 8,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 256,
-                    elements_per_thread: 4,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 512,
-                    elements_per_thread: 4,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 128,
-                    elements_per_thread: 8,
-                    use_simd: true,
-                },
-            ],
-            DeviceTier::Base => vec![
-                // Base chips: smaller threadgroups, moderate vectorization
-                MergeTunedConfig {
-                    threads_per_group: 256,
-                    elements_per_thread: 4,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 128,
-                    elements_per_thread: 4,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 256,
-                    elements_per_thread: 2,
-                    use_simd: true,
-                },
-                MergeTunedConfig {
-                    threads_per_group: 128,
-                    elements_per_thread: 8,
-                    use_simd: true,
-                },
-            ],
-        };
-
-        // Filter by device max threads
-        base_candidates
-            .into_iter()
-            .filter(|c| c.threads_per_group <= max_threads)
-            .collect()
-    }
-
-    /// Benchmark merge kernel configuration.
-    fn benchmark_merge(
-        &self,
-        context: &MetalContext,
-        config: MergeTunedConfig,
-        num_elements: usize,
-    ) -> Result<f64> {
-        let device = context.device();
-
-        // Skip very large allocations
-        let total_bytes = num_elements * 4 * 2; // input + output
-        if total_bytes > 500 * 1024 * 1024 {
-            debug!(
-                "Skipping merge benchmark (memory too large: {} MB)",
-                total_bytes / 1024 / 1024
-            );
-            // Return default time penalty
-            return Ok(if config.threads_per_group == 256 {
-                1.0
-            } else {
-                100.0
-            });
-        }
-
-        // Create test buffers
-        let options = MTLResourceOptions::StorageModePrivate;
-        let buf_input = device
-            .newBufferWithLength_options(num_elements * 4, options)
-            .ok_or(MetalError::BufferCreation {
-                size: num_elements * 4,
-                reason: "merge input".into(),
-            })?;
-        let buf_output = device
-            .newBufferWithLength_options(num_elements * 4, options)
-            .ok_or(MetalError::BufferCreation {
-                size: num_elements * 4,
-                reason: "merge output".into(),
-            })?;
-
-        // Get pipeline for simple magnitude computation
-        let pipeline = context.pipeline_cache_mut().get_or_create_pipeline(
-            context.device(),
-            "fused_compute_magnitudes",
-            None,
-        )?;
-
-        // Create config buffer
-        let params = MergeConfig {
-            num_tensors: 1,
-            total_elements: num_elements as u32,
-            epsilon: 1e-8,
-            _pad: 0,
-        };
-
-        let tensor_info = TensorInfo {
-            offset: 0,
-            size: num_elements as u32,
-            density: 0.5,
-            threshold: 0.0,
-        };
-
-        // Warmup
-        self.dispatch_merge_kernel(
-            context,
-            &pipeline,
-            config,
-            &buf_input,
-            &buf_output,
-            &params,
-            &tensor_info,
-            num_elements,
-        )?;
-
-        // Benchmark
-        let start = Instant::now();
-        let iterations = 5;
-        for _ in 0..iterations {
-            self.dispatch_merge_kernel(
-                context,
-                &pipeline,
-                config,
-                &buf_input,
-                &buf_output,
-                &params,
-                &tensor_info,
-                num_elements,
-            )?;
-        }
-        let elapsed = start.elapsed();
-
-        Ok(elapsed.as_secs_f64() / iterations as f64)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_merge_kernel(
-        &self,
-        context: &MetalContext,
-        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-        config: MergeTunedConfig,
-        input: &ProtocolObject<dyn MTLBuffer>,
-        output: &ProtocolObject<dyn MTLBuffer>,
-        params: &MergeConfig,
-        tensor_info: &TensorInfo,
-        num_elements: usize,
-    ) -> Result<()> {
-        let queue = context.command_queue();
-        let buffer = queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandQueueCreation)?;
-        let encoder = buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::CommandQueueCreation)?;
-
-        encoder.setComputePipelineState(pipeline);
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
-
-            let tensor_info_ptr = NonNull::from(tensor_info).cast();
-            encoder.setBytes_length_atIndex(tensor_info_ptr, std::mem::size_of::<TensorInfo>(), 2);
-
-            let params_ptr = NonNull::from(params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of::<MergeConfig>(), 3);
-        }
-
-        // Calculate grid based on tuned config
-        let elements_per_group = (config.threads_per_group * config.elements_per_thread) as usize;
-        let grid_size = MTLSize {
-            width: num_elements.div_ceil(elements_per_group),
-            height: 1,
-            depth: 1,
-        };
-
-        let threadgroup_size = MTLSize {
-            width: config.threads_per_group as usize,
-            height: 1,
             depth: 1,
         };
 
@@ -3034,14 +2655,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_tuned_config_default() {
-        let c = MergeTunedConfig::default();
-        assert_eq!(c.threads_per_group, 256);
-        assert_eq!(c.elements_per_thread, 4);
-        assert!(c.use_simd);
-    }
-
-    #[test]
     fn swiglu_tuned_config_default() {
         let c = SwiGLUTunedConfig::default();
         assert_eq!(c.threads_per_token, 256);
@@ -3178,21 +2791,6 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn merge_cache_get_set() {
-        let tuner = Tuner::new();
-        let key = "merge:Apple M4:base:16:10:1024:3".to_string();
-        assert!(tuner.get_merge_config(&key).is_none());
-
-        let cfg = MergeTunedConfig {
-            threads_per_group: 512,
-            elements_per_thread: 8,
-            use_simd: true,
-        };
-        tuner.set_merge_config(key.clone(), cfg);
-        assert_eq!(tuner.get_merge_config(&key), Some(cfg));
-    }
-
-    #[test]
     fn lora_forward_cache_key_includes_device_identity() {
         let base = test_device_properties("Apple M4", DeviceTier::Base, 16, 10);
         let max = test_device_properties("Apple M4 Max", DeviceTier::Max, 16, 40);
@@ -3203,19 +2801,6 @@ mod tests {
         assert_ne!(base_key, max_key);
         assert!(base_key.contains("Apple M4:base:16:10"));
         assert!(max_key.contains("Apple M4 Max:max:16:40"));
-    }
-
-    #[test]
-    fn merge_cache_key_includes_device_identity() {
-        let pro = test_device_properties("Apple M3 Pro", DeviceTier::Pro, 15, 18);
-        let ultra = test_device_properties("Apple M4 Ultra", DeviceTier::Ultra, 16, 80);
-
-        let pro_key = merge_cache_key(&pro, 1_048_576, 6);
-        let ultra_key = merge_cache_key(&ultra, 1_048_576, 6);
-
-        assert_ne!(pro_key, ultra_key);
-        assert!(pro_key.contains("Apple M3 Pro:pro:15:18"));
-        assert!(ultra_key.contains("Apple M4 Ultra:ultra:16:80"));
     }
 
     // -------------------------------------------------------------------------
@@ -3230,7 +2815,6 @@ mod tests {
         // Construct a tuner whose cache_dir points at our temp location.
         let tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
@@ -3275,7 +2859,6 @@ mod tests {
         // Build a tuner pointing at that directory and call load_disk_cache.
         let mut tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
@@ -3296,7 +2879,6 @@ mod tests {
 
         let tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
@@ -3321,70 +2903,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_disk_cache_write_read_roundtrip() {
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
-
-        let tuner = Tuner {
-            cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
-            swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
-            flash_attention_cache: Mutex::new(HashMap::new()),
-            norm_lora_cache: Mutex::new(HashMap::new()),
-            mpp_gemm_cache: Mutex::new(HashMap::new()),
-            cache_dir: Some(cache_path.clone()),
-        };
-
-        let key = "merge:Apple M4 Max:max:16:40:1048576:8";
-        let config = MergeTunedConfig {
-            threads_per_group: 512,
-            elements_per_thread: 8,
-            use_simd: true,
-        };
-        tuner.save_merge_to_disk(key, &config);
-
-        let json_path = cache_path.join("merge.json");
-        assert!(json_path.exists(), "merge.json should have been created");
-
-        let contents = fs::read_to_string(&json_path).unwrap();
-        let map: HashMap<String, MergeTunedConfig> = serde_json::from_str(&contents).unwrap();
-        assert_eq!(map.get(key), Some(&config));
-    }
-
-    #[test]
-    fn merge_disk_cache_load_populates_in_memory() {
-        let tmp_dir = tempfile::tempdir().expect("tempdir");
-        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
-        fs::create_dir_all(&cache_path).unwrap();
-
-        let key = "merge:Apple M5 Pro:pro:17:28:2097152:6";
-        let config = MergeTunedConfig {
-            threads_per_group: 256,
-            elements_per_thread: 8,
-            use_simd: true,
-        };
-        let map: HashMap<&str, MergeTunedConfig> = [(key, config)].into_iter().collect();
-        let json = serde_json::to_string_pretty(&map).unwrap();
-        fs::write(cache_path.join("merge.json"), &json).unwrap();
-
-        let mut tuner = Tuner {
-            cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
-            swiglu_cache: Mutex::new(HashMap::new()),
-            cross_entropy_cache: Mutex::new(HashMap::new()),
-            flash_attention_cache: Mutex::new(HashMap::new()),
-            norm_lora_cache: Mutex::new(HashMap::new()),
-            mpp_gemm_cache: Mutex::new(HashMap::new()),
-            cache_dir: Some(cache_path),
-        };
-        tuner.load_disk_cache();
-
-        let guard = tuner.merge_cache.lock().unwrap();
-        assert_eq!(guard.get(key), Some(&config));
-    }
-
-    #[test]
     fn mpp_gemm_disk_cache_load_populates_in_memory() {
         let tmp_dir = tempfile::tempdir().expect("tempdir");
         let cache_path = tmp_dir.path().join("pmetal").join("tuna");
@@ -3401,7 +2919,6 @@ mod tests {
 
         let mut tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
@@ -3422,7 +2939,6 @@ mod tests {
 
         let tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),
@@ -3467,7 +2983,6 @@ mod tests {
 
         let mut tuner = Tuner {
             cache: Mutex::new(HashMap::new()),
-            merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
             flash_attention_cache: Mutex::new(HashMap::new()),

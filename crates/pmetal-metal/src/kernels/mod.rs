@@ -12,7 +12,6 @@ pub mod flash_attention;
 pub mod fp8_training;
 pub mod fused_cross_entropy;
 pub mod fused_lora;
-pub mod fused_merge;
 pub mod fused_moe;
 pub mod fused_norm_lora;
 pub mod fused_rope;
@@ -65,9 +64,6 @@ pub use fused_cross_entropy::{
     FusedLinearCrossEntropyOutput,
 };
 pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
-pub use fused_merge::{
-    FusedMergeMetal, MergeConfig, TensorInfo, build_merge_config, build_tensor_info,
-};
 pub use fused_moe::{ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig};
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
