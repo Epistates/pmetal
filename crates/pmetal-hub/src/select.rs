@@ -215,8 +215,20 @@ pub fn index_files_to_read(files: &[RepoFile], format: WeightFormat) -> Vec<Stri
         .collect()
 }
 
+/// Whether `path` is a file path a repository (or an index file) may name:
+/// relative, `/`-separated, no empty, `.` or `..` component, no backslash or
+/// NUL. Anything else could point out of the directory it is joined onto.
+pub fn is_safe_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains(['\\', '\0'])
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 /// The shard file names a safetensors/PyTorch `*.index.json` refers to, each
-/// once, in name order. `Err` if the JSON is not an index.
+/// once, in name order. `Err` if the JSON is not an index, or names a path
+/// that leaves the model directory.
 pub fn shards_in_index(json: &[u8]) -> Result<Vec<String>> {
     let value: serde_json::Value = serde_json::from_slice(json)
         .map_err(|e| PMetalError::Hub(format!("weight index is not valid JSON: {e}")))?;
@@ -231,6 +243,11 @@ pub fn shards_in_index(json: &[u8]) -> Result<Vec<String>> {
         .collect();
     if shards.is_empty() {
         return Err(PMetalError::Hub("weight index names no shards".into()));
+    }
+    if let Some(bad) = shards.iter().find(|s| !is_safe_relative_path(s)) {
+        return Err(PMetalError::Hub(format!(
+            "weight index names a shard outside the model directory: {bad:?}"
+        )));
     }
     Ok(shards.into_iter().collect())
 }
@@ -768,5 +785,29 @@ mod tests {
         assert_eq!(shards, ["s1", "s2"]);
         assert!(shards_in_index(b"{}").is_err());
         assert!(shards_in_index(b"not json").is_err());
+    }
+
+    #[test]
+    fn paths_that_leave_the_directory_are_unsafe() {
+        for ok in ["model.safetensors", "text/model-00001.safetensors", "a.b/c"] {
+            assert!(is_safe_relative_path(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../../x",
+            "a//b",
+            "./a",
+            "a/.",
+            "a\\b",
+            "a\0b",
+        ] {
+            assert!(!is_safe_relative_path(bad), "{bad:?}");
+        }
+        let err = shards_in_index(br#"{"weight_map":{"a":"../../victim"}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside"), "{err}");
     }
 }

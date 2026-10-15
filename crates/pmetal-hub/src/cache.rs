@@ -90,6 +90,9 @@ pub(crate) fn is_commit_sha(revision: &str) -> bool {
 
 /// The commit a cached revision name points at (`refs/<name>`).
 pub(crate) fn read_ref(cache_root: &Path, folder: &str, revision: &str) -> Option<String> {
+    if !crate::select::is_safe_relative_path(revision) {
+        return None;
+    }
     let sha = std::fs::read_to_string(cache_root.join(folder).join("refs").join(revision)).ok()?;
     let sha = sha.trim();
     is_commit_sha(sha).then(|| sha.to_owned())
@@ -106,10 +109,7 @@ pub(crate) fn write_ref(
 ) -> std::io::Result<()> {
     // A revision name is never a path: refuse anything that would climb out
     // of `refs/`.
-    if revision
-        .split('/')
-        .any(|part| part.is_empty() || part == "." || part == "..")
-    {
+    if !crate::select::is_safe_relative_path(revision) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("'{revision}' is not a usable revision name"),
@@ -119,7 +119,10 @@ pub(crate) fn write_ref(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("pmetal-tmp");
+    // Beside the ref, named after it: `v1.0` and `v1.1` must not share one.
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".pmetal-tmp");
+    let tmp = path.with_file_name(tmp_name);
     std::fs::write(&tmp, sha)?;
     std::fs::rename(&tmp, &path)
 }
@@ -404,6 +407,30 @@ mod tests {
         assert_eq!(
             read_ref(root.path(), "models--o--m", "refs/pr/1").as_deref(),
             Some(SHA_A)
+        );
+    }
+
+    #[test]
+    fn a_ref_name_cannot_read_outside_the_cache_either() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("models--o--m/refs")).unwrap();
+        // A file elsewhere that happens to hold a commit id.
+        std::fs::write(root.path().join("elsewhere"), SHA_A).unwrap();
+        assert_eq!(
+            read_ref(root.path(), "models--o--m", "../../elsewhere"),
+            None
+        );
+        assert_eq!(read_ref(root.path(), "models--o--m", "/etc/hosts"), None);
+        // And dotted release names write distinct files.
+        write_ref(root.path(), "models--o--m", "v1.0", SHA_A).unwrap();
+        write_ref(root.path(), "models--o--m", "v1.1", SHA_B).unwrap();
+        assert_eq!(
+            read_ref(root.path(), "models--o--m", "v1.0").as_deref(),
+            Some(SHA_A)
+        );
+        assert_eq!(
+            read_ref(root.path(), "models--o--m", "v1.1").as_deref(),
+            Some(SHA_B)
         );
     }
 

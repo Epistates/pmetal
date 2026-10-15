@@ -130,6 +130,13 @@ impl RepoHandle {
                         path, size, lfs, ..
                     } = entry?
                     {
+                        // A listing that names a path out of the snapshot
+                        // directory is hostile or broken; its files are
+                        // never fetched, checked or removed.
+                        if !crate::select::is_safe_relative_path(&path) {
+                            tracing::warn!("{}: ignoring the unsafe path {path:?}", self.id);
+                            continue;
+                        }
                         files.push(RepoFile {
                             path,
                             size,
