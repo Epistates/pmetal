@@ -30,8 +30,10 @@
 pub mod audio;
 pub mod checkpoint;
 pub mod config;
+pub mod discriminator;
 pub mod error;
 pub mod generator;
+pub mod loss;
 pub mod nn;
 
 pub use config::*;

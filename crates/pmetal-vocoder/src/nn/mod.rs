@@ -19,4 +19,5 @@ pub use amp_block::AMPBlock;
 pub use conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, ConvTranspose1d};
 pub use overlap::overlap_add;
 pub use resample::{DownSample1d, UpSample1d};
+pub(crate) use weight_norm::impl_no_linears;
 pub use weight_norm::{NormedWeight, StateDict, join_key};
