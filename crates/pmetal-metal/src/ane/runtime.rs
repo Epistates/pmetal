@@ -198,6 +198,7 @@ impl AneRuntime {
             let cached: Bool = msg_send![model, compiledModelExists];
             let mut from_cache = cached.as_bool();
             if !from_cache {
+                ensure_compile_space(weight_dict)?;
                 stage_and_compile(model, &tmp_dir_str, &mil_data, weight_dict)?;
             }
             if let Err(err) = load_model(model) {
@@ -207,6 +208,7 @@ impl AneRuntime {
                 from_cache = false;
                 // Purged between the check and the load.
                 tracing::debug!(error = %err, "cached ANE program didn't load; recompiling");
+                ensure_compile_space(weight_dict)?;
                 stage_and_compile(model, &tmp_dir_str, &mil_data, weight_dict)?;
                 load_model(model)?;
             }
@@ -800,6 +802,68 @@ fn check_surface_sizes(
     Ok(())
 }
 
+/// Bytes that must stay free on the boot volume while a kernel compiles,
+/// beyond the compile's own: what a full disk costs the rest of the machine,
+/// and the room the system's compiled-program cache (which lives on that
+/// volume and can't be moved) grows into.
+const COMPILE_RESERVE_BYTES: u64 = 4 << 30;
+
+/// Boot-volume bytes compiling a kernel with `weight_bytes` of weights needs
+/// free: the staging copy of them, the compiler service's own copy, the
+/// compiled program the system keeps, and the reserve.
+fn compile_space_needed(weight_bytes: u64) -> u64 {
+    3 * weight_bytes + COMPILE_RESERVE_BYTES
+}
+
+/// Fail, saying so, when compiling a kernel with `weight_dict` would leave
+/// the boot volume short. The compiler's own error for a full disk ("Failed
+/// to allocate memory for file backing") names neither the disk nor the
+/// size, and a compile that dies partway leaves its staging behind.
+fn ensure_compile_space(weight_dict: Option<&WeightDict>) -> Result<()> {
+    let weight_bytes: u64 = weight_dict.map_or(0, |wd| {
+        wd.entries.iter().map(|(_, blob)| blob.len() as u64).sum()
+    });
+    // The compile directory is under the temp directory, on the boot volume
+    // with the compiled-program cache.
+    check_compile_space(weight_bytes, free_bytes(&std::env::temp_dir()))
+}
+
+/// [`ensure_compile_space`] given the free space (`None` when unknown,
+/// which doesn't block a compile).
+fn check_compile_space(weight_bytes: u64, free: Option<u64>) -> Result<()> {
+    let needed = compile_space_needed(weight_bytes);
+    match free {
+        Some(free) if free < needed => Err(MetalError::AneCompileFailed(format!(
+            "only {:.1} GiB is free on the boot volume; compiling this kernel needs {:.1} GiB \
+             (its weights are {:.2} GiB, and the system keeps a compiled copy that can't be \
+             moved to another volume). Free some space and run again.",
+            free as f64 / (1u64 << 30) as f64,
+            needed as f64 / (1u64 << 30) as f64,
+            weight_bytes as f64 / (1u64 << 30) as f64,
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Bytes free on the volume holding `path`, `None` when it can't be read.
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    let manager = NSFileManager::defaultManager();
+    let path = NSString::from_str(&path.to_string_lossy());
+    // SAFETY: both messages take and return Foundation objects, and a
+    // missing key or a failure comes back nil.
+    unsafe {
+        let attributes: Option<objc2::rc::Retained<NSDictionary<NSString, AnyObject>>> = msg_send![
+            &*manager,
+            attributesOfFileSystemForPath: &*path,
+            error: std::ptr::null_mut::<*mut NSError>()
+        ];
+        let key = NSString::from_str("NSFileSystemFreeSize");
+        let free: Option<objc2::rc::Retained<NSNumber>> =
+            msg_send![&*attributes?, objectForKey: &*key];
+        Some(free?.unsignedLongLongValue())
+    }
+}
+
 /// Path of the single weight file [`pack_weights`] produces.
 const PACKED_WEIGHTS_PATH: &str = "@model_path/weights/weight.bin";
 
@@ -1281,6 +1345,35 @@ mod tests {
         let y = run(&first);
         assert!(y.iter().any(|v| *v != 0.0));
         assert_eq!(y, run(&second));
+    }
+
+    /// A compile that the boot volume can't hold is refused with the sizes,
+    /// not left to die in the compiler service with a message about "file
+    /// backing". A volume whose free space can't be read doesn't block.
+    #[test]
+    fn a_compile_the_boot_volume_cannot_hold_is_refused_with_the_sizes() {
+        const GIB: u64 = 1 << 30;
+        // 1 GiB of weights needs 3 GiB for the compile and 4 of reserve.
+        assert_eq!(compile_space_needed(GIB), 7 * GIB);
+        assert!(check_compile_space(GIB, Some(7 * GIB)).is_ok());
+        assert!(check_compile_space(GIB, Some(100 * GIB)).is_ok());
+        assert!(check_compile_space(GIB, None).is_ok());
+        let err = check_compile_space(GIB, Some(6 * GIB))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("6.0 GiB is free") && err.contains("needs 7.0 GiB"),
+            "{err}"
+        );
+        assert!(check_compile_space(0, Some(5 * GIB)).is_ok());
+        assert!(check_compile_space(0, Some(3 * GIB)).is_err());
+    }
+
+    #[test]
+    fn free_space_of_the_temp_volume_is_readable() {
+        let free = free_bytes(&std::env::temp_dir()).expect("free space of the temp volume");
+        assert!(free > (1 << 20), "{free} bytes free");
+        assert!(free_bytes(std::path::Path::new("/definitely/not/a/path")).is_none());
     }
 
     unsafe extern "C" {
