@@ -62,20 +62,28 @@ pub(crate) fn decode_f32(bytes: &[u8], dtype: Dtype, name: &str) -> Result<Vec<f
     }
     Ok(match dtype {
         Dtype::F32 => bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
         Dtype::F16 => bytes
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_le_bytes(*c).to_f32())
             .collect(),
         Dtype::BF16 => bytes
-            .chunks_exact(2)
-            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes([c[0], c[1]])) << 16))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
             .collect(),
         Dtype::F64 => bytes
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
             .collect(),
         _ => unreachable!("dtype checked above"),
     })
@@ -1143,7 +1151,7 @@ mod tests {
             r#"{"weight_map": {"x": "a.safetensors", "y": "gone.safetensors"}}"#,
         )
         .unwrap();
-        let err = SafetensorsLoader::new(dir.path()).err().expect("must fail");
+        let err = load_error(dir.path());
         assert!(err.to_string().contains("gone.safetensors"), "{err}");
     }
 
@@ -1152,7 +1160,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_safetensors(&dir.path().join("a.safetensors"), &[("x", &[1.0], &[1])]);
         write_safetensors(&dir.path().join("b.safetensors"), &[("x", &[2.0], &[1])]);
-        let err = SafetensorsLoader::new(dir.path()).err().expect("must fail");
+        let err = load_error(dir.path());
         assert!(err.to_string().contains("tensor x is in both"), "{err}");
     }
 
@@ -1176,7 +1184,7 @@ mod tests {
     #[test]
     fn an_empty_directory_has_no_weights() {
         let dir = tempfile::tempdir().unwrap();
-        let err = SafetensorsLoader::new(dir.path()).err().expect("must fail");
+        let err = load_error(dir.path());
         assert!(err.to_string().contains("No safetensors files found"));
         assert!(SafetensorsLoader::new("/nonexistent/path").is_err());
     }
@@ -1192,6 +1200,14 @@ mod tests {
             loader.load_tensor("y"),
             Err(MergeError::TensorNotFound(_))
         ));
+    }
+
+    /// The message of the error opening `path` must produce.
+    fn load_error(path: impl AsRef<Path>) -> String {
+        match SafetensorsLoader::new(path) {
+            Ok(_) => panic!("opening the model should have failed"),
+            Err(e) => e.to_string(),
+        }
     }
 
     fn list(dir: &Path) -> Vec<String> {
@@ -1366,8 +1382,7 @@ mod tests {
         let mut writer = TensorWriter::with_dtype(dir.path(), Dtype::F16).unwrap();
         let err = writer
             .write_tensor("big", &arr(&[1.0, 70000.0], &[2]))
-            .err()
-            .expect("must fail");
+            .expect_err("must fail");
         assert!(err.to_string().contains("overflow"), "{err}");
         // bfloat16 has the range for it.
         let mut writer = TensorWriter::with_dtype(dir.path(), Dtype::BF16).unwrap();

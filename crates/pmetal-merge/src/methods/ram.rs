@@ -18,80 +18,7 @@
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
-use pmetal_runtime::compat::Array;
-
-// =============================================================================
-// Shared tensor-preparation logic
-// =============================================================================
-
-/// Flattened task vectors and the classification masks derived from them.
-struct RamVectors {
-    /// Task vectors flattened to `[n_models, n_params]` (CPU f32 Vec).
-    tv_flat: Vec<Vec<f32>>,
-    /// Number of parameters.
-    n_params: usize,
-    /// Number of models.
-    n_models: usize,
-    /// `nonzero_mask[m][p]` – true when |delta_m[p]| > epsilon.
-    nonzero_mask: Vec<Vec<bool>>,
-    /// `contrib_counts[p]` – how many models have a non-trivial delta at p.
-    contrib_counts: Vec<usize>,
-}
-
-impl RamVectors {
-    fn prepare(tensors: &[Array], base: &Array, epsilon: f32) -> Result<(Vec<i32>, Self)> {
-        let original_shape = base.shape().to_vec();
-        let n_params = original_shape
-            .iter()
-            .map(|&d| d as usize)
-            .product::<usize>();
-        let n_models = tensors.len();
-
-        let mut tv_flat = Vec::with_capacity(n_models);
-        let mut nonzero_mask: Vec<Vec<bool>> = Vec::with_capacity(n_models);
-
-        // Pull base onto CPU once
-        let mut base_clone = base.reshape(&[-1]);
-        let base_vals: Vec<f32> = base_clone.to_f32_vec(n_params).unwrap_or_default();
-
-        for tensor in tensors {
-            let mut t_flat = tensor.reshape(&[-1]);
-            let t_vals: Vec<f32> = t_flat.to_f32_vec(n_params).unwrap_or_default();
-
-            let delta: Vec<f32> = t_vals
-                .iter()
-                .zip(base_vals.iter())
-                .map(|(t, b)| t - b)
-                .collect();
-
-            let mask: Vec<bool> = delta.iter().map(|d| d.abs() > epsilon).collect();
-
-            tv_flat.push(delta);
-            nonzero_mask.push(mask);
-        }
-
-        // contrib_counts[p] = number of models with nonzero delta at p
-        let mut contrib_counts = vec![0usize; n_params];
-        for mask in nonzero_mask.iter().take(n_models) {
-            for p in 0..n_params {
-                if mask[p] {
-                    contrib_counts[p] += 1;
-                }
-            }
-        }
-
-        Ok((
-            original_shape,
-            RamVectors {
-                tv_flat,
-                n_params,
-                n_models,
-                nonzero_mask,
-                contrib_counts,
-            },
-        ))
-    }
-}
+use pmetal_runtime::compat::{Array, Dtype};
 
 // =============================================================================
 // RAM merge
@@ -153,78 +80,61 @@ impl RamMerge {
         if tensors.is_empty() {
             return Ok(base.clone());
         }
+        let f32_code = Dtype::Float32.as_i32();
+        let epsilon = Array::from_f32(self.epsilon);
 
-        let (original_shape, vecs) = RamVectors::prepare(tensors, base, self.epsilon)?;
-        let n_params = vecs.n_params;
-        let n_models = vecs.n_models;
+        // Task vectors and, per model, where its delta is non-trivial, as 0/1.
+        let deltas: Vec<Array> = tensors.iter().map(|t| t.subtract(base)).collect();
+        let masks: Vec<Array> = deltas
+            .iter()
+            .map(|d| d.abs_val().greater(&epsilon).as_dtype(f32_code))
+            .collect();
+        let mut contributors = masks[0].clone();
+        for mask in &masks[1..] {
+            contributors = contributors.add(mask);
+        }
+        let unique = contributors.equal(&Array::from_f32(1.0)).as_dtype(f32_code);
+        let shared = contributors
+            .greater(&Array::from_f32(1.0))
+            .as_dtype(f32_code);
 
-        // For RAM+: per-model lambda = 1 + r * clamp(rho, 0, alpha)
-        // where rho = shared_count / unique_count  (both are per-model scalar counts)
+        // RAM+: per-model lambda = 1 + r * clamp(rho, 0, alpha), rho being the
+        // model's count of shared entries over its count of unique ones.
         let lambdas: Vec<f32> = if self.plus {
-            (0..n_models)
-                .map(|m| {
-                    // counts over all parameters for this model
-                    let mut shared_count = 0usize;
-                    let mut unique_count = 0usize;
-                    for p in 0..n_params {
-                        if vecs.nonzero_mask[m][p] {
-                            if vecs.contrib_counts[p] > 1 {
-                                shared_count += 1;
-                            } else {
-                                unique_count += 1;
-                            }
-                        }
-                    }
-                    let rho = if unique_count == 0 {
+            masks
+                .iter()
+                .map(|mask| {
+                    let shared_count = mask.multiply(&shared).sum_all().item_f32();
+                    let unique_count = mask.multiply(&unique).sum_all().item_f32();
+                    let rho = if unique_count == 0.0 {
                         0.0
                     } else {
-                        shared_count as f32 / unique_count as f32
+                        shared_count / unique_count
                     };
                     1.0 + self.r * rho.clamp(0.0, self.alpha)
                 })
                 .collect()
         } else {
-            vec![1.0f32; n_models]
+            vec![1.0; tensors.len()]
         };
 
-        // Build merged task vector on CPU
-        let mut merged = vec![0.0f32; n_params];
-
-        for (p, merged_p) in merged.iter_mut().enumerate() {
-            let cnt = vecs.contrib_counts[p];
-            if cnt == 0 {
-                continue;
-            }
-
-            if cnt == 1 {
-                // Unique: exactly one model contributes — keep it with its lambda
-                for (mask, (tv, &lam)) in vecs
-                    .nonzero_mask
-                    .iter()
-                    .zip(vecs.tv_flat.iter().zip(lambdas.iter()))
-                {
-                    if mask[p] {
-                        *merged_p = tv[p] * lam;
-                        break;
-                    }
-                }
-            } else {
-                // Shared: average over all contributing models (no lambda in basic RAM)
-                let mut sum = 0.0f32;
-                let mut contributing = 0usize;
-                for (mask, tv) in vecs.nonzero_mask.iter().zip(vecs.tv_flat.iter()) {
-                    if mask[p] {
-                        sum += tv[p];
-                        contributing += 1;
-                    }
-                }
-                *merged_p = sum / contributing as f32;
-            }
+        // Unique entries keep their one contributor's delta (times its lambda);
+        // shared ones average over the models that moved them (no lambda in
+        // basic RAM); untouched ones stay at the base.
+        let mut unique_sum = deltas[0]
+            .multiply(&masks[0])
+            .multiply(&Array::from_f32(lambdas[0]));
+        let mut shared_sum = deltas[0].multiply(&masks[0]);
+        for ((delta, mask), &lambda) in deltas.iter().zip(&masks).zip(&lambdas).skip(1) {
+            let moved = delta.multiply(mask);
+            unique_sum = unique_sum.add(&moved.multiply(&Array::from_f32(lambda)));
+            shared_sum = shared_sum.add(&moved);
         }
-
-        let delta = Array::from_f32_slice(&merged, &[n_params as i32]);
-        let delta = delta.reshape(&original_shape);
-        Ok(base.add(&delta))
+        let shared_mean = shared_sum.divide(&contributors.maximum(&Array::from_f32(1.0)));
+        let merged = unique_sum
+            .multiply(&unique)
+            .add(&shared_mean.multiply(&shared));
+        Ok(base.add(&merged))
     }
 }
 
@@ -382,6 +292,30 @@ mod tests {
         // Unique position (1 for m1, 3 for m2): lambda ≥ 1.0 so value ≥ 1.0
         assert!(r[1] >= 1.0 - 1e-5, "unique m1 pos 1: {}", r[1]);
         assert!(r[3] >= 1.0 - 1e-5, "unique m2 pos 3: {}", r[3]);
+    }
+
+    #[test]
+    fn ram_plus_rescales_unique_entries_by_the_capped_conflict_ratio() {
+        // m1 = [1, 1, 1, 0], m2 = [1, 0, 1, 1] over a zero base: positions 0
+        // and 2 are shared, 1 (m1) and 3 (m2) unique. Each model has 2 shared
+        // and 1 unique entry, so rho = 2, capped at alpha = 0.2, and the
+        // unique entries are scaled by 1 + r * 0.2 = 1.02.
+        let m1 = Array::from_f32_slice(&[1.0_f32, 1.0, 1.0, 0.0], &[4]);
+        let m2 = Array::from_f32_slice(&[1.0_f32, 0.0, 1.0, 1.0], &[4]);
+        let params = vec![MergeParameters::default(); 2];
+        let result = RamMerge::plus()
+            .merge(
+                &[m1, m2],
+                Some(&base()),
+                &params,
+                &MergeParameters::default(),
+            )
+            .unwrap();
+        crate::test_util::assert_close(
+            &crate::test_util::values(&result),
+            &[1.0, 1.02, 1.0, 1.02],
+            1e-6,
+        );
     }
 
     #[test]

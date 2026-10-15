@@ -33,7 +33,10 @@ pub(crate) async fn run_fuse(
                     .and_then(|c| c["lora_alpha"].as_f64().or_else(|| c["alpha"].as_f64()))
             })
             .unwrap_or(rank);
-        println!("LoRA rank: {rank}, alpha: {alpha}, scale: {:.3}", alpha / rank);
+        println!(
+            "LoRA rank: {rank}, alpha: {alpha}, scale: {:.3}",
+            alpha / rank
+        );
         Some(alpha / rank)
     } else {
         None
@@ -115,7 +118,8 @@ async fn fuse_streaming(
     }
 
     print!("Merging... ");
-    let stats = streaming_lora_merge(&config).map_err(|e| anyhow::anyhow!("LoRA fuse failed: {e}"))?;
+    let stats =
+        streaming_lora_merge(&config).map_err(|e| anyhow::anyhow!("LoRA fuse failed: {e}"))?;
 
     println!("done");
     println!();

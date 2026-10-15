@@ -425,8 +425,10 @@ fn folds_into_a_quantized_base_by_dequantize_fold_requantize() {
         .tensor(&format!("{Q}.weight"))
         .unwrap()
         .data()
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     let read = |name: &str| common::read_tensor_file(&out.join("model.safetensors"), name);
     let (s_out, b_out) = (read(&format!("{Q}.scales")), read(&format!("{Q}.biases")));

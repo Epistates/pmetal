@@ -88,16 +88,22 @@ pub fn read_tensor_file(path: &Path, name: &str) -> Vec<f32> {
     let data = view.data();
     match view.dtype() {
         Dtype::F32 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
         Dtype::F16 => data
-            .chunks_exact(2)
-            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::f16::from_le_bytes(*c).to_f32())
             .collect(),
         Dtype::BF16 => data
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| half::bf16::from_le_bytes(*c).to_f32())
             .collect(),
         d => panic!("unsupported dtype {d:?}"),
     }

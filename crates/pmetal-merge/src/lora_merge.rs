@@ -1030,10 +1030,13 @@ fn write_file_atomically(
 }
 
 /// The A and B factors (f64) and DoRA magnitude of a target.
-fn load_factors(
-    ctx: &MergeContext<'_>,
-    target: &LoraTarget,
-) -> Result<(Array2<f64>, Array2<f64>, Option<Vec<f64>>)> {
+struct LoraFactors {
+    a: Array2<f64>,
+    b: Array2<f64>,
+    magnitude: Option<Vec<f64>>,
+}
+
+fn load_factors(ctx: &MergeContext<'_>, target: &LoraTarget) -> Result<LoraFactors> {
     let a_meta = ctx.adapter.tensor_meta(&target.a)?;
     let b_meta = ctx.adapter.tensor_meta(&target.b)?;
     let lora_a = bytes_to_f64_2d(
@@ -1057,7 +1060,11 @@ fn load_factors(
             bytes_to_f64_1d(ctx.adapter.tensor_bytes(name)?, meta.dtype, &[n], name)
         })
         .transpose()?;
-    Ok((lora_a, lora_b, magnitude))
+    Ok(LoraFactors {
+        a: lora_a,
+        b: lora_b,
+        magnitude,
+    })
 }
 
 /// Bytes of the three tensors an MLX-quantized layer is stored as, produced
@@ -1144,8 +1151,10 @@ fn fold_quantized(
 
     let packed_words: Vec<u32> = shard
         .tensor_bytes(weight_name)?
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     let weight = Array::from_u32_slice(&packed_words, &[out_features as i32, packed as i32]);
     let scales_values = decode_f32(
@@ -1163,7 +1172,11 @@ fn fold_quantized(
     let biases = Array::from_f32_slice(&biases_values, &group_shape);
     let dense = weight.dequantize(&scales, &biases, group_size, bits);
 
-    let (lora_a, lora_b, magnitude) = load_factors(ctx, target)?;
+    let LoraFactors {
+        a: lora_a,
+        b: lora_b,
+        magnitude,
+    } = load_factors(ctx, target)?;
     if lora_b.nrows() != out_features || lora_a.ncols() != in_features {
         return Err(MergeError::ShapeMismatch {
             name: format!(
@@ -1288,7 +1301,11 @@ fn merge_shard(
                 }
             } else if let Some(target) = ctx.targets.get(name) {
                 debug!("merging LoRA for '{name}'");
-                let (lora_a, lora_b, magnitude) = load_factors(ctx, target)?;
+                let LoraFactors {
+                    a: lora_a,
+                    b: lora_b,
+                    magnitude,
+                } = load_factors(ctx, target)?;
                 if magnitude.is_some() && ctx.fan_in_fan_out {
                     return Err(MergeError::InvalidConfig(
                         "DoRA adapters with fan_in_fan_out are not supported".to_string(),

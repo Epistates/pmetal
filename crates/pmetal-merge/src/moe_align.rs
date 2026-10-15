@@ -41,6 +41,19 @@ use std::sync::OnceLock;
 use crate::{Result, TensorLoader};
 use regex::Regex;
 
+/// The unit-length flattened fingerprint of an expert tensor. An unreadable
+/// tensor is an error: an empty fingerprint would align experts by noise.
+fn fingerprint(mut tensor: pmetal_runtime::compat::Array, name: &str) -> Result<Vec<f32>> {
+    let n: usize = tensor.shape().iter().map(|&s| s as usize).product();
+    let values = tensor.to_f32_vec(n);
+    pmetal_runtime::check_unobserved_error()?;
+    let mut values = values.ok_or_else(|| {
+        crate::MergeError::ModelLoad(format!("expert tensor {name}: failed to read {n} values"))
+    })?;
+    l2_normalize(&mut values);
+    Ok(values)
+}
+
 /// Compiled regex matching `…experts.{idx}.…` segments.
 fn experts_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -199,11 +212,7 @@ pub fn align_experts(loaders: &[&dyn TensorLoader]) -> Result<MoeAlignment> {
                 Some(n) => n,
                 None => return Ok(alignment), // give up cleanly — treat all as identity
             };
-            let mut t = loaders[0].load_tensor(&fp_name)?;
-            let n: usize = t.shape().iter().map(|&s| s as usize).product();
-            let mut v = t.to_f32_vec(n).unwrap_or_default();
-            l2_normalize(&mut v);
-            fps.push(v);
+            fps.push(fingerprint(loaders[0].load_tensor(&fp_name)?, &fp_name)?);
         }
         base_fingerprints.insert(layer, fps);
     }
@@ -224,11 +233,7 @@ pub fn align_experts(loaders: &[&dyn TensorLoader]) -> Result<MoeAlignment> {
                         break;
                     }
                 };
-                let mut t = loader.load_tensor(&fp_name)?;
-                let n_el: usize = t.shape().iter().map(|&s| s as usize).product();
-                let mut v = t.to_f32_vec(n_el).unwrap_or_default();
-                l2_normalize(&mut v);
-                model_fps.push(v);
+                model_fps.push(fingerprint(loader.load_tensor(&fp_name)?, &fp_name)?);
             }
             if !had_all {
                 // Layer can't be aligned — leave identity.

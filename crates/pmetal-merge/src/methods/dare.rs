@@ -251,7 +251,7 @@ mod tests {
             &MergeParameters::default(),
         );
         assert!(out.iter().all(|&v| v == 0.0 || v == 4.0));
-        assert!(out.iter().any(|&v| v == 4.0) && out.iter().any(|&v| v == 0.0));
+        assert!(out.contains(&4.0) && out.contains(&0.0));
     }
 
     #[test]
