@@ -463,6 +463,20 @@ pub(crate) fn rms_norm_noscale(x: &Array, eps: f32) -> Array {
     pmetal_runtime::compat::fast::rms_norm_opt(x, None, eps)
 }
 
+/// `gelu_tanh(gate) * up`, in `gate`'s dtype: Gemma 4's gated activation, with
+/// the tanh-approximation GELU rather than the exact erf one.
+///
+/// The activation is evaluated in f32 and returns f32 for a bf16 gate, which a
+/// [`nn::Linear`] after it absorbs by casting its input back down. The routed
+/// experts do not go through one (they are a `matmul` or `gather_qmm` against
+/// the stacked weights), so without the cast their f32 would run the experts
+/// in f32 and carry f32 into the residual stream.
+fn geglu(gate: &Array, up: &Array) -> Array {
+    nn::gelu_tanh_approximate(gate)
+        .multiply(up)
+        .as_dtype(gate.dtype_raw())
+}
+
 fn layer_per_input(per_layer_inputs: &Array, layer_idx: usize) -> Array {
     let b = per_layer_inputs.dim(0);
     let s = per_layer_inputs.dim(1);
@@ -570,8 +584,7 @@ impl Gemma4PerLayerInputBlock {
     pub fn forward(&mut self, hidden: &Array, layer_input: &Array) -> Result<Array, Exception> {
         let residual = hidden.clone();
         let gate = self.gate_proj.forward(hidden);
-        let activated = nn::gelu_tanh_approximate(&gate);
-        let projected = self.projection.forward(&activated.multiply(layer_input));
+        let projected = self.projection.forward(&geglu(&gate, layer_input));
         let projected = self.post_norm.forward(&projected);
         Ok(residual.add(&projected))
     }
@@ -610,10 +623,7 @@ impl Gemma4Mlp {
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-        // Gemma 4 uses the tanh-approximation GELU (MLX's `nn.gelu_approx`)
-        // as its gate activation, not the exact erf GELU.
-        let gelu_gate = nn::gelu_tanh_approximate(&gate);
-        Ok(self.down_proj.forward(&gelu_gate.multiply(&up)))
+        Ok(self.down_proj.forward(&geglu(&gate, &up)))
     }
 }
 
@@ -840,7 +850,7 @@ impl Gemma4Experts {
         );
         let gate = ops::slice_axis(&gate_up, -1, 0, i);
         let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
-        let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, top_k, 1, I]
+        let activated = geglu(&gate, &up); // [N, top_k, 1, I]
 
         // down: [N, top_k, 1, H] -> squeeze the singleton -> [N, top_k, H]
         let down = activated
@@ -857,6 +867,7 @@ impl Gemma4Experts {
             )
             .squeeze_axes(&[2]);
 
+        let top_weights = top_weights.as_dtype(down.dtype_raw());
         let weighted = down.multiply(&top_weights.reshape(&[n, top_k, 1]));
         Ok(weighted.sum_axis(1, false)) // [N, H]
     }
@@ -923,17 +934,20 @@ impl Gemma4Experts {
         let i = self.moe_intermediate_size;
         let k = top_indices.dim(1);
 
+        // The routing weights are f32 (the softmax runs there); against bf16
+        // activations they would promote the whole residual stream.
+        let top_weights = top_weights.as_dtype(hidden_flat.dtype_raw());
         let mut out = ops::zeros_dtype(&[n, h], hidden_flat.dtype());
         for slot in 0..k {
             let slot_experts = ops::slice_axis(top_indices, -1, slot, slot + 1).reshape(&[n]);
-            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1); // [N, 1]
+            let slot_weights = ops::slice_axis(&top_weights, -1, slot, slot + 1); // [N, 1]
 
             let gate_up_w = gate_up_t.take_axis(&slot_experts, 0); // [N, H, 2I]
             let x_b = hidden_flat.reshape(&[n, 1, h]);
             let gate_up = ops::matmul(&x_b, &gate_up_w).squeeze_axes(&[1]); // [N, 2I]
             let gate = ops::slice_axis(&gate_up, -1, 0, i);
             let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
-            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, I]
+            let activated = geglu(&gate, &up); // [N, I]
 
             let down_w = down_t.take_axis(&slot_experts, 0); // [N, I, H]
             let act_b = activated.reshape(&[n, 1, i]);
@@ -972,7 +986,7 @@ impl Gemma4Experts {
             let gate_up = ops::matmul(&x_b, &gate_up_w).squeeze_axes(&[1]);
             let gate = ops::slice_axis(&gate_up, -1, 0, i);
             let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
-            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up);
+            let activated = geglu(&gate, &up);
 
             let down_w = self
                 .down_proj
@@ -2451,6 +2465,39 @@ mod moe_tests {
             host.iter().all(|v| v.is_finite()),
             "MoE forward produced non-finite logits"
         );
+    }
+
+    /// A bf16 model's residual stream stays bf16 through every block: the
+    /// routed experts, the per-layer inputs, the layer scalar and the
+    /// embedding scale each carry a constant (or an f32 routing weight) that
+    /// promotes the stream to f32 if it is built as an f32 array. One such op
+    /// carries f32 through every layer after it, doubling what a training step
+    /// holds and diverging from the engine that serves the model.
+    #[test]
+    #[serial]
+    fn residual_stream_stays_in_the_models_dtype() {
+        let bf16 = Dtype::Bfloat16.as_i32();
+        let mut per_layer = tiny_config(false);
+        per_layer.hidden_size_per_layer_input = Some(8);
+        per_layer.vocab_size_per_layer_input = Some(VOCAB);
+        for (label, config) in [
+            ("dense", tiny_config(false)),
+            ("MoE", tiny_config(true)),
+            ("per-layer inputs", per_layer),
+        ] {
+            let mut model = Gemma4ForCausalLM::new(config).unwrap();
+            // Non-trivial weights, in the model's dtype.
+            for (_, p) in model.flatten_params_mut() {
+                let w = random::uniform_range(-0.3, 0.3, p.shape(), Dtype::Float32);
+                *p = w.as_dtype(bf16);
+            }
+            let ids = Array::from_slice(&[1i32, 2, 3, 4, 5], &[1, 5]);
+            let hidden = model.model.forward_with_cache(&ids, None, None).unwrap();
+            let logits = model.forward(&ids, None).unwrap();
+            pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+            assert_eq!(hidden.dtype_raw(), bf16, "{label}: trunk output dtype");
+            assert_eq!(logits.dtype_raw(), bf16, "{label}: logits dtype");
+        }
     }
 
     /// A checkpoint holding exactly the model's own tensors, under the names a
