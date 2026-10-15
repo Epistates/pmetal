@@ -1216,8 +1216,15 @@ impl DynamicModel {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = NemotronHForCausalLM::new(config)?;
-                crate::loader::load_nemotron_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
+                load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::NemotronH.load_policy(),
+                    |model| {
+                        crate::loader::load_nemotron_weights(model, model_dir)
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    },
+                )?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::NemotronH(model);
                 model.init_post_load_fast_paths()?;
@@ -1286,8 +1293,16 @@ impl DynamicModel {
                 // The release (MXFP4) and transformers' own layout ship the
                 // experts fused; a per-expert `Linear` checkpoint takes the
                 // generic loader.
-                if !model.load_fused_checkpoint(model_dir)? {
-                    load_generic_weights(&mut model, model_dir)
+                let policy = ModelArchitecture::GptOss.load_policy();
+                let snapshot = ParamSnapshot::of(&model);
+                if model.load_fused_checkpoint(model_dir)? {
+                    snapshot
+                        .require_complete(&model, &policy, Vec::new())
+                        .map_err(|e| {
+                            Exception::custom(e.with_quantization_hint(model_dir).to_string())
+                        })?;
+                } else {
+                    load_generic_weights_with(&mut model, model_dir, |_| None, &policy)
                         .map_err(|e| Exception::custom(e.to_string()))?;
                 }
                 eval_module_parameters_batched(&model)?;
@@ -1299,12 +1314,27 @@ impl DynamicModel {
                 let effective = unwrap_text_config(&config_content)?;
                 let config: crate::architectures::gemma4::Gemma4Config =
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
+                // A layer that shares another's keys and values reads them from
+                // its source and has no K/V projections of its own; checkpoints
+                // omit them, and the layer never reads them.
+                let mut policy = ModelArchitecture::Gemma4.load_policy();
+                for layer in config.first_kv_shared_layer_idx()..config.num_hidden_layers as usize {
+                    for tensor in ["k_proj.weight", "v_proj.weight", "k_norm.weight"] {
+                        policy.unloaded_params.push(Exemption::owned(
+                            format!("model.layers.{layer}.self_attn.{tensor}"),
+                            "a KV-shared layer reads its source layer's keys and values",
+                        ));
+                    }
+                }
                 let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
-                let weights = crate::loader::load_weights(model_dir)
+                let mut weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                let report =
-                    crate::architectures::gemma4::load_gemma4_weights(&mut model, &weights)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
+                crate::loader::fuse_switch_glu_experts(&mut weights)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let report = load_checked(&mut model, model_dir, &policy, |model| {
+                    crate::architectures::gemma4::load_gemma4_weights(model, &weights)
+                        .map_err(|e| Exception::custom(e.to_string()))
+                })?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
                         "Gemma 4 weight load: {} loaded, {} skipped (first: {:?})",
@@ -1325,8 +1355,15 @@ impl DynamicModel {
                 // which differ from PMetal's `model.layers.0.attention.query.*`.
                 let weights =
                     load_weights(model_dir).map_err(|e| Exception::custom(e.to_string()))?;
-                load_bert_weights(&mut model, &weights)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
+                load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::Bert.load_policy(),
+                    |model| {
+                        load_bert_weights(model, &weights)
+                            .map_err(|e| Exception::custom(e.to_string()))
+                    },
+                )?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Bert(model))
             }
@@ -1354,8 +1391,15 @@ impl DynamicModel {
                 }
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                let report = crate::architectures::diffusion_gemma::load_diffusion_gemma_weights(
-                    &mut model, &weights,
+                let report = load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::DiffusionGemma.load_policy(),
+                    |model| {
+                        crate::architectures::diffusion_gemma::load_diffusion_gemma_weights(
+                            model, &weights,
+                        )
+                    },
                 )?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
@@ -1380,8 +1424,12 @@ impl DynamicModel {
                 let mut model = MllamaForConditionalGeneration::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                let report =
-                    crate::architectures::mllama::load_mllama_weights(&mut model, &weights)?;
+                let report = load_checked(
+                    &mut model,
+                    model_dir,
+                    &ModelArchitecture::Mllama.load_policy(),
+                    |model| crate::architectures::mllama::load_mllama_weights(model, &weights),
+                )?;
                 if !report.skipped.is_empty() {
                     tracing::info!(
                         "Mllama weight load: {} loaded, {} skipped (first: {:?})",

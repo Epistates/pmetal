@@ -90,6 +90,51 @@ pub fn deepseek_param_name(key: &str) -> Option<String> {
     None
 }
 
+/// Rewrite an MLX-layout mixture-of-experts checkpoint's per-projection expert
+/// tensors into the fused layout Hugging Face releases, in place.
+///
+/// MLX stores a layer's experts as three tensors, `experts.switch_glu.gate_proj`
+/// and `up_proj` (`[E, I, H]`) and `down_proj` (`[E, H, I]`). Hugging Face (and
+/// the models that read its layout) fuse gate and up on the intermediate axis:
+/// `experts.gate_up_proj` `[E, 2I, H]`, gate first, and `experts.down_proj`.
+/// A loader that knows only the fused names finds nothing under the MLX ones, so
+/// every expert of an MLX-quantized MoE (`gemma-4-26b-a4b-it-4bit`) stayed on its
+/// random initialisation. Run after quantization is unpacked, so the tensors
+/// are dense.
+///
+/// # Errors
+/// A `gate_proj` with no `up_proj` or `down_proj` beside it.
+pub fn fuse_switch_glu_experts(weights: &mut HashMap<String, Array>) -> Result<(), LoadError> {
+    const MARK: &str = ".switch_glu.gate_proj.weight";
+    let gates: Vec<String> = weights
+        .keys()
+        .filter(|key| key.ends_with(MARK))
+        .cloned()
+        .collect();
+    for gate_key in gates {
+        let Some(experts) = gate_key.strip_suffix(MARK) else {
+            continue;
+        };
+        let up_key = format!("{experts}.switch_glu.up_proj.weight");
+        let down_key = format!("{experts}.switch_glu.down_proj.weight");
+        let (Some(gate), Some(up), Some(down)) = (
+            weights.remove(&gate_key),
+            weights.remove(&up_key),
+            weights.remove(&down_key),
+        ) else {
+            return Err(LoadError::SafeTensors(format!(
+                "{gate_key} has no matching switch_glu up_proj and down_proj"
+            )));
+        };
+        weights.insert(
+            format!("{experts}.gate_up_proj"),
+            pmetal_runtime::compat::ops::concatenate_axis(&[&gate, &up], 1),
+        );
+        weights.insert(format!("{experts}.down_proj"), down);
+    }
+    Ok(())
+}
+
 pub fn load_nemotron_weights(
     model: &mut NemotronHForCausalLM,
     model_dir: impl AsRef<Path>,
@@ -719,6 +764,61 @@ fn remap_bert_weight_name(hf_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rows(values: std::ops::Range<i32>, shape: &[i32]) -> Array {
+        let data: Vec<f32> = values.map(|v| v as f32).collect();
+        Array::from_f32_slice(&data, shape)
+    }
+
+    fn flat(array: &Array) -> Vec<f32> {
+        let n = array.size();
+        let mut array = array.clone();
+        array.to_f32_vec(n).unwrap()
+    }
+
+    /// ⚠️ MLX names an MoE layer's experts `switch_glu.{gate,up,down}_proj`; the
+    /// loader that knew only the fused names left every expert random.
+    #[test]
+    fn switch_glu_experts_fuse_into_the_hugging_face_layout() {
+        // E = 2 experts, I = 3, H = 4.
+        let gate = rows(0..24, &[2, 3, 4]);
+        let up = rows(100..124, &[2, 3, 4]);
+        let down = rows(200..224, &[2, 4, 3]);
+        let p = "language_model.model.layers.0.experts";
+        let mut weights = HashMap::new();
+        weights.insert(format!("{p}.switch_glu.gate_proj.weight"), gate.clone());
+        weights.insert(format!("{p}.switch_glu.up_proj.weight"), up.clone());
+        weights.insert(format!("{p}.switch_glu.down_proj.weight"), down.clone());
+        weights.insert("model.norm.weight".into(), rows(0..4, &[4]));
+
+        fuse_switch_glu_experts(&mut weights).unwrap();
+
+        assert_eq!(weights.len(), 3, "{:?}", weights.keys());
+        let fused = &weights[&format!("{p}.gate_up_proj")];
+        assert_eq!(fused.shape(), &[2, 6, 4]);
+        // Per expert: the gate rows, then the up rows.
+        let got = flat(fused);
+        let want: Vec<f32> = [
+            flat(&gate)[..12].to_vec(),
+            flat(&up)[..12].to_vec(),
+            flat(&gate)[12..].to_vec(),
+            flat(&up)[12..].to_vec(),
+        ]
+        .concat();
+        assert_eq!(got, want);
+        assert_eq!(flat(&weights[&format!("{p}.down_proj")]), flat(&down));
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    #[test]
+    fn a_switch_glu_gate_without_its_partners_is_an_error() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "layers.0.experts.switch_glu.gate_proj.weight".to_string(),
+            rows(0..24, &[2, 3, 4]),
+        );
+        assert!(fuse_switch_glu_experts(&mut weights).is_err());
+    }
 
     #[test]
     fn qwen3_next_raw_weight_filter_skips_auxiliary_and_routed_expert_keys() {
