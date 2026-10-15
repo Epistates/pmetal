@@ -10,8 +10,13 @@
 //! Variants:
 //! - **Llama 4 Scout**: 109B total params (16 experts), 17B active, 10M context
 //! - **Llama 4 Maverick**: 402B total params (128 experts), 17B active, 1M context
-use pmetal_runtime::compat::{Array, Dtype, Exception, Module, nn, ops};
+use pmetal_runtime::compat::{
+    Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, nn, ops,
+};
 use pmetal_runtime::impl_module_params;
+use pmetal_runtime::llama4_native::route_logits;
+use pmetal_runtime::native_moe;
+use pmetal_runtime::native_weight::LayerWeight;
 
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
@@ -230,19 +235,20 @@ impl ModelConfig for Llama4TextConfig {
 }
 
 // =============================================================================
-// Expert and MoE Components
+// MLP, Expert and MoE Components
 // =============================================================================
 
-/// A single expert (MLP).
+/// A gated MLP (SwiGLU): a dense layer's feed-forward and the MoE layers'
+/// shared expert.
 #[derive(Debug)]
-pub struct Llama4Expert {
+pub struct Llama4Mlp {
     pub gate_proj: nn::Linear,
     pub up_proj: nn::Linear,
     pub down_proj: nn::Linear,
 }
-impl_module_params!(Llama4Expert; gate_proj, up_proj, down_proj);
+impl_module_params!(Llama4Mlp; gate_proj, up_proj, down_proj);
 
-impl Llama4Expert {
+impl Llama4Mlp {
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Result<Self, Exception> {
         let gate_proj = nn::LinearBuilder::new(hidden_size, intermediate_size)
             .bias(false)
@@ -269,90 +275,74 @@ impl Llama4Expert {
     }
 }
 
-/// Router for selecting experts.
+/// The routed experts of a layer, as transformers' `Llama4TextExperts` (and so
+/// every release) holds them: two stacked weights, each applied as `x @ W`.
+///
+/// They are the checkpoint's tensors as they are, not a copy per expert, so a
+/// layer is two arrays whatever the expert count, the gate and up halves
+/// come out of one gather matmul, and no weight is copied to run them.
 #[derive(Debug)]
-pub struct Llama4Router {
-    pub gate: nn::Linear,
-    pub num_experts: i32,
-    pub top_k: i32,
+pub struct Llama4Experts {
+    /// `[experts, hidden, 2 * expert_hidden]`, gate then up along the last
+    /// axis (`gate_up.chunk(2, dim=-1)`).
+    pub gate_up_proj: Array,
+    /// `[experts, expert_hidden, hidden]`.
+    pub down_proj: Array,
 }
-impl_module_params!(Llama4Router; gate);
+impl_module_params!(Llama4Experts; gate_up_proj, down_proj);
 
-impl Llama4Router {
-    pub fn new(hidden_size: i32, num_experts: i32, top_k: i32) -> Result<Self, Exception> {
-        let gate = nn::LinearBuilder::new(hidden_size, num_experts)
-            .bias(false)
-            .build()?;
-        Ok(Self {
-            gate,
-            num_experts,
-            top_k,
-        })
-    }
-
-    /// Route tokens to experts.
-    ///
-    /// Returns `(expert_indices, expert_weights, router_logits)` where:
-    /// - `expert_indices`: `[total_tokens, top_k]` — selected expert IDs (i32)
-    /// - `expert_weights`: `[total_tokens, top_k]` — normalized routing weights
-    /// - `router_logits`:  `[total_tokens, num_experts]` — raw pre-softmax logits
-    pub fn forward(&mut self, x: &Array) -> Result<(Array, Array, Array), Exception> {
-        // x: [total_tokens, hidden]
-        let router_logits = Module::forward(&mut self.gate, x)?;
-
-        // Llama4 routing (HF Llama4TextMoe): pick the top-k
-        // experts by RAW logit, then gate with `sigmoid(logit)` — NOT a
-        // softmax. The previous softmax-then-renormalize collapsed the top-1
-        // weight to exactly 1.0 (softmax over a single selected logit is 1),
-        // throwing away the router signal entirely.
-        let neg_k = -self.top_k;
-        let part_indices = ops::argpartition_axis(&router_logits, neg_k, -1);
-        // Slice the last top_k entries: [total_tokens, top_k]. A selection
-        // carries no gradient, and MLX refuses to differentiate a gather with
-        // respect to its indices.
-        let expert_indices = ops::stop_gradient(&ops::slice_axis_from(&part_indices, -1, neg_k));
-
-        // Gate weight = sigmoid of the selected RAW logits (per expert,
-        // independent — no cross-expert normalisation), in f32 and then back
-        // to the activations' dtype, as `Llama4TextMoe` computes it.
-        let selected_logits = router_logits.take_along_axis(&expert_indices, -1);
-        let expert_weights =
-            ops::sigmoid(&selected_logits.as_type::<f32>()).as_dtype(x.dtype().as_i32());
-
-        Ok((expert_indices, expert_weights, router_logits))
+impl Llama4Experts {
+    /// Randomly initialised experts (lazily: a checkpoint's weights replace
+    /// them before anything computes them).
+    pub fn new(num_experts: i32, hidden_size: i32, intermediate_size: i32) -> Self {
+        let init = |shape: &[i32], fan_in: i32| {
+            let bound = (fan_in as f32).sqrt().recip();
+            pmetal_runtime::compat::random::uniform_range(-bound, bound, shape, Dtype::Float32)
+        };
+        Self {
+            gate_up_proj: init(
+                &[num_experts, hidden_size, 2 * intermediate_size],
+                hidden_size,
+            ),
+            down_proj: init(
+                &[num_experts, intermediate_size, hidden_size],
+                intermediate_size,
+            ),
+        }
     }
 }
 
 /// Mixture of Experts layer with shared expert.
+///
+/// Parameter paths are the checkpoint's: `router.weight`,
+/// `experts.{gate_up_proj,down_proj}`, `shared_expert.*`.
 #[derive(Debug)]
 pub struct Llama4MoE {
-    pub config: Llama4TextConfig,
-
-    pub router: Llama4Router,
-    pub experts: Vec<Llama4Expert>,
-    pub shared_expert: Llama4Expert,
+    /// Experts per token.
+    pub top_k: i32,
+    /// `hidden -> experts`. A router's argmax picks which computation runs,
+    /// so no adapter attaches to it (`pmetal-lora` skips a path ending
+    /// `router`).
+    pub router: nn::Linear,
+    pub experts: Llama4Experts,
+    pub shared_expert: Llama4Mlp,
 }
 impl_module_params!(Llama4MoE; router, experts, shared_expert);
 
 impl Llama4MoE {
     pub fn new(config: &Llama4TextConfig) -> Result<Self, Exception> {
-        let router = Llama4Router::new(
-            config.hidden_size,
-            config.num_local_experts,
-            config.num_experts_per_tok,
-        )?;
-
-        let experts = (0..config.num_local_experts)
-            .map(|_| Llama4Expert::new(config.hidden_size, config.intermediate_size))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let shared_expert = Llama4Expert::new(config.hidden_size, config.intermediate_size)?;
-
+        let router = nn::LinearBuilder::new(config.hidden_size, config.num_local_experts)
+            .bias(false)
+            .build()?;
         Ok(Self {
-            config: config.clone(),
+            top_k: config.num_experts_per_tok,
             router,
-            experts,
-            shared_expert,
+            experts: Llama4Experts::new(
+                config.num_local_experts,
+                config.hidden_size,
+                config.intermediate_size,
+            ),
+            shared_expert: Llama4Mlp::new(config.hidden_size, config.intermediate_size)?,
         })
     }
 
@@ -364,74 +354,87 @@ impl Llama4MoE {
         let total_tokens = shape.iter().take(shape.len() - 1).product::<i32>();
         let flat_x = x.reshape(&[total_tokens, hidden_size]);
 
-        // Route tokens.
-        // expert_indices: [total_tokens, top_k]
-        // expert_weights: [total_tokens, top_k]  (normalized)
-        let (expert_indices, expert_weights, _router_logits) = self.router.forward(&flat_x)?;
+        // Llama4 routing (HF `Llama4TextMoe`): the top-k experts by RAW
+        // logit, gated with `sigmoid(logit)`, not a softmax. The router is
+        // `route_logits`, the native engine's.
+        let router_logits = Module::forward(&mut self.router, &flat_x)?;
+        let (expert_indices, gates) = route_logits(&router_logits, self.top_k, x.dtype().as_i32());
 
-        // Shared expert output (always applied to all tokens)
+        // Llama4 scales the expert *input* by the gate (`experts(x * scores)`),
+        // not the output: the expert MLP is SwiGLU (nonlinear), so the two
+        // are not equivalent. `switch_glu_gated_input` is that, as grouped
+        // gather matmuls with no host readback, shared with the native engine.
+        let gate_up = LayerWeight::Dense(self.experts.gate_up_proj.clone());
+        let down = LayerWeight::Dense(self.experts.down_proj.clone());
+        let routed = native_moe::switch_glu_gated_input(
+            &flat_x,
+            native_moe::GateUp::Fused(&gate_up),
+            &down,
+            &expert_indices,
+            &gates,
+            |gate, up| nn::silu(gate).multiply(up),
+        );
+
+        // Add the shared expert's contribution (applied to every token).
         let shared_out = self.shared_expert.forward(&flat_x)?;
+        Ok(shared_out.add(&routed).reshape(&shape))
+    }
+}
 
-        // Which expert each token goes to is read on the host, so that each
-        // expert runs over its own tokens only. The gate values stay in the
-        // graph: the loss reaches the router, and every adapter upstream of
-        // it, through them, as it does in `Llama4TextMoe`.
-        let expert_indices = expert_indices.as_type::<i32>();
-        expert_indices.eval();
+/// A layer's feed-forward: a dense MLP or the mixture of experts. Parameter
+/// paths are the checkpoint's, `feed_forward.*`.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one per layer, never moved; boxing would add an indirection to every forward"
+)]
+pub enum Llama4FeedForward {
+    Dense(Llama4Mlp),
+    Moe(Llama4MoE),
+}
 
-        let top_k = self.config.num_experts_per_tok as usize;
-        let n_tokens = total_tokens as usize;
-        let expert_ids: Vec<i32> = expert_indices.as_slice::<i32>().to_vec();
-        let flat_weights = expert_weights.reshape(&[-1]);
-
-        // Per expert: the tokens routed to it, and where each one's gate
-        // value sits in `flat_weights`.
-        let mut expert_assignments: Vec<Vec<(i32, i32)>> = vec![Vec::new(); self.experts.len()];
-        for token_idx in 0..n_tokens {
-            for slot in 0..top_k {
-                let flat_idx = token_idx * top_k + slot;
-                let expert_id = expert_ids[flat_idx] as usize;
-                if expert_id < self.experts.len() {
-                    expert_assignments[expert_id].push((token_idx as i32, flat_idx as i32));
-                }
-            }
+impl pmetal_runtime::compat::VisitLinears for Llama4FeedForward {
+    fn visit_linears_mut(&mut self, prefix: &str, f: &mut dyn FnMut(&str, &mut nn::Linear)) {
+        match self {
+            Self::Dense(m) => m.visit_linears_mut(prefix, f),
+            Self::Moe(m) => m.visit_linears_mut(prefix, f),
         }
+    }
+}
 
-        let input_dtype = flat_x.dtype();
-        let mut combined_out = ops::zeros_dtype(&[total_tokens, hidden_size], input_dtype);
-        for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
-            if assignments.is_empty() {
-                continue;
-            }
-
-            let count = assignments.len() as i32;
-            let token_indices: Vec<i32> = assignments.iter().map(|&(token, _)| token).collect();
-            let gate_slots: Vec<i32> = assignments.iter().map(|&(_, slot)| slot).collect();
-
-            let idx_array = Array::from_slice(&token_indices, &[count]);
-            let weight_array = flat_weights
-                .take_axis(&Array::from_slice(&gate_slots, &[count]), 0)
-                .reshape(&[count, 1]);
-
-            // Llama4 scales the expert *input* by the sigmoid gate
-            // (`experts(x * scores)`), not the output. The expert MLP is
-            // SwiGLU (nonlinear), so input- and output-scaling are NOT
-            // equivalent — the input must be scaled to match HF.
-            let expert_input = flat_x.take_axis(&idx_array, 0).multiply(&weight_array);
-            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
-
-            let updates = expert_out.reshape(&[count, 1, hidden_size]);
-            combined_out = pmetal_runtime::compat::indexing::scatter_add_single(
-                &combined_out,
-                &idx_array,
-                &updates,
-                0,
-            );
+impl ModuleParameters for Llama4FeedForward {
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        match self {
+            Self::Dense(m) => m.parameters(),
+            Self::Moe(m) => m.parameters(),
         }
+    }
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        match self {
+            Self::Dense(m) => m.trainable_parameters(),
+            Self::Moe(m) => m.trainable_parameters(),
+        }
+    }
+    fn num_parameters(&self) -> usize {
+        match self {
+            Self::Dense(m) => m.num_parameters(),
+            Self::Moe(m) => m.num_parameters(),
+        }
+    }
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        match self {
+            Self::Dense(m) => m.parameters_mut(),
+            Self::Moe(m) => m.parameters_mut(),
+        }
+    }
+}
 
-        // Add shared expert contribution and reshape to original shape
-        let output = shared_out.add(&combined_out);
-        Ok(output.reshape(&shape))
+impl Llama4FeedForward {
+    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(x),
+            Self::Moe(moe) => moe.forward(x),
+        }
     }
 }
 
@@ -661,10 +664,37 @@ impl Llama4Attention {
             None => (k, v),
         };
 
+        // A single decoded token on a RoPE layer attends to the keys of its
+        // own chunk only, `[p - p % chunk, p]`: read exactly those, so a
+        // decode costs the chunk and not the whole cache under a mask. The
+        // cache keeps every position from 0.
+        let mut chunk_read = false;
+        let (k, v) = match rope_positions {
+            RopePositions::Offset(p)
+                if self.uses_rope
+                    && cached
+                    && seq_len == 1
+                    && mask.is_none()
+                    && self.attention_chunk_size > 0 =>
+            {
+                chunk_read = true;
+                let start = (p / self.attention_chunk_size) * self.attention_chunk_size;
+                if start > 0 {
+                    (
+                        ops::slice_axis(&k, 2, start, k.dim(2)),
+                        ops::slice_axis(&v, 2, start, v.dim(2)),
+                    )
+                } else {
+                    (k, v)
+                }
+            }
+            _ => (k, v),
+        };
+
         // RoPE layers attend within their chunk of `attention_chunk_size`
         // positions (transformers' `create_chunked_causal_mask`, the
         // reference's `block_pos == 0`).
-        let chunk_mask = if self.uses_rope {
+        let chunk_mask = if self.uses_rope && !chunk_read {
             self.chunk_mask(
                 rope_positions,
                 seq_len,
@@ -701,31 +731,26 @@ impl Llama4Attention {
 #[derive(Debug)]
 pub struct Llama4DecoderLayer {
     pub layer_idx: usize,
-    pub is_moe: bool,
 
     pub self_attn: Llama4Attention,
-    pub mlp: Option<Llama4Expert>, // Dense MLP (if not MoE)
-    pub moe: Option<Llama4MoE>,    // MoE layer (if MoE)
+    /// The dense MLP or the mixture of experts: `feed_forward` in a checkpoint.
+    pub feed_forward: Llama4FeedForward,
     pub input_layernorm: nn::RmsNorm,
     pub post_attention_layernorm: nn::RmsNorm,
 }
-impl_module_params!(Llama4DecoderLayer; self_attn, mlp, moe, input_layernorm, post_attention_layernorm);
+impl_module_params!(Llama4DecoderLayer; self_attn, feed_forward, input_layernorm, post_attention_layernorm);
 
 impl Llama4DecoderLayer {
     pub fn new(config: &Llama4TextConfig, layer_idx: usize) -> Result<Self, Exception> {
         let self_attn = Llama4Attention::new(config, layer_idx)?;
 
-        let is_moe = config.is_moe_layer(layer_idx as i32);
-        let (mlp, moe) = if is_moe {
-            (None, Some(Llama4MoE::new(config)?))
+        let feed_forward = if config.is_moe_layer(layer_idx as i32) {
+            Llama4FeedForward::Moe(Llama4MoE::new(config)?)
         } else {
-            (
-                Some(Llama4Expert::new(
-                    config.hidden_size,
-                    config.intermediate_size_mlp,
-                )?),
-                None,
-            )
+            Llama4FeedForward::Dense(Llama4Mlp::new(
+                config.hidden_size,
+                config.intermediate_size_mlp,
+            )?)
         };
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
@@ -737,10 +762,8 @@ impl Llama4DecoderLayer {
 
         Ok(Self {
             layer_idx,
-            is_moe,
             self_attn,
-            mlp,
-            moe,
+            feed_forward,
             input_layernorm,
             post_attention_layernorm,
         })
@@ -772,11 +795,7 @@ impl Llama4DecoderLayer {
 
         // FFN with residual (MoE or dense)
         let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        let ffn_out = if self.is_moe {
-            self.moe.as_mut().unwrap().forward(&normed)?
-        } else {
-            self.mlp.as_mut().unwrap().forward(&normed)?
-        };
+        let ffn_out = self.feed_forward.forward(&normed)?;
         Ok(h.add(&ffn_out))
     }
 }
@@ -869,15 +888,23 @@ pub struct Llama4ForCausalLM {
     pub config: Llama4TextConfig,
 
     pub model: Llama4TextModel,
-    pub lm_head: nn::Linear,
+    /// `None` when `tie_word_embeddings` ties the head to the token
+    /// embedding.
+    pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(Llama4ForCausalLM; model, lm_head);
 
 impl Llama4ForCausalLM {
     pub fn new(config: Llama4TextConfig) -> Result<Self, Exception> {
-        let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-            .bias(false)
-            .build()?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
+        };
 
         let model = Llama4TextModel::new(config.clone())?;
 
@@ -888,6 +915,15 @@ impl Llama4ForCausalLM {
         })
     }
 
+    /// Project hidden states to vocabulary logits, through the LM head when
+    /// the checkpoint has one and the tied embedding otherwise.
+    fn lm_head_forward(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
+        match self.lm_head.as_mut() {
+            Some(lm_head) => Module::forward(lm_head, hidden_states),
+            None => Ok(self.model.embed_tokens.as_linear(hidden_states)),
+        }
+    }
+
     pub fn forward(
         &mut self,
         input_ids: &Array,
@@ -895,7 +931,7 @@ impl Llama4ForCausalLM {
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, position_ids)?;
-        Module::forward(&mut self.lm_head, &hidden_states)
+        self.lm_head_forward(&hidden_states)
     }
 
     /// Forward pass with one rotary position per token, `[seq_len]`.
@@ -923,7 +959,7 @@ impl Llama4ForCausalLM {
         let hidden_states = self
             .model
             .forward_with_cache(input_ids, mask, cache, None)?;
-        Module::forward(&mut self.lm_head, &hidden_states)
+        self.lm_head_forward(&hidden_states)
     }
 }
 
@@ -931,75 +967,33 @@ impl Llama4ForCausalLM {
 // Checkpoint layout
 // =============================================================================
 
-/// A Llama 4 checkpoint's tensors under this module's parameter names.
+/// A Llama 4 checkpoint's text-model tensors, named as this module names its
+/// parameters.
 ///
-/// transformers (and every release) names the text model
-/// `language_model.model.*` / `model.language_model.*` in the multimodal
-/// checkpoints and calls each layer's feed-forward `feed_forward`, with the
-/// routed experts fused (`Llama4TextExperts`):
-///
-/// * `experts.gate_up_proj` `[E, hidden, 2 * expert_hidden]`, applied as
-///   `x @ W`, gate then up (`gate_up.chunk(2, dim=-1)`),
-/// * `experts.down_proj` `[E, expert_hidden, hidden]`, applied as `x @ W`.
-///
-/// Here a dense layer's MLP is `mlp`, a MoE layer is `moe` with a
-/// `router.gate` and per-expert `Linear`s (`[out, in]`), so the fused tensors
-/// are split per expert and transposed. Vision-tower tensors are dropped.
+/// The parameter tree is the checkpoint's own layout: each layer's
+/// `feed_forward` is a dense MLP or a `router`, the fused `experts`
+/// (`gate_up_proj` `[E, hidden, 2 * expert_hidden]`, applied as `x @ W`, gate
+/// then up; `down_proj` `[E, expert_hidden, hidden]`) and a `shared_expert`.
+/// What differs is the multimodal wrapper: a release names the text model
+/// `language_model.model.*` (or `model.language_model.*`), and ships the
+/// vision tower and projector beside it, which a text model does not read.
 pub fn sanitize_checkpoint(
     weights: std::collections::HashMap<String, Array>,
-) -> Result<std::collections::HashMap<String, Array>, Exception> {
-    let mut out = std::collections::HashMap::with_capacity(weights.len());
-    for (key, value) in weights {
-        if key.contains("vision_model") || key.contains("multi_modal_projector") {
-            continue;
-        }
-        let key = if let Some(rest) = key.strip_prefix("language_model.") {
-            rest.to_string()
-        } else if let Some(rest) = key.strip_prefix("model.language_model.") {
-            format!("model.{rest}")
-        } else {
-            key
-        };
-        let Some((layer, rest)) = key.split_once(".feed_forward.") else {
-            out.insert(key, value);
-            continue;
-        };
-        match rest {
-            "experts.gate_up_proj" => {
-                let (experts, inter) = (value.dim(0), value.dim(2) / 2);
-                for e in 0..experts {
-                    let w = ops::slice_axis(&value, 0, e, e + 1).squeeze(0);
-                    for (name, start) in [("gate_proj", 0), ("up_proj", inter)] {
-                        out.insert(
-                            format!("{layer}.moe.experts.{e}.{name}.weight"),
-                            ops::slice_axis(&w, 1, start, start + inter).t(),
-                        );
-                    }
-                }
-            }
-            "experts.down_proj" => {
-                for e in 0..value.dim(0) {
-                    out.insert(
-                        format!("{layer}.moe.experts.{e}.down_proj.weight"),
-                        ops::slice_axis(&value, 0, e, e + 1).squeeze(0).t(),
-                    );
-                }
-            }
-            "router.weight" => {
-                out.insert(format!("{layer}.moe.router.gate.weight"), value);
-            }
-            _ => {
-                let target = match rest.strip_prefix("shared_expert.") {
-                    Some(shared) => format!("{layer}.moe.shared_expert.{shared}"),
-                    None => format!("{layer}.mlp.{rest}"),
-                };
-                out.insert(target, value);
-            }
-        }
-    }
-    pmetal_runtime::check_unobserved_error()
-        .map_err(|e| Exception::custom(format!("llama4: splitting the experts failed: {e}")))?;
-    Ok(out)
+) -> std::collections::HashMap<String, Array> {
+    weights
+        .into_iter()
+        .filter(|(key, _)| !key.contains("vision_model") && !key.contains("multi_modal_projector"))
+        .map(|(key, value)| {
+            let key = if let Some(rest) = key.strip_prefix("language_model.") {
+                rest.to_string()
+            } else if let Some(rest) = key.strip_prefix("model.language_model.") {
+                format!("model.{rest}")
+            } else {
+                key
+            };
+            (key, value)
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -1065,120 +1059,259 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_llama4_expert() {
-        let expert = Llama4Expert::new(64, 256).unwrap();
+    fn test_llama4_mlp() {
+        let mut mlp = Llama4Mlp::new(64, 256).unwrap();
         let x = pmetal_runtime::compat::random::normal(
             &[1, 10, 64],
             pmetal_runtime::compat::Dtype::Float32,
         );
 
-        let mut expert = expert;
-        let out = expert.forward(&x).unwrap();
+        let out = mlp.forward(&x).unwrap();
         out.eval().unwrap();
 
         assert_eq!(out.shape(), &[1, 10, 64]);
     }
 
+    fn host(a: &Array) -> Vec<f64> {
+        let a = a.as_dtype(Dtype::Float32.as_i32());
+        a.eval();
+        a.as_slice::<f32>().iter().map(|&v| f64::from(v)).collect()
+    }
+
+    fn small_moe_config(num_experts: i32, top_k: i32) -> Llama4TextConfig {
+        Llama4TextConfig {
+            hidden_size: 12,
+            intermediate_size: 10,
+            intermediate_size_mlp: 10,
+            num_local_experts: num_experts,
+            num_experts_per_tok: top_k,
+            ..Default::default()
+        }
+    }
+
+    /// `Llama4TextMoe` in f64 on the host, from the layer's own weights: the
+    /// `top_k` experts of each token by raw router logit (sorted here, not by
+    /// the layer's argpartition), each run on the token scaled by its
+    /// `sigmoid(logit)`, the outputs summed unnormalised, plus the shared
+    /// expert on the token.
+    fn host_moe(moe: &Llama4MoE, x: &Array) -> Vec<f64> {
+        let (hidden, inter) = (x.dim(-1) as usize, moe.experts.down_proj.dim(1) as usize);
+        let tokens = x.size() / hidden;
+        let x = host(x);
+        let router = host(&moe.router.weight); // [E, hidden]
+        let experts = moe.experts.gate_up_proj.dim(0) as usize;
+        let gate_up = host(&moe.experts.gate_up_proj); // [E, hidden, 2 * inter]
+        let down = host(&moe.experts.down_proj); // [E, inter, hidden]
+        let (sg, su, sd) = (
+            host(&moe.shared_expert.gate_proj.weight), // [inter, hidden]
+            host(&moe.shared_expert.up_proj.weight),
+            host(&moe.shared_expert.down_proj.weight), // [hidden, inter]
+        );
+        let silu = |v: f64| v / (1.0 + (-v).exp());
+        let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
+
+        let mut out = vec![0.0; tokens * hidden];
+        for t in 0..tokens {
+            let row = &x[t * hidden..(t + 1) * hidden];
+            let logits: Vec<f64> = (0..experts)
+                .map(|e| (0..hidden).map(|h| router[e * hidden + h] * row[h]).sum())
+                .collect();
+            let mut order: Vec<usize> = (0..experts).collect();
+            order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+            for &e in &order[..moe.top_k as usize] {
+                let gate = sigmoid(logits[e]);
+                let scaled: Vec<f64> = row.iter().map(|v| v * gate).collect();
+                let w = &gate_up[e * hidden * 2 * inter..(e + 1) * hidden * 2 * inter];
+                let activated: Vec<f64> = (0..inter)
+                    .map(|i| {
+                        let g: f64 = (0..hidden).map(|h| scaled[h] * w[h * 2 * inter + i]).sum();
+                        let u: f64 = (0..hidden)
+                            .map(|h| scaled[h] * w[h * 2 * inter + inter + i])
+                            .sum();
+                        silu(g) * u
+                    })
+                    .collect();
+                let d = &down[e * inter * hidden..(e + 1) * inter * hidden];
+                for h in 0..hidden {
+                    out[t * hidden + h] += (0..inter)
+                        .map(|i| activated[i] * d[i * hidden + h])
+                        .sum::<f64>();
+                }
+            }
+            let shared: Vec<f64> = (0..inter)
+                .map(|i| {
+                    let g: f64 = (0..hidden).map(|h| row[h] * sg[i * hidden + h]).sum();
+                    let u: f64 = (0..hidden).map(|h| row[h] * su[i * hidden + h]).sum();
+                    silu(g) * u
+                })
+                .collect();
+            for h in 0..hidden {
+                out[t * hidden + h] += (0..inter)
+                    .map(|i| shared[i] * sd[h * inter + i])
+                    .sum::<f64>();
+            }
+        }
+        out
+    }
+
+    /// The layer against `Llama4TextMoe` written out in f64, for one and two
+    /// experts per token, and for token counts on both sides of the point
+    /// where the dispatch groups the `(token, expert)` pairs by expert. The
+    /// gate halves of the fused weight, the gate on the expert's input and the
+    /// unnormalised sum are all load-bearing: a swapped gate and up, a gate on
+    /// the output or a softmax each change the result by far more than the
+    /// tolerance.
     #[test]
     #[serial]
-    fn test_llama4_moe_matches_naive_reference() {
-        let config = Llama4TextConfig {
-            hidden_size: 32,
-            intermediate_size: 64,
-            intermediate_size_mlp: 64,
-            num_local_experts: 4,
-            num_experts_per_tok: 2,
-            ..Default::default()
-        };
+    fn test_llama4_moe_matches_host_reference() {
+        for (experts, top_k, tokens) in [(4, 1, 9), (4, 2, 9), (4, 2, 80), (6, 1, 80)] {
+            let config = small_moe_config(experts, top_k);
+            let mut moe = Llama4MoE::new(&config).unwrap();
+            let x = pmetal_runtime::compat::random::normal(
+                &[1, tokens, config.hidden_size],
+                Dtype::Float32,
+            );
 
-        let mut moe = Llama4MoE::new(&config).unwrap();
-        let x = pmetal_runtime::compat::random::normal(
-            &[2, 5, config.hidden_size],
-            pmetal_runtime::compat::Dtype::Float32,
-        );
-
-        let shape = x.shape().to_vec();
-        let hidden_size = *shape.last().unwrap();
-        let total_tokens = shape.iter().take(shape.len() - 1).product::<i32>();
-        let flat_x = x.reshape(&[total_tokens, hidden_size]).unwrap();
-
-        let (expert_indices, expert_weights, router_logits) = moe.router.forward(&flat_x).unwrap();
-        let shared_out = moe.shared_expert.forward(&flat_x).unwrap();
-
-        // Router weights must be sigmoid(selected raw logits) — independent
-        // per expert, NOT softmax-normalized. Verify against a direct sigmoid
-        // of the gathered logits, and confirm the per-token weights do NOT sum
-        // to 1 (which the old softmax-renormalize path would have forced).
-        let mut sig_ref =
-            ops::sigmoid(&router_logits.take_along_axis(&expert_indices, -1)).unwrap();
-        let mut weights_eval = expert_weights.clone();
-        sig_ref.eval().unwrap();
-        weights_eval.eval().unwrap();
-        let n = (total_tokens * config.num_experts_per_tok) as usize;
-        let w = weights_eval.to_f32_vec(n).unwrap();
-        let s = sig_ref.to_f32_vec(n).unwrap();
-        let max_w_diff = w
-            .iter()
-            .zip(&s)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max);
-        assert!(
-            max_w_diff < 1e-5,
-            "router weights must equal sigmoid(logits): {max_w_diff}"
-        );
-
-        let mut reference = ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
-        let top_k = config.num_experts_per_tok;
-        for slot in 0..top_k {
-            let slot_indices = expert_indices
-                .index((.., slot..slot + 1))
-                .squeeze_axes(&[-1])
-                .unwrap();
-            let slot_weights = expert_weights.index((.., slot..slot + 1));
-
-            // Naive path scales the expert INPUT by the gate (matches
-            // `experts(x * scores)`); unmasked tokens get a zero input and a
-            // zero output (the bias-free SwiGLU expert maps 0 → 0).
-            let mut slot_out =
-                ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
-            for (expert_idx, expert) in moe.experts.iter_mut().enumerate() {
-                let expert_id = Array::from_int(expert_idx as i32);
-                let mask = slot_indices.eq(&expert_id).unwrap();
-                let mask_f32 = mask
-                    .as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32())
-                    .unwrap();
-                let gate = mask_f32
-                    .reshape(&[total_tokens, 1])
-                    .unwrap()
-                    .multiply(&slot_weights)
-                    .unwrap();
-                let scaled_input = flat_x.multiply(&gate).unwrap();
-                let exp_output = expert.forward(&scaled_input).unwrap();
-                slot_out = slot_out.add(&exp_output).unwrap();
-            }
-
-            reference = reference.add(&slot_out).unwrap();
+            let want = host_moe(&moe, &x);
+            let got_array = moe.forward(&x).unwrap();
+            pmetal_runtime::check_unobserved_error().expect("runtime error");
+            assert_eq!(got_array.shape(), &[1, tokens, config.hidden_size]);
+            let got = host(&got_array);
+            let diff = want
+                .iter()
+                .zip(&got)
+                .map(|(w, g)| (w - g).abs())
+                .fold(0.0, f64::max);
+            let scale = want.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+            assert!(
+                diff <= 1e-4 * scale.max(1.0),
+                "{experts} experts, top-{top_k}, {tokens} tokens: max |diff| {diff:e} \
+                 against an output of up to {scale:e}"
+            );
         }
+    }
 
-        let reference = shared_out.add(&reference).unwrap().reshape(&shape).unwrap();
-        let output = moe.forward(&x).unwrap();
-
-        output.eval().unwrap();
-        reference.eval().unwrap();
-        let diff = output
-            .subtract(&reference)
-            .unwrap()
-            .abs()
-            .unwrap()
-            .max(None)
-            .unwrap();
-        diff.eval().unwrap();
-        let max_diff = diff.item::<f32>();
+    /// The router sends each token to its top-k experts by raw logit and
+    /// gates them `sigmoid(logit)`: not a softmax, so the gates of one token
+    /// need not sum to 1.
+    #[test]
+    #[serial]
+    fn test_llama4_router_gates_are_sigmoids_of_the_top_logits() {
+        let logits = Array::from_slice(&[0.5f32, -1.0, 2.0, 0.1, -3.0, 1.5], &[2, 3]);
+        let (inds, gates) = route_logits(&logits, 2, Dtype::Float32.as_i32());
+        let (inds, gates) = (host(&inds), host(&gates));
+        let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
+        // Row 0 [0.5, -1, 2]: experts 2 and 0. Row 1 [0.1, -3, 1.5]: 2 and 0.
+        for (row, want) in [
+            (0usize, [(2usize, 2.0f64), (0, 0.5)]),
+            (1, [(2, 1.5), (0, 0.1)]),
+        ] {
+            for (slot_expert, logit) in want {
+                let slot = (0..2)
+                    .find(|&s| inds[row * 2 + s] as usize == slot_expert)
+                    .unwrap_or_else(|| panic!("row {row}: expert {slot_expert} not chosen"));
+                assert!((gates[row * 2 + slot] - sigmoid(logit)).abs() < 1e-6);
+            }
+        }
         assert!(
-            max_diff < 1e-4,
-            "llama4 moe drifted from naive path: {max_diff}"
+            gates[0] + gates[1] > 1.0,
+            "the gates of a token are not normalised"
         );
-        assert_eq!(output.shape(), &[2, 5, config.hidden_size]);
+    }
+
+    /// The loss reaches the experts' weights and the layer's input through
+    /// the grouped gather matmuls and the fused gate-up slices: the same
+    /// gradients as the experts written as per-token weight lookups.
+    #[test]
+    #[serial]
+    fn test_llama4_moe_gradients_match_per_token_lookups() {
+        let config = small_moe_config(4, 2);
+        let (hidden, inter) = (config.hidden_size, config.intermediate_size);
+        let mut moe = Llama4MoE::new(&config).unwrap();
+        // 40 tokens x 2 experts = 80 pairs: the grouped dispatch.
+        let x = pmetal_runtime::compat::random::normal(&[40, hidden], Dtype::Float32);
+        let gate_up = moe.experts.gate_up_proj.clone();
+        let down = moe.experts.down_proj.clone();
+
+        let layer = |moe: &mut Llama4MoE, arrays: &[Array]| {
+            moe.experts.gate_up_proj = arrays[1].clone();
+            moe.experts.down_proj = arrays[2].clone();
+            moe.forward(&arrays[0]).unwrap().square().sum(None)
+        };
+        let (loss, grads) = pmetal_runtime::compat::nn::value_and_grad_explicit(
+            |arrays: &[Array]| layer(&mut moe, arrays),
+            &[x.clone(), gate_up.clone(), down.clone()],
+            &[],
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().expect("runtime error");
+        assert!(loss.item::<f32>().is_finite());
+
+        // The same layer from per-token lookups: `take_axis` picks each
+        // token's expert weights, and ordinary matmuls run them.
+        let router = moe.router.weight.clone();
+        let shared = (
+            moe.shared_expert.gate_proj.weight.clone(),
+            moe.shared_expert.up_proj.weight.clone(),
+            moe.shared_expert.down_proj.weight.clone(),
+        );
+        let reference = |arrays: &[Array]| {
+            let (x, gate_up, down) = (&arrays[0], &arrays[1], &arrays[2]);
+            let logits = x.matmul(&router.t());
+            let (inds, gates) = route_logits(&logits, 2, Dtype::Float32.as_i32());
+            let mut out = {
+                let g = nn::silu(&x.matmul(&shared.0.t())).multiply(&x.matmul(&shared.1.t()));
+                g.matmul(&shared.2.t())
+            };
+            for slot in 0..2 {
+                let ids = ops::slice_axis(&inds, 1, slot, slot + 1).reshape(&[-1]);
+                let gate = ops::slice_axis(&gates, 1, slot, slot + 1);
+                let scaled = x.multiply(&gate).reshape(&[-1, 1, hidden]);
+                let w = gate_up.take_axis(&ids, 0); // [N, hidden, 2 * inter]
+                let both = scaled.matmul(&w).squeeze_axes(&[1]);
+                let parts = ops::split_sections(&both, &[inter], -1);
+                let activated = nn::silu(&parts[0])
+                    .multiply(&parts[1])
+                    .reshape(&[-1, 1, inter]);
+                let d = down.take_axis(&ids, 0); // [N, inter, hidden]
+                out = out.add(&activated.matmul(&d).squeeze_axes(&[1]));
+            }
+            out.square().sum(None)
+        };
+        let (ref_loss, ref_grads) = pmetal_runtime::compat::nn::value_and_grad_explicit(
+            reference,
+            &[x, gate_up, down],
+            &[],
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().expect("runtime error");
+
+        let rel = |a: &Array, b: &Array| {
+            let (a, b) = (host(a), host(b));
+            let scale = b.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1e-6);
+            a.iter()
+                .zip(&b)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0, f64::max)
+                / scale
+        };
+        let loss_diff = f64::from((loss.item::<f32>() - ref_loss.item::<f32>()).abs())
+            / f64::from(ref_loss.item::<f32>().abs()).max(1.0);
+        assert!(loss_diff < 1e-4, "loss differs by {loss_diff:e}");
+        for (name, (g, r)) in ["input", "gate_up_proj", "down_proj"]
+            .iter()
+            .zip(grads.iter().zip(&ref_grads))
+        {
+            assert!(
+                host(g).iter().any(|v| *v != 0.0),
+                "the {name} gradient is zero"
+            );
+            let diff = rel(g, r);
+            assert!(
+                diff < 1e-3,
+                "{name} gradient differs by {diff:e} (relative)"
+            );
+        }
     }
 
     #[test]
@@ -1208,6 +1341,35 @@ mod tests {
         for value in output.as_slice::<f32>().to_vec() {
             assert!(value.is_finite(), "non-finite Llama4 MoE output");
         }
+    }
+
+    /// A config that ties the head to the embedding builds no head, and the
+    /// logits are the hidden states against the embedding table.
+    #[test]
+    #[serial]
+    fn test_llama4_tied_head_projects_through_the_embedding() {
+        let mut model = Llama4ForCausalLM::new(Llama4TextConfig {
+            hidden_size: 32,
+            intermediate_size: 24,
+            intermediate_size_mlp: 24,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            num_local_experts: 2,
+            vocab_size: 50,
+            tie_word_embeddings: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(model.lm_head.is_none());
+        let ids = Array::from_slice(&[1i32, 2, 3], &[1, 3]);
+        let hidden = model.model.forward(&ids, None, None).unwrap();
+        let want = hidden.matmul(&model.model.embed_tokens.weight.value.t());
+        let got = model.forward(&ids, None, None).unwrap();
+        let diff = got.subtract(&want).abs().max(None);
+        diff.eval();
+        assert!(diff.item::<f32>() < 1e-5);
     }
 
     #[test]

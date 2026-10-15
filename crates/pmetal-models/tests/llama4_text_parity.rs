@@ -435,6 +435,16 @@ fn native_llama4_reads_the_released_multimodal_layout() {
     check_native("native");
 }
 
+/// The same checkpoint through the shared path: the fused `experts` tensors,
+/// `router.weight`, `shared_expert.*` and the dense layer's MLP are its own
+/// parameters under `feed_forward`, and the vision tower and projector tensors
+/// are the only ones it leaves unread.
+#[test]
+#[serial]
+fn dynamic_llama4_reads_the_released_multimodal_layout() {
+    check_dynamic("native");
+}
+
 /// `attention_chunk_size` 6 on the 20-token prompt: the RoPE layers attend
 /// within chunks `0..6, 6..12, …` (transformers' chunked causal mask), the
 /// NoPE layer to the whole prefix. The prefill of 7 already crosses a chunk

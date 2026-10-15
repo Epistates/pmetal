@@ -118,8 +118,18 @@ pub fn config_value(config_content: &str) -> Result<serde_json::Value, Exception
 fn unwrap_text_config(config_content: &str) -> Result<std::borrow::Cow<'_, str>, Exception> {
     let config_json = config_value(config_content)?;
     if config_json.get("text_config").is_some() && config_json.get("hidden_size").is_none() {
-        let inner = serde_json::to_string(&config_json["text_config"])
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        // `tie_word_embeddings` of a wrapper sits beside `text_config`, and
+        // governs the text model's head when the text config says nothing: a
+        // model that read only the inner config would build an untied head the
+        // checkpoint has no tensor for.
+        let mut text = config_json["text_config"].clone();
+        if let (Some(obj), Some(tie)) =
+            (text.as_object_mut(), config_json.get("tie_word_embeddings"))
+        {
+            obj.entry("tie_word_embeddings")
+                .or_insert_with(|| tie.clone());
+        }
+        let inner = serde_json::to_string(&text).map_err(|e| Exception::custom(e.to_string()))?;
         Ok(std::borrow::Cow::Owned(inner))
     } else {
         Ok(std::borrow::Cow::Borrowed(config_content))
@@ -939,12 +949,20 @@ impl DynamicModel {
                 let mut model = Llama4ForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                let weights = crate::architectures::llama4::sanitize_checkpoint(weights)?;
+                let weights = crate::architectures::llama4::sanitize_checkpoint(weights);
                 let mut params = model.flatten_params_mut();
+                let mut unread = Vec::new();
                 for (key, value) in weights {
-                    if let Some(param) = params.get_mut(key.as_str()) {
-                        **param = value;
+                    match params.get_mut(key.as_str()) {
+                        Some(param) => **param = value,
+                        None => unread.push(key),
                     }
+                }
+                if !unread.is_empty() {
+                    unread.sort();
+                    return Err(Exception::custom(format!(
+                        "llama4: checkpoint tensors nothing reads: {unread:?}"
+                    )));
                 }
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Llama4(model))
@@ -1790,7 +1808,7 @@ impl DynamicModel {
     fn lm_head_layer(&self) -> Option<&nn::Linear> {
         match self {
             Self::Llama(m) => m.lm_head.as_ref(),
-            Self::Llama4(m) => Some(&m.lm_head),
+            Self::Llama4(m) => m.lm_head.as_ref(),
             Self::Qwen2(m) => m.lm_head.as_ref(),
             Self::Qwen3(m) => m.lm_head.as_ref(),
             Self::Qwen3MoE(m) => m.lm_head.as_ref(),
