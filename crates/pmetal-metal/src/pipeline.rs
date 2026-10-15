@@ -39,6 +39,21 @@ impl std::fmt::Display for FunctionConstant {
     }
 }
 
+impl FunctionConstant {
+    /// A string that names the constant's type and exact value.
+    ///
+    /// `UInt(1)` and `Float(1.0)` display alike but reach the shader as
+    /// different bytes, and floats are keyed by bit pattern so `0.0` and
+    /// `-0.0` stay apart.
+    fn key_fragment(&self) -> String {
+        match self {
+            FunctionConstant::Bool(v) => format!("bool:{v}"),
+            FunctionConstant::UInt(v) => format!("uint:{v}"),
+            FunctionConstant::Float(v) => format!("float:{:08x}", v.to_bits()),
+        }
+    }
+}
+
 /// Cache for compute pipeline states.
 ///
 /// Creating pipeline states is expensive as it involves shader compilation.
@@ -197,24 +212,16 @@ impl PipelineCache {
 
     /// Get or create a pipeline from the Metal 4 / MPP library.
     ///
-    /// Looks up the function in the Metal 4 library first. Returns an error if
-    /// the Metal 4 library is not loaded (caller should check `has_nax` first).
+    /// Looks up the function in the Metal 4 library. Returns an error if the
+    /// Metal 4 library is not loaded (caller should check `has_nax` first).
     pub fn get_or_create_metal4_pipeline(
         &mut self,
         device: &ProtocolObject<dyn MTLDevice>,
         function_name: &str,
         constants: &HashMap<u64, FunctionConstant>,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
-        // Create a unique key prefixed with "metal4:" to avoid collisions
-        let mut sorted_keys: Vec<_> = constants.keys().collect();
-        sorted_keys.sort();
-        let config_str = sorted_keys
-            .iter()
-            .map(|&k| format!("{}={}", k, constants[k]))
-            .collect::<Vec<_>>()
-            .join(",");
-        let cache_key = format!("metal4:{}:[{}]", function_name, config_str);
-
+        // Prefixed so a Metal 4 entry can never alias a Metal 3 one.
+        let cache_key = format!("metal4:{}", specialized_key(function_name, constants));
         if let Some(pipeline) = self.pipelines.get(&cache_key) {
             return Ok(pipeline.clone());
         }
@@ -222,64 +229,7 @@ impl PipelineCache {
         let library = self.metal4_library.as_ref().ok_or_else(|| {
             MetalError::LibraryLoad("Metal 4 / MPP library not loaded".to_string())
         })?;
-
-        let function_ns = NSString::from_str(function_name);
-
-        let constant_values = MTLFunctionConstantValues::new();
-        for (&index, constant) in constants {
-            unsafe {
-                match constant {
-                    FunctionConstant::Bool(value) => {
-                        let ptr = value as *const bool as *mut std::ffi::c_void;
-                        if let Some(non_null) = NonNull::new(ptr) {
-                            constant_values.setConstantValue_type_atIndex(
-                                non_null,
-                                MTLDataType::Bool,
-                                index as usize,
-                            );
-                        }
-                    }
-                    FunctionConstant::UInt(value) => {
-                        let ptr = value as *const u32 as *mut std::ffi::c_void;
-                        if let Some(non_null) = NonNull::new(ptr) {
-                            constant_values.setConstantValue_type_atIndex(
-                                non_null,
-                                MTLDataType::UInt,
-                                index as usize,
-                            );
-                        }
-                    }
-                    FunctionConstant::Float(value) => {
-                        let ptr = value as *const f32 as *mut std::ffi::c_void;
-                        if let Some(non_null) = NonNull::new(ptr) {
-                            constant_values.setConstantValue_type_atIndex(
-                                non_null,
-                                MTLDataType::Float,
-                                index as usize,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        let function = library
-            .newFunctionWithName_constantValues_error(&function_ns, &constant_values)
-            .map_err(|e| {
-                MetalError::FunctionNotFound(format!("{} (Metal 4): {}", function_name, e))
-            })?;
-
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| MetalError::PipelineCreation(e.to_string()))?;
-
-        debug!(
-            "Created Metal 4 / MPP pipeline for '{}' [{}] (max threads: {})",
-            function_name,
-            config_str,
-            pipeline.maxTotalThreadsPerThreadgroup()
-        );
-
+        let pipeline = specialized_pipeline(library, device, function_name, constants)?;
         self.pipelines.insert(cache_key, pipeline.clone());
         Ok(pipeline)
     }
@@ -312,16 +262,7 @@ impl PipelineCache {
         function_name: &str,
         constants: &HashMap<u64, FunctionConstant>,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
-        // Create a unique key for this configuration
-        let mut sorted_keys: Vec<_> = constants.keys().collect();
-        sorted_keys.sort();
-        let config_str = sorted_keys
-            .iter()
-            .map(|&k| format!("{}={}", k, constants[k]))
-            .collect::<Vec<_>>()
-            .join(",");
-        let cache_key = format!("{}:specialized:[{}]", function_name, config_str);
-
+        let cache_key = specialized_key(function_name, constants);
         if let Some(pipeline) = self.pipelines.get(&cache_key) {
             return Ok(pipeline.clone());
         }
@@ -330,66 +271,7 @@ impl PipelineCache {
             .library
             .as_ref()
             .ok_or_else(|| MetalError::LibraryLoad("Library not loaded".to_string()))?;
-
-        let function_ns = NSString::from_str(function_name);
-
-        // Create constant values object
-        let constant_values = MTLFunctionConstantValues::new();
-        for (&index, constant) in constants {
-            unsafe {
-                match constant {
-                    FunctionConstant::Bool(value) => {
-                        let ptr = value as *const bool as *mut std::ffi::c_void;
-                        if let Some(non_null) = NonNull::new(ptr) {
-                            constant_values.setConstantValue_type_atIndex(
-                                non_null,
-                                MTLDataType::Bool,
-                                index as usize,
-                            );
-                        }
-                    }
-                    FunctionConstant::UInt(value) => {
-                        let ptr = value as *const u32 as *mut std::ffi::c_void;
-                        if let Some(non_null) = NonNull::new(ptr) {
-                            constant_values.setConstantValue_type_atIndex(
-                                non_null,
-                                MTLDataType::UInt,
-                                index as usize,
-                            );
-                        }
-                    }
-                    FunctionConstant::Float(value) => {
-                        let ptr = value as *const f32 as *mut std::ffi::c_void;
-                        if let Some(non_null) = NonNull::new(ptr) {
-                            constant_values.setConstantValue_type_atIndex(
-                                non_null,
-                                MTLDataType::Float,
-                                index as usize,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Create specialized function
-        let function = library
-            .newFunctionWithName_constantValues_error(&function_ns, &constant_values)
-            .map_err(|e| {
-                MetalError::FunctionNotFound(format!("{} (specialized): {}", function_name, e))
-            })?;
-
-        let pipeline = device
-            .newComputePipelineStateWithFunction_error(&function)
-            .map_err(|e| MetalError::PipelineCreation(e.to_string()))?;
-
-        debug!(
-            "Created specialized pipeline for '{}' with config [{}] (max threads: {})",
-            function_name,
-            config_str,
-            pipeline.maxTotalThreadsPerThreadgroup()
-        );
-
+        let pipeline = specialized_pipeline(library, device, function_name, constants)?;
         self.pipelines.insert(cache_key, pipeline.clone());
         Ok(pipeline)
     }
@@ -431,6 +313,61 @@ impl PipelineCache {
     }
 }
 
+/// The cache key of a function specialized with `constants`.
+///
+/// Two requests share a key only if they agree on every constant's index, type
+/// and exact value.
+fn specialized_key(function_name: &str, constants: &HashMap<u64, FunctionConstant>) -> String {
+    let mut indices: Vec<u64> = constants.keys().copied().collect();
+    indices.sort_unstable();
+    let list = indices
+        .iter()
+        .map(|index| format!("{index}={}", constants[index].key_fragment()))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{function_name}:specialized:[{list}]")
+}
+
+/// Build `function_name` from `library` with `constants` and compile it.
+fn specialized_pipeline(
+    library: &ProtocolObject<dyn MTLLibrary>,
+    device: &ProtocolObject<dyn MTLDevice>,
+    function_name: &str,
+    constants: &HashMap<u64, FunctionConstant>,
+) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+    let function_ns = NSString::from_str(function_name);
+
+    let constant_values = MTLFunctionConstantValues::new();
+    for (&index, constant) in constants {
+        let (ptr, data_type) = match constant {
+            FunctionConstant::Bool(value) => (NonNull::from(value).cast(), MTLDataType::Bool),
+            FunctionConstant::UInt(value) => (NonNull::from(value).cast(), MTLDataType::UInt),
+            FunctionConstant::Float(value) => (NonNull::from(value).cast(), MTLDataType::Float),
+        };
+        // SAFETY: `ptr` points to a live `bool`, `u32` or `f32` matching
+        // `data_type`; Metal copies the value during the call.
+        unsafe {
+            constant_values.setConstantValue_type_atIndex(ptr, data_type, index as usize);
+        }
+    }
+
+    let function = library
+        .newFunctionWithName_constantValues_error(&function_ns, &constant_values)
+        .map_err(|e| MetalError::FunctionNotFound(format!("{function_name} (specialized): {e}")))?;
+
+    let pipeline = device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| MetalError::PipelineCreation(e.to_string()))?;
+
+    debug!(
+        "Created specialized pipeline for '{}' with {} constants (max threads: {})",
+        function_name,
+        constants.len(),
+        pipeline.maxTotalThreadsPerThreadgroup()
+    );
+    Ok(pipeline)
+}
+
 impl Default for PipelineCache {
     fn default() -> Self {
         Self::new()
@@ -443,5 +380,98 @@ impl std::fmt::Debug for PipelineCache {
             .field("num_pipelines", &self.pipelines.len())
             .field("library_loaded", &self.library.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::MetalContext;
+
+    fn constants(pairs: &[(u64, FunctionConstant)]) -> HashMap<u64, FunctionConstant> {
+        pairs.iter().copied().collect()
+    }
+
+    /// Constants that print the same but reach the shader differently must
+    /// not share a pipeline.
+    #[test]
+    fn keys_tell_constant_types_apart() {
+        let key = |c: FunctionConstant| specialized_key("f", &constants(&[(0, c)]));
+        assert_ne!(
+            key(FunctionConstant::UInt(1)),
+            key(FunctionConstant::Float(1.0))
+        );
+        assert_ne!(
+            key(FunctionConstant::UInt(1)),
+            key(FunctionConstant::Bool(true))
+        );
+        assert_ne!(
+            key(FunctionConstant::Float(0.0)),
+            key(FunctionConstant::Float(-0.0))
+        );
+        assert_ne!(
+            key(FunctionConstant::Float(0.1)),
+            key(FunctionConstant::Float(0.1 + f32::EPSILON))
+        );
+        assert_eq!(
+            key(FunctionConstant::UInt(7)),
+            key(FunctionConstant::UInt(7))
+        );
+    }
+
+    #[test]
+    fn keys_tell_indices_and_functions_apart_and_ignore_insertion_order() {
+        let a = constants(&[
+            (0, FunctionConstant::UInt(1)),
+            (1, FunctionConstant::UInt(2)),
+        ]);
+        let b = constants(&[
+            (1, FunctionConstant::UInt(2)),
+            (0, FunctionConstant::UInt(1)),
+        ]);
+        assert_eq!(specialized_key("f", &a), specialized_key("f", &b));
+        assert_ne!(specialized_key("f", &a), specialized_key("g", &a));
+        // The same values at other indices are another specialization.
+        let swapped = constants(&[
+            (0, FunctionConstant::UInt(2)),
+            (1, FunctionConstant::UInt(1)),
+        ]);
+        assert_ne!(specialized_key("f", &a), specialized_key("f", &swapped));
+    }
+
+    /// Two specializations of one kernel are two pipelines, and asking again
+    /// gets the cached one back.
+    #[test]
+    fn specialized_pipelines_are_cached_per_constant_set() {
+        let ctx = MetalContext::new().unwrap();
+        let mut cache = ctx.pipeline_cache_mut();
+        let before = cache.len();
+        let with = |threads: u32| constants(&[(0, FunctionConstant::UInt(threads))]);
+
+        let small = cache
+            .get_or_create_specialized_pipeline_typed(
+                ctx.device(),
+                "fused_linear_cross_entropy_forward",
+                &with(32),
+            )
+            .unwrap();
+        let large = cache
+            .get_or_create_specialized_pipeline_typed(
+                ctx.device(),
+                "fused_linear_cross_entropy_forward",
+                &with(256),
+            )
+            .unwrap();
+        let small_again = cache
+            .get_or_create_specialized_pipeline_typed(
+                ctx.device(),
+                "fused_linear_cross_entropy_forward",
+                &with(32),
+            )
+            .unwrap();
+
+        assert_eq!(cache.len(), before + 2);
+        assert!(!std::ptr::eq(&*small, &*large));
+        assert!(std::ptr::eq(&*small, &*small_again));
     }
 }
