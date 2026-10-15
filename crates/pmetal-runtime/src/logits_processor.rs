@@ -24,10 +24,13 @@ use crate::compat::Dtype;
 /// A sampler moves between the threads of a serving engine, so a processor
 /// is `Send`.
 pub trait LogitsProcessor: Send {
-    /// `[1, vocab]` f32 logits with this processor's constraint applied.
-    /// Called once per distribution the sampler builds, in the order of
-    /// the generation's tokens; a processor that tracks the generation
-    /// reads it from [`accept`](Self::accept).
+    /// f32 logits with this processor's constraint applied: `[1, vocab]`,
+    /// or `[rows, vocab]` when a block of positions is drawn at once (only
+    /// from a processor that does not [follow the
+    /// tokens](Self::needs_host_tokens)), the same constraint on every row.
+    /// Called once per distribution the sampler builds, in the order of the
+    /// generation's tokens; a processor that tracks the generation reads it
+    /// from [`accept`](Self::accept).
     fn process(&mut self, logits_2d: &InlineArray) -> InlineArray;
 
     /// The generation emitted `token`. Called, in order, for every token the

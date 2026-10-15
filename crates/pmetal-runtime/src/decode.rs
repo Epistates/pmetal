@@ -535,6 +535,68 @@ impl DecodeSampler {
         token
     }
 
+    /// Sample the tokens of a block of positions from `[B, vocab]` logits,
+    /// the rows in order, as `B` successive [`sample`](Self::sample) calls
+    /// would, each row's token recorded before the next row is drawn: `[B]`,
+    /// not read back. Row `j` takes draw `n + j` of the generation's seed,
+    /// so the tokens are the ones plain one-token-at-a-time decoding draws.
+    ///
+    /// This is the verification step of a speculative decoder that checks a
+    /// block of guesses with one forward: it asks what the model would have
+    /// drawn at every position, assuming each guess before it was right, and
+    /// keeps the guesses that agree. When some of the block is not kept, run
+    /// it on a [`fork`](Self::fork) and [`commit`](Self::commit) the kept
+    /// tokens to the sampler of the generation.
+    ///
+    /// Without penalties (and with no processor that follows the tokens) the
+    /// rows do not depend on each other, so the temperature and the filters
+    /// run once over the whole block; with them, the rows are drawn one
+    /// after the other.
+    pub fn sample_block(&mut self, logits: &InlineArray) -> InlineArray {
+        let rows = logits.dim(0);
+        let history = self.penalties.is_some() || self.needs_host_tokens();
+        if history || rows <= 1 {
+            let drawn: Vec<InlineArray> = (0..rows)
+                .map(|row| {
+                    let one = logits.slice(&[row, 0], &[row + 1, logits.dim(1)]);
+                    self.sample(&one).reshape(&[1])
+                })
+                .collect();
+            let refs: Vec<&InlineArray> = drawn.iter().collect();
+            return crate::compat::ops::concatenate_axis(&refs, 0);
+        }
+        let first = self.draws;
+        self.draws += rows as u64;
+        let mut constrained = logits.clone();
+        for processor in &mut self.processors {
+            constrained = processor.process(&constrained);
+        }
+        if self.params.temperature <= 0.0 {
+            return constrained.argmax(-1);
+        }
+        let log_probs = filtered_log_probs(&constrained, &self.params);
+        let drawn: Vec<InlineArray> = (0..rows)
+            .map(|row| {
+                let one = log_probs.slice(&[row, 0], &[row + 1, log_probs.dim(1)]);
+                one.categorical(-1, self.params.draw_key(first + row as u64).as_ref())
+                    .reshape(&[1])
+            })
+            .collect();
+        let refs: Vec<&InlineArray> = drawn.iter().collect();
+        crate::compat::ops::concatenate_axis(&refs, 0)
+    }
+
+    /// Take tokens another sampler drew into this one, as if this one had
+    /// drawn them: each recorded in order, and the draw counter moved past
+    /// them. A speculative decoder that verified a block on a
+    /// [`fork`](Self::fork) commits the tokens it kept.
+    pub fn commit(&mut self, tokens: &[u32]) {
+        for &token in tokens {
+            self.record_id(token);
+        }
+        self.draws += tokens.len() as u64;
+    }
+
     /// Take a generated token (a one-element array, read lazily unless a
     /// processor needs it on the host) into the history.
     pub fn record(&mut self, token: &InlineArray) {
@@ -1840,6 +1902,86 @@ mod tests {
         };
         assert!(only(&odd_fork, last % 2), "{odd_fork:?}");
         assert!(only(&from_original, 1 - last % 2), "original untouched");
+    }
+
+    /// Six positions' logits, one row each, spread enough that a draw at
+    /// temperature 1 lands on different tokens from row to row.
+    fn block_logits() -> InlineArray {
+        let rows: Vec<f32> = (0..6 * 7)
+            .map(|i| (((i * 37 + 11) % 13) as f32) * 0.31)
+            .collect();
+        InlineArray::from_f32_slice(&rows, &[6, 7])
+    }
+
+    /// A block drawn at once is the rows drawn one after the other, each
+    /// recorded before the next: the same tokens, whether the sampler has
+    /// history (the rows are drawn in turn) or not (the filters run once over
+    /// the block), and a fork that drew a block and committed a prefix of it
+    /// leaves the sampler where drawing that prefix would have.
+    #[test]
+    fn a_block_is_the_rows_drawn_in_turn_and_a_commit_is_a_prefix_of_it() {
+        let logits = block_logits();
+        let row = |i: i32| logits.slice(&[i, 0], &[i + 1, 7]);
+        let configs = [
+            SamplingParams::new(0.0),
+            SamplingParams {
+                seed: Some(21),
+                top_k: 4,
+                top_p: 0.9,
+                ..SamplingParams::new(1.0)
+            },
+            SamplingParams {
+                seed: Some(21),
+                min_p: 0.05,
+                logit_bias: vec![(2, 1.5), (5, -3.0)],
+                ..SamplingParams::new(0.8)
+            },
+            SamplingParams {
+                seed: Some(4),
+                repetition_penalty: 1.4,
+                presence_penalty: 0.5,
+                ..SamplingParams::new(1.0)
+            },
+        ];
+        for (c, params) in configs.iter().enumerate() {
+            let mut turn = DecodeSampler::new(params.clone(), &[1, 3]);
+            let want: Vec<u32> = (0..6).map(|i| turn.sample(&row(i)).item_u32()).collect();
+
+            let mut block = DecodeSampler::new(params.clone(), &[1, 3]);
+            let got = block.sample_block(&logits);
+            assert_eq!(got.shape(), &[6], "config {c}");
+            assert_eq!(
+                (0..6)
+                    .map(|i| got.slice(&[i], &[i + 1]).item_u32())
+                    .collect::<Vec<_>>(),
+                want,
+                "config {c}"
+            );
+            // Both go on to draw the same next token.
+            let next = |s: &mut DecodeSampler| s.sample(&row(0)).item_u32();
+            assert_eq!(
+                next(&mut block),
+                next(&mut turn),
+                "config {c}: after the block"
+            );
+
+            // A fork draws the block; only the first three tokens are kept.
+            let mut kept = DecodeSampler::new(params.clone(), &[1, 3]);
+            let mut fork = kept.fork();
+            let drawn = fork.sample_block(&logits);
+            drawn.eval();
+            kept.commit(&want[..3]);
+            let mut prefix = DecodeSampler::new(params.clone(), &[1, 3]);
+            for i in 0..3 {
+                prefix.sample(&row(i)).item_u32();
+            }
+            assert_eq!(
+                next(&mut kept),
+                next(&mut prefix),
+                "config {c}: after the commit"
+            );
+        }
+        crate::check_unobserved_error().expect("no bridge op failed");
     }
 
     /// `log_probs` is the distribution a draw comes from, normalized, and
