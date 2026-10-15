@@ -327,6 +327,12 @@ impl ClusterTopology {
     pub fn remove_node(&mut self, peer_id: &PeerId) {
         if let Some(idx) = self.peer_to_node.remove(peer_id) {
             self.graph.remove_node(idx);
+            // `Graph::remove_node` moves the last node into the freed slot, so
+            // that node's index changed. Without this its lookups would land
+            // on a stale or out-of-range index.
+            if let Some(moved) = self.graph.node_weight(idx) {
+                self.peer_to_node.insert(moved.peer_id, idx);
+            }
             debug!("Removed node {} from topology", peer_id);
         }
     }
@@ -616,6 +622,51 @@ mod tests {
         // Prev of first should be last
         let prev = topology.ring_prev(first).unwrap();
         assert_eq!(&prev.peer_id, last);
+    }
+
+    /// petgraph reuses a removed node's index for the node that was last.
+    /// Every other peer must still be found at its own entry afterwards, or
+    /// updates and lookups land on the wrong machine.
+    #[test]
+    fn removing_a_node_leaves_every_other_peer_addressable() {
+        let local = PeerId::random();
+        let mut topology = ClusterTopology::new(local, test_profile());
+        let peers: Vec<PeerId> = (0..5).map(|_| PeerId::random()).collect();
+        for (i, peer) in peers.iter().enumerate() {
+            let addr: SocketAddr = format!("10.0.0.{}:5000", i + 1).parse().unwrap();
+            topology.add_node(*peer, vec![(addr, InterfaceKind::Ethernet)]);
+        }
+        topology
+            .add_connection(peers[4], peers[3], ConnectionProfile::ethernet())
+            .unwrap();
+
+        // Remove from the front, so the last node is moved into its slot.
+        topology.remove_node(&peers[0]);
+        topology.remove_node(&peers[2]);
+
+        for (i, peer) in peers.iter().enumerate() {
+            let found = topology.get_node(peer);
+            if i == 0 || i == 2 {
+                assert!(found.is_none(), "peer {i} should be gone");
+            } else {
+                let node = found.unwrap_or_else(|| panic!("peer {i} lost"));
+                assert_eq!(node.peer_id, *peer, "peer {i} resolves to another node");
+                let want: SocketAddr = format!("10.0.0.{}:5000", i + 1).parse().unwrap();
+                assert_eq!(node.socket_addr(), Some(want));
+            }
+        }
+        // Writes go to the right node too.
+        let moved: SocketAddr = "10.9.9.9:5000".parse().unwrap();
+        topology.upsert_node_addr(&peers[4], moved, InterfaceKind::Thunderbolt);
+        assert_eq!(
+            topology.get_node(&peers[4]).unwrap().socket_addr(),
+            Some(moved)
+        );
+        assert_eq!(
+            topology.get_node(&peers[1]).unwrap().socket_addr(),
+            Some("10.0.0.2:5000".parse().unwrap())
+        );
+        assert_eq!(topology.node_count(), 4);
     }
 
     #[test]
