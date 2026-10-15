@@ -218,12 +218,7 @@ pub fn run_merge(config: &MergeConfig) -> Result<PathBuf> {
     if let Some(writer) = writer {
         writer.finalize()?;
     }
-    finish_output(
-        sidecar_dir.as_deref(),
-        &output_path,
-        target_dtype,
-        &edits,
-    )?;
+    finish_output(sidecar_dir.as_deref(), &output_path, target_dtype, &edits)?;
 
     info!("Merge complete! Output saved to: {:?}", output_path);
 
@@ -288,9 +283,9 @@ fn finish_output(
             crate::loader::copy_side_files(src, output_path)?;
             patch_output_config(output_path, target_dtype, edits)?;
         }
-        None => warn!(
-            "no sidecar source resolvable from config; output dir will lack tokenizer/config"
-        ),
+        None => {
+            warn!("no sidecar source resolvable from config; output dir will lack tokenizer/config")
+        }
     }
     Ok(())
 }
@@ -304,18 +299,14 @@ fn finish_output(
 /// another would produce a model that decodes garbage.
 fn sidecar_source(config: &MergeConfig) -> Result<Option<PathBuf>> {
     let first_model = || {
-        config
-            .models
-            .first()
-            .map(|m| m.model.clone())
-            .or_else(|| {
-                config
-                    .slices
-                    .as_ref()
-                    .and_then(|s| s.first())
-                    .and_then(|s| s.sources.first())
-                    .map(|s| s.model.clone())
-            })
+        config.models.first().map(|m| m.model.clone()).or_else(|| {
+            config
+                .slices
+                .as_ref()
+                .and_then(|s| s.first())
+                .and_then(|s| s.sources.first())
+                .map(|s| s.model.clone())
+        })
     };
     let chosen = match config.tokenizer.as_ref().map(|t| t.source.as_str()) {
         Some("union") => {
@@ -567,7 +558,12 @@ impl FlatMerge<'_> {
         };
 
         let vocab_rows = if is_vocab_tensor(name) {
-            align_vocab_rows(name, &mut tensors, &mut base_tensor, self.config.vocab_mismatch)?
+            align_vocab_rows(
+                name,
+                &mut tensors,
+                &mut base_tensor,
+                self.config.vocab_mismatch,
+            )?
         } else {
             None
         };
@@ -713,7 +709,11 @@ fn align_vocab_rows(
     if tensors.iter().chain(base.iter()).any(|t| t.ndim() < 2) {
         return Ok(None);
     }
-    let rows: Vec<i32> = tensors.iter().chain(base.iter()).map(|t| t.dim(0)).collect();
+    let rows: Vec<i32> = tensors
+        .iter()
+        .chain(base.iter())
+        .map(|t| t.dim(0))
+        .collect();
     let (min, max) = (
         *rows.iter().min().expect("at least one tensor"),
         *rows.iter().max().expect("at least one tensor"),
@@ -900,12 +900,13 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<PathBuf> {
                 let mut per_src_params: Vec<MergeParameters> =
                     Vec::with_capacity(src_loaders.len());
                 let mut dtypes: Vec<(String, safetensors::Dtype)> = Vec::new();
-                for (src_idx, (loader, src)) in
-                    src_loaders.iter().zip(&slice.sources).enumerate()
-                {
+                for (src_idx, (loader, src)) in src_loaders.iter().zip(&slice.sources).enumerate() {
                     let src_name = format!("{prefix}.{}.{suffix}", src.layer_range.0 + delta);
                     if loader.has_tensor(&src_name) {
-                        dtypes.push((format!("sources[{src_idx}]"), loader.tensor_dtype(&src_name)?));
+                        dtypes.push((
+                            format!("sources[{src_idx}]"),
+                            loader.tensor_dtype(&src_name)?,
+                        ));
                         tensors.push(loader.load_tensor(&src_name)?);
                         per_src_params.push(effective_params.merge_with(&src.parameters));
                     } else {
@@ -958,9 +959,8 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<PathBuf> {
     // Tensors outside the layer stack: the input side from the first slice's
     // first source, the output side from the last slice's.
     let first_source = SafetensorsLoader::new(Path::new(&slices[0].sources[0].model))?;
-    let last_source = SafetensorsLoader::new(Path::new(
-        &slices[slices.len() - 1].sources[0].model,
-    ))?;
+    let last_source =
+        SafetensorsLoader::new(Path::new(&slices[slices.len() - 1].sources[0].model))?;
     let mut non_layer: BTreeMap<String, &SafetensorsLoader> = BTreeMap::new();
     for (loader, want_output_side) in [(&first_source, false), (&last_source, true)] {
         let prefix = layer_container(loader);
@@ -1042,7 +1042,10 @@ fn layer_container(loader: &SafetensorsLoader) -> Option<String> {
     for name in loader.tensor_names() {
         if let Some(caps) = re.captures(&name) {
             if let Ok(index) = caps[2].parse() {
-                indices.entry(caps[1].to_string()).or_default().insert(index);
+                indices
+                    .entry(caps[1].to_string())
+                    .or_default()
+                    .insert(index);
             }
         }
     }
@@ -1291,10 +1294,19 @@ mod tests {
 
     #[test]
     fn layer_helpers_agree_on_the_naming_conventions() {
-        assert!(is_layer_tensor("model.layers", "model.layers.12.mlp.up_proj.weight"));
+        assert!(is_layer_tensor(
+            "model.layers",
+            "model.layers.12.mlp.up_proj.weight"
+        ));
         assert!(!is_layer_tensor("model.layers", "model.layers.norm.weight"));
-        assert!(!is_layer_tensor("model.layers", "model.embed_tokens.weight"));
-        assert_eq!(extract_layer_index("transformer.h.7.attn.c_attn.weight"), Some(7));
+        assert!(!is_layer_tensor(
+            "model.layers",
+            "model.embed_tokens.weight"
+        ));
+        assert_eq!(
+            extract_layer_index("transformer.h.7.attn.c_attn.weight"),
+            Some(7)
+        );
         assert_eq!(
             remap_layer_index("model.layers.5.self_attn.q_proj.weight", 2).as_deref(),
             Some("model.layers.2.self_attn.q_proj.weight")

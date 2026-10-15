@@ -114,10 +114,7 @@ pub fn multislerp(
         result.reshape(&shape)
     };
 
-    let norms: Vec<f32> = vectors
-        .iter()
-        .map(|v| dot(v, v).max(0.0).sqrt())
-        .collect();
+    let norms: Vec<f32> = vectors.iter().map(|v| dot(v, v).max(0.0).sqrt()).collect();
     let mean_norm: f32 = weights.iter().zip(&norms).map(|(w, n)| w * n).sum();
 
     // Directions exist only for non-zero vectors; their weights are
@@ -171,7 +168,11 @@ pub fn multislerp(
                 continue;
             }
             // Log_μ(u) = θ / sin θ · (u - cos θ · μ); θ / sin θ -> 1 as θ -> 0.
-            let stretch = if theta < 1e-4 { 1.0 } else { theta / theta.sin() };
+            let stretch = if theta < 1e-4 {
+                1.0
+            } else {
+                theta / theta.sin()
+            };
             let log = unit
                 .subtract(&mu.multiply(&Array::from_f32(cos)))
                 .multiply(&Array::from_f32(w * stretch));
@@ -444,7 +445,9 @@ mod tests {
         use super::super::SlerpMerge;
         let n = 64;
         let x: Vec<f32> = (0..n).map(|i| ((i * 7 + 3) as f32 * 0.37).sin()).collect();
-        let y: Vec<f32> = (0..n).map(|i| ((i * 5 + 1) as f32 * 0.91).cos() * 2.0).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| ((i * 5 + 1) as f32 * 0.91).cos() * 2.0)
+            .collect();
         let (a, b) = (arr(&x, &[n]), arr(&y, &[n]));
         let t = 0.3;
         let want = SlerpMerge::slerp(&a, &b, t).unwrap();

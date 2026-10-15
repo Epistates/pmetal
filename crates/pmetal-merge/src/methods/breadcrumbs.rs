@@ -132,7 +132,10 @@ mod tests {
     #[test]
     fn names_and_variants() {
         assert_eq!(BreadcrumbsMerge::new().name(), "breadcrumbs");
-        assert_eq!(BreadcrumbsMerge::new().with_ties().name(), "breadcrumbs_ties");
+        assert_eq!(
+            BreadcrumbsMerge::new().with_ties().name(),
+            "breadcrumbs_ties"
+        );
         assert!(BreadcrumbsMerge::new().requires_base_model());
     }
 

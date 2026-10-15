@@ -36,7 +36,11 @@ fn dare_without_a_configured_seed_is_reproducible() {
                 .unwrap(),
         )
     };
-    assert_eq!(run(), run(), "the same merge twice must give the same bytes");
+    assert_eq!(
+        run(),
+        run(),
+        "the same merge twice must give the same bytes"
+    );
 }
 
 #[test]

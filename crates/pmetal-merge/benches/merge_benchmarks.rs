@@ -7,8 +7,8 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use pmetal_merge::{
-    LinearMerge, MergeMethod, MergeParameters, SignElection, SlerpMerge, TiesMerge,
-    disjoint_merge, sparsify_by_magnitude,
+    LinearMerge, MergeMethod, MergeParameters, SignElection, SlerpMerge, TiesMerge, disjoint_merge,
+    sparsify_by_magnitude,
 };
 use pmetal_runtime::compat::Array;
 use std::hint::black_box;
@@ -60,18 +60,22 @@ fn bench_disjoint_merge(c: &mut Criterion) {
             .collect();
         let weights = vec![1.0; num_models];
         group.throughput(Throughput::Elements((size * num_models) as u64));
-        group.bench_with_input(BenchmarkId::new("models", num_models), &num_models, |b, _| {
-            b.iter(|| {
-                let out = disjoint_merge(
-                    black_box(&tensors),
-                    black_box(&weights),
-                    SignElection::Mass,
-                    true,
-                )
-                .unwrap();
-                force(&out)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("models", num_models),
+            &num_models,
+            |b, _| {
+                b.iter(|| {
+                    let out = disjoint_merge(
+                        black_box(&tensors),
+                        black_box(&weights),
+                        SignElection::Mass,
+                        true,
+                    )
+                    .unwrap();
+                    force(&out)
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -108,14 +112,18 @@ fn bench_linear_merge(c: &mut Criterion) {
             .collect();
         let params = params(num_models, 1.0);
         group.throughput(Throughput::Elements((size * num_models) as u64));
-        group.bench_with_input(BenchmarkId::new("models", num_models), &num_models, |b, _| {
-            b.iter(|| {
-                let out = method
-                    .merge(black_box(&tensors), None, &params, &global)
-                    .unwrap();
-                force(&out)
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("models", num_models),
+            &num_models,
+            |b, _| {
+                b.iter(|| {
+                    let out = method
+                        .merge(black_box(&tensors), None, &params, &global)
+                        .unwrap();
+                    force(&out)
+                });
+            },
+        );
     }
     group.finish();
 }

@@ -225,7 +225,11 @@ mod tests {
             if y != 0.0 {
                 kept += 1;
                 let p = 0.1 + 0.8 * r as f32 / (n as f32 - 1.0);
-                assert!((y - x / p).abs() <= 1e-3 * (x / p), "rank {r}: {y} vs {}", x / p);
+                assert!(
+                    (y - x / p).abs() <= 1e-3 * (x / p),
+                    "rank {r}: {y} vs {}",
+                    x / p
+                );
             }
         }
         // E[kept] = n * density = 500; binomial sigma is about 16.
@@ -269,7 +273,10 @@ mod tests {
             })
             .count();
         // P(exactly one) = 2p(1-p), about 0.48 here.
-        assert!(one_of_two > n / 3, "{one_of_two} positions kept by one model only");
+        assert!(
+            one_of_two > n / 3,
+            "{one_of_two} positions kept by one model only"
+        );
     }
 
     #[test]
@@ -277,7 +284,11 @@ mod tests {
         let models = [arr(&[1.0], &[1])];
         let params = [weight_density(1.0, 0.5)];
         let global = MergeParameters::default();
-        assert!(DellaMerge::new().merge(&models, None, &params, &global).is_err());
+        assert!(
+            DellaMerge::new()
+                .merge(&models, None, &params, &global)
+                .is_err()
+        );
         let base = arr(&[0.0], &[1]);
         assert!(
             DellaMerge::new()

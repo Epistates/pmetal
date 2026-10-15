@@ -92,7 +92,10 @@ fn della_keeps_large_magnitudes_more_often_than_small_ones() {
         out[range.clone()].iter().filter(|&&v| v != 0.0).count() as f32 / range.len() as f32
     };
     let (bottom, top) = (rate(0..n / 4), rate(3 * n / 4..n));
-    assert!(bottom < 0.35, "smallest quarter kept {bottom}, expected about 0.2");
+    assert!(
+        bottom < 0.35,
+        "smallest quarter kept {bottom}, expected about 0.2"
+    );
     assert!(top > 0.65, "largest quarter kept {top}, expected about 0.8");
 }
 

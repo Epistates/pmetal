@@ -32,7 +32,11 @@ fn layered_model(dir: &Path, base: f32) {
         vec![base * 100.0],
         vec![1],
     ));
-    tensors.push(("model.embed_tokens.weight".into(), vec![base * 10.0; 2], vec![2]));
+    tensors.push((
+        "model.embed_tokens.weight".into(),
+        vec![base * 10.0; 2],
+        vec![2],
+    ));
     tensors.push(("model.norm.weight".into(), vec![base * 20.0], vec![1]));
     tensors.push(("lm_head.weight".into(), vec![base * 30.0; 2], vec![2]));
     let specs: Vec<common::Spec<'_>> = tensors
@@ -49,19 +53,25 @@ fn layered_model(dir: &Path, base: f32) {
 }
 
 fn sliced_config(method: &str, yaml_tail: &str, a: &Path, b: &Path, out: &Path) -> MergeConfig {
-    MergeConfig::from_yaml(&format!(
-        "merge_method: {method}\ndtype: float32\noutput_path: {out}\n{yaml_tail}",
-        out = out.display()
+    MergeConfig::from_yaml(
+        &format!(
+            "merge_method: {method}\ndtype: float32\noutput_path: {out}\n{yaml_tail}",
+            out = out.display()
+        )
+        .replace("$A", &a.display().to_string())
+        .replace("$B", &b.display().to_string()),
     )
-    .replace("$A", &a.display().to_string())
-    .replace("$B", &b.display().to_string()))
     .unwrap()
 }
 
 #[test]
 fn sliced_merge_stacks_layers_and_takes_the_head_from_the_last_slice() {
     let work = tempfile::tempdir().unwrap();
-    let (a, b, out) = (work.path().join("a"), work.path().join("b"), work.path().join("out"));
+    let (a, b, out) = (
+        work.path().join("a"),
+        work.path().join("b"),
+        work.path().join("out"),
+    );
     layered_model(&a, 1.0); // layer l holds 1 + l
     layered_model(&b, 100.0); // layer l holds 100 + l
 
@@ -81,7 +91,11 @@ fn sliced_merge_stacks_layers_and_takes_the_head_from_the_last_slice() {
     assert_close(&up(2), &[100.0; 2], 0.0);
     assert_close(&up(3), &[101.0; 2], 0.0);
     // Norm and head follow the last slice; the embedding the first.
-    assert_close(&read_tensor(&out, "model.embed_tokens.weight"), &[10.0; 2], 0.0);
+    assert_close(
+        &read_tensor(&out, "model.embed_tokens.weight"),
+        &[10.0; 2],
+        0.0,
+    );
     assert_close(&read_tensor(&out, "model.norm.weight"), &[2000.0], 0.0);
     assert_close(&read_tensor(&out, "lm_head.weight"), &[3000.0; 2], 0.0);
     // The vision tower's own `layers.0` is not part of the language stack.
@@ -138,7 +152,11 @@ fn sliced_task_arithmetic_reads_the_base_at_the_source_layer() {
 #[test]
 fn a_slice_naming_layers_the_model_lacks_is_an_error() {
     let work = tempfile::tempdir().unwrap();
-    let (a, b, out) = (work.path().join("a"), work.path().join("b"), work.path().join("out"));
+    let (a, b, out) = (
+        work.path().join("a"),
+        work.path().join("b"),
+        work.path().join("out"),
+    );
     layered_model(&a, 1.0);
     layered_model(&b, 2.0);
     let config = sliced_config(
@@ -168,7 +186,11 @@ fn vocab_model(dir: &Path, rows: usize, fill: f32) {
 fn vocab_config(policy: &str, models: &[&Path], base: Option<&Path>, out: &Path) -> MergeConfig {
     let mut yaml = format!(
         "merge_method: {}\ndtype: float32\noutput_path: {}\nvocab_mismatch: {policy}\nmodels:\n",
-        if base.is_some() { "task_arithmetic" } else { "linear" },
+        if base.is_some() {
+            "task_arithmetic"
+        } else {
+            "linear"
+        },
         out.display()
     );
     for m in models {
@@ -197,7 +219,11 @@ fn differing_vocabulary_sizes_are_an_error_by_default() {
 #[test]
 fn truncate_cuts_to_the_smallest_vocabulary_and_updates_the_config() {
     let work = tempfile::tempdir().unwrap();
-    let (a, b, out) = (work.path().join("a"), work.path().join("b"), work.path().join("out"));
+    let (a, b, out) = (
+        work.path().join("a"),
+        work.path().join("b"),
+        work.path().join("out"),
+    );
     vocab_model(&a, 3, 0.0);
     vocab_model(&b, 5, 10.0);
     run_merge(&vocab_config("truncate", &[&a, &b], None, &out)).unwrap();
@@ -214,7 +240,11 @@ fn truncate_cuts_to_the_smallest_vocabulary_and_updates_the_config() {
 #[test]
 fn extend_grows_to_the_largest_vocabulary_filling_rows_from_the_model_that_has_them() {
     let work = tempfile::tempdir().unwrap();
-    let (a, b, out) = (work.path().join("a"), work.path().join("b"), work.path().join("out"));
+    let (a, b, out) = (
+        work.path().join("a"),
+        work.path().join("b"),
+        work.path().join("out"),
+    );
     vocab_model(&a, 3, 0.0);
     vocab_model(&b, 5, 10.0);
     run_merge(&vocab_config("extend", &[&a, &b], None, &out)).unwrap();
@@ -256,8 +286,17 @@ fn extend_with_a_base_pads_the_missing_rows_as_no_change() {
 #[test]
 fn a_tensor_missing_from_the_base_is_named_in_the_error() {
     let work = tempfile::tempdir().unwrap();
-    let (a, base, out) = (work.path().join("a"), work.path().join("base"), work.path().join("out"));
-    write_model_with_config(&a, &[("x", vec![1.0], vec![1]), ("y", vec![2.0], vec![1])], Dtype::F32, "{}");
+    let (a, base, out) = (
+        work.path().join("a"),
+        work.path().join("base"),
+        work.path().join("out"),
+    );
+    write_model_with_config(
+        &a,
+        &[("x", vec![1.0], vec![1]), ("y", vec![2.0], vec![1])],
+        Dtype::F32,
+        "{}",
+    );
     write_model_with_config(&base, &[("x", vec![0.0], vec![1])], Dtype::F32, "{}");
     let mut config = vocab_config("error", &[&a], Some(&base), &out);
     config.vocab_mismatch = VocabMismatch::Error;

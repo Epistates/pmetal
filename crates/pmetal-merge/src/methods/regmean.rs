@@ -129,7 +129,6 @@ impl RegMeanMerge {
         Ok(Some(out))
     }
 
-
     /// Closed-form merge for one linear layer.
     ///
     /// `weights[i]` is the layer's weight in checkpoint layout,
@@ -260,7 +259,11 @@ fn cholesky_solve_rows(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
     let mut y = vec![0.0_f64; n];
     for (b_row, x_row) in b.chunks_exact(n).zip(out.chunks_exact_mut(n)) {
         for i in 0..n {
-            let dot: f64 = l[i * n..i * n + i].iter().zip(&y[..i]).map(|(p, q)| p * q).sum();
+            let dot: f64 = l[i * n..i * n + i]
+                .iter()
+                .zip(&y[..i])
+                .map(|(p, q)| p * q)
+                .sum();
             y[i] = (b_row[i] - dot) / l[i * n + i];
         }
         for i in (0..n).rev() {
@@ -488,7 +491,10 @@ mod tests {
         assert_eq!(result.shape(), &[1, 2]);
         // (W1 G1 + W2 G2) = [6, 0] + [0, 6]; sum G = diag(4, 4); result [1.5, 1.5].
         let v = crate::test_util::values(&result);
-        assert!((v[0] - 1.5).abs() < 1e-4 && (v[1] - 1.5).abs() < 1e-4, "{v:?}");
+        assert!(
+            (v[0] - 1.5).abs() < 1e-4 && (v[1] - 1.5).abs() < 1e-4,
+            "{v:?}"
+        );
     }
 
     /// The solver recovers a known 3x3 system: rows x with x A = b.
@@ -547,7 +553,10 @@ mod tests {
         // sum G = [[3, 1], [1, 2]], inverse = [[2, -1], [-1, 3]] / 5;
         // x = [2, 2] inverse = [2/5, 4/5].
         let full = run(1.0);
-        assert!((full[0] - 0.4).abs() < 1e-5 && (full[1] - 0.8).abs() < 1e-5, "{full:?}");
+        assert!(
+            (full[0] - 0.4).abs() < 1e-5 && (full[1] - 0.8).abs() < 1e-5,
+            "{full:?}"
+        );
         // alpha = 0: G̃ are diagonal: G̃1 = diag(2, 1), G̃2 = I;
         // W1 G̃1 + W2 G̃2 = [2, 1], sum G̃ = diag(3, 2); x = [2/3, 1/2].
         let diagonal = run(0.0);

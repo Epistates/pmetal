@@ -275,7 +275,10 @@ mod tests {
         let base = arr(&vec![0.0; n], &[n as i32]);
         // Two models with the same all-ones task vector, no normalization:
         // independent masks give entries of 0, 2 (one survivor) and 4 (both).
-        let models = [arr(&vec![1.0; n], &[n as i32]), arr(&vec![1.0; n], &[n as i32])];
+        let models = [
+            arr(&vec![1.0; n], &[n as i32]),
+            arr(&vec![1.0; n], &[n as i32]),
+        ];
         let params = [weight_density(1.0, 0.5), weight_density(1.0, 0.5)];
         let global = MergeParameters {
             normalize: Some(false),
@@ -286,7 +289,11 @@ mod tests {
         assert!(out.iter().all(|&x| x == 0.0 || x == 2.0 || x == 4.0));
         // Independent Bernoulli(0.5): P(0) = P(4) = 0.25, P(2) = 0.5. Shared
         // masks would give P(2) = 0.
-        assert!((count(2.0) - 0.5).abs() < 0.05, "P(one survivor) {}", count(2.0));
+        assert!(
+            (count(2.0) - 0.5).abs() < 0.05,
+            "P(one survivor) {}",
+            count(2.0)
+        );
         assert!((count(0.0) - 0.25).abs() < 0.05, "P(none) {}", count(0.0));
 
         // The same model slot in two differently named tensors differs too.

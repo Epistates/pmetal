@@ -79,6 +79,30 @@ pub fn read_tensor(dir: &Path, name: &str) -> Vec<f32> {
     values
 }
 
+/// Read tensor `name` from the safetensors file `path` as f32 (F32, F16 or
+/// BF16 data).
+pub fn read_tensor_file(path: &Path, name: &str) -> Vec<f32> {
+    let bytes = std::fs::read(path).unwrap();
+    let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    let view = st.tensor(name).unwrap();
+    let data = view.data();
+    match view.dtype() {
+        Dtype::F32 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        Dtype::F16 => data
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        Dtype::BF16 => data
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        d => panic!("unsupported dtype {d:?}"),
+    }
+}
+
 /// Assert two slices agree element-wise within `tol`.
 pub fn assert_close(got: &[f32], want: &[f32], tol: f32) {
     assert_eq!(got.len(), want.len(), "length: {got:?} vs {want:?}");

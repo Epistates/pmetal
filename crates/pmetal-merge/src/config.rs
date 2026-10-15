@@ -946,7 +946,10 @@ parameters:
             ..Default::default()
         };
         let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("fisher_paths") && err.contains("2 models"), "{err}");
+        assert!(
+            err.contains("fisher_paths") && err.contains("2 models"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -968,11 +971,19 @@ parameters:
         };
 
         let both = sliced(vec![model("a")], vec![source("a", (0, 4))]);
-        assert!(both.validate().unwrap_err().to_string().contains("mutually exclusive"));
+        assert!(
+            both.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("mutually exclusive")
+        );
 
         let uneven = sliced(vec![], vec![source("a", (0, 4)), source("b", (0, 6))]);
         let err = uneven.validate().unwrap_err().to_string();
-        assert!(err.contains("covers 6 layers but sources[0] covers 4"), "{err}");
+        assert!(
+            err.contains("covers 6 layers but sources[0] covers 4"),
+            "{err}"
+        );
 
         sliced(vec![], vec![source("a", (0, 4)), source("b", (8, 12))])
             .validate()
@@ -987,7 +998,8 @@ parameters:
         .unwrap();
         assert_eq!(config.vocab_mismatch, VocabMismatch::Extend);
         assert_eq!(config.max_shard_size, Some(1000));
-        let default = MergeConfig::from_yaml("merge_method: linear\nmodels:\n  - model: a\n").unwrap();
+        let default =
+            MergeConfig::from_yaml("merge_method: linear\nmodels:\n  - model: a\n").unwrap();
         assert_eq!(default.vocab_mismatch, VocabMismatch::Error);
         assert_eq!(default.max_shard_size, None);
     }

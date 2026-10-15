@@ -104,10 +104,7 @@ fn indexed_shards(index_path: &Path) -> Result<Vec<String>> {
         .get("weight_map")
         .and_then(|m| m.as_object())
         .ok_or_else(|| {
-            MergeError::ModelLoad(format!(
-                "{} has no weight_map object",
-                index_path.display()
-            ))
+            MergeError::ModelLoad(format!("{} has no weight_map object", index_path.display()))
         })?;
     let shards: BTreeSet<String> = map
         .values()
@@ -723,7 +720,9 @@ impl TensorWriter {
         }
         if self.open.is_none() {
             let index = self.closed.len() + 1;
-            let data_path = self.output_path.join(format!(".merge-shard-{index:05}.data"));
+            let data_path = self
+                .output_path
+                .join(format!(".merge-shard-{index:05}.data"));
             let file = File::create(&data_path)?;
             self.open = Some(OpenShard {
                 data_path,
@@ -939,7 +938,12 @@ mod tests {
             .collect();
         let views: HashMap<&str, TensorView<'_>> = bytes
             .iter()
-            .map(|(n, b, s)| (n.as_str(), TensorView::new(Dtype::F32, s.clone(), b).unwrap()))
+            .map(|(n, b, s)| {
+                (
+                    n.as_str(),
+                    TensorView::new(Dtype::F32, s.clone(), b).unwrap(),
+                )
+            })
             .collect();
         std::fs::write(path, safetensors::serialize(views, None).unwrap()).unwrap();
     }
@@ -972,7 +976,10 @@ mod tests {
     #[test]
     fn loads_tensors_whose_data_is_not_aligned() {
         let dir = tempfile::tempdir().unwrap();
-        let data: Vec<u8> = [1.5_f32, -2.0, 3.25].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let data: Vec<u8> = [1.5_f32, -2.0, 3.25]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         let mut header = format!(
             r#"{{"w":{{"dtype":"F32","shape":[3],"data_offsets":[0,{}]}}}}"#,
             data.len()
@@ -988,7 +995,11 @@ mod tests {
         std::fs::write(dir.path().join("model.safetensors"), &file).unwrap();
 
         let loader = SafetensorsLoader::new(dir.path()).unwrap();
-        assert_close(&values(&loader.load_tensor("w").unwrap()), &[1.5, -2.0, 3.25], 0.0);
+        assert_close(
+            &values(&loader.load_tensor("w").unwrap()),
+            &[1.5, -2.0, 3.25],
+            0.0,
+        );
     }
 
     #[test]
@@ -997,7 +1008,10 @@ mod tests {
         write_safetensors(&dir.path().join("a.safetensors"), &[("x", &[1.0], &[1])]);
         write_safetensors(&dir.path().join("b.safetensors"), &[("y", &[2.0], &[1])]);
         // Same tensor name as in `a`: a stray file must not collide with the index.
-        write_safetensors(&dir.path().join("stray.safetensors"), &[("x", &[9.0], &[1])]);
+        write_safetensors(
+            &dir.path().join("stray.safetensors"),
+            &[("x", &[9.0], &[1])],
+        );
         std::fs::write(
             dir.path().join("model.safetensors.index.json"),
             r#"{"metadata": {}, "weight_map": {"x": "a.safetensors", "y": "b.safetensors"}}"#,
@@ -1073,7 +1087,10 @@ mod tests {
         // transformers refuses an archive without `format` metadata.
         let file = MappedFile::open(&dir.path().join("model.safetensors")).unwrap();
         assert_eq!(
-            file.metadata.as_ref().and_then(|m| m.get("format")).map(String::as_str),
+            file.metadata
+                .as_ref()
+                .and_then(|m| m.get("format"))
+                .map(String::as_str),
             Some("pt")
         );
     }
@@ -1087,7 +1104,9 @@ mod tests {
             .with_max_shard_size(16);
         for i in 0..5 {
             let name = format!("t{i}");
-            writer.write_tensor(&name, &arr(&[i as f32, 0.5], &[2])).unwrap();
+            writer
+                .write_tensor(&name, &arr(&[i as f32, 0.5], &[2]))
+                .unwrap();
         }
         writer.finalize().unwrap();
 
@@ -1105,14 +1124,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(index["metadata"]["total_size"], 40);
-        assert_eq!(index["weight_map"]["t0"], "model-00001-of-00003.safetensors");
-        assert_eq!(index["weight_map"]["t3"], "model-00002-of-00003.safetensors");
-        assert_eq!(index["weight_map"]["t4"], "model-00003-of-00003.safetensors");
+        assert_eq!(
+            index["weight_map"]["t0"],
+            "model-00001-of-00003.safetensors"
+        );
+        assert_eq!(
+            index["weight_map"]["t3"],
+            "model-00002-of-00003.safetensors"
+        );
+        assert_eq!(
+            index["weight_map"]["t4"],
+            "model-00003-of-00003.safetensors"
+        );
 
         // A loader follows the index, and every tensor reads back.
         let loader = SafetensorsLoader::new(dir.path()).unwrap();
         assert_eq!(loader.tensor_names().len(), 5);
-        assert_close(&values(&loader.load_tensor("t4").unwrap()), &[4.0, 0.5], 0.0);
+        assert_close(
+            &values(&loader.load_tensor("t4").unwrap()),
+            &[4.0, 0.5],
+            0.0,
+        );
     }
 
     #[test]
@@ -1121,7 +1153,9 @@ mod tests {
         let mut writer = TensorWriter::with_dtype(dir.path(), Dtype::F32)
             .unwrap()
             .with_max_shard_size(4);
-        writer.write_tensor("big", &arr(&[1.0, 2.0, 3.0], &[3])).unwrap();
+        writer
+            .write_tensor("big", &arr(&[1.0, 2.0, 3.0], &[3]))
+            .unwrap();
         writer.write_tensor("small", &arr(&[4.0], &[1])).unwrap();
         writer.finalize().unwrap();
         assert_eq!(list(dir.path()).len(), 3); // two shards and the index
@@ -1143,7 +1177,10 @@ mod tests {
     #[test]
     fn finalize_replaces_weights_from_an_earlier_run() {
         let dir = tempfile::tempdir().unwrap();
-        for old in ["model-00001-of-00002.safetensors", "model.safetensors.index.json"] {
+        for old in [
+            "model-00001-of-00002.safetensors",
+            "model.safetensors.index.json",
+        ] {
             std::fs::write(dir.path().join(old), b"stale").unwrap();
         }
         std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
@@ -1176,7 +1213,9 @@ mod tests {
         assert!(err.to_string().contains("overflow"), "{err}");
         // bfloat16 has the range for it.
         let mut writer = TensorWriter::with_dtype(dir.path(), Dtype::BF16).unwrap();
-        writer.write_tensor("big", &arr(&[1.0, 70000.0], &[2])).unwrap();
+        writer
+            .write_tensor("big", &arr(&[1.0, 70000.0], &[2]))
+            .unwrap();
     }
 
     #[test]

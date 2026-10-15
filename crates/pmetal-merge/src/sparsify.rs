@@ -51,8 +51,9 @@ fn zeros_like_f32(tensor: &Array) -> Array {
 
 /// The `keep`-th largest value of `abs_flat` (`1 <= keep <= len`).
 fn kth_largest(abs_flat: &Array, keep: usize) -> Result<f32> {
-    let k = i32::try_from(keep)
-        .map_err(|_| MergeError::InvalidConfig(format!("tensor too large to select from: {keep}")))?;
+    let k = i32::try_from(keep).map_err(|_| {
+        MergeError::InvalidConfig(format!("tensor too large to select from: {keep}"))
+    })?;
     Ok(abs_flat.topk(k, 0).min(None).item_f32())
 }
 
@@ -313,7 +314,11 @@ mod tests {
         for (i, (&x, &y)) in row.iter().zip(&out).enumerate() {
             if y != 0.0 {
                 let p = 0.1 + 0.8 * (i as f32) / (n as f32 - 1.0);
-                assert!((y - x / p).abs() <= 1e-3 * (x / p), "entry {i}: {y} vs {}", x / p);
+                assert!(
+                    (y - x / p).abs() <= 1e-3 * (x / p),
+                    "entry {i}: {y} vs {}",
+                    x / p
+                );
             }
         }
         // The lower quarter is kept about 0.2 of the time, the upper about 0.8.

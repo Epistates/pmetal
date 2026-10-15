@@ -88,11 +88,6 @@ pub trait MergeMethod: Send + Sync {
         global_params: &MergeParameters,
     ) -> Result<Array> {
         let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
-        self.merge(
-            tensors,
-            base_tensor,
-            &params,
-            &global_params.resolved(name),
-        )
+        self.merge(tensors, base_tensor, &params, &global_params.resolved(name))
     }
 }

@@ -330,7 +330,12 @@ mod tests {
             normalize: Some(false),
             ..Default::default()
         };
-        let out = merge_with(&[0.0, 0.0], &[&[1.0, 1.0], &[1.0, -3.0]], params, unnormalized);
+        let out = merge_with(
+            &[0.0, 0.0],
+            &[&[1.0, 1.0], &[1.0, -3.0]],
+            params,
+            unnormalized,
+        );
         // The same election, summed: p0 = 2*1 + 1*1 = 3, p1 = -3.
         assert_close(&out, &[3.0, -3.0], 1e-6);
     }

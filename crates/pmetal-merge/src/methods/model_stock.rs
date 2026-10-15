@@ -104,8 +104,7 @@ impl MergeMethod for ModelStockMerge {
             }),
             [only] => Ok(only.clone()),
             _ => {
-                let task_vectors: Vec<Array> =
-                    tensors.iter().map(|w| w.subtract(base)).collect();
+                let task_vectors: Vec<Array> = tensors.iter().map(|w| w.subtract(base)).collect();
                 let t = Self::interpolation_ratio(
                     tensors.len(),
                     Self::mean_pairwise_cosine(&task_vectors),
@@ -190,11 +189,7 @@ mod tests {
             &[0.0, 0.0, 0.0],
             &[&[1.0, 0.0, 0.0], &[1.0, 1.0, 0.0], &[1.0, 0.0, 1.0]],
         );
-        assert_close(
-            &out,
-            &[t as f32, (t / 3.0) as f32, (t / 3.0) as f32],
-            1e-5,
-        );
+        assert_close(&out, &[t as f32, (t / 3.0) as f32, (t / 3.0) as f32], 1e-5);
     }
 
     #[test]
@@ -203,7 +198,11 @@ mod tests {
         let c = std::f64::consts::FRAC_1_SQRT_2;
         let t = 2.0 * c / (1.0 + c);
         let out = merge(&[10.0, 10.0], &[&[12.0, 10.0], &[11.0, 11.0]]);
-        assert_close(&out, &[10.0 + (t * 1.5) as f32, 10.0 + (t * 0.5) as f32], 1e-4);
+        assert_close(
+            &out,
+            &[10.0 + (t * 1.5) as f32, 10.0 + (t * 0.5) as f32],
+            1e-4,
+        );
     }
 
     #[test]
@@ -214,7 +213,11 @@ mod tests {
         let base = arr(&[0.0], &[1]);
         let none: [Array; 0] = [];
         let global = MergeParameters::default();
-        assert!(ModelStockMerge::new().merge(&none, Some(&base), &[], &global).is_err());
+        assert!(
+            ModelStockMerge::new()
+                .merge(&none, Some(&base), &[], &global)
+                .is_err()
+        );
         assert!(
             ModelStockMerge::new()
                 .merge(&[arr(&[1.0], &[1])], None, &[], &global)

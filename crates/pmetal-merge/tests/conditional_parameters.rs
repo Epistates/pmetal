@@ -15,12 +15,18 @@ fn two_models(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf)
     let b = dir.join("b");
     write_model(
         &a,
-        &[(ATTN, vec![2.0, 4.0], vec![2]), (MLP, vec![2.0, 4.0], vec![2])],
+        &[
+            (ATTN, vec![2.0, 4.0], vec![2]),
+            (MLP, vec![2.0, 4.0], vec![2]),
+        ],
         Dtype::F32,
     );
     write_model(
         &b,
-        &[(ATTN, vec![4.0, 8.0], vec![2]), (MLP, vec![4.0, 8.0], vec![2])],
+        &[
+            (ATTN, vec![4.0, 8.0], vec![2]),
+            (MLP, vec![4.0, 8.0], vec![2]),
+        ],
         Dtype::F32,
     );
     (a, b)
