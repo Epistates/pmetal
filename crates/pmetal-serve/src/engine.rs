@@ -2698,9 +2698,8 @@ mod tests {
 
     #[test]
     fn continuous_cache_config_honors_cache_mode_override() {
-        let override_mode = CacheMode::Quantized {
-            bits: 4,
-            group_size: 8,
+        let override_mode = CacheMode::TurboQuant {
+            config: pmetal_mlx::kv_cache::TurboQuantConfig::uniform(4, 4),
         };
         let engine = InferenceEngine::new_with_backend(
             || {

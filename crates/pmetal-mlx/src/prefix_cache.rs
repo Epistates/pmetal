@@ -2,8 +2,8 @@
 //! prefilled.
 //!
 //! Chat clients resend the whole conversation every turn, an RL rollout
-//! samples many completions of one prompt, and agents branch from a shared
-//! context. In each case the leading tokens of a request repeat verbatim
+//! samples many completions of one prompt, and tool-calling loops branch from
+//! a shared context. In each case the leading tokens of a request repeat
 //! tokens some earlier request already ran through the model; running them
 //! again discards work.
 //!

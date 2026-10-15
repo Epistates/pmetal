@@ -324,19 +324,28 @@ impl DenseLayer {
         if s <= 1 {
             return None;
         }
-        let keys = self.fetched_positions(Some(w), s);
-        let first_query = self.seen - s;
-        let mut data = Vec::with_capacity(s * keys.len());
-        for q in first_query..self.seen {
-            for &k in &keys {
-                let visible = k <= q && (k < w.sinks || q - k < w.recent);
-                data.push(if visible { 0.0f32 } else { f32::NEG_INFINITY });
-            }
-        }
-        Some(Array::from_f32_slice(
-            &data,
-            &[1, 1, s as i32, keys.len() as i32],
-        ))
+        // The positions are a few hundred integers; the mask itself, which
+        // is `s` by `keys` wide, is built on the device.
+        let keys: Vec<i32> = self
+            .fetched_positions(Some(w), s)
+            .into_iter()
+            .map(|p| p as i32)
+            .collect();
+        let n = keys.len() as i32;
+        let key = Array::from_i32_slice_shaped(&keys, &[1, n]);
+        let query =
+            ops::arange_range((self.seen - s) as i32, self.seen as i32).reshape(&[s as i32, 1]);
+        let behind = ops::subtract(&query, &key); // query - key
+        let causal = ops::greater_equal(&behind, &Array::from_i32(0));
+        let in_window = ops::less(&behind, &Array::from_i32(w.recent as i32));
+        let is_sink = ops::less(&key, &Array::from_i32(w.sinks as i32));
+        let visible = ops::logical_and(&causal, &ops::logical_or(&in_window, &is_sink));
+        let mask = ops::r#where(
+            &visible,
+            &Array::from_f32(0.0),
+            &Array::from_f32(f32::NEG_INFINITY),
+        );
+        Some(mask.reshape(&[1, 1, s as i32, n]))
     }
 
     /// The most tokens [`Self::rollback`] can drop and still serve the next
