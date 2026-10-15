@@ -1150,6 +1150,58 @@ fn windowed_footprint_is_the_window_not_the_context() {
 }
 
 // ---------------------------------------------------------------------------
+// Batches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_batch_in_one_cache_holds_what_its_rows_hold_alone() {
+    // Two sequences in one cache (batch 2) hold exactly what each holds in a
+    // cache of its own: dense, windowed with sinks, affine-quantized and
+    // TurboQuant.
+    let configs = [
+        ("dense", cache_config()),
+        ("rotating", cache_config().with_rotating(12, 3)),
+        ("8-bit", quantized_config(8)),
+        ("turboquant", turbo(TurboQuantConfig::uniform(8, 8))),
+    ];
+    let mut rng = Rng::new(97);
+    let chunks = [20usize, 1, 1, 6];
+    for (name, config) in configs {
+        let mut together = KVCache::new(config.clone());
+        let mut alone = [KVCache::new(config.clone()), KVCache::new(config)];
+        for &s in &chunks {
+            let k = array(&rng.normals(2 * HKV * s * DIM, 1.0), &[2, HKV, s, DIM]);
+            let v = array(&rng.normals(2 * HKV * s * DIM, 1.0), &[2, HKV, s, DIM]);
+            let (batch_k, batch_v) = together.update_and_fetch(0, &k, &v).unwrap();
+            for (row, cache) in alone.iter_mut().enumerate() {
+                let take = |a: &Array| {
+                    a.slice(
+                        &[row as i32, 0, 0, 0],
+                        &[row as i32 + 1, HKV as i32, s as i32, DIM as i32],
+                    )
+                };
+                let (row_k, row_v) = cache.update_and_fetch(0, &take(&k), &take(&v)).unwrap();
+                let pick = |a: &Array| {
+                    a.slice(
+                        &[row as i32, 0, 0, 0],
+                        &[row as i32 + 1, HKV as i32, a.dim(2), DIM as i32],
+                    )
+                };
+                assert_eq!(batch_k.dim(2), row_k.dim(2), "{name}");
+                assert!(
+                    crate::test_utils::max_abs_diff(&pick(&batch_k), &row_k) < 1e-5,
+                    "{name}: keys of row {row}"
+                );
+                assert!(
+                    crate::test_utils::max_abs_diff(&pick(&batch_v), &row_v) < 1e-5,
+                    "{name}: values of row {row}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fused batch cache: rows of different lengths
 // ---------------------------------------------------------------------------
 
