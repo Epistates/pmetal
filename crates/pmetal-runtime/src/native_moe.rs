@@ -134,11 +134,140 @@ pub fn switch_glu_grouped(
     activation: impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
     grouped: bool,
 ) -> InlineArray {
+    switch_glu_projected(
+        x_flat,
+        &GateUp::Split { gate, up },
+        down,
+        inds,
+        scores,
+        activation,
+        grouped,
+    )
+}
+
+/// How a routed layer holds its gate and up projections.
+///
+/// Fused is the layout transformers' `Llama4TextExperts` ships: one
+/// `[E, hidden, 2 * intermediate]` weight, gate then up along the last axis
+/// (`gate_up.chunk(2, dim=-1)`). One gather matmul produces both and the
+/// halves are slices of its output, where splitting the weight would copy the
+/// experts on every forward.
+#[derive(Clone, Copy)]
+pub enum GateUp<'a> {
+    /// Separate `[E, hidden, intermediate]` projections.
+    Split {
+        /// The gate projection.
+        gate: &'a LayerWeight,
+        /// The up projection.
+        up: &'a LayerWeight,
+    },
+    /// One `[E, hidden, 2 * intermediate]` projection, gate first.
+    Fused(&'a LayerWeight),
+}
+
+impl GateUp<'_> {
+    /// `(gate(x), up(x))` for `rows` through the experts `ids` pick.
+    fn project(
+        &self,
+        rows: &InlineArray,
+        ids: &InlineArray,
+        sorted: bool,
+    ) -> (InlineArray, InlineArray) {
+        match self {
+            Self::Split { gate, up } => (
+                gate.gather_mm_from(rows, None, Some(ids), sorted),
+                up.gather_mm_from(rows, None, Some(ids), sorted),
+            ),
+            Self::Fused(gate_up) => {
+                let both = gate_up.gather_mm_from(rows, None, Some(ids), sorted);
+                let dims: Vec<i32> = (0..both.ndim()).map(|i| both.dim(i)).collect();
+                let last = dims.len() - 1;
+                let half = dims[last] / 2;
+                let (mut start, mut stop) = (vec![0; dims.len()], dims.clone());
+                stop[last] = half;
+                let gate = both.slice(&start, &stop);
+                start[last] = half;
+                stop[last] = dims[last];
+                (gate, both.slice(&start, &stop))
+            }
+        }
+    }
+}
+
+/// [`switch_glu_with`] over a fused gate-up projection: `gate_up` is
+/// `[E, hidden, 2 * intermediate]`, see [`GateUp::Fused`].
+pub fn switch_glu_fused(
+    x_flat: &InlineArray,
+    gate_up: &LayerWeight,
+    down: &LayerWeight,
+    inds: &InlineArray,
+    scores: &InlineArray,
+    activation: impl Fn(&InlineArray, &InlineArray) -> InlineArray,
+) -> InlineArray {
+    let grouped = x_flat.dim(0) * inds.dim(1) >= GROUPING_THRESHOLD;
+    switch_glu_projected(
+        x_flat,
+        &GateUp::Fused(gate_up),
+        down,
+        inds,
+        scores,
+        |gate, up, _| activation(gate, up),
+        grouped,
+    )
+}
+
+/// Llama 4's routed experts: the router's gate scales an expert's *input*,
+/// not its output (`experts(x * gates)`), and the gated outputs are summed
+/// unnormalised. The expert is not linear, so the two are different models.
+///
+/// `inds` and `gates` are `[S, top_k]`. Each slot is its own dispatch, with
+/// the gate already applied to its rows.
+pub fn switch_glu_gated_input(
+    x_flat: &InlineArray,
+    gate_up: GateUp<'_>,
+    down: &LayerWeight,
+    inds: &InlineArray,
+    gates: &InlineArray,
+    activation: impl Fn(&InlineArray, &InlineArray) -> InlineArray,
+) -> InlineArray {
+    let (rows, top_k) = (x_flat.dim(0), inds.dim(1));
+    let ones = InlineArray::ones(&[rows, 1], x_flat.dtype_raw());
+    let mut routed: Option<InlineArray> = None;
+    for j in 0..top_k {
+        let slot = inds.slice(&[0, j], &[rows, j + 1]);
+        let gated = x_flat.multiply(&gates.slice(&[0, j], &[rows, j + 1]));
+        let grouped = rows >= GROUPING_THRESHOLD;
+        let y = switch_glu_projected(
+            &gated,
+            &gate_up,
+            down,
+            &slot,
+            &ones,
+            |gate, up, _| activation(gate, up),
+            grouped,
+        );
+        routed = Some(match routed {
+            Some(sum) => sum.add(&y),
+            None => y,
+        });
+    }
+    routed.expect("top_k is at least 1")
+}
+
+fn switch_glu_projected(
+    x_flat: &InlineArray,
+    gate_up: &GateUp<'_>,
+    down: &LayerWeight,
+    inds: &InlineArray,
+    scores: &InlineArray,
+    activation: impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
+    grouped: bool,
+) -> InlineArray {
     let (s, top_k) = (x_flat.dim(0), inds.dim(1));
     let per_expert = if grouped {
-        per_expert_grouped(x_flat, gate, up, down, inds, &activation)
+        per_expert_grouped(x_flat, gate_up, down, inds, &activation)
     } else {
-        per_expert_in_router_order(x_flat, gate, up, down, inds, &activation)
+        per_expert_in_router_order(x_flat, gate_up, down, inds, &activation)
     };
 
     per_expert
@@ -150,16 +279,14 @@ pub fn switch_glu_grouped(
 /// `[S, top_k, hidden]`.
 fn per_expert_in_router_order(
     x_flat: &InlineArray,
-    gate: &LayerWeight,
-    up: &LayerWeight,
+    gate_up: &GateUp<'_>,
     down: &LayerWeight,
     inds: &InlineArray,
     activation: &impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
 ) -> InlineArray {
     // [S, 1, 1, hidden] -> [S, top_k, 1, intermediate]
     let switch_in = switch_glu_input(x_flat);
-    let gated = gate.gather_mm_from(&switch_in, None, Some(inds), false);
-    let upped = up.gather_mm_from(&switch_in, None, Some(inds), false);
+    let (gated, upped) = gate_up.project(&switch_in, inds, false);
     let activated = activation(&gated, &upped, inds);
 
     // [S, top_k, 1, hidden] -> [S, top_k, hidden]
@@ -171,8 +298,7 @@ fn per_expert_in_router_order(
 /// expert, so the gather matmuls see each expert's rows as one contiguous run.
 fn per_expert_grouped(
     x_flat: &InlineArray,
-    gate: &LayerWeight,
-    up: &LayerWeight,
+    gate_up: &GateUp<'_>,
     down: &LayerWeight,
     inds: &InlineArray,
     activation: &impl Fn(&InlineArray, &InlineArray, &InlineArray) -> InlineArray,
@@ -197,8 +323,7 @@ fn per_expert_grouped(
 
     // [S * top_k, 1, hidden] -> [S * top_k, 1, intermediate] -> [S * top_k, 1, hidden]
     let rows = x_flat.take_axis(&sorted_tokens, 0).expand_dims(1);
-    let gated = gate.gather_mm_from(&rows, None, Some(&sorted_experts), true);
-    let upped = up.gather_mm_from(&rows, None, Some(&sorted_experts), true);
+    let (gated, upped) = gate_up.project(&rows, &sorted_experts, true);
     let activated = activation(&gated, &upped, &sorted_experts);
     let down = down.gather_mm_from(&activated, None, Some(&sorted_experts), true);
 
