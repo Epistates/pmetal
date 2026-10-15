@@ -17,6 +17,7 @@
 //! that need tokio/tauri live in their respective surface crates and are wired
 //! up through the trait below.
 
+use crate::types::lenient_f64;
 use crate::{EvalMetrics, StepMetrics};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
@@ -188,8 +189,10 @@ pub enum MetricPayload {
         /// Number of generated tokens.
         tokens: u32,
         /// Tokens per second over the full run.
+        #[serde(deserialize_with = "lenient_f64::deserialize")]
         tok_per_sec: f64,
         /// Time-to-first-token in milliseconds.
+        #[serde(deserialize_with = "lenient_f64::deserialize")]
         ttft_ms: f64,
     },
 }
@@ -202,10 +205,13 @@ pub struct BenchTrialMetrics {
     /// Total tokens processed in the trial.
     pub tokens: u64,
     /// Throughput in tokens/sec.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub tok_per_sec: f64,
     /// Median latency in ms (per-token decode, per-batch prefill).
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub p50_ms: f64,
     /// 99th-percentile latency in ms.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub p99_ms: f64,
 }
 
@@ -217,6 +223,7 @@ pub struct ServeRequestMetrics {
     /// HTTP status code.
     pub status: u16,
     /// Total request latency in ms.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub latency_ms: f64,
     /// Number of generated tokens, if applicable.
     pub tokens: Option<u32>,
@@ -784,6 +791,52 @@ mod tests {
                 assert!((s.loss - 2.31).abs() < 1e-9);
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diverged_metrics_survive_the_wire() {
+        // JSON has no NaN or infinity: serde_json writes them as `null`. A
+        // run that diverges is exactly when a consumer needs the event, so
+        // reading `null` back must give a non-finite number, not an error.
+        let step = StepMetrics {
+            step: 3,
+            loss: f64::NAN,
+            lr: 1e-4,
+            tok_sec: f64::INFINITY,
+            ..Default::default()
+        };
+        let eval = EvalMetrics {
+            loss: 800.0,
+            perplexity: f64::INFINITY,
+            ..Default::default()
+        };
+        for payload in [MetricPayload::Step(step), MetricPayload::Eval(eval)] {
+            let mut buf = Vec::new();
+            let ev = JobEvent::Metric {
+                job_id: "j".into(),
+                payload,
+            };
+            write_event(&mut buf, &ev).unwrap();
+            let back = parse_event(std::str::from_utf8(&buf).unwrap()).unwrap();
+            match back {
+                JobEvent::Metric {
+                    payload: MetricPayload::Step(s),
+                    ..
+                } => {
+                    assert_eq!(s.step, 3);
+                    assert!(s.loss.is_nan() && s.tok_sec.is_nan());
+                    assert_eq!(s.lr, 1e-4);
+                }
+                JobEvent::Metric {
+                    payload: MetricPayload::Eval(e),
+                    ..
+                } => {
+                    assert_eq!(e.loss, 800.0);
+                    assert!(e.perplexity.is_nan());
+                }
+                other => panic!("wrong variant: {other:?}"),
+            }
         }
     }
 
