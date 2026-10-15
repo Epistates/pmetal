@@ -1,195 +1,76 @@
 //! Model Stock merge method.
 //!
-//! Implements the Model Stock algorithm from "Model Stock: All we need is just
-//! a few fine-tuned models" (Jang et al., ECCV 2024).
+//! Implements "Model Stock: All we need is just a few fine-tuned models"
+//! (Jang, Yun and Han, ECCV 2024, arXiv:2403.19522).
 //!
-//! Key insight: Fine-tuned weights lie on a thin shell (sphere) centered around
-//! a "central" point µ. The algorithm finds the perpendicular foot from µ to
-//! the plane defined by the pre-trained weights and fine-tuned models.
+//! The paper observes that fine-tuned weights `w_i` sit on a thin shell
+//! around a centre `w_H` that has the best performance, and that the angle
+//! `θ` between the task vectors `w_i - w_0` (from the pre-trained weights
+//! `w_0`) is nearly constant across fine-tuning runs. The centre is the
+//! foot of the perpendicular from `w_0` to the line through the fine-tuned
+//! weights' average `w_avg`, which has the closed form
 //!
-//! For 2 fine-tuned models:
-//! 1. Define plane using w0 (pretrained), w1, w2
-//! 2. Estimate center µ as average of fine-tuned weights
-//! 3. Find perpendicular foot wH from µ to the plane
+//! ```text
+//! w_H = t · w_avg + (1 - t) · w_0,      t = N·cosθ / (1 + (N - 1)·cosθ)
+//! ```
 //!
-//! For N > 2 models, we use iterative geometric averaging with cosine
-//! similarity weighting to approximate the center.
+//! with `N` fine-tuned models and `cosθ` estimated per tensor as the mean
+//! cosine similarity over all pairs of task vectors. Two fine-tuned models
+//! are enough for an estimate. Orthogonal task vectors give `t = 0` (stay at
+//! the pre-trained weights); identical ones give `t = 1` (the average).
+//!
+//! A single fine-tuned model has no angle to measure, so it is returned
+//! unchanged. `t` is clamped to `[0, 1]`: task vectors that point in
+//! opposing directions (`cosθ <= 0`) fall back to the pre-trained weights
+//! instead of extrapolating away from them.
 
 use crate::{MergeError, MergeMethod, MergeParameters, Result};
 use pmetal_runtime::compat::Array;
 
 /// Model Stock merge method.
-///
-/// Implements geometric interpolation of task vectors using the Model Stock
-/// algorithm. Achieves model soup performance with just 2-3 fine-tuned models.
-#[derive(Debug, Clone)]
-pub struct ModelStockMerge {
-    /// Whether to use cosine similarity weighting for N > 2 models.
-    pub use_cosine_weighting: bool,
-    /// Epsilon for numerical stability.
-    pub eps: f32,
-}
-
-impl Default for ModelStockMerge {
-    fn default() -> Self {
-        Self {
-            use_cosine_weighting: true,
-            eps: 1e-8,
-        }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct ModelStockMerge;
 
 impl ModelStockMerge {
     /// Create a new Model Stock merger.
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
-    /// Create with custom settings.
-    pub fn with_cosine_weighting(mut self, enabled: bool) -> Self {
-        self.use_cosine_weighting = enabled;
-        self
+    /// The interpolation ratio `t` for `n` task vectors whose pairwise
+    /// cosine similarity averages `cos_theta`.
+    pub fn interpolation_ratio(n: usize, cos_theta: f32) -> f32 {
+        let n = n as f32;
+        let denominator = 1.0 + (n - 1.0) * cos_theta;
+        if denominator <= f32::EPSILON {
+            return 0.0;
+        }
+        (n * cos_theta / denominator).clamp(0.0, 1.0)
     }
 
-    /// Compute cosine similarity between two arrays (CPU path).
-    fn cosine_similarity(&self, a: &Array, b: &Array) -> Result<f32> {
-        let n = a.shape().iter().map(|&s| s as usize).product::<usize>();
-        let mut a_clone = a.clone();
-        let mut b_clone = b.clone();
-        let a_flat = a_clone.to_f32_vec(n).unwrap_or_default();
-        let b_flat = b_clone.to_f32_vec(n).unwrap_or_default();
-
-        let dot: f32 = a_flat.iter().zip(b_flat.iter()).map(|(x, y)| x * y).sum();
-        let norm_a: f32 = a_flat.iter().map(|x| x * x).sum::<f32>().sqrt();
-        let norm_b: f32 = b_flat.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-        let denom = norm_a * norm_b + self.eps;
-        Ok(dot / denom)
-    }
-
-    /// Compute the L2 norm scalar of an array (CPU path).
-    fn l2_norm_scalar(&self, a: &Array) -> f32 {
-        let n = a.shape().iter().map(|&s| s as usize).product::<usize>();
-        let mut a_clone = a.clone();
-        let vals = a_clone.to_f32_vec(n).unwrap_or_default();
-        vals.iter().map(|x| x * x).sum::<f32>().sqrt()
-    }
-
-    /// Model Stock for exactly 2 fine-tuned models.
-    ///
-    /// Finds the perpendicular foot from the estimated center to the plane
-    /// defined by the pretrained weights and two fine-tuned weights.
-    fn merge_two_models(&self, base: &Array, w1: &Array, w2: &Array) -> Result<Array> {
-        let n = base.shape().iter().map(|&s| s as usize).product::<usize>();
-
-        // Task vectors
-        let tau1 = w1.subtract(base);
-        let tau2 = w2.subtract(base);
-
-        // Estimate center as average of fine-tuned weights
-        // µ = (w1 + w2) / 2
-        let mu = w1.add(w2).multiply(&Array::from_f32(0.5));
-
-        // Vector from base to center: d = µ - w0
-        let d = mu.subtract(base);
-
-        // Gram-Schmidt orthogonalization to get basis vectors for the plane
-        // v1 = tau1 (normalized)
-        let norm_tau1 = self.l2_norm_scalar(&tau1);
-        let v1 = tau1.divide(&Array::from_f32(norm_tau1 + self.eps));
-
-        // Project tau2 onto v1 (CPU dot product)
-        let mut tau2_clone = tau2.clone();
-        let tau2_vals = tau2_clone.to_f32_vec(n).unwrap_or_default();
-        let mut v1_clone = v1.clone();
-        let v1_vals = v1_clone.to_f32_vec(n).unwrap_or_default();
-        let proj_coeff: f32 = tau2_vals
+    /// Mean cosine similarity over all pairs of `task_vectors`. A pair that
+    /// includes an all-zero vector has no direction and counts as 0.
+    fn mean_pairwise_cosine(task_vectors: &[Array]) -> f32 {
+        let norms: Vec<f32> = task_vectors
             .iter()
-            .zip(v1_vals.iter())
-            .map(|(a, b)| a * b)
-            .sum();
-
-        let proj = v1.multiply(&Array::from_f32(proj_coeff));
-        let v2_unnorm = tau2.subtract(&proj);
-        let norm_v2 = self.l2_norm_scalar(&v2_unnorm);
-        let v2 = v2_unnorm.divide(&Array::from_f32(norm_v2 + self.eps));
-
-        // Project d onto the plane spanned by v1 and v2
-        // wH = w0 + proj(d onto plane)
-        // proj(d onto plane) = (d·v1)*v1 + (d·v2)*v2
-        let mut d_clone = d.clone();
-        let d_vals = d_clone.to_f32_vec(n).unwrap_or_default();
-        let mut v1_clone2 = v1.clone();
-        let v1_vals2 = v1_clone2.to_f32_vec(n).unwrap_or_default();
-        let mut v2_clone = v2.clone();
-        let v2_vals = v2_clone.to_f32_vec(n).unwrap_or_default();
-
-        let coeff1: f32 = d_vals.iter().zip(v1_vals2.iter()).map(|(a, b)| a * b).sum();
-        let coeff2: f32 = d_vals.iter().zip(v2_vals.iter()).map(|(a, b)| a * b).sum();
-
-        let proj_d = v1
-            .multiply(&Array::from_f32(coeff1))
-            .add(&v2.multiply(&Array::from_f32(coeff2)));
-
-        // Result: wH = base + proj_d
-        Ok(base.add(&proj_d))
-    }
-
-    /// Model Stock for N > 2 fine-tuned models using cosine similarity weighting.
-    ///
-    /// Uses an iterative approach that weights each model's contribution
-    /// by its cosine similarity to the estimated center direction.
-    fn merge_n_models(&self, base: &Array, tensors: &[Array]) -> Result<Array> {
-        let n = tensors.len();
-
-        // Compute task vectors
-        let mut task_vectors: Vec<Array> = Vec::with_capacity(n);
-        for t in tensors {
-            task_vectors.push(t.subtract(base));
+            .map(|tv| tv.square().sum_all().sqrt().item_f32())
+            .collect();
+        let mut total = 0.0_f64;
+        let mut pairs = 0_u32;
+        for i in 0..task_vectors.len() {
+            for j in (i + 1)..task_vectors.len() {
+                pairs += 1;
+                let denominator = f64::from(norms[i]) * f64::from(norms[j]);
+                if denominator > 0.0 {
+                    let dot = task_vectors[i]
+                        .multiply(&task_vectors[j])
+                        .sum_all()
+                        .item_f32();
+                    total += f64::from(dot) / denominator;
+                }
+            }
         }
-
-        // Estimate center direction as average of task vectors
-        let mut avg_tau = task_vectors[0].clone();
-        for tau in task_vectors.iter().skip(1) {
-            avg_tau = avg_tau.add(tau);
-        }
-        avg_tau = avg_tau.multiply(&Array::from_f32(1.0 / n as f32));
-
-        if !self.use_cosine_weighting {
-            // Simple averaging (Task Arithmetic)
-            return Ok(base.add(&avg_tau));
-        }
-
-        // Compute softmax cosine similarity weights per the Model Stock paper.
-        // w_i = exp(sim_i) / sum_j( exp(sim_j) )
-        // This is strictly positive for all inputs and does not discard negative
-        // cosine similarities (which can arise for out-of-distribution models).
-        let mut raw_sims: Vec<f32> = Vec::with_capacity(n);
-        for tau in &task_vectors {
-            let sim = self.cosine_similarity(tau, &avg_tau)?;
-            raw_sims.push(sim);
-        }
-
-        // Numerically stable softmax: subtract max before exponentiation.
-        let max_sim = raw_sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_sims: Vec<f32> = raw_sims.iter().map(|&s| (s - max_sim).exp()).collect();
-        let sum_exp: f32 = exp_sims.iter().sum();
-
-        let weights: Vec<f32> = if sum_exp < self.eps {
-            // Degenerate case: fall back to uniform weights.
-            vec![1.0 / n as f32; n]
-        } else {
-            exp_sims.iter().map(|&e| e / sum_exp).collect()
-        };
-
-        // Weighted average of task vectors
-        let mut weighted_tau = task_vectors[0].multiply(&Array::from_f32(weights[0]));
-        for (tau, &w) in task_vectors.iter().skip(1).zip(weights.iter().skip(1)) {
-            weighted_tau = weighted_tau.add(&tau.multiply(&Array::from_f32(w)));
-        }
-
-        // Result: base + weighted_tau
-        Ok(base.add(&weighted_tau))
+        (total / f64::from(pairs)) as f32
     }
 }
 
@@ -216,21 +97,26 @@ impl MergeMethod for ModelStockMerge {
         let base = base_tensor.ok_or(MergeError::BaseModelRequired {
             method: "model_stock".to_string(),
         })?;
-
-        match tensors.len() {
-            0 => Ok(base.clone()),
-            1 => {
-                // Single model: simple task vector addition
-                let tau = tensors[0].subtract(base);
-                Ok(base.add(&tau))
-            }
-            2 => {
-                // Optimal case: use perpendicular foot projection
-                self.merge_two_models(base, &tensors[0], &tensors[1])
-            }
+        match tensors {
+            [] => Err(MergeError::NotEnoughModels {
+                expected: 1,
+                actual: 0,
+            }),
+            [only] => Ok(only.clone()),
             _ => {
-                // N > 2: use cosine similarity weighted averaging
-                self.merge_n_models(base, tensors)
+                let task_vectors: Vec<Array> =
+                    tensors.iter().map(|w| w.subtract(base)).collect();
+                let t = Self::interpolation_ratio(
+                    tensors.len(),
+                    Self::mean_pairwise_cosine(&task_vectors),
+                );
+                let mut mean = task_vectors[0].clone();
+                for tv in &task_vectors[1..] {
+                    mean = mean.add(tv);
+                }
+                let mean = mean.multiply(&Array::from_f32(1.0 / tensors.len() as f32));
+                // w_H = w_0 + t · (w_avg - w_0)
+                Ok(base.add(&mean.multiply(&Array::from_f32(t))))
             }
         }
     }
@@ -239,89 +125,100 @@ impl MergeMethod for ModelStockMerge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{arr, assert_close, values};
 
-    #[test]
-    fn test_model_stock_two_models() {
-        let merger = ModelStockMerge::new();
-
-        // Base model weights
-        let base = Array::from_f32_slice(&[1.0f32, 0.0, 0.0, 0.0], &[4]);
-
-        // Fine-tuned models (slight variations)
-        let w1 = Array::from_f32_slice(&[1.1f32, 0.2, 0.0, 0.0], &[4]);
-        let w2 = Array::from_f32_slice(&[1.0f32, 0.0, 0.3, 0.0], &[4]);
-
-        let result = merger
-            .merge(&[w1, w2], Some(&base), &[], &MergeParameters::default())
-            .unwrap();
-
-        // Result should be between base and the fine-tuned models
-        let shape = result.shape();
-        assert_eq!(shape, &[4]);
+    fn merge(base: &[f32], models: &[&[f32]]) -> Vec<f32> {
+        let shape = [base.len() as i32];
+        let tensors: Vec<Array> = models.iter().map(|m| arr(m, &shape)).collect();
+        values(
+            &ModelStockMerge::new()
+                .merge(
+                    &tensors,
+                    Some(&arr(base, &shape)),
+                    &[],
+                    &MergeParameters::default(),
+                )
+                .unwrap(),
+        )
     }
 
     #[test]
-    fn test_model_stock_cosine_weighting() {
-        let merger = ModelStockMerge::new().with_cosine_weighting(true);
-
-        let base = Array::from_f32_slice(&[0.0f32, 0.0, 0.0], &[3]);
-
-        // Three fine-tuned models
-        let w1 = Array::from_f32_slice(&[1.0f32, 0.0, 0.0], &[3]);
-        let w2 = Array::from_f32_slice(&[0.9f32, 0.1, 0.0], &[3]); // Similar to w1
-        let w3 = Array::from_f32_slice(&[0.0f32, 0.0, 1.0], &[3]); // Different direction
-
-        let mut result = merger
-            .merge(&[w1, w2, w3], Some(&base), &[], &MergeParameters::default())
-            .unwrap();
-
-        // w1 and w2 should have higher weights due to similarity
-        // Result should lean towards their direction
-        let vals = result.to_f32_vec(3).unwrap();
-
-        // X component should be higher than Z since w1, w2 point that way
-        assert!(vals[0] > vals[2]);
+    fn ratio_matches_the_closed_form() {
+        // t = N cos / (1 + (N - 1) cos)
+        assert!((ModelStockMerge::interpolation_ratio(2, 0.5) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((ModelStockMerge::interpolation_ratio(3, 0.5) - 1.5 / 2.0).abs() < 1e-6);
+        assert!((ModelStockMerge::interpolation_ratio(4, 1.0) - 1.0).abs() < 1e-6);
+        assert_eq!(ModelStockMerge::interpolation_ratio(5, 0.0), 0.0);
+        // Opposing task vectors stay at the pre-trained weights.
+        assert_eq!(ModelStockMerge::interpolation_ratio(2, -0.5), 0.0);
+        assert_eq!(ModelStockMerge::interpolation_ratio(3, -0.9), 0.0);
     }
 
     #[test]
-    fn test_model_stock_single_model() {
-        let merger = ModelStockMerge::new();
-
-        let base = Array::from_f32_slice(&[1.0f32, 2.0], &[2]);
-        let w1 = Array::from_f32_slice(&[1.5f32, 2.5], &[2]);
-
-        let mut result = merger
-            .merge(
-                std::slice::from_ref(&w1),
-                Some(&base),
-                &[],
-                &MergeParameters::default(),
-            )
-            .unwrap();
-
-        // Single model should just return w1
-        let mut w1_clone = Array::from_f32_slice(&[1.5f32, 2.5], &[2]);
-
-        let result_vals = result.to_f32_vec(2).unwrap();
-        let expected_vals = w1_clone.to_f32_vec(2).unwrap();
-
-        for (r, e) in result_vals.iter().zip(expected_vals.iter()) {
-            assert!((r - e).abs() < 1e-5);
-        }
+    fn orthogonal_task_vectors_stay_at_the_pretrained_weights() {
+        // cos = 0, so t = 0 although the plain average would be [0.5, 0.5].
+        let out = merge(&[0.0, 0.0], &[&[1.0, 0.0], &[0.0, 1.0]]);
+        assert_close(&out, &[0.0, 0.0], 1e-6);
     }
 
     #[test]
-    fn test_cosine_similarity() {
-        let merger = ModelStockMerge::new();
+    fn identical_task_vectors_give_their_average() {
+        let out = merge(&[1.0, 1.0], &[&[3.0, 5.0], &[3.0, 5.0]]);
+        assert_close(&out, &[3.0, 5.0], 1e-6);
+    }
 
-        let a = Array::from_f32_slice(&[1.0f32, 0.0, 0.0], &[3]);
-        let b = Array::from_f32_slice(&[1.0f32, 0.0, 0.0], &[3]);
+    #[test]
+    fn two_models_interpolate_toward_the_average_by_t() {
+        // tau1 = [2, 0], tau2 = [1, 1]: cos = 2 / (2 * sqrt 2) = 1/sqrt 2,
+        // t = 2c / (1 + c) with c = 0.70710678 is 0.82842712, and the
+        // average task vector is [1.5, 0.5], so the result is t * [1.5, 0.5].
+        let c = std::f64::consts::FRAC_1_SQRT_2;
+        let t = 2.0 * c / (1.0 + c);
+        let out = merge(&[0.0, 0.0], &[&[2.0, 0.0], &[1.0, 1.0]]);
+        assert_close(&out, &[(t * 1.5) as f32, (t * 0.5) as f32], 1e-5);
+    }
 
-        let sim = merger.cosine_similarity(&a, &b).unwrap();
-        assert!((sim - 1.0).abs() < 1e-5); // Identical vectors = 1.0
+    #[test]
+    fn three_models_use_the_mean_pairwise_cosine() {
+        // tau = [1,0,0], [1,1,0], [1,0,1] (base at the origin): the pair
+        // cosines are 1/sqrt 2, 1/sqrt 2 and 1/2, mean (sqrt 2 + 1) / 3 ...
+        // computed in f64 below. t = 3c / (1 + 2c); average = [1, 1/3, 1/3].
+        let r2 = std::f64::consts::FRAC_1_SQRT_2;
+        let c = (r2 + r2 + 0.5) / 3.0;
+        let t = 3.0 * c / (1.0 + 2.0 * c);
+        let out = merge(
+            &[0.0, 0.0, 0.0],
+            &[&[1.0, 0.0, 0.0], &[1.0, 1.0, 0.0], &[1.0, 0.0, 1.0]],
+        );
+        assert_close(
+            &out,
+            &[t as f32, (t / 3.0) as f32, (t / 3.0) as f32],
+            1e-5,
+        );
+    }
 
-        let c = Array::from_f32_slice(&[0.0f32, 1.0, 0.0], &[3]);
-        let sim_orthogonal = merger.cosine_similarity(&a, &c).unwrap();
-        assert!(sim_orthogonal.abs() < 1e-5); // Orthogonal vectors = 0.0
+    #[test]
+    fn the_base_offset_is_removed_before_measuring_angles() {
+        // The same geometry as the two-model test, shifted by a base of 10.
+        let c = std::f64::consts::FRAC_1_SQRT_2;
+        let t = 2.0 * c / (1.0 + c);
+        let out = merge(&[10.0, 10.0], &[&[12.0, 10.0], &[11.0, 11.0]]);
+        assert_close(&out, &[10.0 + (t * 1.5) as f32, 10.0 + (t * 0.5) as f32], 1e-4);
+    }
+
+    #[test]
+    fn single_model_is_returned_and_missing_inputs_are_errors() {
+        let out = merge(&[1.0, 2.0], &[&[1.5, 2.5]]);
+        assert_close(&out, &[1.5, 2.5], 1e-6);
+
+        let base = arr(&[0.0], &[1]);
+        let none: [Array; 0] = [];
+        let global = MergeParameters::default();
+        assert!(ModelStockMerge::new().merge(&none, Some(&base), &[], &global).is_err());
+        assert!(
+            ModelStockMerge::new()
+                .merge(&[arr(&[1.0], &[1])], None, &[], &global)
+                .is_err()
+        );
     }
 }
