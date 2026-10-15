@@ -21,7 +21,7 @@ use pmetal_models::architectures::{
 };
 use pmetal_models::{Gemma4MtpKvSources, validate_gemma4_mtp_pair, validate_qwen3_next_mtp_pair};
 use pmetal_runtime::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops,
+    Array, Exception, ModuleParameters, ModuleParametersExt, Param, nn, ops,
     optimizers::{AdamW, AdamWBuilder, Optimizer},
 };
 use serde::{Deserialize, Serialize};
@@ -219,7 +219,6 @@ pub fn gemma4_assistant_mtp_loss(
     let batch = input_ids.dim(0);
     let seq = input_ids.dim(1);
     let mut total: Option<Array> = None;
-    let embed_scale = Array::from_f32(target.model.embed_scale);
 
     for pos in 0..(seq - 2) {
         let prefix = input_ids.slice(&[0, 0], &[batch, pos + 1]);
@@ -230,8 +229,7 @@ pub fn gemma4_assistant_mtp_loss(
         hidden.eval();
         let last_hidden = hidden.slice(&[0, pos, 0], &[batch, pos + 1, hidden.dim(2)]);
         let token = input_ids.slice(&[0, pos + 1], &[batch, pos + 2]);
-        let token_embed =
-            Module::forward(&mut target.model.embed_tokens, &token)?.multiply(&embed_scale);
+        let token_embed = target.model.embed_scaled(&token);
         let inputs_embeds = ops::concatenate_axis(&[&token_embed, &last_hidden], -1);
         let shared = kv_sources.shared_states(&cache)?;
         let (_, logits) = assistant.forward_logits(&inputs_embeds, &shared, pos + 1)?;
@@ -835,9 +833,7 @@ mod tests {
                 .unwrap();
             let state = ops::slice_axis(&states, 1, i as i32, i as i32 + 1);
             let next = pmetal_runtime::decode::prompt_tokens_to_input(&tokens[i + 1..i + 2]);
-            let embedding = Module::forward(&mut target.model.embed_tokens, &next)
-                .unwrap()
-                .multiply(&Array::from_f32(target.model.embed_scale));
+            let embedding = target.model.embed_scaled(&next);
             let shared = Gemma4MtpKvSources::new(&target.config, &assistant.config.text_config)
                 .unwrap()
                 .shared_states(&cache)

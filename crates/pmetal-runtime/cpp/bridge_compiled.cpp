@@ -30,6 +30,28 @@ static CompiledFn* make_compiled_fixed(CompiledFn fn) {
     return new CompiledFn(mlx::core::compile(std::move(fn), /*shapeless=*/false));
 }
 
+// A compiled closure owned by the cache entry that holds it, for the call sites
+// whose key includes a length (a cache's capacity, a pass's token count).
+// `make_compiled_fixed` leaks its closure, so a trace made for one length stays
+// in MLX's compile cache for the life of the process; owning it lets an
+// evicted entry take its trace with it.
+static CompiledFn compile_owned(CompiledFn fn) {
+    return mlx::core::compile(std::move(fn), /*shapeless=*/false);
+}
+
+// Traces a call site may keep. A decode compiles once per cache capacity, and
+// a server sees a new capacity per request, so an unbounded list is a slow
+// leak; the oldest trace goes first, and the one a long-running decode needs
+// is made again on its next call.
+static constexpr size_t kMaxCompiledEntries = 64;
+
+template <typename Entries>
+static void make_room_for_entry(Entries& entries) {
+    if (entries.size() >= kMaxCompiledEntries) {
+        entries.erase(entries.begin());
+    }
+}
+
 // The rotation `RotaryEmbedding::apply` (src/rope.rs) performs, for a compiled
 // decode graph: `fast::rope` from the kernel's `(base, scale)`, or from the
 // period table when there is one (YaRN, Llama 3 bands, LongRoPE), then the
@@ -379,6 +401,7 @@ void mlx_inline_compiled_attn_layer_fixed(
             bool HAS_FREQS = has_freqs == 1;
             bool HAS_GAIN = has_gain == 1;
 
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 batch,
                 cache_len,
@@ -394,7 +417,7 @@ void mlx_inline_compiled_attn_layer_fixed(
                 rope_scale,
                 q_norm_eps,
                 k_norm_eps,
-                *make_compiled_fixed(
+                compile_owned(
                     [NH, NKV, HD, RD, L, GATED, SCALE, RBASE, RSCALE, QEPS, KEPS,
                      HAS_FREQS, HAS_GAIN]
                     (const std::vector<array>& ins) -> std::vector<array> {
@@ -597,6 +620,7 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
             bool HAS_FREQS = has_freqs == 1;
             bool HAS_GAIN = has_gain == 1;
 
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 batch,
                 cache_len,
@@ -609,7 +633,7 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
                 scale,
                 rope_base,
                 rope_scale,
-                *make_compiled_fixed(
+                compile_owned(
                     [NH, NKV, HD, L, SCALE, RBASE, RSCALE, HAS_FREQS, HAS_GAIN]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
@@ -832,6 +856,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
             bool HAS_FREQS = has_freqs == 1;
             bool HAS_GAIN = has_gain == 1;
 
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 batch,
                 cache_len,
@@ -851,7 +876,7 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
                 temp_attn_scale,
                 qk_norm_eps,
                 floor_scale,
-                *make_compiled_fixed(
+                compile_owned(
                     [NH, NKV, HD, L, SCALE, RBASE, RSCALE,
                      UROPE, UQKN, HBIAS, TTUNE, FLOOR, TSCALE, QKEPS, HAS_FREQS, HAS_GAIN]
                     (const std::vector<array>& ins) -> std::vector<array> {
@@ -1044,6 +1069,7 @@ void mlx_inline_compiled_moe_layer_fixed(
         if (compiled == nullptr) {
             int TOPK = top_k;
             bool NORM_TOPK = norm_topk_prob;
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 batch,
                 hidden,
@@ -1053,7 +1079,7 @@ void mlx_inline_compiled_moe_layer_fixed(
                 top_k,
                 dtype,
                 static_cast<int>(norm_topk_prob),
-                *make_compiled_fixed(
+                compile_owned(
                     [TOPK, NORM_TOPK](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
 
@@ -1264,9 +1290,10 @@ void mlx_inline_compiled_gemma4_attn_block(
             QProjSig VS = v_sig;
             QProjSig OS = o_sig;
 
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 key,
-                *make_compiled_fixed(
+                compile_owned(
                     [NH, NKV, HD, RD, L, SW, KEV, HAS_FREQS, INE, QKE, PNE, RBASE,
                      QS, KS, VS, OS]
                     (const std::vector<array>& ins) -> std::vector<array> {
@@ -1533,9 +1560,10 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
             QProjSig QS = q_sig;
             QProjSig OS = o_sig;
 
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 key,
-                *make_compiled_fixed(
+                compile_owned(
                     [NH, NKV, HD, RD, L, SW, HAS_FREQS, INE, QNE, PNE, RBASE, QS, OS]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
@@ -1688,9 +1716,10 @@ void mlx_inline_compiled_gemma4_mlp_block(
             QProjSig GS = gate_sig;
             QProjSig US = up_sig;
             QProjSig DS = down_sig;
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 key,
-                *make_compiled_fixed(
+                compile_owned(
                     [PRE, POST, GS, US, DS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
                         std::size_t idx = 0;
@@ -1810,9 +1839,10 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
             float POST = post_norm_eps;
             QProjSig GS = gate_sig;
             QProjSig PS = projection_sig;
+            make_room_for_entry(*entries);
             entries->push_back(Entry{
                 key,
-                *make_compiled_fixed(
+                compile_owned(
                     [POST, GS, PS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
                         std::size_t idx = 0;

@@ -4,6 +4,7 @@
 //! values and sinks against central finite differences.
 
 use super::*;
+use crate::compat::ops;
 use crate::f64_reference::*;
 use serial_test::serial;
 
@@ -605,6 +606,131 @@ fn sink_attention_step_against_plain_ops() {
             let ms = start.elapsed().as_secs_f64() * 1e3 / 3.0;
             let peak = get_peak_memory() as f64 / (1 << 20) as f64;
             eprintln!("L={len:5} {name:16} {ms:9.1} ms/step   peak {peak:8.0} MiB");
+        }
+    }
+}
+
+/// Sliding-window attention over a long sequence goes block by block, and
+/// gives the output and the gradients of the same attention under the full
+/// `[L, L]` band mask (a custom mask takes the unblocked path), with and
+/// without logit softcapping, on a length that leaves a short last block.
+#[test]
+#[serial]
+fn blocked_sliding_attention_is_the_masked_attention() {
+    use crate::compat::nn::value_and_grad_explicit;
+    use crate::compat::random;
+    let (heads, kv_heads, head_dim, len, window) = (4, 2, 32, 1100, 256);
+    random::seed(17);
+    let draw = |h: i32| random::normal(&[1, h, len, head_dim], Dtype::Float32);
+    let (q, k, v) = (draw(heads), draw(kv_heads), draw(kv_heads));
+    let probe = random::normal(&[1, heads, len, head_dim], Dtype::Float32);
+    let band = create_sliding_window_mask(len, len, window).unwrap();
+    for softcap in [None, Some(30.0)] {
+        let mut config = FusedAttentionConfig::new(heads, kv_heads, head_dim)
+            .with_scale(0.25)
+            .with_mask_type(AttentionMaskType::SlidingWindow(window));
+        if let Some(cap) = softcap {
+            config = config.with_logit_softcapping(cap);
+        }
+        let run = |mask: Option<&Array>| {
+            let (loss, grads) = value_and_grad_explicit(
+                |a: &[Array]| {
+                    fused_sdpa(&a[0], &a[1], &a[2], &config, mask)
+                        .unwrap()
+                        .multiply(&probe)
+                        .sum_all()
+                },
+                &[q.clone(), k.clone(), v.clone()],
+                &[],
+            )
+            .unwrap();
+            let out = fused_sdpa(&q, &k, &v, &config, mask).unwrap();
+            drain();
+            (
+                vec_of(&out),
+                vec_of(&loss),
+                grads.iter().map(vec_of).collect::<Vec<_>>(),
+            )
+        };
+        let (blocked, blocked_loss, blocked_grads) = run(None);
+        let (full, full_loss, full_grads) = run(Some(&band));
+        assert_close(
+            &format!("output (softcap {softcap:?})"),
+            &blocked,
+            &full,
+            1e-4,
+        );
+        assert_close(
+            &format!("loss (softcap {softcap:?})"),
+            &blocked_loss,
+            &full_loss,
+            1e-4,
+        );
+        for (name, (got, want)) in ["dq", "dk", "dv"]
+            .iter()
+            .zip(blocked_grads.iter().zip(&full_grads))
+        {
+            assert!(
+                max_abs(want) > 0.0,
+                "{name}: the reference gradient is zero"
+            );
+            assert_close(&format!("{name} (softcap {softcap:?})"), got, want, 1e-3);
+        }
+    }
+}
+
+/// A training step's worth of sliding-window attention (forward and backward,
+/// bf16, a Gemma 4 sliding layer's 16 query heads over 8 key heads of width
+/// 256 and window 1024) against full causal attention at the same length. Time
+/// and peak memory; run with `--ignored --nocapture`.
+#[test]
+#[serial]
+#[ignore = "benchmark"]
+fn sliding_attention_step_against_causal() {
+    use crate::compat::nn::value_and_grad_explicit;
+    use crate::compat::random;
+    use crate::inline_array::{get_peak_memory, reset_peak_memory};
+    use std::time::Instant;
+
+    let (heads, kv_heads, head_dim, window) = (16, 8, 256, 1024);
+    let bf16 = Dtype::Bfloat16.as_i32();
+    for len in [2048, 4096, 8192] {
+        let draw = |h: i32| random::normal(&[1, h, len, head_dim], Dtype::Float32).as_dtype(bf16);
+        let (q, k, v) = (draw(heads), draw(kv_heads), draw(kv_heads));
+        for (name, mask_type) in [
+            ("causal", AttentionMaskType::Causal),
+            ("sliding", AttentionMaskType::SlidingWindow(window)),
+        ] {
+            let config = FusedAttentionConfig::new(heads, kv_heads, head_dim)
+                .with_scale(1.0)
+                .with_mask_type(mask_type);
+            let step = || {
+                let (_, grads) = value_and_grad_explicit(
+                    |a: &[Array]| {
+                        fused_sdpa(&a[0], &a[1], &a[2], &config, None)
+                            .unwrap()
+                            .as_dtype(Dtype::Float32.as_i32())
+                            .square()
+                            .sum_all()
+                    },
+                    &[q.clone(), k.clone(), v.clone()],
+                    &[],
+                )
+                .unwrap();
+                grads.iter().for_each(|g| {
+                    g.eval();
+                });
+                drain();
+            };
+            step();
+            reset_peak_memory();
+            let start = Instant::now();
+            for _ in 0..3 {
+                step();
+            }
+            let ms = start.elapsed().as_secs_f64() * 1e3 / 3.0;
+            let peak = get_peak_memory() as f64 / (1 << 20) as f64;
+            eprintln!("L={len:5} {name:8} {ms:9.1} ms/step   peak {peak:8.0} MiB");
         }
     }
 }

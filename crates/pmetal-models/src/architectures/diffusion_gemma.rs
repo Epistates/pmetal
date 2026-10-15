@@ -1100,10 +1100,7 @@ impl DiffusionGemmaForBlockDiffusion {
     pub fn lm_logits(&self, hidden: &Array) -> Array {
         let raw = self.decoder.embed_tokens.as_linear(hidden).as_type::<f32>();
         match self.final_logit_softcapping {
-            Some(cap) => {
-                let c = Array::from_f32(cap);
-                ops::tanh(&raw.divide(&c)).multiply(&c)
-            }
+            Some(cap) => pmetal_runtime::nn::softcap(&raw, cap),
             None => raw,
         }
     }

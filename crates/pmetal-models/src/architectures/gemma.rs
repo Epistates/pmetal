@@ -11,7 +11,7 @@ use pmetal_runtime::impl_module_params;
 
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, restrict_to_sliding_window,
     rope::{RopePositions, rope_embedding},
 };
 use pmetal_runtime::rope::{RopeConfig, RotaryEmbedding};
@@ -603,6 +603,17 @@ impl GemmaAttention {
             (keys, values)
         };
 
+        // A caller's mask (packed sequences' block-diagonal one) says which
+        // sequence a token belongs to, not how far back a local layer reaches.
+        let windowed;
+        let mask = match (mask, self.sliding_window, self.is_local_attention) {
+            (Some(mask), Some(window), true) => {
+                windowed = restrict_to_sliding_window(mask, seq_len, keys.dim(2), window)?;
+                Some(&windowed)
+            }
+            (mask, _, _) => mask,
+        };
+
         // Fused SDPA with optional softcapping
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
 
@@ -1071,10 +1082,7 @@ impl GemmaForCausalLM {
         // Gemma always ties embeddings.
         let logits = self.model.embed_tokens.as_linear(hidden_states);
         match self.model.config.final_logit_softcapping {
-            Some(cap) if cap != 0.0 => {
-                let cap_arr = Array::from_f32(cap);
-                pmetal_runtime::compat::ops::tanh(&logits.divide(&cap_arr)).multiply(&cap_arr)
-            }
+            Some(cap) if cap != 0.0 => pmetal_runtime::nn::softcap(&logits, cap),
             _ => logits,
         }
     }
@@ -1388,6 +1396,187 @@ mod tests {
             ..config
         };
         assert_eq!(gemma2.rotary(true).unwrap().scalar(), Some((1e6, 0.125)));
+    }
+
+    /// A bf16 model's activations and logits stay bf16 for every generation:
+    /// the embedding scale, the norms, the attention softcap and the final
+    /// logit softcap each carry a constant that promotes to f32 if it is built
+    /// as an f32 array, and the f32 logits of a 256k vocabulary are the
+    /// largest tensor in a training step.
+    #[test]
+    #[serial]
+    fn bf16_model_stays_bf16() {
+        use pmetal_runtime::compat::{Dtype, ModuleParametersExt, random};
+        let bf16 = Dtype::Bfloat16.as_i32();
+        let gemma2 = GemmaConfig {
+            model_type: "gemma2".into(),
+            is_gemma2: true,
+            attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
+            query_pre_attn_scalar: Some(16),
+            sliding_window: Some(4),
+            ..small_config()
+        };
+        let gemma3 = GemmaConfig {
+            model_type: "gemma3".into(),
+            is_gemma3: true,
+            sliding_window: Some(4),
+            sliding_window_pattern: 2,
+            rope_local_base_freq: Some(10_000.0),
+            ..small_config()
+        };
+        for (label, config) in [
+            ("gemma", small_config()),
+            ("gemma2", gemma2),
+            ("gemma3", gemma3),
+        ] {
+            let mut model = GemmaForCausalLM::new(config).unwrap();
+            for (_, p) in model.flatten_params_mut() {
+                let w = random::uniform_range(-0.3, 0.3, p.shape(), Dtype::Float32);
+                *p = w.as_dtype(bf16);
+            }
+            let ids = Array::from_slice(&[1_i32, 2, 3, 4, 5, 6], &[1, 6]);
+            let hidden = model.model.forward(&ids, None).unwrap();
+            let logits = model.forward(&ids, None).unwrap();
+            pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+            assert_eq!(hidden.dtype_raw(), bf16, "{label}: trunk output dtype");
+            assert_eq!(logits.dtype_raw(), bf16, "{label}: logits dtype");
+        }
+    }
+
+    /// Cached decode far past the sliding window gives the logits of the
+    /// whole sequence run at once: prefill in two passes, then one token at a
+    /// time, for Gemma 2 (alternating layers) and Gemma 3 (five local layers
+    /// in six, a second RoPE base on those).
+    #[test]
+    #[serial]
+    fn cached_decode_past_the_window_matches_the_full_forward() {
+        use pmetal_runtime::compat::{Dtype, ModuleParametersExt, random};
+        let gemma2 = GemmaConfig {
+            model_type: "gemma2".into(),
+            is_gemma2: true,
+            attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
+            query_pre_attn_scalar: Some(16),
+            sliding_window: Some(4),
+            ..small_config()
+        };
+        let gemma3 = GemmaConfig {
+            model_type: "gemma3".into(),
+            is_gemma3: true,
+            num_hidden_layers: 3,
+            sliding_window: Some(4),
+            sliding_window_pattern: 3,
+            rope_theta: 1_000_000.0,
+            rope_local_base_freq: Some(10_000.0),
+            ..small_config()
+        };
+        for (label, config) in [("gemma2", gemma2), ("gemma3", gemma3)] {
+            random::seed(3);
+            let mut model = GemmaForCausalLM::new(config).unwrap();
+            for (_, p) in model.flatten_params_mut() {
+                *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
+            }
+            let tokens: Vec<i32> = (0..24).map(|i| (i * 37 + 11) % 1000).collect();
+            let all = Array::from_slice(&tokens, &[1, 24]);
+            let mut want = model.forward(&all, None).unwrap();
+            let want = want.to_f32_vec(24 * 1000).unwrap();
+
+            let mut cache = model.create_cache(32);
+            let mut got = Vec::new();
+            for (start, stop) in [(0, 9), (9, 11)]
+                .into_iter()
+                .chain((11..24).map(|i| (i, i + 1)))
+            {
+                let ids = Array::from_slice(&tokens[start..stop], &[1, (stop - start) as i32]);
+                let mut logits = model
+                    .forward_with_cache(&ids, None, Some(&mut cache))
+                    .unwrap();
+                got.extend(logits.to_f32_vec((stop - start) * 1000).unwrap());
+            }
+            pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+            assert_eq!(got.len(), want.len());
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, |m, d| if d.is_nan() { f32::NAN } else { m.max(d) });
+            assert!(worst < 1e-3, "{label}: cached decode is off by {worst}");
+        }
+    }
+
+    /// Two sequences packed into one row, under the block-diagonal causal mask
+    /// packed training builds, give each sequence what it gets alone: the
+    /// mask keeps them apart, the positions restart, and a local layer still
+    /// sees only its window. The mask alone is a causal one, so a layer that
+    /// took it as the whole story would attend past its window inside every
+    /// sequence longer than the window.
+    #[test]
+    #[serial]
+    fn packed_sequences_keep_their_sliding_window() {
+        use pmetal_runtime::compat::{Dtype, ModuleParametersExt, random};
+        let gemma2 = GemmaConfig {
+            model_type: "gemma2".into(),
+            is_gemma2: true,
+            attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
+            query_pre_attn_scalar: Some(16),
+            sliding_window: Some(4),
+            ..small_config()
+        };
+        let gemma3 = GemmaConfig {
+            model_type: "gemma3".into(),
+            is_gemma3: true,
+            num_hidden_layers: 3,
+            sliding_window: Some(4),
+            sliding_window_pattern: 3,
+            rope_theta: 1_000_000.0,
+            rope_local_base_freq: Some(10_000.0),
+            ..small_config()
+        };
+        let (first, second) = (7usize, 9usize);
+        let n = first + second;
+        // Block-diagonal causal, additive.
+        let mut mask = vec![f32::NEG_INFINITY; n * n];
+        for (start, len) in [(0, first), (first, second)] {
+            for i in 0..len {
+                for j in 0..=i {
+                    mask[(start + i) * n + start + j] = 0.0;
+                }
+            }
+        }
+        let mask = Array::from_f32_slice(&mask, &[1, 1, n as i32, n as i32]);
+        let positions: Vec<i32> = (0..first as i32).chain(0..second as i32).collect();
+        let positions = Array::from_slice(&positions, &[n as i32]);
+        let tokens: Vec<i32> = (0..n as i32).map(|i| (i * 53 + 5) % 1000).collect();
+
+        for (label, config) in [("gemma2", gemma2), ("gemma3", gemma3)] {
+            random::seed(5);
+            let mut model = GemmaForCausalLM::new(config).unwrap();
+            for (_, p) in model.flatten_params_mut() {
+                *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
+            }
+            let packed = Array::from_slice(&tokens, &[1, n as i32]);
+            let mut packed_logits = model
+                .forward_with_positions(&packed, Some(&mask), Some(&positions))
+                .unwrap();
+            let packed_logits = packed_logits.to_f32_vec(n * 1000).unwrap();
+
+            let mut worst = 0.0f32;
+            for (start, len) in [(0, first), (first, second)] {
+                let alone = Array::from_slice(&tokens[start..start + len], &[1, len as i32]);
+                let mut alone_logits = model.forward(&alone, None).unwrap();
+                let alone_logits = alone_logits.to_f32_vec(len * 1000).unwrap();
+                let packed_rows = &packed_logits[start * 1000..(start + len) * 1000];
+                for (g, w) in packed_rows.iter().zip(&alone_logits) {
+                    let d = (g - w).abs();
+                    assert!(!d.is_nan(), "{label}: NaN");
+                    worst = worst.max(d);
+                }
+            }
+            pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+            assert!(worst < 1e-3, "{label}: a packed sequence is off by {worst}");
+        }
     }
 
     #[test]
