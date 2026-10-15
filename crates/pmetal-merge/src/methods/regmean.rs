@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use super::MergeMethod;
+use super::{LinearMerge, MergeMethod};
 use crate::loader::SafetensorsLoader;
 use crate::{MergeError, MergeParameters, Result, TensorLoader};
 use pmetal_runtime::compat::{Array, ops};
@@ -112,27 +112,6 @@ impl RegMeanMerge {
         Ok(Some(out))
     }
 
-    fn mean_fallback(
-        tensors: &[Array],
-        params: &[MergeParameters],
-        global_params: &MergeParameters,
-    ) -> Result<Array> {
-        let weights: Vec<f32> = params
-            .iter()
-            .map(|p| global_params.merge_with(p).weight())
-            .collect();
-        let sum: f32 = weights.iter().sum();
-        let weights: Vec<f32> = if sum > 0.0 {
-            weights.iter().map(|w| w / sum).collect()
-        } else {
-            vec![1.0 / tensors.len() as f32; tensors.len()]
-        };
-        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]));
-        for (t, w) in tensors[1..].iter().zip(&weights[1..]) {
-            result = result.add(&t.multiply(&Array::from_f32(*w)));
-        }
-        Ok(result)
-    }
 
     /// Closed-form merge for a single 2-D weight matrix.
     fn regmean_2d(&self, weights: &[Array], grams: &[Array]) -> Result<Array> {
@@ -274,7 +253,7 @@ impl MergeMethod for RegMeanMerge {
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
-        Self::mean_fallback(tensors, params, global_params)
+        LinearMerge::weighted_average(tensors, params, global_params)
     }
 
     fn merge_named(
@@ -291,16 +270,18 @@ impl MergeMethod for RegMeanMerge {
                 actual: 0,
             });
         }
+        let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
+        let global_params = &global_params.resolved(name);
         // RegMean's closed form only applies to 2-D weight matrices; route
         // anything else to the plain mean fallback.
         let is_2d = tensors[0].shape().len() == 2;
         if !is_2d {
-            return Self::mean_fallback(tensors, params, global_params);
+            return LinearMerge::weighted_average(tensors, &params, global_params);
         }
 
         match self.try_load_grams(name)? {
             Some(grams) => self.regmean_2d(tensors, &grams),
-            None => Self::mean_fallback(tensors, params, global_params),
+            None => LinearMerge::weighted_average(tensors, &params, global_params),
         }
     }
 }

@@ -35,7 +35,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use super::MergeMethod;
+use super::{LinearMerge, MergeMethod};
 use crate::loader::SafetensorsLoader;
 use crate::{MergeError, MergeParameters, Result, TensorLoader};
 use pmetal_runtime::compat::{Array, ops};
@@ -137,29 +137,6 @@ impl FisherMerge {
         Ok(num.divide(&safe_den))
     }
 
-    /// Plain weighted-mean fallback used when Fisher data is unavailable
-    /// for the current tensor.
-    fn mean_fallback(
-        tensors: &[Array],
-        params: &[MergeParameters],
-        global_params: &MergeParameters,
-    ) -> Result<Array> {
-        let weights: Vec<f32> = params
-            .iter()
-            .map(|p| global_params.merge_with(p).weight())
-            .collect();
-        let sum: f32 = weights.iter().sum();
-        let weights: Vec<f32> = if sum > 0.0 {
-            weights.iter().map(|w| w / sum).collect()
-        } else {
-            vec![1.0 / tensors.len() as f32; tensors.len()]
-        };
-        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]));
-        for (t, w) in tensors[1..].iter().zip(&weights[1..]) {
-            result = result.add(&t.multiply(&Array::from_f32(*w)));
-        }
-        Ok(result)
-    }
 }
 
 impl MergeMethod for FisherMerge {
@@ -185,7 +162,7 @@ impl MergeMethod for FisherMerge {
         // Without a tensor name we cannot key into the Fisher store —
         // degrade cleanly to the weighted mean fallback. Callers should
         // route through `merge_named` to get the actual Fisher path.
-        Self::mean_fallback(tensors, params, global_params)
+        LinearMerge::weighted_average(tensors, params, global_params)
     }
 
     fn merge_named(
@@ -202,9 +179,11 @@ impl MergeMethod for FisherMerge {
                 actual: 0,
             });
         }
+        let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
+        let global_params = &global_params.resolved(name);
         match self.try_load_fisher(name)? {
             Some(fishers) => self.fisher_weighted_average(tensors, &fishers),
-            None => Self::mean_fallback(tensors, params, global_params),
+            None => LinearMerge::weighted_average(tensors, &params, global_params),
         }
     }
 }

@@ -72,18 +72,27 @@ pub trait MergeMethod: Send + Sync {
         global_params: &MergeParameters,
     ) -> Result<Array>;
 
-    /// Name-aware merge entry. The default implementation forwards to
-    /// `merge`, discarding the name; methods that need per-tensor side
-    /// data (Fisher information, RegMean Gram matrices) override this to
-    /// look up that state.
+    /// Name-aware merge entry, the one every pipeline calls.
+    ///
+    /// The default implementation resolves each filter-conditional parameter
+    /// (`weight: [{value, filter}, ...]`) against `name`, so `merge` only
+    /// ever sees scalars, and forwards to it. Methods that need per-tensor
+    /// side data (Fisher information, RegMean Gram matrices) override this
+    /// to look that state up, and call [`MergeParameters::resolved`] themselves.
     fn merge_named(
         &self,
-        _name: &str,
+        name: &str,
         tensors: &[Array],
         base_tensor: Option<&Array>,
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
-        self.merge(tensors, base_tensor, params, global_params)
+        let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
+        self.merge(
+            tensors,
+            base_tensor,
+            &params,
+            &global_params.resolved(name),
+        )
     }
 }

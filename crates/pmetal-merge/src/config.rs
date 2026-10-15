@@ -469,6 +469,26 @@ impl MergeParameters {
         self.gamma.unwrap_or(0.01)
     }
 
+    /// These parameters with every filter-conditional setting resolved against
+    /// `tensor_name`: each `weight`/`density`/`t`/`lambda` becomes a scalar
+    /// (or `None` when no conditional entry matches, so the usual default
+    /// applies). The merge pipelines call this once per tensor, so the
+    /// methods only ever see scalars.
+    pub fn resolved(&self, tensor_name: &str) -> MergeParameters {
+        let resolve = |s: &Option<ParameterSetting>| {
+            s.as_ref()
+                .and_then(|s| s.resolve(tensor_name))
+                .map(ParameterSetting::Scalar)
+        };
+        MergeParameters {
+            weight: resolve(&self.weight),
+            density: resolve(&self.density),
+            t: resolve(&self.t),
+            lambda: resolve(&self.lambda),
+            ..self.clone()
+        }
+    }
+
     /// Merge with another set of parameters (other overrides self).
     ///
     /// `ParameterSetting` fields: `other` wins when it is `Some`.
