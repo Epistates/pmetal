@@ -9,10 +9,12 @@
 
 mod cqt;
 mod mel;
+mod pcm;
 mod resample;
 mod stft;
 
 pub use cqt::*;
 pub use mel::*;
+pub use pcm::*;
 pub use resample::*;
 pub use stft::*;
