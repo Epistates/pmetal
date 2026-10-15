@@ -606,6 +606,74 @@ fn distiller_with(
     })
 }
 
+/// When the teacher's vocabulary is the larger, its top-k can include ids the
+/// student does not have (padding rows of an embedding matrix, usually).
+/// Those tokens leave the support on both sides: the teacher is renormalized
+/// over the ids the student can score. They used to stay in the teacher with a
+/// student probability of exactly zero, a KL term of ~1e9 per unit of mass.
+#[test]
+#[serial]
+fn teacher_ids_beyond_the_student_vocabulary_leave_the_support() {
+    // Teacher over 8 ids, the largest logit on id 7; the student has 6.
+    let t = [0.5_f32, 2.0, -1.0, 1.0, 0.0, -2.0, 0.3, 9.0];
+    let s = [0.2_f32, 1.0, 0.5, -0.4, 1.5, 0.1];
+    let teacher = Array::from_f32_slice(&t, &[1, 1, 8]);
+    let student = Array::from_f32_slice(&s, &[1, 1, 6]);
+
+    let got = scalar(
+        &KlDivergenceLoss::new()
+            .with_sparse_top_k(4)
+            .compute(&teacher, &student, 1.0)
+            .unwrap(),
+    ) as f64;
+
+    // Teacher top-4 by logit: ids 7, 1, 3, 0 (logits 9, 2, 1, 0.5). Id 7 is
+    // out of range; the support is {1, 3, 0}.
+    let support = [1_usize, 3, 0];
+    let lt = log_softmax(
+        &support.iter().map(|&i| t[i] as f64).collect::<Vec<_>>(),
+        1.0,
+    );
+    let ls = log_softmax(
+        &support.iter().map(|&i| s[i] as f64).collect::<Vec<_>>(),
+        1.0,
+    );
+    let want: f64 = lt.iter().zip(&ls).map(|(a, b)| a.exp() * (a - b)).sum();
+    assert!(
+        (got - want).abs() <= 1e-4 * want.abs(),
+        "got {got}, support-restricted float64 reference {want}"
+    );
+}
+
+/// Models that share a tokenizer but pad their embeddings differently compare
+/// on the common vocabulary, whole: the loss equals the loss of the two
+/// logit tensors cut by hand.
+#[test]
+#[serial]
+fn truncating_to_the_common_vocabulary_keeps_the_distribution() {
+    use pmetal_distill::losses::align_vocab_truncate;
+
+    let t = logits(0.3); // [1, 2, 7]
+    let s: Vec<f32> = (0..2 * 9)
+        .map(|i| ((i * 3) % 7) as f32 * 0.5 - 1.0)
+        .collect();
+    let teacher = array(&t, Dtype::Float32);
+    let student = Array::from_f32_slice(&s, &[1, 2, 9]);
+
+    let (ta, sa) = align_vocab_truncate(&teacher, &student);
+    assert_eq!(ta.shape(), &[1, 2, 7]);
+    assert_eq!(sa.shape(), &[1, 2, 7]);
+    let kept: Vec<f32> = (0..2).flat_map(|r| s[r * 9..r * 9 + 7].to_vec()).collect();
+    assert_eq!(read_f32(&sa, 14), kept);
+    assert_eq!(read_f32(&ta, 14), t);
+}
+
+fn read_f32(a: &Array, n: usize) -> Vec<f32> {
+    let v = a.clone().to_f32_vec(n).unwrap();
+    drain();
+    v
+}
+
 /// A configuration that fails validation does not build a Distiller: a zero
 /// temperature divides every logit by zero.
 #[test]

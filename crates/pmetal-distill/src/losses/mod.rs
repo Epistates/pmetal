@@ -255,10 +255,14 @@ pub(crate) fn reduce_per_token(per_token: &Array, weights: Option<&Array>) -> Re
 /// Uses the default top-k of [`SPARSE_TOPK_DEFAULT`] (128).  For a custom `k`,
 /// call [`align_vocab_with_k`] directly.
 ///
-/// When teacher and student have different vocabulary sizes (cross-architecture
-/// distillation), aligning via sparse top-k is more principled than truncation
-/// or padding: it preserves the distribution information where it matters most
-/// and works regardless of which model has the larger vocabulary.
+/// When teacher and student have different vocabulary sizes, the losses compare
+/// them on the teacher's `k` most likely token ids, renormalized on each side.
+/// Ids are matched **by value**, so this is meaningful when the two models share
+/// a tokenizer and differ only in how far the embedding matrix is padded, or in
+/// a few added special tokens. Models with different tokenizers have unrelated
+/// ids: use [`UniversalLogitLoss`], which compares order statistics instead.
+/// For a pure padding difference [`align_vocab_truncate`] keeps the whole
+/// distribution.
 ///
 /// # Returns
 ///
@@ -270,10 +274,14 @@ pub fn align_vocab(teacher_logits: &Array, student_logits: &Array) -> Result<(Ar
 
 /// Align teacher and student logits when their vocab sizes differ, with a configurable top-k.
 ///
-/// When teacher and student have different vocabulary sizes (cross-architecture
-/// distillation), aligning via sparse top-k is more principled than truncation
-/// or padding: it preserves the distribution information where it matters most
-/// and works regardless of which model has the larger vocabulary.
+/// When teacher and student have different vocabulary sizes, the losses compare
+/// them on the teacher's `k` most likely token ids, renormalized on each side.
+/// Ids are matched **by value**, so this is meaningful when the two models share
+/// a tokenizer and differ only in how far the embedding matrix is padded, or in
+/// a few added special tokens. Models with different tokenizers have unrelated
+/// ids: use [`UniversalLogitLoss`], which compares order statistics instead.
+/// For a pure padding difference [`align_vocab_truncate`] keeps the whole
+/// distribution.
 ///
 /// # Algorithm
 ///
@@ -300,6 +308,9 @@ pub fn align_vocab_with_k(
     student_logits: &Array,
     top_k: i32,
 ) -> Result<(Array, Array, bool)> {
+    // The top-k ids are a function of the teacher alone and must stay out of
+    // the autodiff graph (MLX cannot differentiate a gather's indices).
+    let teacher_logits = &teacher_logits.stop_gradient();
     let teacher_vocab = teacher_logits.dim(-1) as usize;
     let student_vocab = student_logits.dim(-1) as usize;
 
@@ -357,15 +368,38 @@ pub fn align_vocab_with_k(
     let student_gathered = student_logits.take_along_axis(&clamped, -1);
 
     // Mask out positions where the teacher index fell outside the student vocab.
-    // Those positions receive -1e9 so their softmax weight is negligible (~0).
+    // Those tokens leave the support on BOTH sides (-1e9 gives them softmax
+    // weight ~0): the teacher is renormalized over the ids the student can
+    // score. Masking only the student left the teacher's probability on a
+    // token the student gives exactly zero, a KL term of ~1e9 per unit of mass.
     let student_vocab_arr = Array::from_i32(student_vocab as i32);
     let out_of_range = top_k_indices
         .as_dtype(Dtype::Int32.as_i32())
         .greater_equal(&student_vocab_arr);
     let neg_large = Array::from_f32(-1e9_f32);
     let student_aligned = ops::where_fn(&out_of_range, &neg_large, &student_gathered);
+    let teacher_aligned = ops::where_fn(&out_of_range, &neg_large, &teacher_aligned);
 
     Ok((teacher_aligned, student_aligned, true))
+}
+
+/// Cut both logit tensors to their common vocabulary, `[.., min(V_T, V_S)]`.
+///
+/// For models that share a tokenizer but pad the embedding matrix to
+/// different sizes (the extra ids are never real tokens), this is exact, and
+/// keeps the whole distribution where [`align_vocab`]'s top-k keeps only the
+/// teacher's head. Do not use it for models with different tokenizers: the
+/// ids mean different tokens there and nothing about their positions lines up
+/// (see [`UniversalLogitLoss`] for that case).
+pub fn align_vocab_truncate(teacher_logits: &Array, student_logits: &Array) -> (Array, Array) {
+    let common = teacher_logits.dim(-1).min(student_logits.dim(-1));
+    let cut = |logits: &Array| {
+        let mut stop = logits.shape().to_vec();
+        let last = stop.len() - 1;
+        stop[last] = common;
+        logits.slice(&vec![0; stop.len()], &stop)
+    };
+    (cut(teacher_logits), cut(student_logits))
 }
 
 /// Softmax along specified axis.
@@ -520,18 +554,22 @@ mod tests {
         // teacher: [1, 6] with clear ordering
         // token 5 has highest logit (10.0), token 4 second (9.0), etc.
         let teacher_data = [1.0_f32, 2.0, 3.0, 4.0, 9.0, 10.0];
-        let student_data = [0.1_f32, 0.2, 0.3, 0.4]; // only 4 tokens
+        let student_data = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]; // 8 tokens
         let teacher = Array::from_f32_slice(&teacher_data, &[1, 6]);
-        let student = Array::from_f32_slice(&student_data, &[1, 4]);
+        let student = Array::from_f32_slice(&student_data, &[1, 8]);
 
-        let (ta, _sa, _) = align_vocab_with_k(&teacher, &student, 3).unwrap();
+        let (ta, sa, _) = align_vocab_with_k(&teacher, &student, 3).unwrap();
         ta.eval();
 
-        let ta_vals: Vec<f32> = ta.clone().to_f32_vec(3).unwrap();
-        // All three selected values must be from {4.0, 9.0, 10.0}
-        // i.e. all >= 4.0 (the 4th-highest)
-        for v in &ta_vals {
-            assert!(*v >= 4.0 - 1e-5, "unexpected value in top-3: {}", v);
+        let mut ta_vals: Vec<f32> = ta.clone().to_f32_vec(3).unwrap();
+        ta_vals.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(ta_vals, vec![10.0, 9.0, 4.0]);
+
+        // The student is read at the same three ids (5, 4, 3): 0.6, 0.5, 0.4.
+        let mut sa_vals: Vec<f32> = sa.clone().to_f32_vec(3).unwrap();
+        sa_vals.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        for (got, want) in sa_vals.iter().zip([0.6, 0.5, 0.4]) {
+            assert!((got - want).abs() < 1e-6, "{sa_vals:?}");
         }
     }
 
