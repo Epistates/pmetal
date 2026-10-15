@@ -179,12 +179,12 @@ impl PipelineStageRuntime {
 pub fn solve_layer_assignment(
     num_layers: usize,
     profiles: &[NodeProfile],
-) -> Vec<PipelineStageConfig> {
+) -> DistributedResult<Vec<PipelineStageConfig>> {
     let available_ram: Vec<u64> = profiles.iter().map(|p| p.available_ram).collect();
-    let ranges = crate::layer_assignment::assign_layers_proportional(num_layers, &available_ram);
+    let ranges = crate::layer_assignment::assign_layers_proportional(num_layers, &available_ram)?;
 
     let world_size = profiles.len();
-    ranges
+    Ok(ranges
         .into_iter()
         .enumerate()
         .map(|(rank, range)| PipelineStageConfig {
@@ -196,7 +196,7 @@ pub fn solve_layer_assignment(
             wire_dtype: DtypeTag::Float16,
             codec: ActivationCodec::Float16,
         })
-        .collect()
+        .collect())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

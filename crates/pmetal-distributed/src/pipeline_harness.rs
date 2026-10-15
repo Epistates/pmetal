@@ -195,7 +195,7 @@ impl PipelineHarness {
         }
 
         // Solve layer assignment from RAM profiles.
-        let mut stages = solve_layer_assignment(cfg.num_layers, &profiles);
+        let mut stages = solve_layer_assignment(cfg.num_layers, &profiles)?;
         for s in &mut stages {
             s.wire_dtype = cfg.wire_dtype;
             s.codec = cfg.codec;

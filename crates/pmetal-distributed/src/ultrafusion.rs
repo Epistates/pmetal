@@ -14,7 +14,7 @@
 use crate::activation_codec::ActivationCodec;
 use crate::activation_transport::DtypeTag;
 use crate::error::{DistributedError, DistributedResult};
-use crate::layer_assignment::{assign_layers_bandwidth_aware, assign_layers_proportional};
+use crate::layer_assignment::assign_layers_proportional;
 use crate::pipeline::{PipelineStageConfig, PipelineStageRuntime};
 use crate::transport::in_memory_channel;
 use std::ops::Range;
@@ -165,12 +165,7 @@ impl UltraFusionExecutionConfig {
             .iter()
             .map(|die| die.available_ram_bytes)
             .collect();
-        let bandwidths = vec![self.interconnect_bandwidth_bytes_per_sec; self.dies.len()];
-        let ranges = if bandwidths.windows(2).all(|pair| pair[0] == pair[1]) {
-            assign_layers_proportional(num_layers, &available_ram)
-        } else {
-            assign_layers_bandwidth_aware(num_layers, &available_ram, &bandwidths)
-        };
+        let ranges = assign_layers_proportional(num_layers, &available_ram)?;
 
         let stages = ranges
             .into_iter()

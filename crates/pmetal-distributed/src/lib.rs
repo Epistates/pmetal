@@ -165,7 +165,9 @@ pub use fabric::{
     probe_local_fabric, score_link,
 };
 pub use identity::NodeIdentity;
-pub use layer_assignment::{assign_layers_bandwidth_aware, assign_layers_proportional};
+pub use layer_assignment::{
+    LayerProblem, StageNode, assign_layers, assign_layers_proportional, best_ring_order,
+};
 pub use metrics::{DistributedMetrics, MetricsSnapshot, SharedMetrics};
 pub use namespace::NetworkNamespace;
 pub use pipeline::{
