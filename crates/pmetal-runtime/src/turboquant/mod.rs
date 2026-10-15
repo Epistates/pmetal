@@ -61,6 +61,7 @@ mod cache;
 mod config;
 mod kernels;
 mod math;
+mod mixed;
 mod quantizer;
 mod state;
 mod store;
@@ -71,6 +72,7 @@ pub use config::{
 };
 pub use math::{beta_codebook, generate_rademacher_signs, signed_fwht_forward};
 pub(crate) use math::{generate_random_orthogonal, generate_random_projection};
+pub use mixed::{MixedQuantizedKvCache, MixedTurboQuantState};
 pub use quantizer::{Encoded, Quantizer, words_per_row};
 pub use state::TurboQuantState;
 
@@ -84,6 +86,8 @@ mod cache_tests;
 mod codebook_tests;
 #[cfg(test)]
 mod kernel_tests;
+#[cfg(test)]
+mod mixed_tests;
 #[cfg(test)]
 mod quality_tests;
 #[cfg(test)]
