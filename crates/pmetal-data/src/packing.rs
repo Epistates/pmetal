@@ -49,11 +49,8 @@ use pmetal_core::{PMetalError, Result};
 use pmetal_runtime::compat::{Array, Exception, ops as mlx_ops};
 use rayon::prelude::*;
 
-use super::Sample;
+use super::{IGNORE_INDEX, Sample};
 use crate::dataloader::{LoaderState, epoch_order};
-
-/// Label of a position the loss ignores.
-const IGNORE_INDEX: i64 = -100;
 
 /// A packed batch containing multiple concatenated sequences.
 #[derive(Debug, Clone)]

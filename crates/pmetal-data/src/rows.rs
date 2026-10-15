@@ -334,9 +334,30 @@ impl Iterator for RowReader {
     }
 }
 
+/// The binary container a file's first bytes announce, for a file whose name
+/// says nothing (a temp file, a blob in a hub cache).
+fn sniff(path: &Path) -> Option<FileKind> {
+    use std::io::Read;
+    let mut magic = [0u8; 8];
+    let n = File::open(path).ok()?.read(&mut magic).ok()?;
+    let magic = &magic[..n];
+    if magic.starts_with(b"PAR1") {
+        Some(FileKind::Parquet)
+    } else if magic.starts_with(b"ARROW1") || magic.starts_with(&[0xff; 4]) {
+        // The IPC file format, or the stream format's continuation marker.
+        Some(FileKind::Arrow)
+    } else {
+        None
+    }
+}
+
 fn open_rows(path: &Path) -> Result<RowIter> {
-    // An extension that names no format is read as JSONL, as it always was.
-    match FileKind::from_path(path).unwrap_or(FileKind::Jsonl) {
+    // A name that says nothing is read by its first bytes: Parquet and Arrow
+    // announce themselves, and anything else is JSONL, as it always was.
+    let kind = FileKind::from_path(path)
+        .or_else(|| sniff(path))
+        .unwrap_or(FileKind::Jsonl);
+    match kind {
         FileKind::Jsonl => JsonlRows::open(path).map(|r| Box::new(r) as RowIter),
         FileKind::Json => json_rows(path),
         FileKind::Parquet => ParquetRows::open(path).map(|r| Box::new(r) as RowIter),

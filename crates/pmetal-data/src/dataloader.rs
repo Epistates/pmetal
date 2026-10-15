@@ -3,7 +3,7 @@
 use pmetal_runtime::compat::{Array, ops as mlx_ops};
 use std::sync::Arc;
 
-use super::{Sample, TrainingDataset};
+use super::{IGNORE_INDEX, Sample, TrainingDataset};
 use crate::image_processing::FixedSizeImageProcessor;
 
 /// Errors produced while constructing a training batch.
@@ -421,11 +421,11 @@ impl DataLoader {
             // Labels
             if let Some(ref labels) = sample.labels {
                 labels_flat.extend(labels.iter().take(seq_len).copied());
-                labels_flat.extend(std::iter::repeat_n(-100_i64, max_len - seq_len));
+                labels_flat.extend(std::iter::repeat_n(IGNORE_INDEX, max_len - seq_len));
             } else {
                 // No labels: train on every token. The loss does the shifting.
                 labels_flat.extend(sample.input_ids.iter().take(seq_len).map(|&x| x as i64));
-                labels_flat.extend(std::iter::repeat_n(-100_i64, max_len - seq_len));
+                labels_flat.extend(std::iter::repeat_n(IGNORE_INDEX, max_len - seq_len));
             }
 
             // Attention mask
