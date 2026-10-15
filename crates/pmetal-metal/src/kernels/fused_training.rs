@@ -970,6 +970,54 @@ mod tests {
         );
     }
 
+    /// Resident memory of this process, in KiB.
+    fn resident_kib() -> i64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ps prints a number")
+    }
+
+    /// A training loop updates from a thread with no autorelease pool of its
+    /// own; the command buffer and encoder each step makes must not pile up.
+    #[test]
+    fn repeated_updates_do_not_accumulate_autoreleased_objects() {
+        let ctx = create_test_context();
+        let usage = BufferUsage::Shared;
+        let sizes = [64usize, 100];
+        let total: usize = sizes.iter().sum();
+        let adamw = FusedAdamW::new(ctx.clone(), &sizes).unwrap();
+        let buf = || MetalBuffer::<f32>::zeros(&ctx, total, usage).unwrap();
+        let (params, grads, m, v) = (buf(), buf(), buf(), buf());
+        let infos = FusedAdamW::build_param_info(&sizes);
+        let info_buf = MetalBuffer::from_slice(&ctx, &infos, usage).unwrap();
+        let groups = [AdamWConfig::default().scalars().unwrap()];
+        let step = || {
+            let mut batch = BatchedCommandBuffer::new(ctx.clone()).unwrap();
+            adamw
+                .queue_update(&mut batch, &params, &grads, &m, &v, &info_buf, &groups)
+                .unwrap();
+            batch.execute().unwrap();
+        };
+
+        for _ in 0..200 {
+            step();
+        }
+        let before = resident_kib();
+        for _ in 0..10_000 {
+            step();
+        }
+        let growth_kib = resident_kib() - before;
+        assert!(
+            growth_kib < 6 * 1024,
+            "10k updates grew resident memory by {growth_kib} KiB"
+        );
+    }
+
     #[test]
     fn adamw_step_zero_is_refused() {
         let config = AdamWConfig {
