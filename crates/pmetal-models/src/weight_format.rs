@@ -627,6 +627,60 @@ impl GgufModelConfig {
     }
 }
 
+/// Undo the GGUF converter's row permutation of a Llama-architecture
+/// checkpoint's query and key projections, in place.
+///
+/// GGUF runtimes rotate the `llama` architecture's heads in *interleaved* pairs
+/// `(2i, 2i+1)`, where Hugging Face rotates `(i, i + head_dim/2)`. The
+/// converter reorders every head's rows so the two conventions
+/// agree: `reshape(n_head, 2, head_dim/2, ..).swapaxes(1, 2)`, which sends row
+/// `a·head_dim/2 + b` of a head to row `2b + a`. The permutation touches
+/// `q_proj` and `k_proj`, weights and biases, and nothing else, and it is only
+/// done for the `llama` architecture: the Qwen and Phi families rotate in the
+/// Hugging Face convention already.
+///
+/// Loading such a file without undoing it feeds the HF-convention rotation rows
+/// in the wrong order: finite, plausibly shaped logits from attention that
+/// attends to the wrong positions.
+///
+/// `num_heads` is the query head count and `num_kv_heads` the key head count
+/// (the same for MHA).
+pub fn unpermute_llama_qk(
+    weights: &mut HashMap<String, Array>,
+    num_heads: i32,
+    num_kv_heads: i32,
+) -> Result<(), WeightFormatError> {
+    let heads_of = |name: &str| -> Option<i32> {
+        if name.ends_with(".self_attn.q_proj.weight") || name.ends_with(".self_attn.q_proj.bias") {
+            Some(num_heads)
+        } else if name.ends_with(".self_attn.k_proj.weight")
+            || name.ends_with(".self_attn.k_proj.bias")
+        {
+            Some(num_kv_heads)
+        } else {
+            None
+        }
+    };
+    for (name, tensor) in weights.iter_mut() {
+        let Some(heads) = heads_of(name) else {
+            continue;
+        };
+        let shape = tensor.shape().to_vec();
+        let rows = shape[0];
+        if heads <= 0 || rows % (2 * heads) != 0 {
+            return Err(WeightFormatError::Gguf(format!(
+                "{name} has {rows} rows, which {heads} heads cannot split into rotary pairs"
+            )));
+        }
+        let rest: Vec<i32> = shape[1..].to_vec();
+        let mut grouped = vec![heads, rows / heads / 2, 2];
+        grouped.extend(&rest);
+        // The inverse of `[heads, 2, d/2] -> [heads, d/2, 2]`.
+        *tensor = tensor.reshape(&grouped).swap_axes(1, 2).reshape(&shape);
+    }
+    Ok(())
+}
+
 /// Get the detected model architecture from a GGUF file.
 pub fn get_gguf_architecture(path: impl AsRef<Path>) -> Result<Option<String>, WeightFormatError> {
     let path = path.as_ref();
@@ -883,5 +937,110 @@ mod tests {
         // Two different models are still ambiguous.
         std::fs::write(dir.path().join("Other-Q8_0.gguf"), b"x").unwrap();
         assert!(find_gguf_file_in_dir(dir.path()).is_err());
+    }
+
+    /// the GGUF converter's `LlamaModel.permute`, written out row by row rather than as
+    /// the reshape it is in the converter, so the loader cannot agree with it by
+    /// construction: head row `a·d/2 + b` goes to row `2b + a`.
+    fn gguf_permute(rows: &[Vec<f32>], heads: usize) -> Vec<Vec<f32>> {
+        let d = rows.len() / heads;
+        let mut out = vec![Vec::new(); rows.len()];
+        for h in 0..heads {
+            for a in 0..2 {
+                for b in 0..d / 2 {
+                    out[h * d + 2 * b + a] = rows[h * d + a * (d / 2) + b].clone();
+                }
+            }
+        }
+        out
+    }
+
+    fn matrix(rows: &[Vec<f32>]) -> Array {
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        Array::from_f32_slice(&flat, &[rows.len() as i32, rows[0].len() as i32])
+    }
+
+    fn rows_of(array: &Array) -> Vec<Vec<f32>> {
+        let (rows, cols) = (array.shape()[0] as usize, array.shape()[1] as usize);
+        let mut array = array.clone();
+        let flat = array.to_f32_vec(rows * cols).unwrap();
+        flat.chunks(cols).map(<[f32]>::to_vec).collect()
+    }
+
+    /// ⚠️ Every `llama`-architecture GGUF stores its q and k rows permuted, and
+    /// the loader assigned them as they were.
+    #[test]
+    fn gguf_row_permutation_is_undone_for_q_and_k_but_not_v() {
+        let (heads, kv_heads, head_dim, hidden) = (4usize, 2usize, 8usize, 3usize);
+        let rows = |n: usize, seed: f32| -> Vec<Vec<f32>> {
+            (0..n)
+                .map(|r| {
+                    (0..hidden)
+                        .map(|c| seed + (r * hidden + c) as f32)
+                        .collect()
+                })
+                .collect()
+        };
+        let q = rows(heads * head_dim, 0.0);
+        let k = rows(kv_heads * head_dim, 1000.0);
+        let v = rows(kv_heads * head_dim, 2000.0);
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            matrix(&gguf_permute(&q, heads)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.k_proj.weight".to_string(),
+            matrix(&gguf_permute(&k, kv_heads)),
+        );
+        weights.insert(
+            "model.layers.0.self_attn.v_proj.weight".to_string(),
+            matrix(&v),
+        );
+
+        unpermute_llama_qk(&mut weights, heads as i32, kv_heads as i32).unwrap();
+
+        assert_eq!(
+            rows_of(&weights["model.layers.0.self_attn.q_proj.weight"]),
+            q
+        );
+        assert_eq!(
+            rows_of(&weights["model.layers.0.self_attn.k_proj.weight"]),
+            k
+        );
+        assert_eq!(
+            rows_of(&weights["model.layers.0.self_attn.v_proj.weight"]),
+            v
+        );
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    /// A query bias is permuted the same way as the rows it belongs to.
+    #[test]
+    fn a_permuted_bias_is_unpermuted_too() {
+        let (heads, head_dim) = (2usize, 4usize);
+        let rows: Vec<Vec<f32>> = (0..heads * head_dim).map(|r| vec![r as f32]).collect();
+        let permuted = gguf_permute(&rows, heads);
+        let flat: Vec<f32> = permuted.iter().flatten().copied().collect();
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.bias".to_string(),
+            Array::from_f32_slice(&flat, &[(heads * head_dim) as i32]),
+        );
+        unpermute_llama_qk(&mut weights, heads as i32, heads as i32).unwrap();
+        let mut bias = weights["model.layers.0.self_attn.q_proj.bias"].clone();
+        let want: Vec<f32> = rows.iter().flatten().copied().collect();
+        assert_eq!(bias.to_f32_vec(want.len()).unwrap(), want);
+    }
+
+    #[test]
+    fn rows_that_cannot_be_rotary_pairs_are_refused() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            Array::from_f32_slice(&[0.0; 9], &[3, 3]),
+        );
+        assert!(unpermute_llama_qk(&mut weights, 1, 1).is_err());
     }
 }
