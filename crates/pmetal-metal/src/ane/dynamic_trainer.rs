@@ -258,6 +258,48 @@ impl DynamicAneTrainerConfig {
         super::checkpoint::check_model_type(config_json, &["llama", "mistral"], "training")?;
         super::checkpoint::check_shared_limits(config_json, "training")
     }
+
+    /// The model-shape fields of a Hugging Face `config.json` (dimensions,
+    /// head layout, layer and vocabulary counts, RMSNorm epsilon and RoPE
+    /// base), the rest at their defaults, once the model passes
+    /// [`is_ane_trainable`](Self::is_ane_trainable).
+    ///
+    /// `rope_theta` is read from the key of that name or from
+    /// `rope_parameters`, where newer Transformers write it; a config that
+    /// names none gets Llama's and Mistral's default, 10 000. Reading only
+    /// the old key rotated every position of a model that wrote the new one
+    /// at the wrong frequency.
+    pub fn from_model_config(config_json: &serde_json::Value) -> std::result::Result<Self, String> {
+        Self::is_ane_trainable(config_json)?;
+        let int = |key: &str| -> std::result::Result<Option<usize>, String> {
+            match config_json.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .map(|v| Some(v as usize))
+                    .ok_or_else(|| format!("config.json: '{key}' is not a count")),
+            }
+        };
+        let need = |key: &str| -> std::result::Result<usize, String> {
+            int(key)?.ok_or_else(|| format!("config.json missing '{key}'"))
+        };
+        let n_heads = need("num_attention_heads")?;
+        Ok(Self {
+            dim: need("hidden_size")?,
+            hidden_dim: need("intermediate_size")?,
+            n_heads,
+            n_kv_heads: int("num_key_value_heads")?.unwrap_or(n_heads),
+            head_dim: int("head_dim")?,
+            n_layers: need("num_hidden_layers")?,
+            vocab_size: need("vocab_size")?,
+            rms_norm_eps: config_json
+                .get("rms_norm_eps")
+                .and_then(|v| v.as_f64())
+                .map_or(1e-6, |v| v as f32),
+            rope_theta: super::checkpoint::rope_theta(config_json).map_or(10_000.0, |v| v as f32),
+            ..Self::default()
+        })
+    }
 }
 
 /// Per-layer weight storage (f32, row-major).
@@ -2922,6 +2964,57 @@ mod tests {
                 "{model_type:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn the_model_shape_comes_from_config_json_in_either_rope_layout() {
+        let mut config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 576,
+            "intermediate_size": 1536,
+            "num_attention_heads": 9,
+            "num_key_value_heads": 3,
+            "num_hidden_layers": 30,
+            "vocab_size": 49152,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 100000.0,
+        });
+        let c = DynamicAneTrainerConfig::from_model_config(&config).unwrap();
+        assert_eq!(
+            (
+                c.dim,
+                c.hidden_dim,
+                c.n_heads,
+                c.n_kv_heads,
+                c.n_layers,
+                c.vocab_size
+            ),
+            (576, 1536, 9, 3, 30, 49152)
+        );
+        assert_eq!(
+            (c.head_dim, c.rms_norm_eps, c.rope_theta),
+            (None, 1e-5, 100000.0)
+        );
+
+        // The layout newer Transformers write, and a config naming neither.
+        config.as_object_mut().unwrap().remove("rope_theta");
+        config["rope_parameters"] =
+            serde_json::json!({"rope_type": "default", "rope_theta": 500000.0});
+        config["head_dim"] = serde_json::json!(64);
+        let c = DynamicAneTrainerConfig::from_model_config(&config).unwrap();
+        assert_eq!((c.rope_theta, c.head_dim), (500000.0, Some(64)));
+        config.as_object_mut().unwrap().remove("rope_parameters");
+        let c = DynamicAneTrainerConfig::from_model_config(&config).unwrap();
+        assert_eq!(c.rope_theta, 10_000.0, "Llama's default");
+
+        // Missing keys name themselves, and a model that isn't trainable is
+        // refused before any of that.
+        config.as_object_mut().unwrap().remove("num_hidden_layers");
+        let err = DynamicAneTrainerConfig::from_model_config(&config).unwrap_err();
+        assert!(err.contains("num_hidden_layers"), "{err}");
+        config["model_type"] = serde_json::json!("qwen3");
+        let err = DynamicAneTrainerConfig::from_model_config(&config).unwrap_err();
+        assert!(err.contains("qwen3"), "{err}");
     }
 
     #[test]
