@@ -55,6 +55,19 @@ pub fn write_model(dir: &Path, tensors: &[Spec<'_>], dtype: Dtype) {
     .unwrap();
 }
 
+/// Write a model directory with the given `config.json` text and a
+/// tokenizer file.
+pub fn write_model_with_config(dir: &Path, tensors: &[Spec<'_>], dtype: Dtype, config: &str) {
+    write_file(dir, "model.safetensors", tensors, dtype);
+    std::fs::write(dir.join("config.json"), config).unwrap();
+    std::fs::write(dir.join("tokenizer.json"), "{\"version\": \"1.0\"}").unwrap();
+}
+
+/// Read `dir/config.json` as JSON.
+pub fn read_config(dir: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()
+}
+
 /// Read tensor `name` from the model at `dir` as f32, failing on a runtime
 /// error.
 pub fn read_tensor(dir: &Path, name: &str) -> Vec<f32> {

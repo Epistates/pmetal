@@ -111,6 +111,7 @@ fn align_moe_experts_recovers_per_expert_blend() {
             sanity: SanityLevel::Quick,
             dry_run: false,
             align_moe_experts: align,
+            ..Default::default()
         };
         run_merge(&config).unwrap();
 

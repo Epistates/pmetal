@@ -208,6 +208,36 @@ pub struct MergeConfig {
     /// non-MoE merges.
     #[serde(default)]
     pub align_moe_experts: bool,
+
+    /// What to do when the vocabulary tensors (`embed_tokens`, `lm_head`)
+    /// have different row counts across the models. See [`VocabMismatch`].
+    #[serde(default)]
+    pub vocab_mismatch: VocabMismatch,
+
+    /// Largest output shard in bytes. A tensor larger than this gets a shard
+    /// to itself. Defaults to 5 GiB.
+    #[serde(default)]
+    pub max_shard_size: Option<u64>,
+}
+
+/// How to reconcile vocabulary tensors whose row counts differ.
+///
+/// Fine-tunes often pad or extend the vocabulary of their base (added
+/// special tokens, a vocab padded to a multiple of 64). Rows are matched by
+/// token id, which is only meaningful when the models share a tokenizer
+/// prefix, so the default is to refuse and let the user opt in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VocabMismatch {
+    /// Fail with an error naming the tensor and the shapes. Default.
+    #[default]
+    Error,
+    /// Cut every model to the smallest row count.
+    Truncate,
+    /// Grow every model to the largest row count. A model's missing rows are
+    /// filled from the base model, or from the model that has them when
+    /// there is no base (or the base is short too), so they merge as no change.
+    Extend,
 }
 
 fn default_dtype() -> String {
@@ -642,34 +672,8 @@ impl MergeConfig {
                 actual: 0,
             });
         }
-
-        // SLERP requires exactly 2 models
-        if matches!(self.merge_method, MergeMethodConfig::Slerp) && self.models.len() != 2 {
-            return Err(crate::MergeError::InvalidConfig(
-                "SLERP requires exactly 2 models".to_string(),
-            ));
-        }
-
-        // Task vector methods require base model
-        match self.merge_method {
-            MergeMethodConfig::Ties
-            | MergeMethodConfig::DareTies
-            | MergeMethodConfig::DareLinear
-            | MergeMethodConfig::Della
-            | MergeMethodConfig::DellaLinear
-            | MergeMethodConfig::Breadcrumbs
-            | MergeMethodConfig::ModelStock
-            | MergeMethodConfig::Ram
-            | MergeMethodConfig::RamPlus
-                if self.base_model.is_none() =>
-            {
-                return Err(crate::MergeError::BaseModelRequired {
-                    method: format!("{:?}", self.merge_method),
-                });
-            }
-            _ => {}
-        }
-
+        self.merge_method
+            .validate_for(self.models.len(), self.base_model.is_some(), "")?;
         Ok(())
     }
 
@@ -679,6 +683,12 @@ impl MergeConfig {
         if slices.is_empty() {
             return Err(crate::MergeError::InvalidConfig(
                 "slices array must not be empty".to_string(),
+            ));
+        }
+        if !self.models.is_empty() {
+            return Err(crate::MergeError::InvalidConfig(
+                "`models` and `slices` are mutually exclusive; list the models inside the slices"
+                    .to_string(),
             ));
         }
 
@@ -706,29 +716,81 @@ impl MergeConfig {
                 }
             }
 
-            // When a slice uses a task-vector method it needs a base model
-            let effective_method = slice.merge_method.as_ref().unwrap_or(&self.merge_method);
-            match effective_method {
-                MergeMethodConfig::Ties
-                | MergeMethodConfig::DareTies
-                | MergeMethodConfig::DareLinear
-                | MergeMethodConfig::Della
-                | MergeMethodConfig::DellaLinear
-                | MergeMethodConfig::Breadcrumbs
-                | MergeMethodConfig::ModelStock
-                | MergeMethodConfig::Ram
-                | MergeMethodConfig::RamPlus => {
-                    let has_base = slice.base_model.is_some() || self.base_model.is_some();
-                    if !has_base {
-                        return Err(crate::MergeError::BaseModelRequired {
-                            method: format!("{:?}", effective_method),
-                        });
-                    }
-                }
-                _ => {}
+            // Sources are merged layer by layer, so they must cover the same
+            // number of layers.
+            let n_layers = slice.sources[0].n_layers();
+            if let Some((src_idx, src)) = slice
+                .sources
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.n_layers() != n_layers)
+            {
+                return Err(crate::MergeError::InvalidConfig(format!(
+                    "slice[{}].sources[{}]: layer_range covers {} layers but sources[0] covers {}",
+                    slice_idx,
+                    src_idx,
+                    src.n_layers(),
+                    n_layers
+                )));
             }
+
+            let effective_method = slice.merge_method.as_ref().unwrap_or(&self.merge_method);
+            effective_method.validate_for(
+                slice.sources.len(),
+                slice.base_model.is_some() || self.base_model.is_some(),
+                &format!("slice[{slice_idx}]: "),
+            )?;
         }
 
+        Ok(())
+    }
+}
+
+impl MergeMethodConfig {
+    /// Whether the method works on task vectors and so needs a base model.
+    pub fn requires_base_model(&self) -> bool {
+        matches!(
+            self,
+            Self::TaskArithmetic
+                | Self::Ties
+                | Self::DareTies
+                | Self::DareLinear
+                | Self::Della
+                | Self::DellaLinear
+                | Self::Breadcrumbs
+                | Self::ModelStock
+                | Self::Nearswap
+                | Self::Ram
+                | Self::RamPlus
+        )
+    }
+
+    /// Check this method against the number of models it will merge and
+    /// whether a base model is configured. `context` prefixes the messages.
+    fn validate_for(&self, n_models: usize, has_base: bool, context: &str) -> crate::Result<()> {
+        use crate::MergeError;
+        if self.requires_base_model() && !has_base {
+            return Err(MergeError::BaseModelRequired {
+                method: format!("{context}{self:?}"),
+            });
+        }
+        if matches!(self, Self::Slerp) && n_models != 2 {
+            return Err(MergeError::InvalidConfig(format!(
+                "{context}SLERP requires exactly 2 models, got {n_models}"
+            )));
+        }
+        let side_files = match self {
+            Self::Fisher { fisher_paths, .. } => Some(("fisher_paths", fisher_paths.len())),
+            Self::RegMean { gram_paths, .. } => Some(("gram_paths", gram_paths.len())),
+            _ => None,
+        };
+        if let Some((key, count)) = side_files {
+            if count != n_models {
+                return Err(MergeError::InvalidConfig(format!(
+                    "{context}{key} lists {count} paths for {n_models} models; one per model is required"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -748,6 +810,8 @@ impl Default for MergeConfig {
             sanity: crate::sanity::SanityLevel::default(),
             dry_run: false,
             align_moe_experts: false,
+            vocab_mismatch: VocabMismatch::default(),
+            max_shard_size: None,
         }
     }
 }
@@ -836,6 +900,96 @@ parameters:
         };
 
         assert!(config.validate().is_err());
+    }
+
+    fn model(name: &str) -> ModelConfig {
+        ModelConfig {
+            model: name.to_string(),
+            parameters: Default::default(),
+        }
+    }
+
+    #[test]
+    fn every_task_vector_method_requires_a_base_model() {
+        for method in [
+            MergeMethodConfig::TaskArithmetic,
+            MergeMethodConfig::Nearswap,
+            MergeMethodConfig::Ties,
+            MergeMethodConfig::ModelStock,
+            MergeMethodConfig::Breadcrumbs,
+        ] {
+            let config = MergeConfig {
+                merge_method: method.clone(),
+                models: vec![model("a"), model("b")],
+                ..Default::default()
+            };
+            let err = config.validate().expect_err(&format!("{method:?}"));
+            assert!(matches!(err, crate::MergeError::BaseModelRequired { .. }));
+
+            let with_base = MergeConfig {
+                base_model: Some("base".into()),
+                ..config
+            };
+            with_base.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn side_file_paths_must_match_the_model_count() {
+        let config = MergeConfig {
+            merge_method: MergeMethodConfig::Fisher {
+                fisher_paths: vec!["f1".into()],
+                eps: 1e-8,
+                fallback_to_mean: true,
+            },
+            models: vec![model("a"), model("b")],
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("fisher_paths") && err.contains("2 models"), "{err}");
+    }
+
+    #[test]
+    fn slices_and_models_are_exclusive_and_sources_must_cover_equal_layer_counts() {
+        let source = |m: &str, range: (usize, usize)| InputSlice {
+            model: m.to_string(),
+            layer_range: range,
+            parameters: Default::default(),
+        };
+        let sliced = |models: Vec<ModelConfig>, sources: Vec<InputSlice>| MergeConfig {
+            models,
+            slices: Some(vec![OutputSlice {
+                sources,
+                base_model: None,
+                merge_method: None,
+                parameters: Default::default(),
+            }]),
+            ..Default::default()
+        };
+
+        let both = sliced(vec![model("a")], vec![source("a", (0, 4))]);
+        assert!(both.validate().unwrap_err().to_string().contains("mutually exclusive"));
+
+        let uneven = sliced(vec![], vec![source("a", (0, 4)), source("b", (0, 6))]);
+        let err = uneven.validate().unwrap_err().to_string();
+        assert!(err.contains("covers 6 layers but sources[0] covers 4"), "{err}");
+
+        sliced(vec![], vec![source("a", (0, 4)), source("b", (8, 12))])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn vocab_mismatch_and_shard_size_parse_from_yaml() {
+        let config = MergeConfig::from_yaml(
+            "merge_method: linear\nmodels:\n  - model: a\nvocab_mismatch: extend\nmax_shard_size: 1000\n",
+        )
+        .unwrap();
+        assert_eq!(config.vocab_mismatch, VocabMismatch::Extend);
+        assert_eq!(config.max_shard_size, Some(1000));
+        let default = MergeConfig::from_yaml("merge_method: linear\nmodels:\n  - model: a\n").unwrap();
+        assert_eq!(default.vocab_mismatch, VocabMismatch::Error);
+        assert_eq!(default.max_shard_size, None);
     }
 
     // -------------------------------------------------------------------------
