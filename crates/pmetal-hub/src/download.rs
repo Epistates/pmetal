@@ -231,12 +231,18 @@ async fn fetch_model(model_id: &str, options: &DownloadOptions) -> Result<PathBu
     if let SelectedWeights::Gguf { .. } = plan.model.weights {
         ensure_gguf_config(&snapshot, &plan.model);
     }
-    let report = verify_model_dir(&snapshot);
-    if !report.is_complete() {
-        return Err(PMetalError::Hub(format!(
-            "downloaded {model_id} but the result is not a complete model: {}",
-            report.problems.join("; ")
-        )));
+    // A model directory is checked as one (every shard present, every file the
+    // length its header promises) when its weights sit at the top level; a
+    // repository that keeps them in component folders has been checked file by
+    // file against the Hub's sizes above.
+    if plan.model.weight_files().all(|f| !f.path.contains('/')) {
+        let report = verify_model_dir(&snapshot);
+        if !report.is_complete() {
+            return Err(PMetalError::Hub(format!(
+                "downloaded {model_id} but the result is not a complete model: {}",
+                report.problems.join("; ")
+            )));
+        }
     }
     Ok(snapshot)
 }

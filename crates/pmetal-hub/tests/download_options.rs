@@ -482,6 +482,52 @@ async fn a_dataset_download_is_pinned_and_limited_to_its_split() {
 }
 
 #[tokio::test]
+async fn repositories_that_are_not_language_models_still_download() {
+    isolate_env();
+    let hub = FakeHub::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    // A checkpoint with no config.json at all.
+    hub.add_model(
+        "o/plain",
+        Repo::with_files(&[
+            ("model_index.json", b"{}"),
+            ("flux.safetensors", &safetensors_file("a", 600)),
+            ("ae.safetensors", &safetensors_file("b", 600)),
+        ]),
+    );
+    // Weights kept in component folders.
+    hub.add_model(
+        "o/parts",
+        Repo::with_files(&[
+            ("model_index.json", b"{}"),
+            (
+                "unet/diffusion_pytorch_model.safetensors",
+                &safetensors_file("u", 600),
+            ),
+            (
+                "vae/diffusion_pytorch_model.safetensors",
+                &safetensors_file("v", 600),
+            ),
+        ]),
+    );
+    let opts = options(&hub, cache.path());
+
+    let plain = download_model_with("o/plain", &opts).await.unwrap();
+    assert!(plain.join("flux.safetensors").exists() && plain.join("ae.safetensors").exists());
+    let parts = download_model_with("o/parts", &opts).await.unwrap();
+    assert!(
+        parts
+            .join("unet/diffusion_pytorch_model.safetensors")
+            .exists()
+    );
+    assert!(
+        parts
+            .join("vae/diffusion_pytorch_model.safetensors")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn file_names_with_glob_characters_download_as_themselves() {
     isolate_env();
     let hub = FakeHub::start().await;

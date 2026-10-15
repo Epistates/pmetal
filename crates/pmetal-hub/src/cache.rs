@@ -209,7 +209,7 @@ pub fn find_cached_model_in(
     revision: Option<&str>,
 ) -> Option<PathBuf> {
     find_snapshot(cache_root, RepoKind::Model, repo_id, revision, |snapshot| {
-        verify_model_dir(snapshot).is_complete()
+        verify_model_dir(snapshot).is_loadable_language_model()
     })
 }
 

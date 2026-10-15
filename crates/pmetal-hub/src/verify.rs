@@ -24,6 +24,9 @@ pub struct ModelDirReport {
     pub safetensors: Option<SafetensorsSummary>,
     /// Why the directory cannot be loaded; empty when it is complete.
     pub problems: Vec<String>,
+    /// What is absent but not necessarily needed: a missing `config.json`
+    /// (a language model cannot load without one; other models have none).
+    pub warnings: Vec<String>,
 }
 
 impl ModelDirReport {
@@ -31,15 +34,23 @@ impl ModelDirReport {
     pub fn is_complete(&self) -> bool {
         self.problems.is_empty()
     }
+
+    /// Whether this is a complete model a language-model loader can open: no
+    /// problems, and a `config.json` unless the weights are GGUF (which carry
+    /// their own configuration).
+    pub fn is_loadable_language_model(&self) -> bool {
+        self.is_complete() && self.warnings.is_empty()
+    }
 }
 
-/// Check a model directory: a readable `config.json` (a GGUF carries its own
-/// configuration), weights of one format that are all present, each safetensors
-/// file exactly as long as its header says, each GGUF set complete with every
-/// tensor inside its file.
+/// Check a model directory: weights of one format that are all present, each
+/// safetensors file exactly as long as its header says, each GGUF set complete
+/// with every tensor inside its file, and a readable `config.json` if there is
+/// one (its absence is only a warning, except that a GGUF needs none).
 ///
-/// A directory with no weights at all is incomplete. Symlinked files (the Hub
-/// cache layout) are followed; a dangling link counts as missing.
+/// A directory with no weights at all is incomplete. Weights are looked for
+/// directly in `dir`. Symlinked files (the Hub cache layout) are followed; a
+/// dangling link counts as missing.
 pub fn verify_model_dir(dir: &Path) -> ModelDirReport {
     let mut report = ModelDirReport::default();
     if !dir.is_dir() {
@@ -88,7 +99,9 @@ pub fn verify_model_dir(dir: &Path) -> ModelDirReport {
                     report.problems.push("config.json is not valid JSON".into());
                 }
             }
-            Err(_) => report.problems.push("config.json is missing".into()),
+            // Not every repository has one (a diffusion checkpoint's weights
+            // are the whole model), but a language model cannot load without.
+            Err(_) => report.warnings.push("config.json is missing".into()),
         }
     }
     report
@@ -315,9 +328,27 @@ mod tests {
     }
 
     #[test]
-    fn config_is_required_for_safetensors_but_not_gguf() {
+    fn a_missing_config_is_a_warning_and_gguf_needs_none() {
         let dir = tempfile::tempdir().unwrap();
         write_test_safetensors(&dir.path().join("model.safetensors"), &[("w", "F16", &[4])]);
+        let report = verify_model_dir(dir.path());
+        // Complete weights, but not something a language-model loader can open.
+        assert!(report.is_complete());
+        assert!(report.warnings.iter().any(|p| p.contains("config.json")));
+        assert!(!report.is_loadable_language_model());
+
+        let gguf = tempfile::tempdir().unwrap();
+        write_gguf(gguf.path(), "m.gguf", None, &["a"]);
+        let report = verify_model_dir(gguf.path());
+        assert!(report.warnings.is_empty());
+        assert!(report.is_loadable_language_model());
+    }
+
+    #[test]
+    fn a_config_that_is_not_json_is_a_problem() {
+        let dir = model_dir();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &[("w", "F16", &[4])]);
+        std::fs::write(dir.path().join("config.json"), "not json").unwrap();
         let report = verify_model_dir(dir.path());
         assert!(report.problems.iter().any(|p| p.contains("config.json")));
     }
