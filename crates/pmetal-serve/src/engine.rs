@@ -1911,7 +1911,13 @@ impl InferenceEngine {
                 prefix_hit_len,
                 prefill_step_size,
                 |chunk| {
-                    model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
+                    // Only the last chunk's last position is sampled from.
+                    model.forward_with_hybrid_cache_last(
+                        chunk,
+                        None,
+                        Some(cache),
+                        mamba_cache.as_mut(),
+                    )
                 },
             ),
             Some(media) => Self::prefill_media(model, media, cache, mamba_cache.as_mut()),

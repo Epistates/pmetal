@@ -62,13 +62,8 @@ fn build_model_via_production_loader() -> CohereForCausalLM {
     std::fs::create_dir_all(&tmp).expect("temp dir");
     let dst = tmp.join("model.safetensors");
     std::fs::copy(fixture_path("cohere_synth_weights.safetensors"), &dst).expect("copy weights");
-    load_generic_weights_with(
-        &mut model,
-        &tmp,
-        |_| None,
-        &ModelArchitecture::Cohere.load_policy(),
-    )
-    .expect("production loader runs");
+    load_generic_weights_with(&mut model, &tmp, &ModelArchitecture::Cohere.load_policy())
+        .expect("production loader runs");
     let _ = std::fs::remove_dir_all(&tmp);
     model
 }

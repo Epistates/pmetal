@@ -222,16 +222,112 @@ fn dynamic_cached_decode(profile: &str) {
         ));
     }
     assert_all_pass(&format!("{profile}: dynamic cached decode"), &reports);
+}
 
-    // The InlineArray decode path is tried on the first step only: the swish
-    // checkpoint takes it, and the sigmoid one keeps the reason it can't
-    // rather than trying, and logging, again every step.
-    let DynamicModel::Qwen3Next(qwen) = &model else {
-        panic!("{profile}: a Qwen3.5 checkpoint loads as Qwen3Next");
-    };
-    let inline = qwen.inline_weights.as_ref().map(Result::is_ok);
-    let want_inline = Some(profile != "sigmoid");
-    assert_eq!(inline, want_inline, "{profile}: InlineArray decode weights");
+/// The prompt prefilled in passes of several sizes through the `DynamicModel`
+/// caches, the sizes chosen to split it inside a GDN layer's convolution window
+/// (kernel 4) and the reference's 64-token chunk: the logits of every pass, and
+/// the decode that follows the last, must be `transformers`'.
+fn dynamic_chunked_prefill(profile: &str) {
+    let fx = checkpoint(profile);
+    let mut model = DynamicModel::load(fx.path()).expect("checkpoint loads");
+    let ids = fx.input_ids();
+    let t = fx.seq_len();
+    let want = fx.tensor("logits");
+
+    let mut reports = Vec::new();
+    for chunk in [1, 2, 3, 7, 33, 64, 69] {
+        let mut kv = model.create_cache(t as usize + 1);
+        let mut mamba = model
+            .create_mamba_cache()
+            .expect("hybrid model has a GDN cache");
+        // Everything but the last token, `chunk` tokens per pass; then the last
+        // token alone, a decode step from the state the passes left.
+        let mut start = 0;
+        while start < t - 1 {
+            let end = (start + chunk).min(t - 1);
+            let logits = model
+                .forward_with_hybrid_cache(
+                    &rows(&ids, start, end),
+                    None,
+                    Some(&mut kv),
+                    Some(&mut mamba),
+                )
+                .expect("prefill pass");
+            drain_bridge("dynamic chunked prefill");
+            reports.push(ParityReport::compute(
+                &format!("chunk_{chunk}_rows_{start}_{end}"),
+                &logits,
+                &rows(&want, start, end),
+                DECODE_TOL,
+            ));
+            start = end;
+        }
+        let step = model
+            .forward_with_hybrid_cache(&rows(&ids, t - 1, t), None, Some(&mut kv), Some(&mut mamba))
+            .expect("decode step");
+        drain_bridge("dynamic decode after chunked prefill");
+        reports.push(ParityReport::compute(
+            &format!("chunk_{chunk}_decode"),
+            &step,
+            &rows(&want, t - 1, t),
+            DECODE_TOL,
+        ));
+    }
+    assert_all_pass(&format!("{profile}: dynamic chunked prefill"), &reports);
+}
+
+/// A prefill or decode step that wants one position's logits gets `[B, 1,
+/// vocab]` from the head run on that position alone, equal to the last row of
+/// the full forward and to the reference's.
+fn dynamic_last_position_logits(profile: &str) {
+    let fx = checkpoint(profile);
+    let mut model = DynamicModel::load(fx.path()).expect("checkpoint loads");
+    let t = fx.seq_len();
+    let ids = fx.input_ids();
+    let want = rows(&fx.tensor("logits"), t - 1, t);
+
+    let mut kv = model.create_cache(t as usize + 1);
+    let mut mamba = model.create_mamba_cache().expect("GDN cache");
+    let last = model
+        .forward_with_hybrid_cache_last(&ids, None, Some(&mut kv), Some(&mut mamba))
+        .expect("last-position prefill");
+    drain_bridge("dynamic last-position prefill");
+    assert_eq!(last.dim(0), 1);
+    assert_eq!(last.dim(1), 1, "one position's logits");
+    assert_eq!(last.dim(2), want.dim(2));
+    let reports = vec![ParityReport::compute(
+        "last_logits",
+        &last,
+        &want,
+        PREFILL_TOL,
+    )];
+    assert_all_pass(&format!("{profile}: last-position logits"), &reports);
+
+    // The cache it leaves is the full forward's: the next token decodes alike.
+    let next = rows(&ids, t - 1, t);
+    let mut kv_full = model.create_cache(t as usize + 2);
+    let mut mamba_full = model.create_mamba_cache().expect("GDN cache");
+    model
+        .forward_with_hybrid_cache(&ids, None, Some(&mut kv_full), Some(&mut mamba_full))
+        .expect("full prefill");
+    let a = model
+        .forward_with_hybrid_cache_last(&next, None, Some(&mut kv), Some(&mut mamba))
+        .expect("decode after the last-position prefill");
+    let b = model
+        .forward_with_hybrid_cache(&next, None, Some(&mut kv_full), Some(&mut mamba_full))
+        .expect("decode after the full prefill");
+    drain_bridge("dynamic decode");
+    let reports = vec![ParityReport::compute(
+        "decode",
+        &a,
+        &b,
+        Tolerance::new(1e-6, 0.0),
+    )];
+    assert_all_pass(
+        &format!("{profile}: decode after last-position prefill"),
+        &reports,
+    );
 }
 
 fn dynamic_mtp(profile: &str) {
@@ -524,6 +620,42 @@ fn swish_native_chunked_prefill_matches_transformers() {
 /// The routed-experts profile (`qwen3_5_moe`): every layer a sparse block of
 /// 8 experts, 2 per token, plus a shared expert behind its own sigmoid gate,
 /// in transformers' fused `gate_up_proj` layout. 40 tokens.
+#[test]
+#[serial]
+fn swish_dynamic_chunked_prefill_matches_transformers() {
+    dynamic_chunked_prefill("swish");
+}
+
+#[test]
+#[serial]
+fn swish_dynamic_last_position_logits_are_the_last_row() {
+    dynamic_last_position_logits("swish");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_last_position_logits_are_the_last_row() {
+    dynamic_last_position_logits("moe");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_prefill_matches_transformers() {
+    dynamic_prefill("moe");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_cached_decode_matches_transformers() {
+    dynamic_cached_decode("moe");
+}
+
+#[test]
+#[serial]
+fn moe_dynamic_chunked_prefill_matches_transformers() {
+    dynamic_chunked_prefill("moe");
+}
+
 #[test]
 #[serial]
 fn moe_native_matches_transformers() {

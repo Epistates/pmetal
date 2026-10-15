@@ -6,7 +6,10 @@ use pmetal_runtime::compat::{Array, ModuleParametersExt};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use super::{LoadError, load_weights, load_weights_filtered};
+use super::{
+    LoadError, dequantize_sidecar_weights, load_weights, load_weights_filtered_raw,
+    unpack_mlx_quantized_weights,
+};
 use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::llama::LlamaForCausalLM;
@@ -16,12 +19,18 @@ use crate::architectures::nemotron_h::{
 };
 use crate::architectures::phi::{PhiConfig, PhiForCausalLM};
 use crate::architectures::qwen3_next::{
-    Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions, sanitize_weights,
+    Qwen3NextConfig, Qwen3NextFeedForward, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions,
+    sanitize_weights, take_packed_experts,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Qwen3NextLoadOptions {
     pub skip_routed_experts: bool,
+    /// Unpack NVIDIA ModelOpt NVFP4 routed experts to dense weights, as every
+    /// other quantized tensor is, instead of keeping them packed on MLX's
+    /// quantized gather kernels (a quarter of the memory, and what a trainer
+    /// of a dense copy must not have).
+    pub unpack_quantized_experts: bool,
 }
 
 fn is_non_text_auxiliary_weight(key: &str) -> bool {
@@ -76,9 +85,19 @@ pub fn load_qwen3_next_weights_with_options(
     config: &Qwen3NextConfig,
     options: Qwen3NextLoadOptions,
 ) -> Result<(), LoadError> {
-    let mut weights = load_weights_filtered(model_dir, |key| {
-        should_keep_qwen3_next_raw_weight(key, options)
-    })?;
+    // As `load_weights_filtered`, but the routed experts of a ModelOpt NVFP4
+    // checkpoint are lifted out packed before the sidecars are unpacked.
+    let model_dir = model_dir.as_ref();
+    let keep = |key: &str| should_keep_qwen3_next_raw_weight(key, options);
+    let mut weights = load_weights_filtered_raw(model_dir, keep)?;
+    unpack_mlx_quantized_weights(model_dir, &mut weights)?;
+    let packed = if options.skip_routed_experts || options.unpack_quantized_experts {
+        HashMap::new()
+    } else {
+        take_packed_experts(&mut weights, config.num_experts.max(0) as usize)?
+    };
+    dequantize_sidecar_weights(&mut weights)?;
+    weights.retain(|key, _| keep(key));
     sanitize_weights(
         &mut weights,
         config,
@@ -87,6 +106,25 @@ pub fn load_qwen3_next_weights_with_options(
         },
     )
     .map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))?;
+
+    // Packed layers keep their experts outside the parameter tree.
+    for (&layer_idx, experts) in &packed {
+        let Some(Qwen3NextFeedForward::MoE(block)) = model
+            .model
+            .layers
+            .get_mut(layer_idx)
+            .map(|layer| &mut layer.mlp)
+        else {
+            return Err(LoadError::SafeTensors(format!(
+                "packed experts for layer {layer_idx}, which is not a sparse layer"
+            )));
+        };
+        block.use_packed_experts(experts.clone());
+    }
+    let packed_prefixes: Vec<String> = packed
+        .keys()
+        .map(|l| format!("model.layers.{l}.mlp.switch_mlp_"))
+        .collect();
 
     // Apply sanitized weights to model parameters
     let mut params = model.flatten_params_mut();
@@ -119,6 +157,7 @@ pub fn load_qwen3_next_weights_with_options(
     let missing: Vec<String> = expected_keys
         .difference(&loaded_param_keys)
         .filter(|key| !is_qwen3_next_allowed_missing_param(key, options))
+        .filter(|key| !packed_prefixes.iter().any(|p| key.starts_with(p.as_str())))
         .take(20)
         .cloned()
         .collect();
@@ -681,11 +720,11 @@ fn remap_bert_weight_name(hf_name: &str) -> String {
 mod tests {
     use super::*;
 
-
     #[test]
     fn qwen3_next_raw_weight_filter_skips_auxiliary_and_routed_expert_keys() {
         let options = Qwen3NextLoadOptions {
             skip_routed_experts: true,
+            ..Default::default()
         };
 
         assert!(should_keep_qwen3_next_raw_weight(
@@ -707,6 +746,7 @@ mod tests {
     fn qwen3_next_missing_allowlist_only_covers_routed_expert_params() {
         let options = Qwen3NextLoadOptions {
             skip_routed_experts: true,
+            ..Default::default()
         };
 
         assert!(is_qwen3_next_allowed_missing_param(

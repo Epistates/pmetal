@@ -6,8 +6,7 @@
 use crate::architectures::*;
 use crate::loader::{
     Exemption, LoadPolicy, ParamSnapshot, Qwen3NextLoadOptions, assign_weights, load_bert_weights,
-    load_generic_weights, load_generic_weights_with, load_qwen3_next_weights_with_options,
-    load_weights,
+    load_generic_weights_with, load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
 use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
@@ -714,7 +713,6 @@ macro_rules! simple_load {
         load_generic_weights_with(
             &mut model,
             $model_dir,
-            |_| None,
             &ModelArchitecture::$variant.load_policy(),
         )
         .map_err(|e| Exception::custom(e.to_string()))?;
@@ -735,7 +733,6 @@ macro_rules! simple_load_moe {
         load_generic_weights_with(
             &mut model,
             $model_dir,
-            |_| None,
             &ModelArchitecture::$variant.load_policy(),
         )
         .map_err(|e| Exception::custom(e.to_string()))?;
@@ -1190,8 +1187,9 @@ impl DynamicModel {
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let weights = crate::architectures::deepseek::stack_experts(weights)?;
-                assign_weights(&mut model, weights, &policy)
-                    .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
+                assign_weights(&mut model, weights, &policy).map_err(|e| {
+                    Exception::custom(e.with_quantization_hint(model_dir).to_string())
+                })?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::DeepSeek(model))
             }
@@ -1253,6 +1251,7 @@ impl DynamicModel {
                 let load_options = if skip_routed_experts {
                     Qwen3NextLoadOptions {
                         skip_routed_experts: true,
+                        ..Default::default()
                     }
                 } else {
                     Qwen3NextLoadOptions::default()
@@ -1310,7 +1309,7 @@ impl DynamicModel {
                             Exception::custom(e.with_quantization_hint(model_dir).to_string())
                         })?;
                 } else {
-                    load_generic_weights_with(&mut model, model_dir, |_| None, &policy)
+                    load_generic_weights_with(&mut model, model_dir, &policy)
                         .map_err(|e| Exception::custom(e.to_string()))?;
                 }
                 eval_module_parameters_batched(&model)?;
@@ -2342,6 +2341,26 @@ impl DynamicModel {
         }
     }
 
+    /// [`forward_with_hybrid_cache`](Self::forward_with_hybrid_cache) returning
+    /// the last position's logits, `[B, 1, vocab]`, for a caller that samples
+    /// from them alone: a prefill, or a decode step. Qwen 3.5 runs its head on
+    /// that one position; the other architectures compute every position's and
+    /// slice.
+    pub fn forward_with_hybrid_cache_last(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        if let Self::Qwen3Next(m) = self {
+            return m.forward_with_cache_last(input_ids, mask, kv_cache, mamba_cache);
+        }
+        let logits = self.forward_with_hybrid_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        let (b, t, v) = (logits.dim(0), logits.dim(1), logits.dim(2));
+        Ok(logits.slice(&[0, t - 1, 0], &[b, t, v]))
+    }
+
     /// Whether this architecture has a fused `[N, 1]` batched-decode
     /// implementation. Continuous batching falls back to the per-slot
     /// serial path when this is `false`. Hybrid attn+recurrent archs
@@ -2566,7 +2585,8 @@ impl DynamicModel {
         }
     }
 
-    /// Enable SSD-offloaded MoE inference with expert prefetching.
+    /// Enable SSD-offloaded MoE inference: each sparse layer reads the experts
+    /// its tokens route to from `experts_dir`.
     ///
     /// Only supported for architectures built on the Qwen 3.5 MoE block
     /// (Qwen3Next, Qwen4Exp).
@@ -2581,29 +2601,34 @@ impl DynamicModel {
         }
     }
 
+    /// What the offloaded experts' files have been asked for since the last
+    /// [`reset_expert_read_stats`](Self::reset_expert_read_stats), if expert
+    /// offloading is enabled.
+    pub fn expert_read_stats(&self) -> Option<crate::expert_offload::ExpertReadStats> {
+        match self {
+            Self::Qwen3Next(m) => m.offloaded_experts().map(|e| e.stats()),
+            Self::Qwen4Exp(m) => m.offloaded_experts().map(|e| e.stats()),
+            _ => None,
+        }
+    }
+
+    /// Zero the expert read counters (if expert offloading is enabled).
+    pub fn reset_expert_read_stats(&self) {
+        let experts = match self {
+            Self::Qwen3Next(m) => m.offloaded_experts(),
+            Self::Qwen4Exp(m) => m.offloaded_experts(),
+            _ => None,
+        };
+        if let Some(experts) = experts {
+            experts.reset_stats();
+        }
+    }
+
     pub fn requires_expert_offloading(&self) -> bool {
         match self {
             Self::Qwen3Next(m) => m.requires_expert_offloading(),
             Self::Qwen4Exp(m) => m.requires_expert_offloading(),
             _ => false,
-        }
-    }
-
-    /// Get prefetch hit/miss statistics (if expert offloading is enabled).
-    pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
-        match self {
-            Self::Qwen3Next(m) => m.prefetch_stats(),
-            Self::Qwen4Exp(m) => m.prefetch_stats(),
-            _ => None,
-        }
-    }
-
-    /// Reset prefetch hit/miss statistics (if expert offloading is enabled).
-    pub fn reset_prefetch_stats(&self) {
-        match self {
-            Self::Qwen3Next(m) => m.reset_prefetch_stats(),
-            Self::Qwen4Exp(m) => m.reset_prefetch_stats(),
-            _ => {}
         }
     }
 }

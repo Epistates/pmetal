@@ -3,8 +3,6 @@
 //! This crate provides Metal compute kernels for the operations the tensor
 //! runtime has no op for, optimized for Apple Silicon:
 //!
-//! - **Quantized and MoE GEMMs**: dequantizing matmuls, grouped expert GEMMs
-//!   and fused expert MLPs
 //! - **Training kernels**: fused cross-entropy (including the chunked linear +
 //!   cross-entropy that never materializes the logits), fused AdamW, FP8
 //! - **DwGemm**: the f32 weight-gradient GEMM the ANE trainer batches into one
@@ -42,7 +40,6 @@ pub mod buffer;
 pub(crate) mod chip;
 pub mod context;
 pub mod error;
-pub mod expert_buffer;
 pub mod kernels;
 pub(crate) mod msl_layout;
 pub mod neon_convert;
@@ -52,9 +49,6 @@ pub mod view;
 pub use buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use error::{MetalError, Result};
-pub use kernels::fused_moe::{
-    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig,
-};
 pub use pipeline::{FunctionConstant, PipelineCache};
 pub use view::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 

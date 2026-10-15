@@ -25,9 +25,7 @@ mod diffusion;
 mod families;
 mod quant;
 
-pub use assign::{
-    assign_weights, load_generic_weights, load_generic_weights_renamed, load_generic_weights_with,
-};
+pub use assign::{assign_weights, load_generic_weights, load_generic_weights_with};
 pub use audit::{Exemption, LoadPolicy, NEVER_PARAMETERS, ParamSnapshot};
 pub use checkpoint::{WeightIndex, load_safetensors_file};
 pub use diffusion::*;

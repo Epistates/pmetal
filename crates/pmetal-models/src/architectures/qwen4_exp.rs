@@ -61,14 +61,13 @@ use pmetal_runtime::nn::rope::{RopePositions, rope};
 use serde::{Deserialize, Serialize};
 
 use super::qwen3_next::{
-    ExpertOffloadAttachment, GateActivation, PackedRoutedExperts, Qwen3NextAttention,
-    Qwen3NextConfig, Qwen3NextGatedDeltaNet, Qwen3NextRoutedExpertMode, Qwen3NextSanitizeOptions,
-    Qwen3NextSparseMoeBlock, RopeParameters, attach_expert_offload, sanitize_weights,
+    GateActivation, Qwen3NextAttention, Qwen3NextConfig, Qwen3NextGatedDeltaNet,
+    Qwen3NextRoutedExpertMode, Qwen3NextSanitizeOptions, Qwen3NextSparseMoeBlock, RopeParameters,
+    attach_expert_offload, sanitize_weights, take_packed_experts,
 };
 use super::utils::LoadReport;
 use crate::loader::LoadError;
 use crate::traits::ModelConfig;
-use pmetal_runtime::native_weight::LayerWeight;
 
 // ============================================================================
 // Configuration
@@ -1494,8 +1493,7 @@ impl Qwen4ExpDecoderLayer {
         })
     }
 
-    /// `(output streams, MoE input)`; the MoE input feeds the expert
-    /// prefetcher's guess for the next layer.
+    /// The layer's output streams.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &mut self,
@@ -1505,7 +1503,7 @@ impl Qwen4ExpDecoderLayer {
         mut mamba_cache: Option<&mut MambaCache>,
         layer_idx: usize,
         layout: Qwen4ExpCacheLayout,
-    ) -> Result<(Array, Array), Exception> {
+    ) -> Result<Array, Exception> {
         let mut h = streams.clone();
         if let (Some(ple), Some(k)) = (&self.ple, self.ple_index) {
             let out = match mamba_cache.as_deref_mut() {
@@ -1554,7 +1552,7 @@ impl Qwen4ExpDecoderLayer {
         let (mixed, inject) = self.mlp_hyper_connection.mix(&h);
         let out = self.mlp.forward(&mixed)?;
         let inject = inject.expect("decoder hyper-connections inject");
-        Ok((self.mlp_hyper_connection.inject(&h, &out, &inject), mixed))
+        Ok(self.mlp_hyper_connection.inject(&h, &out, &inject))
     }
 }
 
@@ -1566,8 +1564,6 @@ pub struct Qwen4ExpModel {
     pub hyper_connection_mixer: Qwen4ExpGatedResidual,
     pub hc_count: i32,
     pub layout: Qwen4ExpCacheLayout,
-    /// SSD expert offloading, once enabled.
-    pub(crate) offload: Option<ExpertOffloadAttachment>,
 }
 impl_module_params!(Qwen4ExpModel; embed_tokens, layers, hyper_connection_mixer);
 
@@ -1589,7 +1585,6 @@ impl Qwen4ExpModel {
             hyper_connection_mixer: Qwen4ExpGatedResidual::new(config, false)?,
             hc_count: config.hc_count,
             layout: config.cache_layout(),
-            offload: None,
         })
     }
 
@@ -1655,9 +1650,8 @@ impl Qwen4ExpModel {
         }
         let mut h = embedded.tile(&[1, 1, self.hc_count]);
         let layout = self.layout;
-        let decode = input_ids.dim(input_ids.ndim() - 1) == 1;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let (next, moe_input) = layer.forward(
+            h = layer.forward(
                 &h,
                 &tokens,
                 kv_cache.as_deref_mut(),
@@ -1665,19 +1659,10 @@ impl Qwen4ExpModel {
                 layer_idx,
                 layout,
             )?;
-            h = next;
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(layer_idx)
             {
                 buf.record_hidden(layer_idx, h.clone());
-            }
-            // With experts on SSD, start reading the next layer's likely
-            // experts, guessed from this layer's MoE input, while the GPU
-            // works. Decode only: prefill routes too many tokens to guess.
-            if decode && let Some(offload) = &self.offload {
-                offload
-                    .prefetcher
-                    .predict_and_prefetch(layer_idx + 1, &moe_input, &offload.ctx);
             }
         }
         let (mixed, _) = self.hyper_connection_mixer.mix(&h);
@@ -1815,7 +1800,17 @@ impl Qwen4ExpForCausalLM {
         self.model
             .layers
             .iter()
-            .any(|l| !l.mlp.routed_experts_loaded && l.mlp.offload_ctx.is_none())
+            .any(|l| !l.mlp.routed_experts_loaded && l.mlp.offloaded.is_none())
+    }
+
+    /// The reader of the offloaded experts, once they are offloaded.
+    pub fn offloaded_experts(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::expert_offload::OffloadedExperts>> {
+        self.model
+            .layers
+            .iter()
+            .find_map(|layer| layer.mlp.offloaded.as_ref())
     }
 
     /// Serve routed experts from `experts_dir` (written by
@@ -1828,26 +1823,7 @@ impl Qwen4ExpForCausalLM {
             .enumerate()
             .map(|(layer_idx, layer)| (layer_idx, &mut layer.mlp))
             .collect();
-        let offload = attach_expert_offload(
-            experts_dir,
-            &mut blocks,
-            self.config.num_experts as usize,
-            self.config.hidden_size as usize,
-            self.config.num_experts_per_tok as usize,
-        )?;
-        self.model.offload = Some(offload);
-        Ok(())
-    }
-
-    /// Prefetch hit/miss statistics, when experts are offloaded.
-    pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
-        self.model.offload.as_ref().map(|o| o.prefetcher.stats())
-    }
-
-    pub fn reset_prefetch_stats(&self) {
-        if let Some(offload) = &self.model.offload {
-            offload.prefetcher.reset_stats();
-        }
+        attach_expert_offload(experts_dir, &mut blocks)
     }
 }
 
@@ -2183,7 +2159,7 @@ pub fn assign_qwen4_exp_tensors(
     let packed = if options.unpack_quantized_experts {
         HashMap::new()
     } else {
-        take_packed_experts(&mut weights, &model.config)?
+        take_packed_experts(&mut weights, model.config.num_experts as usize)?
     };
     crate::loader::dequantize_sidecar_weights(&mut weights)?;
     let dtypes: HashMap<String, i32> = weights
@@ -2220,11 +2196,7 @@ pub fn assign_qwen4_exp_tensors(
                 LoadError::SafeTensors(format!("packed experts for missing layer {layer_idx}"))
             })?
             .mlp;
-        *block.switch_mlp_gate_proj = Array::zeros_f32(&[1]);
-        *block.switch_mlp_up_proj = Array::zeros_f32(&[1]);
-        *block.switch_mlp_down_proj = Array::zeros_f32(&[1]);
-        block.packed_experts = Some(experts.clone());
-        block.routed_experts_loaded = true;
+        block.use_packed_experts(experts.clone());
     }
     let packed_prefixes: Vec<String> = packed
         .keys()
@@ -2275,90 +2247,6 @@ pub fn assign_qwen4_exp_tensors(
         )));
     }
     Ok(loaded.len() + 3 * packed.len())
-}
-
-/// Lift ModelOpt-quantized routed experts out of `weights` and stack them,
-/// per layer and projection, onto MLX's packed kernels. Any other ModelOpt
-/// tensor goes back in dense, as the shared dequantizer would leave it.
-fn take_packed_experts(
-    weights: &mut HashMap<String, Array>,
-    config: &Qwen4ExpConfig,
-) -> Result<HashMap<usize, PackedRoutedExperts>, LoadError> {
-    use pmetal_runtime::native_loader::take_modelopt_weights;
-    use pmetal_runtime::native_weight::detect_model_dtype;
-
-    if !weights
-        .keys()
-        .any(|k| k.contains(".mlp.experts.") && k.ends_with(".weight_scale"))
-    {
-        return Ok(HashMap::new());
-    }
-    let dtype = detect_model_dtype(|key| weights.get(key).map(|w| w.dtype_raw()));
-    let experts = config.num_experts as usize;
-    let mut parts: HashMap<(usize, usize), Vec<Option<LayerWeight>>> = HashMap::new();
-    for (base, weight) in take_modelopt_weights(weights).map_err(LoadError::SafeTensors)? {
-        match routed_expert_module(&base) {
-            Some((layer, expert, proj)) if expert < experts => {
-                let packed = weight
-                    .into_native(dtype)
-                    .map_err(|e| LoadError::SafeTensors(format!("{base}: {e}")))?
-                    .into_layer_weight();
-                parts
-                    .entry((layer, proj))
-                    .or_insert_with(|| vec![None; experts])[expert] = Some(packed);
-            }
-            _ => {
-                let dense = weight
-                    .to_dense(dtype)
-                    .map_err(|e| LoadError::SafeTensors(format!("{base}: {e}")))?;
-                weights.insert(format!("{base}.weight"), dense);
-            }
-        }
-    }
-
-    let layers: HashSet<usize> = parts.keys().map(|&(layer, _)| layer).collect();
-    let mut packed = HashMap::new();
-    for layer in layers {
-        let mut stack = |proj: usize| -> Result<LayerWeight, LoadError> {
-            let name = ["gate_proj", "up_proj", "down_proj"][proj];
-            let experts = parts.remove(&(layer, proj)).ok_or_else(|| {
-                LoadError::MissingWeight(format!("layer {layer} packed experts' {name}"))
-            })?;
-            let experts = experts
-                .into_iter()
-                .enumerate()
-                .map(|(e, w)| {
-                    w.ok_or_else(|| {
-                        LoadError::MissingWeight(format!("layer {layer} expert {e} {name}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            LayerWeight::stack(experts)
-                .map_err(|e| LoadError::SafeTensors(format!("layer {layer} {name}: {e}")))
-        };
-        let experts = PackedRoutedExperts {
-            gate: stack(0)?,
-            up: stack(1)?,
-            down: stack(2)?,
-        };
-        packed.insert(layer, experts);
-    }
-    Ok(packed)
-}
-
-/// `(layer, expert, projection)` of a per-expert routed module path
-/// (`...layers.{l}.mlp.experts.{e}.{gate,up,down}_proj`).
-fn routed_expert_module(base: &str) -> Option<(usize, usize, usize)> {
-    let (head, tail) = base.split_once(".mlp.experts.")?;
-    let layer = head.rsplit('.').next()?.parse().ok()?;
-    let (expert, proj) = tail.split_once('.')?;
-    let proj = match proj {
-        "gate_proj" => 0,
-        "up_proj" => 1,
-        "down_proj" => 2,
-        _ => return None,
-    };
-    Some((layer, expert.parse().ok()?, proj))
 }
 
 /// Load a Qwen4-Exp checkpoint (the released `Qwen4ExpForConditionalGeneration`

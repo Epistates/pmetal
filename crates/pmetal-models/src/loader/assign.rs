@@ -187,27 +187,12 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
 ) -> Result<(), LoadError> {
-    load_generic_weights_with(model, model_dir, |_| None, &LoadPolicy::strict())
+    load_generic_weights_with(model, model_dir, &LoadPolicy::strict())
 }
 
-/// [`load_generic_weights`] with a hook that rewrites checkpoint keys into
-/// pmetal parameter paths.
-///
-/// `rename` returns `Some(path)` for a key that needs rewriting and `None` to
-/// pass it through. This exists for architectures whose parameter tree is
-/// shaped differently from the checkpoint but not differently enough to justify
-/// a bespoke loader.
-pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
-    model: &mut M,
-    model_dir: impl AsRef<Path>,
-    rename: impl Fn(&str) -> Option<String>,
-) -> Result<(), LoadError> {
-    load_generic_weights_with(model, model_dir, rename, &LoadPolicy::strict())
-}
-
-/// [`load_generic_weights_renamed`] under an explicit [`LoadPolicy`]: the
-/// checkpoint tensors that may go unused and the parameters that may stay as
-/// constructed, each with its reason.
+/// [`load_generic_weights`] under an explicit [`LoadPolicy`]: the checkpoint
+/// tensors that may go unused and the parameters that may stay as constructed,
+/// each with its reason.
 ///
 /// ⚠️ The checkpoint is read whole, never a shard at a time. Unpacking a
 /// quantized one needs `{module}.weight` together with its `.scales` and
@@ -218,27 +203,17 @@ pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
 pub fn load_generic_weights_with<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
-    rename: impl Fn(&str) -> Option<String>,
     policy: &LoadPolicy,
 ) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let snapshot = ParamSnapshot::of(model);
-    let loaded: HashMap<String, Array> = load_weights(model_dir)?
-        .into_iter()
-        .map(|(key, value)| match rename(&key) {
-            Some(renamed) => (renamed, value),
-            None => (key, value),
-        })
-        .collect();
+    let loaded = load_weights(model_dir)?;
     let report = assign_checked(model, loaded, policy, &snapshot)
         .map_err(|e| e.with_quantization_hint(model_dir))?;
     eval_loaded_parameters(model)?;
     report.log_summary(model_dir);
     Ok(())
 }
-
-/// Assign in-memory, HuggingFace-named weights to a model's parameters and
-/// eval them onto the GPU.
 ///
 /// This is the in-memory dual of [`load_generic_weights`]: the safetensors path
 /// memory-maps shards from disk, whereas the GGUF inference path dequantizes
@@ -422,7 +397,7 @@ mod tests {
             "the test supplies its own",
         )]);
         let mut model = tiny_qwen3(false);
-        load_generic_weights_with(&mut model, dir.path(), |_| None, &policy).unwrap();
+        load_generic_weights_with(&mut model, dir.path(), &policy).unwrap();
     }
 
     /// The assignment itself, not just the verdict: every parameter holds the

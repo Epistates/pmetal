@@ -295,7 +295,6 @@ pub(super) fn gdn_forward_recording(
     let (out, new_state) = InlineArray::gdn_metal_step(&q, &k, &v, &g, &beta, &ssm_state, s);
     if let Some(replays) = replays {
         replays.push(GdnReplay {
-            queries: q,
             keys: k,
             values: v,
             g,
