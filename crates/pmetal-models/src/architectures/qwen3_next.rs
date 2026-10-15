@@ -32,17 +32,14 @@ use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
-use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
-use pmetal_mlx::{
-    gather_mm,
-    kernels::{
-        AttentionMaskType, FusedAttentionConfig,
-        fused_moe::moe_combine_mlx,
-        fused_sdpa,
-        gated_delta::gated_delta_update,
-        rope::{RopePositions, rope_embedding},
-    },
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig,
+    fused_moe::moe_combine_mlx,
+    fused_sdpa,
+    gated_delta::gated_delta_update,
+    rope::{RopePositions, rope_embedding},
 };
+use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry, SequenceKey};
 use pmetal_runtime::native_weight::LayerWeight;
 
 // ============================================================================
@@ -2398,15 +2395,15 @@ impl Qwen3NextSparseMoeBlock {
         let up_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_up_proj.as_ref())?;
         let gate_w = gate_weight.swap_axes(-1, -2);
         let up_w = up_weight.swap_axes(-1, -2);
-        let gate_out = gather_mm(&x_expanded, &gate_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
-        let up_out = gather_mm(&x_expanded, &up_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
+        let gate_out = x_expanded.gather_mm(&gate_w, None, Some(&top_indices_i32), false); // [N, k, 1, intermediate]
+        let up_out = x_expanded.gather_mm(&up_w, None, Some(&top_indices_i32), false); // [N, k, 1, intermediate]
 
         let activated = nn::silu(&gate_out).multiply(&up_out);
 
         // Down projection
         let down_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_down_proj.as_ref())?;
         let down_w = down_weight.swap_axes(-1, -2);
-        let down_out = gather_mm(&activated, &down_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, D]
+        let down_out = activated.gather_mm(&down_w, None, Some(&top_indices_i32), false); // [N, k, 1, D]
 
         // squeeze(-2) removes the size-1 dim: [N, k, 1, D] → [N, k, D]
         let down_out = down_out.squeeze_axes(&[-2]);
