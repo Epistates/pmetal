@@ -662,18 +662,11 @@ async fn run_training_direct(
             seed: parse_arg(&spec.args, "--seed", 42u64)?,
             embedding_learning_rate: optional_arg(&spec.args, "--embedding-lr")
                 .and_then(|s| s.parse::<f64>().ok()),
-            lr_scheduler: match optional_arg(&spec.args, "--lr-schedule")
-                .unwrap_or_else(|| "cosine".to_string())
-                .to_lowercase()
-                .as_str()
-            {
-                "constant" => pmetal_core::LrSchedulerType::Constant,
-                "linear" => pmetal_core::LrSchedulerType::Linear,
-                "cosine_with_restarts" => pmetal_core::LrSchedulerType::CosineWithRestarts,
-                "polynomial" => pmetal_core::LrSchedulerType::Polynomial,
-                "wsd" => pmetal_core::LrSchedulerType::Wsd,
-                _ => pmetal_core::LrSchedulerType::Cosine,
-            },
+            lr_scheduler: parse_arg(
+                &spec.args,
+                "--lr-schedule",
+                pmetal_core::LrSchedulerType::Cosine,
+            )?,
             ..Default::default()
         },
         columns,

@@ -1351,20 +1351,9 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             use pmetal_trainer::orchestrator;
 
             // Parse LR schedule
-            let lr_scheduler = match lr_schedule.to_lowercase().as_str() {
-                "constant" => pmetal_core::LrSchedulerType::Constant,
-                "linear" => pmetal_core::LrSchedulerType::Linear,
-                "cosine" => pmetal_core::LrSchedulerType::Cosine,
-                "cosine_with_restarts" => pmetal_core::LrSchedulerType::CosineWithRestarts,
-                "polynomial" => pmetal_core::LrSchedulerType::Polynomial,
-                "wsd" => pmetal_core::LrSchedulerType::Wsd,
-                other => {
-                    anyhow::bail!(
-                        "Unknown lr-schedule '{}'. Valid: constant, linear, cosine, cosine_with_restarts, polynomial, wsd",
-                        other
-                    );
-                }
-            };
+            let lr_scheduler = lr_schedule
+                .parse::<pmetal_core::LrSchedulerType>()
+                .map_err(|e| anyhow::anyhow!("--lr-schedule: {e}"))?;
 
             // Build QLoRA config if quantization is requested
             let qlora = if !matches!(quantization, QuantizationMethod::None) {
@@ -2470,12 +2459,9 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             );
 
             // Parse LR schedule
-            let lr_sched = match lr_schedule.to_lowercase().as_str() {
-                "constant" => pmetal_core::LrSchedulerType::Constant,
-                "linear" => pmetal_core::LrSchedulerType::Linear,
-                "cosine" => pmetal_core::LrSchedulerType::Cosine,
-                other => anyhow::bail!("unknown lr-schedule: {other}"),
-            };
+            let lr_sched = lr_schedule
+                .parse::<pmetal_core::LrSchedulerType>()
+                .map_err(|e| anyhow::anyhow!("--lr-schedule: {e}"))?;
 
             // Build model via factory (supports llama, qwen2, qwen3, gemma, gemma4, mistral, phi, gpt-oss)
             use pmetal_runtime::compat::module::ModuleParameters;
@@ -2736,6 +2722,32 @@ mod argv_roundtrip {
             "TrainSpec argv failed to parse: {}",
             result.unwrap_err()
         );
+    }
+
+    #[cfg(feature = "trainer")]
+    #[test]
+    fn a_schedule_the_trainer_supports_reaches_it_and_a_typo_is_refused() {
+        // `train-mtp` and `train-draft` used to read any name but constant
+        // and linear as cosine, so `wsd` trained on the wrong curve.
+        for (subcommand, model_flag) in [("train-mtp", "--model"), ("train-draft", "--target")] {
+            let parse = |schedule: &str| {
+                try_parse(
+                    subcommand,
+                    [model_flag, "t", "--shards", "s", "--lr-schedule", schedule]
+                        .map(String::from)
+                        .to_vec(),
+                )
+            };
+            let parsed = parse("wsd").unwrap_or_else(|e| panic!("{subcommand}: {e}"));
+            let got = match parsed {
+                Commands::TrainMtp(a) => a.lr_schedule,
+                Commands::TrainDraft(a) => a.lr_schedule,
+                _ => panic!("{subcommand} parsed as another command"),
+            };
+            assert_eq!(got, pmetal_core::LrSchedulerType::Wsd);
+            let err = parse("cosin").unwrap_err();
+            assert!(err.contains("cosin"), "{subcommand}: {err}");
+        }
     }
 
     #[test]

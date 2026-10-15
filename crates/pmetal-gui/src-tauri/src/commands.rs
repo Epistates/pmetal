@@ -1195,14 +1195,8 @@ pub async fn start_training(
             }
         };
 
-        let lr_scheduler = match spec.lr_schedule.as_str() {
-            "constant" => pmetal::core::LrSchedulerType::Constant,
-            "linear" => pmetal::core::LrSchedulerType::Linear,
-            "cosine_with_restarts" => pmetal::core::LrSchedulerType::CosineWithRestarts,
-            "polynomial" => pmetal::core::LrSchedulerType::Polynomial,
-            "wsd" => pmetal::core::LrSchedulerType::Wsd,
-            _ => pmetal::core::LrSchedulerType::Cosine,
-        };
+        let lr_scheduler =
+            pmetal::core::jobs::parse_lr_scheduler(&spec.lr_schedule).map_err(AppError)?;
 
         let job_config = pmetal::trainer::TrainingJobConfig {
             model_id: spec.model.clone(),

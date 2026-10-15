@@ -65,3 +65,9 @@ pub(crate) fn default_optimizer() -> String {
 pub fn parse_optimizer(name: &str) -> Result<crate::OptimizerType, String> {
     name.parse()
 }
+
+/// The schedule a spec's `lr_schedule` field names. An unknown name is an
+/// error, never a quiet fall back to cosine.
+pub fn parse_lr_scheduler(name: &str) -> Result<crate::LrSchedulerType, String> {
+    name.parse()
+}
