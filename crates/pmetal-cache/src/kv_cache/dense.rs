@@ -374,6 +374,32 @@ impl DenseLayer {
     pub(super) fn reset(&mut self) {
         *self = Self::default();
     }
+
+    /// This layer for a batch of `n` identical rows: every row holds what
+    /// the one row held. The buffers are broadcast views until the first
+    /// write gives each row its own.
+    pub(super) fn repeat_batch(&self, n: usize) -> Result<Self, Exception> {
+        let repeat = |a: &Option<Array>| -> Result<Option<Array>, Exception> {
+            let Some(a) = a else { return Ok(None) };
+            if a.dim(0) != 1 {
+                return Err(Exception::custom(format!(
+                    "KV cache: only a one-row cache repeats into a batch, this holds {} rows",
+                    a.dim(0)
+                )));
+            }
+            Ok(Some(a.broadcast_to(&[
+                n as i32,
+                a.dim(1),
+                a.dim(2),
+                a.dim(3),
+            ])))
+        };
+        Ok(Self {
+            keys: repeat(&self.keys)?,
+            values: repeat(&self.values)?,
+            ..self.clone()
+        })
+    }
 }
 
 /// `a` in the dtype of `like`.

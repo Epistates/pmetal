@@ -1,31 +1,25 @@
 //! Text generation for language models.
 //!
-//! This module provides SOTA sampling techniques:
-//! - Greedy decoding
-//! - Temperature sampling
-//! - Top-k sampling
-//! - Top-p (nucleus) sampling
-//! - Min-p sampling (dynamic threshold based on top token probability)
-//! - Repetition penalty (applied to prompt + output)
-//! - Frequency penalty (proportional to appearance count)
-//! - Presence penalty (flat penalty for appeared tokens)
-//! - Stop token handling
-//! - KV-cached generation for fast inference
+//! The generators here drive any model that maps tokens (and a KV cache) to
+//! logits. Sampling is the runtime's one sampler,
+//! [`DecodeSampler`]: temperature, top-k, top-p, min-p (in transformers'
+//! order), the repetition, frequency and presence penalties, the logit bias,
+//! and any [`LogitsProcessor`](pmetal_runtime::decode::LogitsProcessor) a
+//! constraint adds. [`GenerationConfig`] is the request-side description of
+//! it, and [`GenerationConfig::sampler`] builds one for a generation.
 //!
-//! Performance optimizations:
-//! - GPU-native sampling filters (top_k, top_p, min_p) - no CPU round-trips
-//! - Uses pmetal_runtime::compat::random::categorical for GPU-native categorical sampling
-//! - Dedicated generation stream for parallel execution
-//! - All tensor operations stay on GPU until final token extraction
+//! Sampling stays on the GPU, the penalties' token history included, and the
+//! pipelined generators queue each step's forward before the previous token
+//! is read back, so the host never stalls the GPU.
 use pmetal_cache::kv_cache::KVCache;
-use pmetal_runtime::compat::ops::{
-    argmax_axis, async_eval, logsumexp_axis_keepdims, select_axis, take_along_axis,
-};
-use pmetal_runtime::compat::random::categorical;
+use pmetal_runtime::compat::ops::{async_eval, logsumexp_axis_keepdims, select_axis};
 use pmetal_runtime::compat::{Array, Dtype, Exception};
 use pmetal_runtime::decode::{
-    DecodePenalties, SamplingParams, filtered_log_probs, last_token_logits, prompt_tokens_to_input,
+    DecodeSampler, SamplingParams, last_token_logits, prompt_tokens_to_input,
 };
+use pmetal_runtime::inline_array::{GenerationStream, WiredLimit};
+
+use crate::speculative::SpeculativeDecodeMetrics;
 
 /// The KV cache an ANE request needs: prompt and output, rounded up to a
 /// power of two (so nearby requests share a compiled model), 512 to `cap`.
@@ -34,76 +28,6 @@ fn ane_context(prompt_len: usize, max_new: usize, cap: usize) -> usize {
     (prompt_len + max_new)
         .next_power_of_two()
         .clamp(512, cap.max(512))
-}
-
-/// Set the wired memory limit for Metal.
-///
-/// This matches Python's `mx.set_wired_limit()` which prevents page faults
-/// and ensures GPU memory stays resident.
-///
-/// # Returns
-/// The previous wired limit.
-#[inline]
-fn set_wired_limit(limit: usize) -> usize {
-    pmetal_runtime::inline_array::set_wired_limit(limit)
-}
-
-/// Get the Metal device info to determine optimal wired limit.
-///
-/// Returns the max recommended working set size.
-fn get_max_recommended_wired_limit() -> usize {
-    pmetal_runtime::inline_array::get_max_recommended_size()
-}
-
-/// RAII guard for managing wired memory limit during generation.
-///
-/// This matches Python's `wired_limit` context manager that sets
-/// the memory limit based on the Metal device's recommended working set size.
-pub struct WiredLimitGuard {
-    previous_limit: usize,
-}
-
-impl WiredLimitGuard {
-    /// Create a new wired limit guard, setting the limit to the device's
-    /// max recommended working set size.
-    pub fn new() -> Self {
-        let max_limit = get_max_recommended_wired_limit();
-        let previous_limit = set_wired_limit(max_limit);
-        WiredLimitGuard { previous_limit }
-    }
-}
-
-impl Default for WiredLimitGuard {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for WiredLimitGuard {
-    fn drop(&mut self) {
-        // Restore the previous wired limit
-        set_wired_limit(self.previous_limit);
-    }
-}
-
-/// Make this thread's generation stream the default stream for the MLX ops
-/// that follow, creating it on the thread's first call.
-///
-/// The bridge keeps one generation stream per thread (an MLX stream works
-/// only on the thread that made it), so there is no stream value to hold.
-/// The stream stays the default after the call returns, async evaluations
-/// included; [`pmetal_runtime::inline_array::reset_default_stream`] restores
-/// MLX's own.
-#[inline]
-pub fn use_generation_stream() {
-    pmetal_runtime::inline_array::new_generation_stream();
-    pmetal_runtime::inline_array::set_generation_stream();
-}
-
-/// Release the Metal buffers MLX's allocator holds for reuse.
-#[inline]
-pub fn clear_generation_caches() {
-    pmetal_runtime::inline_array::clear_cache();
 }
 
 /// Most attention one prefill chunk computes: its length times the depth it
@@ -189,12 +113,6 @@ where
     last_logits.ok_or_else(|| Exception::custom("chunked prefill produced no output"))
 }
 
-/// Check if logits are Float32 (avoids clone in hot path).
-#[inline]
-fn is_f32(logits: &Array) -> bool {
-    logits.dtype() == Dtype::Float32
-}
-
 /// Configuration for text generation.
 ///
 /// Default values are tuned for balanced quality and diversity.
@@ -234,6 +152,10 @@ pub struct GenerationConfig {
     pub stop_tokens: Vec<u32>,
     /// Random seed for reproducible generation.
     pub seed: Option<u64>,
+    /// `(token, bias)` pairs added to the logits before sampling, after the
+    /// penalties (OpenAI's `logit_bias`: -100 all but bans a token, 100 all
+    /// but forces it).
+    pub logit_bias: Vec<(u32, f32)>,
     /// Whether to use greedy decoding (ignores temperature, top_k, top_p, min_p).
     pub do_sample: bool,
     /// Maximum prompt tokens to process per cached-prefill chunk (0 = disable chunking).
@@ -253,6 +175,7 @@ impl Default for GenerationConfig {
             presence_penalty: 0.0,
             stop_tokens: vec![],
             seed: None,
+            logit_bias: Vec::new(),
             do_sample: true,
             prefill_step_size: 2048,
         }
@@ -302,6 +225,7 @@ impl GenerationConfig {
             presence_penalty: 1.5, // Prevents endless repetitions
             stop_tokens: vec![],
             seed: None,
+            logit_bias: Vec::new(),
             do_sample: true,
             prefill_step_size: 2048,
         }
@@ -322,6 +246,7 @@ impl GenerationConfig {
             presence_penalty: 1.5,
             stop_tokens: vec![],
             seed: None,
+            logit_bias: Vec::new(),
             do_sample: true,
             prefill_step_size: 2048,
         }
@@ -342,6 +267,7 @@ impl GenerationConfig {
             presence_penalty: 0.5,
             stop_tokens: vec![],
             seed: None,
+            logit_bias: Vec::new(),
             do_sample: true,
             prefill_step_size: 2048,
         }
@@ -360,6 +286,7 @@ impl GenerationConfig {
             presence_penalty: 0.0,
             stop_tokens: vec![],
             seed: None,
+            logit_bias: Vec::new(),
             do_sample: true,
             prefill_step_size: 2048,
         }
@@ -395,6 +322,9 @@ impl GenerationConfig {
         }
         if let Some(p) = json.get("top_p").and_then(|v| v.as_f64()) {
             config.top_p = p as f32;
+        }
+        if let Some(p) = json.get("min_p").and_then(|v| v.as_f64()) {
+            config.min_p = p as f32;
         }
         if let Some(rp) = json.get("repetition_penalty").and_then(|v| v.as_f64()) {
             config.repetition_penalty = rp as f32;
@@ -484,20 +414,20 @@ impl GenerationConfig {
         self
     }
 
-    /// The repetition, frequency and presence penalties of a generation
-    /// from `prompt`, kept on the GPU, or `None` when this config has none.
-    /// Every token the generation emits goes into them, in order.
-    pub fn decode_penalties(&self, prompt: &[u32]) -> Option<DecodePenalties> {
-        DecodePenalties::new(
-            self.repetition_penalty,
-            self.frequency_penalty,
-            self.presence_penalty,
-            prompt,
-        )
+    /// The sampler of a generation under this config continuing `prompt`:
+    /// the runtime's [`DecodeSampler`], whose penalties read the prompt and
+    /// every token the generation records into it, in order.
+    pub fn sampler(&self, prompt: &[u32]) -> DecodeSampler {
+        DecodeSampler::new(self.sampling_params(), prompt)
     }
 
-    /// This config's sampling as the bridge's [`SamplingParams`], which
-    /// [`filtered_log_probs`] and the native engines read: greedy
+    /// Whether `token` ends generation.
+    pub fn is_stop_token(&self, token: u32) -> bool {
+        self.stop_tokens.contains(&token)
+    }
+
+    /// This config's sampling as the runtime's [`SamplingParams`], which
+    /// [`DecodeSampler`] and the native engines read: greedy
     /// (temperature 0) without `do_sample`, and a sampling temperature at
     /// or below 0 taken as 1.
     pub fn sampling_params(&self) -> SamplingParams {
@@ -515,7 +445,14 @@ impl GenerationConfig {
             frequency_penalty: self.frequency_penalty,
             presence_penalty: self.presence_penalty,
             seed: self.seed,
+            logit_bias: self.logit_bias.clone(),
         }
+    }
+
+    /// Add `bias` to `token`'s logit before sampling.
+    pub fn with_logit_bias(mut self, token: u32, bias: f32) -> Self {
+        self.logit_bias.push((token, bias));
+        self
     }
 
     /// Set stop tokens.
@@ -548,7 +485,8 @@ impl GenerationConfig {
 /// Output from text generation.
 #[derive(Debug, Clone, Default)]
 pub struct GenerationOutput {
-    /// Generated token IDs (including prompt).
+    /// The prompt, then the generated token IDs. A stop token ends the
+    /// generation and is not part of the output.
     pub token_ids: Vec<u32>,
     /// Number of tokens generated (excluding prompt).
     pub num_generated: usize,
@@ -566,229 +504,53 @@ pub struct GenerationOutput {
     pub speculative_metrics: Option<SpeculativeDecodeMetrics>,
 }
 
-/// Acceptance and accounting counters for speculative decoding.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct SpeculativeDecodeMetrics {
-    /// Number of draft/assistant tokens proposed to the target verifier.
-    pub drafted_tokens: usize,
-    /// Number of drafted tokens accepted by the target verifier.
-    pub accepted_draft_tokens: usize,
-    /// Number of accepted draft tokens actually emitted to the caller.
-    pub emitted_draft_tokens: usize,
-    /// Target bonus tokens emitted after fully accepted draft blocks.
-    pub bonus_tokens: usize,
-    /// Target correction tokens emitted after partial or zero-token accept.
-    pub correction_tokens: usize,
-    /// Number of target verification passes.
-    pub verify_steps: usize,
-    /// Verification passes where every drafted token was accepted.
-    pub full_accept_steps: usize,
-    /// Verification passes where some but not all drafted tokens were accepted.
-    pub partial_accept_steps: usize,
-    /// Verification passes where no drafted token was accepted.
-    pub zero_accept_steps: usize,
-    /// Largest draft block attempted in one speculative step.
-    pub max_draft_tokens: usize,
+/// Why a generation ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// The model produced a stop token.
+    Stop,
+    /// `max_new_tokens` tokens were generated.
+    Length,
+    /// The caller's token callback asked to stop.
+    Caller,
 }
 
-impl SpeculativeDecodeMetrics {
-    pub fn acceptance_rate(&self) -> f32 {
-        if self.drafted_tokens == 0 {
-            0.0
-        } else {
-            self.accepted_draft_tokens as f32 / self.drafted_tokens as f32
-        }
-    }
-
-    pub fn avg_accepted_per_verify(&self) -> f32 {
-        if self.verify_steps == 0 {
-            0.0
-        } else {
-            self.accepted_draft_tokens as f32 / self.verify_steps as f32
-        }
-    }
-
-    pub fn record_verify_step(&mut self, drafted: usize, accepted: usize) {
-        if drafted == 0 {
-            return;
-        }
-        let accepted = accepted.min(drafted);
-        self.drafted_tokens += drafted;
-        self.accepted_draft_tokens += accepted;
-        self.verify_steps += 1;
-        self.max_draft_tokens = self.max_draft_tokens.max(drafted);
-        if accepted == drafted {
-            self.full_accept_steps += 1;
-        } else if accepted == 0 {
-            self.zero_accept_steps += 1;
-        } else {
-            self.partial_accept_steps += 1;
-        }
-    }
-}
-
-/// Sampler for token generation.
-///
-/// Implements SOTA sampling techniques with GPU-native operations.
-/// All sampling runs on GPU without CPU round-trips for maximum performance.
-///
-/// The repetition, frequency and presence penalties read a generation's
-/// token history, which the caller keeps beside the sampler for the
-/// generation's lifetime ([`decode_penalties`](Self::decode_penalties)).
-pub struct Sampler {
-    config: GenerationConfig,
-    /// `config` as the bridge reads it ([`GenerationConfig::sampling_params`]).
-    params: SamplingParams,
-    /// How many tokens this sampler has drawn: with a seed, draw `n` uses
-    /// [`pmetal_runtime::decode::draw_key`]`(seed, n)`.
-    draws: std::cell::Cell<u64>,
-}
-
-impl Sampler {
-    /// Create a new sampler. A seeded config draws every token with its own
-    /// key derived from the seed, so the sampler's tokens don't depend on
-    /// the thread it runs on or on any other random draw.
-    pub fn new(config: GenerationConfig) -> Self {
+impl GenerationOutput {
+    fn ended(
+        token_ids: Vec<u32>,
+        prompt_len: usize,
+        ended: Ended,
+        decode_metrics: Option<pmetal_runtime::decode::DecodeMetrics>,
+    ) -> Self {
         Self {
-            params: config.sampling_params(),
-            config,
-            draws: std::cell::Cell::new(0),
+            num_generated: token_ids.len() - prompt_len,
+            token_ids,
+            stopped_by_token: ended == Ended::Stop,
+            stopped_by_length: ended == Ended::Length,
+            decode_metrics,
+            speculative_metrics: None,
         }
-    }
-
-    /// The key for the next sampled draw (`None` when unseeded), counting it.
-    fn next_key(&self) -> Option<Array> {
-        let draw = self.draws.get();
-        self.draws.set(draw + 1);
-        self.config
-            .seed
-            .map(|seed| pmetal_runtime::decode::draw_key(seed, draw))
-    }
-
-    /// Sample the next token from `[1, vocab]` logits and read it back:
-    /// [`sample_array_penalized`](Self::sample_array_penalized), then a host
-    /// sync, for loops that need each token before running the next step.
-    ///
-    /// Sampling order:
-    /// 1. Apply `penalties` (repetition, frequency, presence) on raw logits,
-    ///    and take the sampled token into them
-    /// 2. Scale by the temperature and filter by top-k, top-p and min-p
-    ///    ([`filtered_log_probs`])
-    /// 3. Draw from what is left (argmax when greedy)
-    ///
-    /// `penalties` are the generation's, from
-    /// [`decode_penalties`](Self::decode_penalties) over its prompt, passed
-    /// for every token it samples.
-    pub fn sample(
-        &self,
-        logits: &Array,
-        penalties: Option<&mut DecodePenalties>,
-    ) -> Result<u32, Exception> {
-        let (token, _log_probs) = self.sample_array_penalized(logits, penalties)?;
-        Ok(token.item::<u32>())
-    }
-
-    /// Sample the next token, returning Arrays for async pipelining.
-    ///
-    /// Unlike `sample()`, this method does NOT call `.item()` - the token stays
-    /// as an Array on the GPU. This is critical for SOTA performance:
-    ///
-    /// ```text
-    /// Correct pattern:
-    ///   sampled = sampler(logprobs)        # Returns Array, stays on GPU
-    ///   next_y, next_logprobs = _step(y)   # y is Array, passed directly
-    ///   mx.async_eval(next_y, next_logprobs)  # BOTH scheduled async
-    ///   yield y.item(), logprobs           # .item() only AFTER async_eval
-    /// ```
-    ///
-    /// The caller should:
-    /// 1. Use the returned token Array directly for the next forward pass
-    /// 2. Schedule async_eval on the next iteration's outputs
-    /// 3. Only call `.item()` on the token AFTER scheduling the next computation
-    ///
-    /// NOTE: Penalties (repetition, frequency, presence) are NOT applied in this
-    /// method; [`sample_array_penalized`](Self::sample_array_penalized)
-    /// applies them without a GPU→CPU sync.
-    ///
-    /// # Returns
-    /// `(token_array, log_probs)` - both stay as Arrays for lazy evaluation
-    pub fn sample_array(&self, logits: &Array) -> Result<(Array, Array), Exception> {
-        // Greedy decoding - GPU-native argmax directly on logits (fastest path)
-        // Skips log_softmax since argmax(logits) == argmax(log_softmax(logits)) due to monotonicity
-        if !self.config.do_sample {
-            let token = greedy_sample_array(logits)?;
-            // Return minimal view for log_probs since greedy doesn't need them
-            let empty_logprobs = logits.clone(); // Placeholder, not used by greedy callers
-            return Ok((token, empty_logprobs));
-        }
-
-        let log_probs = filtered_log_probs(logits, &self.params);
-        let key = self.next_key();
-        let token = categorical(&log_probs, -1, key.as_ref());
-        Ok((token, log_probs))
-    }
-
-    /// The penalties of a generation from `prompt`, kept on the GPU, or
-    /// `None` when this sampler's config has none
-    /// ([`GenerationConfig::decode_penalties`]). Pass them to
-    /// [`sample_array_penalized`](Self::sample_array_penalized) or
-    /// [`sample`](Self::sample) for every token of the generation.
-    pub fn decode_penalties(&self, prompt: &[u32]) -> Option<DecodePenalties> {
-        self.config.decode_penalties(prompt)
-    }
-
-    /// [`sample_array`](Self::sample_array) after `penalties`, which take
-    /// the sampled token in without reading it back, so the next step,
-    /// queued before this token reaches the host, is penalized for it.
-    pub fn sample_array_penalized(
-        &self,
-        logits: &Array,
-        penalties: Option<&mut DecodePenalties>,
-    ) -> Result<(Array, Array), Exception> {
-        let Some(penalties) = penalties else {
-            return self.sample_array(logits);
-        };
-        let (token, log_probs) = self.sample_array(&penalties.apply(logits))?;
-        penalties.record(&token);
-        Ok((token, log_probs))
-    }
-
-    /// Check if token is a stop token.
-    pub fn is_stop_token(&self, token: u32) -> bool {
-        self.config.stop_tokens.contains(&token)
-    }
-
-    /// Get the generation config.
-    pub fn config(&self) -> &GenerationConfig {
-        &self.config
-    }
-
-    /// Get the random seed used (useful for reproducibility logging).
-    pub fn seed(&self) -> u64 {
-        self.config.seed.unwrap_or(0)
     }
 }
 
-/// One generation's [`Sampler`] and [`DecodePenalties`], deciding tokens from
-/// logits an engine hands over on the host (the ANE engine), so they are
-/// sampled and penalized as [`generate_cached`] samples and
-/// penalizes them on the GPU.
+/// One generation's [`DecodeSampler`], deciding tokens from logits an engine
+/// hands over on the host (the ANE engine), so they are sampled and
+/// penalized as [`generate_cached`] samples and penalizes them on the GPU.
 ///
-/// Each call wraps the row as `[1, vocab]` f32 logits, samples it through
-/// [`Sampler::sample`] and takes the token into the penalties, which is what
+/// Each call wraps the row as `[1, vocab]` f32 logits and samples it through
+/// the sampler, which takes the token into its penalties, which is what
 /// [`TokenSampler`](pmetal_metal::ane::lm::TokenSampler) asks of it: the
 /// engines ask for the generation's tokens in order, a speculative one never
 /// past a guess it rejects, so the history holds exactly the tokens before
 /// each position, and the `n`-th token takes the `n`-th seeded draw.
 ///
-/// Greedy decoding with no penalty has nothing to apply and draws nothing,
-/// so it takes the argmax on the host, which is the GPU's argmax (the first
-/// maximum), without the round trip: about 0.5 ms a token on a
-/// 151,936-token vocabulary, several times a pass when guesses are verified.
+/// Greedy decoding with nothing to apply and draws nothing, so it takes the
+/// argmax on the host, which is the GPU's argmax (the first maximum),
+/// without the round trip: about 0.5 ms a token on a 151,936-token
+/// vocabulary, several times a pass when guesses are verified.
 #[cfg(feature = "ane")]
 pub struct HostLogitsSampler {
-    sampler: Sampler,
-    penalties: Option<DecodePenalties>,
+    sampler: DecodeSampler,
 }
 
 #[cfg(feature = "ane")]
@@ -796,8 +558,7 @@ impl HostLogitsSampler {
     /// The sampler of a generation under `config` continuing `prompt`.
     pub fn new(config: &GenerationConfig, prompt: &[u32]) -> Self {
         Self {
-            penalties: config.decode_penalties(prompt),
-            sampler: Sampler::new(config.clone()),
+            sampler: config.sampler(prompt),
         }
     }
 }
@@ -806,26 +567,15 @@ impl HostLogitsSampler {
 impl pmetal_metal::ane::lm::TokenSampler for HostLogitsSampler {
     fn sample(&mut self, logits: &[f32]) -> pmetal_metal::error::Result<u32> {
         use pmetal_metal::error::MetalError;
-        if !self.sampler.config().do_sample && self.penalties.is_none() {
+        if self.sampler.is_plain_argmax() {
             return pmetal_metal::ane::lm::Greedy.sample(logits);
         }
         let row = Array::from_f32_slice(logits, &[1, logits.len() as i32]);
-        let token = self
-            .sampler
-            .sample(&row, self.penalties.as_mut())
-            .map_err(|e| MetalError::Internal(format!("sampling: {e}")))?;
+        let token = self.sampler.sample(&row).item_u32();
         pmetal_runtime::check_unobserved_error()
             .map_err(|e| MetalError::Internal(format!("sampling: {e}")))?;
         Ok(token)
     }
-}
-
-/// Greedy sampling returning Array for async pipelining.
-/// No GPU→CPU sync - stays lazy for maximum performance.
-/// Greedy sampling - return argmax along last axis to match Python's pattern.
-/// Returns shape [batch] for input shape [batch, vocab].
-fn greedy_sample_array(logits: &Array) -> Result<Array, Exception> {
-    Ok(argmax_axis(logits, -1)) // axis=-1 like Python's mx.argmax(x, axis=-1)
 }
 
 /// Convert logits to log probabilities (log-softmax), in f32.
@@ -836,16 +586,16 @@ fn greedy_sample_array(logits: &Array) -> Result<Array, Exception> {
 /// to the logits' own precision, steps of 1/8 for logits between 16 and 32,
 /// so reported logprobs came out coarse and the sampling filters cut on
 /// rounded values.
-fn logits_to_log_probs(logits: &Array) -> Result<Array, Exception> {
+fn logits_to_log_probs(logits: &Array) -> Array {
     let owned;
-    let logits = if is_f32(logits) {
+    let logits = if logits.dtype() == Dtype::Float32 {
         logits
     } else {
         owned = logits.cast(Dtype::Float32);
         &owned
     };
     let lse = logsumexp_axis_keepdims(logits, -1, true);
-    Ok(logits.subtract(&lse))
+    logits.subtract(&lse)
 }
 
 /// Compute the log-probability of a specific token under the given logits
@@ -869,197 +619,57 @@ pub fn token_logprobs(
     token: u32,
     top_n: usize,
 ) -> Result<(f32, Vec<(u32, f32)>), Exception> {
-    let log_probs = logits_to_log_probs(logits)?;
+    use pmetal_runtime::compat::ops::{argpartition_axis, negative, slice_axis, take_along_axis};
+
     // Flatten every leading dim so single-row and batched callers both land
-    // on a 1-D [vocab] view. The sampler path only ever has one active
+    // on a [1, vocab] view. The sampler path only ever has one active
     // prediction per step so this is safe.
-    let vocab = *log_probs
+    let vocab = *logits
         .shape()
         .last()
         .ok_or_else(|| Exception::custom("token_logprobs: empty logits shape"))?;
-    let flat = log_probs.reshape(&[vocab]);
-    flat.eval();
-    let values: Vec<f32> = flat.as_slice().to_vec();
-
-    let idx = token as usize;
-    let chosen = values
-        .get(idx)
-        .copied()
-        .ok_or_else(|| Exception::custom(format!("token_logprobs: token {token} out of range")))?;
-
-    let mut top = Vec::new();
-    if top_n > 0 {
-        // O(V log top_n) partial sort via a min-heap of size top_n. Cheaper
-        // than a full sort for realistic vocab/top_n ratios (128k / 5).
-        use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-        #[derive(PartialEq)]
-        struct Entry(f32, u32);
-        impl Eq for Entry {}
-        impl PartialOrd for Entry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for Entry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // Min-heap on logprob — reverse the natural order.
-                other.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
-            }
-        }
-        let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(top_n + 1);
-        for (i, &v) in values.iter().enumerate() {
-            if heap.len() < top_n {
-                heap.push(Entry(v, i as u32));
-            } else if let Some(min) = heap.peek() {
-                if v > min.0 {
-                    heap.pop();
-                    heap.push(Entry(v, i as u32));
-                }
-            }
-        }
-        let mut collected: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
-        // Sort descending by logprob.
-        collected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        top = collected;
+    if token as i64 >= i64::from(vocab) {
+        return Err(Exception::custom(format!(
+            "token_logprobs: token {token} out of range"
+        )));
     }
+    let log_probs = logits_to_log_probs(logits).reshape(&[1, vocab]);
 
-    Ok((chosen, top))
-}
-
-/// The exact sampling distribution [`Sampler`] draws from, for `[1, vocab]`
-/// logits and the generation's `penalties` (which this reads but does not
-/// record into).
-///
-/// The returned array is normalized log-probabilities after repetition,
-/// frequency/presence penalties, temperature, and top-k/top-p/min-p filtering
-/// ([`filtered_log_probs`], renormalized over the tokens it keeps). This is
-/// useful for speculative sampling verification, where the verifier needs
-/// probabilities for both target and draft distributions rather than only the
-/// sampled token.
-pub fn sampling_log_probs(
-    logits: &Array,
-    penalties: Option<&mut DecodePenalties>,
-    config: &GenerationConfig,
-) -> Result<Array, Exception> {
-    let filtered = match penalties {
-        Some(penalties) => filtered_log_probs(&penalties.apply(logits), &config.sampling_params()),
-        None => filtered_log_probs(logits, &config.sampling_params()),
-    };
-    Ok(filtered.subtract(&logsumexp_axis_keepdims(&filtered, -1, true)))
-}
-
-/// The random draws of one speculative generation: the tokens it samples
-/// (drafts, corrections, bonus tokens) and the uniforms its acceptance tests
-/// compare against.
-///
-/// Seeded, the `n`-th draw of either kind comes from
-/// [`pmetal_runtime::decode::draw_key`]`(seed, n)` (or its bits, for a
-/// uniform), as the plain sampler's tokens do: no random state is shared
-/// with the thread or with another generation, so a seeded speculative
-/// decode picks the same tokens whichever thread runs it and whatever else
-/// draws meanwhile. Unseeded, tokens take the thread's MLX key and uniforms
-/// a SplitMix64 stream started from the clock.
-#[derive(Debug)]
-pub struct SpeculativeDraws {
-    seed: Option<u64>,
-    /// The seed, or the clock when unseeded: where the uniforms come from.
-    uniform_seed: u64,
-    next: u64,
-}
-
-impl SpeculativeDraws {
-    /// The draws of a generation with this seed (`None`: unseeded).
-    pub fn new(seed: Option<u64>) -> Self {
-        let uniform_seed = seed.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0x1234_5678_9abc_def0, |d| d.as_nanos() as u64)
-        });
-        Self {
-            seed,
-            uniform_seed,
-            next: 0,
-        }
+    // The chosen token's log-probability, and the `top_n` largest ones,
+    // gathered on the device: only a handful of values come back, not the
+    // vocabulary (600 KB per token over a 152k vocabulary).
+    let chosen = take_along_axis(&log_probs, &Array::from_slice(&[token as i32], &[1, 1]), -1);
+    let k = top_n.min(vocab as usize);
+    let top = (k > 0).then(|| {
+        // The first k columns of a partition of the negated log-probs at
+        // k - 1 are the k largest, in no order.
+        let part = argpartition_axis(&negative(&log_probs), k as i32 - 1, -1);
+        let ids = slice_axis(&part, 1, 0, k as i32);
+        (take_along_axis(&log_probs, &ids, -1), ids)
+    });
+    chosen.eval();
+    if let Some((values, ids)) = &top {
+        values.eval();
+        ids.eval();
     }
-
-    fn advance(&mut self) -> u64 {
-        let draw = self.next;
-        self.next += 1;
-        draw
-    }
-
-    /// Sample a token from normalized log-probabilities.
-    pub fn sample(&mut self, log_probs: &Array) -> Result<u32, Exception> {
-        let draw = self.advance();
-        let key = self
-            .seed
-            .map(|seed| pmetal_runtime::decode::draw_key(seed, draw));
-        let token = categorical(log_probs, -1, key.as_ref());
-        token.eval();
-        pmetal_runtime::check_unobserved_error()
-            .map_err(|e| Exception::custom(format!("speculative sample: {e}")))?;
-        Ok(token.item::<u32>())
-    }
-
-    /// A uniform in `[0, 1)`, with 24 random bits.
-    pub fn uniform(&mut self) -> f32 {
-        let draw = self.advance();
-        let bits = pmetal_runtime::decode::draw_bits(self.uniform_seed, draw);
-        (bits >> 40) as f32 / (1u64 << 24) as f32
-    }
-}
-
-/// The log-probabilities a speculative decoder samples its correction token
-/// from after rejecting a draft token: the residual `norm(max(0, p − q))` of
-/// the target's probabilities `p` over the draft's `q` (Leviathan et al.,
-/// arXiv 2211.17192, section 2.3; Chen et al., arXiv 2302.01318). With the
-/// acceptance test `min(1, p/q)` before it, every token comes out distributed
-/// as the target alone would sample it. A residual with no mass (the draft
-/// agreeing with the target) leaves the target's distribution.
-pub fn correction_log_probs(
-    target_log_probs: &Array,
-    draft_log_probs: &Array,
-) -> Result<Array, Exception> {
-    let residual = target_log_probs
-        .exp()
-        .subtract(&draft_log_probs.exp())
-        .maximum(&Array::from_f32(0.0));
-    let total = residual.sum_axis(-1, true);
-    let total_value = total.item::<f32>();
     pmetal_runtime::check_unobserved_error()
-        .map_err(|e| Exception::custom(format!("speculative correction distribution: {e}")))?;
-    if !total_value.is_finite() || total_value <= 1e-20 {
-        return Ok(target_log_probs.clone());
-    }
-    Ok(residual.divide(&total).log())
-}
+        .map_err(|e| Exception::custom(format!("token_logprobs: {e}")))?;
+    let chosen = chosen.as_slice::<f32>()[0];
 
-/// Return `exp(log_probs[token])`, validating the token against the vocabulary.
-pub fn token_probability_from_log_probs(log_probs: &Array, token: u32) -> Result<f32, Exception> {
-    let vocab_size = log_probs.dim(-1);
-    if token as i32 >= vocab_size {
-        return Err(Exception::custom(format!(
-            "token_probability_from_log_probs: token {token} out of range for vocab {vocab_size}"
-        )));
+    let mut alternatives = Vec::new();
+    if let Some((values, ids)) = &top {
+        let (values, ids) = (values.as_slice::<f32>(), ids.as_slice::<u32>());
+        alternatives = ids.iter().copied().zip(values.iter().copied()).collect();
+        // Descending by log-probability, ties by token id.
+        alternatives.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     }
-    let row = if log_probs.ndim() == 1 {
-        log_probs.reshape(&[1, vocab_size])
-    } else {
-        log_probs.reshape(&[-1, vocab_size])
-    };
-    if row.dim(0) != 1 {
-        return Err(Exception::custom(format!(
-            "token_probability_from_log_probs expects one distribution row, got {}",
-            row.dim(0)
-        )));
-    }
-    let token_index = Array::from_slice(&[token as i32], &[1, 1]);
-    let log_prob = take_along_axis(&row, &token_index, -1);
-    Ok(log_prob.item::<f32>().exp())
+    Ok((chosen, alternatives))
 }
 
 /// Simple generation function that works with any model that has a `forward` method.
+///
+/// It runs the model over the whole sequence for every token (no cache), which
+/// is what makes it the reference the cached generators are checked against.
 ///
 /// # Arguments
 /// * `forward_fn` - Function that takes input_ids and returns logits
@@ -1077,54 +687,36 @@ where
     F: FnMut(&Array) -> Result<Array, Exception>,
 {
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
-    let sampler = Sampler::new(config.clone());
-    let mut penalties = sampler.decode_penalties(input_ids);
+    let mut sampler = config.sampler(input_ids);
     let prompt_len = input_ids.len();
 
     for _ in 0..config.max_new_tokens {
-        let input = prompt_tokens_to_input(&all_tokens);
-
-        // Get logits from model
-        let logits = forward_fn(&input)?;
-        logits.eval();
-
-        // Logits for the last position, [1, vocab]
-        let last_logits = last_token_logits(&logits);
-
-        // Sample next token
-        let next_token = sampler.sample(&last_logits, penalties.as_mut())?;
-
-        // Check for stop token
-        if sampler.is_stop_token(next_token) {
-            let num_generated = all_tokens.len() - prompt_len;
-            return Ok(GenerationOutput {
-                token_ids: all_tokens,
-                num_generated,
-                stopped_by_token: true,
-                stopped_by_length: false,
-                decode_metrics: None,
-                speculative_metrics: None,
-            });
+        let logits = forward_fn(&prompt_tokens_to_input(&all_tokens))?;
+        let next_token = sampler.sample(&last_token_logits(&logits)).item_u32();
+        if config.is_stop_token(next_token) {
+            return Ok(GenerationOutput::ended(
+                all_tokens,
+                prompt_len,
+                Ended::Stop,
+                None,
+            ));
         }
-
         all_tokens.push(next_token);
     }
-
-    let num_generated = all_tokens.len() - prompt_len;
-    Ok(GenerationOutput {
-        token_ids: all_tokens,
-        num_generated,
-        stopped_by_token: false,
-        stopped_by_length: true,
-        decode_metrics: None,
-        speculative_metrics: None,
-    })
+    Ok(GenerationOutput::ended(
+        all_tokens,
+        prompt_len,
+        Ended::Length,
+        None,
+    ))
 }
 
 /// KV-cached generation for efficient autoregressive decoding.
 ///
 /// This function uses a KV cache to avoid recomputing attention for
-/// previous tokens, providing 10-50x speedup for longer generations.
+/// previous tokens, providing 10-50x speedup for longer generations. It reads
+/// every token back before running the next step, so it is the simple
+/// reference the pipelined [`generate_cached_async_streaming`] is held to.
 ///
 /// # Arguments
 /// * `forward_fn` - Function that takes (input_ids, cache) and returns logits
@@ -1148,129 +740,51 @@ pub fn generate_cached<F>(
 where
     F: FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
 {
-    // Set wired memory limit for optimal GPU memory management
-    let _wired_guard = WiredLimitGuard::new();
+    let _wired = WiredLimit::max();
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
-    let sampler = Sampler::new(config.clone());
-    let mut penalties = sampler.decode_penalties(input_ids);
+    let mut sampler = config.sampler(input_ids);
     let prompt_len = input_ids.len();
 
     // Prefill: process long prompts in chunks to bound peak allocator pressure.
     let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
         forward_fn(chunk_input, cache)
     })?;
-    logits.eval();
+    let mut next_token = sampler.sample(&last_token_logits(&logits)).item_u32();
 
-    // Get logits for the last position and sample first new token
-    let last_logits = last_token_logits(&logits);
-
-    let mut next_token = sampler.sample(&last_logits, penalties.as_mut())?;
-
-    // Check for stop token
-    if sampler.is_stop_token(next_token) {
-        let num_generated = 0;
-        return Ok(GenerationOutput {
-            token_ids: all_tokens,
-            num_generated,
-            stopped_by_token: true,
-            stopped_by_length: false,
-            decode_metrics: None,
-            speculative_metrics: None,
-        });
-    }
-
-    all_tokens.push(next_token);
-
-    // Decode: Process one token at a time using cache
-    for _ in 1..config.max_new_tokens {
-        // Create input for just the new token
-        let token_input = Array::from_slice(&[next_token as i32], &[1, 1]);
-
-        // Forward with cache - only processes the new token
-        let logits = forward_fn(&token_input, cache)?;
-        logits.eval();
-
-        // Get logits for the (only) position
-        let last_logits = select_axis(&logits, 0, 1);
-        // next squeeze removed - select_axis already reduces dim
-
-        // Sample next token
-        next_token = sampler.sample(&last_logits, penalties.as_mut())?;
-
-        // Check for stop token
-        if sampler.is_stop_token(next_token) {
-            let num_generated = all_tokens.len() - prompt_len;
-            return Ok(GenerationOutput {
-                token_ids: all_tokens,
-                num_generated,
-                stopped_by_token: true,
-                stopped_by_length: false,
-                decode_metrics: None,
-                speculative_metrics: None,
-            });
+    for _ in 0..config.max_new_tokens {
+        if config.is_stop_token(next_token) {
+            return Ok(GenerationOutput::ended(
+                all_tokens,
+                prompt_len,
+                Ended::Stop,
+                None,
+            ));
+        }
+        all_tokens.push(next_token);
+        if all_tokens.len() - prompt_len == config.max_new_tokens {
+            break;
         }
 
-        all_tokens.push(next_token);
+        // Forward with cache: only the new token runs.
+        let token_input = Array::from_slice(&[next_token as i32], &[1, 1]);
+        let logits = forward_fn(&token_input, cache)?;
+        next_token = sampler.sample(&select_axis(&logits, 0, 1)).item_u32();
     }
 
-    let num_generated = all_tokens.len() - prompt_len;
-    Ok(GenerationOutput {
-        token_ids: all_tokens,
-        num_generated,
-        stopped_by_token: false,
-        stopped_by_length: true,
-        decode_metrics: None,
-        speculative_metrics: None,
-    })
+    Ok(GenerationOutput::ended(
+        all_tokens,
+        prompt_len,
+        Ended::Length,
+        None,
+    ))
 }
 
 /// Generation with async pipelining.
 ///
-/// This function uses true async evaluation pipelining where:
-/// - Token N's logits are computed while token N-1 is being extracted
-/// - Tokens stay as Arrays on GPU until after next computation is scheduled
-/// - This eliminates GPU→CPU sync bottleneck that was limiting performance
-///
-/// The pattern:
-/// ```text
-/// y, logprobs = _step(prompt)
-/// async_eval(y, logprobs)  // Schedule first token
-/// while n < max_tokens:
-///     next_y, next_logprobs = _step(y)  // y is Array, passed directly!
-///     async_eval(next_y, next_logprobs)  // Schedule BEFORE .item()
-///     yield y.item()  // NOW extract (next is already computing)
-///     y = next_y  // Swap
-/// ```
-///
-/// The key insight: `.item()` forces GPU→CPU sync. By calling it AFTER
-/// scheduling the next forward pass, we overlap computation with extraction.
-///
-/// ## Memory Management
-///
-/// Uses wired memory limit (like Python's `wired_limit` context manager) to
-/// prevent page faults and ensure GPU memory stays resident. This is critical
-/// for consistent high-throughput inference.
-///
-/// ## Backpressure
-///
-/// Implements explicit backpressure by waiting for the current token before
-/// scheduling the next one. This mimics Python's async_eval behavior where
-/// `MAX_ACTIVE_TASKS=10` causes blocking, ensuring perfect GPU pipelining.
-///
-/// The repetition, frequency and presence penalties are applied on the GPU
-/// ([`DecodePenalties`]), so they cost the pipeline no sync.
-///
-/// # Arguments
-/// * `forward_fn` - Function that takes (input_ids, cache) and returns logits
-/// * `input_ids` - Initial token IDs (prompt)
-/// * `config` - Generation configuration
-/// * `cache` - Pre-allocated KV cache
-///
-/// # Returns
-/// Generation output containing all tokens and metadata
+/// [`generate_cached_async_streaming`] without a token callback.
 pub fn generate_cached_async<F>(
-    mut forward_fn: F,
+    forward_fn: F,
     input_ids: &[u32],
     config: GenerationConfig,
     cache: &mut KVCache,
@@ -1278,118 +792,119 @@ pub fn generate_cached_async<F>(
 where
     F: FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
 {
-    // Set wired memory limit for optimal GPU memory management
-    // This prevents page faults and matches Python's wired_limit context manager
-    let _wired_guard = WiredLimitGuard::new();
-    // This is what enables true async pipelining.
+    generate_cached_async_streaming(forward_fn, input_ids, config, cache, |_| true)
+}
 
-    let mut all_tokens: Vec<u32> = input_ids.to_vec();
-    let sampler = Sampler::new(config.clone());
-    let mut penalties = sampler.decode_penalties(input_ids);
-    let prompt_len = input_ids.len();
+/// The pipelined decode loop every cached generator runs: [`generate_cached_async_streaming`],
+/// and the serving engine's per-request decode.
+///
+/// Step `n + 1`'s forward is queued on the GPU before step `n`'s token is
+/// read back, and the token stays an array until then (the next step takes it
+/// as its input, and the sampler's penalties take it in on the GPU), so the
+/// host's work overlaps the GPU's:
+///
+/// ```text
+/// y = sample(first logits)              // an array, still lazy
+/// async_eval(y)
+/// loop:
+///     next_y = sample(step(y))          // y is an array, passed directly
+///     async_eval(next_y)                // queued BEFORE y is read
+///     on_token(y.item())                // blocks while next_y computes
+///     y = next_y
+/// ```
+///
+/// * `first_logits` `[1, vocab]` is where the first token is sampled from
+///   (the prompt's last position).
+/// * `step(input, i)` runs the model on the `[1, 1]` int32 token array
+///   `input` (the token the `i`-th step samples from) and returns the
+///   `[1, vocab]` logits of the next one.
+/// * `on_token(token, logits)` sees each token with the `[1, vocab]` logits
+///   it was sampled from (before the sampler's constraints, for log-probability
+///   reporting) and returns [`ControlFlow::Break`](std::ops::ControlFlow::Break) to end the decode, which it
+///   does without the token being sampled past. One forward past the last
+///   token read has been queued by then, so the cache holds a token the caller
+///   has not seen; a caller that reuses the cache must account for it.
+///
+/// At most `max_tokens` tokens are produced. Returns each step's latency in
+/// nanoseconds, measured from the step's queueing to its token's readback and
+/// closed before `on_token` runs, so a slow consumer does not contaminate it
+/// (the first includes the wait for the prefill).
+///
+/// Run it with a [`GenerationStream`] and a [`WiredLimit`] held, as
+/// [`generate_cached_async_streaming`] does.
+pub fn decode_pipelined<S, C>(
+    first_logits: &Array,
+    sampler: &mut DecodeSampler,
+    max_tokens: usize,
+    mut step: S,
+    mut on_token: C,
+) -> Result<Vec<u128>, Exception>
+where
+    S: FnMut(&Array, usize) -> Result<Array, Exception>,
+    C: FnMut(u32, &Array) -> std::ops::ControlFlow<()>,
+{
+    let mut step_ns = Vec::with_capacity(max_tokens);
+    if max_tokens == 0 {
+        return Ok(step_ns);
+    }
+    let mut logits = first_logits.clone();
+    let mut current = sampler.sample(&logits);
+    async_eval([&current]);
 
-    // The prefill's last-position logits, [1, vocab].
-    let (mut current_y, mut current_logprobs) = {
-        let logits =
-            run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-                use_generation_stream();
-                forward_fn(chunk_input, cache)
-            })?;
-        let current_logits = last_token_logits(&logits);
-        sampler.sample_array_penalized(&current_logits, penalties.as_mut())?
-    };
-
-    // async_eval OUTSIDE stream context (critical for pipelining!)
-    async_eval([&current_y, &current_logprobs]);
-
-    // Decode loop with TRUE async pipelining
-    //
-    // Python pattern: _step() wraps forward in stream context, async_eval outside
-    // This enables the GPU to compute next token while CPU extracts current token.
-    //
-    let mut n = 0;
-
-    loop {
-        // 1. Schedule NEXT forward pass if not at max
-        let next_pair = if n + 1 < config.max_new_tokens {
-            // Forward pass INSIDE stream context
-            let (y, lp) = {
-                use_generation_stream();
-                // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
-                let next_input = current_y
-                    .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
-                    .reshape(&[1, -1]);
-                let next_output = forward_fn(&next_input, cache)?;
-                let next_logits = select_axis(&next_output, 0, 1);
-                sampler.sample_array_penalized(&next_logits, penalties.as_mut())?
-            };
-            // async_eval OUTSIDE stream context (enables pipelining)
-            async_eval([&y, &lp]);
-            Some((y, lp))
+    for i in 0..max_tokens {
+        let started = std::time::Instant::now();
+        let next = if i + 1 < max_tokens {
+            let input = current.as_dtype(Dtype::Int32.as_i32()).reshape(&[1, -1]);
+            let next_logits = step(&input, i)?;
+            let next = sampler.sample(&next_logits);
+            async_eval([&next]);
+            Some((next, next_logits))
         } else {
             None
         };
 
-        // 2. First iteration: force eval on first token (like Python's mx.eval(y) on n==0)
-        if n == 0 {
-            current_y.eval();
+        if i == 0 {
+            // Surfaces an error in the prefill or the first step here, as an
+            // error, instead of in the read below.
+            current
+                .try_eval()
+                .map_err(|e| Exception::custom(e.to_string()))?;
         }
+        // Blocks while the GPU computes the step queued above.
+        let token = current.item_u32();
+        step_ns.push(started.elapsed().as_nanos());
 
-        // 3. Check max tokens BEFORE extraction (like Python)
-        if n >= config.max_new_tokens {
+        if on_token(token, &logits).is_break() {
             break;
         }
-
-        // 4. Extract current token - blocks naturally while GPU computes next
-        let token = current_y.item::<u32>();
-
-        // 5. Check stop token
-        if sampler.is_stop_token(token) {
-            let num_generated = all_tokens.len() - prompt_len;
-            return Ok(GenerationOutput {
-                token_ids: all_tokens,
-                num_generated,
-                stopped_by_token: true,
-                stopped_by_length: false,
-                decode_metrics: None,
-                speculative_metrics: None,
-            });
+        if i % 256 == 255 {
+            pmetal_runtime::inline_array::clear_cache();
         }
-
-        all_tokens.push(token);
-
-        // Clear cache every 256 tokens (matches Python)
-        if n % 256 == 0 && n > 0 {
-            clear_generation_caches();
-        }
-
-        // 6. Swap if we have next
-        if let Some((y, lp)) = next_pair {
-            current_y = y;
-            current_logprobs = lp;
-        }
-
-        n += 1;
+        let Some((next, next_logits)) = next else {
+            break;
+        };
+        current = next;
+        logits = next_logits;
     }
-
-    // Keep compiler happy - logprobs used only for async scheduling
-    let _ = current_logprobs;
-
-    let num_generated = all_tokens.len() - prompt_len;
-    Ok(GenerationOutput {
-        token_ids: all_tokens,
-        num_generated,
-        stopped_by_token: false,
-        stopped_by_length: true,
-        decode_metrics: None,
-        speculative_metrics: None,
-    })
+    Ok(step_ns)
 }
 
-/// Streaming variant of [`generate_cached_async`] that calls `on_token` with each
-/// generated token ID as it's produced, enabling real-time display.
+/// KV-cached generation with async pipelining ([`decode_pipelined`]), calling
+/// `on_token` with each generated token ID as it's produced, enabling
+/// real-time display. The callback returns `true` to continue generation or
+/// `false` to stop early.
 ///
-/// The callback returns `true` to continue generation or `false` to stop early.
+/// Everything runs on the thread's generation stream under a wired-memory
+/// limit at the device's recommended maximum, both restored on return. A
+/// stop token ends the generation: it is neither emitted nor in the output.
+/// One forward past it has been queued by then, so the cache holds a token
+/// the output does not; a caller that reuses the cache must not.
+///
+/// # Arguments
+/// * `forward_fn` - Function that takes (input_ids, cache) and returns logits
+/// * `input_ids` - Initial token IDs (prompt)
+/// * `config` - Generation configuration
+/// * `cache` - Pre-allocated KV cache
 pub fn generate_cached_async_streaming<F, C>(
     mut forward_fn: F,
     input_ids: &[u32],
@@ -1401,113 +916,41 @@ where
     F: FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
     C: FnMut(u32) -> bool,
 {
-    let _wired_guard = WiredLimitGuard::new();
+    let _wired = WiredLimit::max();
+    let _stream = GenerationStream::enter();
 
     let mut all_tokens: Vec<u32> = input_ids.to_vec();
-    let sampler = Sampler::new(config.clone());
-    let mut penalties = sampler.decode_penalties(input_ids);
+    let mut sampler = config.sampler(input_ids);
     let prompt_len = input_ids.len();
 
-    // Per-step decode latencies in nanoseconds. The first step (n=0) is
-    // dropped as warmup — it includes prefill fallout that skews the
-    // tokens-per-second number. See `build_decode_metrics` below.
-    let mut step_ns: Vec<u128> = Vec::with_capacity(config.max_new_tokens);
-
-    let (mut current_y, mut current_logprobs) = {
-        let logits =
-            run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-                use_generation_stream();
-                forward_fn(chunk_input, cache)
-            })?;
-        let current_logits = last_token_logits(&logits);
-        sampler.sample_array_penalized(&current_logits, penalties.as_mut())?
-    };
-    async_eval([&current_y, &current_logprobs]);
-
-    let mut n = 0;
-
-    loop {
-        let step_start = std::time::Instant::now();
-        let next_pair = if n + 1 < config.max_new_tokens {
-            let (y, lp) = {
-                use_generation_stream();
-                let next_input = current_y
-                    .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
-                    .reshape(&[1, -1]);
-                let next_output = forward_fn(&next_input, cache)?;
-                let next_logits = select_axis(&next_output, 0, 1);
-                sampler.sample_array_penalized(&next_logits, penalties.as_mut())?
-            };
-            async_eval([&y, &lp]);
-            Some((y, lp))
-        } else {
-            None
-        };
-
-        if n == 0 {
-            current_y.eval();
-        }
-
-        if n >= config.max_new_tokens {
-            break;
-        }
-
-        let token = current_y.item::<u32>();
-        // End of this decode step (we've materialised the token). Record
-        // the timing before the callback fires so stream-print latency
-        // doesn't contaminate the metric.
-        step_ns.push(step_start.elapsed().as_nanos());
-
-        if sampler.is_stop_token(token) {
-            let num_generated = all_tokens.len() - prompt_len;
-            return Ok(GenerationOutput {
-                token_ids: all_tokens,
-                num_generated,
-                stopped_by_token: true,
-                stopped_by_length: false,
-                decode_metrics: build_decode_metrics(&step_ns),
-                speculative_metrics: None,
-            });
-        }
-
-        all_tokens.push(token);
-
-        // Stream token to caller
-        if !on_token(token) {
-            let num_generated = all_tokens.len() - prompt_len;
-            return Ok(GenerationOutput {
-                token_ids: all_tokens,
-                num_generated,
-                stopped_by_token: false,
-                stopped_by_length: false,
-                decode_metrics: build_decode_metrics(&step_ns),
-                speculative_metrics: None,
-            });
-        }
-
-        if n % 256 == 0 && n > 0 {
-            clear_generation_caches();
-        }
-
-        if let Some((y, lp)) = next_pair {
-            current_y = y;
-            current_logprobs = lp;
-        }
-
-        n += 1;
-    }
-
-    let _ = current_logprobs;
-
-    let num_generated = all_tokens.len() - prompt_len;
-    Ok(GenerationOutput {
-        token_ids: all_tokens,
-        num_generated,
-        stopped_by_token: false,
-        stopped_by_length: true,
-        decode_metrics: build_decode_metrics(&step_ns),
-        speculative_metrics: None,
-    })
+    let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+        forward_fn(chunk_input, cache)
+    })?;
+    let mut ended = Ended::Length;
+    let step_ns = decode_pipelined(
+        &last_token_logits(&logits),
+        &mut sampler,
+        config.max_new_tokens,
+        |input, _| Ok(select_axis(&forward_fn(input, cache)?, 0, 1)),
+        |token, _| {
+            if config.is_stop_token(token) {
+                ended = Ended::Stop;
+                return std::ops::ControlFlow::Break(());
+            }
+            all_tokens.push(token);
+            if !on_token(token) {
+                ended = Ended::Caller;
+                return std::ops::ControlFlow::Break(());
+            }
+            std::ops::ControlFlow::Continue(())
+        },
+    )?;
+    Ok(GenerationOutput::ended(
+        all_tokens,
+        prompt_len,
+        ended,
+        build_decode_metrics(&step_ns),
+    ))
 }
 
 /// Compute a [`DecodeMetrics`] summary from raw per-step latencies (ns).
@@ -1651,35 +1094,281 @@ pub fn is_ane_inference_compatible(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::speculative::token_probability_from_log_probs;
     use pmetal_runtime::decode::greedy_token;
 
-    /// The correction distribution is the clipped, renormalized residual of
-    /// the target over the draft, and the target when there is none.
+    /// A stand-in model whose logits at each position depend only on the
+    /// token there, a fixed pseudo-random table over a 32-token vocabulary:
+    /// cheap, deterministic, and varied enough that sampling, penalties and
+    /// a bias all change what is picked.
+    fn table_logits(tokens: &[i32]) -> Array {
+        const VOCAB: usize = 32;
+        let mut data = Vec::with_capacity(tokens.len() * VOCAB);
+        for &token in tokens {
+            for j in 0..VOCAB {
+                data.push(((token as usize * 7 + j * 13 + token as usize * j) % 17) as f32 * 0.35);
+            }
+        }
+        Array::from_slice(&data, &[1, tokens.len() as i32, VOCAB as i32])
+    }
+
+    fn table_cached(input: &Array, _cache: &mut KVCache) -> Result<Array, Exception> {
+        input.eval();
+        Ok(table_logits(input.as_slice::<i32>()))
+    }
+
+    fn table_uncached(input: &Array) -> Result<Array, Exception> {
+        input.eval();
+        Ok(table_logits(input.as_slice::<i32>()))
+    }
+
+    fn tiny_cache() -> KVCache {
+        KVCache::new(pmetal_cache::kv_cache::KVCacheConfig::new(1, 64, 1, 4))
+    }
+
+    const PROMPT: [u32; 4] = [3, 9, 1, 20];
+
+    /// All three generators on `config`: the uncached reference, the
+    /// cached one and the pipelined one (streaming into the returned vec).
+    fn run_all(config: &GenerationConfig) -> [GenerationOutput; 3] {
+        let plain = generate(table_uncached, &PROMPT, config.clone()).unwrap();
+        let cached =
+            generate_cached(table_cached, &PROMPT, config.clone(), &mut tiny_cache()).unwrap();
+        let mut streamed = Vec::new();
+        let pipelined = generate_cached_async_streaming(
+            table_cached,
+            &PROMPT,
+            config.clone(),
+            &mut tiny_cache(),
+            |t| {
+                streamed.push(t);
+                true
+            },
+        )
+        .unwrap();
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
+        assert_eq!(streamed, pipelined.token_ids[PROMPT.len()..], "streamed");
+        [plain, cached, pipelined]
+    }
+
+    /// The uncached, the cached and the pipelined generators are one decode:
+    /// the same tokens, greedy or drawn from a seed (the `n`-th token takes
+    /// the `n`-th draw in every one), under the penalties and a bias, and a
+    /// stop token ends all of them without being emitted.
     #[test]
-    fn the_correction_samples_the_residual_of_target_over_draft() {
-        let log = |p: &[f32]| {
-            Array::from_slice(
-                &p.iter().map(|p| p.ln()).collect::<Vec<_>>(),
-                &[1, p.len() as i32],
-            )
-        };
-        let probs = |a: Array| {
-            let a = a.exp();
-            a.eval();
-            a.as_slice::<f32>().to_vec()
-        };
-        let target = [0.5f32, 0.3, 0.2];
-        // Residual (0.3, 0, 0.1) over 0.4.
-        let got = probs(correction_log_probs(&log(&target), &log(&[0.2, 0.6, 0.1])).unwrap());
-        for (g, w) in got.iter().zip([0.75f32, 0.0, 0.25]) {
-            assert!((g - w).abs() < 1e-6, "{got:?}");
+    fn the_generators_agree_on_every_token() {
+        let configs = [
+            GenerationConfig::greedy(14),
+            GenerationConfig::greedy(14)
+                .with_repetition_penalty(1.4)
+                .with_frequency_penalty(0.3)
+                .with_logit_bias(5, -100.0)
+                .with_logit_bias(11, 2.5),
+            GenerationConfig::sampling(14, 0.9)
+                .with_top_k(8)
+                .with_top_p(0.9)
+                .with_presence_penalty(0.4)
+                .with_seed(17),
+        ];
+        for (i, config) in configs.iter().enumerate() {
+            let [plain, cached, pipelined] = run_all(config);
+            assert_eq!(plain.num_generated, 14, "config {i}");
+            assert_eq!(cached.token_ids, plain.token_ids, "cached, config {i}");
+            assert_eq!(
+                pipelined.token_ids, plain.token_ids,
+                "pipelined, config {i}"
+            );
+            for out in [&plain, &cached, &pipelined] {
+                assert!(out.stopped_by_length && !out.stopped_by_token, "config {i}");
+            }
+            let made = &plain.token_ids[PROMPT.len()..];
+            if i == 1 {
+                assert!(!made.contains(&5), "a ban of -100 holds: {made:?}");
+            }
+
+            // The first repeat-free pick is made a stop token: every
+            // generator ends before it and leaves it out.
+            let stop = made[3];
+            let at = made.iter().position(|&t| t == stop).unwrap();
+            let stopped = config.clone().with_stop_tokens(vec![stop]);
+            let [plain, cached, pipelined] = run_all(&stopped);
+            for out in [&plain, &cached, &pipelined] {
+                assert_eq!(out.num_generated, at, "config {i}");
+                assert!(out.stopped_by_token && !out.stopped_by_length, "config {i}");
+                assert!(!out.token_ids[PROMPT.len()..].contains(&stop), "config {i}");
+            }
+            assert_eq!(cached.token_ids, plain.token_ids, "cached stop, config {i}");
+            assert_eq!(
+                pipelined.token_ids, plain.token_ids,
+                "pipelined stop, config {i}"
+            );
         }
-        // A draft equal to the target leaves no residual: the target.
-        let got = probs(correction_log_probs(&log(&target), &log(&target)).unwrap());
-        for (g, w) in got.iter().zip(target) {
-            assert!((g - w).abs() < 1e-6, "{got:?}");
+    }
+
+    /// The length limit is exact, a limit of zero generates nothing, and a
+    /// callback that declines ends the generation with the token it saw.
+    #[test]
+    fn the_generators_respect_the_limits_and_the_callback() {
+        for n in [0usize, 1, 2] {
+            let [plain, cached, pipelined] = run_all(&GenerationConfig::greedy(n));
+            for out in [&plain, &cached, &pipelined] {
+                assert_eq!(out.num_generated, n);
+                assert_eq!(out.token_ids.len(), PROMPT.len() + n);
+                assert!(out.stopped_by_length);
+            }
+            assert_eq!(cached.token_ids, plain.token_ids);
+            assert_eq!(pipelined.token_ids, plain.token_ids);
         }
-        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+
+        let mut seen = Vec::new();
+        let out = generate_cached_async_streaming(
+            table_cached,
+            &PROMPT,
+            GenerationConfig::greedy(10),
+            &mut tiny_cache(),
+            |t| {
+                seen.push(t);
+                seen.len() < 3
+            },
+        )
+        .unwrap();
+        assert_eq!(out.num_generated, 3);
+        assert_eq!(seen, out.token_ids[PROMPT.len()..]);
+        assert!(!out.stopped_by_token && !out.stopped_by_length);
+    }
+
+    /// The wired limit a generation takes is put back when it returns.
+    #[test]
+    #[serial_test::serial(wired_limit)]
+    fn a_generation_leaves_the_wired_limit_as_it_found_it() {
+        let before = pmetal_runtime::inline_array::set_wired_limit(1 << 30);
+        let out = generate_cached_async(
+            table_cached,
+            &PROMPT,
+            GenerationConfig::greedy(3),
+            &mut tiny_cache(),
+        )
+        .unwrap();
+        assert_eq!(out.num_generated, 3);
+        let after = pmetal_runtime::inline_array::set_wired_limit(before);
+        assert_eq!(after, 1 << 30, "the wired limit is back");
+    }
+
+    /// The sampler draws from exactly the distribution it reports (which
+    /// speculative decoding verifies against), under every filter, the
+    /// temperature and the penalties together: unseeded draws land on the
+    /// kept tokens about as often as that distribution says, and a seed fixes
+    /// the draw.
+    #[test]
+    fn the_sampler_draws_from_its_reported_distribution() {
+        let config = GenerationConfig::sampling(1, 0.7)
+            .with_top_k(6)
+            .with_top_p(0.9)
+            .with_min_p(0.05)
+            .with_repetition_penalty(1.3)
+            .with_frequency_penalty(0.2);
+        let logits = Array::from_slice(
+            &[2.0f32, 1.8, 1.5, 1.4, 1.0, 0.6, 0.5, -0.3, -1.0, -2.0],
+            &[1, 10],
+        );
+        let prompt = [0u32, 3];
+        let fresh = |config: &GenerationConfig| {
+            let mut sampler = config.sampler(&prompt);
+            sampler.record_id(1);
+            sampler
+        };
+        let want = fresh(&config).log_probs(&logits);
+        want.eval();
+        let want: Vec<f32> = want.as_slice::<f32>().iter().map(|v| v.exp()).collect();
+        assert!(want.iter().filter(|&&p| p > 0.0).count() > 2, "{want:?}");
+        assert!(want.contains(&0.0), "{want:?}");
+
+        let draws = 4000;
+        let mut counts = [0usize; 10];
+        for _ in 0..draws {
+            counts[fresh(&config).sample(&logits).item_u32() as usize] += 1;
+        }
+        for (i, (&count, &p)) in counts.iter().zip(&want).enumerate() {
+            let freq = count as f32 / draws as f32;
+            assert!(
+                (freq - p).abs() < 0.03,
+                "token {i}: drawn {freq:.3} of the time, probability {p:.3}"
+            );
+        }
+
+        // A seed makes the first draw the same token every time.
+        let seeded = config.clone().with_seed(11);
+        let first = fresh(&seeded).sample(&logits).item_u32();
+        assert!(want[first as usize] > 0.0);
+        for _ in 0..20 {
+            assert_eq!(fresh(&seeded).sample(&logits).item_u32(), first);
+        }
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
+    }
+
+    /// A model's `generation_config.json` sets the defaults the sampler
+    /// uses: the filters a model card recommends, its stop tokens (one or
+    /// several), and a length.
+    #[test]
+    fn a_model_directory_sets_the_sampling_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0.02,
+                "repetition_penalty": 1.05, "do_sample": true,
+                "max_new_tokens": 99, "eos_token_id": [7, 8]}"#,
+        )
+        .unwrap();
+        let config = GenerationConfig::from_model_dir(dir.path());
+        assert_eq!(
+            (config.temperature, config.top_k, config.top_p, config.min_p),
+            (0.6, 20, 0.95, 0.02)
+        );
+        assert_eq!(config.repetition_penalty, 1.05);
+        assert_eq!(config.max_new_tokens, 99);
+        assert_eq!(config.stop_tokens, vec![7, 8]);
+        // No file, no change.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            GenerationConfig::from_model_dir(empty.path()).top_k,
+            GenerationConfig::default().top_k
+        );
+    }
+
+    #[test]
+    fn stop_tokens_are_the_configs() {
+        let config = GenerationConfig::default().with_stop_tokens(vec![2, 50256]);
+        assert!(config.is_stop_token(2));
+        assert!(config.is_stop_token(50256));
+        assert!(!config.is_stop_token(100));
+    }
+
+    /// Reading the sampler's distribution takes nothing into its penalties;
+    /// drawing a token does, and the next draw is penalized for it.
+    #[test]
+    fn reading_the_distribution_records_nothing_and_drawing_does() {
+        let config = GenerationConfig::greedy(4)
+            .with_frequency_penalty(1.0)
+            .with_presence_penalty(0.5);
+        let logits = Array::from_f32_slice(&[5.0, 5.0, 5.0, 5.0, 5.0], &[1, 5]);
+        let mut sampler = config.sampler(&[]);
+        for token in [0, 2, 2, 2] {
+            sampler.record_id(token);
+        }
+
+        // Token 0: 5 - 1 - 0.5 = 3.5; token 2: 5 - 3 - 0.5 = 1.5, so the
+        // greedy point mass is on token 1, the first of the untouched ones.
+        for _ in 0..2 {
+            let log_probs = sampler.log_probs(&logits);
+            assert_eq!(
+                token_probability_from_log_probs(&log_probs, 1).unwrap(),
+                1.0
+            );
+        }
+        // Tokens 1, 3 and 4 tie; each pick is penalized for the next.
+        let picks: Vec<u32> = (0..3).map(|_| sampler.sample(&logits).item_u32()).collect();
+        assert_eq!(picks, [1, 3, 4]);
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
     }
 
     #[test]
@@ -1725,6 +1414,33 @@ mod tests {
         let (chosen, _) = token_logprobs(&logits, 0, 0).unwrap();
         let expected = -(1.0f32 + 0.125f32.exp()).ln();
         assert!((chosen - expected).abs() < 1e-5, "{chosen} vs {expected}");
+    }
+
+    /// Over a vocabulary far larger than `top_n`, with many exact ties, the
+    /// device-side top-n is what a full sort of the log-softmax gives.
+    #[test]
+    fn token_logprobs_top_n_matches_a_full_sort_over_a_large_vocabulary() {
+        let vocab = 500usize;
+        let row: Vec<f32> = (0..vocab)
+            .map(|t| ((t * 41 + 3) % 19) as f32 * 0.3 + f32::from(t == 123) * 4.0)
+            .collect();
+        let logits = Array::from_slice(&row, &[1, 1, vocab as i32]);
+        let lse = row.iter().map(|&x| f64::from(x).exp()).sum::<f64>().ln() as f32;
+        let mut want: Vec<(u32, f32)> = row
+            .iter()
+            .enumerate()
+            .map(|(t, &x)| (t as u32, x - lse))
+            .collect();
+        want.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let (chosen, top) = token_logprobs(&logits, 77, 12).unwrap();
+        assert!((chosen - (row[77] - lse)).abs() < 1e-4);
+        assert_eq!(top.len(), 12);
+        for (rank, ((id, lp), (_, want_lp))) in top.iter().zip(&want).enumerate() {
+            assert!((lp - want_lp).abs() < 1e-4, "rank {rank}");
+            assert!((lp - (row[*id as usize] - lse)).abs() < 1e-4, "rank {rank}");
+        }
+        assert_eq!(top[0].0, 123);
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
     }
 
     #[test]
@@ -1855,122 +1571,6 @@ mod tests {
         assert_eq!(token, 5);
     }
 
-    /// The Sampler draws from exactly the distribution `sampling_log_probs`
-    /// reports (which speculative decoding verifies against), under every
-    /// filter, the temperature and the penalties together, and its seeded
-    /// draws land on the kept tokens about as often as that distribution
-    /// says.
-    #[test]
-    fn the_sampler_draws_from_sampling_log_probs() {
-        let config = GenerationConfig::sampling(1, 0.7)
-            .with_top_k(6)
-            .with_top_p(0.9)
-            .with_min_p(0.05)
-            .with_repetition_penalty(1.3)
-            .with_frequency_penalty(0.2)
-            .with_seed(11);
-        let logits = Array::from_slice(
-            &[2.0f32, 1.8, 1.5, 1.4, 1.0, 0.6, 0.5, -0.3, -1.0, -2.0],
-            &[1, 10],
-        );
-        let prompt = [0u32, 3];
-        let mut reported = config.decode_penalties(&prompt);
-        reported.as_mut().unwrap().record_id(1);
-        let want = sampling_log_probs(&logits, reported.as_mut(), &config).unwrap();
-        let want: Vec<f32> = want.as_slice::<f32>().iter().map(|v| v.exp()).collect();
-
-        let sampler = Sampler::new(config.clone());
-        let mut counts = [0usize; 10];
-        let draws = 4000;
-        for _ in 0..draws {
-            let mut penalties = config.decode_penalties(&prompt);
-            penalties.as_mut().unwrap().record_id(1);
-            let (token, drawn_from) = sampler
-                .sample_array_penalized(&logits, penalties.as_mut())
-                .unwrap();
-            let drawn_from = drawn_from.subtract(&logsumexp_axis_keepdims(&drawn_from, -1, true));
-            let got: Vec<f32> = drawn_from
-                .as_slice::<f32>()
-                .iter()
-                .map(|v| v.exp())
-                .collect();
-            for (g, w) in got.iter().zip(&want) {
-                assert!((g - w).abs() < 1e-6, "{got:?} against {want:?}");
-            }
-            counts[token.item::<u32>() as usize] += 1;
-        }
-        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
-        assert!(want.iter().filter(|&&p| p > 0.0).count() > 2, "{want:?}");
-        assert!(want.contains(&0.0), "{want:?}");
-        for (i, (&count, &p)) in counts.iter().zip(&want).enumerate() {
-            let freq = count as f32 / draws as f32;
-            assert!(
-                (freq - p).abs() < 0.03,
-                "token {i}: drawn {freq:.3} of the time, probability {p:.3}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_sampling_log_probs_applies_filters() {
-        let config = GenerationConfig::sampling(1, 1.0)
-            .with_top_k(1)
-            .with_top_p(1.0)
-            .with_min_p(0.0)
-            .with_repetition_penalty(1.0);
-        let logits = Array::from_slice(&[0.0f32, 1.0, 3.0], &[3]);
-        let log_probs = sampling_log_probs(&logits, None, &config).unwrap();
-
-        let top_prob = token_probability_from_log_probs(&log_probs, 2).unwrap();
-        let masked_prob = token_probability_from_log_probs(&log_probs, 1).unwrap();
-        assert!((top_prob - 1.0).abs() < 1e-6);
-        assert_eq!(masked_prob, 0.0);
-    }
-
-    #[test]
-    fn test_speculative_decode_metrics_accumulate_verify_steps() {
-        let mut metrics = SpeculativeDecodeMetrics::default();
-
-        metrics.record_verify_step(3, 3);
-        metrics.record_verify_step(3, 1);
-        metrics.record_verify_step(2, 0);
-        metrics.record_verify_step(0, 0);
-        metrics.record_verify_step(2, 5);
-
-        assert_eq!(metrics.drafted_tokens, 10);
-        assert_eq!(metrics.accepted_draft_tokens, 6);
-        assert_eq!(metrics.verify_steps, 4);
-        assert_eq!(metrics.full_accept_steps, 2);
-        assert_eq!(metrics.partial_accept_steps, 1);
-        assert_eq!(metrics.zero_accept_steps, 1);
-        assert_eq!(metrics.max_draft_tokens, 3);
-        assert!((metrics.acceptance_rate() - 0.6).abs() < f32::EPSILON);
-        assert!((metrics.avg_accepted_per_verify() - 1.5).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_sampler_greedy() {
-        let config = GenerationConfig::greedy(10);
-        let sampler = Sampler::new(config);
-
-        let mut logits_vec = vec![-10.0f32; 100];
-        logits_vec[42] = 10.0;
-        let logits = Array::from_slice(&logits_vec, &[100]);
-
-        let token = sampler.sample(&logits, None).unwrap();
-        assert_eq!(token, 42);
-    }
-
-    #[test]
-    fn test_stop_token_detection() {
-        let config = GenerationConfig::default().with_stop_tokens(vec![2, 50256]);
-        let sampler = Sampler::new(config);
-
-        assert!(sampler.is_stop_token(2));
-        assert!(sampler.is_stop_token(50256));
-        assert!(!sampler.is_stop_token(100));
-    }
-
     #[test]
     fn test_qwen3_thinking_preset() {
         let config = GenerationConfig::qwen3_thinking(512);
@@ -1993,37 +1593,6 @@ mod tests {
         assert_eq!(config.min_p, 0.0);
         assert_eq!(config.presence_penalty, 1.5);
         assert!(config.do_sample);
-    }
-
-    /// `sampling_log_probs` reads the generation's penalties without taking
-    /// anything into them; the `Sampler` takes in every token it samples.
-    #[test]
-    fn sampling_reads_the_penalties_and_the_sampler_records_into_them() {
-        let config = GenerationConfig::greedy(4)
-            .with_frequency_penalty(1.0)
-            .with_presence_penalty(0.5);
-        let logits = Array::from_f32_slice(&[5.0, 5.0, 5.0, 5.0, 5.0], &[1, 5]);
-        let mut penalties = config.decode_penalties(&[]);
-        for token in [0, 2, 2, 2] {
-            penalties.as_mut().unwrap().record_id(token);
-        }
-
-        // Token 0: 5 - 1 - 0.5 = 3.5; token 2: 5 - 3 - 0.5 = 1.5.
-        for _ in 0..2 {
-            let log_probs = sampling_log_probs(&logits, penalties.as_mut(), &config).unwrap();
-            let p = |token| token_probability_from_log_probs(&log_probs, token).unwrap();
-            assert!((p(1) / p(0) - 1.5f32.exp()).abs() < 1e-3);
-            assert!((p(1) / p(2) - 3.5f32.exp()).abs() < 1e-2);
-            assert!((p(1) - p(3)).abs() < 1e-6);
-        }
-
-        // Tokens 1, 3 and 4 tie; each pick is penalized for the next.
-        let sampler = Sampler::new(config);
-        let picks: Vec<u32> = (0..3)
-            .map(|_| sampler.sample(&logits, penalties.as_mut()).unwrap())
-            .collect();
-        assert_eq!(picks, [1, 3, 4]);
-        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
     }
 
     #[cfg(feature = "ane")]

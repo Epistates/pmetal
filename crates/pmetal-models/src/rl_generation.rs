@@ -1,80 +1,32 @@
-//! Fast RL inference with batched generation.
+//! Batched generation for RL training.
 //!
-//! This module provides optimized generation for RL training scenarios (GRPO, DPO)
-//! where we need to generate multiple completions from the same prompt efficiently.
+//! GRPO samples a group of completions (say 8) from each prompt. Run one
+//! after the other, each completion would prefill the prompt and decode on
+//! its own, and a decode step at batch size one is bandwidth-bound: the whole
+//! model is read to produce a single token. This module does what the group
+//! shares once and the rest together:
 //!
-//! ## Use Case
-//!
-//! In GRPO, for each prompt we generate `num_generations` completions (e.g., 8).
-//! Without batching:
 //! ```text
-//! Prompt: "What is 2+2?"
-//! Gen 1: forward → sample → forward → sample → ... (sequential)
-//! Gen 2: forward → sample → forward → sample → ... (sequential)
-//! ...
+//! Prompt:  prefill once (from the prefix cache where a repeat allows)
+//! Fork:    the prompt's KV state repeated into a batch of `num_generations`
+//! Decode:  one [num_generations, 1] forward per step -> one batched sample
 //! ```
 //!
-//! With batched generation:
-//! ```text
-//! Prompt: "What is 2+2?"
-//! Prefill: batch_forward(prompt, batch=8)
-//! Decode: batch_forward(tokens, batch=8) → batch_sample → repeat
-//! ```
+//! Every completion starts at the same position and advances one token per
+//! step, so the batch needs no padding, no per-row offsets and no masks: it
+//! is the ordinary cached forward with a batch dimension. A completion that
+//! has ended keeps riding along (the step costs the same) and its further
+//! tokens are dropped.
 //!
-//! This provides 4-10x speedup for RL training depending on batch size.
-//!
-//! ## Key Optimizations
-//!
-//! 1. **Prefix Caching**: Use cached KV states for the prompt
-//! 2. **Batched Decoding**: Process all sequences in parallel
-//! 3. **Early Exit Masking**: Skip computation for finished sequences
-//! 4. **Async Pipelining**: Overlap sampling with next forward pass
-//! 5. **Speculative Decoding**: Layer-split draft/verify for 2-4x generation speedup
+//! A completion that ends in a stop token keeps it: a policy gradient needs
+//! the stop token in the completion to learn to stop.
 use pmetal_runtime::compat::{Array, Exception, ops};
+use pmetal_runtime::decode::DecodeSampler;
 
 use pmetal_cache::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_cache::prefix_cache::PrefixCache;
 
-use crate::generation::{GenerationConfig, Sampler};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Speculative RL generation statistics
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Cumulative statistics collected during speculative RL generation.
-///
-/// Useful for logging and understanding whether speculation is helping.
-#[derive(Debug, Clone, Default)]
-pub struct SpeculativeRlStats {
-    /// Total draft tokens proposed across all sequences and decode steps.
-    pub total_draft_proposed: usize,
-    /// Total draft tokens accepted (matched verifier greedy argmax).
-    pub total_draft_accepted: usize,
-    /// Total tokens emitted (accepted drafts + correction tokens).
-    pub total_tokens_emitted: usize,
-    /// Number of speculative decode steps executed.
-    pub num_steps: usize,
-}
-
-impl SpeculativeRlStats {
-    /// Fraction of proposed draft tokens that were accepted.
-    pub fn acceptance_rate(&self) -> f32 {
-        if self.total_draft_proposed == 0 {
-            0.0
-        } else {
-            self.total_draft_accepted as f32 / self.total_draft_proposed as f32
-        }
-    }
-
-    /// Average tokens emitted per speculative step (should be > 1 to show speedup).
-    pub fn tokens_per_step(&self) -> f32 {
-        if self.num_steps == 0 {
-            0.0
-        } else {
-            self.total_tokens_emitted as f32 / self.num_steps as f32
-        }
-    }
-}
+use crate::generation::{GenerationConfig, run_cached_prefill_chunks_at};
 
 /// Result type for RL generation.
 pub type RlGenResult<T> = Result<T, Exception>;
@@ -82,11 +34,11 @@ pub type RlGenResult<T> = Result<T, Exception>;
 /// Batched generation output.
 #[derive(Debug, Clone)]
 pub struct BatchedGenerationOutput {
-    /// Generated token IDs for each sequence [batch, seq_len].
+    /// For each completion, the prompt followed by the generated tokens.
     pub token_ids: Vec<Vec<u32>>,
     /// Number of tokens generated for each sequence.
     pub num_generated: Vec<usize>,
-    /// Whether each sequence was stopped by a stop token.
+    /// Whether each sequence was stopped by a stop token (which it keeps).
     pub stopped_by_token: Vec<bool>,
     /// Whether each sequence was stopped by max length.
     pub stopped_by_length: Vec<bool>,
@@ -99,7 +51,7 @@ pub struct BatchedRlConfig {
     pub num_generations: usize,
     /// Maximum new tokens to generate.
     pub max_new_tokens: usize,
-    /// Temperature for sampling.
+    /// Temperature for sampling; 0 is greedy.
     pub temperature: f32,
     /// Top-k sampling (0 = disabled).
     pub top_k: usize,
@@ -113,21 +65,6 @@ pub struct BatchedRlConfig {
     pub seed: Option<u64>,
     /// Whether to use prefix caching.
     pub use_prefix_cache: bool,
-    /// Enable speculative decoding for faster rollout generation.
-    ///
-    /// Uses the two-closure draft/verify approach: a `draft_fn` produces tokens
-    /// cheaply (e.g. early-exit through fewer layers) and a `verify_fn` runs the
-    /// full model to accept or correct each position in a single batched pass.
-    ///
-    /// Only takes effect when `generate_speculative` is called directly; has no
-    /// effect on `generate`.  Defaults to `false`.
-    pub use_speculative: bool,
-    /// Number of draft tokens to propose per speculative step.
-    ///
-    /// Higher values yield more speedup when the acceptance rate is high, but
-    /// add overhead when the draft model diverges from the verifier.
-    /// Typical sweet-spot: 3–5.  Defaults to `3`.
-    pub speculative_draft_tokens: usize,
 }
 
 impl Default for BatchedRlConfig {
@@ -142,8 +79,6 @@ impl Default for BatchedRlConfig {
             stop_tokens: vec![],
             seed: None,
             use_prefix_cache: true,
-            use_speculative: false,
-            speculative_draft_tokens: 3,
         }
     }
 }
@@ -187,16 +122,6 @@ impl BatchedRlConfig {
         self
     }
 
-    /// Enable speculative decoding with the given number of draft tokens per step.
-    ///
-    /// When enabled, `generate_speculative` should be called instead of `generate`
-    /// to provide the two forward closures (draft and verify).
-    pub fn with_speculative(mut self, draft_tokens: usize) -> Self {
-        self.use_speculative = true;
-        self.speculative_draft_tokens = draft_tokens.max(1);
-        self
-    }
-
     /// Convert to GenerationConfig for single-sequence generation.
     pub fn to_generation_config(&self) -> GenerationConfig {
         GenerationConfig {
@@ -210,6 +135,7 @@ impl BatchedRlConfig {
             presence_penalty: 0.0,
             stop_tokens: self.stop_tokens.clone(),
             seed: self.seed,
+            logit_bias: Vec::new(),
             // Temperature 0 is greedy, not an unscaled draw.
             do_sample: self.temperature > 0.0,
             prefill_step_size: 2048,
@@ -217,13 +143,12 @@ impl BatchedRlConfig {
     }
 }
 
-/// Batched generator for RL training.
+/// Batched generator for RL training: the completions of a prompt, prefilled
+/// once and decoded together. See the module docs.
 ///
-/// This generator efficiently produces multiple completions from the same prompt
-/// using batched forward passes and parallel sampling.
-///
-/// Samples through [`Sampler`], with the config's temperature, top-k, top-p,
-/// min-p and seed.
+/// Samples through the runtime's [`DecodeSampler`], with the config's
+/// temperature, top-k, top-p, min-p and seed, one draw per step for the whole
+/// batch.
 pub struct BatchedRlGenerator {
     /// Configuration.
     config: BatchedRlConfig,
@@ -231,43 +156,30 @@ pub struct BatchedRlGenerator {
     prefix_cache: Option<PrefixCache>,
     /// KV cache config for creating new caches.
     kv_config: KVCacheConfig,
-    /// Sampler with the full filter chain (temperature, top-k, top-p, min-p).
-    sampler: Sampler,
-    /// Statistics from the most recent `generate_speculative` call.
-    last_speculative_stats: Option<SpeculativeRlStats>,
 }
 
 impl BatchedRlGenerator {
     /// Create a new batched RL generator.
     pub fn new(config: BatchedRlConfig, kv_config: KVCacheConfig) -> Self {
-        let prefix_cache = if config.use_prefix_cache {
-            Some(PrefixCache::new(32, 0))
-        } else {
-            None
-        };
-
-        let sampler = Sampler::new(config.to_generation_config());
-
+        let prefix_cache = config.use_prefix_cache.then(|| PrefixCache::new(32, 0));
         Self {
             config,
             prefix_cache,
             kv_config,
-            sampler,
-            last_speculative_stats: None,
         }
     }
 
-    /// Generate multiple completions for a prompt.
-    ///
-    /// This function generates `num_generations` completions from the same prompt
-    /// using batched inference for maximum efficiency.
+    /// Generate `num_generations` completions of `prompt_tokens`.
     ///
     /// # Arguments
-    /// * `forward_fn` - Model forward function: (input_ids, cache) -> logits
+    /// * `forward_fn` - Model forward function: (input_ids `[B, T]`, cache) ->
+    ///   logits `[B, T, vocab]`. It runs the prompt once at batch size one,
+    ///   then every decode step at batch size `num_generations`.
     /// * `prompt_tokens` - Tokenized prompt
     ///
-    /// # Returns
-    /// Batched generation output with all completions
+    /// # Errors
+    /// On an empty prompt or no completions, when the model fails, and when
+    /// the cache cannot repeat into a batch (TurboQuant).
     pub fn generate<F>(
         &mut self,
         mut forward_fn: F,
@@ -276,22 +188,21 @@ impl BatchedRlGenerator {
     where
         F: FnMut(&Array, &mut KVCache) -> RlGenResult<Array>,
     {
-        let batch_size = self.config.num_generations;
-
-        // Initialize per-sequence state
-        let mut sequences: Vec<Vec<u32>> =
-            (0..batch_size).map(|_| prompt_tokens.to_vec()).collect();
-        let mut finished: Vec<bool> = vec![false; batch_size];
-        let mut stopped_by_token: Vec<bool> = vec![false; batch_size];
+        let batch = self.config.num_generations;
+        let prompt_len = prompt_tokens.len();
+        if prompt_len == 0 {
+            return Err(Exception::custom("cannot generate from an empty prompt"));
+        }
+        if batch == 0 {
+            return Err(Exception::custom("cannot generate zero completions"));
+        }
+        let max_new = self.config.max_new_tokens;
+        let generation = self.config.to_generation_config();
 
         // Prefill the prompt once. A prefix-cache hit covers its leading
         // tokens (all but the last when the prompt repeats), so only the
         // rest runs, and what runs also yields the logits of the prompt's
         // last token, which every completion's first token is sampled from.
-        let prompt_len = prompt_tokens.len();
-        if prompt_len == 0 {
-            return Err(Exception::custom("cannot generate from an empty prompt"));
-        }
         let hit = match self.prefix_cache.as_mut() {
             Some(prefix_cache) => {
                 prefix_cache.find_longest_prefix(prompt_tokens, &self.kv_config)?
@@ -302,425 +213,65 @@ impl BatchedRlGenerator {
             Some(hit) => (hit.restored_cache, hit.prefix_len),
             None => (KVCache::new(self.kv_config.clone()), 0),
         };
-        let suffix: Vec<i32> = prompt_tokens[covered..].iter().map(|&t| t as i32).collect();
-        let suffix_len = suffix.len();
-        let suffix_input = Array::from_slice(&suffix, &[1, suffix_len as i32]);
-        let logits = forward_fn(&suffix_input, &mut prefilled)?;
-        logits.eval();
-        // logits [1, L, V] -> [1, V] at the prompt's last position.
-        let last_logits = ops::select_axis(&logits, suffix_len as i32 - 1, 1);
+        let logits = run_cached_prefill_chunks_at(
+            &prompt_tokens[covered..],
+            covered,
+            generation.prefill_step_size,
+            |chunk| forward_fn(chunk, &mut prefilled),
+        )?;
+        // [1, T, V] -> [1, V] at the prompt's last position.
+        let last_logits = ops::select_axis(&logits, logits.dim(1) - 1, 1);
         if let Some(prefix_cache) = self.prefix_cache.as_mut() {
             prefix_cache.insert(prompt_tokens, &prefilled);
         }
 
-        // Each completion continues from its own fork of the prefilled cache
-        // and draws its first token from the same logits.
-        let mut caches: Vec<KVCache> = (0..batch_size).map(|_| prefilled.fork()).collect();
-        let mut current_tokens: Vec<u32> = vec![0; batch_size];
-        for seq_idx in 0..batch_size {
-            let token = self.sample(&last_logits)?;
-            current_tokens[seq_idx] = token;
-            sequences[seq_idx].push(token);
-            if self.is_stop_token(token) {
-                finished[seq_idx] = true;
-                stopped_by_token[seq_idx] = true;
-            }
-        }
+        // Every completion continues from its own row of the prefilled
+        // cache and draws its first token from the same logits.
+        let mut cache = prefilled.repeat_batch(batch)?;
+        let mut sampler = DecodeSampler::new(generation.sampling_params(), prompt_tokens);
+        let vocab = last_logits.dim(-1);
+        let mut tokens = sampler.sample(&ops::broadcast_to(&last_logits, &[batch as i32, vocab]));
 
-        // Decode loop: the token sampled from the prompt was the first of
-        // `max_new_tokens`.
-        for _step in 1..self.config.max_new_tokens {
-            // Check if all sequences are done
-            if finished.iter().all(|&f| f) {
+        let mut sequences: Vec<Vec<u32>> = vec![prompt_tokens.to_vec(); batch];
+        let mut stopped_by_token = vec![false; batch];
+        let mut finished = vec![max_new == 0; batch];
+        for step in 0..max_new {
+            // The tokens of this step, on the host: one read for the batch.
+            tokens.eval();
+            pmetal_runtime::check_unobserved_error()
+                .map_err(|e| Exception::custom(format!("rollout sampling: {e}")))?;
+            let drawn: Vec<u32> = tokens.as_slice::<u32>().to_vec();
+            for (row, &token) in drawn.iter().enumerate() {
+                if finished[row] {
+                    continue;
+                }
+                sequences[row].push(token);
+                if generation.is_stop_token(token) {
+                    stopped_by_token[row] = true;
+                    finished[row] = true;
+                } else if sequences[row].len() - prompt_len >= max_new {
+                    finished[row] = true;
+                }
+            }
+            if finished.iter().all(|&f| f) || step + 1 == max_new {
                 break;
             }
 
-            // Process each sequence (could be batched in fully optimized version)
-            for seq_idx in 0..batch_size {
-                if finished[seq_idx] {
-                    continue;
-                }
-
-                // Create input for current token
-                let token_input = Array::from_slice(&[current_tokens[seq_idx] as i32], &[1, 1]);
-
-                // Forward pass
-                let logits = forward_fn(&token_input, &mut caches[seq_idx])?;
-                logits.eval();
-
-                // Sample the next token: logits [1, 1, V] -> [1, V].
-                let last_logits = pmetal_runtime::compat::ops::select_axis(&logits, 0, 1);
-                let token = self.sample(&last_logits)?;
-                current_tokens[seq_idx] = token;
-                sequences[seq_idx].push(token);
-
-                // Check for stop
-                if self.is_stop_token(token) {
-                    finished[seq_idx] = true;
-                    stopped_by_token[seq_idx] = true;
-                }
-            }
+            // One forward for the whole batch: row i takes its own token.
+            let input = tokens.as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32());
+            let input = input.reshape(&[batch as i32, 1]);
+            let logits = forward_fn(&input, &mut cache)?;
+            tokens = sampler.sample(&ops::select_axis(&logits, 0, 1));
         }
 
-        // Build output
         let num_generated: Vec<usize> = sequences.iter().map(|s| s.len() - prompt_len).collect();
-
-        let stopped_by_length: Vec<bool> = finished
-            .iter()
-            .zip(stopped_by_token.iter())
-            .zip(num_generated.iter())
-            .map(|((&f, &st), &n)| !st && (f || n >= self.config.max_new_tokens))
-            .collect();
-
+        let stopped_by_length = stopped_by_token.iter().map(|&stopped| !stopped).collect();
         Ok(BatchedGenerationOutput {
             token_ids: sequences,
             num_generated,
             stopped_by_token,
             stopped_by_length,
         })
-    }
-
-    /// Generate multiple completions using speculative decoding (layer-split draft/verify).
-    ///
-    /// This variant accelerates the decode loop by generating `speculative_draft_tokens`
-    /// cheap draft tokens with `draft_fn` (e.g. first N/3 layers only) and then verifying
-    /// all of them in a single batched forward pass with `verify_fn` (full model).
-    ///
-    /// ## Algorithm (per sequence, per decode step)
-    ///
-    /// 1. **Prefill**: run `verify_fn` on the prompt (identical to standard generation).
-    /// 2. **Draft phase**: generate `k` tokens greedily with `draft_fn` one at a time
-    ///    using a throw-away KV cache. Because the draft model sees only partial layers,
-    ///    each step is significantly cheaper than a full forward pass.
-    /// 3. **Verify phase**: concatenate the last accepted token with the `k` draft tokens
-    ///    and run `verify_fn` once, producing `k+1` logit rows in a single call.
-    /// 4. **Accept/reject**: compare the verifier's greedy argmax at each position against
-    ///    the corresponding draft token. Accept consecutive matching tokens; on the first
-    ///    mismatch take the verifier's token instead. If all `k` match, emit an additional
-    ///    bonus token from the verifier's prediction at position `k`.
-    /// 5. **Cache management**: both draft and verify caches grow with accepted tokens.
-    ///    The verify cache is the primary KV state; the draft cache is discarded after
-    ///    each step and rebuilt from scratch next iteration.
-    ///
-    /// ## Throughput
-    ///
-    /// At high acceptance rates the verifier processes `k+1` positions per call while
-    /// emitting up to `k+1` tokens — effectively amortising the cost of `k` tokens over
-    /// a single forward pass. Measured speedup over standard autoregressive generation:
-    /// approximately 2–4× depending on model, `k`, and prompt distribution.
-    ///
-    /// ## Arguments
-    ///
-    /// * `draft_fn` — Cheap partial-model forward: `(input_ids, &mut KVCache) -> logits`.
-    ///   Typically runs only the first N/3 transformer layers.
-    /// * `verify_fn` — Full-model forward: `(input_ids, &mut KVCache) -> logits`.
-    ///   The source of truth for acceptance and correction.
-    /// * `prompt_tokens` — Tokenised prompt (shared across all `num_generations` sequences).
-    ///
-    /// ## Returns
-    ///
-    /// `BatchedGenerationOutput` with the same structure as `generate`.
-    /// Token IDs include the prompt followed by the generated completion.
-    /// Statistics are available via `speculative_rl_stats` after this call.
-    pub fn generate_speculative<D, V>(
-        &mut self,
-        mut draft_fn: D,
-        mut verify_fn: V,
-        prompt_tokens: &[u32],
-    ) -> RlGenResult<BatchedGenerationOutput>
-    where
-        D: FnMut(&Array, &mut KVCache) -> RlGenResult<Array>,
-        V: FnMut(&Array, &mut KVCache) -> RlGenResult<Array>,
-    {
-        let batch_size = self.config.num_generations;
-        let num_draft = self.config.speculative_draft_tokens.max(1);
-        let prompt_len = prompt_tokens.len();
-
-        // Per-sequence state
-        let mut sequences: Vec<Vec<u32>> =
-            (0..batch_size).map(|_| prompt_tokens.to_vec()).collect();
-        let mut finished: Vec<bool> = vec![false; batch_size];
-        let mut stopped_by_token: Vec<bool> = vec![false; batch_size];
-        // Last verified token for each sequence (seed of the next draft phase).
-        let mut last_tokens: Vec<u32> = vec![0; batch_size];
-
-        // Verify-side KV caches — one per sequence.
-        let mut verify_caches: Vec<KVCache> = (0..batch_size)
-            .map(|_| KVCache::new(self.kv_config.clone()))
-            .collect();
-
-        // Draft-side KV caches — one per sequence, created once and advanced
-        // incrementally rather than rebuilt from scratch each step.
-        let mut draft_caches: Vec<KVCache> = (0..batch_size)
-            .map(|_| KVCache::new(self.kv_config.clone()))
-            .collect();
-
-        // Accumulate speculative stats across all sequences and steps.
-        let mut stats = SpeculativeRlStats::default();
-
-        // ── Prefill: run full model AND draft model on prompt for each sequence ─
-        let prompt_input = Array::from_slice(
-            &prompt_tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-            &[1, prompt_len as i32],
-        );
-
-        for seq_idx in 0..batch_size {
-            // Warm up verify cache on the prompt.
-            let logits = verify_fn(&prompt_input, &mut verify_caches[seq_idx])?;
-            logits.eval();
-
-            // Sample the first token from the last prompt position.
-            let last_logits =
-                pmetal_runtime::compat::ops::select_axis(&logits, prompt_len as i32 - 1, 1);
-            let token = self.sample(&last_logits)?;
-            last_tokens[seq_idx] = token;
-            sequences[seq_idx].push(token);
-
-            if self.is_stop_token(token) {
-                finished[seq_idx] = true;
-                stopped_by_token[seq_idx] = true;
-            }
-
-            // Warm up draft cache on the same prompt so it starts in sync with
-            // the verify cache.  We discard the draft logits here — the greedy
-            // first token is authoritative from the verify model.
-            let draft_warmup = draft_fn(&prompt_input, &mut draft_caches[seq_idx])?;
-            draft_warmup.eval();
-        }
-
-        // ── Decode loop — speculative steps ─────────────────────────────────
-        loop {
-            // Exit when ALL sequences have finished.  Individual sequences are
-            // marked finished[i]=true by the inner per-sequence logic when they
-            // hit a stop token or exhaust max_new_tokens.  We must NOT exit on
-            // the first sequence reaching its budget — that would prematurely
-            // truncate other sequences that still have tokens to generate.
-            if finished.iter().all(|&f| f) {
-                break;
-            }
-
-            for seq_idx in 0..batch_size {
-                if finished[seq_idx] {
-                    continue;
-                }
-                let generated_so_far = sequences[seq_idx].len() - prompt_len;
-                if generated_so_far >= self.config.max_new_tokens {
-                    finished[seq_idx] = true;
-                    continue;
-                }
-
-                // How many draft tokens can we still request without overshooting?
-                let remaining = self.config.max_new_tokens - generated_so_far;
-                let k = num_draft.min(remaining);
-
-                // ── Draft phase ─────────────────────────────────────────────
-                // The draft cache for this sequence is already warmed up through
-                // all previously accepted tokens (initialized during prefill,
-                // then incrementally advanced each step).  We feed `last_tokens`
-                // — the most recently accepted token — as the single-token input
-                // to advance the draft cache by one position before sampling.
-                //
-                // After verification we will roll back the draft cache to discard
-                // any positions corresponding to rejected draft tokens, keeping it
-                // exactly in sync with the accepted prefix.
-                let seed_input = Array::from_slice(&[last_tokens[seq_idx] as i32], &[1, 1]);
-                let seed_logits = draft_fn(&seed_input, &mut draft_caches[seq_idx])?;
-                seed_logits.eval();
-
-                // Greedily sample k draft tokens starting from the seed position.
-                let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
-                let mut draft_current = {
-                    // seed_logits: [1, 1, vocab] -> select batch 0 -> [1, vocab] -> select seq 0 -> [vocab]
-                    let row = pmetal_runtime::compat::ops::select_axis(
-                        &pmetal_runtime::compat::ops::select_axis(&seed_logits, 0, 0),
-                        0,
-                        0,
-                    );
-                    greedy_argmax_1d(&row)
-                };
-                draft_tokens.push(draft_current);
-
-                for _ in 1..k {
-                    let input = Array::from_slice(&[draft_current as i32], &[1, 1]);
-                    let logits = draft_fn(&input, &mut draft_caches[seq_idx])?;
-                    logits.eval();
-                    let row = pmetal_runtime::compat::ops::select_axis(
-                        &pmetal_runtime::compat::ops::select_axis(&logits, 0, 0),
-                        0,
-                        0,
-                    );
-                    draft_current = greedy_argmax_1d(&row);
-                    draft_tokens.push(draft_current);
-                }
-                // draft_tokens: k tokens proposed by the cheap draft model
-
-                // ── Verify phase ────────────────────────────────────────────
-                // Build verify input: [last_accepted | draft_tokens] = k+1 tokens.
-                // The verify KV cache already holds the state up to (but not including)
-                // `last_tokens[seq_idx]`, so we feed last_accepted + draft to extend it.
-                let mut verify_input_ids: Vec<i32> = Vec::with_capacity(k + 1);
-                verify_input_ids.push(last_tokens[seq_idx] as i32);
-                for &dt in &draft_tokens {
-                    verify_input_ids.push(dt as i32);
-                }
-                let verify_arr =
-                    Array::from_slice(&verify_input_ids, &[1, verify_input_ids.len() as i32]);
-                let verify_logits = verify_fn(&verify_arr, &mut verify_caches[seq_idx])?;
-                verify_logits.eval();
-                // verify_logits: [1, k+1, vocab_size]
-
-                // ── Accept/reject ────────────────────────────────────────────
-                // Position i in verify_logits is the verifier's prediction *for* the
-                // token after verify_input_ids[i].  So:
-                //   - position 0 predicts what follows last_accepted → compares with draft[0]
-                //   - position 1 predicts what follows draft[0]       → compares with draft[1]
-                //   - ...
-                //   - position k predicts what follows draft[k-1]     → bonus token
-                let mut accepted_tokens: Vec<u32> = Vec::with_capacity(k + 1);
-                let mut n_accepted_draft: usize = 0;
-
-                // Remove batch dim once: verify_logits [1, k+1, vocab] -> [k+1, vocab]
-                let vl_no_batch = pmetal_runtime::compat::ops::select_axis(&verify_logits, 0, 0);
-                for (i, &draft_tok) in draft_tokens.iter().enumerate() {
-                    let row = pmetal_runtime::compat::ops::select_axis(&vl_no_batch, i as i32, 0);
-                    let verifier_tok = greedy_argmax_1d(&row);
-
-                    if verifier_tok == draft_tok {
-                        // Accept: draft and verifier agree
-                        accepted_tokens.push(draft_tok);
-                        n_accepted_draft += 1;
-                    } else {
-                        // Reject: take verifier's correction, discard remaining drafts
-                        accepted_tokens.push(verifier_tok);
-                        break;
-                    }
-                }
-
-                // If all k draft tokens were accepted, emit a bonus token from the
-                // verifier's prediction at position k.  The bonus token is intentionally
-                // taken via greedy argmax (not stochastic sampling): at this boundary
-                // the verifier has already committed to a forward pass and its argmax
-                // is the unbiased correction token.  Stochastic sampling would require
-                // re-normalising the verifier's distribution after accept/reject, which
-                // is only necessary when the verifier itself uses sampling — RL rollouts
-                // use deterministic verification to keep accept/reject semantics clean.
-                if n_accepted_draft == k {
-                    let bonus_row =
-                        pmetal_runtime::compat::ops::select_axis(&vl_no_batch, k as i32, 0);
-                    let bonus_tok = greedy_argmax_1d(&bonus_row);
-                    accepted_tokens.push(bonus_tok);
-                }
-
-                // ── Cache rollback ───────────────────────────────────────────
-                // Verify cache:
-                //   The verify model ran a single forward pass over k+1 tokens
-                //   (last_accepted + k draft tokens), advancing the verify KV
-                //   cache by k+1 positions.  We only keep accepted_tokens.len()
-                //   positions, so roll back the rejected tail.
-                //
-                //   accepted_tokens.len():
-                //     n_accepted_draft == k → k+1 tokens (k drafts + bonus)
-                //     n_accepted_draft <  k → n_accepted_draft+1 tokens (accepted + correction)
-                let verify_advance = k + 1;
-                let keep_positions = accepted_tokens.len();
-                let verify_rollback = verify_advance.saturating_sub(keep_positions);
-                if verify_rollback > 0 {
-                    verify_caches[seq_idx].rollback(verify_rollback);
-                }
-
-                // Draft cache:
-                //   During the draft phase we fed the seed token plus (k-1)
-                //   additional draft tokens, advancing the draft cache by k
-                //   positions total (seed + k-1 generated = k).  We want to
-                //   keep only n_accepted_draft positions from the draft phase
-                //   and then feed the correction/bonus token so the draft cache
-                //   ends up exactly one step behind the next verify seed.
-                //
-                //   Roll back rejected positions:
-                //     draft_advance = k   (seed + k-1 generated draft tokens)
-                //     keep_draft    = n_accepted_draft
-                //     draft_rollback = k - n_accepted_draft
-                let draft_rollback = k.saturating_sub(n_accepted_draft);
-                if draft_rollback > 0 {
-                    draft_caches[seq_idx].rollback(draft_rollback);
-                }
-
-                // Feed the correction/bonus token through the draft model so
-                // its cache is aligned with the last emitted token.  This makes
-                // the next step's seed feed (the new last_tokens) the single
-                // fresh token added on top of a fully warmed-up cache.
-                //
-                // `accepted_tokens` ends with either the correction token (on
-                // partial acceptance) or the bonus token (on full acceptance).
-                // Either way, the last element is the correction/bonus token
-                // that should now be reflected in the draft cache.
-                if let Some(&correction_tok) = accepted_tokens.last() {
-                    let corr_input = Array::from_slice(&[correction_tok as i32], &[1, 1]);
-                    let corr_logits = draft_fn(&corr_input, &mut draft_caches[seq_idx])?;
-                    corr_logits.eval();
-                }
-
-                // Update statistics
-                stats.total_draft_proposed += k;
-                stats.total_draft_accepted += n_accepted_draft;
-                stats.total_tokens_emitted += accepted_tokens.len();
-                stats.num_steps += 1;
-
-                // Append accepted tokens to the sequence, stopping at stop tokens
-                // or budget exhaustion.
-                for tok in accepted_tokens {
-                    let seq_len = sequences[seq_idx].len() - prompt_len;
-                    if seq_len >= self.config.max_new_tokens {
-                        finished[seq_idx] = true;
-                        break;
-                    }
-                    last_tokens[seq_idx] = tok;
-                    sequences[seq_idx].push(tok);
-
-                    if self.is_stop_token(tok) {
-                        finished[seq_idx] = true;
-                        stopped_by_token[seq_idx] = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Store stats so callers can inspect them after generation.
-        self.last_speculative_stats = Some(stats);
-
-        // Build output (same structure as generate)
-        let num_generated: Vec<usize> = sequences.iter().map(|s| s.len() - prompt_len).collect();
-        let stopped_by_length: Vec<bool> = finished
-            .iter()
-            .zip(stopped_by_token.iter())
-            .zip(num_generated.iter())
-            .map(|((&f, &st), &n)| !st && (f || n >= self.config.max_new_tokens))
-            .collect();
-
-        Ok(BatchedGenerationOutput {
-            token_ids: sequences,
-            num_generated,
-            stopped_by_token,
-            stopped_by_length,
-        })
-    }
-
-    /// Return the speculative decoding statistics from the most recent
-    /// `generate_speculative` call, if any.
-    pub fn last_speculative_stats(&self) -> Option<&SpeculativeRlStats> {
-        self.last_speculative_stats.as_ref()
-    }
-
-    /// Sample a token from logits through the full filter chain
-    /// (temperature, top-k, top-p, min-p).
-    fn sample(&mut self, logits: &Array) -> RlGenResult<u32> {
-        Ok(self.sampler.sample_array(logits)?.0.item::<u32>())
-    }
-
-    /// Check if a token is a stop token.
-    fn is_stop_token(&self, token: u32) -> bool {
-        self.config.stop_tokens.contains(&token)
     }
 
     /// Prefix cache statistics: `(hits, misses, hit_rate)`.
@@ -736,20 +287,6 @@ impl BatchedRlGenerator {
             pc.clear();
         }
     }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Return the greedy argmax of a 1-D logits vector `[vocab_size]`.
-///
-/// Used inside `generate_speculative` for draft sampling and accept/reject
-/// decisions.  The caller must have already called `.eval()` on `row`.
-fn greedy_argmax_1d(row: &Array) -> u32 {
-    use pmetal_runtime::compat::indexing::argmax;
-    let idx = argmax(row);
-    idx.item::<u32>()
 }
 
 /// Generate multiple completions for RL training.
@@ -831,12 +368,14 @@ mod tests {
 
     /// A stand-in model whose logits put 30 on (token + 1) mod 16 at every
     /// position, so its greedy continuation of any prompt counts upward. It
-    /// stores a zero key and value per token, as a real model stores its own.
+    /// stores a zero key and value per token and row, as a real model stores
+    /// its own.
     fn counting_model(input: &Array, cache: &mut KVCache) -> RlGenResult<Array> {
         const VOCAB: usize = 16;
         input.eval();
+        let (rows, len) = (input.dim(0) as usize, input.dim(1) as usize);
         let ids: Vec<i32> = input.as_slice::<i32>().to_vec();
-        let kv = Array::zeros_f32(&[1, 4, ids.len() as i32, 64]);
+        let kv = Array::zeros_f32(&[rows as i32, 4, len as i32, 64]);
         for layer in 0..2 {
             cache.update_and_fetch(layer, &kv, &kv)?;
         }
@@ -846,7 +385,7 @@ mod tests {
         }
         Ok(Array::from_slice(
             &logits,
-            &[1, ids.len() as i32, VOCAB as i32],
+            &[rows as i32, len as i32, VOCAB as i32],
         ))
     }
 
@@ -871,7 +410,7 @@ mod tests {
         }
         assert!(out.stopped_by_length.iter().all(|&b| b));
 
-        // A stop token ends the completion early.
+        // A stop token ends the completion early, and stays in it.
         let mut generator = BatchedRlGenerator::new(
             BatchedRlConfig {
                 use_prefix_cache: false,
@@ -884,29 +423,6 @@ mod tests {
         let out = generator.generate(counting_model, &[4]).unwrap();
         assert_eq!(out.token_ids[0], vec![4, 5, 6, 7]);
         assert!(out.stopped_by_token[0] && !out.stopped_by_length[0]);
-
-        // Speculative rollouts verify each draft against the right row of the
-        // verifier's logits, so a draft that agrees is accepted in full.
-        let mut generator = BatchedRlGenerator::new(
-            BatchedRlConfig {
-                use_prefix_cache: false,
-                ..BatchedRlConfig::new(2)
-                    .with_max_new_tokens(7)
-                    .with_stop_tokens(vec![15])
-                    .with_speculative(3)
-            },
-            create_test_kv_config(),
-        );
-        let out = generator
-            .generate_speculative(counting_model, counting_model, &[1, 2])
-            .unwrap();
-        pmetal_runtime::check_unobserved_error().unwrap();
-        for seq in &out.token_ids {
-            assert_eq!(&seq[..6], &[1, 2, 3, 4, 5, 6]);
-            assert!(seq.windows(2).all(|w| w[1] == (w[0] + 1) % 16), "{seq:?}");
-        }
-        let stats = generator.last_speculative_stats().unwrap();
-        assert_eq!(stats.total_draft_accepted, stats.total_draft_proposed);
     }
 
     #[test]
@@ -959,52 +475,47 @@ mod tests {
         );
     }
 
+    /// The decode steps are batched: one forward per step for the whole
+    /// group, at the group's batch size, instead of one per completion.
     #[test]
-    fn test_speculative_config_defaults() {
-        let config = BatchedRlConfig::default();
-        assert!(!config.use_speculative);
-        assert_eq!(config.speculative_draft_tokens, 3);
+    fn the_group_decodes_in_one_forward_per_step() {
+        let config = BatchedRlConfig::new(5)
+            .with_max_new_tokens(4)
+            .with_temperature(0.0)
+            .without_prefix_cache();
+        let mut generator = BatchedRlGenerator::new(config, create_test_kv_config());
+        let shapes = std::cell::RefCell::new(Vec::new());
+        let run = |input: &Array, cache: &mut KVCache| {
+            shapes.borrow_mut().push((input.dim(0), input.dim(1)));
+            counting_model(input, cache)
+        };
+        let out = generator.generate(&run, &[1, 2, 3]).unwrap();
+        // The prompt at batch one, then three steps (the fourth token is
+        // sampled from the third step's logits) at batch five.
+        assert_eq!(*shapes.borrow(), vec![(1, 3), (5, 1), (5, 1), (5, 1)]);
+        assert!(out.token_ids.iter().all(|s| s == &[1, 2, 3, 4, 5, 6, 7]));
     }
 
     #[test]
-    fn test_speculative_config_builder() {
-        let config = BatchedRlConfig::new(4).with_speculative(5);
-        assert!(config.use_speculative);
-        assert_eq!(config.speculative_draft_tokens, 5);
-    }
-
-    #[test]
-    fn test_speculative_config_min_draft_tokens() {
-        // with_speculative clamps to minimum 1
-        let config = BatchedRlConfig::new(4).with_speculative(0);
-        assert_eq!(config.speculative_draft_tokens, 1);
-    }
-
-    #[test]
-    fn test_speculative_rl_stats_acceptance_rate() {
-        let mut stats = SpeculativeRlStats::default();
-        assert_eq!(stats.acceptance_rate(), 0.0);
-
-        stats.total_draft_proposed = 100;
-        stats.total_draft_accepted = 73;
-        assert!((stats.acceptance_rate() - 0.73).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_speculative_rl_stats_tokens_per_step() {
-        let mut stats = SpeculativeRlStats::default();
-        assert_eq!(stats.tokens_per_step(), 0.0);
-
-        stats.total_tokens_emitted = 40;
-        stats.num_steps = 10;
-        assert!((stats.tokens_per_step() - 4.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_generator_has_no_initial_speculative_stats() {
-        let config = BatchedRlConfig::default();
-        let kv_config = create_test_kv_config();
-        let generator = BatchedRlGenerator::new(config, kv_config);
-        assert!(generator.last_speculative_stats().is_none());
+    fn degenerate_requests_are_errors_or_empty() {
+        let mut generator = BatchedRlGenerator::new(
+            BatchedRlConfig::new(2).without_prefix_cache(),
+            create_test_kv_config(),
+        );
+        assert!(generator.generate(counting_model, &[]).is_err());
+        let mut none = BatchedRlGenerator::new(
+            BatchedRlConfig::new(0).without_prefix_cache(),
+            create_test_kv_config(),
+        );
+        assert!(none.generate(counting_model, &[1]).is_err());
+        let mut zero = BatchedRlGenerator::new(
+            BatchedRlConfig::new(2)
+                .with_max_new_tokens(0)
+                .without_prefix_cache(),
+            create_test_kv_config(),
+        );
+        let out = zero.generate(counting_model, &[1, 2]).unwrap();
+        assert_eq!(out.token_ids, vec![vec![1, 2], vec![1, 2]]);
+        assert_eq!(out.num_generated, vec![0, 0]);
     }
 }

@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::InlineArray;
+pub use crate::logits_processor::{AllowedTokens, LogitBias, LogitsProcessor};
 
 static COMPILED_DECODE: OnceLock<AtomicBool> = OnceLock::new();
 
@@ -140,6 +141,10 @@ pub struct SamplingParams {
     /// drawn with [`draw_key`]`(seed, n)`, so the same seed, prompt and
     /// model give the same tokens. `None` draws from the thread's MLX key.
     pub seed: Option<u64>,
+    /// `(token, bias)` pairs added to the logits before sampling, after the
+    /// penalties ([`LogitBias`](crate::logits_processor::LogitBias)). Empty
+    /// for none.
+    pub logit_bias: Vec<(u32, f32)>,
 }
 
 impl SamplingParams {
@@ -153,6 +158,7 @@ impl SamplingParams {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             seed: None,
+            logit_bias: Vec::new(),
         }
     }
 
@@ -197,9 +203,10 @@ impl SamplingParams {
 /// `logsumexp`). A `temperature` at or below 0 is taken as 1; greedy
 /// decoding doesn't come here ([`sample_token`]).
 ///
-/// Every sampler in the crate graph draws from this: [`sample_token`] for
-/// the native engines, and `pmetal_models`' `Sampler` and
-/// `sampling_log_probs`, which speculative decoding verifies against.
+/// Every sampler in the workspace draws from this, through
+/// [`DecodeSampler`]: the native engines, the dynamic models, the serving
+/// engine, and the speculative decoders, which verify against the
+/// distribution [`DecodeSampler::log_probs`] reports.
 pub fn filtered_log_probs(logits_2d: &InlineArray, params: &SamplingParams) -> InlineArray {
     let mut scores = logits_2d.as_dtype(crate::compat::Dtype::Float32.as_i32());
     if params.temperature > 0.0 && params.temperature != 1.0 {
@@ -389,17 +396,31 @@ impl PenaltyHistory {
     }
 }
 
-/// The sampler of one native generation: its [`SamplingParams`], its
-/// penalties over the prompt and every token drawn so far, and the index of
-/// its next draw.
+/// The sampler of one generation: its [`SamplingParams`], the penalties over
+/// the prompt and every token drawn so far, its logit bias and
+/// [`LogitsProcessor`]s, and the index of its next draw. This is the one
+/// sampler of the workspace: the native engines, the dynamic models, the
+/// serving engine and the speculative decoders all draw through it.
+///
+/// A step's logits go through, in order:
+///
+/// 1. the repetition, frequency and presence penalties,
+/// 2. the logit bias and then the processors added with
+///    [`with_processor`](Self::with_processor),
+/// 3. [`filtered_log_probs`]: temperature, top-k, top-p, min-p,
+///
+/// and the token is drawn from what is left (the argmax at temperature 0).
 ///
 /// Every token of the generation comes from [`sample`](Self::sample): the
 /// prompt's last position (draw 0), the primed step (draw 1), and each step
 /// of the decode loop after them, so each is penalized for all the tokens
-/// before it.
+/// before it. A speculative decoder reads the distribution a position would
+/// be drawn from with [`log_probs`](Self::log_probs), follows its drafts on a
+/// [`fork`](Self::fork), and [`record`](Self::record)s the tokens it keeps.
 pub struct DecodeSampler {
     params: SamplingParams,
     penalties: Option<DecodePenalties>,
+    processors: Vec<Box<dyn LogitsProcessor>>,
     draws: u64,
 }
 
@@ -412,29 +433,192 @@ impl DecodeSampler {
             params.presence_penalty,
             prompt,
         );
+        let processors = LogitBias::new(&params.logit_bias)
+            .map(|bias| Box::new(bias) as Box<dyn LogitsProcessor>)
+            .into_iter()
+            .collect();
         Self {
             params,
             penalties,
+            processors,
             draws: 0,
         }
+    }
+
+    /// Add a constraint that runs after the ones already here.
+    #[must_use]
+    pub fn with_processor(mut self, processor: Box<dyn LogitsProcessor>) -> Self {
+        self.processors.push(processor);
+        self
     }
 
     pub fn params(&self) -> &SamplingParams {
         &self.params
     }
 
+    /// A copy that records on its own, with the same history, processors'
+    /// state and next draw: a speculative decoder follows its drafts on one
+    /// and keeps only the accepted tokens in the original.
+    #[must_use]
+    pub fn fork(&self) -> Self {
+        Self {
+            params: self.params.clone(),
+            penalties: self.penalties.clone(),
+            processors: self.processors.iter().map(|p| p.fork()).collect(),
+            draws: self.draws,
+        }
+    }
+
+    /// Whether every token is the plain argmax of the logits: temperature 0
+    /// with no penalty, bias or processor to change them, so a caller that
+    /// holds the logits on the host can take the argmax there.
+    pub fn is_plain_argmax(&self) -> bool {
+        self.params.temperature <= 0.0 && self.penalties.is_none() && self.processors.is_empty()
+    }
+
+    /// Whether a processor needs every token on the host before the next
+    /// step ([`LogitsProcessor::needs_host_tokens`]).
+    pub fn needs_host_tokens(&self) -> bool {
+        self.processors.iter().any(|p| p.needs_host_tokens())
+    }
+
+    /// `[1, vocab]` f32 logits after the penalties, the bias and the
+    /// processors: what the temperature and the filters read, and what a
+    /// greedy decoder takes the argmax of. Reads the history without
+    /// recording a token.
+    pub fn constrained_logits(&mut self, logits_2d: &InlineArray) -> InlineArray {
+        let mut logits = match self.penalties.as_mut() {
+            Some(penalties) => penalties.apply(logits_2d),
+            None => logits_2d.clone(),
+        };
+        for processor in &mut self.processors {
+            logits = processor.process(&logits);
+        }
+        logits
+    }
+
+    /// The normalized log-probabilities the next token is drawn from, for
+    /// `[B, vocab]` logits: after the penalties, the bias, the processors,
+    /// the temperature and the filters, `-inf` for a token ruled out. At
+    /// temperature 0 the distribution is the argmax's point mass. Reads the
+    /// history without recording a token.
+    pub fn log_probs(&mut self, logits_2d: &InlineArray) -> InlineArray {
+        let logits = self.constrained_logits(logits_2d);
+        if self.params.temperature <= 0.0 {
+            let vocab = logits.dim(-1);
+            let ids = InlineArray::arange(vocab, crate::compat::Dtype::Int32.as_i32());
+            let best = logits
+                .argmax(-1)
+                .reshape(&[-1, 1])
+                .as_dtype(crate::compat::Dtype::Int32.as_i32());
+            return ids.equal(&best).where_cond(
+                &InlineArray::from_f32(0.0),
+                &InlineArray::from_f32(f32::NEG_INFINITY),
+            );
+        }
+        let filtered = filtered_log_probs(&logits, &self.params);
+        filtered.subtract(&filtered.logsumexp(-1, true))
+    }
+
     /// Sample the next token from `[1, vocab]` logits ([`sample_token`]
-    /// after the penalties), without reading it back.
+    /// after the constraints) and record it. The token is not read back,
+    /// unless a processor needs it on the host.
     pub fn sample(&mut self, logits_2d: &InlineArray) -> InlineArray {
         let draw = self.draws;
         self.draws += 1;
-        match self.penalties.as_mut() {
-            Some(penalties) => {
-                let token = sample_token(&penalties.apply(logits_2d), &self.params, draw);
-                penalties.record(&token);
-                token
+        let token = if self.penalties.is_none() && self.processors.is_empty() {
+            sample_token(logits_2d, &self.params, draw)
+        } else {
+            let logits = self.constrained_logits(logits_2d);
+            sample_token(&logits, &self.params, draw)
+        };
+        self.record(&token);
+        token
+    }
+
+    /// Sample the tokens of a block of positions from `[B, vocab]` logits,
+    /// the rows in order, as `B` successive [`sample`](Self::sample) calls
+    /// would, each row's token recorded before the next row is drawn: `[B]`,
+    /// not read back. Row `j` takes draw `n + j` of the generation's seed,
+    /// so the tokens are the ones plain one-token-at-a-time decoding draws.
+    ///
+    /// This is the verification step of a speculative decoder that checks a
+    /// block of guesses with one forward: it asks what the model would have
+    /// drawn at every position, assuming each guess before it was right, and
+    /// keeps the guesses that agree. When some of the block is not kept, run
+    /// it on a [`fork`](Self::fork) and [`commit`](Self::commit) the kept
+    /// tokens to the sampler of the generation.
+    ///
+    /// Without penalties (and with no processor that follows the tokens) the
+    /// rows do not depend on each other, so the temperature and the filters
+    /// run once over the whole block; with them, the rows are drawn one
+    /// after the other.
+    pub fn sample_block(&mut self, logits: &InlineArray) -> InlineArray {
+        let rows = logits.dim(0);
+        let history = self.penalties.is_some() || self.needs_host_tokens();
+        if history || rows <= 1 {
+            let drawn: Vec<InlineArray> = (0..rows)
+                .map(|row| {
+                    let one = logits.slice(&[row, 0], &[row + 1, logits.dim(1)]);
+                    self.sample(&one).reshape(&[1])
+                })
+                .collect();
+            let refs: Vec<&InlineArray> = drawn.iter().collect();
+            return crate::compat::ops::concatenate_axis(&refs, 0);
+        }
+        let first = self.draws;
+        self.draws += rows as u64;
+        let mut constrained = logits.clone();
+        for processor in &mut self.processors {
+            constrained = processor.process(&constrained);
+        }
+        if self.params.temperature <= 0.0 {
+            return constrained.argmax(-1);
+        }
+        let log_probs = filtered_log_probs(&constrained, &self.params);
+        let drawn: Vec<InlineArray> = (0..rows)
+            .map(|row| {
+                let one = log_probs.slice(&[row, 0], &[row + 1, log_probs.dim(1)]);
+                one.categorical(-1, self.params.draw_key(first + row as u64).as_ref())
+                    .reshape(&[1])
+            })
+            .collect();
+        let refs: Vec<&InlineArray> = drawn.iter().collect();
+        crate::compat::ops::concatenate_axis(&refs, 0)
+    }
+
+    /// Take tokens another sampler drew into this one, as if this one had
+    /// drawn them: each recorded in order, and the draw counter moved past
+    /// them. A speculative decoder that verified a block on a
+    /// [`fork`](Self::fork) commits the tokens it kept.
+    pub fn commit(&mut self, tokens: &[u32]) {
+        for &token in tokens {
+            self.record_id(token);
+        }
+        self.draws += tokens.len() as u64;
+    }
+
+    /// Take a generated token (a one-element array, read lazily unless a
+    /// processor needs it on the host) into the history.
+    pub fn record(&mut self, token: &InlineArray) {
+        if let Some(penalties) = self.penalties.as_mut() {
+            penalties.record(token);
+        }
+        if self.needs_host_tokens() {
+            let id = token.item_u32();
+            for processor in self.processors.iter_mut().filter(|p| p.needs_host_tokens()) {
+                processor.accept(id);
             }
-            None => sample_token(logits_2d, &self.params, draw),
+        }
+    }
+
+    /// [`record`](Self::record) a token the host already holds.
+    pub fn record_id(&mut self, token: u32) {
+        if let Some(penalties) = self.penalties.as_mut() {
+            penalties.record_id(token);
+        }
+        for processor in self.processors.iter_mut().filter(|p| p.needs_host_tokens()) {
+            processor.accept(token);
         }
     }
 }
@@ -1069,39 +1253,66 @@ pub fn quantized_sdpa_with_qjl(
     }
 }
 
-/// Shared generation-session setup for bridge-native decode loops.
+/// A generation's stream and memory limits, held for as long as it decodes:
+/// this thread's generation stream as the default stream
+/// ([`GenerationStream`]) and the wired memory limit at the device's
+/// recommended maximum ([`WiredLimit`]). Dropping it waits for the stream's
+/// pending work and puts both back, on every path out of the generation, a
+/// panic included (a default stream left pointing at the generation stream
+/// makes array destructors race Metal's teardown).
+#[must_use = "the stream and the limit are in force only while this lives"]
+pub struct GenerationSession {
+    // The stream is released first, then the limit.
+    _stream: crate::inline_array::GenerationStream,
+    _wired: crate::inline_array::WiredLimit,
+}
+
+impl GenerationSession {
+    /// Enter the generation stream and raise the wired limit.
+    pub fn enter() -> Self {
+        Self {
+            _stream: crate::inline_array::GenerationStream::enter(),
+            _wired: crate::inline_array::WiredLimit::max(),
+        }
+    }
+}
+
+/// Shared generation-session setup for native decode loops.
 ///
 /// `mlx::core::enable_compile()` was benchmarked and shown to regress decode
-/// throughput on the active native paths, so the canonical bridge path keeps
+/// throughput on the active native paths, so the canonical runtime path keeps
 /// it disabled here.
 fn begin_generation_session_impl(
     tag: &str,
     _model_dtype: i32,
     reset_peak_memory: bool,
     log_session: bool,
-) {
+) -> GenerationSession {
     crate::inline_array::clear_cache();
     if reset_peak_memory {
         crate::inline_array::reset_peak_memory();
     }
-    static GENERATION_STREAM_INIT: std::sync::Once = std::sync::Once::new();
-    GENERATION_STREAM_INIT.call_once(crate::inline_array::new_generation_stream);
-    crate::inline_array::set_generation_stream();
-    crate::inline_array::set_wired_limit_max();
-
     let _ = (tag, log_session);
+    GenerationSession::enter()
 }
 
-pub fn begin_generation_session(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, true, true);
+/// Clear the allocator's cache, reset its peak and enter a
+/// [`GenerationSession`].
+pub fn begin_generation_session(tag: &str, model_dtype: i32) -> GenerationSession {
+    begin_generation_session_impl(tag, model_dtype, true, true)
 }
 
-pub fn begin_generation_session_preserve_peak(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, false, true);
+/// [`begin_generation_session`] keeping the allocator's peak.
+pub fn begin_generation_session_preserve_peak(tag: &str, model_dtype: i32) -> GenerationSession {
+    begin_generation_session_impl(tag, model_dtype, false, true)
 }
 
-pub fn begin_generation_session_preserve_peak_silent(tag: &str, model_dtype: i32) {
-    begin_generation_session_impl(tag, model_dtype, false, false);
+/// [`begin_generation_session_preserve_peak`] without the session log line.
+pub fn begin_generation_session_preserve_peak_silent(
+    tag: &str,
+    model_dtype: i32,
+) -> GenerationSession {
+    begin_generation_session_impl(tag, model_dtype, false, false)
 }
 
 /// Prime a decode loop by preparing the cache, running one forward step, and
@@ -1119,7 +1330,10 @@ pub fn prime_generation<Weights, Cache>(
     mut prepare_cache: impl FnMut(&mut Cache),
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
 ) -> InlineArray {
-    begin_generation_session_impl(tag, model_dtype, reset_peak_memory, log_session);
+    // Held until the first token is queued: the stream is restored (after
+    // waiting for that token's forward, which the loop would wait for first
+    // anyway) when this returns, and the decode loop enters its own.
+    let _session = begin_generation_session_impl(tag, model_dtype, reset_peak_memory, log_session);
     prepare_cache(cache);
 
     let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
@@ -1144,6 +1358,9 @@ pub fn generate_from_primed_sample<Weights, Cache>(
     mut on_token: impl FnMut(u32) -> bool,
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
 ) -> (Vec<u32>, Option<DecodeMetrics>) {
+    // On the generation stream and under the raised wired limit until the
+    // loop is done, whichever way it ends.
+    let _session = GenerationSession::enter();
     let mut tokens = Vec::with_capacity(max_tokens);
     let mut step_times: Vec<f64> = Vec::new();
 
@@ -1213,12 +1430,9 @@ pub fn generate_from_primed_sample<Weights, Cache>(
         None
     };
 
-    crate::inline_array::synchronize();
-    // Restore the default stream before returning. InlineArray Drops happen
-    // when the caller's weights/cache go out of scope — they must execute on
-    // the main stream, not the generation stream, to avoid SIGSEGV from
-    // Metal teardown racing with stream cleanup.
-    crate::inline_array::reset_default_stream();
+    // Dropping the session waits for the stream and restores the default
+    // one: the caller's weights and cache are dropped on the main stream, not
+    // the generation stream, which Metal's teardown would race.
     (tokens, metrics)
 }
 
@@ -1556,5 +1770,277 @@ mod tests {
         let finite: Vec<bool> = lp.as_slice::<f32>().iter().map(|v| v.is_finite()).collect();
         assert_eq!(finite, [false, false, true, true, false, false]);
         crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// The probabilities of `logits` under `sampler`, read without drawing.
+    fn probabilities(sampler: &mut DecodeSampler, logits: &[f32]) -> Vec<f32> {
+        let row = InlineArray::from_f32_slice(logits, &[1, logits.len() as i32]);
+        let lp = sampler.log_probs(&row);
+        lp.eval();
+        crate::check_unobserved_error().expect("no bridge op failed");
+        lp.as_slice::<f32>().iter().map(|v| v.exp()).collect()
+    }
+
+    /// A bias is added to the logits after the penalties: a ban keeps its
+    /// full size where a penalty before it would have divided it down.
+    #[test]
+    fn the_logit_bias_shifts_the_logits_after_the_penalties() {
+        let logits = InlineArray::from_f32_slice(&[3.0, 2.0, 0.0, 0.0], &[1, 4]);
+        let sampler = |bias: Vec<(u32, f32)>, repetition: f32| {
+            DecodeSampler::new(
+                SamplingParams {
+                    logit_bias: bias,
+                    repetition_penalty: repetition,
+                    ..SamplingParams::new(0.0)
+                },
+                &[0],
+            )
+        };
+        // Greedy: the banned top token gives way to the next.
+        assert_eq!(
+            sampler(vec![(0, -100.0)], 1.0).sample(&logits).item_u32(),
+            1
+        );
+        // A boost forces a token the model gave nothing, and a token
+        // outside the vocabulary is ignored.
+        assert_eq!(
+            sampler(vec![(3, 100.0), (99, 100.0)], 1.0)
+                .sample(&logits)
+                .item_u32(),
+            3
+        );
+        // Penalty first: 3 / 2 = 1.5, then the bias 0.75: 2.25 beats 2.0.
+        assert_eq!(sampler(vec![(0, 0.75)], 2.0).sample(&logits).item_u32(), 0);
+        assert_eq!(sampler(vec![(0, 0.25)], 2.0).sample(&logits).item_u32(), 1);
+        // A bias of zero is no bias.
+        assert!(LogitBias::new(&[(1, 0.0)]).is_none());
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// An allowed set is the only thing a sampled generation can emit, and
+    /// the distribution it reports is the model's, renormalized over the set.
+    #[test]
+    fn allowed_tokens_are_all_a_generation_can_emit() {
+        let logits = [2.0f32, 1.0, 0.5, 3.0, -1.0];
+        let allowed = || Box::new(AllowedTokens::new(&[1, 2, 4])) as Box<dyn LogitsProcessor>;
+        let mut greedy =
+            DecodeSampler::new(SamplingParams::new(0.0), &[]).with_processor(allowed());
+        let row = InlineArray::from_f32_slice(&logits, &[1, 5]);
+        assert_eq!(greedy.sample(&row).item_u32(), 1);
+
+        let mut sampler = DecodeSampler::new(
+            SamplingParams {
+                seed: Some(5),
+                ..SamplingParams::new(1.0)
+            },
+            &[],
+        )
+        .with_processor(allowed());
+        let p = probabilities(&mut sampler, &logits);
+        let z: f32 = [1.0f32, 0.5, -1.0].iter().map(|l| l.exp()).sum();
+        for (token, want) in [
+            (0, 0.0),
+            (3, 0.0),
+            (1, 1.0f32.exp() / z),
+            (2, 0.5f32.exp() / z),
+        ] {
+            assert!(
+                (p[token] - want).abs() < 1e-5,
+                "token {token}: {}",
+                p[token]
+            );
+        }
+        for _ in 0..300 {
+            let token = sampler.sample(&row).item_u32();
+            assert!([1, 2, 4].contains(&token), "drew {token}");
+        }
+        // Nothing allowed that the vocabulary has leaves the logits alone.
+        let mut none = DecodeSampler::new(SamplingParams::new(0.0), &[])
+            .with_processor(Box::new(AllowedTokens::new(&[99])));
+        assert_eq!(none.sample(&row).item_u32(), 3);
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// Only an even token may follow an odd one and the reverse: a grammar in
+    /// miniature, whose state is the last token the sampler recorded.
+    #[derive(Clone)]
+    struct Alternating {
+        last: Option<u32>,
+    }
+
+    impl LogitsProcessor for Alternating {
+        fn process(&mut self, logits_2d: &InlineArray) -> InlineArray {
+            let vocab = logits_2d.dim(-1) as u32;
+            let legal: Vec<u32> = (0..vocab)
+                .filter(|t| self.last.is_none_or(|l| t % 2 != l % 2))
+                .collect();
+            AllowedTokens::new(&legal).process(logits_2d)
+        }
+
+        fn accept(&mut self, token: u32) {
+            self.last = Some(token);
+        }
+
+        fn needs_host_tokens(&self) -> bool {
+            true
+        }
+
+        fn fork(&self) -> Box<dyn LogitsProcessor> {
+            Box::new(self.clone())
+        }
+    }
+
+    /// A processor that follows the generation sees every token in order,
+    /// and a fork follows its own tokens without touching the original.
+    #[test]
+    fn a_stateful_processor_follows_the_tokens_the_sampler_records() {
+        let logits = InlineArray::from_f32_slice(&[1.0; 6], &[1, 6]);
+        let params = SamplingParams {
+            seed: Some(9),
+            ..SamplingParams::new(1.0)
+        };
+        let mut sampler =
+            DecodeSampler::new(params, &[]).with_processor(Box::new(Alternating { last: None }));
+        assert!(sampler.needs_host_tokens());
+        let mut tokens = Vec::new();
+        for _ in 0..12 {
+            tokens.push(sampler.sample(&logits).item_u32());
+        }
+        assert!(
+            tokens.windows(2).all(|w| w[0] % 2 != w[1] % 2),
+            "{tokens:?}"
+        );
+
+        // The fork continues from the same state; recording a token of the
+        // same parity as the last on it (which the grammar would refuse)
+        // moves only its own state.
+        let last = *tokens.last().unwrap();
+        let mut fork = sampler.fork();
+        fork.record_id(last + 2);
+        let from_original = probabilities(&mut sampler, &[1.0; 6]);
+        let from_fork = probabilities(&mut fork, &[1.0; 6]);
+        let only = |p: &[f32], parity: u32| {
+            p.iter()
+                .enumerate()
+                .all(|(t, &p)| (p > 0.0) == (t as u32 % 2 == parity))
+        };
+        assert!(only(&from_original, 1 - last % 2), "{from_original:?}");
+        assert!(only(&from_fork, 1 - last % 2), "{from_fork:?}");
+        let odd_fork = {
+            let mut f = sampler.fork();
+            f.record_id(last + 1);
+            probabilities(&mut f, &[1.0; 6])
+        };
+        assert!(only(&odd_fork, last % 2), "{odd_fork:?}");
+        assert!(only(&from_original, 1 - last % 2), "original untouched");
+    }
+
+    /// Six positions' logits, one row each, spread enough that a draw at
+    /// temperature 1 lands on different tokens from row to row.
+    fn block_logits() -> InlineArray {
+        let rows: Vec<f32> = (0..6 * 7)
+            .map(|i| (((i * 37 + 11) % 13) as f32) * 0.31)
+            .collect();
+        InlineArray::from_f32_slice(&rows, &[6, 7])
+    }
+
+    /// A block drawn at once is the rows drawn one after the other, each
+    /// recorded before the next: the same tokens, whether the sampler has
+    /// history (the rows are drawn in turn) or not (the filters run once over
+    /// the block), and a fork that drew a block and committed a prefix of it
+    /// leaves the sampler where drawing that prefix would have.
+    #[test]
+    fn a_block_is_the_rows_drawn_in_turn_and_a_commit_is_a_prefix_of_it() {
+        let logits = block_logits();
+        let row = |i: i32| logits.slice(&[i, 0], &[i + 1, 7]);
+        let configs = [
+            SamplingParams::new(0.0),
+            SamplingParams {
+                seed: Some(21),
+                top_k: 4,
+                top_p: 0.9,
+                ..SamplingParams::new(1.0)
+            },
+            SamplingParams {
+                seed: Some(21),
+                min_p: 0.05,
+                logit_bias: vec![(2, 1.5), (5, -3.0)],
+                ..SamplingParams::new(0.8)
+            },
+            SamplingParams {
+                seed: Some(4),
+                repetition_penalty: 1.4,
+                presence_penalty: 0.5,
+                ..SamplingParams::new(1.0)
+            },
+        ];
+        for (c, params) in configs.iter().enumerate() {
+            let mut turn = DecodeSampler::new(params.clone(), &[1, 3]);
+            let want: Vec<u32> = (0..6).map(|i| turn.sample(&row(i)).item_u32()).collect();
+
+            let mut block = DecodeSampler::new(params.clone(), &[1, 3]);
+            let got = block.sample_block(&logits);
+            assert_eq!(got.shape(), &[6], "config {c}");
+            assert_eq!(
+                (0..6)
+                    .map(|i| got.slice(&[i], &[i + 1]).item_u32())
+                    .collect::<Vec<_>>(),
+                want,
+                "config {c}"
+            );
+            // Both go on to draw the same next token.
+            let next = |s: &mut DecodeSampler| s.sample(&row(0)).item_u32();
+            assert_eq!(
+                next(&mut block),
+                next(&mut turn),
+                "config {c}: after the block"
+            );
+
+            // A fork draws the block; only the first three tokens are kept.
+            let mut kept = DecodeSampler::new(params.clone(), &[1, 3]);
+            let mut fork = kept.fork();
+            let drawn = fork.sample_block(&logits);
+            drawn.eval();
+            kept.commit(&want[..3]);
+            let mut prefix = DecodeSampler::new(params.clone(), &[1, 3]);
+            for i in 0..3 {
+                prefix.sample(&row(i)).item_u32();
+            }
+            assert_eq!(
+                next(&mut kept),
+                next(&mut prefix),
+                "config {c}: after the commit"
+            );
+        }
+        crate::check_unobserved_error().expect("no bridge op failed");
+    }
+
+    /// `log_probs` is the distribution a draw comes from, normalized, and
+    /// reading it records nothing: at temperature 0 it is the argmax's point
+    /// mass, penalized.
+    #[test]
+    fn log_probs_is_the_drawn_distribution_and_records_nothing() {
+        let logits = [2.0f32, 1.0, 0.0, -1.0];
+        let params = SamplingParams {
+            top_k: 3,
+            ..SamplingParams::new(0.5)
+        };
+        let mut sampler = DecodeSampler::new(params, &[]);
+        let p = probabilities(&mut sampler, &logits);
+        assert!((p.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{p:?}");
+        assert_eq!(p[3], 0.0);
+        assert!(p[0] > p[1] && p[1] > p[2]);
+
+        let penalized = SamplingParams {
+            repetition_penalty: 4.0,
+            ..SamplingParams::new(0.0)
+        };
+        let mut greedy = DecodeSampler::new(penalized, &[0]);
+        // Token 0's 2.0 / 4 falls under token 1's 1.0, every time asked.
+        for _ in 0..2 {
+            assert_eq!(probabilities(&mut greedy, &logits), [0.0, 1.0, 0.0, 0.0]);
+        }
+        let row = InlineArray::from_f32_slice(&logits, &[1, 4]);
+        assert_eq!(greedy.sample(&row).item_u32(), 1);
     }
 }

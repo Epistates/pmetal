@@ -15,8 +15,7 @@ use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::compat::{Array, Exception};
 use pmetal_runtime::native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 
-use crate::dflash_decoder::DFlashDraftQuant;
-use crate::dflash_drafts::{DFlashDraft, load_dflash_draft};
+use crate::dflash_drafts::{DFlashDraft, DFlashDraftQuant, load_dflash_draft};
 
 /// Whether the model in `dir` is a DFlash draft model, by its `config.json`.
 pub fn is_dflash_draft(dir: &Path) -> bool {

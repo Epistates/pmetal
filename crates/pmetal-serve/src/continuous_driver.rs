@@ -6,9 +6,9 @@
 //! - A [`SlotIdxMap`] that tracks which `SlotId` lives in which row of
 //!   a [`BatchKVCache`].
 //! - A [`ContinuousEngineState`] that bundles the batched KV cache
-//!   with a per-slot [`Sampler`] and [`DecodePenalties`] so each slot
-//!   has its own temperature / top-p settings and its own penalty
-//!   history on the GPU.
+//!   with a per-slot [`DecodeSampler`] so each slot has its own
+//!   temperature / top-p settings and its own penalty history on the
+//!   GPU.
 //! - A [`SlotForward`] trait that decouples the driver from
 //!   `DynamicModel` so unit tests can stub the forward pass.
 //! - Drivers [`drive_prefill_step`] and [`drive_decode_step`] that the
@@ -28,9 +28,9 @@
 
 use crate::continuous_batch::SlotId;
 use pmetal_cache::kv_cache::{BatchKVCache, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache};
-use pmetal_models::generation::Sampler;
+use pmetal_models::generation::GenerationConfig;
 use pmetal_runtime::compat::{Array, Exception};
-use pmetal_runtime::decode::DecodePenalties;
+use pmetal_runtime::decode::DecodeSampler;
 use std::collections::HashMap;
 
 /// Trait that the driver uses to invoke the model's forward pass.
@@ -163,26 +163,6 @@ impl SlotIdxMap {
     }
 }
 
-/// A slot's sampler and the penalties of its generation: the slot's
-/// prompt and every token sampled for it, kept on the GPU, so a slot's
-/// history lives with its row from admission to retirement and no other
-/// slot reads it.
-struct SlotSampling {
-    sampler: Sampler,
-    penalties: Option<DecodePenalties>,
-}
-
-impl SlotSampling {
-    /// Sample the slot's next token from its `[1, vocab]` logits, lazily;
-    /// the penalties take the token in before it reaches the host.
-    fn sample(&mut self, logits: &Array) -> Result<Array, Exception> {
-        let (token, _log_probs) = self
-            .sampler
-            .sample_array_penalized(logits, self.penalties.as_mut())?;
-        Ok(token)
-    }
-}
-
 /// Continuous-batch engine state.
 ///
 /// Holds the per-slot KV caches, per-slot samplers and penalties, and
@@ -198,7 +178,10 @@ pub struct ContinuousEngineState {
     /// batched decode. When `None`, the driver falls back to the
     /// per-slot `caches` path.
     fused_cache: Option<FusedBatchKVCache>,
-    samplers: Vec<Option<SlotSampling>>,
+    /// Each slot's sampler: its penalties hold the slot's prompt and every
+    /// token sampled for it on the GPU, so a slot's history lives with its
+    /// row from admission to retirement and no other slot reads it.
+    samplers: Vec<Option<DecodeSampler>>,
     map: SlotIdxMap,
 }
 
@@ -264,8 +247,8 @@ impl ContinuousEngineState {
         self.map.len()
     }
 
-    /// Assign a slot to a free batch row, attaching its sampler and the
-    /// penalties of a generation from `prompt` (the whole prompt, including
+    /// Assign a slot to a free batch row, attaching the sampler of a
+    /// generation under `config` from `prompt` (the whole prompt, including
     /// any part restored from a prefix cache).
     ///
     /// Returns the allocated `batch_idx`, or an error if all rows are
@@ -276,7 +259,7 @@ impl ContinuousEngineState {
     pub fn admit(
         &mut self,
         slot: SlotId,
-        sampler: Sampler,
+        config: &GenerationConfig,
         prompt: &[u32],
     ) -> Result<usize, Exception> {
         let idx = self.map.allocate(slot).ok_or_else(|| {
@@ -286,8 +269,7 @@ impl ContinuousEngineState {
                 self.capacity()
             ))
         })?;
-        let penalties = sampler.decode_penalties(prompt);
-        self.samplers[idx] = Some(SlotSampling { sampler, penalties });
+        self.samplers[idx] = Some(config.sampler(prompt));
         if let Some(fused) = self.fused_cache.as_mut() {
             fused.admit(idx)?;
         }
@@ -346,12 +328,13 @@ impl ContinuousEngineState {
     /// token stays lazy; the slot's next sample is penalized for it whether
     /// or not the host has read it.
     pub fn sample(&mut self, slot: SlotId, logits: &Array) -> Result<Array, Exception> {
-        self.map
+        let sampler = self
+            .map
             .get(slot)
             .and_then(|idx| self.samplers.get_mut(idx))
             .and_then(Option::as_mut)
-            .ok_or_else(|| Exception::custom(format!("sample: slot {slot:?} has no sampler")))?
-            .sample(logits)
+            .ok_or_else(|| Exception::custom(format!("sample: slot {slot:?} has no sampler")))?;
+        Ok(sampler.sample(logits))
     }
 }
 
@@ -602,8 +585,13 @@ mod tests {
     #[test]
     fn continuous_state_admit_retire_roundtrip() {
         let mut state = ContinuousEngineState::new(2, make_config());
-        let sampler = Sampler::new(pmetal_models::generation::GenerationConfig::default());
-        let idx = state.admit(SlotId(1), sampler, &[]).unwrap();
+        let idx = state
+            .admit(
+                SlotId(1),
+                &pmetal_models::generation::GenerationConfig::default(),
+                &[],
+            )
+            .unwrap();
         assert_eq!(idx, 0);
         assert_eq!(state.active(), 1);
         assert_eq!(state.batch_idx(SlotId(1)), Some(0));
@@ -683,10 +671,10 @@ mod tests {
         }
     }
 
-    fn sampling(seed: Option<u64>) -> Sampler {
-        let mut config = pmetal_models::generation::GenerationConfig::sampling(64, 1.0);
+    fn sampling(seed: Option<u64>) -> GenerationConfig {
+        let mut config = GenerationConfig::sampling(64, 1.0);
         config.seed = seed;
-        Sampler::new(config)
+        config
     }
 
     /// Eight decode steps of `seeded` (seed 5), with `others` admitted
@@ -694,10 +682,10 @@ mod tests {
     fn seeded_slot_tokens(others: &[Option<u64>]) -> Vec<u32> {
         let mut state = ContinuousEngineState::new(1 + others.len(), make_config());
         let seeded = SlotId(0);
-        state.admit(seeded, sampling(Some(5)), &[]).unwrap();
+        state.admit(seeded, &sampling(Some(5)), &[]).unwrap();
         let other_ids: Vec<SlotId> = (1..=others.len() as u64).map(SlotId).collect();
         for (&id, &seed) in other_ids.iter().zip(others) {
-            state.admit(id, sampling(seed), &[]).unwrap();
+            state.admit(id, &sampling(seed), &[]).unwrap();
         }
         let mut tokens = Vec::new();
         for _ in 0..8 {
@@ -735,14 +723,14 @@ mod tests {
         state
             .admit(
                 s1,
-                Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &pmetal_models::generation::GenerationConfig::default(),
                 &[],
             )
             .unwrap();
         state
             .admit(
                 s2,
-                Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &pmetal_models::generation::GenerationConfig::default(),
                 &[],
             )
             .unwrap();
@@ -774,7 +762,7 @@ mod tests {
         state
             .admit(
                 s,
-                Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &pmetal_models::generation::GenerationConfig::default(),
                 &[1, 2, 3],
             )
             .unwrap();
@@ -799,7 +787,7 @@ mod tests {
         state
             .admit(
                 s,
-                Sampler::new(pmetal_models::generation::GenerationConfig::default()),
+                &pmetal_models::generation::GenerationConfig::default(),
                 &[1, 2, 3],
             )
             .unwrap();
@@ -861,12 +849,12 @@ mod tests {
     /// row a finished request frees starts the next one from empty.
     #[test]
     fn hybrid_slots_each_get_their_own_recurrent_state() {
-        let sampler = || Sampler::new(pmetal_models::generation::GenerationConfig::default());
+        let sampler = || pmetal_models::generation::GenerationConfig::default();
         let mut state =
             ContinuousEngineState::new(2, make_config()).with_recurrent_state(&MambaCache::new(1));
         let (a, b, c) = (SlotId(1), SlotId(2), SlotId(3));
-        state.admit(a, sampler(), &[10, 11]).unwrap();
-        state.admit(b, sampler(), &[20, 21]).unwrap();
+        state.admit(a, &sampler(), &[10, 11]).unwrap();
+        state.admit(b, &sampler(), &[20, 21]).unwrap();
         let mut stub = RecurrentStub { seen: Vec::new() };
 
         drive_prefill_step(&mut stub, &mut state, a, &[10, 11], true).unwrap();
@@ -884,7 +872,7 @@ mod tests {
 
         // `a` finishes; `c` takes its row and must not inherit its state.
         state.retire(a);
-        assert_eq!(state.admit(c, sampler(), &[30]).unwrap(), 0);
+        assert_eq!(state.admit(c, &sampler(), &[30]).unwrap(), 0);
         drive_prefill_step(&mut stub, &mut state, c, &[30], true).unwrap();
         let pc = stub.seen.last().unwrap();
         assert!(pc.1, "a reused row starts from empty state");

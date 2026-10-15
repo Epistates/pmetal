@@ -106,6 +106,44 @@ impl KVCache {
         self.clone()
     }
 
+    /// This cache for a batch of `n` identical rows: every row holds what
+    /// this one-row cache holds, so a prompt prefilled once serves `n`
+    /// completions that decode together as one `[n, 1]` forward. The rows
+    /// share the buffers until their first write.
+    ///
+    /// # Errors
+    /// When the cache holds more than one row, or its mode is TurboQuant,
+    /// whose rotated, compressed blocks have no batched layout.
+    pub fn repeat_batch(&self, n: usize) -> Result<Self, Exception> {
+        if n == 0 {
+            return Err(Exception::custom("KV cache: a batch of zero rows"));
+        }
+        if self.turboquant_layers.is_some() {
+            return Err(Exception::custom(
+                "KV cache: a TurboQuant cache does not repeat into a batch",
+            ));
+        }
+        let layer_caches = self
+            .layer_caches
+            .iter()
+            .map(|layer| layer.repeat_batch(n))
+            .collect::<Result<Vec<_>, _>>()?;
+        let quantized_layers = match &self.quantized_layers {
+            Some(layers) => Some(
+                layers
+                    .iter()
+                    .map(|layer| layer.repeat_batch(n))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+        Ok(Self {
+            layer_caches,
+            quantized_layers,
+            ..self.clone()
+        })
+    }
+
     /// Tokens the cache can serve a single-token step from: all of them, or
     /// at most the window of a sliding or rotating mode.
     pub fn seq_len(&self) -> usize {

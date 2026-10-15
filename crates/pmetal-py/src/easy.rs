@@ -9,7 +9,7 @@ use pmetal_models::architectures::{
     DFlashDraftConfig, DFlashDraftModel, Gemma4AssistantForCausalLM, Qwen3NextMtpForCausalLM,
     load_gemma4_assistant_from_dir, load_qwen3_next_mtp_from_dir,
 };
-use pmetal_models::dflash_decoder::load_dflash_draft_from_dir;
+use pmetal_models::dflash_drafts::load_dflash_draft_from_dir;
 use pmetal_trainer::{
     MtpTrainingConfig, MtpTrainingResult, batch_from_tokens, initialize_qwen3_next_mtp_from_target,
     make_gemma4_assistant_config, make_qwen3_next_mtp_config, run_dflash_draft_training,

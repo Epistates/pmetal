@@ -52,6 +52,7 @@ fn greedy() -> SamplingParams {
         extra_stop_token_ids: vec![],
         stop_sequences: vec![],
         logprobs_top_n: None,
+        logit_bias: Vec::new(),
     }
 }
 

@@ -20,7 +20,6 @@ use crate::architectures::dflash_draft::{
     DFlashDraftConfig, DFlashDraftModel, LoadReport, make_context_cache,
 };
 use crate::architectures::dflash2_draft::DFlash2DraftModel;
-use crate::dflash_decoder::DFlashDraftQuant;
 
 /// A DFlash draft model of either generation.
 #[derive(Debug)]
@@ -203,6 +202,65 @@ pub fn read_dflash_config(dir: &Path) -> Result<DFlashDraftConfig, Exception> {
     })
 }
 
+/// Quantization mode applied to a DFlash draft after loading.
+///
+/// DFlash speedup is sensitive to draft quality — 4-bit weight quantization
+/// alone drops acceptance rates. `Fp8` keeps ±240 range which covers every
+/// Linear layer in the upstream Qwen3-DFlash checkpoints and shaves ~50%
+/// off draft memory vs BF16 with minimal acceptance-rate regression.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum DFlashDraftQuant {
+    /// Keep weights at their loaded dtype (typically BF16).
+    #[default]
+    None,
+    /// Quantize every `.weight` tensor to FP8 (E4M3) in-place via
+    /// [`crate::fp8_utils::quantize_model_linears`]. Leaves biases and
+    /// normalisation scales alone.
+    Fp8,
+}
+
+/// Load a first-generation DFlash draft model from a local directory.
+///
+/// Equivalent to
+/// [`load_dflash_draft_from_dir_quantized`]`(dir, DFlashDraftQuant::None)`.
+pub fn load_dflash_draft_from_dir(
+    model_dir: impl AsRef<Path>,
+) -> Result<(DFlashDraftModel, LoadReport), Exception> {
+    load_dflash_draft_from_dir_quantized(model_dir, DFlashDraftQuant::None)
+}
+
+/// Load a first-generation DFlash draft model from a local directory with an
+/// optional post-load weight quantization pass: the concrete model, which
+/// training takes, and a [`LoadReport`] saying which parameter tensors were
+/// assigned (it does not insist that all were; [`load_dflash_draft`] does).
+///
+/// Expects:
+/// * `config.json` with the `DFlashDraftConfig` schema (including the
+///   `dflash_config.target_layer_ids` / `mask_token_id` fields).
+/// * One or more `*.safetensors` files whose weight names follow the
+///   upstream naming described in [`DFlashDraftModel::load_weights`].
+pub fn load_dflash_draft_from_dir_quantized(
+    model_dir: impl AsRef<Path>,
+    quant: DFlashDraftQuant,
+) -> Result<(DFlashDraftModel, LoadReport), Exception> {
+    let dir = model_dir.as_ref();
+    let config = read_dflash_config(dir)?;
+    if config.is_dflash2() {
+        return Err(Exception::custom(format!(
+            "DFlash draft {} is DFlash 2; load it with dflash_drafts::load_dflash_draft",
+            dir.display()
+        )));
+    }
+    let mut draft = DFlashDraftModel::new(config)?;
+    let weights = crate::loader::load_weights(dir)
+        .map_err(|e| Exception::custom(format!("DFlash draft: weight load failed: {e}")))?;
+    let report = draft.load_weights(&weights)?;
+    if quant == DFlashDraftQuant::Fp8 {
+        crate::fp8_utils::quantize_model_linears(&mut draft)?;
+    }
+    Ok((draft, report))
+}
+
 /// Load the DFlash draft in `dir`, either generation, then optionally
 /// quantize it.
 ///
@@ -210,32 +268,25 @@ pub fn read_dflash_config(dir: &Path) -> Result<DFlashDraftConfig, Exception> {
 /// be filled, or loading fails naming the difference.
 pub fn load_dflash_draft(dir: &Path, quant: DFlashDraftQuant) -> Result<DFlashDraft, Exception> {
     let config = read_dflash_config(dir)?;
-    let weights = crate::loader::load_weights(dir)
-        .map_err(|e| Exception::custom(format!("DFlash draft: weight load failed: {e}")))?;
-    let mut draft = if config.is_dflash2() {
+    if config.is_dflash2() {
+        let weights = crate::loader::load_weights(dir)
+            .map_err(|e| Exception::custom(format!("DFlash draft: weight load failed: {e}")))?;
         let mut model = DFlash2DraftModel::new(config)?;
         model.load_weights(&weights)?;
-        DFlashDraft::V2(model)
-    } else {
-        let mut model = DFlashDraftModel::new(config)?;
-        let report: LoadReport = model.load_weights(&weights)?;
-        let expected = model.flatten_params().len();
-        if report.loaded != expected || !report.skipped.is_empty() {
-            return Err(Exception::custom(format!(
-                "DFlash draft {}: filled {} of {expected} parameters; unrecognised: {:?}",
-                dir.display(),
-                report.loaded,
-                report.skipped
-            )));
+        if quant == DFlashDraftQuant::Fp8 {
+            crate::fp8_utils::quantize_model_linears(&mut model)?;
         }
-        DFlashDraft::V1(model)
-    };
-    match quant {
-        DFlashDraftQuant::None => {}
-        DFlashDraftQuant::Fp8 => match &mut draft {
-            DFlashDraft::V1(m) => crate::fp8_utils::quantize_model_linears(m)?,
-            DFlashDraft::V2(m) => crate::fp8_utils::quantize_model_linears(m)?,
-        },
+        return Ok(DFlashDraft::V2(model));
     }
-    Ok(draft)
+    let (model, report) = load_dflash_draft_from_dir_quantized(dir, quant)?;
+    let expected = model.flatten_params().len();
+    if report.loaded != expected || !report.skipped.is_empty() {
+        return Err(Exception::custom(format!(
+            "DFlash draft {}: filled {} of {expected} parameters; unrecognised: {:?}",
+            dir.display(),
+            report.loaded,
+            report.skipped
+        )));
+    }
+    Ok(DFlashDraft::V1(model))
 }
