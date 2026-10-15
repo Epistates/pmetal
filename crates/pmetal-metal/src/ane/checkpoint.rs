@@ -16,12 +16,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{MetalError, Result};
 
-/// A checkpoint tensor's data as f32. The ANE engines read f32, f16 and bf16;
-/// anything else (a packed quantized weight, an integer tensor) is an error.
-pub(crate) fn tensor_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
-    bytes_to_f32(tensor.dtype(), tensor.data())
-}
-
+/// A tensor's bytes as f32. The ANE engines read f32, f16 and bf16; anything
+/// else (a packed quantized weight, an integer tensor) is an error.
 fn bytes_to_f32(dtype: safetensors::Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
     use safetensors::Dtype;
     let width = match dtype {

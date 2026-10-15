@@ -26,20 +26,6 @@ use pmetal_runtime::compat::{Array, Dtype, Exception};
 use pmetal_runtime::decode::{
     DecodePenalties, SamplingParams, filtered_log_probs, last_token_logits, prompt_tokens_to_input,
 };
-#[cfg(feature = "ane")]
-use std::collections::HashMap;
-
-#[cfg(feature = "ane")]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct HybridCpuEngineKey {
-    model_path: std::path::PathBuf,
-}
-
-#[cfg(feature = "ane")]
-thread_local! {
-    static HYBRID_CPU_ENGINE_CACHE: std::cell::RefCell<HashMap<HybridCpuEngineKey, pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine>> =
-        std::cell::RefCell::new(HashMap::new());
-}
 
 /// The KV cache an ANE request needs: prompt and output, rounded up to a
 /// power of two (so nearby requests share a compiled model), 512 to `cap`.
@@ -48,60 +34,6 @@ fn ane_context(prompt_len: usize, max_new: usize, cap: usize) -> usize {
     (prompt_len + max_new)
         .next_power_of_two()
         .clamp(512, cap.max(512))
-}
-
-#[cfg(feature = "ane")]
-fn build_hybrid_cpu_engine(
-    model_path: &std::path::Path,
-    config: pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
-) -> std::result::Result<
-    pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine,
-    pmetal_metal::error::MetalError,
-> {
-    let mut engine = pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine::new(config)?;
-    engine.load_weights_safetensors(model_path)?;
-    Ok(engine)
-}
-
-#[cfg(feature = "ane")]
-fn with_cached_hybrid_cpu_engine<R>(
-    model_path: &std::path::Path,
-    config: pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
-    f: impl FnOnce(
-        &mut pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine,
-    ) -> std::result::Result<R, pmetal_metal::error::MetalError>,
-) -> std::result::Result<R, pmetal_metal::error::MetalError> {
-    let key = HybridCpuEngineKey {
-        model_path: model_path.to_path_buf(),
-    };
-
-    HYBRID_CPU_ENGINE_CACHE.with(
-        |cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
-            let mut cache = cache.borrow_mut();
-            let needs_rebuild = match cache.get(&key) {
-                Some(engine) => engine.config().max_seq_len < config.max_seq_len,
-                None => true,
-            };
-
-            if needs_rebuild {
-                tracing::info!(
-                    model = %model_path.display(),
-                    max_seq_len = config.max_seq_len,
-                    "Building cached CPU-hybrid inference engine"
-                );
-                let engine = build_hybrid_cpu_engine(model_path, config.clone())?;
-                cache.insert(key.clone(), engine);
-            }
-
-            let engine = cache.get_mut(&key).ok_or_else(|| {
-                pmetal_metal::error::MetalError::Internal(
-                    "CPU-hybrid engine cache missing freshly-built entry".to_string(),
-                )
-            })?;
-            engine.set_generation_params(config.max_tokens, config.eos_token_id);
-            f(engine)
-        },
-    )
 }
 
 /// Set the wired memory limit for Metal.
@@ -838,8 +770,8 @@ impl Sampler {
 }
 
 /// One generation's [`Sampler`] and [`DecodePenalties`], deciding tokens from
-/// logits an engine hands over on the host (the ANE and CPU-hybrid engines),
-/// so they are sampled and penalized as [`generate_cached`] samples and
+/// logits an engine hands over on the host (the ANE engine), so they are
+/// sampled and penalized as [`generate_cached`] samples and
 /// penalizes them on the GPU.
 ///
 /// Each call wraps the row as `[1, vocab]` f32 logits, samples it through
@@ -1614,24 +1546,6 @@ fn build_decode_metrics(step_ns: &[u128]) -> Option<pmetal_runtime::decode::Deco
 // ANE generation (Apple Neural Engine)
 // ============================================================================
 
-/// Generate text using the ANE hybrid inference engine (ANE prefill + CPU decode).
-///
-/// Loads model weights from SafeTensors on disk, compiles ANE kernels for the
-/// prompt length, and runs autoregressive generation with KV caching.
-///
-/// Returns a [`GenerationOutput`] compatible with the GPU generation functions.
-#[cfg(feature = "ane")]
-fn load_model_config_json(
-    model_path: &std::path::Path,
-) -> std::result::Result<serde_json::Value, pmetal_metal::error::MetalError> {
-    let config_text = std::fs::read_to_string(model_path.join("config.json")).map_err(|e| {
-        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to read config.json: {e}"))
-    })?;
-    serde_json::from_str(&config_text).map_err(|e| {
-        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to parse config.json: {e}"))
-    })
-}
-
 #[cfg(feature = "ane")]
 fn build_cached_generation_output(
     input_len: usize,
@@ -1732,200 +1646,6 @@ pub fn is_ane_inference_compatible(
     config_json: &serde_json::Value,
 ) -> std::result::Result<(), String> {
     pmetal_metal::ane::lm::check_supported(config_json)
-}
-
-/// Check if a model config is compatible with the CPU hybrid engine: a
-/// dense Qwen3.5-family text config whose every value the engine runs.
-#[cfg(feature = "ane")]
-pub fn is_hybrid_cpu_compatible(
-    config_json: &serde_json::Value,
-) -> std::result::Result<(), String> {
-    pmetal_metal::ane::inference_hybrid::is_hybrid_cpu_compatible(config_json)?;
-    hybrid_cpu_inference_config(config_json, 1)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
-/// The CPU hybrid engine's configuration for a Qwen3.5-family
-/// `config.json`, flat or nested under `text_config`.
-///
-/// The config is read through
-/// [`normalize_text_config`](pmetal_runtime::qwen3_native::family::normalize_text_config),
-/// as both GPU engines read it: transformers' defaults for absent keys, the
-/// outer `tie_word_embeddings`, `layer_types`, `rope_parameters` and the
-/// output gate resolved the same way, and anything it cannot run refused by
-/// name. Generation parameters are left at greedy defaults for the caller to
-/// set.
-#[cfg(feature = "ane")]
-pub fn hybrid_cpu_inference_config(
-    config_json: &serde_json::Value,
-    max_seq_len: usize,
-) -> std::result::Result<
-    pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
-    pmetal_metal::error::MetalError,
-> {
-    use pmetal_metal::ane::inference_hybrid::{GdnOutputGate, Qwen3NextInferenceConfig};
-    use pmetal_metal::error::MetalError;
-    use pmetal_runtime::qwen3_native::family::{
-        GdnGateActivation, gdn_qk_rms_norm_eps, normalize_text_config,
-    };
-
-    let text = normalize_text_config(config_json).map_err(MetalError::InvalidConfig)?;
-    let usize_of = |key: &str| -> std::result::Result<usize, MetalError> {
-        text.get(key)
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as usize)
-            .ok_or_else(|| {
-                MetalError::InvalidConfig(format!(
-                    "config key `{key}` must be a non-negative integer"
-                ))
-            })
-    };
-    let f32_of = |key: &str| -> std::result::Result<f32, MetalError> {
-        text.get(key)
-            .and_then(serde_json::Value::as_f64)
-            .map(|v| v as f32)
-            .ok_or_else(|| {
-                MetalError::InvalidConfig(format!("config key `{key}` must be a number"))
-            })
-    };
-
-    let num_experts = text
-        .get("num_experts")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    if num_experts > 0 {
-        return Err(MetalError::InvalidConfig(format!(
-            "the CPU hybrid engine has no MoE layers (num_experts = {num_experts})"
-        )));
-    }
-    if text["rope_parameters"]["rope_type"] != "default" {
-        return Err(MetalError::InvalidConfig(format!(
-            "the CPU hybrid engine runs plain RoPE only, not rope_type {}",
-            text["rope_parameters"]["rope_type"]
-        )));
-    }
-
-    let gdn_output_gate = match GdnGateActivation::resolve(text["output_gate_type"].as_str(), None)
-        .map_err(MetalError::InvalidConfig)?
-    {
-        GdnGateActivation::Silu => GdnOutputGate::Silu,
-        GdnGateActivation::Sigmoid => GdnOutputGate::Sigmoid,
-    };
-    let head_k_dim = usize_of("linear_key_head_dim")?;
-    let layer_types = text["layer_types"].as_array().map(|types| {
-        types
-            .iter()
-            .filter_map(|t| t.as_str().map(String::from))
-            .collect()
-    });
-
-    Ok(Qwen3NextInferenceConfig {
-        dim: usize_of("hidden_size")?,
-        hidden_dim: usize_of("intermediate_size")?,
-        n_heads: usize_of("num_attention_heads")?,
-        n_kv_heads: usize_of("num_key_value_heads")?,
-        head_dim: usize_of("head_dim")?,
-        n_layers: usize_of("num_hidden_layers")?,
-        vocab_size: usize_of("vocab_size")?,
-        max_seq_len,
-        rms_norm_eps: f32_of("rms_norm_eps")?,
-        rope_theta: f32_of("rope_theta")?,
-        partial_rotary_factor: f32_of("partial_rotary_factor")?,
-        num_v_heads: usize_of("linear_num_value_heads")?,
-        num_k_heads: usize_of("linear_num_key_heads")?,
-        head_k_dim,
-        head_v_dim: usize_of("linear_value_head_dim")?,
-        conv_kernel_size: usize_of("linear_conv_kernel_dim")?,
-        gdn_output_gate,
-        gdn_qk_norm_eps: gdn_qk_rms_norm_eps(head_k_dim as i32),
-        // `layer_types` is always present after normalization and governs;
-        // the interval is only its fallback inside the engine.
-        full_attention_interval: text
-            .get("full_attention_interval")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(4, |v| v as usize),
-        layer_types,
-        tie_word_embeddings: text["tie_word_embeddings"].as_bool().unwrap_or(false),
-        max_tokens: 0,
-        eos_token_id: None,
-    })
-}
-
-#[cfg(feature = "ane")]
-fn build_hybrid_cpu_inference_config(
-    model_path: &std::path::Path,
-    input_ids: &[u32],
-    gen_config: &GenerationConfig,
-) -> std::result::Result<
-    pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceConfig,
-    pmetal_metal::error::MetalError,
-> {
-    let config_json = load_model_config_json(model_path)?;
-    let mut config = hybrid_cpu_inference_config(
-        &config_json,
-        input_ids.len() + gen_config.max_new_tokens + 64,
-    )?;
-    config.max_tokens = gen_config.max_new_tokens;
-    config.eos_token_id = gen_config.stop_tokens.first().copied();
-    Ok(config)
-}
-
-/// Generate tokens using the CPU GEMV hybrid engine for Qwen3.5 models.
-///
-/// This path uses CPU-only inference with `cblas_sgemv` for all matrix-vector
-/// multiplies, eliminating GPU kernel launch overhead for batch=1 decode.
-/// GDN layers use O(1) linear recurrence; attention layers use standard KV cache.
-///
-/// Compatible with non-MoE Qwen3.5 models (e.g., 0.8B). Each token is sampled
-/// as [`generate_cached`] samples it ([`HostLogitsSampler`]).
-#[cfg(feature = "ane")]
-pub fn generate_cached_hybrid_cpu(
-    model_path: &std::path::Path,
-    input_ids: &[u32],
-    gen_config: &GenerationConfig,
-) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
-    generate_cached_hybrid_cpu_streaming(model_path, input_ids, gen_config, |_| true)
-}
-
-#[cfg(feature = "ane")]
-pub fn generate_cached_hybrid_cpu_streaming<F>(
-    model_path: &std::path::Path,
-    input_ids: &[u32],
-    gen_config: &GenerationConfig,
-    mut on_token: F,
-) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError>
-where
-    F: FnMut(u32) -> bool,
-{
-    let engine_config = build_hybrid_cpu_inference_config(model_path, input_ids, gen_config)?;
-    let stop_tokens = gen_config.stop_tokens.clone();
-    let prompt_len = input_ids.len();
-    let mut cancelled = false;
-    let mut saw_stop_token = false;
-    let mut sampler = HostLogitsSampler::new(gen_config, input_ids);
-
-    let token_ids = with_cached_hybrid_cpu_engine(model_path, engine_config, |engine| {
-        engine.generate_cached_streaming(input_ids, &mut sampler, |token| {
-            if stop_tokens.contains(&token) {
-                saw_stop_token = true;
-                return false;
-            }
-            if !on_token(token) {
-                cancelled = true;
-                return false;
-            }
-            true
-        })
-    });
-
-    Ok(build_cached_generation_output(
-        prompt_len,
-        token_ids?,
-        gen_config,
-        cancelled,
-        saw_stop_token,
-    ))
 }
 
 #[cfg(test)]

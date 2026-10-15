@@ -39,8 +39,7 @@ pmetal-metal/
 │       ├── dynamic_kernel.rs # Dynamic weight kernel generators (training)
 │       ├── dynamic_trainer.rs# Compile-once training loop
 │       ├── extend.rs         # Multi-layer prefill/decode/verify kernels over an IOSurface KV cache
-│       ├── lm.rs             # ANE text generation from a Hugging Face checkpoint
-│       └── inference_hybrid.rs # CPU decode engine for Qwen3.5 hybrid models
+│       └── lm.rs             # ANE text generation from a Hugging Face checkpoint
 ```
 
 ### ANE Dynamic Weight Pipeline

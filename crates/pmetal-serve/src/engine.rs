@@ -16,10 +16,7 @@ use pmetal_models::architectures::qwen3_5_vision::{Qwen3_5MultimodalConfig, Qwen
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
 use pmetal_models::model_thread::{Background, ModelThread, ModelThreadStartError};
-use pmetal_models::{
-    GenerationOutput, generate_cached_ane_streaming, generate_cached_hybrid_cpu_streaming,
-    is_ane_inference_compatible, is_hybrid_cpu_compatible,
-};
+use pmetal_models::{GenerationOutput, generate_cached_ane_streaming, is_ane_inference_compatible};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -137,7 +134,6 @@ struct DecodeRun {
 enum PreferredGenerationBackend {
     Gpu,
     Ane,
-    CpuHybrid,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,10 +271,6 @@ fn select_accelerated_backend(
 
     if !prefer_gpu_for_decode && is_ane_inference_compatible(config_json).is_ok() {
         return PreferredGenerationBackend::Ane;
-    }
-
-    if is_hybrid_cpu_compatible(config_json).is_ok() {
-        return PreferredGenerationBackend::CpuHybrid;
     }
 
     PreferredGenerationBackend::Gpu
@@ -466,7 +458,7 @@ pub struct InferenceEngine {
     vision: Vision,
     /// Model name/ID for API responses.
     model_id: String,
-    /// Resolved local model directory (used by ANE / CPU-hybrid backends).
+    /// Resolved local model directory (used by the ANE backend).
     model_path: std::path::PathBuf,
     /// Maximum sequence length for KV cache.
     max_seq_len: usize,
@@ -486,7 +478,7 @@ pub struct InferenceEngine {
     /// request to skip the prefill of any prompt prefix we've already
     /// processed. Empty for hybrid/recurrent models (they can't be
     /// safely snapshot-truncated) and for every request where the
-    /// engine is also running an accelerated ANE/CPU-hybrid backend.
+    /// engine is also running the ANE backend.
     /// Its entries are only touched on the model thread.
     prefix_cache: Arc<Mutex<crate::prefix_cache::ServePrefixCache>>,
     /// The continuous-batching pump while it is enabled (`None` by
@@ -1517,14 +1509,6 @@ impl InferenceEngine {
                     true
                 },
             ),
-            PreferredGenerationBackend::CpuHybrid => {
-                generate_cached_hybrid_cpu_streaming(model_path, input_ids, gen_config, |_| {
-                    if first_token_time_ms.is_none() {
-                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    true
-                })
-            }
             PreferredGenerationBackend::Gpu => unreachable!(),
         };
 
@@ -1593,25 +1577,6 @@ impl InferenceEngine {
                     true
                 },
             ),
-            PreferredGenerationBackend::CpuHybrid => {
-                generate_cached_hybrid_cpu_streaming(model_path, input_ids, gen_config, |token| {
-                    if first_token_time_ms.is_none() {
-                        first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-                    }
-                    completion_tokens += 1;
-                    if tx
-                        .blocking_send(TokenEvent::Token {
-                            id: token,
-                            logprob: None,
-                        })
-                        .is_err()
-                    {
-                        receiver_dropped = true;
-                        return false;
-                    }
-                    true
-                })
-            }
             PreferredGenerationBackend::Gpu => unreachable!(),
         };
 
@@ -2257,10 +2222,10 @@ impl InferenceEngine {
             media: prompt.media.clone(),
         };
 
-        // The accelerated ANE / CPU-hybrid engines keep their own models
-        // (the ANE ones on their own thread), so they run on the blocking
-        // pool. They can't collect logprobs, match raw-text stops or read
-        // media, and they hand the request back to the GPU when they fail.
+        // The accelerated ANE engine keeps its own models (on its own
+        // thread), so it runs on the blocking pool. It cannot collect
+        // logprobs, match raw-text stops or read media, and it hands the
+        // request back to the GPU when it fails.
         if request.logprobs_top_n.is_none()
             && request.stop_sequences.is_empty()
             && request.media.is_none()
@@ -2393,8 +2358,8 @@ impl InferenceEngine {
     /// Validates `params` before dispatching. If validation fails, sends a
     /// single `TokenEvent::Error` through the channel and returns immediately.
     ///
-    /// Queues the request on the model thread (or, for an accelerated ANE /
-    /// CPU-hybrid backend, runs it on the blocking pool) and returns the
+    /// Queues the request on the model thread (or, for the ANE backend, runs
+    /// it on the blocking pool) and returns the
     /// receiver end immediately so the route handler can start consuming
     /// events while generation proceeds in parallel.
     ///
@@ -2459,8 +2424,8 @@ impl InferenceEngine {
             on_gpu(tx);
             return rx;
         }
-        // The accelerated ANE / CPU-hybrid engines keep their own models, so
-        // they run on the blocking pool; a request they fail goes to the GPU.
+        // The accelerated ANE engine keeps its own models, so it runs on the
+        // blocking pool; a request it fails goes to the GPU.
         let backend = Arc::clone(&self.backend);
         let model_path = self.model_path.clone();
         let draft_path = self.ane_draft_path.clone();
@@ -2637,7 +2602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_accelerated_backend_prefers_cpu_hybrid_for_qwen3_next() {
+    fn test_select_accelerated_backend_keeps_qwen3_next_on_the_gpu() {
         let config = serde_json::json!({
             "model_type": "qwen3_next",
             "hidden_size": 1024,
@@ -2648,7 +2613,7 @@ mod tests {
         });
         assert_eq!(
             select_accelerated_backend(&config, true),
-            PreferredGenerationBackend::CpuHybrid
+            PreferredGenerationBackend::Gpu
         );
     }
 

@@ -714,46 +714,7 @@ pub(crate) async fn run_inference(
         #[cfg(not(feature = "ane"))]
         let ane_output: Option<GenerationOutput> = None;
 
-        #[cfg(feature = "ane")]
-        let cpu_hybrid_output: Option<GenerationOutput> = if ane_output.is_none() && ane {
-            match std::fs::read_to_string(model_path.join("config.json")) {
-                Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
-                    Ok(config_json) => {
-                        use pmetal_models::is_hybrid_cpu_compatible;
-                        match is_hybrid_cpu_compatible(&config_json) {
-                            Ok(()) => {
-                                tracing::info!("Attempting CPU GEMV hybrid engine");
-                                match pmetal_models::generate_cached_hybrid_cpu(
-                                    &model_path,
-                                    &input_ids,
-                                    &gen_config,
-                                ) {
-                                    Ok(output) => Some(output),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "CPU hybrid engine failed ({}), falling back to GPU",
-                                            e
-                                        );
-                                        None
-                                    }
-                                }
-                            }
-                            Err(_) => None,
-                        }
-                    }
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        #[cfg(not(feature = "ane"))]
-        let cpu_hybrid_output: Option<GenerationOutput> = None;
-
         if let Some(output) = ane_output {
-            output
-        } else if let Some(output) = cpu_hybrid_output {
             output
         } else {
             already_streamed = true;

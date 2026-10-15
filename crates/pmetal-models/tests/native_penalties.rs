@@ -9,9 +9,10 @@
 //! gpt-oss and Gemma 4. The repetition penalty covers the prompt as well as
 //! the output, as transformers' `RepetitionPenaltyLogitsProcessor` does.
 //!
-//! The CPU hybrid engine (`infer --ane` and serve's accelerated path on a
-//! dense Qwen3.5) ignored all three, and top-p and min-p with them: it now
-//! samples its host logits through the same sampler and penalties.
+//! The ANE engine (`infer --ane`) ignored all three, and top-p and min-p with
+//! them: it now samples its host logits through the same sampler and
+//! penalties, which the host-logits cases below check on the CPU against the
+//! GPU path.
 //!
 //! The model is the tiny Qwen3.5 checkpoint the parity suite ships. Its
 //! greedy decode repeats itself, so every penalty changes the tokens.
@@ -126,15 +127,41 @@ fn dynamic_pipelined(penalties: Penalties) -> Vec<u32> {
     out.token_ids[PROMPT.len()..].to_vec()
 }
 
-/// The CPU hybrid engine, which hands its logits to the sampler on the host.
+/// The dynamic model's logits read back to the host one row at a time and
+/// handed to a `HostLogitsSampler`, as the ANE engine hands over its own.
 #[cfg(feature = "ane")]
-fn cpu_hybrid(penalties: Penalties) -> Vec<u32> {
+fn host_logits(config: &GenerationConfig) -> Vec<u32> {
+    use pmetal_metal::ane::lm::TokenSampler;
+    use pmetal_models::generation::HostLogitsSampler;
+    use pmetal_runtime::compat::Dtype;
+    use pmetal_runtime::decode::{last_token_logits, prompt_tokens_to_input};
+
     let dir = checkpoint();
-    let out =
-        pmetal_models::generate_cached_hybrid_cpu(dir.path(), &PROMPT, &greedy_config(penalties))
-            .expect("generate");
-    pmetal_runtime::check_unobserved_error().expect("CPU hybrid decode: no bridge op failed");
-    out.token_ids[PROMPT.len()..].to_vec()
+    let mut model = DynamicModel::load(dir.path()).expect("checkpoint loads");
+    let mut cache = model.create_cache(PROMPT.len() + NEW_TOKENS + 8);
+    let mut mamba = model.create_mamba_cache();
+    let mut sampler = HostLogitsSampler::new(config, &PROMPT);
+    let mut feed = PROMPT.to_vec();
+    let mut out = Vec::new();
+    while out.len() < NEW_TOKENS {
+        let logits = model
+            .forward_with_hybrid_cache(
+                &prompt_tokens_to_input(&feed),
+                None,
+                Some(&mut cache),
+                mamba.as_mut(),
+            )
+            .expect("forward");
+        let row = last_token_logits(&logits).cast(Dtype::Float32);
+        row.eval();
+        let token = sampler
+            .sample(row.as_slice::<f32>())
+            .expect("host sampling");
+        out.push(token);
+        feed = vec![token];
+    }
+    pmetal_runtime::check_unobserved_error().expect("host-logits decode: no runtime op failed");
+    out
 }
 
 fn check(penalties: Penalties) {
@@ -153,9 +180,9 @@ fn check(penalties: Penalties) {
     );
     #[cfg(feature = "ane")]
     assert_eq!(
-        cpu_hybrid(penalties),
+        host_logits(&greedy_config(penalties)),
         want,
-        "CPU hybrid engine, {penalties:?}"
+        "host-side sampling, {penalties:?}"
     );
 }
 
@@ -165,7 +192,7 @@ fn unpenalized_greedy_decoding_agrees() {
     assert_eq!(native(NONE), want);
     assert_eq!(dynamic_pipelined(NONE), want);
     #[cfg(feature = "ane")]
-    assert_eq!(cpu_hybrid(NONE), want);
+    assert_eq!(host_logits(&greedy_config(NONE)), want);
 }
 
 #[test]
@@ -194,12 +221,12 @@ fn frequency_and_presence_penalties_are_applied_on_every_engine() {
     });
 }
 
-/// Sampling on the CPU hybrid engine is the GPU path's sampling: with a
-/// seed, the same temperature, top-k, top-p, min-p and penalties draw the
-/// same tokens from its host logits as `generate_cached` does on the GPU.
+/// Sampling a host-side logits row is the GPU path's sampling: with a seed,
+/// the same temperature, top-k, top-p, min-p and penalties draw the same
+/// tokens from the rows as `generate_cached` does on the GPU.
 #[cfg(feature = "ane")]
 #[test]
-fn seeded_sampling_matches_on_the_cpu_hybrid_engine() {
+fn seeded_sampling_matches_on_host_logits() {
     let config = GenerationConfig::sampling(NEW_TOKENS, 0.8)
         .with_top_k(40)
         .with_top_p(0.9)
@@ -219,9 +246,7 @@ fn seeded_sampling_matches_on_the_cpu_hybrid_engine() {
     )
     .expect("generate")
     .token_ids;
-    let got = pmetal_models::generate_cached_hybrid_cpu(dir.path(), &PROMPT, &config)
-        .expect("generate")
-        .token_ids;
-    pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
-    assert_eq!(got, want);
+    let got = host_logits(&config);
+    pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
+    assert_eq!(got, want[PROMPT.len()..]);
 }
