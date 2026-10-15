@@ -170,8 +170,17 @@ pub trait DFlashTarget {
     /// `kv_cache` arg.
     /// Such targets should also return a dummy cache from
     /// [`DFlashTarget::make_kv_cache`] that is never touched.
+    ///
+    /// A cache that can't give back all `n` tokens (a sliding window that
+    /// has already dropped them) is an error: the rejected tokens would stay
+    /// in it and every later token would attend to them.
     fn rollback_rejected(&mut self, kv_cache: &mut KVCache, n: usize) -> Result<(), Exception> {
-        kv_cache.rollback(n);
+        let removed = kv_cache.rollback(n);
+        if removed != n {
+            return Err(Exception::custom(format!(
+                "DFlash: the target's KV cache rolled back {removed} of {n} rejected tokens"
+            )));
+        }
         Ok(())
     }
 
