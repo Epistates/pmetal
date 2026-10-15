@@ -60,8 +60,9 @@ pub use distill::{DistillLossOutput, Distiller, DistillerBuilder, run_distillati
 pub use error::{DistillError, Result};
 pub use losses::{
     AttentionTransferLoss, DistillLoss, GkdLoss, GreedySampler, HiddenStateLoss, HingeRankingLoss,
-    JensenShannonLoss, JsdSkewedLoss, KlDivergenceLoss, LogisticRankingLoss, MseLoss,
-    OnPolicySampler, SkewKlLoss, SoftCrossEntropyLoss, TvdLoss, UniversalLogitLoss,
+    JensenShannonLoss, JsdSkewedLoss, KlDivergenceLoss, LogisticRankingLoss, MiniLlmLoss,
+    MiniLlmOutput, MseLoss, OnPolicySampler, SkewKlLoss, SoftCrossEntropyLoss, TvdLoss,
+    UniversalLogitLoss,
 };
 pub use offline::{LogitCache, LogitCompressor};
 pub use reasoning::RationaleLoss;
