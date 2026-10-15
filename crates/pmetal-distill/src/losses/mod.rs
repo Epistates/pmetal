@@ -40,7 +40,7 @@ mod tvd;
 mod universal_logit;
 
 pub use attention_transfer::AttentionTransferLoss;
-pub use gkd::{GkdLoss, GreedySampler, OnPolicySampler};
+pub use gkd::{GkdLoss, GreedySampler, OnPolicySampler, TemperatureSampler};
 pub use hidden_state::HiddenStateLoss;
 pub use hinge_ranking::HingeRankingLoss;
 pub use jensen_shannon::JensenShannonLoss;
