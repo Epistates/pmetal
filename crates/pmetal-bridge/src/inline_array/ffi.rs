@@ -879,6 +879,16 @@ bridge_extern! {
         reason: *mut *const std::ffi::c_char,
     ) -> i32;
 
+    // ── Cross-entropy statistics of existing logits ──
+    // 0 on success, 2 on an exception (error channel set).
+    pub(super) fn mlx_inline_ce_row_stats(
+        dst_lse: *mut RawBuf,
+        dst_target: *mut RawBuf,
+        dst_zsum: *mut RawBuf,
+        logits: *const RawBuf,
+        targets: *const RawBuf,
+    ) -> i32;
+
     // ── Gradient checkpointing ──
     // Wraps `forward_fn` with mlx::core::checkpoint() so that activations
     // are discarded after the forward pass and recomputed during backward.

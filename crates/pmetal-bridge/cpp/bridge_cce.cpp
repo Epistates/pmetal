@@ -906,6 +906,183 @@ const char* unsupported(const array& x, const array& w, const array* bias) {
   return nullptr;
 }
 
+// ── Cross-entropy over logits that already exist ─────────────────────────────
+//
+// A model without the fused head hands the loss its `[tokens, vocab]` logits.
+// What the loss needs of a row is three numbers, and a threadgroup per row
+// reads the row once for all of them, in f32 whatever the logits' dtype:
+//
+//   lse     the row's logsumexp (an online maximum and sum of exponentials)
+//   target  the logit at the row's label, read as it is stored
+//   zsum    the sum of the row's logits (label smoothing needs their mean)
+//
+// The loss is arithmetic on those [tokens] vectors, so label smoothing, the
+// z-loss and the ignore mask all stay in ordinary ops, and the one custom
+// gradient is the logits': `glse * softmax + gt * onehot + gzsum`, written
+// once, in the logits' dtype. Built from MLX ops instead, the same loss holds
+// an f32 copy of the logits and another of their gradient, and runs 2.5 times
+// as long.
+
+constexpr int kRowThreads = 256;
+
+// Inputs: z [N, V]; targets [N] (int32); dims {N, V}.
+// Outputs: lse, target, zsum, each [N] f32.
+const char* kRowStatsSource = R"METAL(
+  const int V = dims[1];
+  const int row = int(threadgroup_position_in_grid.x);
+  const uint tid = thread_index_in_threadgroup;
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  // `auto`: MLX passes an input of fewer than eight elements in constant
+  // memory, not device memory.
+  auto zr = z + size_t(row) * V;
+
+  float run_m = -INFINITY;
+  float run_s = 0.0f;
+  float run_sum = 0.0f;
+  for (int j = int(tid); j < V; j += ROW_THREADS) {
+    const float a = float(zr[j]);
+    run_sum += a;
+    if (a > run_m) {
+      run_s = run_s * fast::exp(run_m - a) + 1.0f;
+      run_m = a;
+    } else if (a > -INFINITY) {
+      run_s += fast::exp(a - run_m);
+    }
+  }
+
+  threadgroup float part_m[ROW_THREADS / 32];
+  threadgroup float part_s[ROW_THREADS / 32];
+  threadgroup float part_sum[ROW_THREADS / 32];
+  const float sg_m = simd_max(run_m);
+  const float sg_s = simd_sum(run_m > -INFINITY ? run_s * fast::exp(run_m - sg_m) : 0.0f);
+  const float sg_sum = simd_sum(run_sum);
+  if (lane == 0) {
+    part_m[sg] = sg_m;
+    part_s[sg] = sg_s;
+    part_sum[sg] = sg_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) {
+    const bool live = lane < ROW_THREADS / 32;
+    const float pm = live ? part_m[lane] : -INFINITY;
+    const float ps = live ? part_s[lane] : 0.0f;
+    const float pu = live ? part_sum[lane] : 0.0f;
+    const float m = simd_max(pm);
+    const float s = simd_sum(pm > -INFINITY ? ps * fast::exp(pm - m) : 0.0f);
+    const float u = simd_sum(pu);
+    if (lane == 0) {
+      const int t = targets[row];
+      lse[row] = m + log(s);
+      zsum[row] = u;
+      target[row] = (t >= 0 && t < V) ? float(zr[t]) : 0.0f;
+    }
+  }
+)METAL";
+
+// Inputs: z [N, V]; targets [N]; lse, glse, gt, gzsum [N] (f32: the rows'
+// logsumexp and the cotangents of the three statistics); dims {N, V}.
+// Output: dz [N, V] in z's dtype.
+const char* kRowGradSource = R"METAL(
+  const int V = dims[1];
+  const int row = int(threadgroup_position_in_grid.x);
+  const uint tid = thread_index_in_threadgroup;
+  auto zr = z + size_t(row) * V;
+  device TZ* dr = dz + size_t(row) * V;
+  const float l = lse[row];
+  const float g_lse = glse[row];
+  const float g_target = gt[row];
+  const float g_sum = gzsum[row];
+  const int t = targets[row];
+  for (int j = int(tid); j < V; j += ROW_THREADS) {
+    const float p = fast::exp(float(zr[j]) - l);
+    dr[j] = TZ(g_lse * p + g_sum + (j == t ? g_target : 0.0f));
+  }
+)METAL";
+
+mx::fast::CustomKernelFunction& row_stats_kernel() {
+  static auto kernel = mx::fast::metal_kernel(
+      "pmetal_ce_row_stats",
+      {"z", "targets", "dims"},
+      {"lse", "target", "zsum"},
+      kRowStatsSource,
+      "");
+  return kernel;
+}
+
+mx::fast::CustomKernelFunction& row_grad_kernel() {
+  static auto kernel = mx::fast::metal_kernel(
+      "pmetal_ce_row_grad",
+      {"z", "targets", "lse", "glse", "gt", "gzsum", "dims"},
+      {"dz"},
+      kRowGradSource,
+      "");
+  return kernel;
+}
+
+std::vector<std::pair<std::string, mx::fast::TemplateArg>> row_targs(const array& z) {
+  return {{"TZ", z.dtype()}, {"ROW_THREADS", kRowThreads}};
+}
+
+// [lse, target logit, sum of logits] per row of z [N, V].
+std::vector<array> row_stats(const array& z, const array& targets) {
+  const int N = z.shape(0);
+  const int V = z.shape(1);
+  const array dims = array({N, V}, mx::int32);
+  return row_stats_kernel()(
+      {z, targets, dims},
+      {{N}, {N}, {N}},
+      {mx::float32, mx::float32, mx::float32},
+      {N * kRowThreads, 1, 1},
+      {kRowThreads, 1, 1},
+      row_targs(z),
+      0.0f,
+      false,
+      {});
+}
+
+// The same statistics from MLX ops, for a device without Metal or a dtype the
+// kernels don't take. Differentiable as it is.
+std::vector<array> row_stats_ops(const array& z, const array& targets) {
+  const array zf = mx::astype(z, mx::float32);
+  const array idx = mx::expand_dims(targets, 1);
+  const array safe = mx::clip(idx, std::optional<array>(array(0)),
+                              std::optional<array>(array(z.shape(1) - 1)));
+  const array inside = mx::logical_and(mx::greater_equal(idx, array(0)),
+                                       mx::less(idx, array(z.shape(1))));
+  const array picked = mx::squeeze(mx::take_along_axis(zf, safe, 1), 1);
+  const array target = mx::where(mx::squeeze(inside, 1), picked, array(0.0f));
+  return {mx::logsumexp(zf, 1), target, mx::sum(zf, 1)};
+}
+
+// d/dz of `glse * lse + gt * z[target] + gzsum * sum(z)`.
+array row_grad(const array& z, const array& targets, const array& lse, const array& glse,
+               const array& gt, const array& gzsum, bool nested) {
+  const int N = z.shape(0);
+  const int V = z.shape(1);
+  if (nested) {
+    const array p = mx::exp(mx::subtract(mx::astype(z, mx::float32), mx::expand_dims(lse, 1)));
+    const array cols = mx::expand_dims(mx::arange(0, V, mx::int32), 0);
+    const array onehot = mx::astype(mx::equal(mx::expand_dims(targets, 1), cols), mx::float32);
+    const array d = mx::add(
+        mx::add(mx::multiply(mx::expand_dims(glse, 1), p),
+                mx::multiply(mx::expand_dims(gt, 1), onehot)),
+        mx::expand_dims(gzsum, 1));
+    return mx::astype(d, z.dtype());
+  }
+  const array dims = array({N, V}, mx::int32);
+  return row_grad_kernel()(
+      {z, targets, lse, glse, gt, gzsum, dims},
+      {{N, V}},
+      {z.dtype()},
+      {N * kRowThreads, 1, 1},
+      {kRowThreads, 1, 1},
+      row_targs(z),
+      0.0f,
+      false,
+      {})[0];
+}
+
 } // namespace
 
 extern "C" {
@@ -981,6 +1158,64 @@ int mlx_inline_cce_fused(mlx_inline_array* dst_lse, mlx_inline_array* dst_target
     pmetal_bridge_set_last_error("cce_fused", "unknown C++ exception");
     bridge_placeholder(dst_lse);
     bridge_placeholder(dst_target);
+    status = 2;
+  }
+  return status;
+}
+
+// Each row of `logits` [N, V]: its logsumexp, the logit at its target and the
+// sum of its logits, all f32 [N]. Differentiable with respect to the logits.
+// Returns 0, or 2 with the error on the channel.
+int mlx_inline_ce_row_stats(mlx_inline_array* dst_lse, mlx_inline_array* dst_target,
+                            mlx_inline_array* dst_zsum, const mlx_inline_array* logits,
+                            const mlx_inline_array* targets) {
+  int status = 0;
+  try {
+    const array& z = as_arr(logits);
+    if (z.ndim() != 2 || z.shape(0) == 0 || z.shape(1) == 0) {
+      throw std::invalid_argument("[ce_row_stats] logits must be a non-empty [tokens, vocab] matrix");
+    }
+    if (as_arr(targets).size() != static_cast<size_t>(z.shape(0))) {
+      throw std::invalid_argument(
+          "[ce_row_stats] " + std::to_string(as_arr(targets).size()) + " targets for " +
+          std::to_string(z.shape(0)) + " tokens");
+    }
+    const array t = mx::astype(as_arr(targets), mx::int32);
+    const auto kernel_dtype = [](mx::Dtype d) {
+      return d == mx::float32 || d == mx::float16 || d == mx::bfloat16;
+    };
+    std::vector<array> outs;
+    if (!mx::metal::is_available() || mx::default_device().type != mx::Device::gpu ||
+        !kernel_dtype(z.dtype())) {
+      outs = row_stats_ops(z, t);
+    } else {
+      auto fwd = [t](const std::vector<array>& primals) { return row_stats(primals[0], t); };
+      auto vjp = [t](const std::vector<array>& primals, const std::vector<array>& cotangents,
+                     const std::vector<array>& outputs) {
+        // A second derivative runs this backward inside a nested
+        // `value_and_grad`, and the Metal kernel has no VJP.
+        return std::vector<array>{row_grad(
+            primals[0], t, outputs[0], mx::astype(cotangents[0], mx::float32),
+            mx::astype(cotangents[1], mx::float32), mx::astype(cotangents[2], mx::float32),
+            pmetal_bridge_grad_depth() > 1)};
+      };
+      outs = mx::custom_vjp(fwd, vjp)({z});
+    }
+    new (dst_lse->buf) array(outs[0]);
+    new (dst_target->buf) array(outs[1]);
+    new (dst_zsum->buf) array(outs[2]);
+    pmetal_bridge_clear_error_internal();
+  } catch (const std::exception& e) {
+    pmetal_bridge_set_last_error("ce_row_stats", e.what());
+    bridge_placeholder(dst_lse);
+    bridge_placeholder(dst_target);
+    bridge_placeholder(dst_zsum);
+    status = 2;
+  } catch (...) {
+    pmetal_bridge_set_last_error("ce_row_stats", "unknown C++ exception");
+    bridge_placeholder(dst_lse);
+    bridge_placeholder(dst_target);
+    bridge_placeholder(dst_zsum);
     status = 2;
   }
   return status;

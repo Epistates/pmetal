@@ -207,10 +207,146 @@ pub fn recv_like(x: &InlineArray, from: i32, group: Option<&Group>) -> BridgeRes
     checked(|dst| unsafe { mlx_inline_distributed_recv_like(dst, &x.raw, from, group_ptr(group)) })
 }
 
+/// Bytes of gradients one collective carries by default: large enough that a
+/// ring over a fast link is bandwidth-bound, small enough to start sending
+/// before the last gradient is ready.
+pub const DEFAULT_BUCKET_BYTES: usize = 32 << 20;
+
+/// Average `grads` over `group` in place, as data-parallel training needs
+/// after each rank's backward pass.
+///
+/// The gradients stay on the device and the collectives stay lazy: they are
+/// flattened, packed into buckets of up to `bucket_bytes` (one dtype to a
+/// bucket, the dtype the gradients have, so each bucket is one `all_sum` over
+/// a single contiguous array rather than one per parameter), summed over the
+/// group, divided by its size and split back to their shapes. A group of one
+/// leaves the gradients as they are.
+pub fn average_gradients<K>(
+    grads: &mut std::collections::HashMap<K, InlineArray>,
+    group: Option<&Group>,
+    bucket_bytes: usize,
+) -> BridgeResult<()>
+where
+    K: Eq + std::hash::Hash + Ord + Clone,
+{
+    let size = group.map_or_else(|| Group::init(false).map(|g| g.size()), |g| Ok(g.size()))?;
+    if size <= 1 {
+        return Ok(());
+    }
+    average_gradients_with(grads, size, bucket_bytes, |bucket| all_sum(bucket, group))
+}
+
+/// [`average_gradients`] with the collective given: `reduce` sums a flat
+/// bucket over `size` ranks.
+fn average_gradients_with<K>(
+    grads: &mut std::collections::HashMap<K, InlineArray>,
+    size: i32,
+    bucket_bytes: usize,
+    reduce: impl Fn(&InlineArray) -> BridgeResult<InlineArray>,
+) -> BridgeResult<()>
+where
+    K: Eq + std::hash::Hash + Ord + Clone,
+{
+    // Every rank packs the same buckets in the same order: by dtype, then key.
+    let mut keys: Vec<K> = grads.keys().cloned().collect();
+    keys.sort();
+    let mut buckets: Vec<(i32, Vec<K>, usize)> = Vec::new();
+    for key in keys {
+        let grad = &grads[&key];
+        let dtype = grad.dtype_raw();
+        let bytes = grad.nbytes();
+        match buckets.last_mut() {
+            Some((d, members, held))
+                if *d == dtype && (*held == 0 || *held + bytes <= bucket_bytes) =>
+            {
+                members.push(key);
+                *held += bytes;
+            }
+            _ => buckets.push((dtype, vec![key], bytes)),
+        }
+    }
+
+    let mean = 1.0 / size as f32;
+    for (_, members, _) in buckets {
+        let flat: Vec<InlineArray> = members.iter().map(|k| grads[k].reshape(&[-1])).collect();
+        let packed = crate::compat::ops::concatenate_owned_axis(&flat, 0);
+        let averaged = reduce(&packed)?.mul_scalar(mean);
+        let mut offsets = Vec::with_capacity(members.len());
+        let mut at = 0;
+        for k in &members[..members.len() - 1] {
+            at += grads[k].size() as i32;
+            offsets.push(at);
+        }
+        let pieces = if offsets.is_empty() {
+            vec![averaged]
+        } else {
+            averaged.split(&offsets, 0)
+        };
+        for (k, piece) in members.iter().zip(pieces) {
+            let shape = grads[k].shape().to_vec();
+            grads.insert(k.clone(), piece.reshape(&shape));
+        }
+    }
+    check_last_error()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::check_unobserved_error;
+
+    /// Packing, summing and splitting returns every gradient to its own shape
+    /// and place, across dtypes and several buckets. Three ranks hold `g`, `2g`
+    /// and `3g`, so the sum is `6g` and the average `2g`.
+    #[test]
+    fn averaging_gradients_unpacks_every_bucket_to_its_parameter() {
+        use crate::compat::Dtype;
+        use std::collections::HashMap;
+        let f32_ = Dtype::Float32.as_i32();
+        let bf16 = Dtype::Bfloat16.as_i32();
+        let make = |values: &[f32], shape: &[i32], dtype: i32| {
+            InlineArray::from_f32_slice(values, shape).as_dtype(dtype)
+        };
+        let mut grads: HashMap<String, InlineArray> = HashMap::from([
+            (
+                "a".into(),
+                make(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3], f32_),
+            ),
+            ("b".into(), make(&[-1.0, 0.5], &[2], f32_)),
+            ("c".into(), make(&[8.0, 16.0], &[1, 2], bf16)),
+            ("d".into(), make(&[3.0], &[1], f32_)),
+        ]);
+        let want: Vec<(&str, Vec<f32>)> = vec![
+            ("a", vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]),
+            ("b", vec![-2.0, 1.0]),
+            ("c", vec![16.0, 32.0]),
+            ("d", vec![6.0]),
+        ];
+        // A bucket holds 24 bytes: `a` alone, then `b` with nothing after it
+        // (`c` is another dtype), and so on.
+        average_gradients_with(&mut grads, 3, 24, |bucket| Ok(bucket.mul_scalar(6.0)))
+            .expect("average");
+        for (key, values) in want {
+            let mut g = grads[key].as_dtype(f32_);
+            assert_eq!(g.to_f32_vec(values.len()).expect("eval"), values, "{key}");
+        }
+        assert_eq!(grads["a"].shape(), &[2, 3]);
+        assert_eq!(grads["c"].shape(), &[1, 2]);
+        assert_eq!(grads["c"].dtype(), Dtype::Bfloat16);
+        check_unobserved_error().expect("no bridge op failed");
+    }
+
+    #[test]
+    fn a_group_of_one_leaves_gradients_alone() {
+        let group = Group::init(false).expect("init");
+        let mut grads = std::collections::HashMap::from([(
+            "w".to_string(),
+            InlineArray::from_f32_slice(&[1.0, 2.0], &[2]),
+        )]);
+        average_gradients(&mut grads, Some(&group), DEFAULT_BUCKET_BYTES).expect("average");
+        let mut w = grads["w"].clone();
+        assert_eq!(w.to_f32_vec(2).expect("eval"), vec![1.0, 2.0]);
+    }
 
     /// A process launched without a distributed configuration is a group of
     /// one, and every collective hands back its input.

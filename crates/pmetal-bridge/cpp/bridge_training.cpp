@@ -202,9 +202,13 @@ void mlx_inline_minimum(mlx_inline_array* dst, const mlx_inline_array* a, const 
 
 // ── Training ops: activation ─────────────────────────────────────────────────
 
+// `max(x, 0)` with the zero in the input's dtype: an f32 zero would promote a
+// bf16 or f16 input to f32.
 void mlx_inline_relu(mlx_inline_array* dst, const mlx_inline_array* a) {
-    BRIDGE_TRY_DST("relu", dst,
-        new (dst->buf) array(mlx::core::maximum(as_arr(a), array(0.0f))));
+    BRIDGE_TRY_DST("relu", dst, {
+        const auto& x = as_arr(a);
+        new (dst->buf) array(mlx::core::maximum(x, array(0.0f, x.dtype())));
+    });
 }
 
 // Exact GELU, `x·Φ(x) = 0.5·x·(1 + erf(x/√2))`: MLX's `nn.gelu`, PyTorch's
@@ -641,12 +645,16 @@ void mlx_inline_irfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_ff
 
 // ── leaky_relu ────────────────────────────────────────────────────────────────
 
+// `x` where positive, `neg_slope * x` elsewhere, as `torch.nn.LeakyReLU`.
+// (`max(x, slope * x)` is that only for a slope of at most 1.) The constants
+// take the input's dtype, which the output keeps.
 void mlx_inline_leaky_relu(mlx_inline_array* dst, const mlx_inline_array* a, float neg_slope) {
     BRIDGE_TRY_DST("leaky_relu", dst, {
         const auto& x = as_arr(a);
-                new (dst->buf) array(mlx::core::maximum(
-                    mlx::core::multiply(x, array(neg_slope)),
-                    x));
+        new (dst->buf) array(mlx::core::where(
+            mlx::core::greater(x, array(0.0f, x.dtype())),
+            x,
+            mlx::core::multiply(x, array(neg_slope, x.dtype()))));
     });
 }
 
