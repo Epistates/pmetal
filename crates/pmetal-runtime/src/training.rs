@@ -92,6 +92,35 @@ impl CrossEntropy {
         self
     }
 
+    /// `labels` flattened, the labels to gather with (an ignored label is out
+    /// of the vocabulary, so it is replaced by 0), and the `[N]` f32 mask of
+    /// the tokens that count.
+    fn gather_labels_and_mask(&self, labels: &InlineArray) -> (InlineArray, InlineArray) {
+        let f32_ = Dtype::Float32.as_i32();
+        let flat_labels = labels.reshape(&[-1]);
+        let (gather_labels, valid) = match self.ignore_index {
+            Some(ignore) => {
+                let dtype = flat_labels.dtype_raw();
+                let ignore = InlineArray::from_int(ignore).as_dtype(dtype);
+                let zero = InlineArray::from_int(0).as_dtype(dtype);
+                let valid = flat_labels.not_equal(&ignore);
+                let safe = valid.where_cond(&flat_labels, &zero);
+                (safe, valid.as_dtype(f32_))
+            }
+            None => (
+                flat_labels.clone(),
+                InlineArray::ones(&[flat_labels.dim(0)], f32_),
+            ),
+        };
+        // MLX >= 0.32: label indices must never enter the grad trace.
+        (
+            gather_labels
+                .as_dtype(Dtype::Int32.as_i32())
+                .stop_gradient(),
+            valid,
+        )
+    }
+
     /// Each token's loss as a flat `[N]` f32 array, zero where ignored, and
     /// the `[N]` f32 mask of the tokens that count (1 where counted).
     ///
@@ -103,40 +132,61 @@ impl CrossEntropy {
         logits: &InlineArray,
         labels: &InlineArray,
     ) -> (InlineArray, InlineArray) {
-        let f32_ = Dtype::Float32.as_i32();
         let vocab = logits.dim(-1);
         let z = logits.reshape(&[-1, vocab]);
-        let flat_labels = labels.reshape(&[-1]);
+        let (targets, valid) = self.gather_labels_and_mask(labels);
+        let stats = logit_row_stats(&z, &targets);
+        (self.loss_from_row_stats(&stats, vocab, &valid), valid)
+    }
 
-        let (gather_labels, valid) = match self.ignore_index {
-            Some(ignore) => {
-                let dtype = flat_labels.dtype_raw();
-                let ignore = InlineArray::from_int(ignore).as_dtype(dtype);
-                let zero = InlineArray::from_int(0).as_dtype(dtype);
-                let valid = flat_labels.not_equal(&ignore);
-                // An ignored label is out of the vocabulary; never gather it.
-                let safe = valid.where_cond(&flat_labels, &zero);
-                (safe, valid.as_dtype(f32_))
-            }
-            None => (
-                flat_labels.clone(),
-                InlineArray::ones(&[flat_labels.dim(0)], f32_),
-            ),
-        };
+    /// [`per_token`](Self::per_token) for statistics computed elsewhere: a
+    /// fused head-and-loss kernel that never forms the logits produces each
+    /// row's `lse` and target logit (and the sum of the row, when smoothing),
+    /// and the loss is the same function of them.
+    ///
+    /// * `stats` - `[N]` rows; `logit_sum` is read only when the smoothing is
+    ///   not zero, and may be a placeholder otherwise
+    /// * `labels` - `[N]` integer labels, in the vocabulary or ignored
+    /// * `vocab` - the number of classes the rows sum over
+    pub fn per_token_from_row_stats(
+        &self,
+        stats: &LogitRowStats,
+        labels: &InlineArray,
+        vocab: i32,
+    ) -> (InlineArray, InlineArray) {
+        let (_, valid) = self.gather_labels_and_mask(labels);
+        (self.loss_from_row_stats(stats, vocab, &valid), valid)
+    }
 
-        // MLX >= 0.32: label indices must never enter the grad trace.
-        let targets = gather_labels
-            .as_dtype(Dtype::Int32.as_i32())
-            .stop_gradient();
+    /// [`mean`](Self::mean) for statistics computed elsewhere; see
+    /// [`per_token_from_row_stats`](Self::per_token_from_row_stats).
+    pub fn mean_from_row_stats(
+        &self,
+        stats: &LogitRowStats,
+        labels: &InlineArray,
+        vocab: i32,
+    ) -> InlineArray {
+        let (loss, valid) = self.per_token_from_row_stats(stats, labels, vocab);
+        loss.sum_all()
+            .divide(&valid.sum_all().maximum(&InlineArray::from_f32(1.0)))
+    }
+
+    /// The masked per-token loss: the one definition of
+    /// `(1 − ε)(lse − z_y) + ε(lse − mean z) + λ·lse²`.
+    fn loss_from_row_stats(
+        &self,
+        stats: &LogitRowStats,
+        vocab: i32,
+        valid: &InlineArray,
+    ) -> InlineArray {
         let LogitRowStats {
             lse,
             target_logit,
             logit_sum,
-        } = logit_row_stats(&z, &targets);
-
+        } = stats;
         let eps = self.label_smoothing;
         let mut loss = if eps == 0.0 {
-            lse.subtract(&target_logit)
+            lse.subtract(target_logit)
         } else {
             // (1 − ε)(lse − z_y) + ε(lse − mean z) = lse − (1 − ε)·z_y − ε·mean z
             lse.subtract(&target_logit.mul_scalar(1.0 - eps))
@@ -145,7 +195,7 @@ impl CrossEntropy {
         if self.z_loss != 0.0 {
             loss = loss.add(&lse.square().mul_scalar(self.z_loss));
         }
-        (loss.multiply(&valid), valid)
+        loss.multiply(valid)
     }
 
     /// The summed loss over the counted tokens and how many there are, both

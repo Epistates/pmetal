@@ -11,10 +11,10 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Once;
 
-use pmetal_core::{PMetalError, Result};
+use pmetal_core::Result;
 
 use super::format::{Conversation, Example};
-use crate::chat_templates::{ChatTemplate, Message};
+use crate::chat_templates::{ChatTemplate, Message, tokens_inside};
 use crate::tokenizer::Tokenizer;
 
 use super::IGNORE_INDEX;
@@ -155,16 +155,19 @@ fn render_chat(
 
 /// Render through the chat template.
 ///
-/// The template reports where the *last* message's text begins
-/// ([`FormattedChat::response_start`](crate::chat_templates::FormattedChat)),
-/// so assistant turn `i` is found by rendering the conversation up to it: its
-/// text runs from there to the end of that rendering. That holds in the full
-/// conversation only if the rendering is a prefix of it. A template that
-/// rewrites earlier turns (Qwen3's drops the reasoning of turns before the
-/// last question) breaks that, and the turn's bytes in the full text cannot
-/// be told from guesses; rather than train on guesses or lose the turn, it is
-/// rendered as a sample of its own, the conversation up to it, which is how
-/// the template renders it when asked to generate it.
+/// The template finds where the model's own words sit in a conversation
+/// ([`FormattedChat::response_spans`](crate::chat_templates::FormattedChat):
+/// one per assistant turn it writes the same whatever follows it, with
+/// `response_turns` saying which turns those are). The conversation is
+/// rendered up to its last assistant turn (a trailing user turn the model
+/// never answers adds nothing to train on) and the spans of the turns the loss
+/// covers are kept.
+///
+/// A turn the template writes differently in context than as the turn being
+/// answered (Qwen3 drops the reasoning of the turns before the last question)
+/// has no span in that rendering. Rather than train on a guess or lose it, it
+/// is rendered as a sample of its own: the conversation up to that turn,
+/// whose final span is how the template writes it for generation.
 fn render_templated(
     conversation: &Conversation,
     template: &ChatTemplate,
@@ -172,16 +175,25 @@ fn render_templated(
 ) -> Vec<TextSample> {
     let tools = (!conversation.tools.is_empty()).then_some(conversation.tools.as_slice());
     let messages = &conversation.messages;
-    let full = template.apply_with_tools(messages, tools);
+    let Some(last) = messages.iter().rposition(|m| m.role == "assistant") else {
+        // Nothing the model says: a sample with nothing to train on, which
+        // loading drops.
+        let text = template.apply_with_tools(messages, tools).text;
+        return vec![TextSample::with_spans(text, Vec::new(), true)];
+    };
+    let full = template.apply_with_tools(&messages[..=last], tools);
 
     let mut spans: Vec<Range<usize>> = Vec::with_capacity(trained.len());
     let mut separate: Vec<TextSample> = Vec::new();
     for &i in trained {
-        let (start, end) = if i + 1 == messages.len() {
-            (full.response_start, full.text.len())
-        } else {
-            let upto = template.apply_with_tools(&messages[..=i], tools);
-            if !full.text.starts_with(&upto.text) {
+        let located = full
+            .response_turns
+            .iter()
+            .position(|&turn| turn == i)
+            .map(|at| full.response_spans[at].clone());
+        match located {
+            Some(span) => spans.push(span),
+            None => {
                 static NOTE: Once = Once::new();
                 NOTE.call_once(|| {
                     tracing::info!(
@@ -190,20 +202,14 @@ fn render_templated(
                          its own (train on the last turn only to avoid the extra samples)"
                     );
                 });
-                if upto.response_start < upto.text.len()
-                    && upto.text.is_char_boundary(upto.response_start)
-                {
-                    let span = upto.response_start..upto.text.len();
-                    separate.push(TextSample::with_spans(upto.text, vec![span], true));
+                let alone = template.apply_with_tools(&messages[..=i], tools);
+                if let Some(span) = alone.response_spans.last().cloned() {
+                    separate.push(TextSample::with_spans(alone.text, vec![span], true));
                 }
-                continue;
             }
-            (upto.response_start, upto.text.len())
-        };
-        if start < end && full.text.is_char_boundary(start) {
-            spans.push(start..end);
         }
     }
+    spans.sort_by_key(|s| s.start);
     let mut samples = Vec::with_capacity(1 + separate.len());
     if !spans.is_empty() || separate.is_empty() {
         samples.push(TextSample::with_spans(full.text, spans, true));
@@ -246,31 +252,6 @@ fn render_plain(messages: &[Message], trained: &[usize]) -> TextSample {
     TextSample::with_spans(text, spans, false)
 }
 
-/// Render `messages` through `template` and tokenize them: the ids and the
-/// labels (unshifted; [`IGNORE_INDEX`] outside the assistant turns `loss`
-/// names), cut to `max_length`.
-pub(crate) fn tokenize_messages(
-    messages: &[Message],
-    template: &ChatTemplate,
-    tokenizer: &Tokenizer,
-    max_length: usize,
-    loss: AssistantLoss,
-) -> Result<(Vec<u32>, Vec<i64>)> {
-    let conversation = Conversation {
-        messages: messages.to_vec(),
-        tools: Vec::new(),
-        trained: vec![None; messages.len()],
-    };
-    // The first sample holds the turns the template lets us locate in place:
-    // all of them under `LastTurn`, which is what this is for.
-    let sample = render_chat(&conversation, Some(template), loss)
-        .into_iter()
-        .next()
-        .ok_or_else(|| PMetalError::InvalidArgument("a conversation with no messages".into()))?;
-    let tokenized = tokenize(tokenizer, &sample, max_length)?;
-    Ok((tokenized.input_ids, tokenized.labels))
-}
-
 /// A tokenized sample.
 #[derive(Debug, Clone)]
 pub(crate) struct Tokenized {
@@ -292,12 +273,12 @@ impl Tokenized {
 /// Tokenize `sample`, label the tokens its trained spans cover, and cut to
 /// `max_length`.
 ///
-/// A token carries loss when it *starts* inside a trained span. (A token
-/// that starts in the prompt and runs into the answer belongs to the prompt:
-/// training on it would teach the model to produce text the prompt contains.)
-/// Tokens the tokenizer adds that stand for no text (a BOS, an appended EOS)
-/// follow the token before them, so a BOS is never trained and the EOS after a
-/// trained answer is.
+/// A token carries loss when it lies wholly inside a trained span
+/// ([`tokens_inside`], the rule conversations use too: a token that starts in
+/// the prompt and runs into the answer belongs to the prompt, since training
+/// on it would teach the model to produce text the prompt contains). A token
+/// the tokenizer adds that stands for no text follows the token before it, so
+/// a BOS is never trained and an EOS appended after a trained answer is.
 ///
 /// Text that was not rendered by a chat template is encoded with the
 /// tokenizer's special tokens (BOS and so on) and given an end-of-sequence
@@ -307,12 +288,8 @@ pub(crate) fn tokenize(
     sample: &TextSample,
     max_length: usize,
 ) -> Result<Tokenized> {
-    let encoding = tokenizer
-        .inner()
-        .encode(sample.text.as_str(), !sample.templated)
-        .map_err(|e| PMetalError::Tokenizer(e.to_string()))?;
-    let mut ids = encoding.get_ids().to_vec();
-    let mut offsets = encoding.get_offsets().to_vec();
+    let encoded = tokenizer.encode_with_offsets(&sample.text, !sample.templated)?;
+    let (mut ids, mut offsets) = (encoded.ids, encoded.offsets);
 
     if !sample.templated {
         if let Some(eos) = tokenizer.eos_token_id() {
@@ -325,19 +302,21 @@ pub(crate) fn tokenize(
 
     let original_len = ids.len();
     ids.truncate(max_length);
+    offsets.truncate(max_length);
 
     let labels = match sample.spans() {
         None => ids.iter().map(|&id| i64::from(id)).collect(),
         Some(spans) => {
-            let mut carries = false;
+            let mut trained = tokens_inside(&spans, &offsets);
+            // Tokens that cover no text follow the one before them.
+            for i in 1..trained.len() {
+                if offsets[i].0 == offsets[i].1 {
+                    trained[i] = trained[i - 1];
+                }
+            }
             ids.iter()
-                .zip(&offsets)
-                .map(|(&id, &(start, end))| {
-                    if end > start {
-                        carries = spans.iter().any(|s| s.start <= start && start < s.end);
-                    }
-                    if carries { i64::from(id) } else { IGNORE_INDEX }
-                })
+                .zip(&trained)
+                .map(|(&id, &train)| if train { i64::from(id) } else { IGNORE_INDEX })
                 .collect()
         }
     };

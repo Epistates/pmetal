@@ -1,22 +1,21 @@
-//! Fused attention kernel using MLX's fast SDPA.
+//! Scaled dot-product attention for the model forwards.
 //!
-//! This module wraps MLX's `scaled_dot_product_attention` which provides:
-//! - Metal-optimized kernels for single-token generation (query_seq_len = 1)
-//! - Native support for GQA/MQA without manual K/V head expansion
-//! - Memory-efficient attention computation
-//! - Automatic float32 softmax precision for numerical stability
+//! Plain attention, with any mask, is MLX's fused kernel, which also serves
+//! attention under autograd, so one path covers inference and training
+//! (`pmetal-runtime`'s `sdpa`). Attention sinks (gpt-oss) are the runtime's
+//! `sdpa_with_sinks`. Logit softcapping (Gemma 2) has no fused kernel and is
+//! computed from ops, with the scores held in f32.
 //!
-//! Performance Benefits:
-//! - 30-50% faster than manual SDPA for single-token inference
-//! - Reduced memory bandwidth by avoiding intermediate tensor materialization
-//! - Native GQA support eliminates expand_kv_heads overhead
+//! A hand-written Metal attention kernel used to sit in front of MLX's; it was
+//! slower than MLX at every prefill length measured (2.4x to 2.6x at 512 to
+//! 8192 tokens), wrong for odd lengths, aligned its causal mask to the
+//! top-left instead of MLX's bottom-right for a query shorter than its keys,
+//! and could not be differentiated, so it was removed.
 //!
-//! MLX's kernels are also what attention runs on under autograd, so one path
-//! serves inference and training. A hand-written Metal attention kernel used to
-//! sit in front of it; it was slower than MLX at every prefill length measured
-//! (2.4x to 2.6x at 512 to 8192 tokens), wrong for odd lengths, aligned its
-//! causal mask to the top-left instead of MLX's bottom-right for a query
-//! shorter than its keys, and could not be differentiated, so it was removed.
+//! Masks are additive: `0` where a query may attend and `-inf` where it may
+//! not; a boolean mask is true where it may. The causal mask and the sliding window are aligned to the bottom
+//! right, so a query shorter than its keys (the continuation of a cached
+//! prompt, or one decoded token) sees the most recent keys.
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
@@ -40,9 +39,6 @@ pub struct FusedAttentionConfig {
     pub num_kv_heads: i32,
     /// Head dimension (key/query dimension used for scoring).
     pub head_dim: i32,
-    /// Value head dimension. When `None`, defaults to `head_dim`.
-    /// Set this for architectures with asymmetric K/V dimensions (e.g. DeepSeek MLA).
-    pub value_head_dim: Option<i32>,
     /// Softmax scaling factor (default: 1/sqrt(head_dim)).
     pub scale: f32,
     /// Mask type.
@@ -58,30 +54,10 @@ impl FusedAttentionConfig {
             num_heads,
             num_kv_heads,
             head_dim,
-            value_head_dim: None,
             scale: 1.0 / (head_dim as f32).sqrt(),
             mask_type: AttentionMaskType::Causal,
             logit_softcapping: None,
         }
-    }
-
-    /// Set a distinct value head dimension (for architectures like DeepSeek MLA
-    /// where value projections have different width than key/query projections).
-    pub fn with_value_head_dim(mut self, value_head_dim: i32) -> Self {
-        self.value_head_dim = Some(value_head_dim);
-        self
-    }
-
-    /// Effective value head dimension (falls back to `head_dim` when unset).
-    #[must_use]
-    pub fn effective_value_head_dim(&self) -> i32 {
-        self.value_head_dim.unwrap_or(self.head_dim)
-    }
-
-    /// Whether key and value head dimensions differ.
-    #[must_use]
-    pub fn is_asymmetric(&self) -> bool {
-        self.value_head_dim.is_some_and(|v| v != self.head_dim)
     }
 
     /// Set custom scaling factor.
@@ -101,39 +77,86 @@ impl FusedAttentionConfig {
         self.logit_softcapping = Some(cap);
         self
     }
+}
 
-    /// Check if this is grouped-query attention.
-    #[must_use]
-    pub fn is_gqa(&self) -> bool {
-        self.num_kv_heads < self.num_heads
-    }
+/// How a call tells the kernel which keys each query sees: a mode MLX
+/// understands (`"causal"`, or `""` for no mask) and, in place of it, an
+/// additive array.
+struct Masking {
+    mode: &'static str,
+    array: Option<Array>,
+}
 
-    /// Get number of query heads per KV head.
-    #[must_use]
-    pub fn num_groups(&self) -> i32 {
-        self.num_heads / self.num_kv_heads
+impl Masking {
+    /// The custom mask if the caller gave one, else what the configuration's
+    /// mask type asks for.
+    ///
+    /// MLX requires the additive mask to promote to the attention output
+    /// dtype, so an f32 mask against a bf16 model is a hard error, not a
+    /// silent upcast. Mask builders (`create_causal_mask` and friends) all
+    /// produce f32 regardless of the model, so the mask is coerced here, at
+    /// the one point every architecture funnels through, rather than in each
+    /// of them. A thrown op returns a placeholder that broadcasts through the
+    /// layer, so the failure would not even be loud.
+    fn resolve(
+        config: &FusedAttentionConfig,
+        custom_mask: Option<&Array>,
+        queries: &Array,
+        keys: &Array,
+    ) -> Result<Self, Exception> {
+        let dtype = queries.dtype().as_i32();
+        if let Some(mask) = custom_mask {
+            // A boolean mask (true = may attend) is MLX's own and passes
+            // through; coerced it would read as the additive values 0 and 1.
+            let keep = matches!(mask.dtype(), Dtype::Bool) || mask.dtype() == queries.dtype();
+            return Ok(Self {
+                mode: "",
+                array: Some(if keep {
+                    mask.clone()
+                } else {
+                    mask.as_dtype(dtype)
+                }),
+            });
+        }
+        Ok(match config.mask_type {
+            AttentionMaskType::None => Self {
+                mode: "",
+                array: None,
+            },
+            AttentionMaskType::Causal => Self {
+                mode: "causal",
+                array: None,
+            },
+            AttentionMaskType::SlidingWindow(window) => Self {
+                mode: "",
+                array: Some(
+                    create_sliding_window_mask(queries.dim(2), keys.dim(2), window)?
+                        .as_dtype(dtype),
+                ),
+            },
+        })
     }
 }
 
 /// Fused scaled dot-product attention.
 ///
-/// Computes: softmax(Q @ K.T / sqrt(d_k) + mask) @ V
+/// Computes: softmax(Q @ K.T * scale + mask) @ V
 ///
-/// Uses MLX's optimized Metal kernels for maximum performance.
+/// Uses MLX's optimized Metal kernels for maximum performance. A custom mask
+/// replaces the configuration's mask type. With
+/// [`logit_softcapping`](FusedAttentionConfig::logit_softcapping) the scores
+/// are `cap · tanh(scores / cap)` before the mask and the softmax, which no
+/// fused kernel does; that path forms the `[query, key]` scores in f32.
 ///
 /// # Arguments
 /// * `queries` - Query tensor [batch, n_heads, seq_len, head_dim]
 /// * `keys` - Key tensor [batch, n_kv_heads, seq_len, head_dim] (NOT pre-expanded for GQA)
-/// * `values` - Value tensor [batch, n_kv_heads, seq_len, head_dim] (NOT pre-expanded for GQA)
+/// * `values` - Value tensor [batch, n_kv_heads, seq_len, value_dim] (NOT pre-expanded for GQA)
 /// * `config` - Attention configuration
-/// * `custom_mask` - Optional custom attention mask [batch?, 1?, seq_len, seq_len]
+/// * `custom_mask` - Optional attention mask [batch?, 1?, seq_len, seq_len]: additive, or boolean with true where a query may attend
 ///
 /// # Returns
-/// Attention output [batch, n_heads, seq_len, head_dim]
-///
-/// # Note
-/// For GQA/MQA, pass K/V tensors with their native number of heads.
-/// The fused kernel handles head repetition internally, avoiding memory overhead.
+/// Attention output [batch, n_heads, seq_len, value_dim], in the queries' dtype
 pub fn fused_sdpa(
     queries: &Array,
     keys: &Array,
@@ -141,149 +164,117 @@ pub fn fused_sdpa(
     config: &FusedAttentionConfig,
     custom_mask: Option<&Array>,
 ) -> Result<Array, Exception> {
-    // MLX requires the additive mask to promote to the attention output dtype,
-    // so an f32 mask against a bf16 model is a hard error — not a silent
-    // upcast. Mask builders (`create_causal_mask` and friends) all produce f32
-    // regardless of the model, so coerce here, at the one point every
-    // architecture funnels through, rather than in each of them.
-    let coerced_mask = custom_mask.and_then(|mask| {
-        (mask.dtype() != queries.dtype()).then(|| mask.as_dtype(queries.dtype().as_i32()))
-    });
-    let custom_mask = coerced_mask.as_ref().or(custom_mask);
-
-    // Apply logit softcapping if configured (Gemma2 style)
-    // This requires pre/post processing around attention
+    let masking = Masking::resolve(config, custom_mask, queries, keys)?;
     if let Some(cap) = config.logit_softcapping {
-        return manual_sdpa_with_softcapping(queries, keys, values, config, custom_mask, cap);
+        return softcapped_sdpa(queries, keys, values, config.scale, cap, &masking);
     }
-
-    fast_fused_sdpa(queries, keys, values, config, custom_mask)
+    Ok(match &masking.array {
+        Some(mask) => queries.sdpa_with_mask(keys, values, config.scale, Some(mask)),
+        None => queries.sdpa(keys, values, config.scale, masking.mode),
+    })
 }
 
-fn fast_fused_sdpa(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    custom_mask: Option<&Array>,
-) -> Result<Array, Exception> {
-    // Determine mask to use
-    match (&config.mask_type, custom_mask) {
-        // Custom mask provided - use it directly
-        (_, Some(mask)) => Ok(queries.sdpa_with_mask(keys, values, config.scale, Some(mask))),
-
-        // Causal masking - use MLX's built-in causal mask
-        (AttentionMaskType::Causal, None) => Ok(queries.sdpa(keys, values, config.scale, "causal")),
-
-        // No mask (bidirectional attention) — MLX accepts "" for no mask, not "none"
-        (AttentionMaskType::None, None) => Ok(queries.sdpa(keys, values, config.scale, "")),
-
-        // Sliding window - create custom mask
-        (AttentionMaskType::SlidingWindow(window_size), None) => {
-            let query_len = queries.dim(2);
-            let key_len = keys.dim(2);
-            // Build it in the query's dtype. MLX rejects a mask that does not
-            // promote to the output type rather than upcasting, so the f32
-            // builder threw on every bf16 model — and a thrown bridge op
-            // returns a 0-dim array that broadcasts on through the layer
-            // instead of failing. `fused_sdpa` coerces the *caller's* mask for
-            // exactly this reason; a mask built in here needs the same care.
-            let mask = create_sliding_window_mask(query_len, key_len, *window_size)?
-                .as_dtype(queries.dtype().as_i32());
-            Ok(queries.sdpa_with_mask(keys, values, config.scale, Some(&mask)))
-        }
-    }
-}
-
-/// Fused SDPA with attention logit softcapping (Gemma2 style).
+/// Attention with logit softcapping (Gemma 2): the scores `scale · Q Kᵀ` go
+/// through `cap · tanh(scores / cap)` before the mask and the softmax.
 ///
-/// Applies: scores = cap * tanh(scores / cap) before softmax
-fn manual_sdpa_with_softcapping(
+/// MLX's fused kernel has no hook between the scores and the softmax, so this
+/// builds them from ops, and holds them in f32: a bf16 score of 40 is only
+/// good to 0.1, which the softmax turns into a 10% error in a weight. Grouped
+/// heads share their keys and values by broadcasting a group axis in the
+/// batched matmul, so neither is copied per query head.
+fn softcapped_sdpa(
     queries: &Array,
     keys: &Array,
     values: &Array,
-    config: &FusedAttentionConfig,
-    custom_mask: Option<&Array>,
+    scale: f32,
     cap: f32,
+    masking: &Masking,
 ) -> Result<Array, Exception> {
-    // Unfortunately, MLX's fused SDPA doesn't support logit softcapping.
-    // We need to manually compute attention with softcapping.
-    // Still benefit from proper GQA handling.
+    let f32_ = Dtype::Float32.as_i32();
+    let (batch, heads, q_len, width) = (
+        queries.dim(0),
+        queries.dim(1),
+        queries.dim(2),
+        queries.dim(3),
+    );
+    let (kv_heads, k_len) = (keys.dim(1), keys.dim(2));
+    if kv_heads == 0 || heads % kv_heads != 0 {
+        return Err(Exception::custom(format!(
+            "softcapped attention: {heads} query heads over {kv_heads} key heads"
+        )));
+    }
+    let group = heads / kv_heads;
 
-    let shape = queries.shape();
-    let batch = shape[0];
-    let n_heads = shape[1];
-    let q_seq_len = shape[2];
+    // [B, Hk, G, Lq, D] against [B, Hk, 1, D, Lk]: the group axis broadcasts.
+    let q = queries
+        .as_dtype(f32_)
+        .reshape(&[batch, kv_heads, group, q_len, width]);
+    let k_t = keys
+        .as_dtype(f32_)
+        .reshape(&[batch, kv_heads, 1, k_len, width])
+        .transpose_axes(&[0, 1, 2, 4, 3]);
+    let mut scores = q.matmul(&k_t).multiply(&Array::from_f32(scale));
 
-    let k_shape = keys.shape();
-    let n_kv_heads = k_shape[1];
-    let kv_seq_len = k_shape[2];
+    // `tanh` the primitive: expanded as (exp(2x) - 1) / (exp(2x) + 1) it
+    // overflows to inf / inf = NaN once x / cap passes about 44, and softcapping
+    // exists to tame outlier scores, not to blow up on them.
+    let cap = Array::from_f32(cap);
+    scores = ops::tanh(&scores.divide(&cap)).multiply(&cap);
 
-    // Expand K/V for GQA if needed
-    let (keys, values) = if n_kv_heads < n_heads {
-        let repeats = n_heads / n_kv_heads;
-        (
-            expand_kv_heads(keys, repeats)?,
-            expand_kv_heads(values, repeats)?,
-        )
-    } else {
-        (keys.clone(), values.clone())
-    };
-
-    // Q @ K.T
-    let keys_t = keys.transpose_axes(&[0, 1, 3, 2]);
-    let scores = queries.matmul(&keys_t);
-
-    // Scale
-    let scale_arr = Array::from_f32(config.scale);
-    let scores = scores.multiply(&scale_arr);
-
-    // Apply softcapping: cap * tanh(scores / cap).
-    //
-    // Uses the `tanh` primitive rather than expanding it as
-    // `(exp(2x) - 1) / (exp(2x) + 1)`, which overflows to `inf/inf = NaN` once
-    // `scores / cap` exceeds ~44 — the same defect that made the Gemma GELU
-    // produce NaN. Softcapping exists precisely to tame outlier logits, so it
-    // must not itself blow up on them.
-    let cap_arr = Array::from_f32(cap);
-    let scores = pmetal_runtime::compat::ops::tanh(&scores.divide(&cap_arr));
-    let scores = scores.multiply(&cap_arr);
-
-    // Apply mask
-    let scores = match (&config.mask_type, custom_mask) {
-        (_, Some(mask)) => scores.add(mask),
-        (AttentionMaskType::Causal, None) => {
-            let mask = create_causal_mask(q_seq_len, kv_seq_len)?;
-            scores.add(&mask)
+    let mask = match (&masking.array, masking.mode) {
+        (Some(mask), _) if mask.dtype() == Dtype::Bool => {
+            Some(mask.where_cond(&Array::from_f32(0.0), &Array::from_f32(f32::NEG_INFINITY)))
         }
-        (AttentionMaskType::SlidingWindow(window_size), None) => {
-            let mask = create_sliding_window_mask(q_seq_len, kv_seq_len, *window_size)?;
-            scores.add(&mask)
-        }
-        (AttentionMaskType::None, None) => scores,
+        (Some(mask), _) => Some(mask.as_dtype(f32_)),
+        (None, "causal") => Some(create_causal_mask(q_len, k_len)?),
+        _ => None,
     };
+    if let Some(mask) = mask {
+        scores = scores.add(&group_mask(&mask, batch, kv_heads, group, q_len, k_len)?);
+    }
 
-    // Softmax
-    let weights = scores.softmax(-1);
+    let weights = scores.softmax(-1).as_dtype(values.dtype().as_i32());
+    let values = values.reshape(&[batch, kv_heads, 1, k_len, values.dim(3)]);
+    let out = weights.matmul(&values); // [B, Hk, G, Lq, Dv]
+    Ok(out
+        .reshape(&[batch, heads, q_len, values.dim(4)])
+        .as_dtype(queries.dtype().as_i32()))
+}
 
-    // Attention output: weights @ V
-    let output = weights.matmul(&values);
-
-    // Verify output shape — output uses value dimension, not key dimension
-    let v_head_dim = values.dim(3);
-    debug_assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, v_head_dim]);
-
-    Ok(output)
+/// An additive mask `[Lq, Lk]`, `[1 | B, 1, Lq, Lk]` or `[1 | B, H, Lq, Lk]`
+/// laid out against scores of shape `[B, Hk, G, Lq, Lk]`.
+fn group_mask(
+    mask: &Array,
+    batch: i32,
+    kv_heads: i32,
+    group: i32,
+    q_len: i32,
+    k_len: i32,
+) -> Result<Array, Exception> {
+    match mask.ndim() {
+        2 => Ok(mask.reshape(&[1, 1, 1, q_len, k_len])),
+        4 if mask.dim(1) == 1 => Ok(mask.reshape(&[mask.dim(0), 1, 1, q_len, k_len])),
+        4 if mask.dim(1) == kv_heads * group => {
+            Ok(mask.reshape(&[mask.dim(0), kv_heads, group, q_len, k_len]))
+        }
+        _ => Err(Exception::custom(format!(
+            "softcapped attention: a mask of shape {:?} does not fit scores of {} x {} x {} x {} x {}",
+            mask.shape(),
+            batch,
+            kv_heads,
+            group,
+            q_len,
+            k_len
+        ))),
+    }
 }
 
 /// Scaled dot-product attention with **attention sinks** (GPT-OSS).
 ///
-/// MLX's fused kernel (and this crate's bridge SDPA) have no `sinks` parameter,
-/// so this mirrors `mx.fast.scaled_dot_product_attention(..., sinks=sinks)`
-/// eagerly: one learned per-head logit joins the softmax denominator as a
-/// virtual key that contributes nothing to the output. Concretely, for each
-/// (batch, head, query) row the softmax is taken over `[scores, sink_h]` and
-/// the sink column is then dropped from the weighted sum:
+/// One learned logit per head joins the softmax denominator as a virtual key
+/// that contributes no value: for each (batch, head, query) row the softmax is
+/// taken over `[scores, sink_h]` and the sink column is dropped from the
+/// weighted sum.
 ///
 /// ```text
 ///   scores  = scale · (Q · Kᵀ) + mask          # [B, H, L, S]
@@ -291,9 +282,11 @@ fn manual_sdpa_with_softcapping(
 ///   out     = p[..., :S] @ V
 /// ```
 ///
-/// `sinks` is a 1-D `[n_heads]` array. GQA K/V are expanded internally, exactly
-/// like `manual_sdpa_with_softcapping`. Logit softcapping is intentionally
-/// unsupported here — GPT-OSS uses sinks, not softcap.
+/// This is the runtime's fused `sdpa_with_sinks`: grouped K/V are not
+/// expanded and the `[L, S]` scores are not formed in memory, and its
+/// gradient reaches the queries, keys, values and the sinks. `sinks` is a
+/// 1-D `[n_heads]` array. Logit softcapping is not supported here (GPT-OSS
+/// uses sinks, not softcap).
 pub fn sink_sdpa(
     queries: &Array,
     keys: &Array,
@@ -302,75 +295,22 @@ pub fn sink_sdpa(
     custom_mask: Option<&Array>,
     sinks: &Array,
 ) -> Result<Array, Exception> {
-    let shape = queries.shape();
-    let batch = shape[0];
-    let n_heads = shape[1];
-    let q_seq_len = shape[2];
-
-    let k_shape = keys.shape();
-    let n_kv_heads = k_shape[1];
-    let kv_seq_len = k_shape[2];
-
-    // Expand K/V for GQA if needed (sink softmax is per-expanded-head).
-    let (keys, values) = if n_kv_heads < n_heads {
-        let repeats = n_heads / n_kv_heads;
-        (
-            expand_kv_heads(keys, repeats)?,
-            expand_kv_heads(values, repeats)?,
-        )
-    } else {
-        (keys.clone(), values.clone())
-    };
-
-    // scale · (Q · Kᵀ)
-    let keys_t = keys.transpose_axes(&[0, 1, 3, 2]);
-    let scale_arr = Array::from_f32(config.scale);
-    let scores = queries.matmul(&keys_t).multiply(&scale_arr);
-
-    // Additive mask (matches the fused-kernel mask semantics).
-    let scores = match (&config.mask_type, custom_mask) {
-        (_, Some(mask)) => scores.add(mask),
-        (AttentionMaskType::Causal, None) => {
-            scores.add(&create_causal_mask(q_seq_len, kv_seq_len)?)
-        }
-        (AttentionMaskType::SlidingWindow(window_size), None) => scores.add(
-            &create_sliding_window_mask(q_seq_len, kv_seq_len, *window_size)?,
-        ),
-        (AttentionMaskType::None, None) => scores,
-    };
-
-    // Sink column: per-head logit broadcast to [B, H, L, 1], concatenated as the
-    // (S+1)-th key, softmaxed over the full row, then dropped from the sum.
-    let sink_col = sinks
-        .reshape(&[1, n_heads, 1, 1])
-        .broadcast_to(&[batch, n_heads, q_seq_len, 1]);
-    let combined = ops::concatenate_axis(&[&scores, &sink_col], -1);
-    let weights = combined.softmax(-1);
-    let weights = ops::slice_axis(&weights, -1, 0, kv_seq_len);
-
-    let output = weights.matmul(&values);
-
-    let v_head_dim = values.dim(3);
-    debug_assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, v_head_dim]);
-    Ok(output)
-}
-
-/// Expand K/V heads for grouped query attention.
-///
-/// [batch, n_kv_heads, seq_len, head_dim] -> [batch, n_heads, seq_len, head_dim]
-fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
-    let shape = x.shape();
-    let batch = shape[0];
-    let n_kv_heads = shape[1];
-    let seq_len = shape[2];
-    let head_dim = shape[3];
-
-    // [B, kv_heads, L, head_dim] -> [B, kv_heads, 1, L, head_dim]
-    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim]);
-    // Broadcast to [B, kv_heads, repeats, L, head_dim]
-    let x = x.broadcast_to(&[batch, n_kv_heads, repeats, seq_len, head_dim]);
-    // Reshape to [B, n_heads, L, head_dim]
-    Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
+    if config.logit_softcapping.is_some() {
+        return Err(Exception::custom(
+            "sink_sdpa: attention sinks and logit softcapping are not supported together",
+        ));
+    }
+    let masking = Masking::resolve(config, custom_mask, queries, keys)?;
+    // MLX requires the sinks to promote to the output dtype.
+    let sinks = sinks.as_dtype(queries.dtype().as_i32());
+    Ok(queries.sdpa_with_sinks(
+        keys,
+        values,
+        config.scale,
+        masking.mode,
+        masking.array.as_ref(),
+        &sinks,
+    ))
 }
 
 /// Create causal attention mask.
@@ -436,771 +376,6 @@ pub fn create_sliding_window_mask(
     Ok(mask.reshape(&[1, 1, query_len, key_len]))
 }
 
-/// Memory-efficient attention for long sequences.
-///
-/// Uses chunked computation to reduce peak memory usage for very long sequences.
-/// Falls back to standard fused SDPA for short sequences.
-///
-/// # Arguments
-/// * `queries` - Query tensor [batch, n_heads, seq_len, head_dim]
-/// * `keys` - Key tensor [batch, n_kv_heads, seq_len, head_dim]
-/// * `values` - Value tensor [batch, n_kv_heads, seq_len, head_dim]
-/// * `config` - Attention configuration
-/// * `chunk_size` - Maximum sequence length per chunk (for queries)
-///
-/// # Note
-/// Chunking is applied to queries only. Full K/V context is maintained.
-pub fn memory_efficient_attention(
-    queries: &Array,
-    keys: &Array,
-    values: &Array,
-    config: &FusedAttentionConfig,
-    chunk_size: i32,
-) -> Result<Array, Exception> {
-    let q_seq_len = queries.dim(2);
-
-    // Short sequence - use standard fused SDPA
-    if q_seq_len <= chunk_size {
-        return fused_sdpa(queries, keys, values, config, None);
-    }
-
-    // Long sequence - chunk the queries
-    let kv_seq_len = keys.dim(2);
-
-    let mut outputs = Vec::new();
-    let mut start = 0;
-
-    while start < q_seq_len {
-        let end = (start + chunk_size).min(q_seq_len);
-        let chunk_len = end - start;
-
-        // Extract query chunk using slice
-        // queries shape: [batch, n_heads, seq_len, head_dim]
-        let batch = queries.dim(0);
-        let n_h = queries.dim(1);
-        let hd = queries.dim(3);
-        let q_chunk = queries.slice(&[0, 0, start, 0], &[batch, n_h, end, hd]);
-
-        // Create appropriate mask for this chunk
-        // Chunk queries can attend to all keys up to their position
-        let mask = if config.mask_type == AttentionMaskType::Causal {
-            // Causal: can attend to positions [0, start + chunk_pos]
-            Some(create_chunk_causal_mask(chunk_len, kv_seq_len, start)?)
-        } else {
-            None
-        };
-
-        // Compute attention for chunk
-        let chunk_output = fused_sdpa(&q_chunk, keys, values, config, mask.as_ref())?;
-        outputs.push(chunk_output);
-
-        start = end;
-    }
-
-    // Concatenate outputs along sequence dimension
-    let outputs_refs: Vec<&Array> = outputs.iter().collect();
-    Ok(ops::concatenate_axis(&outputs_refs, 2))
-}
-
-/// Create causal mask for a query chunk.
-///
-/// For queries at positions [start, start + chunk_len), create a mask where
-/// position i (relative in chunk) can attend to keys at positions [0, start + i].
-fn create_chunk_causal_mask(
-    chunk_len: i32,
-    key_len: i32,
-    start_pos: i32,
-) -> Result<Array, Exception> {
-    // Create base causal mask
-    // Each query position can attend to: all keys up to (start_pos + local_pos)
-
-    let mut mask_data = Vec::with_capacity((chunk_len * key_len) as usize);
-
-    for q_pos in 0..chunk_len {
-        let global_q_pos = start_pos + q_pos;
-        for k_pos in 0..key_len {
-            if k_pos <= global_q_pos {
-                mask_data.push(0.0f32);
-            } else {
-                mask_data.push(f32::NEG_INFINITY);
-            }
-        }
-    }
-
-    let mask = Array::from_f32_slice(&mask_data, &[chunk_len, key_len]);
-    Ok(mask.reshape(&[1, 1, chunk_len, key_len]))
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pmetal_runtime::compat::random;
-
-    fn random_tensor(shape: &[i32]) -> Array {
-        random::normal(shape, Dtype::Float32)
-    }
-
-    /// An f32 additive mask against a bf16 model must work.
-    ///
-    /// MLX's SDPA refuses a mask that doesn't promote to the output dtype — it
-    /// errors rather than upcasting — and every mask builder in `pmetal-models`
-    /// emits f32 regardless of the checkpoint's dtype. Before `fused_sdpa`
-    /// coerced the mask, this combination threw on *every* bf16 checkpoint
-    /// taking the uncached prefill path (the one `DynamicModel::forward` uses),
-    /// and the thrown op returned a placeholder that then broadcast harmlessly
-    /// through the residual stream — so the output kept its shape and stayed
-    /// finite while attention had contributed nothing.
-    #[test]
-    fn an_f32_mask_works_against_a_bf16_model() {
-        let (heads, seq, head_dim) = (2, 4, 8);
-        let shape = [1, heads, seq, head_dim];
-        let bf16 = |s: &[i32]| random::normal(s, Dtype::Float32).as_dtype(Dtype::Bfloat16.as_i32());
-        let (q, k, v) = (bf16(&shape), bf16(&shape), bf16(&shape));
-
-        // Additive causal mask in f32, exactly as `create_causal_mask` builds it.
-        let mask = {
-            let lower = ops::tri(seq, seq, 0, Dtype::Float32);
-            ops::where_fn(
-                &lower.equal(&Array::from_f32(0.0)),
-                &Array::from_f32(f32::NEG_INFINITY),
-                &Array::from_f32(0.0),
-            )
-        };
-        assert_eq!(mask.dtype(), Dtype::Float32);
-
-        let config = FusedAttentionConfig::new(heads, heads, head_dim)
-            .with_mask_type(AttentionMaskType::None);
-        let mut out = fused_sdpa(&q, &k, &v, &config, Some(&mask)).expect("fused_sdpa runs");
-        out.eval();
-
-        pmetal_runtime::check_unobserved_error()
-            .expect("no bridge exception with an f32 mask on bf16");
-        assert_eq!(out.shape(), &shape);
-        let values = out.to_f32_vec(out.size()).expect("output readable");
-        assert!(
-            values.iter().all(|x| x.is_finite()),
-            "attention output is not finite"
-        );
-        assert!(
-            values.iter().any(|&x| x != 0.0),
-            "attention output is all zeros — the masked path produced nothing"
-        );
-    }
-
-    /// `AttentionMaskType::SlidingWindow` must work against a bf16 model too.
-    ///
-    /// The sibling test above covers the mask a *caller* supplies, which
-    /// `fused_sdpa` coerces. This covers the one the kernel builds for itself,
-    /// which it did not: an f32 mask reached `sdpa_with_mask` and threw on every
-    /// bf16 checkpoint, so no windowed layer of any Gemma / Phi / Qwen / Mistral
-    /// model ever ran its window. Nothing caught it because the throw returns a
-    /// placeholder that broadcasts — and because architectures papered over the
-    /// window by handing the whole stack one causal mask instead.
-    #[test]
-    fn a_sliding_window_runs_against_a_bf16_model() {
-        let (heads, seq, head_dim) = (2, 8, 8);
-        let window = 3;
-        let shape = [1, heads, seq, head_dim];
-        let f32_qkv: Vec<Array> = (0..3).map(|_| random_tensor(&shape)).collect();
-        let to_bf16 = |a: &Array| a.as_dtype(Dtype::Bfloat16.as_i32());
-
-        let config = FusedAttentionConfig::new(heads, heads, head_dim)
-            .with_mask_type(AttentionMaskType::SlidingWindow(window));
-
-        let bf16_out = fused_sdpa(
-            &to_bf16(&f32_qkv[0]),
-            &to_bf16(&f32_qkv[1]),
-            &to_bf16(&f32_qkv[2]),
-            &config,
-            None,
-        )
-        .expect("fused_sdpa runs");
-        bf16_out.eval();
-        pmetal_runtime::check_unobserved_error()
-            .expect("no bridge exception from a self-built sliding-window mask on bf16");
-        assert_eq!(bf16_out.shape(), &shape);
-
-        // The window has to actually be honoured, not just not-throw: compare
-        // against the same attention in f32, where the mask dtype already
-        // matched and the path was known good.
-        let mut f32_out = fused_sdpa(&f32_qkv[0], &f32_qkv[1], &f32_qkv[2], &config, None)
-            .expect("f32 reference");
-        f32_out.eval();
-        let got = bf16_out
-            .as_dtype(Dtype::Float32.as_i32())
-            .to_f32_vec(bf16_out.size())
-            .expect("bf16 output readable");
-        let want = f32_out
-            .to_f32_vec(f32_out.size())
-            .expect("f32 output readable");
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f32, f32::max);
-        assert!(worst < 0.05, "bf16 windowed attention diverges by {worst}");
-
-        // ...and the window must differ from plain causal, or the comparison
-        // above would pass on an implementation that silently dropped it.
-        let causal = config.with_mask_type(AttentionMaskType::Causal);
-        let mut causal_out =
-            fused_sdpa(&f32_qkv[0], &f32_qkv[1], &f32_qkv[2], &causal, None).expect("causal");
-        causal_out.eval();
-        let causal_values = causal_out
-            .to_f32_vec(causal_out.size())
-            .expect("causal output readable");
-        assert!(
-            want.iter()
-                .zip(&causal_values)
-                .any(|(a, b)| (a - b).abs() > 1e-3),
-            "a {window}-token window over {seq} tokens produced plain causal attention"
-        );
-    }
-
-    #[test]
-    fn sink_sdpa_matches_hand_computed_softmax() {
-        // 1 batch, 1 head, 1 query, 2 keys, head_dim 1, scale 1.0, no mask.
-        // scores = q·kᵀ = [2, 3]; sink logit c = 0.5. The sink joins the
-        // softmax denominator as a valueless key, so:
-        //   Z   = e² + e³ + e^0.5
-        //   w   = [e²/Z, e³/Z]              (sink weight dropped)
-        //   out = 10·w0 + 20·w1
-        let q = Array::from_slice(&[1.0_f32], &[1, 1, 1, 1]);
-        let k = Array::from_slice(&[2.0_f32, 3.0], &[1, 1, 2, 1]);
-        let v = Array::from_slice(&[10.0_f32, 20.0], &[1, 1, 2, 1]);
-        let sinks = Array::from_slice(&[0.5_f32], &[1]);
-
-        let cfg = FusedAttentionConfig::new(1, 1, 1)
-            .with_scale(1.0)
-            .with_mask_type(AttentionMaskType::None);
-        let mut out = sink_sdpa(&q, &k, &v, &cfg, None, &sinks).expect("sink_sdpa");
-        let got = out.to_f32_vec(1).expect("vec")[0];
-
-        let (e2, e3, ec) = (2.0_f64.exp(), 3.0_f64.exp(), 0.5_f64.exp());
-        let z = e2 + e3 + ec;
-        let expected = (10.0 * e2 / z + 20.0 * e3 / z) as f32;
-        assert!(
-            (got - expected).abs() < 1e-4,
-            "sink_sdpa out {got} != hand-computed {expected}"
-        );
-    }
-
-    #[test]
-    fn sink_sdpa_zero_sink_still_shifts_denominator() {
-        // A zero sink is NOT a no-op: it adds e^0 = 1 to the denominator, so
-        // the output must differ from plain (sink-free) attention.
-        let q = Array::from_slice(&[1.0_f32], &[1, 1, 1, 1]);
-        let k = Array::from_slice(&[2.0_f32, 3.0], &[1, 1, 2, 1]);
-        let v = Array::from_slice(&[10.0_f32, 20.0], &[1, 1, 2, 1]);
-        let cfg = FusedAttentionConfig::new(1, 1, 1)
-            .with_scale(1.0)
-            .with_mask_type(AttentionMaskType::None);
-
-        let zeros = Array::from_slice(&[0.0_f32], &[1]);
-        let mut with_sink = sink_sdpa(&q, &k, &v, &cfg, None, &zeros).expect("sink");
-        let s = with_sink.to_f32_vec(1).expect("vec")[0];
-
-        // Plain softmax over [2,3]: out = (10·e² + 20·e³)/(e²+e³).
-        let (e2, e3) = (2.0_f64.exp(), 3.0_f64.exp());
-        let plain = ((10.0 * e2 + 20.0 * e3) / (e2 + e3)) as f32;
-        let with_one = ((10.0 * e2 + 20.0 * e3) / (e2 + e3 + 1.0)) as f32;
-        assert!(
-            (s - with_one).abs() < 1e-4,
-            "zero-sink out {s} != {with_one}"
-        );
-        assert!(
-            (s - plain).abs() > 1e-3,
-            "zero sink should differ from plain softmax"
-        );
-    }
-
-    #[test]
-    fn test_fused_sdpa_basic() {
-        let batch = 2;
-        let n_heads = 4;
-        let seq_len = 8;
-        let head_dim = 32;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_gqa() {
-        let batch = 2;
-        let n_heads = 8;
-        let n_kv_heads = 2; // GQA with 4 groups
-        let seq_len = 8;
-        let head_dim = 32;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_mqa() {
-        let batch = 2;
-        let n_heads = 8;
-        let n_kv_heads = 1; // MQA
-        let seq_len = 8;
-        let head_dim = 32;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_kv_heads, head_dim);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_no_mask() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 8;
-        let head_dim = 32;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim)
-            .with_mask_type(AttentionMaskType::None);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_sliding_window() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 16;
-        let head_dim = 32;
-        let window_size = 4;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim)
-            .with_mask_type(AttentionMaskType::SlidingWindow(window_size));
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_softcapping() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 8;
-        let head_dim = 64;
-        let softcap = 50.0;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config =
-            FusedAttentionConfig::new(n_heads, n_heads, head_dim).with_logit_softcapping(softcap);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_softcapping_matches_manual_reference() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 8;
-        let head_dim = 64;
-        let softcap = 50.0;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config =
-            FusedAttentionConfig::new(n_heads, n_heads, head_dim).with_logit_softcapping(softcap);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-        let reference =
-            manual_sdpa_with_softcapping(&queries, &keys, &values, &config, None, softcap).unwrap();
-
-        let output = output.as_dtype(Dtype::Float32.as_i32());
-        let reference = reference.as_dtype(Dtype::Float32.as_i32());
-        let _ = &output; // eval not needed
-        let _ = &reference; // eval not needed
-
-        let mut out_s = output.clone();
-        out_s.eval();
-        let mut ref_s = reference.clone();
-        ref_s.eval();
-        let out_n2 = out_s.size();
-        let ref_n2 = ref_s.size();
-        let out_data2 = out_s.to_f32_vec(out_n2).unwrap_or_default();
-        let ref_data2 = ref_s.to_f32_vec(ref_n2).unwrap_or_default();
-        for (actual, expected) in out_data2.iter().zip(ref_data2.iter()) {
-            assert!(
-                (actual - expected).abs() < 0.1,
-                "Metal softcap attention diverged from manual reference: actual={}, expected={}",
-                actual,
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn test_fused_sdpa_preserves_input_dtype() {
-        let batch = 1;
-        let n_heads = 2;
-        let seq_len = 4;
-        let head_dim = 64;
-
-        let queries =
-            random_tensor(&[batch, n_heads, seq_len, head_dim]).as_dtype(Dtype::Float32.as_i32());
-        let keys =
-            random_tensor(&[batch, n_heads, seq_len, head_dim]).as_dtype(Dtype::Float32.as_i32());
-        let values =
-            random_tensor(&[batch, n_heads, seq_len, head_dim]).as_dtype(Dtype::Float32.as_i32());
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        assert_eq!(output.dtype(), Dtype::Float32);
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_causal_mask_creation() {
-        let mask = create_causal_mask(4, 4).unwrap();
-        let _ = &mask; // eval not needed
-
-        assert_eq!(mask.shape(), &[1, 1, 4, 4]);
-    }
-
-    #[test]
-    fn test_sliding_window_mask() {
-        let mask = create_sliding_window_mask(8, 8, 3).unwrap();
-        let _ = &mask; // eval not needed
-
-        assert_eq!(mask.shape(), &[1, 1, 8, 8]);
-    }
-
-    #[test]
-    fn test_sliding_window_mask_generation_alignment() {
-        let mask = create_sliding_window_mask(1, 6, 3).unwrap();
-        let _ = &mask; // eval not needed
-
-        assert_eq!(mask.shape(), &[1, 1, 1, 6]);
-        let observed = {
-            let mut m_own = mask.clone();
-            m_own.eval();
-            m_own.to_f32_vec(m_own.size()).unwrap_or_default()
-        };
-        assert_eq!(
-            observed.as_slice(),
-            &[
-                f32::NEG_INFINITY,
-                f32::NEG_INFINITY,
-                f32::NEG_INFINITY,
-                0.0,
-                0.0,
-                0.0
-            ]
-        );
-    }
-
-    #[test]
-    fn test_memory_efficient_attention_short() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 8;
-        let head_dim = 32;
-        let chunk_size = 16; // Larger than seq_len, so no chunking
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim);
-        let output =
-            memory_efficient_attention(&queries, &keys, &values, &config, chunk_size).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_memory_efficient_attention_chunked() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 32;
-        let head_dim = 32;
-        let chunk_size = 8; // Will create 4 chunks
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim);
-        let output =
-            memory_efficient_attention(&queries, &keys, &values, &config, chunk_size).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_custom_scale() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 8;
-        let head_dim = 64;
-        let custom_scale = 0.1; // Different from 1/sqrt(64) = 0.125
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim).with_scale(custom_scale);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_single_token_generation() {
-        // This is the optimized path - query_len = 1 triggers Metal kernel
-        let batch = 1;
-        let n_heads = 4;
-        let q_seq_len = 1; // Single token query
-        let kv_seq_len = 32; // Cached keys/values
-        let head_dim = 64;
-
-        let queries = random_tensor(&[batch, n_heads, q_seq_len, head_dim]);
-        let keys = random_tensor(&[batch, n_heads, kv_seq_len, head_dim]);
-        let values = random_tensor(&[batch, n_heads, kv_seq_len, head_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim);
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-
-        let _ = &output; // eval not needed
-        assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, head_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_asymmetric_value_head_dim() {
-        // DeepSeek-style: key_dim=128, value_dim=64
-        let batch = 1;
-        let n_heads = 4;
-        let n_kv_heads = 2;
-        let seq_len = 8;
-        let key_dim = 128;
-        let value_dim = 64;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, key_dim]);
-        let keys = random_tensor(&[batch, n_kv_heads, seq_len, key_dim]);
-        let values = random_tensor(&[batch, n_kv_heads, seq_len, value_dim]);
-
-        let config =
-            FusedAttentionConfig::new(n_heads, n_kv_heads, key_dim).with_value_head_dim(value_dim);
-
-        assert!(config.is_asymmetric());
-        assert_eq!(config.effective_value_head_dim(), value_dim);
-
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-        let _ = &output; // eval not needed
-
-        // Output should use VALUE dimension, not key dimension
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, value_dim]);
-    }
-
-    #[test]
-    fn test_fused_sdpa_asymmetric_single_token_decode() {
-        // Single-token decode with asymmetric dims (the hot path for inference)
-        let batch = 1;
-        let n_heads = 8;
-        let n_kv_heads = 2;
-        let q_seq_len = 1;
-        let kv_seq_len = 32;
-        let key_dim = 128;
-        let value_dim = 64;
-
-        let queries = random_tensor(&[batch, n_heads, q_seq_len, key_dim]);
-        let keys = random_tensor(&[batch, n_kv_heads, kv_seq_len, key_dim]);
-        let values = random_tensor(&[batch, n_kv_heads, kv_seq_len, value_dim]);
-
-        let config =
-            FusedAttentionConfig::new(n_heads, n_kv_heads, key_dim).with_value_head_dim(value_dim);
-
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-        let _ = &output; // eval not needed
-
-        assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, value_dim]);
-    }
-
-    #[test]
-    fn test_asymmetric_softcapping_output_shape() {
-        let batch = 1;
-        let n_heads = 4;
-        let seq_len = 8;
-        let key_dim = 64;
-        let value_dim = 32;
-
-        let queries = random_tensor(&[batch, n_heads, seq_len, key_dim]);
-        let keys = random_tensor(&[batch, n_heads, seq_len, key_dim]);
-        let values = random_tensor(&[batch, n_heads, seq_len, value_dim]);
-
-        let config = FusedAttentionConfig::new(n_heads, n_heads, key_dim)
-            .with_value_head_dim(value_dim)
-            .with_logit_softcapping(30.0);
-
-        let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
-        let _ = &output; // eval not needed
-
-        assert_eq!(output.shape(), &[batch, n_heads, seq_len, value_dim]);
-    }
-
-    #[test]
-    fn test_config_symmetric_by_default() {
-        let config = FusedAttentionConfig::new(4, 2, 64);
-        assert!(!config.is_asymmetric());
-        assert_eq!(config.effective_value_head_dim(), 64);
-    }
-
-    /// Plain causal attention in f32 from primitives with known VJPs.
-    fn reference_causal_attention(q: &Array, k: &Array, v: &Array, scale: f32) -> Array {
-        let repeats = q.dim(1) / k.dim(1);
-        let k = expand_kv_heads(k, repeats).unwrap();
-        let v = expand_kv_heads(v, repeats).unwrap();
-        let scores = q
-            .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
-            .multiply(&Array::from_f32(scale))
-            .add(&create_causal_mask(q.dim(2), k.dim(2)).unwrap());
-        scores.softmax(-1).matmul(&v)
-    }
-
-    /// Largest magnitude in `array`.
-    fn max_abs(array: &Array) -> Result<f32, Exception> {
-        let max = array.as_dtype(Dtype::Float32.as_i32()).abs_val().max(None);
-        max.eval();
-        Ok(max.item_f32())
-    }
-
-    /// Largest absolute difference between two arrays.
-    fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
-        let diff = lhs
-            .as_dtype(Dtype::Float32.as_i32())
-            .subtract(&rhs.as_dtype(Dtype::Float32.as_i32()))
-            .abs_val()
-            .max(None);
-        diff.eval();
-        Ok(diff.item_f32())
-    }
-
-    /// The gradient through `fused_sdpa` must match plain attention built from
-    /// primitives with known VJPs, for Q, K and V.
-    #[test]
-    fn test_attention_under_autograd_keeps_its_gradient() {
-        use pmetal_runtime::compat::nn::value_and_grad_explicit;
-
-        let (heads, kv_heads, head_dim, len) = (4, 2, 128, 2048);
-        random::seed(3);
-        let q = random::uniform_range(-1.0, 1.0, &[1, heads, len, head_dim], Dtype::Float32);
-        let k = random::uniform_range(-1.0, 1.0, &[1, kv_heads, len, head_dim], Dtype::Float32);
-        let v = random::uniform_range(-1.0, 1.0, &[1, kv_heads, len, head_dim], Dtype::Float32);
-        let config = FusedAttentionConfig::new(heads, kv_heads, head_dim);
-
-        // Only the last few query rows enter the loss, so it stays O(1) and a
-        // finite difference resolves it in f32.
-        let rows = 4;
-        let mut w = vec![0.0_f32; (heads * len * head_dim) as usize];
-        for h in 0..heads {
-            for r in (len - rows)..len {
-                for c in 0..head_dim {
-                    let i = ((h * len + r) * head_dim + c) as usize;
-                    w[i] = ((i * 31 % 97) as f32 / 97.0) - 0.5;
-                }
-            }
-        }
-        let w = Array::from_f32_slice(&w, &[1, heads, len, head_dim]);
-        let scale = config.scale;
-
-        let grads = |f: &dyn Fn(&[Array]) -> Array| {
-            let (loss, g) = value_and_grad_explicit(
-                |a: &[Array]| f(a).multiply(&w).sum_all(),
-                &[q.clone(), k.clone(), v.clone()],
-                &[],
-            )
-            .unwrap();
-            loss.eval();
-            g.iter().for_each(|x| {
-                x.eval();
-            });
-            pmetal_runtime::check_unobserved_error().unwrap();
-            g
-        };
-        let fused = grads(&|a| fused_sdpa(&a[0], &a[1], &a[2], &config, None).unwrap());
-        let reference = grads(&|a| reference_causal_attention(&a[0], &a[1], &a[2], scale));
-
-        for (name, (got, want)) in ["dq", "dk", "dv"].iter().zip(fused.iter().zip(&reference)) {
-            let scale = max_abs(want).unwrap();
-            let diff = max_abs_diff(got, want).unwrap();
-            assert!(scale > 0.0, "{name}: reference gradient is zero");
-            assert!(
-                diff <= 1e-3 * scale,
-                "{name}: fused attention gradient is off by {diff} (scale {scale})"
-            );
-        }
-
-        // Finite differences of the attention itself at the largest entries.
-        let loss_at = |which: usize, idx: usize, delta: f32| {
-            let mut inputs = [q.clone(), k.clone(), v.clone()];
-            let n = inputs[which].size();
-            let mut data = inputs[which].to_f32_vec(n).unwrap();
-            data[idx] += delta;
-            inputs[which] = Array::from_f32_slice(&data, inputs[which].shape());
-            reference_causal_attention(&inputs[0], &inputs[1], &inputs[2], scale)
-                .multiply(&w)
-                .sum_all()
-                .item_f32()
-        };
-        for (which, grad) in fused.iter().enumerate() {
-            let n = grad.size();
-            let data = grad.clone().to_f32_vec(n).unwrap();
-            let (idx, &want) = data
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-                .unwrap();
-            let h = 1e-2_f32;
-            let fd = (loss_at(which, idx, h) - loss_at(which, idx, -h)) / (2.0 * h);
-            assert!(
-                (fd - want).abs() <= 1e-2 * want.abs() + 1e-4,
-                "input {which}[{idx}]: autograd {want} vs finite difference {fd}"
-            );
-        }
-    }
-}
+#[path = "fused_attention_tests.rs"]
+mod tests;

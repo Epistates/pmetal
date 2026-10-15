@@ -7,6 +7,9 @@
 //! - Tool/function calling support (Qwen, Llama 3.1+, Mistral v3+, ChatML)
 
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
+
+mod builtin;
 
 // ============================================================================
 // Tool calling types (OpenAI-compatible)
@@ -386,116 +389,6 @@ pub fn documented_reasoning_effort_levels(
     }
 }
 
-// ============================================================================
-// Tool formatting helpers (shared across templates)
-// ============================================================================
-
-/// Format tool definitions as a JSON list for injection into system prompts.
-///
-/// Used by Qwen and ChatML templates. Produces:
-/// ```text
-/// # Tools
-///
-/// You may call one or more functions to assist with the user query.
-///
-/// You are provided with function signatures within <tools></tools> XML tags:
-/// <tools>
-/// {"type": "function", "function": {"name": "...", ...}}
-/// </tools>
-///
-/// For each function call, return a json object with function name and arguments
-/// within <tool_call></tool_call> XML tags:
-/// <tool_call>
-/// {"name": <function-name>, "arguments": <args-json-object>}
-/// </tool_call>
-/// ```
-fn format_tools_qwen(tools: &[ToolDefinition]) -> String {
-    let mut s = String::from(
-        "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>",
-    );
-    for tool in tools {
-        s.push('\n');
-        s.push_str(&serde_json::to_string(tool).unwrap_or_default());
-    }
-    s.push_str("\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
-    s
-}
-
-/// Format tool definitions for Llama 3.1+ system prompt.
-///
-/// Produces:
-/// ```text
-/// You have access to the following functions. To call a function, please respond
-/// with JSON for a function call.
-/// Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.
-/// Do not use variables.
-///
-/// {tool_json}
-/// ```
-fn format_tools_llama3(tools: &[ToolDefinition]) -> String {
-    let mut s = String::from(
-        "You have access to the following functions. To call a function, please respond with JSON for a function call.\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.\nDo not use variables.\n\n",
-    );
-    for tool in tools {
-        if let Ok(json) = serde_json::to_string_pretty(tool) {
-            s.push_str(&json);
-            s.push_str("\n\n");
-        }
-    }
-    s
-}
-
-/// Format tool definitions for Mistral v3+ templates.
-///
-/// Produces: `[AVAILABLE_TOOLS] [{"type":"function","function":{...}}, ...] [/AVAILABLE_TOOLS]`
-fn format_tools_mistral(tools: &[ToolDefinition]) -> String {
-    let json = serde_json::to_string(tools).unwrap_or_else(|_| "[]".to_string());
-    format!("[AVAILABLE_TOOLS] {json} [/AVAILABLE_TOOLS]")
-}
-
-/// Format a single tool call in Qwen `<tool_call>` format.
-fn format_tool_call_qwen(tc: &ToolCall) -> String {
-    let args = if tc.function.arguments.is_string() {
-        tc.function.arguments.as_str().unwrap_or("{}").to_string()
-    } else {
-        serde_json::to_string(&tc.function.arguments).unwrap_or_else(|_| "{}".to_string())
-    };
-    format!(
-        "\n<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>",
-        tc.function.name, args
-    )
-}
-
-/// Format a single tool call in Llama 3.1 JSON format.
-fn format_tool_call_llama3(tc: &ToolCall) -> String {
-    let args = if tc.function.arguments.is_string() {
-        tc.function.arguments.as_str().unwrap_or("{}").to_string()
-    } else {
-        serde_json::to_string(&tc.function.arguments).unwrap_or_else(|_| "{}".to_string())
-    };
-    format!(
-        "{{\"name\": \"{}\", \"parameters\": {}}}",
-        tc.function.name, args
-    )
-}
-
-/// Format tool calls for Mistral v3+ templates.
-///
-/// Produces: `[TOOL_CALLS] [{"name":"...","arguments":{...}}]`
-fn format_tool_calls_mistral(tool_calls: &[ToolCall]) -> String {
-    let calls: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "name": tc.function.name,
-                "arguments": tc.function.arguments,
-            })
-        })
-        .collect();
-    let json = serde_json::to_string(&calls).unwrap_or_else(|_| "[]".to_string());
-    format!("[TOOL_CALLS] {json}")
-}
-
 /// Known chat template types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatTemplateType {
@@ -582,16 +475,32 @@ impl ChatTemplateType {
     }
 }
 
-/// Result of applying a chat template.
+/// A conversation rendered by a chat template, with where the model's own
+/// output sits in it.
 #[derive(Debug, Clone)]
 pub struct FormattedChat {
     /// The full formatted text.
     pub text: String,
-    /// Byte offset where the response begins (for loss masking).
-    /// All tokens before this offset should be masked with -100.
+    /// Byte offset where the final response begins: everything before it is
+    /// the prompt. Where the conversation does not end in an assistant turn
+    /// the text is a generation prompt and this is its length.
     pub response_start: usize,
     /// The template type used.
     pub template_type: ChatTemplateType,
+    /// Byte ranges of `text` the model itself wrote, one per assistant turn
+    /// (its reasoning and tool calls included, up to and including the token
+    /// that ends the turn). Everything outside the ranges is prompt.
+    ///
+    /// A turn is listed only if the template renders it the same way
+    /// whether or not later turns follow, which is how its range can be
+    /// found: Qwen3, for one, drops the thinking of every turn before the
+    /// last user message, so only its final turn is listed.
+    pub response_spans: Vec<Range<usize>>,
+    /// The index in the conversation's messages of the assistant turn each of
+    /// [`response_spans`](Self::response_spans) is, in the same order. A turn
+    /// the template does not render the same whatever follows has no span, so
+    /// this is how to tell which turns have one.
+    pub response_turns: Vec<usize>,
 }
 
 impl FormattedChat {
@@ -611,22 +520,20 @@ impl FormattedChat {
 pub struct ChatTemplate {
     /// The template type.
     pub template_type: ChatTemplateType,
-    /// Optional default system message.
+    /// System message used when a conversation has none (read by the
+    /// built-in templates only; a model's own template has its own default).
     pub default_system_message: Option<String>,
-    /// BOS token (optional).
+    /// BOS token string, as `{{ bos_token }}` renders it.
     pub bos_token: Option<String>,
-    /// EOS token.
+    /// EOS token string, as `{{ eos_token }}` renders it.
     pub eos_token: String,
-    /// Whether to add BOS at the start.
-    pub add_bos: bool,
-    /// Whether to add EOS at the end.
-    pub add_eos: bool,
-    /// Raw Jinja template source from `tokenizer_config.json::chat_template`.
-    /// When present, [`ChatTemplate::apply_inference`] renders this directly
-    /// via `minijinja`, which is bit-exact with HuggingFace's
-    /// `AutoTokenizer.apply_chat_template`. Falls back to the hardcoded
-    /// `format_*` functions when this is `None` (base models without a
-    /// chat_template) or when Jinja rendering fails at runtime.
+    /// The Jinja source of the model's own chat template, from
+    /// `chat_template.jinja` or `tokenizer_config.json`. Everything this type
+    /// renders goes through it, with the engine and environment transformers
+    /// uses, so what the model is trained on is what it is served. `None` for
+    /// a checkpoint with no chat template (a base model): the conventional
+    /// format of [`template_type`](Self::template_type) is rendered instead,
+    /// from the built-in Jinja templates.
     pub jinja_source: Option<String>,
 }
 
@@ -638,16 +545,6 @@ impl ChatTemplate {
             default_system_message: None,
             bos_token: template_type.bos_token().map(String::from),
             eos_token: template_type.eos_token().to_string(),
-            add_bos: matches!(
-                template_type,
-                ChatTemplateType::Llama2
-                    | ChatTemplateType::Llama3
-                    | ChatTemplateType::Llama4
-                    | ChatTemplateType::DeepSeek
-                    | ChatTemplateType::Cohere
-                    | ChatTemplateType::Gemma4
-            ),
-            add_eos: true,
             jinja_source: None,
         }
     }
@@ -733,122 +630,309 @@ impl ChatTemplate {
         template
     }
 
+    /// The chat template a model ships, from its Jinja `source` and the
+    /// strings of its BOS and EOS tokens (`{{ bos_token }}`,
+    /// `{{ eos_token }}`).
+    ///
+    /// The source renders every conversation. Its family (from the markers it
+    /// writes; `model_name` tells Qwen's ChatML from the rest) sets the
+    /// template type: the stop tokens of a model of that family, the
+    /// reasoning levels it documents, and the built-in format a conversation
+    /// it refuses is rendered in. A template of no family known here is
+    /// [`ChatTemplateType::Custom`].
+    pub fn from_jinja(
+        source: impl Into<String>,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
+        model_name: &str,
+    ) -> Self {
+        let source = source.into();
+        let mut template = detect_template_from_jinja(&source)
+            .unwrap_or_else(|| Self::new(ChatTemplateType::Custom));
+        if template.template_type == ChatTemplateType::ChatMl
+            && model_name.to_lowercase().contains("qwen")
+        {
+            template = Self::qwen();
+        }
+        if bos_token.is_some() {
+            template.bos_token = bos_token;
+        }
+        if let Some(eos) = eos_token {
+            template.eos_token = eos;
+        }
+        template.jinja_source = Some(source);
+        template
+    }
+
     /// Set the default system message.
     pub fn with_system_message(mut self, message: impl Into<String>) -> Self {
         self.default_system_message = Some(message.into());
         self
     }
 
-    /// Set whether to add BOS token.
-    pub fn with_add_bos(mut self, add_bos: bool) -> Self {
-        self.add_bos = add_bos;
-        self
-    }
-
-    /// Set whether to add EOS token.
-    pub fn with_add_eos(mut self, add_eos: bool) -> Self {
-        self.add_eos = add_eos;
-        self
-    }
-
-    /// Format a conversation using this template.
+    /// Format a conversation for training: the text the model's own chat
+    /// template renders it as, and where the model's output sits in it.
     ///
-    /// Returns the formatted text and the byte offset where the final
-    /// assistant response begins (for loss masking in SFT training).
+    /// A conversation ending in an assistant turn renders without a
+    /// generation prompt, as the model is trained on it;
+    /// [`FormattedChat::response_spans`] marks every assistant turn,
+    /// [`FormattedChat::response_start`] the last. A conversation that ends
+    /// on a user (or tool) turn renders with the generation prompt, as a
+    /// prompt to continue, and has no spans.
+    ///
+    /// A conversation the template refuses (its own `raise_exception`: roles
+    /// that must alternate, a system turn Gemma 2 has no place for) is
+    /// rendered by the built-in format of the template type instead, with a
+    /// warning. [`try_apply`](Self::try_apply) is the strict form that
+    /// reports the refusal.
     pub fn apply(&self, messages: &[Message]) -> FormattedChat {
         self.apply_with_tools(messages, None)
     }
 
-    /// Format a conversation with optional tool definitions.
-    ///
-    /// When `tools` is `Some`, tool definitions are injected into the system
-    /// prompt using the model-specific format, and messages with role="tool"
-    /// or `tool_calls` are formatted accordingly.
+    /// [`apply`](Self::apply) with tool definitions, which the template
+    /// places as it does for serving.
     pub fn apply_with_tools(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> FormattedChat {
-        if let Some(formatted) = self.render_reasoning_conversation(messages, tools) {
-            return formatted;
-        }
-        match self.template_type {
-            ChatTemplateType::ChatMl | ChatTemplateType::Qwen => {
-                self.format_chatml(messages, tools)
+        match self.try_apply(messages, tools, &ChatTemplateKwargs::new()) {
+            Ok(formatted) => formatted,
+            Err(e) => {
+                tracing::warn!(
+                    "{e}; rendering with the built-in {:?} format",
+                    self.template_type
+                );
+                let builtin = Self {
+                    jinja_source: None,
+                    ..self.clone()
+                };
+                builtin
+                    .try_apply(messages, tools, &ChatTemplateKwargs::new())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("{e}; rendering the conversation as plain text");
+                        plain_conversation(messages, self.template_type)
+                    })
             }
-            ChatTemplateType::Llama3 => self.format_llama3(messages, tools),
-            ChatTemplateType::Llama4 => self.format_llama4(messages, tools),
-            ChatTemplateType::Mistral => self.format_mistral(messages, tools),
-            ChatTemplateType::DeepSeek => self.format_deepseek(messages, tools),
-            // Templates without native tool support — inject tools into system prompt via ChatML style
-            ChatTemplateType::Llama2 => self.format_llama2(messages),
-            ChatTemplateType::Gemma => self.format_gemma(messages),
-            ChatTemplateType::Gemma4 => self.format_gemma4(messages),
-            ChatTemplateType::Phi3 => self.format_phi3(messages),
-            ChatTemplateType::Phi4 => self.format_phi4(messages),
-            ChatTemplateType::Alpaca => self.format_alpaca(messages),
-            ChatTemplateType::Vicuna => self.format_vicuna(messages),
-            ChatTemplateType::Zephyr => self.format_zephyr(messages),
-            ChatTemplateType::GptOss => self.format_gpt_oss(messages),
-            ChatTemplateType::Cohere => self.format_cohere(messages),
-            ChatTemplateType::Custom => self.format_chatml(messages, tools),
         }
     }
 
-    /// A conversation ending in an assistant turn, rendered by a reasoning
-    /// model's own template, with the response starting where generation
-    /// would.
+    /// Format a conversation for training, or say why the template refuses
+    /// it. `kwargs` are the template's own variables (`enable_thinking`,
+    /// `reasoning_effort`, …), as `apply_chat_template(**kwargs)` takes them.
     ///
-    /// Qwen 3's template writes the final assistant turn as
-    /// `<think>\n{reasoning}\n</think>\n\n{answer}`, with an empty block when
-    /// there is no reasoning, and serving prompts with that empty block in
-    /// non-thinking mode. The hand-written ChatML formatter knows nothing of
-    /// it, so a fine-tune taught the model to answer straight after
-    /// `<|im_start|>assistant\n`, where it puts all its mass on `<think>`:
-    /// Qwen3-0.6B's first-token loss on such data was 21 nats.
-    ///
-    /// The prompt is the conversation before the last turn with the
-    /// generation prompt the template appends, non-thinking first (the
-    /// empty block stays out of the loss, as serving supplies it) and then
-    /// thinking (reasoning in the answer is trained). `None` when the
-    /// template has no reasoning block, the last turn isn't the assistant's,
-    /// or neither prompt is a prefix of the full rendering; the hand-written
-    /// formatter takes those.
-    fn render_reasoning_conversation(
+    /// The prompt of the final assistant turn is the generation prompt the
+    /// model is served with, and the response is what follows it, so the
+    /// model is trained on the text it will see and write. Almost always that
+    /// is simply how the template renders the conversation. Where it is not
+    /// (Gemma 4 prompts with an empty thought channel its history turns
+    /// leave out), the generation prompt is put in front of the turn's
+    /// content.
+    pub fn try_apply(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-    ) -> Option<FormattedChat> {
-        let src = self.jinja_source.as_deref()?;
-        if !src.contains("</think>") {
-            return None;
-        }
-        let (last, prompt) = messages.split_last()?;
-        if last.role != "assistant" {
-            return None;
-        }
-        let text = self
-            .render_jinja(src, messages, false, tools, &ChatTemplateKwargs::new())
-            .ok()?;
-        [false, true].into_iter().find_map(|thinking| {
-            let kwargs =
-                ChatTemplateKwargs::new().with(ChatTemplateKwargs::ENABLE_THINKING, thinking);
-            let prefix = self.render_jinja(src, prompt, true, tools, &kwargs).ok()?;
-            text.starts_with(&prefix).then(|| FormattedChat {
-                response_start: prefix.len(),
-                text: text.clone(),
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<FormattedChat, String> {
+        let Some((last, earlier)) = messages
+            .split_last()
+            .filter(|(last, _)| last.role == "assistant")
+        else {
+            let text = self.render(messages, tools, kwargs, true)?;
+            return Ok(FormattedChat {
+                response_start: text.len(),
+                text,
                 template_type: self.template_type,
-            })
+                response_spans: Vec::new(),
+                response_turns: Vec::new(),
+            });
+        };
+
+        let TrainingRender {
+            mut text,
+            response_start,
+            variants,
+        } = self.render_final_turn(messages, last, earlier, tools, kwargs)?;
+        let (mut turns, mut spans): (Vec<usize>, Vec<Range<usize>>) = self
+            .earlier_assistant_spans(messages, tools, &variants, &text, response_start)
+            .into_iter()
+            .unzip();
+        turns.push(messages.len() - 1);
+        spans.push(response_start..text.len());
+
+        // Harmony ends a conversation's final message with `<|return|>`, and
+        // the `<|end|>` its template writes there would teach the model to
+        // stop on a token that closes every other message too.
+        if self.template_type == ChatTemplateType::GptOss {
+            if let Some(body) = text.strip_suffix("<|end|>") {
+                text.truncate(body.len());
+                text.push_str("<|return|>");
+                if let Some(span) = spans.last_mut() {
+                    span.end = text.len();
+                }
+            }
+        }
+
+        Ok(FormattedChat {
+            text,
+            response_start,
+            template_type: self.template_type,
+            response_spans: spans,
+            response_turns: turns,
         })
+    }
+
+    /// The text of a conversation ending in an assistant turn, and where that
+    /// turn's response begins in it.
+    ///
+    /// A template with an `enable_thinking` switch the caller left unset is
+    /// tried with thinking off, then on (on first for a turn that carries
+    /// reasoning): the generation prompt of a non-thinking conversation ends
+    /// in an empty `<think>` block serving supplies, which is not the
+    /// model's to learn, while one with reasoning needs the prompt that stops
+    /// before the block.
+    fn render_final_turn(
+        &self,
+        messages: &[Message],
+        last: &Message,
+        earlier: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<TrainingRender, String> {
+        let thinks = last
+            .reasoning_content
+            .as_deref()
+            .is_some_and(|r| !r.is_empty())
+            || last.content.contains("</think>");
+        let variants: Vec<ChatTemplateKwargs> =
+            if kwargs.get(ChatTemplateKwargs::ENABLE_THINKING).is_none()
+                && self.reads_kwarg(ChatTemplateKwargs::ENABLE_THINKING)
+            {
+                let order = if thinks { [true, false] } else { [false, true] };
+                order
+                    .into_iter()
+                    .map(|thinking| {
+                        let mut k = kwargs.clone();
+                        k.set(ChatTemplateKwargs::ENABLE_THINKING, thinking);
+                        k
+                    })
+                    .collect()
+            } else {
+                vec![kwargs.clone()]
+            };
+
+        // The turn as the template renders it, for each variant.
+        let mut renders = Vec::with_capacity(variants.len());
+        let mut first_error = None;
+        for k in &variants {
+            match self.render(messages, tools, k, false) {
+                Ok(text) => {
+                    let prompt = self.render(earlier, tools, k, true);
+                    renders.push((k, text, prompt.ok()));
+                }
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+
+        // For the first variant that fits: the template's rendering of the
+        // conversation, when the generation prompt is the start of it;
+        // otherwise the generation prompt followed by the turn from where
+        // the two part, provided they part inside the final turn.
+        for (k, text, prompt) in &renders {
+            let Some(prompt) = prompt else { continue };
+            if text.starts_with(prompt.as_str()) {
+                return Ok(TrainingRender {
+                    response_start: prompt.len(),
+                    text: text.clone(),
+                    variants: chosen_first(&variants, k),
+                });
+            }
+            let Ok(before) = self.render(earlier, tools, k, false) else {
+                continue;
+            };
+            let shared = common_prefix_len(prompt, text);
+            if text.starts_with(&before) && shared >= before.len() {
+                return Ok(TrainingRender {
+                    response_start: prompt.len(),
+                    text: format!("{prompt}{}", &text[shared..]),
+                    variants: chosen_first(&variants, k),
+                });
+            }
+        }
+
+        // The template renders the turn in a way its prompt does not lead to
+        // at all. Train on the text from the turn's content.
+        let Some((k, text, _)) = renders.first() else {
+            return Err(first_error.unwrap_or_else(|| "no chat template to render".into()));
+        };
+        tracing::warn!(
+            "the {:?} chat template does not render the final assistant turn as it prompts for \
+             it; training on the text from the turn's content",
+            self.template_type
+        );
+        let content = last.content.trim();
+        let response_start = (!content.is_empty())
+            .then(|| text.rfind(content))
+            .flatten()
+            .unwrap_or(text.len());
+        Ok(TrainingRender {
+            response_start,
+            text: text.clone(),
+            variants: chosen_first(&variants, k),
+        })
+    }
+
+    /// The byte range of `text` that each assistant turn before the last
+    /// wrote.
+    ///
+    /// A range starts where the generation prompt for that turn ends and ends
+    /// where the conversation up to that turn ends. Both are found by
+    /// rendering the shorter conversations and requiring them to be prefixes
+    /// of `text`, which holds when the template writes a turn the same
+    /// whatever follows it. A turn for which it does not (Qwen3 drops the
+    /// thinking of every turn before the last user message, so serving would
+    /// have written something else) is left out.
+    fn earlier_assistant_spans(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        variants: &[ChatTemplateKwargs],
+        text: &str,
+        final_start: usize,
+    ) -> Vec<(usize, Range<usize>)> {
+        let mut spans: Vec<(usize, Range<usize>)> = Vec::new();
+        for (index, message) in messages[..messages.len() - 1].iter().enumerate() {
+            if message.role != "assistant" {
+                continue;
+            }
+            let start = variants.iter().find_map(|k| {
+                let prompt = self.render(&messages[..index], tools, k, true).ok()?;
+                text.starts_with(&prompt).then_some(prompt.len())
+            });
+            let end = variants.iter().find_map(|k| {
+                let turn = self.render(&messages[..=index], tools, k, false).ok()?;
+                text.starts_with(&turn).then_some(turn.len())
+            });
+            if let (Some(start), Some(end)) = (start, end) {
+                if start <= end
+                    && end <= final_start
+                    && spans.last().is_none_or(|(_, prev)| prev.end <= start)
+                {
+                    spans.push((index, start..end));
+                }
+            }
+        }
+        spans
     }
 
     /// Format an inference prompt with any template-specific generation prefill.
     ///
-    /// When a Jinja `chat_template` is attached (from
-    /// `tokenizer_config.json`), this method renders it via `minijinja` —
-    /// bit-exact with HuggingFace's `AutoTokenizer.apply_chat_template`.
-    /// Falls back to the hardcoded `format_*` functions only when the
-    /// Jinja source is missing or rendering fails.
+    /// Renders the model's own chat template (`tokenizer_config.json` or
+    /// `chat_template.jinja`), as `AutoTokenizer.apply_chat_template` does;
+    /// the built-in format of the template type when the model ships none, or
+    /// when its template refuses the conversation.
     pub fn apply_inference(
         &self,
         messages: &[Message],
@@ -860,7 +944,7 @@ impl ChatTemplate {
         self.apply_inference_with_kwargs(messages, tools, &kwargs)
             .unwrap_or_else(|e| {
                 tracing::warn!("{e}; falling back to the built-in formatter");
-                self.apply_builtin_inference(messages, tools, no_thinking)
+                self.apply_builtin_inference(messages, tools, &kwargs)
             })
     }
 
@@ -881,12 +965,12 @@ impl ChatTemplate {
     /// the thinking block from it, so leaving it inside `content` would
     /// print a second, nested one.
     ///
-    /// Without a Jinja template the built-in formatter runs, honouring
-    /// `enable_thinking` only. A template that fails to render falls back
-    /// the same way when the kwargs are `enable_thinking` alone; with any
-    /// other kwarg the error is returned, because the built-in formatter
-    /// cannot honour it and a template's own `raise_exception` (an
-    /// unsupported `reasoning_effort` level, say) is the caller's to see.
+    /// Without a Jinja template the built-in format runs. A template that
+    /// fails to render falls back the same way when the kwargs are
+    /// `enable_thinking` alone; with any other kwarg the error is returned,
+    /// because the built-in format cannot honour it and a template's own
+    /// `raise_exception` (an unsupported `reasoning_effort` level, say) is
+    /// the caller's to see.
     pub fn apply_inference_with_kwargs(
         &self,
         messages: &[Message],
@@ -894,25 +978,25 @@ impl ChatTemplate {
         kwargs: &ChatTemplateKwargs,
     ) -> Result<FormattedChat, String> {
         kwargs.check_reserved()?;
-        let no_thinking = kwargs.enable_thinking() == Some(false);
-        let Some(src) = self.jinja_source.as_deref() else {
-            return Ok(self.apply_builtin_inference(messages, tools, no_thinking));
+        let formatted = |text: String| FormattedChat {
+            response_start: text.len(),
+            text,
+            template_type: self.template_type,
+            response_spans: Vec::new(),
+            response_turns: Vec::new(),
         };
-        match self.render_jinja(src, messages, true, tools, kwargs) {
-            Ok(text) => Ok(FormattedChat {
-                text,
-                response_start: 0, // training masks set this separately
-                template_type: self.template_type,
-            }),
+        match self.render(messages, tools, kwargs, true) {
+            Ok(text) => Ok(formatted(text)),
             Err(e)
-                if kwargs
-                    .keys()
-                    .all(|k| k == ChatTemplateKwargs::ENABLE_THINKING) =>
+                if self.jinja_source.is_some()
+                    && kwargs
+                        .keys()
+                        .all(|k| k == ChatTemplateKwargs::ENABLE_THINKING) =>
             {
                 tracing::warn!(
-                    "Jinja chat template render failed, falling back to hardcoded formatter: {e}"
+                    "Jinja chat template render failed, falling back to the built-in format: {e}"
                 );
-                Ok(self.apply_builtin_inference(messages, tools, no_thinking))
+                Ok(self.apply_builtin_inference(messages, tools, kwargs))
             }
             Err(e) => Err(format!("chat template: {e}")),
         }
@@ -1014,16 +1098,30 @@ impl ChatTemplate {
         Ok(())
     }
 
-    /// The hardcoded formatter, for models without a Jinja chat template.
+    /// The generation prompt in the built-in format of the template type,
+    /// for models without a chat template of their own.
     fn apply_builtin_inference(
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
-        no_thinking: bool,
+        kwargs: &ChatTemplateKwargs,
     ) -> FormattedChat {
-        match self.template_type {
-            ChatTemplateType::Qwen => self.format_qwen_inference(messages, tools, no_thinking),
-            _ => self.apply_with_tools(messages, tools),
+        let builtin = Self {
+            jinja_source: None,
+            ..self.clone()
+        };
+        match builtin.render(messages, tools, kwargs, true) {
+            Ok(text) => FormattedChat {
+                response_start: text.len(),
+                text,
+                template_type: self.template_type,
+                response_spans: Vec::new(),
+                response_turns: Vec::new(),
+            },
+            Err(e) => {
+                tracing::warn!("{e}; rendering the conversation as plain text");
+                plain_conversation(messages, self.template_type)
+            }
         }
     }
 
@@ -1033,8 +1131,8 @@ impl ChatTemplate {
     ///
     /// Messages with [`parts`](Message::parts) reach the template as a list
     /// of items, so it places each image and video placeholder where the
-    /// reference processor's `apply_chat_template` would. The hardcoded
-    /// formatters know nothing of media, which is why a prompt carrying media
+    /// reference processor's `apply_chat_template` would. The built-in
+    /// formats know nothing of media, which is why a prompt carrying media
     /// must come through here.
     pub fn render_inference_jinja(
         &self,
@@ -1064,7 +1162,52 @@ impl ChatTemplate {
         self.render_jinja(src, messages, true, tools, kwargs)
     }
 
-    /// Render the upstream Jinja template.
+    /// Render a conversation through the chat template, as transformers'
+    /// `apply_chat_template(messages, tools=tools,
+    /// add_generation_prompt=add_generation_prompt, tokenize=False,
+    /// **kwargs)` renders it.
+    ///
+    /// The template is the model's own when it ships one, else the built-in
+    /// format of [`template_type`](Self::template_type) (the formats of `chat_templates/builtin.rs`).
+    ///
+    /// An `Err` is the template refusing the conversation (its own
+    /// `raise_exception`, such as roles that do not alternate), failing to
+    /// compile, or a built-in format asked for what it cannot do: tools it
+    /// has no place for, or images and videos.
+    pub fn render(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        kwargs: &ChatTemplateKwargs,
+        add_generation_prompt: bool,
+    ) -> Result<String, String> {
+        kwargs.check_reserved()?;
+        match self.jinja_source.as_deref() {
+            Some(src) => self.render_jinja(src, messages, add_generation_prompt, tools, kwargs),
+            None => {
+                if messages.iter().any(Message::has_media) {
+                    return Err(
+                        "the model ships no chat template, and the built-in formats \
+                                have no place for images or videos"
+                            .into(),
+                    );
+                }
+                let mut kwargs = kwargs.clone();
+                if let Some(system) = &self.default_system_message {
+                    kwargs.set_default("default_system_message", system.as_str());
+                }
+                self.render_jinja(
+                    builtin::source(self.template_type),
+                    messages,
+                    add_generation_prompt,
+                    tools,
+                    &kwargs,
+                )
+            }
+        }
+    }
+
+    /// Render `src`, a Jinja chat template, over the conversation.
     fn render_jinja(
         &self,
         src: &str,
@@ -1073,7 +1216,12 @@ impl ChatTemplate {
         tools: Option<&[ToolDefinition]>,
         kwargs: &ChatTemplateKwargs,
     ) -> Result<String, String> {
-        let split_thinking = self.reads_kwarg("reasoning_content");
+        // Raw `<think>…</think>` text in an assistant message moves to
+        // `reasoning_content` only for a template that renders that field as
+        // a `<think>` block. Gemma 4's reads the field too, but writes its
+        // thinking as a thought channel, so a `<think>` in the content is
+        // just content there.
+        let split_thinking = self.reads_kwarg("reasoning_content") && src.contains("</think>");
 
         // Map pmetal's internal Message into the shape HF Jinja templates
         // expect. We carry tool_calls / tool_call_id through verbatim.
@@ -1139,1050 +1287,70 @@ impl ChatTemplate {
 
         crate::jinja_chat::render_chat_template(src, &jinja_messages, &options)
     }
+}
 
-    /// Format using ChatML / Qwen format with tool support.
-    ///
-    /// Tool format (Qwen 2.5 style):
-    /// - System message includes `# Tools` section with JSON schemas in `<tools>` tags
-    /// - Assistant tool calls: `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
-    /// - Tool responses: role="tool" rendered as `<|im_start|>user\n<tool_response>...</tool_response><|im_end|>`
-    fn format_chatml(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
+/// A conversation rendered for training: the text, where the final response
+/// begins in it, and the template kwargs (the thinking switch among them)
+/// the rendering was made with, the one that fits first.
+struct TrainingRender {
+    text: String,
+    response_start: usize,
+    variants: Vec<ChatTemplateKwargs>,
+}
 
-        // Build system message content
-        let has_system = messages.iter().any(|m| m.role == "system");
-        let system_content = if has_system {
-            let sys_msg = messages.iter().find(|m| m.role == "system").unwrap();
-            let mut content = sys_msg.content.clone();
-            if let Some(tool_defs) = tools {
-                if !tool_defs.is_empty() {
-                    content.push_str(&format_tools_qwen(tool_defs));
-                }
-            }
-            Some(content)
-        } else {
-            let base = self.default_system_message.clone().unwrap_or_default();
-            if let Some(tool_defs) = tools {
-                if !tool_defs.is_empty() {
-                    Some(format!("{}{}", base, format_tools_qwen(tool_defs)))
-                } else if !base.is_empty() {
-                    Some(base)
-                } else {
-                    None
-                }
-            } else if !base.is_empty() {
-                Some(base)
-            } else {
-                None
-            }
-        };
+/// `variants` with `chosen` moved to the front.
+fn chosen_first(
+    variants: &[ChatTemplateKwargs],
+    chosen: &ChatTemplateKwargs,
+) -> Vec<ChatTemplateKwargs> {
+    let mut ordered = vec![chosen.clone()];
+    ordered.extend(variants.iter().filter(|v| *v != chosen).cloned());
+    ordered
+}
 
-        // Emit system message
-        if let Some(ref sys) = system_content {
-            text.push_str(&format!("<|im_start|>system\n{}<|im_end|>\n", sys));
+/// Length in bytes of the longest common prefix of `a` and `b` that ends on a
+/// character boundary of both.
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.char_indices()
+        .zip(b.chars())
+        .find(|((_, x), y)| x != y)
+        .map_or_else(|| a.len().min(b.len()), |((at, _), _)| at)
+}
+
+/// A conversation as `role: content` lines, for a template that refuses it
+/// and a built-in format that cannot take it either. The last assistant turn
+/// is the response.
+fn plain_conversation(messages: &[Message], template_type: ChatTemplateType) -> FormattedChat {
+    let mut text = String::new();
+    let mut response_spans = Vec::new();
+    let mut response_turns = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        text.push_str(&message.role);
+        text.push_str(": ");
+        let start = text.len();
+        text.push_str(&message.content);
+        if message.role == "assistant" {
+            response_spans.push(start..text.len());
+            response_turns.push(index);
         }
-
-        // Track consecutive tool messages to merge them (Qwen style)
-        let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
-
-        for (i, msg) in non_system.iter().enumerate() {
-            let is_last = i == non_system.len() - 1;
-
-            match msg.role.as_str() {
-                "assistant" if msg.has_tool_calls() => {
-                    // Assistant message with tool calls
-                    let header = "<|im_start|>assistant".to_string();
-                    if is_last {
-                        response_start = text.len() + header.len() + 1; // +1 for \n
-                    }
-                    text.push_str(&header);
-                    if !msg.content.is_empty() {
-                        text.push('\n');
-                        text.push_str(&msg.content);
-                    }
-                    for tc in msg.tool_calls.as_ref().unwrap() {
-                        text.push_str(&format_tool_call_qwen(tc));
-                    }
-                    text.push_str("<|im_end|>\n");
-                }
-                "tool" => {
-                    // Qwen merges consecutive tool responses into one user turn
-                    let is_first_tool =
-                        i == 0 || non_system.get(i - 1).is_none_or(|prev| prev.role != "tool");
-                    let is_last_tool = non_system.get(i + 1).is_none_or(|next| next.role != "tool");
-
-                    if is_first_tool {
-                        text.push_str("<|im_start|>user");
-                    }
-                    text.push_str("\n<tool_response>\n");
-                    text.push_str(&msg.content);
-                    text.push_str("\n</tool_response>");
-                    if is_last_tool {
-                        text.push_str("<|im_end|>\n");
-                    }
-                }
-                role => {
-                    // Regular user/assistant message
-                    let header = format!("<|im_start|>{}\n", role);
-                    if role == "assistant" && is_last {
-                        response_start = text.len() + header.len();
-                    }
-                    text.push_str(&header);
-                    text.push_str(&msg.content);
-                    text.push_str("<|im_end|>\n");
-                }
-            }
-        }
-
-        // For training/inference, add assistant header if last message is user or tool
-        if let Some(last) = non_system.last() {
-            if last.role == "user" || last.role == "tool" {
-                text.push_str("<|im_start|>assistant\n");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
+        text.push_str("\n\n");
     }
-
-    /// Format Qwen inference exactly like its tokenizer-provided ChatML prompt.
-    ///
-    /// The last-user generation prompt is:
-    /// - `<|im_start|>assistant\n<think>\n` in thinking mode
-    /// - `<|im_start|>assistant\n<think>\n\n</think>\n\n` in non-thinking mode
-    fn format_qwen_inference(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-        no_thinking: bool,
-    ) -> FormattedChat {
-        let mut formatted = self.format_chatml(messages, tools);
-        let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
-
-        if matches!(non_system.last(), Some(last) if last.role == "user" || last.role == "tool") {
-            let assistant_header = "<|im_start|>assistant\n";
-            if formatted.text.ends_with(assistant_header) {
-                let replacement = if no_thinking {
-                    format!("{assistant_header}<think>\n\n</think>\n\n")
-                } else {
-                    format!("{assistant_header}<think>\n")
-                };
-                let new_len = formatted.text.len() - assistant_header.len();
-                formatted.text.truncate(new_len);
-                formatted.text.push_str(&replacement);
-                formatted.response_start = formatted.text.len();
-            }
-        }
-
-        formatted
+    let ends_with_assistant = messages.last().is_some_and(|m| m.role == "assistant");
+    if !ends_with_assistant {
+        text.push_str("assistant: ");
+        response_spans.clear();
+        response_turns.clear();
     }
-
-    /// Format using Llama-2 format.
-    fn format_llama2(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        if self.add_bos {
-            if let Some(ref bos) = self.bos_token {
-                text.push_str(bos);
-            }
-        }
-
-        let mut system_message = self.default_system_message.clone();
-        let mut user_messages: Vec<&Message> = Vec::new();
-        let mut assistant_messages: Vec<&Message> = Vec::new();
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => system_message = Some(msg.content.clone()),
-                "user" => user_messages.push(msg),
-                "assistant" => assistant_messages.push(msg),
-                _ => {}
-            }
-        }
-
-        // Format first turn with system message
-        if let Some(first_user) = user_messages.first() {
-            text.push_str("[INST] ");
-            if let Some(ref sys) = system_message {
-                text.push_str(&format!("<<SYS>>\n{}\n<</SYS>>\n\n", sys));
-            }
-            text.push_str(&first_user.content);
-            text.push_str(" [/INST]");
-
-            // First assistant response
-            if let Some(first_assistant) = assistant_messages.first() {
-                response_start = text.len() + 1;
-                text.push(' ');
-                text.push_str(&first_assistant.content);
-            } else {
-                response_start = text.len() + 1;
-                text.push(' ');
-            }
-        }
-
-        // Additional turns: canonical multi-turn wraps each pair in <s>...</s>.
-        // Format: </s><s>[INST] u2 [/INST] a2 </s><s>[INST] u3 [/INST] ...
-        for i in 1..user_messages.len().max(assistant_messages.len()) {
-            // Close previous turn and open a new one
-            text.push_str("</s><s>");
-            if i < user_messages.len() {
-                text.push_str(&format!("[INST] {} [/INST]", user_messages[i].content));
-            }
-            if i < assistant_messages.len() {
-                response_start = text.len() + 1;
-                text.push(' ');
-                text.push_str(&assistant_messages[i].content);
-            } else {
-                response_start = text.len() + 1;
-                text.push(' ');
-            }
-        }
-
-        if self.add_eos && !text.ends_with("</s>") {
-            text.push_str("</s>");
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Llama-3 format.
-    /// Format using Llama 3 / 3.1+ format with tool support.
-    ///
-    /// Tool format (Llama 3.1 style):
-    /// - System message includes "Environment: ipython" and tool schemas when tools present
-    /// - Assistant tool calls: `{"name": "...", "parameters": {...}}`
-    /// - Tool responses: role="ipython" with content
-    fn format_llama3(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-        let has_tools = tools.is_some_and(|t| !t.is_empty());
-
-        if self.add_bos {
-            text.push_str("<|begin_of_text|>");
-        }
-
-        // Build system message
-        let has_system = messages.iter().any(|m| m.role == "system");
-        let system_content = if has_system {
-            let sys = messages.iter().find(|m| m.role == "system").unwrap();
-            let mut content = String::new();
-            if has_tools {
-                content.push_str("Environment: ipython\n");
-            }
-            content.push_str(&sys.content);
-            if let Some(tool_defs) = tools {
-                if !tool_defs.is_empty() {
-                    content.push('\n');
-                    content.push_str(&format_tools_llama3(tool_defs));
-                }
-            }
-            content
-        } else {
-            let mut content = String::new();
-            if has_tools {
-                content.push_str("Environment: ipython\n");
-            }
-            if let Some(ref default) = self.default_system_message {
-                content.push_str(default);
-            }
-            if let Some(tool_defs) = tools {
-                if !tool_defs.is_empty() {
-                    content.push('\n');
-                    content.push_str(&format_tools_llama3(tool_defs));
-                }
-            }
-            content
-        };
-
-        // Always emit system header for Llama 3
-        text.push_str("<|start_header_id|>system<|end_header_id|>\n\n");
-        text.push_str(system_content.trim());
-        text.push_str("<|eot_id|>");
-
-        // Process non-system messages
-        let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
-
-        for (i, msg) in non_system.iter().enumerate() {
-            let is_last = i == non_system.len() - 1;
-
-            match msg.role.as_str() {
-                "assistant" if msg.has_tool_calls() => {
-                    let header = "<|start_header_id|>assistant<|end_header_id|>\n\n";
-                    if is_last {
-                        response_start = text.len() + header.len();
-                    }
-                    text.push_str(header);
-                    if !msg.content.is_empty() {
-                        text.push_str(msg.content.trim());
-                    }
-                    // Format each tool call
-                    for tc in msg.tool_calls.as_ref().unwrap() {
-                        text.push_str(&format_tool_call_llama3(tc));
-                    }
-                    text.push_str("<|eot_id|>");
-                }
-                "tool" | "ipython" => {
-                    // Tool responses use ipython header in Llama 3.1
-                    text.push_str("<|start_header_id|>ipython<|end_header_id|>\n\n");
-                    text.push_str(msg.content.trim());
-                    text.push_str("<|eot_id|>");
-                }
-                role => {
-                    let header = format!("<|start_header_id|>{}<|end_header_id|>\n\n", role);
-                    if role == "assistant" && is_last {
-                        response_start = text.len() + header.len();
-                    }
-                    text.push_str(&header);
-                    text.push_str(msg.content.trim());
-                    text.push_str("<|eot_id|>");
-                }
-            }
-        }
-
-        // Add assistant generation prompt if last is user or tool
-        if let Some(last) = non_system.last() {
-            if last.role == "user" || last.role == "tool" || last.role == "ipython" {
-                text.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Mistral format.
-    /// Format using Mistral v3+ format with tool support.
-    ///
-    /// Tool format:
-    /// - `[AVAILABLE_TOOLS] [{...}, ...] [/AVAILABLE_TOOLS]` before first user message
-    /// - `[TOOL_CALLS] [{"name": "...", "arguments": {...}}]` for assistant tool calls
-    /// - `[TOOL_RESULTS] {"content": "..."} [/TOOL_RESULTS]` for tool responses
-    fn format_mistral(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        if self.add_bos {
-            text.push_str("<s>");
-        }
-
-        let mut system_content: Option<String> = None;
-        let mut is_first_user = true;
-
-        for (i, msg) in messages.iter().enumerate() {
-            match msg.role.as_str() {
-                "system" => {
-                    system_content = Some(msg.content.clone());
-                }
-                "user" => {
-                    // Inject tool definitions before first user message
-                    if is_first_user {
-                        if let Some(tool_defs) = tools {
-                            if !tool_defs.is_empty() {
-                                text.push_str(&format_tools_mistral(tool_defs));
-                            }
-                        }
-                    }
-                    text.push_str("[INST] ");
-                    if is_first_user {
-                        if let Some(ref sys) = system_content {
-                            text.push_str(sys);
-                            text.push_str("\n\n");
-                        }
-                        is_first_user = false;
-                    }
-                    text.push_str(&msg.content);
-                    text.push_str(" [/INST]");
-                }
-                "assistant" if msg.has_tool_calls() => {
-                    response_start = text.len();
-                    text.push_str(&format_tool_calls_mistral(msg.tool_calls.as_ref().unwrap()));
-                    text.push_str("</s>");
-                }
-                "assistant" => {
-                    response_start = text.len();
-                    text.push_str(&msg.content);
-                    if i < messages.len() - 1 {
-                        text.push_str("</s>");
-                    }
-                }
-                "tool" => {
-                    text.push_str(&format!(
-                        "[TOOL_RESULTS] {{\"content\": {}}} [/TOOL_RESULTS]",
-                        serde_json::to_string(&msg.content)
-                            .unwrap_or_else(|_| format!("\"{}\"", msg.content))
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(last) = messages.last() {
-            if last.role == "user" || last.role == "tool" {
-                response_start = text.len();
-            }
-        }
-
-        if self.add_eos && !text.ends_with("</s>") {
-            text.push_str("</s>");
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Gemma format.
-    fn format_gemma(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        for (i, msg) in messages.iter().enumerate() {
-            let role = match msg.role.as_str() {
-                "user" | "human" => "user",
-                "assistant" | "gpt" => "model",
-                "system" => "user", // Gemma treats system as user turn
-                _ => &msg.role,
-            };
-
-            let formatted = format!("<start_of_turn>{}\n{}<end_of_turn>\n", role, msg.content);
-
-            // Track where the last model response begins
-            if (msg.role == "assistant" || msg.role == "model") && i == messages.len() - 1 {
-                let header = format!("<start_of_turn>{}\n", role);
-                response_start = text.len() + header.len();
-            }
-
-            text.push_str(&formatted);
-        }
-
-        // For training, add model turn header if last is user
-        if let Some(last) = messages.last() {
-            if last.role == "user" || last.role == "human" {
-                text.push_str("<start_of_turn>model\n");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Gemma 4's `<|turn>...<turn|>` wrappers.
-    ///
-    /// The role for the assistant turn is `model`. For the default
-    /// (non-thinking) generation prompt we append `<|channel>thought\n
-    /// <channel|>` right after the `<|turn>model\n` header — this matches
-    /// the upstream Jinja template's `enable_thinking=False` default, which
-    /// pre-opens *and* immediately closes an empty thought channel so the
-    /// model can write its answer directly into the `model` turn. Omitting
-    /// this suffix causes the model to emit pathological `---` loops,
-    /// because Gemma 4 was trained to always emit something in the thought
-    /// channel before the final answer.
-    ///
-    /// System messages are honoured via an explicit `<|turn>system` block
-    /// (unlike Gemma 2/3 which folded system into user). Reasoning mode
-    /// (`<|think|>` system-block prefix) is not yet exposed and is a
-    /// follow-up — gate it on a future `enable_thinking` flag.
-    fn format_gemma4(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        // Gemma 4's tokenizer post-processor adds nothing; its chat template
-        // opens with `{{ bos_token }}`. Gemma 2 and 3 are the other way round.
-        if self.add_bos {
-            if let Some(ref bos) = self.bos_token {
-                text.push_str(bos);
-            }
-        }
-
-        for (i, msg) in messages.iter().enumerate() {
-            let role = match msg.role.as_str() {
-                "user" | "human" => "user",
-                "assistant" | "gpt" | "model" => "model",
-                "system" | "developer" => "system",
-                other => other,
-            };
-
-            let formatted = format!("<|turn>{}\n{}<turn|>\n", role, msg.content);
-
-            if (msg.role == "assistant" || msg.role == "model") && i == messages.len() - 1 {
-                let header = format!("<|turn>{}\n", role);
-                response_start = text.len() + header.len();
-            }
-
-            text.push_str(&formatted);
-        }
-
-        // Generation prompt when the last message is user/system: start a
-        // new model turn AND pre-close the thought channel (see doc above).
-        if let Some(last) = messages.last() {
-            if last.role == "user" || last.role == "human" || last.role == "system" {
-                text.push_str("<|turn>model\n");
-                response_start = text.len();
-                text.push_str("<|channel>thought\n<channel|>");
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Phi-3 format.
-    fn format_phi3(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        for (i, msg) in messages.iter().enumerate() {
-            let tag = match msg.role.as_str() {
-                "system" => "<|system|>",
-                "user" => "<|user|>",
-                "assistant" => "<|assistant|>",
-                _ => "<|user|>",
-            };
-
-            text.push_str(tag);
-            text.push('\n');
-            text.push_str(&msg.content);
-            text.push_str("<|end|>\n");
-
-            if msg.role == "assistant" && i == messages.len() - 1 {
-                // Response started after the tag and newline
-                response_start = text.len() - msg.content.len() - "<|end|>\n".len();
-            }
-        }
-
-        // For training, add assistant header if last is user
-        if let Some(last) = messages.last() {
-            if last.role == "user" {
-                text.push_str("<|assistant|>\n");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Phi-4 format.
-    fn format_phi4(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        for (i, msg) in messages.iter().enumerate() {
-            // Canonical Phi-4 format: <|im_start|>role<|im_sep|>content<|im_end|>\n
-            let formatted = format!(
-                "<|im_start|>{}<|im_sep|>{}<|im_end|>\n",
-                msg.role, msg.content
-            );
-
-            if msg.role == "assistant" && i == messages.len() - 1 {
-                let header = format!("<|im_start|>{}<|im_sep|>", msg.role);
-                response_start = text.len() + header.len();
-            }
-
-            text.push_str(&formatted);
-        }
-
-        // For training, add assistant header if last is user
-        if let Some(last) = messages.last() {
-            if last.role == "user" {
-                text.push_str("<|im_start|>assistant<|im_sep|>");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Alpaca format.
-    fn format_alpaca(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-
-        let mut instruction = String::new();
-        let mut input = String::new();
-        let mut output = String::new();
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" | "instruction" => instruction = msg.content.clone(),
-                "user" | "input" => input = msg.content.clone(),
-                "assistant" | "output" => output = msg.content.clone(),
-                _ => {}
-            }
-        }
-
-        if !instruction.is_empty() {
-            text.push_str("### Instruction:\n");
-            text.push_str(&instruction);
-            text.push_str("\n\n");
-        }
-
-        if !input.is_empty() {
-            text.push_str("### Input:\n");
-            text.push_str(&input);
-            text.push_str("\n\n");
-        }
-
-        text.push_str("### Response:\n");
-        let response_start = text.len();
-
-        if !output.is_empty() {
-            text.push_str(&output);
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Vicuna format.
-    fn format_vicuna(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        // System message at the start
-        if let Some(ref sys) = self.default_system_message {
-            text.push_str(sys);
-            text.push_str("\n\n");
-        }
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system"
-                    // Already handled or override
-                    if text.is_empty() => {
-                        text.push_str(&msg.content);
-                        text.push_str("\n\n");
-                    }
-                "user" => {
-                    text.push_str("USER: ");
-                    text.push_str(&msg.content);
-                    text.push('\n');
-                }
-                "assistant" => {
-                    text.push_str("ASSISTANT: ");
-                    response_start = text.len();
-                    text.push_str(&msg.content);
-                    text.push('\n');
-                }
-                _ => {}
-            }
-        }
-
-        // For training, add assistant prefix if last is user
-        if let Some(last) = messages.last() {
-            if last.role == "user" {
-                text.push_str("ASSISTANT: ");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Zephyr format.
-    fn format_zephyr(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        for (i, msg) in messages.iter().enumerate() {
-            let tag = match msg.role.as_str() {
-                "system" => "<|system|>",
-                "user" => "<|user|>",
-                "assistant" => "<|assistant|>",
-                _ => "<|user|>",
-            };
-
-            text.push_str(tag);
-            text.push('\n');
-            text.push_str(&msg.content);
-            text.push_str("</s>\n");
-
-            if msg.role == "assistant" && i == messages.len() - 1 {
-                response_start = text.len() - msg.content.len() - "</s>\n".len();
-            }
-        }
-
-        // For training, add assistant header if last is user
-        if let Some(last) = messages.last() {
-            if last.role == "user" {
-                text.push_str("<|assistant|>\n");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using GPT-OSS Harmony format.
-    ///
-    /// Harmony format structure:
-    /// - `<|start|>role<|message|>content<|end|>` for basic messages
-    /// - `<|start|>assistant<|channel|>final<|message|>content<|end|>` for assistant
-    ///
-    /// Roles: system, developer, user, assistant
-    /// Channels: analysis (reasoning), commentary, final (response)
-    /// EOS: `<|return|>` marks end of generation
-    fn format_gpt_oss(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        // Add default system message if no system message and we have a default
-        let has_system = messages.iter().any(|m| m.role == "system");
-        let all_messages: Vec<Message> = if !has_system {
-            if let Some(ref system_msg) = self.default_system_message {
-                let mut msgs = vec![Message::system(system_msg.clone())];
-                msgs.extend(messages.iter().cloned());
-                msgs
-            } else {
-                messages.to_vec()
-            }
-        } else {
-            messages.to_vec()
-        };
-
-        for (i, msg) in all_messages.iter().enumerate() {
-            match msg.role.as_str() {
-                "system" => {
-                    // System messages use simple format
-                    text.push_str("<|start|>system<|message|>");
-                    text.push_str(&msg.content);
-                    text.push_str("<|end|>");
-                }
-                "developer" => {
-                    // Developer messages for system-level instructions
-                    text.push_str("<|start|>developer<|message|>");
-                    text.push_str(&msg.content);
-                    text.push_str("<|end|>");
-                }
-                "user" => {
-                    // User messages use simple format
-                    text.push_str("<|start|>user<|message|>");
-                    text.push_str(&msg.content);
-                    text.push_str("<|end|>");
-                }
-                "assistant" => {
-                    // Assistant uses final channel for responses
-                    let header = "<|start|>assistant<|channel|>final<|message|>";
-                    text.push_str(header);
-
-                    // Track where the last assistant response begins
-                    if i == all_messages.len() - 1 {
-                        response_start = text.len();
-                    }
-
-                    text.push_str(&msg.content);
-                    text.push_str("<|end|>");
-                }
-                _ => {
-                    // Unknown role: treat as user
-                    text.push_str("<|start|>user<|message|>");
-                    text.push_str(&msg.content);
-                    text.push_str("<|end|>");
-                }
-            }
-        }
-
-        // For training, add assistant header if last message is user
-        if let Some(last) = all_messages.last() {
-            if last.role == "user" {
-                text.push_str("<|start|>assistant<|channel|>final<|message|>");
-                response_start = text.len();
-            }
-        }
-
-        // Add return token at the end for training
-        if self.add_eos {
-            text.push_str("<|return|>");
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Llama-4 format with tool support.
-    ///
-    /// Llama 4 uses different header tokens than Llama 3:
-    /// - `<|header_start|>` / `<|header_end|>` (not `<|start_header_id|>` / `<|end_header_id|>`)
-    /// - `<|eot|>` (not `<|eot_id|>`)
-    ///
-    /// Tool format follows Llama 3.1 conventions but with Llama 4 tokens.
-    fn format_llama4(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-        let has_tools = tools.is_some_and(|t| !t.is_empty());
-
-        if self.add_bos {
-            text.push_str("<|begin_of_text|>");
-        }
-
-        // Build system message with tools
-        let has_system = messages.iter().any(|m| m.role == "system");
-        let system_content = {
-            let mut content = String::new();
-            if has_tools {
-                content.push_str("Environment: ipython\n");
-            }
-            if has_system {
-                let sys = messages.iter().find(|m| m.role == "system").unwrap();
-                content.push_str(&sys.content);
-            } else if let Some(ref default) = self.default_system_message {
-                content.push_str(default);
-            }
-            if let Some(tool_defs) = tools {
-                if !tool_defs.is_empty() {
-                    content.push('\n');
-                    content.push_str(&format_tools_llama3(tool_defs));
-                }
-            }
-            content
-        };
-
-        if !system_content.is_empty() {
-            text.push_str("<|header_start|>system<|header_end|>\n\n");
-            text.push_str(system_content.trim());
-            text.push_str("<|eot|>");
-        }
-
-        let non_system: Vec<&Message> = messages.iter().filter(|m| m.role != "system").collect();
-
-        for (i, msg) in non_system.iter().enumerate() {
-            let is_last = i == non_system.len() - 1;
-
-            match msg.role.as_str() {
-                "assistant" if msg.has_tool_calls() => {
-                    let header = "<|header_start|>assistant<|header_end|>\n\n";
-                    if is_last {
-                        response_start = text.len() + header.len();
-                    }
-                    text.push_str(header);
-                    if !msg.content.is_empty() {
-                        text.push_str(msg.content.trim());
-                    }
-                    for tc in msg.tool_calls.as_ref().unwrap() {
-                        text.push_str(&format_tool_call_llama3(tc));
-                    }
-                    text.push_str("<|eot|>");
-                }
-                "tool" | "ipython" => {
-                    text.push_str("<|header_start|>ipython<|header_end|>\n\n");
-                    text.push_str(msg.content.trim());
-                    text.push_str("<|eot|>");
-                }
-                role => {
-                    let header = format!("<|header_start|>{}<|header_end|>\n\n", role);
-                    if role == "assistant" && is_last {
-                        response_start = text.len() + header.len();
-                    }
-                    text.push_str(&header);
-                    text.push_str(msg.content.trim());
-                    text.push_str("<|eot|>");
-                }
-            }
-        }
-
-        if let Some(last) = non_system.last() {
-            if last.role == "user" || last.role == "tool" || last.role == "ipython" {
-                text.push_str("<|header_start|>assistant<|header_end|>\n\n");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using DeepSeek format with tool support.
-    ///
-    /// DeepSeek uses full-width unicode pipe characters (U+FF5C) and
-    /// lower-one-eighth-block (U+2581) for underscores in token names.
-    /// Tool format: tools injected into system prompt using Qwen-style tags.
-    fn format_deepseek(
-        &self,
-        messages: &[Message],
-        tools: Option<&[ToolDefinition]>,
-    ) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        if self.add_bos {
-            text.push_str("<｜begin▁of▁sentence｜>");
-        }
-
-        for (i, msg) in messages.iter().enumerate() {
-            match msg.role.as_str() {
-                "system" => {
-                    text.push_str(&msg.content);
-                    if let Some(tool_defs) = tools {
-                        if !tool_defs.is_empty() {
-                            text.push_str(&format_tools_qwen(tool_defs));
-                        }
-                    }
-                }
-                "user" => {
-                    text.push_str("<｜User｜>");
-                    text.push_str(&msg.content);
-                }
-                "assistant" if msg.has_tool_calls() => {
-                    text.push_str("<｜Assistant｜>");
-                    if i == messages.len() - 1 {
-                        response_start = text.len();
-                    }
-                    if !msg.content.is_empty() {
-                        text.push_str(&msg.content);
-                    }
-                    for tc in msg.tool_calls.as_ref().unwrap() {
-                        text.push_str(&format_tool_call_qwen(tc));
-                    }
-                    if i < messages.len() - 1 {
-                        text.push_str("<｜end▁of▁sentence｜>");
-                    }
-                }
-                "assistant" => {
-                    text.push_str("<｜Assistant｜>");
-                    if i == messages.len() - 1 {
-                        response_start = text.len();
-                    }
-                    text.push_str(&msg.content);
-                    if i < messages.len() - 1 {
-                        text.push_str("<｜end▁of▁sentence｜>");
-                    }
-                }
-                "tool" => {
-                    text.push_str("<｜User｜>\n<tool_response>\n");
-                    text.push_str(&msg.content);
-                    text.push_str("\n</tool_response>");
-                }
-                _ => {
-                    text.push_str("<｜User｜>");
-                    text.push_str(&msg.content);
-                }
-            }
-        }
-
-        if let Some(last) = messages.last() {
-            if last.role == "user" || last.role == "tool" {
-                text.push_str("<｜Assistant｜>");
-                response_start = text.len();
-            }
-        }
-
-        if self.add_eos && !text.ends_with("<｜end▁of▁sentence｜>") {
-            text.push_str("<｜end▁of▁sentence｜>");
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
-    }
-
-    /// Format using Cohere Command R format.
-    ///
-    /// Uses `<|START_OF_TURN_TOKEN|>`, `<|USER_TOKEN|>`, `<|CHATBOT_TOKEN|>`,
-    /// and `<|END_OF_TURN_TOKEN|>` tokens.
-    fn format_cohere(&self, messages: &[Message]) -> FormattedChat {
-        let mut text = String::new();
-        let mut response_start = 0;
-
-        if self.add_bos {
-            if let Some(ref bos) = self.bos_token {
-                text.push_str(bos);
-            }
-        }
-
-        for (i, msg) in messages.iter().enumerate() {
-            let role_token = match msg.role.as_str() {
-                "system" => "<|SYSTEM_TOKEN|>",
-                "user" => "<|USER_TOKEN|>",
-                "assistant" => "<|CHATBOT_TOKEN|>",
-                _ => "<|USER_TOKEN|>",
-            };
-
-            text.push_str("<|START_OF_TURN_TOKEN|>");
-            text.push_str(role_token);
-            text.push_str(&msg.content);
-            text.push_str("<|END_OF_TURN_TOKEN|>");
-
-            if msg.role == "assistant" && i == messages.len() - 1 {
-                response_start = text.len() - msg.content.len() - "<|END_OF_TURN_TOKEN|>".len();
-            }
-        }
-
-        if let Some(last) = messages.last() {
-            if last.role == "user" {
-                text.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
-                response_start = text.len();
-            }
-        }
-
-        FormattedChat {
-            text,
-            response_start,
-            template_type: self.template_type,
-        }
+    let response_start = match (ends_with_assistant, response_spans.last()) {
+        (true, Some(span)) => span.start,
+        _ => text.len(),
+    };
+    FormattedChat {
+        text,
+        response_start,
+        template_type,
+        response_spans,
+        response_turns,
     }
 }
 
@@ -2203,49 +1371,41 @@ pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> C
         .unwrap_or(serde_json::Value::Null);
     let standalone = std::fs::read_to_string(model_path.join("chat_template.jinja")).ok();
     if let Some(jinja) = standalone.or_else(|| extract_jinja_template(&json)) {
-        // Detect the template family (for the eos_token lookup and
-        // fallback path), but we'll also attach the raw Jinja so
-        // `apply_inference` can execute the upstream template
-        // verbatim and get a bit-exact match.
-        let detected_family = detect_template_from_jinja(&jinja)
-            // When the detector can't classify the Jinja family,
-            // fall back to a ChatML skeleton so eos/bos defaults
-            // are sensible. The attached Jinja source is what
-            // actually drives rendering.
-            .unwrap_or_else(ChatTemplate::chatml);
-        let mut template = detected_family;
-
-        // Refine: ChatML-looking Qwen checkpoints get the Qwen
-        // variant so the hardcoded fallback (for base models)
-        // uses the right defaults. The Jinja source still wins
-        // for the rendering path.
-        if template.template_type == ChatTemplateType::ChatMl {
-            let is_qwen = json
-                .get("model_type")
-                .and_then(|v| v.as_str())
-                .is_some_and(|t| t.to_lowercase().contains("qwen"))
-                || model_name.to_lowercase().contains("qwen");
-            if is_qwen {
-                template = ChatTemplate::qwen();
-            }
-        }
-
-        // Pull bos / eos token strings from the tokenizer config
-        // so the Jinja renderer can substitute `{{ bos_token }}`
-        // and `{{ eos_token }}` exactly like HF does.
-        if let Some(bos) = extract_token_string_field(&json, "bos_token") {
-            template.bos_token = Some(bos);
-        }
-        if let Some(eos) = extract_token_string_field(&json, "eos_token") {
-            template.eos_token = eos;
-        }
-
-        // Attach the raw Jinja source — this is what `apply_inference`
-        // executes first, falling back to `format_*` on failure.
-        template.jinja_source = Some(jinja);
-
+        // Pull bos / eos token strings from the tokenizer config (else the
+        // special-tokens map) so the Jinja renderer can substitute
+        // `{{ bos_token }}` and `{{ eos_token }}` exactly like HF does.
+        let special_tokens_map =
+            std::fs::read_to_string(model_path.join("special_tokens_map.json"))
+                .ok()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .unwrap_or(serde_json::Value::Null);
+        let token_string = |key| {
+            extract_token_string_field(&json, key)
+                .or_else(|| extract_token_string_field(&special_tokens_map, key))
+        };
+        let model_type = json
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let template = ChatTemplate::from_jinja(
+            jinja,
+            token_string("bos_token"),
+            token_string("eos_token"),
+            &format!("{model_name} {model_type}"),
+        );
         tracing::info!(
             "Chat template: {:?} (jinja attached)",
+            template.template_type
+        );
+        return template;
+    }
+
+    // 1b. A GGUF carries its chat template in `tokenizer.chat_template`.
+    if let Some(gguf) = crate::tokenizer::gguf_chat_template(model_path) {
+        let template =
+            ChatTemplate::from_jinja(gguf.template, gguf.bos_token, gguf.eos_token, model_name);
+        tracing::info!(
+            "Chat template: {:?} (jinja from GGUF metadata)",
             template.template_type
         );
         return template;
@@ -2371,6 +1531,11 @@ fn detect_template_from_jinja(jinja: &str) -> Option<ChatTemplate> {
     if jinja.contains("<|start|>") && jinja.contains("<|message|>") {
         return Some(ChatTemplate::gpt_oss());
     }
+    // Zephyr: `<|user|>` / `<|assistant|>` turns closed by the EOS token
+    // (Phi-3's close with `<|end|>`, which was checked above).
+    if jinja.contains("<|user|>") && jinja.contains("<|assistant|>") {
+        return Some(ChatTemplate::new(ChatTemplateType::Zephyr));
+    }
     // Alpaca: ### Instruction
     if jinja.contains("### Instruction") {
         return Some(ChatTemplate::alpaca());
@@ -2442,6 +1607,42 @@ pub fn detect_template_from_model(model_name: &str) -> ChatTemplate {
     }
 }
 
+impl FormattedChat {
+    /// Which tokens the model wrote, given the byte span of the text each
+    /// token covers ([`TokenizedText::offsets`](crate::TokenizedText::offsets)).
+    ///
+    /// A token counts only if it lies wholly inside one of the
+    /// [`response_spans`](Self::response_spans) and is not empty (a BOS the
+    /// tokenizer added covers nothing); a token that straddles the edge of a
+    /// span began in the prompt and is masked.
+    pub fn trainable_tokens(&self, offsets: &[(usize, usize)]) -> Vec<bool> {
+        tokens_inside(&self.response_spans, offsets)
+    }
+}
+
+/// Which tokens lie wholly inside one of `spans` (sorted, disjoint byte
+/// ranges), given each token's byte span of the text.
+///
+/// A token that covers nothing (a BOS the tokenizer added) is outside every
+/// span, and one that straddles the edge of a span is outside it. This is
+/// the one rule that turns a loss mask in bytes into a loss mask over tokens,
+/// for conversations ([`FormattedChat::trainable_tokens`]) and for the
+/// prompt/completion and document samples of dataset loading alike.
+pub(crate) fn tokens_inside(spans: &[Range<usize>], offsets: &[(usize, usize)]) -> Vec<bool> {
+    let mut spans = spans.iter().peekable();
+    offsets
+        .iter()
+        .map(|&(start, end)| {
+            // Tokens come in text order, so spans already passed are done.
+            while spans.next_if(|span| span.end <= start).is_some() {}
+            end > start
+                && spans
+                    .peek()
+                    .is_some_and(|span| span.start <= start && end <= span.end)
+        })
+        .collect()
+}
+
 /// Builder for creating training samples with response masking.
 #[derive(Debug, Clone)]
 pub struct TrainingSampleBuilder {
@@ -2456,8 +1657,8 @@ impl TrainingSampleBuilder {
 
     /// Build a training sample from messages.
     ///
-    /// Returns the formatted text and the prompt length in characters.
-    /// The prompt length can be used to mask prompt tokens in the loss.
+    /// Returns the formatted text and the byte offset where the final
+    /// response begins.
     pub fn build(&self, messages: &[Message]) -> (String, usize) {
         let formatted = self.template.apply(messages);
         (formatted.text, formatted.response_start)
@@ -2465,25 +1666,49 @@ impl TrainingSampleBuilder {
 
     /// Build a training sample and tokenize it with label masking.
     ///
-    /// Returns (input_ids, labels) where labels have -100 for everything but
-    /// the conversation's final assistant turn, truncated to `max_length`
-    /// tokens. Tokenized the way dataset loading tokenizes a conversation
-    /// ([`TrainingDataset::load`](crate::TrainingDataset::load)): the mask is
-    /// cut from the token offsets, and the template's own special tokens are
-    /// not doubled by the tokenizer's.
+    /// Returns `(input_ids, labels)`; a label is `-100` for every token the
+    /// model did not write (the system and user turns, the role headers) and
+    /// the token id for each token of an assistant turn, through the token
+    /// that ends it. All the assistant turns of the conversation that the
+    /// template renders the same way with or without later turns are
+    /// trained, not just the last.
+    ///
+    /// The text is tokenized once, without the tokenizer's own BOS (the
+    /// template wrote the model's), and the masks come from each token's span
+    /// of that text, so a token cannot be counted into the wrong side of the
+    /// prompt/response boundary by tokenizing the prompt separately.
     pub fn build_tokenized(
         &self,
         messages: &[Message],
         tokenizer: &super::Tokenizer,
         max_length: usize,
     ) -> pmetal_core::Result<(Vec<u32>, Vec<i64>)> {
-        crate::dataset::tokenize_messages(
-            messages,
-            &self.template,
-            tokenizer,
-            max_length,
-            crate::AssistantLoss::LastTurn,
-        )
+        let formatted = self
+            .template
+            .try_apply(messages, None, &ChatTemplateKwargs::new())
+            .map_err(pmetal_core::PMetalError::Tokenizer)?;
+        Self::tokenize(&formatted, tokenizer, max_length)
+    }
+
+    /// Tokenize a formatted conversation with label masking, as
+    /// [`build_tokenized`](Self::build_tokenized) does, truncating to
+    /// `max_length` tokens.
+    pub fn tokenize(
+        formatted: &FormattedChat,
+        tokenizer: &super::Tokenizer,
+        max_length: usize,
+    ) -> pmetal_core::Result<(Vec<u32>, Vec<i64>)> {
+        let mut encoded = tokenizer.encode_with_offsets(&formatted.text, false)?;
+        encoded.ids.truncate(max_length);
+        encoded.offsets.truncate(max_length);
+        let trainable = formatted.trainable_tokens(&encoded.offsets);
+        let labels = encoded
+            .ids
+            .iter()
+            .zip(&trainable)
+            .map(|(&id, &train)| if train { i64::from(id) } else { -100 })
+            .collect();
+        Ok((encoded.ids, labels))
     }
 }
 
@@ -2523,18 +1748,26 @@ mod tests {
         );
     }
 
+    /// A template of no family this knows is `Custom` (it used to be called
+    /// ChatML, and Granite's `<|start_of_role|>` template was detected as
+    /// one), and the special tokens come from the tokenizer files.
     #[test]
-    fn test_chatml_format() {
-        let template = ChatTemplate::chatml();
-        let messages = vec![
-            Message::user("Hello, how are you?"),
-            Message::assistant("I'm doing well, thank you!"),
-        ];
-
-        let formatted = template.apply(&messages);
-        assert!(formatted.text.contains("<|im_start|>user"));
-        assert!(formatted.text.contains("<|im_start|>assistant"));
-        assert!(formatted.text.contains("<|im_end|>"));
+    fn an_unrecognised_template_is_custom_with_its_own_special_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "<|start_of_role|>{{ messages[0].role }}<|end_of_role|>"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("special_tokens_map.json"),
+            r#"{"bos_token": "<bos>", "eos_token": {"content": "<|end_of_text|>"}}"#,
+        )
+        .unwrap();
+        let template = detect_chat_template(dir.path(), "granite-3.1-2b-instruct");
+        assert_eq!(template.template_type, ChatTemplateType::Custom);
+        assert_eq!(template.eos_token, "<|end_of_text|>");
+        assert_eq!(template.bos_token.as_deref(), Some("<bos>"));
     }
 
     /// A message's parts reach the template as the list of items the
@@ -2592,10 +1825,16 @@ mod tests {
              <|vision_start|><|image_pad|><|vision_end|> with \
              <|vision_start|><|video_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant"
         );
-        // No fallback: without a template, a prompt with media has nowhere to go.
+        // Without the model's own template, a prompt with media has nowhere
+        // to go: the built-in formats do not guess at placeholders.
         assert!(
             ChatTemplate::chatml()
                 .render_inference_jinja(&messages, false, None)
+                .is_err()
+        );
+        assert!(
+            ChatTemplate::chatml()
+                .render(&messages, None, &ChatTemplateKwargs::new(), true)
                 .is_err()
         );
     }
@@ -2624,6 +1863,26 @@ mod tests {
                 .ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n")
         );
         assert_eq!(formatted.response_start, formatted.text.len());
+    }
+
+    #[test]
+    fn test_qwen_inference_prompt_adds_open_think_block_when_enabled() {
+        let template = ChatTemplate::qwen();
+        let messages = vec![Message::user("write fizzbuzz")];
+        let formatted = template.apply_inference(&messages, false, None);
+        assert!(formatted.text.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert_eq!(formatted.response_start, formatted.text.len());
+    }
+
+    #[test]
+    fn test_qwen_inference_prompt_does_not_inject_default_system_message() {
+        let template = ChatTemplate::qwen();
+        let messages = vec![Message::user("write fizzbuzz")];
+        let formatted = template.apply_inference(&messages, true, None);
+        assert_eq!(
+            formatted.text,
+            "<|im_start|>user\nwrite fizzbuzz<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
     }
 
     /// Qwen 3's template, reduced to the parts a single exchange reaches:
@@ -2686,101 +1945,122 @@ mod tests {
         );
     }
 
+    /// Every assistant turn a template writes the same whatever follows it is
+    /// trained, and nothing else is: the system and user turns, the role
+    /// headers, and a turn whose rendering changes once later turns follow.
     #[test]
-    fn test_qwen_inference_prompt_adds_open_think_block_when_enabled() {
-        let template = ChatTemplate::qwen();
-        let messages = vec![Message::user("write fizzbuzz")];
-        let formatted = template.apply_inference(&messages, false, None);
-        assert!(formatted.text.ends_with("<|im_start|>assistant\n<think>\n"));
-        assert_eq!(formatted.response_start, formatted.text.len());
+    fn every_assistant_turn_the_template_writes_stably_is_a_response_span() {
+        let template = ChatTemplate::chatml();
+        let messages = vec![
+            Message::system("Be brief."),
+            Message::user("Hi"),
+            Message::assistant("Hello"),
+            Message::user("2+2?"),
+            Message::assistant("4"),
+        ];
+        let formatted = template.apply(&messages);
+        let spans: Vec<&str> = formatted
+            .response_spans
+            .iter()
+            .map(|s| &formatted.text[s.clone()])
+            .collect();
+        assert_eq!(spans, ["Hello<|im_end|>\n", "4<|im_end|>\n"]);
+        // The messages the spans are the assistant turns of.
+        assert_eq!(formatted.response_turns, [2, 4]);
+        assert_eq!(formatted.response(), "4<|im_end|>\n");
+
+        // A reasoning template writes the empty think block of every turn the
+        // same way, and that block is part of the prompt serving supplies.
+        let mut qwen3 = ChatTemplate::qwen();
+        qwen3.jinja_source = Some(QWEN3_REASONING_TEMPLATE.to_string());
+        let formatted = qwen3.apply(&messages);
+        let spans: Vec<&str> = formatted
+            .response_spans
+            .iter()
+            .map(|s| &formatted.text[s.clone()])
+            .collect();
+        assert_eq!(spans, ["Hello<|im_end|>\n", "4<|im_end|>\n"]);
+    }
+
+    /// The labels of a tokenized training conversation are the ids of the
+    /// assistant's tokens and nothing else, through the end-of-turn token; and
+    /// the template's BOS is the only one (the tokenizer's post-processor adds
+    /// another to whatever it is asked to encode with specials, which is how
+    /// every Llama 3 sample began with two).
+    #[test]
+    fn labels_cover_the_assistant_turns_and_the_text_has_one_bos() {
+        use crate::tokenizer::testing::byte_level_bpe;
+        let tokenizer = byte_level_bpe(
+            &[],
+            &[
+                "<|begin_of_text|>",
+                "<|start_header_id|>",
+                "<|end_header_id|>",
+                "<|eot_id|>",
+            ],
+            Some("<|begin_of_text|>"),
+        );
+        let bos = tokenizer.inner().token_to_id("<|begin_of_text|>").unwrap();
+        let eot = tokenizer.inner().token_to_id("<|eot_id|>").unwrap();
+        let messages = [
+            Message::system("Be brief."),
+            Message::user("Hi"),
+            Message::assistant("Hello"),
+            Message::user("2+2?"),
+            Message::assistant("4"),
+        ];
+        let (ids, labels) = TrainingSampleBuilder::new(ChatTemplate::llama3())
+            .build_tokenized(&messages, &tokenizer, usize::MAX)
+            .unwrap();
+        assert_eq!(ids.iter().filter(|&&id| id == bos).count(), 1);
+        assert_eq!(ids[0], bos);
+
+        let trained: Vec<u32> = ids
+            .iter()
+            .zip(&labels)
+            .filter(|&(_, &label)| label != -100)
+            .map(|(&id, _)| id)
+            .collect();
+        // "Hello" and "4", each closed by <|eot_id|>: bytes are one token each.
+        let bytes = |text: &str| -> Vec<u32> { tokenizer.encode(text).unwrap() };
+        let expected: Vec<u32> = [bytes("Hello"), vec![eot], bytes("4"), vec![eot]].concat();
+        assert_eq!(trained, expected);
+        assert!(
+            labels
+                .iter()
+                .all(|&l| l == -100 || ids.contains(&(l as u32)))
+        );
+        // Truncation keeps the first tokens, labels included.
+        let (short_ids, short_labels) = TrainingSampleBuilder::new(ChatTemplate::llama3())
+            .build_tokenized(&messages, &tokenizer, 10)
+            .unwrap();
+        assert_eq!(short_ids, ids[..10]);
+        assert_eq!(short_labels, labels[..10]);
     }
 
     #[test]
-    fn test_qwen_inference_prompt_does_not_inject_default_system_message() {
-        let template = ChatTemplate::qwen();
-        let messages = vec![Message::user("write fizzbuzz")];
-        let formatted = template.apply_inference(&messages, true, None);
+    fn a_conversation_ending_on_the_user_is_a_prompt() {
+        let formatted = ChatTemplate::chatml().apply(&[Message::user("Hi")]);
         assert_eq!(
             formatted.text,
-            "<|im_start|>user\nwrite fizzbuzz<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
         );
+        assert!(formatted.response_spans.is_empty());
+        assert_eq!(formatted.response_start, formatted.text.len());
+        assert_eq!(formatted.response(), "");
     }
 
     #[test]
-    fn test_llama3_format() {
-        let template = ChatTemplate::llama3();
-        let messages = vec![
-            Message::user("What is 2+2?"),
-            Message::assistant("2+2 equals 4."),
-        ];
-
-        let formatted = template.apply(&messages);
-        assert!(formatted.text.contains("<|begin_of_text|>"));
+    fn harmony_trains_the_final_message_to_end_in_return() {
+        let formatted =
+            ChatTemplate::gpt_oss().apply(&[Message::user("Hi"), Message::assistant("Hello")]);
         assert!(
-            formatted
-                .text
-                .contains("<|start_header_id|>user<|end_header_id|>")
+            formatted.text.ends_with("Hello<|return|>"),
+            "{}",
+            formatted.text
         );
-        assert!(formatted.text.contains("<|eot_id|>"));
-    }
-
-    #[test]
-    fn test_response_masking() {
-        let template = ChatTemplate::chatml();
-        let messages = vec![Message::user("Hello"), Message::assistant("Hi there!")];
-
-        let formatted = template.apply(&messages);
-
-        // Response start should be after the user turn
-        assert!(formatted.response_start > 0);
-        assert!(formatted.response_start < formatted.text.len());
-
-        // The prompt should end before the response content
-        let prompt = formatted.prompt();
-        assert!(prompt.contains("Hello"));
-        assert!(!prompt.contains("Hi there"));
-
-        // The response should contain the assistant's message
-        let response = formatted.response();
-        assert!(response.contains("Hi there"));
-    }
-
-    #[test]
-    fn test_gemma_format() {
-        let template = ChatTemplate::gemma();
-        let messages = vec![
-            Message::user("Tell me a joke"),
-            Message::assistant("Why did the chicken cross the road?"),
-        ];
-
-        let formatted = template.apply(&messages);
-        assert!(formatted.text.contains("<start_of_turn>user"));
-        assert!(formatted.text.contains("<start_of_turn>model"));
-        assert!(formatted.text.contains("<end_of_turn>"));
-    }
-
-    /// Gemma 4's tokenizer post-processor is a pass-through: unlike Gemma 2
-    /// and 3 it prepends nothing, and the released chat template opens with
-    /// `{{ bos_token }}`. Without it the model receives a conversation with no
-    /// beginning and answers as though the prompt were empty, which reads like
-    /// a broken forward pass rather than a missing token.
-    #[test]
-    fn gemma4_opens_with_bos_and_gemma_does_not() {
-        let messages = vec![Message::user("What is 2 + 2?")];
-
-        let gemma4 = ChatTemplate::gemma4().apply(&messages).text;
-        assert!(
-            gemma4.starts_with("<bos><|turn>user\n"),
-            "gemma4 prompt must open with the BOS its template emits, got {gemma4:?}"
-        );
-
-        // Gemma 2 / 3 get theirs from the tokenizer, so emitting one here
-        // would double it.
-        let gemma = ChatTemplate::gemma().apply(&messages).text;
-        assert!(
-            gemma.starts_with("<start_of_turn>user\n"),
-            "gemma prompt must not carry a BOS of its own, got {gemma:?}"
-        );
+        assert_eq!(formatted.response(), "Hello<|return|>");
+        assert!(!formatted.text.contains("<|end|><|return|>"));
     }
 
     #[test]
@@ -2804,108 +2084,6 @@ mod tests {
     }
 
     #[test]
-    fn test_alpaca_format() {
-        let template = ChatTemplate::alpaca();
-        let messages = vec![
-            Message::new("instruction", "Summarize the following text"),
-            Message::new("input", "The quick brown fox jumps over the lazy dog."),
-            Message::new("output", "A fox jumps over a dog."),
-        ];
-
-        let formatted = template.apply(&messages);
-        assert!(formatted.text.contains("### Instruction:"));
-        assert!(formatted.text.contains("### Input:"));
-        assert!(formatted.text.contains("### Response:"));
-    }
-
-    #[test]
-    fn test_training_for_response_only() {
-        let template = ChatTemplate::llama3();
-        let messages = vec![
-            Message::system("You are a helpful assistant."),
-            Message::user("What is the capital of France?"),
-            Message::assistant("The capital of France is Paris."),
-        ];
-
-        let formatted = template.apply(&messages);
-
-        // Verify prompt contains system and user but not the answer
-        let prompt = formatted.prompt();
-        assert!(prompt.contains("helpful assistant"));
-        assert!(prompt.contains("capital of France"));
-
-        // Verify response is just the assistant content
-        let response = formatted.response();
-        assert!(response.contains("Paris"));
-    }
-
-    #[test]
-    fn test_gpt_oss_format() {
-        let template = ChatTemplate::gpt_oss();
-        let messages = vec![
-            Message::user("Hello, how are you?"),
-            Message::assistant("I'm doing well, thank you!"),
-        ];
-
-        let formatted = template.apply(&messages);
-
-        // Check Harmony format tokens
-        assert!(formatted.text.contains("<|start|>user<|message|>"));
-        assert!(
-            formatted
-                .text
-                .contains("<|start|>assistant<|channel|>final<|message|>")
-        );
-        assert!(formatted.text.contains("<|end|>"));
-        assert!(formatted.text.contains("<|return|>"));
-
-        // Verify content is preserved
-        assert!(formatted.text.contains("Hello, how are you?"));
-        assert!(formatted.text.contains("I'm doing well, thank you!"));
-    }
-
-    #[test]
-    fn test_gpt_oss_response_masking() {
-        let template = ChatTemplate::gpt_oss();
-        let messages = vec![
-            Message::system("You are a helpful AI assistant."),
-            Message::user("What is 2+2?"),
-            Message::assistant("2+2 equals 4."),
-        ];
-
-        let formatted = template.apply(&messages);
-
-        // Response start should point to after the assistant header
-        assert!(formatted.response_start > 0);
-        assert!(formatted.response_start < formatted.text.len());
-
-        // The prompt should contain system and user content
-        let prompt = formatted.prompt();
-        assert!(prompt.contains("helpful AI assistant"));
-        assert!(prompt.contains("What is 2+2?"));
-
-        // The response should be the assistant's answer
-        let response = formatted.response();
-        assert!(response.contains("2+2 equals 4"));
-    }
-
-    #[test]
-    fn test_gpt_oss_developer_role() {
-        let template = ChatTemplate::gpt_oss();
-        let messages = vec![
-            Message::new("developer", "Use formal language."),
-            Message::user("Hello"),
-            Message::assistant("Greetings."),
-        ];
-
-        let formatted = template.apply(&messages);
-
-        // Developer role should be formatted
-        assert!(formatted.text.contains("<|start|>developer<|message|>"));
-        assert!(formatted.text.contains("Use formal language."));
-    }
-
-    #[test]
     fn test_gpt_oss_eos_token() {
         assert_eq!(ChatTemplateType::GptOss.eos_token(), "<|return|>");
     }
@@ -2923,27 +2101,6 @@ mod tests {
         assert_eq!(
             detect_template_from_model("harmony-chat-model").template_type,
             ChatTemplateType::GptOss
-        );
-    }
-
-    #[test]
-    fn test_gpt_oss_training_prompt_generation() {
-        let template = ChatTemplate::gpt_oss();
-        let messages = vec![Message::user("Explain quantum computing.")];
-
-        let formatted = template.apply(&messages);
-
-        // Last message is user, so should add assistant header for training
-        assert!(
-            formatted
-                .text
-                .contains("<|start|>assistant<|channel|>final<|message|>")
-        );
-
-        // Response start should be at the end, ready for model to generate
-        assert_eq!(
-            formatted.response_start,
-            formatted.text.len() - "<|return|>".len()
         );
     }
 }

@@ -291,13 +291,38 @@ enum Commands {
     Decide(crate::cli::decide::DecideArgs),
 
     /// Download a model from HuggingFace
+    ///
+    /// Fetches the configs, tokenizer and one set of weights from a single
+    /// commit, then checks them. Authenticates with `HF_TOKEN`, or the token
+    /// stored by `hf auth login`. `HF_ENDPOINT` selects a mirror and
+    /// `HF_HUB_OFFLINE=1` uses only the local cache.
     Download {
-        /// Model ID
+        /// Model ID, optionally with a GGUF quantization: `org/model-GGUF:Q4_K_M`
         model: String,
 
-        /// Specific revision
+        /// Branch, tag or commit (default: the cached copy, else the default branch)
         #[arg(long)]
         revision: Option<String>,
+
+        /// Weight format to fetch
+        #[arg(long, value_enum, default_value_t = commands::download::WeightsArg::Auto)]
+        format: commands::download::WeightsArg,
+
+        /// GGUF quantization to fetch (e.g. Q4_K_M, Q8_0); implies --format gguf
+        #[arg(long, value_name = "QUANT")]
+        quant: Option<String>,
+
+        /// Also hash large files against the Hub's SHA-256 digests (reads them back from disk)
+        #[arg(long)]
+        verify_sha256: bool,
+
+        /// Show the commit, the files and their size, then stop
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Use only the local cache; never touch the network
+        #[arg(long)]
+        offline: bool,
     },
 
     /// Publish a model directory to HuggingFace (creates the repo if needed)
@@ -351,6 +376,22 @@ enum Commands {
         /// Output results as JSON
         #[arg(long)]
         json: bool,
+
+        /// Only models with this tag (repeatable): gguf, mlx, moe, license:apache-2.0, ...
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
+        /// Only models from this user or organization
+        #[arg(long)]
+        author: Option<String>,
+
+        /// Pipeline tag to search; `any` searches every kind of model
+        #[arg(long, default_value = "text-generation")]
+        pipeline_tag: String,
+
+        /// Result order
+        #[arg(long, value_enum, default_value_t = commands::search::SortArg::Downloads)]
+        sort: commands::search::SortArg,
     },
 
     /// Block-diffusion speculative decoding (DFlash).
@@ -1714,10 +1755,26 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
-        Commands::Download { model, revision } => {
+        Commands::Download {
+            model,
+            revision,
+            format,
+            quant,
+            verify_sha256,
+            dry_run,
+            offline,
+        } => {
             tracing::info!(model = %model, "Downloading model");
-            let path = pmetal_hub::download_model(&model, revision.as_deref(), None).await?;
-            println!("Model downloaded to: {}", path.display());
+            commands::download::run_download(commands::download::DownloadRequest {
+                model,
+                revision,
+                format,
+                quant,
+                verify_sha256,
+                dry_run,
+                offline,
+            })
+            .await?;
         }
 
         Commands::Upload {
@@ -1730,14 +1787,19 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             exclude,
         } => {
             tracing::info!(path = %path, repo = %repo, "Uploading model");
+            let (bar, progress) = commands::download::transfer_bar()?;
             let options = pmetal_hub::UploadOptions {
                 private,
                 revision,
                 commit_message: message,
                 create_pr,
                 ignore: exclude,
+                progress: Some(progress),
+                ..Default::default()
             };
-            let report = pmetal_hub::upload_model(&path, &repo, None, &options).await?;
+            let report = pmetal_hub::upload_model(&path, &repo, None, &options).await;
+            bar.finish_and_clear();
+            let report = report?;
             println!("Uploaded {path} to {}", report.repo_url);
             if let Some(commit) = report.commit_url {
                 println!("Commit: {commit}");
@@ -1760,8 +1822,23 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             download,
             detailed,
             json,
+            tags,
+            author,
+            pipeline_tag,
+            sort,
         } => {
-            commands::search::run_search(&query, limit, download, detailed, json).await?;
+            commands::search::run_search(commands::search::SearchRequest {
+                query,
+                limit,
+                download,
+                detailed,
+                json,
+                tags,
+                author,
+                pipeline_tag,
+                sort,
+            })
+            .await?;
         }
 
         Commands::Dflash(args) => {

@@ -77,12 +77,11 @@ impl ModelsTab {
             .ok()
             .map(|ctx| {
                 let props = ctx.properties();
-                pmetal_hub::DeviceSpec {
-                    memory_gb: props.recommended_working_set_size as f64
-                        / (1024.0 * 1024.0 * 1024.0),
-                    bandwidth_gbps: props.memory_bandwidth_gbps,
-                    unified_memory: props.has_unified_memory,
-                }
+                pmetal_hub::DeviceSpec::from_device(
+                    props.recommended_working_set_size,
+                    props.memory_bandwidth_gbps,
+                    props.has_unified_memory,
+                )
             });
 
         let mut tab = Self {
@@ -158,17 +157,10 @@ impl ModelsTab {
             return;
         };
         for model in &mut self.models {
-            let config_path = model.path.join("config.json");
-            if !config_path.exists() {
-                continue;
-            }
-            let Ok(content) = std::fs::read_to_string(&config_path) else {
+            // The config's architecture and the weights' measured size.
+            let Some(model_spec) = pmetal_hub::model_spec_from_dir(&model.path) else {
                 continue;
             };
-            let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
-                continue;
-            };
-            let model_spec = pmetal_hub::model_spec_from_config(&config, Some(model.size_bytes));
             model.fit_estimate = Some(pmetal_hub::estimate_fit(&model_spec, device));
         }
     }

@@ -6259,12 +6259,16 @@ name = "pmetal-hub"
 version = "0.6.0"
 dependencies = [
  "dirs 7.0.0",
+ "futures",
  "hf-hub",
+ "memmap2",
  "pmetal-core",
  "pmetal-gguf",
  "reqwest",
  "serde",
+ "serde-saphyr",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
  "walkdir",
@@ -6344,9 +6348,6 @@ dependencies = [
  "pmetal-metal",
  "pmetal-runtime",
  "rand 0.10.3",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -6424,6 +6425,7 @@ version = "0.6.0"
 dependencies = [
  "half",
  "hf-hub",
+ "pmetal-hub",
  "pmetal-runtime",
  "safetensors",
  "serde",

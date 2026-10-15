@@ -7,6 +7,10 @@
 //! [`rope_embedding`]. The helpers here thread [`RopePositions`] (a cache
 //! offset, or one position per token for packed batches) through the fused
 //! kernel and the explicit cos/sin tables.
+//!
+//! The rotation is computed in f32 and returned in the input's dtype on every
+//! route: the cos/sin tables are f32, and a product with them would otherwise
+//! promote a half-precision input.
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, fast, ops};
 use pmetal_runtime::rope::{RotaryEmbedding, rotate_with_cos_sin};
@@ -49,6 +53,11 @@ impl<'a> RopePositions<'a> {
 /// builds the cos/sin tables from the position vector. They compute the same
 /// rotation, which this module's tests pin down for both `traditional`
 /// settings, at a non-zero offset, and for partial RoPE.
+///
+/// * `x` - `[batch, heads, seq_len, head_dim]`
+/// * `dims` - the number of leading channels to rotate (the rest pass through)
+/// * `traditional` - pairs `(x[2i], x[2i+1])` instead of `(x[i], x[i + dims/2])`
+/// * `scale` - multiplies the positions
 pub fn rope(
     x: &Array,
     positions: RopePositions<'_>,
@@ -58,9 +67,10 @@ pub fn rope(
     scale: f32,
 ) -> Result<Array, Exception> {
     match positions {
-        RopePositions::Offset(offset) => apply_rope(x, dims, traditional, base, scale, offset),
+        RopePositions::Offset(offset) => Ok(fast::rope(x, dims, traditional, base, scale, offset)),
         RopePositions::Explicit(ids) => {
-            apply_rope_with_positions(x, ids, dims, traditional, base, scale)
+            let inv_freq = base_inverse_frequencies(base, dims);
+            Ok(rotate_at(x, ids, &inv_freq, dims, traditional, scale))
         }
     }
 }
@@ -97,153 +107,20 @@ pub fn rope_with_periods(
             periods,
         )),
         RopePositions::Explicit(ids) => {
-            apply_rope_with_positions_and_periods(x, ids, periods, dims, traditional, scale)
+            let inv_freq = Array::from_f32(1.0).divide(periods);
+            Ok(rotate_at(x, ids, &inv_freq, dims, traditional, scale))
         }
     }
 }
 
-/// Apply RoPE to a tensor (functional version).
-///
-/// # Arguments
-/// * `x` - Input tensor of shape [..., seq_len, head_dim]
-/// * `dims` - Number of dimensions to apply RoPE to
-/// * `traditional` - If true, use traditional RoPE implementation
-/// * `base` - Base frequency for the embeddings
-/// * `scale` - Scale for the positions
-/// * `offset` - Position offset
-///
-/// # Returns
-/// Tensor with rotary embeddings applied.
-pub fn apply_rope(
-    x: &Array,
-    dims: i32,
-    traditional: bool,
-    base: f32,
-    scale: f32,
-    offset: i32,
-) -> Result<Array, Exception> {
-    Ok(fast::rope(x, dims, traditional, base, scale, offset))
-}
-
-/// Apply RoPE with explicit position IDs.
-///
-/// This is essential for packed sequence training where multiple sequences
-/// are concatenated and position IDs need to reset for each sequence.
-///
-/// Uses the non-traditional (efficient) RoPE implementation where dimensions
-/// are split in half rather than interleaved.
-///
-/// # Arguments
-/// * `x` - Input tensor of shape [batch, heads, seq_len, head_dim]
-/// * `position_ids` - Position indices of shape `[seq_len]`
-/// * `dims` - Number of dimensions to apply RoPE to (usually head_dim)
-/// * `traditional` - If true, use traditional (interleaved) RoPE
-/// * `base` - Base frequency for the embeddings (default 10000.0)
-/// * `scale` - Scale factor for positions (default 1.0)
-///
-/// # Returns
-/// Tensor with rotary embeddings applied according to position_ids.
-///
-/// # Example
-/// ```ignore
-/// // Packed sequences: [seq1_tok1, seq1_tok2, seq2_tok1, seq2_tok2, seq2_tok3]
-/// // Position IDs:     [0,         1,         0,         1,         2]
-/// let x = Array::zeros::<f32>(&[1, 4, 5, 64]); // batch=1, heads=4, seq=5, dim=64
-/// let position_ids = Array::from_i32_slice(&[0_i32, 1, 0, 1, 2], &[5]);
-/// let output = apply_rope_with_positions(&x, &position_ids, 64, false, 10000.0, 1.0)?;
-/// ```
-pub fn apply_rope_with_positions(
-    x: &Array,
-    position_ids: &Array,
-    dims: i32,
-    traditional: bool,
-    base: f32,
-    scale: f32,
-) -> Result<Array, Exception> {
-    // Compute inverse frequencies: inv_freq[i] = 1.0 / (base^(2i/dims))
-    // indices: [0, 1, ..., half_dims-1] as float
-    let indices = ops::arange_range(0, dims / 2); // [half_dims] float32
-    let neg_two_over_dims = Array::from_f32(-2.0 / dims as f32);
-    let exponents = indices.multiply(&neg_two_over_dims);
-    let base_arr = Array::from_f32(base);
-    let inv_freq = base_arr.pow(&exponents); // [half_dims]
-
-    rope_with_positions_and_inv_freq(x, position_ids, &inv_freq, dims, traditional, scale)
-}
-
-/// Apply RoPE with explicit position IDs and an explicit period table.
-///
-/// Sibling of [`apply_rope_with_positions`] for scalings that rescale each
-/// frequency band separately, where no single `base` describes the rotation
-/// (Llama 3). `periods` is the same `[dims / 2]` table `mx.fast.rope` takes —
-/// periods, not inverse frequencies — so one table serves both the fused
-/// contiguous-offset path and this packed-sequence one.
-pub fn apply_rope_with_positions_and_periods(
-    x: &Array,
-    position_ids: &Array,
-    periods: &Array,
-    dims: i32,
-    traditional: bool,
-    scale: f32,
-) -> Result<Array, Exception> {
-    let inv_freq = Array::from_f32(1.0).divide(periods);
-    rope_with_positions_and_inv_freq(x, position_ids, &inv_freq, dims, traditional, scale)
-}
-
-/// Shared body: rotate `x` at the given per-token positions using a
-/// precomputed `[dims / 2]` inverse-frequency table.
-fn rope_with_positions_and_inv_freq(
-    x: &Array,
-    position_ids: &Array,
-    inv_freq: &Array,
-    dims: i32,
-    traditional: bool,
-    scale: f32,
-) -> Result<Array, Exception> {
-    // x shape: [batch, heads, seq_len, head_dim]
-    let half_dims = dims / 2;
-
-    // position_ids: [seq_len] as i32 → float and scale
-    let pos_float = position_ids.as_dtype(Dtype::Float32.as_i32());
-    let scale_arr = Array::from_f32(scale);
-    let scaled_pos = pos_float.multiply(&scale_arr); // [seq_len]
-
-    // Compute angles: [seq_len, half_dims]
-    let pos_expanded = scaled_pos.expand_dims(-1); // [seq_len, 1]
-    let inv_freq_expanded = inv_freq.expand_dims(0); // [1, half_dims]
-    let angles = pos_expanded.multiply(&inv_freq_expanded); // [seq_len, half_dims]
-
-    // Compute cos and sin
-    let cos_theta = angles.cos(); // [seq_len, half_dims]
-    let sin_theta = angles.sin(); // [seq_len, half_dims]
-
-    // Reshape for broadcasting with x: [1, 1, seq_len, half_dims]
-    let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims]);
-    let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims]);
-
-    Ok(rotate_with_cos_sin(
-        x,
-        &cos_theta,
-        &sin_theta,
-        dims,
-        traditional,
-    ))
-}
-
 /// Apply RoPE with per-batch-row position IDs.
 ///
-/// Sibling of [`apply_rope_with_positions`] for the fused continuous-batching
-/// decode path. Each batch row carries its own absolute offsets, so the
-/// computed cos/sin are broadcast as `[batch, 1, seq_len, half_dims]` rather
-/// than `[1, 1, seq_len, half_dims]`.
+/// For the fused continuous-batching decode path, where each batch row
+/// carries its own absolute offset: the cos/sin tables are broadcast as
+/// `[batch, 1, seq_len, dims / 2]` rather than `[1, 1, seq_len, dims / 2]`.
 ///
-/// # Arguments
-/// * `x` - Input tensor of shape `[batch, heads, seq_len, head_dim]`
-/// * `position_ids` - Position indices of shape `[batch, seq_len]` (int32)
-/// * `dims` - Number of dimensions to apply RoPE to
-/// * `traditional` - If true, use traditional (interleaved) RoPE
-/// * `base` - Base frequency for the embeddings
-/// * `scale` - Scale factor for positions
+/// * `x` - `[batch, heads, seq_len, head_dim]`
+/// * `position_ids` - `[batch, seq_len]`, integer
 pub fn apply_rope_with_per_batch_positions(
     x: &Array,
     position_ids: &Array,
@@ -252,111 +129,76 @@ pub fn apply_rope_with_per_batch_positions(
     base: f32,
     scale: f32,
 ) -> Result<Array, Exception> {
-    let shape = x.shape();
-    if shape.len() != 4 {
+    if x.ndim() != 4 {
         return Err(Exception::custom(format!(
-            "apply_rope_with_per_batch_positions: expected rank-4 input, got {shape:?}"
+            "apply_rope_with_per_batch_positions: expected rank-4 input, got {:?}",
+            x.shape()
         )));
     }
-    let batch = shape[0];
-    let head_dim = shape[3];
-    let half_dims = dims / 2;
-
-    let pos_shape = position_ids.shape();
-    if pos_shape.len() != 2 || pos_shape[0] != batch {
+    if position_ids.ndim() != 2 || position_ids.dim(0) != x.dim(0) {
         return Err(Exception::custom(format!(
-            "apply_rope_with_per_batch_positions: position_ids must be [batch={batch}, seq_len], got {pos_shape:?}"
+            "apply_rope_with_per_batch_positions: position_ids must be [batch={}, seq_len], got {:?}",
+            x.dim(0),
+            position_ids.shape()
         )));
     }
+    let inv_freq = base_inverse_frequencies(base, dims);
+    Ok(rotate_at(
+        x,
+        position_ids,
+        &inv_freq,
+        dims,
+        traditional,
+        scale,
+    ))
+}
 
-    // inv_freq[i] = base ^ (-2i / dims)
-    let indices = ops::arange_range(0, half_dims);
-    let neg_two_over_dims = Array::from_f32(-2.0 / dims as f32);
-    let exponents = indices.multiply(&neg_two_over_dims);
-    let base_arr = Array::from_f32(base);
-    let inv_freq = base_arr.pow(&exponents); // [half_dims]
+/// `base^(-2i / dims)` for `i` in `0..dims / 2`.
+fn base_inverse_frequencies(base: f32, dims: i32) -> Array {
+    let exponents = ops::arange_range(0, dims / 2).multiply(&Array::from_f32(-2.0 / dims as f32));
+    Array::from_f32(base).pow(&exponents)
+}
 
-    // scaled positions: [batch, seq_len]
-    let pos_float = position_ids.as_dtype(Dtype::Float32.as_i32());
-    let scale_arr = Array::from_f32(scale);
-    let scaled_pos = pos_float.multiply(&scale_arr);
-
-    // angles: [batch, seq_len, half_dims]
-    let pos_expanded = scaled_pos.expand_dims(-1); // [batch, seq_len, 1]
-    let inv_freq_expanded = inv_freq.reshape(&[1, 1, half_dims]); // [1, 1, half_dims]
-    let angles = pos_expanded.multiply(&inv_freq_expanded);
-
-    let cos_theta = angles.cos();
-    let sin_theta = angles.sin();
-
-    // Reshape to [batch, 1, seq_len, half_dims] for broadcasting with
-    // x shaped [batch, heads, seq_len, head_dim].
-    let cos_theta = cos_theta.reshape(&[batch, 1, -1, half_dims]);
-    let sin_theta = sin_theta.reshape(&[batch, 1, -1, half_dims]);
-
-    if traditional {
-        let x_rope = if dims < head_dim {
-            x.split(&[dims], -1).remove(0)
-        } else {
-            x.clone()
-        };
-        let rope_shape = x_rope.shape();
-        let batch_r = rope_shape[0];
-        let heads = rope_shape[1];
-        let seq_len = rope_shape[2];
-        let x_pairs = x_rope.reshape(&[batch_r, heads, seq_len, half_dims, 2]);
-        let x_even = x_pairs
-            .slice(&[0, 0, 0, 0, 0], &[batch_r, heads, seq_len, half_dims, 1])
-            .squeeze(-1);
-        let x_odd = x_pairs
-            .slice(&[0, 0, 0, 0, 1], &[batch_r, heads, seq_len, half_dims, 2])
-            .squeeze(-1);
-
-        let r_even = x_even
-            .multiply(&cos_theta)
-            .subtract(&x_odd.multiply(&sin_theta));
-        let r_odd = x_even.multiply(&sin_theta).add(&x_odd.multiply(&cos_theta));
-
-        let stacked = ops::stack_axis(vec![r_even, r_odd].as_slice(), -1);
-        let x_rotated = stacked.reshape(&[batch_r, heads, seq_len, dims]);
-
-        if dims < head_dim {
-            let parts = x.split(&[dims], -1);
-            Ok(ops::concatenate_axis(&[&x_rotated, &parts[1]], -1))
-        } else {
-            Ok(x_rotated)
-        }
+/// Rotate `x` (`[batch, heads, seq_len, head_dim]`) at one position per token
+/// (`position_ids`: `[seq_len]` shared by the batch, or `[batch, seq_len]`)
+/// with a `[dims / 2]` inverse-frequency table, in f32, and return `x`'s dtype.
+fn rotate_at(
+    x: &Array,
+    position_ids: &Array,
+    inv_freq: &Array,
+    dims: i32,
+    traditional: bool,
+    scale: f32,
+) -> Array {
+    let half = dims / 2;
+    // angles: [seq_len, half] or [batch, seq_len, half]
+    let angles = position_ids
+        .as_dtype(Dtype::Float32.as_i32())
+        .multiply(&Array::from_f32(scale))
+        .expand_dims(-1)
+        .multiply(&inv_freq.reshape(&[half]));
+    // Laid out against x: [1 | batch, 1, seq_len, half].
+    let rows = if position_ids.ndim() == 2 {
+        position_ids.dim(0)
     } else {
-        let parts = if dims == head_dim {
-            x.split(&[half_dims], -1)
-        } else {
-            x.split(&[half_dims, dims], -1)
-        };
-        let x1 = &parts[0];
-        let x2 = &parts[1];
-        let rx1 = x1.multiply(&cos_theta).subtract(&x2.multiply(&sin_theta));
-        let rx2 = x1.multiply(&sin_theta).add(&x2.multiply(&cos_theta));
-        let x_rotated = ops::concatenate_axis(&[&rx1, &rx2], -1);
-        if dims < head_dim && parts.len() > 2 {
-            Ok(ops::concatenate_axis(&[&x_rotated, &parts[2]], -1))
-        } else {
-            Ok(x_rotated)
-        }
-    }
+        1
+    };
+    let shape = [rows, 1, -1, half];
+    let (cos, sin) = (angles.cos().reshape(&shape), angles.sin().reshape(&shape));
+    rotate_with_cos_sin(
+        &x.as_dtype(Dtype::Float32.as_i32()),
+        &cos,
+        &sin,
+        dims,
+        traditional,
+    )
+    .as_dtype(x.dtype().as_i32())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_runtime::compat::{Array, Dtype, random};
-
-    #[test]
-    fn test_rope_functional() {
-        let x = random::normal(&[8, 4, 64], Dtype::Float32);
-        let output = apply_rope(&x, 64, false, 10000.0, 1.0, 0).unwrap();
-        assert_eq!(output.shape()[1], 4); // seq_len
-        assert_eq!(output.shape()[2], 64); // head_dim
-    }
+    use pmetal_runtime::compat::{Array, Dtype};
 
     // ------------------------------------------------------------------
     // RopePositions
@@ -523,6 +365,161 @@ mod tests {
         let run_through =
             rope(&packed, RopePositions::Offset(0), dims, false, 10000.0, 1.0).unwrap();
         assert!(max_abs_diff(&separate, &run_through) > 1e-2);
+    }
+
+    /// Rotation by `position * scale * base^(-2i / dims)` in f64, over
+    /// `x [B, H, L, D]` at `positions [B][L]`; the channels past `dims` pass
+    /// through. Pairs are `(x[i], x[i + dims/2])`, or `(x[2i], x[2i+1])` when
+    /// `traditional`.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate_f64(
+        x: &[f64],
+        shape: [usize; 4],
+        positions: &[Vec<f64>],
+        dims: usize,
+        traditional: bool,
+        base: f64,
+        scale: f64,
+    ) -> Vec<f64> {
+        let [_, heads, len, width] = shape;
+        let mut out = x.to_vec();
+        for (b, row_positions) in positions.iter().enumerate() {
+            for h in 0..heads {
+                for (l, position) in row_positions.iter().enumerate().take(len) {
+                    let row = ((b * heads + h) * len + l) * width;
+                    for i in 0..dims / 2 {
+                        let angle = position * scale * base.powf(-2.0 * i as f64 / dims as f64);
+                        let (sin, cos) = angle.sin_cos();
+                        let (a, c) = if traditional {
+                            (row + 2 * i, row + 2 * i + 1)
+                        } else {
+                            (row + i, row + i + dims / 2)
+                        };
+                        out[a] = x[a] * cos - x[c] * sin;
+                        out[c] = x[a] * sin + x[c] * cos;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn values(a: &Array) -> Vec<f64> {
+        let mut a = a.as_dtype(Dtype::Float32.as_i32());
+        a.eval();
+        a.to_f32_vec(a.size())
+            .unwrap()
+            .into_iter()
+            .map(f64::from)
+            .collect()
+    }
+
+    /// Every way of giving positions rotates as the definition does, in f64:
+    /// a cache offset, one position per token, one per token per batch row;
+    /// both pairings, partial rotation, a position scale; and the result
+    /// keeps the input's dtype (the cos/sin tables are f32, and a product with
+    /// them promotes a half-precision input to f32 unless it is cast back).
+    #[test]
+    fn rotations_are_the_definition_and_keep_the_dtype() {
+        let (batch, heads, len, width) = (2usize, 3usize, 5usize, 16usize);
+        let shape = [batch as i32, heads as i32, len as i32, width as i32];
+        let base_x = ramp(&shape);
+        for dtype in [Dtype::Float32, Dtype::Bfloat16] {
+            let x = base_x.as_dtype(dtype.as_i32());
+            let x64 = values(&x);
+            let tol = if dtype == Dtype::Float32 { 2e-5 } else { 2e-2 };
+            for (dims, traditional, scale) in [
+                (16, false, 1.0),
+                (16, true, 0.5),
+                (8, false, 1.0),
+                (8, true, 2.0),
+            ] {
+                // A shared run of positions from an offset.
+                let offset = 7;
+                let shared: Vec<Vec<f64>> = (0..batch)
+                    .map(|_| (0..len).map(|l| (offset + l) as f64).collect())
+                    .collect();
+                // Per-row positions, differing by row.
+                let per_row: Vec<Vec<f64>> = (0..batch)
+                    .map(|b| (0..len).map(|l| (3 * b + 2 * l + 1) as f64).collect())
+                    .collect();
+                let shared_ids = Array::from_i32_slice_shaped(
+                    &shared[0].iter().map(|&p| p as i32).collect::<Vec<_>>(),
+                    &[len as i32],
+                );
+                let row_ids = Array::from_i32_slice_shaped(
+                    &per_row
+                        .iter()
+                        .flatten()
+                        .map(|&p| p as i32)
+                        .collect::<Vec<_>>(),
+                    &[batch as i32, len as i32],
+                );
+                let cases: [(&str, Array, &[Vec<f64>]); 3] = [
+                    (
+                        "offset",
+                        rope(
+                            &x,
+                            RopePositions::Offset(offset as i32),
+                            dims,
+                            traditional,
+                            10000.0,
+                            scale as f32,
+                        )
+                        .unwrap(),
+                        &shared,
+                    ),
+                    (
+                        "explicit",
+                        rope(
+                            &x,
+                            RopePositions::Explicit(&shared_ids),
+                            dims,
+                            traditional,
+                            10000.0,
+                            scale as f32,
+                        )
+                        .unwrap(),
+                        &shared,
+                    ),
+                    (
+                        "per batch row",
+                        apply_rope_with_per_batch_positions(
+                            &x,
+                            &row_ids,
+                            dims,
+                            traditional,
+                            10000.0,
+                            scale as f32,
+                        )
+                        .unwrap(),
+                        &per_row,
+                    ),
+                ];
+                for (name, got, positions) in cases {
+                    let what = format!("{name}, {dtype:?}, dims {dims}, traditional {traditional}");
+                    assert_eq!(
+                        got.dtype(),
+                        dtype,
+                        "{what}: the output keeps the input's dtype"
+                    );
+                    let want = rotate_f64(
+                        &x64,
+                        [batch, heads, len, width],
+                        positions,
+                        dims as usize,
+                        traditional,
+                        10000.0,
+                        scale,
+                    );
+                    let worst = values(&got)
+                        .iter()
+                        .zip(&want)
+                        .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+                    assert!(worst <= tol, "{what}: off by {worst:e}");
+                }
+            }
+        }
     }
 
     #[test]

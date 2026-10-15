@@ -111,27 +111,32 @@ fn pack(dataset: &TrainingDataset) -> Result<(), Box<dyn std::error::Error>> {
 
 ### Chat Template Application
 
-`detect_chat_template` reads the model's real Jinja template from `tokenizer_config.json` and falls
-back to a family default when there isn't one.
+`detect_chat_template` reads the model's own Jinja template (`chat_template.jinja`,
+`tokenizer_config.json`, or a GGUF's `tokenizer.chat_template`) and renders every conversation
+with it, as `apply_chat_template` does, so a model is trained on the text it is served. A
+checkpoint with no template (a base model) is rendered in the conventional format of its family.
 
 ```rust,no_run
 use std::path::Path;
 
-use pmetal_data::chat_templates::{Message, detect_chat_template};
+use pmetal_data::Tokenizer;
+use pmetal_data::chat_templates::{Message, TrainingSampleBuilder, detect_chat_template};
 
-fn format(model_dir: &Path) -> String {
+fn format(model_dir: &Path) -> pmetal_core::Result<(Vec<u32>, Vec<i64>)> {
     let template = detect_chat_template(model_dir, "Qwen/Qwen3-0.6B");
+    let tokenizer = Tokenizer::from_model_dir(model_dir)?;
 
-    let formatted = template.apply(&[
-        Message::user("Hello!"),
-        Message::assistant("Hi there!"),
-    ]);
-
-    // `response_start` is the byte offset to mask the prompt up to.
-    let _prompt_len = formatted.response_start;
-    formatted.text
+    // Every assistant turn is a response span; the labels are -100 everywhere else.
+    TrainingSampleBuilder::new(template).build_tokenized(
+        &[Message::user("Hello!"), Message::assistant("Hi there!")],
+        &tokenizer,
+        2048,
+    )
 }
 ```
+
+A tokenizer also reports the span of the text each token covers
+(`Tokenizer::encode_with_offsets`) and encodes a dataset in parallel (`encode_batch`).
 
 ## Dataset Format Examples
 

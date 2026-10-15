@@ -11,6 +11,7 @@ categories.workspace = true
 
 [dependencies]
 pmetal-runtime = { workspace = true }
+pmetal-hub = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

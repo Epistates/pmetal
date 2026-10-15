@@ -1,38 +1,55 @@
 //! A restricted unpickler for PyTorch state dicts.
 //!
-//! A `.pt` file's `data.pkl` is a Python pickle, which in general can run
-//! arbitrary code on load. This interpreter understands only the opcodes
+//! A `.pt` / `.bin` file's `data.pkl` is a Python pickle, which in general can
+//! run arbitrary code on load. This interpreter understands only the opcodes
 //! `torch.save` emits for plain containers and tensors, and builds objects
 //! only for a short allow-list of globals (`OrderedDict` and the tensor
-//! rebuilders). Anything else is an error, never an execution.
+//! rebuilders). Anything else is an error, never an execution: there is no
+//! path from file bytes to calling anything.
 
-use crate::error::{Result, VocoderError};
+use pmetal_core::{PMetalError, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 /// Element type of a tensor storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageDtype {
+pub enum TorchDtype {
+    /// 32-bit float.
     F32,
+    /// 64-bit float.
     F64,
+    /// 16-bit float.
     F16,
+    /// bfloat16.
     Bf16,
+    /// 8-bit float, 4 exponent bits (`float8_e4m3fn`).
+    F8E4M3,
+    /// 8-bit float, 5 exponent bits.
+    F8E5M2,
+    /// 64-bit integer.
     I64,
+    /// 32-bit integer.
     I32,
+    /// 16-bit integer.
     I16,
+    /// 8-bit integer.
     I8,
+    /// Unsigned byte.
     U8,
+    /// Boolean (one byte).
     Bool,
 }
 
-impl StorageDtype {
-    fn from_class(name: &str) -> Option<Self> {
+impl TorchDtype {
+    fn from_storage_class(name: &str) -> Option<Self> {
         Some(match name {
             "FloatStorage" => Self::F32,
             "DoubleStorage" => Self::F64,
             "HalfStorage" => Self::F16,
             "BFloat16Storage" => Self::Bf16,
+            "Float8_e4m3fnStorage" => Self::F8E4M3,
+            "Float8_e5m2Storage" => Self::F8E5M2,
             "LongStorage" => Self::I64,
             "IntStorage" => Self::I32,
             "ShortStorage" => Self::I16,
@@ -49,36 +66,54 @@ impl StorageDtype {
             Self::F64 | Self::I64 => 8,
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::Bf16 | Self::I16 => 2,
-            Self::I8 | Self::U8 | Self::Bool => 1,
+            Self::I8 | Self::U8 | Self::Bool | Self::F8E4M3 | Self::F8E5M2 => 1,
+        }
+    }
+
+    /// The name safetensors uses for this element type.
+    pub fn safetensors_name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F64 => "F64",
+            Self::F16 => "F16",
+            Self::Bf16 => "BF16",
+            Self::F8E4M3 => "F8_E4M3",
+            Self::F8E5M2 => "F8_E5M2",
+            Self::I64 => "I64",
+            Self::I32 => "I32",
+            Self::I16 => "I16",
+            Self::I8 => "I8",
+            Self::U8 => "U8",
+            Self::Bool => "BOOL",
         }
     }
 }
 
 /// A reference to a storage file inside the archive.
 #[derive(Debug, Clone)]
-pub struct StorageRef {
+pub(crate) struct StorageRef {
     /// The `data/<key>` entry name.
-    pub key: String,
+    pub(crate) key: String,
     /// Element type.
-    pub dtype: StorageDtype,
+    pub(crate) dtype: TorchDtype,
 }
 
 /// A tensor as a view into a storage.
 #[derive(Debug, Clone)]
-pub struct TensorRef {
+pub(crate) struct TensorRef {
     /// The backing storage.
-    pub storage: StorageRef,
+    pub(crate) storage: StorageRef,
     /// Offset into the storage, in elements.
-    pub offset: usize,
+    pub(crate) offset: usize,
     /// Shape.
-    pub shape: Vec<usize>,
+    pub(crate) shape: Vec<usize>,
     /// Strides, in elements.
-    pub stride: Vec<usize>,
+    pub(crate) stride: Vec<usize>,
 }
 
 /// A value on the unpickler's stack.
 #[derive(Debug, Clone)]
-pub enum Obj {
+pub(crate) enum Obj {
     None,
     Int(i64),
     Str(Rc<str>),
@@ -95,7 +130,7 @@ pub enum Obj {
 
 impl Obj {
     /// The string, if this is one.
-    pub fn as_str(&self) -> Option<&str> {
+    pub(crate) fn as_str(&self) -> Option<&str> {
         match self {
             Obj::Str(s) => Some(s),
             _ => None,
@@ -103,28 +138,16 @@ impl Obj {
     }
 
     /// The `(key, value)` pairs, if this is a dict.
-    pub fn dict_items(&self) -> Option<Vec<(Obj, Obj)>> {
+    pub(crate) fn dict_items(&self) -> Option<Vec<(Obj, Obj)>> {
         match self {
             Obj::Dict(d) => Some(d.borrow().clone()),
             _ => None,
         }
     }
-
-    /// The value stored under string key `key`, if this is a dict that has it.
-    pub fn get(&self, key: &str) -> Option<Obj> {
-        match self {
-            Obj::Dict(d) => d
-                .borrow()
-                .iter()
-                .find(|(k, _)| k.as_str() == Some(key))
-                .map(|(_, v)| v.clone()),
-            _ => None,
-        }
-    }
 }
 
-fn bad(msg: impl Into<String>) -> VocoderError {
-    VocoderError::WeightLoad(format!(
+fn bad(msg: impl Into<String>) -> PMetalError {
+    PMetalError::Serialization(format!(
         "unsupported PyTorch checkpoint pickle: {}",
         msg.into()
     ))
@@ -184,7 +207,7 @@ impl<'a> Reader<'a> {
 }
 
 /// Unpickle `data` into an object tree (tensors stay references).
-pub fn load(data: &[u8]) -> Result<Obj> {
+pub(crate) fn load(data: &[u8]) -> Result<Obj> {
     let mut r = Reader { data, pos: 0 };
     let mut stack: Vec<Obj> = Vec::new();
     let mut memo: HashMap<u32, Obj> = HashMap::new();
@@ -268,7 +291,7 @@ pub fn load(data: &[u8]) -> Result<Obj> {
                 stack.push(r.string(n)?);
             }
             0x8d => {
-                let n = r.u64()? as usize;
+                let n = usize::try_from(r.u64()?).map_err(|_| bad("string too long"))?;
                 stack.push(r.string(n)?);
             }
             b'U' => {
@@ -421,7 +444,7 @@ fn persistent_load(pid: &Obj) -> Result<Obj> {
                 Obj::Global(_, name) => name.to_string(),
                 _ => return Err(bad("storage class is not a global")),
             };
-            let dtype = StorageDtype::from_class(&class_name)
+            let dtype = TorchDtype::from_storage_class(&class_name)
                 .ok_or_else(|| bad(format!("storage type `{class_name}`")))?;
             let key = match key {
                 Obj::Str(s) => s.to_string(),
@@ -497,5 +520,68 @@ fn reduce(callable: &Obj, args: &Obj) -> Result<Obj> {
             .cloned()
             .ok_or_else(|| bad("torch.Size without data")),
         (m, n) => Err(bad(format!("call of `{m}.{n}`"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_execution_globals_are_refused() {
+        // `os.system("echo")` as a pickle: GLOBAL os system, a string
+        // argument, TUPLE1, REDUCE. The call is never made.
+        let mut p = vec![0x80, 2];
+        p.extend_from_slice(b"cos\nsystem\n");
+        p.extend_from_slice(&[0x8c, 4]);
+        p.extend_from_slice(b"echo");
+        p.extend_from_slice(&[0x85, b'R', b'.']);
+        let err = load(&p).unwrap_err().to_string();
+        assert!(err.contains("os.system"), "{err}");
+    }
+
+    #[test]
+    fn builtins_eval_and_getattr_are_refused() {
+        for (module, name) in [
+            ("builtins", "eval"),
+            ("builtins", "getattr"),
+            ("subprocess", "Popen"),
+        ] {
+            let mut p = vec![0x80, 2];
+            p.extend_from_slice(format!("c{module}\n{name}\n").as_bytes());
+            p.extend_from_slice(b")R.");
+            assert!(load(&p).is_err(), "{module}.{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_opcodes_and_truncation_are_errors() {
+        assert!(load(&[0x80, 2, 0xfe]).is_err());
+        assert!(load(&[0x80, 2]).is_err());
+        assert!(load(&[]).is_err());
+        // A string that claims more bytes than exist.
+        assert!(load(&[0x80, 2, b'X', 0xff, 0xff, 0xff, 0x7f, b'a']).is_err());
+    }
+
+    #[test]
+    fn a_plain_dict_of_strings_loads() {
+        // {"a": "b"}: EMPTY_DICT, SHORT_BINUNICODE a, SHORT_BINUNICODE b, SETITEM, STOP
+        let p = [0x80, 2, b'}', 0x8c, 1, b'a', 0x8c, 1, b'b', b's', b'.'];
+        let items = load(&p).unwrap().dict_items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0.as_str(), Some("a"));
+        assert_eq!(items[0].1.as_str(), Some("b"));
+    }
+
+    #[test]
+    fn dtype_names_and_widths() {
+        assert_eq!(TorchDtype::Bf16.safetensors_name(), "BF16");
+        assert_eq!(TorchDtype::Bf16.size(), 2);
+        assert_eq!(TorchDtype::F8E4M3.size(), 1);
+        assert_eq!(
+            TorchDtype::from_storage_class("LongStorage"),
+            Some(TorchDtype::I64)
+        );
+        assert_eq!(TorchDtype::from_storage_class("ComplexFloatStorage"), None);
     }
 }

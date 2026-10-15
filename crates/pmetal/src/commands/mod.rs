@@ -7,6 +7,7 @@ pub(crate) mod decide;
 pub(crate) mod dflash;
 #[cfg(feature = "trainer")]
 pub(crate) mod distill;
+pub(crate) mod download;
 #[cfg(feature = "trainer")]
 pub(crate) mod embed_train;
 #[cfg(feature = "lora")]

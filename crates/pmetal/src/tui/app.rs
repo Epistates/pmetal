@@ -1977,23 +1977,12 @@ impl App {
                         let params_str = pmetal_hub::fit::format_params(params_b);
                         let downloads_str = pmetal_hub::search::format_downloads(r.downloads);
 
-                        let (mem_str, fit_level, tps_str) = if let Some(dev) =
-                            &self.models.device_spec
-                        {
-                            let quant = pmetal_hub::fit::detect_quantization_from_id(&r.model_id);
-                            let model_spec = pmetal_hub::ModelSpec {
-                                params_b,
-                                quantization: quant,
-                                context_length: 4096,
-                                num_kv_heads: None,
-                                head_dim: None,
-                                num_layers: None,
-                                is_moe: r.tags.iter().any(|t| t == "moe"),
-                                num_experts: None,
-                                active_experts: None,
-                                kv_cache_bits: None,
-                            };
-                            let fit = pmetal_hub::estimate_fit(&model_spec, dev);
+                        let fit = self
+                            .models
+                            .device_spec
+                            .as_ref()
+                            .and_then(|dev| r.fit(dev, pmetal_hub::fit::DEFAULT_FIT_CONTEXT));
+                        let (mem_str, fit_level, tps_str) = if let Some(fit) = fit {
                             (
                                 format!("{:.1}GB", fit.total_required_gb),
                                 fit.fit_level,
