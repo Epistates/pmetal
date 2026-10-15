@@ -21,7 +21,9 @@ use crate::InlineArray;
 use crate::compat::Dtype;
 
 /// One step of constraint on a generation's logits. See the module docs.
-pub trait LogitsProcessor {
+/// A sampler moves between the threads of a serving engine, so a processor
+/// is `Send`.
+pub trait LogitsProcessor: Send {
     /// `[1, vocab]` f32 logits with this processor's constraint applied.
     /// Called once per distribution the sampler builds, in the order of
     /// the generation's tokens; a processor that tracks the generation

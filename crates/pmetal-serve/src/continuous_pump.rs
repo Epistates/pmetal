@@ -44,7 +44,7 @@
 //!   and attaches the entry to the emitted `TokenEvent::Token`. Tokens
 //!   without a logprob request pay nothing.
 //! - Per-slot repetition / frequency / presence penalties — each slot's
-//!   `Sampler` is built from its own `GenerationConfig` and, at admission,
+//!   sampler is built from its own `GenerationConfig` and, at admission,
 //!   given its own `DecodePenalties` over the request's whole prompt;
 //!   every token sampled for the slot is folded into them on the GPU, so
 //!   penalties apply exactly as they do in single-request generation
@@ -61,7 +61,7 @@ use crate::continuous_driver::{
 use crate::engine::{TokenEvent, TokenLogprobEntry, detect_stop_sequence_suffix};
 use pmetal_cache::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_cache::prefix_cache::PrefixCache;
-use pmetal_models::generation::{GenerationConfig, Sampler, token_logprobs};
+use pmetal_models::generation::{GenerationConfig, token_logprobs};
 use pmetal_runtime::compat::{Array, Exception};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -471,9 +471,9 @@ impl ContinuousPump {
             return Ok(());
         }
         let rec = self.records.get(&slot);
-        let sampler = Sampler::new(rec.map(|r| r.gen_config.clone()).unwrap_or_default());
+        let config = rec.map(|r| r.gen_config.clone()).unwrap_or_default();
         let prompt = rec.map_or(&[][..], |r| r.prompt.as_slice());
-        self.state.admit(slot, sampler, prompt)?;
+        self.state.admit(slot, &config, prompt)?;
         let prefix_seed = self
             .records
             .get_mut(&slot)
@@ -1251,16 +1251,15 @@ mod tests {
         }
     }
 
-    /// The single-request path's greedy tokens: `Sampler::sample` with the
-    /// penalties of a generation from the prompt, one token at a time.
+    /// The single-request path's greedy tokens: a `DecodeSampler` over the
+    /// prompt, one token at a time.
     fn single_request_tokens(prompt: &[u32], config: GenerationConfig, max: usize) -> Vec<u32> {
-        let sampler = Sampler::new(config);
-        let mut penalties = sampler.decode_penalties(prompt);
+        let mut sampler = config.sampler(prompt);
         let mut history = prompt.to_vec();
         for _ in 0..max {
             let last = *history.last().unwrap();
             let logits = Array::from_f32_slice(&hashed_logits(last), &[1, HASHED_VOCAB]);
-            let token = sampler.sample(&logits, penalties.as_mut()).unwrap();
+            let token = sampler.sample(&logits).item_u32();
             history.push(token);
         }
         history.split_off(prompt.len())

@@ -13,10 +13,11 @@ use pmetal_data::qwen_vl_processing::{ProcessedMedia, QwenVlProcessor, RgbImage}
 use pmetal_models::architectures::mllama::{CrossAttentionInputs, MllamaVisionInputs};
 use pmetal_models::architectures::qwen3_5_vision::{Qwen3_5MultimodalConfig, Qwen3_5Vision};
 use pmetal_models::dispatcher::DynamicModel;
-use pmetal_models::generation::{GenerationConfig, Sampler};
+use pmetal_models::generation::GenerationConfig;
 use pmetal_models::model_thread::{Background, ModelThread, ModelThreadStartError};
 use pmetal_models::{GenerationOutput, generate_cached_ane_streaming, is_ane_inference_compatible};
 use pmetal_runtime::compat::{Array, Dtype, ModuleParameters as _};
+use pmetal_runtime::decode::DecodeSampler;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -1616,17 +1617,17 @@ impl InferenceEngine {
     ///
     /// Model outputs have shape `[1, seq_len, vocab_size]` (after prefill) or
     /// `[1, 1, vocab_size]` (after decode steps). We extract the last position
-    /// and flatten to a 1-D array of shape `[vocab_size]` suitable for
-    /// `Sampler::sample`.
+    /// and flatten to an array of shape `[1, vocab_size]` suitable for
+    /// `DecodeSampler::sample`.
     fn extract_last_logits(logits: &Array) -> ServeResult<Array> {
         // Shape: [batch=1, seq_len, vocab_size]
         let last_idx = logits.dim(1) - 1;
         let vocab_size = logits.dim(2);
         // take_axis with a 1-element index array extracts position last_idx
-        // along axis 1 → [1, 1, vocab_size].  reshape flattens to [vocab_size].
+        // along axis 1 → [1, 1, vocab_size].  reshape drops the position axis.
         let idx = Array::from_slice(&[last_idx], &[1]);
         let last = logits.take_axis(&idx, 1);
-        Ok(last.reshape(&[vocab_size]))
+        Ok(last.reshape(&[1, vocab_size]))
     }
 
     /// Encode a prompt's media on the model thread: run the vision tower
@@ -1802,7 +1803,7 @@ impl InferenceEngine {
         model: &mut DynamicModel,
         cache: &mut KVCache,
         mamba_cache: &mut Option<MambaCache>,
-        sampler: &mut Sampler,
+        sampler: &mut DecodeSampler,
         tokenizer: &pmetal_data::Tokenizer,
         input_ids: &[u32],
         max_tokens: usize,
@@ -1819,14 +1820,13 @@ impl InferenceEngine {
         E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
     {
         use pmetal_models::generation::{
-            WiredLimitGuard, clear_generation_caches, run_cached_prefill_chunks_at, token_logprobs,
-            use_generation_stream,
+            decode_pipelined, run_cached_prefill_chunks_at, token_logprobs,
         };
-        use pmetal_runtime::compat::ops::async_eval;
+        use pmetal_runtime::inline_array::{GenerationStream, WiredLimit};
 
-        let _wired_guard = WiredLimitGuard::new();
+        let _wired = WiredLimit::max();
+        let _stream = GenerationStream::enter();
 
-        let mut all_tokens: Vec<u32> = input_ids.to_vec();
         let mut generated: Vec<u32> = Vec::with_capacity(max_tokens);
         let mut logprobs_out: Option<Vec<TokenLogprobEntry>> =
             logprobs_top_n.map(|_| Vec::with_capacity(max_tokens));
@@ -1876,9 +1876,8 @@ impl InferenceEngine {
 
         // === Prefill (chunked, on possibly shortened suffix) ===
         //
-        // `run_cached_prefill_chunks_at` calls `forward` once per chunk; each
-        // call makes the generation stream the default first, so chunked
-        // prefill also runs on the generation stream. Chunks shrink as the
+        // `run_cached_prefill_chunks_at` calls `forward` once per chunk, on
+        // the generation stream this decode holds. Chunks shrink as the
         // cache deepens (counting a restored prefix), so none runs past the
         // GPU watchdog near the end of a long context. The final chunk's
         // logits are returned lazily so we can fold them into the async
@@ -1892,14 +1891,10 @@ impl InferenceEngine {
                 prefix_hit_len,
                 prefill_step_size,
                 |chunk| {
-                    use_generation_stream();
                     model.forward_with_hybrid_cache(chunk, None, Some(cache), mamba_cache.as_mut())
                 },
             ),
-            Some(media) => {
-                use_generation_stream();
-                Self::prefill_media(model, media, cache, mamba_cache.as_mut())
-            }
+            Some(media) => Self::prefill_media(model, media, cache, mamba_cache.as_mut()),
         }
         .map_err(ServeError::Model)?;
 
@@ -1918,131 +1913,96 @@ impl InferenceEngine {
             }
         }
 
-        let mut current_last = Self::extract_last_logits(&prefill_logits)?;
-        // The penalties take each sampled token in on the GPU, so the
-        // look-ahead step below is penalized for the token it runs on.
-        let mut penalties = sampler.decode_penalties(&all_tokens);
-        let (mut current_y, _filtered) = sampler
-            .sample_array_penalized(&current_last, penalties.as_mut())
-            .map_err(ServeError::Model)?;
-        // Schedule the first-token pair async so the GPU starts working
-        // before we enter the loop.
-        async_eval([&current_y, &current_last]);
+        let first_logits = Self::extract_last_logits(&prefill_logits)?;
+        let mut decode_error: Option<ServeError> = None;
 
         // === Decode loop with 1-step look-ahead ===
-        let mut i = 0usize;
-        while i < max_tokens {
-            // 1. Schedule NEXT forward BEFORE extracting current token.
-            let next = if i + 1 < max_tokens {
-                let pair = {
-                    use_generation_stream();
-                    let next_input = current_y
-                        .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
-                        .reshape(&[1, -1]);
-                    let next_full = Self::decode_step(
-                        model,
-                        media,
-                        &next_input,
-                        i,
-                        cache,
-                        mamba_cache.as_mut(),
-                    )
-                    .map_err(ServeError::Model)?;
-                    let next_last = Self::extract_last_logits(&next_full)?;
-                    let (ny, _) = sampler
-                        .sample_array_penalized(&next_last, penalties.as_mut())
-                        .map_err(ServeError::Model)?;
-                    (ny, next_last)
-                };
-                async_eval([&pair.0, &pair.1]);
-                Some(pair)
-            } else {
-                None
-            };
-
-            // 2. First iteration: force-eval the token so .item() below
-            //    gets data (the n==0 special case).
-            if i == 0 {
-                current_y.try_eval().map_err(|e| {
-                    ServeError::Model(pmetal_runtime::compat::Exception::custom(e.to_string()))
-                })?;
-            }
-
-            // 3. Extract token from GPU — blocks until current_y is ready.
-            //    GPU is already computing token(i+1) in parallel.
-            let token = current_y.item::<u32>();
-
-            if first_token_time_ms.is_none() {
-                first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
-            }
-
-            // 4. Stop-token check (before any side-effects).
-            if stop_tokens.contains(&token) {
-                finish_reason = "stop";
-                break;
-            }
-
-            // 5. Optional logprobs: compute from RAW last-position logits
-            //    (the sampler's filtered log-probs aren't suitable for
-            //    OpenAI-style reporting). Cheap when top_n is small.
-            let logprob_entry = match logprobs_top_n {
-                Some(top_n) => match token_logprobs(&current_last, token, top_n + 1) {
-                    Ok((lp, mut top)) => {
-                        top.retain(|(tok, _)| *tok != token);
-                        top.truncate(top_n);
-                        Some(TokenLogprobEntry {
-                            token,
-                            logprob: lp,
-                            top_logprobs: top,
-                        })
-                    }
-                    Err(_) => None,
-                },
-                None => None,
-            };
-
-            generated.push(token);
-            all_tokens.push(token);
-
-            // 6. Accumulate logprob for non-streaming return value. We
-            //    clone so the owned value can still be handed to the
-            //    streaming callback below.
-            if let (Some(entry), Some(out)) = (logprob_entry.as_ref(), logprobs_out.as_mut()) {
-                out.push(entry.clone());
-            }
-
-            // 7. Emit to caller (moves logprob entry into TokenEvent for
-            //    streaming; ignored by non-streaming).
-            match on_token(token, logprob_entry) {
-                StepOutcome::Continue => {}
-                StepOutcome::Cancel => {
-                    cancelled = true;
-                    break;
+        //
+        // `decode_pipelined` queues token(i+1)'s forward before token(i) is
+        // read back, and the sampler's penalties take each sampled token in
+        // on the GPU, so no step's history lags the host.
+        let outcome = decode_pipelined(
+            &first_logits,
+            sampler,
+            max_tokens,
+            |next_input, i| {
+                let next_full =
+                    Self::decode_step(model, media, next_input, i, cache, mamba_cache.as_mut())
+                        .map_err(ServeError::Model)
+                        .map_err(|e| {
+                            let message = e.to_string();
+                            decode_error = Some(e);
+                            pmetal_runtime::compat::Exception::custom(message)
+                        })?;
+                Self::extract_last_logits(&next_full).map_err(|e| {
+                    let message = e.to_string();
+                    decode_error = Some(e);
+                    pmetal_runtime::compat::Exception::custom(message)
+                })
+            },
+            |token, logits| {
+                if first_token_time_ms.is_none() {
+                    first_token_time_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
                 }
-            }
 
-            // 8. Stop-sequence detection on decoded text (multi-token
-            //    suffix match via tokenizer).
-            if let Some(n_strip) =
-                detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences)
-            {
-                stripped_tokens = n_strip;
-                finish_reason = "stop";
-                break;
-            }
+                // Stop-token check (before any side-effects).
+                if stop_tokens.contains(&token) {
+                    finish_reason = "stop";
+                    return std::ops::ControlFlow::Break(());
+                }
 
-            // 9. Periodic allocation-cache sweep.
-            if i > 0 && i % 256 == 0 {
-                clear_generation_caches();
-            }
+                // Optional logprobs: compute from the RAW last-position
+                // logits (the sampler's filtered log-probs aren't suitable
+                // for OpenAI-style reporting). Cheap when top_n is small.
+                let logprob_entry = match logprobs_top_n {
+                    Some(top_n) => match token_logprobs(logits, token, top_n + 1) {
+                        Ok((lp, mut top)) => {
+                            top.retain(|(tok, _)| *tok != token);
+                            top.truncate(top_n);
+                            Some(TokenLogprobEntry {
+                                token,
+                                logprob: lp,
+                                top_logprobs: top,
+                            })
+                        }
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
 
-            // 10. Swap current ← next.
-            if let Some((ny, nl)) = next {
-                current_y = ny;
-                current_last = nl;
-            }
+                generated.push(token);
 
-            i += 1;
+                // Accumulate logprob for non-streaming return value. We
+                // clone so the owned value can still be handed to the
+                // streaming callback below.
+                if let (Some(entry), Some(out)) = (logprob_entry.as_ref(), logprobs_out.as_mut()) {
+                    out.push(entry.clone());
+                }
+
+                // Emit to caller (moves logprob entry into TokenEvent for
+                // streaming; ignored by non-streaming).
+                match on_token(token, logprob_entry) {
+                    StepOutcome::Continue => {}
+                    StepOutcome::Cancel => {
+                        cancelled = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+
+                // Stop-sequence detection on decoded text (multi-token
+                // suffix match via tokenizer).
+                if let Some(n_strip) =
+                    detect_stop_sequence_suffix(tokenizer, &generated, stop_sequences)
+                {
+                    stripped_tokens = n_strip;
+                    finish_reason = "stop";
+                    return std::ops::ControlFlow::Break(());
+                }
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        if let Err(e) = outcome {
+            return Err(decode_error.take().unwrap_or(ServeError::Model(e)));
         }
 
         // Truncate tail if a stop-sequence was matched. Non-streaming
@@ -2110,7 +2070,7 @@ impl InferenceEngine {
         let max_tokens = request.gen_config.max_new_tokens;
         let stop_tokens = request.gen_config.stop_tokens.clone();
         let prefill_step_size = request.gen_config.prefill_step_size;
-        let mut sampler = Sampler::new(request.gen_config);
+        let mut sampler = request.gen_config.sampler(&request.input_ids);
         let run = Self::run_async_decode(
             model,
             &mut cache,

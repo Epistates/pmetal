@@ -79,7 +79,10 @@ pub use registry::*;
 pub use rl_generation::{
     BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator, generate_rl_completions,
 };
-pub use speculative::{SpeculativeConfig, SpeculativeDecoder, SpeculativeStats};
+pub use speculative::{
+    SpeculativeDecodeMetrics, SpeculativeDraws, correction_log_probs,
+    token_probability_from_log_probs,
+};
 pub use traits::{CausalLMModel, LoraCapable, ModelConfig, Quantizable, QuantizationType};
 pub use weight_format::{GgufModelConfig, WeightFormat, WeightFormatError, WeightLoader};
 

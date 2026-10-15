@@ -468,6 +468,13 @@ impl DecodeSampler {
         }
     }
 
+    /// Whether every token is the plain argmax of the logits: temperature 0
+    /// with no penalty, bias or processor to change them, so a caller that
+    /// holds the logits on the host can take the argmax there.
+    pub fn is_plain_argmax(&self) -> bool {
+        self.params.temperature <= 0.0 && self.penalties.is_none() && self.processors.is_empty()
+    }
+
     /// Whether a processor needs every token on the host before the next
     /// step ([`LogitsProcessor::needs_host_tokens`]).
     pub fn needs_host_tokens(&self) -> bool {
@@ -475,8 +482,10 @@ impl DecodeSampler {
     }
 
     /// `[1, vocab]` f32 logits after the penalties, the bias and the
-    /// processors: what the temperature and the filters read.
-    fn constrained(&mut self, logits_2d: &InlineArray) -> InlineArray {
+    /// processors: what the temperature and the filters read, and what a
+    /// greedy decoder takes the argmax of. Reads the history without
+    /// recording a token.
+    pub fn constrained_logits(&mut self, logits_2d: &InlineArray) -> InlineArray {
         let mut logits = match self.penalties.as_mut() {
             Some(penalties) => penalties.apply(logits_2d),
             None => logits_2d.clone(),
@@ -493,7 +502,7 @@ impl DecodeSampler {
     /// temperature 0 the distribution is the argmax's point mass. Reads the
     /// history without recording a token.
     pub fn log_probs(&mut self, logits_2d: &InlineArray) -> InlineArray {
-        let logits = self.constrained(logits_2d);
+        let logits = self.constrained_logits(logits_2d);
         if self.params.temperature <= 0.0 {
             let vocab = logits.dim(-1);
             let ids = InlineArray::arange(vocab, crate::compat::Dtype::Int32.as_i32());
@@ -519,7 +528,7 @@ impl DecodeSampler {
         let token = if self.penalties.is_none() && self.processors.is_empty() {
             sample_token(logits_2d, &self.params, draw)
         } else {
-            let logits = self.constrained(logits_2d);
+            let logits = self.constrained_logits(logits_2d);
             sample_token(&logits, &self.params, draw)
         };
         self.record(&token);

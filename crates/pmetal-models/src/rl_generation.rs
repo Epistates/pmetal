@@ -35,7 +35,9 @@ use pmetal_runtime::compat::{Array, Exception, ops};
 use pmetal_cache::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_cache::prefix_cache::PrefixCache;
 
-use crate::generation::{GenerationConfig, Sampler};
+use pmetal_runtime::decode::DecodeSampler;
+
+use crate::generation::GenerationConfig;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Speculative RL generation statistics
@@ -210,6 +212,7 @@ impl BatchedRlConfig {
             presence_penalty: 0.0,
             stop_tokens: self.stop_tokens.clone(),
             seed: self.seed,
+            logit_bias: Vec::new(),
             // Temperature 0 is greedy, not an unscaled draw.
             do_sample: self.temperature > 0.0,
             prefill_step_size: 2048,
@@ -232,7 +235,7 @@ pub struct BatchedRlGenerator {
     /// KV cache config for creating new caches.
     kv_config: KVCacheConfig,
     /// Sampler with the full filter chain (temperature, top-k, top-p, min-p).
-    sampler: Sampler,
+    sampler: DecodeSampler,
     /// Statistics from the most recent `generate_speculative` call.
     last_speculative_stats: Option<SpeculativeRlStats>,
 }
@@ -246,7 +249,7 @@ impl BatchedRlGenerator {
             None
         };
 
-        let sampler = Sampler::new(config.to_generation_config());
+        let sampler = config.to_generation_config().sampler(&[]);
 
         Self {
             config,
@@ -715,7 +718,7 @@ impl BatchedRlGenerator {
     /// Sample a token from logits through the full filter chain
     /// (temperature, top-k, top-p, min-p).
     fn sample(&mut self, logits: &Array) -> RlGenResult<u32> {
-        Ok(self.sampler.sample_array(logits)?.0.item::<u32>())
+        Ok(self.sampler.sample(logits).item::<u32>())
     }
 
     /// Check if a token is a stop token.
