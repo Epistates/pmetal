@@ -153,6 +153,15 @@ bridge_extern! {
         shape: *const i32,
         ndim: i32,
     );
+    pub(super) fn mlx_inline_from_external(
+        dst: *mut RawBuf,
+        data: *mut std::ffi::c_void,
+        shape: *const i32,
+        ndim: i32,
+        dtype: i32,
+        release: unsafe extern "C" fn(*mut std::ffi::c_void),
+        ctx: *mut std::ffi::c_void,
+    );
     pub(super) fn mlx_inline_from_u16_bits_slice(
         dst: *mut RawBuf,
         data: *const u16,

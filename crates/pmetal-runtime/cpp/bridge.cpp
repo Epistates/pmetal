@@ -655,6 +655,28 @@ void mlx_inline_from_u8_slice(
     });
 }
 
+void mlx_inline_from_external(
+    mlx_inline_array* dst,
+    void* data,
+    const int* shape,
+    int ndim,
+    int dtype,
+    void (*release)(void* ctx),
+    void* ctx) {
+    // The guard releases `ctx` when the last copy of the deleter goes, which
+    // is also when this call throws before an array took it over.
+    std::shared_ptr<void> guard(ctx, [release](void* p) {
+        if (release != nullptr && p != nullptr) {
+            release(p);
+        }
+    });
+    BRIDGE_TRY_DST("from_external", dst, {
+        mlx::core::Shape s(shape, shape + ndim);
+        new (dst->buf) array(
+            data, s, dtype_from_int(dtype), [guard](void*) mutable { guard.reset(); });
+    });
+}
+
 void mlx_inline_from_u16_bits_slice(
     mlx_inline_array* dst,
     const uint16_t* data,
