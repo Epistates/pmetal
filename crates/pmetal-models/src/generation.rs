@@ -619,62 +619,51 @@ pub fn token_logprobs(
     token: u32,
     top_n: usize,
 ) -> Result<(f32, Vec<(u32, f32)>), Exception> {
-    let log_probs = logits_to_log_probs(logits);
+    use pmetal_runtime::compat::ops::{argpartition_axis, negative, slice_axis, take_along_axis};
+
     // Flatten every leading dim so single-row and batched callers both land
-    // on a 1-D [vocab] view. The sampler path only ever has one active
+    // on a [1, vocab] view. The sampler path only ever has one active
     // prediction per step so this is safe.
-    let vocab = *log_probs
+    let vocab = *logits
         .shape()
         .last()
         .ok_or_else(|| Exception::custom("token_logprobs: empty logits shape"))?;
-    let flat = log_probs.reshape(&[vocab]);
-    flat.eval();
-    let values: Vec<f32> = flat.as_slice().to_vec();
-
-    let idx = token as usize;
-    let chosen = values
-        .get(idx)
-        .copied()
-        .ok_or_else(|| Exception::custom(format!("token_logprobs: token {token} out of range")))?;
-
-    let mut top = Vec::new();
-    if top_n > 0 {
-        // O(V log top_n) partial sort via a min-heap of size top_n. Cheaper
-        // than a full sort for realistic vocab/top_n ratios (128k / 5).
-        use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-        #[derive(PartialEq)]
-        struct Entry(f32, u32);
-        impl Eq for Entry {}
-        impl PartialOrd for Entry {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for Entry {
-            fn cmp(&self, other: &Self) -> Ordering {
-                // Min-heap on logprob — reverse the natural order.
-                other.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
-            }
-        }
-        let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(top_n + 1);
-        for (i, &v) in values.iter().enumerate() {
-            if heap.len() < top_n {
-                heap.push(Entry(v, i as u32));
-            } else if let Some(min) = heap.peek() {
-                if v > min.0 {
-                    heap.pop();
-                    heap.push(Entry(v, i as u32));
-                }
-            }
-        }
-        let mut collected: Vec<(u32, f32)> = heap.into_iter().map(|e| (e.1, e.0)).collect();
-        // Sort descending by logprob.
-        collected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        top = collected;
+    if token as i64 >= i64::from(vocab) {
+        return Err(Exception::custom(format!(
+            "token_logprobs: token {token} out of range"
+        )));
     }
+    let log_probs = logits_to_log_probs(logits).reshape(&[1, vocab]);
 
-    Ok((chosen, top))
+    // The chosen token's log-probability, and the `top_n` largest ones,
+    // gathered on the device: only a handful of values come back, not the
+    // vocabulary (600 KB per token over a 152k vocabulary).
+    let chosen = take_along_axis(&log_probs, &Array::from_slice(&[token as i32], &[1, 1]), -1);
+    let k = top_n.min(vocab as usize);
+    let top = (k > 0).then(|| {
+        // The first k columns of a partition of the negated log-probs at
+        // k - 1 are the k largest, in no order.
+        let part = argpartition_axis(&negative(&log_probs), k as i32 - 1, -1);
+        let ids = slice_axis(&part, 1, 0, k as i32);
+        (take_along_axis(&log_probs, &ids, -1), ids)
+    });
+    chosen.eval();
+    if let Some((values, ids)) = &top {
+        values.eval();
+        ids.eval();
+    }
+    pmetal_runtime::check_unobserved_error()
+        .map_err(|e| Exception::custom(format!("token_logprobs: {e}")))?;
+    let chosen = chosen.as_slice::<f32>()[0];
+
+    let mut alternatives = Vec::new();
+    if let Some((values, ids)) = &top {
+        let (values, ids) = (values.as_slice::<f32>(), ids.as_slice::<u32>());
+        alternatives = ids.iter().copied().zip(values.iter().copied()).collect();
+        // Descending by log-probability, ties by token id.
+        alternatives.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
+    Ok((chosen, alternatives))
 }
 
 /// Simple generation function that works with any model that has a `forward` method.
@@ -1425,6 +1414,33 @@ mod tests {
         let (chosen, _) = token_logprobs(&logits, 0, 0).unwrap();
         let expected = -(1.0f32 + 0.125f32.exp()).ln();
         assert!((chosen - expected).abs() < 1e-5, "{chosen} vs {expected}");
+    }
+
+    /// Over a vocabulary far larger than `top_n`, with many exact ties, the
+    /// device-side top-n is what a full sort of the log-softmax gives.
+    #[test]
+    fn token_logprobs_top_n_matches_a_full_sort_over_a_large_vocabulary() {
+        let vocab = 500usize;
+        let row: Vec<f32> = (0..vocab)
+            .map(|t| ((t * 41 + 3) % 19) as f32 * 0.3 + f32::from(t == 123) * 4.0)
+            .collect();
+        let logits = Array::from_slice(&row, &[1, 1, vocab as i32]);
+        let lse = row.iter().map(|&x| f64::from(x).exp()).sum::<f64>().ln() as f32;
+        let mut want: Vec<(u32, f32)> = row
+            .iter()
+            .enumerate()
+            .map(|(t, &x)| (t as u32, x - lse))
+            .collect();
+        want.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let (chosen, top) = token_logprobs(&logits, 77, 12).unwrap();
+        assert!((chosen - (row[77] - lse)).abs() < 1e-4);
+        assert_eq!(top.len(), 12);
+        for (rank, ((id, lp), (_, want_lp))) in top.iter().zip(&want).enumerate() {
+            assert!((lp - want_lp).abs() < 1e-4, "rank {rank}");
+            assert!((lp - (row[*id as usize] - lse)).abs() < 1e-4, "rank {rank}");
+        }
+        assert_eq!(top[0].0, 123);
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
     }
 
     #[test]
