@@ -66,6 +66,7 @@ pub mod accelerate;
 pub mod ane;
 pub mod bridge;
 pub mod buffer;
+pub(crate) mod chip;
 pub mod context;
 pub mod error;
 pub mod expert_buffer;
