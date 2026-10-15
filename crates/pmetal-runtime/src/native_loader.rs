@@ -31,13 +31,26 @@ pub fn read_config_json(model_dir: &Path) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))
 }
 
-/// The `quantization` block from a checkpoint's `config.json`, or `None` when
-/// the weights are dense.
+/// The quantization block of a parsed `config.json`, or `None` when the
+/// weights are dense.
 ///
 /// ⚠️ `mlx_lm.convert` writes the block **twice**, under `quantization` (MLX's
 /// own key, which is where per-module overrides live) and `quantization_config`
 /// (the HF key), with identical contents. MLX's key wins. HF's multimodal
 /// exports also park it inside `text_config`, which is checked last.
+pub fn quantization_block(config: &serde_json::Value) -> Option<&serde_json::Value> {
+    ["quantization", "quantization_config"]
+        .iter()
+        .find_map(|key| {
+            config
+                .get(key)
+                .or_else(|| config.get("text_config").and_then(|tc| tc.get(key)))
+        })
+}
+
+/// The `quantization` block from a checkpoint's `config.json`, or `None` when
+/// the weights are dense; see [`quantization_block`] for where it is looked
+/// for.
 ///
 /// `normalize` maps the checkpoint's module paths onto the caller's key
 /// namespace; see [`MlxQuantization::from_json`].
@@ -49,13 +62,7 @@ pub fn load_mlx_quantization(
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
 
-    let block = ["quantization", "quantization_config"]
-        .iter()
-        .find_map(|key| {
-            json.get(key)
-                .or_else(|| json.get("text_config").and_then(|tc| tc.get(key)))
-        });
-    let Some(block) = block else {
+    let Some(block) = quantization_block(&json) else {
         return Ok(None);
     };
     MlxQuantization::from_json(block, normalize)
@@ -504,9 +511,28 @@ fn broadcasts_to_2d(scale_m: i32, scale_n: i32, weight_m: i32, weight_n: i32) ->
 
 #[cfg(test)]
 mod tests {
-    use super::discover_safetensors_shards;
+    use super::{discover_safetensors_shards, quantization_block};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn the_quantization_block_is_found_under_either_key_and_in_text_config() {
+        let find = |json: &str| {
+            let config: serde_json::Value = serde_json::from_str(json).unwrap();
+            quantization_block(&config).map(|b| b["bits"].as_i64().unwrap())
+        };
+        // MLX's key wins over the HF spelling of the same block.
+        assert_eq!(
+            find(r#"{"quantization": {"bits": 4}, "quantization_config": {"bits": 8}}"#),
+            Some(4)
+        );
+        assert_eq!(find(r#"{"quantization_config": {"bits": 8}}"#), Some(8));
+        assert_eq!(
+            find(r#"{"text_config": {"quantization": {"bits": 3}}}"#),
+            Some(3)
+        );
+        assert_eq!(find(r#"{"hidden_size": 8}"#), None);
+    }
 
     /// e2m1 by code: sign bit high, then two exponent bits and one mantissa.
     const E2M1: [f64; 16] = [
