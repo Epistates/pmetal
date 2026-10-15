@@ -7,10 +7,18 @@
 //! - Metal 3 (macOS 14.0+): All shaders in src/kernels/metal/
 //! - Metal 4 (macOS 26.0+): MPP/NAX shaders in src/kernels/metal4/
 //!   Only compiled when Metal compiler version >= 400 and SDK >= 26.0
+//!
+//! Each shader is compiled on its own thread, and a shader whose source, shared
+//! headers and compiler flags have not changed since the last build in this
+//! target directory is not compiled again: editing one kernel recompiles that
+//! kernel, not the library.
 
 use std::env;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::SystemTime;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -18,11 +26,20 @@ fn main() {
     let shaders_dir = manifest_dir.join("src").join("kernels").join("metal");
     let metal4_dir = manifest_dir.join("src").join("kernels").join("metal4");
 
+    // Declare has_metal4 cfg for check-cfg lint
+    println!("cargo::rustc-check-cfg=cfg(has_metal4)");
+
     // Check if we're on macOS
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "macos" {
         println!("cargo:warning=Metal shaders only compile on macOS");
         return;
     }
+
+    // Re-run if shaders change, or the toolchain they are built with moves
+    println!("cargo:rerun-if-changed=src/kernels/metal");
+    println!("cargo:rerun-if-changed=src/kernels/metal4");
+    println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    println!("cargo:rerun-if-env-changed=SDKROOT");
 
     // Verify Metal toolchain is available before attempting compilation
     check_metal_toolchain();
@@ -30,15 +47,18 @@ fn main() {
     // Detect Metal compiler version and SDK version
     let metal_version = detect_metal_version();
     let sdk_version = detect_sdk_version();
+    let compiler_id = compiler_identity();
 
     // Compile Metal 3 shaders (always)
+    let mut fingerprint_sources: Vec<PathBuf> = Vec::new();
     if shaders_dir.exists() {
-        compile_metal_shaders(
+        fingerprint_sources.push(compile_metal_shaders(
             &shaders_dir,
             &out_dir,
             "air64-apple-macos14.0",
             "pmetal_kernels",
-        );
+            &compiler_id,
+        ));
     } else {
         println!(
             "cargo:warning=No metal shaders directory found at {:?}",
@@ -48,44 +68,29 @@ fn main() {
 
     // Compile Metal 4 / MPP shaders (conditional on toolchain support)
     let has_metal4 = metal_version >= 400 && sdk_version >= 26.0;
-    if has_metal4 && metal4_dir.exists() {
-        let metal4_files: Vec<_> = std::fs::read_dir(&metal4_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                let p = e.ok()?.path();
-                if p.extension()?.to_str()? == "metal" {
-                    Some(p)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if !metal4_files.is_empty() {
-            compile_metal_shaders(
-                &metal4_dir,
-                &out_dir,
-                "air64-apple-macos26.0",
-                "pmetal_kernels_metal4",
-            );
-            println!("cargo:rustc-cfg=has_metal4");
-            println!(
-                "cargo:warning=Metal 4 / MPP shaders compiled (Metal version {metal_version}, SDK {sdk_version})"
-            );
-        }
-    } else if metal4_dir.exists() {
-        // Metal 4 shaders present but toolchain lacks support — expected on SDK < 27.
-        // Not a warning; just skip silently.
+    if has_metal4 && metal4_dir.exists() && metal_sources(&metal4_dir).next().is_some() {
+        fingerprint_sources.push(compile_metal_shaders(
+            &metal4_dir,
+            &out_dir,
+            "air64-apple-macos26.0",
+            "pmetal_kernels_metal4",
+            &compiler_id,
+        ));
+        println!("cargo:rustc-cfg=has_metal4");
+        println!(
+            "cargo:warning=Metal 4 / MPP shaders compiled (Metal version {metal_version}, SDK {sdk_version})"
+        );
     }
 
-    // Declare has_metal4 cfg for check-cfg lint
-    println!("cargo::rustc-check-cfg=cfg(has_metal4)");
-
-    // Re-run if shaders change
-    println!("cargo:rerun-if-changed=src/kernels/metal");
-    println!("cargo:rerun-if-changed=src/kernels/metal4");
+    // A digest of the compiled libraries. Cached tuning results are scoped to
+    // it, so a result measured with one build of a kernel is never reused for
+    // another.
+    let mut digest = FNV_OFFSET;
+    for library in &fingerprint_sources {
+        let bytes = fs::read(library).expect("Failed to read compiled metallib");
+        digest = fnv1a(digest, &bytes);
+    }
+    println!("cargo:rustc-env=PMETAL_KERNEL_FINGERPRINT={digest:016x}");
 
     // Link against Accelerate.framework for vDSP vector operations
     println!("cargo:rustc-link-lib=framework=Accelerate");
@@ -98,6 +103,32 @@ fn main() {
     }
 }
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a, 64-bit.
+fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(seed, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Run `xcrun -sdk macosx metal <args>`, feeding `stdin` if given.
+fn run_metal(args: &[&str], stdin: Option<&str>) -> Option<std::process::Output> {
+    let mut command = Command::new("xcrun");
+    command.args(["-sdk", "macosx", "metal"]).args(args);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command.stdin(if stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = command.spawn().ok()?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(text.as_bytes()).ok()?;
+    }
+    child.wait_with_output().ok()
+}
+
 /// Detect the maximum Metal language version the toolchain supports.
 ///
 /// `__METAL_VERSION__` is determined by the chosen `-std=` flag. Without one,
@@ -108,16 +139,20 @@ fn main() {
 /// fall back to probing `metal3.1`. Returns 0 when nothing works (should be
 /// rare — means the toolchain is broken, not just old).
 fn detect_metal_version() -> u32 {
-    for std_flag in &["metal4.0", "metal3.1"] {
-        let script = format!(
-            "echo '__METAL_VERSION__' | xcrun -sdk macosx metal -std={std_flag} -E -x metal -P - 2>/dev/null | tail -1 | tr -d '\\n'",
+    for std_flag in ["metal4.0", "metal3.1"] {
+        let std_arg = format!("-std={std_flag}");
+        let output = run_metal(
+            &[&std_arg, "-E", "-x", "metal", "-P", "-"],
+            Some("__METAL_VERSION__\n"),
         );
-        let output = Command::new("zsh").args(["-c", &script]).output();
-        if let Ok(o) = output
+        if let Some(o) = output
             && o.status.success()
         {
-            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if let Ok(n) = v.parse::<u32>()
+            let text = String::from_utf8_lossy(&o.stdout);
+            if let Some(n) = text
+                .lines()
+                .rev()
+                .find_map(|line| line.trim().parse::<u32>().ok())
                 && n > 0
             {
                 return n;
@@ -125,6 +160,14 @@ fn detect_metal_version() -> u32 {
         }
     }
     0
+}
+
+/// The compiler's own version banner. A shader compiled by another compiler is
+/// not the same shader, so a change in this invalidates every object.
+fn compiler_identity() -> String {
+    run_metal(&["--version"], None)
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 /// Detect macOS SDK version (e.g. 14.5, 26.2).
@@ -189,9 +232,38 @@ fn check_metal_toolchain() {
     }
 }
 
-fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_name: &str) {
+/// The `.metal` files directly in `dir`.
+fn metal_sources(dir: &Path) -> impl Iterator<Item = PathBuf> {
+    fs::read_dir(dir).into_iter().flatten().filter_map(|entry| {
+        let path = entry.ok()?.path();
+        (path.extension()?.to_str()? == "metal").then_some(path)
+    })
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// The newest modification time among every file in `dirs` (shaders and the
+/// headers they share).
+fn newest_input(dirs: &[&Path]) -> Option<SystemTime> {
+    dirs.iter()
+        .flat_map(|dir| fs::read_dir(dir).into_iter().flatten())
+        .filter_map(|entry| modified(&entry.ok()?.path()))
+        .max()
+}
+
+/// Compile `shaders_dir`'s `.metal` files into `<lib_name>.metallib` in
+/// `out_dir`, and return that path.
+fn compile_metal_shaders(
+    shaders_dir: &Path,
+    out_dir: &Path,
+    target: &str,
+    lib_name: &str,
+    compiler_id: &str,
+) -> PathBuf {
     let cache_root = out_dir.join(".cache");
-    std::fs::create_dir_all(&cache_root).expect("Failed to create shader compiler cache");
+    fs::create_dir_all(&cache_root).expect("Failed to create shader compiler cache");
 
     // Determine metal language standard from target
     let std_flag = if target.contains("macos26") {
@@ -200,101 +272,111 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_n
         "-std=metal3.1"
     };
 
-    let metal_files: Vec<_> = std::fs::read_dir(shaders_dir)
-        .expect("Failed to read shaders directory")
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()?.to_str()? == "metal" {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut metal_files: Vec<PathBuf> = metal_sources(shaders_dir).collect();
+    metal_files.sort();
 
     if metal_files.is_empty() {
         println!("cargo:warning=No .metal files found in {:?}", shaders_dir);
-        return;
     }
 
-    // Compile each .metal file to .air (intermediate representation)
-    let mut air_files = Vec::new();
-    for metal_file in &metal_files {
-        let stem = metal_file.file_stem().unwrap().to_str().unwrap();
-        let air_file = out_dir.join(format!("{}_{}.air", lib_name, stem));
+    // Shaders include headers from their own directory and from `metal/`, so a
+    // change to any file in either invalidates every object (the headers are
+    // shared and the include graph is not tracked).
+    let shared_dir = shaders_dir.parent().unwrap().join("metal");
+    let newest_source = newest_input(&[shaders_dir, &shared_dir]);
 
-        println!("cargo:rerun-if-changed={}", metal_file.display());
+    // The flags, compiler and shader set a cached library was built with. A
+    // mismatch rebuilds everything (a deleted shader would otherwise live on
+    // in the old library).
+    let names: Vec<String> = metal_files
+        .iter()
+        .map(|file| file.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    let flags = format!(
+        "{std_flag} -O3 -ffast-math -target {target}\n{}\n{compiler_id}",
+        names.join(",")
+    );
+    let stamp_path = out_dir.join(format!("{lib_name}.flags"));
+    let flags_unchanged = fs::read_to_string(&stamp_path).is_ok_and(|old| old == flags);
 
-        let output = Command::new("xcrun")
-            .env("HOME", out_dir)
-            .env("XDG_CACHE_HOME", &cache_root)
-            .args([
-                "-sdk",
-                "macosx",
-                "metal",
-                // Metal language standard
-                std_flag,
-                // Optimization flags
-                "-O3",
-                // Enable fast math for ML workloads
-                "-ffast-math",
-                // Target Apple Silicon
-                "-target",
-                target,
-                // Include path for shared headers (both metal/ and metal4/)
-                "-I",
-                shaders_dir.to_str().unwrap(),
-                "-I",
-                shaders_dir
-                    .parent()
-                    .unwrap()
-                    .join("metal")
-                    .to_str()
-                    .unwrap(),
-                // Compile to AIR
-                "-c",
-                metal_file.to_str().unwrap(),
-                "-o",
-                air_file.to_str().unwrap(),
-            ])
-            .output()
-            .expect("Failed to run Metal compiler (xcrun verified but execution failed)");
+    let air_files: Vec<PathBuf> = metal_files
+        .iter()
+        .map(|metal_file| {
+            let stem = metal_file.file_stem().unwrap().to_str().unwrap();
+            out_dir.join(format!("{lib_name}_{stem}.air"))
+        })
+        .collect();
+
+    let stale: Vec<usize> = (0..metal_files.len())
+        .filter(|&i| {
+            !flags_unchanged
+                || match (modified(&air_files[i]), newest_source) {
+                    (Some(air), Some(source)) => air < source,
+                    _ => true,
+                }
+        })
+        .collect();
+
+    // Compile the stale shaders concurrently, as many at a time as cargo's
+    // job count (the compiler is the whole cost of a clean build).
+    let jobs = env::var("NUM_JOBS")
+        .ok()
+        .and_then(|n| n.parse::<usize>().ok())
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1)
+        .clamp(1, 8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(stale.len()) {
+            scope.spawn(|| {
+                loop {
+                    let slot = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&i) = stale.get(slot) else {
+                        break;
+                    };
+                    compile_to_air(
+                        &metal_files[i],
+                        &air_files[i],
+                        shaders_dir,
+                        &shared_dir,
+                        std_flag,
+                        target,
+                        out_dir,
+                        &cache_root,
+                    );
+                }
+            });
+        }
+    });
+
+    let metallib_file = out_dir.join(format!("{lib_name}.metallib"));
+    let library_stale = !stale.is_empty() || !metallib_file.exists();
+
+    // Link all .air files into a single .metallib
+    if library_stale {
+        let mut cmd = Command::new("xcrun");
+        cmd.env("HOME", out_dir);
+        cmd.env("XDG_CACHE_HOME", &cache_root);
+        cmd.args(["-sdk", "macosx", "metallib"]);
+
+        for air_file in &air_files {
+            cmd.arg(air_file);
+        }
+
+        cmd.arg("-o").arg(&metallib_file);
+
+        let output = cmd.output().expect("Failed to run metallib linker");
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             panic!(
-                "Failed to compile Metal shader: {}\n\n--- compiler output ---\n{}",
-                metal_file.display(),
-                stderr
+                "Failed to link Metal library {}\n\n--- linker output ---\n{}",
+                lib_name, stderr
             );
         }
-
-        air_files.push(air_file);
-    }
-
-    // Link all .air files into a single .metallib
-    let metallib_file = out_dir.join(format!("{}.metallib", lib_name));
-
-    let mut cmd = Command::new("xcrun");
-    cmd.env("HOME", out_dir);
-    cmd.env("XDG_CACHE_HOME", &cache_root);
-    cmd.args(["-sdk", "macosx", "metallib"]);
-
-    for air_file in &air_files {
-        cmd.arg(air_file.to_str().unwrap());
-    }
-
-    cmd.args(["-o", metallib_file.to_str().unwrap()]);
-
-    let output = cmd.output().expect("Failed to run metallib linker");
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!(
-            "Failed to link Metal library {}\n\n--- linker output ---\n{}",
-            lib_name, stderr
-        );
+        // Recorded only now that every object built: an interrupted build
+        // leaves no stamp, so the next one starts over.
+        fs::write(&stamp_path, &flags).expect("Failed to record shader flags");
     }
 
     // Set env var for embedding — uppercase lib name
@@ -305,9 +387,64 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path, target: &str, lib_n
     println!("cargo:rustc-env={}={}", env_name, metallib_file.display());
 
     println!(
-        "Successfully compiled {} Metal shaders to {:?} (target: {})",
+        "Compiled {} of {} Metal shaders to {:?} (target: {})",
+        stale.len(),
         metal_files.len(),
         metallib_file,
         target
     );
+    metallib_file
+}
+
+/// Compile one `.metal` file to `.air`, panicking with the compiler's output
+/// if it fails.
+#[allow(clippy::too_many_arguments)]
+fn compile_to_air(
+    metal_file: &Path,
+    air_file: &Path,
+    shaders_dir: &Path,
+    shared_dir: &Path,
+    std_flag: &str,
+    target: &str,
+    out_dir: &Path,
+    cache_root: &Path,
+) {
+    let output = Command::new("xcrun")
+        .env("HOME", out_dir)
+        .env("XDG_CACHE_HOME", cache_root)
+        .args([
+            "-sdk",
+            "macosx",
+            "metal",
+            // Metal language standard
+            std_flag,
+            // Optimization flags
+            "-O3",
+            // Enable fast math for ML workloads
+            "-ffast-math",
+            // Target Apple Silicon
+            "-target",
+            target,
+        ])
+        // Include path for shared headers (both metal/ and metal4/)
+        .arg("-I")
+        .arg(shaders_dir)
+        .arg("-I")
+        .arg(shared_dir)
+        // Compile to AIR
+        .arg("-c")
+        .arg(metal_file)
+        .arg("-o")
+        .arg(air_file)
+        .output()
+        .expect("Failed to run Metal compiler (xcrun verified but execution failed)");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "Failed to compile Metal shader: {}\n\n--- compiler output ---\n{}",
+            metal_file.display(),
+            stderr
+        );
+    }
 }

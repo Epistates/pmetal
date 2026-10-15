@@ -17,11 +17,12 @@
 
 use half::f16;
 use pmetal_metal::{
-    bridge::{MetalBufferView, metal_buffer_from_ptr},
+    MetalBufferView,
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result as MetalResult},
     kernels::dequant::DequantKernels,
+    view::metal_buffer_from_ptr,
 };
 use pmetal_runtime::compat::{Array, Dtype};
 

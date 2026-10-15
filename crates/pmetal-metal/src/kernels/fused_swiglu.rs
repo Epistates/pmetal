@@ -30,11 +30,11 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::{BufferUsage, MetalBuffer},
-    context::MetalContext,
+    context::{CommandQueueExt, MetalContext},
     error::{MetalError, Result},
     pipeline::FunctionConstant,
     tuna::SwiGLUTunedConfig,
@@ -393,9 +393,7 @@ impl FusedSwiGLU {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -468,9 +466,7 @@ impl FusedSwiGLU {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -675,9 +671,7 @@ impl FusedMLP {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()

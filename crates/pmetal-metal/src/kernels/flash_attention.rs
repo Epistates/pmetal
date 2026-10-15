@@ -34,10 +34,10 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
-use crate::context::MetalContext;
+use crate::context::{CommandQueueExt, MetalContext};
 use crate::error::{MetalError, Result};
 use crate::tuna::FlashAttentionTunedConfig;
 
@@ -403,9 +403,7 @@ impl FlashAttention {
         // forward activations and write to disjoint gradient buffers), so they
         // can share one submission rather than two separate commit+wait cycles.
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         self.encode_backward_dq(
             &command_buffer,
@@ -517,9 +515,7 @@ impl FlashAttention {
 
         // Get command queue and create command buffer
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         // Create compute encoder
         let encoder = command_buffer
@@ -1071,9 +1067,7 @@ impl FlashAttentionVarlen {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()

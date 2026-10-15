@@ -42,11 +42,11 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::{BufferUsage, MetalBuffer},
-    context::MetalContext,
+    context::{CommandQueueExt, MetalContext},
     error::{MetalError, Result},
 };
 
@@ -364,9 +364,7 @@ impl MoeKernel {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -426,9 +424,7 @@ impl MoeKernel {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -519,9 +515,7 @@ impl MoeKernel {
             MetalBuffer::<u32>::zeros(&self.ctx, self.config.num_experts, BufferUsage::Shared)?;
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -588,9 +582,7 @@ impl MoeKernel {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()

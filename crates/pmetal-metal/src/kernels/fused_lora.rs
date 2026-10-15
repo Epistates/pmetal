@@ -32,12 +32,10 @@ use half::f16;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize};
 
 use crate::buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
-use crate::context::MetalContext;
+use crate::context::{CommandQueueExt, MetalContext};
 use crate::error::{MetalError, Result};
 
 /// Configuration for fused LoRA operations.
@@ -439,9 +437,7 @@ impl FusedLora {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -518,9 +514,7 @@ impl FusedLora {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -591,9 +585,7 @@ impl FusedLora {
             };
 
             let command_queue = self.ctx.command_queue();
-            let command_buffer = command_queue
-                .commandBuffer()
-                .ok_or(MetalError::CommandBufferCreation)?;
+            let command_buffer = command_queue.new_command_buffer()?;
 
             let encoder = command_buffer
                 .computeCommandEncoder()
@@ -692,9 +684,7 @@ impl FusedLora {
             };
 
             let command_queue = self.ctx.command_queue();
-            let command_buffer = command_queue
-                .commandBuffer()
-                .ok_or(MetalError::CommandBufferCreation)?;
+            let command_buffer = command_queue.new_command_buffer()?;
 
             let encoder = command_buffer
                 .computeCommandEncoder()
@@ -766,9 +756,7 @@ impl FusedLora {
         };
 
         let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = command_queue.new_command_buffer()?;
 
         let encoder = command_buffer
             .computeCommandEncoder()

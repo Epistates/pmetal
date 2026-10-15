@@ -11,17 +11,18 @@
 //! We use inline asm with `fcvtn`/`fcvtl` instead, which is fully stable on
 //! aarch64 and achieves the same throughput.
 //!
-//! These functions are used in the MLX bridge layer for raw buffer operations
-//! where MLX's built-in dtype conversion isn't available.
+//! These functions convert raw weight and activation buffers (for example the
+//! ANE input and output surfaces) where the runtime's own dtype conversion
+//! is not available.
 
 /// Convert a slice of f32 values to fp16 (stored as u16 bits) using NEON.
 ///
 /// Falls back to scalar conversion on non-aarch64 platforms or for remainder
 /// elements not covered by the 4-wide vectorized loop.
 ///
-/// # Safety
+/// # Panics
 ///
-/// `dst` must have the same length as `src`.
+/// If `dst` and `src` differ in length.
 pub fn f32_to_f16_bulk(src: &[f32], dst: &mut [u16]) {
     assert_eq!(
         src.len(),
@@ -48,9 +49,9 @@ pub fn f32_to_f16_bulk(src: &[f32], dst: &mut [u16]) {
 /// Falls back to scalar conversion on non-aarch64 platforms or for remainder
 /// elements not covered by the 4-wide vectorized loop.
 ///
-/// # Safety
+/// # Panics
 ///
-/// `dst` must have the same length as `src`.
+/// If `dst` and `src` differ in length.
 pub fn f16_to_f32_bulk(src: &[u16], dst: &mut [f32]) {
     assert_eq!(
         src.len(),
@@ -215,6 +216,68 @@ fn f16_to_f32_scalar(src: &[u16], dst: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every fp16 bit pattern widens to the f32 the `half` crate produces
+    /// (NaNs compare as NaNs, since their payloads may differ).
+    #[test]
+    fn widening_matches_the_reference_for_every_fp16_pattern() {
+        let src: Vec<u16> = (0..=u16::MAX).collect();
+        let mut dst = vec![0f32; src.len()];
+        f16_to_f32_bulk(&src, &mut dst);
+        for (&bits, &got) in src.iter().zip(&dst) {
+            let want = half::f16::from_bits(bits).to_f32();
+            if want.is_nan() {
+                assert!(got.is_nan(), "{bits:#06x}");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "{bits:#06x}");
+            }
+        }
+    }
+
+    /// Narrowing rounds to nearest-even exactly as the reference does, across
+    /// the whole f32 range: normals, subnormals, overflow to infinity and ties.
+    #[test]
+    fn narrowing_matches_the_reference_across_the_f32_range() {
+        // Every 257th f32 bit pattern, plus the neighbours of every fp16
+        // rounding boundary, is about 17M values.
+        let mut src: Vec<f32> = (0..=u32::MAX).step_by(257).map(f32::from_bits).collect();
+        for bits in 0..=u16::MAX {
+            let exact = half::f16::from_bits(bits).to_f32();
+            if exact.is_finite() {
+                let b = exact.to_bits();
+                // The value, and the f32s just either side of it and of the
+                // tie halfway to the next fp16.
+                for delta in [-1i64, 0, 1] {
+                    src.push(f32::from_bits((i64::from(b) + delta) as u32));
+                }
+                let next = half::f16::from_bits(bits.wrapping_add(1)).to_f32();
+                if next.is_finite() {
+                    let tie = f32::from_bits((exact.to_bits() / 2) + (next.to_bits() / 2));
+                    for delta in [-1i64, 0, 1] {
+                        src.push(f32::from_bits((i64::from(tie.to_bits()) + delta) as u32));
+                    }
+                }
+            }
+        }
+        // Length not a multiple of 8, so the 4-wide and scalar tails run too.
+        src.truncate(src.len() - src.len() % 8 + 3);
+        let mut dst = vec![0u16; src.len()];
+        f32_to_f16_bulk(&src, &mut dst);
+        for (&value, &bits) in src.iter().zip(&dst) {
+            let want = half::f16::from_f32(value);
+            if value.is_nan() {
+                assert!(half::f16::from_bits(bits).is_nan(), "{value:e}");
+            } else {
+                assert_eq!(bits, want.to_bits(), "{:#010x}", value.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "same length")]
+    fn mismatched_lengths_are_rejected() {
+        f32_to_f16_bulk(&[1.0, 2.0], &mut [0u16; 3]);
+    }
 
     #[test]
     fn test_f32_to_f16_roundtrip() {

@@ -23,14 +23,12 @@
 //! - `fp8_update_scale`: Dynamic scale update
 
 use half::bf16;
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-};
+use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize};
 use std::ptr::NonNull;
 
 use crate::{
     buffer::{BufferUsage, MetalBuffer},
-    context::MetalContext,
+    context::{CommandQueueExt, MetalContext},
     error::{MetalError, Result},
 };
 
@@ -216,11 +214,7 @@ impl Fp8TrainingKernel {
             None,
         )?;
 
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = self.ctx.command_queue().new_command_buffer()?;
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;
@@ -294,11 +288,7 @@ impl Fp8TrainingKernel {
             None,
         )?;
 
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = self.ctx.command_queue().new_command_buffer()?;
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;
@@ -388,11 +378,7 @@ impl Fp8TrainingKernel {
             None,
         )?;
 
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let command_buffer = self.ctx.command_queue().new_command_buffer()?;
         let encoder = command_buffer
             .computeCommandEncoder()
             .ok_or(MetalError::EncoderCreation)?;
