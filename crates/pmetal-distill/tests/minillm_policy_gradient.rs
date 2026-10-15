@@ -139,7 +139,7 @@ fn value_and_gradient_match_the_float64_surrogate() {
                     .unwrap()
                     .total
             },
-            &[s.clone()],
+            std::slice::from_ref(&s),
             &[],
         )
         .unwrap();

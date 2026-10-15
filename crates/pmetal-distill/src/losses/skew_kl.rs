@@ -94,13 +94,12 @@ impl DistillLoss for SkewKlLoss {
             temperature,
             self.sparse_top_k,
         )?;
-        let per_token = match (self.direction, self.alpha) {
-            (Direction::Forward, a) if a == 0.0 => kl_from_log_probs(&log_t, &log_s),
-            (Direction::Reverse, a) if a == 0.0 => kl_from_log_probs(&log_s, &log_t),
-            (Direction::Forward, a) => kl_from_log_probs(&log_t, &log_mixture(&log_t, &log_s, a)),
-            (Direction::Reverse, a) => {
-                kl_from_log_probs(&log_s, &log_mixture(&log_t, &log_s, 1.0 - a))
-            }
+        let a = self.alpha;
+        let per_token = match self.direction {
+            Direction::Forward if a == 0.0 => kl_from_log_probs(&log_t, &log_s),
+            Direction::Reverse if a == 0.0 => kl_from_log_probs(&log_s, &log_t),
+            Direction::Forward => kl_from_log_probs(&log_t, &log_mixture(&log_t, &log_s, a)),
+            Direction::Reverse => kl_from_log_probs(&log_s, &log_mixture(&log_t, &log_s, 1.0 - a)),
         };
         reduce_per_token(&per_token, weights)
     }

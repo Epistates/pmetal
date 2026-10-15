@@ -154,7 +154,7 @@ impl MiniLlmLoss {
         let log_q0_y = gather(&log_q_behavior);
 
         // Rewards r_t = log p - log q, constants.
-        let ones = Array::ones(&log_p_y.shape().to_vec(), f32_);
+        let ones = Array::ones(log_p_y.shape(), f32_);
         let m = match mask {
             Some(m) => m.reshape(log_p_y.shape()).as_dtype(f32_),
             None => ones,

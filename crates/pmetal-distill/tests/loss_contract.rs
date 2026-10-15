@@ -214,6 +214,9 @@ fn mixed_reverse_kl(mix: f64) -> impl Fn(&[f64], &[f64]) -> f64 {
     }
 }
 
+/// A divergence of two log-probability rows, computed in float64.
+type PerToken = Box<dyn Fn(&[f64], &[f64]) -> f64>;
+
 fn kl(lt: &[f64], ls: &[f64]) -> f64 {
     lt.iter().zip(ls).map(|(a, b)| a.exp() * (a - b)).sum()
 }
@@ -229,11 +232,7 @@ fn bf16_logits_are_normalised_in_f32() {
     let (t64, s64) = (rounded(&t, Dtype::Bfloat16), rounded(&s, Dtype::Bfloat16));
     let temperature = 2.0_f32;
 
-    type Case = (
-        &'static str,
-        Box<dyn DistillLoss>,
-        Box<dyn Fn(&[f64], &[f64]) -> f64>,
-    );
+    type Case = (&'static str, Box<dyn DistillLoss>, PerToken);
     let cases: Vec<Case> = vec![
         ("kl", Box::new(KlDivergenceLoss::new()), Box::new(kl)),
         ("tvd", Box::new(TvdLoss::new()), Box::new(tvd)),
@@ -453,7 +452,7 @@ fn skew_kl_matches_the_distillm_definitions() {
                 })
                 .sum()
         };
-        let cases: [(&str, SkewKlLoss, Box<dyn Fn(&[f64], &[f64]) -> f64>); 2] = [
+        let cases: [(&str, SkewKlLoss, PerToken); 2] = [
             ("skl", SkewKlLoss::forward(alpha), Box::new(skew_forward)),
             ("srkl", SkewKlLoss::reverse(alpha), Box::new(skew_reverse)),
         ];
