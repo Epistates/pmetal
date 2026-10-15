@@ -2,12 +2,14 @@
 //!
 //! The two engines implement fixed architectures. Training
 //! ([`super::dynamic_trainer`]) is Llama-shaped: SiLU-gated FFN, no per-head
-//! q/k norm. Inference ([`super::inference`]) is Qwen3-shaped: the same FFN
-//! plus per-head q/k RMSNorm. Neither routes experts, applies `rope_scaling`,
-//! adds attention or MLP biases, uses a sliding window, or has an output
-//! projection separate from the embeddings. A checkpoint outside that shape
-//! used to load anyway and compute a different function with no error (#34),
-//! as did one whose tensors failed to convert or had the wrong size.
+//! q/k norm, logits from the embedding table. Inference ([`super::lm`]) is
+//! Qwen3-shaped: the same FFN plus per-head q/k RMSNorm, with an output
+//! projection of its own when the checkpoint has one. Neither routes experts,
+//! applies scaled RoPE (`rope_scaling`, or a `rope_parameters` that isn't
+//! `default`), adds attention or MLP biases, or uses a sliding window or any
+//! layer other than full attention. A checkpoint outside that shape used to
+//! load anyway and compute a different function with no error (#34), as did
+//! one whose tensors failed to convert or had the wrong size.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -113,6 +115,12 @@ impl Checkpoint {
         self.index.contains_key(name)
     }
 
+    /// Fail, naming them, unless the checkpoint has every tensor in
+    /// `required`: before an engine spends minutes compiling.
+    pub(crate) fn require(&self, required: impl IntoIterator<Item = String>) -> Result<()> {
+        missing_tensors(required.into_iter().filter(|n| !self.contains(n)).collect())
+    }
+
     /// `name` as f32, which must have `expected` elements.
     pub(crate) fn f32(&self, name: &str, expected: usize) -> Result<Vec<f32>> {
         let (file, info) = self
@@ -150,8 +158,27 @@ pub(crate) fn check_shared_limits(
     check_tied_embeddings(config, engine)
 }
 
-/// What no ANE engine implements: routed experts, `rope_scaling`, sliding
-/// windows, attention or MLP biases.
+/// The RoPE settings object of a `config.json`: `rope_parameters` in the
+/// layout newer Transformers write, else the older `rope_scaling`.
+fn rope_settings(
+    config: &serde_json::Value,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    ["rope_parameters", "rope_scaling"]
+        .iter()
+        .find_map(|key| config.get(key).and_then(|v| v.as_object()))
+}
+
+/// The RoPE base frequency a `config.json` names: `rope_theta`, or the same
+/// key inside the RoPE settings object. `None` when it names none.
+pub(crate) fn rope_theta(config: &serde_json::Value) -> Option<f64> {
+    config
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .or_else(|| rope_settings(config)?.get("rope_theta")?.as_f64())
+}
+
+/// What no ANE engine implements: routed experts, scaled RoPE, sliding
+/// windows or any layer that isn't full attention, attention or MLP biases.
 pub(crate) fn check_architecture_limits(
     config: &serde_json::Value,
     engine: &str,
@@ -168,14 +195,43 @@ pub(crate) fn check_architecture_limits(
             "MoE models with routed experts are not supported by ANE {engine}."
         ));
     }
-    if set("rope_scaling") {
-        return Err(format!(
-            "rope_scaling is not implemented by the ANE {engine} engine, which applies plain RoPE."
-        ));
+    // Plain RoPE is `{"rope_type": "default"}` or nothing; any other type
+    // (yarn, llama3, linear, ...) rescales frequencies these kernels don't.
+    for key in ["rope_parameters", "rope_scaling"] {
+        let Some(settings) = config.get(key).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        let kind = ["rope_type", "type"]
+            .iter()
+            .find_map(|k| settings.get(*k).and_then(|v| v.as_str()));
+        let scaled = match kind {
+            Some(kind) => kind != "default",
+            None => settings.contains_key("factor"),
+        };
+        if scaled {
+            return Err(format!(
+                "{key} ({}) is not implemented by the ANE {engine} engine, which applies plain RoPE.",
+                kind.unwrap_or("scaled")
+            ));
+        }
     }
     if set("sliding_window") && flag("use_sliding_window") != Some(false) {
         return Err(format!(
             "Sliding-window attention is not implemented by the ANE {engine} engine."
+        ));
+    }
+    if let Some(other) = config
+        .get("layer_types")
+        .and_then(|v| v.as_array())
+        .and_then(|types| {
+            types
+                .iter()
+                .filter_map(|t| t.as_str())
+                .find(|t| *t != "full_attention")
+        })
+    {
+        return Err(format!(
+            "A {other} layer is not implemented by the ANE {engine} engine, which runs full attention."
         ));
     }
     for key in ["attention_bias", "mlp_bias"] {
@@ -260,30 +316,36 @@ impl StrictLoader {
 
     /// Fail unless every tensor in `required` was loaded.
     pub(crate) fn require(&self, required: impl IntoIterator<Item = String>) -> Result<()> {
-        let missing: Vec<String> = required
-            .into_iter()
-            .filter(|name| !self.loaded.contains(name))
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let shown = missing
-            .iter()
-            .take(5)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        let more = missing.len().saturating_sub(5);
-        Err(MetalError::InvalidConfig(format!(
-            "checkpoint is missing {} tensor(s) the ANE engine needs: {shown}{}",
-            missing.len(),
-            if more > 0 {
-                format!(" and {more} more")
-            } else {
-                String::new()
-            }
-        )))
+        missing_tensors(
+            required
+                .into_iter()
+                .filter(|name| !self.loaded.contains(name))
+                .collect(),
+        )
     }
+}
+
+/// `Ok` for no missing tensors, else the error naming the first few.
+fn missing_tensors(missing: Vec<String>) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let shown = missing
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = missing.len().saturating_sub(5);
+    Err(MetalError::InvalidConfig(format!(
+        "checkpoint is missing {} tensor(s) the ANE engine needs: {shown}{}",
+        missing.len(),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )))
 }
 
 /// Per-layer tensor names under `model.layers.{i}.`.
@@ -334,6 +396,144 @@ mod tests {
             "tie_word_embeddings": true,
         });
         assert!(check_shared_limits(&config, "inference").is_ok());
+    }
+
+    /// Newer Transformers write the RoPE settings as `rope_parameters`
+    /// (`rope_type`, `rope_theta`, ...) in place of `rope_scaling` and
+    /// `rope_theta`. A scaled RoPE there ran as plain RoPE, and a plain one
+    /// written as `{"rope_type": "default"}` was refused.
+    #[test]
+    fn rope_settings_are_read_in_either_layout() {
+        let plain = |v| check_architecture_limits(&v, "inference").is_ok();
+        assert!(plain(
+            json!({"rope_parameters": {"rope_type": "default", "rope_theta": 1e6}})
+        ));
+        assert!(plain(json!({"rope_scaling": {"rope_type": "default"}})));
+        assert!(plain(json!({"rope_parameters": null})));
+        for scaled in ["yarn", "linear", "dynamic", "llama3", "longrope"] {
+            assert!(
+                !plain(json!({"rope_parameters": {"rope_type": scaled, "factor": 4.0}})),
+                "rope_parameters {scaled}"
+            );
+            assert!(
+                !plain(json!({"rope_scaling": {"type": scaled, "factor": 4.0}})),
+                "rope_scaling {scaled}"
+            );
+        }
+        // A settings object that names no type but carries a factor is scaling.
+        assert!(!plain(json!({"rope_parameters": {"factor": 2.0}})));
+
+        assert_eq!(rope_theta(&json!({"rope_theta": 5e5})), Some(5e5));
+        assert_eq!(
+            rope_theta(&json!({"rope_parameters": {"rope_theta": 1e7}})),
+            Some(1e7)
+        );
+        assert_eq!(
+            rope_theta(&json!({"rope_scaling": {"rope_theta": 2e4}})),
+            Some(2e4)
+        );
+        assert_eq!(rope_theta(&json!({})), None);
+    }
+
+    /// Per-layer attention types: any layer that isn't full attention is a
+    /// window or a recurrence these kernels don't compute.
+    #[test]
+    fn layer_types_other_than_full_attention_are_refused() {
+        let ok = json!({"layer_types": ["full_attention", "full_attention"]});
+        assert!(check_architecture_limits(&ok, "inference").is_ok());
+        for other in ["sliding_attention", "linear_attention"] {
+            let config = json!({"layer_types": ["full_attention", other]});
+            let err = check_architecture_limits(&config, "inference").unwrap_err();
+            assert!(err.contains(other), "{err}");
+        }
+    }
+
+    fn write_tensors(path: &std::path::Path, tensors: &[(&str, safetensors::Dtype, Vec<u8>)]) {
+        let views: Vec<_> = tensors
+            .iter()
+            .map(|(name, dtype, bytes)| {
+                let width = if *dtype == safetensors::Dtype::F32 {
+                    4
+                } else {
+                    2
+                };
+                (
+                    name.to_string(),
+                    safetensors::tensor::TensorView::new(*dtype, vec![bytes.len() / width], bytes)
+                        .unwrap(),
+                )
+            })
+            .collect();
+        safetensors::serialize_to_file(views, None, path).unwrap();
+    }
+
+    /// f32, f16 and bf16 tensors read back as f32, from one file or from
+    /// shards named in an index; a tensor of another dtype, of another size,
+    /// or absent is an error that names it.
+    #[test]
+    fn a_checkpoint_reads_tensors_across_shards_and_refuses_the_rest() {
+        let f32s: Vec<u8> = [1.5f32, -2.0, 0.25]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let f16s: Vec<u8> = [1.5f32, -2.0]
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())
+            .collect();
+        let bf16s: Vec<u8> = [3.0f32, -0.5]
+            .iter()
+            .flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes())
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        write_tensors(
+            &dir.path().join("a.safetensors"),
+            &[
+                ("w32", safetensors::Dtype::F32, f32s),
+                ("w16", safetensors::Dtype::F16, f16s),
+            ],
+        );
+        write_tensors(
+            &dir.path().join("b.safetensors"),
+            &[
+                ("wbf", safetensors::Dtype::BF16, bf16s),
+                ("ints", safetensors::Dtype::U16, vec![1, 0, 2, 0]),
+            ],
+        );
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            json!({"weight_map": {
+                "w32": "a.safetensors", "w16": "a.safetensors",
+                "wbf": "b.safetensors", "ints": "b.safetensors",
+            }})
+            .to_string(),
+        )
+        .unwrap();
+
+        let ckpt = Checkpoint::open(dir.path()).unwrap();
+        assert_eq!(ckpt.f32("w32", 3).unwrap(), [1.5, -2.0, 0.25]);
+        assert_eq!(ckpt.f32("w16", 2).unwrap(), [1.5, -2.0]);
+        assert_eq!(ckpt.f32("wbf", 2).unwrap(), [3.0, -0.5]);
+
+        let err = ckpt.f32("w32", 4).unwrap_err().to_string();
+        assert!(err.contains("w32") && err.contains("3 elements"), "{err}");
+        let err = ckpt.f32("ints", 2).unwrap_err().to_string();
+        assert!(err.contains("ints"), "{err}");
+        let err = ckpt.f32("absent", 1).unwrap_err().to_string();
+        assert!(err.contains("absent"), "{err}");
+
+        assert!(ckpt.require(["w32".to_string(), "wbf".to_string()]).is_ok());
+        let err = ckpt
+            .require([
+                "w32".into(),
+                "model.norm.weight".into(),
+                "lm_head.weight".into(),
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 tensor(s)") && err.contains("model.norm.weight"),
+            "{err}"
+        );
     }
 
     #[test]

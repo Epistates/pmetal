@@ -607,12 +607,21 @@ mod tests {
     #[test]
     fn a_shape_past_the_surface_is_refused() {
         let surface = IoSurface::for_tensor(4, 8).unwrap();
-        let refused = |f: &dyn Fn()| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
-        };
+        let refused =
+            |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
         assert!(refused(&|| surface.write_f32_as_fp16(&[0.0; 5 * 8], 5, 8)));
-        assert!(refused(&|| surface.write_f32_as_fp16_at(1, &[0.0; 4 * 8], 4, 8)));
-        assert!(refused(&|| surface.read_fp16_as_f32(&mut [0.0; 5 * 8], 0, 5, 8)));
+        assert!(refused(&|| surface.write_f32_as_fp16_at(
+            1,
+            &[0.0; 4 * 8],
+            4,
+            8
+        )));
+        assert!(refused(&|| surface.read_fp16_as_f32(
+            &mut [0.0; 5 * 8],
+            0,
+            5,
+            8
+        )));
         assert!(refused(&|| {
             let other = IoSurface::for_tensor(2, 8).unwrap();
             surface.copy_from(0, &other, 0, 4, 8);
