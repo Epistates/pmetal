@@ -107,12 +107,15 @@ pub fn verify_model_dir(dir: &Path) -> ModelDirReport {
     report
 }
 
-/// File names directly in `dir`, files and symlinks alike, sorted.
+/// File names directly in `dir`, files and symlinks alike, sorted. Hidden
+/// files are left out: exFAT and network volumes grow an AppleDouble stub
+/// (`._model.safetensors`) beside every file, and Finder leaves `.DS_Store`.
 fn top_level_files(dir: &Path) -> std::io::Result<Vec<String>> {
     let mut names: Vec<String> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
         .filter(|e| !e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
         .collect();
     names.sort();
     Ok(names)
@@ -316,6 +319,19 @@ mod tests {
             "{:?}",
             report.problems
         );
+    }
+
+    #[test]
+    fn appledouble_and_finder_files_are_not_weights() {
+        // exFAT and network volumes grow a `._name` stub beside every file.
+        let dir = model_dir();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &[("w", "F16", &[4])]);
+        std::fs::write(dir.path().join("._model.safetensors"), [0u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("._config.json"), [0u8; 4096]).unwrap();
+        std::fs::write(dir.path().join(".DS_Store"), b"x").unwrap();
+        let report = verify_model_dir(dir.path());
+        assert!(report.is_complete(), "{:?}", report.problems);
+        assert_eq!(report.weight_files.len(), 1);
     }
 
     #[test]
