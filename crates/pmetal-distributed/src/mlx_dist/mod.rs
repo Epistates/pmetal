@@ -32,6 +32,7 @@
 //! ```
 
 pub mod backend;
+pub mod exchange;
 pub mod group;
 pub mod ops;
 

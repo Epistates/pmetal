@@ -2,16 +2,18 @@
 //!
 //! Splits sequences across ranks along the sequence dimension, enabling
 //! inference on sequences longer than a single node's memory can hold.
-//! KV blocks are exchanged between ranks in a ring pattern.
+//! Key/value (or query) blocks are exchanged between ranks in a ring.
 //!
 //! # Design
 //!
-//! - **Pass-KV** (prefill): Each rank holds a local Q chunk and passes
-//!   KV blocks around the ring. Partial attention is computed at each
-//!   step and accumulated using online softmax.
+//! - **Pass-KV** (prefill): each rank holds its share of Q, K and V and passes
+//!   K/V blocks around the ring. Partial attention is computed at each step
+//!   and merged with an online softmax, so the result is exactly full
+//!   attention. Causal masking works from token positions, and the zig-zag
+//!   [`SequenceLayout`] keeps the causal work even across ranks.
 //!
-//! - **Pass-Q** (decode): Each rank holds the full KV cache and passes
-//!   Q blocks around the ring. Better for decode where KV is large.
+//! - **Pass-Q** (short queries over a long cache): query blocks travel, with
+//!   their partial outputs, and arrive home after visiting every rank.
 //!
 //! # Hybrid Model Consideration
 //!
@@ -22,10 +24,15 @@
 //! # Reference
 //!
 //! - Ring Attention (Liu et al., 2023)
-//! - Context Parallelism for scaling million-token inference (Meta, 2025)
+//! - Striped Attention (Brandon et al., 2023)
+//! - Context Parallelism for scalable million-token inference (Yang et al., 2024)
 
 pub mod ring_attention;
 pub mod sequence_split;
 
-pub use ring_attention::{CPMode, ring_attention_forward};
-pub use sequence_split::{gather_sequence, split_sequence};
+pub use ring_attention::{
+    CPMode, RingAttentionConfig, merge_partial_attention, ring_attention_forward,
+};
+pub use sequence_split::{
+    SequenceLayout, gather_sequence, local_seq_range, split_sequence, split_sequence_with_layout,
+};
