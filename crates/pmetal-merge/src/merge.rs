@@ -406,7 +406,7 @@ fn merge_tensor(
             Some(a) => a.remap_tensor_name(idx + base_offset, name),
             None => name.to_string(),
         };
-        if loader.tensor_names().contains(&lookup_name) {
+        if loader.has_tensor(&lookup_name) {
             let tensor = loader.load_tensor(&lookup_name)?;
             tensors.push(tensor);
 
@@ -423,7 +423,7 @@ fn merge_tensor(
     // If no tensors found, check base model
     if tensors.is_empty() {
         if let Some(base) = base_loader {
-            if base.tensor_names().contains(&name.to_string()) {
+            if base.has_tensor(&name) {
                 return base.load_tensor(name);
             }
         }
@@ -433,7 +433,7 @@ fn merge_tensor(
     // Load base tensor if needed
     let base_tensor = if method.requires_base_model() {
         if let Some(base) = base_loader {
-            if base.tensor_names().contains(&name.to_string()) {
+            if base.has_tensor(&name) {
                 Some(base.load_tensor(name)?)
             } else {
                 None
@@ -475,14 +475,14 @@ fn verify_source_dtypes(
     let mut labels: Vec<String> = Vec::new();
 
     for (idx, loader) in loaders.iter().enumerate() {
-        if loader.tensor_names().contains(&name.to_string()) {
+        if loader.has_tensor(&name) {
             let dt = loader.tensor_dtype(name)?;
             seen.push(dt);
             labels.push(format!("model[{}]={:?}", idx, dt));
         }
     }
     if let Some(base) = base_loader {
-        if base.tensor_names().contains(&name.to_string()) {
+        if base.has_tensor(&name) {
             let dt = base.tensor_dtype(name)?;
             seen.push(dt);
             labels.push(format!("base={:?}", dt));
@@ -709,7 +709,7 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
                     let src_layer_idx = src_def.layer_range.0 + layer_delta;
                     let src_name = format!("model.layers.{}.{}", src_layer_idx, suffix);
 
-                    if src_loader.tensor_names().contains(&src_name) {
+                    if src_loader.has_tensor(&src_name) {
                         let tensor = src_loader.load_tensor(&src_name)?;
                         tensors.push(tensor);
                         // Per-source params override slice params
@@ -891,7 +891,7 @@ fn load_base_tensor_for_slice(
     // For base tensors we use the output name directly — the caller passes the
     // output-remapped name, and we look for it as-is.  If not found, fall back
     // to None (the merge method decides how to handle a missing base tensor).
-    if base.tensor_names().contains(&out_name.to_string()) {
+    if base.has_tensor(&out_name) {
         return Ok(Some(base.load_tensor(out_name)?));
     }
 

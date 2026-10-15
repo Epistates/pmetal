@@ -115,7 +115,7 @@ impl RegMeanMerge {
 
         let mut out = Vec::with_capacity(loaders.len());
         for (idx, loader) in loaders.iter().enumerate() {
-            if loader.tensor_names().iter().any(|n| n == name) {
+            if loader.has_tensor(name) {
                 out.push(loader.load_tensor(name)?);
             } else if self.fallback_to_mean {
                 return Ok(None);

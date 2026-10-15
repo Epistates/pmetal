@@ -42,13 +42,13 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use half::{bf16, f16};
-use memmap2::Mmap;
 use ndarray::{Array2, s};
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::loader::copy_side_files;
+use crate::mapped::{MappedFile, TensorMeta};
 use crate::{MergeError, Result};
 
 // ---------------------------------------------------------------------------
@@ -431,109 +431,6 @@ fn dtype_tag(dtype: Dtype) -> &'static str {
         Dtype::U64 => "U64",
         Dtype::BOOL => "BOOL",
         _ => "F32",
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Memory-mapped safetensors file handle
-// ---------------------------------------------------------------------------
-
-/// Parsed tensor metadata entry from a safetensors file.
-#[derive(Debug, Clone)]
-struct TensorMeta {
-    dtype: Dtype,
-    shape: Vec<usize>,
-    /// Absolute byte offset within the mmap (past the header).
-    data_start: usize,
-    data_end: usize,
-}
-
-/// A memory-mapped safetensors file with pre-indexed tensor locations.
-///
-/// Tensors are stored in file order for sequential access patterns.
-struct MappedFile {
-    mmap: Mmap,
-    /// Ordered by file offset.
-    tensors: Vec<(String, TensorMeta)>,
-    index: HashMap<String, usize>,
-    metadata: Option<HashMap<String, String>>,
-}
-
-impl MappedFile {
-    fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(|e| {
-            MergeError::ModelLoad(format!("failed to open {}: {}", path.display(), e))
-        })?;
-
-        // SAFETY: The file is opened read-only; we hold the Mmap for the
-        // duration of the merge and do not mutate the file.
-        #[allow(unsafe_code)]
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            MergeError::ModelLoad(format!("failed to mmap {}: {}", path.display(), e))
-        })?;
-
-        let (header_len, metadata_view) = SafeTensors::read_metadata(&mmap).map_err(|e| {
-            MergeError::ModelLoad(format!(
-                "failed to parse safetensors header in {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-        // Safetensors format: 8-byte LE u64 header length, JSON header, then data.
-        let data_offset = 8 + header_len;
-
-        let mut tensors: Vec<(String, TensorMeta)> = Vec::new();
-        for (name, info) in metadata_view.tensors() {
-            let (start, end) = info.data_offsets;
-            tensors.push((
-                name,
-                TensorMeta {
-                    dtype: info.dtype,
-                    shape: info.shape.clone(),
-                    data_start: data_offset + start,
-                    data_end: data_offset + end,
-                },
-            ));
-        }
-
-        // Sort by file offset to maximise sequential read locality.
-        tensors.sort_by_key(|(_, m)| m.data_start);
-
-        let index: HashMap<String, usize> = tensors
-            .iter()
-            .enumerate()
-            .map(|(i, (name, _))| (name.clone(), i))
-            .collect();
-
-        let metadata = metadata_view.metadata().clone();
-
-        Ok(Self {
-            mmap,
-            tensors,
-            index,
-            metadata,
-        })
-    }
-
-    fn tensor_meta(&self, name: &str) -> Result<&TensorMeta> {
-        self.index
-            .get(name)
-            .map(|&i| &self.tensors[i].1)
-            .ok_or_else(|| MergeError::TensorNotFound(name.to_string()))
-    }
-
-    fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
-        let meta = self.tensor_meta(name)?;
-        Ok(&self.mmap[meta.data_start..meta.data_end])
-    }
-
-    fn advise_sequential(&self) {
-        let _ = self.mmap.advise(memmap2::Advice::Sequential);
-    }
-
-    fn advise_dontneed(&self) {
-        let _ = self.mmap.advise(memmap2::Advice::Normal);
     }
 }
 
@@ -964,7 +861,7 @@ fn merge_single_file(
     base.advise_sequential();
 
     for (name, meta) in &base.tensors {
-        let base_data = &base.mmap[meta.data_start..meta.data_end];
+        let base_data = base.slice(meta);
 
         if let Some((a_name, b_name)) = lora_pairs.get(name) {
             debug!("merging LoRA for '{name}'");
@@ -1131,7 +1028,7 @@ fn merge_sharded(
         stats.bytes_written += 8 + header_bytes.len() as u64;
 
         for (name, meta) in &shard.tensors {
-            let base_data = &shard.mmap[meta.data_start..meta.data_end];
+            let base_data = shard.slice(meta);
 
             if let Some((a_name, b_name)) = lora_pairs.get(name) {
                 debug!("merging LoRA for '{name}' in shard '{shard_filename}'");

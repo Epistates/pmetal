@@ -32,6 +32,10 @@ pub enum MergeError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 
+    /// A runtime operation failed.
+    #[error("Runtime error: {0}")]
+    Runtime(#[from] pmetal_runtime::RuntimeError),
+
     /// MLX operation error.
     #[error("MLX error: {0}")]
     Mlx(#[from] pmetal_runtime::compat::Exception),

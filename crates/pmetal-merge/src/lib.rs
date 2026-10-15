@@ -41,6 +41,7 @@ mod config;
 mod consensus;
 mod error;
 mod loader;
+mod mapped;
 pub mod lora_merge;
 mod merge;
 pub mod methods;
