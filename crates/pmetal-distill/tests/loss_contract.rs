@@ -9,7 +9,7 @@
 
 use pmetal_distill::losses::{
     DistillLoss, HiddenStateLoss, HingeRankingLoss, JensenShannonLoss, JsdSkewedLoss,
-    KlDivergenceLoss, LogisticRankingLoss, MiniLlmLoss, MseLoss, SoftCrossEntropyLoss, TvdLoss,
+    KlDivergenceLoss, LogisticRankingLoss, MseLoss, SkewKlLoss, SoftCrossEntropyLoss, TvdLoss,
     UniversalLogitLoss,
 };
 use pmetal_runtime::compat::nn::value_and_grad_explicit;
@@ -61,7 +61,8 @@ fn every_loss() -> Vec<(&'static str, Box<dyn DistillLoss>)> {
         ("soft_ce", Box::new(SoftCrossEntropyLoss::new())),
         ("tvd", Box::new(TvdLoss::new())),
         ("jsd_skewed", Box::new(JsdSkewedLoss::new(0.3))),
-        ("minillm", Box::new(MiniLlmLoss::new(0.8))),
+        ("skew_kl", Box::new(SkewKlLoss::forward(0.1))),
+        ("skew_reverse_kl", Box::new(SkewKlLoss::reverse(0.1))),
         ("uld", Box::new(UniversalLogitLoss::new())),
         ("mse", Box::new(MseLoss::new())),
         ("hinge", Box::new(HingeRankingLoss::new().with_top_k(5))),
@@ -199,7 +200,7 @@ fn skewed_jsd(alpha: f64) -> impl Fn(&[f64], &[f64]) -> f64 {
     }
 }
 
-/// `KL(S || mix T + (1 - mix) S)`.
+/// `KL(S || mix T + (1 - mix) S)`, the skew reverse KL with `α = 1 - mix`.
 fn mixed_reverse_kl(mix: f64) -> impl Fn(&[f64], &[f64]) -> f64 {
     move |lt, ls| {
         lt.iter()
@@ -242,8 +243,8 @@ fn bf16_logits_are_normalised_in_f32() {
             Box::new(skewed_jsd(0.3)),
         ),
         (
-            "minillm",
-            Box::new(MiniLlmLoss::new(0.8)),
+            "skew_reverse_kl",
+            Box::new(SkewKlLoss::reverse(0.2)),
             Box::new(mixed_reverse_kl(0.8)),
         ),
     ];
@@ -415,6 +416,121 @@ fn mse_distillation_is_independent_of_the_temperature() {
     assert!(
         (cold - hot).abs() <= 1e-5 * cold.abs(),
         "MSE at T=1 is {cold}, at T=4 is {hot}"
+    );
+}
+
+/// DistiLLM's skew divergences (Ko et al., ICML 2024, eq. 5 and the
+/// reverse): `SKL(α) = KL(T || αT + (1-α)S)` and
+/// `SRKL(α) = KL(S || (1-α)T + αS)`. At α = 0 they are the plain forward and
+/// reverse KL; the paper's recommended α is 0.1.
+#[test]
+#[serial]
+fn skew_kl_matches_the_distillm_definitions() {
+    use pmetal_distill::losses::SkewKlLoss;
+
+    let (t, s) = (logits(0.3), logits(1.9));
+    let (teacher, student) = (array(&t, Dtype::Float32), array(&s, Dtype::Float32));
+    let (t64, s64) = (rounded(&t, Dtype::Float32), rounded(&s, Dtype::Float32));
+    let temperature = 2.0_f32;
+
+    for alpha in [0.0_f32, 0.1, 0.5, 0.9] {
+        let a = alpha as f64;
+        let skew_forward = move |lt: &[f64], ls: &[f64]| -> f64 {
+            lt.iter()
+                .zip(ls)
+                .map(|(x, y)| {
+                    let (pt, ps) = (x.exp(), y.exp());
+                    pt * (x - (a * pt + (1.0 - a) * ps).ln())
+                })
+                .sum()
+        };
+        let skew_reverse = move |lt: &[f64], ls: &[f64]| -> f64 {
+            lt.iter()
+                .zip(ls)
+                .map(|(x, y)| {
+                    let (pt, ps) = (x.exp(), y.exp());
+                    ps * (y - ((1.0 - a) * pt + a * ps).ln())
+                })
+                .sum()
+        };
+        let cases: [(&str, SkewKlLoss, Box<dyn Fn(&[f64], &[f64]) -> f64>); 2] = [
+            ("skl", SkewKlLoss::forward(alpha), Box::new(skew_forward)),
+            ("srkl", SkewKlLoss::reverse(alpha), Box::new(skew_reverse)),
+        ];
+        for (name, loss, per_token) in cases {
+            let got = scalar(&loss.compute(&teacher, &student, temperature).unwrap()) as f64;
+            let want = reference(&t64, &s64, temperature as f64, per_token);
+            assert!(
+                (got - want).abs() <= 2e-5 * want.abs().max(1e-2),
+                "{name} alpha={alpha}: got {got}, float64 reference {want}"
+            );
+        }
+    }
+
+    // α = 0 is the classical divergences.
+    let skl0 = scalar(
+        &SkewKlLoss::forward(0.0)
+            .compute(&teacher, &student, 1.0)
+            .unwrap(),
+    );
+    let kl = scalar(
+        &KlDivergenceLoss::new()
+            .compute(&teacher, &student, 1.0)
+            .unwrap(),
+    );
+    assert!((skl0 - kl).abs() <= 1e-5 * kl, "SKL(0) {skl0} vs KL {kl}");
+}
+
+/// Generalized JSD (Agarwal et al., ICLR 2024, eq. 2) against its definition
+/// at interior β, and its endpoints: β = 0 is the forward KL(T || S) and
+/// β = 1 the reverse KL(S || T), not zero.
+#[test]
+#[serial]
+fn generalized_jsd_matches_the_definition_and_its_limits() {
+    let (t, s) = (logits(0.3), logits(1.9));
+    let (teacher, student) = (array(&t, Dtype::Float32), array(&s, Dtype::Float32));
+    let (t64, s64) = (rounded(&t, Dtype::Float32), rounded(&s, Dtype::Float32));
+
+    for beta in [0.1_f32, 0.5, 0.9] {
+        let got = scalar(
+            &JsdSkewedLoss::new(beta)
+                .compute(&teacher, &student, 2.0)
+                .unwrap(),
+        ) as f64;
+        let want = reference(&t64, &s64, 2.0, skewed_jsd(beta as f64));
+        assert!(
+            (got - want).abs() <= 2e-5 * want,
+            "beta={beta}: {got} vs {want}"
+        );
+    }
+
+    let forward = scalar(
+        &KlDivergenceLoss::new()
+            .compute(&teacher, &student, 2.0)
+            .unwrap(),
+    );
+    let reverse = scalar(
+        &KlDivergenceLoss::reverse()
+            .compute(&teacher, &student, 2.0)
+            .unwrap(),
+    );
+    let at_zero = scalar(
+        &JsdSkewedLoss::new(0.0)
+            .compute(&teacher, &student, 2.0)
+            .unwrap(),
+    );
+    let at_one = scalar(
+        &JsdSkewedLoss::new(1.0)
+            .compute(&teacher, &student, 2.0)
+            .unwrap(),
+    );
+    assert!(
+        (at_zero - forward).abs() <= 1e-5 * forward,
+        "{at_zero} {forward}"
+    );
+    assert!(
+        (at_one - reverse).abs() <= 1e-5 * reverse,
+        "{at_one} {reverse}"
     );
 }
 

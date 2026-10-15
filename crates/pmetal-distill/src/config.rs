@@ -142,13 +142,26 @@ pub enum LossType {
     /// Mean Squared Error on logits.
     MseLoss,
 
-    /// Skewed Jensen-Shannon (DistiLLM-2, Ko et al. 2024) with mixing
-    /// weight `alpha`. `alpha = 0.5` matches symmetric JSD; values closer
-    /// to `1.0` weight the teacher term more heavily.
+    /// Generalized Jensen-Shannon divergence `JSD(β)` of Agarwal et al.
+    /// (ICLR 2024), with `alpha` as β: `β·KL(T || M) + (1-β)·KL(S || M)` with
+    /// `M = β·T + (1-β)·S`. `alpha = 0.5` is the symmetric JSD; `0` is the
+    /// forward KL `KL(T || S)` and `1` the reverse KL `KL(S || T)`.
     JsdSkewed {
-        /// Mixing weight, clamped to `[ε, 1-ε]` at construction time.
+        /// Mixing weight β, in `[0, 1]`.
         #[serde(default = "default_jsd_skewed_alpha")]
         alpha: f32,
+    },
+
+    /// DistiLLM's skew KL (Ko et al., ICML 2024): `KL(T || α·T + (1-α)·S)`,
+    /// or with `reverse` the skew reverse KL `KL(S || (1-α)·T + α·S)`. The
+    /// paper's best value is `alpha = 0.1`.
+    SkewKl {
+        /// Mixing weight, in `[0, 1)`.
+        #[serde(default = "default_skew_kl_alpha")]
+        alpha: f32,
+        /// Take the reverse direction.
+        #[serde(default)]
+        reverse: bool,
     },
 
     /// Universal Logit Distillation (Boizard et al. 2024). Cross-tokenizer
@@ -160,15 +173,6 @@ pub enum LossType {
         /// vocabularies ≫ 32K.
         #[serde(default)]
         top_k: Option<usize>,
-    },
-
-    /// MiniLLM-style reverse-KL (Gu et al. 2024) with optional teacher
-    /// mixing. `mix = 1.0` is plain reverse-KL; smaller values blend in
-    /// the student's own distribution to stabilize early training.
-    MiniLlm {
-        /// Teacher-mix weight, clamped to `[0, 1]`.
-        #[serde(default = "default_minillm_mix")]
-        mix: f32,
     },
 
     /// Generalized Knowledge Distillation (Agarwal et al. 2024). Loss-only
@@ -187,8 +191,8 @@ pub enum LossType {
 fn default_jsd_skewed_alpha() -> f32 {
     0.5
 }
-fn default_minillm_mix() -> f32 {
-    1.0
+fn default_skew_kl_alpha() -> f32 {
+    0.1
 }
 fn default_gkd_lambda() -> f32 {
     0.5

@@ -116,7 +116,11 @@ impl DistillerBuilder {
                         }
                         Box::new(loss)
                     }
-                    LossType::MiniLlm { mix } => Box::new(crate::losses::MiniLlmLoss::new(mix)),
+                    LossType::SkewKl { alpha, reverse } => Box::new(if reverse {
+                        crate::losses::SkewKlLoss::reverse(alpha)
+                    } else {
+                        crate::losses::SkewKlLoss::forward(alpha)
+                    }),
                     LossType::Gkd {
                         lambda,
                         sampler_temperature,
