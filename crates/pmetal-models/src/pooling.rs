@@ -1,6 +1,6 @@
 //! Pooling strategies for converting sequence representations to fixed-size embeddings.
 
-use pmetal_runtime::compat::{Array, Exception};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 /// Pooling modes for sentence embeddings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PoolingMode {
@@ -31,13 +31,19 @@ impl std::fmt::Display for PoolingMode {
 
 /// Pool sequence hidden states into a single embedding vector.
 ///
+/// The arithmetic runs in f32 whatever the model's dtype and the result is cast
+/// back to it: summing a long sequence, or weighting positions up to the
+/// sequence length, loses real precision in bf16 (257 is not representable),
+/// and an f32 scalar mixed into bf16 operands silently promotes the whole
+/// result to f32.
+///
 /// # Arguments
 /// * `hidden_states` - `[batch, seq_len, hidden_dim]`
 /// * `attention_mask` - `[batch, seq_len]` (1 for real tokens, 0 for padding)
 /// * `mode` - Pooling strategy
 ///
 /// # Returns
-/// Embedding tensor `[batch, hidden_dim]`
+/// Embedding tensor `[batch, hidden_dim]`, in the dtype of `hidden_states`.
 pub fn pool(
     hidden_states: &Array,
     attention_mask: &Array,
@@ -45,79 +51,64 @@ pub fn pool(
 ) -> Result<Array, Exception> {
     let batch = hidden_states.dim(0);
     let seq_len = hidden_states.dim(1);
+    let out_dtype = hidden_states.dtype().as_i32();
+    let f32_dtype = Dtype::Float32.as_i32();
+    let hidden = hidden_states.as_dtype(f32_dtype);
+    // `[batch, seq_len, 1]`, 1.0 where a real token sits.
+    let mask = attention_mask
+        .reshape(&[batch, seq_len, 1])
+        .as_dtype(f32_dtype);
+    let tiny = Array::from_f32(1e-9);
 
-    match mode {
+    let pooled = match mode {
         PoolingMode::Mean => {
-            // Expand mask to [batch, seq_len, 1] for broadcasting
-            let mask_expanded = attention_mask
-                .reshape(&[batch, seq_len, 1])
-                .as_dtype(hidden_states.dtype().as_i32());
-            // Zero out padding positions, sum over sequence, divide by token count
-            let masked = hidden_states.multiply(&mask_expanded);
-            let sum = masked.sum_axes(&[1], false);
-            let count = mask_expanded.sum_axes(&[1], false);
-            let count = pmetal_runtime::compat::ops::maximum(&count, &Array::from_f32(1e-9));
-            Ok(sum.divide(&count))
+            let sum = hidden.multiply(&mask).sum_axes(&[1], false);
+            let count = ops::maximum(&mask.sum_axes(&[1], false), &tiny);
+            sum.divide(&count)
         }
-        PoolingMode::Cls => {
-            // Take first token embedding [batch, hidden_dim]
-            Ok(pmetal_runtime::compat::ops::slice_axis(hidden_states, 1, 0, 1).squeeze_axes(&[1]))
-        }
+        PoolingMode::Cls => ops::slice_axis(&hidden, 1, 0, 1).squeeze_axes(&[1]),
         PoolingMode::Max => {
-            // Replace padding positions with -inf then take max over sequence
-            let mask_expanded = attention_mask
-                .reshape(&[batch, seq_len, 1])
-                .as_dtype(hidden_states.dtype().as_i32());
-            // inv_mask is 1 where padding, 0 where real token
-            let inv_mask = Array::from_f32(1.0).subtract(&mask_expanded);
-            let neg_inf = Array::from_f32(-1e9);
-            let masked = hidden_states.add(&inv_mask.multiply(&neg_inf));
-            Ok(masked.max_axis(1, false))
+            // Padding positions are pushed far below any real state.
+            let padding = Array::from_f32(1.0).subtract(&mask);
+            hidden
+                .add(&padding.multiply(&Array::from_f32(-1e9)))
+                .max_axis(1, false)
         }
         PoolingMode::LastToken => {
-            // Vectorized gather: compute last non-padding position per sequence and
-            // use take_along_axis to extract in a single operation (no Python-style loop).
-            let hidden_dim = hidden_states.dim(2);
-
-            // lengths [batch] → last index [batch] as Int32
-            let last_indices = attention_mask
-                .as_dtype(pmetal_runtime::compat::Dtype::Int32.as_i32())
-                .sum_axes(&[1], false) // [batch]
-                .subtract(&Array::from_int(1)); // [batch]
-
-            // Reshape to [batch, 1, 1] then broadcast to [batch, 1, hidden_dim]
-            // so take_along_axis can gather along the sequence dimension.
-            let indices_expanded = last_indices.reshape(&[batch, 1, 1]);
-            let indices_broadcast = pmetal_runtime::compat::ops::broadcast_to(
-                &indices_expanded,
-                &[batch, 1, hidden_dim],
-            );
-
-            // take_along_axis(hidden_states, indices, axis=1) → [batch, 1, hidden_dim]
-            let gathered = hidden_states.take_along_axis(&indices_broadcast, 1);
-
-            // Squeeze the singleton seq dimension → [batch, hidden_dim]
-            Ok(gathered.squeeze_axes(&[1]))
+            // The last *attended* position, wherever the padding is: right
+            // padding ends the sequence early, left padding (what last-token
+            // embedders use) starts it late, and `count - 1` is right only for
+            // the first. A row with nothing attended reads position 0.
+            let positions = ops::arange(seq_len, Dtype::Int32).reshape(&[1, seq_len]);
+            let attended = attention_mask
+                .as_dtype(Dtype::Int32.as_i32())
+                .gt(&Array::from_int(0));
+            let last =
+                ops::where_fn(&attended, &positions, &Array::from_int(-1)).max_axis(1, false);
+            let last = ops::maximum(&last, &Array::from_int(0));
+            let hidden_dim = hidden.dim(2);
+            let indices = ops::broadcast_to(&last.reshape(&[batch, 1, 1]), &[batch, 1, hidden_dim]);
+            hidden.take_along_axis(&indices, 1).squeeze_axes(&[1])
         }
         PoolingMode::WeightedMean => {
             // Linearly increasing weights: position i gets weight (i+1)
-            let weights: Vec<f32> = (1..=seq_len).map(|i| i as f32).collect();
-            let weights = Array::from_slice(&weights, &[1, seq_len, 1])
-                .as_dtype(hidden_states.dtype().as_i32());
-            let mask_expanded = attention_mask
-                .reshape(&[batch, seq_len, 1])
-                .as_dtype(hidden_states.dtype().as_i32());
-            let weighted = hidden_states.multiply(&weights).multiply(&mask_expanded);
-            let sum = weighted.sum_axes(&[1], false);
-            let weight_sum = weights.multiply(&mask_expanded).sum_axes(&[1], false);
-            let weight_sum =
-                pmetal_runtime::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-9));
-            Ok(sum.divide(&weight_sum))
+            let weights = ops::arange(seq_len, Dtype::Float32)
+                .add(&Array::from_f32(1.0))
+                .reshape(&[1, seq_len, 1]);
+            let sum = hidden
+                .multiply(&weights)
+                .multiply(&mask)
+                .sum_axes(&[1], false);
+            let weight_sum = ops::maximum(&weights.multiply(&mask).sum_axes(&[1], false), &tiny);
+            sum.divide(&weight_sum)
         }
-    }
+    };
+    Ok(pooled.as_dtype(out_dtype))
 }
 
 /// L2-normalize embeddings along the last axis.
+///
+/// Computed in f32 and returned in the dtype of `embeddings`.
 ///
 /// # Arguments
 /// * `embeddings` - `[batch, dim]`
@@ -125,9 +116,10 @@ pub fn pool(
 /// # Returns
 /// Unit-normalized embeddings `[batch, dim]`
 pub fn normalize_embeddings(embeddings: &Array) -> Result<Array, Exception> {
-    let norm = embeddings.square().sum_axes(&[-1], true).sqrt();
-    let norm = pmetal_runtime::compat::ops::maximum(&norm, &Array::from_f32(1e-12));
-    Ok(embeddings.divide(&norm))
+    let wide = embeddings.as_dtype(Dtype::Float32.as_i32());
+    let norm = wide.square().sum_axes(&[-1], true).sqrt();
+    let norm = ops::maximum(&norm, &Array::from_f32(1e-12));
+    Ok(wide.divide(&norm).as_dtype(embeddings.dtype().as_i32()))
 }
 
 #[cfg(test)]
@@ -171,6 +163,106 @@ mod tests {
         assert_eq!(out.shape(), &[2, 8]);
         let v: f32 = out.flatten(0, -1).index(0).item();
         assert!((v - 2.0).abs() < 1e-5, "expected 2.0, got {}", v);
+    }
+
+    /// `[batch, seq, 1]` hidden states whose value at position `p` is `p`, so a
+    /// pooled value names the position it came from.
+    fn positional(batch: i32, seq: i32) -> Array {
+        let values: Vec<f32> = (0..batch * seq).map(|i| (i % seq) as f32).collect();
+        Array::from_slice(&values, &[batch, seq, 1])
+    }
+
+    fn values(array: &Array) -> Vec<f32> {
+        let n = array.size();
+        let mut array = array.as_dtype(Dtype::Float32.as_i32());
+        array.to_f32_vec(n).unwrap()
+    }
+
+    /// ⚠️ The last token is the last *attended* one, wherever the padding is.
+    /// Qwen3-Embedding (and every other last-token embedder) pads on the left,
+    /// where `count - 1` indexes a pad position instead of the final token.
+    #[test]
+    fn last_token_pooling_handles_left_and_right_padding() {
+        let hidden = positional(3, 5);
+        let mask = Array::from_slice(
+            &[
+                0i32, 0, 1, 1, 1, // left-padded: last real token is position 4
+                1, 1, 1, 0, 0, // right-padded: position 2
+                1, 1, 1, 1, 1, // unpadded: position 4
+            ],
+            &[3, 5],
+        );
+        let pooled = pool(&hidden, &mask, PoolingMode::LastToken).unwrap();
+        assert_eq!(pooled.shape(), &[3, 1]);
+        assert_eq!(values(&pooled), vec![4.0, 2.0, 4.0]);
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    /// A row with nothing attended pools to position 0 rather than reading
+    /// out of bounds.
+    #[test]
+    fn last_token_pooling_of_an_empty_row_stays_in_bounds() {
+        let hidden = positional(1, 4);
+        let mask = Array::from_slice(&[0i32, 0, 0, 0], &[1, 4]);
+        let pooled = pool(&hidden, &mask, PoolingMode::LastToken).unwrap();
+        assert_eq!(values(&pooled), vec![0.0]);
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    /// Pooling a bf16 model's states must hand back bf16, not an f32 the
+    /// scalars promoted it to.
+    #[test]
+    fn pooling_keeps_the_dtype_of_the_hidden_states() {
+        let hidden = positional(2, 4).as_dtype(Dtype::Bfloat16.as_i32());
+        let mask = Array::from_slice(&[1i32, 1, 1, 0, 1, 1, 1, 1], &[2, 4]);
+        for mode in [
+            PoolingMode::Mean,
+            PoolingMode::Cls,
+            PoolingMode::Max,
+            PoolingMode::LastToken,
+            PoolingMode::WeightedMean,
+        ] {
+            let pooled = pool(&hidden, &mask, mode).unwrap();
+            assert_eq!(pooled.dtype(), Dtype::Bfloat16, "{mode}");
+        }
+        let normed = normalize_embeddings(&hidden.reshape(&[2, 4])).unwrap();
+        assert_eq!(normed.dtype(), Dtype::Bfloat16);
+        pmetal_runtime::check_unobserved_error().unwrap();
+    }
+
+    /// Mean and weighted-mean over a long bf16 sequence accumulate in f32: the
+    /// position weights 1..=seq are not all representable in bf16 (257 is not),
+    /// so weighting in the model dtype shifts the answer.
+    #[test]
+    fn weighted_mean_is_exact_over_a_long_bf16_sequence() {
+        let seq = 600;
+        let hidden = Array::from_slice(&vec![1.0f32; seq as usize], &[1, seq, 1])
+            .as_dtype(Dtype::Bfloat16.as_i32());
+        let mask = Array::from_slice(&vec![1i32; seq as usize], &[1, seq]);
+        let pooled = pool(&hidden, &mask, PoolingMode::WeightedMean).unwrap();
+        // Every state is 1, so any weighting of them is 1.
+        assert_eq!(values(&pooled), vec![1.0]);
+        let mean = pool(&hidden, &mask, PoolingMode::Mean).unwrap();
+        assert_eq!(values(&mean), vec![1.0]);
+    }
+
+    #[test]
+    fn mean_and_weighted_mean_skip_padding() {
+        let hidden = positional(1, 4); // 0 1 2 3
+        let mask = Array::from_slice(&[1i32, 1, 0, 0], &[1, 4]);
+        let mean = values(&pool(&hidden, &mask, PoolingMode::Mean).unwrap());
+        assert!((mean[0] - 0.5).abs() < 1e-6, "{mean:?}");
+        // Weights 1 and 2 on states 0 and 1: (0*1 + 1*2) / (1 + 2).
+        let weighted = values(&pool(&hidden, &mask, PoolingMode::WeightedMean).unwrap());
+        assert!((weighted[0] - 2.0 / 3.0).abs() < 1e-6, "{weighted:?}");
+    }
+
+    #[test]
+    fn max_pooling_ignores_padding() {
+        let hidden = positional(1, 4);
+        let mask = Array::from_slice(&[1i32, 1, 0, 0], &[1, 4]);
+        let pooled = pool(&hidden, &mask, PoolingMode::Max).unwrap();
+        assert_eq!(values(&pooled), vec![1.0]);
     }
 
     #[test]
