@@ -145,7 +145,13 @@ impl SafetensorsLoader {
                 }
             } else {
                 for entry in std::fs::read_dir(&path)? {
-                    let file_path = entry?.path();
+                    let entry = entry?;
+                    // Hidden files are never weights; macOS litters archives and
+                    // non-native volumes with `._model.safetensors` metadata stubs.
+                    if entry.file_name().to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    let file_path = entry.path();
                     if file_path.extension().is_some_and(|e| e == "safetensors") {
                         weight_files.push(file_path);
                     }
@@ -1108,6 +1114,16 @@ mod tests {
         write_safetensors(&dir.path().join("b.safetensors"), &[("x", &[2.0], &[1])]);
         let err = SafetensorsLoader::new(dir.path()).err().expect("must fail");
         assert!(err.to_string().contains("tensor x is in both"), "{err}");
+    }
+
+    #[test]
+    fn hidden_files_next_to_the_weights_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write_safetensors(&dir.path().join("model.safetensors"), &[("x", &[1.0], &[1])]);
+        // The AppleDouble stub macOS leaves on non-native volumes.
+        std::fs::write(dir.path().join("._model.safetensors"), b"\x00\x05\x16\x07stub").unwrap();
+        let loader = SafetensorsLoader::new(dir.path()).unwrap();
+        assert_eq!(loader.tensor_names(), vec!["x"]);
     }
 
     #[test]
