@@ -137,46 +137,62 @@ impl Default for KlCalibrationConfig {
 /// Both terms are in [0, ∞), with 0 meaning perfect reconstruction.  Using the sum means a
 /// tensor with poor direction preservation OR large absolute error will be penalised, which maps
 /// well to the activations a model layer sees in practice.
-fn compute_kl_divergence(original: &[f32], dequantized: &[f32]) -> f64 {
+///
+/// With `importance` (one weight per input channel, see [`Importance`]) both terms are taken
+/// under that weighting: the expected squared error of the layer's *output* for the calibration
+/// activations is `sum_j E[a_j^2] * sum_i dW_ij^2`, so channels the activations excite count for
+/// more, and the score measures the error the model would actually see.
+fn compute_kl_divergence(
+    original: &[f32],
+    dequantized: &[f32],
+    importance: Option<&Importance<'_>>,
+) -> f64 {
     debug_assert_eq!(original.len(), dequantized.len());
     let n = original.len();
     if n == 0 {
         return 0.0;
     }
 
-    // 1. Normalised RMSE
-    let mut sq_err_sum = 0.0_f64;
-    let mut sq_orig_sum = 0.0_f64;
+    let (mut sq_err, mut sq_orig, mut dot, mut norm_b) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for i in 0..n {
-        let diff = (original[i] - dequantized[i]) as f64;
-        sq_err_sum += diff * diff;
-        sq_orig_sum += (original[i] as f64) * (original[i] as f64);
+        let w = importance.map_or(1.0, |imp| f64::from(imp.at(i)));
+        let (a, b) = (f64::from(original[i]), f64::from(dequantized[i]));
+        sq_err += w * (a - b) * (a - b);
+        sq_orig += w * a * a;
+        dot += w * a * b;
+        norm_b += w * b * b;
     }
-    let nrmse = if sq_orig_sum > 0.0 {
-        (sq_err_sum / n as f64).sqrt() / (sq_orig_sum / n as f64).sqrt()
+
+    // 1. Normalised RMSE
+    let nrmse = if sq_orig > 0.0 {
+        (sq_err / sq_orig).sqrt()
     } else {
         0.0
     };
-
-    // 2. Cosine distance  (1 - cosine_similarity)
-    let mut dot = 0.0_f64;
-    let mut norm_a = 0.0_f64;
-    let mut norm_b = 0.0_f64;
-    for i in 0..n {
-        let a = original[i] as f64;
-        let b = dequantized[i] as f64;
-        dot += a * b;
-        norm_a += a * a;
-        norm_b += b * b;
-    }
-    let cos_sim = if norm_a > 0.0 && norm_b > 0.0 {
-        dot / (norm_a.sqrt() * norm_b.sqrt())
+    // 2. Cosine distance (1 - cosine_similarity)
+    let cos_sim = if sq_orig > 0.0 && norm_b > 0.0 {
+        dot / (sq_orig.sqrt() * norm_b.sqrt())
     } else {
         1.0
     };
-    let cos_loss = 1.0 - cos_sim;
+    nrmse + (1.0 - cos_sim)
+}
 
-    nrmse + cos_loss
+/// Per-input-channel importance laid over a tensor of rows of `n_per_row`
+/// values: consecutive groups of `rows_per_slice` rows each use their own
+/// `n_per_row` weights (the experts of a stacked MoE tensor).
+struct Importance<'a> {
+    weights: &'a [f32],
+    n_per_row: usize,
+    rows_per_slice: usize,
+}
+
+impl Importance<'_> {
+    #[inline]
+    fn at(&self, i: usize) -> f32 {
+        let slice = i / self.n_per_row / self.rows_per_slice;
+        self.weights[slice * self.n_per_row + i % self.n_per_row]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,9 +267,12 @@ impl DynamicQuantizer {
     }
 
     /// Check if a tensor name indicates a critical layer that should always be high precision.
+    ///
+    /// The output head is `output.weight` (GGUF) or `lm_head` (Hugging Face);
+    /// `blk.N.attn_output.weight` is an ordinary attention projection.
     fn is_critical_layer(name: &str) -> bool {
         // Output head
-        if name.contains("lm_head") || name.contains("output") {
+        if name.contains("lm_head") || name == "output.weight" || name.ends_with(".output.weight") {
             return true;
         }
         // Token embeddings
@@ -275,12 +294,13 @@ impl DynamicQuantizer {
             || name.contains("o_proj")
             || name.contains("self_attn")
             || name.contains("attention")
+            || (name.contains("attn_") && !name.contains("norm"))
     }
 
     /// Extract layer index from tensor name (e.g., "model.layers.5.mlp" -> Some(5)).
     fn extract_layer_index(name: &str) -> Option<usize> {
-        // Common patterns: "layers.N.", "layer.N.", "h.N.", "blocks.N."
-        let patterns = ["layers.", "layer.", "h.", "blocks."];
+        // Common patterns: "layers.N.", "layer.N.", "h.N.", "blocks.N.", GGUF "blk.N."
+        let patterns = ["layers.", "layer.", "blk.", "h.", "blocks."];
         for pattern in patterns {
             if let Some(idx) = name.find(pattern) {
                 let rest = &name[idx + pattern.len()..];
@@ -292,6 +312,12 @@ impl DynamicQuantizer {
             }
         }
         None
+    }
+
+    /// The importance of each input channel of a tensor from the imatrix, as
+    /// [`crate::quantize::quantize_tensor`] consumes it.
+    pub fn importance_for(&self, name: &str) -> Option<Vec<f32>> {
+        self.imatrix.as_ref()?.importance(name)
     }
 
     /// Determine the quantization type for a tensor.
@@ -425,7 +451,7 @@ impl DynamicQuantizer {
         kl_config: &KlCalibrationConfig,
     ) -> CalibratedTensor {
         use crate::dequant::dequantize;
-        use crate::quantize::quantize;
+        use crate::quantize::quantize_tensor;
 
         // Critical layers always use the high-quality fallback.
         if Self::is_critical_layer(name) {
@@ -436,35 +462,68 @@ impl DynamicQuantizer {
             };
         }
 
-        // Determine the sample window for the quality metric.
-        let sample: &[f32] = if kl_config.sample_size > 0 && data.len() > kl_config.sample_size {
-            // Take a prefix of the weight elements for speed.
-            // WARNING: This assumes weight values are roughly i.i.d. across the flattened
-            // tensor — true for many weight matrices but not guaranteed for structured
-            // weights (e.g. rotary-position biases, depthwise convolution kernels).
-            // If you observe poor calibration quality on such tensors, set
-            // `sample_size = 0` to evaluate the full tensor instead.
-            &data[..kl_config.sample_size]
-        } else {
-            data
+        // Rows of the tensor (the innermost dimension), and the importance of its
+        // input channels if the imatrix has them. A stacked MoE tensor has one
+        // run of channels per slice of rows.
+        let n_per_row = match shape.last() {
+            Some(&d) if d > 0 && data.len() % d as usize == 0 => d as usize,
+            _ => data.len().max(1),
         };
+        let n_rows = data.len() / n_per_row;
+        let importance_vec = self.importance_for(name).filter(|w| {
+            !w.is_empty() && w.len() % n_per_row == 0 && n_rows % (w.len() / n_per_row) == 0
+        });
+        let slices = importance_vec.as_ref().map_or(1, |w| w.len() / n_per_row);
+        let rows_per_slice = (n_rows / slices).max(1);
+
+        // Score a sample of whole rows, spread evenly through every slice,
+        // quantizing only the sample (the cost is the sample's, not the
+        // tensor's). Rows rather than a prefix: a prefix of a stacked-experts
+        // tensor is one expert, and of any tensor the first few rows.
+        let want_rows = if kl_config.sample_size > 0 {
+            kl_config.sample_size.div_ceil(n_per_row).max(1)
+        } else {
+            n_rows
+        };
+        let take = want_rows.div_ceil(slices).clamp(1, rows_per_slice);
+        let sampled: Vec<f32>;
+        let sample: &[f32] = if take >= rows_per_slice {
+            data
+        } else {
+            let mut rows = Vec::with_capacity(slices * take * n_per_row);
+            for slice in 0..slices {
+                for k in 0..take {
+                    let row = slice * rows_per_slice + k * rows_per_slice / take;
+                    rows.extend_from_slice(&data[row * n_per_row..(row + 1) * n_per_row]);
+                }
+            }
+            sampled = rows;
+            &sampled
+        };
+        let sample_rows = sample.len() / n_per_row;
+        let rows_per_sample_slice = (sample_rows / slices).max(1);
+        let importance = importance_vec.as_deref().map(|weights| Importance {
+            weights,
+            n_per_row,
+            rows_per_slice: rows_per_sample_slice,
+        });
+        let sample_shape = [sample_rows as i32, n_per_row as i32];
 
         let mut all_scores: Vec<(GgmlType, f64)> = Vec::new();
 
         for &candidate in &kl_config.candidates {
-            // Quantize the *full* tensor (the dequantized slice must cover `sample`).
-            let quantized = match quantize(data, candidate) {
-                Ok(q) => q,
-                Err(_) => continue,
-            };
+            let quantized =
+                match quantize_tensor(sample, candidate, n_per_row, importance_vec.as_deref()) {
+                    Ok(q) => q,
+                    Err(_) => continue,
+                };
 
-            let dequantized = match dequantize(&quantized, candidate, shape) {
+            let dequantized = match dequantize(&quantized, candidate, &sample_shape) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
 
-            let cmp_len = sample.len().min(dequantized.len());
-            let score = compute_kl_divergence(sample, &dequantized[..cmp_len]);
+            let score = compute_kl_divergence(sample, &dequantized, importance.as_ref());
             all_scores.push((candidate, score));
         }
 
@@ -559,7 +618,11 @@ impl DynamicQuantizer {
 
         let mut total_kl = 0.0_f64;
         let mut total_elements = 0u64;
-        let mut total_bits = 0u64;
+        let mut total_bits = 0.0f64;
+        let sizes: HashMap<&str, usize> = tensor_sizes
+            .iter()
+            .map(|(name, n)| (name.as_str(), *n))
+            .collect();
 
         for (name, cal) in calibration {
             *summary.type_counts.entry(cal.quant_type).or_insert(0) += 1;
@@ -570,10 +633,9 @@ impl DynamicQuantizer {
                 summary.worst_tensor = name.clone();
             }
 
-            if let Some((_, n)) = tensor_sizes.iter().find(|(tname, _)| tname == name) {
-                let n = *n as u64;
-                total_elements += n;
-                total_bits += n * self.bits_per_element(cal.quant_type);
+            if let Some(&n) = sizes.get(name.as_str()) {
+                total_elements += n as u64;
+                total_bits += n as f64 * bits_per_element(cal.quant_type);
             }
         }
 
@@ -584,7 +646,7 @@ impl DynamicQuantizer {
         };
 
         summary.estimated_bpw = if total_elements > 0 {
-            total_bits as f32 / total_elements as f32
+            (total_bits / total_elements as f64) as f32
         } else {
             0.0
         };
@@ -596,106 +658,91 @@ impl DynamicQuantizer {
     // BPW budget enforcement
     // -----------------------------------------------------------------------
 
-    /// Enforce a bits-per-weight budget by downgrading the tensors with the lowest
-    /// quality-loss impact first (greedy, highest-compression direction).
+    /// Enforce a bits-per-weight budget by repeatedly taking the cheapest
+    /// downgrade: among every non-critical tensor and every cheaper candidate
+    /// already scored for it, the move that adds the least quality loss per
+    /// bit saved (loss increase divided by `elements x bits per element`
+    /// freed). A tensor can step down more than once, and a stack of small
+    /// cheap moves wins over one expensive one, which is the marginal
+    /// analysis that minimises total loss for a bit budget.
     fn apply_bpw_budget(
         &self,
         map: &mut CalibrationMap,
         tensors: &[(String, Vec<f32>, Vec<i32>)],
         target_bpw: f32,
-        kl_config: &KlCalibrationConfig,
+        _kl_config: &KlCalibrationConfig,
     ) {
-        let compute_avg_bpw = |map: &CalibrationMap| -> f32 {
-            let mut total_elements = 0u64;
-            let mut total_bits = 0u64;
-            for (name, data, _) in tensors {
-                let n = data.len() as u64;
-                total_elements += n;
-                if let Some(cal) = map.get(name) {
-                    total_bits += n * self.bits_per_element(cal.quant_type);
-                }
-            }
-            if total_elements == 0 {
-                0.0
-            } else {
-                total_bits as f32 / total_elements as f32
-            }
-        };
-
-        if compute_avg_bpw(map) <= target_bpw {
-            return; // Already within budget — nothing to do.
-        }
-
-        // Collect non-critical tensors ordered by ascending score (least impactful first).
-        let mut downgradeable: Vec<(String, f64)> = map
+        let sizes: HashMap<&str, u64> = tensors
             .iter()
-            .filter(|(name, _)| !Self::is_critical_layer(name))
-            .map(|(name, cal)| (name.clone(), cal.kl_score))
+            .map(|(name, data, _)| (name.as_str(), data.len() as u64))
             .collect();
-        downgradeable.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let total_elements: u64 = sizes.values().sum();
+        if total_elements == 0 {
+            return;
+        }
+        let bits_of = |map: &CalibrationMap| -> f64 {
+            map.iter()
+                .map(|(name, cal)| {
+                    sizes.get(name.as_str()).copied().unwrap_or(0) as f64
+                        * bits_per_element(cal.quant_type)
+                })
+                .sum()
+        };
+        // Tensors the map has no size for are not counted against the budget.
+        let target_bits = f64::from(target_bpw) * total_elements as f64;
+        let mut total_bits = bits_of(map);
 
-        for (name, _) in &downgradeable {
-            if let Some(cal) = map.get_mut(name) {
-                // Find the next lower-quality candidate in the ordered list.
-                let current_idx = kl_config
-                    .candidates
-                    .iter()
-                    .position(|&c| c == cal.quant_type);
-                if let Some(idx) = current_idx {
-                    if idx + 1 < kl_config.candidates.len() {
-                        let next_type = kl_config.candidates[idx + 1];
-                        // Use the pre-computed score if available; otherwise keep current.
-                        let next_score = cal
-                            .all_scores
-                            .iter()
-                            .find(|&&(t, _)| t == next_type)
-                            .map(|&(_, s)| s)
-                            .unwrap_or(cal.kl_score);
-                        cal.quant_type = next_type;
-                        cal.kl_score = next_score;
+        // Deterministic order for ties.
+        let mut names: Vec<String> = map
+            .keys()
+            .filter(|n| !Self::is_critical_layer(n) && sizes.contains_key(n.as_str()))
+            .cloned()
+            .collect();
+        names.sort();
+
+        while total_bits > target_bits {
+            // (loss increase per bit saved, tensor, new type, new score, bits saved)
+            let mut best: Option<(f64, &str, GgmlType, f64, f64)> = None;
+            for name in &names {
+                let cal = &map[name];
+                let n = sizes[name.as_str()] as f64;
+                let current = bits_per_element(cal.quant_type);
+                for &(candidate, score) in &cal.all_scores {
+                    let saved = n * (current - bits_per_element(candidate));
+                    if saved <= 0.0 {
+                        continue;
+                    }
+                    let ratio = (score - cal.kl_score).max(0.0) / saved;
+                    if best.is_none_or(|(r, ..)| ratio < r) {
+                        best = Some((ratio, name, candidate, score, saved));
                     }
                 }
             }
-
-            if compute_avg_bpw(map) <= target_bpw {
+            let Some((_, name, candidate, score, saved)) = best else {
                 break;
+            };
+            if let Some(cal) = map.get_mut(name) {
+                cal.quant_type = candidate;
+                cal.kl_score = score;
             }
+            total_bits -= saved;
         }
 
-        // Verify the budget was achieved.  When all non-critical tensors are already at
-        // the lowest-quality candidate the loop exits without meeting the target.
-        let final_bpw = compute_avg_bpw(map);
-        if final_bpw > target_bpw {
+        if total_bits > target_bits {
             tracing::warn!(
                 "BPW budget not met: target={:.2}, achieved={:.2}. \
-                 All tensors are already at minimum quality.",
+                 Every tensor is already at its cheapest scored type.",
                 target_bpw,
-                final_bpw,
+                total_bits / total_elements as f64,
             );
         }
     }
+}
 
-    // -----------------------------------------------------------------------
-    // Bits-per-element table
-    // -----------------------------------------------------------------------
-
-    /// Approximate bits per stored element for a given quantization type.
-    ///
-    /// K-quant types store overhead (scales, mins) in the block header, so the
-    /// effective BPE is slightly above the nominal quant width.
-    fn bits_per_element(&self, dtype: GgmlType) -> u64 {
-        match dtype {
-            GgmlType::F32 => 32,
-            GgmlType::F16 | GgmlType::Bf16 => 16,
-            GgmlType::Q8_0 | GgmlType::Q8K => 9,
-            GgmlType::Q6K => 7,
-            GgmlType::Q5K => 6,
-            GgmlType::Q4_0 | GgmlType::Q4K => 5,
-            GgmlType::Q3K => 4,
-            GgmlType::Q2K => 3,
-            _ => 5, // Conservative default for unknown/IQ types.
-        }
-    }
+/// Bits stored per element by a type, block overhead (scales, minimums)
+/// included: `8 * bytes per block / elements per block`.
+fn bits_per_element(dtype: GgmlType) -> f64 {
+    8.0 * dtype.type_size() as f64 / dtype.block_size() as f64
 }
 
 /// Summary of quantization decisions for debugging.
@@ -933,7 +980,7 @@ mod tests {
     #[test]
     fn test_kl_divergence_identical() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let kl = compute_kl_divergence(&data, &data);
+        let kl = compute_kl_divergence(&data, &data, None);
         assert!(kl < 1e-10, "Identical data should have ~0 KL: {}", kl);
     }
 
@@ -941,7 +988,7 @@ mod tests {
     fn test_kl_divergence_different() {
         let original = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let perturbed = vec![1.1f32, 2.1, 2.9, 4.2, 4.8];
-        let kl = compute_kl_divergence(&original, &perturbed);
+        let kl = compute_kl_divergence(&original, &perturbed, None);
         assert!(kl > 0.0, "Different data should have positive KL");
         assert!(kl < 1.0, "Small perturbation should have small KL: {}", kl);
     }
@@ -950,7 +997,7 @@ mod tests {
     fn test_kl_divergence_zero_vector() {
         // All-zero original should not panic and return 0.0 (no energy to lose).
         let zeros = vec![0.0f32; 8];
-        let kl = compute_kl_divergence(&zeros, &zeros);
+        let kl = compute_kl_divergence(&zeros, &zeros, None);
         assert_eq!(kl, 0.0, "All-zero identical should give 0: {}", kl);
     }
 
@@ -1093,5 +1140,232 @@ mod tests {
         assert!((summary.max_kl_score - 0.005).abs() < 1e-9);
         assert!((summary.avg_kl_score - 0.0035).abs() < 1e-9);
         assert!(summary.estimated_bpw > 0.0);
+    }
+
+    // -----------------------------------------------------------------------
+    // GGUF naming, budget and importance
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gguf_names_are_classified_correctly() {
+        // The output head is critical; an attention output projection is not.
+        assert!(DynamicQuantizer::is_critical_layer("output.weight"));
+        assert!(!DynamicQuantizer::is_critical_layer(
+            "blk.3.attn_output.weight"
+        ));
+        assert!(DynamicQuantizer::is_attention_layer("blk.0.attn_q.weight"));
+        assert!(DynamicQuantizer::is_attention_layer(
+            "blk.0.attn_output.weight"
+        ));
+        assert!(!DynamicQuantizer::is_attention_layer(
+            "blk.0.attn_norm.weight"
+        ));
+        assert!(!DynamicQuantizer::is_attention_layer("blk.0.ffn_up.weight"));
+        assert_eq!(
+            DynamicQuantizer::extract_layer_index("blk.7.attn_q.weight"),
+            Some(7)
+        );
+
+        let config = DynamicQuantizationConfig {
+            base_type: GgmlType::Q4K,
+            high_precision_type: GgmlType::Q6K,
+            fallback_type: GgmlType::Q8_0,
+            attention_high_precision: true,
+            edge_layers_high_precision: 2,
+            ..Default::default()
+        };
+        let quantizer = DynamicQuantizer::new(config, None);
+        assert_eq!(
+            quantizer.get_tensor_type("blk.9.attn_q.weight", &[]),
+            GgmlType::Q6K
+        );
+        assert_eq!(
+            quantizer.get_tensor_type("blk.1.ffn_up.weight", &[]),
+            GgmlType::Q6K
+        );
+        assert_eq!(
+            quantizer.get_tensor_type("blk.9.ffn_up.weight", &[]),
+            GgmlType::Q4K
+        );
+        assert_eq!(
+            quantizer.get_tensor_type("output.weight", &[]),
+            GgmlType::Q8_0
+        );
+    }
+
+    #[test]
+    fn bits_per_element_includes_block_overhead() {
+        assert_eq!(bits_per_element(GgmlType::Q4_0), 4.5);
+        assert_eq!(bits_per_element(GgmlType::Q4K), 4.5);
+        assert_eq!(bits_per_element(GgmlType::Q5K), 5.5);
+        assert_eq!(bits_per_element(GgmlType::Q6K), 6.5625);
+        assert_eq!(bits_per_element(GgmlType::Q2K), 2.625);
+        assert_eq!(bits_per_element(GgmlType::Q3K), 3.4375);
+        assert_eq!(bits_per_element(GgmlType::Q8_0), 8.5);
+        assert_eq!(bits_per_element(GgmlType::F16), 16.0);
+        assert_eq!(bits_per_element(GgmlType::Iq4Xs), 4.25);
+    }
+
+    fn weight_like(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                let mut s = 0.0f32;
+                for _ in 0..12 {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    s += (state >> 40) as f32 / (1u64 << 24) as f32;
+                }
+                (s - 6.0) * 0.02
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_bit_budget_is_met_by_stepping_tensors_down_repeatedly() {
+        let quantizer = DynamicQuantizer::new(DynamicQuantizationConfig::default(), None);
+        let tensors: Vec<(String, Vec<f32>, Vec<i32>)> = (0..4)
+            .map(|i| {
+                (
+                    format!("blk.{i}.ffn_up.weight"),
+                    weight_like(256 * 8, 7 + i),
+                    vec![8, 256],
+                )
+            })
+            .collect();
+        // A threshold nothing can meet keeps every tensor at the best candidate
+        // (Q8_K, 9.125 bits); 3.0 then needs several steps each.
+        let kl_config = KlCalibrationConfig {
+            kl_threshold: 0.0,
+            target_bpw: Some(3.0),
+            ..Default::default()
+        };
+        let map = quantizer.calibrate_all(&tensors, &kl_config);
+        let sizes: Vec<_> = tensors
+            .iter()
+            .map(|(n, d, _)| (n.clone(), d.len()))
+            .collect();
+        let summary = quantizer.summarize_calibration(&map, &sizes);
+        assert!(
+            summary.estimated_bpw <= 3.0,
+            "budget missed: {} bits per weight",
+            summary.estimated_bpw
+        );
+        // And it did not overshoot to the floor: Q2_K everywhere is 2.625.
+        assert!(
+            summary.estimated_bpw > 2.7,
+            "downgraded further than needed: {}",
+            summary.estimated_bpw
+        );
+    }
+
+    #[test]
+    fn the_budget_allocation_beats_a_uniform_one() {
+        // Tensors of different difficulty under a 5-bit budget: the allocation
+        // must meet it with less total loss than giving every tensor Q4_K, the
+        // uniform choice that also fits.
+        let mut spiky = weight_like(256 * 8, 2);
+        for (i, v) in spiky.iter_mut().enumerate() {
+            if i % 7 == 0 {
+                *v *= 12.0;
+            }
+        }
+        let tensors = vec![
+            (
+                "blk.0.ffn_up.weight".to_string(),
+                weight_like(256 * 8, 1),
+                vec![8, 256],
+            ),
+            ("blk.1.ffn_up.weight".to_string(), spiky, vec![8, 256]),
+            (
+                "blk.2.ffn_up.weight".to_string(),
+                weight_like(256 * 8, 3),
+                vec![8, 256],
+            ),
+        ];
+        let quantizer = DynamicQuantizer::new(DynamicQuantizationConfig::default(), None);
+        let kl_config = KlCalibrationConfig {
+            kl_threshold: 0.0,
+            target_bpw: Some(5.0),
+            ..Default::default()
+        };
+        let map = quantizer.calibrate_all(&tensors, &kl_config);
+        let sizes: Vec<_> = tensors
+            .iter()
+            .map(|(n, d, _)| (n.clone(), d.len()))
+            .collect();
+        assert!(quantizer.summarize_calibration(&map, &sizes).estimated_bpw <= 5.0);
+
+        let score = |name: &str, t: GgmlType| {
+            map[name]
+                .all_scores
+                .iter()
+                .find(|(c, _)| *c == t)
+                .unwrap()
+                .1
+        };
+        let chosen: f64 = map.values().map(|c| c.kl_score).sum();
+        let uniform: f64 = map.keys().map(|n| score(n, GgmlType::Q4K)).sum();
+        assert!(
+            chosen <= uniform + 1e-12,
+            "chosen {chosen} vs uniform Q4_K {uniform}"
+        );
+    }
+
+    #[test]
+    fn calibration_scores_under_the_imatrix_importance() {
+        let name = "blk.0.ffn_up.weight";
+        let data = weight_like(256 * 4, 3);
+        let shape = [4, 256];
+        let kl_config = KlCalibrationConfig {
+            candidates: vec![GgmlType::Q4K],
+            kl_threshold: 1.0,
+            ..Default::default()
+        };
+
+        let plain = DynamicQuantizer::new(DynamicQuantizationConfig::default(), None)
+            .calibrate_tensor(name, &data, &shape, &kl_config);
+
+        let mut imatrix = IMatrix::new();
+        // Only the first 16 input channels carry activations.
+        let sums: Vec<f32> = (0..256)
+            .map(|j| if j < 16 { 1000.0 } else { 0.001 })
+            .collect();
+        imatrix.insert(name.to_string(), sums, 1);
+        let quantizer = DynamicQuantizer::new(DynamicQuantizationConfig::default(), Some(imatrix));
+        assert_eq!(quantizer.importance_for(name).unwrap().len(), 256);
+        let weighted = quantizer.calibrate_tensor(name, &data, &shape, &kl_config);
+
+        assert_ne!(plain.kl_score, weighted.kl_score);
+        // A tensor of another name has no importance and scores as unweighted.
+        let other = quantizer.calibrate_tensor("blk.0.ffn_down.weight", &data, &shape, &kl_config);
+        assert_eq!(other.kl_score, plain.kl_score);
+    }
+
+    #[test]
+    fn row_sampling_scores_a_spread_of_whole_rows() {
+        let quantizer = DynamicQuantizer::new(DynamicQuantizationConfig::default(), None);
+        let data = weight_like(256 * 64, 5);
+        let full = KlCalibrationConfig {
+            candidates: vec![GgmlType::Q4K, GgmlType::Q2K],
+            kl_threshold: 1.0,
+            sample_size: 0,
+            ..Default::default()
+        };
+        let sampled = KlCalibrationConfig {
+            sample_size: 256 * 8,
+            ..full.clone()
+        };
+        let a = quantizer.calibrate_tensor("blk.0.ffn_up.weight", &data, &[64, 256], &full);
+        let b = quantizer.calibrate_tensor("blk.0.ffn_up.weight", &data, &[64, 256], &sampled);
+        // The sample is representative: scores agree to a few percent and rank alike.
+        for ((t1, s1), (t2, s2)) in a.all_scores.iter().zip(&b.all_scores) {
+            assert_eq!(t1, t2);
+            assert!((s1 - s2).abs() < 0.1 * s1, "{t1:?}: {s1} vs {s2}");
+        }
+        // A row length no candidate can hold is not a panic: it falls back.
+        let odd = quantizer.calibrate_tensor("blk.0.ffn_up.weight", &data[..100], &[1, 100], &full);
+        assert_eq!(odd.quant_type, full.fallback_type);
     }
 }

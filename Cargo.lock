@@ -5293,8 +5293,10 @@ version = "0.6.0"
 dependencies = [
  "byteorder",
  "half",
+ "memmap2",
  "pmetal-core",
  "proptest",
+ "rayon",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

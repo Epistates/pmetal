@@ -1174,7 +1174,7 @@ pub(crate) async fn run_quantization(
             CalibrationMap, DynamicQuantizationConfig, DynamicQuantizer, KlCalibrationConfig,
         },
         imatrix::IMatrix,
-        quantize::quantize,
+        quantize::{fit_to_row_length, quantize_tensor},
     };
 
     println!("========================================");
@@ -1215,7 +1215,9 @@ pub(crate) async fn run_quantization(
             fallback_type: base_type,
             ..Default::default()
         };
-        DynamicQuantizer::new(config, None)
+        // The imatrix still weights the quantization error of a fixed-type
+        // method; every tier is the same type, so it does not change the type.
+        DynamicQuantizer::new(config, imatrix)
     } else {
         let config = DynamicQuantizationConfig::default();
         DynamicQuantizer::new(config, imatrix)
@@ -1306,7 +1308,9 @@ pub(crate) async fn run_quantization(
 
             let shape_i32: Vec<i32> = tensor.shape().to_vec();
             float_cache.insert(name.clone(), (data_f32.clone(), shape_i32.clone()));
-            tensor_data.push((name.clone(), data_f32, shape_i32));
+            // Keyed by GGUF name: that is what the imatrix and the lookups below use.
+            let gguf_name = pmetal_models::weight_format::WeightLoader::hf_to_gguf_name(name);
+            tensor_data.push((gguf_name, data_f32, shape_i32));
         }
 
         let kl_config = KlCalibrationConfig {
@@ -1373,14 +1377,21 @@ pub(crate) async fn run_quantization(
             proposed_type,
         );
 
+        // A block never straddles a row: fall back to a type whose block
+        // divides the row, as the reference does.
+        let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
+        let target_type = fit_to_row_length(target_type, n_per_row);
+
         tracing::info!(
             "Quantizing stacked expert tensor {} ({} experts) to {:?}",
             gguf_name,
             group.len(),
             target_type
         );
-        let quantized_data = quantize(&data_f32, target_type)
-            .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", gguf_name, e))?;
+        let importance = quantizer.importance_for(&gguf_name);
+        let quantized_data =
+            quantize_tensor(&data_f32, target_type, n_per_row, importance.as_deref())
+                .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", gguf_name, e))?;
         builder.add_raw_tensor(gguf_name, shape_u64, target_type, quantized_data);
     }
 
@@ -1414,7 +1425,7 @@ pub(crate) async fn run_quantization(
         let target_type = if calibration_map.is_empty() {
             quantizer.get_tensor_type(&gguf_name, &shape_u64)
         } else {
-            quantizer.get_tensor_type_calibrated(name, &shape_u64, &calibration_map)
+            quantizer.get_tensor_type_calibrated(&gguf_name, &shape_u64, &calibration_map)
         };
         let target_type = llama_style_tensor_type(
             method,
@@ -1424,17 +1435,21 @@ pub(crate) async fn run_quantization(
             target_type,
         );
 
+        let n_per_row = shape_u64.last().copied().unwrap_or(1) as usize;
+        let target_type = fit_to_row_length(target_type, n_per_row);
+
         tracing::info!("Quantizing {} ({}) to {:?}", name, gguf_name, target_type);
-        let quantized_data = quantize(&data_f32, target_type)
-            .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", name, e))?;
+        let importance = quantizer.importance_for(&gguf_name);
+        let quantized_data =
+            quantize_tensor(&data_f32, target_type, n_per_row, importance.as_deref())
+                .map_err(|e| anyhow::anyhow!("Quantization error for {}: {:?}", name, e))?;
 
         builder.add_raw_tensor(gguf_name, shape_u64, target_type, quantized_data);
     }
 
     // 8. Write GGUF output
     let validated_output = crate::validate_output_path(output_path, "quantization output")?;
-    let mut file = std::fs::File::create(&validated_output)?;
-    builder.write(&mut file)?;
+    builder.write_file(&validated_output)?;
 
     println!("Quantization complete!");
     Ok(())

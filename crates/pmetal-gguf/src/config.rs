@@ -30,42 +30,42 @@ pub fn config_from_gguf(content: &GgufContent) -> Option<serde_json::Value> {
     config.insert("architectures".to_string(), serde_json::json!([hf_arch]));
 
     // Model name
-    if let Some(name) = get_string(content, "general.name") {
+    if let Some(name) = content.get_str("general.name").map(str::to_string) {
         config.insert("_name_or_path".to_string(), serde_json::Value::String(name));
     }
 
     // Hidden size (embedding length)
-    if let Some(v) = get_u64(content, &format!("{arch}.embedding_length")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.embedding_length")) {
         config.insert("hidden_size".to_string(), serde_json::json!(v));
     }
 
     // Number of layers
-    if let Some(v) = get_u64(content, &format!("{arch}.block_count")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.block_count")) {
         config.insert("num_hidden_layers".to_string(), serde_json::json!(v));
     }
 
     // Attention heads
-    if let Some(v) = get_u64(content, &format!("{arch}.attention.head_count")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.attention.head_count")) {
         config.insert("num_attention_heads".to_string(), serde_json::json!(v));
     }
 
     // KV heads (GQA)
-    if let Some(v) = get_u64(content, &format!("{arch}.attention.head_count_kv")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.attention.head_count_kv")) {
         config.insert("num_key_value_heads".to_string(), serde_json::json!(v));
     }
 
     // Intermediate size (FFN)
-    if let Some(v) = get_u64(content, &format!("{arch}.feed_forward_length")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.feed_forward_length")) {
         config.insert("intermediate_size".to_string(), serde_json::json!(v));
     }
 
     // Context length
-    if let Some(v) = get_u64(content, &format!("{arch}.context_length")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.context_length")) {
         config.insert("max_position_embeddings".to_string(), serde_json::json!(v));
     }
 
     // Vocab size — count tokenizer tokens if available
-    if let Some(v) = get_u64(content, &format!("{arch}.vocab_size")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.vocab_size")) {
         config.insert("vocab_size".to_string(), serde_json::json!(v));
     } else if let Some(MetadataValue::Array(tokens)) = content.get_metadata("tokenizer.ggml.tokens")
     {
@@ -73,32 +73,33 @@ pub fn config_from_gguf(content: &GgufContent) -> Option<serde_json::Value> {
     }
 
     // RoPE
-    if let Some(v) = get_f64(content, &format!("{arch}.rope.freq_base")) {
+    if let Some(v) = content.get_f64(&format!("{arch}.rope.freq_base")) {
         config.insert("rope_theta".to_string(), serde_json::json!(v));
     }
 
-    if let Some(v) = get_u64(content, &format!("{arch}.attention.key_length"))
-        .or_else(|| get_u64(content, &format!("{arch}.attention.head_dim")))
-        .or_else(|| get_u64(content, &format!("{arch}.rope.dimension_count")))
+    if let Some(v) = content
+        .get_u64(&format!("{arch}.attention.key_length"))
+        .or_else(|| content.get_u64(&format!("{arch}.attention.head_dim")))
+        .or_else(|| content.get_u64(&format!("{arch}.rope.dimension_count")))
     {
         config.insert("head_dim".to_string(), serde_json::json!(v));
     }
 
     // RMS norm epsilon
-    if let Some(v) = get_f64(content, &format!("{arch}.attention.layer_norm_rms_epsilon")) {
+    if let Some(v) = content.get_f64(&format!("{arch}.attention.layer_norm_rms_epsilon")) {
         config.insert("rms_norm_eps".to_string(), serde_json::json!(v));
     }
 
     // MoE params
-    if let Some(v) = get_u64(content, &format!("{arch}.expert_count")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.expert_count")) {
         config.insert("num_local_experts".to_string(), serde_json::json!(v));
     }
-    if let Some(v) = get_u64(content, &format!("{arch}.expert_used_count")) {
+    if let Some(v) = content.get_u64(&format!("{arch}.expert_used_count")) {
         config.insert("num_experts_per_tok".to_string(), serde_json::json!(v));
     }
 
     // Quantization info from general.file_type
-    if let Some(v) = get_u64(content, "general.file_type") {
+    if let Some(v) = content.get_u64("general.file_type") {
         config.insert("gguf_file_type".to_string(), serde_json::json!(v));
     }
 
@@ -123,7 +124,12 @@ pub fn write_config_from_gguf(
     }
 
     let json = serde_json::to_string_pretty(&config).ok()?;
-    std::fs::write(&path, json).ok()?;
+    // Through a temporary file, so an interrupted write never leaves a
+    // truncated config.json that the "do not overwrite" check above would
+    // then preserve.
+    let mut temp = tempfile::NamedTempFile::new_in(output_dir).ok()?;
+    std::io::Write::write_all(&mut temp, json.as_bytes()).ok()?;
+    temp.persist(&path).ok()?;
     Some(path)
 }
 
@@ -158,41 +164,6 @@ fn map_architecture_class(arch: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Metadata helpers
-// ---------------------------------------------------------------------------
-
-fn get_string(content: &GgufContent, key: &str) -> Option<String> {
-    match content.get_metadata(key)? {
-        MetadataValue::String(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
-fn get_u64(content: &GgufContent, key: &str) -> Option<u64> {
-    match content.get_metadata(key)? {
-        MetadataValue::Uint8(v) => Some(*v as u64),
-        MetadataValue::Uint16(v) => Some(*v as u64),
-        MetadataValue::Uint32(v) => Some(*v as u64),
-        MetadataValue::Uint64(v) => Some(*v),
-        MetadataValue::Int8(v) => Some(*v as u64),
-        MetadataValue::Int16(v) => Some(*v as u64),
-        MetadataValue::Int32(v) => Some(*v as u64),
-        MetadataValue::Int64(v) => Some(*v as u64),
-        _ => None,
-    }
-}
-
-fn get_f64(content: &GgufContent, key: &str) -> Option<f64> {
-    match content.get_metadata(key)? {
-        MetadataValue::Float32(v) => Some(*v as f64),
-        MetadataValue::Float64(v) => Some(*v),
-        MetadataValue::Uint32(v) => Some(*v as f64),
-        MetadataValue::Int32(v) => Some(*v as f64),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,10 +179,8 @@ mod tests {
             map.insert(k.to_string(), v);
         }
         GgufContent {
-            version: crate::GgufVersion::V3,
             metadata: map,
-            tensor_infos: HashMap::new(),
-            tensor_data_offset: 0,
+            ..GgufContent::default()
         }
     }
 
@@ -242,12 +211,7 @@ mod tests {
 
     #[test]
     fn test_config_from_gguf_no_architecture() {
-        let content = GgufContent {
-            version: crate::GgufVersion::V3,
-            metadata: HashMap::new(),
-            tensor_infos: HashMap::new(),
-            tensor_data_offset: 0,
-        };
+        let content = GgufContent::default();
         assert!(config_from_gguf(&content).is_none());
     }
 

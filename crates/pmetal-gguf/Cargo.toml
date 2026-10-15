@@ -13,13 +13,15 @@ categories.workspace = true
 pmetal-core = { workspace = true }
 byteorder = { workspace = true }
 half = { workspace = true }
+memmap2 = { workspace = true }
+rayon = { workspace = true }
 serde_json = { workspace = true }
 zerocopy = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

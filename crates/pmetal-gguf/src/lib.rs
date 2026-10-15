@@ -37,14 +37,17 @@ pub mod dequant;
 pub mod dynamic;
 mod fp4;
 pub mod imatrix;
+mod iq_grids;
 pub mod iq_quants;
 pub mod k_quants;
+mod model;
 pub mod quantize;
 pub mod reader;
 pub mod tokenizer;
 mod types;
 mod writer;
 
+pub use model::{GgufModel, first_shard_path};
 pub use reader::{
     GgufContent, GgufReadError, GgufVersion, MAX_ARRAY_LENGTH, MAX_METADATA_COUNT,
     MAX_STRING_LENGTH, MAX_TENSOR_COUNT, MAX_TENSOR_DIMS,

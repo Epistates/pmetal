@@ -96,6 +96,57 @@ pub enum GgmlType {
     Q1_0 = 41,
 }
 
+impl TryFrom<u32> for GgmlType {
+    type Error = ();
+
+    /// Decode the type id stored in a tensor-info entry.
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ok(match value {
+            0 => Self::F32,
+            1 => Self::F16,
+            2 => Self::Q4_0,
+            3 => Self::Q4_1,
+            6 => Self::Q5_0,
+            7 => Self::Q5_1,
+            8 => Self::Q8_0,
+            9 => Self::Q8_1,
+            10 => Self::Q2K,
+            11 => Self::Q3K,
+            12 => Self::Q4K,
+            13 => Self::Q5K,
+            14 => Self::Q6K,
+            15 => Self::Q8K,
+            16 => Self::Iq2Xxs,
+            17 => Self::Iq2Xs,
+            18 => Self::Iq3Xxs,
+            19 => Self::Iq1S,
+            20 => Self::Iq4Nl,
+            21 => Self::Iq3S,
+            22 => Self::Iq2S,
+            23 => Self::Iq4Xs,
+            24 => Self::I8,
+            25 => Self::I16,
+            26 => Self::I32,
+            27 => Self::I64,
+            28 => Self::F64,
+            29 => Self::Iq1M,
+            30 => Self::Bf16,
+            31 => Self::Q4_0_4_4,
+            32 => Self::Q4_0_4_8,
+            33 => Self::Q4_0_8_8,
+            34 => Self::Tq1_0,
+            35 => Self::Tq2_0,
+            36 => Self::Iq4Nl_4_4,
+            37 => Self::Iq4Nl_4_8,
+            38 => Self::Iq4Nl_8_8,
+            39 => Self::Mxfp4,
+            40 => Self::Nvfp4,
+            41 => Self::Q1_0,
+            _ => return Err(()),
+        })
+    }
+}
+
 impl GgmlType {
     /// Get the number of bytes per element for this type.
     /// Note: For quantized types, this returns the block size in bytes.
@@ -140,6 +191,13 @@ impl GgmlType {
             Self::Nvfp4 => 36, // 64 values: 4-byte scales + 32 packed FP4 bytes
             Self::Q1_0 => 18,  // 128 values: f16 scale + 16 packed 1-bit bytes
         }
+    }
+
+    /// Whether the type stores blocks of quantized values (as opposed to plain
+    /// floats and integers). Such a file must declare
+    /// `general.quantization_version`.
+    pub fn is_quantized(&self) -> bool {
+        self.block_size() > 1
     }
 
     /// Get the block size (number of elements per block) for quantized types.
@@ -220,7 +278,7 @@ pub enum MetadataValueType {
 }
 
 /// A metadata value in GGUF format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
     /// 8-bit unsigned integer
     Uint8(u8),
@@ -267,6 +325,73 @@ impl MetadataValue {
             Self::Uint64(_) => MetadataValueType::Uint64,
             Self::Int64(_) => MetadataValueType::Int64,
             Self::Float64(_) => MetadataValueType::Float64,
+        }
+    }
+
+    /// The value as an unsigned integer, if it is an integer type holding a
+    /// non-negative value that fits.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Uint8(v) => Some(u64::from(*v)),
+            Self::Uint16(v) => Some(u64::from(*v)),
+            Self::Uint32(v) => Some(u64::from(*v)),
+            Self::Uint64(v) => Some(*v),
+            Self::Int8(v) => u64::try_from(*v).ok(),
+            Self::Int16(v) => u64::try_from(*v).ok(),
+            Self::Int32(v) => u64::try_from(*v).ok(),
+            Self::Int64(v) => u64::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    /// The value as a signed integer, if it is an integer type that fits.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Int8(v) => Some(i64::from(*v)),
+            Self::Int16(v) => Some(i64::from(*v)),
+            Self::Int32(v) => Some(i64::from(*v)),
+            Self::Int64(v) => Some(*v),
+            Self::Uint8(v) => Some(i64::from(*v)),
+            Self::Uint16(v) => Some(i64::from(*v)),
+            Self::Uint32(v) => Some(i64::from(*v)),
+            Self::Uint64(v) => i64::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    /// The value as a float: a float type, or an integer (converted).
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Float32(v) => Some(f64::from(*v)),
+            Self::Float64(v) => Some(*v),
+            other => other
+                .as_i64()
+                .map(|v| v as f64)
+                .or_else(|| other.as_u64().map(|v| v as f64)),
+        }
+    }
+
+    /// The value as a string slice.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The value as a bool.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// The value as an array.
+    pub fn as_array(&self) -> Option<&[MetadataValue]> {
+        match self {
+            Self::Array(a) => Some(a),
+            _ => None,
         }
     }
 
@@ -596,5 +721,24 @@ mod tests {
         assert_eq!(GgmlType::Nvfp4.type_size(), 36);
         assert_eq!(GgmlType::Q1_0.block_size(), 128);
         assert_eq!(GgmlType::Q1_0.type_size(), 18);
+    }
+
+    #[test]
+    fn metadata_accessors_convert_only_when_lossless() {
+        use super::MetadataValue as V;
+        assert_eq!(V::Uint8(7).as_u64(), Some(7));
+        assert_eq!(V::Int32(-1).as_u64(), None);
+        assert_eq!(V::Int32(-1).as_i64(), Some(-1));
+        assert_eq!(V::Uint64(u64::MAX).as_i64(), None);
+        assert_eq!(V::Uint32(3).as_f64(), Some(3.0));
+        assert_eq!(V::Int16(-2).as_f64(), Some(-2.0));
+        assert_eq!(V::Float32(0.5).as_f64(), Some(0.5));
+        assert_eq!(V::String("x".into()).as_u64(), None);
+        assert_eq!(V::String("x".into()).as_str(), Some("x"));
+        assert_eq!(V::Bool(true).as_bool(), Some(true));
+        assert_eq!(
+            V::Array(vec![V::Uint8(1)]).as_array().map(<[_]>::len),
+            Some(1)
+        );
     }
 }

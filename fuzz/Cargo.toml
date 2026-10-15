@@ -23,3 +23,15 @@ name = "gguf_reader"
 path = "fuzz_targets/gguf_reader.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "gguf_dequant"
+path = "fuzz_targets/gguf_dequant.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "gguf_quantize"
+path = "fuzz_targets/gguf_quantize.rs"
+test = false
+doc = false

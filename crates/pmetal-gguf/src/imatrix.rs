@@ -23,6 +23,15 @@
 //! - `dataset_len: i32` - Dataset filename length
 //! - `dataset: [u8; dataset_len]` - Dataset filename
 //!
+//! # GGUF format
+//!
+//! Current imatrix tools write a GGUF file (`general.type = "imatrix"`) with,
+//! per weight matrix `<name>`, an `F32` tensor `<name>.in_sum2` of the summed
+//! squared input activations (`n_per_row` values, times the number of experts
+//! for a mixture-of-experts matrix) and `<name>.counts` with the number of
+//! tokens accumulated (one per expert); `imatrix.chunk_count` and
+//! `imatrix.datasets` describe the run. [`IMatrix::load`] reads either format.
+//!
 //! # References
 //!
 //! - [llama.cpp imatrix](https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/imatrix.cpp)
@@ -62,7 +71,8 @@ impl IMatrix {
         Self::default()
     }
 
-    /// Load IMatrix from a file (llama.cpp legacy .dat format).
+    /// Load an importance matrix from a file, in either the GGUF format or the
+    /// legacy `.dat` format (told apart by the file's first four bytes).
     ///
     /// # Errors
     ///
@@ -75,7 +85,92 @@ impl IMatrix {
         let file_size = file.metadata().map_err(PMetalError::Io)?.len();
         let mut reader = BufReader::new(file);
 
+        let mut magic = [0u8; 4];
+        let is_gguf =
+            reader.read_exact(&mut magic).is_ok() && u32::from_le_bytes(magic) == crate::GGUF_MAGIC;
+        reader.rewind().map_err(PMetalError::Io)?;
+        if is_gguf {
+            drop(reader);
+            return Self::load_gguf(path);
+        }
         Self::load_from_reader(&mut reader, file_size)
+    }
+
+    /// Load an importance matrix from a GGUF file as written by current
+    /// imatrix tools.
+    ///
+    /// Each matrix's `in_sum2` is divided by its `counts` (per expert for a
+    /// stacked mixture-of-experts matrix) so the stored values are mean
+    /// squared activations, with `ncall` 1.
+    pub fn load_gguf(path: &std::path::Path) -> Result<Self> {
+        use crate::{GgmlType, GgufModel, MetadataValue};
+
+        let model = GgufModel::open(path)
+            .map_err(|e| PMetalError::Serialization(format!("imatrix GGUF: {e}")))?;
+        let to_f32 = |name: &str| -> Result<Vec<f32>> {
+            let info = model.tensor_info(name).ok_or_else(|| {
+                PMetalError::InvalidArgument(format!("imatrix GGUF has no tensor {name}"))
+            })?;
+            if info.dtype != GgmlType::F32 {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "imatrix tensor {name} is {:?}, expected F32",
+                    info.dtype
+                )));
+            }
+            let bytes = model
+                .tensor_data(name)
+                .map_err(|e| PMetalError::Serialization(format!("imatrix GGUF: {e}")))?;
+            Ok(bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect())
+        };
+
+        let mut out = Self::new();
+        let names: Vec<String> = model.tensor_names().map(String::from).collect();
+        for tensor in &names {
+            let Some(name) = tensor
+                .strip_suffix(".in_sum2")
+                .or_else(|| tensor.strip_suffix(".sums"))
+            else {
+                continue;
+            };
+            let sums = to_f32(tensor)?;
+            let counts = to_f32(&format!("{name}.counts"))?;
+            if counts.is_empty() || sums.len() % counts.len() != 0 {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "imatrix tensor {tensor} has {} values for {} counts",
+                    sums.len(),
+                    counts.len()
+                )));
+            }
+            let per_expert = sums.len() / counts.len();
+            let mut values = Vec::with_capacity(sums.len());
+            for (e, count) in counts.iter().enumerate() {
+                let inv = if *count > 0.0 { 1.0 / count } else { 0.0 };
+                values.extend(
+                    sums[e * per_expert..(e + 1) * per_expert]
+                        .iter()
+                        .map(|v| v * inv),
+                );
+            }
+            out.insert(name.to_string(), values, 1);
+        }
+        out.last_chunk = match model.get_metadata("imatrix.chunk_count") {
+            Some(MetadataValue::Uint32(v)) => i32::try_from(*v).ok(),
+            Some(MetadataValue::Int32(v)) => Some(*v),
+            _ => None,
+        };
+        out.dataset_name = match model.get_metadata("imatrix.datasets") {
+            Some(MetadataValue::Array(items)) => items.iter().find_map(|v| match v {
+                MetadataValue::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        Ok(out)
     }
 
     /// Load IMatrix from a reader.
@@ -180,12 +275,20 @@ impl IMatrix {
         })
     }
 
-    /// Save IMatrix to a file (llama.cpp legacy .dat format).
+    /// Save IMatrix to a file (llama.cpp legacy .dat format), atomically.
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let file = std::fs::File::create(path).map_err(PMetalError::Io)?;
-        let mut writer = BufWriter::new(file);
-
-        self.save_to_writer(&mut writer)
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => std::path::Path::new("."),
+        };
+        let temp = tempfile::NamedTempFile::new_in(dir).map_err(PMetalError::Io)?;
+        let mut writer = BufWriter::new(temp);
+        self.save_to_writer(&mut writer)?;
+        let temp = writer
+            .into_inner()
+            .map_err(|e| PMetalError::Io(e.into_error()))?;
+        temp.persist(path).map_err(|e| PMetalError::Io(e.error))?;
+        Ok(())
     }
 
     /// Save IMatrix to a writer.
@@ -195,8 +298,10 @@ impl IMatrix {
             .write_i32::<LittleEndian>(self.data.len() as i32)
             .map_err(PMetalError::Io)?;
 
-        // Write each entry
-        for (name, values) in &self.data {
+        // Write each entry, in name order so the output is reproducible.
+        let mut entries: Vec<_> = self.data.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, values) in entries {
             let name_bytes = name.as_bytes();
 
             // Write name length
@@ -257,6 +362,17 @@ impl IMatrix {
     /// Check if this imatrix is empty.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// The importance of each input channel of `name`: the mean squared
+    /// activation, which is what the quantizers weight the error by
+    /// ([`crate::quantize::quantize_tensor`]). The legacy format stores sums
+    /// over `ncall` chunks, so they are divided by it; a stacked
+    /// mixture-of-experts matrix has one run of channels per expert.
+    pub fn importance(&self, name: &str) -> Option<Vec<f32>> {
+        let values = self.data.get(name)?;
+        let ncall = self.ncalls.get(name).copied().unwrap_or(1).max(1) as f32;
+        Some(values.iter().map(|v| v / ncall).collect())
     }
 
     /// Get the total importance score for a tensor.
@@ -452,5 +568,80 @@ mod tests {
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn importance_divides_legacy_sums_by_the_call_count() {
+        let imatrix = create_test_imatrix();
+        assert_eq!(
+            imatrix.importance("layer.0.weight"),
+            Some(vec![0.1, 0.2, 0.3, 0.4])
+        );
+        assert!(imatrix.importance("nonexistent").is_none());
+    }
+
+    #[test]
+    fn saving_is_deterministic_and_round_trips_through_a_file() {
+        let mut imatrix = IMatrix::new();
+        for i in 0..20 {
+            imatrix.insert(format!("blk.{i}.w"), vec![i as f32; 3], 4);
+        }
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        imatrix.save_to_writer(&mut a).unwrap();
+        imatrix.clone().save_to_writer(&mut b).unwrap();
+        assert_eq!(a, b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.dat");
+        imatrix.save(&path).unwrap();
+        let loaded = IMatrix::load(&path).unwrap();
+        assert_eq!(loaded.data, imatrix.data);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn gguf_imatrix_is_loaded_and_normalised_per_expert() {
+        use crate::{GgmlType, GgufBuilder, MetadataValue};
+        let mut b = GgufBuilder::with_model("imatrix", "m");
+        b.add_metadata("general.type", MetadataValue::String("imatrix".into()));
+        b.add_u32("imatrix.chunk_count", 7);
+        b.add_string_array("imatrix.datasets", vec!["calib.txt".into()]);
+        // A dense matrix: 4 channels, 8 tokens.
+        b.add_f32_tensor(
+            "blk.0.attn_q.weight.in_sum2",
+            vec![1, 4],
+            vec![8.0, 16.0, 0.0, 4.0],
+        );
+        b.add_f32_tensor("blk.0.attn_q.weight.counts", vec![1, 1], vec![8.0]);
+        // A stacked-experts matrix: 2 experts x 3 channels, 2 and 4 tokens.
+        b.add_f32_tensor(
+            "blk.0.ffn_up_exps.weight.in_sum2",
+            vec![2, 3],
+            vec![2.0, 4.0, 6.0, 4.0, 8.0, 12.0],
+        );
+        b.add_f32_tensor(
+            "blk.0.ffn_up_exps.weight.counts",
+            vec![1, 2],
+            vec![2.0, 4.0],
+        );
+        b.add_raw_tensor("other", vec![1], GgmlType::F32, vec![0; 4]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("imatrix.gguf");
+        b.write_file(&path).unwrap();
+
+        let m = IMatrix::load(&path).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(
+            m.importance("blk.0.attn_q.weight"),
+            Some(vec![1.0, 2.0, 0.0, 0.5])
+        );
+        assert_eq!(
+            m.importance("blk.0.ffn_up_exps.weight"),
+            Some(vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0])
+        );
+        assert_eq!(m.last_chunk, Some(7));
+        assert_eq!(m.dataset_name.as_deref(), Some("calib.txt"));
     }
 }
