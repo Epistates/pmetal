@@ -13,16 +13,30 @@ categories.workspace = true
 pmetal-core = { workspace = true }
 pmetal-gguf = { workspace = true }
 hf-hub = { workspace = true }
+futures = { workspace = true }
+memmap2 = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 walkdir = { workspace = true }
 serde_json = { workspace = true }
+serde-saphyr = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true, features = ["query"] }
 
+[features]
+# Builders for PyTorch checkpoints (`torch::testing`), for this crate's own
+# integration tests. Not part of the supported API.
+testing = []
+
 [dev-dependencies]
+# This crate's integration tests build checkpoints with the `testing` feature.
+# No version, so publishing drops it instead of resolving the crate against
+# itself on the registry.
+pmetal-hub = { path = ".", features = ["testing"] }
 base64 = { workspace = true }
+safetensors = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

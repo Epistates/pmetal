@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::process::Stdio;
 
 use tokio::process::Command;
@@ -109,12 +108,11 @@ pub fn build_device_spec() -> McpResult<pmetal_hub::DeviceSpec> {
         .map_err(|e| McpError::internal(format!("Metal not available: {e}")))?;
     let props = ctx.properties();
 
-    const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
-    Ok(pmetal_hub::DeviceSpec {
-        memory_gb: props.recommended_working_set_size as f64 / BYTES_PER_GB,
-        bandwidth_gbps: props.memory_bandwidth_gbps,
-        unified_memory: props.has_unified_memory,
-    })
+    Ok(pmetal_hub::DeviceSpec::from_device(
+        props.recommended_working_set_size,
+        props.memory_bandwidth_gbps,
+        props.has_unified_memory,
+    ))
 }
 
 /// Run a pmetal subcommand synchronously, taking an already-built argv slice.
@@ -151,21 +149,9 @@ pub async fn run_pmetal_blocking_argv(subcommand: &str, argv: &[String]) -> McpR
 }
 
 /// Find the HuggingFace cache directory.
+///
+/// The one resolution the downloads themselves use (`HF_HUB_CACHE`, its legacy
+/// name, then `HF_HOME`), so what is listed is where models were put.
 pub fn hf_cache_dir() -> std::path::PathBuf {
-    if let Ok(cache) = std::env::var("HF_HOME") {
-        return Path::new(&cache).join("hub");
-    }
-    if let Ok(cache) = std::env::var("HUGGINGFACE_HUB_CACHE") {
-        return cache.into();
-    }
-    dirs_fallback()
-        .join(".cache")
-        .join("huggingface")
-        .join("hub")
-}
-
-fn dirs_fallback() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    pmetal_hub::cache_dir()
 }

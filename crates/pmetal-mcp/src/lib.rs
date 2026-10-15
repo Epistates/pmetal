@@ -154,18 +154,14 @@ async fn estimate_model_memory(
         .map(|tags| tags.iter().any(|t| t.as_str() == Some("moe")))
         .unwrap_or(false);
 
-    let model_spec = pmetal_hub::ModelSpec {
-        params_b,
-        quantization: quant,
-        context_length: context_length.unwrap_or(4096) as u32,
-        num_kv_heads: None,
-        head_dim: None,
-        num_layers: None,
-        is_moe,
-        num_experts: None,
-        active_experts: None,
-        kv_cache_bits: None,
-    };
+    let mut model_spec = pmetal_hub::ModelSpec::new(params_b, quant)
+        .with_context(context_length.unwrap_or(4096) as u32);
+    model_spec.is_moe = is_moe;
+    // The measured size of the checkpoint, unless the caller asked what the
+    // model would take at a quantization it is not published in.
+    if quantization.is_none() {
+        model_spec.weight_bytes = result.get("safetensors_bytes").and_then(|v| v.as_u64());
+    }
 
     let fit = pmetal_hub::estimate_fit(&model_spec, &device_spec);
     Ok((fit, params_b))
@@ -213,33 +209,22 @@ impl PmetalMcpServer {
         let json_results: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
-                let fit_info =
-                    if let (Some(dev), Some(params_b)) = (&device_spec, r.estimated_params_b) {
-                        let quant = pmetal_hub::fit::detect_quantization_from_id(&r.model_id);
-                        let model_spec = pmetal_hub::ModelSpec {
-                            params_b,
-                            quantization: quant,
-                            context_length: 4096,
-                            num_kv_heads: None,
-                            head_dim: None,
-                            num_layers: None,
-                            is_moe: r.tags.iter().any(|t| t == "moe"),
-                            num_experts: None,
-                            active_experts: None,
-                            kv_cache_bits: None,
-                        };
-                        let fit = pmetal_hub::estimate_fit(&model_spec, dev);
+                let fit_info = device_spec
+                    .as_ref()
+                    .and_then(|dev| r.fit(dev, pmetal_hub::fit::DEFAULT_FIT_CONTEXT))
+                    .map(|fit| {
                         serde_json::json!({
                             "level": fit.fit_level.label(),
                             "total_gb": fit.total_required_gb,
                             "weights_gb": fit.weights_gb,
+                            "weights_measured": fit.weights_measured,
+                            "context_length": fit.context_length,
                             "training_gb": fit.training_memory_gb,
                             "training_fit": fit.training_fit.label(),
                             "estimated_tps": fit.estimated_tps,
                         })
-                    } else {
-                        serde_json::Value::Null
-                    };
+                    })
+                    .unwrap_or(serde_json::Value::Null);
 
                 serde_json::json!({
                     "model_id": r.model_id,
