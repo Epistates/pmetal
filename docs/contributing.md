@@ -100,7 +100,7 @@ cargo +nightly fuzz run gguf_reader -- -max_total_time=60
 crates/
 ├── pmetal-core/        # Core types, traits, configurations
 ├── pmetal-metal/       # Metal GPU kernels + ANE runtime
-├── pmetal-mlx/         # MLX backend integration
+├── pmetal-cache/       # KV caches, prefix reuse, speculative-decoding state
 ├── pmetal-models/      # LLM architectures
 ├── pmetal-lora/        # LoRA/QLoRA implementations
 ├── pmetal-trainer/     # Training loops (SFT, DPO, GRPO, etc.)

@@ -14,9 +14,9 @@ PMetal is a Rust workspace of 20 crates:
 | `pmetal` | CLI binary, TUI, inference runner, and the umbrella library |
 | `pmetal-core` | Foundation: configs, traits, types, error handling, job specs |
 | `pmetal-core-derive` | Derive macros for the core traits |
-| `pmetal-runtime` | C++ FFI bridge to MLX |
+| `pmetal-runtime` | Tensor runtime: arrays, ops, native engines, memory figures |
 | `pmetal-metal` | Custom Metal GPU kernels + ANE runtime |
-| `pmetal-mlx` | MLX backend integration, KV caches, quantization |
+| `pmetal-cache` | KV caches, prefix reuse, speculative-decoding state |
 | `pmetal-models` | LLM architectures (Llama, Qwen, DeepSeek, Gemma, etc.) |
 | `pmetal-lora` | LoRA/QLoRA training implementations |
 | `pmetal-trainer` | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO) |

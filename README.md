@@ -355,11 +355,11 @@ PMetal is organized as a Rust workspace with 20 specialized crates:
 
 ```text
 pmetal/
-├── pmetal-runtime       # Zero-allocation MLX C++ bridge (inline array FFI)
+├── pmetal-runtime       # Tensor runtime: arrays, ops (attention, RoPE, loss), native engines
 ├── pmetal-core         # Foundation: configs, traits, types, error handling
 ├── pmetal-core-derive  # Derive macros for the core traits
 ├── pmetal-metal        # Custom Metal GPU kernels + ANE runtime
-├── pmetal-mlx          # MLX backend integration (KV cache, RoPE, etc.)
+├── pmetal-cache        # KV caches, prefix reuse, speculative-decoding state
 ├── pmetal-models       # LLM architectures (Llama, Qwen, DeepSeek, etc.)
 ├── pmetal-lora         # LoRA/QLoRA training implementations
 ├── pmetal-trainer      # Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, etc.)
@@ -676,7 +676,8 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `gguf` | Yes* | `pmetal-gguf` | GGUF format support |
 | `metal` | Yes* | `pmetal-metal` | Metal GPU kernels |
 | `hub` | Yes* | `pmetal-hub` | HuggingFace Hub integration |
-| `mlx` | Yes* | `pmetal-mlx` | MLX backend |
+| `runtime` | Yes* | `pmetal-runtime` | Tensor runtime: arrays, ops, native engines |
+| `cache` | Yes* | `pmetal-cache` | KV caches, prefix reuse, speculative-decoding state |
 | `models` | Yes* | `pmetal-models` | LLM architectures |
 | `lora` | Yes | `pmetal-lora` | LoRA/QLoRA |
 | `trainer` | Yes | `pmetal-trainer` | Training loops (pulls in `data`, `distill`) |
@@ -686,7 +687,7 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `distributed` | Yes | `pmetal-distributed` | Distributed training and the `cluster` subcommand |
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
-| `native-only` | No | `pmetal-runtime` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
+| `native-only` | No | `pmetal-runtime` | Bridge-only build, without `pmetal-cache` or `pmetal-models` |
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | No | `pmetal-serve` | OpenAI- and Anthropic-compatible inference server |

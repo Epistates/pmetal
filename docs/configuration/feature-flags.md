@@ -16,7 +16,8 @@ Entries marked `Yes*` are not listed in `default` but arrive through one of thos
 | `gguf` | Yes* | `pmetal-gguf` | GGUF format support |
 | `metal` | Yes* | `pmetal-metal` | Metal GPU kernels |
 | `hub` | Yes* | `pmetal-hub` | HuggingFace Hub integration |
-| `mlx` | Yes* | `pmetal-mlx` | MLX backend |
+| `runtime` | Yes* | `pmetal-runtime` | Tensor runtime: arrays, ops, native engines |
+| `cache` | Yes* | `pmetal-cache` | KV caches, prefix reuse, speculative-decoding state |
 | `models` | Yes* | `pmetal-models` | LLM architectures |
 | `lora` | Yes | `pmetal-lora` | LoRA/QLoRA |
 | `trainer` | Yes | `pmetal-trainer` | Training loops (pulls in `data`, `distill`) |
@@ -26,7 +27,7 @@ Entries marked `Yes*` are not listed in `default` but arrive through one of thos
 | `distributed` | Yes | `pmetal-distributed` | Distributed training and `pmetal cluster` |
 | `ane` | Yes | — | Apple Neural Engine |
 | `dashboard` | Yes | — | TUI control center |
-| `native-only` | **No** | `pmetal-runtime` | Bridge-only build, without `pmetal-mlx` or `pmetal-models` |
+| `native-only` | **No** | `pmetal-runtime` | Bridge-only build, without `pmetal-cache` or `pmetal-models` |
 | `vocoder` | **No** | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | **No** | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | **No** | `pmetal-serve` | OpenAI-compatible inference server (`pmetal serve`) |
