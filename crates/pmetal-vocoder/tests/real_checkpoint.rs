@@ -9,6 +9,7 @@
 mod common;
 
 use common::{Fixture, assert_runtime_ok, max_abs_diff, to_vec};
+use pmetal_runtime::compat::Dtype;
 use pmetal_vocoder::BigVGAN;
 use std::path::PathBuf;
 
@@ -19,14 +20,27 @@ fn model_dir(name: &str) -> Option<PathBuf> {
 }
 
 fn check(name: &str, max_diff: f32, min_snr_db: f32) {
+    check_dtype(name, None, max_diff, min_snr_db);
+}
+
+/// Synthesise with the model cast to `dtype` (float32 when `None`) and compare
+/// with the reference's float32 waveform.
+fn check_dtype(name: &str, dtype: Option<Dtype>, max_diff: f32, min_snr_db: f32) {
     let Some(dir) = model_dir(name) else {
         eprintln!("BIGVGAN_CHECKPOINT_DIR/{name} not found; skipping");
         return;
     };
-    let model = BigVGAN::from_dir(&dir).expect("load the released checkpoint");
+    // `from_dir` loads weights and prepares the fused inference path.
+    let mut model = BigVGAN::from_dir(&dir).expect("load the released checkpoint");
     let fx = Fixture::load_path(&dir.join("ref.safetensors"));
+    let mut mel = fx.array("mel");
+    if let Some(dtype) = dtype {
+        model.to_dtype(dtype);
+        model.prepare_for_inference();
+        mel = mel.as_dtype(dtype);
+    }
 
-    let audio = model.forward(&fx.array("mel")).expect("forward");
+    let audio = model.forward(&mel).expect("forward");
     assert_eq!(audio.shape(), fx.shape("audio"));
     let got = to_vec(&audio);
     let expected = fx.values("audio");
@@ -101,4 +115,13 @@ fn bigvgan_base_24khz_matches_reference() {
 #[ignore = "needs a downloaded checkpoint (see the module docs)"]
 fn bigvgan_v2_24khz_matches_reference() {
     check("v2_24", 2e-4, 70.0);
+}
+
+/// Half precision costs rounding noise, not artefacts: the waveform stays
+/// within a few percent of the float32 one.
+#[test]
+#[ignore = "needs a downloaded checkpoint (see the module docs)"]
+fn bigvgan_v2_24khz_in_half_precision_tracks_the_reference() {
+    check_dtype("v2_24", Some(Dtype::Float16), 5e-2, 30.0);
+    check_dtype("v2_24", Some(Dtype::Bfloat16), 2e-1, 20.0);
 }

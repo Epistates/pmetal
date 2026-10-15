@@ -36,7 +36,7 @@ impl BigVGAN {
             })?;
         let mut model = Self::new(config)?;
         model.load_weights(&weights)?;
-        model.fuse_weight_norm();
+        model.prepare_for_inference();
         Ok(model)
     }
 

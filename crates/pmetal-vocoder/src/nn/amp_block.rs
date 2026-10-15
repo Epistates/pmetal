@@ -140,6 +140,13 @@ impl AMPBlock {
         self.convs2.iter_mut().for_each(Conv1d::fuse);
     }
 
+    /// Switch every activation to the fused inference kernel (no gradient).
+    pub fn prepare_inference(&mut self) {
+        self.activations
+            .iter_mut()
+            .for_each(Activation1d::prepare_inference);
+    }
+
     /// Cast parameters to `dtype`.
     pub fn cast(&mut self, dtype: Dtype) {
         self.convs1.iter_mut().for_each(|c| c.cast(dtype));

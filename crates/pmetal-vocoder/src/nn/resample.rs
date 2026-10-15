@@ -114,6 +114,11 @@ impl UpSample1d {
         self.ratio
     }
 
+    /// `(ratio, kernel_size, replicate_pad, trim_left)`.
+    pub(crate) fn geometry(&self) -> (i32, i32, i32, i32) {
+        (self.ratio, self.kernel_size, self.pad, self.pad_left)
+    }
+
     /// How many input samples on each side an output sample can depend on.
     pub fn input_reach(&self) -> i32 {
         // An output sample reads `ceil(kernel / ratio)` padded input samples;
@@ -207,6 +212,11 @@ impl DownSample1d {
             weight: depthwise_weight(&taps, channels),
             taps,
         })
+    }
+
+    /// `(ratio, kernel_size, pad_left, pad_right)`.
+    pub(crate) fn geometry(&self) -> (i32, i32, i32, i32) {
+        (self.ratio, self.kernel_size, self.pad_left, self.pad_right)
     }
 
     /// How many input samples on each side an output sample can depend on,

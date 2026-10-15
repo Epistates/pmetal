@@ -192,6 +192,20 @@ impl BigVGAN {
         self.conv_post.fuse();
     }
 
+    /// Get the model ready for fast synthesis: fold weight normalisation into
+    /// the weights ([`fuse_weight_norm`](Self::fuse_weight_norm)) and run every
+    /// anti-aliased activation as one fused GPU kernel. Neither can be
+    /// differentiated, so this is for inference; call it after the final
+    /// [`to_dtype`](Self::to_dtype) and weight loading (either drops the fused
+    /// kernels again).
+    pub fn prepare_for_inference(&mut self) {
+        self.fuse_weight_norm();
+        self.resblocks
+            .iter_mut()
+            .for_each(AMPBlock::prepare_inference);
+        self.activation_post.prepare_inference();
+    }
+
     /// Cast every parameter to `dtype`. The periodic activations always
     /// compute in float32 internally; convolutions run in `dtype`.
     pub fn to_dtype(&mut self, dtype: Dtype) {

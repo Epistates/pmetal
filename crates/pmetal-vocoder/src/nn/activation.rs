@@ -5,6 +5,7 @@
 //! Activations here are channels-last, `[batch, time, channels]`, with one
 //! learnable parameter per channel.
 
+use super::fused::{self, FusedParams, Geometry};
 use super::resample::{DownSample1d, UpSample1d};
 use super::weight_norm::{StateDict, impl_no_linears, join_key};
 use crate::config::ActivationType;
@@ -162,6 +163,24 @@ impl PeriodicActivation {
         }
     }
 
+    /// The constants the fused kernel needs, in float32: the effective
+    /// `alpha` and `1 / (denominator + eps)` per channel.
+    pub(crate) fn inference_constants(&self) -> (Array, Array) {
+        let eps = Array::from_f32(NO_DIV_BY_ZERO);
+        let f32_of = |p: &Param<Array>| p.value.as_dtype(Dtype::Float32);
+        let (alpha, denominator) = match self {
+            Self::Snake(a) => {
+                let alpha = effective(&f32_of(&a.alpha), a.alpha_logscale);
+                (alpha.clone(), alpha)
+            }
+            Self::SnakeBeta(a) => (
+                effective(&f32_of(&a.alpha), a.logscale),
+                effective(&f32_of(&a.beta), a.logscale),
+            ),
+        };
+        (alpha, Array::from_f32(1.0).divide(&denominator.add(&eps)))
+    }
+
     /// Cast parameters to `dtype`.
     pub fn cast(&mut self, dtype: Dtype) {
         let params: Vec<&mut Param<Array>> = match self {
@@ -238,6 +257,8 @@ pub struct Activation1d {
     pub upsample: UpSample1d,
     /// Low-pass decimator.
     pub downsample: DownSample1d,
+    /// Constants for the fused inference kernel, once prepared.
+    fused: Option<FusedParams>,
 }
 
 impl Activation1d {
@@ -259,14 +280,76 @@ impl Activation1d {
             upsample: UpSample1d::new(up_ratio, up_kernel_size, channels)?,
             downsample: DownSample1d::new(down_ratio, down_kernel_size, channels)?,
             act,
+            fused: None,
         })
     }
 
     /// Apply to `[batch, time, channels]`.
+    ///
+    /// After [`prepare_inference`](Self::prepare_inference) this runs as one
+    /// fused GPU kernel (no gradient); before it, as separate differentiable ops.
     pub fn forward(&self, x: &Array) -> Result<Array> {
+        if let Some(fused) = &self.fused {
+            if x.ndim() != 3 || x.dim(2) != self.act.channels() {
+                return Err(VocoderError::ShapeMismatch {
+                    expected: vec![-1, -1, self.act.channels()],
+                    actual: x.shape().to_vec(),
+                });
+            }
+            if matches!(x.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16) {
+                return fused::anti_alias_activation(x, fused);
+            }
+        }
         let up = self.upsample.forward(x)?;
         let activated = self.act.forward(&up)?;
         self.downsample.forward(&activated)
+    }
+
+    /// Switch to the fused inference kernel, with the parameters as they are
+    /// now. The kernel has no gradient and does not see later changes to the
+    /// activation's parameters or the filters; any such change (loading,
+    /// casting, [`unprepare`](Self::unprepare)) drops back to the op path.
+    pub fn prepare_inference(&mut self) {
+        let (alpha, inv_den) = self.act.inference_constants();
+        let (up_ratio, up_kernel, up_pad, up_pad_left) = self.upsample.geometry();
+        let (down_ratio, down_kernel, down_pad_left, down_pad_right) = self.downsample.geometry();
+        let scale = up_ratio as f32;
+        let up_taps: Vec<f32> = self.upsample.taps().iter().map(|t| t * scale).collect();
+        let fused = FusedParams {
+            geometry: Geometry {
+                up_ratio,
+                down_ratio,
+                up_kernel,
+                down_kernel,
+                up_pad,
+                up_pad_left,
+                down_pad_left,
+                down_pad_right,
+            },
+            alpha,
+            inv_den,
+            up_taps: Array::from_f32_slice(&up_taps, &[up_kernel]),
+            down_taps: Array::from_f32_slice(self.downsample.taps(), &[down_kernel]),
+        };
+        for a in [
+            &fused.alpha,
+            &fused.inv_den,
+            &fused.up_taps,
+            &fused.down_taps,
+        ] {
+            a.eval();
+        }
+        self.fused = Some(fused);
+    }
+
+    /// Return to the differentiable op path.
+    pub fn unprepare(&mut self) {
+        self.fused = None;
+    }
+
+    /// Whether the fused kernel is in use.
+    pub fn is_prepared(&self) -> bool {
+        self.fused.is_some()
     }
 
     /// How many input samples on each side an output sample can depend on:
@@ -277,6 +360,7 @@ impl Activation1d {
 
     /// Cast parameters to `dtype`.
     pub fn cast(&mut self, dtype: Dtype) {
+        self.fused = None;
         self.act.cast(dtype);
     }
 
@@ -286,6 +370,7 @@ impl Activation1d {
     /// function of the ratio and kernel size, so a checkpoint that lacks them
     /// is fine, and one that has them must agree on the length.
     pub fn load_state(&mut self, sd: &mut StateDict, prefix: &str) -> Result<()> {
+        self.fused = None;
         self.act.load_state(sd, &join_key(prefix, "act"))?;
         let up_key = join_key(prefix, "upsample.filter");
         if let Some(f) = sd.take_opt(&up_key) {

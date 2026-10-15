@@ -10,6 +10,7 @@ mod activation;
 mod amp_block;
 mod conv;
 pub mod filter;
+mod fused;
 mod overlap;
 mod resample;
 mod weight_norm;
