@@ -4,9 +4,10 @@
 //!
 //! 1. [`crate::rows`] streams the file's rows (JSONL, JSON, Parquet, Arrow,
 //!    CSV; a directory is its train split's shards);
-//! 2. [`format`] reads a row as a document, a prompt and completion, or a
-//!    conversation, by the format named or detected from its columns;
-//! 3. [`render`] turns that into text and tokens, with the loss mask decided
+//! 2. `format` reads a row as a document, a prompt and completion, or a
+//!    conversation, by the [`DatasetFormat`] named or detected from its
+//!    columns;
+//! 3. `render` turns that into text and tokens, with the loss mask decided
 //!    in bytes of the text and carried to the tokens by their offsets.
 //!
 //! [`TrainingDataset::load`] runs all three over bounded chunks of rows, the

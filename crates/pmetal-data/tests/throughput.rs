@@ -94,7 +94,11 @@ fn reading_and_loading_throughput() {
 
     for (name, path) in [("jsonl", &jsonl), ("parquet", &parquet)] {
         let start = Instant::now();
-        let n = RowReader::open(path).unwrap().map(|r| r.unwrap()).count();
+        let n = RowReader::open(path)
+            .unwrap()
+            .filter(|row| row.is_ok())
+            .count();
+        assert_eq!(n, rows);
         let secs = start.elapsed().as_secs_f64();
         println!(
             "read {name}: {n} rows in {secs:.2}s ({:.0} rows/s)",

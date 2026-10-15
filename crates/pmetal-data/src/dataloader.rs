@@ -855,11 +855,8 @@ mod tests {
     #[test]
     fn a_sample_with_two_images_is_refused_by_the_single_image_loader() {
         use crate::image_processing::{FixedSizeImageProcessor, FixedSizeImageProcessorConfig};
-        let sample = Sample::with_images(
-            vec![1, 2],
-            vec![1, 2],
-            vec!["a.png".into(), "b.png".into()],
-        );
+        let sample =
+            Sample::with_images(vec![1, 2], vec![1, 2], vec!["a.png".into(), "b.png".into()]);
         let mut l = DataLoader::new(
             TrainingDataset::from_samples(vec![sample]),
             DataLoaderConfig::default(),
