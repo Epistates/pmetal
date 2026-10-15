@@ -599,7 +599,10 @@ fn gemma4_module_port_cached_decode_matches_the_full_forward() {
         ),
     ] {
         let ids = input_ids_from_shard(&load_shard(&fixture_path(reference)));
-        let tokens: Vec<i32> = to_f32_vec_eval(&ids).into_iter().map(|v| v as i32).collect();
+        let tokens: Vec<i32> = to_f32_vec_eval(&ids)
+            .into_iter()
+            .map(|v| v as i32)
+            .collect();
         let t = tokens.len();
         let mut model = build_model(config_json, weights);
         let want = model.forward(&ids, None).expect("full forward");
@@ -632,7 +635,10 @@ fn gemma4_module_port_cached_decode_matches_the_full_forward() {
         );
         println!("\n== Gemma 4 module port cached decode, {label} ==");
         print_report_table(std::slice::from_ref(&report));
-        assert!(report.passed(), "{label}: cached decode is off the full forward");
+        assert!(
+            report.passed(),
+            "{label}: cached decode is off the full forward"
+        );
     }
 }
 

@@ -610,6 +610,75 @@ fn sink_attention_step_against_plain_ops() {
     }
 }
 
+/// Sliding-window attention over a long sequence goes block by block, and
+/// gives the output and the gradients of the same attention under the full
+/// `[L, L]` band mask (a custom mask takes the unblocked path), with and
+/// without logit softcapping, on a length that leaves a short last block.
+#[test]
+#[serial]
+fn blocked_sliding_attention_is_the_masked_attention() {
+    use crate::compat::nn::value_and_grad_explicit;
+    use crate::compat::random;
+    let (heads, kv_heads, head_dim, len, window) = (4, 2, 32, 1100, 256);
+    random::seed(17);
+    let draw = |h: i32| random::normal(&[1, h, len, head_dim], Dtype::Float32);
+    let (q, k, v) = (draw(heads), draw(kv_heads), draw(kv_heads));
+    let probe = random::normal(&[1, heads, len, head_dim], Dtype::Float32);
+    let band = create_sliding_window_mask(len, len, window).unwrap();
+    for softcap in [None, Some(30.0)] {
+        let mut config = FusedAttentionConfig::new(heads, kv_heads, head_dim)
+            .with_scale(0.25)
+            .with_mask_type(AttentionMaskType::SlidingWindow(window));
+        if let Some(cap) = softcap {
+            config = config.with_logit_softcapping(cap);
+        }
+        let run = |mask: Option<&Array>| {
+            let (loss, grads) = value_and_grad_explicit(
+                |a: &[Array]| {
+                    fused_sdpa(&a[0], &a[1], &a[2], &config, mask)
+                        .unwrap()
+                        .multiply(&probe)
+                        .sum_all()
+                },
+                &[q.clone(), k.clone(), v.clone()],
+                &[],
+            )
+            .unwrap();
+            let out = fused_sdpa(&q, &k, &v, &config, mask).unwrap();
+            drain();
+            (
+                vec_of(&out),
+                vec_of(&loss),
+                grads.iter().map(vec_of).collect::<Vec<_>>(),
+            )
+        };
+        let (blocked, blocked_loss, blocked_grads) = run(None);
+        let (full, full_loss, full_grads) = run(Some(&band));
+        assert_close(
+            &format!("output (softcap {softcap:?})"),
+            &blocked,
+            &full,
+            1e-4,
+        );
+        assert_close(
+            &format!("loss (softcap {softcap:?})"),
+            &blocked_loss,
+            &full_loss,
+            1e-4,
+        );
+        for (name, (got, want)) in ["dq", "dk", "dv"]
+            .iter()
+            .zip(blocked_grads.iter().zip(&full_grads))
+        {
+            assert!(
+                max_abs(want) > 0.0,
+                "{name}: the reference gradient is zero"
+            );
+            assert_close(&format!("{name} (softcap {softcap:?})"), got, want, 1e-3);
+        }
+    }
+}
+
 /// A training step's worth of sliding-window attention (forward and backward,
 /// bf16, a Gemma 4 sliding layer's 16 query heads over 8 key heads of width
 /// 256 and window 1024) against full causal attention at the same length. Time

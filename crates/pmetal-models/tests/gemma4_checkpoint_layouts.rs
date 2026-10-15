@@ -91,7 +91,10 @@ fn mlx_checkpoints(config_json: &str, weights: &str, reference: &str) -> Checkpo
                 split(half, 2 * half),
             );
         } else if let Some(layer) = key.strip_suffix(".experts.down_proj") {
-            tensors.insert(format!("{layer}.experts.switch_glu.down_proj.weight"), w.clone());
+            tensors.insert(
+                format!("{layer}.experts.switch_glu.down_proj.weight"),
+                w.clone(),
+            );
         } else {
             tensors.insert(key, w.clone());
         }

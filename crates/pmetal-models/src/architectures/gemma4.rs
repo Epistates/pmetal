@@ -1920,8 +1920,12 @@ pub fn load_gemma4_weights(
         optional.insert(format!("{prefix}.layer_scalar"));
         if layer.kv_shared_source_layer.is_some() {
             optional.extend(
-                ["self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"]
-                    .map(|name| format!("{prefix}.{name}")),
+                [
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                    "self_attn.k_norm.weight",
+                ]
+                .map(|name| format!("{prefix}.{name}")),
             );
         }
 
@@ -2103,7 +2107,10 @@ pub fn load_gemma4_weights(
         )));
     }
     let unclaimed = weights.unclaimed();
-    if let Some(stray) = unclaimed.iter().find(|key| key.starts_with("model.layers.")) {
+    if let Some(stray) = unclaimed
+        .iter()
+        .find(|key| key.starts_with("model.layers."))
+    {
         return Err(Exception::custom(format!(
             "Gemma 4: {} checkpoint tensor(s) have no place in the model, first: {stray:?}; \
              this layout is not one the loader understands",
@@ -2568,7 +2575,10 @@ mod moe_tests {
                     .zip(&alone_logits)
                     .map(|(g, w)| (g - w).abs())
                     .fold(0.0f32, |m, d| if d.is_nan() { f32::NAN } else { m.max(d) });
-                assert!(worst < 1e-3, "moe={moe}: a packed sequence is off by {worst}");
+                assert!(
+                    worst < 1e-3,
+                    "moe={moe}: a packed sequence is off by {worst}"
+                );
             }
             pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
         }
@@ -2662,7 +2672,11 @@ mod moe_tests {
         assert_eq!(shared, [2, 3]);
         let mut weights = own_tensors(&model);
         for i in shared {
-            for name in ["self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"] {
+            for name in [
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.k_norm.weight",
+            ] {
                 weights.remove(&format!("model.layers.{i}.{name}"));
             }
         }
@@ -2690,12 +2704,23 @@ mod moe_tests {
         }
         load_gemma4_weights(&mut model, &weights).expect("stacked experts load");
 
-        let fused = model.model.layers[1].moe.as_ref().unwrap().experts.gate_up_proj.as_ref();
+        let fused = model.model.layers[1]
+            .moe
+            .as_ref()
+            .unwrap()
+            .experts
+            .gate_up_proj
+            .as_ref();
         assert_eq!(fused.shape(), &[e, 2 * i, h]);
         let want = ops::concatenate_axis(&[&gate, &up], 1);
         assert_eq!(max_abs_diff(fused, &want, (e * 2 * i * h) as usize), 0.0);
-        let down_loaded = model.model.layers[0].moe.as_ref().unwrap().experts.down_proj.as_ref();
+        let down_loaded = model.model.layers[0]
+            .moe
+            .as_ref()
+            .unwrap()
+            .experts
+            .down_proj
+            .as_ref();
         assert_eq!(max_abs_diff(down_loaded, &down, (e * h * i) as usize), 0.0);
     }
 }
-

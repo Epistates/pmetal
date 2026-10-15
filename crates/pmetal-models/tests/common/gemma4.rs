@@ -132,4 +132,3 @@ pub fn shared_synthetic_config_json() -> &'static str {
         "enable_moe_block": false
     }"#
 }
-

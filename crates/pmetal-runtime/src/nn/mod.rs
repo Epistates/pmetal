@@ -63,7 +63,9 @@ mod softcap_tests {
     /// inputs far past the point where a hand-expanded tanh overflows.
     #[test]
     fn softcap_matches_f64_and_keeps_the_dtype() {
-        let xs = [-1.0e4f32, -90.0, -30.0, -1.5, 0.0, 0.25, 7.0, 30.0, 1.3e3, 1.0e4];
+        let xs = [
+            -1.0e4f32, -90.0, -30.0, -1.5, 0.0, 0.25, 7.0, 30.0, 1.3e3, 1.0e4,
+        ];
         let cap = 30.0f32;
         let want: Vec<f64> = xs
             .iter()
@@ -73,7 +75,10 @@ mod softcap_tests {
             let x = Array::from_f32_slice(&xs, &[xs.len() as i32]).as_dtype(dtype.as_i32());
             let y = softcap(&x, cap);
             assert_eq!(y.dtype(), dtype, "a {dtype:?} head stays {dtype:?}");
-            let got = y.as_dtype(Dtype::Float32.as_i32()).to_f32_vec(xs.len()).unwrap();
+            let got = y
+                .as_dtype(Dtype::Float32.as_i32())
+                .to_f32_vec(xs.len())
+                .unwrap();
             crate::check_unobserved_error().expect("a runtime op threw");
             for ((x, got), want) in xs.iter().zip(&got).zip(&want) {
                 assert!(got.is_finite(), "softcap({x}) = {got}");

@@ -1425,7 +1425,11 @@ mod tests {
             rope_local_base_freq: Some(10_000.0),
             ..small_config()
         };
-        for (label, config) in [("gemma", small_config()), ("gemma2", gemma2), ("gemma3", gemma3)] {
+        for (label, config) in [
+            ("gemma", small_config()),
+            ("gemma2", gemma2),
+            ("gemma3", gemma3),
+        ] {
             let mut model = GemmaForCausalLM::new(config).unwrap();
             for (_, p) in model.flatten_params_mut() {
                 let w = random::uniform_range(-0.3, 0.3, p.shape(), Dtype::Float32);

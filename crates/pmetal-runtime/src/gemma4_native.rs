@@ -2612,18 +2612,44 @@ mod tests {
         );
         let o_w = dense(&[n_heads * head_dim, hidden_size]);
         let ones = |n: i32| InlineArray::ones(&[n], bf16);
-        let (in_norm, q_norm, k_norm, post_norm) =
-            (ones(hidden_size), ones(head_dim), ones(head_dim), ones(hidden_size));
+        let (in_norm, q_norm, k_norm, post_norm) = (
+            ones(hidden_size),
+            ones(head_dim),
+            ones(head_dim),
+            ones(hidden_size),
+        );
         let x = rand(&[1, 1, hidden_size]);
         let run = |capacity: i32| -> Vec<f32> {
             let keys = rand(&[1, n_kv, capacity, head_dim]);
             let values = rand(&[1, n_kv, capacity, head_dim]);
             let (out, _, _) = InlineArray::compiled_gemma4_attn_block(
-                &x, &in_norm, &q_w, &k_w, Some(&v_w), &o_w, &q_norm, &k_norm, &post_norm, None,
-                &keys, &values, capacity / 2, 0, n_heads, n_kv, head_dim, 1e-6, 1e-6, 1e-6, 0,
-                10000.0, head_dim,
+                &x,
+                &in_norm,
+                &q_w,
+                &k_w,
+                Some(&v_w),
+                &o_w,
+                &q_norm,
+                &k_norm,
+                &post_norm,
+                None,
+                &keys,
+                &values,
+                capacity / 2,
+                0,
+                n_heads,
+                n_kv,
+                head_dim,
+                1e-6,
+                1e-6,
+                1e-6,
+                0,
+                10000.0,
+                head_dim,
             );
-            out.as_dtype(Dtype::Float32.as_i32()).to_f32_vec(hidden_size as usize).unwrap()
+            out.as_dtype(Dtype::Float32.as_i32())
+                .to_f32_vec(hidden_size as usize)
+                .unwrap()
         };
         // The same cache contents on every call at one capacity.
         random::seed(7);
