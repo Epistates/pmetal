@@ -14,24 +14,8 @@
 //! 7. End encoding.
 //! 8. Commit the command buffer.
 //!
-//! # Metal 4 lifecycle migration note
-//!
-//! All callers currently use the Metal 3 command-buffer path (step 2 above).
-//! When Metal 4 command buffers are runtime-tested on M5, replace the creation
-//! block marked `TODO(metal4-lifecycle)` with:
-//!
-//! ```text
-//! // TODO(metal4-lifecycle): When Metal4CommandBuffer is runtime-tested on M5,
-//! // replace the command buffer creation below with:
-//! //   let mut cb = Metal4CommandBuffer::new(device, pool)?;
-//! //   cb.begin()?;
-//! //   let encoder = cb.encoder()?;
-//! //   ... bind + dispatch ...
-//! //   cb.end_and_commit(queue)?;
-//! ```
-//!
-//! That is a one-line change per call site because the binding closure and grid
-//! arguments are unchanged.
+//! The MPP kernels are ordinary compute pipelines from the Metal 4 shader
+//! library, encoded on the context's regular command queue.
 
 use std::collections::HashMap;
 
@@ -65,9 +49,9 @@ use crate::{
 ///
 /// # Availability
 ///
-/// Callers are responsible for checking `is_available()` (NAX + Metal 4 library
-/// present) before calling this function. Calling without the Metal 4 library
-/// loaded will return `Err(MetalError::LibraryLoad(...))`.
+/// Callers are responsible for checking [`MetalContext::supports_mpp`] before
+/// calling this function. Calling without the Metal 4 library loaded will
+/// return `Err(MetalError::LibraryLoad(...))`.
 pub(crate) fn encode_mpp_kernel(
     ctx: &MetalContext,
     kernel_name: &str,
@@ -85,28 +69,26 @@ pub(crate) fn encode_mpp_kernel(
         cache.get_or_create_metal4_pipeline(ctx.device(), kernel_name, &constants)?
     };
 
-    // TODO(metal4-lifecycle): When Metal4CommandBuffer is runtime-tested on M5,
-    // replace the three lines below with:
-    //   let mut cb = Metal4CommandBuffer::new(ctx.device(), pool)?;
-    //   cb.begin()?;
-    //   let encoder = cb.encoder()?;
-    // and replace `command_buffer.commit()` at the end with:
-    //   cb.end_and_commit(ctx.command_queue())?;
-    let command_buffer = ctx
-        .command_queue()
-        .commandBuffer()
-        .ok_or(MetalError::CommandBufferCreation)?;
-    let encoder = command_buffer
-        .computeCommandEncoder()
-        .ok_or(MetalError::EncoderCreation)?;
+    // The encoder is autoreleased; scoping a pool around it releases it when
+    // encoding ends rather than when the calling thread exits. The returned
+    // command buffer is retained, so it outlives the pool.
+    objc2::rc::autoreleasepool(|_| {
+        let command_buffer = ctx
+            .command_queue()
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
 
-    encoder.setComputePipelineState(&pipeline);
+        encoder.setComputePipelineState(&pipeline);
 
-    bind_buffers(&encoder);
+        bind_buffers(&encoder);
 
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup_size);
-    encoder.endEncoding();
-    command_buffer.commit();
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup_size);
+        encoder.endEncoding();
+        command_buffer.commit();
 
-    Ok(command_buffer)
+        Ok(command_buffer)
+    })
 }

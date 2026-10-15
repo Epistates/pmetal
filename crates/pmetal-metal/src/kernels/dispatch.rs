@@ -80,6 +80,20 @@ pub fn dispatch_simple_kernel(
     grid_size: MTLSize,
     thread_group_size: Option<MTLSize>,
 ) -> Result<()> {
+    // Metal hands back the command buffer and encoder autoreleased; a thread
+    // with no pool of its own would hold them until it exits.
+    objc2::rc::autoreleasepool(|_| {
+        dispatch_in_pool(ctx, kernel_name, buffers, grid_size, thread_group_size)
+    })
+}
+
+fn dispatch_in_pool(
+    ctx: &MetalContext,
+    kernel_name: &str,
+    buffers: &[&MetalBufferRef],
+    grid_size: MTLSize,
+    thread_group_size: Option<MTLSize>,
+) -> Result<()> {
     // (a) Pipeline
     let pipeline = {
         let mut cache = ctx.pipeline_cache_mut();
@@ -125,6 +139,11 @@ pub fn dispatch_simple_kernel(
     command_buffer.commit();
     command_buffer.waitUntilCompleted();
 
+    // A command buffer that the GPU failed is not a result.
+    if let Some(error) = command_buffer.error() {
+        return Err(MetalError::ExecutionFailed(error.to_string()));
+    }
+
     Ok(())
 }
 
@@ -146,4 +165,60 @@ pub fn dispatch_linear_kernel(
         depth: 1,
     };
     dispatch_simple_kernel(ctx, kernel_name, buffers, grid_size, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::{BufferUsage, MetalBuffer};
+
+    /// Resident memory of this process, in KiB.
+    fn resident_kib() -> i64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ps prints a number")
+    }
+
+    /// A dispatch from a thread with no autorelease pool of its own (every
+    /// Rust thread) must not accumulate the command buffer and encoder Metal
+    /// hands back autoreleased: without a pool around the dispatch this grew
+    /// by about 1.8 KiB per call, forever.
+    #[test]
+    fn repeated_dispatches_do_not_accumulate_autoreleased_objects() {
+        let ctx = MetalContext::new().unwrap();
+        let n = 4096usize;
+        let input = MetalBuffer::<u8>::zeros(&ctx, n / 32 * 18, BufferUsage::Shared).unwrap();
+        let output = MetalBuffer::<f32>::zeros(&ctx, n, BufferUsage::Shared).unwrap();
+        let (input, output) = (input.as_retained(), output.as_retained());
+        let dispatch = || {
+            dispatch_linear_kernel(&ctx, "dequantize_q4_0", &[&input, &output], n).unwrap();
+        };
+
+        for _ in 0..200 {
+            dispatch();
+        }
+        let before = resident_kib();
+        for _ in 0..10_000 {
+            dispatch();
+        }
+        let growth_kib = resident_kib() - before;
+        assert!(
+            growth_kib < 6 * 1024,
+            "10k dispatches grew resident memory by {growth_kib} KiB"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_of_an_unknown_kernel_is_an_error() {
+        let ctx = MetalContext::new().unwrap();
+        let buffer = MetalBuffer::<f32>::zeros(&ctx, 4, BufferUsage::Shared).unwrap();
+        let buffer = buffer.as_retained();
+        let result = dispatch_linear_kernel(&ctx, "no_such_kernel", &[&buffer], 4);
+        assert!(matches!(result, Err(MetalError::FunctionNotFound(_))));
+    }
 }
