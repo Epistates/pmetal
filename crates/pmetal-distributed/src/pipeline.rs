@@ -227,8 +227,7 @@ pub fn solve_layer_assignment(
 /// token = argmax(logits[0, -1, :])
 /// ```
 ///
-/// This is the standard greedy decode step identical to what dnet's `generate_stream`
-/// loop does when `temperature=0`.
+/// This is the standard greedy decode step (temperature 0).
 ///
 /// [`generate_first_shard`]: PipelineGenerationLoop::generate_first_shard
 /// [`run_shard_loop`]: PipelineGenerationLoop::run_shard_loop

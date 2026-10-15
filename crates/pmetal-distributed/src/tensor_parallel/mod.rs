@@ -7,7 +7,8 @@
 //!
 //! # Sharding Pattern
 //!
-//! Following the Megatron-LM convention used by MLX:
+//! Following the column/row split of Shoeybi et al. (2019), "Megatron-LM: Training
+//! Multi-Billion Parameter Language Models Using Model Parallelism":
 //!
 //! - **AllToSharded** (column parallel): Weight `[output/N, input]`.
 //!   Each rank computes a slice of the output. No communication needed

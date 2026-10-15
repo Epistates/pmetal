@@ -276,7 +276,7 @@ pub fn plan_gdn(
 /// 2. **No `shared_expert_gate`** — DeepSeek's shared branch is always
 ///    mixed in without a gating scalar.
 /// 3. **Stacked routed experts live under `switch_mlp.*`** (the
-///    pmetal bridge loader rewrites `experts.{e}.{m}.weight` into
+///    pmetal runtime loader rewrites `experts.{e}.{m}.weight` into
 ///    `switch_mlp.{m}.weight` with leading axis 0 = expert). The plan
 ///    targets these stacked names so the expert dimension aligns with
 ///    [`ShardingDirective::ExpertSharded`].

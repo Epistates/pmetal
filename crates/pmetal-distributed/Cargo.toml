@@ -74,11 +74,11 @@ ordered-float = { workspace = true }
 # Local NIC enumeration for fabric detection (Thunderbolt / Ethernet / WiFi).
 if-addrs = { workspace = true }
 
-# MLX bridge (optional — gated behind mlx-collectives feature)
+# MLX runtime (optional — gated behind mlx-collectives feature)
 pmetal-runtime = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+# Fail every test at the runtime op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tempfile = { workspace = true }
 

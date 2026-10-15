@@ -1,6 +1,6 @@
 //! Distributed linear layer operations for tensor parallelism.
 //!
-//! Implements the two fundamental distributed linear patterns from Megatron-LM:
+//! Implements the two fundamental distributed linear patterns of Shoeybi et al. (2019):
 //!
 //! - **AllToSharded**: Column-parallel. Weight `[output/N, input]`.
 //!   Forward: `sum_gradients` → local matmul → sharded output.

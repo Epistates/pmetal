@@ -45,8 +45,8 @@ pub fn all_sum(x: &Array, g: Option<&DistributedGroup>) -> Result<Array, Excepti
 /// `x` unchanged, with its gradient summed over the group in the backward
 /// pass.
 ///
-/// This is Megatron's `f` operator, which tensor parallelism puts on the
-/// replicated input of a column-parallel layer: each rank's shard of the
+/// This is the operator tensor parallelism (Shoeybi et al., 2019, "Megatron-LM")
+/// puts on the replicated input of a column-parallel layer: each rank's shard of the
 /// weights sees all of `x`, so the true gradient of `x` is the sum of the
 /// gradients the ranks compute. Nothing is communicated in the forward pass.
 /// ([`all_sum`] differentiates as the identity, so it is not a substitute.)
