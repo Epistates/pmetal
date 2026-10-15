@@ -62,8 +62,9 @@ pub use error::{DistillError, Result};
 pub use losses::{
     AttentionTransferLoss, DistillLoss, GkdLoss, GreedySampler, HiddenStateLoss, HingeRankingLoss,
     JensenShannonLoss, JsdSkewedLoss, KlDivergenceLoss, LogisticRankingLoss, MiniLlmLoss,
-    MiniLlmOutput, MseLoss, OnPolicySampler, SkewKlLoss, SoftCrossEntropyLoss, SparseKlLoss,
-    TemperatureSampler, TvdLoss, UniversalLogitLoss,
+    MiniLlmOutput, MseLoss, OnPolicySampler, SampledTokenKl, SampledTokenKlOutput,
+    SampledTokenKlTarget, SkewKlLoss, SoftCrossEntropyLoss, SparseKlLoss, TemperatureSampler,
+    TvdLoss, UniversalLogitLoss,
 };
 pub use offline::{
     CacheMetadata, CompressedLogits, LogitCache, LogitCompressor, SparseLogits, SparseTargets,
