@@ -752,23 +752,85 @@ pub struct LmHead {
     pub softcap: Option<f32>,
 }
 
+/// What a cut cross-entropy loss computes besides the plain mean negative
+/// log-likelihood.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CceLoss {
+    /// Targets equal to this are not scored.
+    pub ignore_index: i32,
+    /// Smooth the target distribution toward uniform by this share, in
+    /// `[0, 1)`: `(1 - eps)(lse - z_y) + eps(lse - mean z)`, as PyTorch's
+    /// `label_smoothing` defines it.
+    pub label_smoothing: f32,
+    /// Add `weight * lse^2` to each token's loss (the z-loss that keeps the
+    /// softmax normaliser near 1), finite and non-negative.
+    pub z_loss: f32,
+}
+
+impl CceLoss {
+    /// The plain loss, skipping `ignore_index`.
+    pub const fn new(ignore_index: i32) -> Self {
+        Self {
+            ignore_index,
+            label_smoothing: 0.0,
+            z_loss: 0.0,
+        }
+    }
+
+    /// With label smoothing `epsilon`.
+    #[must_use]
+    pub const fn with_label_smoothing(mut self, epsilon: f32) -> Self {
+        self.label_smoothing = epsilon;
+        self
+    }
+
+    /// With z-loss `weight`.
+    #[must_use]
+    pub const fn with_z_loss(mut self, weight: f32) -> Self {
+        self.z_loss = weight;
+        self
+    }
+}
+
 impl LmHead {
-    /// Mean cross-entropy of `targets` (`[n]`, `ignore_index` skipped) under
-    /// the logits of `hidden` (`[n, hidden]`, or any leading shape that
-    /// flattens to it), computed a vocabulary chunk at a time.
+    /// Mean cross-entropy of `targets` (`[n]`, `loss.ignore_index` skipped)
+    /// under the logits of `hidden` (`[n, hidden]`, or any leading shape that
+    /// flattens to it), computed a vocabulary chunk at a time, with label
+    /// smoothing and z-loss as `loss` asks.
+    ///
+    /// # Errors
+    /// A label smoothing outside `[0, 1)` or a z-loss weight that is negative
+    /// or not finite, or the loss kernel failing.
     pub fn cut_cross_entropy(
         &self,
         hidden: &Array,
         targets: &Array,
-        ignore_index: i32,
+        loss: CceLoss,
     ) -> Result<Array, Exception> {
         use pmetal_runtime::nn::loss::{CutCrossEntropy, CutCrossEntropyConfig};
+
+        // The runtime's builders assert; a bad value from a config file is an
+        // error to report, not a panic.
+        if !(0.0..1.0).contains(&loss.label_smoothing) {
+            return Err(Exception::custom(format!(
+                "label smoothing must be in [0, 1), got {}",
+                loss.label_smoothing
+            )));
+        }
+        if !loss.z_loss.is_finite() || loss.z_loss < 0.0 {
+            return Err(Exception::custom(format!(
+                "z-loss weight must be finite and non-negative, got {}",
+                loss.z_loss
+            )));
+        }
 
         let width = hidden.dim(-1);
         let flat = hidden.reshape(&[-1, width]);
         let mut config = CutCrossEntropyConfig::new()
-            .with_ignore_index(ignore_index)
-            .with_logit_scale(self.logit_scale);
+            .with_ignore_index(loss.ignore_index)
+            .with_logit_scale(self.logit_scale)
+            .with_label_smoothing(loss.label_smoothing)
+            .with_z_loss(loss.z_loss);
         if let Some(cap) = self.softcap {
             config = config.with_softcap(cap);
         }

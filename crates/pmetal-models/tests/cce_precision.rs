@@ -83,7 +83,8 @@ fn loss(variant: &str, head: &LmHead, targets: &Array, h: &Array, w: &Array) -> 
         "cut cross-entropy" => {
             let mut head = head.clone();
             head.weight = w.clone();
-            head.cut_cross_entropy(h, targets, -100).expect("cce")
+            head.cut_cross_entropy(h, targets, pmetal_models::dispatcher::CceLoss::new(-100))
+                .expect("cce")
         }
         "cut cross-entropy, chunked" => {
             let mut config = CutCrossEntropyConfig::new().with_logit_scale(head.logit_scale);

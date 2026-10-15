@@ -171,7 +171,11 @@ pub(crate) fn compute_cce_loss<M: TrainableModel>(
     let seq_len = hidden_states.dim(1);
     let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
     let shift_labels = labels.index((.., 1..)).reshape(&[-1]);
-    head.cut_cross_entropy(&shift_hidden, &shift_labels, -100)
+    head.cut_cross_entropy(
+        &shift_hidden,
+        &shift_labels,
+        pmetal_models::dispatcher::CceLoss::new(-100),
+    )
 }
 
 /// Training step using Cut Cross-Entropy (avoids materializing the full logits tensor).
