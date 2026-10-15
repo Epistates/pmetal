@@ -5,7 +5,7 @@
 //! contribution by its Fisher value at every parameter position:
 //!
 //! ```text
-//! θ_merged = (Σ_i F_i ⊙ θ_i) / (Σ_i F_i + ε)
+//! θ_merged = (Σ_i λ_i (F_i + ε) ⊙ θ_i) / (Σ_i λ_i (F_i + ε))
 //! ```
 //!
 //! The diagonal Fisher captures parameter sensitivity to the per-model
@@ -25,8 +25,9 @@
 //!
 //! # Edge cases
 //!
-//! * All-zero `F_i` for some position: the `ε` ridge prevents division by
-//!   zero and the merged value reduces to a plain mean at that position.
+//! * All-zero `F_i` at some position: the `ε` floor on each Fisher value
+//!   keeps the denominator positive, and the merged value there is the plain
+//!   λ-weighted mean of the models.
 //! * Missing `fisher.safetensors`: `FisherMerge` errors out at the first
 //!   tensor it cannot resolve unless `fallback_to_mean` is set.
 //!
@@ -117,26 +118,43 @@ impl FisherMerge {
         Ok(Some(out))
     }
 
-    fn fisher_weighted_average(&self, tensors: &[Array], fishers: &[Array]) -> Result<Array> {
-        if tensors.len() != fishers.len() {
+    /// `Σ λ_i (F_i + ε) ⊙ θ_i / Σ λ_i (F_i + ε)`: the ε floor on every Fisher
+    /// value is what makes a position that no model has any information
+    /// about (all `F_i` zero) fall back to the λ-weighted mean instead of
+    /// to zero.
+    fn fisher_weighted_average(
+        &self,
+        tensors: &[Array],
+        fishers: &[Array],
+        lambdas: &[f32],
+    ) -> Result<Array> {
+        if tensors.len() != fishers.len() || tensors.len() != lambdas.len() {
             return Err(MergeError::InvalidConfig(format!(
-                "fisher count {} ≠ model count {}",
+                "fisher: {} models, {} Fisher tensors, {} weights",
+                tensors.len(),
                 fishers.len(),
-                tensors.len()
+                lambdas.len()
             )));
         }
 
-        // numerator = Σ F_i ⊙ θ_i, denominator = Σ F_i.
-        let mut num = tensors[0].multiply(&fishers[0]);
-        let mut den = fishers[0].clone();
-        for (t, f) in tensors[1..].iter().zip(&fishers[1..]) {
-            num = num.add(&t.multiply(f));
-            den = den.add(f);
+        let eps = Array::from_f32(self.eps);
+        let mut num: Option<Array> = None;
+        let mut den: Option<Array> = None;
+        for ((theta, fisher), &lambda) in tensors.iter().zip(fishers).zip(lambdas) {
+            let weight = fisher.add(&eps).multiply(&Array::from_f32(lambda));
+            let term = weight.multiply(theta);
+            num = Some(match num {
+                Some(n) => n.add(&term),
+                None => term,
+            });
+            den = Some(match den {
+                Some(d) => d.add(&weight),
+                None => weight,
+            });
         }
-        let safe_den = den.add(&Array::from_f32(self.eps));
-        Ok(num.divide(&safe_den))
+        let (num, den) = (num.expect("non-empty"), den.expect("non-empty"));
+        Ok(num.divide(&den))
     }
-
 }
 
 impl MergeMethod for FisherMerge {
@@ -182,7 +200,13 @@ impl MergeMethod for FisherMerge {
         let params: Vec<MergeParameters> = params.iter().map(|p| p.resolved(name)).collect();
         let global_params = &global_params.resolved(name);
         match self.try_load_fisher(name)? {
-            Some(fishers) => self.fisher_weighted_average(tensors, &fishers),
+            Some(fishers) => {
+                let lambdas: Vec<f32> = params
+                    .iter()
+                    .map(|p| global_params.merge_with(p).weight())
+                    .collect();
+                self.fisher_weighted_average(tensors, &fishers, &lambdas)
+            }
             None => LinearMerge::weighted_average(tensors, &params, global_params),
         }
     }
@@ -308,5 +332,65 @@ mod tests {
         for (got, expected) in v.iter().zip([5.0_f32, 5.0].iter()) {
             assert!((got - expected).abs() < 1e-4, "{} vs {}", got, expected);
         }
+    }
+
+    /// Where no model has any Fisher information the merge is the plain mean
+    /// of the models, not zero.
+    #[test]
+    fn positions_without_fisher_information_average_the_models() {
+        let workdir = tempfile::tempdir().unwrap();
+        let f_a = workdir.path().join("fisher_a");
+        let f_b = workdir.path().join("fisher_b");
+        // Column 0 has no information in either model; column 1 only in B.
+        write_fisher_safetensors(&f_a, &[("w", vec![0.0_f32, 0.0], vec![2])]);
+        write_fisher_safetensors(&f_b, &[("w", vec![0.0_f32, 5.0], vec![2])]);
+
+        let merge = FisherMerge::new(vec![f_a, f_b]);
+        let t1 = Array::from_f32_slice(&[2.0_f32, 2.0], &[2]);
+        let t2 = Array::from_f32_slice(&[4.0_f32, 4.0], &[2]);
+        let result = merge
+            .merge_named(
+                "w",
+                &[t1, t2],
+                None,
+                &[MergeParameters::default(), MergeParameters::default()],
+                &MergeParameters::default(),
+            )
+            .unwrap();
+        let v = crate::test_util::values(&result);
+        // (2 + 4) / 2 = 3 where F = 0; where only B is informed it takes over.
+        assert!((v[0] - 3.0).abs() < 1e-4, "got {}", v[0]);
+        assert!((v[1] - 4.0).abs() < 1e-3, "got {}", v[1]);
+    }
+
+    /// Model coefficients lambda_i scale each model's Fisher weight.
+    #[test]
+    fn model_weights_scale_the_fisher_terms() {
+        let workdir = tempfile::tempdir().unwrap();
+        let f_a = workdir.path().join("fisher_a");
+        let f_b = workdir.path().join("fisher_b");
+        write_fisher_safetensors(&f_a, &[("w", vec![1.0_f32], vec![1])]);
+        write_fisher_safetensors(&f_b, &[("w", vec![1.0_f32], vec![1])]);
+
+        let merge = FisherMerge::new(vec![f_a, f_b]).with_eps(0.0);
+        let weight = |w: f32| MergeParameters {
+            weight: Some(w.into()),
+            ..Default::default()
+        };
+        let result = merge
+            .merge_named(
+                "w",
+                &[
+                    Array::from_f32_slice(&[10.0_f32], &[1]),
+                    Array::from_f32_slice(&[0.0_f32], &[1]),
+                ],
+                None,
+                &[weight(3.0), weight(1.0)],
+                &MergeParameters::default(),
+            )
+            .unwrap();
+        // (3 * 1 * 10 + 1 * 1 * 0) / (3 + 1) = 7.5
+        let v = crate::test_util::values(&result);
+        assert!((v[0] - 7.5).abs() < 1e-5, "got {}", v[0]);
     }
 }

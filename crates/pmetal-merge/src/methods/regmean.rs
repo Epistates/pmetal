@@ -2,11 +2,16 @@
 //!
 //! For *linear-layer* weights, RegMean has a closed-form merge in terms of
 //! per-model Gram matrices `G_i = Xᵢᵀ Xᵢ`, where `Xᵢ` is the layer's input
-//! activations on a calibration set:
+//! activations on a calibration set. With the paper's `[in, out]` weights:
 //!
 //! ```text
-//! W_merged = (Σ_i G_i)⁻¹ · (Σ_i G_i Wᵢ)
+//! W_merged = (Σ_i G̃_i)⁻¹ · (Σ_i G̃_i Wᵢ)
 //! ```
+//!
+//! Checkpoints store the transpose, `[out, in]`, so the same merge reads
+//! `W = (Σ_i Wᵢ G̃_i)(Σ_i G̃_i)⁻¹`, which is what is computed. `G̃_i` is `G_i`
+//! with its off-diagonal entries scaled by `alpha` (the paper's 0.9), which
+//! shrinks the cross-feature terms toward plain averaging.
 //!
 //! Intuition: each model's weight matrix is locally optimal for its own
 //! input distribution; weighting by `G_i` makes the merged weights optimal
@@ -15,7 +20,7 @@
 //! For non-linear-shaped weights (norms, biases, embeddings) RegMean has
 //! no closed form, so this implementation falls back to a plain weighted
 //! mean for any tensor whose Gram matrix is missing or whose shape is not
-//! 2-D (`[in_features, out_features]`).
+//! 2-D (`[out_features, in_features]`).
 //!
 //! # Where Gram matrices come from
 //!
@@ -27,11 +32,12 @@
 //!
 //! # Numerical stability
 //!
-//! `(Σ_i G_i)` may be ill-conditioned. We add a `ridge · I` regularizer
-//! (Tikhonov) before solving — `ridge` defaults to `1e-3 · trace(Σ)/N`,
-//! a scale-invariant choice. The actual solve uses MLX's `linalg::solve`
-//! when available, falling back to the `Σ G_i` row-wise pseudo-inverse
-//! otherwise (described below).
+//! `(Σ_i G̃_i)` may be ill-conditioned. A `ridge · I` regularizer (Tikhonov)
+//! is added before solving, with `ridge` scaled by the mean diagonal of the
+//! sum so the choice is scale-invariant (default `1e-3`). The system is
+//! symmetric positive definite and is solved by a Cholesky factorisation in
+//! f64; a matrix that is still not positive definite is an error that names
+//! the tensor rather than a silent identity.
 //!
 //! Clean-room implementation from the paper's equations.
 
@@ -49,6 +55,9 @@ pub struct RegMeanMerge {
     gram_paths: Vec<PathBuf>,
     /// Tikhonov ridge for `(Σ G_i + ridge·I)`. `0.0` disables regularization.
     ridge: f32,
+    /// Factor applied to the off-diagonal entries of each Gram matrix before
+    /// merging (the paper's alpha, 0.9); `1.0` is the unscaled closed form.
+    alpha: f32,
     /// When `true`, tensors absent from a model's Gram file are merged via
     /// plain weighted mean instead of erroring.
     fallback_to_mean: bool,
@@ -61,6 +70,7 @@ impl RegMeanMerge {
         Self {
             gram_paths,
             ridge: 1e-3,
+            alpha: 0.9,
             fallback_to_mean: true,
             loaders: Mutex::new(None),
         }
@@ -69,6 +79,13 @@ impl RegMeanMerge {
     /// Override the Tikhonov ridge.
     pub fn with_ridge(mut self, ridge: f32) -> Self {
         self.ridge = ridge.max(0.0);
+        self
+    }
+
+    /// Set the off-diagonal scale alpha of the Gram matrices (the paper uses
+    /// 0.9; `1.0` disables it).
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.alpha = alpha;
         self
     }
 
@@ -113,8 +130,16 @@ impl RegMeanMerge {
     }
 
 
-    /// Closed-form merge for a single 2-D weight matrix.
-    fn regmean_2d(&self, weights: &[Array], grams: &[Array]) -> Result<Array> {
+    /// Closed-form merge for one linear layer.
+    ///
+    /// `weights[i]` is the layer's weight in checkpoint layout,
+    /// `[out_features, in_features]`, and `grams[i]` its Gram matrix
+    /// `Gᵢ = XᵢᵀXᵢ` of the layer's inputs, `[in_features, in_features]`. The
+    /// paper writes the weight as `[in, out]` and merges
+    /// `(Σ G̃ᵢ)⁻¹ Σ G̃ᵢ Wᵢ`; in checkpoint layout that is
+    /// `(Σ Wᵢ G̃ᵢ)(Σ G̃ᵢ + ridge·I)⁻¹`, where `G̃ᵢ` is `Gᵢ` with its
+    /// off-diagonal entries scaled by `alpha`.
+    fn regmean_2d(&self, name: &str, weights: &[Array], grams: &[Array]) -> Result<Array> {
         if weights.len() != grams.len() {
             return Err(MergeError::InvalidConfig(format!(
                 "regmean: gram count {} ≠ weight count {}",
@@ -122,115 +147,132 @@ impl RegMeanMerge {
                 weights.len()
             )));
         }
-        // Σ G_i and Σ G_i W_i
-        let mut sum_g = grams[0].clone();
-        let mut sum_gw = grams[0].matmul(&weights[0]);
-        for (g, w) in grams[1..].iter().zip(&weights[1..]) {
-            sum_g = sum_g.add(g);
-            sum_gw = sum_gw.add(&g.matmul(w));
+        let (out_features, in_features) = (weights[0].dim(0), weights[0].dim(1));
+        let gram_shape = [in_features, in_features];
+        for (weight, gram) in weights.iter().zip(grams) {
+            if weight.shape() != [out_features, in_features] || gram.shape() != gram_shape {
+                return Err(MergeError::ShapeMismatch {
+                    name: format!("regmean '{name}' (gram for weight [out, in])"),
+                    expected: gram_shape.to_vec(),
+                    actual: gram.shape().to_vec(),
+                });
+            }
         }
 
-        // Tikhonov ridge: scale-invariant choice ridge · diag_mean(Σ G).
-        let n = sum_g.dim(-1) as usize;
+        // G̃ = alpha · G + (1 - alpha) · diag(G): scale the off-diagonal part.
+        let eye = Array::eye(in_features, pmetal_runtime::compat::Dtype::Float32);
+        let scaled = |gram: &Array| -> Array {
+            if (self.alpha - 1.0).abs() < f32::EPSILON {
+                return gram.clone();
+            }
+            let diagonal = gram.multiply(&eye);
+            gram.subtract(&diagonal)
+                .multiply(&Array::from_f32(self.alpha))
+                .add(&diagonal)
+        };
+
+        let mut sum_g: Option<Array> = None;
+        let mut sum_wg: Option<Array> = None;
+        for (weight, gram) in weights.iter().zip(grams) {
+            let g = scaled(gram);
+            let wg = weight.matmul(&g);
+            sum_g = Some(match sum_g {
+                Some(s) => s.add(&g),
+                None => g,
+            });
+            sum_wg = Some(match sum_wg {
+                Some(s) => s.add(&wg),
+                None => wg,
+            });
+        }
+        let (mut sum_g, sum_wg) = (sum_g.expect("non-empty"), sum_wg.expect("non-empty"));
+
+        // Tikhonov ridge, scale-invariant: ridge · mean(diag(ΣG̃)).
         if self.ridge > 0.0 {
-            let trace = diag_mean(&sum_g);
-            let lambda = self.ridge * trace.max(1e-12);
-            let eye = identity_matrix(n, lambda);
-            sum_g = sum_g.add(&eye);
+            let mean_diagonal = sum_g.multiply(&eye).sum_all().item_f32() / in_features as f32;
+            let lambda = self.ridge * mean_diagonal.max(1e-12);
+            sum_g = sum_g.add(&eye.multiply(&Array::from_f32(lambda)));
         }
 
-        // Solve `sum_g · W_merged = sum_gw` via the pseudo-inverse of
-        // `sum_g`. The bridge does not currently expose `linalg::solve`,
-        // so we materialize `sum_g` to f32, invert on CPU via a small
-        // dedicated routine, and re-wrap. Layer dimensions for LLMs
-        // typically cap out at a few thousand × few thousand on the
-        // attention side; this stays tractable for calibration-driven
-        // merges.
-        let inv_g = pseudo_inverse_2d(&sum_g)?;
-        Ok(inv_g.matmul(&sum_gw))
+        // X (ΣG̃) = ΣWG̃ with ΣG̃ symmetric positive definite: solve row by row.
+        let n = in_features as usize;
+        let a: Vec<f64> = host_values(&sum_g, n * n, name)?;
+        let b: Vec<f64> = host_values(&sum_wg, out_features as usize * n, name)?;
+        let x = cholesky_solve_rows(&a, n, &b).ok_or_else(|| {
+            MergeError::InvalidConfig(format!(
+                "regmean '{name}': the summed Gram matrix is not positive definite; \
+                 raise `ridge` or calibrate on more data"
+            ))
+        })?;
+        let x: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        Ok(Array::from_f32_slice(&x, &[out_features, in_features]))
     }
 }
 
-/// Mean of the diagonal of a 2-D square matrix.
-fn diag_mean(m: &Array) -> f32 {
-    let n = m.dim(-1) as usize;
-    let mut copy = m.clone();
-    let total = n * n;
-    let flat: Vec<f32> = copy.to_f32_vec(total).unwrap_or_default();
-    let mut acc = 0.0_f32;
-    for i in 0..n {
-        acc += flat[i * n + i];
-    }
-    acc / n.max(1) as f32
+/// `array` as host f64, failing if the runtime cannot read it.
+fn host_values(array: &Array, n: usize, name: &str) -> Result<Vec<f64>> {
+    array
+        .clone()
+        .to_f32_vec(n)
+        .map(|v| v.into_iter().map(f64::from).collect())
+        .ok_or_else(|| {
+            MergeError::InvalidConfig(format!("regmean '{name}': failed to read a matrix"))
+        })
 }
 
-/// `λ · I` for a square `n × n` matrix.
-fn identity_matrix(n: usize, lambda: f32) -> Array {
-    let mut data = vec![0.0_f32; n * n];
+/// Solve `x · A = b_row` for every row of `b`, for symmetric positive
+/// definite `A` (`n × n`, row-major) and `b` of `m × n`, by Cholesky
+/// factorisation `A = L Lᵀ` in f64. Returns `None` if `A` is not positive
+/// definite (a non-positive pivot).
+fn cholesky_solve_rows(a: &[f64], n: usize, b: &[f64]) -> Option<Vec<f64>> {
+    debug_assert_eq!(a.len(), n * n);
+    debug_assert_eq!(b.len() % n, 0);
+    // Lower-triangular L (row-major) and its transpose U (also row-major),
+    // so both substitution sweeps read contiguous rows.
+    let mut l = vec![0.0_f64; n * n];
     for i in 0..n {
-        data[i * n + i] = lambda;
-    }
-    Array::from_f32_slice(&data, &[n as i32, n as i32])
-}
-
-/// Pseudo-inverse of a 2-D square symmetric positive-(semi)-definite
-/// matrix via Gauss-Jordan elimination on f32. Falls back to a plain
-/// weighted-mean-style identity if singular.
-fn pseudo_inverse_2d(m: &Array) -> Result<Array> {
-    let n = m.dim(-1) as usize;
-    let total = n * n;
-    let mut a = m.clone().to_f32_vec(total).unwrap_or_default();
-    if a.len() != total {
-        return Err(MergeError::InvalidConfig(
-            "pseudo_inverse_2d: failed to materialize matrix".to_string(),
-        ));
-    }
-    let mut inv = vec![0.0_f32; n * n];
-    for i in 0..n {
-        inv[i * n + i] = 1.0;
-    }
-    // Gauss-Jordan: forward elimination + back-substitution on [a | I].
-    for col in 0..n {
-        // Pivot: largest |a[row][col]| for numerical stability.
-        let mut pivot = col;
-        let mut best = a[col * n + col].abs();
-        for row in (col + 1)..n {
-            let v = a[row * n + col].abs();
-            if v > best {
-                best = v;
-                pivot = row;
-            }
-        }
-        if best < 1e-12 {
-            // Singular — return identity. Caller will see the merge as
-            // "average of weighted weights" which degrades gracefully.
-            return Ok(identity_matrix(n, 1.0));
-        }
-        if pivot != col {
-            for k in 0..n {
-                a.swap(col * n + k, pivot * n + k);
-                inv.swap(col * n + k, pivot * n + k);
-            }
-        }
-        let inv_pivot = 1.0_f32 / a[col * n + col];
-        for k in 0..n {
-            a[col * n + k] *= inv_pivot;
-            inv[col * n + k] *= inv_pivot;
-        }
-        for row in 0..n {
-            if row == col {
-                continue;
-            }
-            let factor = a[row * n + col];
-            if factor.abs() > 1e-30 {
-                for k in 0..n {
-                    a[row * n + k] -= factor * a[col * n + k];
-                    inv[row * n + k] -= factor * inv[col * n + k];
+        for j in 0..=i {
+            let dot: f64 = l[i * n..i * n + j]
+                .iter()
+                .zip(&l[j * n..j * n + j])
+                .map(|(x, y)| x * y)
+                .sum();
+            let sum = a[i * n + j] - dot;
+            if i == j {
+                if sum <= 0.0 || !sum.is_finite() {
+                    return None;
                 }
+                l[i * n + i] = sum.sqrt();
+            } else {
+                l[i * n + j] = sum / l[j * n + j];
             }
         }
     }
-    Ok(Array::from_f32_slice(&inv, &[n as i32, n as i32]))
+    let mut u = vec![0.0_f64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            u[j * n + i] = l[i * n + j];
+        }
+    }
+
+    // x A = b  <=>  A xᵀ = bᵀ  <=>  L (Lᵀ xᵀ) = bᵀ (A is symmetric).
+    let mut out = vec![0.0_f64; b.len()];
+    let mut y = vec![0.0_f64; n];
+    for (b_row, x_row) in b.chunks_exact(n).zip(out.chunks_exact_mut(n)) {
+        for i in 0..n {
+            let dot: f64 = l[i * n..i * n + i].iter().zip(&y[..i]).map(|(p, q)| p * q).sum();
+            y[i] = (b_row[i] - dot) / l[i * n + i];
+        }
+        for i in (0..n).rev() {
+            let dot: f64 = u[i * n + i + 1..(i + 1) * n]
+                .iter()
+                .zip(&x_row[i + 1..])
+                .map(|(p, q)| p * q)
+                .sum();
+            x_row[i] = (y[i] - dot) / u[i * n + i];
+        }
+    }
+    Some(out)
 }
 
 impl MergeMethod for RegMeanMerge {
@@ -280,7 +322,7 @@ impl MergeMethod for RegMeanMerge {
         }
 
         match self.try_load_grams(name)? {
-            Some(grams) => self.regmean_2d(tensors, &grams),
+            Some(grams) => self.regmean_2d(name, tensors, &grams),
             None => LinearMerge::weighted_average(tensors, &params, global_params),
         }
     }
@@ -418,16 +460,100 @@ mod tests {
         assert!((v[1] - 6.0).abs() < 1e-4);
     }
 
-    /// `pseudo_inverse_2d` recovers a 2x2 inverse correctly.
+    /// Checkpoint weights are `[out_features, in_features]` and the Gram
+    /// matrices `[in_features, in_features]`, so a non-square layer must merge
+    /// as `(sum_i W_i G_i) (sum_i G_i)^-1`.
     #[test]
-    fn pseudo_inverse_2x2() {
-        // [[2, 0], [0, 4]] → inverse [[0.5, 0], [0, 0.25]]
-        let m = Array::from_f32_slice(&[2.0_f32, 0.0, 0.0, 4.0], &[2, 2]);
-        let inv = pseudo_inverse_2d(&m).unwrap();
-        let v: Vec<f32> = inv.clone().to_f32_vec(4).unwrap();
-        assert!((v[0] - 0.5).abs() < 1e-5);
-        assert!((v[3] - 0.25).abs() < 1e-5);
-        assert!(v[1].abs() < 1e-5);
-        assert!(v[2].abs() < 1e-5);
+    fn non_square_layer_uses_the_checkpoint_layout() {
+        let workdir = tempfile::tempdir().unwrap();
+        let g_a = workdir.path().join("g_a");
+        let g_b = workdir.path().join("g_b");
+        // G1 = diag(3, 1), G2 = diag(1, 3)
+        write_grams(&g_a, &[("w", vec![3.0_f32, 0.0, 0.0, 1.0], vec![2, 2])]);
+        write_grams(&g_b, &[("w", vec![1.0_f32, 0.0, 0.0, 3.0], vec![2, 2])]);
+
+        let merge = RegMeanMerge::new(vec![g_a, g_b]).with_ridge(0.0);
+        // One output row: W1 = [2, 0], W2 = [0, 2].
+        let t1 = Array::from_f32_slice(&[2.0_f32, 0.0], &[1, 2]);
+        let t2 = Array::from_f32_slice(&[0.0_f32, 2.0], &[1, 2]);
+        let result = merge
+            .merge_named(
+                "w",
+                &[t1, t2],
+                None,
+                &[MergeParameters::default(), MergeParameters::default()],
+                &MergeParameters::default(),
+            )
+            .unwrap();
+        assert_eq!(result.shape(), &[1, 2]);
+        // (W1 G1 + W2 G2) = [6, 0] + [0, 6]; sum G = diag(4, 4); result [1.5, 1.5].
+        let v = crate::test_util::values(&result);
+        assert!((v[0] - 1.5).abs() < 1e-4 && (v[1] - 1.5).abs() < 1e-4, "{v:?}");
+    }
+
+    /// The solver recovers a known 3x3 system: rows x with x A = b.
+    #[test]
+    fn cholesky_solves_a_known_system() {
+        // A = [[4, 1, 0], [1, 3, 1], [0, 1, 2]] (symmetric positive definite).
+        let a = [4.0, 1.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0, 2.0];
+        // x = [1, 2, 3] and [0, -1, 1]; b = x A.
+        let x = [[1.0, 2.0, 3.0], [0.0, -1.0, 1.0]];
+        let mut b = Vec::new();
+        for row in &x {
+            for j in 0..3 {
+                b.push((0..3).map(|i| row[i] * a[i * 3 + j]).sum::<f64>());
+            }
+        }
+        let got = cholesky_solve_rows(&a, 3, &b).unwrap();
+        for (g, w) in got.iter().zip(x.iter().flatten()) {
+            assert!((g - w).abs() < 1e-12, "{got:?}");
+        }
+    }
+
+    #[test]
+    fn cholesky_rejects_a_matrix_that_is_not_positive_definite() {
+        // Eigenvalues 3 and -1.
+        assert!(cholesky_solve_rows(&[1.0, 2.0, 2.0, 1.0], 2, &[1.0, 0.0]).is_none());
+    }
+
+    /// alpha scales the off-diagonal part of each Gram matrix before merging.
+    #[test]
+    fn alpha_shrinks_the_cross_feature_terms() {
+        let workdir = tempfile::tempdir().unwrap();
+        let g_a = workdir.path().join("g_a");
+        let g_b = workdir.path().join("g_b");
+        // G1 = [[2, 1], [1, 1]], G2 = [[1, 0], [0, 1]]
+        write_grams(&g_a, &[("w", vec![2.0_f32, 1.0, 1.0, 1.0], vec![2, 2])]);
+        write_grams(&g_b, &[("w", vec![1.0_f32, 0.0, 0.0, 1.0], vec![2, 2])]);
+        let run = |alpha: f32| {
+            let merge = RegMeanMerge::new(vec![g_a.clone(), g_b.clone()])
+                .with_ridge(0.0)
+                .with_alpha(alpha);
+            let result = merge
+                .merge_named(
+                    "w",
+                    &[
+                        Array::from_f32_slice(&[1.0_f32, 0.0], &[1, 2]),
+                        Array::from_f32_slice(&[0.0_f32, 1.0], &[1, 2]),
+                    ],
+                    None,
+                    &[MergeParameters::default(), MergeParameters::default()],
+                    &MergeParameters::default(),
+                )
+                .unwrap();
+            crate::test_util::values(&result)
+        };
+        // alpha = 1: W1 G1 = [2, 1], W2 G2 = [0, 1], sum [2, 2];
+        // sum G = [[3, 1], [1, 2]], inverse = [[2, -1], [-1, 3]] / 5;
+        // x = [2, 2] inverse = [2/5, 4/5].
+        let full = run(1.0);
+        assert!((full[0] - 0.4).abs() < 1e-5 && (full[1] - 0.8).abs() < 1e-5, "{full:?}");
+        // alpha = 0: G̃ are diagonal: G̃1 = diag(2, 1), G̃2 = I;
+        // W1 G̃1 + W2 G̃2 = [2, 1], sum G̃ = diag(3, 2); x = [2/3, 1/2].
+        let diagonal = run(0.0);
+        assert!(
+            (diagonal[0] - 2.0 / 3.0).abs() < 1e-5 && (diagonal[1] - 0.5).abs() < 1e-5,
+            "{diagonal:?}"
+        );
     }
 }
