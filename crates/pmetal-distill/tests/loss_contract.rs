@@ -119,7 +119,7 @@ fn all_zero_weights_give_zero_loss() {
 fn the_teacher_receives_no_gradient() {
     let t = logits(0.3);
     let s = logits(1.9);
-    for (name, loss) in every_loss().into_iter().filter(|(n, _)| *n != "uld") {
+    for (name, loss) in every_loss() {
         let shape = [1, TOKENS as i32, VOCAB as i32];
         let f = |a: &[Array]| loss.compute(&a[0], &a[1], 2.0).unwrap();
         let (value, mut grads) = value_and_grad_explicit(
@@ -252,6 +252,126 @@ fn bf16_logits_are_normalised_in_f32() {
         assert!(
             (got - want).abs() <= 2e-5 * want.abs().max(1e-2),
             "{name}: got {got}, float64 reference {want}"
+        );
+    }
+}
+
+/// Universal Logit Distillation (Boizard et al., 2024, eq. 5): the L1 distance
+/// between the two probability vectors sorted in decreasing order, the shorter
+/// padded with zeros. A sum over the sorted entries, not a mean, and not
+/// over their cumulative sums.
+fn uld_reference(teacher: &[f64], student: &[f64], temperature: f64, top_k: Option<usize>) -> f64 {
+    let sorted = |row: &[f64]| {
+        let mut p: Vec<f64> = log_softmax(row, temperature)
+            .into_iter()
+            .map(f64::exp)
+            .collect();
+        p.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        if let Some(k) = top_k {
+            p.truncate(k);
+        }
+        p
+    };
+    let (t, s) = (sorted(teacher), sorted(student));
+    (0..t.len().max(s.len()))
+        .map(|i| (t.get(i).unwrap_or(&0.0) - s.get(i).unwrap_or(&0.0)).abs())
+        .sum()
+}
+
+fn uld_mean_reference(
+    teacher: &[f64],
+    teacher_vocab: usize,
+    student: &[f64],
+    student_vocab: usize,
+    temperature: f64,
+    top_k: Option<usize>,
+) -> f64 {
+    (0..TOKENS)
+        .map(|t| {
+            uld_reference(
+                &teacher[t * teacher_vocab..(t + 1) * teacher_vocab],
+                &student[t * student_vocab..(t + 1) * student_vocab],
+                temperature,
+                top_k,
+            )
+        })
+        .sum::<f64>()
+        / TOKENS as f64
+}
+
+/// ULD against the paper's closed form, with equal and with different
+/// vocabularies.
+#[test]
+#[serial]
+fn uld_is_the_l1_distance_between_sorted_distributions() {
+    let teacher_vocab = VOCAB;
+    let student_vocab = 5;
+    let t = logits(0.3);
+    let s: Vec<f32> = (0..TOKENS * student_vocab)
+        .map(|i| 3.0 * ((i as f32) * 0.77 + 1.1).cos())
+        .collect();
+    let teacher = array(&t, Dtype::Float32);
+    let student = Array::from_f32_slice(&s, &[1, TOKENS as i32, student_vocab as i32]);
+    let t64: Vec<f64> = t.iter().map(|x| *x as f64).collect();
+    let s64: Vec<f64> = s.iter().map(|x| *x as f64).collect();
+
+    for (top_k, loss) in [
+        (None, UniversalLogitLoss::new()),
+        (Some(4), UniversalLogitLoss::new().with_top_k(4)),
+    ] {
+        for temperature in [1.0_f32, 2.0] {
+            let got = scalar(&loss.compute(&teacher, &student, temperature).unwrap()) as f64;
+            let want = uld_mean_reference(
+                &t64,
+                teacher_vocab,
+                &s64,
+                student_vocab,
+                temperature as f64,
+                top_k,
+            );
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1e-2),
+                "top_k={top_k:?} T={temperature}: got {got}, float64 reference {want}"
+            );
+        }
+    }
+}
+
+/// The student's gradient through the sort. (The permutation that sorts the
+/// student is a function of the student; if it enters the autodiff graph, MLX
+/// refuses to differentiate the gather, and no run could train.)
+#[test]
+#[serial]
+fn uld_gradient_matches_finite_differences() {
+    let teacher = array(&logits(0.3), Dtype::Float32);
+    let s = logits(1.9);
+    let shape = [1, TOKENS as i32, VOCAB as i32];
+    let loss = UniversalLogitLoss::new();
+    let f = |x: &Array| loss.compute(&teacher, x, 1.5).unwrap();
+
+    let (value, mut grads) = value_and_grad_explicit(
+        |a: &[Array]| f(&a[0]),
+        &[Array::from_f32_slice(&s, &shape)],
+        &[],
+    )
+    .unwrap();
+    value.eval();
+    grads[0].eval();
+    drain();
+    let grad = grads[0].to_f32_vec(s.len()).unwrap();
+
+    let h = 2e-3_f32;
+    for i in 0..s.len() {
+        let (mut plus, mut minus) = (s.clone(), s.clone());
+        plus[i] += h;
+        minus[i] -= h;
+        let fd = (scalar(&f(&Array::from_f32_slice(&plus, &shape)))
+            - scalar(&f(&Array::from_f32_slice(&minus, &shape))))
+            / (2.0 * h);
+        assert!(
+            (grad[i] - fd).abs() <= 2e-4 + 2e-2 * fd.abs(),
+            "entry {i}: autograd {} vs finite differences {fd}",
+            grad[i]
         );
     }
 }

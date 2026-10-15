@@ -1,54 +1,45 @@
-//! Universal Logit Distillation (ULD) — cross-tokenizer KD via Wasserstein-1.
+//! Universal Logit Distillation (ULD): cross-tokenizer KD without a shared
+//! vocabulary.
 //!
 //! From Boizard et al., 2024 (*Towards Cross-Tokenizer Distillation: the
-//! Universal Logit Distillation Loss*). The original setup of knowledge
-//! distillation assumes teacher and student share a tokenizer, so the logit
-//! axis aligns position-by-position. ULD removes that assumption: it sorts
-//! both distributions in descending order and compares the *order statistics*,
-//! which are tokenizer-invariant. The Wasserstein-1 distance over sorted
-//! probability vectors then quantifies the disagreement.
+//! Universal Logit Distillation Loss for LLMs*). Distillation by KL needs the
+//! teacher's and the student's logit axes to mean the same tokens. ULD drops
+//! that requirement: it compares the two distributions by their *order
+//! statistics*, which do not depend on which token is which. With both
+//! probability vectors sorted in decreasing order (`σ_S`, `σ_T`), the
+//! Wasserstein distance with a 0-1 ground cost has the closed form
 //!
-//! Algorithm (clean-room, derived from the paper's Algorithm 1):
+//! ```text
+//! W₁ = Σ_i | p_S(σ_S(i)) - p_T(σ_T(i)) |        (eq. 5)
+//! ```
 //!
-//!   1. Apply temperature scaling and softmax to teacher and student logits.
-//!   2. Sort each per-token distribution in descending order: `p_sorted`,
-//!      `q_sorted` ∈ ℝ^V (the same V for both — see padding below).
-//!   3. If the two distributions have unequal vocab sizes V_T and V_S, pad
-//!      the shorter one on the right with zeros to length max(V_T, V_S).
-//!      (Sorted distributions are heavy-tailed; padding zeros at the tail
-//!      reflects "no mass beyond top-K" in the original tokenizer.)
-//!   4. Loss = mean over tokens of `mean_v(|F_p(v) - F_q(v)|)`, where
-//!      F is the cumulative distribution of the sorted vector — i.e.
-//!      `mean(|cumsum(p_sorted) - cumsum(q_sorted)|)`. The classical
-//!      Wasserstein-1 distance uses a *sum* over `v`; we use the mean so
-//!      the loss magnitude is comparable across vocab sizes (Boizard et
-//!      al. take the same approach for cross-tokenizer training stability).
-//!      The optimum is unaffected — only the gradient scale changes by
-//!      a constant `1/V`.
+//! where the shorter vector is padded with zeros to the longer's length. This
+//! is a sum over the sorted entries, bounded by 2, and it costs one sort per
+//! side. The paper adds it to the student's ordinary cross-entropy with a
+//! weight λ (1.5 by default); this loss is the `W₁` term only, and the
+//! [`Distiller`](crate::Distiller) combines it with the hard-label loss.
 //!
-//! Optional `top_k` truncates both distributions to their top-K entries
-//! before sorting; this is exactly the truncation the paper uses for
-//! efficiency when V is large (≫ 32K).
+//! Optional `top_k` truncates both sorted vectors to their K largest entries,
+//! which bounds the cost on very large vocabularies at the price of ignoring
+//! the tail mass (at most `2 · tail` of the distance).
 //!
-//! Same-tokenizer parity: when V_T == V_S and both distributions are
-//! actually identical, the loss is exactly zero. When V_T == V_S and the
-//! distributions differ only by permutation, ULD also returns zero — that
-//! is the *intentional* tokenizer-invariance property, distinct from
-//! standard KL which would penalize the permutation. Tests cover both.
+//! A permutation of the vocabulary leaves the loss unchanged. That is the
+//! property that makes the loss tokenizer-invariant, and it is also why it is
+//! a weak signal when a shared vocabulary exists: prefer KL or JSD then.
+//!
+//! The paper aligns the two models' sequences by truncating to the shorter
+//! tokenization; position `t` of the teacher is compared with position `t` of
+//! the student. Aligning positions across tokenizations is the caller's job.
 
-#![allow(unsafe_code)]
-
-use super::{DistillLoss, reduce_per_token};
+use super::{DistillLoss, reduce_per_token, tempered_log_probs};
 use crate::Result;
 use pmetal_runtime::compat::Array;
 
 /// Universal Logit Distillation loss.
 ///
-/// Runs on the MLX graph path (no Metal kernel — sort dispatch is non-trivial
-/// in the current MLX bindings). Suitable for use cases where teacher and
-/// student have *different tokenizers* and standard KL is therefore
-/// ill-defined; for shared-tokenizer flows prefer KL or JSD which preserve
-/// gradient signal at the per-vocab-position level.
+/// Runs on the MLX graph. The student's sorting permutation is cut out of the
+/// autodiff graph (the gradient flows through the sorted *values*, not the
+/// permutation), which MLX requires of a gather's indices.
 pub struct UniversalLogitLoss {
     temperature_override: Option<f32>,
     top_k: Option<usize>,
@@ -63,7 +54,7 @@ impl UniversalLogitLoss {
         }
     }
 
-    /// Truncate both distributions to their top-K entries before sorting.
+    /// Truncate both distributions to their top-K entries before comparing.
     /// Significantly faster on large vocabularies (e.g. 256K).
     pub fn with_top_k(mut self, k: usize) -> Self {
         self.top_k = Some(k.max(1));
@@ -77,41 +68,20 @@ impl UniversalLogitLoss {
         self
     }
 
-    fn compute_inner(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-    ) -> Result<Array> {
+    fn per_token(&self, teacher_logits: &Array, student_logits: &Array, temperature: f32) -> Array {
         let temp = self.temperature_override.unwrap_or(temperature).max(1e-6);
-        let inv_t = 1.0_f32 / temp;
-        let t_scaled = teacher_logits.multiply(&Array::from_f32(inv_t));
-        let s_scaled = student_logits.multiply(&Array::from_f32(inv_t));
-        let p_t = t_scaled.softmax(-1);
-        let p_s = s_scaled.softmax(-1);
+        let p_t = tempered_log_probs(teacher_logits, temp).exp();
+        let p_s = tempered_log_probs(student_logits, temp).exp();
 
-        // Optional top-K truncation. We sort first and slice; for the pure
-        // ULD path this is exactly what the paper's Algorithm 1 step does
-        // when it sets K ≪ V to bound runtime.
-        let (sorted_t, sorted_s) = sort_desc_with_optional_topk(&p_t, &p_s, self.top_k);
+        let sorted_t = sort_desc(&p_t, self.top_k);
+        let sorted_s = sort_desc(&p_s, self.top_k);
 
-        // Pad the shorter to match the longer along the last axis. After
-        // sort_desc_with_optional_topk both are already truncated, so the
-        // only remaining mismatch is when teacher/student vocab sizes
-        // genuinely differ.
-        let len_t = sorted_t.dim(-1) as usize;
-        let len_s = sorted_s.dim(-1) as usize;
-        let n = len_t.max(len_s);
+        // Pad the shorter with zeros: "no mass beyond this many tokens".
+        let n = sorted_t.dim(-1).max(sorted_s.dim(-1));
         let padded_t = pad_last_axis_to(&sorted_t, n);
         let padded_s = pad_last_axis_to(&sorted_s, n);
 
-        // Wasserstein-1 over sorted probability vectors:
-        //   W1 = Σ_v |F_p(v) - F_q(v)| = Σ_v |cumsum(p)[v] - cumsum(q)[v]|
-        // Average over the V axis, then mean over tokens.
-        let cum_t = padded_t.cumsum(-1);
-        let cum_s = padded_s.cumsum(-1);
-        let abs_diff = cum_t.subtract(&cum_s).abs_val();
-        Ok(abs_diff.mean_axis(-1, false))
+        padded_s.subtract(&padded_t).abs_val().sum_axis(-1, false)
     }
 }
 
@@ -129,7 +99,7 @@ impl DistillLoss for UniversalLogitLoss {
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        let per_token = self.compute_inner(teacher_logits, student_logits, temperature)?;
+        let per_token = self.per_token(teacher_logits, student_logits, temperature);
         reduce_per_token(&per_token, weights)
     }
 
@@ -138,53 +108,37 @@ impl DistillLoss for UniversalLogitLoss {
     }
 }
 
-/// Sort each row in descending order, optionally truncating to top-K.
+/// Sort each row in descending order, optionally keeping only the largest `k`.
 ///
-/// The bridge exposes `argsort` (ascending) and `take_along_axis` but no
-/// direct sort. We argsort the negated array — equivalent to descending
-/// argsort of the original — then gather along the last axis.
-fn sort_desc_with_optional_topk(p_t: &Array, p_s: &Array, top_k: Option<usize>) -> (Array, Array) {
-    let neg = Array::from_f32(-1.0);
-    let idx_t = p_t.multiply(&neg).argsort(-1);
-    let idx_s = p_s.multiply(&neg).argsort(-1);
-    let mut sorted_t = p_t.take_along_axis(&idx_t, -1);
-    let mut sorted_s = p_s.take_along_axis(&idx_s, -1);
-    if let Some(k) = top_k {
-        sorted_t = slice_first_k_last_axis(&sorted_t, k);
-        sorted_s = slice_first_k_last_axis(&sorted_s, k);
+/// There is no sort op, so this argsorts the negated values and gathers. The
+/// permutation is an integer index set; it must not be in the autodiff graph
+/// (MLX cannot differentiate a gather with respect to its indices), so it is
+/// detached and the gradient reaches `p` through the gathered values.
+fn sort_desc(p: &Array, top_k: Option<usize>) -> Array {
+    let order = p.negative().argsort(-1).stop_gradient();
+    let sorted = p.take_along_axis(&order, -1);
+    match top_k {
+        Some(k) if (k as i32) < sorted.dim(-1) => {
+            let mut stop: Vec<i32> = sorted.shape().to_vec();
+            let last = stop.len() - 1;
+            stop[last] = k as i32;
+            sorted.slice(&vec![0; stop.len()], &stop)
+        }
+        _ => sorted,
     }
-    (sorted_t, sorted_s)
 }
 
-/// Slice the leading `k` entries along the last axis.
-fn slice_first_k_last_axis(arr: &Array, k: usize) -> Array {
-    let v = arr.dim(-1) as usize;
-    if k >= v {
-        return arr.clone();
-    }
-    let mut start: Vec<i32> = vec![0; arr.shape().len()];
-    let mut stop: Vec<i32> = arr.shape().to_vec();
-    let last = arr.shape().len() - 1;
-    start[last] = 0;
-    stop[last] = k as i32;
-    arr.slice(&start, &stop)
-}
-
-/// Right-pad a tensor's last axis to length `n` with zeros (no-op when
-/// already long enough). Implemented via `concatenate` because the bridge
-/// does not expose a generic `pad` op.
-fn pad_last_axis_to(arr: &Array, n: usize) -> Array {
-    let cur = arr.dim(-1) as usize;
+/// Right-pad a tensor's last axis with zeros to length `n` (no-op when it is
+/// already that long).
+fn pad_last_axis_to(arr: &Array, n: i32) -> Array {
+    let cur = arr.dim(-1);
     if cur >= n {
         return arr.clone();
     }
-    let extra = n - cur;
-    let mut pad_shape: Vec<i32> = arr.shape().to_vec();
-    let last = pad_shape.len() - 1;
-    pad_shape[last] = extra as i32;
-    let total: usize = pad_shape.iter().map(|&s| s as usize).product();
-    let zeros = Array::from_f32_slice(&vec![0.0_f32; total], &pad_shape);
-    pmetal_runtime::compat::ops::concatenate_axis(&[arr, &zeros], -1)
+    let mut widths = vec![0; 2 * arr.shape().len()];
+    let last = widths.len() - 1;
+    widths[last] = n - cur;
+    arr.pad_constant(&widths, 0.0)
 }
 
 #[cfg(test)]
