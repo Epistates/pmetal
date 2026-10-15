@@ -1,6 +1,6 @@
-//! Download progress with throughput and ETA.
+//! Download and upload progress with throughput and ETA.
 //!
-//! The Hub client reports raw per-file events. [`DownloadProgress`] is what a
+//! The Hub client reports raw per-file events. [`TransferProgress`] is what a
 //! progress bar wants instead: bytes and files done against the total, a
 //! smoothed transfer rate, and the time left.
 
@@ -8,11 +8,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hf_hub::progress::{DownloadEvent, FileStatus, ProgressEvent, ProgressHandler};
+use hf_hub::progress::{DownloadEvent, FileStatus, ProgressEvent, ProgressHandler, UploadEvent};
 
-/// A snapshot of a running download.
+/// A snapshot of a running download or upload.
 #[derive(Debug, Clone, PartialEq)]
-pub struct DownloadProgress {
+pub struct TransferProgress {
     /// Files finished, including files that were already in the cache.
     pub files_done: usize,
     /// Files the download covers.
@@ -33,9 +33,9 @@ pub struct DownloadProgress {
     pub finished: bool,
 }
 
-/// Receives [`DownloadProgress`] snapshots. Must be quick and must not block:
+/// Receives [`TransferProgress`] snapshots. Must be quick and must not block:
 /// it runs on the transfer path.
-pub type ProgressCallback = Arc<dyn Fn(&DownloadProgress) + Send + Sync>;
+pub type ProgressCallback = Arc<dyn Fn(&TransferProgress) + Send + Sync>;
 
 /// How far back the transfer rate looks.
 const RATE_WINDOW: Duration = Duration::from_secs(5);
@@ -49,10 +49,19 @@ struct FileState {
     done: bool,
 }
 
+/// What an upload reports; the Hub client measures the rate itself.
+#[derive(Default)]
+struct UploadState {
+    bytes: u64,
+    rate: Option<f64>,
+    files: usize,
+}
+
 /// Folds Hub events into progress snapshots. The clock is a parameter so the
 /// arithmetic is testable.
 pub(crate) struct Tracker {
     files: HashMap<String, FileState>,
+    upload: UploadState,
     total_files: usize,
     total_bytes: u64,
     samples: VecDeque<(Instant, u64)>,
@@ -65,6 +74,7 @@ impl Tracker {
     pub(crate) fn new() -> Self {
         Self {
             files: HashMap::new(),
+            upload: UploadState::default(),
             total_files: 0,
             total_bytes: 0,
             samples: VecDeque::new(),
@@ -84,7 +94,7 @@ impl Tracker {
         &mut self,
         now: Instant,
         event: &DownloadEvent,
-    ) -> Option<DownloadProgress> {
+    ) -> Option<TransferProgress> {
         match event {
             DownloadEvent::Start {
                 total_files,
@@ -122,7 +132,66 @@ impl Tracker {
         Some(self.snapshot(now, done))
     }
 
-    fn snapshot(&self, now: Instant, done: u64) -> DownloadProgress {
+    /// Apply an upload event. The Hub client measures the rate itself while
+    /// bytes move; the ETA follows from it. Committing (the last, silent step)
+    /// is reported as the current file so a bar does not sit at 100% unexplained.
+    pub(crate) fn on_upload_event(&mut self, event: &UploadEvent) -> Option<TransferProgress> {
+        match event {
+            UploadEvent::Start {
+                total_files,
+                total_bytes,
+            } => {
+                self.total_files = *total_files;
+                self.total_bytes = *total_bytes;
+            }
+            UploadEvent::Progress {
+                bytes_completed,
+                total_bytes,
+                bytes_per_sec,
+                files,
+                ..
+            } => {
+                self.total_bytes = *total_bytes;
+                self.upload.bytes = self.upload.bytes.max(*bytes_completed);
+                self.upload.rate = *bytes_per_sec;
+                let complete = files
+                    .iter()
+                    .filter(|f| f.status == FileStatus::Complete)
+                    .count();
+                self.upload.files = self.upload.files.max(complete);
+                self.current = files
+                    .iter()
+                    .find(|f| f.status == FileStatus::InProgress)
+                    .map(|f| f.filename.clone())
+                    .or_else(|| self.current.clone());
+            }
+            UploadEvent::Committing => self.current = Some("committing".to_owned()),
+            UploadEvent::Complete => {
+                self.finished = true;
+                self.upload.bytes = self.total_bytes;
+                self.upload.files = self.total_files;
+            }
+        }
+        let eta = self.upload.rate.filter(|r| *r > 0.0).map(|r| {
+            Duration::from_secs_f64(self.total_bytes.saturating_sub(self.upload.bytes) as f64 / r)
+        });
+        Some(TransferProgress {
+            files_done: self.upload.files,
+            total_files: self.total_files,
+            bytes_done: self.upload.bytes,
+            total_bytes: self.total_bytes,
+            bytes_per_sec: self.upload.rate,
+            eta: if self.finished {
+                Some(Duration::ZERO)
+            } else {
+                eta
+            },
+            current_file: self.current.clone(),
+            finished: self.finished,
+        })
+    }
+
+    fn snapshot(&self, now: Instant, done: u64) -> TransferProgress {
         let total_bytes = self
             .total_bytes
             .max(self.files.values().map(|f| f.total).sum());
@@ -130,7 +199,7 @@ impl Tracker {
         let eta = rate
             .filter(|r| *r > 0.0)
             .map(|r| Duration::from_secs_f64(total_bytes.saturating_sub(done) as f64 / r));
-        DownloadProgress {
+        TransferProgress {
             files_done: self.files.values().filter(|f| f.done).count(),
             total_files: self.total_files.max(self.files.len()),
             bytes_done: done,
@@ -175,12 +244,12 @@ impl CallbackHandler {
 
 impl ProgressHandler for CallbackHandler {
     fn on_progress(&self, event: &ProgressEvent) {
-        let ProgressEvent::Download(event) = event else {
-            return;
-        };
-        let snapshot = match self.tracker.lock() {
-            Ok(mut tracker) => tracker.on_event(Instant::now(), event),
-            Err(_) => return,
+        let snapshot = match (event, self.tracker.lock()) {
+            (ProgressEvent::Download(event), Ok(mut tracker)) => {
+                tracker.on_event(Instant::now(), event)
+            }
+            (ProgressEvent::Upload(event), Ok(mut tracker)) => tracker.on_upload_event(event),
+            _ => None,
         };
         if let Some(snapshot) = snapshot {
             (self.callback)(&snapshot);

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use pmetal_hub::{
-    DownloadOptions, DownloadProgress, HubOptions, Verification, WeightFormat, download_model_with,
-    plan_model_download, split_quant_selector, verify_model_dir,
+    DownloadOptions, HubOptions, ProgressCallback, TransferProgress, Verification, WeightFormat,
+    download_model_with, plan_model_download, split_quant_selector, verify_model_dir,
 };
 
 /// The weight format to fetch.
@@ -86,6 +86,35 @@ fn human_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// A byte progress bar with rate and ETA, and the callback that drives it from
+/// a transfer's progress snapshots. Used by downloads and uploads.
+pub(crate) fn transfer_bar() -> anyhow::Result<(ProgressBar, ProgressCallback)> {
+    let bar = ProgressBar::new(0);
+    bar.set_style(
+        ProgressStyle::with_template("{spinner} [{bar:30}] {bytes}/{total_bytes}  {msg}")?
+            .progress_chars("=> "),
+    );
+    let shown = bar.clone();
+    let callback: ProgressCallback = Arc::new(move |p: &TransferProgress| {
+        shown.set_length(p.total_bytes);
+        shown.set_position(p.bytes_done);
+        let rate = p.bytes_per_sec.map(human_rate).unwrap_or_default();
+        let eta = p
+            .eta
+            .filter(|_| !p.finished)
+            .map(|d| format!("ETA {}", human_duration(d)))
+            .unwrap_or_default();
+        let what = p.current_file.as_deref().filter(|f| *f == "committing");
+        shown.set_message(format!(
+            "{}/{} files  {rate}  {eta}  {}",
+            p.files_done,
+            p.total_files,
+            what.unwrap_or_default()
+        ));
+    });
+    Ok((bar, callback))
+}
+
 /// Run `pmetal download`.
 pub(crate) async fn run_download(request: DownloadRequest) -> anyhow::Result<()> {
     let (model, mut options) = options_for(&request);
@@ -108,26 +137,8 @@ pub(crate) async fn run_download(request: DownloadRequest) -> anyhow::Result<()>
         return Ok(());
     }
 
-    let bar = ProgressBar::new(0);
-    bar.set_style(
-        ProgressStyle::with_template("{spinner} [{bar:30}] {bytes}/{total_bytes}  {msg}")?
-            .progress_chars("=> "),
-    );
-    let shown = bar.clone();
-    options.progress = Some(Arc::new(move |p: &DownloadProgress| {
-        shown.set_length(p.total_bytes);
-        shown.set_position(p.bytes_done);
-        let rate = p.bytes_per_sec.map(human_rate).unwrap_or_default();
-        let eta = p
-            .eta
-            .filter(|_| !p.finished)
-            .map(|d| format!("ETA {}", human_duration(d)))
-            .unwrap_or_default();
-        shown.set_message(format!(
-            "{}/{} files  {rate}  {eta}",
-            p.files_done, p.total_files
-        ));
-    }));
+    let (bar, callback) = transfer_bar()?;
+    options.progress = Some(callback);
 
     let path = download_model_with(&model, &options).await;
     bar.finish_and_clear();

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use pmetal_core::SecretString;
 use pmetal_hub::{
-    DownloadOptions, DownloadProgress, HubOptions, Verification, WeightFormat,
+    DownloadOptions, HubOptions, TransferProgress, Verification, WeightFormat,
     download_dataset_with, download_model_with, find_cached_model_in, plan_model_download,
     resolve_model_path_with,
 };
@@ -327,7 +327,7 @@ async fn a_repository_with_only_pytorch_weights_is_refused_not_half_downloaded()
 #[tokio::test]
 async fn progress_reports_every_byte_and_ends_finished() {
     let (hub, cache) = hub_with_model("o/m").await;
-    let seen: Arc<Mutex<Vec<DownloadProgress>>> = Arc::default();
+    let seen: Arc<Mutex<Vec<TransferProgress>>> = Arc::default();
     let sink = seen.clone();
     let mut opts = options(&hub, cache.path());
     opts.progress = Some(Arc::new(move |p| sink.lock().unwrap().push(p.clone())));

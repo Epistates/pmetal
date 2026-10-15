@@ -35,7 +35,7 @@ pub use client::HubOptions;
 pub use dataset::*;
 pub use download::*;
 pub use fit::*;
-pub use progress::{DownloadProgress, ProgressCallback};
+pub use progress::{ProgressCallback, TransferProgress};
 pub use resolve::*;
 pub use search::*;
 pub use select::{GgufVariant, ModelPlan, RepoFile, SelectedWeights, WeightFormat, gguf_variants};

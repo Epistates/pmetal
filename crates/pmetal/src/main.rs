@@ -1787,15 +1787,19 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             exclude,
         } => {
             tracing::info!(path = %path, repo = %repo, "Uploading model");
+            let (bar, progress) = commands::download::transfer_bar()?;
             let options = pmetal_hub::UploadOptions {
                 private,
                 revision,
                 commit_message: message,
                 create_pr,
                 ignore: exclude,
+                progress: Some(progress),
                 ..Default::default()
             };
-            let report = pmetal_hub::upload_model(&path, &repo, None, &options).await?;
+            let report = pmetal_hub::upload_model(&path, &repo, None, &options).await;
+            bar.finish_and_clear();
+            let report = report?;
             println!("Uploaded {path} to {}", report.repo_url);
             if let Some(commit) = report.commit_url {
                 println!("Commit: {commit}");
