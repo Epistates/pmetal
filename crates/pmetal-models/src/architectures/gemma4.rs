@@ -1742,12 +1742,79 @@ impl Gemma4ForCausalLM {
 // Weight loading
 // ----------------------------------------------------------------------------
 
+/// A checkpoint's tensors, remembering which ones the loader asked for, so the
+/// ones nothing asked for can be reported.
+struct CheckpointTensors {
+    tensors: HashMap<String, Array>,
+    claimed: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+impl CheckpointTensors {
+    fn get(&self, key: &str) -> Option<&Array> {
+        let tensor = self.tensors.get(key)?;
+        self.claimed.borrow_mut().insert(key.to_string());
+        Some(tensor)
+    }
+
+    /// Keys nothing asked for, sorted.
+    fn unclaimed(&self) -> Vec<&str> {
+        let claimed = self.claimed.borrow();
+        let mut keys: Vec<&str> = self
+            .tensors
+            .keys()
+            .filter(|key| !claimed.contains(*key))
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+}
+
+/// MLX conversions stack each layer's experts as
+/// `experts.switch_glu.{gate,up,down}_proj.weight`, `[E, out, in]`; the module
+/// holds them as Hugging Face ships them, `gate_up_proj` `[E, 2·I, H]` (gate
+/// first) and `down_proj` `[E, H, I]`. Rewrites the first spelling into the
+/// second.
+fn fuse_stacked_experts(weights: &mut HashMap<String, Array>) {
+    let layers: Vec<String> = weights
+        .keys()
+        .filter_map(|key| key.strip_suffix(".experts.switch_glu.gate_proj.weight"))
+        .map(str::to_string)
+        .collect();
+    for layer in layers {
+        let stacked = |name: &str| format!("{layer}.experts.switch_glu.{name}_proj.weight");
+        let fused = format!("{layer}.experts.gate_up_proj");
+        // Both spellings, or a half-stacked set: leave it for the loader to
+        // report rather than guess.
+        if weights.contains_key(&fused)
+            || ["gate", "up", "down"]
+                .iter()
+                .any(|name| !weights.contains_key(&stacked(name)))
+        {
+            continue;
+        }
+        let (gate, up, down) = (
+            weights.remove(&stacked("gate")).expect("checked above"),
+            weights.remove(&stacked("up")).expect("checked above"),
+            weights.remove(&stacked("down")).expect("checked above"),
+        );
+        weights.insert(fused, ops::concatenate_axis(&[&gate, &up], 1));
+        weights.insert(format!("{layer}.experts.down_proj"), down);
+    }
+}
+
 /// Load Gemma 4 weights into an existing [`Gemma4ForCausalLM`] instance.
 ///
-/// Keys arrive in any of the three released layouts and are normalised onto
-/// the bare `model.*` text tower by
+/// Keys arrive in any of the released layouts and are normalised onto the bare
+/// `model.*` text tower by
 /// [`pmetal_runtime::gemma4_native::normalize_checkpoint_key`]; vision and
-/// audio weights are skipped.
+/// audio weights are skipped. Experts may be fused (`gate_up_proj`) or stacked
+/// per projection (`switch_glu`).
+///
+/// A tensor the model needs and the checkpoint lacks, or a tensor under
+/// `model.layers` that the model has no place for, is an error naming it: both
+/// mean the loader does not understand this layout, and the model that results
+/// runs on whatever the missing tensor was initialised to.
 pub fn load_gemma4_weights(
     model: &mut Gemma4ForCausalLM,
     raw_weights: &HashMap<String, Array>,
@@ -1757,13 +1824,22 @@ pub fn load_gemma4_weights(
     // Strip the multimodal prefix + skip vision / audio tower entries. The
     // rule lives in `pmetal_runtime::gemma4_native` so the native engine and
     // this loader accept exactly the same set of checkpoints.
-    let weights: HashMap<String, Array> = raw_weights
+    let mut normalized: HashMap<String, Array> = raw_weights
         .iter()
         .filter_map(|(key, value)| {
             pmetal_runtime::gemma4_native::normalize_checkpoint_key(key)
                 .map(|stripped| (stripped, value.clone()))
         })
         .collect();
+    fuse_stacked_experts(&mut normalized);
+    let weights = CheckpointTensors {
+        tensors: normalized,
+        claimed: Default::default(),
+    };
+    // Tensors a complete checkpoint may leave out: a KV-shared layer reads an
+    // earlier layer's keys and values, so releases ship it no `k_proj`,
+    // `v_proj` or `k_norm`, and `layer_scalar` is a buffer that defaults to 1.
+    let mut optional: std::collections::HashSet<String> = Default::default();
 
     if let Some(w) = weights.get("model.embed_tokens.weight") {
         model.model.embed_tokens.weight = Param::new(w.clone());
@@ -1773,10 +1849,12 @@ pub fn load_gemma4_weights(
             "Gemma 4: missing model.embed_tokens.weight after prefix strip",
         ));
     }
-    if let Some(w) = weights.get("model.norm.weight") {
-        model.model.norm.weight = Param::new(w.clone());
-        report.loaded += 1;
-    }
+    load_norm(
+        &mut model.model.norm.weight,
+        &weights,
+        "model.norm.weight",
+        &mut report,
+    );
     if let Some(ref mut per_layer_inputs) = model.model.per_layer_inputs {
         if let Some(w) = weights.get("model.embed_tokens_per_layer.weight") {
             per_layer_inputs.embed_tokens.weight = Param::new(w.clone());
@@ -1802,6 +1880,13 @@ pub fn load_gemma4_weights(
 
     for (layer_idx, layer) in model.model.layers.iter_mut().enumerate() {
         let prefix = format!("model.layers.{layer_idx}");
+        optional.insert(format!("{prefix}.layer_scalar"));
+        if layer.kv_shared_source_layer.is_some() {
+            optional.extend(
+                ["self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"]
+                    .map(|name| format!("{prefix}.{name}")),
+            );
+        }
 
         // Load each norm's learnable weight. Inlined to avoid a slice-of-
         // mut-references dance (which would require `**slot` deref through
@@ -1968,12 +2053,40 @@ pub fn load_gemma4_weights(
         }
     }
 
+    let missing: Vec<&String> = report
+        .skipped
+        .iter()
+        .filter(|key| !optional.contains(*key))
+        .collect();
+    if !missing.is_empty() {
+        return Err(Exception::custom(format!(
+            "Gemma 4: the checkpoint lacks {} tensor(s) the model needs, first: {:?}",
+            missing.len(),
+            &missing[..missing.len().min(5)]
+        )));
+    }
+    let unclaimed = weights.unclaimed();
+    if let Some(stray) = unclaimed.iter().find(|key| key.starts_with("model.layers.")) {
+        return Err(Exception::custom(format!(
+            "Gemma 4: {} checkpoint tensor(s) have no place in the model, first: {stray:?}; \
+             this layout is not one the loader understands",
+            unclaimed.len(),
+        )));
+    }
+    if !unclaimed.is_empty() {
+        tracing::warn!(
+            count = unclaimed.len(),
+            first = unclaimed[0],
+            "Gemma 4 checkpoint tensors the model does not read"
+        );
+    }
+
     Ok(report)
 }
 
 fn load_linear(
     linear: &mut nn::Linear,
-    weights: &HashMap<String, Array>,
+    weights: &CheckpointTensors,
     prefix: &str,
     report: &mut LoadReport,
 ) {
@@ -1987,7 +2100,7 @@ fn load_linear(
 
 fn load_norm(
     slot: &mut Param<Array>,
-    weights: &HashMap<String, Array>,
+    weights: &CheckpointTensors,
     key: &str,
     report: &mut LoadReport,
 ) {
@@ -2340,65 +2453,128 @@ mod moe_tests {
         );
     }
 
-    /// The weight loader resolves the MoE tensor keys (router + fused experts +
-    /// the three MoE-only norms) for every MoE layer.
+    /// A checkpoint holding exactly the model's own tensors, under the names a
+    /// checkpoint gives them (the module nests the routed branch under `moe`,
+    /// which checkpoints do not).
+    fn own_tensors(model: &Gemma4ForCausalLM) -> HashMap<String, Array> {
+        model
+            .flatten_params()
+            .iter()
+            .map(|(key, value)| (key.replace(".moe.", "."), value.clone()))
+            .collect()
+    }
+
+    /// The loader claims every tensor of the model it loads, MoE branch
+    /// included, and reports none missing.
     #[test]
     #[serial]
-    fn load_gemma4_moe_weights_resolves_expert_keys() {
-        let mut model = Gemma4ForCausalLM::new(tiny_config(true)).unwrap();
+    fn load_gemma4_weights_claims_every_parameter() {
+        for moe in [false, true] {
+            let mut model = Gemma4ForCausalLM::new(tiny_config(moe)).unwrap();
+            let weights = own_tensors(&model);
+            let report = load_gemma4_weights(&mut model, &weights).unwrap();
+            assert_eq!(report.loaded, weights.len(), "moe={moe}");
+            assert!(report.skipped.is_empty(), "moe={moe}: {:?}", report.skipped);
+        }
+    }
 
-        // Minimal weight set: the required embedding + every layer's MoE keys,
-        // each shaped as the loader expects. Non-MoE tensors are intentionally
-        // omitted (they land in `skipped`); we only assert the MoE keys load.
-        let mut weights: HashMap<String, Array> = HashMap::new();
-        weights.insert(
-            "model.embed_tokens.weight".to_string(),
-            Array::zeros_f32(&[VOCAB, HIDDEN]),
-        );
-        let mut moe_keys: Vec<String> = Vec::new();
-        for i in 0..2 {
-            let p = format!("model.layers.{i}");
-            let entries: Vec<(String, Vec<i32>)> = vec![
-                (format!("{p}.router.proj.weight"), vec![NUM_EXPERTS, HIDDEN]),
-                (format!("{p}.router.scale"), vec![HIDDEN]),
-                (format!("{p}.router.per_expert_scale"), vec![NUM_EXPERTS]),
-                (
-                    format!("{p}.experts.gate_up_proj"),
-                    vec![NUM_EXPERTS, 2 * MOE_INTER, HIDDEN],
-                ),
-                (
-                    format!("{p}.experts.down_proj"),
-                    vec![NUM_EXPERTS, HIDDEN, MOE_INTER],
-                ),
-                (
-                    format!("{p}.post_feedforward_layernorm_1.weight"),
-                    vec![HIDDEN],
-                ),
-                (
-                    format!("{p}.pre_feedforward_layernorm_2.weight"),
-                    vec![HIDDEN],
-                ),
-                (
-                    format!("{p}.post_feedforward_layernorm_2.weight"),
-                    vec![HIDDEN],
-                ),
-            ];
-            for (key, shape) in entries {
-                weights.insert(key.clone(), Array::zeros_f32(&shape));
-                // The loader strips `.weight` off linear keys before lookup, so
-                // track the key form it reports skipped (the full tensor name).
-                moe_keys.push(key);
+    /// A tensor the model needs and the checkpoint lacks is an error, wherever
+    /// it is: this used to leave the layer on its initial value and log it.
+    #[test]
+    #[serial]
+    fn load_gemma4_weights_refuses_a_missing_tensor() {
+        let mut model = Gemma4ForCausalLM::new(tiny_config(true)).unwrap();
+        for victim in [
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.0.experts.down_proj",
+            "model.layers.1.router.per_expert_scale",
+            "model.norm.weight",
+        ] {
+            let mut weights = own_tensors(&model);
+            assert!(weights.remove(victim).is_some(), "{victim} is a parameter");
+            let err = match load_gemma4_weights(&mut model, &weights) {
+                Ok(report) => panic!("{victim} is missing, yet the load succeeded: {report:?}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(victim), "{err}");
+        }
+    }
+
+    /// A tensor under `model.layers` with no place in the model is an error
+    /// too: it is the layout the loader does not understand.
+    #[test]
+    #[serial]
+    fn load_gemma4_weights_refuses_a_stray_layer_tensor() {
+        let mut model = Gemma4ForCausalLM::new(tiny_config(false)).unwrap();
+        let mut weights = own_tensors(&model);
+        let stray = "model.layers.0.experts.switch_glu.gate_proj.weight";
+        weights.insert(stray.to_string(), Array::zeros_f32(&[2, 2, 2]));
+        let err = load_gemma4_weights(&mut model, &weights)
+            .expect_err("a stray tensor loaded")
+            .to_string();
+        assert!(err.contains(stray), "{err}");
+        // What is not under a layer is a warning: a checkpoint's `lm_head`
+        // when the embeddings are tied, say.
+        weights.remove(stray);
+        weights.insert("lm_head.weight".to_string(), Array::zeros_f32(&[2, 2]));
+        load_gemma4_weights(&mut model, &weights).expect("a stray lm_head is not an error");
+    }
+
+    /// A KV-shared layer reads an earlier layer's keys and values, so releases
+    /// ship it no `k_proj`, `v_proj` or `k_norm`; that is not a missing tensor.
+    #[test]
+    #[serial]
+    fn load_gemma4_weights_accepts_a_shared_layer_without_kv() {
+        let mut config = tiny_config(false);
+        config.num_hidden_layers = 4;
+        config.layer_types = ["sliding_attention", "full_attention"]
+            .iter()
+            .cycle()
+            .take(4)
+            .map(|s| s.to_string())
+            .collect();
+        config.num_kv_shared_layers = Some(2);
+        let mut model = Gemma4ForCausalLM::new(config).unwrap();
+        let shared: Vec<usize> = (0..4)
+            .filter(|&i| model.model.layers[i].kv_shared_source_layer.is_some())
+            .collect();
+        assert_eq!(shared, [2, 3]);
+        let mut weights = own_tensors(&model);
+        for i in shared {
+            for name in ["self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.k_norm.weight"] {
+                weights.remove(&format!("model.layers.{i}.{name}"));
             }
         }
+        load_gemma4_weights(&mut model, &weights).expect("shared layers need no keys or values");
+    }
 
-        let report = load_gemma4_weights(&mut model, &weights).unwrap();
-        for key in &moe_keys {
-            assert!(
-                !report.skipped.contains(key),
-                "MoE weight {key} was not resolved by the loader"
-            );
+    /// MLX conversions stack experts as `switch_glu.{gate,up,down}_proj`,
+    /// `[E, out, in]`. They load as the fused layout the module holds, gate
+    /// first.
+    #[test]
+    #[serial]
+    fn load_gemma4_weights_fuses_stacked_experts() {
+        let mut model = Gemma4ForCausalLM::new(tiny_config(true)).unwrap();
+        let mut weights = own_tensors(&model);
+        let rand = |shape: &[i32]| random::uniform_range(-0.5, 0.5, shape, Dtype::Float32);
+        let (e, i, h) = (NUM_EXPERTS, MOE_INTER, HIDDEN);
+        let (gate, up, down) = (rand(&[e, i, h]), rand(&[e, i, h]), rand(&[e, h, i]));
+        for layer in 0..2 {
+            let p = format!("model.layers.{layer}.experts");
+            weights.remove(&format!("{p}.gate_up_proj"));
+            weights.remove(&format!("{p}.down_proj"));
+            weights.insert(format!("{p}.switch_glu.gate_proj.weight"), gate.clone());
+            weights.insert(format!("{p}.switch_glu.up_proj.weight"), up.clone());
+            weights.insert(format!("{p}.switch_glu.down_proj.weight"), down.clone());
         }
-        // 8 MoE tensors per layer × 2 layers + embedding.
-        assert!(report.loaded >= 17, "loaded only {}", report.loaded);
+        load_gemma4_weights(&mut model, &weights).expect("stacked experts load");
+
+        let fused = model.model.layers[1].moe.as_ref().unwrap().experts.gate_up_proj.as_ref();
+        assert_eq!(fused.shape(), &[e, 2 * i, h]);
+        let want = ops::concatenate_axis(&[&gate, &up], 1);
+        assert_eq!(max_abs_diff(fused, &want, (e * 2 * i * h) as usize), 0.0);
+        let down_loaded = model.model.layers[0].moe.as_ref().unwrap().experts.down_proj.as_ref();
+        assert_eq!(max_abs_diff(down_loaded, &down, (e * h * i) as usize), 0.0);
     }
 }
+
