@@ -1,9 +1,9 @@
-//! Audio processing utilities for vocoder.
+//! Audio front end for the vocoder.
 //!
-//! This module provides MLX-native implementations of:
-//! - STFT (Short-Time Fourier Transform)
-//! - Mel filterbank
-//! - Audio feature extraction
+//! MLX-native implementations of:
+//! - the STFT and its inverse, matching `torch.stft` / `torch.istft`
+//! - the librosa-compatible mel filterbank
+//! - the BigVGAN mel front end ([`MelFrontEnd`])
 
 mod mel;
 mod stft;
