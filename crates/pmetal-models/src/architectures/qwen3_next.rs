@@ -1372,7 +1372,6 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             Some(&ssm_state),
             None,
-            false,
         )?;
 
         // Gated norm (f32 precision)
@@ -1545,12 +1544,9 @@ impl Qwen3NextGatedDeltaNet {
 
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
-        // An uncached forward is a training (or scoring) pass, which needs the
-        // differentiable ops path: the fused GDN Metal kernel has no VJP, so
-        // under value_and_grad it failed ("Primitive::vjp Not implemented
-        // for CustomKernel") and the loss came out NaN. Same rule as
-        // qwen3_next_qlora. Cached prefill and decode keep the kernel.
-        let training = cache.is_none();
+        // The recurrence picks its own path: the fused kernel has no VJP, so
+        // inputs under a gradient trace take the differentiable chunked or
+        // sequential path, and everything else keeps the kernel.
         let (out, new_state) = gated_delta_update(
             &q_normed,
             &k_normed,
@@ -1561,7 +1557,6 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
-            training,
         )?;
 
         if let Some(cache) = cache {
@@ -1641,7 +1636,6 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
-            false,
         )?;
         out.eval();
         layer_profile.push_section("gdn_recurrence", recurrence_start);

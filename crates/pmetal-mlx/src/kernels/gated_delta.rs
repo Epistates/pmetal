@@ -1,22 +1,31 @@
-//! Gated Delta Network (GDN) linear attention implementation.
+//! Gated delta rule (GDN) linear attention for Qwen 3.5's recurrent layers.
 //!
-//! Implements the delta-rule-based recurrence for Qwen 3.5's linear attention layers.
-//! The GDN replaces quadratic softmax attention with a linear recurrence:
+//! The rule (Yang, Kautz and Hatamizadeh, "Gated Delta Networks: Improving
+//! Mamba2 with Delta Rule", ICLR 2025), per head with state `S ∈ ℝ^{Dv×Dk}`:
 //!
-//!   state = state * g + k^T * (beta * (v - state @ k))
-//!   y = state @ q
+//! ```text
+//! S ← S · diag(g_t)
+//! S ← S + β_t (v_t − S k_t) k_tᵀ
+//! y_t = S q_t
+//! ```
 //!
-//! This gives O(1) per-token generation cost vs O(n) for standard attention.
+//! It costs `O(1)` per generated token. Three implementations of it live here
+//! and [`gated_delta_update`] chooses between them:
 //!
-//! # Implementations
+//! - the fused Metal kernel, for inference where it fits (it has no VJP);
+//! - [`gated_delta_chunk_ops_impl`], the chunkwise parallel algorithm of
+//!   Yang et al., "Parallelizing Linear Transformers with the Delta Rule over
+//!   Sequence Length" (NeurIPS 2024): the WY representation turns each chunk
+//!   of `C = 64` tokens into a few batched matmuls and leaves only the
+//!   `O(T / C)` state hand-offs sequential. Differentiable, so training uses
+//!   it for sequences longer than a chunk;
+//! - [`gated_delta_ops`], the plain recurrence, for decode and short inputs.
 //!
-//! - `gated_delta_ops`: Pure MLX ops sequential loop (short sequences / decode)
-//! - `gated_delta_chunk_ops`: Chunkwise parallel algorithm (training prefill, T > 64)
-//! - `gated_delta_update`: Top-level API that dispatches between the two paths
+//! Every path carries the recurrence in f32 whatever the inputs' dtype and
+//! returns the output in the queries' dtype and the state in the state's.
 //!
-//! The chunkwise parallel algorithm (WY factorization from FLA, ICLR 2025) splits
-//! the sequence into chunks of 64 and parallelizes intra-chunk computation via
-//! matrix operations, reducing sequential steps from O(T) to O(T/64).
+//! The tests hold all three to a float64 implementation of the rule, values
+//! and gradients.
 //!
 //! # Shapes
 //!
@@ -25,12 +34,6 @@
 //! - g: `[B, T, Hv]` (scalar gating) or `[B, T, Hv, Dk]` (vectorized)
 //! - beta: `[B, T, Hv]`
 //! - state: `[B, Hv, Dv, Dk]`
-//!
-//! # Reference
-//!
-//! - Ported from the MLX reference implementation (Apple, 2025).
-//! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
-//!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
 use pmetal_runtime::compat::{Array, Dtype, Exception, linalg, ops};
 
@@ -123,19 +126,7 @@ pub fn compute_g_impl(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array
 ///
 /// # Returns
 /// (output `[B, H, Dv]`, new_state `[B, H, Dv, Dk]`)
-/// GDN step dispatch.
-fn gated_delta_step_compiled(
-    q: &Array,
-    k: &Array,
-    v: &Array,
-    g: &Array,
-    beta: &Array,
-    state: &Array,
-) -> Result<(Array, Array), Exception> {
-    gated_delta_step_core_ops(q, k, v, g, beta, state)
-}
-
-fn gated_delta_step_core_ops(
+fn gated_delta_step(
     q: &Array,
     k: &Array,
     v: &Array,
@@ -196,7 +187,7 @@ fn gated_delta_step_ops(
     mask: Option<&Array>,
 ) -> Result<(Array, Array), Exception> {
     let old_state = state.clone();
-    let (y, new_state) = gated_delta_step_compiled(q, k, v, g, beta, state)?;
+    let (y, new_state) = gated_delta_step(q, k, v, g, beta, state)?;
 
     // Apply mask: if masked, keep old state
     let new_state = if let Some(mask) = mask {
@@ -253,8 +244,24 @@ fn gated_delta_decode_ops(
     };
     let beta_t = beta.reshape(&[b, hv]);
 
-    let (y, new_state) = gated_delta_step_compiled(&q_t, &k_t, &v_t, &g_t, &beta_t, state)?;
+    let (y, new_state) = gated_delta_step(&q_t, &k_t, &v_t, &g_t, &beta_t, state)?;
     Ok((y.reshape(&[b, 1, hv, dv]), new_state))
+}
+
+/// Whether any input is narrower than f32. The recurrence is carried in f32
+/// whatever the inputs' dtype (as the fused kernel does): a state accumulated
+/// in bf16 over a few hundred steps drifts far outside bf16's own rounding of
+/// the result.
+fn needs_widening(inputs: &[&Array], state: Option<&Array>) -> bool {
+    inputs
+        .iter()
+        .copied()
+        .chain(state)
+        .any(|a| a.dtype() != Dtype::Float32)
+}
+
+fn to_f32(a: &Array) -> Array {
+    a.as_dtype(Dtype::Float32.as_i32())
 }
 
 /// Ops-based sequential implementation for prompt prefill.
@@ -288,11 +295,29 @@ pub fn gated_delta_ops(
     let hv = v.dim(2);
     let dv = v.dim(3);
 
+    if needs_widening(&[q, k, v, g, beta], state) {
+        let state_dtype = state.map_or(q.dtype(), Array::dtype);
+        let widened = state.map(to_f32);
+        let (y, new_state) = gated_delta_ops(
+            &to_f32(q),
+            &to_f32(k),
+            &to_f32(v),
+            &to_f32(g),
+            &to_f32(beta),
+            widened.as_ref(),
+            mask,
+        )?;
+        return Ok((
+            y.as_dtype(q.dtype().as_i32()),
+            new_state.as_dtype(state_dtype.as_i32()),
+        ));
+    }
+
     // Initialize state if not provided
     let mut state = if let Some(s) = state {
         s.clone()
     } else {
-        ops::zeros(&[b, hv, dv, dk], q.dtype())
+        ops::zeros(&[b, hv, dv, dk], Dtype::Float32)
     };
 
     if t == 1 && mask.is_none() {
@@ -310,56 +335,30 @@ pub fn gated_delta_ops(
         (q, k)
     };
 
-    let b_i = b as usize;
-    let hk_i = q.dim(2) as usize;
-    let _hv_i = hv as usize;
-    let dk_i = dk as usize;
-    let dv_i = dv as usize;
-    let _ = (hk_i, dk_i, dv_i); // used via dim() calls below
     let mut ys = Vec::with_capacity(t as usize);
 
     for t_idx in 0..t {
+        let next = t_idx + 1;
         // Slice timestep t: [B, 1, H, D] -> squeeze axis 1 -> [B, H, D]
-        let ti = t_idx as usize;
-        let ti1 = ti + 1;
-        let q_h = q.dim(2) as usize;
-        let q_d = q.dim(3) as usize;
-        let v_h = v.dim(2) as usize;
-        let v_d = v.dim(3) as usize;
-        let q_t = q
-            .slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, q_h as i32, q_d as i32])
-            .squeeze(1);
-        let k_t = k
-            .slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, q_h as i32, q_d as i32])
-            .squeeze(1);
-        let v_t = v
-            .slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, v_h as i32, v_d as i32])
-            .squeeze(1);
-
-        let g_t = if g.ndim() == 3 {
-            let g_h = g.dim(2) as usize;
-            g.slice(&[0, t_idx, 0], &[b, ti1 as i32, g_h as i32])
-                .squeeze(1)
-        } else {
-            let g_h = g.dim(2) as usize;
-            let g_d = g.dim(3) as usize;
-            g.slice(&[0, t_idx, 0, 0], &[b, ti1 as i32, g_h as i32, g_d as i32])
-                .squeeze(1)
+        let step = |x: &Array| {
+            let mut stop: Vec<i32> = x.shape().to_vec();
+            stop[1] = next;
+            let mut start = vec![0; stop.len()];
+            start[1] = t_idx;
+            x.slice(&start, &stop).squeeze(1)
         };
-
-        let beta_h = beta.dim(2) as usize;
-        let beta_t = beta
-            .slice(&[0, t_idx, 0], &[b, ti1 as i32, beta_h as i32])
-            .squeeze(1);
-
-        let mask_t = mask.map(|m| m.slice(&[0, t_idx], &[b, ti1 as i32]).squeeze(1));
-
-        let (y, new_state) =
-            gated_delta_step_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, mask_t.as_ref())?;
+        let (y, new_state) = gated_delta_step_ops(
+            &step(q),
+            &step(k),
+            &step(v),
+            &step(g),
+            &step(beta),
+            &state,
+            mask.map(step).as_ref(),
+        )?;
         state = new_state;
         ys.push(y);
     }
-    let _ = b_i; // suppress unused warning
 
     // Stack outputs: Vec<[B, Hv, Dv]> -> [B, T, Hv, Dv]
     let y = ops::stack_axis(&ys, 1);
@@ -385,6 +384,32 @@ fn chunk_decay_matrix(log_g: &Array) -> Result<Array, Exception> {
     let log_decay = cs_i.subtract(&cs_j); // [*, C, C]
     let decay = log_decay.exp();
     Ok(ops::tril(&decay, 0)) // zero upper triangle; diagonal = exp(0) = 1
+}
+
+/// The inverse of `m = I + A`, `A` strictly lower triangular, for a batch of
+/// matrices `[..., C, C]`, differentiable in `m`.
+///
+/// MLX's `tri_inv` has no VJP, so the inverse is computed outside the graph
+/// and given its derivative by hand: `d(M⁻¹) = −M⁻¹ dM M⁻¹`. Writing
+///
+/// ```text
+/// Y = Y₀ − Y₀ (M − sg(M)) Y₀,        Y₀ = sg(M⁻¹)
+/// ```
+///
+/// makes `Y` equal `Y₀` exactly (`M − sg(M)` is zero) while autograd sees the
+/// first-order variation of the inverse, so the gradients of `k`, `β` and `g`
+/// (all of which `A` is built from) are the rule's. Treating the inverse as a
+/// constant instead, as an earlier version did, leaves them out of the
+/// gradient: the gradient of `k` came out wrong in sign. The correction costs
+/// two extra `[C, C]` batched matmuls forward and two backward, and is skipped
+/// where nothing is differentiated. Only the first derivative is exact.
+fn unit_lower_inverse(m: &Array) -> Array {
+    let inverse = linalg::tri_inv(&m.stop_gradient(), false);
+    if !m.is_tracer() {
+        return inverse;
+    }
+    let delta = m.subtract(&m.stop_gradient());
+    inverse.subtract(&ops::matmul(&ops::matmul(&inverse, &delta), &inverse))
 }
 
 /// Chunkwise parallel GDN implementation.
@@ -423,6 +448,23 @@ fn gated_delta_chunk_ops_impl(
     mask: Option<&Array>,
     chunk_size: i32,
 ) -> Result<(Array, Array), Exception> {
+    if needs_widening(&[q, k, v, g, beta], Some(state)) {
+        let (y, new_state) = gated_delta_chunk_ops_impl(
+            &to_f32(q),
+            &to_f32(k),
+            &to_f32(v),
+            &to_f32(g),
+            &to_f32(beta),
+            &to_f32(state),
+            mask,
+            chunk_size,
+        )?;
+        return Ok((
+            y.as_dtype(q.dtype().as_i32()),
+            new_state.as_dtype(state.dtype().as_i32()),
+        ));
+    }
+
     let b = q.dim(0);
     let t = q.dim(1);
     let hk = q.dim(2);
@@ -511,17 +553,11 @@ fn gated_delta_chunk_ops_impl(
         let end = start + c;
 
         // Extract chunk data via slice
-        let bv = b as usize;
-        let hv2 = h as usize;
-        let dk_s = q.dim(3) as usize;
-        let dv_s = v.dim(3) as usize;
-        let c_s = c as usize;
         let q_c = q.slice(&[0, 0, start, 0], &[b, h, end, q.dim(3)]); // [B, H, C, Dk]
         let k_c = k.slice(&[0, 0, start, 0], &[b, h, end, k.dim(3)]); // [B, H, C, Dk]
         let v_c = v.slice(&[0, 0, start, 0], &[b, h, end, v.dim(3)]); // [B, H, C, Dv]
         let g_c = g.slice(&[0, 0, start], &[b, h, end]); // [B, H, C]
         let beta_c = beta.slice(&[0, 0, start], &[b, h, end]); // [B, H, C]
-        let _ = (bv, hv2, dk_s, dv_s, c_s);
 
         // Decay matrix: clamp log result (not exp-space input) to prevent -inf/NaN in f16
         let log_g_c = g_c.log(); // [B, H, C]
@@ -531,13 +567,11 @@ fn gated_delta_chunk_ops_impl(
 
         let gamma_init = cs.exp(); // [B, H, C]
 
-        let cs_h = cs.dim(2) as usize;
         let cs_last = cs.slice(&[0, 0, c - 1], &[b, h, c]).squeeze(-1); // [B, H]
         let gamma_total = cs_last.exp(); // [B, H]
 
         let cs_last_exp = ops::expand_dims(&cs_last, -1); // [B, H, 1]
         let gamma_last = cs_last_exp.subtract(&cs).exp(); // [B, H, C]
-        let _ = cs_h;
 
         // WY factorization: build (I + A) matrix
         let k_c_t = k_c.transpose_axes(&[0, 1, 3, 2]); // [B, H, Dk, C]
@@ -575,10 +609,7 @@ fn gated_delta_chunk_ops_impl(
     // ========================================================================
     let i_plus_a_refs: Vec<&Array> = i_plus_a_list.iter().collect();
     let batched_ipa = ops::concatenate_axis(&i_plus_a_refs, 0); // [N*B*H, C, C]
-    // stop_gradient: tri_inv has no VJP in MLX. The inverse is a fixed preconditioner
-    // in the WY factorization — gradients should not flow through matrix inversion.
-    // This matches the FLA reference impl which computes tri_inv in torch.no_grad().
-    let batched_inv = linalg::tri_inv(&batched_ipa, false).stop_gradient();
+    let batched_inv = unit_lower_inverse(&batched_ipa);
 
     // Split back per-chunk and precompute delta_v, t_inv_bg
     struct ChunkInvData {
@@ -655,19 +686,6 @@ fn gated_delta_chunk_ops_impl(
     let y = y.transpose_axes(&[0, 2, 1, 3]);
 
     Ok((y, state))
-}
-
-#[cfg(test)]
-fn gated_delta_chunk_ops(
-    q: &Array,
-    k: &Array,
-    v: &Array,
-    g: &Array,
-    beta: &Array,
-    state: &Array,
-    mask: Option<&Array>,
-) -> Result<(Array, Array), Exception> {
-    gated_delta_chunk_ops_impl(q, k, v, g, beta, state, mask, DEFAULT_GDN_CHUNK_SIZE)
 }
 
 // ============================================================================
@@ -795,6 +813,19 @@ pub fn gated_delta_state_advance(
     Ok(new_state)
 }
 
+/// Chooses how to run the recurrence from what is being asked of it.
+///
+/// - Nothing differentiated: the fused Metal kernel when it fits (no mask,
+///   `Dk % 32 == 0`, `Dk <= 256`, scalar gate).
+/// - Longer than a chunk: the chunkwise path, which is differentiable
+///   ([`unit_lower_inverse`]) and builds `O(T / C)` graph nodes where the
+///   sequential loop builds `O(T)`, each holding a state-sized array for the
+///   backward pass.
+/// - Otherwise: the sequential ops path.
+///
+/// Whether autograd is tracing the inputs decides the first step, not a flag:
+/// a kernel with no VJP under a trace fails and everything upstream trains on
+/// nothing, while a frozen model's forward, traced or not, keeps the kernel.
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_dispatch(
     q: &Array,
@@ -804,24 +835,18 @@ fn gated_delta_dispatch(
     beta: &Array,
     state: &Array,
     mask: Option<&Array>,
-    training: bool,
     chunk_size_override: Option<i32>,
 ) -> Result<(Array, Array), Exception> {
-    // A caller differentiating through a cached forward passes `training =
-    // false`; the traced inputs say otherwise, and they decide.
-    let training = training || super::utils::any_traced(&[q, k, v, g, beta, state]);
-    if !training {
-        // For inference: try fused Metal kernel first (single dispatch per layer)
-        if let Some(result) = try_gdn_metal_kernel(q, k, v, g, beta, state, mask)? {
-            return Ok(result);
-        }
+    // `try_gdn_metal_kernel` declines anything autograd is tracing.
+    if let Some(result) = try_gdn_metal_kernel(q, k, v, g, beta, state, mask)? {
+        return Ok(result);
+    }
 
-        let t = q.dim(1);
-        if let Some(chunk_size) = resolve_chunk_size_override(chunk_size_override)
-            && t > chunk_size
-        {
-            return gated_delta_chunk_ops_impl(q, k, v, g, beta, state, mask, chunk_size);
-        }
+    let t = q.dim(1);
+    if let Some(chunk_size) = resolve_chunk_size_override(chunk_size_override)
+        && t > chunk_size
+    {
+        return gated_delta_chunk_ops_impl(q, k, v, g, beta, state, mask, chunk_size);
     }
     gated_delta_ops(q, k, v, g, beta, Some(state), mask)
 }
@@ -830,9 +855,10 @@ fn gated_delta_dispatch(
 ///
 /// Computes the gated delta network recurrence for a sequence of tokens.
 /// Handles beta/gate computation from raw inputs and dispatches to the
-/// appropriate implementation:
-/// - `T > 64`: chunkwise parallel (WY factorization) for training prefill
-/// - `T <= 64`: sequential loop for decode / short sequences
+/// implementation that fits (see `gated_delta_dispatch`): the fused Metal
+/// kernel for inference where it applies, the chunkwise parallel algorithm
+/// (WY factorization) for sequences longer than a chunk, with or without
+/// gradients, and the sequential loop for the rest.
 ///
 /// # Arguments
 /// * `q`, `k` - Query/key projections, shape `[B, T, Hk, Dk]`
@@ -843,9 +869,6 @@ fn gated_delta_dispatch(
 /// * `dt_bias` - Learnable bias, shape `[Hv]`
 /// * `state` - Optional initial state `[B, Hv, Dv, Dk]`
 /// * `mask` - Optional mask `[B, T]`
-/// * `training` - If true, forces sequential path (chunk path's `tri_inv` has no VJP
-///   and produces NaN inside `value_and_grad`). If false, dispatches to the chunk path
-///   for sequences longer than the configured chunk size for O(T/C) prefill.
 ///
 /// # Returns
 /// (output `[B, T, Hv, Dv]`, final_state `[B, Hv, Dv, Dk]`)
@@ -860,20 +883,17 @@ pub fn gated_delta_update(
     dt_bias: &Array,
     state: Option<&Array>,
     mask: Option<&Array>,
-    training: bool,
 ) -> Result<(Array, Array), Exception> {
-    gated_delta_update_with_chunk_size_override(
-        q, k, v, a, b, a_log, dt_bias, state, mask, training, None,
-    )
+    gated_delta_update_with_chunk_size_override(q, k, v, a, b, a_log, dt_bias, state, mask, None)
 }
 
 /// Variant of [`gated_delta_update`] that allows benchmarking or forcing a
-/// specific inference prefill chunk size.
+/// specific prefill chunk size.
 ///
 /// `chunk_size_override` semantics:
 /// - `None`: use the configured runtime default (`PMETAL_GDN_CHUNK_SIZE` or 64)
-/// - `Some(n > 0)`: force chunked inference with size `n` (clamped to 16..=512)
-/// - `Some(0)` or negative: force the sequential path even for long inference prompts
+/// - `Some(n > 0)`: force chunking with size `n` (clamped to 16..=512)
+/// - `Some(0)` or negative: force the sequential path even for long prompts
 #[allow(clippy::too_many_arguments)]
 pub fn gated_delta_update_with_chunk_size_override(
     q: &Array,
@@ -885,7 +905,6 @@ pub fn gated_delta_update_with_chunk_size_override(
     dt_bias: &Array,
     state: Option<&Array>,
     mask: Option<&Array>,
-    training: bool,
     chunk_size_override: Option<i32>,
 ) -> Result<(Array, Array), Exception> {
     // beta = sigmoid(b)
@@ -908,702 +927,9 @@ pub fn gated_delta_update_with_chunk_size_override(
         }
     };
 
-    gated_delta_dispatch(
-        q,
-        k,
-        v,
-        &g,
-        &beta,
-        state_ref,
-        mask,
-        training,
-        chunk_size_override,
-    )
+    gated_delta_dispatch(q, k, v, &g, &beta, state_ref, mask, chunk_size_override)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use pmetal_runtime::compat::random;
-    use serial_test::serial;
-
-    fn to_f32_vec(arr: &Array) -> Vec<f32> {
-        let mut a = arr.clone();
-        a.eval();
-        let n = a.size();
-        a.to_f32_vec(n).unwrap_or_default()
-    }
-
-    #[test]
-    #[serial]
-    fn test_compute_g_shape() {
-        let a_log = Array::from_f32_slice(&[0.5f32, 1.0, 1.5], &[3]);
-        let a = random::normal(&[2, 4, 3], Dtype::Float32);
-        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2, 0.3], &[3]);
-
-        let g = compute_g(&a_log, &a, &dt_bias).unwrap();
-        assert_eq!(g.shape(), &[2, 4, 3]);
-        // g should be in (0, 1] since it's exp(-positive)
-        let g_data = to_f32_vec(&g);
-        for val in &g_data {
-            assert!(*val > 0.0 && *val <= 1.0, "g value {} out of range", val);
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_gated_delta_ops_shape() {
-        let b = 2;
-        let t = 4;
-        let hk = 2;
-        let dk = 8;
-        let hv = 4;
-        let dv = 8;
-
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let g = random::uniform(&[b, t, hv], Dtype::Float32);
-        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
-
-        let (y, state) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        assert_eq!(y.shape(), &[b, t, hv, dv]);
-        assert_eq!(state.shape(), &[b, hv, dv, dk]);
-    }
-
-    #[test]
-    #[serial]
-    fn test_gated_delta_update_shape() {
-        let b = 1;
-        let t = 3;
-        let hk = 2;
-        let dk = 8;
-        let hv = 4;
-        let dv = 8;
-
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[b, t, hv], Dtype::Float32);
-        let b_input = random::normal(&[b, t, hv], Dtype::Float32);
-        let a_log = Array::from_f32_slice(&[1.0f32, 2.0, 3.0, 4.0], &[hv]);
-        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[hv]);
-
-        let (y, state) = gated_delta_update(
-            &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
-        )
-        .unwrap();
-
-        assert_eq!(y.shape(), &[b, t, hv, dv]);
-        assert_eq!(state.shape(), &[b, hv, dv, dk]);
-    }
-
-    #[test]
-    #[serial]
-    fn test_state_continuity() {
-        // Verify that processing in two chunks gives the same result as one chunk
-        let b = 1;
-        let hk = 1;
-        let dk = 4;
-        let hv = 2;
-        let dv = 4;
-        let t = 4;
-
-        random::seed(42);
-
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let g = random::uniform(&[b, t, hv], Dtype::Float32);
-        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
-
-        // Process all 4 steps at once
-        let (_y_full, state_full) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        // Process in two chunks of 2
-        let q1 = q.slice(&[0, 0, 0, 0], &[b, 2, hk, dk]);
-        let k1 = k.slice(&[0, 0, 0, 0], &[b, 2, hk, dk]);
-        let v1 = v.slice(&[0, 0, 0, 0], &[b, 2, hv, dv]);
-        let g1 = g.slice(&[0, 0, 0], &[b, 2, hv]);
-        let beta1 = beta.slice(&[0, 0, 0], &[b, 2, hv]);
-
-        let (_y1, state1) = gated_delta_ops(&q1, &k1, &v1, &g1, &beta1, None, None).unwrap();
-
-        let q2 = q.slice(&[0, 2, 0, 0], &[b, t, hk, dk]);
-        let k2 = k.slice(&[0, 2, 0, 0], &[b, t, hk, dk]);
-        let v2 = v.slice(&[0, 2, 0, 0], &[b, t, hv, dv]);
-        let g2 = g.slice(&[0, 2, 0], &[b, t, hv]);
-        let beta2 = beta.slice(&[0, 2, 0], &[b, t, hv]);
-
-        let (_y2, state2) =
-            gated_delta_ops(&q2, &k2, &v2, &g2, &beta2, Some(&state1), None).unwrap();
-
-        // States should match
-        state_full.eval();
-        state2.eval();
-        let diff = state_full.subtract(&state2).abs();
-        let max_diff = diff.max(None);
-        max_diff.eval();
-        let max_diff_val: f32 = max_diff.item();
-        assert!(
-            max_diff_val < 1e-4,
-            "State mismatch: max diff = {}",
-            max_diff_val
-        );
-    }
-
-    /// Helper: assert two arrays are close within tolerance, returning the max diff.
-    fn assert_close(a: &Array, b: &Array, tol: f32, msg: &str) {
-        let a_eval = a.clone();
-        let b_eval = b.clone();
-        a_eval.eval();
-        b_eval.eval();
-        let diff = a_eval.subtract(&b_eval).abs();
-        let max_diff = diff.max(None);
-        max_diff.eval();
-        let max_diff_val: f32 = max_diff.item();
-        assert!(
-            max_diff_val < tol,
-            "{}: max diff = {} (tol = {})",
-            msg,
-            max_diff_val,
-            tol
-        );
-    }
-
-    /// Helper: generate random GDN inputs for testing.
-    fn random_gdn_inputs(
-        b: i32,
-        t: i32,
-        hk: i32,
-        dk: i32,
-        hv: i32,
-        dv: i32,
-    ) -> (Array, Array, Array, Array, Array) {
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        // g in (0.5, 1.0) to keep decay moderate and avoid numerical issues
-        let g = random::uniform(&[b, t, hv], Dtype::Float32);
-        // beta in (0.0, 0.5) to keep updates moderate
-        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
-        (q, k, v, g, beta)
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_vs_sequential_t128() {
-        // Numerical equivalence: chunk output should match sequential for T=128
-        let b = 1;
-        let t = 128;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(123);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        // Sequential reference
-        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        // Chunk path
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        assert_eq!(y_chunk.shape(), y_seq.shape());
-        assert_eq!(state_chunk.shape(), state_seq.shape());
-        assert_close(&y_chunk, &y_seq, 1e-3, "T=128 output mismatch");
-        assert_close(&state_chunk, &state_seq, 1e-3, "T=128 state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_vs_sequential_t256() {
-        // Numerical equivalence: chunk output should match sequential for T=256
-        let b = 1;
-        let t = 256;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(456);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        assert_close(&y_chunk, &y_seq, 1e-3, "T=256 output mismatch");
-        assert_close(&state_chunk, &state_seq, 1e-3, "T=256 state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_state_continuity() {
-        // Process T=256 in one call vs two calls of T=128 with state passing
-        let b = 1;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-        let t = 256;
-
-        random::seed(789);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-
-        // Process all 256 at once via chunk path
-        let (_y_full, state_full) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        // Process in two halves of 128
-        let q1 = q.slice(&[0, 0, 0, 0], &[b, 128, hk, dk]);
-        let k1 = k.slice(&[0, 0, 0, 0], &[b, 128, hk, dk]);
-        let v1 = v.slice(&[0, 0, 0, 0], &[b, 128, hv, dv]);
-        let g1 = g.slice(&[0, 0, 0], &[b, 128, hv]);
-        let beta1 = beta.slice(&[0, 0, 0], &[b, 128, hv]);
-
-        let (_y1, state1) =
-            gated_delta_chunk_ops(&q1, &k1, &v1, &g1, &beta1, &state_init, None).unwrap();
-
-        let q2 = q.slice(&[0, 128, 0, 0], &[b, t, hk, dk]);
-        let k2 = k.slice(&[0, 128, 0, 0], &[b, t, hk, dk]);
-        let v2 = v.slice(&[0, 128, 0, 0], &[b, t, hv, dv]);
-        let g2 = g.slice(&[0, 128, 0], &[b, t, hv]);
-        let beta2 = beta.slice(&[0, 128, 0], &[b, t, hv]);
-
-        let (_y2, state2) =
-            gated_delta_chunk_ops(&q2, &k2, &v2, &g2, &beta2, &state1, None).unwrap();
-
-        assert_close(
-            &state_full,
-            &state2,
-            1e-3,
-            "Chunk state continuity mismatch",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_non_divisible_t() {
-        // T=100 is not divisible by 64 — tests padding logic
-        let b = 1;
-        let t = 100;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(101);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        // Sequential reference
-        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        // Chunk path (will pad to 128)
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        assert_eq!(
-            y_chunk.shape(),
-            &[b, t, hv, dv],
-            "Output shape should be unpadded"
-        );
-        assert_close(&y_chunk, &y_seq, 1e-3, "T=100 output mismatch");
-        assert_close(&state_chunk, &state_seq, 1e-3, "T=100 state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_gqa() {
-        // GQA: Hv=4, Hk=2 (repeat factor 2)
-        let b = 1;
-        let t = 128;
-        let hk = 2;
-        let dk = 8;
-        let hv = 4;
-        let dv = 8;
-
-        random::seed(202);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        // Sequential reference
-        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        // Chunk path
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        assert_eq!(y_chunk.shape(), &[b, t, hv, dv]);
-        assert_close(&y_chunk, &y_seq, 1e-3, "GQA output mismatch");
-        assert_close(&state_chunk, &state_seq, 1e-3, "GQA state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_with_mask() {
-        // Masked inputs: verify chunk handles mask correctly
-        let b = 1;
-        let t = 128;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(303);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        // Mask: first 100 tokens valid, last 28 masked
-        let mut mask_data = vec![1.0f32; t as usize];
-        mask_data[100..].fill(0.0);
-        let mask = Array::from_f32_slice(&mask_data, &[b, t]);
-
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-
-        // Chunk path with mask: state should match processing only the first 100 tokens
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, Some(&mask)).unwrap();
-
-        // Sequential on just the first 100 tokens (no mask needed)
-        let q_100 = q.slice(&[0, 0, 0, 0], &[b, 100, hk, dk]);
-        let k_100 = k.slice(&[0, 0, 0, 0], &[b, 100, hk, dk]);
-        let v_100 = v.slice(&[0, 0, 0, 0], &[b, 100, hv, dv]);
-        let g_100 = g.slice(&[0, 0, 0], &[b, 100, hv]);
-        let beta_100 = beta.slice(&[0, 0, 0], &[b, 100, hv]);
-
-        let (_y_ref, state_ref) =
-            gated_delta_ops(&q_100, &k_100, &v_100, &g_100, &beta_100, None, None).unwrap();
-
-        assert_eq!(y_chunk.shape(), &[b, t, hv, dv]);
-        // States should match since masked positions shouldn't update state
-        assert_close(&state_chunk, &state_ref, 1e-3, "Masked state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_update_dispatches_chunk() {
-        // Verify gated_delta_update dispatches to chunk path for T > configured chunk size
-        let b = 1;
-        let t = 128;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(404);
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[b, t, hv], Dtype::Float32);
-        let b_input = random::normal(&[b, t, hv], Dtype::Float32);
-        let a_log = Array::from_f32_slice(&[0.5f32, 1.0], &[hv]);
-        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2], &[hv]);
-
-        let (y, state) = gated_delta_update(
-            &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
-        )
-        .unwrap();
-
-        assert_eq!(y.shape(), &[b, t, hv, dv]);
-        assert_eq!(state.shape(), &[b, hv, dv, dk]);
-
-        // Verify output is finite
-        y.eval();
-        state.eval();
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_t65() {
-        // Worst-case padding: T=65 → 2 chunks, second has 1 real + 63 padded tokens
-        let b = 1;
-        let t = 65;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(505);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        // Sequential reference
-        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        // Chunk path (pads to 128)
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        assert_eq!(
-            y_chunk.shape(),
-            &[b, t, hv, dv],
-            "Output shape should be unpadded"
-        );
-        assert_close(&y_chunk, &y_seq, 1e-3, "T=65 output mismatch");
-        assert_close(&state_chunk, &state_seq, 1e-3, "T=65 state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_batched() {
-        // B=2 to verify batch dimension handling in chunk path
-        let b = 2;
-        let t = 128;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(606);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        // Sequential reference
-        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
-
-        // Chunk path
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        assert_eq!(y_chunk.shape(), &[b, t, hv, dv]);
-        assert_close(&y_chunk, &y_seq, 1e-3, "B=2 output mismatch");
-        assert_close(&state_chunk, &state_seq, 1e-3, "B=2 state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_nonzero_initial_state() {
-        // Non-zero S₀ validates the inter-chunk contribution term (Γ_init * Q @ S^T)
-        let b = 1;
-        let t = 128;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(707);
-        let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
-
-        // Non-zero initial state
-        let state_init = random::normal(&[b, hv, dv, dk], Dtype::Float32);
-
-        // Sequential reference with same initial state
-        let (y_seq, state_seq) =
-            gated_delta_ops(&q, &k, &v, &g, &beta, Some(&state_init), None).unwrap();
-
-        // Chunk path
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
-
-        assert_eq!(y_chunk.shape(), &[b, t, hv, dv]);
-        assert_close(&y_chunk, &y_seq, 1e-3, "Nonzero S₀ output mismatch");
-        assert_close(&state_chunk, &state_seq, 1e-3, "Nonzero S₀ state mismatch");
-    }
-
-    #[test]
-    #[serial]
-    fn test_decode_specialized_matches_step_ops() {
-        let b = 1;
-        let t = 1;
-        let hk = 2;
-        let dk = 64;
-        let hv = 4; // GQA: 4 value heads, 2 key heads
-        let dv = 64;
-
-        random::seed(42);
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let g = random::uniform(&[b, t, hv], Dtype::Float32);
-        let beta = random::uniform(&[b, t, hv], Dtype::Float32);
-
-        let state = ops::zeros(&[b, hv, dv, dk], Dtype::Float32);
-
-        let q_rep = ops::repeat_axis(q.clone(), hv / hk, 2);
-        let k_rep = ops::repeat_axis(k.clone(), hv / hk, 2);
-        let q_t = q_rep.reshape(&[b, hv, dk]);
-        let k_t = k_rep.reshape(&[b, hv, dk]);
-        let v_t = v.reshape(&[b, hv, dv]);
-        let g_t = g.reshape(&[b, hv]);
-        let beta_t = beta.reshape(&[b, hv]);
-
-        let (y_ref_step, state_ref) =
-            gated_delta_step_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None).unwrap();
-        let y_ref = y_ref_step.reshape(&[b, t, hv, dv]);
-
-        let (y_decode, state_decode) =
-            gated_delta_decode_ops(&q, &k, &v, &g, &beta, &state).unwrap();
-
-        assert_eq!(y_decode.shape(), y_ref.shape());
-        assert_eq!(state_decode.shape(), state_ref.shape());
-        assert_close(
-            &y_decode,
-            &y_ref,
-            1e-3,
-            "Decode-specialized output mismatch",
-        );
-        assert_close(
-            &state_decode,
-            &state_ref,
-            1e-3,
-            "Decode-specialized state mismatch",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_size_override_zero_forces_sequential_path() {
-        let b = 1;
-        let t = 96;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(808);
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[b, t, hv], Dtype::Float32);
-        let b_in = random::normal(&[b, t, hv], Dtype::Float32);
-        let a_log = random::normal(&[hv], Dtype::Float32).abs();
-        let dt_bias = random::normal(&[hv], Dtype::Float32);
-
-        let (y_seq, state_seq) = gated_delta_update_with_chunk_size_override(
-            &q, &k, &v, &a, &b_in, &a_log, &dt_bias, None, None, true, None,
-        )
-        .unwrap();
-        let (y_forced, state_forced) = gated_delta_update_with_chunk_size_override(
-            &q,
-            &k,
-            &v,
-            &a,
-            &b_in,
-            &a_log,
-            &dt_bias,
-            None,
-            None,
-            false,
-            Some(0),
-        )
-        .unwrap();
-
-        assert_close(&y_forced, &y_seq, 1e-3, "Forced sequential output mismatch");
-        assert_close(
-            &state_forced,
-            &state_seq,
-            1e-3,
-            "Forced sequential state mismatch",
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_chunk_size_override_positive_matches_chunk_path() {
-        let b = 1;
-        let t = 128;
-        let hk = 2;
-        let dk = 8;
-        let hv = 2;
-        let dv = 8;
-
-        random::seed(909);
-        let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let k = random::normal(&[b, t, hk, dk], Dtype::Float32);
-        let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-        let a = random::normal(&[b, t, hv], Dtype::Float32);
-        let b_in = random::normal(&[b, t, hv], Dtype::Float32);
-        let a_log = random::normal(&[hv], Dtype::Float32).abs();
-        let dt_bias = random::normal(&[hv], Dtype::Float32);
-        let g = compute_g(&a_log, &a, &dt_bias).unwrap();
-        let beta = b_in.sigmoid();
-        let state_init = ops::zeros(&[b, hv, dv, dk], q.dtype());
-
-        let (y_forced, state_forced) = gated_delta_update_with_chunk_size_override(
-            &q,
-            &k,
-            &v,
-            &a,
-            &b_in,
-            &a_log,
-            &dt_bias,
-            None,
-            None,
-            false,
-            Some(32),
-        )
-        .unwrap();
-        let (y_chunk, state_chunk) =
-            gated_delta_chunk_ops_impl(&q, &k, &v, &g, &beta, &state_init, None, 32).unwrap();
-
-        assert_close(&y_forced, &y_chunk, 1e-3, "Forced chunk output mismatch");
-        assert_close(
-            &state_forced,
-            &state_chunk,
-            1e-3,
-            "Forced chunk state mismatch",
-        );
-    }
-
-    /// Differentiating through the recurrence with `training = false`, the
-    /// flag a cached forward passes, gives the gradient the ops path gives.
-    /// The inference dispatch would otherwise take the fused Metal kernel (Dk
-    /// 32, no mask) or the chunked path, neither of which autograd can go
-    /// through: the custom kernel has no VJP, so the step failed.
-    #[test]
-    #[serial]
-    fn a_traced_recurrence_takes_the_differentiable_path() {
-        use pmetal_runtime::compat::nn::value_and_grad_explicit;
-
-        let (b, hk, dk, hv, dv) = (1, 2, 32, 4, 16);
-        let a_log = Array::from_f32_slice(&[0.5f32, 1.0, 1.5, 2.0], &[hv]);
-        let dt_bias = Array::from_f32_slice(&[0.1f32, 0.2, 0.3, 0.4], &[hv]);
-        for (t, chunk) in [(6, None), (48, Some(16))] {
-            random::seed(9);
-            let q = random::normal(&[b, t, hk, dk], Dtype::Float32);
-            let k = random::normal(&[b, t, hk, dk], Dtype::Float32).multiply(&Array::from_f32(0.2));
-            let v = random::normal(&[b, t, hv, dv], Dtype::Float32);
-            let a = random::normal(&[b, t, hv], Dtype::Float32);
-            let b_in = random::normal(&[b, t, hv], Dtype::Float32);
-
-            let grad_of = |training: bool| {
-                let (_, grads) = value_and_grad_explicit(
-                    |x: &[Array]| {
-                        let (y, _) = gated_delta_update_with_chunk_size_override(
-                            &x[0], &x[1], &x[2], &a, &b_in, &a_log, &dt_bias, None, None, training,
-                            chunk,
-                        )
-                        .unwrap();
-                        y.square().sum_all()
-                    },
-                    &[q.clone(), k.clone(), v.clone()],
-                    &[],
-                )
-                .unwrap();
-                pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
-                grads
-            };
-            let want = grad_of(true);
-            let got = grad_of(false);
-            for (g, w) in got.iter().zip(&want) {
-                let scale: f32 = w.abs().max(None).item();
-                assert!(scale > 0.0, "T={t}: the ops path's gradient is zero");
-                assert_close(
-                    g,
-                    w,
-                    1e-4 * scale,
-                    &format!("T={t}: gradient through the inference dispatch"),
-                );
-            }
-        }
-    }
-}
+#[path = "gated_delta_tests.rs"]
+mod tests;
