@@ -114,6 +114,15 @@ pub(crate) struct Geometry {
 }
 
 impl Geometry {
+    /// Whether the kernel's threadgroup tile fits Metal's 32 KiB threadgroup
+    /// memory for `channels` channels (it does for every ratio BigVGAN uses;
+    /// larger decimation ratios fall back to the op path).
+    pub fn fits_threadgroup_memory(&self, channels: i32) -> bool {
+        let lanes = channels.clamp(1, MAX_LANES);
+        let tile_samples = TILE * self.down_ratio + self.down_kernel - self.down_ratio;
+        i64::from(tile_samples) * i64::from(lanes) * 4 <= 30_000
+    }
+
     /// Output length for `len` input samples.
     pub fn out_len(&self, len: i32) -> i32 {
         (len * self.up_ratio + self.down_pad_left + self.down_pad_right - self.down_kernel)

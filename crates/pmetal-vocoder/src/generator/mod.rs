@@ -115,6 +115,12 @@ impl BigVGAN {
         self.config.hop_size
     }
 
+    /// The precision the model computes in (that of its input convolution's
+    /// weight; see [`to_dtype`](Self::to_dtype)).
+    pub fn dtype(&self) -> Dtype {
+        self.conv_pre.weight.weight.value.dtype()
+    }
+
     /// Synthesise from a channels-last mel `[batch, frames, n_mels]` to a
     /// channels-last waveform `[batch, frames * hop_size, 1]`.
     pub fn forward_nlc(&self, mel: &Array) -> Result<Array> {
@@ -124,7 +130,9 @@ impl BigVGAN {
                 actual: mel.shape().to_vec(),
             });
         }
-        let mut x = self.conv_pre.forward(mel)?;
+        // The mel runs in the model's precision (a half-precision model fed a
+        // float32 mel would otherwise promote every convolution back to float32).
+        let mut x = self.conv_pre.forward(&mel.as_dtype(self.dtype()))?;
         let num_kernels = self.num_kernels();
         for (i, up) in self.ups.iter().enumerate() {
             x = up.forward(&x)?;

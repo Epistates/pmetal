@@ -296,7 +296,9 @@ impl Activation1d {
                     actual: x.shape().to_vec(),
                 });
             }
-            if matches!(x.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16) {
+            if matches!(x.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)
+                && fused.geometry.fits_threadgroup_memory(x.dim(2))
+            {
                 return fused::anti_alias_activation(x, fused);
             }
         }

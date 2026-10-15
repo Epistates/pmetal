@@ -40,7 +40,11 @@ fn activation(
 #[test]
 fn fused_kernel_equals_the_op_path_across_shapes_ratios_and_variants() {
     random::seed(42);
+    // The first pair (16x with 96 taps) is too wide for the kernel's threadgroup
+    // tile with 32 channels or more and must fall back to the op path rather
+    // than fail.
     let ratios = [
+        ((16, 16), (96, 96)),
         ((2, 2), (12, 12)),
         ((3, 3), (18, 18)),
         ((2, 2), (11, 11)),

@@ -170,7 +170,10 @@ fn half_precision_tracks_float32() {
     let mel = fx.array("mel");
     let reference = to_vec(&model.forward(&mel).unwrap());
     model.to_dtype(Dtype::Bfloat16);
-    let audio = model.forward(&mel.as_dtype(Dtype::Bfloat16)).unwrap();
+    // A float32 mel runs in the model's precision rather than promoting every
+    // convolution back to float32.
+    assert_eq!(model.dtype(), Dtype::Bfloat16);
+    let audio = model.forward(&mel).unwrap();
     assert_eq!(audio.dtype(), Dtype::Bfloat16);
     let got = to_vec(&audio);
     let signal: f32 = reference.iter().map(|v| v * v).sum();
