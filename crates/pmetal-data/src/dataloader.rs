@@ -91,6 +91,50 @@ pub fn shuffled_indices(n: usize, seed: u64) -> Vec<usize> {
     indices
 }
 
+/// Reorder `indices` so that consecutive `batch_size` runs hold items of
+/// similar `length`, in megabatches of `megabatch_batches` batches: see
+/// [`DataLoader::with_length_grouping`]. A pure function of its inputs and
+/// `seed`. A short final batch stays last.
+pub(crate) fn group_by_length(
+    indices: &mut Vec<usize>,
+    length: impl Fn(usize) -> usize,
+    batch_size: usize,
+    megabatch_batches: usize,
+    seed: u64,
+) {
+    let megabatch_len = batch_size * megabatch_batches.max(1);
+    let mut grouped: Vec<usize> = Vec::with_capacity(indices.len());
+    let mut remainder: Vec<usize> = Vec::new();
+    // The batch (start offset in `grouped`) holding the longest item so far.
+    let mut longest = (0usize, 0usize);
+    for (n, chunk) in indices.chunks(megabatch_len).enumerate() {
+        let mut chunk = chunk.to_vec();
+        // Longest first; ties by position, which keeps the order total.
+        chunk.sort_by_key(|&i| std::cmp::Reverse(length(i)));
+        let full = chunk.len() / batch_size * batch_size;
+        let batches = full / batch_size;
+        for b in shuffled_indices(
+            batches,
+            seed ^ (n as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407),
+        ) {
+            let batch = &chunk[b * batch_size..(b + 1) * batch_size];
+            let max = batch.iter().map(|&i| length(i)).max().unwrap_or(0);
+            if max > longest.1 {
+                longest = (grouped.len(), max);
+            }
+            grouped.extend_from_slice(batch);
+        }
+        remainder.extend_from_slice(&chunk[full..]);
+    }
+    // Only the last megabatch can be short; its leftovers close the epoch.
+    grouped.extend_from_slice(&remainder);
+    // The batch with the longest item leads the epoch.
+    if longest.0 + batch_size <= grouped.len() {
+        grouped[..longest.0 + batch_size].rotate_right(batch_size);
+    }
+    *indices = grouped;
+}
+
 /// The items one rank serves in an epoch, in order.
 ///
 /// The epoch is `0..n` (shuffled by `seed` when `shuffle`), and rank `rank` of
@@ -203,6 +247,8 @@ pub struct DataLoader {
     position: usize,
     /// Seed of the epoch being served.
     epoch_seed: u64,
+    /// Megabatch size, in batches, when batching by length.
+    length_grouping: Option<usize>,
     /// Optional image processor for multimodal data.
     image_processor: Option<Arc<FixedSizeImageProcessor>>,
 }
@@ -227,6 +273,7 @@ impl DataLoader {
         let mut loader = Self {
             dataset,
             epoch_seed: config.seed,
+            length_grouping: None,
             config,
             indices: Vec::new(),
             position: 0,
@@ -250,6 +297,37 @@ impl DataLoader {
             self.config.rank,
             self.config.world_size,
         );
+        if let Some(megabatch) = self.length_grouping {
+            let max_len = self.config.max_seq_len;
+            let samples = self.dataset.samples();
+            group_by_length(
+                &mut self.indices,
+                |i| samples[i].input_ids.len().min(max_len),
+                self.config.batch_size.max(1),
+                megabatch,
+                seed,
+            );
+        }
+    }
+
+    /// Batch samples of similar length together to cut padding.
+    ///
+    /// Each epoch's order is cut into megabatches of `megabatch_batches`
+    /// batches; inside one the samples are sorted by length and dealt into
+    /// batches, so a batch pads to nearly its own shortest sample instead of
+    /// to the longest of a random draw. The batches of a megabatch are then
+    /// shuffled (the sort would otherwise feed them longest to shortest, a
+    /// curriculum nobody asked for), except that the batch holding the epoch's
+    /// longest sample goes first: a run that is going to run out of memory
+    /// does so on step one. 50 is a good size (the longer the megabatch, the
+    /// less padding and the less random a batch's composition).
+    ///
+    /// Takes effect from the next epoch; the loader is rewound to the start
+    /// of the current one.
+    pub fn with_length_grouping(mut self, megabatch_batches: usize) -> Self {
+        self.length_grouping = Some(megabatch_batches.max(1));
+        self.start_epoch(self.epoch_seed);
+        self
     }
 
     /// Start a new epoch, ordered by `new_seed` (`config.seed` when `None`).
@@ -662,6 +740,97 @@ mod tests {
         assert!(l.restore(at(11)).is_err(), "past the end");
         assert!(l.restore(at(3)).is_err(), "not on a batch boundary");
         assert!(l.restore(at(8)).is_ok());
+    }
+
+    fn variable_length_dataset(n: usize) -> TrainingDataset {
+        let mut state = 99u64;
+        TrainingDataset::from_samples(
+            (0..n)
+                .map(|i| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let len = 1 + (state >> 33) as usize % 200;
+                    Sample::new(vec![i as u32; len])
+                })
+                .collect(),
+        )
+    }
+
+    /// Tokens a padded batch holds beyond its samples' own.
+    fn padding(dataset: &TrainingDataset, order: &[usize], batch_size: usize) -> usize {
+        order
+            .chunks(batch_size)
+            .map(|batch| {
+                let longest = batch.iter().map(|&i| dataset.samples()[i].input_ids.len());
+                let longest = longest.max().unwrap();
+                batch
+                    .iter()
+                    .map(|&i| longest - dataset.samples()[i].input_ids.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Batching by length serves the same samples, with far less padding, the
+    /// longest sample's batch first, and any short batch last.
+    #[test]
+    fn length_grouping_cuts_padding_without_losing_samples() {
+        let dataset = variable_length_dataset(1003);
+        let config = || DataLoaderConfig {
+            batch_size: 8,
+            max_seq_len: 4096,
+            seed: 5,
+            ..Default::default()
+        };
+        let mut plain = DataLoader::new(dataset.clone(), config(), None);
+        let mut grouped = DataLoader::new(dataset.clone(), config(), None).with_length_grouping(50);
+        let plain_order = served(&mut plain);
+        let grouped_order = served(&mut grouped);
+
+        let mut sorted = grouped_order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..1003).collect::<Vec<_>>());
+        let before = padding(&dataset, &plain_order, 8);
+        let after = padding(&dataset, &grouped_order, 8);
+        assert!(after * 5 < before, "padding {before} -> {after}");
+
+        let longest = (0..1003)
+            .max_by_key(|&i| dataset.samples()[i].input_ids.len())
+            .unwrap();
+        assert!(grouped_order[..8].contains(&longest), "longest batch first");
+        assert_eq!(grouped_order.len() % 8, 1003 % 8);
+    }
+
+    /// A grouped epoch is a function of its seed like any other, so it
+    /// resumes.
+    #[test]
+    fn a_length_grouped_epoch_is_deterministic_and_resumable() {
+        let dataset = variable_length_dataset(300);
+        let make = || {
+            DataLoader::new(
+                dataset.clone(),
+                DataLoaderConfig {
+                    batch_size: 4,
+                    seed: 8,
+                    ..Default::default()
+                },
+                None,
+            )
+            .with_length_grouping(10)
+        };
+        let mut a = make();
+        let mut b = make();
+        assert_eq!(served(&mut a), served(&mut b));
+        a.reset(Some(9));
+        for _ in 0..5 {
+            a.try_next_batch().unwrap().unwrap();
+        }
+        let state = a.state();
+        let rest = served(&mut a);
+        let mut resumed = make();
+        resumed.restore(state).unwrap();
+        assert_eq!(served(&mut resumed), rest);
     }
 
     /// Labels that don't line up with the tokens would shift every label

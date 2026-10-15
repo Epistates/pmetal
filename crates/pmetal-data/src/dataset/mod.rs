@@ -14,10 +14,12 @@
 
 mod embedding;
 mod format;
+mod mix;
 mod render;
 
 pub use embedding::{EmbeddingDataset, EmbeddingPair, EmbeddingTriplet};
 pub use format::{DatasetColumnConfig, DatasetFormat};
+pub use mix::MixSource;
 pub(crate) use render::tokenize_messages;
 pub use render::{AssistantLoss, TextSample};
 
