@@ -43,40 +43,57 @@ impl MergeMethod for LinearMerge {
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
+        Self::weighted_average(tensors, params, global_params)
+    }
+}
+
+impl LinearMerge {
+    /// `Σ wᵢ·tensorᵢ`, with the weights divided by their sum when the
+    /// `normalize` parameter is on (the default), so equal weights give the
+    /// mean (a model soup, Wortsman et al. 2022).
+    ///
+    /// Also the fallback of the methods that need side data (Fisher, RegMean)
+    /// when a tensor has none.
+    pub(crate) fn weighted_average(
+        tensors: &[Array],
+        params: &[MergeParameters],
+        global_params: &MergeParameters,
+    ) -> Result<Array> {
         if tensors.is_empty() {
             return Err(MergeError::NotEnoughModels {
                 expected: 1,
                 actual: 0,
             });
         }
+        if params.len() != tensors.len() {
+            return Err(MergeError::InvalidConfig(format!(
+                "{} tensors but {} per-model parameter sets",
+                tensors.len(),
+                params.len()
+            )));
+        }
 
-        // Get weights for each tensor
-        let weights: Vec<f32> = params
+        let mut weights: Vec<f32> = params
             .iter()
             .map(|p| global_params.merge_with(p).weight())
             .collect();
 
-        // Optionally normalize weights
-        let weights = if global_params.normalize() {
+        if global_params.normalize() {
             let sum: f32 = weights.iter().sum();
             if sum <= 0.0 {
                 return Err(MergeError::InvalidConfig(
                     "Cannot normalize weights: sum is zero or negative".to_string(),
                 ));
             }
-            weights.iter().map(|w| w / sum).collect()
-        } else {
-            weights
-        };
-
-        // Compute weighted sum
-        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]));
-
-        for (tensor, weight) in tensors[1..].iter().zip(&weights[1..]) {
-            let weighted = tensor.multiply(&Array::from_f32(*weight));
-            result = result.add(&weighted);
+            for w in &mut weights {
+                *w /= sum;
+            }
         }
 
+        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]));
+        for (tensor, weight) in tensors[1..].iter().zip(&weights[1..]) {
+            result = result.add(&tensor.multiply(&Array::from_f32(*weight)));
+        }
         Ok(result)
     }
 }

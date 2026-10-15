@@ -557,7 +557,7 @@ The `pmetal dataset` subcommand provides utilities for analysis, download from H
 ### Model Operations
 
 - **HuggingFace Hub Search**: `pmetal search` with memory fit estimation and download
-- **Model Merging** (15 strategies via `MergeConfig`, 12 via CLI):
+- **Model Merging** (17 strategies via `MergeConfig`, 14 via CLI):
 
   | CLI | Library | Description |
   |-----|---------|-------------|
@@ -570,17 +570,17 @@ The `pmetal dataset` subcommand provides utilities for analysis, download from H
   | `della` | `DellaMerge` | Adaptive magnitude-based pruning |
   | `della_linear` | `DellaMerge` | Adaptive magnitude pruning (linear variant) |
   | `breadcrumbs` | `BreadcrumbsMerge` | Breadcrumbs merge strategy |
-  | `model_stock` | `ModelStockMerge` | Geometric interpolation based on task vector similarity |
-  | `nearswap` | `NearswapMerge` | Near-swap merge strategy |
+  | `model_stock` | `ModelStockMerge` | Interpolation toward the pre-trained weights by task-vector angle |
+  | `consensus` | `ConsensusMerge` | TALL-mask consensus merging |
+  | `multislerp` | `MultiSlerpMerge` | Weighted spherical (Karcher) mean of 3+ models |
+  | `nearswap` | `NearswapMerge` | Per-parameter selection of the value nearest the base |
   | `passthrough` | `PassthroughMerge` | Layer passthrough composition |
   | — | `RamMerge` | RAM merge strategy |
-  | — | `SouperMerge` | Souper merge strategy |
-  | — | `MultiSlerpMerge` | Multi-model SLERP |
 
-- **GPU-Accelerated Merging**: Metal-based merge operations for large models
-- **FP8-Aware Merging**: Merge with FP8 quantization for memory efficiency
-- **Async Merge Pipeline**: Double-buffered streaming merge for large models
-- **LoRA Fusing**: Merge LoRA adapters into base weights (standard and accurate modes)
+- **Streaming merges**: memory-mapped checkpoints, one tensor at a time, atomic indexed output
+- **FP8 checkpoints**: E4M3 weights with block scales are dequantized on load
+- **Frankenmerges**: layer `slices`, filter and layer-gradient parameters
+- **LoRA Fusing**: PEFT and `pmetal train` adapters, rsLoRA, DoRA, quantized bases
 - **GGUF Quantization** (13 format options):
 
   | Format | Description |

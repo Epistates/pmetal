@@ -2,13 +2,27 @@
 //!
 //! This module provides the high-level API for running model merges.
 //! It coordinates loading models, applying merge algorithms, and saving results.
+//!
+//! A merge streams: tensors are read from memory-mapped checkpoints one name
+//! at a time, merged in f32, checked, and appended to the output writer
+//! before the next is touched, so memory use is a few tensors and not the
+//! models.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use pmetal_runtime::compat::Array;
 use regex::Regex;
 use tracing::{debug, info, warn};
+
+use crate::moe_align::MoeAlignment;
+use crate::{
+    BreadcrumbsMerge, ConsensusMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError,
+    MergeMethod, MergeMethodConfig, MergeParameters, ModelStockMerge, MultiSlerpMerge,
+    NearswapMerge, PassthroughMerge, RamMerge, Result, SafetensorsLoader, SlerpMerge,
+    TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge, VocabMismatch,
+};
 
 /// Tensor-name pattern that identifies MoE routed-expert weights.
 ///
@@ -55,22 +69,32 @@ pub fn moe_merge_caveat() -> &'static str {
      `crate::merge::moe_merge_caveat` docs for mitigations."
 }
 
-use crate::{
-    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError, MergeMethod,
-    MergeMethodConfig, MergeParameters, ModelStockMerge, MultiSlerpMerge, NearswapMerge,
-    PassthroughMerge, RamMerge, Result, SafetensorsLoader, SlerpMerge, TaskArithmeticMerge,
-    TensorLoader, TensorWriter, TiesMerge,
-    batched::{BatchConfig, BatchedMerger, MergeStats, StreamingBatchedMerger},
-};
+/// Edits a merge makes to the `config.json` it copies from its source so the
+/// config still describes the weights.
+#[derive(Debug, Default, Clone)]
+struct ConfigEdits {
+    /// New row count of the vocabulary tensors, after a vocab mismatch was
+    /// reconciled.
+    vocab_rows: Option<usize>,
+    /// For a layer-sliced merge, the source layer each output layer was taken
+    /// from (the first source of its slice).
+    layer_map: Option<Vec<usize>>,
+}
 
 /// Main entry point for running a model merge.
+///
+/// Dispatches to the layer-sliced pipeline when the configuration has
+/// `slices` and runs a flat merge of `models` otherwise.
 ///
 /// # Arguments
 /// * `config` - Merge configuration specifying models, method, and parameters
 ///
 /// # Returns
 /// Path to the merged model output directory
-pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
+pub fn run_merge(config: &MergeConfig) -> Result<PathBuf> {
+    if config.is_sliced() {
+        return run_merge_sliced(config);
+    }
     info!("Starting merge with method: {:?}", config.merge_method);
 
     // Create the merge method
@@ -89,7 +113,7 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
     let base_loader = load_base_model(config)?;
 
     // Get all tensor names (union across all models)
-    let mut tensor_names = collect_tensor_names(&loaders, &base_loader)?;
+    let mut tensor_names = collect_tensor_names(&loaders, &base_loader);
     info!("Found {} tensors to merge", tensor_names.len());
 
     let moe_present = contains_moe_experts(&tensor_names);
@@ -110,8 +134,7 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
     let alignment = if moe_present && config.align_moe_experts {
         // Build the loader pointer set: `base` first, then `loaders[..]`.
         let mut all_loaders: Vec<&dyn TensorLoader> = Vec::with_capacity(loaders.len() + 1);
-        let base_alignment_loader = base_loader.as_ref();
-        if let Some(b) = base_alignment_loader {
+        if let Some(b) = base_loader.as_ref() {
             all_loaders.push(b);
         }
         for l in &loaders {
@@ -141,12 +164,14 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
         None
     };
 
+    let sidecar_dir = sidecar_source(config)?;
+
     // Tied lm_head ↔ embed_tokens: when `config.json` advertises the tie
     // AND both tensors live on disk, drop the alias so we merge once.
     // HF loaders re-tie at `from_pretrained()`.
-    if let Some(skip) = pick_sidecar_source(config).and_then(|src| {
-        let names: std::collections::HashSet<String> = tensor_names.iter().cloned().collect();
-        crate::loader::detect_tied_embeddings(&src, &names)
+    if let Some(skip) = sidecar_dir.as_deref().and_then(|src| {
+        let names: HashSet<String> = tensor_names.iter().cloned().collect();
+        crate::loader::detect_tied_embeddings(src, &names)
     }) {
         let (canonical, alias) = skip;
         info!(
@@ -156,42 +181,40 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
         tensor_names.retain(|n| n != &alias);
     }
 
-    // Determine output path
-    let output_path = config
-        .output_path
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
-
-    // Create output writer at the configured dtype.
+    let output_path = output_dir(config);
     let target_dtype = crate::loader::parse_dtype(&config.dtype)?;
-    let mut writer_opt = if config.dry_run {
-        None
-    } else {
-        Some(TensorWriter::with_dtype(&output_path, target_dtype)?)
+    let mut writer = open_writer(config, &output_path, target_dtype)?;
+
+    // Gradient-valued parameters need the layer count: the highest layer
+    // index seen, plus one.
+    let mut parameters = config.parameters.clone();
+    parameters.layer_count = tensor_names
+        .iter()
+        .filter_map(|n| extract_layer_index(n))
+        .max()
+        .map(|last| last + 1);
+
+    let flat = FlatMerge {
+        config,
+        parameters: &parameters,
+        method: &*method,
+        loaders: &loaders,
+        base_loader: base_loader.as_ref(),
+        alignment: alignment.as_ref(),
     };
+    let mut edits = ConfigEdits::default();
 
     // Process each tensor
     let total = tensor_names.len();
     for (idx, name) in tensor_names.iter().enumerate() {
-        if idx % 100 == 0 || idx == total - 1 {
+        if idx % 100 == 0 || idx + 1 == total {
             info!("Processing tensor {}/{}: {}", idx + 1, total, name);
         }
-
-        let merged = merge_tensor(
-            name,
-            &loaders,
-            base_loader.as_ref(),
-            &*method,
-            config,
-            alignment.as_ref(),
-        )?;
-        // Sanity-check before writing — turns silent NaN/inf corruption into
-        // a hard error before a poisoned shard hits disk.
-        let _ = crate::sanity::check_tensor(name, &merged, config.sanity)?;
-
-        if let Some(writer) = writer_opt.as_mut() {
-            writer.write_tensor(name, &merged)?;
+        let (merged, vocab_rows) = flat.merge_tensor(name)?;
+        if let Some(rows) = vocab_rows {
+            edits.vocab_rows = Some(edits.vocab_rows.map_or(rows, |r| r.max(rows)));
         }
+        emit_tensor(name, &merged, config, writer.as_mut())?;
     }
 
     if config.dry_run {
@@ -202,131 +225,182 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
         return Ok(output_path);
     }
 
-    // Finalize output
-    if let Some(writer) = writer_opt {
+    if let Some(writer) = writer {
         writer.finalize()?;
     }
-
-    // Copy tokenizer / config sidecars from the canonical source so the
-    // output dir is a self-contained HF model. Source priority:
-    //   1. `base_model` (if set — task-vector / TIES / DARE flows)
-    //   2. first model in the merge set
-    if let Some(src) = pick_sidecar_source(config) {
-        if let Err(e) = crate::loader::copy_side_files(&src, &output_path) {
-            warn!("sidecar copy from {:?} failed: {}", src, e);
-        } else {
-            // Best-effort: align config.json's `torch_dtype` with the actual
-            // on-disk weight dtype so downstream loaders cast correctly.
-            let _ = crate::loader::patch_config_dtype(&output_path, target_dtype);
-        }
-    } else {
-        warn!("no sidecar source resolvable from config; output dir will lack tokenizer/config");
-    }
+    finish_output(sidecar_dir.as_deref(), &output_path, target_dtype, &edits)?;
 
     info!("Merge complete! Output saved to: {:?}", output_path);
 
     Ok(output_path)
 }
 
-/// Resolve the source directory for tokenizer / config sidecars. Local
-/// paths win immediately; Hub specs are skipped (the resolved local cache
-/// directory is opaque from the config alone, so we'd need an extra
-/// resolution step we don't currently take here).
-fn pick_sidecar_source(config: &MergeConfig) -> Option<std::path::PathBuf> {
-    let candidates: Vec<&str> = std::iter::once(config.base_model.as_deref())
-        .flatten()
-        .chain(config.models.iter().map(|m| m.model.as_str()))
-        .collect();
-    for cand in candidates {
-        let p = std::path::PathBuf::from(cand);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Run a model merge using batched processing for improved throughput.
-///
-/// This variant uses the optimized batched processing pipeline which:
-/// - Processes multiple tensors per GPU sync (reduces sync overhead)
-/// - Uses O(n) online thresholding instead of O(n log n) sorting
-/// - Writes merged tensors immediately (memory-efficient streaming)
-///
-/// # Arguments
-/// * `config` - Merge configuration specifying models, method, and parameters
-/// * `batch_config` - Optional batch processing configuration
-///
-/// # Returns
-/// Tuple of (output path, merge statistics)
-pub fn run_merge_batched(
-    config: &MergeConfig,
-    batch_config: Option<BatchConfig>,
-) -> Result<(std::path::PathBuf, MergeStats)> {
-    let batch_config = batch_config.unwrap_or_default();
-
-    info!(
-        "Starting batched merge with method: {:?} (batch_size={})",
-        config.merge_method, batch_config.batch_size
-    );
-
-    // Create the merge method
-    let method = create_merge_method(&config.merge_method);
-    info!(
-        "Using merge method: {} - {}",
-        method.name(),
-        method.description()
-    );
-
-    // Validate configuration
-    validate_config(config, &*method)?;
-
-    // Load models lazily
-    let loaders = load_models(config)?;
-    let base_loader = load_base_model(config)?;
-
-    // Get all tensor names (union across all models)
-    let tensor_names = collect_tensor_names(&loaders, &base_loader)?;
-    info!("Found {} tensors to merge", tensor_names.len());
-
-    if contains_moe_experts(&tensor_names) {
-        warn!(
-            method = method.name(),
-            "MoE routed experts detected in merge set — {}",
-            moe_merge_caveat()
-        );
-    }
-
-    // Determine output path
-    let output_path = config
+/// Where the merged model goes.
+fn output_dir(config: &MergeConfig) -> PathBuf {
+    config
         .output_path
         .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
+        .unwrap_or_else(|| PathBuf::from("merged_model"))
+}
 
-    // Create output writer at the configured dtype.
-    let target_dtype = crate::loader::parse_dtype(&config.dtype)?;
-    let writer = TensorWriter::with_dtype(&output_path, target_dtype)?;
+/// The output writer, or `None` for a dry run.
+fn open_writer(
+    config: &MergeConfig,
+    output_path: &Path,
+    dtype: safetensors::Dtype,
+) -> Result<Option<TensorWriter>> {
+    if config.dry_run {
+        return Ok(None);
+    }
+    let mut writer = TensorWriter::with_dtype(output_path, dtype)?;
+    if let Some(limit) = config.max_shard_size {
+        let limit = usize::try_from(limit)
+            .map_err(|_| MergeError::InvalidConfig(format!("max_shard_size {limit} too large")))?;
+        writer = writer.with_max_shard_size(limit);
+    }
+    Ok(Some(writer))
+}
 
-    // Create batched merger
-    let merger = BatchedMerger::new(
-        batch_config,
-        &*method,
-        &loaders,
-        base_loader.as_ref(),
-        config,
-    );
+/// Check a merged tensor and append it to the output.
+///
+/// The sanity sweep turns a NaN/inf into a hard error before it reaches disk,
+/// and draining the runtime's error slot turns an op that threw (which leaves
+/// a placeholder array behind, not an exception) into one as well.
+fn emit_tensor(
+    name: &str,
+    merged: &Array,
+    config: &MergeConfig,
+    writer: Option<&mut TensorWriter>,
+) -> Result<()> {
+    let _ = crate::sanity::check_tensor(name, merged, config.sanity)?;
+    pmetal_runtime::check_unobserved_error()?;
+    if let Some(writer) = writer {
+        writer.write_tensor(name, merged)?;
+    }
+    Ok(())
+}
 
-    // Create streaming merger and process
-    let mut streaming = StreamingBatchedMerger::new(merger, writer);
-    let stats = streaming.process_all(&tensor_names)?;
+/// Copy the tokenizer and config sidecars into the output and bring its
+/// `config.json` in line with the merged weights.
+fn finish_output(
+    sidecar_dir: Option<&Path>,
+    output_path: &Path,
+    target_dtype: safetensors::Dtype,
+    edits: &ConfigEdits,
+) -> Result<()> {
+    match sidecar_dir {
+        Some(src) => {
+            crate::loader::copy_side_files(src, output_path)?;
+            patch_output_config(output_path, target_dtype, edits)?;
+        }
+        None => {
+            warn!("no sidecar source resolvable from config; output dir will lack tokenizer/config")
+        }
+    }
+    Ok(())
+}
 
-    info!(
-        "Batched merge complete! {} tensors in {:.1}ms ({:.1} tensors/sec)",
-        stats.total_tensors, stats.elapsed_ms, stats.tensors_per_second
-    );
-    info!("Output saved to: {:?}", output_path);
+/// The directory whose tokenizer and config files the output inherits.
+///
+/// `tokenizer.source` picks it: `base` (the default) is the base model, or
+/// the first model without one; `first` is the first model; any other value
+/// is a directory. `union` (a merged vocabulary) is not implemented and is
+/// rejected, because silently copying one tokenizer next to weights meant for
+/// another would produce a model that decodes garbage.
+fn sidecar_source(config: &MergeConfig) -> Result<Option<PathBuf>> {
+    let first_model = || {
+        config.models.first().map(|m| m.model.clone()).or_else(|| {
+            config
+                .slices
+                .as_ref()
+                .and_then(|s| s.first())
+                .and_then(|s| s.sources.first())
+                .map(|s| s.model.clone())
+        })
+    };
+    let chosen = match config.tokenizer.as_ref().map(|t| t.source.as_str()) {
+        Some("union") => {
+            return Err(MergeError::InvalidConfig(
+                "tokenizer.source: union is not supported; use `base`, `first`, or a model \
+                 directory, and reconcile differing vocabularies with `vocab_mismatch`"
+                    .to_string(),
+            ));
+        }
+        Some("first") => first_model(),
+        Some("base") | None => config.base_model.clone().or_else(first_model),
+        Some(path) => Some(path.to_string()),
+    };
+    Ok(chosen.and_then(|candidate| {
+        let path = PathBuf::from(&candidate);
+        if path.is_dir() {
+            Some(path)
+        } else if path.is_file() {
+            path.parent().map(Path::to_path_buf)
+        } else {
+            warn!("sidecar source {candidate:?} is not a local directory; skipping it");
+            None
+        }
+    }))
+}
 
-    Ok((output_path, stats))
+/// Write the merge's changes into the output's `config.json`: the weight
+/// dtype, a changed vocabulary size, and (for sliced merges) the layer count
+/// and per-layer lists. A missing or unparseable config is left alone.
+fn patch_output_config(
+    output_path: &Path,
+    dtype: safetensors::Dtype,
+    edits: &ConfigEdits,
+) -> Result<()> {
+    crate::loader::patch_config_dtype(output_path, dtype)?;
+    if edits.vocab_rows.is_none() && edits.layer_map.is_none() {
+        return Ok(());
+    }
+    let path = output_path.join("config.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(());
+    };
+    let Some(root) = config.as_object_mut() else {
+        return Ok(());
+    };
+    let apply = |map: &mut serde_json::Map<String, serde_json::Value>| {
+        if let Some(rows) = edits.vocab_rows {
+            if map.contains_key("vocab_size") {
+                map.insert("vocab_size".to_string(), rows.into());
+            }
+        }
+        if let Some(layer_map) = &edits.layer_map {
+            patch_layer_fields(map, layer_map);
+        }
+    };
+    // Multimodal configs nest the language model's fields under `text_config`.
+    if let Some(nested) = root.get_mut("text_config").and_then(|v| v.as_object_mut()) {
+        apply(nested);
+    }
+    apply(root);
+    crate::loader::write_atomic(&path, serde_json::to_string_pretty(&config)?.as_bytes())
+}
+
+/// Resize `num_hidden_layers` and remap the per-layer lists
+/// (`layer_types`, `layers_block_type`) of one config object.
+fn patch_layer_fields(map: &mut serde_json::Map<String, serde_json::Value>, layer_map: &[usize]) {
+    let Some(old_layers) = map.get("num_hidden_layers").and_then(|v| v.as_u64()) else {
+        return;
+    };
+    map.insert("num_hidden_layers".to_string(), layer_map.len().into());
+    for key in ["layer_types", "layers_block_type"] {
+        if let Some(list) = map.get(key).and_then(|v| v.as_array()) {
+            if list.len() as u64 == old_layers {
+                let remapped: Vec<serde_json::Value> = layer_map
+                    .iter()
+                    .filter_map(|&src| list.get(src).cloned())
+                    .collect();
+                map.insert(key.to_string(), remapped.into());
+            }
+        }
+    }
 }
 
 /// Create the appropriate merge method from configuration.
@@ -342,6 +416,7 @@ fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
         MergeMethodConfig::DellaLinear => Box::new(DellaMerge::linear()),
         MergeMethodConfig::Breadcrumbs => Box::new(BreadcrumbsMerge::new()),
         MergeMethodConfig::ModelStock => Box::new(ModelStockMerge::new()),
+        MergeMethodConfig::Consensus => Box::new(ConsensusMerge::new()),
         MergeMethodConfig::Nearswap => Box::new(NearswapMerge::new()),
         MergeMethodConfig::Ram => Box::new(RamMerge::new()),
         MergeMethodConfig::RamPlus => Box::new(RamMerge::plus()),
@@ -373,26 +448,7 @@ fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
 /// Slice-mode validation is handled by `MergeConfig::validate()` and
 /// `run_merge_sliced()`.
 fn validate_config(config: &MergeConfig, method: &dyn MergeMethod) -> Result<()> {
-    // Slice-mode: delegate to config-level validator which covers slices.
-    if config.is_sliced() {
-        return config.validate();
-    }
-
-    // Flat mode: check minimum model count
-    if config.models.is_empty() {
-        return Err(MergeError::NotEnoughModels {
-            expected: 1,
-            actual: 0,
-        });
-    }
-
-    // SLERP requires exactly 2 models
-    if matches!(config.merge_method, MergeMethodConfig::Slerp) && config.models.len() != 2 {
-        return Err(MergeError::InvalidConfig(format!(
-            "SLERP requires exactly 2 models, got {}",
-            config.models.len()
-        )));
-    }
+    config.validate()?;
 
     // Check base model requirement
     if method.requires_base_model() && config.base_model.is_none() {
@@ -409,7 +465,7 @@ fn load_models(config: &MergeConfig) -> Result<Vec<SafetensorsLoader>> {
     let mut loaders = Vec::with_capacity(config.models.len());
 
     for model_config in &config.models {
-        let path = std::path::Path::new(&model_config.model);
+        let path = Path::new(&model_config.model);
         debug!("Loading model: {:?}", path);
         let loader = SafetensorsLoader::new(path)?;
         loaders.push(loader);
@@ -422,7 +478,7 @@ fn load_models(config: &MergeConfig) -> Result<Vec<SafetensorsLoader>> {
 fn load_base_model(config: &MergeConfig) -> Result<Option<SafetensorsLoader>> {
     match &config.base_model {
         Some(base_path) => {
-            let path = std::path::Path::new(base_path);
+            let path = Path::new(base_path);
             debug!("Loading base model: {:?}", path);
             let loader = SafetensorsLoader::new(path)?;
             Ok(Some(loader))
@@ -431,116 +487,113 @@ fn load_base_model(config: &MergeConfig) -> Result<Option<SafetensorsLoader>> {
     }
 }
 
-/// Collect all tensor names across all models.
+/// Collect all tensor names across all models, sorted.
 fn collect_tensor_names(
     loaders: &[SafetensorsLoader],
     base_loader: &Option<SafetensorsLoader>,
-) -> Result<Vec<String>> {
-    let mut all_names = std::collections::HashSet::new();
-
-    for loader in loaders {
-        for name in loader.tensor_names() {
-            all_names.insert(name);
-        }
+) -> Vec<String> {
+    let mut all_names = BTreeSet::new();
+    for loader in loaders.iter().chain(base_loader.iter()) {
+        all_names.extend(loader.tensor_names());
     }
-
-    if let Some(base) = base_loader {
-        for name in base.tensor_names() {
-            all_names.insert(name);
-        }
-    }
-
-    let mut names: Vec<String> = all_names.into_iter().collect();
-    names.sort();
-    Ok(names)
+    all_names.into_iter().collect()
 }
 
-/// Merge a single tensor across all models. When `alignment` is `Some`,
-/// per-model expert tensor names are remapped via the precomputed
-/// permutation table before loading — i.e., model `i`'s `experts.K.…`
-/// is rewritten to `experts.π(K).…` where π is the alignment to the
-/// base. The `merge_tensor` signature stays oblivious to MoE structure;
-/// the rewrite happens at the loader-name level.
-fn merge_tensor(
-    name: &str,
-    loaders: &[SafetensorsLoader],
-    base_loader: Option<&SafetensorsLoader>,
-    method: &dyn MergeMethod,
-    config: &MergeConfig,
-    alignment: Option<&crate::moe_align::MoeAlignment>,
-) -> Result<Array> {
-    // Verify the source dtypes agree across the models that hold this tensor.
-    // We do this *before* loading because `load_tensor` upcasts to f32, which
-    // would erase the source dtype distinction.
-    if !config.allow_mixed_dtype {
-        verify_source_dtypes(name, loaders, base_loader)?;
-    }
+/// The inputs of a flat merge, tensor by tensor.
+struct FlatMerge<'a> {
+    config: &'a MergeConfig,
+    /// The global parameters, with the layer count filled in.
+    parameters: &'a MergeParameters,
+    method: &'a dyn MergeMethod,
+    loaders: &'a [SafetensorsLoader],
+    base_loader: Option<&'a SafetensorsLoader>,
+    alignment: Option<&'a MoeAlignment>,
+}
 
-    // Load tensors from each model. With MoE alignment, the loader-side
-    // name for model `i` is `alignment.remap_tensor_name(i + base_offset, name)`.
-    // The base model (if present) sits at index 0 in the alignment, so
-    // `loaders[i]` corresponds to alignment index `i + 1` when a base is
-    // configured, or `i` when there isn't one.
-    let mut tensors = Vec::with_capacity(loaders.len());
-    let mut params = Vec::with_capacity(loaders.len());
-    let base_offset = if base_loader.is_some() { 1 } else { 0 };
-
-    for (idx, loader) in loaders.iter().enumerate() {
-        let lookup_name = match alignment {
-            Some(a) => a.remap_tensor_name(idx + base_offset, name),
-            None => name.to_string(),
-        };
-        if loader.tensor_names().contains(&lookup_name) {
-            let tensor = loader.load_tensor(&lookup_name)?;
-            tensors.push(tensor);
-
-            // Get per-model parameters
-            let model_params = config
-                .models
-                .get(idx)
-                .map(|m| m.parameters.clone())
-                .unwrap_or_default();
-            params.push(model_params);
+impl FlatMerge<'_> {
+    /// Merge a single tensor across all models. With a MoE alignment,
+    /// per-model expert tensor names are remapped via the precomputed
+    /// permutation table before loading — model `i`'s `experts.K.…` is
+    /// rewritten to `experts.π(K).…`, π being the alignment to the base.
+    ///
+    /// Returns the merged tensor and, when a vocabulary mismatch was
+    /// reconciled, the new row count.
+    fn merge_tensor(&self, name: &str) -> Result<(Array, Option<usize>)> {
+        // Verify the source dtypes agree across the models that hold this tensor.
+        // We do this *before* loading because `load_tensor` upcasts to f32, which
+        // would erase the source dtype distinction.
+        if !self.config.allow_mixed_dtype {
+            verify_source_dtypes(name, self.loaders, self.base_loader)?;
         }
-    }
 
-    // If no tensors found, check base model
-    if tensors.is_empty() {
-        if let Some(base) = base_loader {
-            if base.tensor_names().contains(&name.to_string()) {
-                return base.load_tensor(name);
+        // The base model (if present) sits at index 0 in the alignment, so
+        // `loaders[i]` is alignment index `i + 1` when a base is configured.
+        let mut tensors = Vec::with_capacity(self.loaders.len());
+        let mut params = Vec::with_capacity(self.loaders.len());
+        let base_offset = usize::from(self.base_loader.is_some());
+
+        for (idx, loader) in self.loaders.iter().enumerate() {
+            let lookup_name = match self.alignment {
+                Some(a) => a.remap_tensor_name(idx + base_offset, name),
+                None => name.to_string(),
+            };
+            if loader.has_tensor(&lookup_name) {
+                tensors.push(loader.load_tensor(&lookup_name)?);
+                params.push(
+                    self.config
+                        .models
+                        .get(idx)
+                        .map(|m| m.parameters.clone())
+                        .unwrap_or_default(),
+                );
             }
         }
-        return Err(MergeError::TensorNotFound(name.to_string()));
-    }
 
-    // Load base tensor if needed
-    let base_tensor = if method.requires_base_model() {
-        if let Some(base) = base_loader {
-            if base.tensor_names().contains(&name.to_string()) {
-                Some(base.load_tensor(name)?)
-            } else {
-                None
+        // A tensor only the base model has is carried over unchanged.
+        if tensors.is_empty() {
+            return match self.base_loader {
+                Some(base) if base.has_tensor(name) => Ok((base.load_tensor(name)?, None)),
+                _ => Err(MergeError::TensorNotFound(name.to_string())),
+            };
+        }
+
+        let mut base_tensor = if self.method.requires_base_model() {
+            match self.base_loader {
+                Some(base) if base.has_tensor(name) => Some(base.load_tensor(name)?),
+                _ => {
+                    return Err(MergeError::TensorNotFound(format!(
+                        "{name} (held by the merged models but missing from the base model)"
+                    )));
+                }
             }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    // Verify shapes match
-    verify_shapes(name, &tensors, base_tensor.as_ref())?;
+        let vocab_rows = if is_vocab_tensor(name) {
+            align_vocab_rows(
+                name,
+                &mut tensors,
+                &mut base_tensor,
+                self.config.vocab_mismatch,
+            )?
+        } else {
+            None
+        };
 
-    // Run the merge — `merge_named` is the dispatch entry; methods that
-    // don't care about the name fall through to `merge` via the default impl.
-    method.merge_named(
-        name,
-        &tensors,
-        base_tensor.as_ref(),
-        &params,
-        &config.parameters,
-    )
+        verify_shapes(name, &tensors, base_tensor.as_ref())?;
+
+        // Run the merge — `merge_named` is the dispatch entry; methods that
+        // don't care about the name fall through to `merge` via the default impl.
+        let merged = self.method.merge_named(
+            name,
+            &tensors,
+            base_tensor.as_ref(),
+            &params,
+            self.parameters,
+        )?;
+        Ok((merged, vocab_rows))
+    }
 }
 
 /// Verify that the source dtype of `name` agrees across every loader that
@@ -555,33 +608,32 @@ fn verify_source_dtypes(
     loaders: &[SafetensorsLoader],
     base_loader: Option<&SafetensorsLoader>,
 ) -> Result<()> {
-    let mut seen: Vec<safetensors::Dtype> = Vec::new();
-    let mut labels: Vec<String> = Vec::new();
-
+    let mut sources: Vec<(String, safetensors::Dtype)> = Vec::new();
     for (idx, loader) in loaders.iter().enumerate() {
-        if loader.tensor_names().contains(&name.to_string()) {
-            let dt = loader.tensor_dtype(name)?;
-            seen.push(dt);
-            labels.push(format!("model[{}]={:?}", idx, dt));
+        if loader.has_tensor(name) {
+            sources.push((format!("model[{idx}]"), loader.tensor_dtype(name)?));
         }
     }
     if let Some(base) = base_loader {
-        if base.tensor_names().contains(&name.to_string()) {
-            let dt = base.tensor_dtype(name)?;
-            seen.push(dt);
-            labels.push(format!("base={:?}", dt));
+        if base.has_tensor(name) {
+            sources.push(("base".to_string(), base.tensor_dtype(name)?));
         }
     }
+    check_same_dtype(name, &sources)
+}
 
-    if seen.is_empty() {
+/// Error with [`MergeError::DtypeMismatch`] unless every labelled dtype is equal.
+fn check_same_dtype(name: &str, sources: &[(String, safetensors::Dtype)]) -> Result<()> {
+    let Some((_, first)) = sources.first() else {
         return Ok(());
-    }
-
-    let first = seen[0];
-    if seen.iter().any(|d| *d != first) {
+    };
+    if sources.iter().any(|(_, d)| d != first) {
         return Err(MergeError::DtypeMismatch {
             name: name.to_string(),
-            dtypes: labels,
+            dtypes: sources
+                .iter()
+                .map(|(label, d)| format!("{label}={d:?}"))
+                .collect(),
         });
     }
     Ok(())
@@ -621,6 +673,114 @@ fn verify_shapes(name: &str, tensors: &[Array], base: Option<&Array>) -> Result<
 }
 
 // =============================================================================
+// Vocabulary mismatch
+// =============================================================================
+
+/// Whether `name` is a 2-D-by-convention tensor indexed by token id
+/// (input embedding or output head).
+fn is_vocab_tensor(name: &str) -> bool {
+    const VOCAB_SUFFIXES: [&str; 7] = [
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "wte.weight",
+        "word_embeddings.weight",
+        "embed_out.weight",
+        "tok_embeddings.weight",
+        "output.weight",
+    ];
+    VOCAB_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
+/// The first `rows` rows of a tensor.
+fn take_rows(tensor: &Array, rows: i32) -> Array {
+    let shape = tensor.shape();
+    let starts = vec![0; shape.len()];
+    let mut stops = shape.to_vec();
+    stops[0] = rows;
+    tensor.slice(&starts, &stops)
+}
+
+/// Rows `[from, to)` of a tensor.
+fn row_range(tensor: &Array, from: i32, to: i32) -> Array {
+    let shape = tensor.shape();
+    let mut starts = vec![0; shape.len()];
+    starts[0] = from;
+    let mut stops = shape.to_vec();
+    stops[0] = to;
+    tensor.slice(&starts, &stops)
+}
+
+/// Reconcile vocabulary tensors with different row counts according to
+/// `policy`, in place. Returns the common row count when it had to change
+/// something.
+fn align_vocab_rows(
+    name: &str,
+    tensors: &mut [Array],
+    base: &mut Option<Array>,
+    policy: VocabMismatch,
+) -> Result<Option<usize>> {
+    if tensors.iter().chain(base.iter()).any(|t| t.ndim() < 2) {
+        return Ok(None);
+    }
+    let rows: Vec<i32> = tensors
+        .iter()
+        .chain(base.iter())
+        .map(|t| t.dim(0))
+        .collect();
+    let (min, max) = (
+        *rows.iter().min().expect("at least one tensor"),
+        *rows.iter().max().expect("at least one tensor"),
+    );
+    if min == max {
+        return Ok(None);
+    }
+
+    match policy {
+        VocabMismatch::Error => Err(MergeError::InvalidConfig(format!(
+            "tensor {name}: the models have different vocabulary sizes ({rows:?} rows); set \
+             `vocab_mismatch: truncate` or `extend` if they share a tokenizer prefix"
+        ))),
+        VocabMismatch::Truncate => {
+            warn!("{name}: truncating {rows:?} rows to {min}");
+            for t in tensors.iter_mut().chain(base.iter_mut()) {
+                if t.dim(0) > min {
+                    *t = take_rows(t, min);
+                }
+            }
+            Ok(Some(min as usize))
+        }
+        VocabMismatch::Extend => {
+            warn!("{name}: extending {rows:?} rows to {max}");
+            // The longest model supplies rows nobody else has.
+            let longest = tensors
+                .iter()
+                .max_by_key(|t| t.dim(0))
+                .expect("at least one tensor")
+                .clone();
+            // Missing rows come from the base (itself topped up from the
+            // longest model) so they merge as no change, or from the longest
+            // model when there is no base.
+            let reference = match base.as_ref() {
+                Some(b) if b.dim(0) < max => {
+                    b.concatenate_2(&row_range(&longest, b.dim(0), max), 0)
+                }
+                Some(b) => b.clone(),
+                None => longest,
+            };
+            for t in tensors.iter_mut() {
+                if t.dim(0) < max {
+                    *t = t.concatenate_2(&row_range(&reference, t.dim(0), max), 0);
+                }
+            }
+            if let Some(b) = base.as_mut() {
+                *b = reference;
+            }
+            Ok(Some(max as usize))
+        }
+    }
+}
+
+// =============================================================================
 // Slice-based frankenmerging
 // =============================================================================
 
@@ -631,9 +791,11 @@ fn verify_shapes(name: &str, tensors: &[Array], base: Option<&Array>) -> Result<
 ///
 /// # Layer Remapping
 ///
-/// Tensor names follow the convention `model.layers.{N}.{rest}`.  For each
-/// output slice the source layer indices are remapped to a contiguous output
-/// range.  For example:
+/// The layers live under one container whose tensor names look like
+/// `<prefix>.<N>.<rest>` (`model.layers.N`, `transformer.h.N`, …); it is
+/// detected as the prefix with the most distinct layer indices, so a vision
+/// tower's own `layers.N` is not mistaken for it. For each output slice the
+/// source layer indices are remapped to a contiguous output range:
 ///
 /// ```text
 /// slice[0]: model_a layers [0,16)  →  output layers [0,16)
@@ -641,20 +803,26 @@ fn verify_shapes(name: &str, tensors: &[Array], base: Option<&Array>) -> Result<
 /// ```
 ///
 /// Tensor `model.layers.8.self_attn.q_proj.weight` from `model_b` becomes
-/// `model.layers.16.self_attn.q_proj.weight` in the output.
+/// `model.layers.16.self_attn.q_proj.weight` in the output. When a slice
+/// merges several sources, they are combined layer by layer, and a task-vector
+/// method takes its base from the layer the slice's *first* source reads.
 ///
 /// # Non-layer Tensors
 ///
-/// Tensors that do not contain a `layers.N` component (e.g. `model.embed_tokens.weight`,
-/// `model.norm.weight`, `lm_head.weight`) are copied from the first source model
-/// of the first slice unless overridden by `base_model`.
+/// Tensors outside the layer container come from the first source of one
+/// slice: the input side (`embed_tokens`, position embeddings, anything not
+/// listed below) from the first slice, and the output side (the final norm,
+/// `lm_head`) from the last slice, so a model that ends in different layers
+/// ends with their norm and head. The output's `config.json` gets the new
+/// `num_hidden_layers`, and per-layer lists such as `layer_types` follow the
+/// layers they describe.
 ///
 /// # Arguments
 /// * `config` - Merge configuration with `slices` populated.
 ///
 /// # Returns
 /// Path to the merged model output directory.
-pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
+pub fn run_merge_sliced(config: &MergeConfig) -> Result<PathBuf> {
     config.validate()?;
 
     let slices = config.slices.as_ref().ok_or_else(|| {
@@ -663,169 +831,126 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
 
     info!("Starting slice-based frankenmerge: {} slices", slices.len());
 
-    // Pre-compile the layer-index regex once
-    let layer_re = layer_index_regex();
-
-    // Determine output path
-    let output_path = config
-        .output_path
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
-
+    let output_path = output_dir(config);
     let target_dtype = crate::loader::parse_dtype(&config.dtype)?;
-    let mut writer = TensorWriter::with_dtype(&output_path, target_dtype)?;
+    let mut writer = open_writer(config, &output_path, target_dtype)?;
+    let sidecar_dir = sidecar_source(config)?;
 
-    // Track which non-layer tensors we've already written so we don't duplicate
-    let mut written_non_layer: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Collect base model loader (optional)
     let global_base_loader: Option<SafetensorsLoader> = match &config.base_model {
-        Some(p) => Some(SafetensorsLoader::new(std::path::Path::new(p))?),
+        Some(p) => Some(SafetensorsLoader::new(Path::new(p))?),
         None => None,
     };
 
-    // Compute output layer offsets: output_offset[i] = sum of n_layers for slices [0..i)
-    let output_offsets: Vec<usize> = {
-        let mut offsets = Vec::with_capacity(slices.len());
-        let mut running = 0usize;
-        for slice in slices {
-            offsets.push(running);
-            // Use the layer count of the first source as authoritative
-            if let Some(first_src) = slice.sources.first() {
-                running += first_src.n_layers();
-            }
-        }
-        offsets
-    };
-
-    let total_output_layers: usize = slices
-        .iter()
-        .filter_map(|s| s.sources.first())
-        .map(|src| src.n_layers())
-        .sum();
-
+    let total_output_layers: usize = slices.iter().map(|s| s.sources[0].n_layers()).sum();
     info!(
         "Output model will have {} transformer layers across {} slices",
         total_output_layers,
         slices.len()
     );
 
-    for (slice_idx, (slice, &out_offset)) in slices.iter().zip(output_offsets.iter()).enumerate() {
-        info!(
-            "Processing slice[{}]: output layers [{}..{})",
-            slice_idx,
-            out_offset,
-            out_offset + slice.sources.first().map(|s| s.n_layers()).unwrap_or(0)
-        );
+    let mut layer_map: Vec<usize> = Vec::with_capacity(total_output_layers);
 
-        // Effective merge method for this slice
+    for (slice_idx, slice) in slices.iter().enumerate() {
         let effective_method_cfg = slice.merge_method.as_ref().unwrap_or(&config.merge_method);
         let method = create_merge_method(effective_method_cfg);
 
         // Effective parameters: global → slice-level (slice wins)
-        let effective_params = config.parameters.merge_with(&slice.parameters);
+        let mut effective_params = config.parameters.merge_with(&slice.parameters);
+        effective_params.layer_count = Some(total_output_layers);
 
         // Effective base model: global → slice-level override
         let slice_base_loader: Option<SafetensorsLoader> = match &slice.base_model {
-            Some(p) => Some(SafetensorsLoader::new(std::path::Path::new(p))?),
+            Some(p) => Some(SafetensorsLoader::new(Path::new(p))?),
             None => None,
         };
-        let base_loader_ref: Option<&SafetensorsLoader> =
+        let base_loader: Option<&SafetensorsLoader> =
             slice_base_loader.as_ref().or(global_base_loader.as_ref());
 
-        // Load source model loaders for this slice
         let src_loaders: Vec<SafetensorsLoader> = slice
             .sources
             .iter()
-            .map(|src| SafetensorsLoader::new(std::path::Path::new(&src.model)))
+            .map(|src| SafetensorsLoader::new(Path::new(&src.model)))
             .collect::<Result<_>>()?;
 
-        // Build the set of (output_name, source_name_per_model, per_source_params)
-        // by iterating over layer indices in the source range.
-        let (out_src_start, out_src_end) = slice
-            .sources
-            .first()
-            .map(|s| s.layer_range)
-            .unwrap_or((0, 0));
+        let prefix = layer_container(&src_loaders[0]).ok_or_else(|| {
+            MergeError::InvalidConfig(format!(
+                "slice[{slice_idx}]: {} has no numbered layer tensors (`<prefix>.<N>.<name>`)",
+                slice.sources[0].model
+            ))
+        })?;
+        let out_start = layer_map.len();
+        let n_layers = slice.sources[0].n_layers();
+        info!(
+            "Processing slice[{slice_idx}]: output layers [{out_start}..{})",
+            out_start + n_layers
+        );
 
-        let n_layers = out_src_end.saturating_sub(out_src_start);
-
-        // Collect all output layer tensor names that will be produced by this slice
-        // We iterate over the source layers and remap to output layer indices.
+        let first_names = src_loaders[0].tensor_names();
         let mut slice_tensor_count = 0usize;
+        for delta in 0..n_layers {
+            let out_layer = out_start + delta;
+            let first_layer = slice.sources[0].layer_range.0 + delta;
+            layer_map.push(first_layer);
 
-        for layer_delta in 0..n_layers {
-            let out_layer_idx = out_offset + layer_delta;
-
-            // Collect all tensor suffixes for this layer from the first source model
-            // (suffixes should be the same across sources)
-            let src_layer_idx_0 = slice.sources[0].layer_range.0 + layer_delta;
-            let layer_prefix_src = format!("model.layers.{}.", src_layer_idx_0);
-            let layer_prefix_out = format!("model.layers.{}.", out_layer_idx);
-
-            // Gather all tensor suffixes available for this layer from the first source
-            let suffixes: Vec<String> = src_loaders[0]
-                .tensor_names()
-                .into_iter()
-                .filter(|n| n.starts_with(&layer_prefix_src))
-                .map(|n| n[layer_prefix_src.len()..].to_string())
+            let first_prefix = format!("{prefix}.{first_layer}.");
+            let suffixes: Vec<&str> = first_names
+                .iter()
+                .filter_map(|n| n.strip_prefix(&first_prefix))
                 .collect();
-
             if suffixes.is_empty() {
-                debug!(
-                    "slice[{}]: no tensors found for source layer {} in model {:?}",
-                    slice_idx, src_layer_idx_0, slice.sources[0].model
-                );
+                return Err(MergeError::InvalidConfig(format!(
+                    "slice[{slice_idx}]: {} has no tensors for layer {first_layer} (layer_range \
+                     {:?})",
+                    slice.sources[0].model, slice.sources[0].layer_range
+                )));
             }
 
-            for suffix in &suffixes {
-                let out_name = format!("{}{}", layer_prefix_out, suffix);
+            for suffix in suffixes {
+                let out_name = format!("{prefix}.{out_layer}.{suffix}");
 
-                // Collect the corresponding tensor from each source model
-                // (each source may contribute a different layer to the same output layer)
+                // The matching tensor of each source; a source may take a
+                // different layer of its model for the same output layer.
                 let mut tensors: Vec<Array> = Vec::with_capacity(src_loaders.len());
                 let mut per_src_params: Vec<MergeParameters> =
                     Vec::with_capacity(src_loaders.len());
-
-                for (src_idx, (src_loader, src_def)) in
-                    src_loaders.iter().zip(slice.sources.iter()).enumerate()
-                {
-                    let src_layer_idx = src_def.layer_range.0 + layer_delta;
-                    let src_name = format!("model.layers.{}.{}", src_layer_idx, suffix);
-
-                    if src_loader.tensor_names().contains(&src_name) {
-                        let tensor = src_loader.load_tensor(&src_name)?;
-                        tensors.push(tensor);
-                        // Per-source params override slice params
-                        let p = effective_params.merge_with(&src_def.parameters);
-                        per_src_params.push(p);
+                let mut dtypes: Vec<(String, safetensors::Dtype)> = Vec::new();
+                for (src_idx, (loader, src)) in src_loaders.iter().zip(&slice.sources).enumerate() {
+                    let src_name = format!("{prefix}.{}.{suffix}", src.layer_range.0 + delta);
+                    if loader.has_tensor(&src_name) {
+                        dtypes.push((
+                            format!("sources[{src_idx}]"),
+                            loader.tensor_dtype(&src_name)?,
+                        ));
+                        tensors.push(loader.load_tensor(&src_name)?);
+                        per_src_params.push(effective_params.merge_with(&src.parameters));
                     } else {
                         debug!(
-                            "slice[{}] src[{}]: tensor {} not found, skipping",
-                            slice_idx, src_idx, src_name
+                            "slice[{slice_idx}] src[{src_idx}]: tensor {src_name} not found, skipping"
                         );
                     }
                 }
 
-                if tensors.is_empty() {
-                    debug!(
-                        "slice[{}]: no source tensors for {}, skipping",
-                        slice_idx, out_name
-                    );
-                    continue;
-                }
-
-                // Load base tensor if the method requires it
                 let base_tensor = if method.requires_base_model() {
-                    load_base_tensor_for_slice(
-                        base_loader_ref,
-                        &out_name,
-                        &layer_re,
-                        out_layer_idx,
-                    )?
+                    let base_name = format!("{prefix}.{first_layer}.{suffix}");
+                    match base_loader {
+                        Some(base) if base.has_tensor(&base_name) => {
+                            if !config.allow_mixed_dtype {
+                                dtypes.push(("base".to_string(), base.tensor_dtype(&base_name)?));
+                            }
+                            Some(base.load_tensor(&base_name)?)
+                        }
+                        _ => {
+                            return Err(MergeError::TensorNotFound(format!(
+                                "{base_name} (slice[{slice_idx}]'s base model)"
+                            )));
+                        }
+                    }
                 } else {
                     None
                 };
+                if !config.allow_mixed_dtype {
+                    check_same_dtype(&out_name, &dtypes)?;
+                }
 
                 verify_shapes(&out_name, &tensors, base_tensor.as_ref())?;
 
@@ -838,56 +963,58 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
                     &per_src_params,
                     &effective_params,
                 )?;
-                writer.write_tensor(&out_name, &merged)?;
+                emit_tensor(&out_name, &merged, config, writer.as_mut())?;
                 slice_tensor_count += 1;
             }
         }
+        info!("slice[{slice_idx}] complete: {slice_tensor_count} layer tensors written");
+    }
 
-        // On the first slice, also copy non-layer tensors (embed_tokens, lm_head, etc.)
-        // from the first source model.  Only do this once.
-        if slice_idx == 0 {
-            let first_loader = &src_loaders[0];
-            let non_layer_tensors: Vec<String> = first_loader
-                .tensor_names()
-                .into_iter()
-                .filter(|n| !is_layer_tensor(n, &layer_re))
-                .collect();
-
-            for name in &non_layer_tensors {
-                if !written_non_layer.contains(name) {
-                    let tensor = first_loader.load_tensor(name)?;
-                    writer.write_tensor(name, &tensor)?;
-                    written_non_layer.insert(name.clone());
-                    debug!("Copied non-layer tensor: {}", name);
-                }
+    // Tensors outside the layer stack: the input side from the first slice's
+    // first source, the output side from the last slice's.
+    let first_source = SafetensorsLoader::new(Path::new(&slices[0].sources[0].model))?;
+    let last_source =
+        SafetensorsLoader::new(Path::new(&slices[slices.len() - 1].sources[0].model))?;
+    let mut non_layer: BTreeMap<String, &SafetensorsLoader> = BTreeMap::new();
+    for (loader, want_output_side) in [(&first_source, false), (&last_source, true)] {
+        let prefix = layer_container(loader);
+        for name in loader.tensor_names() {
+            let in_stack = prefix.as_deref().is_some_and(|p| is_layer_tensor(p, &name));
+            if !in_stack && is_output_side_tensor(&name) == want_output_side {
+                non_layer.insert(name, loader);
             }
-
-            info!(
-                "Copied {} non-layer tensors from first source model",
-                non_layer_tensors.len()
-            );
         }
-
-        info!(
-            "slice[{}] complete: {} layer tensors written",
-            slice_idx, slice_tensor_count
-        );
     }
-
-    writer.finalize()?;
-
-    // Copy sidecars (tokenizer/config) so the output dir is self-contained.
-    if let Some(src) = pick_sidecar_source(config) {
-        if let Err(e) = crate::loader::copy_side_files(&src, &output_path) {
-            warn!("sidecar copy from {:?} failed: {}", src, e);
-        } else {
-            let _ = crate::loader::patch_config_dtype(&output_path, target_dtype);
-        }
-    } else {
-        warn!(
-            "no sidecar source resolvable from config; sliced output dir will lack tokenizer/config"
-        );
+    if let Some(skip) = sidecar_dir.as_deref().and_then(|src| {
+        let names: HashSet<String> = non_layer.keys().cloned().collect();
+        crate::loader::detect_tied_embeddings(src, &names)
+    }) {
+        info!("tied embeddings detected: skipping alias {}", skip.1);
+        non_layer.remove(&skip.1);
     }
+    for (name, loader) in &non_layer {
+        let tensor = loader.load_tensor(name)?;
+        emit_tensor(name, &tensor, config, writer.as_mut())?;
+        debug!("Copied non-layer tensor: {name}");
+    }
+    info!("Copied {} non-layer tensors", non_layer.len());
+
+    if config.dry_run {
+        info!("Dry-run slice merge complete: no output written");
+        return Ok(output_path);
+    }
+    if let Some(writer) = writer {
+        writer.finalize()?;
+    }
+    finish_output(
+        sidecar_dir.as_deref(),
+        &output_path,
+        target_dtype,
+        &ConfigEdits {
+            vocab_rows: None,
+            layer_map: Some(layer_map),
+        },
+    )?;
 
     info!(
         "Slice-based merge complete! Output saved to: {:?}",
@@ -897,9 +1024,49 @@ pub fn run_merge_sliced(config: &MergeConfig) -> Result<std::path::PathBuf> {
     Ok(output_path)
 }
 
-/// Returns `true` if the tensor name contains a `layers.N` component.
-fn is_layer_tensor(name: &str, re: &Regex) -> bool {
-    re.is_match(name)
+/// Whether `name` is output-side: the final norm or the head. These come from
+/// the last slice of a frankenmerge; everything else outside the layers is
+/// input-side.
+fn is_output_side_tensor(name: &str) -> bool {
+    name.contains("lm_head")
+        || name.contains("embed_out")
+        || name.contains("ln_f")
+        || name.contains("final_layer")
+        || name.ends_with("norm.weight")
+        || name.ends_with("norm.bias")
+        || name.ends_with("output.weight")
+}
+
+/// Whether `name` is `<prefix>.<digits>.<something>`.
+fn is_layer_tensor(prefix: &str, name: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(index, _)| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The prefix of the model's layer stack: of all `<prefix>.<N>.` containers,
+/// the one with the most distinct indices (ties go to the shorter prefix).
+fn layer_container(loader: &SafetensorsLoader) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"^(.*?(?:layers|h|blocks|layer))\.(\d+)\.").expect("layer regex compiles")
+    });
+    let mut indices: HashMap<String, BTreeSet<usize>> = HashMap::new();
+    for name in loader.tensor_names() {
+        if let Some(caps) = re.captures(&name) {
+            if let Ok(index) = caps[2].parse() {
+                indices
+                    .entry(caps[1].to_string())
+                    .or_default()
+                    .insert(index);
+            }
+        }
+    }
+    indices
+        .into_iter()
+        .max_by(|(pa, a), (pb, b)| a.len().cmp(&b.len()).then(pb.len().cmp(&pa.len())))
+        .map(|(prefix, _)| prefix)
 }
 
 /// Compile the layer-index regex (matches `model.layers.{N}.` prefix).
@@ -957,41 +1124,13 @@ pub fn remap_layer_index(name: &str, new_idx: usize) -> Option<String> {
     )
 }
 
-/// Load a base tensor for a slice merge, handling the layer-name remapping.
-///
-/// The base model stores tensors at their *original* layer indices.  The
-/// `out_name` uses the *output* layer index.  We remap back to look up the
-/// corresponding tensor in the base model.
-fn load_base_tensor_for_slice(
-    base_loader: Option<&SafetensorsLoader>,
-    out_name: &str,
-    layer_re: &Regex,
-    _out_layer_idx: usize,
-) -> Result<Option<Array>> {
-    let Some(base) = base_loader else {
-        return Ok(None);
-    };
-
-    // For base tensors we use the output name directly — the caller passes the
-    // output-remapped name, and we look for it as-is.  If not found, fall back
-    // to None (the merge method decides how to handle a missing base tensor).
-    if base.tensor_names().contains(&out_name.to_string()) {
-        return Ok(Some(base.load_tensor(out_name)?));
-    }
-
-    // Not in the base model — acceptable for sliced frankenmerges where the
-    // base only covers some layers.
-    let _ = layer_re; // suppress unused warning
-    Ok(None)
-}
-
 /// Builder for creating merge configurations programmatically.
 #[derive(Debug, Default)]
 pub struct MergeBuilder {
     method: Option<MergeMethodConfig>,
     models: Vec<String>,
     base_model: Option<String>,
-    output_path: Option<std::path::PathBuf>,
+    output_path: Option<PathBuf>,
     parameters: MergeParameters,
     per_model_params: HashMap<usize, MergeParameters>,
     dtype: Option<String>,
@@ -1034,7 +1173,7 @@ impl MergeBuilder {
     }
 
     /// Set the output path.
-    pub fn output(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+    pub fn output(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_path = Some(path.into());
         self
     }
@@ -1060,6 +1199,12 @@ impl MergeBuilder {
     /// Set lambda scaling factor.
     pub fn lambda(mut self, lambda: f32) -> Self {
         self.parameters.lambda = Some(crate::config::ParameterSetting::Scalar(lambda));
+        self
+    }
+
+    /// Set the seed of the stochastic methods (DARE, DELLA).
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.parameters.seed = Some(seed);
         self
     }
 
@@ -1096,7 +1241,8 @@ impl MergeBuilder {
         // Honor the builder's dtype if set; fall back to the same default the
         // YAML deserializer uses (`bfloat16`) so programmatic and YAML
         // construction agree.
-        let dtype = self.dtype.unwrap_or_else(|| "bfloat16".to_string());
+        let defaults = MergeConfig::default();
+        let dtype = self.dtype.unwrap_or(defaults.dtype);
         // Validate eagerly so the failure surfaces here rather than at save time.
         let _ = crate::loader::parse_dtype(&dtype)?;
 
@@ -1107,17 +1253,12 @@ impl MergeBuilder {
             output_path: self.output_path,
             dtype,
             parameters: self.parameters,
-            tokenizer: None,
-            slices: None,
-            allow_mixed_dtype: false,
-            sanity: crate::sanity::SanityLevel::default(),
-            dry_run: false,
-            align_moe_experts: false,
+            ..defaults
         })
     }
 
     /// Build and run the merge.
-    pub fn run(self) -> Result<std::path::PathBuf> {
+    pub fn run(self) -> Result<PathBuf> {
         let config = self.build()?;
         run_merge(&config)
     }
@@ -1163,5 +1304,46 @@ mod tests {
         let merge = PassthroughMerge::new();
         assert_eq!(merge.name(), "passthrough");
         assert!(!merge.requires_base_model());
+    }
+
+    #[test]
+    fn layer_helpers_agree_on_the_naming_conventions() {
+        assert!(is_layer_tensor(
+            "model.layers",
+            "model.layers.12.mlp.up_proj.weight"
+        ));
+        assert!(!is_layer_tensor("model.layers", "model.layers.norm.weight"));
+        assert!(!is_layer_tensor(
+            "model.layers",
+            "model.embed_tokens.weight"
+        ));
+        assert_eq!(
+            extract_layer_index("transformer.h.7.attn.c_attn.weight"),
+            Some(7)
+        );
+        assert_eq!(
+            remap_layer_index("model.layers.5.self_attn.q_proj.weight", 2).as_deref(),
+            Some("model.layers.2.self_attn.q_proj.weight")
+        );
+        assert!(is_output_side_tensor("model.norm.weight"));
+        assert!(is_output_side_tensor("lm_head.weight"));
+        assert!(!is_output_side_tensor("model.embed_tokens.weight"));
+    }
+
+    #[test]
+    fn layer_fields_follow_the_layers_they_describe() {
+        let mut config: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+            r#"{"num_hidden_layers": 3, "layer_types": ["full", "sliding", "sliding"],
+                "hidden_size": 8}"#,
+        )
+        .unwrap();
+        // Output layers drawn from source layers 2, 0, 0, 1.
+        patch_layer_fields(&mut config, &[2, 0, 0, 1]);
+        assert_eq!(config["num_hidden_layers"], 4);
+        assert_eq!(
+            config["layer_types"],
+            serde_json::json!(["sliding", "full", "full", "sliding"])
+        );
+        assert_eq!(config["hidden_size"], 8);
     }
 }

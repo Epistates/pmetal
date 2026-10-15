@@ -136,7 +136,7 @@ fn dry_run_does_not_write_weights() {
         allow_mixed_dtype: false,
         sanity: SanityLevel::Quick,
         dry_run: true,
-        align_moe_experts: false,
+        ..Default::default()
     };
 
     run_merge(&config).expect("dry run should succeed");

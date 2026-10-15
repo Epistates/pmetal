@@ -29,7 +29,7 @@ ndarray = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
-# Fail every test at the bridge op that throws (pmetal-runtime `strict-errors`).
+# Fail every test at the runtime op that throws (pmetal-runtime `strict-errors`).
 pmetal-runtime = { workspace = true, features = ["strict-errors"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }

@@ -86,7 +86,7 @@ impl MergeMethod for NearswapMerge {
         &self,
         tensors: &[Array],
         base_tensor: Option<&Array>,
-        params: &[MergeParameters],
+        _params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
         if tensors.is_empty() {
@@ -102,67 +102,23 @@ impl MergeMethod for NearswapMerge {
 
         let lambda = global_params.lambda();
 
-        // Fast path for a single model: no selection needed.
-        if tensors.len() == 1 {
-            let merged_params = global_params.merge_with(&params[0]);
-            let _ = merged_params; // weight not used in selection, but honour lambda
-            if (lambda - 1.0).abs() < 1e-7 {
-                return Ok(tensors[0].clone());
-            }
-            // Interpolate: base + lambda * (t - base)
-            let tv = Self::task_vector(&tensors[0], base)?;
-            let scaled = tv.multiply(&Array::from_f32(lambda));
-            return Ok(base.add(&scaled));
+        // For each element keep the model whose value is closest to the base
+        // (the earlier model on a tie), comparing on the device.
+        let mut best = tensors[0].clone();
+        let mut best_distance = tensors[0].subtract(base).abs_val();
+        for tensor in &tensors[1..] {
+            let distance = tensor.subtract(base).abs_val();
+            let closer = distance.less(&best_distance);
+            best = closer.where_cond(tensor, &best);
+            best_distance = closer.where_cond(&distance, &best_distance);
         }
 
-        // General case: for each element pick the model closest to base.
-        //
-        // We work in flat (1-D) space and restore the original shape afterwards.
-        let original_shape = base.shape().to_vec();
-        let n: usize = original_shape.iter().map(|&d| d as usize).product();
-
-        // Flatten base and get values.
-        let mut base_flat = base.reshape(&[-1]);
-        let base_vals: Vec<f32> = base_flat.to_f32_vec(n).unwrap_or_default();
-
-        // Flatten every source tensor and collect values.
-        let mut flat_tensors: Vec<Vec<f32>> = Vec::with_capacity(tensors.len());
-        for t in tensors.iter() {
-            let mut flat = t.reshape(&[-1]);
-            flat_tensors.push(flat.to_f32_vec(n).unwrap_or_default());
+        if (lambda - 1.0).abs() < 1e-7 {
+            return Ok(best);
         }
-
-        // For each position, select the value from the nearest model.
-        let mut result_vals = vec![0.0_f32; n];
-
-        for i in 0..n {
-            let base_val = base_vals[i];
-
-            // Find the model with the smallest |W_m[i] - W_base[i]|.
-            let mut best_model = 0;
-            let mut best_dist = (flat_tensors[0][i] - base_val).abs();
-
-            for (m, model_vals) in flat_tensors.iter().enumerate().skip(1) {
-                let dist = (model_vals[i] - base_val).abs();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_model = m;
-                }
-            }
-
-            let selected = flat_tensors[best_model][i];
-
-            // Apply lambda interpolation if requested.
-            if (lambda - 1.0).abs() < 1e-7 {
-                result_vals[i] = selected;
-            } else {
-                // W_merged[i] = W_base[i] + lambda * (W_{m*}[i] - W_base[i])
-                result_vals[i] = base_val + lambda * (selected - base_val);
-            }
-        }
-
-        let result_flat = Array::from_f32_slice(&result_vals, &[n as i32]);
-        Ok(result_flat.reshape(&original_shape))
+        // W_merged = W_base + lambda * (W_{m*} - W_base)
+        let tv = Self::task_vector(&best, base)?;
+        Ok(base.add(&tv.multiply(&Array::from_f32(lambda))))
     }
 }
 

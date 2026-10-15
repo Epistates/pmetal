@@ -55,11 +55,13 @@ pub(crate) async fn run_merge_command(
         "della_linear" | "della-linear" => MergeMethodConfig::DellaLinear,
         "breadcrumbs" => MergeMethodConfig::Breadcrumbs,
         "model_stock" | "model-stock" => MergeMethodConfig::ModelStock,
+        "consensus" => MergeMethodConfig::Consensus,
+        "multislerp" | "multi_slerp" | "multi-slerp" => MergeMethodConfig::MultiSlerp,
         "nearswap" => MergeMethodConfig::Nearswap,
         "passthrough" => MergeMethodConfig::Passthrough,
         other => anyhow::bail!(
             "Unknown merge method '{}'. Valid options: linear, slerp, task_arithmetic, ties, \
-             dare_ties, dare_linear, della, della_linear, breadcrumbs, model_stock, nearswap, passthrough",
+             dare_ties, dare_linear, della, della_linear, breadcrumbs, model_stock, consensus, multislerp, nearswap, passthrough",
             other
         ),
     };
@@ -97,7 +99,7 @@ pub(crate) async fn run_merge_command(
         allow_mixed_dtype: false,
         sanity: pmetal_merge::SanityLevel::default(),
         dry_run: false,
-        align_moe_experts: false,
+        ..Default::default()
     };
 
     println!("Running merge...");

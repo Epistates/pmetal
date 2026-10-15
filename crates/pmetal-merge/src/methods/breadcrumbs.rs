@@ -1,181 +1,49 @@
-//! Model Breadcrumbs - Deterministic Sparsification for Model Merging.
+//! Model Breadcrumbs - sparse masks that drop both noise and outliers.
 //!
-//! Model Breadcrumbs (2025) is an alternative to DARE that uses deterministic,
-//! layer-wise masking instead of random dropping. It applies a dual masking
-//! strategy that simultaneously removes large outliers and small perturbations.
-//!
-//! # Algorithm
-//!
-//! For each task vector τ:
-//! 1. **Upper mask**: Remove large outliers (> top_p percentile)
-//! 2. **Lower mask**: Remove small noise (< bottom_p percentile)
-//! 3. **Final mask**: Keep values between lower and upper thresholds
-//! 4. **Rescale**: Optionally rescale to maintain expected value
-//!
-//! # Formula
+//! Model Breadcrumbs (Davari and Belilovsky, "Model Breadcrumbs: Scaling
+//! Multi-Task Model Merging with Sparse Masks", ECCV 2024, arXiv:2312.06795)
+//! thins each fine-tuned task vector layer by layer, masking out two tails
+//! of its magnitude distribution: the smallest entries, which are mostly
+//! fine-tuning noise, and the largest ones, which are outliers that dominate
+//! a sum and interfere across tasks. What remains is the middle band:
 //!
 //! ```text
-//! upper_thresh = percentile(|τ|, top_p)
-//! lower_thresh = percentile(|τ|, bottom_p)
-//! mask = (lower_thresh <= |τ|) & (|τ| <= upper_thresh)
-//! sparse_τ = τ * mask / density  (if rescale=true)
+//! mask_i = 1  where  rank-from-top(|τ_i|) is in (gamma·n, density·n]
+//! θ = θ_base + λ · combine(mask_1 ⊙ τ_1, ..., mask_N ⊙ τ_N)
 //! ```
 //!
-//! # Advantages over DARE
+//! `density` (per model, default 1) is the fraction of entries kept before
+//! the outliers go, and `gamma` (global, default 0.01) the fraction of the
+//! largest entries removed, so a fraction `density - gamma` survives. The
+//! masks are deterministic. Unlike DARE there is no rescaling: the paper's
+//! sparse vectors are added as they are.
 //!
-//! - **Deterministic**: Same input always produces same output
-//! - **Dual filtering**: Removes both outliers AND noise
-//! - **Layer-adaptive**: Thresholds computed per-layer
-//! - **More stable**: Better noise resistance in practice
-//!
-//! # References
-//!
-//! - "Model Breadcrumbs: Scaling Multi-Task Model Merging with Sparse Masks"
-//! - arXiv:2312.06795 (2023), extended 2025
+//! `combine` is the weighted sum (divided by the total weight under
+//! `normalize`, the default), or with TIES consensus the sign election and
+//! disjoint merge.
 
 use super::MergeMethod;
-use crate::{MergeError, MergeParameters, Result, sign_consensus};
-use pmetal_runtime::compat::{Array, Dtype};
+use crate::consensus::combine_task_vectors;
+use crate::{MergeError, MergeParameters, Result, sparsify_breadcrumbs};
+use pmetal_runtime::compat::Array;
 
 /// Model Breadcrumbs merge implementation.
-///
-/// Uses deterministic dual-masking (removing both outliers and small noise)
-/// for more stable model merging than random DARE.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BreadcrumbsMerge {
-    /// Upper percentile threshold (remove values above this).
-    /// E.g., 0.99 means remove top 1% outliers.
-    /// Default: 0.99
-    pub top_p: f32,
-
-    /// Lower percentile threshold (remove values below this).
-    /// E.g., 0.10 means remove bottom 10% small values.
-    /// Default: 0.10
-    pub bottom_p: f32,
-
-    /// Whether to rescale remaining values to maintain expected sum.
-    /// Default: true
-    pub rescale: bool,
-
     /// Whether to use TIES-style sign consensus.
-    /// Default: false
-    pub use_ties_consensus: bool,
-}
-
-impl Default for BreadcrumbsMerge {
-    fn default() -> Self {
-        Self::new()
-    }
+    use_ties_consensus: bool,
 }
 
 impl BreadcrumbsMerge {
-    /// Create a new Model Breadcrumbs merger with default settings.
+    /// Model Breadcrumbs with a weighted-sum combination.
     pub fn new() -> Self {
-        Self {
-            top_p: 0.99,
-            bottom_p: 0.10,
-            rescale: true,
-            use_ties_consensus: false,
-        }
-    }
-
-    /// Create with custom percentile thresholds.
-    ///
-    /// # Arguments
-    ///
-    /// * `top_p` - Upper percentile (e.g., 0.99 removes top 1%)
-    /// * `bottom_p` - Lower percentile (e.g., 0.10 removes bottom 10%)
-    pub fn with_thresholds(top_p: f32, bottom_p: f32) -> Self {
-        Self {
-            top_p,
-            bottom_p,
-            rescale: true,
-            use_ties_consensus: false,
-        }
+        Self::default()
     }
 
     /// Enable TIES sign consensus.
     pub fn with_ties(mut self) -> Self {
         self.use_ties_consensus = true;
         self
-    }
-
-    /// Disable rescaling.
-    pub fn without_rescale(mut self) -> Self {
-        self.rescale = false;
-        self
-    }
-
-    /// Set the lower percentile threshold.
-    pub fn with_bottom_p(mut self, bottom_p: f32) -> Self {
-        self.bottom_p = bottom_p;
-        self
-    }
-
-    /// Set the upper percentile threshold.
-    pub fn with_top_p(mut self, top_p: f32) -> Self {
-        self.top_p = top_p;
-        self
-    }
-
-    /// Compute the nth percentile of absolute values.
-    fn compute_percentile(values: &[f32], percentile: f32) -> f32 {
-        if values.is_empty() {
-            return 0.0;
-        }
-
-        let mut sorted = values.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        let idx = ((sorted.len() - 1) as f32 * percentile).round() as usize;
-        let idx = idx.min(sorted.len() - 1);
-        sorted[idx]
-    }
-
-    /// Apply dual-mask sparsification to a task vector.
-    fn sparsify(&self, delta: &Array) -> Result<Array> {
-        // Get absolute values for thresholding
-        let mut abs_delta = delta.abs_val();
-        let n = delta.shape().iter().map(|&s| s as usize).product();
-        let abs_values: Vec<f32> = abs_delta.to_f32_vec(n).unwrap_or_default();
-
-        // Compute percentile thresholds
-        let lower_thresh = Self::compute_percentile(&abs_values, self.bottom_p);
-        let upper_thresh = Self::compute_percentile(&abs_values, self.top_p);
-
-        // Create mask: keep values where lower_thresh <= |v| <= upper_thresh
-        let mask: Vec<f32> = abs_values
-            .iter()
-            .map(|&v| {
-                if v >= lower_thresh && v <= upper_thresh {
-                    1.0
-                } else {
-                    0.0
-                }
-            })
-            .collect();
-
-        let mask_array = Array::from_f32_slice(&mask, delta.shape());
-        let sparse_delta = delta.multiply(&mask_array);
-
-        // Optionally rescale to maintain expected value
-        if self.rescale {
-            let kept_count: f32 = mask.iter().sum();
-            let total_count = mask.len() as f32;
-            let density = kept_count / total_count;
-
-            if density > 0.0 && density < 1.0 {
-                let scale = Array::from_f32(1.0 / density);
-                return Ok(sparse_delta.multiply(&scale));
-            }
-        }
-
-        Ok(sparse_delta)
-    }
-
-    /// Compute task vector (delta from base).
-    fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base))
     }
 }
 
@@ -210,215 +78,145 @@ impl MergeMethod for BreadcrumbsMerge {
         let base = base_tensor.ok_or_else(|| MergeError::BaseModelRequired {
             method: self.name().to_string(),
         })?;
-
         if tensors.is_empty() {
             return Err(MergeError::NotEnoughModels {
                 expected: 1,
                 actual: 0,
             });
         }
+        if params.len() != tensors.len() {
+            return Err(MergeError::InvalidConfig(format!(
+                "{} tensors but {} per-model parameter sets",
+                tensors.len(),
+                params.len()
+            )));
+        }
 
-        // Compute task vectors
-        let task_vectors: Vec<Array> = tensors
-            .iter()
-            .map(|t| Self::task_vector(t, base))
-            .collect::<Result<Vec<_>>>()?;
+        let gamma = global_params.gamma();
+        let mut sparse = Vec::with_capacity(tensors.len());
+        let mut weights = Vec::with_capacity(tensors.len());
+        for (tensor, per_model) in tensors.iter().zip(params) {
+            let effective = global_params.merge_with(per_model);
+            let task_vector = tensor.subtract(base);
+            sparse.push(sparsify_breadcrumbs(
+                &task_vector,
+                effective.density(),
+                gamma,
+            )?);
+            weights.push(effective.weight());
+        }
 
-        // Get weights
-        let weights: Vec<f32> = params
-            .iter()
-            .map(|p| global_params.merge_with(p).weight())
-            .collect();
-
-        let lambda = global_params.lambda();
-
-        // Apply breadcrumbs sparsification to each task vector
-        let sparse_vectors: Vec<Array> = task_vectors
-            .iter()
-            .map(|tv| self.sparsify(tv))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Optionally apply sign consensus and compute the weighted sum.
-        // sign_consensus returns the weighted sum of agreeing contributions directly.
-        let weighted_sum = if self.use_ties_consensus {
-            sign_consensus(&sparse_vectors, &weights)?
-        } else {
-            // Compute weighted sum without sign filtering.
-            let mut acc = Array::zeros(task_vectors[0].shape(), Dtype::Float32.as_i32());
-            for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
-                let weighted = vector.multiply(&Array::from_f32(*weight));
-                acc = acc.add(&weighted);
-            }
-            acc
-        };
-
-        // Scale by lambda and add back to base
-        let result = weighted_sum.multiply(&Array::from_f32(lambda));
-        Ok(base.add(&result))
+        let combined = combine_task_vectors(
+            &sparse,
+            &weights,
+            self.use_ties_consensus,
+            global_params.normalize(),
+        )?;
+        Ok(base.add(&combined.multiply(&Array::from_f32(global_params.lambda()))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{arr, assert_close, values, weight_density};
 
-    #[test]
-    fn test_breadcrumbs_default() {
-        let bc = BreadcrumbsMerge::new();
-        assert!((bc.top_p - 0.99).abs() < 1e-6);
-        assert!((bc.bottom_p - 0.10).abs() < 1e-6);
-        assert!(bc.rescale);
-        assert!(!bc.use_ties_consensus);
-    }
-
-    #[test]
-    fn test_breadcrumbs_builder() {
-        let bc = BreadcrumbsMerge::with_thresholds(0.95, 0.20)
-            .with_ties()
-            .without_rescale();
-
-        assert!((bc.top_p - 0.95).abs() < 1e-6);
-        assert!((bc.bottom_p - 0.20).abs() < 1e-6);
-        assert!(!bc.rescale);
-        assert!(bc.use_ties_consensus);
-    }
-
-    #[test]
-    fn test_compute_percentile() {
-        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-
-        // 0th percentile should be min
-        let p0 = BreadcrumbsMerge::compute_percentile(&values, 0.0);
-        assert!((p0 - 1.0).abs() < 1e-5);
-
-        // 100th percentile should be max
-        let p100 = BreadcrumbsMerge::compute_percentile(&values, 1.0);
-        assert!((p100 - 10.0).abs() < 1e-5);
-
-        // 50th percentile should be median-ish
-        let p50 = BreadcrumbsMerge::compute_percentile(&values, 0.5);
-        assert!((5.0..=6.0).contains(&p50));
-    }
-
-    #[test]
-    fn test_sparsify_removes_outliers() {
-        let bc = BreadcrumbsMerge::with_thresholds(0.9, 0.1).without_rescale();
-
-        // Create tensor with some outliers
-        let delta = Array::from_f32_slice(
-            &[
-                0.1_f32, 0.2, 0.3, 0.4, 0.5,  // Normal values
-                10.0, // Outlier (should be removed)
-                0.01, // Small noise (should be removed)
-            ],
-            &[7],
-        );
-
-        let mut sparse = bc.sparsify(&delta).unwrap();
-        let sparse_vals = sparse.to_f32_vec(7).unwrap();
-
-        // Middle values should be kept, extremes removed
-        assert!(sparse_vals[5].abs() < 1e-6); // Outlier removed
-        assert!(sparse_vals[6].abs() < 1e-6); // Small noise removed
-    }
-
-    #[test]
-    fn test_breadcrumbs_with_base_model() {
-        let bc = BreadcrumbsMerge::new();
-
-        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_f32_slice(&[1.5_f32, 2.5, 3.5], &[3]);
-        let t2 = Array::from_f32_slice(&[1.3_f32, 2.3, 3.3], &[3]);
-
-        let params = vec![
-            MergeParameters {
-                weight: Some(0.5_f32.into()),
-                ..Default::default()
-            },
-            MergeParameters {
-                weight: Some(0.5_f32.into()),
-                ..Default::default()
-            },
-        ];
-        let global = MergeParameters::default();
-
-        let mut result = bc.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
-
-        // Result should be close to average task vector added to base
-        let result_slice = result.to_f32_vec(3).unwrap();
-        assert!(result_slice[0].is_finite());
-    }
-
-    #[test]
-    fn test_breadcrumbs_requires_base() {
-        let bc = BreadcrumbsMerge::new();
-        assert!(bc.requires_base_model());
-    }
-
-    #[test]
-    fn test_breadcrumbs_vs_ties() {
-        let bc_plain = BreadcrumbsMerge::new();
-        let bc_ties = BreadcrumbsMerge::new().with_ties();
-
-        assert_eq!(bc_plain.name(), "breadcrumbs");
-        assert_eq!(bc_ties.name(), "breadcrumbs_ties");
-    }
-
-    #[test]
-    fn test_breadcrumbs_preserves_base_with_zero_lambda() {
-        let bc = BreadcrumbsMerge::new();
-
-        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
-
-        let params = vec![MergeParameters {
-            weight: Some(1.0_f32.into()),
+    fn global(gamma: f32, normalize: bool) -> MergeParameters {
+        MergeParameters {
+            gamma: Some(gamma),
+            normalize: Some(normalize),
             ..Default::default()
-        }];
-
-        let global = MergeParameters {
-            lambda: Some(0.0_f32.into()),
-            ..Default::default()
-        };
-
-        let mut result = bc.merge(&[t1], Some(&base), &params, &global).unwrap();
-
-        let result_slice = result.to_f32_vec(3).unwrap();
-        let mut base_clone = base.clone();
-        let base_slice = base_clone.to_f32_vec(3).unwrap();
-
-        // With lambda=0, result should equal base
-        for (r, b) in result_slice.iter().zip(base_slice.iter()) {
-            assert!((r - b).abs() < 1e-5);
         }
     }
 
     #[test]
-    fn test_empty_input() {
-        let bc = BreadcrumbsMerge::new();
-        let base = Array::from_f32_slice(&[1.0_f32, 2.0], &[2]);
-        let result = bc.merge(&[], Some(&base), &[], &MergeParameters::default());
-        assert!(result.is_err());
+    fn names_and_variants() {
+        assert_eq!(BreadcrumbsMerge::new().name(), "breadcrumbs");
+        assert_eq!(
+            BreadcrumbsMerge::new().with_ties().name(),
+            "breadcrumbs_ties"
+        );
+        assert!(BreadcrumbsMerge::new().requires_base_model());
     }
 
     #[test]
-    fn test_rescale_maintains_energy() {
-        let bc_rescale = BreadcrumbsMerge::with_thresholds(0.8, 0.2);
-        let bc_no_rescale = BreadcrumbsMerge::with_thresholds(0.8, 0.2).without_rescale();
+    fn masks_the_smallest_and_the_largest_entries_of_each_task_vector() {
+        // Task vector magnitudes 1..=10 (signs mixed). density 0.8 drops the
+        // two smallest (1, 2); gamma 0.1 drops the largest (10).
+        let task = [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, -10.0];
+        let base = arr(&[100.0; 10], &[10]);
+        let model: Vec<f32> = task.iter().map(|t| 100.0 + t).collect();
+        let out = BreadcrumbsMerge::new()
+            .merge(
+                &[arr(&model, &[10])],
+                Some(&base),
+                &[weight_density(1.0, 0.8)],
+                &global(0.1, true),
+            )
+            .unwrap();
+        let want: Vec<f32> = [0.0, 0.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0, 9.0, 0.0]
+            .iter()
+            .map(|d| 100.0 + d)
+            .collect();
+        assert_close(&values(&out), &want, 1e-5);
+    }
 
-        let delta = Array::from_f32_slice(
-            &[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-            &[10],
+    #[test]
+    fn survivors_are_not_rescaled() {
+        // Dropping entries must not inflate the others (DARE's 1/density).
+        let base = arr(&[0.0; 4], &[4]);
+        let out = BreadcrumbsMerge::new()
+            .merge(
+                &[arr(&[1.0, 2.0, 3.0, 4.0], &[4])],
+                Some(&base),
+                &[weight_density(1.0, 0.5)],
+                &global(0.0, true),
+            )
+            .unwrap();
+        assert_close(&values(&out), &[0.0, 0.0, 3.0, 4.0], 1e-6);
+    }
+
+    #[test]
+    fn combines_models_by_weighted_sum_and_normalize() {
+        // Full density, no outlier removal: two task vectors [2] and [6]
+        // with weights 1 and 3.
+        let base = arr(&[0.0], &[1]);
+        let models = [arr(&[2.0], &[1]), arr(&[6.0], &[1])];
+        let params = [weight_density(1.0, 1.0), weight_density(3.0, 1.0)];
+        let run = |normalize| {
+            values(
+                &BreadcrumbsMerge::new()
+                    .merge(&models, Some(&base), &params, &global(0.0, normalize))
+                    .unwrap(),
+            )
+        };
+        // (1*2 + 3*6) / 4 = 5, or 20 summed.
+        assert_close(&run(true), &[5.0], 1e-6);
+        assert_close(&run(false), &[20.0], 1e-6);
+    }
+
+    #[test]
+    fn ties_variant_drops_the_minority_sign() {
+        let base = arr(&[0.0], &[1]);
+        let models = [arr(&[10.0], &[1]), arr(&[-1.0], &[1]), arr(&[-1.0], &[1])];
+        let params = vec![weight_density(1.0, 1.0); 3];
+        let out = BreadcrumbsMerge::new()
+            .with_ties()
+            .merge(&models, Some(&base), &params, &global(0.0, true))
+            .unwrap();
+        // Mass +8 elects positive; only +10 agrees.
+        assert_close(&values(&out), &[10.0], 1e-6);
+    }
+
+    #[test]
+    fn gamma_larger_than_density_is_rejected() {
+        let base = arr(&[0.0, 0.0], &[2]);
+        let err = BreadcrumbsMerge::new().merge(
+            &[arr(&[1.0, 2.0], &[2])],
+            Some(&base),
+            &[weight_density(1.0, 0.5)],
+            &global(0.75, true),
         );
-
-        let mut sparse_rescaled = bc_rescale.sparsify(&delta).unwrap();
-        let mut sparse_plain = bc_no_rescale.sparsify(&delta).unwrap();
-
-        let sum_rescaled: f32 = sparse_rescaled.to_f32_vec(10).unwrap().iter().sum();
-        let sum_plain: f32 = sparse_plain.to_f32_vec(10).unwrap().iter().sum();
-
-        // Rescaled should have higher sum due to density compensation
-        // (assuming we removed some values)
-        println!("Rescaled sum: {}, Plain sum: {}", sum_rescaled, sum_plain);
+        assert!(err.is_err());
     }
 }

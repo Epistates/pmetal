@@ -1,10 +1,14 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Fuse LoRA weights into base model weights.
 ///
-/// Loads LoRA adapter weights and merges them into the base model's corresponding
-/// layer, copies all other files (config, tokenizer, etc.), and saves the result.
+/// Folds the adapter into the base model with the streaming merge of
+/// `pmetal-merge` (memory-mapped, f64 arithmetic, atomic output), which
+/// reads the scale (`alpha / r`, `alpha / sqrt(r)` under rsLoRA) and DoRA
+/// magnitudes from the adapter itself and keeps the base's tensor layout and
+/// sidecar files. `alpha_override` and `rank_override` replace the adapter's
+/// own values; either one alone is combined with the other from
+/// `adapter_config.json`.
 pub(crate) async fn run_fuse(
     model_path: &str,
     lora_path: &str,
@@ -15,217 +19,45 @@ pub(crate) async fn run_fuse(
     println!("  PMetal LoRA Fuse");
     println!("========================================");
 
-    // Resolve model path (could be HF ID or local path)
-    tracing::info!("Resolving model: {}", model_path);
-    let model_dir: PathBuf = pmetal_hub::resolve_model_path(model_path, None, None).await?;
-    println!("Base model:   {}", model_dir.display());
-
-    // Resolve LoRA adapter path
-    let lora_file = if Path::new(lora_path).is_dir() {
-        let f = Path::new(lora_path).join("lora_weights.safetensors");
-        if !f.exists() {
-            anyhow::bail!("No lora_weights.safetensors found in {}", lora_path);
-        }
-        f
+    let scaling = if alpha_override.is_some() || rank_override.is_some() {
+        let config = read_adapter_config(lora_path);
+        let rank = rank_override
+            .map(|r| r as f64)
+            .or_else(|| config.as_ref().and_then(|c| c["r"].as_f64()))
+            .ok_or_else(|| anyhow::anyhow!("--alpha needs --rank: no r in adapter_config.json"))?;
+        let alpha = alpha_override
+            .map(f64::from)
+            .or_else(|| {
+                config
+                    .as_ref()
+                    .and_then(|c| c["lora_alpha"].as_f64().or_else(|| c["alpha"].as_f64()))
+            })
+            .unwrap_or(rank);
+        println!(
+            "LoRA rank: {rank}, alpha: {alpha}, scale: {:.3}",
+            alpha / rank
+        );
+        Some(alpha / rank)
     } else {
-        PathBuf::from(lora_path)
+        None
     };
-    println!("LoRA adapter: {}", lora_file.display());
-    println!("Output:       {}", output_path);
 
-    // Load base model weights
-    print!("\nLoading base model weights... ");
-    let mut base_weights = pmetal_models::loader::load_weights(&model_dir)?;
-    println!("OK ({} tensors)", base_weights.len());
+    fuse_streaming(model_path, lora_path, output_path, false, scaling).await
+}
 
-    // Load LoRA adapter weights
-    print!("Loading LoRA adapter weights... ");
-    let lora_file_str = lora_file
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 LoRA path: {}", lora_file.display()))?;
-    let lora_weights: HashMap<String, pmetal_runtime::compat::Array> =
-        pmetal_runtime::inline_array::load_safetensors_shard(lora_file_str)
-            .map(|pairs| pairs.into_iter().collect())
-            .ok_or_else(|| {
-                anyhow::anyhow!("failed to load safetensors: {}", lora_file.display())
-            })?;
-    println!("OK ({} tensors)", lora_weights.len());
-
-    // Read rank and alpha from adapter_config.json, with CLI overrides taking precedence
-    let lora_dir = if std::path::Path::new(lora_path).is_dir() {
-        std::path::PathBuf::from(lora_path)
+/// `adapter_config.json` next to the adapter, if it parses.
+fn read_adapter_config(lora_path: &str) -> Option<serde_json::Value> {
+    let dir = if Path::new(lora_path).is_dir() {
+        PathBuf::from(lora_path)
     } else {
-        std::path::Path::new(lora_path)
+        Path::new(lora_path)
             .parent()
-            .unwrap_or(std::path::Path::new("."))
+            .unwrap_or(Path::new("."))
             .to_path_buf()
     };
-    let adapter_config = std::fs::read_to_string(lora_dir.join("adapter_config.json"))
+    std::fs::read_to_string(dir.join("adapter_config.json"))
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-
-    let rank = rank_override.unwrap_or_else(|| {
-        // Prefer adapter_config.json, then fall back to shape detection
-        if let Some(ref cfg) = adapter_config {
-            if let Some(r) = cfg["r"].as_u64() {
-                return r as usize;
-            }
-        }
-        // Fallback: detect from attention lora_a shapes (skip rank-0 MLP weights)
-        lora_weights
-            .iter()
-            .filter(|(k, _)| k.contains("self_attn") && k.contains("lora_a"))
-            .map(|(_, v)| *v.shape().iter().min().unwrap_or(&16) as usize)
-            .next()
-            .unwrap_or(16)
-    });
-
-    let alpha = alpha_override.unwrap_or_else(|| {
-        if let Some(ref cfg) = adapter_config {
-            if let Some(a) = cfg["alpha"].as_f64() {
-                tracing::info!("Loaded r={}, alpha={} from adapter_config.json", rank, a);
-                return a as f32;
-            }
-        }
-        rank as f32
-    });
-    let scale = alpha / rank as f32;
-    println!("LoRA rank: {rank}, alpha: {alpha}, scale: {scale:.3}");
-
-    // Apply LoRA: W_fused = W_base + scale * (B @ A)
-    print!("Fusing weights... ");
-    let mut fused_count = 0usize;
-
-    // Group LoRA weights by layer: find matching (lora_a, lora_b) pairs
-    let mut lora_a_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
-    let mut lora_b_map: HashMap<String, &pmetal_runtime::compat::Array> = HashMap::new();
-
-    for (name, array) in &lora_weights {
-        if let Some(base_name) = name.strip_suffix(".lora_a") {
-            lora_a_map.insert(base_name.to_string(), array);
-        } else if let Some(base_name) = name.strip_suffix(".lora_b") {
-            lora_b_map.insert(base_name.to_string(), array);
-        }
-    }
-
-    for (layer_name, &lora_a) in &lora_a_map {
-        let Some(&lora_b) = lora_b_map.get(layer_name) else {
-            tracing::warn!("Missing lora_b for {layer_name}, skipping");
-            continue;
-        };
-
-        // Map LoRA layer name to base weight name
-        // LoRA names: "layers.0.self_attn.q_proj.lora_a" → base: "model.layers.0.self_attn.q_proj.weight"
-        let base_key = if layer_name.starts_with("model.") {
-            format!("{layer_name}.weight")
-        } else {
-            format!("model.{layer_name}.weight")
-        };
-
-        let Some(base_weight) = base_weights.get(&base_key) else {
-            tracing::warn!("Base weight {base_key} not found, skipping");
-            continue;
-        };
-
-        // Compute delta = scale * (B @ A) and add to base weight
-        // lora_a: [r, in_features], lora_b: [out_features, r]
-        // delta: [out_features, in_features]
-        let base_dtype = base_weight.dtype_raw();
-        let delta = pmetal_runtime::compat::ops::matmul(lora_b, lora_a);
-        let scaled_delta =
-            pmetal_runtime::compat::ops::multiply(&delta, &pmetal_runtime::array!(scale));
-        let fused = pmetal_runtime::compat::ops::add(base_weight, &scaled_delta);
-        // Cast back to base dtype (LoRA is f32, base is typically bf16/f16)
-        let fused = if fused.dtype_raw() != base_dtype {
-            fused.as_dtype(base_dtype)
-        } else {
-            fused
-        };
-
-        base_weights.insert(base_key, fused);
-        fused_count += 1;
-    }
-    println!("OK ({fused_count} layers fused)");
-
-    // Create output directory
-    let output_dir = Path::new(output_path);
-    std::fs::create_dir_all(output_dir)?;
-
-    // Copy non-weight files from base model (config.json, tokenizer, etc.)
-    print!("Copying model files... ");
-    let mut copied = 0usize;
-    for entry in std::fs::read_dir(&model_dir)?.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        // Skip weight files (we'll save our own) and symlinks
-        if name_str.ends_with(".safetensors")
-            || name_str == "model.safetensors.index.json"
-            || name_str.starts_with(".")
-        {
-            continue;
-        }
-        let dest = output_dir.join(&name);
-        if entry.path().is_file() {
-            std::fs::copy(entry.path(), &dest)?;
-            copied += 1;
-        }
-    }
-    println!("OK ({copied} files)");
-
-    // Save fused weights as a single safetensors file
-    print!("Saving fused model... ");
-    let output_file = output_dir.join("model.safetensors");
-    let output_file_str = output_file
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 output path: {}", output_file.display()))?;
-    let entries: Vec<(&str, &pmetal_runtime::compat::Array)> = base_weights
-        .iter()
-        .map(|(key, value)| (key.as_str(), value))
-        .collect();
-    pmetal_runtime::compat::Array::save_safetensors(output_file_str, &entries)?;
-
-    // Generate model.safetensors.index.json (required by many model loaders)
-    let mut weight_map = serde_json::Map::new();
-    let mut total_size: u64 = 0;
-    for (key, arr) in &base_weights {
-        weight_map.insert(
-            key.clone(),
-            serde_json::Value::String("model.safetensors".to_string()),
-        );
-        total_size += arr.nbytes() as u64;
-    }
-    let index = serde_json::json!({
-        "metadata": { "total_size": total_size },
-        "weight_map": weight_map,
-    });
-    std::fs::write(
-        output_dir.join("model.safetensors.index.json"),
-        serde_json::to_string_pretty(&index)?,
-    )?;
-
-    let size = std::fs::metadata(&output_file)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let gb = size as f64 / (1024.0 * 1024.0 * 1024.0);
-    println!("OK ({:.2} GB)", gb);
-
-    println!("\n========================================");
-    println!("Fused model saved to: {output_path}");
-    println!("\nNext steps:");
-    println!(
-        "  Inference:  pmetal infer -m {} -p \"Your prompt\"",
-        output_path
-    );
-    println!(
-        "  Quantize:   pmetal quantize -m {} -o {}.gguf",
-        output_path, output_path
-    );
-    println!(
-        "  Modelfile:  pmetal ollama modelfile -b {} -o Modelfile",
-        output_path
-    );
-
-    Ok(())
+        .and_then(|s| serde_json::from_str(&s).ok())
 }
 
 /// Fuse LoRA weights using the f64-accurate streaming merge path.
@@ -240,23 +72,32 @@ pub(crate) async fn run_fuse_accurate(
     output_path: &str,
     low_memory: bool,
 ) -> anyhow::Result<()> {
-    use pmetal_merge::{AccurateMergeConfig, streaming_lora_merge};
-
     println!("  PMetal LoRA Fuse (f64-accurate path)");
     println!("========================================");
+    fuse_streaming(model_path, lora_path, output_path, low_memory, None).await
+}
+
+async fn fuse_streaming(
+    model_path: &str,
+    lora_path: &str,
+    output_path: &str,
+    low_memory: bool,
+    scaling: Option<f64>,
+) -> anyhow::Result<()> {
+    use pmetal_merge::{AccurateMergeConfig, streaming_lora_merge};
 
     // Resolve model path (could be HF ID or local path)
     tracing::info!("Resolving model: {}", model_path);
     let model_dir: PathBuf = pmetal_hub::resolve_model_path(model_path, None, None).await?;
 
-    // The adapter path must be a directory containing adapter_config.json.
-    let adapter_dir: PathBuf = if std::path::Path::new(lora_path).is_dir() {
+    // The adapter path must be a directory containing adapter_config.json,
+    // or one of its weight files.
+    let adapter_dir: PathBuf = if Path::new(lora_path).is_dir() {
         PathBuf::from(lora_path)
     } else {
-        // If given a file, use the parent directory.
-        std::path::Path::new(lora_path)
+        Path::new(lora_path)
             .parent()
-            .unwrap_or(std::path::Path::new("."))
+            .unwrap_or(Path::new("."))
             .to_path_buf()
     };
 
@@ -265,8 +106,6 @@ pub(crate) async fn run_fuse_accurate(
     println!("Output:       {output_path}");
     if low_memory {
         println!("Mode:         low-memory (tiled, 512 rows/tile)");
-    } else {
-        println!("Mode:         standard (full-matrix f64)");
     }
     println!();
 
@@ -274,10 +113,13 @@ pub(crate) async fn run_fuse_accurate(
     if low_memory {
         config = config.with_low_memory(512);
     }
+    if let Some(scaling) = scaling {
+        config = config.with_scaling(scaling);
+    }
 
     print!("Merging... ");
-    let stats = streaming_lora_merge(&config)
-        .map_err(|e| anyhow::anyhow!("f64-accurate LoRA merge failed: {e}"))?;
+    let stats =
+        streaming_lora_merge(&config).map_err(|e| anyhow::anyhow!("LoRA fuse failed: {e}"))?;
 
     println!("done");
     println!();

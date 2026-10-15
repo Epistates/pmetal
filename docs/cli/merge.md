@@ -51,11 +51,13 @@ pmetal merge \
 | `della` | Adaptive magnitude-based pruning |
 | `della_linear` | Adaptive magnitude pruning (linear variant) |
 | `breadcrumbs` | Breadcrumbs merge strategy |
-| `model_stock` | Geometric interpolation based on task vector similarity |
-| `nearswap` | Near-swap merge strategy |
+| `model_stock` | Interpolation toward the pre-trained weights by task-vector angle |
+| `consensus` | TALL-mask consensus merging (needs `--base`) |
+| `multislerp` | Weighted spherical mean of 3+ models |
+| `nearswap` | Per-parameter selection of the value nearest the base |
 | `passthrough` | Layer passthrough composition |
 
-Three more (`ram`, `ram_plus`, `multi_slerp`) are reachable by setting `MergeConfig.merge_method` directly.
+More (`ram`, `ram_plus`, `fisher`, `regmean`, layer `slices`) are reachable by setting `MergeConfig.merge_method` or a YAML config directly.
 
 ## See Also
 

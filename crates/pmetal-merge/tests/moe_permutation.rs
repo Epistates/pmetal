@@ -92,6 +92,7 @@ fn ties_merge_is_permutation_sensitive_across_experts() {
         &densities,
         &weights,
         1.0,
+        true,
     )
     .expect("ordered merge");
 
@@ -99,7 +100,7 @@ fn ties_merge_is_permutation_sensitive_across_experts() {
     // paired with B's *expert 1*.
     let task_b1 = b1.subtract(&base0);
     let merged_0_permuted =
-        TiesMerge::merge_task_vectors(&[task_a0, task_b1], &densities, &weights, 1.0)
+        TiesMerge::merge_task_vectors(&[task_a0, task_b1], &densities, &weights, 1.0, true)
             .expect("permuted merge");
 
     merged_0_ordered.eval();
@@ -130,11 +131,17 @@ fn ties_merge_is_permutation_sensitive_across_experts() {
         &densities,
         &weights,
         1.0,
+        true,
     )
     .expect("ordered merge 1");
-    let merged_1_permuted =
-        TiesMerge::merge_task_vectors(&[task_a1, b0.subtract(&base1)], &densities, &weights, 1.0)
-            .expect("permuted merge 1");
+    let merged_1_permuted = TiesMerge::merge_task_vectors(
+        &[task_a1, b0.subtract(&base1)],
+        &densities,
+        &weights,
+        1.0,
+        true,
+    )
+    .expect("permuted merge 1");
     merged_1_ordered.eval();
     merged_1_permuted.eval();
     let ordered1: Vec<f32> = merged_1_ordered.as_slice::<f32>().to_vec();

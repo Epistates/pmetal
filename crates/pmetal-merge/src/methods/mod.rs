@@ -2,16 +2,21 @@
 //!
 //! Each merge method implements a different algorithm for combining model weights.
 //!
-//! # Q1 2026 SOTA Methods
+//! # Methods
 //!
-//! - **TIES**: Task arithmetic with sparsification and sign consensus
-//! - **DARE**: Random pruning with rescaling
-//! - **Model Breadcrumbs**: Deterministic dual-masking (removes outliers AND noise)
-//! - **Souper**: Optimal coefficient model soup with inverse-deviation weighting
-//! - **DELLA**: Adaptive magnitude-based pruning
-//! - **Model Stock**: Geometric interpolation based on task vector similarity
+//! - **Linear / task arithmetic**: weighted averages of weights or task vectors
+//! - **SLERP / Multi-SLERP**: spherical interpolation and the weighted
+//!   Karcher mean on the sphere
+//! - **TIES**: trim, elect a sign by mass, disjoint mean (Yadav et al.)
+//! - **DARE**: random drop and rescale (Yu et al.)
+//! - **DELLA**: magnitude-ranked drop and rescale (Deep et al.)
+//! - **Model Breadcrumbs**: masks the smallest entries and the outliers
+//! - **Consensus**: TALL-mask consensus merging (Wang et al.)
+//! - **Model Stock**: geometric interpolation toward the pre-trained weights
+//! - **Fisher / RegMean**: data-informed averaging from precomputed statistics
 
 mod breadcrumbs;
+mod consensus;
 mod dare;
 mod della;
 mod fisher;
@@ -23,11 +28,11 @@ mod passthrough;
 mod ram;
 mod regmean;
 mod slerp;
-mod souper;
 mod task_arithmetic;
 mod ties;
 
 pub use breadcrumbs::BreadcrumbsMerge;
+pub use consensus::ConsensusMerge;
 pub use dare::DareMerge;
 pub use della::DellaMerge;
 pub use fisher::FisherMerge;
@@ -39,7 +44,6 @@ pub use passthrough::PassthroughMerge;
 pub use ram::RamMerge;
 pub use regmean::RegMeanMerge;
 pub use slerp::SlerpMerge;
-pub use souper::SouperMerge;
 pub use task_arithmetic::TaskArithmeticMerge;
 pub use ties::TiesMerge;
 
@@ -72,18 +76,25 @@ pub trait MergeMethod: Send + Sync {
         global_params: &MergeParameters,
     ) -> Result<Array>;
 
-    /// Name-aware merge entry. The default implementation forwards to
-    /// `merge`, discarding the name; methods that need per-tensor side
-    /// data (Fisher information, RegMean Gram matrices) override this to
-    /// look up that state.
+    /// Name-aware merge entry, the one every pipeline calls.
+    ///
+    /// The default implementation resolves each filter-conditional parameter
+    /// (`weight: [{value, filter}, ...]`) against `name`, so `merge` only
+    /// ever sees scalars, and forwards to it. Methods that need per-tensor
+    /// side data (Fisher information, RegMean Gram matrices) override this
+    /// to look that state up, and call [`MergeParameters::resolved`] themselves.
     fn merge_named(
         &self,
-        _name: &str,
+        name: &str,
         tensors: &[Array],
         base_tensor: Option<&Array>,
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
-        self.merge(tensors, base_tensor, params, global_params)
+        let params: Vec<MergeParameters> = params
+            .iter()
+            .map(|p| p.resolved_in(name, global_params.layer_count))
+            .collect();
+        self.merge(tensors, base_tensor, &params, &global_params.resolved(name))
     }
 }

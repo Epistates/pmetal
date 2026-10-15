@@ -36,19 +36,20 @@
 //! `model.layers.0.self_attn.q_proj.weight` by stripping the prefix and the
 //! `.lora_{A,B}.weight` suffix.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use half::{bf16, f16};
-use memmap2::Mmap;
 use ndarray::{Array2, s};
-use safetensors::{Dtype, SafeTensors};
+use pmetal_runtime::compat::Array;
+use safetensors::Dtype;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::loader::copy_side_files;
+use crate::loader::{copy_side_files, decode_f32, write_atomic};
+use crate::mapped::{MappedFile, TensorMeta};
 use crate::{MergeError, Result};
 
 // ---------------------------------------------------------------------------
@@ -140,12 +141,25 @@ pub struct LoraMergeStats {
 // ---------------------------------------------------------------------------
 
 /// Parsed fields from `adapter_config.json` that are needed for the merge.
+///
+/// Both layouts are read: PEFT's (`lora_alpha`, `use_rslora`, `use_dora`,
+/// `alpha_pattern`, `fan_in_fan_out`) and the one `pmetal train` writes
+/// (`alpha`, `use_rslora`).
 #[derive(Debug, Clone, Deserialize)]
 struct AdapterConfigJson {
     r: u32,
+    #[serde(alias = "alpha")]
     lora_alpha: f64,
     #[serde(default)]
     fan_in_fan_out: bool,
+    /// rsLoRA (Kalajdzievski 2023): scale by `alpha / sqrt(r)`.
+    #[serde(default)]
+    use_rslora: bool,
+    #[serde(default)]
+    use_dora: bool,
+    /// Per-module `alpha` overrides, keyed by module-name regex (PEFT).
+    #[serde(default)]
+    alpha_pattern: HashMap<String, f64>,
 }
 
 impl AdapterConfigJson {
@@ -174,9 +188,32 @@ impl AdapterConfigJson {
         Ok(cfg)
     }
 
-    /// `lora_alpha / r`
-    fn scaling(&self) -> f64 {
-        self.lora_alpha / f64::from(self.r)
+    /// The `alpha` of `module`: the first `alpha_pattern` entry whose key
+    /// matches the module name (PEFT matches `(.*\.)?<key>$`), else `lora_alpha`.
+    fn alpha_for(&self, module: &str) -> Result<f64> {
+        let mut keys: Vec<&String> = self.alpha_pattern.keys().collect();
+        keys.sort();
+        for key in keys {
+            let re = regex::Regex::new(&format!(r"^(.*\.)?{key}$")).map_err(|e| {
+                MergeError::InvalidConfig(format!("alpha_pattern key {key:?} is not a regex: {e}"))
+            })?;
+            if re.is_match(module) {
+                return Ok(self.alpha_pattern[key]);
+            }
+        }
+        Ok(self.lora_alpha)
+    }
+
+    /// The scale applied to `B A` for a module whose adapter has `rank`:
+    /// `alpha / rank`, or `alpha / sqrt(rank)` under rsLoRA.
+    fn scaling_for(&self, module: &str, rank: usize) -> Result<f64> {
+        let alpha = self.alpha_for(module)?;
+        let rank = rank as f64;
+        Ok(if self.use_rslora {
+            alpha / rank.sqrt()
+        } else {
+            alpha / rank
+        })
     }
 }
 
@@ -435,109 +472,6 @@ fn dtype_tag(dtype: Dtype) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Memory-mapped safetensors file handle
-// ---------------------------------------------------------------------------
-
-/// Parsed tensor metadata entry from a safetensors file.
-#[derive(Debug, Clone)]
-struct TensorMeta {
-    dtype: Dtype,
-    shape: Vec<usize>,
-    /// Absolute byte offset within the mmap (past the header).
-    data_start: usize,
-    data_end: usize,
-}
-
-/// A memory-mapped safetensors file with pre-indexed tensor locations.
-///
-/// Tensors are stored in file order for sequential access patterns.
-struct MappedFile {
-    mmap: Mmap,
-    /// Ordered by file offset.
-    tensors: Vec<(String, TensorMeta)>,
-    index: HashMap<String, usize>,
-    metadata: Option<HashMap<String, String>>,
-}
-
-impl MappedFile {
-    fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(|e| {
-            MergeError::ModelLoad(format!("failed to open {}: {}", path.display(), e))
-        })?;
-
-        // SAFETY: The file is opened read-only; we hold the Mmap for the
-        // duration of the merge and do not mutate the file.
-        #[allow(unsafe_code)]
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            MergeError::ModelLoad(format!("failed to mmap {}: {}", path.display(), e))
-        })?;
-
-        let (header_len, metadata_view) = SafeTensors::read_metadata(&mmap).map_err(|e| {
-            MergeError::ModelLoad(format!(
-                "failed to parse safetensors header in {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-        // Safetensors format: 8-byte LE u64 header length, JSON header, then data.
-        let data_offset = 8 + header_len;
-
-        let mut tensors: Vec<(String, TensorMeta)> = Vec::new();
-        for (name, info) in metadata_view.tensors() {
-            let (start, end) = info.data_offsets;
-            tensors.push((
-                name,
-                TensorMeta {
-                    dtype: info.dtype,
-                    shape: info.shape.clone(),
-                    data_start: data_offset + start,
-                    data_end: data_offset + end,
-                },
-            ));
-        }
-
-        // Sort by file offset to maximise sequential read locality.
-        tensors.sort_by_key(|(_, m)| m.data_start);
-
-        let index: HashMap<String, usize> = tensors
-            .iter()
-            .enumerate()
-            .map(|(i, (name, _))| (name.clone(), i))
-            .collect();
-
-        let metadata = metadata_view.metadata().clone();
-
-        Ok(Self {
-            mmap,
-            tensors,
-            index,
-            metadata,
-        })
-    }
-
-    fn tensor_meta(&self, name: &str) -> Result<&TensorMeta> {
-        self.index
-            .get(name)
-            .map(|&i| &self.tensors[i].1)
-            .ok_or_else(|| MergeError::TensorNotFound(name.to_string()))
-    }
-
-    fn tensor_bytes(&self, name: &str) -> Result<&[u8]> {
-        let meta = self.tensor_meta(name)?;
-        Ok(&self.mmap[meta.data_start..meta.data_end])
-    }
-
-    fn advise_sequential(&self) {
-        let _ = self.mmap.advise(memmap2::Advice::Sequential);
-    }
-
-    fn advise_dontneed(&self) {
-        let _ = self.mmap.advise(memmap2::Advice::Normal);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Safetensors header builder
 // ---------------------------------------------------------------------------
 
@@ -585,58 +519,153 @@ fn build_header(
 /// The PEFT adapter prefix that all adapter tensor names begin with.
 const ADAPTER_PREFIX: &str = "base_model.model.";
 
-/// Build a mapping from base tensor name → `(lora_A_adapter_name, lora_B_adapter_name)`.
+/// What a LoRA adapter tensor is, from its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdapterPart {
+    /// Down-projection `A`, `[r, in]`.
+    A,
+    /// Up-projection `B`, `[out, r]`.
+    B,
+    /// DoRA magnitude vector, one entry per output row.
+    Magnitude,
+}
+
+/// Split an adapter tensor name into its module path and what it holds.
 ///
-/// Adapter tensor names follow the pattern:
-/// `base_model.model.<base_name_without_weight>.lora_{A,B}.weight`
-fn build_lora_pairs(
-    base_names: &[&str],
-    adapter_names: &[&str],
-) -> HashMap<String, (String, String)> {
-    let base_set: std::collections::HashSet<&str> = base_names.iter().copied().collect();
+/// PEFT: `base_model.model.<module>.lora_A.weight` (also `lora_B`, and
+/// `lora_magnitude_vector[.weight]`). Native (`pmetal train`):
+/// `<module>.lora_a`, `.lora_b`, `.lora_magnitude`.
+fn classify_adapter_tensor(name: &str) -> Option<(&str, AdapterPart)> {
+    let name = name.strip_prefix(ADAPTER_PREFIX).unwrap_or(name);
+    const SUFFIXES: [(&str, AdapterPart); 7] = [
+        (".lora_A.weight", AdapterPart::A),
+        (".lora_B.weight", AdapterPart::B),
+        (".lora_magnitude_vector.weight", AdapterPart::Magnitude),
+        (".lora_magnitude_vector", AdapterPart::Magnitude),
+        (".lora_a", AdapterPart::A),
+        (".lora_b", AdapterPart::B),
+        (".lora_magnitude", AdapterPart::Magnitude),
+    ];
+    SUFFIXES
+        .iter()
+        .find_map(|(suffix, part)| name.strip_suffix(suffix).map(|module| (module, *part)))
+}
 
-    let mut lora_a: HashMap<String, String> = HashMap::new();
-    let mut lora_b: HashMap<String, String> = HashMap::new();
+/// One adapted weight: where its factors live in the adapter file and the
+/// scale to fold them with.
+#[derive(Debug, Clone)]
+struct LoraTarget {
+    a: String,
+    b: String,
+    /// DoRA magnitude vector, if the adapter has one for this module.
+    magnitude: Option<String>,
+    scaling: f64,
+}
 
-    for &adapter_name in adapter_names {
-        let Some(stripped) = adapter_name.strip_prefix(ADAPTER_PREFIX) else {
+/// Map each adapted base weight to its [`LoraTarget`].
+///
+/// The base weight of module `m` is `m.weight`, or `model.m.weight` (the
+/// native layout drops the leading `model.`). Everything that looks like an
+/// adapter tensor but cannot be applied is an error, because a merge that
+/// quietly skips layers hands back a model that is not the fine-tune.
+fn discover_targets(
+    base_names: &HashSet<&str>,
+    adapter: &MappedFile,
+    cfg: &AdapterConfigJson,
+    scaling_override: Option<f64>,
+) -> Result<HashMap<String, LoraTarget>> {
+    struct Parts {
+        a: Option<String>,
+        b: Option<String>,
+        magnitude: Option<String>,
+    }
+    let mut modules: BTreeMap<&str, Parts> = BTreeMap::new();
+    let mut unsupported: Vec<&str> = Vec::new();
+    for (name, _) in &adapter.tensors {
+        match classify_adapter_tensor(name) {
+            Some((module, part)) => {
+                let parts = modules.entry(module).or_insert(Parts {
+                    a: None,
+                    b: None,
+                    magnitude: None,
+                });
+                let slot = match part {
+                    AdapterPart::A => &mut parts.a,
+                    AdapterPart::B => &mut parts.b,
+                    AdapterPart::Magnitude => &mut parts.magnitude,
+                };
+                *slot = Some(name.clone());
+            }
+            None if name.contains("lora_") || name.contains(".modules_to_save.") => {
+                unsupported.push(name);
+            }
+            None => {}
+        }
+    }
+    if !unsupported.is_empty() {
+        return Err(MergeError::InvalidConfig(format!(
+            "adapter tensors of a kind this merge cannot fold ({} of them, e.g. {}): embedding \
+             LoRA and modules_to_save are not supported",
+            unsupported.len(),
+            unsupported[..unsupported.len().min(3)].join(", ")
+        )));
+    }
+
+    let mut targets = HashMap::new();
+    let mut unmatched: Vec<&str> = Vec::new();
+    for (module, parts) in &modules {
+        let (Some(a), Some(b)) = (&parts.a, &parts.b) else {
+            return Err(MergeError::InvalidConfig(format!(
+                "adapter has {} for '{module}' but not its partner",
+                if parts.a.is_some() {
+                    "lora_A"
+                } else {
+                    "lora_B"
+                }
+            )));
+        };
+        let candidates = [format!("{module}.weight"), format!("model.{module}.weight")];
+        let Some(base_name) = candidates.iter().find(|c| base_names.contains(c.as_str())) else {
+            unmatched.push(module);
             continue;
         };
-
-        if let Some(base_part) = stripped.strip_suffix(".lora_A.weight") {
-            let base_weight = format!("{base_part}.weight");
-            if base_set.contains(base_weight.as_str()) {
-                lora_a.insert(base_weight, adapter_name.to_string());
-            }
-        } else if let Some(base_part) = stripped.strip_suffix(".lora_B.weight") {
-            let base_weight = format!("{base_part}.weight");
-            if base_set.contains(base_weight.as_str()) {
-                lora_b.insert(base_weight, adapter_name.to_string());
-            }
+        let a_meta = adapter.tensor_meta(a)?;
+        let rank = *a_meta.shape.first().ok_or_else(|| {
+            MergeError::InvalidConfig(format!("lora_A for '{module}' is a scalar"))
+        })?;
+        let scaling = match scaling_override {
+            Some(s) => s,
+            None => cfg.scaling_for(module, rank)?,
+        };
+        if cfg.use_dora && parts.magnitude.is_none() {
+            return Err(MergeError::InvalidConfig(format!(
+                "adapter_config says use_dora but '{module}' has no magnitude vector"
+            )));
         }
+        targets.insert(
+            base_name.clone(),
+            LoraTarget {
+                a: a.clone(),
+                b: b.clone(),
+                magnitude: parts.magnitude.clone(),
+                scaling,
+            },
+        );
     }
-
-    let mut pairs: HashMap<String, (String, String)> = HashMap::new();
-    for (base_name, a_name) in &lora_a {
-        if let Some(b_name) = lora_b.get(base_name) {
-            pairs.insert(base_name.clone(), (a_name.clone(), b_name.clone()));
-        } else {
-            warn!(
-                "adapter has lora_A for '{}' but no matching lora_B — skipping",
-                base_name
-            );
-        }
+    if !unmatched.is_empty() {
+        return Err(MergeError::InvalidConfig(format!(
+            "{} adapted module(s) have no weight in the base model (e.g. {}); is this adapter \
+             for a different model?",
+            unmatched.len(),
+            unmatched[..unmatched.len().min(3)].join(", ")
+        )));
     }
-    for base_name in lora_b.keys() {
-        if !lora_a.contains_key(base_name) {
-            warn!(
-                "adapter has lora_B for '{}' but no matching lora_A — skipping",
-                base_name
-            );
-        }
+    if targets.is_empty() {
+        return Err(MergeError::InvalidConfig(
+            "the adapter holds no LoRA tensors".to_string(),
+        ));
     }
-
-    pairs
+    Ok(targets)
 }
 
 /// Build a mapping from base bias tensor name → adapter bias tensor name.
@@ -707,6 +736,7 @@ fn merge_and_write_tensor(
     dtype: Dtype,
     low_memory: bool,
     tile_size: usize,
+    magnitude: Option<&[f64]>,
     writer: &mut impl Write,
 ) -> Result<()> {
     if base_shape.len() != 2 {
@@ -729,6 +759,16 @@ fn merge_and_write_tensor(
         }
     };
     let row_bytes = cols * elem_size;
+
+    if let Some(m) = magnitude {
+        if m.len() != rows {
+            return Err(MergeError::ShapeMismatch {
+                name: "DoRA magnitude length".to_string(),
+                expected: vec![rows as i32],
+                actual: vec![m.len() as i32],
+            });
+        }
+    }
 
     if base_bytes.len() != rows * row_bytes {
         return Err(MergeError::ShapeMismatch {
@@ -788,7 +828,15 @@ fn merge_and_write_tensor(
             };
 
             let base_tile = &base_bytes[start * row_bytes..end * row_bytes];
-            write_merged_rows(base_tile, &delta_tile, tile_rows, cols, dtype, writer)?;
+            write_merged_rows(
+                base_tile,
+                &delta_tile,
+                tile_rows,
+                cols,
+                dtype,
+                magnitude.map(|m| &m[start..end]),
+                writer,
+            )?;
 
             start = end;
         }
@@ -811,24 +859,71 @@ fn merge_and_write_tensor(
             });
         }
 
-        write_merged_rows(base_bytes, &delta_f64, rows, cols, dtype, writer)?;
+        write_merged_rows(base_bytes, &delta_f64, rows, cols, dtype, magnitude, writer)?;
     }
 
     Ok(())
 }
 
+/// Decode one row of `dtype` bytes into f64.
+fn decode_row(bytes: &[u8], dtype: Dtype, out: &mut [f64]) {
+    match dtype {
+        Dtype::F16 => {
+            for (c, o) in bytes.as_chunks::<2>().0.iter().zip(out) {
+                *o = f16::from_le_bytes(*c).to_f64();
+            }
+        }
+        Dtype::BF16 => {
+            for (c, o) in bytes.as_chunks::<2>().0.iter().zip(out) {
+                *o = bf16::from_le_bytes(*c).to_f64();
+            }
+        }
+        _ => {
+            for (c, o) in bytes.as_chunks::<4>().0.iter().zip(out) {
+                *o = f64::from(f32::from_le_bytes(*c));
+            }
+        }
+    }
+}
+
+/// Encode a row of f64 as `dtype` bytes. Values beyond the range of the
+/// narrow dtypes saturate instead of becoming infinity.
+fn encode_row(values: &[f64], dtype: Dtype, out: &mut [u8]) {
+    match dtype {
+        Dtype::F16 => {
+            for (v, c) in values.iter().zip(out.as_chunks_mut::<2>().0) {
+                let v = (*v as f32).clamp(f16::MIN.to_f32(), f16::MAX.to_f32());
+                c.copy_from_slice(&f16::from_f32(v).to_le_bytes());
+            }
+        }
+        Dtype::BF16 => {
+            for (v, c) in values.iter().zip(out.as_chunks_mut::<2>().0) {
+                let v = (*v as f32).clamp(bf16::MIN.to_f32(), bf16::MAX.to_f32());
+                c.copy_from_slice(&bf16::from_f32(v).to_le_bytes());
+            }
+        }
+        _ => {
+            for (v, c) in values.iter().zip(out.as_chunks_mut::<4>().0) {
+                c.copy_from_slice(&(*v as f32).to_le_bytes());
+            }
+        }
+    }
+}
+
 /// Fused row-by-row base + delta downcast pass.
 ///
 /// Reads `base_bytes` and `delta` (which must have `rows` rows × `cols` cols)
-/// element-by-element.  Every addition is done in f64 before the final
-/// downcast to `dtype`.  The result is written directly to `writer` without
-/// any intermediate allocation beyond a single row-sized output buffer.
+/// row by row. Every addition is done in f64 before the final downcast to
+/// `dtype`. With a DoRA `magnitude` (one entry per row) each combined row is
+/// renormalised to that magnitude, `m_i * row / ||row||`, before the
+/// downcast. Memory beyond the inputs is one row of f64 and one of bytes.
 fn write_merged_rows(
     base_bytes: &[u8],
     delta: &Array2<f64>,
     rows: usize,
     cols: usize,
     dtype: Dtype,
+    magnitude: Option<&[f64]>,
     writer: &mut impl Write,
 ) -> Result<()> {
     let elem_size: usize = match dtype {
@@ -846,57 +941,28 @@ fn write_merged_rows(
         MergeError::InvalidConfig("delta array is not contiguous in memory".to_string())
     })?;
 
+    let mut row = vec![0.0_f64; cols];
     let mut out_row: Vec<u8> = vec![0u8; row_bytes];
 
     for i in 0..rows {
-        let base_row = &base_bytes[i * row_bytes..(i + 1) * row_bytes];
-        let delta_row = &delta_flat[i * cols..(i + 1) * cols];
-
-        match dtype {
-            Dtype::F16 => {
-                for ((base_chunk, &d), out_chunk) in base_row
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(delta_row)
-                    .zip(out_row.as_chunks_mut::<2>().0.iter_mut())
-                {
-                    let base_val = f16::from_le_bytes(*base_chunk).to_f64();
-                    let merged =
-                        ((base_val + d) as f32).clamp(f16::MIN.to_f32(), f16::MAX.to_f32());
-                    out_chunk.copy_from_slice(&f16::from_f32(merged).to_le_bytes());
-                }
-            }
-            Dtype::BF16 => {
-                for ((base_chunk, &d), out_chunk) in base_row
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .zip(delta_row)
-                    .zip(out_row.as_chunks_mut::<2>().0.iter_mut())
-                {
-                    let base_val = bf16::from_le_bytes(*base_chunk).to_f64();
-                    let merged =
-                        ((base_val + d) as f32).clamp(bf16::MIN.to_f32(), bf16::MAX.to_f32());
-                    out_chunk.copy_from_slice(&bf16::from_f32(merged).to_le_bytes());
-                }
-            }
-            Dtype::F32 => {
-                for ((base_chunk, &d), out_chunk) in base_row
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .zip(delta_row)
-                    .zip(out_row.as_chunks_mut::<4>().0.iter_mut())
-                {
-                    let base_val = f32::from_le_bytes(*base_chunk) as f64;
-                    let merged = (base_val + d) as f32;
-                    out_chunk.copy_from_slice(&merged.to_le_bytes());
-                }
-            }
-            _ => unreachable!("dtype already validated above"),
+        decode_row(
+            &base_bytes[i * row_bytes..(i + 1) * row_bytes],
+            dtype,
+            &mut row,
+        );
+        for (v, d) in row.iter_mut().zip(&delta_flat[i * cols..(i + 1) * cols]) {
+            *v += d;
         }
-
+        if let Some(magnitude) = magnitude {
+            let norm = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if norm > 0.0 {
+                let scale = magnitude[i] / norm;
+                for v in &mut row {
+                    *v *= scale;
+                }
+            }
+        }
+        encode_row(&row, dtype, &mut out_row);
         writer.write_all(&out_row)?;
     }
 
@@ -904,37 +970,28 @@ fn write_merged_rows(
 }
 
 // ---------------------------------------------------------------------------
-// Single-file merge
+// Shard merge
 // ---------------------------------------------------------------------------
 
-/// Merge a single-file base model with the adapter and write the output.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "private helper threading the merge settings"
-)]
-fn merge_single_file(
-    base: &MappedFile,
-    adapter: &MappedFile,
-    lora_pairs: &HashMap<String, (String, String)>,
-    bias_map: &HashMap<String, String>,
-    scaling: f64,
+/// Everything a shard merge needs besides the shard itself.
+struct MergeContext<'a> {
+    adapter: &'a MappedFile,
+    targets: &'a HashMap<String, LoraTarget>,
+    bias_map: &'a HashMap<String, String>,
     fan_in_fan_out: bool,
     low_memory: bool,
     tile_size: usize,
-    output_path: &Path,
-    stats: &mut LoraMergeStats,
+    /// The base model's `quantization` config, for MLX-quantized weights.
+    quantization: Option<&'a serde_json::Value>,
+}
+
+/// Write a file all or nothing: build it in a `.partial` sibling, force it to
+/// disk and rename it into place; the partial is removed on failure.
+fn write_file_atomically(
+    path: &Path,
+    build: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
 ) -> Result<()> {
-    // Build the output header from the base file's tensor order and dtypes.
-    let output_tensors: Vec<(String, TensorMeta)> = base
-        .tensors
-        .iter()
-        .map(|(name, meta)| (name.clone(), meta.clone()))
-        .collect();
-
-    let header_bytes = build_header(&output_tensors, base.metadata.as_ref())?;
-
-    // Create parent dirs if needed.
-    if let Some(parent) = output_path.parent() {
+    if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| {
                 MergeError::ModelLoad(format!(
@@ -945,85 +1002,361 @@ fn merge_single_file(
             })?;
         }
     }
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    let result = (|| -> Result<()> {
+        let file = File::create(&partial).map_err(|e| {
+            MergeError::ModelLoad(format!(
+                "failed to create output file {}: {}",
+                partial.display(),
+                e
+            ))
+        })?;
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        build(&mut writer)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        fs::rename(&partial, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    result
+}
 
-    let out_file = File::create(output_path).map_err(|e| {
-        MergeError::ModelLoad(format!(
-            "failed to create output file {}: {}",
-            output_path.display(),
-            e
+/// The A and B factors (f64) and DoRA magnitude of a target.
+struct LoraFactors {
+    a: Array2<f64>,
+    b: Array2<f64>,
+    magnitude: Option<Vec<f64>>,
+}
+
+fn load_factors(ctx: &MergeContext<'_>, target: &LoraTarget) -> Result<LoraFactors> {
+    let a_meta = ctx.adapter.tensor_meta(&target.a)?;
+    let b_meta = ctx.adapter.tensor_meta(&target.b)?;
+    let lora_a = bytes_to_f64_2d(
+        ctx.adapter.tensor_bytes(&target.a)?,
+        a_meta.dtype,
+        &a_meta.shape,
+        &target.a,
+    )?;
+    let lora_b = bytes_to_f64_2d(
+        ctx.adapter.tensor_bytes(&target.b)?,
+        b_meta.dtype,
+        &b_meta.shape,
+        &target.b,
+    )?;
+    let magnitude = target
+        .magnitude
+        .as_ref()
+        .map(|name| {
+            let meta = ctx.adapter.tensor_meta(name)?;
+            let n: usize = meta.shape.iter().product();
+            bytes_to_f64_1d(ctx.adapter.tensor_bytes(name)?, meta.dtype, &[n], name)
+        })
+        .transpose()?;
+    Ok(LoraFactors {
+        a: lora_a,
+        b: lora_b,
+        magnitude,
+    })
+}
+
+/// Bytes of the three tensors an MLX-quantized layer is stored as, produced
+/// together when the layer is folded and written as each comes up in the
+/// shard's order.
+#[derive(Default)]
+struct QuantizedLayer {
+    weight: Option<Vec<u8>>,
+    scales: Option<Vec<u8>>,
+    biases: Option<Vec<u8>>,
+}
+
+/// `(group_size, bits)` for `module` from the base config's `quantization`
+/// block: a per-module entry wins over the top-level setting.
+fn quant_params(quantization: &serde_json::Value, module: &str) -> Option<(i32, i32)> {
+    let read = |v: &serde_json::Value| {
+        Some((
+            i32::try_from(v.get("group_size")?.as_i64()?).ok()?,
+            i32::try_from(v.get("bits")?.as_i64()?).ok()?,
         ))
-    })?;
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    };
+    quantization
+        .get(module)
+        .and_then(read)
+        .or_else(|| read(quantization))
+}
 
-    // Safetensors binary format: 8-byte LE u64 header length, then header JSON, then data.
-    let header_len = header_bytes.len() as u64;
-    writer.write_all(&header_len.to_le_bytes())?;
-    writer.write_all(&header_bytes)?;
-    stats.bytes_written += 8 + header_bytes.len() as u64;
+/// Encode f32 values as `dtype` bytes (F16, BF16 or F32).
+fn encode_f32(values: &[f32], dtype: Dtype) -> Vec<u8> {
+    let wide: Vec<f64> = values.iter().map(|&v| f64::from(v)).collect();
+    let elem = if dtype == Dtype::F32 { 4 } else { 2 };
+    let mut out = vec![0u8; values.len() * elem];
+    encode_row(&wide, dtype, &mut out);
+    out
+}
 
-    base.advise_sequential();
+/// Fold an adapter into an MLX affine-quantized weight: dequantize,
+/// `W + s·B·A` (DoRA: renormalise the rows), quantize again with the layer's
+/// group size and bit width. Requantizing is lossy by construction; the
+/// result is within half a quantization step of the exact sum.
+fn fold_quantized(
+    shard: &MappedFile,
+    weight_name: &str,
+    ctx: &MergeContext<'_>,
+) -> Result<QuantizedLayer> {
+    let target = &ctx.targets[weight_name];
+    let module = weight_name.strip_suffix(".weight").unwrap_or(weight_name);
+    let (group_size, bits) = ctx
+        .quantization
+        .and_then(|q| quant_params(q, module))
+        .ok_or_else(|| {
+            MergeError::ModelLoad(format!(
+                "{weight_name} is quantized but the base config.json has no `quantization` \
+                 block with group_size and bits"
+            ))
+        })?;
+    if ctx.fan_in_fan_out {
+        return Err(MergeError::InvalidConfig(
+            "fan_in_fan_out adapters cannot be folded into quantized weights".to_string(),
+        ));
+    }
 
-    for (name, meta) in &base.tensors {
-        let base_data = &base.mmap[meta.data_start..meta.data_end];
+    let scales_name = format!("{module}.scales");
+    let biases_name = format!("{module}.biases");
+    for sibling in [&scales_name, &biases_name] {
+        if shard.tensor_meta(sibling).is_err() {
+            return Err(MergeError::ModelLoad(format!(
+                "quantized layer {module}: {sibling} is not in the same shard as its weight"
+            )));
+        }
+    }
+    let weight_meta = shard.tensor_meta(weight_name)?;
+    let scales_meta = shard.tensor_meta(&scales_name)?;
+    let biases_meta = shard.tensor_meta(&biases_name)?;
+    if weight_meta.shape.len() != 2 {
+        return Err(MergeError::ShapeMismatch {
+            name: format!("{weight_name} (quantized, expected 2D)"),
+            expected: vec![2],
+            actual: weight_meta.shape.iter().map(|&s| s as i32).collect(),
+        });
+    }
+    let (out_features, packed) = (weight_meta.shape[0], weight_meta.shape[1]);
+    let in_features = packed * 32 / bits as usize;
 
-        if let Some((a_name, b_name)) = lora_pairs.get(name) {
-            debug!("merging LoRA for '{name}'");
+    let packed_words: Vec<u32> = shard
+        .tensor_bytes(weight_name)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    let weight = Array::from_u32_slice(&packed_words, &[out_features as i32, packed as i32]);
+    let scales_values = decode_f32(
+        shard.tensor_bytes(&scales_name)?,
+        scales_meta.dtype,
+        &scales_name,
+    )?;
+    let biases_values = decode_f32(
+        shard.tensor_bytes(&biases_name)?,
+        biases_meta.dtype,
+        &biases_name,
+    )?;
+    let group_shape: Vec<i32> = scales_meta.shape.iter().map(|&s| s as i32).collect();
+    let scales = Array::from_f32_slice(&scales_values, &group_shape);
+    let biases = Array::from_f32_slice(&biases_values, &group_shape);
+    let dense = weight.dequantize(&scales, &biases, group_size, bits);
 
-            let a_meta = adapter.tensor_meta(a_name)?;
-            let b_meta = adapter.tensor_meta(b_name)?;
-            let a_bytes = adapter.tensor_bytes(a_name)?;
-            let b_bytes = adapter.tensor_bytes(b_name)?;
+    let LoraFactors {
+        a: lora_a,
+        b: lora_b,
+        magnitude,
+    } = load_factors(ctx, target)?;
+    if lora_b.nrows() != out_features || lora_a.ncols() != in_features {
+        return Err(MergeError::ShapeMismatch {
+            name: format!(
+                "{weight_name} (adapter [{}x{}] · [{}x{}])",
+                lora_b.nrows(),
+                lora_b.ncols(),
+                lora_a.nrows(),
+                lora_a.ncols()
+            ),
+            expected: vec![out_features as i32, in_features as i32],
+            actual: vec![lora_b.nrows() as i32, lora_a.ncols() as i32],
+        });
+    }
+    let delta = lora_b.dot(&lora_a) * target.scaling;
+    let delta_f32: Vec<f32> = delta.iter().map(|&v| v as f32).collect();
+    let mut combined = dense.add(&Array::from_f32_slice(
+        &delta_f32,
+        &[out_features as i32, in_features as i32],
+    ));
+    if let Some(magnitude) = magnitude {
+        let magnitude: Vec<f32> = magnitude.iter().map(|&v| v as f32).collect();
+        let norm = combined.square().sum_axis(1, true).sqrt();
+        let factor = Array::from_f32_slice(&magnitude, &[out_features as i32, 1]).divide(&norm);
+        combined = combined.multiply(&factor);
+    }
 
-            let lora_a = bytes_to_f64_2d(a_bytes, a_meta.dtype, &a_meta.shape, a_name)?;
-            let lora_b = bytes_to_f64_2d(b_bytes, b_meta.dtype, &b_meta.shape, b_name)?;
+    let (new_weight, new_scales, new_biases) = combined.quantize_weights(group_size, bits);
+    let weight_bytes: Vec<u8> = new_weight
+        .as_slice::<u32>()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let read_f32 = |mut a: Array| a.to_f32_vec(a.size());
+    let new_scales = read_f32(new_scales);
+    let new_biases = read_f32(new_biases);
+    pmetal_runtime::check_unobserved_error()?;
+    let (Some(new_scales), Some(new_biases)) = (new_scales, new_biases) else {
+        return Err(MergeError::ModelLoad(format!(
+            "{weight_name}: reading the requantized layer failed"
+        )));
+    };
+    Ok(QuantizedLayer {
+        weight: Some(weight_bytes),
+        scales: Some(encode_f32(&new_scales, scales_meta.dtype)),
+        biases: Some(encode_f32(&new_biases, biases_meta.dtype)),
+    })
+}
 
-            merge_and_write_tensor(
-                base_data,
-                &lora_a,
-                &lora_b,
-                scaling,
-                fan_in_fan_out,
-                &meta.shape,
-                meta.dtype,
-                low_memory,
-                tile_size,
-                &mut writer,
-            )?;
-
-            stats.tensors_merged += 1;
-            stats.bytes_written += base_data.len() as u64;
-        } else if let Some(adapter_bias_name) = bias_map.get(name) {
-            debug!("merging bias for '{name}' from adapter tensor '{adapter_bias_name}'");
-
-            let adapter_meta = adapter.tensor_meta(adapter_bias_name)?;
-            let adapter_bytes = adapter.tensor_bytes(adapter_bias_name)?;
-
-            merge_and_write_bias(
-                base_data,
-                &meta.shape,
-                meta.dtype,
-                adapter_bytes,
-                &adapter_meta.shape,
-                adapter_meta.dtype,
-                name,
-                adapter_bias_name,
-                &mut writer,
-            )?;
-
-            stats.biases_merged += 1;
-            stats.bytes_written += base_data.len() as u64;
-        } else {
-            // Pass-through: write bytes unchanged.
-            writer.write_all(base_data)?;
-            stats.tensors_copied += 1;
-            stats.bytes_written += base_data.len() as u64;
+/// Merge one base shard (or single-file model) with the adapter and write the
+/// result atomically to `output_path`.
+///
+/// Dense adapted weights are folded row by row in f64, quantized ones through
+/// [`fold_quantized`], adapter biases are added, and every other tensor is
+/// copied byte for byte.
+fn merge_shard(
+    shard: &MappedFile,
+    ctx: &MergeContext<'_>,
+    output_path: &Path,
+    stats: &mut LoraMergeStats,
+) -> Result<()> {
+    // Quantized layers: the `.weight` is a u32 tensor whose `.scales` and
+    // `.biases` change along with it.
+    let mut quantized_sibling: HashMap<String, String> = HashMap::new();
+    for (name, meta) in &shard.tensors {
+        if meta.dtype == Dtype::U32 && ctx.targets.contains_key(name) {
+            let module = name.strip_suffix(".weight").unwrap_or(name);
+            quantized_sibling.insert(format!("{module}.scales"), name.clone());
+            quantized_sibling.insert(format!("{module}.biases"), name.clone());
         }
     }
 
-    writer.flush()?;
-    base.advise_dontneed();
+    write_file_atomically(output_path, |writer| {
+        let output_tensors: Vec<(String, TensorMeta)> = shard
+            .tensors
+            .iter()
+            .map(|(name, meta)| (name.clone(), meta.clone()))
+            .collect();
+        let header_bytes = build_header(&output_tensors, shard.metadata.as_ref())?;
+        writer.write_all(&(header_bytes.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_bytes)?;
+        stats.bytes_written += 8 + header_bytes.len() as u64;
 
-    Ok(())
+        shard.advise_sequential();
+        let mut pending: HashMap<String, QuantizedLayer> = HashMap::new();
+
+        for (name, meta) in &shard.tensors {
+            let base_data = shard.slice(meta);
+            let is_quant_weight = meta.dtype == Dtype::U32 && ctx.targets.contains_key(name);
+
+            if is_quant_weight || quantized_sibling.contains_key(name) {
+                let weight_name = if is_quant_weight {
+                    name
+                } else {
+                    &quantized_sibling[name]
+                };
+                if !pending.contains_key(weight_name) {
+                    debug!("merging LoRA into quantized '{weight_name}'");
+                    pending.insert(
+                        weight_name.clone(),
+                        fold_quantized(shard, weight_name, ctx)?,
+                    );
+                    stats.tensors_merged += 1;
+                }
+                let layer = pending.get_mut(weight_name).expect("inserted above");
+                let piece = if name == weight_name {
+                    layer.weight.take()
+                } else if name.ends_with(".scales") {
+                    layer.scales.take()
+                } else {
+                    layer.biases.take()
+                };
+                let piece = piece
+                    .filter(|p| p.len() == base_data.len())
+                    .ok_or_else(|| {
+                        MergeError::ModelLoad(format!(
+                            "requantized '{name}' does not have the size of the base tensor"
+                        ))
+                    })?;
+                writer.write_all(&piece)?;
+                if layer.weight.is_none() && layer.scales.is_none() && layer.biases.is_none() {
+                    pending.remove(weight_name);
+                }
+            } else if let Some(target) = ctx.targets.get(name) {
+                debug!("merging LoRA for '{name}'");
+                let LoraFactors {
+                    a: lora_a,
+                    b: lora_b,
+                    magnitude,
+                } = load_factors(ctx, target)?;
+                if magnitude.is_some() && ctx.fan_in_fan_out {
+                    return Err(MergeError::InvalidConfig(
+                        "DoRA adapters with fan_in_fan_out are not supported".to_string(),
+                    ));
+                }
+                merge_and_write_tensor(
+                    base_data,
+                    &lora_a,
+                    &lora_b,
+                    target.scaling,
+                    ctx.fan_in_fan_out,
+                    &meta.shape,
+                    meta.dtype,
+                    ctx.low_memory,
+                    ctx.tile_size,
+                    magnitude.as_deref(),
+                    writer,
+                )?;
+                stats.tensors_merged += 1;
+            } else if let Some(adapter_bias_name) = ctx.bias_map.get(name) {
+                debug!("merging bias for '{name}' from adapter tensor '{adapter_bias_name}'");
+                let adapter_meta = ctx.adapter.tensor_meta(adapter_bias_name)?;
+                merge_and_write_bias(
+                    base_data,
+                    &meta.shape,
+                    meta.dtype,
+                    ctx.adapter.tensor_bytes(adapter_bias_name)?,
+                    &adapter_meta.shape,
+                    adapter_meta.dtype,
+                    name,
+                    adapter_bias_name,
+                    writer,
+                )?;
+                stats.biases_merged += 1;
+            } else {
+                // Pass-through: write bytes unchanged.
+                writer.write_all(base_data)?;
+                stats.tensors_copied += 1;
+            }
+            stats.bytes_written += base_data.len() as u64;
+        }
+        if !pending.is_empty() {
+            return Err(MergeError::ModelLoad(format!(
+                "quantized layer(s) {:?} were folded but their scales or biases are not in this \
+                 shard",
+                pending.keys().collect::<Vec<_>>()
+            )));
+        }
+        shard.advise_dontneed();
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1065,20 +1398,10 @@ impl ShardIndex {
 // Sharded merge
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "private helper threading the merge settings"
-)]
 fn merge_sharded(
     base_dir: &Path,
     index: &ShardIndex,
-    adapter: &MappedFile,
-    lora_pairs: &HashMap<String, (String, String)>,
-    bias_map: &HashMap<String, String>,
-    scaling: f64,
-    fan_in_fan_out: bool,
-    low_memory: bool,
-    tile_size: usize,
+    ctx: &MergeContext<'_>,
     output_dir: &Path,
     stats: &mut LoraMergeStats,
 ) -> Result<()> {
@@ -1102,104 +1425,20 @@ fn merge_sharded(
                 "shard filename '{shard_filename}' contains path traversal"
             )));
         }
-
-        let shard_path = base_dir.join(&shard_filename);
-        let shard = MappedFile::open(&shard_path)?;
-        shard.advise_sequential();
-
-        let output_shard_path = output_dir.join(&shard_filename);
-        let shard_tensors: Vec<(String, TensorMeta)> = shard
-            .tensors
-            .iter()
-            .map(|(n, m)| (n.clone(), m.clone()))
-            .collect();
-
-        let header_bytes = build_header(&shard_tensors, shard.metadata.as_ref())?;
-
-        let out_file = File::create(&output_shard_path).map_err(|e| {
-            MergeError::ModelLoad(format!(
-                "failed to create {}: {}",
-                output_shard_path.display(),
-                e
-            ))
-        })?;
-        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
-
-        let header_len = header_bytes.len() as u64;
-        writer.write_all(&header_len.to_le_bytes())?;
-        writer.write_all(&header_bytes)?;
-        stats.bytes_written += 8 + header_bytes.len() as u64;
-
-        for (name, meta) in &shard.tensors {
-            let base_data = &shard.mmap[meta.data_start..meta.data_end];
-
-            if let Some((a_name, b_name)) = lora_pairs.get(name) {
-                debug!("merging LoRA for '{name}' in shard '{shard_filename}'");
-
-                let a_meta = adapter.tensor_meta(a_name)?;
-                let b_meta = adapter.tensor_meta(b_name)?;
-                let a_bytes = adapter.tensor_bytes(a_name)?;
-                let b_bytes = adapter.tensor_bytes(b_name)?;
-
-                let lora_a = bytes_to_f64_2d(a_bytes, a_meta.dtype, &a_meta.shape, a_name)?;
-                let lora_b = bytes_to_f64_2d(b_bytes, b_meta.dtype, &b_meta.shape, b_name)?;
-
-                merge_and_write_tensor(
-                    base_data,
-                    &lora_a,
-                    &lora_b,
-                    scaling,
-                    fan_in_fan_out,
-                    &meta.shape,
-                    meta.dtype,
-                    low_memory,
-                    tile_size,
-                    &mut writer,
-                )?;
-
-                stats.tensors_merged += 1;
-                stats.bytes_written += base_data.len() as u64;
-            } else if let Some(adapter_bias_name) = bias_map.get(name) {
-                debug!(
-                    "merging bias for '{name}' from adapter tensor '{adapter_bias_name}' \
-                     in shard '{shard_filename}'"
-                );
-
-                let adapter_meta = adapter.tensor_meta(adapter_bias_name)?;
-                let adapter_bytes = adapter.tensor_bytes(adapter_bias_name)?;
-
-                merge_and_write_bias(
-                    base_data,
-                    &meta.shape,
-                    meta.dtype,
-                    adapter_bytes,
-                    &adapter_meta.shape,
-                    adapter_meta.dtype,
-                    name,
-                    adapter_bias_name,
-                    &mut writer,
-                )?;
-
-                stats.biases_merged += 1;
-                stats.bytes_written += base_data.len() as u64;
-            } else {
-                writer.write_all(base_data)?;
-                stats.tensors_copied += 1;
-                stats.bytes_written += base_data.len() as u64;
-            }
-        }
-
-        writer.flush()?;
-        shard.advise_dontneed();
+        let shard = MappedFile::open(&base_dir.join(&shard_filename))?;
+        merge_shard(&shard, ctx, &output_dir.join(&shard_filename), stats)?;
     }
 
-    // Copy the index.json to the output, preserving the weight_map.
+    // The tensors keep their shards, so the index carries over unchanged.
     let output_index = serde_json::json!({
         "metadata": index.metadata,
         "weight_map": index.weight_map,
     });
     let json = serde_json::to_string_pretty(&output_index).map_err(MergeError::Serde)?;
-    fs::write(output_dir.join("model.safetensors.index.json"), json)?;
+    write_atomic(
+        &output_dir.join("model.safetensors.index.json"),
+        json.as_bytes(),
+    )?;
 
     Ok(())
 }
@@ -1208,165 +1447,121 @@ fn merge_sharded(
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// The adapter's weight file and `adapter_config.json`: PEFT's
+/// `adapter_model.safetensors` or `pmetal train`'s `lora_weights.safetensors`
+/// in a directory, or a weight file directly.
+fn locate_adapter(adapter_path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let (dir, file) = if adapter_path.is_file() {
+        (
+            adapter_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf(),
+            Some(adapter_path.to_path_buf()),
+        )
+    } else {
+        (adapter_path.to_path_buf(), None)
+    };
+    let weights = match file {
+        Some(file) => file,
+        None => ["adapter_model.safetensors", "lora_weights.safetensors"]
+            .iter()
+            .map(|n| dir.join(n))
+            .find(|p| p.is_file())
+            .ok_or_else(|| {
+                MergeError::ModelLoad(format!(
+                    "neither adapter_model.safetensors nor lora_weights.safetensors found in {}",
+                    dir.display()
+                ))
+            })?,
+    };
+    Ok((weights, dir.join("adapter_config.json")))
+}
+
 /// Perform a streaming f64-accurate LoRA merge.
 ///
-/// Reads `adapter_config.json` from `config.adapter_path`, resolves the base
+/// Reads `adapter_config.json` next to the adapter weights, resolves the base
 /// model (single file or sharded directory), maps adapter tensors to base
 /// tensors, and writes the merged model to `config.output_path`.
 ///
-/// Non-adapted tensors are copied byte-for-byte (zero-allocation path).
+/// Adapters in PEFT's layout (`adapter_model.safetensors`, keys
+/// `base_model.model.<module>.lora_{A,B}.weight`) and in `pmetal train`'s
+/// (`lora_weights.safetensors`, keys `<module>.lora_{a,b}`) are both read.
+/// Each adapted weight becomes `W + s·B·A` with `s = alpha / r` (`alpha /
+/// sqrt(r)` under rsLoRA, `alpha_pattern` overriding `alpha` per module), and
+/// DoRA adapters renormalise each output row to their magnitude vector.
+/// MLX-quantized weights are dequantized, folded and quantized again.
+///
+/// Non-adapted tensors are copied byte-for-byte (zero-allocation path), and
+/// every output file is written atomically.
 ///
 /// # Errors
 ///
 /// Returns [`MergeError`] if any of the following occur:
 ///
 /// - `adapter_config.json` is missing or malformed
-/// - `adapter_model.safetensors` is missing
+/// - the adapter weights are missing
+/// - an adapted module has no weight in the base model, an adapter tensor is
+///   of a kind that cannot be folded, or a factor pair is incomplete
 /// - Base model path does not exist or contains no safetensors files
 /// - A LoRA tensor has an unsupported dtype or unexpected shape
 /// - I/O or serialization errors during output writing
 pub fn streaming_lora_merge(config: &AccurateMergeConfig) -> Result<LoraMergeStats> {
     let start = std::time::Instant::now();
 
-    // ---- Adapter config -------------------------------------------------
-    let config_path = config.adapter_path.join("adapter_config.json");
-    let adapter_cfg = AdapterConfigJson::from_path(&config_path)?;
-    let scaling = config.scaling.unwrap_or_else(|| adapter_cfg.scaling());
-
-    info!(
-        "LoRA merge: rank={}, alpha={}, scaling={:.4}, fan_in_fan_out={}",
-        adapter_cfg.r, adapter_cfg.lora_alpha, scaling, adapter_cfg.fan_in_fan_out
-    );
-
-    // ---- Adapter weights ------------------------------------------------
-    let adapter_weights_path = config.adapter_path.join("adapter_model.safetensors");
-    if !adapter_weights_path.exists() {
-        return Err(MergeError::ModelLoad(format!(
-            "adapter_model.safetensors not found in {}",
-            config.adapter_path.display()
-        )));
-    }
+    // ---- Adapter ----------------------------------------------------------
+    let config_dir = if config.adapter_path.is_file() {
+        config.adapter_path.parent().unwrap_or(Path::new("."))
+    } else {
+        &config.adapter_path
+    };
+    let adapter_cfg = AdapterConfigJson::from_path(&config_dir.join("adapter_config.json"))?;
+    let (adapter_weights_path, _) = locate_adapter(&config.adapter_path)?;
     let adapter = MappedFile::open(&adapter_weights_path)?;
     info!(
-        "Loaded adapter with {} tensors from {}",
+        "LoRA merge: rank={}, alpha={}, rslora={}, dora={}, fan_in_fan_out={}, {} adapter \
+         tensors from {}",
+        adapter_cfg.r,
+        adapter_cfg.lora_alpha,
+        adapter_cfg.use_rslora,
+        adapter_cfg.use_dora,
+        adapter_cfg.fan_in_fan_out,
         adapter.tensors.len(),
         adapter_weights_path.display()
     );
 
     let mut stats = LoraMergeStats::default();
 
-    // ---- Route single vs sharded ----------------------------------------
+    // ---- Base model: single file or sharded ----------------------------------
     let base_path = &config.base_model_path;
+    let base_dir = if base_path.is_file() {
+        base_path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    } else {
+        base_path.clone()
+    };
+    let quantization_config: Option<serde_json::Value> =
+        fs::read_to_string(base_dir.join("config.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|cfg| {
+                cfg.get("quantization")
+                    .or_else(|| cfg.get("quantization_config"))
+                    .cloned()
+            });
 
-    if base_path.is_file() {
-        // Single-file base model.
-        let base = MappedFile::open(base_path)?;
-        info!(
-            "Single-file base model: {} tensors in {}",
-            base.tensors.len(),
-            base_path.display()
-        );
-
-        let base_names: Vec<&str> = base.tensors.iter().map(|(n, _)| n.as_str()).collect();
-        let adapter_names: Vec<&str> = adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
-        let lora_pairs = build_lora_pairs(&base_names, &adapter_names);
-        let bias_map = build_bias_map(&base_names, &adapter_names);
-
-        info!(
-            "Identified {} LoRA-adapted tensors, {} adapter biases",
-            lora_pairs.len(),
-            bias_map.len()
-        );
-
-        merge_single_file(
-            &base,
-            &adapter,
-            &lora_pairs,
-            &bias_map,
-            scaling,
-            adapter_cfg.fan_in_fan_out,
-            config.low_memory,
-            config.tile_size,
-            &config.output_path,
-            &mut stats,
-        )?;
+    enum BaseLayout {
+        Single(PathBuf),
+        Sharded(ShardIndex),
+    }
+    let layout = if base_path.is_file() {
+        BaseLayout::Single(base_path.clone())
     } else if base_path.is_dir() {
         let single = base_path.join("model.safetensors");
         let index_path = base_path.join("model.safetensors.index.json");
-
         if single.is_file() {
-            // Directory containing a single model.safetensors.
-            let base = MappedFile::open(&single)?;
-            info!(
-                "Single-file base model (in directory): {} tensors",
-                base.tensors.len()
-            );
-
-            let base_names: Vec<&str> = base.tensors.iter().map(|(n, _)| n.as_str()).collect();
-            let adapter_names: Vec<&str> =
-                adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
-            let lora_pairs = build_lora_pairs(&base_names, &adapter_names);
-            let bias_map = build_bias_map(&base_names, &adapter_names);
-
-            info!(
-                "Identified {} LoRA-adapted tensors, {} adapter biases",
-                lora_pairs.len(),
-                bias_map.len()
-            );
-
-            merge_single_file(
-                &base,
-                &adapter,
-                &lora_pairs,
-                &bias_map,
-                scaling,
-                adapter_cfg.fan_in_fan_out,
-                config.low_memory,
-                config.tile_size,
-                &config.output_path.join("model.safetensors"),
-                &mut stats,
-            )?;
-
-            // Copy non-safetensors files (config.json, tokenizer, etc.).
-            copy_side_files(base_path, &config.output_path)?;
+            BaseLayout::Single(single)
         } else if index_path.is_file() {
-            // Sharded base model.
-            let index = ShardIndex::from_path(&index_path)?;
-            info!(
-                "Sharded base model: {} shards",
-                index.shard_filenames().len()
-            );
-
-            // Collect all base tensor names from all shards for name mapping.
-            let all_base_names: Vec<String> = index.weight_map.keys().cloned().collect();
-            let base_name_refs: Vec<&str> = all_base_names.iter().map(|s| s.as_str()).collect();
-            let adapter_names: Vec<&str> =
-                adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
-            let lora_pairs = build_lora_pairs(&base_name_refs, &adapter_names);
-            let bias_map = build_bias_map(&base_name_refs, &adapter_names);
-
-            info!(
-                "Identified {} LoRA-adapted tensors, {} adapter biases across shards",
-                lora_pairs.len(),
-                bias_map.len()
-            );
-
-            merge_sharded(
-                base_path,
-                &index,
-                &adapter,
-                &lora_pairs,
-                &bias_map,
-                scaling,
-                adapter_cfg.fan_in_fan_out,
-                config.low_memory,
-                config.tile_size,
-                &config.output_path,
-                &mut stats,
-            )?;
-
-            // Copy non-safetensors files.
-            copy_side_files(base_path, &config.output_path)?;
+            BaseLayout::Sharded(ShardIndex::from_path(&index_path)?)
         } else {
             return Err(MergeError::ModelLoad(format!(
                 "base model directory '{}' contains neither model.safetensors \
@@ -1379,6 +1574,58 @@ pub fn streaming_lora_merge(config: &AccurateMergeConfig) -> Result<LoraMergeSta
             "base model path '{}' does not exist",
             base_path.display()
         )));
+    };
+
+    // Base tensor names (and, for a single file, the mapped file itself).
+    let single_file = match &layout {
+        BaseLayout::Single(path) => Some(MappedFile::open(path)?),
+        BaseLayout::Sharded(_) => None,
+    };
+    let base_name_list: Vec<&str> = match (&single_file, &layout) {
+        (Some(file), _) => file.tensors.iter().map(|(n, _)| n.as_str()).collect(),
+        (None, BaseLayout::Sharded(index)) => index.weight_map.keys().map(String::as_str).collect(),
+        (None, BaseLayout::Single(_)) => unreachable!("single layouts are mapped above"),
+    };
+    let base_names: HashSet<&str> = base_name_list.iter().copied().collect();
+    let adapter_names: Vec<&str> = adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
+
+    let targets = discover_targets(&base_names, &adapter, &adapter_cfg, config.scaling)?;
+    let bias_map = build_bias_map(&base_name_list, &adapter_names);
+    info!(
+        "Identified {} LoRA-adapted tensors, {} adapter biases",
+        targets.len(),
+        bias_map.len()
+    );
+
+    let ctx = MergeContext {
+        adapter: &adapter,
+        targets: &targets,
+        bias_map: &bias_map,
+        fan_in_fan_out: adapter_cfg.fan_in_fan_out,
+        low_memory: config.low_memory,
+        tile_size: config.tile_size,
+        quantization: quantization_config.as_ref(),
+    };
+
+    match (&layout, &single_file) {
+        (BaseLayout::Single(_), Some(file)) => {
+            // A directory base gets its model.safetensors and sidecars; a file
+            // base is written to the output path itself.
+            let output = if base_path.is_file() {
+                config.output_path.clone()
+            } else {
+                config.output_path.join("model.safetensors")
+            };
+            merge_shard(file, &ctx, &output, &mut stats)?;
+            if base_path.is_dir() {
+                copy_side_files(base_path, &config.output_path)?;
+            }
+        }
+        (BaseLayout::Sharded(index), _) => {
+            merge_sharded(base_path, index, &ctx, &config.output_path, &mut stats)?;
+            copy_side_files(base_path, &config.output_path)?;
+        }
+        (BaseLayout::Single(_), None) => unreachable!("single layouts are mapped above"),
     }
 
     stats.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1517,6 +1764,7 @@ mod tests {
             Dtype::F32,
             false,
             512,
+            None,
             &mut out,
         )
         .unwrap();
@@ -1555,6 +1803,7 @@ mod tests {
             Dtype::F32,
             false,
             512,
+            None,
             &mut out,
         )
         .unwrap();
@@ -1593,6 +1842,7 @@ mod tests {
             Dtype::F32,
             false,
             512,
+            None,
             &mut out_full,
         )
         .unwrap();
@@ -1608,6 +1858,7 @@ mod tests {
             Dtype::F32,
             true,
             2, // tile_size = 2 rows
+            None,
             &mut out_tiled,
         )
         .unwrap();
@@ -1656,6 +1907,7 @@ mod tests {
             Dtype::F32,
             false,
             512,
+            None,
             &mut out,
         )
         .unwrap();

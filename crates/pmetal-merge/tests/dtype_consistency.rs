@@ -69,7 +69,7 @@ fn mismatched_dtype_errors_by_default() {
         allow_mixed_dtype: false,
         sanity: pmetal_merge::SanityLevel::default(),
         dry_run: false,
-        align_moe_experts: false,
+        ..Default::default()
     };
 
     let err = run_merge(&config).expect_err("should reject mixed-dtype inputs");
@@ -115,7 +115,7 @@ fn mismatched_dtype_passes_with_allow_mixed_flag() {
         allow_mixed_dtype: true,
         sanity: pmetal_merge::SanityLevel::default(),
         dry_run: false,
-        align_moe_experts: false,
+        ..Default::default()
     };
 
     let path = run_merge(&config).expect("mixed dtypes should be allowed when opted in");

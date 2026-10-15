@@ -64,13 +64,63 @@ use std::path::PathBuf;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConditionalParam {
-    /// The numeric parameter value.
-    pub value: f32,
+    /// The parameter value: a number, or a list of numbers that is spread
+    /// linearly over the model's layers (a gradient; see [`ParamValue`]).
+    pub value: ParamValue,
 
     /// Substring filter on tensor names.  When `None` (or `"*"`), this entry
     /// acts as a catch-all default.  The first matching entry wins.
     #[serde(default)]
     pub filter: Option<String>,
+}
+
+/// The value of a [`ConditionalParam`] entry.
+///
+/// A list is a **gradient** over the layers: its entries are anchors spread
+/// evenly from the first layer to the last, and a layer takes the linear
+/// interpolation between the two nearest anchors. `[0, 1]` ramps from 0 at the
+/// first layer to 1 at the last; `[0, 0.5, 0, 1]` has three segments. A
+/// gradient only applies to tensors with a layer index (`...layers.N...`), and
+/// only once the merge knows the layer count; other tensors skip the entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ParamValue {
+    /// One value for every matching tensor.
+    Scalar(f32),
+    /// Anchors interpolated over the layers.
+    Gradient(Vec<f32>),
+}
+
+impl From<f32> for ParamValue {
+    fn from(v: f32) -> Self {
+        ParamValue::Scalar(v)
+    }
+}
+
+impl ParamValue {
+    /// The value for a tensor in layer `layer` of `layers`, or `None` for a
+    /// gradient that cannot be placed.
+    fn at(&self, layer: Option<(usize, usize)>) -> Option<f32> {
+        match self {
+            ParamValue::Scalar(v) => Some(*v),
+            ParamValue::Gradient(anchors) => {
+                let (layer, layers) = layer?;
+                match anchors.as_slice() {
+                    [] => None,
+                    [only] => Some(*only),
+                    _ if layers <= 1 => Some(anchors[0]),
+                    _ => {
+                        let position = layer.min(layers - 1) as f32 / (layers - 1) as f32
+                            * (anchors.len() - 1) as f32;
+                        let low = position.floor() as usize;
+                        let high = (low + 1).min(anchors.len() - 1);
+                        let frac = position - low as f32;
+                        Some(anchors[low] * (1.0 - frac) + anchors[high] * frac)
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A parameter value that is either a bare scalar or a list of conditional
@@ -91,6 +141,9 @@ pub enum ParameterSetting {
     Scalar(f32),
     /// An ordered list of conditional entries; the first matching entry wins.
     Conditional(Vec<ConditionalParam>),
+    /// A gradient over the layers (see [`ParamValue`]) for every tensor that
+    /// has a layer index.
+    Gradient(Vec<f32>),
 }
 
 impl ParameterSetting {
@@ -101,6 +154,13 @@ impl ParameterSetting {
     /// of `tensor_name` (or whose `filter` is `None` / `"*"`) is returned.
     /// Returns `None` if no entry matches.
     pub fn resolve(&self, tensor_name: &str) -> Option<f32> {
+        self.resolve_in(tensor_name, None)
+    }
+
+    /// [`resolve`](Self::resolve) for a model of `layers` layers, which lets
+    /// gradient values (lists) be placed on the tensor's layer.
+    pub fn resolve_in(&self, tensor_name: &str, layers: Option<usize>) -> Option<f32> {
+        let layer = crate::merge::extract_layer_index(tensor_name).zip(layers);
         match self {
             ParameterSetting::Scalar(v) => Some(*v),
             ParameterSetting::Conditional(entries) => {
@@ -111,11 +171,14 @@ impl ParameterSetting {
                         Some(f) => tensor_name.contains(f.as_str()),
                     };
                     if matches {
-                        return Some(entry.value);
+                        if let Some(value) = entry.value.at(layer) {
+                            return Some(value);
+                        }
                     }
                 }
                 None
             }
+            ParameterSetting::Gradient(anchors) => ParamValue::Gradient(anchors.clone()).at(layer),
         }
     }
 
@@ -208,6 +271,36 @@ pub struct MergeConfig {
     /// non-MoE merges.
     #[serde(default)]
     pub align_moe_experts: bool,
+
+    /// What to do when the vocabulary tensors (`embed_tokens`, `lm_head`)
+    /// have different row counts across the models. See [`VocabMismatch`].
+    #[serde(default)]
+    pub vocab_mismatch: VocabMismatch,
+
+    /// Largest output shard in bytes. A tensor larger than this gets a shard
+    /// to itself. Defaults to 5 GiB.
+    #[serde(default)]
+    pub max_shard_size: Option<u64>,
+}
+
+/// How to reconcile vocabulary tensors whose row counts differ.
+///
+/// Fine-tunes often pad or extend the vocabulary of their base (added
+/// special tokens, a vocab padded to a multiple of 64). Rows are matched by
+/// token id, which is only meaningful when the models share a tokenizer
+/// prefix, so the default is to refuse and let the user opt in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VocabMismatch {
+    /// Fail with an error naming the tensor and the shapes. Default.
+    #[default]
+    Error,
+    /// Cut every model to the smallest row count.
+    Truncate,
+    /// Grow every model to the largest row count. A model's missing rows are
+    /// filled from the base model, or from the model that has them when
+    /// there is no base (or the base is short too), so they merge as no change.
+    Extend,
 }
 
 fn default_dtype() -> String {
@@ -260,6 +353,10 @@ pub enum MergeMethodConfig {
 
     /// Geometric interpolation based on task vector similarity.
     ModelStock,
+
+    /// Consensus merging with TALL masks (Wang et al., 2024). Uses
+    /// `tall_lambda`, `min_tasks`, `lambda` and the per-model `weight`.
+    Consensus,
 
     /// Parameter-wise selective interpolation.
     Nearswap,
@@ -382,10 +479,32 @@ pub struct MergeParameters {
     #[serde(default)]
     pub gamma: Option<f32>,
 
-    /// Use int8 mask for memory efficiency.
+    /// TALL-mask threshold of consensus merging: a task claims a coordinate
+    /// where `|tau_t| >= tall_lambda * |tau_MTL - tau_t|`. Defaults to 0.4.
     #[serde(default)]
-    pub int8_mask: Option<bool>,
+    pub tall_lambda: Option<f32>,
+
+    /// Number of tasks that must claim a coordinate for consensus merging to
+    /// keep it. Defaults to 2, capped at the number of models.
+    #[serde(default)]
+    pub min_tasks: Option<u32>,
+
+    /// Number of transformer layers of the model being merged, which places
+    /// gradient values on a tensor's layer. Set by the pipeline; not part of
+    /// the configuration file.
+    #[serde(skip)]
+    pub layer_count: Option<usize>,
+
+    /// Seed for the stochastic methods (DARE, DELLA). Each tensor and each
+    /// model draws its own independent mask from it, so a merge is
+    /// reproducible and no two task vectors share a drop pattern. Defaults
+    /// to [`DEFAULT_SEED`].
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
+
+/// The seed used when none is configured: merges are reproducible by default.
+pub const DEFAULT_SEED: u64 = 0;
 
 impl MergeParameters {
     // ------------------------------------------------------------------
@@ -464,9 +583,41 @@ impl MergeParameters {
         self.epsilon.unwrap_or(0.1)
     }
 
+    /// Get the seed of the stochastic methods, [`DEFAULT_SEED`] unless set.
+    pub fn seed(&self) -> u64 {
+        self.seed.unwrap_or(DEFAULT_SEED)
+    }
+
     /// Get gamma with default of 0.01.
     pub fn gamma(&self) -> f32 {
         self.gamma.unwrap_or(0.01)
+    }
+
+    /// These parameters with every filter-conditional setting resolved against
+    /// `tensor_name`: each `weight`/`density`/`t`/`lambda` becomes a scalar
+    /// (or `None` when no conditional entry matches, so the usual default
+    /// applies). The merge pipelines call this once per tensor, so the
+    /// methods only ever see scalars.
+    pub fn resolved(&self, tensor_name: &str) -> MergeParameters {
+        self.resolved_in(tensor_name, self.layer_count)
+    }
+
+    /// [`resolved`](Self::resolved) for a model of `layers` layers, so that
+    /// gradient values land on the tensor's layer. Per-model parameters carry
+    /// no layer count of their own and take the global one.
+    pub fn resolved_in(&self, tensor_name: &str, layers: Option<usize>) -> MergeParameters {
+        let resolve = |s: &Option<ParameterSetting>| {
+            s.as_ref()
+                .and_then(|s| s.resolve_in(tensor_name, layers))
+                .map(ParameterSetting::Scalar)
+        };
+        MergeParameters {
+            weight: resolve(&self.weight),
+            density: resolve(&self.density),
+            t: resolve(&self.t),
+            lambda: resolve(&self.lambda),
+            ..self.clone()
+        }
     }
 
     /// Merge with another set of parameters (other overrides self).
@@ -482,7 +633,10 @@ impl MergeParameters {
             rescale: other.rescale.or(self.rescale),
             epsilon: other.epsilon.or(self.epsilon),
             gamma: other.gamma.or(self.gamma),
-            int8_mask: other.int8_mask.or(self.int8_mask),
+            tall_lambda: other.tall_lambda.or(self.tall_lambda),
+            min_tasks: other.min_tasks.or(self.min_tasks),
+            layer_count: other.layer_count.or(self.layer_count),
+            seed: other.seed.or(self.seed),
         }
     }
 }
@@ -611,34 +765,8 @@ impl MergeConfig {
                 actual: 0,
             });
         }
-
-        // SLERP requires exactly 2 models
-        if matches!(self.merge_method, MergeMethodConfig::Slerp) && self.models.len() != 2 {
-            return Err(crate::MergeError::InvalidConfig(
-                "SLERP requires exactly 2 models".to_string(),
-            ));
-        }
-
-        // Task vector methods require base model
-        match self.merge_method {
-            MergeMethodConfig::Ties
-            | MergeMethodConfig::DareTies
-            | MergeMethodConfig::DareLinear
-            | MergeMethodConfig::Della
-            | MergeMethodConfig::DellaLinear
-            | MergeMethodConfig::Breadcrumbs
-            | MergeMethodConfig::ModelStock
-            | MergeMethodConfig::Ram
-            | MergeMethodConfig::RamPlus
-                if self.base_model.is_none() =>
-            {
-                return Err(crate::MergeError::BaseModelRequired {
-                    method: format!("{:?}", self.merge_method),
-                });
-            }
-            _ => {}
-        }
-
+        self.merge_method
+            .validate_for(self.models.len(), self.base_model.is_some(), "")?;
         Ok(())
     }
 
@@ -648,6 +776,12 @@ impl MergeConfig {
         if slices.is_empty() {
             return Err(crate::MergeError::InvalidConfig(
                 "slices array must not be empty".to_string(),
+            ));
+        }
+        if !self.models.is_empty() {
+            return Err(crate::MergeError::InvalidConfig(
+                "`models` and `slices` are mutually exclusive; list the models inside the slices"
+                    .to_string(),
             ));
         }
 
@@ -675,29 +809,82 @@ impl MergeConfig {
                 }
             }
 
-            // When a slice uses a task-vector method it needs a base model
-            let effective_method = slice.merge_method.as_ref().unwrap_or(&self.merge_method);
-            match effective_method {
-                MergeMethodConfig::Ties
-                | MergeMethodConfig::DareTies
-                | MergeMethodConfig::DareLinear
-                | MergeMethodConfig::Della
-                | MergeMethodConfig::DellaLinear
-                | MergeMethodConfig::Breadcrumbs
-                | MergeMethodConfig::ModelStock
-                | MergeMethodConfig::Ram
-                | MergeMethodConfig::RamPlus => {
-                    let has_base = slice.base_model.is_some() || self.base_model.is_some();
-                    if !has_base {
-                        return Err(crate::MergeError::BaseModelRequired {
-                            method: format!("{:?}", effective_method),
-                        });
-                    }
-                }
-                _ => {}
+            // Sources are merged layer by layer, so they must cover the same
+            // number of layers.
+            let n_layers = slice.sources[0].n_layers();
+            if let Some((src_idx, src)) = slice
+                .sources
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.n_layers() != n_layers)
+            {
+                return Err(crate::MergeError::InvalidConfig(format!(
+                    "slice[{}].sources[{}]: layer_range covers {} layers but sources[0] covers {}",
+                    slice_idx,
+                    src_idx,
+                    src.n_layers(),
+                    n_layers
+                )));
             }
+
+            let effective_method = slice.merge_method.as_ref().unwrap_or(&self.merge_method);
+            effective_method.validate_for(
+                slice.sources.len(),
+                slice.base_model.is_some() || self.base_model.is_some(),
+                &format!("slice[{slice_idx}]: "),
+            )?;
         }
 
+        Ok(())
+    }
+}
+
+impl MergeMethodConfig {
+    /// Whether the method works on task vectors and so needs a base model.
+    pub fn requires_base_model(&self) -> bool {
+        matches!(
+            self,
+            Self::TaskArithmetic
+                | Self::Ties
+                | Self::DareTies
+                | Self::DareLinear
+                | Self::Della
+                | Self::DellaLinear
+                | Self::Breadcrumbs
+                | Self::ModelStock
+                | Self::Consensus
+                | Self::Nearswap
+                | Self::Ram
+                | Self::RamPlus
+        )
+    }
+
+    /// Check this method against the number of models it will merge and
+    /// whether a base model is configured. `context` prefixes the messages.
+    fn validate_for(&self, n_models: usize, has_base: bool, context: &str) -> crate::Result<()> {
+        use crate::MergeError;
+        if self.requires_base_model() && !has_base {
+            return Err(MergeError::BaseModelRequired {
+                method: format!("{context}{self:?}"),
+            });
+        }
+        if matches!(self, Self::Slerp) && n_models != 2 {
+            return Err(MergeError::InvalidConfig(format!(
+                "{context}SLERP requires exactly 2 models, got {n_models}"
+            )));
+        }
+        let side_files = match self {
+            Self::Fisher { fisher_paths, .. } => Some(("fisher_paths", fisher_paths.len())),
+            Self::RegMean { gram_paths, .. } => Some(("gram_paths", gram_paths.len())),
+            _ => None,
+        };
+        if let Some((key, count)) = side_files {
+            if count != n_models {
+                return Err(MergeError::InvalidConfig(format!(
+                    "{context}{key} lists {count} paths for {n_models} models; one per model is required"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -717,6 +904,8 @@ impl Default for MergeConfig {
             sanity: crate::sanity::SanityLevel::default(),
             dry_run: false,
             align_moe_experts: false,
+            vocab_mismatch: VocabMismatch::default(),
+            max_shard_size: None,
         }
     }
 }
@@ -807,6 +996,157 @@ parameters:
         assert!(config.validate().is_err());
     }
 
+    fn model(name: &str) -> ModelConfig {
+        ModelConfig {
+            model: name.to_string(),
+            parameters: Default::default(),
+        }
+    }
+
+    #[test]
+    fn every_task_vector_method_requires_a_base_model() {
+        for method in [
+            MergeMethodConfig::TaskArithmetic,
+            MergeMethodConfig::Nearswap,
+            MergeMethodConfig::Ties,
+            MergeMethodConfig::ModelStock,
+            MergeMethodConfig::Breadcrumbs,
+        ] {
+            let config = MergeConfig {
+                merge_method: method.clone(),
+                models: vec![model("a"), model("b")],
+                ..Default::default()
+            };
+            let err = config.validate().expect_err(&format!("{method:?}"));
+            assert!(matches!(err, crate::MergeError::BaseModelRequired { .. }));
+
+            let with_base = MergeConfig {
+                base_model: Some("base".into()),
+                ..config
+            };
+            with_base.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn side_file_paths_must_match_the_model_count() {
+        let config = MergeConfig {
+            merge_method: MergeMethodConfig::Fisher {
+                fisher_paths: vec!["f1".into()],
+                eps: 1e-8,
+                fallback_to_mean: true,
+            },
+            models: vec![model("a"), model("b")],
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("fisher_paths") && err.contains("2 models"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn slices_and_models_are_exclusive_and_sources_must_cover_equal_layer_counts() {
+        let source = |m: &str, range: (usize, usize)| InputSlice {
+            model: m.to_string(),
+            layer_range: range,
+            parameters: Default::default(),
+        };
+        let sliced = |models: Vec<ModelConfig>, sources: Vec<InputSlice>| MergeConfig {
+            models,
+            slices: Some(vec![OutputSlice {
+                sources,
+                base_model: None,
+                merge_method: None,
+                parameters: Default::default(),
+            }]),
+            ..Default::default()
+        };
+
+        let both = sliced(vec![model("a")], vec![source("a", (0, 4))]);
+        assert!(
+            both.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("mutually exclusive")
+        );
+
+        let uneven = sliced(vec![], vec![source("a", (0, 4)), source("b", (0, 6))]);
+        let err = uneven.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("covers 6 layers but sources[0] covers 4"),
+            "{err}"
+        );
+
+        sliced(vec![], vec![source("a", (0, 4)), source("b", (8, 12))])
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn vocab_mismatch_and_shard_size_parse_from_yaml() {
+        let config = MergeConfig::from_yaml(
+            "merge_method: linear\nmodels:\n  - model: a\nvocab_mismatch: extend\nmax_shard_size: 1000\n",
+        )
+        .unwrap();
+        assert_eq!(config.vocab_mismatch, VocabMismatch::Extend);
+        assert_eq!(config.max_shard_size, Some(1000));
+        let default =
+            MergeConfig::from_yaml("merge_method: linear\nmodels:\n  - model: a\n").unwrap();
+        assert_eq!(default.vocab_mismatch, VocabMismatch::Error);
+        assert_eq!(default.max_shard_size, None);
+    }
+
+    #[test]
+    fn gradients_interpolate_linearly_over_the_layers() {
+        let layer = |n: usize| format!("model.layers.{n}.mlp.up_proj.weight");
+        // [0, 1] over 5 layers: 0, .25, .5, .75, 1
+        let ramp = ParameterSetting::Gradient(vec![0.0, 1.0]);
+        for (n, want) in [(0, 0.0), (1, 0.25), (2, 0.5), (4, 1.0)] {
+            assert_eq!(ramp.resolve_in(&layer(n), Some(5)), Some(want), "layer {n}");
+        }
+        // [0, 0.5, 0, 1] has three segments over 4 layers... anchors at layers 0..3.
+        let wave = ParameterSetting::Gradient(vec![0.0, 0.5, 0.0, 1.0]);
+        let at = |n| wave.resolve_in(&layer(n), Some(4)).unwrap();
+        assert!((at(0) - 0.0).abs() < 1e-6 && (at(1) - 0.5).abs() < 1e-6);
+        assert!((at(2) - 0.0).abs() < 1e-6 && (at(3) - 1.0).abs() < 1e-6);
+        // Between anchors: 7 layers put layer 1 a third of the way from the
+        // first anchor to the second.
+        let third = ParameterSetting::Gradient(vec![0.0, 0.6, 0.0])
+            .resolve_in(&layer(1), Some(7))
+            .unwrap();
+        assert!((third - 0.2).abs() < 1e-6, "{third}");
+        // No layer index, or no layer count: a gradient does not apply.
+        assert_eq!(ramp.resolve_in("model.embed_tokens.weight", Some(5)), None);
+        assert_eq!(ramp.resolve_in(&layer(1), None), None);
+    }
+
+    #[test]
+    fn a_filtered_gradient_falls_through_to_the_default_for_other_tensors() {
+        let yaml = r#"
+- value: [0.0, 1.0]
+  filter: self_attn
+- value: 0.5
+"#;
+        let setting: ParameterSetting = serde_saphyr::from_str(yaml).unwrap();
+        let attn = "model.layers.2.self_attn.q_proj.weight";
+        assert_eq!(setting.resolve_in(attn, Some(3)), Some(1.0));
+        assert_eq!(
+            setting.resolve_in("model.layers.0.self_attn.q_proj.weight", Some(3)),
+            Some(0.0)
+        );
+        // MLP tensors, and non-layer ones, take the default entry.
+        assert_eq!(
+            setting.resolve_in("model.layers.2.mlp.up_proj.weight", Some(3)),
+            Some(0.5)
+        );
+        assert_eq!(setting.resolve_in("lm_head.weight", Some(3)), Some(0.5));
+        // A bare list is a gradient too.
+        let bare: ParameterSetting = serde_saphyr::from_str("[0.0, 1.0]").unwrap();
+        assert!(matches!(bare, ParameterSetting::Gradient(_)));
+    }
+
     // -------------------------------------------------------------------------
     // ConditionalParam / ParameterSetting tests
     // -------------------------------------------------------------------------
@@ -828,15 +1168,15 @@ parameters:
     fn test_parameter_setting_conditional_filter() {
         let setting = ParameterSetting::Conditional(vec![
             ConditionalParam {
-                value: 0.8,
+                value: 0.8.into(),
                 filter: Some("self_attn".to_string()),
             },
             ConditionalParam {
-                value: 0.3,
+                value: 0.3.into(),
                 filter: Some("mlp".to_string()),
             },
             ConditionalParam {
-                value: 0.5,
+                value: 0.5.into(),
                 filter: None,
             },
         ]);
@@ -856,7 +1196,7 @@ parameters:
     #[test]
     fn test_parameter_setting_conditional_wildcard() {
         let setting = ParameterSetting::Conditional(vec![ConditionalParam {
-            value: 0.6,
+            value: 0.6.into(),
             filter: Some("*".to_string()),
         }]);
         assert_eq!(setting.resolve("anything"), Some(0.6));
@@ -865,7 +1205,7 @@ parameters:
     #[test]
     fn test_parameter_setting_no_match_returns_none() {
         let setting = ParameterSetting::Conditional(vec![ConditionalParam {
-            value: 0.8,
+            value: 0.8.into(),
             filter: Some("self_attn".to_string()),
         }]);
         assert_eq!(setting.resolve("model.lm_head.weight"), None);
@@ -1101,11 +1441,11 @@ slices:
         let per_model = MergeParameters {
             weight: Some(ParameterSetting::Conditional(vec![
                 ConditionalParam {
-                    value: 0.9,
+                    value: 0.9.into(),
                     filter: Some("attn".to_string()),
                 },
                 ConditionalParam {
-                    value: 0.4,
+                    value: 0.4.into(),
                     filter: None,
                 },
             ])),

@@ -1,44 +1,64 @@
-//! Multi-SLERP – barycentric interpolation on a hypersphere for N models.
+//! Multi-SLERP - the weighted spherical mean of N models.
 //!
-//! Standard SLERP only works for two models.  Multi-SLERP extends it to an
-//! arbitrary number of models by working in tangent space:
+//! Plain SLERP interpolates between two points on a hypersphere. Multi-SLERP
+//! generalises it to N points with weights by taking their weighted
+//! Fréchet (Karcher) mean on the unit sphere: the point `μ` minimising
+//! `Σ w_i · d(μ, u_i)²` for the geodesic distance `d`. For two models with
+//! weights `1 - t` and `t` that point is exactly the SLERP point at `t`.
 //!
-//! 1. Stack and (optionally) subtract the base tensor from each model.
-//! 2. Project each tensor to the unit hypersphere.
-//! 3. Compute the **weighted Euclidean mean** of the unit vectors and normalize
-//!    it — this becomes the tangent-space origin `mean`.
-//! 4. For each unit vector, compute its **tangent vector** relative to `mean`:
-//!    `v_i = unit_i − (unit_i · mean) * mean`
-//! 5. Compute the weighted sum of tangent vectors: `T = Σ w_i * v_i`
-//! 6. Map back to the sphere using the **exponential map**:
-//!    `result = cos(‖T‖) * mean + sin(‖T‖) * T / ‖T‖`
-//! 7. Scale by the weighted average of original norms.
-//! 8. If a base was subtracted, add it back.
+//! # Algorithm
 //!
-//! Fallback: when `‖mean‖ < eps` (antipodal cancellation) and there are exactly
-//! two models the method falls back to linear interpolation.
+//! 1. Optionally subtract the base tensor, so the mean is taken over task
+//!    vectors.
+//! 2. Split each tensor into its norm `‖x_i‖` and unit direction `u_i`.
+//! 3. Start from the normalised weighted Euclidean mean of the directions and
+//!    refine it by the Riemannian gradient step
+//!    `v = Σ w_i · Log_μ(u_i)`, `μ ← Exp_μ(v)`, with
+//!    `Log_μ(u) = θ / sin θ · (u - cos θ · μ)` and `θ = arccos⟨μ, u⟩`,
+//!    until `‖v‖` is negligible.
+//! 4. Scale the result by the weighted mean of the norms, `Σ w_i ‖x_i‖`, and
+//!    add the base back.
 //!
-//! Reference: <https://goddard.blog/posts/multislerp-wow-what-a-cool-idea>
+//! Models with a zero task vector have no direction and take no part in the
+//! direction mean (their weight is spread over the others), but they still
+//! pull the norm down. When the directions cancel exactly (an antipodal pair
+//! with equal weights) the mean is undefined: two models fall back to linear
+//! interpolation, more are an error.
 
 use super::MergeMethod;
 use crate::{MergeError, MergeParameters, Result};
 use pmetal_runtime::compat::Array;
 
-// =============================================================================
-// Core algorithm (CPU, f32 arithmetic)
-// =============================================================================
+/// Gradient steps of the Karcher iteration; it converges in a handful for
+/// models that share a base, so this is a safety net, not a tuning knob.
+const MAX_ITERATIONS: usize = 50;
+
+/// The iteration stops once the Riemannian gradient is shorter than this
+/// many radians.
+const TOLERANCE: f32 = 1e-6;
+
+/// `Σ_i weights[i] · terms[i]` for arrays; `weights.len() == terms.len() >= 1`.
+fn weighted_sum(terms: &[Array], weights: &[f32]) -> Array {
+    let mut sum = terms[0].multiply(&Array::from_f32(weights[0]));
+    for (term, &w) in terms[1..].iter().zip(&weights[1..]) {
+        sum = sum.add(&term.multiply(&Array::from_f32(w)));
+    }
+    sum
+}
+
+fn dot(a: &Array, b: &Array) -> f32 {
+    a.multiply(b).sum_all().item_f32()
+}
 
 /// Compute the multi-SLERP of `tensors` with given `weights`.
 ///
-/// All heavy lifting is done on the CPU to avoid MLX graph-building overhead
-/// for the many per-element scalar operations involved.
-///
 /// # Arguments
-/// * `tensors`           – Model tensors to interpolate.
-/// * `weights`           – Per-model weights (will be normalized if `normalize_weights=true`).
-/// * `base_tensor`       – Optional origin; subtracted before and added back after.
-/// * `normalize_weights` – If true, normalize weights to sum to 1.0.
-/// * `eps`               – Numerical stability epsilon.
+/// * `tensors`           - Model tensors to interpolate.
+/// * `weights`           - Per-model weights (will be normalized if `normalize_weights=true`).
+/// * `base_tensor`       - Optional origin; subtracted before and added back after.
+/// * `normalize_weights` - If true, normalize weights to sum to 1.0.
+/// * `eps`               - Norm below which a vector counts as zero and a
+///   weighted direction sum below which directions count as cancelling.
 pub fn multislerp(
     tensors: &[Array],
     weights: &[f32],
@@ -46,105 +66,86 @@ pub fn multislerp(
     normalize_weights: bool,
     eps: f32,
 ) -> Result<Array> {
-    assert_eq!(tensors.len(), weights.len());
-
     if tensors.is_empty() {
         return Err(MergeError::NotEnoughModels {
             expected: 1,
             actual: 0,
         });
     }
-
+    if weights.len() != tensors.len() {
+        return Err(MergeError::InvalidConfig(format!(
+            "Multi-SLERP: {} tensors but {} weights",
+            tensors.len(),
+            weights.len()
+        )));
+    }
     if tensors.len() == 1 {
         return Ok(tensors[0].clone());
     }
 
-    let original_shape = tensors[0].shape().to_vec();
-    let n_params: usize = original_shape.iter().map(|&d| d as usize).product();
-
-    // Optionally normalize weights
     let weights: Vec<f32> = if normalize_weights {
-        let s: f32 = weights.iter().sum();
-        if s <= 0.0 {
+        let total: f32 = weights.iter().sum();
+        if total <= 0.0 {
             return Err(MergeError::InvalidConfig(
                 "Multi-SLERP: weight sum is zero".to_string(),
             ));
         }
-        weights.iter().map(|w| w / s).collect()
+        weights.iter().map(|w| w / total).collect()
     } else {
         weights.to_vec()
     };
 
-    // Pull all tensors onto CPU as flat f32
-    let flat_tensors: Vec<Vec<f32>> = tensors
+    let shape = tensors[0].shape().to_vec();
+    let vectors: Vec<Array> = tensors
         .iter()
         .map(|t| {
-            let mut flat = t.reshape(&[-1]);
-            flat.to_f32_vec(n_params).unwrap_or_default()
+            let flat = t.reshape(&[-1]);
+            match base_tensor {
+                Some(base) => flat.subtract(&base.reshape(&[-1])),
+                None => flat,
+            }
         })
         .collect();
-
-    let base_flat: Option<Vec<f32>> = base_tensor.map(|b| {
-        let mut flat = b.reshape(&[-1]);
-        flat.to_f32_vec(n_params).unwrap_or_default()
-    });
-
-    // Subtract base if provided
-    let flat_vecs: Vec<Vec<f32>> = if let Some(ref bf) = base_flat {
-        flat_tensors
-            .iter()
-            .map(|t| t.iter().zip(bf.iter()).map(|(a, b)| a - b).collect())
-            .collect()
-    } else {
-        flat_tensors.clone()
+    let finish = |result: Array| -> Array {
+        let result = match base_tensor {
+            Some(base) => result.add(&base.reshape(&[-1])),
+            None => result,
+        };
+        result.reshape(&shape)
     };
 
-    // Compute per-tensor norms
-    let norms: Vec<f32> = flat_vecs
-        .iter()
-        .map(|v| v.iter().map(|x| x * x).sum::<f32>().sqrt())
-        .collect();
+    let norms: Vec<f32> = vectors.iter().map(|v| dot(v, v).max(0.0).sqrt()).collect();
+    let mean_norm: f32 = weights.iter().zip(&norms).map(|(w, n)| w * n).sum();
 
-    // Compute unit vectors
-    let unit_vecs: Vec<Vec<f32>> = flat_vecs
-        .iter()
-        .zip(norms.iter())
-        .map(|(v, &n)| {
-            let denom = n + eps;
-            v.iter().map(|x| x / denom).collect()
-        })
-        .collect();
-
-    // Weighted mean of unit vectors
-    let mut mean = vec![0.0f32; n_params];
-    for (unit, &w) in unit_vecs.iter().zip(weights.iter()) {
-        for (m, &u) in mean.iter_mut().zip(unit.iter()) {
-            *m += w * u;
-        }
+    // Directions exist only for non-zero vectors; their weights are
+    // renormalised to sum to the same total.
+    let directional: Vec<usize> = (0..vectors.len()).filter(|&i| norms[i] > eps).collect();
+    if directional.is_empty() {
+        return Ok(finish(vectors[0].multiply(&Array::from_f32(0.0))));
     }
+    let direction_total: f32 = directional.iter().map(|&i| weights[i]).sum();
+    if direction_total.abs() < f32::EPSILON {
+        return Err(MergeError::InvalidConfig(
+            "Multi-SLERP: the weights of the non-zero vectors sum to zero".to_string(),
+        ));
+    }
+    let units: Vec<Array> = directional
+        .iter()
+        .map(|&i| vectors[i].multiply(&Array::from_f32(1.0 / norms[i])))
+        .collect();
+    let dir_weights: Vec<f32> = directional
+        .iter()
+        .map(|&i| weights[i] / direction_total)
+        .collect();
 
-    let mean_norm: f32 = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if mean_norm < eps {
-        // Antipodal cancellation fallback
+    // Start from the normalised Euclidean mean of the directions.
+    let start = weighted_sum(&units, &dir_weights);
+    let start_norm = dot(&start, &start).max(0.0).sqrt();
+    if start_norm < eps {
         if tensors.len() == 2 {
-            // Linear interpolation fallback
-            let w0 = weights[0];
-            let w1 = weights[1];
-            let result: Vec<f32> = flat_vecs[0]
-                .iter()
-                .zip(flat_vecs[1].iter())
-                .map(|(a, b)| w0 * a + w1 * b)
-                .collect();
-
-            let result_with_base: Vec<f32> = if let Some(ref bf) = base_flat {
-                result.iter().zip(bf.iter()).map(|(r, b)| r + b).collect()
-            } else {
-                result
-            };
-
-            let arr = Array::from_f32_slice(&result_with_base, &[n_params as i32]);
-            return Ok(arr.reshape(&original_shape));
+            // Antipodal directions with equal weights: no geodesic is
+            // preferred, interpolate linearly.
+            return Ok(finish(weighted_sum(&vectors, &weights)));
         }
         return Err(MergeError::InvalidConfig(
             "Multi-SLERP: weighted sum of unit tensors is zero (antipodal cancellation). \
@@ -153,64 +154,45 @@ pub fn multislerp(
                 .to_string(),
         ));
     }
+    let mut mu = start.multiply(&Array::from_f32(1.0 / start_norm));
 
-    // Normalize mean to unit length
-    let mean_unit: Vec<f32> = mean.iter().map(|x| x / mean_norm).collect();
-
-    // Project each unit vector into the tangent plane at mean_unit
-    // tangent_i = unit_i − (unit_i · mean_unit) * mean_unit
-    let tangent_vecs: Vec<Vec<f32>> = unit_vecs
-        .iter()
-        .map(|unit| {
-            let dot: f32 = unit.iter().zip(mean_unit.iter()).map(|(u, m)| u * m).sum();
-            unit.iter()
-                .zip(mean_unit.iter())
-                .map(|(u, m)| u - dot * m)
-                .collect()
-        })
-        .collect();
-
-    // Weighted sum of tangent vectors
-    let mut tangent_result = vec![0.0f32; n_params];
-    for (tv, &w) in tangent_vecs.iter().zip(weights.iter()) {
-        for (tr, &t) in tangent_result.iter_mut().zip(tv.iter()) {
-            *tr += w * t;
+    // Karcher iteration: step along the weighted mean of the log maps.
+    for _ in 0..MAX_ITERATIONS {
+        let mut gradient: Option<Array> = None;
+        for (unit, &w) in units.iter().zip(&dir_weights) {
+            let cos = dot(&mu, unit).clamp(-1.0, 1.0);
+            let theta = cos.acos();
+            if theta > std::f32::consts::PI - 1e-3 {
+                // Antipodal to the current mean: Log is undefined there, and
+                // the other directions decide the step.
+                continue;
+            }
+            // Log_μ(u) = θ / sin θ · (u - cos θ · μ); θ / sin θ -> 1 as θ -> 0.
+            let stretch = if theta < 1e-4 {
+                1.0
+            } else {
+                theta / theta.sin()
+            };
+            let log = unit
+                .subtract(&mu.multiply(&Array::from_f32(cos)))
+                .multiply(&Array::from_f32(w * stretch));
+            gradient = Some(match gradient {
+                Some(g) => g.add(&log),
+                None => log,
+            });
         }
+        let gradient = gradient.expect("at least one direction");
+        let step = dot(&gradient, &gradient).max(0.0).sqrt();
+        if step < TOLERANCE {
+            break;
+        }
+        // Exp_μ(v) = cos‖v‖ · μ + sin‖v‖ · v / ‖v‖
+        mu = mu
+            .multiply(&Array::from_f32(step.cos()))
+            .add(&gradient.multiply(&Array::from_f32(step.sin() / step)));
     }
 
-    // Exponential map: result = cos(‖T‖) * mean_unit + sin(‖T‖) * T / ‖T‖
-    let tangent_norm: f32 = tangent_result.iter().map(|x| x * x).sum::<f32>().sqrt() + eps;
-    let cos_t = tangent_norm.cos();
-    let sin_t = tangent_norm.sin();
-
-    let result_unit: Vec<f32> = mean_unit
-        .iter()
-        .zip(tangent_result.iter())
-        .map(|(&m, &t)| cos_t * m + sin_t * t / tangent_norm)
-        .collect();
-
-    // Scale by weighted average of original norms
-    let avg_norm: f32 = weights
-        .iter()
-        .zip(norms.iter())
-        .map(|(w, n)| w * n)
-        .sum::<f32>();
-
-    let result_scaled: Vec<f32> = result_unit.iter().map(|x| x * avg_norm).collect();
-
-    // Add base back if it was subtracted
-    let final_result: Vec<f32> = if let Some(ref bf) = base_flat {
-        result_scaled
-            .iter()
-            .zip(bf.iter())
-            .map(|(r, b)| r + b)
-            .collect()
-    } else {
-        result_scaled
-    };
-
-    let arr = Array::from_f32_slice(&final_result, &[n_params as i32]);
-    Ok(arr.reshape(&original_shape))
+    Ok(finish(mu.multiply(&Array::from_f32(mean_norm))))
 }
 
 // =============================================================================
@@ -289,6 +271,7 @@ impl MergeMethod for MultiSlerpMerge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{arr, assert_close, values};
 
     #[test]
     fn test_multislerp_single_tensor() {
@@ -443,6 +426,74 @@ mod tests {
         let r = result.to_f32_vec(2).unwrap();
         // Should be strongly biased toward [1, 0]: r[0] >> r[1]
         assert!(r[0] > r[1], "expected x>y for 9:1 weighting, got {:?}", r);
+    }
+
+    #[test]
+    fn two_models_are_the_slerp_point_not_the_normalized_lerp() {
+        // Orthogonal unit vectors with weights 0.75 / 0.25 are the SLERP
+        // point at t = 0.25: angle 22.5 degrees. A normalized weighted mean
+        // would sit at atan(1/3) = 18.4 degrees instead.
+        let a = arr(&[1.0, 0.0], &[2]);
+        let b = arr(&[0.0, 1.0], &[2]);
+        let out = multislerp(&[a, b], &[0.75, 0.25], None, true, 1e-8).unwrap();
+        let angle = std::f32::consts::FRAC_PI_8;
+        assert_close(&values(&out), &[angle.cos(), angle.sin()], 1e-5);
+    }
+
+    #[test]
+    fn two_models_agree_with_slerp_on_arbitrary_vectors() {
+        use super::super::SlerpMerge;
+        let n = 64;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 7 + 3) as f32 * 0.37).sin()).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| ((i * 5 + 1) as f32 * 0.91).cos() * 2.0)
+            .collect();
+        let (a, b) = (arr(&x, &[n]), arr(&y, &[n]));
+        let t = 0.3;
+        let want = SlerpMerge::slerp(&a, &b, t).unwrap();
+        let got = multislerp(&[a, b], &[1.0 - t, t], None, true, 1e-8).unwrap();
+        assert_close(&values(&got), &values(&want), 1e-4);
+    }
+
+    #[test]
+    fn unit_axes_meet_at_the_diagonal_and_norms_are_averaged() {
+        // Three orthonormal axes: by symmetry the weighted mean is
+        // (1, 1, 1) / sqrt 3, with norm 1.
+        let e = |i: usize| {
+            let mut v = vec![0.0; 3];
+            v[i] = 1.0;
+            arr(&v, &[3])
+        };
+        let out = multislerp(&[e(0), e(1), e(2)], &[1.0; 3], None, true, 1e-8).unwrap();
+        let c = 1.0 / 3.0_f32.sqrt();
+        assert_close(&values(&out), &[c, c, c], 1e-5);
+
+        // Norms 2 and 4 on orthogonal axes: direction at 45 degrees, norm 3.
+        let out = multislerp(
+            &[arr(&[2.0, 0.0], &[2]), arr(&[0.0, 4.0], &[2])],
+            &[1.0, 1.0],
+            None,
+            true,
+            1e-8,
+        )
+        .unwrap();
+        let v = 3.0 * std::f32::consts::FRAC_1_SQRT_2;
+        assert_close(&values(&out), &[v, v], 1e-5);
+    }
+
+    #[test]
+    fn a_zero_task_vector_only_pulls_the_norm_down() {
+        let base = arr(&[10.0, 10.0], &[2]);
+        let out = multislerp(
+            &[arr(&[12.0, 10.0], &[2]), arr(&[10.0, 10.0], &[2])],
+            &[1.0, 1.0],
+            Some(&base),
+            true,
+            1e-8,
+        )
+        .unwrap();
+        // Direction (1, 0) from the only non-zero task vector, norm 0.5 * 2.
+        assert_close(&values(&out), &[11.0, 10.0], 1e-5);
     }
 
     #[test]

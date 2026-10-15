@@ -70,12 +70,25 @@ impl MergeMethod for TaskArithmeticMerge {
         // Priority: global lambda -> 1.0
         let lambda = global_params.lambda();
 
+        // The paper sums the task vectors; `normalize: true` asks for their
+        // weighted mean instead (off unless set, unlike the sparsifying methods).
+        let weights: Vec<f32> = (0..tensors.len()).map(get_weight).collect();
+        let divisor = if global_params.normalize == Some(true) {
+            let total: f32 = weights.iter().sum();
+            if total.abs() < 1e-12 {
+                return Err(MergeError::InvalidConfig(
+                    "Cannot normalize weights: they sum to zero".to_string(),
+                ));
+            }
+            total
+        } else {
+            1.0
+        };
+
         // Accumulate weighted task vectors
         let mut accumulated_task_vector = Array::zeros(base.shape(), Dtype::Float32.as_i32());
 
-        for (i, model_tensor) in tensors.iter().enumerate() {
-            let weight = get_weight(i);
-
+        for (model_tensor, weight) in tensors.iter().zip(weights.iter().map(|w| w / divisor)) {
             // Task vector = Model - Base
             let task_vector = model_tensor.subtract(base);
 
@@ -95,5 +108,59 @@ impl MergeMethod for TaskArithmeticMerge {
         let merged = base.add(&final_delta);
 
         Ok(merged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{arr, assert_close, values};
+
+    fn weight(w: f32) -> MergeParameters {
+        MergeParameters {
+            weight: Some(w.into()),
+            ..Default::default()
+        }
+    }
+
+    /// theta = theta_0 + lambda * sum_i w_i (theta_i - theta_0)
+    #[test]
+    fn sums_the_weighted_task_vectors_and_scales_by_lambda() {
+        let base = arr(&[1.0, 1.0], &[2]);
+        let models = [arr(&[2.0, 3.0], &[2]), arr(&[4.0, 0.0], &[2])];
+        let global = MergeParameters {
+            lambda: Some(0.5_f32.into()),
+            ..Default::default()
+        };
+        let out = TaskArithmeticMerge::new()
+            .merge(&models, Some(&base), &[weight(0.5), weight(2.0)], &global)
+            .unwrap();
+        // tau = [1, 2], [3, -1]: 0.5 * (0.5 * [1, 2] + 2 * [3, -1]) = [3.25, -0.5]
+        assert_close(&values(&out), &[4.25, 0.5], 1e-6);
+    }
+
+    #[test]
+    fn explicit_normalize_takes_the_weighted_mean_and_a_negative_weight_subtracts() {
+        let base = arr(&[0.0], &[1]);
+        let models = [arr(&[4.0], &[1]), arr(&[8.0], &[1])];
+        let global = MergeParameters {
+            normalize: Some(true),
+            ..Default::default()
+        };
+        let out = TaskArithmeticMerge::new()
+            .merge(&models, Some(&base), &[weight(1.0), weight(3.0)], &global)
+            .unwrap();
+        assert_close(&values(&out), &[7.0], 1e-6); // (4 + 24) / 4
+
+        // Forgetting a skill: negating a task vector (Ilharco et al., 2023).
+        let out = TaskArithmeticMerge::new()
+            .merge(
+                &models[..1],
+                Some(&base),
+                &[weight(-1.0)],
+                &MergeParameters::default(),
+            )
+            .unwrap();
+        assert_close(&values(&out), &[-4.0], 1e-6);
     }
 }

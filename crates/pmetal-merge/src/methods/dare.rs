@@ -1,34 +1,41 @@
 //! DARE merge method - Drop And REscale.
 //!
-//! DARE is an alternative to TIES that uses random pruning instead of
-//! magnitude-based pruning. It randomly drops a fraction of parameters
-//! and rescales the remaining ones to maintain the expected value.
+//! DARE (Yu et al., "Language Models are Super Mario", 2024) observes that
+//! most of a fine-tuned model's task vector is redundant: dropping a random
+//! fraction `1 - density` of its entries and multiplying the survivors by
+//! `1 / density` preserves the model's behaviour in expectation, and the
+//! thinned vectors of several models interfere less when combined.
 //!
-//! Formula:
 //! ```text
-//! mask = random_uniform() < density
-//! sparse_delta = mask * delta / density  (if rescale=true)
-//! sparse_delta = mask * delta            (if rescale=false)
+//! m ~ Bernoulli(density)                 (independent per entry)
+//! τ̂ = m ⊙ τ / density                    (rescale = true, the default)
+//! θ = θ_base + λ · combine(τ̂_1, ..., τ̂_N)
 //! ```
 //!
-//! Reference: Yu et al., "Language Models are Super Mario: Absorbing Abilities from Homologous Models as a Free Lunch" (2023)
+//! `combine` is the weighted sum (`dare_linear`) or, for `dare_ties`, the
+//! TIES sign election and disjoint merge. With `normalize` (the default) the
+//! weighted sum is divided by the total weight and the disjoint merge is a
+//! mean over the agreeing models.
+//!
+//! Each (tensor, model) pair draws its own mask from the `seed` parameter, so
+//! a merge is reproducible and no two models share a drop pattern.
 //!
 //! Best for:
 //! - Alternative to TIES when you want stochastic sparsification
 //! - When magnitude-based pruning removes important small-magnitude weights
 
 use super::MergeMethod;
-use crate::{MergeError, MergeParameters, Result, sign_consensus};
-use pmetal_runtime::compat::{Array, Dtype};
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use crate::consensus::combine_task_vectors;
+use crate::seed::mask_seed;
+use crate::{MergeError, MergeParameters, Result, sparsify_dare};
+use pmetal_runtime::compat::Array;
 
 /// DARE merge implementation.
 #[derive(Debug, Clone)]
 pub struct DareMerge {
     /// Whether to use TIES-style sign consensus.
     use_ties_consensus: bool,
-    /// Random seed for reproducibility.
+    /// Seed overriding the `seed` merge parameter.
     seed: Option<u64>,
 }
 
@@ -60,77 +67,61 @@ impl DareMerge {
         Self::new(false)
     }
 
-    /// Set random seed for reproducibility.
+    /// Fix the seed, taking precedence over the `seed` merge parameter.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
 
-    /// Apply random mask with rescaling.
-    ///
-    /// # Arguments
-    /// * `shape` - Shape of the mask to generate.
-    /// * `density` - Fraction of parameters to keep (0.0 - 1.0).
-    /// * `rescale` - If true, divide kept values by `density` to preserve expected magnitude.
-    /// * `seed` - Optional RNG seed for reproducibility.
-    fn random_mask(shape: &[i32], density: f32, rescale: bool, seed: Option<u64>) -> Result<Array> {
-        let size: usize = shape.iter().map(|&s| s as usize).product();
-
-        // Seed-controlled RNG: use StdRng when a seed is provided so results
-        // are reproducible, fall back to the thread-local RNG otherwise.
-        let mask: Vec<f32> = match seed {
-            Some(s) => {
-                let mut rng = StdRng::seed_from_u64(s);
-                (0..size)
-                    .map(|_| {
-                        if rng.random::<f32>() < density {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect()
-            }
-            None => {
-                let mut rng = rand::rng();
-                (0..size)
-                    .map(|_| {
-                        if rng.random::<f32>() < density {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect()
-            }
-        };
-
-        let mut mask_array = Array::from_f32_slice(&mask, shape);
-
-        // Rescale to maintain expected value
-        if rescale && density > 0.0 && density < 1.0 {
-            mask_array = mask_array.divide(&Array::from_f32(density));
+    fn merge_tensor(
+        &self,
+        name: &str,
+        tensors: &[Array],
+        base_tensor: Option<&Array>,
+        params: &[MergeParameters],
+        global_params: &MergeParameters,
+    ) -> Result<Array> {
+        let base = base_tensor.ok_or_else(|| MergeError::BaseModelRequired {
+            method: self.name().to_string(),
+        })?;
+        if tensors.is_empty() {
+            return Err(MergeError::NotEnoughModels {
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if params.len() != tensors.len() {
+            return Err(MergeError::InvalidConfig(format!(
+                "{} tensors but {} per-model parameter sets",
+                tensors.len(),
+                params.len()
+            )));
         }
 
-        Ok(mask_array)
-    }
+        let rescale = global_params.rescale();
+        let seed = self.seed.unwrap_or_else(|| global_params.seed());
 
-    /// Apply DARE to a single task vector.
-    fn dare_sparsify(&self, delta: &Array, density: f32, rescale: bool) -> Result<Array> {
-        if density >= 1.0 {
-            return Ok(delta.clone());
+        let mut sparse = Vec::with_capacity(tensors.len());
+        let mut weights = Vec::with_capacity(tensors.len());
+        for (slot, (tensor, per_model)) in tensors.iter().zip(params).enumerate() {
+            let effective = global_params.merge_with(per_model);
+            let task_vector = tensor.subtract(base);
+            sparse.push(sparsify_dare(
+                &task_vector,
+                effective.density(),
+                mask_seed(seed, name, slot),
+                rescale,
+            )?);
+            weights.push(effective.weight());
         }
-        if density <= 0.0 {
-            return Ok(Array::zeros(delta.shape(), Dtype::Float32.as_i32()));
-        }
 
-        let mask = Self::random_mask(delta.shape(), density, rescale, self.seed)?;
-        Ok(delta.multiply(&mask))
-    }
-
-    /// Compute task vector (delta from base).
-    fn task_vector(tensor: &Array, base: &Array) -> Result<Array> {
-        Ok(tensor.subtract(base))
+        let combined = combine_task_vectors(
+            &sparse,
+            &weights,
+            self.use_ties_consensus,
+            global_params.normalize(),
+        )?;
+        Ok(base.add(&combined.multiply(&Array::from_f32(global_params.lambda()))))
     }
 }
 
@@ -162,134 +153,195 @@ impl MergeMethod for DareMerge {
         params: &[MergeParameters],
         global_params: &MergeParameters,
     ) -> Result<Array> {
-        let base = base_tensor.ok_or_else(|| MergeError::BaseModelRequired {
-            method: self.name().to_string(),
-        })?;
+        self.merge_tensor("", tensors, base_tensor, params, global_params)
+    }
 
-        // Compute task vectors
-        let task_vectors: Vec<Array> = tensors
+    fn merge_named(
+        &self,
+        name: &str,
+        tensors: &[Array],
+        base_tensor: Option<&Array>,
+        params: &[MergeParameters],
+        global_params: &MergeParameters,
+    ) -> Result<Array> {
+        let params: Vec<MergeParameters> = params
             .iter()
-            .map(|t| Self::task_vector(t, base))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Get parameters
-        let densities: Vec<f32> = params
-            .iter()
-            .map(|p| global_params.merge_with(p).density())
+            .map(|p| p.resolved_in(name, global_params.layer_count))
             .collect();
-
-        let weights: Vec<f32> = params
-            .iter()
-            .map(|p| global_params.merge_with(p).weight())
-            .collect();
-
-        let rescale = global_params.rescale();
-        let lambda = global_params.lambda();
-
-        // Apply DARE sparsification to each task vector
-        let sparse_vectors: Vec<Array> = task_vectors
-            .iter()
-            .zip(densities.iter())
-            .map(|(tv, &density)| self.dare_sparsify(tv, density, rescale))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Optionally apply sign consensus and compute the weighted sum.
-        // sign_consensus returns the weighted sum of agreeing contributions directly.
-        let weighted_sum = if self.use_ties_consensus {
-            sign_consensus(&sparse_vectors, &weights)?
-        } else {
-            // Compute weighted sum without sign filtering.
-            let mut acc = Array::zeros(task_vectors[0].shape(), Dtype::Float32.as_i32());
-            for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
-                let weighted = vector.multiply(&Array::from_f32(*weight));
-                acc = acc.add(&weighted);
-            }
-            acc
-        };
-
-        // Scale by lambda and add back to base
-        let result = weighted_sum.multiply(&Array::from_f32(lambda));
-        Ok(base.add(&result))
+        self.merge_tensor(
+            name,
+            tensors,
+            base_tensor,
+            &params,
+            &global_params.resolved(name),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{arr, assert_close, values, weight_density};
 
-    #[test]
-    fn test_dare_random_mask() {
-        // With density=1.0, all elements should be kept
-        let mut mask = DareMerge::random_mask(&[100], 1.0, false, Some(42)).unwrap();
-        let mask_slice = mask.to_f32_vec(100).unwrap();
-        assert!(mask_slice.iter().all(|&x| x == 1.0));
-
-        // With density=0.0, all elements should be dropped
-        let mut mask = DareMerge::random_mask(&[100], 0.0, false, Some(42)).unwrap();
-        let mask_slice = mask.to_f32_vec(100).unwrap();
-        assert!(mask_slice.iter().all(|&x| x == 0.0));
+    fn run(
+        method: &DareMerge,
+        base: &Array,
+        models: &[Array],
+        params: &[MergeParameters],
+        global: &MergeParameters,
+    ) -> Vec<f32> {
+        values(&method.merge(models, Some(base), params, global).unwrap())
     }
 
     #[test]
-    fn test_dare_random_mask_seeded_reproducible() {
-        // Same seed must produce identical masks.
-        let mut m1 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
-        let mut m2 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
-        let s1 = m1.to_f32_vec(1000).unwrap();
-        let s2 = m2.to_f32_vec(1000).unwrap();
-        assert_eq!(s1, s2);
-    }
+    fn full_density_is_a_weighted_task_arithmetic() {
+        // delta1 = 4, delta2 = 8 with weights 1 and 3.
+        let base = arr(&[10.0], &[1]);
+        let models = [arr(&[14.0], &[1]), arr(&[18.0], &[1])];
+        let params = [weight_density(1.0, 1.0), weight_density(3.0, 1.0)];
 
-    #[test]
-    fn test_dare_rescaling() {
-        // With rescale=true, kept values should be divided by density
-        let mut mask = DareMerge::random_mask(&[1000], 0.5, true, Some(42)).unwrap();
-        let mask_slice = mask.to_f32_vec(1000).unwrap();
+        // normalize (default): 10 + (1*4 + 3*8) / 4 = 17
+        let out = run(
+            &DareMerge::linear(),
+            &base,
+            &models,
+            &params,
+            &MergeParameters::default(),
+        );
+        assert_close(&out, &[17.0], 1e-6);
 
-        // Non-zero values should be 2.0 (1.0 / 0.5)
-        for &v in &mask_slice {
-            assert!(v == 0.0 || (v - 2.0).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn test_dare_preserves_base_with_zero_lambda() {
-        let merge = DareMerge::linear();
-
-        let base = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0], &[3]);
-        let t1 = Array::from_f32_slice(&[2.0_f32, 3.0, 4.0], &[3]);
-
-        let params = vec![MergeParameters {
-            weight: Some(1.0_f32.into()),
-            density: Some(0.5_f32.into()),
+        // No normalization: 10 + 28 = 38; lambda scales the sum.
+        let global = MergeParameters {
+            normalize: Some(false),
+            lambda: Some(0.5_f32.into()),
             ..Default::default()
-        }];
+        };
+        let out = run(&DareMerge::linear(), &base, &models, &params, &global);
+        assert_close(&out, &[24.0], 1e-6);
+    }
 
+    #[test]
+    fn zero_lambda_returns_the_base() {
+        let base = arr(&[1.0, 2.0, 3.0], &[3]);
+        let models = [arr(&[2.0, 3.0, 4.0], &[3])];
         let global = MergeParameters {
             lambda: Some(0.0_f32.into()),
             ..Default::default()
         };
-
-        let mut result = merge.merge(&[t1], Some(&base), &params, &global).unwrap();
-        let result_slice = result.to_f32_vec(3).unwrap();
-        let mut base_clone = base.clone();
-        let base_slice = base_clone.to_f32_vec(3).unwrap();
-
-        // With lambda=0, result should equal base
-        for (r, b) in result_slice.iter().zip(base_slice.iter()) {
-            assert!((r - b).abs() < 1e-5);
-        }
+        let out = run(
+            &DareMerge::linear(),
+            &base,
+            &models,
+            &[weight_density(1.0, 0.5)],
+            &global,
+        );
+        assert_close(&out, &[1.0, 2.0, 3.0], 1e-6);
     }
 
     #[test]
-    fn test_dare_ties_vs_linear() {
-        // Just verify both variants can be created and run
-        let dare_ties = DareMerge::with_ties();
-        let dare_linear = DareMerge::linear();
+    fn survivors_are_rescaled_by_the_inverse_density() {
+        let n = 4096;
+        let base = arr(&vec![0.0; n], &[n as i32]);
+        let models = [arr(&vec![1.0; n], &[n as i32])];
+        let out = run(
+            &DareMerge::linear(),
+            &base,
+            &models,
+            &[weight_density(1.0, 0.25)],
+            &MergeParameters::default(),
+        );
+        assert!(out.iter().all(|&v| v == 0.0 || v == 4.0));
+        assert!(out.contains(&4.0) && out.contains(&0.0));
+    }
 
-        assert_eq!(dare_ties.name(), "dare_ties");
-        assert_eq!(dare_linear.name(), "dare_linear");
-        assert!(dare_ties.use_ties_consensus);
-        assert!(!dare_linear.use_ties_consensus);
+    #[test]
+    fn merges_are_reproducible_by_default_and_follow_the_seed() {
+        let n = 2048;
+        let base = arr(&vec![0.0; n], &[n as i32]);
+        let models = [arr(&vec![1.0; n], &[n as i32])];
+        let params = [weight_density(1.0, 0.5)];
+        let merge = |seed: Option<u64>| {
+            let global = MergeParameters {
+                seed,
+                ..Default::default()
+            };
+            run(&DareMerge::linear(), &base, &models, &params, &global)
+        };
+        assert_eq!(merge(None), merge(None));
+        assert_eq!(merge(Some(3)), merge(Some(3)));
+        assert_ne!(merge(Some(3)), merge(Some(4)));
+    }
+
+    #[test]
+    fn models_and_tensors_draw_independent_masks() {
+        let n = 8192;
+        let base = arr(&vec![0.0; n], &[n as i32]);
+        // Two models with the same all-ones task vector, no normalization:
+        // independent masks give entries of 0, 2 (one survivor) and 4 (both).
+        let models = [
+            arr(&vec![1.0; n], &[n as i32]),
+            arr(&vec![1.0; n], &[n as i32]),
+        ];
+        let params = [weight_density(1.0, 0.5), weight_density(1.0, 0.5)];
+        let global = MergeParameters {
+            normalize: Some(false),
+            ..Default::default()
+        };
+        let out = run(&DareMerge::linear(), &base, &models, &params, &global);
+        let count = |v: f32| out.iter().filter(|&&x| x == v).count() as f32 / n as f32;
+        assert!(out.iter().all(|&x| x == 0.0 || x == 2.0 || x == 4.0));
+        // Independent Bernoulli(0.5): P(0) = P(4) = 0.25, P(2) = 0.5. Shared
+        // masks would give P(2) = 0.
+        assert!(
+            (count(2.0) - 0.5).abs() < 0.05,
+            "P(one survivor) {}",
+            count(2.0)
+        );
+        assert!((count(0.0) - 0.25).abs() < 0.05, "P(none) {}", count(0.0));
+
+        // The same model slot in two differently named tensors differs too.
+        let merge_named = |name: &str| {
+            values(
+                &DareMerge::linear()
+                    .merge_named(name, &models[..1], Some(&base), &params[..1], &global)
+                    .unwrap(),
+            )
+        };
+        assert_ne!(merge_named("a.weight"), merge_named("b.weight"));
+        assert_eq!(merge_named("a.weight"), merge_named("a.weight"));
+    }
+
+    #[test]
+    fn dare_ties_elects_a_sign_among_the_survivors() {
+        // Full density turns DARE-TIES into plain TIES: mass +8 at p0 keeps
+        // only +10; both negative at p1 average to -3.
+        let base = arr(&[0.0, 0.0], &[2]);
+        let models = [
+            arr(&[10.0, -4.0], &[2]),
+            arr(&[-1.0, -2.0], &[2]),
+            arr(&[-1.0, 0.0], &[2]),
+        ];
+        let params = vec![weight_density(1.0, 1.0); 3];
+        let out = run(
+            &DareMerge::with_ties(),
+            &base,
+            &models,
+            &params,
+            &MergeParameters::default(),
+        );
+        assert_close(&out, &[10.0, -3.0], 1e-6);
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_density() {
+        let base = arr(&[0.0], &[1]);
+        let models = [arr(&[1.0], &[1])];
+        let err = DareMerge::linear().merge(
+            &models,
+            Some(&base),
+            &[weight_density(1.0, 1.5)],
+            &MergeParameters::default(),
+        );
+        assert!(err.is_err());
     }
 }

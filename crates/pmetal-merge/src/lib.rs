@@ -37,30 +37,24 @@
 
 #![warn(missing_docs)]
 
-pub mod async_merge;
-pub mod batched;
 mod config;
 mod consensus;
 mod error;
-pub mod fp8_merge;
-pub mod gpu_merge;
 mod loader;
 pub mod lora_merge;
+mod mapped;
 mod merge;
 pub mod methods;
 pub mod moe_align;
 pub mod sanity;
+mod seed;
 mod sparsify;
+#[cfg(test)]
+mod test_util;
 
-pub use async_merge::{AsyncMergeConfig, AsyncMergePipeline, DoubleBufferManager, PipelineStats};
-pub use batched::{BatchConfig, BatchResult, BatchedMerger, MergeStats, TensorBatch};
 pub use config::*;
 pub use consensus::*;
 pub use error::*;
-pub use fp8_merge::{
-    DynamicScale, Fp8Format, Fp8MergeConfig, Fp8Merger, Fp8Tensor, MemorySavingsReport,
-};
-pub use gpu_merge::{GpuMergeConfig, GpuMerger};
 pub use loader::*;
 pub use lora_merge::{AccurateMergeConfig, LoraMergeStats, streaming_lora_merge};
 pub use merge::*;
@@ -69,8 +63,8 @@ pub use sparsify::*;
 
 /// Re-export merge methods for convenience
 pub use methods::{
-    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeMethod, ModelStockMerge,
-    MultiSlerpMerge, NearswapMerge, PassthroughMerge, RamMerge, SlerpMerge, SouperMerge,
+    BreadcrumbsMerge, ConsensusMerge, DareMerge, DellaMerge, LinearMerge, MergeMethod,
+    ModelStockMerge, MultiSlerpMerge, NearswapMerge, PassthroughMerge, RamMerge, SlerpMerge,
     TaskArithmeticMerge, TiesMerge,
 };
 
