@@ -234,8 +234,7 @@ impl AneRuntime {
 
             Ok(AneModel {
                 model,
-                request_class: self.request_class,
-                io_surface_class: self.io_surface_class,
+                requests: RequestBuilder::new(self),
                 input_layouts,
                 output_layouts,
                 staging: Mutex::new(Staging::default()),
@@ -272,8 +271,7 @@ pub struct AnePerformanceStats {
 /// Implements `Drop` for RAII: unloads from ANE hardware.
 pub struct AneModel {
     model: *mut AnyObject,
-    request_class: &'static AnyClass,
-    io_surface_class: &'static AnyClass,
+    requests: RequestBuilder,
     input_layouts: Vec<AneTensorLayout>,
     output_layouts: Vec<AneTensorLayout>,
     /// Surfaces laid out the model's way, for callers' packed ones whose
@@ -362,90 +360,12 @@ impl AneModel {
         outputs: &[*mut c_void],
         collect_stats: bool,
     ) -> Result<AnePerformanceStats> {
-        unsafe {
-            let rt = AneRuntime::global()?;
-            let perf_stats = if collect_stats {
-                let Some(perf_class) = rt
-                    .perf_stats_class
-                    .filter(|_| perf_stats_request_supported())
-                else {
-                    self.evaluate_raw(inputs, outputs, false)?;
-                    return Ok(AnePerformanceStats::default());
-                };
-
-                let zero = NSNumber::new_u64(0);
-                let perf_stats: *mut AnyObject = msg_send![
-                    perf_class,
-                    statsWithHardwareExecutionNS: &*zero
-                ];
-                if perf_stats.is_null() {
-                    self.evaluate_raw(inputs, outputs, false)?;
-                    return Ok(AnePerformanceStats::default());
-                }
-                perf_stats
-            } else {
-                std::ptr::null_mut()
-            };
-
-            let request = self.build_request(inputs, outputs, perf_stats);
-            self.evaluate_request(request)?;
-
-            let hw_time = if perf_stats.is_null() {
-                0
-            } else {
-                msg_send![perf_stats, hwExecutionTime]
-            };
-
-            Ok(AnePerformanceStats {
-                hw_execution_time_ns: hw_time,
+        self.requests
+            .run(inputs, outputs, collect_stats, |request| {
+                // SAFETY: `request` is a live `_ANERequest` for this model's
+                // surfaces, kept alive by the pool `run` holds.
+                unsafe { self.evaluate_request(request) }
             })
-        }
-    }
-
-    unsafe fn build_request(
-        &self,
-        inputs: &[*mut c_void],
-        outputs: &[*mut c_void],
-        perf_stats: *mut AnyObject,
-    ) -> *mut AnyObject {
-        let mut wrapped_inputs: Vec<*mut AnyObject> = Vec::with_capacity(inputs.len());
-        let mut input_indices: Vec<objc2::rc::Retained<NSNumber>> =
-            Vec::with_capacity(inputs.len());
-        for (i, &surface) in inputs.iter().enumerate() {
-            let surface = surface.cast::<__IOSurface>();
-            let wrapped: *mut AnyObject =
-                msg_send![self.io_surface_class, objectWithIOSurface: surface];
-            wrapped_inputs.push(wrapped);
-            input_indices.push(NSNumber::new_usize(i));
-        }
-
-        let mut wrapped_outputs: Vec<*mut AnyObject> = Vec::with_capacity(outputs.len());
-        let mut output_indices: Vec<objc2::rc::Retained<NSNumber>> =
-            Vec::with_capacity(outputs.len());
-        for (i, &surface) in outputs.iter().enumerate() {
-            let surface = surface.cast::<__IOSurface>();
-            let wrapped: *mut AnyObject =
-                msg_send![self.io_surface_class, objectWithIOSurface: surface];
-            wrapped_outputs.push(wrapped);
-            output_indices.push(NSNumber::new_usize(i));
-        }
-
-        let ns_inputs = unsafe { ns_array_from_raw(&wrapped_inputs) };
-        let ns_input_idx = unsafe { ns_array_from_numbers(&input_indices) };
-        let ns_outputs = unsafe { ns_array_from_raw(&wrapped_outputs) };
-        let ns_output_idx = unsafe { ns_array_from_numbers(&output_indices) };
-        let zero = NSNumber::new_usize(0);
-
-        msg_send![
-            self.request_class,
-            requestWithInputs: &*ns_inputs,
-            inputIndices: &*ns_input_idx,
-            outputs: &*ns_outputs,
-            outputIndices: &*ns_output_idx,
-            weightsBuffer: std::ptr::null::<AnyObject>(),
-            perfStats: perf_stats,
-            procedureIndex: &*zero
-        ]
     }
 
     unsafe fn evaluate_request(&self, request: *mut AnyObject) -> Result<()> {
@@ -464,6 +384,111 @@ impl AneModel {
         }
 
         Ok(())
+    }
+}
+
+/// Builds the `_ANERequest` for one evaluation.
+#[derive(Clone, Copy)]
+struct RequestBuilder {
+    request_class: &'static AnyClass,
+    io_surface_class: &'static AnyClass,
+    perf_stats_class: Option<&'static AnyClass>,
+}
+
+impl RequestBuilder {
+    fn new(rt: &AneRuntime) -> Self {
+        Self {
+            request_class: rt.request_class,
+            io_surface_class: rt.io_surface_class,
+            perf_stats_class: rt.perf_stats_class,
+        }
+    }
+
+    /// Build a request over `inputs` and `outputs` and hand it to `run`,
+    /// returning the hardware time it recorded when `collect_stats` is set
+    /// (0 where the platform doesn't report it).
+    ///
+    /// The framework returns the request, its wrappers and the stats
+    /// autoreleased, and the wrappers hold their IOSurfaces. A Rust thread
+    /// has no pool to drain them, so without this one every pass kept all of
+    /// its surfaces (the whole KV cache among them) for the life of the
+    /// process.
+    fn run(
+        &self,
+        inputs: &[*mut c_void],
+        outputs: &[*mut c_void],
+        collect_stats: bool,
+        run: impl FnOnce(*mut AnyObject) -> Result<()>,
+    ) -> Result<AnePerformanceStats> {
+        objc2::rc::autoreleasepool(|_| self.run_in_pool(inputs, outputs, collect_stats, run))
+    }
+
+    fn run_in_pool(
+        &self,
+        inputs: &[*mut c_void],
+        outputs: &[*mut c_void],
+        collect_stats: bool,
+        run: impl FnOnce(*mut AnyObject) -> Result<()>,
+    ) -> Result<AnePerformanceStats> {
+        unsafe {
+            let perf_stats: *mut AnyObject = match self
+                .perf_stats_class
+                .filter(|_| collect_stats && perf_stats_request_supported())
+            {
+                Some(class) => {
+                    let zero = NSNumber::new_u64(0);
+                    msg_send![class, statsWithHardwareExecutionNS: &*zero]
+                }
+                None => std::ptr::null_mut(),
+            };
+            let request = self.build(inputs, outputs, perf_stats);
+            run(request)?;
+            let hw_time = if perf_stats.is_null() {
+                0
+            } else {
+                msg_send![perf_stats, hwExecutionTime]
+            };
+            Ok(AnePerformanceStats {
+                hw_execution_time_ns: hw_time,
+            })
+        }
+    }
+
+    unsafe fn build(
+        &self,
+        inputs: &[*mut c_void],
+        outputs: &[*mut c_void],
+        perf_stats: *mut AnyObject,
+    ) -> *mut AnyObject {
+        let wrap = |surfaces: &[*mut c_void]| -> Vec<*mut AnyObject> {
+            surfaces
+                .iter()
+                .map(|&surface| {
+                    let surface = surface.cast::<__IOSurface>();
+                    msg_send![self.io_surface_class, objectWithIOSurface: surface]
+                })
+                .collect()
+        };
+        let indices = |n: usize| -> Vec<objc2::rc::Retained<NSNumber>> {
+            (0..n).map(NSNumber::new_usize).collect()
+        };
+        let (wrapped_inputs, wrapped_outputs) = (wrap(inputs), wrap(outputs));
+        let ns_inputs = unsafe { ns_array_from_raw(&wrapped_inputs) };
+        let ns_input_idx = unsafe { ns_array_from_numbers(&indices(inputs.len())) };
+        let ns_outputs = unsafe { ns_array_from_raw(&wrapped_outputs) };
+        let ns_output_idx = unsafe { ns_array_from_numbers(&indices(outputs.len())) };
+        let zero = NSNumber::new_usize(0);
+
+        msg_send![
+            self.request_class,
+            requestWithInputs: &*ns_inputs,
+            inputIndices: &*ns_input_idx,
+            outputs: &*ns_outputs,
+            outputIndices: &*ns_output_idx,
+            weightsBuffer: std::ptr::null::<AnyObject>(),
+            perfStats: perf_stats,
+            procedureIndex: &*zero
+        ]
     }
 }
 
@@ -1258,6 +1283,46 @@ mod tests {
         assert_eq!(y, run(&second));
     }
 
+    unsafe extern "C" {
+        fn CFGetRetainCount(cf: *const c_void) -> isize;
+    }
+
+    /// An evaluation leaves nothing behind. The framework hands back
+    /// autoreleased objects (the request, a wrapper per surface that holds
+    /// its IOSurface, the arrays), and a thread other than the main one has
+    /// no pool to drain them, so every pass kept its surfaces and request for
+    /// the life of the process. Run on a plain thread, as the ANE worker
+    /// does, and no model is needed to build the requests.
+    #[test]
+    fn building_requests_does_not_retain_surfaces() {
+        let outcome = std::thread::spawn(|| {
+            let rt = match AneRuntime::global() {
+                Ok(rt) => rt,
+                Err(MetalError::AneNotAvailable) => return None,
+                Err(e) => panic!("Unexpected error: {e}"),
+            };
+            let requests = RequestBuilder::new(rt);
+            let input = IoSurface::for_tensor(8, 32).unwrap();
+            let output = IoSurface::for_tensor(8, 32).unwrap();
+            let held = |s: &IoSurface| unsafe { CFGetRetainCount(s.as_ptr()) };
+            let before = (held(&input), held(&output));
+            for _ in 0..200 {
+                requests
+                    .run(&[input.as_ptr()], &[output.as_ptr()], false, |request| {
+                        assert!(!request.is_null());
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            Some((before, (held(&input), held(&output))))
+        })
+        .join()
+        .unwrap();
+        if let Some((before, after)) = outcome {
+            assert_eq!(after, before, "retain counts of the input and output");
+        }
+    }
+
     #[test]
     #[ignore = "requires ANE hardware and private AppleNeuralEngine.framework"]
     fn test_f32_evaluation_round_trips() {
@@ -1271,7 +1336,6 @@ mod tests {
         program.emit_cast("x16", &[1, 1, 1, 4], "x", "fp16");
         program.emit_cast("out", &[1, 1, 1, 4], "x16", "fp32");
         let mil_text = program.finalize("out");
-
         let model = match rt.compile(mil_text.as_bytes(), None) {
             Ok(model) => model,
             Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
