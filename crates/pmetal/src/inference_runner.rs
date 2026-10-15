@@ -439,8 +439,10 @@ impl InferenceRunner {
             };
             let formatted = expand_media(rendered.map_err(Exception::custom)?)?;
 
+            // The template wrote the model's BOS itself; the tokenizer's
+            // post-processor would put a second one in front of it.
             let ids = tokenizer
-                .encode_with_special_tokens(&formatted)
+                .encode(&formatted)
                 .map_err(|e| Exception::custom(e.to_string()))?;
             (
                 ids,

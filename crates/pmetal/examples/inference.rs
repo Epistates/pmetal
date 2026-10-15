@@ -39,7 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = Tokenizer::from_model_dir(&model_path)?;
     let template = detect_chat_template(&model_path, model_id);
     let formatted = template.apply(&[Message::user(prompt)]).text;
-    let input_ids = tokenizer.encode_with_special_tokens(&formatted)?;
+    // The template wrote the model's BOS itself.
+    let input_ids = tokenizer.encode(&formatted)?;
 
     // Load model
     let mut model = DynamicModel::load(&model_path)?;

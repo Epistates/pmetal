@@ -98,8 +98,9 @@ pub async fn run_dflash(
         if std::env::var_os("PMETAL_DFLASH_DEBUG_PROMPT").is_some() {
             eprintln!("[dflash debug] rendered prompt: {:?}", rendered);
         }
+        // The template wrote the model's BOS itself.
         tokenizer
-            .encode_with_special_tokens(&rendered)
+            .encode(&rendered)
             .map_err(|e| anyhow::anyhow!("encoding chat-templated prompt: {e}"))?
             .into_iter()
             .map(|t| t as i32)
