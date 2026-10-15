@@ -40,6 +40,7 @@ use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
 use crate::kernels::dw_gemm::{DwGemm, GPU_DW_MIN_DIM};
 use crate::kernels::fused_training::{AdamWConfig, BatchedCommandBuffer};
+use pmetal_core::{LearningRateScheduler, LrSchedulerType};
 
 /// Configuration for the dynamic ANE trainer.
 ///
@@ -2245,7 +2246,6 @@ impl DynamicAneTrainer {
         Ok(loss)
     }
 
-    /// Compute learning rate with warmup + cosine decay.
     /// The factor the gradient carries through the backward pass, undone on
     /// the f32 weight gradients after it. The loss is a mean over the
     /// sequence, so each position's gradient is 1/seq of a sum's; at 1024
@@ -2256,19 +2256,19 @@ impl DynamicAneTrainer {
         self.config.loss_scale * self.config.seq_len as f32
     }
 
+    /// Learning rate at optimizer `step` of a `max_steps` run: linear warmup,
+    /// then cosine to `learning_rate * min_lr_ratio`, which it holds past the
+    /// last step. The schedule is `pmetal_core`'s, the one every trainer uses.
     fn get_lr(&self, step: usize, max_steps: usize) -> f32 {
-        let base_lr = self.config.learning_rate;
-        let warmup = self.config.warmup_steps;
-        let min_lr = base_lr * self.config.min_lr_ratio;
-
-        if step < warmup {
-            base_lr * (step as f32 / warmup as f32)
-        } else if max_steps > warmup {
-            let progress = (step - warmup) as f32 / (max_steps - warmup) as f32;
-            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
-        } else {
-            base_lr
-        }
+        let base_lr = f64::from(self.config.learning_rate);
+        LearningRateScheduler::new(
+            base_lr,
+            max_steps,
+            self.config.warmup_steps,
+            LrSchedulerType::Cosine,
+        )
+        .with_min_lr(base_lr * f64::from(self.config.min_lr_ratio))
+        .get_lr(step) as f32
     }
 
     /// Run a complete training batch (accumulate + Adam update).
@@ -2716,6 +2716,39 @@ mod tests {
         assert_eq!(trainer.adam_t(), 0);
         assert_eq!(trainer.compile_count(), 0);
         assert_eq!(trainer.config().n_layers, 2);
+    }
+
+    /// Warmup to the base rate, cosine down to the floor by the last step,
+    /// and the floor after it: a run that overshoots `max_steps` (a resumed
+    /// run, a caller counting differently) must not see the rate climb back
+    /// up the cosine's next arch.
+    #[test]
+    fn the_schedule_warms_up_decays_and_holds_its_floor() {
+        let trainer = DynamicAneTrainer::new(DynamicAneTrainerConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            n_kv_heads: 4,
+            n_layers: 1,
+            vocab_size: 100,
+            seq_len: 16,
+            learning_rate: 1e-3,
+            warmup_steps: 4,
+            min_lr_ratio: 0.1,
+            ..Default::default()
+        });
+        let lr = |step| trainer.get_lr(step, 20);
+        assert!(lr(1) < lr(2) && lr(2) < lr(3), "warmup rises");
+        assert!((lr(4) - 1e-3).abs() < 1e-9, "base rate when warmup ends");
+        assert!(lr(12) < lr(4) && lr(12) > lr(20), "cosine decays");
+        assert!((lr(20) - 1e-4).abs() < 1e-9, "floor at the last step");
+        for step in [21, 35, 60, 1000] {
+            assert!(
+                (lr(step) - 1e-4).abs() < 1e-9,
+                "step {step}: {} should still be the floor",
+                lr(step)
+            );
+        }
     }
 
     #[test]
