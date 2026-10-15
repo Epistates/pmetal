@@ -937,8 +937,6 @@ impl MoELayer {
         stacked_up: &Array,
         stacked_down: &Array,
     ) -> Result<Array, Exception> {
-        use pmetal_mlx::gather_mm;
-
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -969,7 +967,7 @@ impl MoELayer {
         // up_t: [num_experts, hidden, intermediate]
         // indices: [B*L, top_k]
         // Result: [B*L, top_k, intermediate]
-        let up_out = gather_mm(&x_expanded, &up_t, None, Some(&indices), false)?;
+        let up_out = x_expanded.gather_mm(&up_t, None, Some(&indices), false);
 
         // Apply relu2 activation (relu squared)
         let activated = pmetal_runtime::compat::nn::relu(&up_out).square();
@@ -978,7 +976,7 @@ impl MoELayer {
         // activated: [B*L, top_k, intermediate]
         // down_t: [num_experts, intermediate, hidden]
         // Result: [B*L, top_k, hidden]
-        let down_out = gather_mm(&activated, &down_t, None, Some(&indices), false)?;
+        let down_out = activated.gather_mm(&down_t, None, Some(&indices), false);
 
         // Weight and sum over top_k experts: [B*L, top_k, hidden] -> [B*L, hidden]
         // weights: [B*L, top_k] -> expand to [B*L, top_k, 1]

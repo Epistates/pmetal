@@ -1,17 +1,22 @@
 # pmetal-mlx
 
-MLX backend integration with advanced training utilities.
+Model-side operations, KV caches and decoding state over the PMetal runtime.
 
 ## Overview
 
-This crate provides the bridge between PMetal and Apple's MLX framework, along with custom implementations for training utilities not available in the base MLX library.
+`pmetal-runtime` owns the arrays, the ops and the fused kernels. This crate is
+what the model forwards build on top of them: attention with masks, sinks and
+logit softcapping, the gated delta rule, the cut cross-entropy loss, rotary
+embeddings at explicit positions, and the caches a decoder carries.
 
 ## Features
 
-- **Gradient Checkpointing**: Memory-efficient training for large models
-- **KV Cache**: Efficient key-value caching for inference
-- **Mixture of Experts**: MoE layer implementations
-- **Speculative Decoding State**: The hidden states a draft model reads and the recurrent-layer inputs a rollback replays
+- **Attention**: scaled dot-product attention (MLX's fused kernel, also under autograd), attention sinks on the runtime's fused op, Gemma 2 logit softcapping with f32 scores
+- **Gated delta rule**: sequential, chunkwise parallel (differentiable, so training uses it) and the fused inference kernel, one dispatcher
+- **Cut cross-entropy**: the LM-head loss without the logits, with label smoothing and a z-loss
+- **KV cache**: dense, rotating, quantized, TurboQuant and recurrent-state caches, and prefix reuse
+- **Mixture of Experts**: the expert MLP and the combine step
+- **Speculative decoding state**: The hidden states a draft model reads and the recurrent-layer inputs a rollback replays
 
 ## Usage
 
@@ -28,12 +33,17 @@ fn setup() {
 
 | Module | Description |
 |--------|-------------|
-| `kernels` | Custom MLX kernels (fused attention, cut cross entropy, RMS norm, GDN, etc.) |
-| `kernels/gated_delta` | Gated Delta Network (GDN) recurrence with fused Metal shader |
-| `gradient_checkpoint` | Gradient-checkpointing config (the mechanism lives in `pmetal-runtime`) |
-| `kv_cache` | Key-value cache for efficient inference |
-| `moe` | Mixture of Experts support |
+| `kernels::fused_attention` | `fused_sdpa`, `sink_sdpa`, the mask builders |
+| `kernels::gated_delta` | The gated delta rule and its dispatcher |
+| `kernels::cut_cross_entropy` | `CutCrossEntropy` over an LM head |
+| `kernels::rope` | `RopePositions` and rotation at contiguous or explicit positions |
+| `kernels::fused_moe` | The MoE combine |
+| `kernels::training_context` | `with_training_mode`, `is_training` |
+| `kv_cache`, `prefix_cache` | Key-value caches for inference |
+| `moe` | The expert MLP |
 | `speculative` | `SpecCapture`, the state a target's forward pass records for speculative decoding |
+| `memory` | Allocator and system memory figures |
+| `bridge` | Array to Metal buffer |
 
 ## License
 
