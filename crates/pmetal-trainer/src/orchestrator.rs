@@ -615,12 +615,8 @@ pub async fn run_training(
         "Loading training dataset: {}",
         dataset_path_resolved.display()
     );
-    let is_parquet = dataset_path_resolved
-        .extension()
-        .is_some_and(|ext| ext == "parquet");
     let train_dataset = load_dataset(
         &dataset_path_resolved,
-        is_parquet,
         &tokenizer,
         full_config.training.max_seq_len,
         &chat_template,
@@ -1580,88 +1576,21 @@ async fn attempt_ane_training(
 
 fn load_dataset(
     path: &Path,
-    is_parquet: bool,
     tokenizer: &Tokenizer,
     max_seq_len: usize,
     chat_template: &pmetal_data::chat_templates::ChatTemplate,
     columns: Option<&DatasetColumnConfig>,
 ) -> anyhow::Result<TrainingDataset> {
-    if is_parquet {
-        tracing::info!("Detected Parquet format");
-        let explicit_col = columns.and_then(|c| c.text_column.as_deref());
-        let prompt_col = columns.and_then(|c| c.prompt_column.as_deref());
-        if let Some(col) = explicit_col {
-            Ok(TrainingDataset::from_parquet_tokenized(
-                path,
-                tokenizer,
-                col,
-                max_seq_len,
-                prompt_col,
-            )?)
-        } else {
-            // Try well-known column names, then fall back to converting
-            // parquet → temporary JSONL for chat-format datasets (e.g. "messages" column).
-            let result =
-                TrainingDataset::from_parquet_tokenized(path, tokenizer, "text", max_seq_len, None);
-            if let Ok(ds) = result {
-                return Ok(ds);
-            }
-            let result = TrainingDataset::from_parquet_tokenized(
-                path,
-                tokenizer,
-                "content",
-                max_seq_len,
-                None,
-            );
-            if let Ok(ds) = result {
-                return Ok(ds);
-            }
-            // Parquet with chat format (e.g. "messages" column): convert to
-            // temporary JSONL and use the full-featured JSONL pipeline which
-            // handles OpenAI/ShareGPT/Alpaca formats with chat templates.
-            tracing::info!(
-                "Parquet has no text/content column — converting to JSONL for chat format detection"
-            );
-            let tmp_dir = std::env::temp_dir().join("pmetal-parquet-convert");
-            std::fs::create_dir_all(&tmp_dir)?;
-            let tmp_jsonl = tmp_dir.join("converted.jsonl");
-            {
-                use std::io::Write;
-                let file = std::fs::File::open(path)?;
-                let builder =
-                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
-                let reader = builder.build()?;
-                let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp_jsonl)?);
-                let mut buf = Vec::new();
-                for batch in reader {
-                    let batch = batch?;
-                    buf.clear();
-                    let mut json_writer = arrow::json::LineDelimitedWriter::new(&mut buf);
-                    json_writer.write(&batch)?;
-                    json_writer.finish()?;
-                    out.write_all(&buf)?;
-                }
-                out.flush()?;
-            }
-            Ok(TrainingDataset::from_jsonl_tokenized(
-                &tmp_jsonl,
-                tokenizer,
-                DatasetFormat::Auto,
-                max_seq_len,
-                Some(chat_template),
-                columns,
-            )?)
-        }
-    } else {
-        Ok(TrainingDataset::from_jsonl_tokenized(
-            path,
-            tokenizer,
-            DatasetFormat::Auto,
-            max_seq_len,
-            Some(chat_template),
-            columns,
-        )?)
-    }
+    // One loader for every container (JSONL, JSON, Parquet, Arrow, CSV) and
+    // for a directory of shards.
+    Ok(TrainingDataset::from_jsonl_tokenized(
+        path,
+        tokenizer,
+        DatasetFormat::Auto,
+        max_seq_len,
+        Some(chat_template),
+        columns,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1701,58 +1630,28 @@ pub async fn resolve_dataset_path(dataset_id: &str) -> anyhow::Result<PathBuf> {
             {
                 tracing::info!("Downloading dataset from HuggingFace: {}", id);
                 let dir = pmetal_hub::download_dataset(&id, None, None, None).await?;
-                // Try JSONL/JSON/CSV first
-                let resolved = TrainingDataset::resolve_dataset_path_pub(&dir);
-                if let Ok(p) = resolved {
+                // The cached repository: its train split, whatever the
+                // container (JSONL, JSON, Parquet, Arrow, CSV), every shard.
+                if let Ok(p) = TrainingDataset::resolve_dataset_path_pub(&dir) {
                     return Ok(p);
-                }
-                // Check for parquet files in the cached directory (no network call)
-                let mut parquet_files: Vec<_> = std::fs::read_dir(&dir)?
-                    .filter_map(|e| e.ok())
-                    .flat_map(|e| {
-                        let p = e.path();
-                        if p.is_dir() {
-                            // Recurse one level (e.g. default/train/)
-                            std::fs::read_dir(&p)
-                                .ok()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|e2| e2.ok())
-                                .flat_map(|e2| {
-                                    let p2 = e2.path();
-                                    if p2.is_dir() {
-                                        std::fs::read_dir(&p2)
-                                            .ok()
-                                            .into_iter()
-                                            .flatten()
-                                            .filter_map(|e3| e3.ok())
-                                            .map(|e3| e3.path())
-                                            .collect::<Vec<_>>()
-                                    } else {
-                                        vec![p2]
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        } else {
-                            vec![p]
-                        }
-                    })
-                    .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
-                    .collect();
-                parquet_files.sort();
-
-                if let Some(pf) = parquet_files.into_iter().next() {
-                    tracing::info!("Found parquet in cache: {}", pf.display());
-                    return Ok(pf);
                 }
 
                 // Last resort: download parquet from HF API (network call)
                 let parquet_paths =
                     pmetal_hub::download_dataset_parquet(&id, "train", None, None).await?;
-                if parquet_paths.is_empty() {
-                    anyhow::bail!("No JSONL or Parquet files found for dataset {}", id);
+                match parquet_paths.as_slice() {
+                    [] => anyhow::bail!("No JSONL or Parquet files found for dataset {}", id),
+                    [only] => Ok(only.clone()),
+                    [first, rest @ ..] => {
+                        // Shards of one split: read together, from their directory.
+                        match first.parent() {
+                            Some(parent) if rest.iter().all(|p| p.parent() == Some(parent)) => {
+                                Ok(parent.to_path_buf())
+                            }
+                            _ => Ok(first.clone()),
+                        }
+                    }
                 }
-                Ok(parquet_paths[0].clone())
             }
             #[cfg(not(feature = "hub"))]
             {
