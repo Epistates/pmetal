@@ -1,0 +1,110 @@
+{
+  "cases": [
+    {
+      "mode": "RGB",
+      "name": "down_square",
+      "resample": 3,
+      "source_hw": [
+        64,
+        48
+      ],
+      "target_hw": [
+        28,
+        28
+      ]
+    },
+    {
+      "mode": "RGB",
+      "name": "wide_to_tall",
+      "resample": 3,
+      "source_hw": [
+        20,
+        90
+      ],
+      "target_hw": [
+        32,
+        24
+      ]
+    },
+    {
+      "mode": "RGB",
+      "name": "upscale",
+      "resample": 3,
+      "source_hw": [
+        10,
+        12
+      ],
+      "target_hw": [
+        40,
+        36
+      ]
+    },
+    {
+      "mode": "RGB",
+      "name": "same_size",
+      "resample": 3,
+      "source_hw": [
+        28,
+        28
+      ],
+      "target_hw": [
+        28,
+        28
+      ]
+    },
+    {
+      "mode": "RGBA",
+      "name": "rgba",
+      "resample": 3,
+      "source_hw": [
+        30,
+        34
+      ],
+      "target_hw": [
+        24,
+        20
+      ]
+    },
+    {
+      "mode": "L",
+      "name": "gray",
+      "resample": 3,
+      "source_hw": [
+        37,
+        29
+      ],
+      "target_hw": [
+        16,
+        16
+      ]
+    },
+    {
+      "mode": "RGB",
+      "name": "bilinear_down",
+      "resample": 2,
+      "source_hw": [
+        64,
+        48
+      ],
+      "target_hw": [
+        28,
+        28
+      ]
+    }
+  ],
+  "image_mean": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "image_std": [
+    0.5,
+    0.5,
+    0.5
+  ],
+  "model_id": "synthetic",
+  "oracle": "transformers",
+  "processor": "SiglipImageProcessorPil",
+  "torch_version": "2.14.1",
+  "transformers_version": "5.19.0"
+}

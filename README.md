@@ -533,14 +533,15 @@ Rotation-based KV cache quantization for long-context inference on the native Qw
 
 ### Dataset Formats
 
-Auto-detected training data formats:
+Auto-detected training data formats (from a row's columns, structured layouts before `text`):
 
+- **OpenAI/Messages**: `{"messages": [{"role": "user", "content": "..."}, ...]}` (content parts, tool calls and per-message `weight`; every assistant turn trains)
 - **ShareGPT**: `{"conversations": [{"from": "human", "value": "..."}, ...]}`
 - **Alpaca**: `{"instruction": "...", "input": "...", "output": "..."}`
-- **OpenAI/Messages**: `{"messages": [{"role": "user", "content": "..."}, ...]}`
+- **Prompt/completion**: `{"prompt": "...", "completion": "..."}`, strings or message lists
 - **Reasoning**: `{"problem": "...", "thinking": "...", "solution": "..."}`
 - **Simple**: `{"text": "..."}`
-- **Parquet**: Supports both standard text columns and reasoning formats
+- **Containers**: JSONL, JSON, Parquet, Arrow and CSV files, or a directory of shards (a dataset's `train` split)
 
 **Custom columns**: Use `--text-column` for arbitrary field names, `--text-columns col1,col2` to concatenate multiple columns, and `--prompt-column`/`--response-column` for SFT loss masking. All training commands (train, distill, grpo, rlkd) support column flags uniformly.
 

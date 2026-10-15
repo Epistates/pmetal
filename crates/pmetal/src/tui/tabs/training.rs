@@ -115,42 +115,25 @@ impl TrainingTab {
     /// Peek at the selected dataset and populate info/warnings.
     /// Called from the app when the dataset field value changes.
     pub fn peek_dataset(&mut self, path: &str) {
-        use pmetal_data::{TrainingDataset, peek_columns};
-        use std::io::{BufRead, BufReader};
+        use pmetal_data::{peek_columns, sample_row_chars};
 
         self.dataset_info = None;
         self.seq_len_warning = None;
 
-        let resolved = TrainingDataset::resolve_dataset_path_pub(std::path::Path::new(path))
-            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let path = std::path::Path::new(path);
 
         // Get columns
-        let columns = peek_columns(&resolved).unwrap_or_default();
+        let columns = peek_columns(path).unwrap_or_default();
         if !columns.is_empty() {
             self.dataset_info = Some(format!("Columns: {}", columns.join(", ")));
         }
 
-        // Sample first 100 rows for length estimates
-        let mut char_lengths: Vec<usize> = Vec::new();
-        if let Ok(file) = std::fs::File::open(&resolved) {
-            let reader = BufReader::new(file);
-            for line in reader.lines().take(100).flatten() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if let Ok(obj) =
-                    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed)
-                {
-                    let total: usize = obj
-                        .values()
-                        .filter_map(|v| v.as_str())
-                        .map(|s| s.len())
-                        .sum();
-                    char_lengths.push(total / 4); // rough token estimate
-                }
-            }
-        }
+        // Sample first 100 rows for length estimates (a token is ~4 chars)
+        let char_lengths: Vec<usize> = sample_row_chars(path, 100)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|chars| chars / 4)
+            .collect();
 
         if char_lengths.is_empty() {
             return;

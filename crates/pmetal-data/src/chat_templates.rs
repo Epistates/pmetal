@@ -496,6 +496,11 @@ pub struct FormattedChat {
     /// found: Qwen3, for one, drops the thinking of every turn before the
     /// last user message, so only its final turn is listed.
     pub response_spans: Vec<Range<usize>>,
+    /// The index in the conversation's messages of the assistant turn each of
+    /// [`response_spans`](Self::response_spans) is, in the same order. A turn
+    /// the template does not render the same whatever follows has no span, so
+    /// this is how to tell which turns have one.
+    pub response_turns: Vec<usize>,
 }
 
 impl FormattedChat {
@@ -739,6 +744,7 @@ impl ChatTemplate {
                 text,
                 template_type: self.template_type,
                 response_spans: Vec::new(),
+                response_turns: Vec::new(),
             });
         };
 
@@ -747,8 +753,11 @@ impl ChatTemplate {
             response_start,
             variants,
         } = self.render_final_turn(messages, last, earlier, tools, kwargs)?;
-        let mut spans =
-            self.earlier_assistant_spans(messages, tools, &variants, &text, response_start);
+        let (mut turns, mut spans): (Vec<usize>, Vec<Range<usize>>) = self
+            .earlier_assistant_spans(messages, tools, &variants, &text, response_start)
+            .into_iter()
+            .unzip();
+        turns.push(messages.len() - 1);
         spans.push(response_start..text.len());
 
         // Harmony ends a conversation's final message with `<|return|>`, and
@@ -769,6 +778,7 @@ impl ChatTemplate {
             response_start,
             template_type: self.template_type,
             response_spans: spans,
+            response_turns: turns,
         })
     }
 
@@ -891,8 +901,8 @@ impl ChatTemplate {
         variants: &[ChatTemplateKwargs],
         text: &str,
         final_start: usize,
-    ) -> Vec<Range<usize>> {
-        let mut spans: Vec<Range<usize>> = Vec::new();
+    ) -> Vec<(usize, Range<usize>)> {
+        let mut spans: Vec<(usize, Range<usize>)> = Vec::new();
         for (index, message) in messages[..messages.len() - 1].iter().enumerate() {
             if message.role != "assistant" {
                 continue;
@@ -908,9 +918,9 @@ impl ChatTemplate {
             if let (Some(start), Some(end)) = (start, end) {
                 if start <= end
                     && end <= final_start
-                    && spans.last().is_none_or(|prev| prev.end <= start)
+                    && spans.last().is_none_or(|(_, prev)| prev.end <= start)
                 {
-                    spans.push(start..end);
+                    spans.push((index, start..end));
                 }
             }
         }
@@ -973,6 +983,7 @@ impl ChatTemplate {
             text,
             template_type: self.template_type,
             response_spans: Vec::new(),
+            response_turns: Vec::new(),
         };
         match self.render(messages, tools, kwargs, true) {
             Ok(text) => Ok(formatted(text)),
@@ -1105,6 +1116,7 @@ impl ChatTemplate {
                 text,
                 template_type: self.template_type,
                 response_spans: Vec::new(),
+                response_turns: Vec::new(),
             },
             Err(e) => {
                 tracing::warn!("{e}; rendering the conversation as plain text");
@@ -1311,13 +1323,15 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 fn plain_conversation(messages: &[Message], template_type: ChatTemplateType) -> FormattedChat {
     let mut text = String::new();
     let mut response_spans = Vec::new();
-    for message in messages {
+    let mut response_turns = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
         text.push_str(&message.role);
         text.push_str(": ");
         let start = text.len();
         text.push_str(&message.content);
         if message.role == "assistant" {
             response_spans.push(start..text.len());
+            response_turns.push(index);
         }
         text.push_str("\n\n");
     }
@@ -1325,6 +1339,7 @@ fn plain_conversation(messages: &[Message], template_type: ChatTemplateType) -> 
     if !ends_with_assistant {
         text.push_str("assistant: ");
         response_spans.clear();
+        response_turns.clear();
     }
     let response_start = match (ends_with_assistant, response_spans.last()) {
         (true, Some(span)) => span.start,
@@ -1335,6 +1350,7 @@ fn plain_conversation(messages: &[Message], template_type: ChatTemplateType) -> 
         response_start,
         template_type,
         response_spans,
+        response_turns,
     }
 }
 
@@ -1600,19 +1616,31 @@ impl FormattedChat {
     /// tokenizer added covers nothing); a token that straddles the edge of a
     /// span began in the prompt and is masked.
     pub fn trainable_tokens(&self, offsets: &[(usize, usize)]) -> Vec<bool> {
-        let mut spans = self.response_spans.iter().peekable();
-        offsets
-            .iter()
-            .map(|&(start, end)| {
-                // Tokens come in text order, so spans already passed are done.
-                while spans.next_if(|span| span.end <= start).is_some() {}
-                end > start
-                    && spans
-                        .peek()
-                        .is_some_and(|span| span.start <= start && end <= span.end)
-            })
-            .collect()
+        tokens_inside(&self.response_spans, offsets)
     }
+}
+
+/// Which tokens lie wholly inside one of `spans` (sorted, disjoint byte
+/// ranges), given each token's byte span of the text.
+///
+/// A token that covers nothing (a BOS the tokenizer added) is outside every
+/// span, and one that straddles the edge of a span is outside it. This is
+/// the one rule that turns a loss mask in bytes into a loss mask over tokens,
+/// for conversations ([`FormattedChat::trainable_tokens`]) and for the
+/// prompt/completion and document samples of dataset loading alike.
+pub(crate) fn tokens_inside(spans: &[Range<usize>], offsets: &[(usize, usize)]) -> Vec<bool> {
+    let mut spans = spans.iter().peekable();
+    offsets
+        .iter()
+        .map(|&(start, end)| {
+            // Tokens come in text order, so spans already passed are done.
+            while spans.next_if(|span| span.end <= start).is_some() {}
+            end > start
+                && spans
+                    .peek()
+                    .is_some_and(|span| span.start <= start && end <= span.end)
+        })
+        .collect()
 }
 
 /// Builder for creating training samples with response masking.
@@ -1937,6 +1965,8 @@ mod tests {
             .map(|s| &formatted.text[s.clone()])
             .collect();
         assert_eq!(spans, ["Hello<|im_end|>\n", "4<|im_end|>\n"]);
+        // The messages the spans are the assistant turns of.
+        assert_eq!(formatted.response_turns, [2, 4]);
         assert_eq!(formatted.response(), "4<|im_end|>\n");
 
         // A reasoning template writes the empty think block of every turn the

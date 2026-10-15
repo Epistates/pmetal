@@ -2005,58 +2005,11 @@ fn load_workload_text_samples(
     dataset_path: &Path,
     chat_template: &pmetal_data::chat_templates::ChatTemplate,
 ) -> anyhow::Result<Vec<TextSample>> {
-    if dataset_path.extension().is_some_and(|ext| ext == "parquet") {
-        if let Ok(samples) = TrainingDataset::load_parquet_text(dataset_path, "text", None) {
-            return Ok(samples);
-        }
-        if let Ok(samples) = TrainingDataset::load_parquet_text(dataset_path, "content", None) {
-            return Ok(samples);
-        }
-
-        let tmp_jsonl = write_temp_jsonl_from_parquet(dataset_path)?;
-        return Ok(TrainingDataset::load_jsonl_text(
-            &tmp_jsonl,
-            DatasetFormat::Auto,
-            Some(chat_template),
-        )?);
-    }
-
     Ok(TrainingDataset::load_jsonl_text(
         dataset_path,
         DatasetFormat::Auto,
         Some(chat_template),
     )?)
-}
-
-fn write_temp_jsonl_from_parquet(dataset_path: &Path) -> anyhow::Result<PathBuf> {
-    let tmp_dir = std::env::temp_dir().join("pmetal-bench-workload");
-    std::fs::create_dir_all(&tmp_dir)?;
-    let tmp_jsonl = tmp_dir.join(format!(
-        "dataset_{}_{}.jsonl",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-
-    let file = std::fs::File::open(dataset_path)?;
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let reader = builder.build()?;
-    let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp_jsonl)?);
-    let mut buf = Vec::new();
-
-    for batch in reader {
-        let batch = batch?;
-        buf.clear();
-        let mut json_writer = arrow_json::writer::LineDelimitedWriter::new(&mut buf);
-        json_writer.write(&batch)?;
-        json_writer.finish()?;
-        out.write_all(&buf)?;
-    }
-    out.flush()?;
-
-    Ok(tmp_jsonl)
 }
 
 fn benchmark_prompt_text(sample: &TextSample) -> &str {
@@ -4557,14 +4510,8 @@ mod tests {
     fn sampled_workload_dataset_writes_prompt_column() {
         let output = NamedTempFile::new().expect("temp output");
         let samples = vec![
-            TextSample {
-                text: "prompt\n\nresponse".to_string(),
-                prompt: Some("prompt".to_string()),
-            },
-            TextSample {
-                text: "plain text".to_string(),
-                prompt: None,
-            },
+            TextSample::completion("prompt", "\n\nresponse"),
+            TextSample::document("plain text"),
         ];
 
         write_sampled_workload_dataset(&samples, output.path()).expect("write dataset");

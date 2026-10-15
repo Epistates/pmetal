@@ -26,8 +26,9 @@ pub struct FixedSizeImageProcessorConfig {
     pub mean: [f32; 3],
     /// Normalization standard deviation (RGB).
     pub std: [f32; 3],
-    /// Rescaling factor (e.g., 1/255.0).
-    pub rescale_factor: f32,
+    /// Rescaling factor (e.g., 1/255.0). An `f64`, as the reference holds it:
+    /// it multiplies in f64, and an f32 factor rounds some pixels one ULP away.
+    pub rescale_factor: f64,
     /// Resampling filter, corresponding to `preprocessor_config.json`'s
     /// `resample`. Llama 3.2 Vision ships `2` = bilinear.
     pub resample: ResampleFilter,
@@ -52,43 +53,27 @@ impl Default for FixedSizeImageProcessorConfig {
     }
 }
 
-/// Fixed-size CLIP-style image processor: stretch to a fixed square, rescale,
+/// Fixed-size CLIP-style image processor: stretch to a fixed size, rescale,
 /// normalise.
 ///
 /// This is the generic training-data path — it is *not* any released VLM's
 /// preprocessing, because every one of them preserves aspect ratio somehow.
 /// Llama 3.2 Vision in particular tiles (see the caveat on the defaults below).
-///
-/// Supports:
-/// - Single image preprocessing
-/// - Batch preprocessing
-/// - GPU-accelerated normalization via MLX
+/// What it does reproduce is the processor that stretches, SigLIP's
+/// (`SiglipImageProcessor` in `transformers`), exactly: the image is
+/// converted to RGB, resized with the Pillow-exact resampler and normalised
+/// with the reference's staging (see `PixelNormalizer`), at atol 0 on its
+/// fixture. Decoding a file is the `image` crate's, which is not bit-exact
+/// with Pillow's for lossy formats.
 #[derive(Debug, Clone)]
 pub struct FixedSizeImageProcessor {
     config: FixedSizeImageProcessorConfig,
-    /// Pre-computed normalization arrays for GPU processing.
-    mean_array: Option<Array>,
-    std_array: Option<Array>,
 }
 
 impl FixedSizeImageProcessor {
     /// Create a new processor.
     pub fn new(config: FixedSizeImageProcessorConfig) -> Self {
-        Self {
-            config,
-            mean_array: None,
-            std_array: None,
-        }
-    }
-
-    /// Initialize GPU arrays for normalization.
-    /// Call this once before processing many images for better performance.
-    pub fn init_gpu_arrays(&mut self) -> Result<(), Exception> {
-        // Mean: [1, 3, 1, 1] for broadcasting over [N, C, H, W]
-        self.mean_array = Some(Array::from_f32_slice(&self.config.mean, &[1, 3, 1, 1]));
-        // Std: [1, 3, 1, 1]
-        self.std_array = Some(Array::from_f32_slice(&self.config.std, &[1, 3, 1, 1]));
-        Ok(())
+        Self { config }
     }
 
     /// Load and preprocess an image from file.
@@ -98,20 +83,18 @@ impl FixedSizeImageProcessor {
         let img = image::open(image_path)
             .map_err(|e| Exception::custom(format!("Failed to open image: {}", e)))?;
 
-        self.process_image(img)
+        self.process_image(&img)
     }
 
     /// Process a loaded DynamicImage.
     ///
-    /// Optimized implementation that:
-    /// 1. Resizes image to target size
-    /// 2. Converts to NCHW float32 layout
-    /// 3. Applies rescaling and normalization
+    /// 1. Converts to RGB, then resizes to the target size (the reference's
+    ///    order: `do_convert_rgb` runs before the resize);
+    /// 2. rescales and normalises with the reference's staging;
+    /// 3. lays the result out as NCHW float32.
     ///
     /// Returns: Array of shape [1, 3, H, W]
-    pub fn process_image(&self, img: DynamicImage) -> Result<Array, Exception> {
-        // 1. Convert to RGB, then resize — the reference order (`do_convert_rgb`
-        // runs before the resize), and the resampler is Pillow-exact.
+    pub fn process_image(&self, img: &DynamicImage) -> Result<Array, Exception> {
         let rgb = pillow_resample::resize_rgb8(
             &img.to_rgb8(),
             self.config.size.0,
@@ -124,75 +107,24 @@ impl FixedSizeImageProcessor {
         let num_pixels = height * width;
         let pixels = rgb.as_raw();
 
-        // 2. Convert to NCHW format with single-pass processing
-        // Pre-allocate exact size needed: 3 channels * height * width
-        let total_size = 3 * num_pixels;
-        let mut data = Vec::with_capacity(total_size);
-
-        // Process each channel using iterator for better vectorization
-        for c in 0..3 {
-            let mean = self.config.mean[c];
-            let std = self.config.std[c];
-            let scale = self.config.rescale_factor;
-
-            // Extract channel c from interleaved RGB data
-            // Pixels are stored as [R, G, B, R, G, B, ...]
-            // We want [R0, R1, R2, ...] for channel 0
-            data.extend((0..num_pixels).map(|i| {
-                let pixel_val = pixels[i * 3 + c] as f32;
-                (pixel_val * scale - mean) / std
-            }));
-        }
-
-        // Create Array: [1, C, H, W]
-        let shape = &[1, 3i32, height as i32, width as i32];
-        let array = Array::from_f32_slice(&data, shape);
-
-        Ok(array)
-    }
-
-    /// Process image with GPU-accelerated normalization.
-    ///
-    /// More efficient for large batches as normalization happens on GPU.
-    /// Requires `init_gpu_arrays()` to be called first.
-    pub fn process_image_gpu(&self, img: DynamicImage) -> Result<Array, Exception> {
-        let mean = self.mean_array.as_ref().ok_or_else(|| {
-            Exception::custom("GPU arrays not initialized. Call init_gpu_arrays() first.")
-        })?;
-        let std = self.std_array.as_ref().ok_or_else(|| {
-            Exception::custom("GPU arrays not initialized. Call init_gpu_arrays() first.")
-        })?;
-
-        // 1. Convert to RGB, then resize (see `process_image`).
-        let rgb = pillow_resample::resize_rgb8(
-            &img.to_rgb8(),
-            self.config.size.0,
-            self.config.size.1,
-            self.config.resample,
+        let normalizer = PixelNormalizer::new(
+            true,
+            self.config.rescale_factor,
+            true,
+            self.config.mean,
+            self.config.std,
         );
-
-        let width = rgb.width() as usize;
-        let height = rgb.height() as usize;
-        let num_pixels = height * width;
-        let pixels = rgb.as_raw();
-
-        // 2. Convert to NCHW uint8 first (just layout conversion)
+        // Pixels are stored [R, G, B, R, G, B, ...]; the output is planar
+        // [R0, R1, ..., G0, ...].
         let mut data = Vec::with_capacity(3 * num_pixels);
         for c in 0..3 {
-            data.extend((0..num_pixels).map(|i| pixels[i * 3 + c] as f32));
+            data.extend((0..num_pixels).map(|i| normalizer.apply(pixels[i * 3 + c], c)));
         }
 
-        // 3. Create array and do normalization on GPU
-        let shape = &[1, 3i32, height as i32, width as i32];
-        let arr = Array::from_f32_slice(&data, shape);
-
-        // GPU operations: rescale then normalize
-        let rescale = Array::from_f32(self.config.rescale_factor);
-        let scaled = arr.multiply(&rescale);
-        let centered = scaled.subtract(mean);
-        let normalized = centered.divide(std);
-
-        Ok(normalized)
+        Ok(Array::from_f32_slice(
+            &data,
+            &[1, 3i32, height as i32, width as i32],
+        ))
     }
 
     /// Process a batch of images.
@@ -203,15 +135,13 @@ impl FixedSizeImageProcessor {
             return Err(Exception::custom("Empty image batch"));
         }
 
-        let mut batch_data = Vec::new();
-
-        for img in images {
-            let processed = self.process_image(img.clone())?;
-            batch_data.push(processed);
-        }
+        let processed = images
+            .iter()
+            .map(|img| self.process_image(img))
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Stack along batch dimension
-        let batch_refs: Vec<&Array> = batch_data.iter().collect();
+        let batch_refs: Vec<&Array> = processed.iter().collect();
         Ok(pmetal_runtime::compat::ops::concatenate_axis(
             &batch_refs,
             0,
@@ -240,14 +170,14 @@ impl FixedSizeImageProcessor {
 /// SigLIP-style image processor with different normalization.
 #[derive(Debug, Clone)]
 pub struct SiglipImageProcessor {
-    config: FixedSizeImageProcessorConfig,
+    inner: FixedSizeImageProcessor,
 }
 
 impl SiglipImageProcessor {
-    /// Create a new SigLIP processor.
+    /// Create a new SigLIP processor for a `(width, height)` target.
     pub fn new(size: (u32, u32)) -> Self {
         Self {
-            config: FixedSizeImageProcessorConfig {
+            inner: FixedSizeImageProcessor::new(FixedSizeImageProcessorConfig {
                 size,
                 // SigLIP normalises with `IMAGENET_STANDARD_MEAN/STD`, not
                 // CLIP's stats, and resamples bicubic (`"resample": 3`) where
@@ -256,14 +186,13 @@ impl SiglipImageProcessor {
                 std: [0.5, 0.5, 0.5],
                 rescale_factor: 1.0 / 255.0,
                 resample: ResampleFilter::Bicubic,
-            },
+            }),
         }
     }
 
     /// Process an image.
-    pub fn process_image(&self, img: DynamicImage) -> Result<Array, Exception> {
-        let processor = FixedSizeImageProcessor::new(self.config.clone());
-        processor.process_image(img)
+    pub fn process_image(&self, img: &DynamicImage) -> Result<Array, Exception> {
+        self.inner.process_image(img)
     }
 }
 
@@ -1116,10 +1045,11 @@ mod tests {
         let processor = SiglipImageProcessor::new((384, 384));
 
         // SigLIP uses 0.5 mean/std
-        assert_eq!(processor.config.mean, [0.5, 0.5, 0.5]);
-        assert_eq!(processor.config.std, [0.5, 0.5, 0.5]);
+        let config = processor.inner.config();
+        assert_eq!(config.mean, [0.5, 0.5, 0.5]);
+        assert_eq!(config.std, [0.5, 0.5, 0.5]);
         // ...and bicubic resampling, where Llama 3.2 Vision ships bilinear.
-        assert_eq!(processor.config.resample, ResampleFilter::Bicubic);
+        assert_eq!(config.resample, ResampleFilter::Bicubic);
         assert_eq!(
             FixedSizeImageProcessorConfig::default().resample,
             ResampleFilter::Bilinear
@@ -1138,7 +1068,7 @@ mod tests {
         let img_buf = image::RgbImage::from_fn(4, 4, |_x, _y| image::Rgb([128u8, 64, 192]));
         let img = DynamicImage::ImageRgb8(img_buf);
 
-        let mut result = processor.process_image(img).unwrap();
+        let mut result = processor.process_image(&img).unwrap();
         result.eval();
 
         // Check shape: [1, 3, 4, 4]

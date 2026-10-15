@@ -1,11 +1,9 @@
 //! DataLoader for creating training batches.
 
 use pmetal_runtime::compat::{Array, ops as mlx_ops};
-use rand::SeedableRng;
-use rand::seq::SliceRandom;
 use std::sync::Arc;
 
-use super::{Sample, TrainingDataset};
+use super::{IGNORE_INDEX, Sample, TrainingDataset};
 use crate::image_processing::FixedSizeImageProcessor;
 
 /// Errors produced while constructing a training batch.
@@ -30,6 +28,155 @@ pub enum DataLoaderError {
         /// Index of the sample missing image data.
         sample_index: usize,
     },
+    /// The fixed-size image path takes one image per sample.
+    #[error("sample {sample_index} has {count} images; a batch takes one per sample")]
+    TooManyImages {
+        /// Index of the sample within the batch.
+        sample_index: usize,
+        /// How many images it has.
+        count: usize,
+    },
+    /// A sample's labels are not one per token, so padding them would shift
+    /// every label after the first missing one onto the wrong token.
+    #[error("sample {sample_index} has {labels} labels for {tokens} tokens")]
+    LabelLength {
+        /// Dataset index of the sample.
+        sample_index: usize,
+        /// Number of tokens.
+        tokens: usize,
+        /// Number of labels.
+        labels: usize,
+    },
+    /// A [`LoaderState`] that this loader's epoch cannot be at.
+    #[error(
+        "cannot resume at sample {position} of an epoch of {epoch_len} in batches of {batch_size}"
+    )]
+    BadState {
+        /// Position the state asked for.
+        position: usize,
+        /// Samples this rank serves per epoch.
+        epoch_len: usize,
+        /// Batch size of this loader.
+        batch_size: usize,
+    },
+}
+
+/// Where a loader is in its epoch: enough to resume it exactly.
+///
+/// Take it with the loader's `state()` whenever a checkpoint is written, and
+/// hand it to `restore()` on a loader built over the same data and
+/// configuration: the rest of the epoch is the one the first run would have
+/// served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoaderState {
+    /// The seed the epoch was started with (the order is a function of it).
+    pub epoch_seed: u64,
+    /// How many of the epoch's items (samples for [`DataLoader`], packed rows
+    /// for [`PackedDataLoader`](crate::PackedDataLoader)) were already served.
+    pub position: usize,
+}
+
+/// A permutation of `0..n` that depends only on `seed`.
+///
+/// Fisher-Yates over SplitMix64: written out rather than taken from `rand` so
+/// an epoch's order is the same in every build, which a checkpoint taken mid
+/// epoch relies on to resume where it stopped.
+pub fn shuffled_indices(n: usize, seed: u64) -> Vec<usize> {
+    let mut state = seed;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        // Multiply-shift range reduction: uniform up to 2^-64 * n.
+        let j = ((u128::from(next()) * (i as u128 + 1)) >> 64) as usize;
+        indices.swap(i, j);
+    }
+    indices
+}
+
+/// Reorder `indices` so that consecutive `batch_size` runs hold items of
+/// similar `length`, in megabatches of `megabatch_batches` batches: see
+/// [`DataLoader::with_length_grouping`]. A pure function of its inputs and
+/// `seed`. A short final batch stays last.
+pub(crate) fn group_by_length(
+    indices: &mut Vec<usize>,
+    length: impl Fn(usize) -> usize,
+    batch_size: usize,
+    megabatch_batches: usize,
+    seed: u64,
+) {
+    let megabatch_len = batch_size * megabatch_batches.max(1);
+    let mut grouped: Vec<usize> = Vec::with_capacity(indices.len());
+    let mut remainder: Vec<usize> = Vec::new();
+    // The batch (start offset in `grouped`) holding the longest item so far.
+    let mut longest = (0usize, 0usize);
+    for (n, chunk) in indices.chunks(megabatch_len).enumerate() {
+        let mut chunk = chunk.to_vec();
+        // Longest first; ties by position, which keeps the order total.
+        chunk.sort_by_key(|&i| std::cmp::Reverse(length(i)));
+        let full = chunk.len() / batch_size * batch_size;
+        let batches = full / batch_size;
+        for b in shuffled_indices(
+            batches,
+            seed ^ (n as u64 + 1).wrapping_mul(0xA24B_AED4_963E_E407),
+        ) {
+            let batch = &chunk[b * batch_size..(b + 1) * batch_size];
+            let max = batch.iter().map(|&i| length(i)).max().unwrap_or(0);
+            if max > longest.1 {
+                longest = (grouped.len(), max);
+            }
+            grouped.extend_from_slice(batch);
+        }
+        remainder.extend_from_slice(&chunk[full..]);
+    }
+    // Only the last megabatch can be short; its leftovers close the epoch.
+    grouped.extend_from_slice(&remainder);
+    // The batch with the longest item leads the epoch.
+    if longest.0 + batch_size <= grouped.len() {
+        grouped[..longest.0 + batch_size].rotate_right(batch_size);
+    }
+    *indices = grouped;
+}
+
+/// The items one rank serves in an epoch, in order.
+///
+/// The epoch is `0..n` (shuffled by `seed` when `shuffle`), and rank `rank` of
+/// `world_size` takes every `world_size`-th item from its own offset. Each
+/// rank gets exactly `n / world_size` items: a rank that served one more would
+/// wait forever on a collective its peers never join, so the last
+/// `n % world_size` items of the epoch's order sit out (a different few each
+/// epoch when shuffled). Fewer items than ranks is the exception: the order
+/// wraps so no rank is left with nothing.
+pub(crate) fn epoch_order(
+    n: usize,
+    shuffle: bool,
+    seed: u64,
+    rank: usize,
+    world_size: usize,
+) -> Vec<usize> {
+    let order = if shuffle {
+        shuffled_indices(n, seed)
+    } else {
+        (0..n).collect()
+    };
+    if world_size <= 1 {
+        return order;
+    }
+    let share = n / world_size;
+    if share == 0 {
+        return order.get(rank % n.max(1)).copied().into_iter().collect();
+    }
+    order
+        .into_iter()
+        .take(share * world_size)
+        .skip(rank)
+        .step_by(world_size)
+        .collect()
 }
 
 /// A batch of training data ready for the model.
@@ -90,15 +237,27 @@ impl Default for DataLoaderConfig {
 }
 
 /// DataLoader that yields batches from a dataset.
+///
+/// An epoch's order is a function of the seed it was started with
+/// ([`new`](Self::new) uses `config.seed`, [`reset`](Self::reset) the seed it
+/// is given), so [`state`](Self::state) and [`restore`](Self::restore) resume
+/// a run mid-epoch exactly. Under data parallelism (`config.rank` /
+/// `config.world_size`) each rank serves an equal, disjoint share of every
+/// epoch.
 pub struct DataLoader {
-    /// The dataset.
-    dataset: TrainingDataset,
+    /// The dataset, shared: a loader per epoch (or per evaluation) over one
+    /// dataset reads it without copying it.
+    dataset: Arc<TrainingDataset>,
     /// Configuration.
     config: DataLoaderConfig,
-    /// Current index permutation.
+    /// This rank's samples for the current epoch, in serving order.
     indices: Vec<usize>,
-    /// Current position in the dataset.
+    /// How many of `indices` were already served.
     position: usize,
+    /// Seed of the epoch being served.
+    epoch_seed: u64,
+    /// Megabatch size, in batches, when batching by length.
+    length_grouping: Option<usize>,
     /// Optional image processor for multimodal data.
     image_processor: Option<Arc<FixedSizeImageProcessor>>,
 }
@@ -114,68 +273,122 @@ struct BatchComponents {
 }
 
 impl DataLoader {
-    /// Create a new DataLoader.
+    /// Create a new DataLoader, its first epoch ordered by `config.seed`.
+    ///
+    /// `dataset` is a [`TrainingDataset`] or an `Arc` of one; with an `Arc`
+    /// (cloned per loader) the samples are not copied.
     pub fn new(
-        dataset: TrainingDataset,
+        dataset: impl Into<Arc<TrainingDataset>>,
         config: DataLoaderConfig,
         image_processor: Option<Arc<FixedSizeImageProcessor>>,
     ) -> Self {
-        let n = dataset.len();
-        let mut indices: Vec<usize> = (0..n).collect();
-
-        if config.shuffle {
-            // All nodes use the same seed so they produce the same permutation,
-            // then each node takes its own shard.
-            let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
-            indices.shuffle(&mut rng);
-        }
-
-        // Distributed data sharding: keep every world_size-th index starting at rank
-        if config.world_size > 1 {
-            indices = indices
-                .into_iter()
-                .skip(config.rank)
-                .step_by(config.world_size)
-                .collect();
-        }
-
-        Self {
-            dataset,
+        let mut loader = Self {
+            dataset: dataset.into(),
+            epoch_seed: config.seed,
+            length_grouping: None,
             config,
-            indices,
+            indices: Vec::new(),
             position: 0,
             image_processor,
-        }
+        };
+        loader.start_epoch(loader.config.seed);
+        loader
     }
 
-    /// Reset the DataLoader for a new epoch.
-    pub fn reset(&mut self, new_seed: Option<u64>) {
+    /// Order the epoch started by `seed` for this rank and rewind to its
+    /// first sample.
+    fn start_epoch(&mut self, seed: u64) {
+        self.epoch_seed = seed;
         self.position = 0;
-        let n = self.dataset.len();
-        let mut indices: Vec<usize> = (0..n).collect();
-        if self.config.shuffle {
-            let seed = new_seed.unwrap_or(self.config.seed);
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            indices.shuffle(&mut rng);
+        // Every rank derives the same permutation from the same seed, then
+        // takes its own share of it.
+        self.indices = epoch_order(
+            self.dataset.len(),
+            self.config.shuffle,
+            seed,
+            self.config.rank,
+            self.config.world_size,
+        );
+        if let Some(megabatch) = self.length_grouping {
+            let max_len = self.config.max_seq_len;
+            let samples = self.dataset.samples();
+            group_by_length(
+                &mut self.indices,
+                |i| samples[i].input_ids.len().min(max_len),
+                self.config.batch_size.max(1),
+                megabatch,
+                seed,
+            );
         }
-        // Re-apply distributed sharding
-        if self.config.world_size > 1 {
-            indices = indices
-                .into_iter()
-                .skip(self.config.rank)
-                .step_by(self.config.world_size)
-                .collect();
-        }
-        self.indices = indices;
     }
 
-    /// Get the number of batches.
+    /// Batch samples of similar length together to cut padding.
+    ///
+    /// Each epoch's order is cut into megabatches of `megabatch_batches`
+    /// batches; inside one the samples are sorted by length and dealt into
+    /// batches, so a batch pads to nearly its own shortest sample instead of
+    /// to the longest of a random draw. The batches of a megabatch are then
+    /// shuffled (the sort would otherwise feed them longest to shortest, a
+    /// curriculum nobody asked for), except that the batch holding the epoch's
+    /// longest sample goes first: a run that is going to run out of memory
+    /// does so on step one. 50 is a good size (the longer the megabatch, the
+    /// less padding and the less random a batch's composition).
+    ///
+    /// Takes effect from the next epoch; the loader is rewound to the start
+    /// of the current one.
+    pub fn with_length_grouping(mut self, megabatch_batches: usize) -> Self {
+        self.length_grouping = Some(megabatch_batches.max(1));
+        self.start_epoch(self.epoch_seed);
+        self
+    }
+
+    /// Start a new epoch, ordered by `new_seed` (`config.seed` when `None`).
+    ///
+    /// The order is a function of the seed alone, not of the epochs served
+    /// before: a loader built with `config.seed = s` serves what a loader that
+    /// was `reset(Some(s))` serves.
+    pub fn reset(&mut self, new_seed: Option<u64>) {
+        self.start_epoch(new_seed.unwrap_or(self.config.seed));
+    }
+
+    /// Where the loader is in its epoch; see [`LoaderState`].
+    pub fn state(&self) -> LoaderState {
+        LoaderState {
+            epoch_seed: self.epoch_seed,
+            position: self.position,
+        }
+    }
+
+    /// Resume at `state`, taken from a loader over the same dataset and
+    /// configuration (the same shard, too: a checkpoint is per rank).
+    ///
+    /// # Errors
+    /// If `state.position` is past the end of the epoch, or not on a batch
+    /// boundary of this loader's batch size, which means the dataset or the
+    /// configuration is not the one the state was taken from.
+    pub fn restore(&mut self, state: LoaderState) -> Result<(), DataLoaderError> {
+        self.start_epoch(state.epoch_seed);
+        let batch_size = self.config.batch_size.max(1);
+        if state.position > self.indices.len() || state.position % batch_size != 0 {
+            return Err(DataLoaderError::BadState {
+                position: state.position,
+                epoch_len: self.indices.len(),
+                batch_size,
+            });
+        }
+        self.position = state.position;
+        Ok(())
+    }
+
+    /// Number of batches this loader serves per epoch: this rank's share of
+    /// the dataset, in batches.
     pub fn num_batches(&self) -> usize {
-        let n = self.dataset.len();
+        let n = self.indices.len();
+        let batch_size = self.config.batch_size.max(1);
         if self.config.drop_last {
-            n / self.config.batch_size
+            n / batch_size
         } else {
-            n.div_ceil(self.config.batch_size)
+            n.div_ceil(batch_size)
         }
     }
 
@@ -206,7 +419,7 @@ impl DataLoader {
             return Ok(None);
         }
 
-        let batch_end = (self.position + self.config.batch_size).min(self.indices.len());
+        let batch_end = (self.position + self.config.batch_size.max(1)).min(self.indices.len());
         let batch_indices = &self.indices[self.position..batch_end];
 
         // Check if we should drop incomplete batch
@@ -227,11 +440,21 @@ impl DataLoader {
     ) -> Result<BatchComponents, DataLoaderError> {
         let batch_size = indices.len();
 
-        // Collect samples
         let samples: Vec<&Sample> = indices
             .iter()
-            .filter_map(|&i| self.dataset.get(i))
+            .map(|&i| &self.dataset.samples()[i])
             .collect();
+        for (sample, &index) in samples.iter().zip(indices) {
+            if let Some(labels) = &sample.labels {
+                if labels.len() != sample.input_ids.len() {
+                    return Err(DataLoaderError::LabelLength {
+                        sample_index: index,
+                        tokens: sample.input_ids.len(),
+                        labels: labels.len(),
+                    });
+                }
+            }
+        }
 
         // Find max sequence length in this batch
         let max_len = samples
@@ -255,6 +478,15 @@ impl DataLoader {
                 for (idx, sample) in samples.iter().enumerate() {
                     match &sample.images {
                         Some(images) if !images.is_empty() => {
+                            // One image per sample: the batch holds one pixel
+                            // tensor per sample, so a second image would be
+                            // dropped while its placeholder stayed in the text.
+                            if images.len() > 1 {
+                                return Err(DataLoaderError::TooManyImages {
+                                    sample_index: idx,
+                                    count: images.len(),
+                                });
+                            }
                             let path = &images[0];
                             match processor.preprocess(path) {
                                 Ok(tensor) => pixel_tensors.push(tensor),
@@ -288,11 +520,11 @@ impl DataLoader {
             // Labels
             if let Some(ref labels) = sample.labels {
                 labels_flat.extend(labels.iter().take(seq_len).copied());
-                labels_flat.extend(std::iter::repeat_n(-100_i64, max_len - seq_len));
+                labels_flat.extend(std::iter::repeat_n(IGNORE_INDEX, max_len - seq_len));
             } else {
-                // No labels - use input_ids shifted (causal LM)
+                // No labels: train on every token. The loss does the shifting.
                 labels_flat.extend(sample.input_ids.iter().take(seq_len).map(|&x| x as i64));
-                labels_flat.extend(std::iter::repeat_n(-100_i64, max_len - seq_len));
+                labels_flat.extend(std::iter::repeat_n(IGNORE_INDEX, max_len - seq_len));
             }
 
             // Attention mask
@@ -372,6 +604,309 @@ pub fn create_batch_iterator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn numbered(n: usize) -> TrainingDataset {
+        TrainingDataset::from_samples((0..n).map(|i| Sample::new(vec![i as u32 + 1])).collect())
+    }
+
+    fn loader(n: usize, config: DataLoaderConfig) -> DataLoader {
+        DataLoader::new(numbered(n), config, None)
+    }
+
+    /// Every sample the loader serves this epoch, in order.
+    fn served(loader: &mut DataLoader) -> Vec<usize> {
+        let mut out = Vec::new();
+        while let Some(batch) = loader.try_next_batch().unwrap() {
+            out.extend(batch.sample_indices);
+        }
+        out
+    }
+
+    /// The same epoch twice from one seed is the same order; different seeds
+    /// give different ones; and the order is pinned, because a checkpoint
+    /// taken in one build is resumed in another.
+    #[test]
+    fn an_epoch_order_is_a_pure_function_of_its_seed() {
+        assert_eq!(shuffled_indices(10, 42), shuffled_indices(10, 42));
+        assert_ne!(shuffled_indices(10, 42), shuffled_indices(10, 43));
+        assert_eq!(shuffled_indices(10, 0), [4, 9, 2, 5, 1, 7, 6, 0, 3, 8]);
+        let mut sorted = shuffled_indices(1000, 7);
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..1000).collect::<Vec<_>>());
+        assert!(shuffled_indices(0, 1).is_empty());
+        assert_eq!(shuffled_indices(1, 1), [0]);
+    }
+
+    /// `reset(Some(s))` lands where a fresh loader seeded `s` starts, whatever
+    /// epochs came before.
+    #[test]
+    fn reset_depends_on_the_seed_alone() {
+        let config = |seed| DataLoaderConfig {
+            batch_size: 3,
+            seed,
+            ..Default::default()
+        };
+        let mut worn = loader(20, config(1));
+        served(&mut worn);
+        worn.reset(Some(5));
+        served(&mut worn);
+        worn.reset(Some(9));
+        let mut fresh = loader(20, config(9));
+        assert_eq!(served(&mut worn), served(&mut fresh));
+        worn.reset(None);
+        assert_eq!(served(&mut worn), served(&mut loader(20, config(1))));
+    }
+
+    /// Ranks serve disjoint shares of equal size: a rank with one more batch
+    /// than its peers would wait on a collective they never reach.
+    #[test]
+    fn ranks_serve_equal_disjoint_shares() {
+        for (n, world) in [(10, 3), (11, 4), (12, 4), (7, 7), (100, 8)] {
+            let mut union = Vec::new();
+            for rank in 0..world {
+                let mut l = loader(
+                    n,
+                    DataLoaderConfig {
+                        batch_size: 2,
+                        rank,
+                        world_size: world,
+                        ..Default::default()
+                    },
+                );
+                let share = n / world;
+                assert_eq!(l.num_batches(), share.div_ceil(2), "n {n} world {world}");
+                let mine = served(&mut l);
+                assert_eq!(mine.len(), share, "n {n} world {world} rank {rank}");
+                union.extend(mine);
+            }
+            let count = union.len();
+            union.sort_unstable();
+            union.dedup();
+            assert_eq!(union.len(), count, "a sample went to two ranks");
+        }
+    }
+
+    /// Without a shuffle the shards partition the dataset, less the remainder.
+    #[test]
+    fn unshuffled_shards_partition_the_dataset() {
+        let mut all = Vec::new();
+        for rank in 0..3 {
+            let config = DataLoaderConfig {
+                shuffle: false,
+                rank,
+                world_size: 3,
+                ..Default::default()
+            };
+            all.extend(served(&mut loader(9, config)));
+        }
+        all.sort_unstable();
+        assert_eq!(all, (0..9).collect::<Vec<_>>());
+    }
+
+    /// Fewer samples than ranks: every rank still gets one.
+    #[test]
+    fn a_tiny_dataset_still_feeds_every_rank() {
+        for rank in 0..4 {
+            let config = DataLoaderConfig {
+                rank,
+                world_size: 4,
+                ..Default::default()
+            };
+            assert_eq!(served(&mut loader(2, config)).len(), 1);
+        }
+    }
+
+    /// Stop after some batches, save the state, resume in a new loader: the
+    /// rest of the epoch is what the first loader would have served.
+    #[test]
+    fn a_restored_loader_serves_the_rest_of_the_epoch() {
+        let config = || DataLoaderConfig {
+            batch_size: 4,
+            seed: 11,
+            rank: 1,
+            world_size: 2,
+            ..Default::default()
+        };
+        let mut first = loader(50, config());
+        first.reset(Some(12));
+        for _ in 0..3 {
+            first.try_next_batch().unwrap().unwrap();
+        }
+        let state = first.state();
+        assert_eq!(state.position, 12);
+        let rest = served(&mut first);
+
+        let mut resumed = loader(50, config());
+        resumed.restore(state).unwrap();
+        assert_eq!(served(&mut resumed), rest);
+
+        // The state survives a checkpoint round trip.
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(serde_json::from_str::<LoaderState>(&json).unwrap(), state);
+    }
+
+    #[test]
+    fn a_state_from_another_epoch_shape_is_refused() {
+        let mut l = loader(
+            10,
+            DataLoaderConfig {
+                batch_size: 4,
+                ..Default::default()
+            },
+        );
+        let at = |position| LoaderState {
+            epoch_seed: 1,
+            position,
+        };
+        assert!(l.restore(at(11)).is_err(), "past the end");
+        assert!(l.restore(at(3)).is_err(), "not on a batch boundary");
+        assert!(l.restore(at(8)).is_ok());
+    }
+
+    /// Loaders over one `Arc` share the samples; none copies them.
+    #[test]
+    fn loaders_over_an_arc_share_the_dataset() {
+        let shared = Arc::new(numbered(10));
+        let a = DataLoader::new(Arc::clone(&shared), DataLoaderConfig::default(), None);
+        let b = DataLoader::new(Arc::clone(&shared), DataLoaderConfig::default(), None);
+        assert_eq!(Arc::strong_count(&shared), 3);
+        assert_eq!((a.len(), b.len()), (10, 10));
+    }
+
+    fn variable_length_dataset(n: usize) -> TrainingDataset {
+        let mut state = 99u64;
+        TrainingDataset::from_samples(
+            (0..n)
+                .map(|i| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let len = 1 + (state >> 33) as usize % 200;
+                    Sample::new(vec![i as u32; len])
+                })
+                .collect(),
+        )
+    }
+
+    /// Tokens a padded batch holds beyond its samples' own.
+    fn padding(dataset: &TrainingDataset, order: &[usize], batch_size: usize) -> usize {
+        order
+            .chunks(batch_size)
+            .map(|batch| {
+                let longest = batch.iter().map(|&i| dataset.samples()[i].input_ids.len());
+                let longest = longest.max().unwrap();
+                batch
+                    .iter()
+                    .map(|&i| longest - dataset.samples()[i].input_ids.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    /// Batching by length serves the same samples, with far less padding, the
+    /// longest sample's batch first, and any short batch last.
+    #[test]
+    fn length_grouping_cuts_padding_without_losing_samples() {
+        let dataset = variable_length_dataset(1003);
+        let config = || DataLoaderConfig {
+            batch_size: 8,
+            max_seq_len: 4096,
+            seed: 5,
+            ..Default::default()
+        };
+        let mut plain = DataLoader::new(dataset.clone(), config(), None);
+        let mut grouped = DataLoader::new(dataset.clone(), config(), None).with_length_grouping(50);
+        let plain_order = served(&mut plain);
+        let grouped_order = served(&mut grouped);
+
+        let mut sorted = grouped_order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..1003).collect::<Vec<_>>());
+        let before = padding(&dataset, &plain_order, 8);
+        let after = padding(&dataset, &grouped_order, 8);
+        assert!(after * 5 < before, "padding {before} -> {after}");
+
+        let longest = (0..1003)
+            .max_by_key(|&i| dataset.samples()[i].input_ids.len())
+            .unwrap();
+        assert!(grouped_order[..8].contains(&longest), "longest batch first");
+        assert_eq!(grouped_order.len() % 8, 1003 % 8);
+    }
+
+    /// A grouped epoch is a function of its seed like any other, so it
+    /// resumes.
+    #[test]
+    fn a_length_grouped_epoch_is_deterministic_and_resumable() {
+        let dataset = variable_length_dataset(300);
+        let make = || {
+            DataLoader::new(
+                dataset.clone(),
+                DataLoaderConfig {
+                    batch_size: 4,
+                    seed: 8,
+                    ..Default::default()
+                },
+                None,
+            )
+            .with_length_grouping(10)
+        };
+        let mut a = make();
+        let mut b = make();
+        assert_eq!(served(&mut a), served(&mut b));
+        a.reset(Some(9));
+        for _ in 0..5 {
+            a.try_next_batch().unwrap().unwrap();
+        }
+        let state = a.state();
+        let rest = served(&mut a);
+        let mut resumed = make();
+        resumed.restore(state).unwrap();
+        assert_eq!(served(&mut resumed), rest);
+    }
+
+    /// A second image would be dropped while its placeholder stayed in the
+    /// text; that is an error, not a silent truncation.
+    #[test]
+    fn a_sample_with_two_images_is_refused_by_the_single_image_loader() {
+        use crate::image_processing::{FixedSizeImageProcessor, FixedSizeImageProcessorConfig};
+        let sample =
+            Sample::with_images(vec![1, 2], vec![1, 2], vec!["a.png".into(), "b.png".into()]);
+        let mut l = DataLoader::new(
+            TrainingDataset::from_samples(vec![sample]),
+            DataLoaderConfig::default(),
+            Some(Arc::new(FixedSizeImageProcessor::new(
+                FixedSizeImageProcessorConfig::default(),
+            ))),
+        );
+        assert!(matches!(
+            l.try_next_batch(),
+            Err(DataLoaderError::TooManyImages { count: 2, .. })
+        ));
+    }
+
+    /// Labels that don't line up with the tokens would shift every label
+    /// after the gap; that is an error, not a padded batch.
+    #[test]
+    fn labels_that_do_not_match_the_tokens_are_an_error() {
+        let bad = Sample {
+            input_ids: vec![1, 2, 3],
+            labels: Some(vec![1, 2]),
+            images: None,
+        };
+        let mut l = DataLoader::new(
+            TrainingDataset::from_samples(vec![bad]),
+            DataLoaderConfig::default(),
+            None,
+        );
+        assert!(matches!(
+            l.try_next_batch(),
+            Err(DataLoaderError::LabelLength {
+                tokens: 3,
+                labels: 2,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn test_dataloader_basic() {

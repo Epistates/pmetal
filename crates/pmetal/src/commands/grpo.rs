@@ -92,38 +92,14 @@ pub(crate) async fn run_grpo_cli(
 
     // 3. Load Dataset (Prompts — supports both JSONL and Parquet)
     tracing::info!("Loading prompt dataset: {}", dataset_path);
-    let is_parquet = std::path::Path::new(dataset_path)
-        .extension()
-        .is_some_and(|ext| ext == "parquet");
-    let dataset = if is_parquet {
-        tracing::info!("Detected Parquet format");
-        let result = TrainingDataset::from_parquet_tokenized(
-            dataset_path,
-            &tokenizer,
-            "text",
-            max_seq_len,
-            None,
-        );
-        match result {
-            Ok(ds) => ds,
-            Err(_) => TrainingDataset::from_parquet_tokenized(
-                dataset_path,
-                &tokenizer,
-                "content",
-                max_seq_len,
-                None,
-            )?,
-        }
-    } else {
-        TrainingDataset::from_jsonl_tokenized(
-            dataset_path,
-            &tokenizer,
-            DatasetFormat::Auto,
-            max_seq_len,
-            Some(&chat_template),
-            column_cfg.as_ref(),
-        )?
-    };
+    let dataset = TrainingDataset::from_jsonl_tokenized(
+        dataset_path,
+        &tokenizer,
+        DatasetFormat::Auto,
+        max_seq_len,
+        Some(&chat_template),
+        column_cfg.as_ref(),
+    )?;
     tracing::info!("GRPO dataset loaded: {} samples", dataset.len());
     {
         let stats = dataset.compute_statistics(max_seq_len);

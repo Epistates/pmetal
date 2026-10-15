@@ -1,168 +1,140 @@
 //! Sequence packing for efficient training.
 //!
-//! Packing concatenates multiple sequences into single batches to
-//! eliminate padding and improve GPU utilization. This can provide
-//! 2-3x training throughput improvement on datasets with variable-length sequences.
+//! Packing concatenates several short documents into one row so a batch carries
+//! no padding to speak of. On a dataset of variable-length samples that is a
+//! 2-3x throughput gain over padding every sample to the longest.
 //!
-//! # Overview
-//!
-//! Traditional batching pads all sequences to the maximum length:
 //! ```text
-//! [seq1: 10 tokens][PAD PAD PAD PAD PAD PAD]  <- 6 wasted positions
-//! [seq2: 16 tokens]                           <- full
-//! [seq3: 8 tokens][PAD PAD PAD PAD PAD PAD PAD PAD]  <- 8 wasted
+//! padded:  [doc1: 10 tokens][PAD x6]   [doc2: 16 tokens]   [doc3: 8][PAD x8]
+//! packed:  [doc1: 10][doc3: 8][PAD x6] [doc2: 16]
 //! ```
 //!
-//! Sample packing concatenates sequences efficiently:
-//! ```text
-//! [seq1: 10 tokens][seq3: 8 tokens][seq5: 12 tokens][PAD PAD]  <- only 2 wasted
-//! [seq2: 16 tokens][seq4: 14 tokens]                           <- full
-//! ```
+//! # What a packed row guarantees
 //!
-//! # Algorithm
+//! A packed row trains exactly what the same documents would train unpacked:
 //!
-//! This module implements First-Fit Decreasing (FFD) bin packing:
-//! 1. Sort sequences by length (descending)
-//! 2. For each sequence, try to fit into existing bins
-//! 3. If no bin has room, create a new bin
+//! - **Attention** is block-diagonal and causal: a token sees its own document
+//!   and nothing else ([`PackedBatch::build_attention_mask`],
+//!   [`PackedTrainingBatch::attention_mask`]).
+//! - **Positions** restart at zero in every document ([`PackedBatch::position_ids`]).
+//!   RoPE is relative, so a uniform shift inside a masked block would change
+//!   nothing; the restart matters to the models that read absolute positions.
+//! - **Labels** are unshifted, as everywhere in this crate: the loss compares
+//!   the logits at `t` with the label at `t + 1`. The first token of every
+//!   document after the first has its label masked, which is the one place the
+//!   shift would otherwise score a document's last token against the next
+//!   document's first.
+//! - **Padding** (to [`PackerConfig::pad_to_multiple`]) is a block of its own:
+//!   its tokens attend to each other only, carry label `-100`, and so neither
+//!   see nor are seen by a document, and no attention row is ever empty (an
+//!   all-`-inf` row is a NaN).
 //!
-//! This achieves near-optimal packing efficiency (typically >90% utilization).
+//! # Algorithms
 //!
-//! # Key Components
+//! [`PackingAlgorithm::FirstFitDecreasing`] (the default) and
+//! [`PackingAlgorithm::BestFitDecreasing`] sort documents longest first and
+//! place each in the first (or tightest) row it fits, in `O(n log n)`.
+//! [`PackingAlgorithm::Greedy`] keeps the dataset's order and starts a new row
+//! when the next document does not fit.
 //!
-//! - [`PackedBatch`]: A packed batch with cu_seqlens for FlashAttention
-//! - [`SequencePacker`]: Bin-packing algorithm implementation
-//! - Block diagonal attention masks for SDPA
-//! - Position ID management (reset per sequence)
-//! - Label boundary masking
+//! A document longer than a row is truncated to the row; none is dropped.
 //!
 //! # References
 //!
-//! - [FlashAttention Variable Length](https://github.com/Dao-AILab/flash-attention)
+//! - [FlashAttention variable length](https://github.com/Dao-AILab/flash-attention)
 
-use super::Sample;
+use std::collections::BTreeSet;
+
 use pmetal_core::{PMetalError, Result};
+use pmetal_runtime::compat::{Array, Exception, ops as mlx_ops};
+use rayon::prelude::*;
 
-/// Error type for packing operations.
-#[derive(Debug, thiserror::Error)]
-pub enum PackingError {
-    /// No samples to pack.
-    #[error("No samples to pack")]
-    EmptySamples,
-    /// All samples were filtered out (e.g., too short).
-    #[error("All samples were filtered out")]
-    AllFiltered,
-}
+use super::{IGNORE_INDEX, Sample};
+use crate::dataloader::{LoaderState, epoch_order};
 
 /// A packed batch containing multiple concatenated sequences.
 #[derive(Debug, Clone)]
 pub struct PackedBatch {
-    /// Concatenated input token IDs.
+    /// Concatenated input token IDs, padding included.
     pub input_ids: Vec<u32>,
-    /// Position IDs (reset for each sequence).
+    /// Position IDs (restart at zero for each sequence, and for the padding).
     pub position_ids: Vec<u32>,
-    /// Cumulative sequence lengths for attention (length: num_sequences + 1).
-    /// `cu_seqlens[0] = 0`, `cu_seqlens[i+1] = cu_seqlens[i] + seq_lengths[i]`
+    /// Cumulative lengths of the attention blocks: the documents, then the
+    /// padding when there is any. `cu_seqlens[0] = 0`,
+    /// `cu_seqlens[i+1] = cu_seqlens[i] + seq_lengths[i]`.
     pub cu_seqlens: Vec<u32>,
-    /// Individual sequence lengths.
+    /// Length of each attention block (documents, then padding).
     pub seq_lengths: Vec<u32>,
-    /// Maximum sequence length in this batch.
+    /// Longest attention block in this batch.
     pub max_seqlen: usize,
-    /// Number of sequences in this batch.
+    /// Number of documents in this batch (the padding block is not one).
     pub num_sequences: usize,
-    /// Concatenated labels (with boundary tokens masked as -100).
-    pub labels: Option<Vec<i64>>,
+    /// Labels, aligned with `input_ids` and unshifted. A document that came
+    /// without labels trains on every token; the first token of every
+    /// document after the first, and all padding, is `-100`.
+    pub labels: Vec<i64>,
+    /// Trailing padding tokens, counted in `input_ids`.
+    pub padding: usize,
+}
+
+/// Fill the causal block of one document in an `n x n` additive mask.
+fn fill_causal_block(mask: &mut [f32], n: usize, start: usize, len: usize, window: Option<usize>) {
+    for i in 0..len {
+        let first = window.map_or(0, |w| (i + 1).saturating_sub(w));
+        let row = (start + i) * n + start;
+        mask[row + first..=row + i].fill(0.0);
+    }
 }
 
 impl PackedBatch {
-    /// Get the total number of tokens in this batch.
+    /// Get the total number of tokens in this batch, padding included.
     pub fn total_tokens(&self) -> usize {
         self.input_ids.len()
     }
 
-    /// Build a block diagonal attention mask for SDPA.
+    /// The tokens that belong to a document, i.e. without the padding.
+    pub fn real_tokens(&self) -> usize {
+        self.input_ids.len() - self.padding
+    }
+
+    /// Additive attention mask: `mask[i * n + j]` is `0.0` where token `i` may
+    /// attend to token `j` and `-inf` elsewhere, with `n = total_tokens()`.
     ///
-    /// Returns a 2D mask where `mask[i][j]` is:
-    /// - 0.0 if token i can attend to token j
-    /// - -inf if token i should not attend to token j
-    ///
-    /// The mask ensures each sequence only attends to itself
-    /// with causal masking within each sequence.
-    ///
-    /// # Performance
-    /// Optimized to minimize per-element operations. Complexity is O(n²) for
-    /// initialization plus O(sum(len_i²)) for filling causal blocks.
-    /// For typical packed batches (2048 total tokens), this takes ~1-2ms.
+    /// Each attention block (a document, or the padding) is causal and sees
+    /// nothing outside itself.
     pub fn build_attention_mask(&self) -> Vec<f32> {
+        self.block_causal_mask(None)
+    }
+
+    /// [`build_attention_mask`](Self::build_attention_mask) with a sliding
+    /// window: a token attends to at most `window_size` tokens, itself
+    /// included.
+    pub fn build_attention_mask_with_window(&self, window_size: usize) -> Vec<f32> {
+        self.block_causal_mask(Some(window_size))
+    }
+
+    fn block_causal_mask(&self, window: Option<usize>) -> Vec<f32> {
         let n = self.total_tokens();
-
-        // Pre-allocate with -inf (masked out)
         let mut mask = vec![f32::NEG_INFINITY; n * n];
-
-        // Fill causal blocks for each sequence
-        // Optimization: compute row base once per row instead of per element
-        let mut offset = 0usize;
+        let mut start = 0usize;
         for &len in &self.seq_lengths {
-            let len = len as usize;
-
-            // For each row in this sequence's block
-            for i in 0..len {
-                let row_start = (offset + i) * n + offset;
-                // Fill positions 0..=i with 0.0 (causal: can attend to self and previous)
-                // Use fill instead of per-element assignment for better cache locality
-                let end = i + 1;
-                mask[row_start..row_start + end].fill(0.0);
-            }
-            offset += len;
+            fill_causal_block(&mut mask, n, start, len as usize, window);
+            start += len as usize;
         }
-
         mask
     }
 
-    /// Build a block diagonal attention mask, returning as an MLX Array.
-    ///
-    /// This is more efficient than building `Vec<f32>` and then converting,
-    /// as it avoids an intermediate allocation.
+    /// The mask as an MLX array of shape `[total_tokens, total_tokens]`.
     pub fn build_attention_mask_array(&self) -> std::result::Result<Array, Exception> {
         let n = self.total_tokens() as i32;
-        let mask_data = self.build_attention_mask();
-        Ok(Array::from_f32_slice(&mask_data, &[n, n]))
+        Ok(Array::from_f32_slice(&self.build_attention_mask(), &[n, n]))
     }
 
-    /// Build a block diagonal attention mask with sliding window.
-    ///
-    /// Same as `build_attention_mask` but with a sliding window constraint:
-    /// tokens can only attend to at most `window_size` previous tokens.
-    pub fn build_attention_mask_with_window(&self, window_size: usize) -> Vec<f32> {
-        let n = self.total_tokens();
-        let mut mask = vec![f32::NEG_INFINITY; n * n];
-
-        let mut offset = 0usize;
-        for &len in &self.seq_lengths {
-            let len = len as usize;
-            for i in 0..len {
-                let start = if i >= window_size {
-                    i - window_size + 1
-                } else {
-                    0
-                };
-                for j in start..=i {
-                    mask[(offset + i) * n + (offset + j)] = 0.0;
-                }
-            }
-            offset += len;
-        }
-
-        mask
-    }
-
-    /// Get sequence end positions for loss masking.
-    ///
-    /// Returns indices of the last token of each sequence.
+    /// Index of the last token of each document.
     pub fn sequence_boundaries(&self) -> Vec<usize> {
         let mut boundaries = Vec::with_capacity(self.num_sequences);
         let mut offset = 0usize;
-        for &len in &self.seq_lengths {
+        for &len in self.seq_lengths.iter().take(self.num_sequences) {
             if len > 0 {
                 boundaries.push(offset + len as usize - 1);
             }
@@ -171,30 +143,18 @@ impl PackedBatch {
         boundaries
     }
 
-    /// Mask label positions that would predict across sequence boundaries.
+    /// Mask the label of the first token of every document after the first.
     ///
-    /// For causal LM with shifted labels (`logits[i]` predicts `labels[i+1]`),
-    /// we need to mask the FIRST token of each sequence after the first one.
-    /// This prevents the last token of sequence N from being penalized for
-    /// not predicting the first token of sequence N+1.
-    ///
-    /// Example: For packed sequences `[A, B, C | D, E]` with labels `[A, B, C, D, E]`,
-    /// after `shift_labels = labels[1:]` we get `[B, C, D, E]`.
-    /// `logits[2]` (from C) would predict D, but C is the end of seq1,
-    /// so we must set `labels[3] = -100` to ignore this cross-boundary prediction.
+    /// Labels are unshifted, so the loss scores the logits at `t` against
+    /// `labels[t + 1]`. Without this the last token of one document would be
+    /// scored on predicting the first token of the next, which it cannot see.
     pub fn mask_label_boundaries(&mut self, ignore_index: i64) {
-        if let Some(ref mut labels) = self.labels {
-            // Mask the first token of each sequence (except the first sequence)
-            // because that's what would be predicted from the last token of the previous sequence
-            let mut offset = 0usize;
-            for (i, &len) in self.seq_lengths.iter().enumerate() {
-                let len = len as usize;
-                if i > 0 && offset < labels.len() {
-                    // First token of this sequence - shouldn't be predicted from previous seq
-                    labels[offset] = ignore_index;
-                }
-                offset += len;
+        let mut offset = 0usize;
+        for (i, &len) in self.seq_lengths.iter().take(self.num_sequences).enumerate() {
+            if i > 0 && offset < self.labels.len() {
+                self.labels[offset] = ignore_index;
             }
+            offset += len as usize;
         }
     }
 }
@@ -202,21 +162,32 @@ impl PackedBatch {
 /// Packing algorithm to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PackingAlgorithm {
-    /// Simple greedy packing (preserves order).
+    /// Keep the dataset's order; start a new row when the next sample does not
+    /// fit.
     Greedy,
 
-    /// First-Fit Decreasing (better utilization, reorders samples).
+    /// First-Fit Decreasing: longest first, each into the first row with room
+    /// (better utilization, reorders samples).
     #[default]
     FirstFitDecreasing,
+
+    /// Best-Fit Decreasing: longest first, each into the row it leaves the
+    /// least room in. Packs as tightly as first fit or tighter.
+    BestFitDecreasing,
 }
 
 /// Sequence packer configuration.
 #[derive(Debug, Clone)]
 pub struct PackerConfig {
-    /// Maximum total length per packed batch.
+    /// Maximum number of real tokens per packed row.
     pub max_length: usize,
-    /// Pad to multiple of this value.
+    /// Pad each row with a block of `pad_token_id` to a multiple of this
+    /// (`0` and `1` leave rows unpadded). Padding is added on top of
+    /// `max_length`, so a row is at most `pad_to_multiple - 1` tokens longer.
     pub pad_to_multiple: usize,
+    /// Token the padding is made of. Its label is `-100` and nothing attends
+    /// to it, so only needs to be a valid vocabulary id.
+    pub pad_token_id: u32,
     /// Mask sequence boundaries in labels with -100.
     /// This prevents the loss from penalizing predictions
     /// at sequence boundaries.
@@ -225,7 +196,8 @@ pub struct PackerConfig {
     pub algorithm: PackingAlgorithm,
     /// Minimum sequence length (drop shorter sequences).
     pub min_length: usize,
-    /// Maximum sequence length (truncate longer sequences).
+    /// Truncate sequences to this length before packing (never longer than
+    /// `max_length`, to which a longer sequence is truncated regardless).
     pub max_seq_length: Option<usize>,
 }
 
@@ -234,6 +206,7 @@ impl Default for PackerConfig {
         Self {
             max_length: 2048,
             pad_to_multiple: 8,
+            pad_token_id: 0,
             mask_boundaries: true,
             algorithm: PackingAlgorithm::FirstFitDecreasing,
             min_length: 1,
@@ -269,27 +242,52 @@ impl PackerConfig {
         self
     }
 
+    /// Use BFD packing (tightest fit).
+    pub fn with_bfd(mut self) -> Self {
+        self.algorithm = PackingAlgorithm::BestFitDecreasing;
+        self
+    }
+
     /// Set minimum sequence length.
     pub fn with_min_length(mut self, min_length: usize) -> Self {
         self.min_length = min_length;
         self
     }
 
-    /// Set maximum sequence length (truncates longer sequences).
-    /// This is CRITICAL for datasets with variable-length sequences.
-    /// Without this, sequences longer than max_length are SKIPPED entirely.
+    /// Truncate every sequence to `max_seq_length` before packing.
     pub fn with_max_seq_length(mut self, max_seq_length: usize) -> Self {
         self.max_seq_length = Some(max_seq_length);
         self
+    }
+
+    /// Pad each row to a multiple of `multiple` with `pad_token_id`.
+    pub fn with_padding(mut self, multiple: usize, pad_token_id: u32) -> Self {
+        self.pad_to_multiple = multiple;
+        self.pad_token_id = pad_token_id;
+        self
+    }
+
+    /// The longest a sequence can be once packed.
+    fn sequence_cap(&self) -> usize {
+        self.max_seq_length
+            .map_or(self.max_length, |m| m.min(self.max_length))
+    }
+
+    /// `len` rounded up to `pad_to_multiple`.
+    fn padded(&self, len: usize) -> usize {
+        match self.pad_to_multiple {
+            0 | 1 => len,
+            m => len.div_ceil(m) * m,
+        }
     }
 }
 
 /// Statistics about packing efficiency.
 #[derive(Debug, Clone, Default)]
 pub struct PackingStats {
-    /// Total number of tokens before packing.
+    /// Tokens in the packed rows that belong to a document.
     pub total_tokens: usize,
-    /// Total capacity (batches * max_length).
+    /// Total capacity (rows * max_length).
     pub total_capacity: usize,
     /// Number of batches created.
     pub num_batches: usize,
@@ -301,6 +299,12 @@ pub struct PackingStats {
     pub avg_sequences_per_batch: f64,
     /// Maximum sequences in a single batch.
     pub max_sequences_per_batch: usize,
+    /// Padding tokens added to reach `pad_to_multiple`.
+    pub padding_tokens: usize,
+    /// Sequences longer than a row, cut to fit one.
+    pub truncated_sequences: usize,
+    /// Sequences shorter than `min_length`, left out.
+    pub dropped_sequences: usize,
 }
 
 impl PackingStats {
@@ -310,7 +314,8 @@ impl PackingStats {
             return Self::default();
         }
 
-        let total_tokens: usize = batches.iter().map(|b| b.total_tokens()).sum();
+        let padding_tokens: usize = batches.iter().map(|b| b.padding).sum();
+        let total_tokens: usize = batches.iter().map(|b| b.real_tokens()).sum();
         let total_capacity = batches.len() * max_length;
         let num_sequences: usize = batches.iter().map(|b| b.num_sequences).sum();
         let max_seqs = batches.iter().map(|b| b.num_sequences).max().unwrap_or(0);
@@ -320,9 +325,12 @@ impl PackingStats {
             total_capacity,
             num_batches: batches.len(),
             num_sequences,
-            efficiency: total_tokens as f64 / total_capacity as f64,
+            efficiency: total_tokens as f64 / total_capacity.max(1) as f64,
             avg_sequences_per_batch: num_sequences as f64 / batches.len() as f64,
             max_sequences_per_batch: max_seqs,
+            padding_tokens,
+            truncated_sequences: 0,
+            dropped_sequences: 0,
         }
     }
 
@@ -338,28 +346,133 @@ impl PackingStats {
     }
 }
 
-/// A bin for FFD packing (internal use).
-struct PackingBin {
-    samples: Vec<Sample>,
-    current_length: usize,
+/// Which samples go in which row.
+struct Plan {
+    /// Sample indices of each row, in the order they are laid out.
+    rows: Vec<Vec<u32>>,
+    truncated: usize,
+    dropped: usize,
 }
 
-impl PackingBin {
-    fn new() -> Self {
-        Self {
-            samples: Vec::new(),
-            current_length: 0,
+/// Leftmost-fit search over the free space of an open-ended list of rows.
+///
+/// A segment tree of free capacity, grown by doubling, so placing one sample
+/// is `O(log rows)` instead of a scan of every row opened so far.
+struct FirstFitTree {
+    capacity: u32,
+    /// Leaves in the tree, a power of two.
+    leaves: usize,
+    /// `tree[1]` is the maximum free space; leaves start at `tree[leaves]`.
+    tree: Vec<u32>,
+}
+
+impl FirstFitTree {
+    fn new(capacity: u32) -> Self {
+        let mut tree = Self {
+            capacity,
+            leaves: 0,
+            tree: Vec::new(),
+        };
+        tree.grow(64);
+        tree
+    }
+
+    /// Resize to `leaves` leaves, keeping the free space already recorded.
+    /// Every new leaf is an unopened, empty row.
+    fn grow(&mut self, leaves: usize) {
+        let old = std::mem::take(&mut self.tree);
+        let old_leaves = self.leaves;
+        self.leaves = leaves;
+        self.tree = vec![self.capacity; 2 * leaves];
+        if old_leaves > 0 {
+            self.tree[leaves..leaves + old_leaves].copy_from_slice(&old[old_leaves..]);
+        }
+        for node in (1..leaves).rev() {
+            self.tree[node] = self.tree[2 * node].max(self.tree[2 * node + 1]);
         }
     }
 
-    fn can_fit(&self, sample_len: usize, max_length: usize) -> bool {
-        self.current_length + sample_len <= max_length
+    /// Place `len` tokens in the first row with room, opening one if none has.
+    /// Returns its index.
+    fn place(&mut self, len: u32) -> usize {
+        if self.tree[1] < len {
+            self.grow(self.leaves * 2);
+        }
+        let mut node = 1;
+        while node < self.leaves {
+            node = if self.tree[2 * node] >= len {
+                2 * node
+            } else {
+                2 * node + 1
+            };
+        }
+        self.tree[node] -= len;
+        let row = node - self.leaves;
+        while node > 1 {
+            node /= 2;
+            self.tree[node] = self.tree[2 * node].max(self.tree[2 * node + 1]);
+        }
+        row
     }
+}
 
-    fn add(&mut self, sample: Sample) {
-        self.current_length += sample.input_ids.len();
-        self.samples.push(sample);
+/// Order-preserving next-fit: a new row whenever the next sample overflows.
+fn plan_greedy(lens: &[(u32, usize)], capacity: usize) -> Vec<Vec<u32>> {
+    let mut rows: Vec<Vec<u32>> = Vec::new();
+    let mut used = 0;
+    for &(index, len) in lens {
+        match rows.last_mut() {
+            Some(row) if used + len <= capacity => {
+                row.push(index);
+                used += len;
+            }
+            _ => {
+                rows.push(vec![index]);
+                used = len;
+            }
+        }
     }
+    rows
+}
+
+/// First-fit over `lens` in the given order.
+fn plan_first_fit(lens: &[(u32, usize)], capacity: usize) -> Vec<Vec<u32>> {
+    let mut tree = FirstFitTree::new(capacity as u32);
+    let mut rows: Vec<Vec<u32>> = Vec::new();
+    for &(index, len) in lens {
+        let row = tree.place(len as u32);
+        if row == rows.len() {
+            rows.push(Vec::new());
+        }
+        rows[row].push(index);
+    }
+    rows
+}
+
+/// Best-fit over `lens` in the given order: the row with the least free space
+/// that still holds the sample, the lowest-numbered among ties.
+fn plan_best_fit(lens: &[(u32, usize)], capacity: usize) -> Vec<Vec<u32>> {
+    let mut rows: Vec<Vec<u32>> = Vec::new();
+    // (free space, row) of every row with any left.
+    let mut free: BTreeSet<(usize, usize)> = BTreeSet::new();
+    for &(index, len) in lens {
+        let fit = free.range((len, 0)..).next().copied();
+        let (left, row) = match fit {
+            Some((room, row)) => {
+                free.remove(&(room, row));
+                rows[row].push(index);
+                (room - len, row)
+            }
+            None => {
+                rows.push(vec![index]);
+                (capacity - len, rows.len() - 1)
+            }
+        };
+        if left > 0 {
+            free.insert((left, row));
+        }
+    }
+    rows
 }
 
 /// Sequence packer for creating packed batches.
@@ -380,209 +493,144 @@ impl SequencePacker {
 
     /// Pack samples into batches.
     ///
-    /// Uses the configured packing algorithm (greedy or FFD).
+    /// Uses the configured packing algorithm.
     pub fn pack(&self, samples: &[Sample]) -> Result<Vec<PackedBatch>> {
-        match self.config.algorithm {
-            PackingAlgorithm::Greedy => self.pack_greedy(samples),
-            PackingAlgorithm::FirstFitDecreasing => self.pack_ffd(samples),
-        }
+        Ok(self.pack_with_stats(samples)?.0)
     }
 
     /// Pack samples into batches and return stats.
     pub fn pack_with_stats(&self, samples: &[Sample]) -> Result<(Vec<PackedBatch>, PackingStats)> {
-        let batches = self.pack(samples)?;
-        let stats = PackingStats::from_batches(&batches, self.config.max_length);
+        let plan = self.plan(samples)?;
+        let batches = plan
+            .rows
+            .par_iter()
+            .map(|row| self.create_packed_batch(samples, row))
+            .collect::<Result<Vec<_>>>()?;
+        let mut stats = PackingStats::from_batches(&batches, self.config.max_length);
+        stats.truncated_sequences = plan.truncated;
+        stats.dropped_sequences = plan.dropped;
         Ok((batches, stats))
     }
 
-    /// Greedy packing (preserves order).
-    fn pack_greedy(&self, samples: &[Sample]) -> Result<Vec<PackedBatch>> {
-        let mut batches = Vec::new();
-        let mut current_batch = Vec::new();
-        let mut current_length = 0;
+    /// Decide which sample goes in which row, touching lengths only.
+    fn plan(&self, samples: &[Sample]) -> Result<Plan> {
+        let config = &self.config;
+        if config.max_length == 0 || config.max_length > u32::MAX as usize {
+            return Err(PMetalError::InvalidArgument(format!(
+                "packing max_length must be between 1 and {}, got {}",
+                u32::MAX,
+                config.max_length
+            )));
+        }
+        if samples.len() > u32::MAX as usize {
+            return Err(PMetalError::InvalidArgument(format!(
+                "cannot pack {} samples at once",
+                samples.len()
+            )));
+        }
 
-        for sample in samples {
-            let sample_len = self.get_sample_length(sample);
-
-            // Skip samples that are too short
-            if sample_len < self.config.min_length {
+        let cap = config.sequence_cap();
+        let min_length = config.min_length.max(1);
+        let (mut truncated, mut dropped) = (0, 0);
+        let mut lens: Vec<(u32, usize)> = Vec::with_capacity(samples.len());
+        for (index, sample) in samples.iter().enumerate() {
+            let len = sample.input_ids.len();
+            if len < min_length {
+                dropped += 1;
                 continue;
             }
-
-            // Skip samples that exceed the max pack length (same guard as FFD packer)
-            if sample_len > self.config.max_length {
-                tracing::warn!(
-                    sample_len,
-                    max_length = self.config.max_length,
-                    "Skipping oversized sample in greedy packer"
-                );
-                continue;
+            if len > cap {
+                truncated += 1;
             }
-
-            if current_length + sample_len > self.config.max_length {
-                if !current_batch.is_empty() {
-                    batches.push(self.create_packed_batch(&current_batch)?);
-                }
-                current_batch = vec![self.prepare_sample(sample)];
-                current_length = sample_len;
-            } else {
-                current_batch.push(self.prepare_sample(sample));
-                current_length += sample_len;
-            }
+            lens.push((index as u32, len.min(cap)));
         }
 
-        if !current_batch.is_empty() {
-            batches.push(self.create_packed_batch(&current_batch)?);
-        }
-
-        Ok(batches)
-    }
-
-    /// First-Fit Decreasing (FFD) packing for better utilization.
-    ///
-    /// This algorithm:
-    /// 1. Sorts samples by length (descending)
-    /// 2. For each sample, finds the first bin with room
-    /// 3. Creates new bins as needed
-    ///
-    /// Typically achieves 90%+ packing efficiency.
-    fn pack_ffd(&self, samples: &[Sample]) -> Result<Vec<PackedBatch>> {
-        // Prepare samples (apply length constraints)
-        let mut indexed_samples: Vec<(usize, Sample)> = samples
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.input_ids.len() >= self.config.min_length)
-            .map(|(i, s)| (i, self.prepare_sample(s)))
-            .collect();
-
-        // Sort by length descending (largest first)
-        indexed_samples.sort_by_key(|b| std::cmp::Reverse(b.1.input_ids.len()));
-
-        // Pack using first-fit decreasing
-        let mut bins: Vec<PackingBin> = Vec::new();
-
-        for (_, sample) in indexed_samples {
-            let sample_len = sample.input_ids.len();
-
-            // Skip samples too long for any bin
-            if sample_len > self.config.max_length {
-                continue;
-            }
-
-            // Find first bin with room
-            let mut placed = false;
-            for bin in &mut bins {
-                if bin.can_fit(sample_len, self.config.max_length) {
-                    bin.add(sample.clone());
-                    placed = true;
-                    break;
-                }
-            }
-
-            // Create new bin if needed
-            if !placed {
-                let mut bin = PackingBin::new();
-                bin.add(sample);
-                bins.push(bin);
-            }
-        }
-
-        // Convert bins to packed batches
-        let mut batches = Vec::with_capacity(bins.len());
-        for bin in bins {
-            if !bin.samples.is_empty() {
-                batches.push(self.create_packed_batch(&bin.samples)?);
-            }
-        }
-
-        Ok(batches)
-    }
-
-    /// Get sample length (with potential truncation).
-    fn get_sample_length(&self, sample: &Sample) -> usize {
-        let len = sample.input_ids.len();
-        if let Some(max) = self.config.max_seq_length {
-            len.min(max)
-        } else {
-            len
-        }
-    }
-
-    /// Prepare a sample (apply truncation if needed).
-    fn prepare_sample(&self, sample: &Sample) -> Sample {
-        if let Some(max) = self.config.max_seq_length {
-            if sample.input_ids.len() > max {
-                return Sample {
-                    input_ids: sample.input_ids[..max].to_vec(),
-                    attention_mask: sample.attention_mask[..max].to_vec(),
-                    labels: sample.labels.as_ref().map(|l| l[..max].to_vec()),
-                    images: sample.images.clone(),
-                };
-            }
-        }
-        sample.clone()
-    }
-
-    fn create_packed_batch(&self, samples: &[Sample]) -> Result<PackedBatch> {
-        // Concatenate all token IDs
-        let input_ids: Vec<u32> = samples
-            .iter()
-            .flat_map(|s| s.input_ids.iter().copied())
-            .collect();
-
-        // Create position IDs (reset for each sequence)
-        let position_ids: Vec<u32> = samples
-            .iter()
-            .flat_map(|s| (0..s.input_ids.len() as u32).collect::<Vec<_>>())
-            .collect();
-
-        // Individual sequence lengths
-        let seq_lengths: Vec<u32> = samples.iter().map(|s| s.input_ids.len() as u32).collect();
-
-        // Cumulative sequence lengths (for flash attention varlen)
-        let mut cu_seqlens = vec![0u32];
-        let mut cumsum = 0u32;
-        for sample in samples {
-            cumsum = cumsum
-                .checked_add(sample.input_ids.len() as u32)
-                .ok_or_else(|| {
-                    PMetalError::InvalidArgument(format!(
-                        "Packed batch total tokens exceed u32::MAX ({})",
-                        u32::MAX
-                    ))
-                })?;
-            cu_seqlens.push(cumsum);
-        }
-
-        let max_seqlen = samples.iter().map(|s| s.input_ids.len()).max().unwrap_or(0);
-
-        // Concatenate labels if present
-        let labels = if samples.iter().all(|s| s.labels.is_some()) {
-            Some(
-                samples
-                    .iter()
-                    .flat_map(|s| s.labels.as_ref().unwrap().iter().copied())
-                    .collect(),
-            )
-        } else {
-            None
+        // Stable, so equal lengths keep the dataset's order.
+        let longest_first = |lens: &mut Vec<(u32, usize)>| {
+            lens.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
         };
+        let rows = match config.algorithm {
+            PackingAlgorithm::Greedy => plan_greedy(&lens, config.max_length),
+            PackingAlgorithm::FirstFitDecreasing => {
+                longest_first(&mut lens);
+                plan_first_fit(&lens, config.max_length)
+            }
+            PackingAlgorithm::BestFitDecreasing => {
+                longest_first(&mut lens);
+                plan_best_fit(&lens, config.max_length)
+            }
+        };
+        Ok(Plan {
+            rows,
+            truncated,
+            dropped,
+        })
+    }
+
+    fn create_packed_batch(&self, samples: &[Sample], row: &[u32]) -> Result<PackedBatch> {
+        let cap = self.config.sequence_cap();
+        let docs: Vec<&Sample> = row.iter().map(|&i| &samples[i as usize]).collect();
+        let lens: Vec<usize> = docs.iter().map(|s| s.input_ids.len().min(cap)).collect();
+        let real: usize = lens.iter().sum();
+        let total = self.config.padded(real);
+        let padding = total - real;
+
+        let overflow = |what: &str| {
+            PMetalError::InvalidArgument(format!(
+                "Packed batch {what} exceed u32::MAX ({})",
+                u32::MAX
+            ))
+        };
+        if u32::try_from(total).is_err() {
+            return Err(overflow("total tokens"));
+        }
+
+        let mut input_ids = Vec::with_capacity(total);
+        let mut position_ids = Vec::with_capacity(total);
+        let mut labels = Vec::with_capacity(total);
+        let mut seq_lengths = Vec::with_capacity(docs.len() + 1);
+        let mut cu_seqlens = Vec::with_capacity(docs.len() + 2);
+        cu_seqlens.push(0u32);
+
+        for (doc, &len) in docs.iter().zip(&lens) {
+            input_ids.extend_from_slice(&doc.input_ids[..len]);
+            position_ids.extend(0..len as u32);
+            match &doc.labels {
+                Some(l) if l.len() == doc.input_ids.len() => labels.extend_from_slice(&l[..len]),
+                Some(l) => {
+                    return Err(PMetalError::InvalidArgument(format!(
+                        "a sample has {} labels for {} tokens",
+                        l.len(),
+                        doc.input_ids.len()
+                    )));
+                }
+                None => labels.extend(doc.input_ids[..len].iter().map(|&t| i64::from(t))),
+            }
+            seq_lengths.push(len as u32);
+            cu_seqlens.push(*cu_seqlens.last().unwrap_or(&0) + len as u32);
+        }
+
+        if padding > 0 {
+            input_ids.resize(total, self.config.pad_token_id);
+            position_ids.extend(0..padding as u32);
+            labels.resize(total, IGNORE_INDEX);
+            seq_lengths.push(padding as u32);
+            cu_seqlens.push(total as u32);
+        }
 
         let mut batch = PackedBatch {
             input_ids,
             position_ids,
             cu_seqlens,
+            max_seqlen: seq_lengths.iter().map(|&l| l as usize).max().unwrap_or(0),
             seq_lengths,
-            max_seqlen,
-            num_sequences: samples.len(),
+            num_sequences: docs.len(),
             labels,
+            padding,
         };
-
-        // Mask sequence boundaries in labels to prevent cross-sequence loss
         if self.config.mask_boundaries {
-            batch.mask_label_boundaries(-100);
+            batch.mask_label_boundaries(IGNORE_INDEX);
         }
-
         Ok(batch)
     }
 }
@@ -597,8 +645,6 @@ impl Default for SequencePacker {
 // MLX Training Integration
 // =============================================================================
 
-use pmetal_runtime::compat::{Array, Exception};
-
 /// A packed batch ready for training with MLX Arrays.
 ///
 /// This is the bridge between the packing infrastructure and the training loop.
@@ -610,13 +656,13 @@ pub struct PackedTrainingBatch {
     pub input_ids: Array,
     /// Position IDs reset per sequence `[total_tokens]`.
     pub position_ids: Array,
-    /// Cumulative sequence lengths [num_sequences + 1].
+    /// Cumulative lengths of the attention blocks, `[blocks + 1]`.
     pub cu_seqlens: Array,
-    /// Cumulative sequence lengths as a CPU-side Vec for mask construction.
+    /// `cu_seqlens` on the CPU, for mask construction.
     pub cu_seqlens_raw: Vec<i32>,
     /// Packed labels for loss computation `[total_tokens]`.
     pub labels: Array,
-    /// Total number of tokens.
+    /// Total number of tokens, padding included.
     pub total_tokens: usize,
     /// Number of sequences in this packed batch.
     pub num_sequences: usize,
@@ -629,76 +675,69 @@ impl PackedTrainingBatch {
     ///
     /// # Errors
     ///
-    /// Returns an error if label conversion fails (e.g., no labels present).
+    /// Returns an error if a token id or label does not fit in an `i32`.
     pub fn from_packed_batch(batch: &PackedBatch) -> std::result::Result<Self, Exception> {
-        // Convert input_ids to Array [total_tokens]
-        let input_ids_i32: Vec<i32> = batch.input_ids.iter().map(|&x| x as i32).collect();
-        let input_ids = Array::from_i32_slice(&input_ids_i32);
-
-        // Convert position_ids to Array [total_tokens]
-        let position_ids_i32: Vec<i32> = batch.position_ids.iter().map(|&x| x as i32).collect();
-        let position_ids = Array::from_i32_slice(&position_ids_i32);
-
-        // Convert cu_seqlens to Array [num_sequences + 1]
-        let cu_seqlens_raw: Vec<i32> = batch.cu_seqlens.iter().map(|&x| x as i32).collect();
-        let cu_seqlens = Array::from_i32_slice(&cu_seqlens_raw);
-
-        // Convert labels to Array [total_tokens]
-        // If labels are None, use input_ids shifted by 1 (language modeling)
-        let labels = if let Some(ref labels_vec) = batch.labels {
-            // i64 label values — cast to i32 (all values fit: token IDs < 2^24, sentinel -100)
-            let labels_i32: Vec<i32> = labels_vec.iter().map(|&x| x as i32).collect();
-            Array::from_i32_slice(&labels_i32)
-        } else {
-            // Default: next token prediction (shift input_ids by 1)
-            let mut labels_i32: Vec<i32> = batch.input_ids[1..].iter().map(|&x| x as i32).collect();
-            labels_i32.push(-100); // Ignore last token prediction
-            Array::from_i32_slice(&labels_i32)
+        let to_i32 = |v: i64| {
+            i32::try_from(v).map_err(|_| Exception::custom(format!("{v} does not fit an i32")))
         };
+        let input_ids_i32 = batch
+            .input_ids
+            .iter()
+            .map(|&x| to_i32(i64::from(x)))
+            .collect::<std::result::Result<Vec<i32>, _>>()?;
+        let position_ids_i32 = batch
+            .position_ids
+            .iter()
+            .map(|&x| to_i32(i64::from(x)))
+            .collect::<std::result::Result<Vec<i32>, _>>()?;
+        let cu_seqlens_raw = batch
+            .cu_seqlens
+            .iter()
+            .map(|&x| to_i32(i64::from(x)))
+            .collect::<std::result::Result<Vec<i32>, _>>()?;
+        let labels_i32 = batch
+            .labels
+            .iter()
+            .map(|&x| to_i32(x))
+            .collect::<std::result::Result<Vec<i32>, _>>()?;
 
         Ok(Self {
-            input_ids,
-            position_ids,
-            cu_seqlens,
+            input_ids: Array::from_i32_slice(&input_ids_i32),
+            position_ids: Array::from_i32_slice(&position_ids_i32),
+            cu_seqlens: Array::from_i32_slice(&cu_seqlens_raw),
             cu_seqlens_raw,
-            labels,
+            labels: Array::from_i32_slice(&labels_i32),
             total_tokens: batch.input_ids.len(),
             num_sequences: batch.num_sequences,
             max_seqlen: batch.max_seqlen,
         })
     }
 
-    /// Create a packed attention mask for this batch.
+    /// The block-diagonal causal mask for this batch, `[total_tokens,
+    /// total_tokens]`, `0.0` where a token may attend and `-inf` elsewhere.
     ///
-    /// Returns a 2D block-diagonal causal mask [total_tokens, total_tokens].
-    /// Each sequence only attends to tokens within itself.
+    /// Identical to [`PackedBatch::build_attention_mask`], but built on the
+    /// device from per-token block ids: the dense `n x n` matrix never exists
+    /// on the host.
     pub fn attention_mask(&self) -> std::result::Result<Array, Exception> {
-        // Create block-diagonal mask
-        let n = self.total_tokens;
-        let mut mask = vec![f32::NEG_INFINITY; n * n];
-
-        // For each position, allow attending to positions in the same sequence
-        // up to and including the current position (causal)
-        let cu_seqlens = self.cu_seqlens_vec();
-
-        for seq_idx in 0..self.num_sequences {
-            let seq_start = cu_seqlens[seq_idx] as usize;
-            let seq_end = cu_seqlens[seq_idx + 1] as usize;
-
-            for q in seq_start..seq_end {
-                for k in seq_start..=q {
-                    mask[q * n + k] = 0.0;
-                }
-            }
+        let n = self.total_tokens as i32;
+        let mut block = Vec::with_capacity(self.total_tokens);
+        for (id, w) in self.cu_seqlens_raw.windows(2).enumerate() {
+            block.extend(std::iter::repeat_n(
+                id as i32,
+                (w[1] - w[0]).max(0) as usize,
+            ));
         }
-
-        let n_i32 = n as i32;
-        Ok(Array::from_f32_slice(&mask, &[n_i32, n_i32]))
-    }
-
-    /// Get cu_seqlens as a Vec for CPU iteration.
-    fn cu_seqlens_vec(&self) -> Vec<i32> {
-        self.cu_seqlens_raw.clone()
+        let block = Array::from_i32_slice(&block);
+        let position = mlx_ops::arange_n(n);
+        let same_block = mlx_ops::equal(&block.reshape(&[n, 1]), &block.reshape(&[1, n]));
+        let causal = mlx_ops::greater_equal(&position.reshape(&[n, 1]), &position.reshape(&[1, n]));
+        let allowed = mlx_ops::logical_and(&same_block, &causal);
+        Ok(mlx_ops::where_fn(
+            &allowed,
+            &Array::from_f32(0.0),
+            &Array::from_f32(f32::NEG_INFINITY),
+        ))
     }
 
     /// Get token count (for throughput calculations).
@@ -713,85 +752,129 @@ impl PackedTrainingBatch {
 }
 
 /// A DataLoader that yields packed batches for padding-free training.
+///
+/// The documents are packed once, up front; an epoch is those rows in an order
+/// that depends only on the seed it was started with, so an interrupted run
+/// can be resumed into the exact epoch with [`state`](Self::state) and
+/// [`restore`](Self::restore). Under data parallelism
+/// ([`with_sharding`](Self::with_sharding)) each rank takes an equal share of
+/// the rows.
 pub struct PackedDataLoader {
-    /// The packer configuration.
-    packer: SequencePacker,
-    /// Pre-packed batches.
+    config: PackerConfig,
+    /// Every packed row, in packing order.
     batches: Vec<PackedBatch>,
-    /// Current batch index.
+    /// Rows to serve this epoch, in order, for this rank.
+    order: Vec<usize>,
+    /// Rows already served this epoch.
     position: usize,
-    /// Whether to shuffle batches each epoch.
+    /// Whether to shuffle rows each epoch.
     shuffle: bool,
-    /// Random seed.
+    /// Seed `reset(None)` starts an epoch from.
     seed: u64,
+    /// Seed of the epoch being served.
+    epoch_seed: u64,
+    rank: usize,
+    world_size: usize,
+    stats: PackingStats,
 }
 
 impl PackedDataLoader {
-    /// Create a new PackedDataLoader from samples.
+    /// Pack `samples` and serve the rows, shuffled by `seed` when `shuffle`.
     pub fn new(samples: &[Sample], config: PackerConfig, shuffle: bool, seed: u64) -> Result<Self> {
-        let packer = SequencePacker::new(config);
-        let batches = packer.pack(samples)?;
-
-        Ok(Self {
-            packer,
+        let (batches, stats) = SequencePacker::new(config.clone()).pack_with_stats(samples)?;
+        let mut loader = Self {
+            config,
             batches,
+            order: Vec::new(),
             position: 0,
             shuffle,
             seed,
-        })
+            epoch_seed: seed,
+            rank: 0,
+            world_size: 1,
+            stats,
+        };
+        loader.start_epoch(seed);
+        Ok(loader)
     }
 
-    /// Get packing statistics.
-    pub fn stats(&self) -> PackingStats {
-        let total_tokens: usize = self.batches.iter().map(|b| b.input_ids.len()).sum();
-        let max_len = self.packer.config.max_length;
-        let total_capacity: usize = self.batches.len() * max_len;
-        let num_sequences: usize = self.batches.iter().map(|b| b.num_sequences).sum();
-        let max_seqs_per_batch = self
-            .batches
-            .iter()
-            .map(|b| b.num_sequences)
-            .max()
-            .unwrap_or(0);
-
-        PackingStats {
-            total_tokens,
-            total_capacity,
-            num_batches: self.batches.len(),
-            num_sequences,
-            efficiency: total_tokens as f64 / total_capacity.max(1) as f64,
-            avg_sequences_per_batch: num_sequences as f64 / self.batches.len().max(1) as f64,
-            max_sequences_per_batch: max_seqs_per_batch,
+    /// Serve this rank's share of the rows: every `world_size`-th row of the
+    /// epoch's order starting at `rank`. Every rank gets the same number of
+    /// rows (the remainder, fewer than `world_size` rows a different set each
+    /// shuffled epoch, is left out) so the ranks stay in step.
+    pub fn with_sharding(mut self, rank: usize, world_size: usize) -> Result<Self> {
+        if world_size == 0 || rank >= world_size {
+            return Err(PMetalError::InvalidArgument(format!(
+                "rank {rank} is not in a world of {world_size}"
+            )));
         }
+        self.rank = rank;
+        self.world_size = world_size;
+        self.start_epoch(self.epoch_seed);
+        Ok(self)
     }
 
-    /// Get number of batches.
-    pub fn num_batches(&self) -> usize {
-        self.batches.len()
-    }
-
-    /// Reset for a new epoch.
-    pub fn reset(&mut self, new_seed: Option<u64>) {
+    fn start_epoch(&mut self, seed: u64) {
+        self.epoch_seed = seed;
         self.position = 0;
-        if self.shuffle {
-            use rand::SeedableRng;
-            use rand::seq::SliceRandom;
-            let seed = new_seed.unwrap_or(self.seed);
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-            self.batches.shuffle(&mut rng);
+        self.order = epoch_order(
+            self.batches.len(),
+            self.shuffle,
+            seed,
+            self.rank,
+            self.world_size,
+        );
+    }
+
+    /// Packing statistics of all the rows, every rank's included.
+    pub fn stats(&self) -> PackingStats {
+        self.stats.clone()
+    }
+
+    /// Number of rows this rank serves per epoch.
+    pub fn num_batches(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Start a new epoch, shuffled by `new_seed` (the construction seed when
+    /// `None`). The order depends on the seed alone.
+    pub fn reset(&mut self, new_seed: Option<u64>) {
+        self.start_epoch(new_seed.unwrap_or(self.seed));
+    }
+
+    /// Where the loader is: enough to resume it exactly.
+    pub fn state(&self) -> LoaderState {
+        LoaderState {
+            epoch_seed: self.epoch_seed,
+            position: self.position,
         }
+    }
+
+    /// Resume at `state`, taken from a loader built over the same samples and
+    /// configuration.
+    pub fn restore(&mut self, state: LoaderState) -> Result<()> {
+        self.start_epoch(state.epoch_seed);
+        if state.position > self.order.len() {
+            return Err(PMetalError::InvalidArgument(format!(
+                "cannot resume at batch {} of an epoch of {}",
+                state.position,
+                self.order.len()
+            )));
+        }
+        self.position = state.position;
+        Ok(())
     }
 
     /// Get the next packed training batch.
     pub fn next_batch(&mut self) -> Option<std::result::Result<PackedTrainingBatch, Exception>> {
-        if self.position >= self.batches.len() {
-            return None;
-        }
-
-        let batch = &self.batches[self.position];
+        let row = *self.order.get(self.position)?;
         self.position += 1;
+        Some(PackedTrainingBatch::from_packed_batch(&self.batches[row]))
+    }
 
-        Some(PackedTrainingBatch::from_packed_batch(batch))
+    /// The packer configuration the rows were built with.
+    pub fn config(&self) -> &PackerConfig {
+        &self.config
     }
 }
 
@@ -845,10 +928,8 @@ mod tests {
     use super::*;
 
     fn make_sample(ids: Vec<u32>, labels: Option<Vec<i64>>) -> Sample {
-        let len = ids.len();
         Sample {
             input_ids: ids,
-            attention_mask: vec![1; len],
             labels,
             images: None,
         }
@@ -863,7 +944,11 @@ mod tests {
         ];
 
         // Use greedy packing to preserve order for predictable test assertions
-        let packer = SequencePacker::new(PackerConfig::with_max_length(10).with_greedy());
+        let packer = SequencePacker::new(
+            PackerConfig::with_max_length(10)
+                .with_padding(1, 0)
+                .with_greedy(),
+        );
         let batches = packer.pack(&samples).unwrap();
 
         assert_eq!(batches.len(), 1);
@@ -896,7 +981,8 @@ mod tests {
             seq_lengths: vec![2, 3],
             max_seqlen: 3,
             num_sequences: 2,
-            labels: None,
+            labels: vec![0; 5],
+            padding: 0,
         };
 
         let mask = batch.build_attention_mask();
@@ -942,7 +1028,8 @@ mod tests {
             seq_lengths: vec![2, 1, 3],
             max_seqlen: 3,
             num_sequences: 3,
-            labels: None,
+            labels: vec![0; 6],
+            padding: 0,
         };
 
         let boundaries = batch.sequence_boundaries();
@@ -961,12 +1048,13 @@ mod tests {
         // Use greedy packing to preserve order for predictable test assertions
         let packer = SequencePacker::new(
             PackerConfig::with_max_length(10)
+                .with_padding(1, 0)
                 .with_greedy()
                 .mask_boundaries(true),
         );
         let batches = packer.pack(&samples).unwrap();
 
-        let labels = batches[0].labels.as_ref().unwrap();
+        let labels = &batches[0].labels;
         // First token of each sequence (except seq1) should be -100
         // This prevents cross-boundary prediction: logits[1] shouldn't predict token 3,
         // and logits[2] shouldn't predict token 4
@@ -991,7 +1079,8 @@ mod tests {
             seq_lengths: vec![5],
             max_seqlen: 5,
             num_sequences: 1,
-            labels: None,
+            labels: vec![0; 5],
+            padding: 0,
         };
 
         // Window size 2: each token can attend to itself and 1 previous token
@@ -1031,8 +1120,16 @@ mod tests {
         // Batch 3: [5, 5] = 10 tokens
         // = 3 batches, 30/30 = 100% efficiency
 
-        let ffd_packer = SequencePacker::new(PackerConfig::with_max_length(10).with_ffd());
-        let greedy_packer = SequencePacker::new(PackerConfig::with_max_length(10).with_greedy());
+        let ffd_packer = SequencePacker::new(
+            PackerConfig::with_max_length(10)
+                .with_padding(1, 0)
+                .with_ffd(),
+        );
+        let greedy_packer = SequencePacker::new(
+            PackerConfig::with_max_length(10)
+                .with_padding(1, 0)
+                .with_greedy(),
+        );
 
         let (ffd_batches, ffd_stats) = ffd_packer.pack_with_stats(&samples).unwrap();
         let (greedy_batches, greedy_stats) = greedy_packer.pack_with_stats(&samples).unwrap();
@@ -1057,19 +1154,24 @@ mod tests {
 
     #[test]
     fn test_ffd_with_large_sample() {
-        // Sample that exceeds max_length should be skipped
+        // A sample that exceeds max_length is cut to a full row, not dropped.
         let samples = vec![
             make_sample(vec![1; 15], None), // Too large for max_length=10
             make_sample(vec![2; 5], None),
             make_sample(vec![3; 3], None),
         ];
 
-        let packer = SequencePacker::new(PackerConfig::with_max_length(10).with_ffd());
-        let batches = packer.pack(&samples).unwrap();
+        let packer = SequencePacker::new(
+            PackerConfig::with_max_length(10)
+                .with_padding(1, 0)
+                .with_ffd(),
+        );
+        let (batches, stats) = packer.pack_with_stats(&samples).unwrap();
 
-        // Only the samples that fit should be packed
         let total_tokens: usize = batches.iter().map(|b| b.total_tokens()).sum();
-        assert_eq!(total_tokens, 8); // 5 + 3, excluding the 15-token sample
+        assert_eq!(total_tokens, 18); // 10 + 5 + 3
+        assert_eq!(stats.truncated_sequences, 1);
+        assert_eq!(stats.dropped_sequences, 0);
     }
 
     #[test]
@@ -1080,7 +1182,7 @@ mod tests {
             make_sample(vec![3; 7], None),
         ];
 
-        let packer = SequencePacker::new(PackerConfig::with_max_length(10));
+        let packer = SequencePacker::new(PackerConfig::with_max_length(10).with_padding(1, 0));
         let (batches, stats) = packer.pack_with_stats(&samples).unwrap();
 
         assert_eq!(stats.num_sequences, 3);
@@ -1102,7 +1204,11 @@ mod tests {
             make_sample(vec![6], None),
         ];
 
-        let packer = SequencePacker::new(PackerConfig::with_max_length(10).with_greedy());
+        let packer = SequencePacker::new(
+            PackerConfig::with_max_length(10)
+                .with_padding(1, 0)
+                .with_greedy(),
+        );
         let batches = packer.pack(&samples).unwrap();
 
         // Greedy should maintain order
@@ -1119,11 +1225,411 @@ mod tests {
             make_sample(vec![5, 6, 7], None), // OK
         ];
 
-        let packer = SequencePacker::new(PackerConfig::with_max_length(10).with_min_length(2));
+        let packer = SequencePacker::new(
+            PackerConfig::with_max_length(10)
+                .with_padding(1, 0)
+                .with_min_length(2),
+        );
         let batches = packer.pack(&samples).unwrap();
 
         let total_tokens: usize = batches.iter().map(|b| b.total_tokens()).sum();
         assert_eq!(total_tokens, 5); // Only [2,3] and [5,6,7]
+    }
+
+    /// The row-major `i32` contents of an array, failing the test if an op
+    /// threw while producing it.
+    fn read_i32(a: &Array) -> Vec<i32> {
+        let v = a.as_slice::<i32>().to_vec();
+        pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
+        v
+    }
+
+    /// Labels are unshifted (the loss shifts them), so a batch built from
+    /// samples that carry none must train on every token and still mask the
+    /// first token of each later document. It used to shift `input_ids` by one
+    /// itself, which the loss then shifted again, and let the last token of
+    /// each document predict the first of the next.
+    #[test]
+    fn labels_default_to_the_input_ids_with_document_boundaries_masked() {
+        let samples = vec![
+            make_sample(vec![1, 2, 3], None),
+            make_sample(vec![4, 5], None),
+        ];
+        let packer = SequencePacker::new(PackerConfig::with_max_length(8).with_greedy());
+        let batches = packer.pack(&samples).unwrap();
+        let training = PackedTrainingBatch::from_packed_batch(&batches[0]).unwrap();
+        assert_eq!(read_i32(&training.labels)[..5], [1, 2, 3, -100, 5]);
+    }
+
+    /// `pad_to_multiple` was a config knob nothing read.
+    #[test]
+    fn batches_are_padded_to_the_configured_multiple() {
+        let samples = vec![make_sample(vec![1, 2, 3], None), make_sample(vec![4], None)];
+        let packer = SequencePacker::new(PackerConfig::with_max_length(64).with_greedy());
+        let batch = &packer.pack(&samples).unwrap()[0];
+        assert_eq!(
+            batch.total_tokens() % 8,
+            0,
+            "{} tokens",
+            batch.total_tokens()
+        );
+        assert_eq!(batch.num_sequences, 2);
+    }
+
+    /// A sequence longer than a batch is truncated to fit, as the unpacked
+    /// loader truncates at `max_seq_len`; FFD used to drop it, silently,
+    /// unless `max_seq_length` was also set.
+    #[test]
+    fn an_overlong_sequence_is_truncated_not_dropped() {
+        let samples = vec![make_sample((1..=15).collect(), None)];
+        for algorithm in [
+            PackingAlgorithm::FirstFitDecreasing,
+            PackingAlgorithm::Greedy,
+        ] {
+            let mut config = PackerConfig::with_max_length(10).with_padding(1, 0);
+            config.algorithm = algorithm;
+            let batches = SequencePacker::new(config).pack(&samples).unwrap();
+            assert_eq!(batches.len(), 1, "{algorithm:?}");
+            assert_eq!(batches[0].input_ids[..10], (1..=10).collect::<Vec<u32>>());
+        }
+    }
+
+    /// The order a loader serves a shuffled epoch in is a function of the seed
+    /// it was reset with, not of how many epochs it has already served:
+    /// otherwise an interrupted run can never reproduce the epoch it stopped
+    /// in.
+    #[test]
+    fn a_reset_epoch_order_depends_only_on_its_seed() {
+        let samples: Vec<Sample> = (1..=40)
+            .map(|i| make_sample(vec![i; (i as usize % 5) + 1], None))
+            .collect();
+        let order = |loader: &mut PackedDataLoader| -> Vec<Vec<i32>> {
+            loader.map(|b| read_i32(&b.unwrap().input_ids)).collect()
+        };
+        let config = || PackerConfig::with_max_length(6).with_greedy();
+        let mut fresh = PackedDataLoader::new(&samples, config(), true, 7).unwrap();
+        fresh.reset(Some(11));
+        let mut worn = PackedDataLoader::new(&samples, config(), true, 7).unwrap();
+        worn.reset(Some(3));
+        worn.reset(Some(5));
+        worn.reset(Some(11));
+        assert_eq!(order(&mut fresh), order(&mut worn));
+    }
+
+    /// Deterministic pseudo-random lengths in `1..=max`, so the property tests
+    /// need no extra dependency and fail reproducibly.
+    fn random_lengths(count: usize, max: usize, mut state: u64) -> Vec<usize> {
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                1 + ((state >> 33) as usize % max)
+            })
+            .collect()
+    }
+
+    /// Sample `i` is `[i * 1000, i * 1000 + 1, ...]`, so a token names its
+    /// document and its position in it. A prompt of `prompt_len(i)` tokens is
+    /// masked, as SFT masks it.
+    fn tagged_samples(lengths: &[usize]) -> Vec<Sample> {
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let ids: Vec<u32> = (0..len as u32).map(|t| i as u32 * 1000 + t).collect();
+                let prompt = len / 3;
+                let labels = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(t, &id)| if t < prompt { -100 } else { i64::from(id) })
+                    .collect();
+                make_sample(ids, Some(labels))
+            })
+            .collect()
+    }
+
+    /// What the loss scores for an unpacked sample: the label at `t + 1`
+    /// against the logits at `t`, as `(document, t, label)`.
+    fn unpacked_loss_targets(samples: &[Sample]) -> Vec<(usize, usize, i64)> {
+        let mut targets = Vec::new();
+        for (doc, s) in samples.iter().enumerate() {
+            let labels = s.labels.as_ref().unwrap();
+            for t in 0..labels.len() - 1 {
+                if labels[t + 1] != -100 {
+                    targets.push((doc, t, labels[t + 1]));
+                }
+            }
+        }
+        targets.sort_unstable();
+        targets
+    }
+
+    /// The same, read off packed rows: what the loss scores at row position
+    /// `p` is the label at `p + 1`.
+    fn packed_loss_targets(batches: &[PackedBatch]) -> Vec<(usize, usize, i64)> {
+        let mut targets = Vec::new();
+        for b in batches {
+            for p in 0..b.total_tokens() - 1 {
+                if b.labels[p + 1] != -100 {
+                    // The context token names its document and position.
+                    let id = b.input_ids[p] as usize;
+                    assert!(b.position_ids[p] as usize == id % 1000, "position restarts");
+                    targets.push((id / 1000, id % 1000, b.labels[p + 1]));
+                }
+            }
+        }
+        targets.sort_unstable();
+        targets
+    }
+
+    /// Packing changes nothing about what is trained: the (context, target)
+    /// pairs the loss scores in the packed rows are exactly those of the
+    /// unpacked samples, for every algorithm, padding, and truncation.
+    #[test]
+    fn packed_rows_train_exactly_what_the_unpacked_samples_train() {
+        let lengths = random_lengths(200, 40, 3);
+        let samples = tagged_samples(&lengths);
+        let expected = unpacked_loss_targets(&samples);
+        for algorithm in [
+            PackingAlgorithm::Greedy,
+            PackingAlgorithm::FirstFitDecreasing,
+            PackingAlgorithm::BestFitDecreasing,
+        ] {
+            for pad in [1, 8, 64] {
+                let mut config = PackerConfig::with_max_length(96).with_padding(pad, 7);
+                config.algorithm = algorithm;
+                let batches = SequencePacker::new(config).pack(&samples).unwrap();
+                assert_eq!(
+                    packed_loss_targets(&batches),
+                    expected,
+                    "{algorithm:?}, pad {pad}"
+                );
+                let docs: usize = batches.iter().map(|b| b.num_sequences).sum();
+                assert_eq!(docs, samples.len());
+            }
+        }
+    }
+
+    /// Every token attends to exactly its own document's earlier tokens
+    /// (itself included), padding to its own block, and no row is empty.
+    #[test]
+    fn the_attention_mask_confines_every_token_to_its_own_document() {
+        let samples = tagged_samples(&random_lengths(30, 12, 9));
+        let batches = SequencePacker::new(PackerConfig::with_max_length(40).with_padding(16, 0))
+            .pack(&samples)
+            .unwrap();
+        assert!(batches.iter().any(|b| b.padding > 0));
+        for b in &batches {
+            let n = b.total_tokens();
+            let mask = b.build_attention_mask();
+            // Block of each position, from the cumulative lengths.
+            let mut block = vec![0usize; n];
+            for (id, w) in b.cu_seqlens.windows(2).enumerate() {
+                block[w[0] as usize..w[1] as usize].fill(id);
+            }
+            for q in 0..n {
+                let mut visible = 0;
+                for k in 0..n {
+                    let allowed = block[q] == block[k] && k <= q;
+                    assert_eq!(mask[q * n + k] == 0.0, allowed, "q {q} k {k}");
+                    visible += usize::from(allowed);
+                }
+                assert!(visible >= 1, "row {q} attends to nothing");
+            }
+        }
+    }
+
+    /// The device-built mask is the host-built one.
+    #[test]
+    fn the_device_mask_equals_the_host_mask() {
+        let samples = tagged_samples(&random_lengths(12, 9, 5));
+        let batches = SequencePacker::new(PackerConfig::with_max_length(24).with_padding(8, 0))
+            .pack(&samples)
+            .unwrap();
+        for b in &batches {
+            let device = PackedTrainingBatch::from_packed_batch(b)
+                .unwrap()
+                .attention_mask()
+                .unwrap();
+            pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
+            let host = b.build_attention_mask();
+            assert_eq!(device.as_slice::<f32>(), host.as_slice());
+        }
+    }
+
+    /// Padding is a block of its own, labelled `-100`, made of the pad token.
+    #[test]
+    fn padding_is_an_isolated_block_the_loss_ignores() {
+        let samples = vec![make_sample(vec![1, 2, 3], None), make_sample(vec![4], None)];
+        let batch = SequencePacker::new(
+            PackerConfig::with_max_length(16)
+                .with_greedy()
+                .with_padding(8, 99),
+        )
+        .pack(&samples)
+        .unwrap()
+        .remove(0);
+        assert_eq!(batch.input_ids, [1, 2, 3, 4, 99, 99, 99, 99]);
+        assert_eq!(batch.labels, [1, 2, 3, -100, -100, -100, -100, -100]);
+        assert_eq!(batch.position_ids, [0, 1, 2, 0, 0, 1, 2, 3]);
+        assert_eq!(batch.seq_lengths, [3, 1, 4]);
+        assert_eq!(batch.cu_seqlens, [0, 3, 4, 8]);
+        assert_eq!((batch.num_sequences, batch.padding), (2, 4));
+        assert_eq!(batch.sequence_boundaries(), [2, 3]);
+        assert_eq!(batch.real_tokens(), 4);
+    }
+
+    /// The segment tree places every sample exactly where a scan of the open
+    /// rows does.
+    #[test]
+    fn first_fit_by_segment_tree_equals_first_fit_by_scan() {
+        for (count, max, cap, seed) in [(500, 30, 64, 1), (2000, 100, 128, 2), (300, 7, 8, 3)] {
+            let lens: Vec<(u32, usize)> = random_lengths(count, max, seed)
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| (i as u32, l.min(cap)))
+                .collect();
+            let mut scanned: Vec<(usize, Vec<u32>)> = Vec::new();
+            for &(index, len) in &lens {
+                match scanned.iter_mut().find(|(used, _)| used + len <= cap) {
+                    Some((used, row)) => {
+                        *used += len;
+                        row.push(index);
+                    }
+                    None => scanned.push((len, vec![index])),
+                }
+            }
+            let scanned: Vec<Vec<u32>> = scanned.into_iter().map(|(_, row)| row).collect();
+            assert_eq!(plan_first_fit(&lens, cap), scanned);
+        }
+    }
+
+    /// Best fit never needs more rows than first fit on the same input, and
+    /// every row stays within the cap.
+    #[test]
+    fn best_fit_decreasing_is_valid_and_no_looser_than_first_fit() {
+        let samples = tagged_samples(&random_lengths(1000, 50, 4));
+        let rows = |algorithm| {
+            let mut config = PackerConfig::with_max_length(128).with_padding(1, 0);
+            config.algorithm = algorithm;
+            SequencePacker::new(config).pack(&samples).unwrap()
+        };
+        let ffd = rows(PackingAlgorithm::FirstFitDecreasing);
+        let bfd = rows(PackingAlgorithm::BestFitDecreasing);
+        assert!(bfd.len() <= ffd.len(), "{} vs {}", bfd.len(), ffd.len());
+        assert!(bfd.iter().all(|b| b.total_tokens() <= 128));
+        let total: usize = bfd.iter().map(|b| b.total_tokens()).sum();
+        let expected: usize = samples.iter().map(|s| s.input_ids.len()).sum();
+        assert_eq!(total, expected);
+    }
+
+    /// Throughput of the planner and of batch construction, against the scan
+    /// it replaced. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn packing_throughput() {
+        use std::time::Instant;
+        let cap = 4096;
+        for count in [100_000usize, 1_000_000] {
+            let lengths = random_lengths(count, 2048, 17);
+            let lens: Vec<(u32, usize)> = {
+                let mut v: Vec<(u32, usize)> = lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &l)| (i as u32, l))
+                    .collect();
+                v.sort_by_key(|&(_, l)| std::cmp::Reverse(l));
+                v
+            };
+            let start = Instant::now();
+            let tree_rows = plan_first_fit(&lens, cap).len();
+            let tree_time = start.elapsed();
+
+            let start = Instant::now();
+            let best_rows = plan_best_fit(&lens, cap).len();
+            let best_time = start.elapsed();
+
+            let scan_time = (count <= 100_000).then(|| {
+                let start = Instant::now();
+                let mut open: Vec<usize> = Vec::new();
+                for &(_, len) in &lens {
+                    match open.iter_mut().find(|used| **used + len <= cap) {
+                        Some(used) => *used += len,
+                        None => open.push(len),
+                    }
+                }
+                assert_eq!(open.len(), tree_rows);
+                start.elapsed()
+            });
+
+            let samples = tagged_samples(&lengths);
+            let start = Instant::now();
+            let (batches, stats) = SequencePacker::new(PackerConfig::with_max_length(cap))
+                .pack_with_stats(&samples)
+                .unwrap();
+            let pack_time = start.elapsed();
+            println!(
+                "{count} samples: first-fit {tree_rows} rows in {tree_time:?} \
+                 (scan {scan_time:?}), best-fit {best_rows} rows in {best_time:?}, \
+                 end-to-end pack {} rows in {pack_time:?}, {:.2}% efficient",
+                batches.len(),
+                stats.efficiency * 100.0
+            );
+        }
+    }
+
+    fn row_signatures(loader: PackedDataLoader) -> Vec<Vec<i32>> {
+        loader.map(|b| read_i32(&b.unwrap().input_ids)).collect()
+    }
+
+    /// Ranks serve disjoint, equally sized shares of the rows.
+    #[test]
+    fn data_parallel_ranks_share_the_rows_without_overlap() {
+        let samples = tagged_samples(&random_lengths(101, 30, 6));
+        let config = || PackerConfig::with_max_length(64).with_padding(1, 0);
+        let whole = PackedDataLoader::new(&samples, config(), true, 5).unwrap();
+        let rows = whole.num_batches();
+        let all = row_signatures(whole);
+        let world = 4;
+        let shares: Vec<Vec<Vec<i32>>> = (0..world)
+            .map(|rank| {
+                let loader = PackedDataLoader::new(&samples, config(), true, 5)
+                    .unwrap()
+                    .with_sharding(rank, world)
+                    .unwrap();
+                assert_eq!(loader.num_batches(), rows / world);
+                row_signatures(loader)
+            })
+            .collect();
+        let mut seen: Vec<&Vec<i32>> = shares.iter().flatten().collect();
+        assert_eq!(seen.len(), (rows / world) * world);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            (rows / world) * world,
+            "a row went to two ranks"
+        );
+        assert!(seen.iter().all(|row| all.contains(row)));
+    }
+
+    /// A loader resumed from a saved state serves the rest of the epoch the
+    /// first one would have.
+    #[test]
+    fn a_restored_packed_loader_serves_the_rest_of_the_epoch() {
+        let samples = tagged_samples(&random_lengths(80, 30, 8));
+        let config = || PackerConfig::with_max_length(64).with_padding(1, 0);
+        let mut first = PackedDataLoader::new(&samples, config(), true, 21).unwrap();
+        first.reset(Some(22));
+        let head: Vec<_> = (&mut first).take(3).collect();
+        assert_eq!(head.len(), 3);
+        let state = first.state();
+        let rest = row_signatures(first);
+
+        let mut resumed = PackedDataLoader::new(&samples, config(), true, 21).unwrap();
+        resumed.restore(state).unwrap();
+        assert_eq!(row_signatures(resumed), rest);
     }
 
     #[test]
