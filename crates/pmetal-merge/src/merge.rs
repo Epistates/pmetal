@@ -18,10 +18,10 @@ use tracing::{debug, info, warn};
 
 use crate::moe_align::MoeAlignment;
 use crate::{
-    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError, MergeMethod,
-    MergeMethodConfig, MergeParameters, ModelStockMerge, MultiSlerpMerge, NearswapMerge,
-    PassthroughMerge, RamMerge, Result, SafetensorsLoader, SlerpMerge, TaskArithmeticMerge,
-    TensorLoader, TensorWriter, TiesMerge, VocabMismatch,
+    BreadcrumbsMerge, ConsensusMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError,
+    MergeMethod, MergeMethodConfig, MergeParameters, ModelStockMerge, MultiSlerpMerge,
+    NearswapMerge, PassthroughMerge, RamMerge, Result, SafetensorsLoader, SlerpMerge,
+    TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge, VocabMismatch,
 };
 
 /// Tensor-name pattern that identifies MoE routed-expert weights.
@@ -406,6 +406,7 @@ fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
         MergeMethodConfig::DellaLinear => Box::new(DellaMerge::linear()),
         MergeMethodConfig::Breadcrumbs => Box::new(BreadcrumbsMerge::new()),
         MergeMethodConfig::ModelStock => Box::new(ModelStockMerge::new()),
+        MergeMethodConfig::Consensus => Box::new(ConsensusMerge::new()),
         MergeMethodConfig::Nearswap => Box::new(NearswapMerge::new()),
         MergeMethodConfig::Ram => Box::new(RamMerge::new()),
         MergeMethodConfig::RamPlus => Box::new(RamMerge::plus()),

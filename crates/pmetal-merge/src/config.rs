@@ -291,6 +291,10 @@ pub enum MergeMethodConfig {
     /// Geometric interpolation based on task vector similarity.
     ModelStock,
 
+    /// Consensus merging with TALL masks (Wang et al., 2024). Uses
+    /// `tall_lambda`, `min_tasks`, `lambda` and the per-model `weight`.
+    Consensus,
+
     /// Parameter-wise selective interpolation.
     Nearswap,
 
@@ -411,6 +415,16 @@ pub struct MergeParameters {
     /// Gamma for breadcrumbs outlier removal.
     #[serde(default)]
     pub gamma: Option<f32>,
+
+    /// TALL-mask threshold of consensus merging: a task claims a coordinate
+    /// where `|tau_t| >= tall_lambda * |tau_MTL - tau_t|`. Defaults to 0.4.
+    #[serde(default)]
+    pub tall_lambda: Option<f32>,
+
+    /// Number of tasks that must claim a coordinate for consensus merging to
+    /// keep it. Defaults to 2, capped at the number of models.
+    #[serde(default)]
+    pub min_tasks: Option<u32>,
 
     /// Seed for the stochastic methods (DARE, DELLA). Each tensor and each
     /// model draws its own independent mask from it, so a merge is
@@ -543,6 +557,8 @@ impl MergeParameters {
             rescale: other.rescale.or(self.rescale),
             epsilon: other.epsilon.or(self.epsilon),
             gamma: other.gamma.or(self.gamma),
+            tall_lambda: other.tall_lambda.or(self.tall_lambda),
+            min_tasks: other.min_tasks.or(self.min_tasks),
             seed: other.seed.or(self.seed),
         }
     }
@@ -759,6 +775,7 @@ impl MergeMethodConfig {
                 | Self::DellaLinear
                 | Self::Breadcrumbs
                 | Self::ModelStock
+                | Self::Consensus
                 | Self::Nearswap
                 | Self::Ram
                 | Self::RamPlus
