@@ -11,7 +11,7 @@
 use crate::Result;
 use pmetal_runtime::compat::{Array, Dtype, ops};
 
-use super::DistillLoss;
+use super::{DistillLoss, reduce_per_token};
 
 /// Logistic ranking loss for smooth pairwise token ordering.
 ///
@@ -47,7 +47,7 @@ impl Default for LogisticRankingLoss {
 }
 
 impl DistillLoss for LogisticRankingLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -122,16 +122,7 @@ impl DistillLoss for LogisticRankingLoss {
         let safe_count = ops::maximum(&pair_count, &Array::from_f32(1.0));
         let per_token = pair_sum.divide(&safe_count);
 
-        if let Some(w) = weights {
-            let w_flat = w.reshape(&[-1]);
-            let weighted = per_token.multiply(&w_flat);
-            let sum = weighted.sum_all();
-            let w_sum = w_flat.sum_all();
-            let safe_sum = ops::maximum(&w_sum, &Array::from_f32(1.0));
-            Ok(sum.divide(&safe_sum))
-        } else {
-            Ok(per_token.mean_all())
-        }
+        reduce_per_token(&per_token, weights)
     }
 
     fn name(&self) -> &'static str {

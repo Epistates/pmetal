@@ -3,34 +3,22 @@
 //! This module provides the high-level API for running knowledge distillation,
 //! including online, offline, and progressive distillation modes.
 
-use std::path::PathBuf;
-
 use pmetal_runtime::compat::{Array, Dtype, ops};
+use pmetal_runtime::training::CrossEntropy;
 
 use crate::{
-    DistillConfig, DistillError, DistillMethod, LossType, Result,
+    DistillConfig, DistillError, DistillMethod, LossType, Result, SparseLogits, SparseTargets,
     losses::{
-        DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
-        SoftCrossEntropyLoss,
+        AttentionTransferLoss, DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss,
+        MseLoss, SoftCrossEntropyLoss, SparseKlLoss,
+        hidden_state::{LayerDistillation, mean_over_layer_pairs},
+        reduce_per_token, tempered_log_probs,
     },
 };
 
-/// Loss-only entry point. End-to-end orchestration (model loading, dataset
-/// iteration, optimizer steps, checkpointing) lives in `pmetal-trainer` —
-/// this crate intentionally exposes only the loss math + per-batch
-/// `Distiller::compute_loss`. Calling this returns a descriptive error so the
-/// caller is steered to the trainer crate or the `pmetal distill` CLI.
-pub fn run_distillation(config: &DistillConfig) -> Result<PathBuf> {
-    config.validate()?;
-    let _ = config; // accepted but not consumed — the validation above is the
-    // only effect inside this crate.
-    Err(DistillError::InvalidConfig(
-        "end-to-end distillation orchestration is not available in `pmetal-distill` alone; \
-         use the `pmetal distill` CLI or `pmetal_trainer::DistillationTrainer` with \
-         model, dataset, and adapter configuration"
-            .to_string(),
-    ))
-}
+// End-to-end orchestration (model loading, dataset iteration, optimizer steps,
+// checkpointing) lives in `pmetal-trainer`; this crate is the loss math and the
+// per-batch `Distiller::compute_loss`.
 
 /// Builder for creating a Distiller instance.
 pub struct DistillerBuilder {
@@ -72,6 +60,7 @@ impl DistillerBuilder {
         let config = self
             .config
             .ok_or_else(|| DistillError::InvalidConfig("Configuration is required".to_string()))?;
+        config.validate()?;
 
         // Create loss function from config if not provided
         let loss: Box<dyn DistillLoss> = self.loss.unwrap_or_else(|| {
@@ -80,15 +69,12 @@ impl DistillerBuilder {
                     Box::new(crate::reasoning::OutcomeSupervisedRationaleLoss::new(
                         config.loss.rationale_weight,
                     ))
-                } else if let (Some(start), Some(end)) =
-                    (&config.loss.start_marker, &config.loss.end_marker)
-                {
-                    Box::new(crate::reasoning::RationaleLoss::with_markers(
-                        config.loss.rationale_weight,
-                        start,
-                        end,
-                    ))
                 } else {
+                    // Explicit reasoning markers (`start_marker`/`end_marker`)
+                    // are token strings; turning them into a per-token mask
+                    // needs the tokenizer, so the training loop does it
+                    // (`reasoning::generate_reasoning_mask`) and passes the
+                    // mask as the per-token weights.
                     Box::new(crate::reasoning::RationaleLoss::new(
                         config.loss.rationale_weight,
                     ))
@@ -115,7 +101,11 @@ impl DistillerBuilder {
                         }
                         Box::new(loss)
                     }
-                    LossType::MiniLlm { mix } => Box::new(crate::losses::MiniLlmLoss::new(mix)),
+                    LossType::SkewKl { alpha, reverse } => Box::new(if reverse {
+                        crate::losses::SkewKlLoss::reverse(alpha)
+                    } else {
+                        crate::losses::SkewKlLoss::forward(alpha)
+                    }),
                     LossType::Gkd {
                         lambda,
                         sampler_temperature,
@@ -124,10 +114,37 @@ impl DistillerBuilder {
             }
         });
 
+        // The attention-transfer term, from `loss.attention`.
+        let attention = config.loss.attention.as_ref().map(|a| AttentionTerm {
+            loss: AttentionTransferLoss::new()
+                .with_loss_type(a.loss_type.clone())
+                .with_head_reduction(a.head_reduction.clone()),
+            layer_mapping: a.layer_mapping.clone(),
+            weight: a.weight,
+        });
+
+        // The hidden-state term: the config names the layer pairs and the
+        // weight; a loss handed to the builder replaces the config's loss type.
+        let layer_distill = match (&config.loss.hidden_state, self.hidden_loss) {
+            (Some(hidden), injected) => Some(LayerDistillation::new(
+                hidden.layer_mapping.clone(),
+                injected.unwrap_or_else(|| HiddenStateLoss::new(hidden.loss_type.clone())),
+                hidden.weight,
+            )),
+            (None, Some(_)) => {
+                return Err(DistillError::InvalidConfig(
+                    "a hidden-state loss needs `loss.hidden_state` to name the layer pairs to align"
+                        .to_string(),
+                ));
+            }
+            (None, None) => None,
+        };
+
         Ok(Distiller {
             config,
             loss,
-            hidden_loss: self.hidden_loss,
+            layer_distill,
+            attention,
         })
     }
 }
@@ -144,8 +161,17 @@ pub struct Distiller {
     config: DistillConfig,
     /// Primary loss function.
     loss: Box<dyn DistillLoss>,
-    /// Optional hidden state loss.
-    hidden_loss: Option<HiddenStateLoss>,
+    /// Hidden-state alignment across the configured layer pairs, if any.
+    layer_distill: Option<LayerDistillation>,
+    /// Attention-map transfer across the configured layer pairs, if any.
+    attention: Option<AttentionTerm>,
+}
+
+/// The attention-transfer term of a [`Distiller`], from `loss.attention`.
+struct AttentionTerm {
+    loss: AttentionTransferLoss,
+    layer_mapping: Vec<(usize, usize)>,
+    weight: f32,
 }
 
 impl Distiller {
@@ -176,25 +202,128 @@ impl Distiller {
         step: usize,
         total_steps: usize,
     ) -> Result<DistillLossOutput> {
-        // Resolve (temperature, alpha): static config or progressive schedule.
-        let (temperature, alpha) = if self.config.method == DistillMethod::Progressive {
-            self.progressive_params(step, total_steps)
-        } else {
-            (self.config.loss.temperature, self.config.loss.alpha)
-        };
+        check_logit_pair(teacher_logits, student_logits)?;
+        let (temperature, alpha) = self.schedule(step, total_steps);
 
-        // Soft distillation loss
         let soft_loss =
             self.loss
                 .compute_weighted(teacher_logits, student_logits, temperature, weights)?;
+        self.combine(
+            soft_loss,
+            self.loss.temperature_scale(temperature),
+            alpha,
+            student_logits,
+            labels,
+        )
+    }
 
-        // Scale by T². Hinton et al. 2015 (§2.2): when teacher/student logits
+    /// [`compute_loss`](Self::compute_loss) against a top-k teacher read from
+    /// an offline cache ([`LogitCache::load_sequence_sparse`](crate::LogitCache::load_sequence_sparse),
+    /// collated with [`SparseLogits::stack`](crate::SparseLogits::stack)),
+    /// without ever forming the dense `[batch, seq, vocab]` teacher.
+    ///
+    /// The soft term is the forward KL
+    /// ([`SparseKlLoss`](crate::losses::SparseKlLoss)), so this needs the
+    /// configured loss to be the forward KL (or the soft cross-entropy, which
+    /// has the same gradient); any other loss needs the dense teacher and is
+    /// refused rather than silently swapped for another.
+    pub fn compute_loss_sparse(
+        &self,
+        teacher: &SparseLogits,
+        student_logits: &Array,
+        labels: Option<&Array>,
+        weights: Option<&Array>,
+        step: usize,
+        total_steps: usize,
+    ) -> Result<DistillLossOutput> {
+        self.require_forward_kl()?;
+        let (temperature, alpha) = self.schedule(step, total_steps);
+        let soft_loss =
+            SparseKlLoss::new().compute(teacher, student_logits, temperature, weights)?;
+        self.combine(
+            soft_loss,
+            temperature * temperature,
+            alpha,
+            student_logits,
+            labels,
+        )
+    }
+
+    /// [`compute_loss_sparse`](Self::compute_loss_sparse) against sampled
+    /// draws ([`SparseTargets`], Random-Sampling KD).
+    ///
+    /// The draws estimate the teacher at the temperature they were taken at,
+    /// so the configured temperature must be that one (an error otherwise;
+    /// with the progressive method, whose temperature moves, it never is).
+    pub fn compute_loss_sampled(
+        &self,
+        teacher: &SparseTargets,
+        student_logits: &Array,
+        labels: Option<&Array>,
+        weights: Option<&Array>,
+        step: usize,
+        total_steps: usize,
+    ) -> Result<DistillLossOutput> {
+        self.require_forward_kl()?;
+        let (temperature, alpha) = self.schedule(step, total_steps);
+        let soft_loss =
+            SparseKlLoss::new().compute_sampled(teacher, student_logits, temperature, weights)?;
+        self.combine(
+            soft_loss,
+            temperature * temperature,
+            alpha,
+            student_logits,
+            labels,
+        )
+    }
+
+    /// A sparse teacher only has a forward-KL form.
+    fn require_forward_kl(&self) -> Result<()> {
+        let cfg = &self.config.loss;
+        let forward_kl = !cfg.rationale
+            && match cfg.loss_type {
+                LossType::KlDivergence => !cfg.reverse_kl,
+                LossType::SoftCrossEntropy => true,
+                _ => false,
+            };
+        if forward_kl {
+            Ok(())
+        } else {
+            Err(DistillError::InvalidConfig(
+                "a sparse teacher supports the forward KL (loss_type kl_divergence without \
+                 reverse_kl, or soft_cross_entropy); this configuration needs the dense teacher \
+                 logits"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// `(temperature, alpha)` at `step`: the static config, or the progressive
+    /// schedule when the method is `Progressive`, so the schedule takes effect.
+    fn schedule(&self, step: usize, total_steps: usize) -> (f32, f32) {
+        if self.config.method == DistillMethod::Progressive {
+            self.progressive_params(step, total_steps)
+        } else {
+            (self.config.loss.temperature, self.config.loss.alpha)
+        }
+    }
+
+    /// Scale the soft loss and blend it with the hard-label loss.
+    fn combine(
+        &self,
+        soft_loss: Array,
+        temperature_scale: f32,
+        alpha: f32,
+        student_logits: &Array,
+        labels: Option<&Array>,
+    ) -> Result<DistillLossOutput> {
+        // Scale by T² (Hinton et al. 2015, §2.1): when teacher/student logits
         // are softened by `T`, the gradient with respect to student logits is
         // attenuated by 1/T². Multiplying the loss by T² restores the
         // gradient magnitude so a single optimizer step has the same effect
-        // regardless of the temperature setting.
-        let t_squared = temperature * temperature;
-        let soft_scaled = soft_loss.multiply(&Array::from_f32(t_squared));
+        // regardless of the temperature setting. A loss that never softens
+        // anything (logit MSE) opts out through `temperature_scale`.
+        let soft_scaled = soft_loss.multiply(&Array::from_f32(temperature_scale));
 
         // Combined with hard labels if provided
         let (total_loss, hard_loss_opt) = if let Some(labels) = labels {
@@ -213,7 +342,7 @@ impl Distiller {
 
         Ok(DistillLossOutput {
             total: total_loss,
-            soft: soft_scaled.clone(),
+            soft: soft_scaled,
             hard: hard_loss_opt,
             hidden: None,
             metrics: std::collections::HashMap::new(),
@@ -245,22 +374,48 @@ impl Distiller {
             total_steps,
         )?;
 
-        // Add hidden state loss if configured
-        if let Some(_hidden_loss) = &self.hidden_loss {
-            if let Some(hidden_config) = &self.config.loss.hidden_state {
-                let layer_distill = crate::losses::hidden_state::LayerDistillation::new(
-                    hidden_config.layer_mapping.clone(),
-                    HiddenStateLoss::new(hidden_config.loss_type.clone()),
-                    hidden_config.weight,
-                );
-
-                let hidden = layer_distill.compute(teacher_hiddens, student_hiddens)?;
-                output.total = output.total.add(&hidden);
-                output.hidden = Some(hidden);
-            }
+        // Add the hidden-state term when one is configured. The token weights
+        // that mask the logit loss mask the hidden states too.
+        if let Some(layer_distill) = &self.layer_distill {
+            let hidden =
+                layer_distill.compute_with_mask(teacher_hiddens, student_hiddens, weights)?;
+            output.total = output.total.add(&hidden);
+            output.hidden = Some(hidden);
         }
 
         Ok(output)
+    }
+
+    /// The attention-transfer term configured by `loss.attention`: the mean
+    /// over the mapped layer pairs of the chosen attention loss, times the
+    /// configured weight. `None` when no attention transfer is configured.
+    ///
+    /// `teacher_attn` and `student_attn` are the post-softmax attention maps
+    /// of every layer, `[batch, heads, q, k]` each. Add the result to the
+    /// total of [`compute_loss`](Self::compute_loss) like the hidden term.
+    pub fn compute_attention_loss(
+        &self,
+        teacher_attn: &[Array],
+        student_attn: &[Array],
+    ) -> Result<Option<Array>> {
+        let Some(term) = &self.attention else {
+            return Ok(None);
+        };
+        let weights = vec![1.0; term.layer_mapping.len()];
+        mean_over_layer_pairs(
+            &term.layer_mapping,
+            &weights,
+            term.weight,
+            teacher_attn,
+            student_attn,
+            |teacher, student| term.loss.compute(teacher, student),
+        )
+        .map(Some)
+    }
+
+    /// The name of the soft loss in use (`"kl_divergence"`, `"skew_kl"`, ...).
+    pub fn loss_name(&self) -> &'static str {
+        self.loss.name()
     }
 
     /// Get the configuration.
@@ -320,48 +475,73 @@ impl DistillLossOutput {
     /// - `top1_agreement`: fraction of tokens where argmax agrees.
     /// - `kl_per_token`: mean fwd-KL(teacher || student) in nats.
     pub fn with_metrics(
-        mut self,
+        self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
     ) -> Self {
-        // Probabilities (and clamp for log) at the configured temperature.
-        let inv_t = 1.0_f32 / temperature.max(1e-6);
-        let t_scaled = teacher_logits.multiply(&Array::from_f32(inv_t));
-        let s_scaled = student_logits.multiply(&Array::from_f32(inv_t));
-        let t_log_p = t_scaled.log_softmax(-1);
-        let s_log_p = s_scaled.log_softmax(-1);
+        self.with_weighted_metrics(teacher_logits, student_logits, temperature, None)
+    }
+
+    /// [`with_metrics`](Self::with_metrics) averaged over the tokens the
+    /// per-token `weights` (`[batch, seq]`, e.g. the loss mask) keep, so
+    /// padding and prompt positions do not pollute the telemetry.
+    ///
+    /// The teacher and the student must share a vocabulary. All four values
+    /// come back in one device-to-host transfer.
+    pub fn with_weighted_metrics(
+        mut self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+        weights: Option<&Array>,
+    ) -> Self {
+        let teacher_logits = teacher_logits.stop_gradient();
+        let student_logits = student_logits.stop_gradient();
+        let t_log_p = tempered_log_probs(&teacher_logits, temperature);
+        let s_log_p = tempered_log_probs(&student_logits, temperature);
         let t_p = t_log_p.exp();
         let s_p = s_log_p.exp();
 
-        // Per-token entropies, then mean over all axes except the last
-        // (which is the vocab axis we already summed across).
-        let neg = Array::from_f32(-1.0);
-        let h_teacher = t_p.multiply(&t_log_p).sum_axis(-1, false).multiply(&neg);
-        let h_student = s_p.multiply(&s_log_p).sum_axis(-1, false).multiply(&neg);
-
-        // Forward-KL(teacher || student) per token, then mean.
+        // Per-token entropies and forward KL(teacher || student).
+        let h_teacher = t_p.multiply(&t_log_p).sum_axis(-1, false).negative();
+        let h_student = s_p.multiply(&s_log_p).sum_axis(-1, false).negative();
         let kl = t_p
             .multiply(&t_log_p.subtract(&s_log_p))
             .sum_axis(-1, false);
 
-        // top-1 agreement: fraction where argmax(teacher) == argmax(student).
-        let t_top = teacher_logits.argmax(-1);
-        let s_top = student_logits.argmax(-1);
-        let agree = t_top
-            .equal(&s_top)
-            .as_dtype(Dtype::Float32.as_i32())
-            .mean_all();
+        // top-1 agreement: whether argmax(teacher) == argmax(student).
+        let agree = teacher_logits
+            .argmax(-1)
+            .equal(&student_logits.argmax(-1))
+            .as_dtype(Dtype::Float32.as_i32());
 
-        let h_t_mean: f32 = h_teacher.mean_all().item();
-        let h_s_mean: f32 = h_student.mean_all().item();
-        let kl_mean: f32 = kl.mean_all().item();
-        let agree_f: f32 = agree.item();
+        let mean = |per_token: &Array| -> Array {
+            // A weight tensor of the wrong size is a caller bug; telemetry
+            // reports it as NaN rather than panicking mid-training.
+            reduce_per_token(per_token, weights)
+                .unwrap_or_else(|_| Array::from_f32(f32::NAN))
+                .reshape(&[1])
+        };
+        let packed = ops::concatenate_axis(
+            &[
+                &mean(&h_teacher),
+                &mean(&h_student),
+                &mean(&kl),
+                &mean(&agree),
+            ],
+            0,
+        );
+        let [h_t, h_s, kl_mean, agree_mean] = packed
+            .clone()
+            .to_f32_vec(4)
+            .and_then(|v| <[f32; 4]>::try_from(v).ok())
+            .unwrap_or([f32::NAN; 4]);
 
-        self.metrics.insert("teacher_entropy", h_t_mean);
-        self.metrics.insert("student_entropy", h_s_mean);
+        self.metrics.insert("teacher_entropy", h_t);
+        self.metrics.insert("student_entropy", h_s);
         self.metrics.insert("kl_per_token", kl_mean);
-        self.metrics.insert("top1_agreement", agree_f);
+        self.metrics.insert("top1_agreement", agree_mean);
         self
     }
 }
@@ -369,44 +549,32 @@ impl DistillLossOutput {
 /// Compute hard cross-entropy loss with labels, masking positions whose label
 /// equals `ignore_index` (PyTorch convention: `-100`).
 ///
-/// All ops stay in the MLX graph so gradients flow correctly. The mask is the
-/// indicator `labels != ignore_index`; ignored positions contribute zero loss
-/// and are excluded from the divisor. This matches `torch.nn.functional.cross_entropy(reduction='mean')`.
+/// Teacher and student logits must agree on every axis but the vocabulary
+/// (a differing vocabulary is a cross-vocabulary run, which the losses align).
+///
+/// An exception inside the runtime does not abort: it leaves a placeholder
+/// array behind, so a mismatch has to be caught before the first op.
+fn check_logit_pair(teacher: &Array, student: &Array) -> Result<()> {
+    let (t, s) = (teacher.shape(), student.shape());
+    if t.len() < 2 || t.len() != s.len() || t[..t.len() - 1] != s[..s.len() - 1] {
+        return Err(DistillError::ShapeMismatch {
+            teacher: t.to_vec(),
+            student: s.to_vec(),
+        });
+    }
+    Ok(())
+}
+
+/// The runtime's fused cross-entropy evaluates in f32 whatever the logits'
+/// dtype (a bf16 normalizer over a large vocabulary is off by tenths of a
+/// nat), keeps the labels out of the gradient trace, and ignores the masked
+/// positions in both the sum and the divisor, as
+/// `torch.nn.functional.cross_entropy(reduction='mean')` does. An all-ignored
+/// batch gives zero.
 fn compute_hard_loss(logits: &Array, labels: &Array, ignore_index: i32) -> Result<Array> {
-    // Log-softmax for numerical stability
-    let log_probs = logits.log_softmax(-1);
-
-    // Flatten to [batch*seq, vocab] for gather
-    let vocab_size = logits.dim(-1);
-    let log_probs_flat = log_probs.reshape(&[-1, vocab_size]);
-    let labels_flat = labels.reshape(&[-1]);
-
-    // Build ignore mask: 1 where label != ignore_index, else 0.
-    let ignore_arr = Array::from_i32(ignore_index);
-    let valid_mask = labels_flat
-        .not_equal(&ignore_arr)
-        .as_dtype(Dtype::Float32.as_i32());
-
-    // Clamp labels to a safe gather range. Ignored positions get `0` for the
-    // gather lookup; their contribution is zeroed by `valid_mask` afterwards.
-    // Negative labels (e.g. -100) would otherwise crash gather.
-    let zero_i = Array::from_i32(0);
-    let upper = Array::from_i32(vocab_size - 1);
-    let labels_clamped = ops::minimum(&ops::maximum(&labels_flat, &zero_i), &upper)
-        .as_dtype(Dtype::Int32.as_i32())
-        .reshape(&[-1, 1]);
-
-    // Gather log-probs at label positions using take_along_axis (stays in graph)
-    let gathered = log_probs_flat.take_along_axis(&labels_clamped, -1);
-    let gathered = gathered.squeeze(-1);
-
-    // Apply mask: only count non-ignored tokens
-    let neg_log_probs = gathered.negative().multiply(&valid_mask);
-
-    // Mean over valid tokens (avoid division by zero)
-    let num_valid = valid_mask.sum_all();
-    let safe_num = ops::maximum(&num_valid, &Array::from_f32(1.0));
-    Ok(neg_log_probs.sum_all().divide(&safe_num))
+    Ok(CrossEntropy::new()
+        .with_ignore_index(ignore_index)
+        .mean(logits, labels))
 }
 
 #[cfg(test)]
@@ -507,15 +675,6 @@ mod tests {
         config.loss.loss_type = LossType::MseLoss;
         let d = Distiller::new(config.clone()).unwrap();
         assert_eq!(d.loss.name(), "mse");
-    }
-
-    #[test]
-    fn test_run_distillation_requires_external_orchestration() {
-        let err = run_distillation(&test_config()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("end-to-end distillation orchestration is not available")
-        );
     }
 
     /// `compute_hard_loss` must obey `TrainingConfig.ignore_index`. The two

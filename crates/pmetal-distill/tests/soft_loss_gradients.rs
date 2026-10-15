@@ -39,7 +39,7 @@ fn mask() -> Array {
 }
 
 fn drain() {
-    pmetal_runtime::check_unobserved_error().expect("a bridge op threw");
+    pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
 }
 
 /// Loss value and autograd gradient of `f` at `x`.

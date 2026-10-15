@@ -1,46 +1,69 @@
 //! TAID: Temporally Adaptive Interpolated Distillation.
 //!
-//! Implements the TAID algorithm from "TAID: Temporally Adaptive Interpolated
-//! Distillation for Efficient Knowledge Transfer" (ICLR 2025 Spotlight).
+//! Shing, Misaki, Bao, Yokoi and Akiba, *TAID: Temporally Adaptive
+//! Interpolated Distillation for Efficient Knowledge Transfer in Language
+//! Models* (ICLR 2025). A student far smaller than its teacher cannot match
+//! the teacher's distribution directly: forward KL makes it spread mass over
+//! modes it cannot represent, reverse KL collapses it onto one. TAID gives it
+//! an intermediate target that starts at the student itself and moves toward
+//! the teacher as the student improves.
 //!
-//! Key innovation: Instead of distilling directly from teacher to student,
-//! TAID creates an adaptive intermediate distribution that:
+//! # The method
 //!
-//! 1. **Starts closer to teacher**: Early in training when student is weak
-//! 2. **Gradually shifts toward student**: As student improves
-//! 3. **Adapts per-sample**: Harder samples use more teacher guidance
+//! With teacher logits `z_T`, the student's logits `z_S` held constant, and an
+//! interpolation parameter `t ∈ [0, 1]`, the intermediate distribution is a
+//! mixture **in logit space** (Definition 3.1):
 //!
-//! This prevents mode collapse and allows more stable knowledge transfer.
+//! ```text
+//! p_t = softmax( (1 - t) · sg(z_S) + t · z_T )
+//! ```
 //!
-//! # Algorithm
+//! `sg` is a stop-gradient: the target does not move with the student's
+//! gradient step, so the objective is plain forward KL against a fixed
+//! target (Definition 3.2):
 //!
-//! Given teacher distribution P_T and student distribution P_S:
-//! 1. Compute interpolated target: P_I = α * P_T + (1 - α) * P_S
-//! 2. α adapts based on: (a) training progress, (b) sample difficulty
-//! 3. Student learns to match P_I instead of P_T directly
+//! ```text
+//! J_t = KL( p_t || softmax(z_S) )         averaged over tokens
+//! ```
+//!
+//! `t = 0` is the student itself (zero loss, zero gradient); `t = 1` is the
+//! teacher. `t` does not follow a fixed schedule alone. After each step the
+//! relative improvement of the objective drives a momentum that speeds `t` up
+//! while the student keeps up and slows it while it does not (Algorithm 1):
+//!
+//! ```text
+//! δ_n = (J_{n-1} - J_n) / (J_{n-1} + ε)
+//! m_n = β · m_{n-1} + (1 - β) · δ_n
+//! t_n = min(t_end, max(t_linear(n), t_{n-1} + α · sigmoid(m_n) · (t_end - t_{n-1})))
+//! ```
+//!
+//! where `t_linear` is the straight line from `t_start` to `t_end` over the
+//! run, a floor that guarantees the teacher is reached.
 //!
 //! # Usage
+//!
+//! [`TaidDistiller`] is stateful: it carries `t` and the momentum.
+//! [`compute_loss`](TaidDistiller::compute_loss) builds the lazy loss at the
+//! current `t`; after the optimizer step, hand the objective's value to
+//! [`observe`](TaidDistiller::observe) to advance `t`.
 //!
 //! ```rust,ignore
 //! use pmetal_distill::{TaidConfig, TaidDistiller};
 //!
-//! let config = TaidConfig::default()
-//!     .with_initial_alpha(0.9)
-//!     .with_final_alpha(0.5)
-//!     .with_difficulty_scaling(true);
-//!
-//! let distiller = TaidDistiller::new(config);
-//! let loss = distiller.compute_loss(&teacher_logits, &student_logits, step, total_steps)?;
+//! let mut taid = TaidDistiller::new(TaidConfig::default())?;
+//! for step in 1..=total_steps {
+//!     let out = taid.compute_loss(&teacher_logits, &student_logits, Some(&mask), None)?;
+//!     // ... differentiate out.total, update the student ...
+//!     taid.observe(out.distillation.item::<f32>() as f64, step, total_steps);
+//! }
 //! ```
+//!
+//! The teacher and the student must share a vocabulary (the mixture is taken
+//! per token id).
 
-use crate::Result;
-use crate::losses::softmax;
-use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
-
-/// Log-softmax along specified axis.
-fn log_softmax(x: &Array, axis: i32) -> Result<Array> {
-    Ok(x.log_softmax(axis))
-}
+use crate::losses::{kl_from_log_probs, reduce_per_token, tempered_log_probs};
+use pmetal_runtime::compat::{Array, Exception};
+use pmetal_runtime::training::CrossEntropy;
 
 /// Error type for TAID operations.
 #[derive(Debug, thiserror::Error)]
@@ -59,153 +82,81 @@ pub enum TaidError {
 /// Result type for TAID operations.
 pub type TaidResult<T> = std::result::Result<T, TaidError>;
 
-/// TAID configuration.
+/// TAID hyperparameters. Defaults are the paper's instruction-tuning values.
 #[derive(Debug, Clone)]
 pub struct TaidConfig {
-    /// Initial interpolation factor (α at step 0).
-    /// Higher values = more teacher guidance early on.
-    /// Default: 0.9
-    pub initial_alpha: f64,
+    /// `t` at the first step (`t_start`). The paper uses 0.2 for most
+    /// teacher/student pairs and 0.4 for Phi-3-mini and the vision-language
+    /// pair. Must be in `(0, 1]` for the student to receive any gradient.
+    pub t_start: f64,
 
-    /// Final interpolation factor (α at final step).
-    /// Lower values = student-driven learning late in training.
-    /// Default: 0.5
-    pub final_alpha: f64,
+    /// `t` the schedule reaches at the last step (`t_end`); 1.0 is the
+    /// teacher itself.
+    pub t_end: f64,
 
-    /// Interpolation schedule type.
-    /// Default: Cosine
-    pub schedule: TaidSchedule,
+    /// Step size of the adaptive update (`α`): 5e-4 for instruction tuning
+    /// and vision-language models, 5e-5 for pre-training.
+    pub alpha: f64,
 
-    /// Temperature for softmax over teacher logits.
-    /// Higher temperature = softer targets.
-    /// Default: 4.0
-    pub temperature: f64,
+    /// Momentum of the improvement signal (`β`), 0.99 in every experiment.
+    pub beta: f64,
 
-    /// Whether to use per-sample difficulty-aware alpha.
-    /// Default: true
-    pub difficulty_aware: bool,
+    /// Guard on the denominator of the relative improvement (`ε`).
+    pub epsilon: f64,
 
-    /// Scaling factor for difficulty-based alpha adjustment.
-    /// Default: 0.2
-    pub difficulty_scale: f64,
-
-    /// Minimum alpha value (clamp for numerical stability).
-    /// Default: 0.1
-    pub min_alpha: f64,
-
-    /// Maximum alpha value (clamp for numerical stability).
-    /// Default: 1.0
-    pub max_alpha: f64,
-
-    /// Whether to use KL divergence or cross-entropy for loss.
-    /// Default: KL
-    pub loss_type: TaidLossType,
-
-    /// Whether to use label smoothing.
-    /// Default: false
-    pub label_smoothing: bool,
-
-    /// Label smoothing factor.
-    /// Default: 0.1
-    pub label_smoothing_factor: f64,
-
-    /// Hard target weight (optional ground truth loss).
-    /// Default: 0.0 (pure distillation)
+    /// Weight of the hard-label cross-entropy in the total loss:
+    /// `(1 - w) · J + w · CE`. Zero is pure distillation.
     pub hard_target_weight: f64,
-}
 
-/// Schedule for alpha interpolation over training.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TaidSchedule {
-    /// Linear decay from initial to final alpha.
-    Linear,
-    /// Cosine annealing (smoother transition).
-    #[default]
-    Cosine,
-    /// Exponential decay.
-    Exponential,
-    /// Step-wise schedule (drops at specific milestones).
-    Step,
-    /// Constant alpha (no temporal adaptation).
-    Constant,
-}
-
-/// Loss type for TAID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TaidLossType {
-    /// KL divergence: D_KL(P_I || P_S)
-    #[default]
-    KlDivergence,
-    /// Cross-entropy: -P_I * log(P_S)
-    CrossEntropy,
-    /// Jensen-Shannon divergence: symmetric KL
-    JensenShannon,
-    /// Reverse KL: D_KL(P_S || P_I)
-    ReverseKl,
+    /// Label value marking positions the hard-label loss ignores.
+    pub ignore_index: i32,
 }
 
 impl Default for TaidConfig {
     fn default() -> Self {
         Self {
-            initial_alpha: 0.9,
-            final_alpha: 0.5,
-            schedule: TaidSchedule::Cosine,
-            temperature: 4.0,
-            difficulty_aware: true,
-            difficulty_scale: 0.2,
-            min_alpha: 0.1,
-            max_alpha: 1.0,
-            loss_type: TaidLossType::KlDivergence,
-            label_smoothing: false,
-            label_smoothing_factor: 0.1,
+            t_start: 0.2,
+            t_end: 1.0,
+            alpha: 5e-4,
+            beta: 0.99,
+            epsilon: 1e-8,
             hard_target_weight: 0.0,
+            ignore_index: -100,
         }
     }
 }
 
 impl TaidConfig {
-    /// Create a new TAID config.
+    /// Create a new TAID config with the paper's defaults.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Set initial alpha.
-    pub fn with_initial_alpha(mut self, alpha: f64) -> Self {
-        self.initial_alpha = alpha;
+    /// Set `t_start`.
+    pub fn with_t_start(mut self, t: f64) -> Self {
+        self.t_start = t;
         self
     }
 
-    /// Set final alpha.
-    pub fn with_final_alpha(mut self, alpha: f64) -> Self {
-        self.final_alpha = alpha;
+    /// Set `t_end`.
+    pub fn with_t_end(mut self, t: f64) -> Self {
+        self.t_end = t;
         self
     }
 
-    /// Set schedule type.
-    pub fn with_schedule(mut self, schedule: TaidSchedule) -> Self {
-        self.schedule = schedule;
+    /// Set the adaptive step size `α`.
+    pub fn with_alpha(mut self, alpha: f64) -> Self {
+        self.alpha = alpha;
         self
     }
 
-    /// Set temperature.
-    pub fn with_temperature(mut self, temp: f64) -> Self {
-        self.temperature = temp;
+    /// Set the momentum `β`.
+    pub fn with_beta(mut self, beta: f64) -> Self {
+        self.beta = beta;
         self
     }
 
-    /// Enable/disable difficulty-aware alpha.
-    pub fn with_difficulty_scaling(mut self, enabled: bool) -> Self {
-        self.difficulty_aware = enabled;
-        self
-    }
-
-    /// Set loss type.
-    pub fn with_loss_type(mut self, loss_type: TaidLossType) -> Self {
-        self.loss_type = loss_type;
-        self
-    }
-
-    /// Set hard target weight.
+    /// Set the hard-label weight.
     pub fn with_hard_target_weight(mut self, weight: f64) -> Self {
         self.hard_target_weight = weight;
         self
@@ -213,363 +164,170 @@ impl TaidConfig {
 
     /// Validate the configuration.
     pub fn validate(&self) -> TaidResult<()> {
-        if self.initial_alpha < 0.0 || self.initial_alpha > 1.0 {
-            return Err(TaidError::Config("initial_alpha must be in [0, 1]".into()));
+        let in_unit = |x: f64| x.is_finite() && (0.0..=1.0).contains(&x);
+        if !(in_unit(self.t_start) && self.t_start > 0.0) {
+            return Err(TaidError::Config(
+                "t_start must be in (0, 1]: at 0 the target is the student itself and there is no gradient"
+                    .into(),
+            ));
         }
-        if self.final_alpha < 0.0 || self.final_alpha > 1.0 {
-            return Err(TaidError::Config("final_alpha must be in [0, 1]".into()));
+        if !in_unit(self.t_end) || self.t_end < self.t_start {
+            return Err(TaidError::Config("t_end must be in [t_start, 1]".into()));
         }
-        if self.temperature <= 0.0 {
-            return Err(TaidError::Config("temperature must be positive".into()));
+        if !(self.alpha.is_finite() && self.alpha >= 0.0) {
+            return Err(TaidError::Config("alpha must be non-negative".into()));
         }
-        if self.min_alpha > self.max_alpha {
-            return Err(TaidError::Config("min_alpha must be <= max_alpha".into()));
+        if !(self.beta.is_finite() && (0.0..1.0).contains(&self.beta)) {
+            return Err(TaidError::Config("beta must be in [0, 1)".into()));
+        }
+        if !(self.epsilon.is_finite() && self.epsilon > 0.0) {
+            return Err(TaidError::Config("epsilon must be positive".into()));
+        }
+        if !in_unit(self.hard_target_weight) {
+            return Err(TaidError::Config(
+                "hard_target_weight must be in [0, 1]".into(),
+            ));
         }
         Ok(())
     }
 }
 
-/// TAID Distiller.
-///
-/// Implements temporally adaptive interpolated distillation.
+/// TAID Distiller: the intermediate distribution and the adaptive `t`.
 pub struct TaidDistiller {
-    /// Configuration.
     config: TaidConfig,
+    /// The interpolation parameter the next loss is built at.
+    t: f64,
+    /// Momentum of the relative improvement, `m_n`.
+    momentum: f64,
+    /// The objective the previous step reported, `J_{n-1}`.
+    previous_objective: Option<f64>,
 }
 
 impl TaidDistiller {
-    /// Create a new TAID distiller.
+    /// Create a new TAID distiller, with `t = t_start`.
     pub fn new(config: TaidConfig) -> TaidResult<Self> {
         config.validate()?;
-        Ok(Self { config })
+        Ok(Self {
+            t: config.t_start,
+            momentum: 0.0,
+            previous_objective: None,
+            config,
+        })
     }
 
-    /// Compute the interpolation factor alpha based on training progress.
-    ///
-    /// # Arguments
-    /// * `step` - Current training step
-    /// * `total_steps` - Total training steps
-    ///
-    /// # Returns
-    /// Base alpha value (before per-sample difficulty adjustment)
-    pub fn compute_base_alpha(&self, step: usize, total_steps: usize) -> f64 {
-        if total_steps == 0 {
-            return self.config.initial_alpha;
-        }
+    /// The interpolation parameter the next loss is built at.
+    pub fn t(&self) -> f64 {
+        self.t
+    }
 
-        let progress = (step as f64) / (total_steps as f64);
-        let alpha_range = self.config.initial_alpha - self.config.final_alpha;
+    /// The momentum `m_n` of the improvement signal.
+    pub fn momentum(&self) -> f64 {
+        self.momentum
+    }
 
-        let alpha = match self.config.schedule {
-            TaidSchedule::Linear => self.config.initial_alpha - alpha_range * progress,
-            TaidSchedule::Cosine => {
-                // Cosine annealing: starts slow, speeds up, then slows down
-                let cosine_factor = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
-                self.config.final_alpha + alpha_range * cosine_factor
-            }
-            TaidSchedule::Exponential => {
-                // Exponential decay
-                let decay_rate = (self.config.final_alpha / self.config.initial_alpha).ln();
-                self.config.initial_alpha * (decay_rate * progress).exp()
-            }
-            TaidSchedule::Step => {
-                // Step-wise: 4 stages
-                if progress < 0.25 {
-                    self.config.initial_alpha
-                } else if progress < 0.5 {
-                    self.config.initial_alpha - alpha_range * 0.33
-                } else if progress < 0.75 {
-                    self.config.initial_alpha - alpha_range * 0.66
-                } else {
-                    self.config.final_alpha
-                }
-            }
-            TaidSchedule::Constant => self.config.initial_alpha,
+    /// The linear floor `t_linear` after `step` of `total_steps` steps.
+    pub fn linear_t(&self, step: usize, total_steps: usize) -> f64 {
+        let progress = if total_steps == 0 {
+            1.0
+        } else {
+            (step as f64 / total_steps as f64).min(1.0)
         };
-
-        alpha.clamp(self.config.min_alpha, self.config.max_alpha)
+        self.config.t_start + (self.config.t_end - self.config.t_start) * progress
     }
 
-    /// Compute per-sample difficulty and adjust alpha.
+    /// Advance `t` after a training step.
     ///
-    /// Difficulty is measured by KL divergence between teacher and student.
-    /// Higher difficulty = higher alpha (more teacher guidance).
-    ///
-    /// # Arguments
-    /// * `teacher_probs` - Teacher probability distribution [batch, seq, vocab]
-    /// * `student_probs` - Student probability distribution [batch, seq, vocab]
-    /// * `base_alpha` - Base alpha from temporal schedule
-    ///
-    /// # Returns
-    /// Per-sample alpha values `[batch]`
-    pub fn compute_difficulty_alpha(
-        &self,
-        teacher_probs: &Array,
-        student_probs: &Array,
-        base_alpha: f64,
-    ) -> TaidResult<Array> {
-        if !self.config.difficulty_aware {
-            // Return constant alpha for all samples
-            let batch_size = teacher_probs.dim(0);
-            return Ok(Array::from_f32_slice(
-                &vec![base_alpha as f32; batch_size as usize],
-                &[batch_size],
-            ));
+    /// `objective` is the value of the TAID objective `J` that step computed
+    /// (the `distillation` term of its [`TaidLossOutput`]) and `step` the
+    /// number of steps completed including this one. The first call has no
+    /// earlier objective to compare with and contributes no improvement.
+    /// Non-finite objectives are ignored: `t` still follows its linear floor.
+    pub fn observe(&mut self, objective: f64, step: usize, total_steps: usize) {
+        let delta = match self.previous_objective {
+            Some(previous) if objective.is_finite() && previous.is_finite() => {
+                (previous - objective) / (previous + self.config.epsilon)
+            }
+            _ => 0.0,
+        };
+        if objective.is_finite() {
+            self.previous_objective = Some(objective);
         }
+        self.momentum = self.config.beta * self.momentum + (1.0 - self.config.beta) * delta;
 
-        // Compute KL divergence per sample as difficulty measure
-        // KL(P_T || P_S) = sum(P_T * log(P_T / P_S))
-        let eps = Array::from_f32(1e-10);
-        let student_safe = student_probs.add(&eps);
-        let log_ratio = teacher_probs.divide(&student_safe).log();
-        let kl_per_token = teacher_probs.multiply(&log_ratio);
-
-        // Sum over vocab and seq dimensions to get per-sample KL
-        let kl_per_sample = kl_per_token.sum_axes(&[-1], false).sum_axes(&[-1], false);
-
-        // Normalize difficulty to [0, 1] range using a shifted sigmoid so that
-        // KL ≈ 0 (easy sample) maps to normalized_diff ≈ 0 → alpha ≈ base_alpha.
-        //
-        // Without shifting, sigmoid(0) = 0.5, so an easy sample with KL=0 would
-        // receive alpha = base_alpha + 0.5 * (max_alpha - base_alpha), i.e. always
-        // halfway to max_alpha even on trivially easy samples.
-        //
-        // The shift is: shifted_kl = scale * kl - kl_threshold
-        // where kl_threshold is chosen so sigmoid(-kl_threshold) ≈ 0.
-        // We use kl_threshold = 5.0 (sigmoid(-5) ≈ 0.007) as a practical value.
-        let scale = Array::from_f32(self.config.difficulty_scale as f32);
-        let kl_threshold = Array::from_f32(5.0_f32);
-        let scaled_kl = kl_per_sample.multiply(&scale);
-        // shifted_kl < 0 when kl is small → sigmoid ≈ 0 → alpha ≈ base_alpha
-        let shifted_kl = scaled_kl.subtract(&kl_threshold);
-        let sigmoid_diff = shifted_kl.negative().exp().add(&Array::from_f32(1.0));
-        let normalized_diff = Array::from_f32(1.0).divide(&sigmoid_diff);
-
-        // Adjust alpha: alpha = base_alpha + difficulty_adjustment
-        // Where difficulty_adjustment scales from 0 to (max_alpha - base_alpha)
-        let alpha_adjustment_range = (self.config.max_alpha - base_alpha) as f32;
-        let adjustment = normalized_diff.multiply(&Array::from_f32(alpha_adjustment_range));
-        let alpha = adjustment.add(&Array::from_f32(base_alpha as f32));
-
-        // Clamp to valid range
-        let min_alpha = Array::from_f32(self.config.min_alpha as f32);
-        let max_alpha = Array::from_f32(self.config.max_alpha as f32);
-        let clamped = ops::maximum(&alpha, &min_alpha);
-        let clamped = ops::minimum(&clamped, &max_alpha);
-
-        Ok(clamped)
+        let sigmoid = 1.0 / (1.0 + (-self.momentum).exp());
+        let advanced = self.t + self.config.alpha * sigmoid * (self.config.t_end - self.t);
+        let floor = self.linear_t(step, total_steps);
+        self.t = advanced.max(floor).min(self.config.t_end);
     }
 
-    /// Compute the interpolated target distribution.
+    /// Log-probabilities of the intermediate distribution
+    /// `softmax((1 - t) · sg(z_S) + t · z_T)`, in f32.
     ///
-    /// P_I = α * P_T + (1 - α) * P_S
+    /// Neither the teacher nor the student logits carry gradient out of this.
+    pub fn intermediate_log_probs(&self, teacher_logits: &Array, student_logits: &Array) -> Array {
+        let f32_ = pmetal_runtime::compat::Dtype::Float32.as_i32();
+        let t = self.t as f32;
+        let teacher = teacher_logits.stop_gradient().as_dtype(f32_);
+        let student = student_logits.stop_gradient().as_dtype(f32_);
+        let mixed = student
+            .multiply(&Array::from_f32(1.0 - t))
+            .add(&teacher.multiply(&Array::from_f32(t)));
+        tempered_log_probs(&mixed, 1.0)
+    }
+
+    /// Compute the TAID loss at the current `t`.
     ///
     /// # Arguments
-    /// * `teacher_probs` - Teacher softmax probs [batch, seq, vocab]
-    /// * `student_probs` - Student softmax probs [batch, seq, vocab]
-    /// * `alpha` - Interpolation factor `[batch]` or scalar
-    ///
-    /// # Returns
-    /// Interpolated distribution [batch, seq, vocab]
-    pub fn interpolate_distributions(
-        &self,
-        teacher_probs: &Array,
-        student_probs: &Array,
-        alpha: &Array,
-    ) -> TaidResult<Array> {
-        // Expand alpha for broadcasting: [batch] -> [batch, 1, 1]
-        let alpha_expanded = alpha.reshape(&[alpha.dim(0), 1, 1]);
-        let one_minus_alpha = Array::from_f32(1.0).subtract(&alpha_expanded);
-
-        // P_I = α * P_T + (1 - α) * P_S
-        let teacher_contrib = teacher_probs.multiply(&alpha_expanded);
-        let student_contrib = student_probs.multiply(&one_minus_alpha);
-        let interpolated = teacher_contrib.add(&student_contrib);
-
-        Ok(interpolated)
-    }
-
-    /// Apply temperature scaling to logits.
-    pub fn apply_temperature(&self, logits: &Array) -> TaidResult<Array> {
-        let temp = Array::from_f32(self.config.temperature as f32);
-        Ok(logits.divide(&temp))
-    }
-
-    /// Compute TAID loss.
-    ///
-    /// # Arguments
-    /// * `teacher_logits` - Teacher model logits [batch, seq, vocab]
-    /// * `student_logits` - Student model logits [batch, seq, vocab]
-    /// * `step` - Current training step
-    /// * `total_steps` - Total training steps
-    /// * `labels` - Optional ground truth labels for hard target loss
-    ///
-    /// # Returns
-    /// TaidLossOutput containing total loss and components
+    /// * `teacher_logits` - `[batch, seq, vocab]`
+    /// * `student_logits` - `[batch, seq, vocab]`, the same vocabulary
+    /// * `weights` - optional per-token weights `[batch, seq]` (a 0/1 mask of
+    ///   the positions that count); the loss is `sum(J·w) / sum(w)`
+    /// * `labels` - optional ground-truth ids `[batch, seq]` for the
+    ///   hard-label term when `hard_target_weight > 0`
     pub fn compute_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
-        step: usize,
-        total_steps: usize,
+        weights: Option<&Array>,
         labels: Option<&Array>,
     ) -> TaidResult<TaidLossOutput> {
-        // Apply temperature scaling
-        let teacher_scaled = self.apply_temperature(teacher_logits)?;
-        let student_scaled = self.apply_temperature(student_logits)?;
+        if teacher_logits.shape() != student_logits.shape() {
+            return Err(crate::DistillError::ShapeMismatch {
+                teacher: teacher_logits.shape().to_vec(),
+                student: student_logits.shape().to_vec(),
+            }
+            .into());
+        }
 
-        // Compute softmax probabilities
-        let teacher_probs = softmax(&teacher_scaled, -1)?;
-        let student_probs = softmax(&student_scaled, -1)?;
-        let student_log_probs = log_softmax(&student_scaled, -1)?;
+        let log_p_t = self.intermediate_log_probs(teacher_logits, student_logits);
+        let log_q = tempered_log_probs(student_logits, 1.0);
+        let per_token = kl_from_log_probs(&log_p_t, &log_q);
+        let distillation = reduce_per_token(&per_token, weights)?;
 
-        // Compute base alpha from temporal schedule
-        let base_alpha = self.compute_base_alpha(step, total_steps);
-
-        // Compute per-sample alpha (difficulty-aware)
-        let alpha = self.compute_difficulty_alpha(&teacher_probs, &student_probs, base_alpha)?;
-
-        // Compute interpolated target distribution
-        let target_probs =
-            self.interpolate_distributions(&teacher_probs, &student_probs, &alpha)?;
-
-        // Compute log of the interpolated target using the log-sum-exp trick to avoid
-        // catastrophic cancellation when computing log(α·P_T + (1-α)·P_S).
-        //
-        // Given log_p = log(α·P_T + (1-α)·P_S) and the temperature-scaled log-softmax
-        // of teacher/student, we have:
-        //   log_target = log_sum_exp([log_teacher + log(α),
-        //                             log_student + log(1-α)])
-        //
-        // This is numerically equivalent but avoids exp→add→log round-trips that
-        // amplify floating-point error near the tails of the distribution.
-        let alpha_expanded = alpha.reshape(&[alpha.dim(0), 1, 1]);
-        let one_minus_alpha_expanded = Array::from_f32(1.0).subtract(&alpha_expanded);
-
-        let log_teacher_scaled = log_softmax(&teacher_scaled, -1)?;
-        // log_student_probs is already computed as `student_log_probs`
-        let log_target = {
-            // a = log_teacher + log(α),  b = log_student + log(1-α)
-            let eps_a = Array::from_f32(1e-10);
-            let log_a_coeff = alpha_expanded.add(&eps_a).log();
-            let log_b_coeff = one_minus_alpha_expanded.add(&eps_a).log();
-            let a = log_teacher_scaled.add(&log_a_coeff);
-            let b = student_log_probs.add(&log_b_coeff);
-            // log_sum_exp(a, b) = max(a,b) + log(exp(a-max)+exp(b-max))
-            let m = ops::maximum(&a, &b);
-            m.add(&a.subtract(&m).exp().add(&b.subtract(&m).exp()).log())
+        let hard_target = match labels {
+            Some(labels) if self.config.hard_target_weight > 0.0 => Some(
+                CrossEntropy::new()
+                    .with_ignore_index(self.config.ignore_index)
+                    .mean(student_logits, labels),
+            ),
+            _ => None,
         };
 
-        // Compute distillation loss
-        let distill_loss = match self.config.loss_type {
-            TaidLossType::KlDivergence => {
-                // KL(P_I || P_S) = sum(P_I * (log_target - log_student))
-                let kl = target_probs.multiply(&log_target.subtract(&student_log_probs));
-                kl.sum_axes(&[-1], false).mean_all()
+        let total = match &hard_target {
+            Some(hard) => {
+                let w = self.config.hard_target_weight as f32;
+                distillation
+                    .multiply(&Array::from_f32(1.0 - w))
+                    .add(&hard.multiply(&Array::from_f32(w)))
             }
-            TaidLossType::CrossEntropy => {
-                // -P_I * log(P_S)
-                let ce = target_probs.multiply(&student_log_probs).negative();
-                ce.sum_axes(&[-1], false).mean_all()
-            }
-            TaidLossType::JensenShannon => {
-                // JS = 0.5 * KL(P_I || M) + 0.5 * KL(P_S || M)
-                // where M = 0.5 * (P_I + P_S), computed in log-space via
-                // log_m = log(0.5) + log_sum_exp(log_target, log_student)
-                let log_half = Array::from_f32(0.5_f32.ln());
-                let m_max = ops::maximum(&log_target, &student_log_probs);
-                let log_m = log_half.add(
-                    &m_max.add(
-                        &log_target
-                            .subtract(&m_max)
-                            .exp()
-                            .add(&student_log_probs.subtract(&m_max).exp())
-                            .log(),
-                    ),
-                );
-
-                let kl_target = target_probs.multiply(&log_target.subtract(&log_m));
-                let kl_student = student_probs.multiply(&student_log_probs.subtract(&log_m));
-
-                let js = kl_target.add(&kl_student).multiply(&Array::from_f32(0.5));
-                js.sum_axes(&[-1], false).mean_all()
-            }
-            TaidLossType::ReverseKl => {
-                // KL(P_S || P_I) = sum(P_S * (log_student - log_target))
-                let kl = student_probs.multiply(&student_log_probs.subtract(&log_target));
-                kl.sum_axes(&[-1], false).mean_all()
-            }
+            None => distillation.clone(),
         };
-
-        // Scale distillation loss by temperature^2 (standard practice)
-        let temp_sq = (self.config.temperature * self.config.temperature) as f32;
-        let scaled_distill_loss = distill_loss.multiply(&Array::from_f32(temp_sq));
-
-        // Optional hard target loss
-        let hard_loss = if self.config.hard_target_weight > 0.0 {
-            if let Some(lbl) = labels {
-                // Cross-entropy with ground truth using vectorized GPU gather.
-                // Replaces an O(B*S) element-wise loop with a single take_along_axis
-                // call, eliminating per-element GPU-CPU syncs.
-                let student_log_probs_unscaled = log_softmax(student_logits, -1)?;
-
-                // Create mask for valid labels (not -100)
-                let neg100 = Array::from_i32(-100);
-                let valid_mask = lbl.not_equal(&neg100).as_dtype(Dtype::Float32.as_i32());
-
-                // Replace -100 with 0 for safe gathering (masked out afterward)
-                let safe_labels = ops::maximum(lbl, &Array::from_i32(0));
-
-                // Vectorized gather: take_along_axis selects log_prob at label index
-                // for every (batch, seq) position in a single GPU operation.
-                // This replaces an O(B*S) nested loop of individual .item() reads.
-                let gather_indices = safe_labels.expand_dims(-1i32);
-                let target_log_probs = student_log_probs_unscaled
-                    .take_along_axis(&gather_indices, -1)
-                    .squeeze(-1);
-
-                // CE = -log_prob at the target token
-                let ce_array = target_log_probs.negative();
-                let masked_ce = ce_array.multiply(&valid_mask);
-                let total_valid_sum = valid_mask.sum_all();
-                let total_valid = ops::maximum(&total_valid_sum, &Array::from_f32(1.0));
-                Some(masked_ce.sum_all().divide(&total_valid))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // Combine losses
-        let total_loss = if let Some(ref hl) = hard_loss {
-            let hard_weight = Array::from_f32(self.config.hard_target_weight as f32);
-            let soft_weight = Array::from_f32(1.0 - self.config.hard_target_weight as f32);
-            let soft_part = scaled_distill_loss.multiply(&soft_weight);
-            let hard_part = hl.multiply(&hard_weight);
-            soft_part.add(&hard_part)
-        } else {
-            scaled_distill_loss.clone()
-        };
-
-        // Compute mean alpha for logging — kept as Array so callers can fuse
-        // this into their own graph without forcing a GPU-CPU sync here.
-        let mean_alpha = alpha.mean_all();
-
-        // Variance of per-sample alpha. When `difficulty_aware` is `false`
-        // every sample shares the schedule alpha so this is exactly zero;
-        // when on, it surfaces how spread-out the difficulty signal is for
-        // the current batch — useful for spotting collapse (var → 0) or
-        // schedule misconfiguration (var → max_alpha²).
-        let alpha_var = alpha.subtract(&mean_alpha).square().mean_all();
 
         Ok(TaidLossOutput {
-            total: total_loss,
-            distillation: scaled_distill_loss,
-            hard_target: hard_loss,
-            mean_alpha,
-            alpha_var,
-            base_alpha: base_alpha as f32,
+            total,
+            distillation,
+            hard_target,
+            t: self.t,
         })
     }
 
@@ -584,225 +342,38 @@ impl TaidDistiller {
 pub struct TaidLossOutput {
     /// Total combined loss.
     pub total: Array,
-    /// Distillation loss component.
+    /// The TAID objective `J_t`, a lazy scalar. Evaluate it after the step
+    /// and pass it to [`TaidDistiller::observe`].
     pub distillation: Array,
-    /// Hard target loss component (if used).
+    /// Hard-label cross-entropy (if used).
     pub hard_target: Option<Array>,
-    /// Mean alpha used in this batch, kept as a lazy `Array` so callers can log
-    /// it without forcing a GPU-CPU sync before the backward pass.
-    /// Call `.item::<f32>()` when you need the scalar value for logging.
-    pub mean_alpha: Array,
-    /// Variance of per-sample alpha across the batch — zero when
-    /// `difficulty_aware` is off; rises with batch heterogeneity when it
-    /// is on. Lazy `Array`, same telemetry contract as `mean_alpha`.
-    pub alpha_var: Array,
-    /// Base alpha from temporal schedule (scalar, cheap to extract).
-    pub base_alpha: f32,
+    /// The interpolation parameter this loss was built at.
+    pub t: f64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
-    fn test_taid_config_default() {
-        let config = TaidConfig::default();
-        assert!((config.initial_alpha - 0.9).abs() < 1e-10);
-        assert!((config.final_alpha - 0.5).abs() < 1e-10);
-        assert_eq!(config.schedule, TaidSchedule::Cosine);
-        assert!(config.difficulty_aware);
-    }
-
-    #[test]
-    fn test_taid_config_validation() {
+    fn default_config_is_valid_and_starts_at_t_start() {
         let config = TaidConfig::default();
         assert!(config.validate().is_ok());
-
-        let invalid = TaidConfig {
-            initial_alpha: 1.5,
-            ..Default::default()
-        };
-        assert!(invalid.validate().is_err());
-
-        let invalid_temp = TaidConfig {
-            temperature: 0.0,
-            ..Default::default()
-        };
-        assert!(invalid_temp.validate().is_err());
+        let distiller = TaidDistiller::new(config).unwrap();
+        assert!((distiller.t() - 0.2).abs() < 1e-12);
     }
 
     #[test]
-    fn test_compute_base_alpha_linear() {
-        let config = TaidConfig {
-            initial_alpha: 1.0,
-            final_alpha: 0.0,
-            schedule: TaidSchedule::Linear,
-            ..Default::default()
-        };
-        let distiller = TaidDistiller::new(config).unwrap();
-
-        // Start
-        let alpha_0 = distiller.compute_base_alpha(0, 100);
-        assert!((alpha_0 - 1.0).abs() < 0.01);
-
-        // Middle
-        let alpha_50 = distiller.compute_base_alpha(50, 100);
-        assert!((alpha_50 - 0.5).abs() < 0.01);
-
-        // End
-        let alpha_100 = distiller.compute_base_alpha(100, 100);
-        assert!((alpha_100 - 0.1).abs() < 0.01); // Clamped to min_alpha
-    }
-
-    #[test]
-    fn test_compute_base_alpha_cosine() {
-        let config = TaidConfig {
-            initial_alpha: 0.9,
-            final_alpha: 0.5,
-            schedule: TaidSchedule::Cosine,
-            ..Default::default()
-        };
-        let distiller = TaidDistiller::new(config).unwrap();
-
-        let alpha_0 = distiller.compute_base_alpha(0, 100);
-        let alpha_50 = distiller.compute_base_alpha(50, 100);
-        let alpha_100 = distiller.compute_base_alpha(100, 100);
-
-        // Cosine: starts at initial, ends at final
-        assert!((alpha_0 - 0.9).abs() < 0.01);
-        assert!((alpha_100 - 0.5).abs() < 0.01);
-        // Middle should be between but closer to mean due to cosine shape
-        assert!(alpha_50 > 0.5 && alpha_50 < 0.9);
-    }
-
-    #[test]
-    #[serial]
-    fn test_interpolate_distributions() {
-        let config = TaidConfig::default();
-        let distiller = TaidDistiller::new(config).unwrap();
-
-        // Simple 2x1x3 distributions
-        let teacher = Array::from_f32_slice(&[0.7f32, 0.2, 0.1, 0.1, 0.8, 0.1], &[2, 1, 3]);
-        let student = Array::from_f32_slice(&[0.3f32, 0.4, 0.3, 0.5, 0.3, 0.2], &[2, 1, 3]);
-        let alpha = Array::from_f32_slice(&[0.5f32, 0.8], &[2]);
-
-        let interpolated = distiller
-            .interpolate_distributions(&teacher, &student, &alpha)
-            .unwrap();
-
-        interpolated.eval();
-        assert_eq!(interpolated.shape(), &[2, 1, 3]);
-
-        // For first sample: 0.5 * teacher + 0.5 * student
-        // = 0.5 * [0.7, 0.2, 0.1] + 0.5 * [0.3, 0.4, 0.3]
-        // = [0.5, 0.3, 0.2]
-        let vals: Vec<f32> = interpolated.as_slice::<f32>().to_vec();
-        assert!((vals[0] - 0.5).abs() < 0.01);
-        assert!((vals[1] - 0.3).abs() < 0.01);
-    }
-
-    #[test]
-    #[serial]
-    fn test_taid_loss_computation() {
-        let config = TaidConfig {
-            difficulty_aware: false, // Simpler test
-            temperature: 1.0,
-            ..Default::default()
-        };
-        let distiller = TaidDistiller::new(config).unwrap();
-
-        // Create simple logits
-        let teacher_logits = Array::from_f32_slice(&[2.0f32, 1.0, 0.0, 0.0, 1.0, 2.0], &[2, 1, 3]);
-        let student_logits = Array::from_f32_slice(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0], &[2, 1, 3]);
-
-        let output = distiller
-            .compute_loss(&teacher_logits, &student_logits, 0, 100, None)
-            .unwrap();
-
-        output.total.eval();
-        output.distillation.eval();
-
-        assert!(output.total.item::<f32>().is_finite());
-        assert!(output.distillation.item::<f32>() >= 0.0);
-        assert!(output.hard_target.is_none());
-        assert!(output.base_alpha > 0.0);
-    }
-
-    #[test]
-    #[serial]
-    fn test_taid_with_hard_targets() {
-        let config = TaidConfig {
-            difficulty_aware: false,
-            hard_target_weight: 0.5,
-            ..Default::default()
-        };
-        let distiller = TaidDistiller::new(config).unwrap();
-
-        let teacher_logits = Array::from_f32_slice(&[2.0f32, 1.0, 0.0], &[1, 1, 3]);
-        let student_logits = Array::from_f32_slice(&[1.0f32, 1.0, 1.0], &[1, 1, 3]);
-        let labels = Array::from_slice(&[0i32], &[1, 1]);
-
-        let output = distiller
-            .compute_loss(&teacher_logits, &student_logits, 50, 100, Some(&labels))
-            .unwrap();
-
-        output.total.eval();
-        assert!(output.total.item::<f32>().is_finite());
-        assert!(output.hard_target.is_some());
-    }
-
-    #[test]
-    fn test_taid_schedule_step() {
-        let config = TaidConfig {
-            initial_alpha: 1.0,
-            final_alpha: 0.2,
-            schedule: TaidSchedule::Step,
-            min_alpha: 0.1,
-            ..Default::default()
-        };
-        let distiller = TaidDistiller::new(config).unwrap();
-
-        let alpha_10 = distiller.compute_base_alpha(10, 100);
-        let alpha_30 = distiller.compute_base_alpha(30, 100);
-        let alpha_60 = distiller.compute_base_alpha(60, 100);
-        let alpha_80 = distiller.compute_base_alpha(80, 100);
-
-        // Step-wise decreases
-        assert!(alpha_10 > alpha_30);
-        assert!(alpha_30 > alpha_60);
-        assert!(alpha_60 > alpha_80);
-    }
-
-    #[test]
-    #[serial]
-    fn test_difficulty_alpha() {
-        let config = TaidConfig {
-            difficulty_aware: true,
-            difficulty_scale: 1.0, // High scaling for visible effect
-            ..Default::default()
-        };
-        let distiller = TaidDistiller::new(config).unwrap();
-
-        // Easy sample: teacher and student agree
-        let teacher_easy = Array::from_f32_slice(&[0.8f32, 0.1, 0.1], &[1, 1, 3]);
-        let student_easy = Array::from_f32_slice(&[0.7f32, 0.15, 0.15], &[1, 1, 3]);
-
-        // Hard sample: teacher and student disagree
-        let teacher_hard = Array::from_f32_slice(&[0.9f32, 0.05, 0.05], &[1, 1, 3]);
-        let student_hard = Array::from_f32_slice(&[0.1f32, 0.45, 0.45], &[1, 1, 3]);
-
-        let alpha_easy = distiller
-            .compute_difficulty_alpha(&teacher_easy, &student_easy, 0.5)
-            .unwrap();
-        let alpha_hard = distiller
-            .compute_difficulty_alpha(&teacher_hard, &student_hard, 0.5)
-            .unwrap();
-
-        alpha_easy.eval();
-        alpha_hard.eval();
-
-        // Hard samples should have higher alpha (more teacher guidance)
-        assert!(alpha_hard.item::<f32>() > alpha_easy.item::<f32>());
+    fn config_validation_rejects_nonsense() {
+        for bad in [
+            TaidConfig::default().with_t_start(0.0),
+            TaidConfig::default().with_t_start(1.5),
+            TaidConfig::default().with_t_end(0.1),
+            TaidConfig::default().with_beta(1.0),
+            TaidConfig::default().with_alpha(-1.0),
+            TaidConfig::default().with_hard_target_weight(2.0),
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?}");
+        }
     }
 }

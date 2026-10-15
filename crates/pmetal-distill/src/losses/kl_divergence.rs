@@ -11,9 +11,7 @@
 //! al. §2 is applied once, by [`Distiller::compute_loss`](crate::Distiller::compute_loss),
 //! not here, so the value is the divergence itself.
 
-use super::{
-    DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, reduce_per_token, tempered_log_probs,
-};
+use super::{DistillLoss, SPARSE_TOPK_DEFAULT, aligned_log_probs, reduce_per_token};
 use crate::Result;
 use pmetal_runtime::compat::Array;
 
@@ -75,7 +73,7 @@ impl Default for KlDivergenceLoss {
 }
 
 impl DistillLoss for KlDivergenceLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -83,11 +81,12 @@ impl DistillLoss for KlDivergenceLoss {
         weights: Option<&Array>,
     ) -> Result<Array> {
         // Align vocab sizes (sparse top-k over the teacher when they differ).
-        let (teacher_logits, student_logits, _) =
-            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
-
-        let teacher_log_probs = tempered_log_probs(&teacher_logits, temperature);
-        let student_log_probs = tempered_log_probs(&student_logits, temperature);
+        let (teacher_log_probs, student_log_probs) = aligned_log_probs(
+            teacher_logits,
+            student_logits,
+            temperature,
+            self.sparse_top_k,
+        )?;
 
         let kl_per_token = if self.reverse {
             let log_ratio = student_log_probs.subtract(&teacher_log_probs);

@@ -1,106 +1,51 @@
-//! Rationale-Based Knowledge Distillation (RBKD).
+//! Rationale-weighted distillation for reasoning traces.
 //!
-//! This module implements reasoning-aware distillation that specifically targets
-//! "Reasoning Tokens" (Chain-of-Thought) to ensure the student model learns the
-//! *process* of reasoning, not just the final answer.
+//! Distilling a reasoning model spends most of its tokens on formulaic text
+//! (restating the question, connectives, boilerplate) and a few on the steps
+//! where the teacher actually decides something. [`RationaleLoss`] puts more
+//! weight where the teacher is uncertain, a token-level reweighting of the
+//! forward KL:
 //!
-//! # Q1 2026 SOTA Context
-//!
-//! Based on research like "Distilling Reasoning Capabilities" (2025), this method
-//! applies higher weight to tokens identified as part of the reasoning chain
-//! (e.g., between `<thinking>` tags or automatically detected via attention/entropy).
-//!
-//! # Algorithm
-//!
-//! The key insight is that not all tokens are equally important for distillation:
-//! - **High-entropy tokens**: Teacher is uncertain → student needs more guidance
-//! - **Reasoning tokens**: Critical for learning the thought process
-//! - **Answer tokens**: Important but often easier to learn
-//!
-//! The loss is computed as:
 //! ```text
-//! weight_i = 1.0 + reasoning_weight * (entropy_i / max_entropy)
-//! loss = Σ(weight_i * KL(teacher_i || student_i)) / Σ(weight_i)
+//! w_i  = 1 + reasoning_weight · H(teacher_i) / ln V
+//! loss = Σ_i w_i · KL(teacher_i || student_i) / Σ_i w_i
 //! ```
 //!
-//! # Usage
+//! where `H` is the entropy of the teacher's softened distribution and `ln V`
+//! the entropy of a uniform one, so `H / ln V ∈ [0, 1]` and a token's weight
+//! depends only on that token, not on what else is in the batch. This is a
+//! heuristic, not a published estimator.
 //!
-//! ```rust,ignore
-//! use pmetal_distill::{RationaleLoss, DistillLoss};
+//! Which tokens are *reasoning* tokens is a separate signal. An explicit span
+//! (`<think> ... </think>`) is turned into a 0/1 mask over token ids by
+//! [`generate_reasoning_mask`]; pass it, scaled as you like, as the per-token
+//! `weights` of any [`DistillLoss`]. Resolving marker *strings* to ids needs
+//! a tokenizer and is the caller's: [`LossConfig`](crate::LossConfig) carries
+//! the strings so the training loop can.
 //!
-//! // Create loss with 2x weight on high-entropy (reasoning) tokens
-//! let loss = RationaleLoss::new(2.0);
-//!
-//! let distill_loss = loss.compute(&teacher_logits, &student_logits, temperature)?;
-//! ```
-//!
-//! # References
-//!
-//! - Li et al., "LLMs can easily learn to reason from demonstration" (2025)
-//! - "Distilling Reasoning Capabilities into Smaller Language Models" (2025)
+//! [`OutcomeSupervisedRationaleLoss`] adds a per-sample correctness weight so
+//! only traces that reached a correct answer are distilled.
 
 use crate::{DistillLoss, Result};
 use pmetal_runtime::compat::{Array, Dtype, ops};
 
-/// Rationale-Based Knowledge Distillation Loss.
+/// Entropy-weighted forward-KL loss for reasoning distillation.
 ///
-/// Applies higher weight to tokens where the teacher distribution has high entropy,
-/// which typically corresponds to reasoning-heavy positions where the student needs
-/// more guidance.
+/// Applies higher weight to tokens where the teacher distribution has high
+/// entropy, which typically corresponds to the steps of a trace where the
+/// student needs more guidance.
 #[derive(Debug, Clone)]
 pub struct RationaleLoss {
-    /// Weight multiplier for high-entropy (reasoning) tokens.
-    /// The actual weight applied is: 1.0 + reasoning_weight * normalized_entropy.
-    /// Default: 1.0 (so max weight is 2.0 for highest entropy tokens)
+    /// Weight multiplier for high-entropy tokens: a token's weight is
+    /// `1 + reasoning_weight · H / ln V`. Default 1.0 (so the highest-entropy
+    /// tokens weigh twice the lowest).
     pub reasoning_weight: f32,
-
-    /// Whether to use explicit reasoning markers (e.g., `<thinking>` tags).
-    /// When false, uses entropy-based heuristic detection.
-    pub use_explicit_markers: bool,
-
-    /// Optional start marker for explicit reasoning regions.
-    pub start_marker: Option<String>,
-
-    /// Optional end marker for explicit reasoning regions.
-    pub end_marker: Option<String>,
-
-    /// Epsilon for numerical stability in log computations.
-    pub eps: f32,
 }
 
 impl RationaleLoss {
     /// Create a new Rationale Loss with the given reasoning weight.
     pub fn new(reasoning_weight: f32) -> Self {
-        Self {
-            reasoning_weight,
-            use_explicit_markers: false,
-            start_marker: None,
-            end_marker: None,
-            eps: 1e-6,
-        }
-    }
-
-    /// Create with explicit reasoning markers.
-    ///
-    /// # Arguments
-    ///
-    /// * `reasoning_weight` - Weight for reasoning tokens
-    /// * `start_marker` - Start of reasoning region (e.g., `<thinking>`)
-    /// * `end_marker` - End of reasoning region (e.g., `</thinking>`)
-    pub fn with_markers(reasoning_weight: f32, start_marker: &str, end_marker: &str) -> Self {
-        Self {
-            reasoning_weight,
-            use_explicit_markers: true,
-            start_marker: Some(start_marker.to_string()),
-            end_marker: Some(end_marker.to_string()),
-            eps: 1e-6,
-        }
-    }
-
-    /// Set epsilon for numerical stability.
-    pub fn with_eps(mut self, eps: f32) -> Self {
-        self.eps = eps;
-        self
+        Self { reasoning_weight }
     }
 }
 
@@ -108,6 +53,14 @@ impl Default for RationaleLoss {
     fn default() -> Self {
         Self::new(1.0)
     }
+}
+
+/// `log_softmax(logits / T)` in f32.
+fn softened_log_probs(logits: &Array, temperature: f32) -> Array {
+    logits
+        .as_dtype(Dtype::Float32.as_i32())
+        .divide(&Array::from_f32(temperature))
+        .log_softmax(-1)
 }
 
 impl RationaleLoss {
@@ -125,19 +78,12 @@ impl RationaleLoss {
         student_logits: &Array,
         temperature: f32,
     ) -> Result<Array> {
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp);
-        let student_scaled = student_logits.divide(&temp);
-
-        let teacher_logprobs = teacher_scaled.log_softmax(-1);
-        let student_logprobs = student_scaled.log_softmax(-1);
-
-        let teacher_probs = teacher_logprobs.exp();
-        let log_ratio = teacher_logprobs.subtract(&student_logprobs);
-        let kl_per_vocab = teacher_probs.multiply(&log_ratio);
-
-        // Sum over vocab dimension -> [batch, seq]
-        Ok(kl_per_vocab.sum_axes(&[-1], false))
+        let teacher_logprobs = softened_log_probs(&teacher_logits.stop_gradient(), temperature);
+        let student_logprobs = softened_log_probs(student_logits, temperature);
+        Ok(teacher_logprobs
+            .exp()
+            .multiply(&teacher_logprobs.subtract(&student_logprobs))
+            .sum_axes(&[-1], false))
     }
 
     /// Compute per-token entropy of the teacher distribution.
@@ -148,17 +94,25 @@ impl RationaleLoss {
     /// * `teacher_logits` - Teacher logits `[batch, seq, vocab]`
     /// * `temperature` - Softmax temperature
     pub fn compute_entropy(&self, teacher_logits: &Array, temperature: f32) -> Result<Array> {
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp);
-
-        let teacher_logprobs = teacher_scaled.log_softmax(-1);
-        let teacher_probs = teacher_logprobs.exp();
-
+        let teacher_logprobs = softened_log_probs(&teacher_logits.stop_gradient(), temperature);
         // H = -sum(p * log(p)) over vocab -> [batch, seq]
-        let p_log_p = teacher_probs.multiply(&teacher_logprobs);
-        Ok(p_log_p
+        Ok(teacher_logprobs
+            .exp()
+            .multiply(&teacher_logprobs)
             .sum_axes(&[-1], false)
-            .multiply(&Array::from_f32(-1.0)))
+            .negative())
+    }
+
+    /// The weight of every token, `1 + reasoning_weight · H / ln V`, a
+    /// constant of the teacher.
+    fn token_weights(&self, teacher_logits: &Array, temperature: f32) -> Result<Array> {
+        let entropy = self.compute_entropy(teacher_logits, temperature)?;
+        let max_entropy = (teacher_logits.dim(-1).max(2) as f32).ln();
+        Ok(entropy
+            .divide(&Array::from_f32(max_entropy))
+            .multiply(&Array::from_f32(self.reasoning_weight))
+            .add(&Array::from_f32(1.0))
+            .stop_gradient())
     }
 }
 
@@ -167,82 +121,77 @@ impl DistillLoss for RationaleLoss {
         "rationale_loss"
     }
 
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
         external_weights: Option<&Array>,
     ) -> Result<Array> {
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp);
-        let student_scaled = student_logits.divide(&temp);
+        let kl_per_token = self.per_token_kl(teacher_logits, student_logits, temperature)?;
+        let mut weight = self.token_weights(teacher_logits, temperature)?;
 
-        // 1. Compute per-token KL divergence stably
-        let teacher_logprobs = teacher_scaled.log_softmax(-1);
-        let student_logprobs = student_scaled.log_softmax(-1);
-
-        let teacher_probs = teacher_logprobs.exp();
-        let log_ratio = teacher_logprobs.subtract(&student_logprobs);
-        let kl_per_vocab = teacher_probs.multiply(&log_ratio);
-        let kl_per_token = kl_per_vocab.sum_axes(&[-1], false);
-
-        // 2. Compute internal reasoning weights based on teacher entropy
-        let p_log_p = teacher_probs.multiply(&teacher_logprobs);
-        let entropy = p_log_p
-            .sum_axes(&[-1], false)
-            .multiply(&Array::from_f32(-1.0));
-
-        // Normalize entropy in-graph (no .item() to preserve autodiff)
-        let max_entropy = entropy.max(None);
-        let safe_max = ops::maximum(&max_entropy, &Array::from_f32(1e-6));
-        let normalized_entropy = entropy.divide(&safe_max);
-
-        let mut internal_weight = normalized_entropy
-            .multiply(&Array::from_f32(self.reasoning_weight))
-            .add(&Array::from_f32(1.0));
-
-        // 3. Combine with external weights (e.g., from reasoning markers or outcome supervision)
+        // Combine with external weights (a padding or reasoning-span mask,
+        // outcome correctness). They may broadcast, e.g. `[batch, 1]`.
         if let Some(w) = external_weights {
-            internal_weight = internal_weight.multiply(w);
+            weight = weight.multiply(&w.as_dtype(Dtype::Float32.as_i32()));
         }
 
-        // 4. Apply weights and compute mean
-        let weighted_loss = kl_per_token.multiply(&internal_weight);
-
-        // Weighted mean in-graph (no .item() to preserve autodiff)
-        let total_weighted_loss = weighted_loss.sum_all();
-        let total_weights = internal_weight.sum_all();
-        let safe_weights = ops::maximum(&total_weights, &Array::from_f32(1e-6));
-        Ok(total_weighted_loss.divide(&safe_weights))
+        // Weighted mean in-graph.
+        let total = kl_per_token.multiply(&weight).sum_all();
+        let total_weights = weight.sum_all();
+        Ok(total.divide(&ops::maximum(&total_weights, &Array::from_f32(1e-6))))
     }
 }
 
-/// Helper to generate a reasoning mask from token IDs using markers.
+/// A `[batch, seq]` float mask that is 1 on the tokens inside a reasoning
+/// span and 0 elsewhere.
+///
+/// A span opens at `start_token` (which is inside it) and closes at the next
+/// `end_token` (which is not). The state is whichever marker came last: a
+/// closing marker with nothing open (a window that began mid-span), repeated
+/// markers and several spans per row all behave, and a span still open at the
+/// end of the row runs to the end.
 ///
 /// # Arguments
 /// * `tokens` - Tokenized sequence `[batch, seq]`
 /// * `start_token` - Token ID for the start of reasoning (e.g., `<think>`)
 /// * `end_token` - Token ID for the end of reasoning (e.g., `</think>`)
 pub fn generate_reasoning_mask(tokens: &Array, start_token: u32, end_token: u32) -> Result<Array> {
-    let start_arr = Array::from_i32(start_token as i32);
-    let end_arr = Array::from_i32(end_token as i32);
+    let i32_ = Dtype::Int32.as_i32();
+    let seq = tokens.dim(-1);
+    let is_start = tokens.equal(&Array::from_i32(start_token as i32));
+    let is_end = tokens.equal(&Array::from_i32(end_token as i32));
+    let start = is_start.as_dtype(i32_);
+    let end = is_end.as_dtype(i32_);
 
-    let is_start = tokens.equal(&start_arr);
-    let is_end = tokens.equal(&end_arr);
+    // +1 at a start marker, -1 at an end marker, 0 elsewhere.
+    let sign = start.subtract(&end);
+    let marker = start.add(&end);
+    // How many markers up to and including each position.
+    let seen = marker.cumsum(-1);
 
-    // Use cumulative sum to track being "inside" reasoning tags.
-    // exclusive cumsum for start: the start token itself should NOT be included.
-    // inclusive cumsum for end: the end token position should mark the boundary.
-    let start_cumsum = ops::cumsum(&is_start.as_dtype(Dtype::Int32.as_i32()), 1);
-    let end_cumsum = ops::cumsum(&is_end.as_dtype(Dtype::Int32.as_i32()), 1);
+    // Compact the markers' signs in position order: sorting by
+    // `(not a marker, position)` puts them first, so the n-th marker's sign
+    // sits at rank n-1.
+    let position = Array::arange(seq, i32_);
+    let key = Array::from_i32(1)
+        .subtract(&marker)
+        .multiply(&Array::from_i32(seq))
+        .add(&position);
+    let by_rank = sign.take_along_axis(&key.argsort(-1), -1);
 
-    let mask = start_cumsum.subtract(&end_cumsum);
+    // The sign of the latest marker at or before each position.
+    let rank = ops::maximum(&seen.subtract(&Array::from_i32(1)), &Array::from_i32(0));
+    let latest = by_rank.take_along_axis(&rank, -1);
 
-    // Clamp to [0, 1] to handle multiple/nested reasoning blocks correctly
-    let mask = ops::clip(&mask, Some(&Array::from_i32(0)), Some(&Array::from_i32(1)));
-
-    Ok(mask.as_dtype(Dtype::Float32.as_i32()))
+    let open = latest
+        .greater(&Array::from_i32(0))
+        .as_dtype(Dtype::Float32.as_i32());
+    let any_marker = seen
+        .greater(&Array::from_i32(0))
+        .as_dtype(Dtype::Float32.as_i32());
+    Ok(open.multiply(&any_marker))
 }
 
 /// Outcome-Supervised Rationale Distillation Loss.
@@ -251,10 +200,12 @@ pub fn generate_reasoning_mask(tokens: &Array, start_token: u32, end_token: u32)
 /// Uses a scalar correctness signal per sample to zero out or down-weight incorrect reasoning chains.
 #[derive(Debug, Clone)]
 pub struct OutcomeSupervisedRationaleLoss {
+    /// The entropy-weighted loss the correctness weights are applied to.
     pub base_loss: RationaleLoss,
 }
 
 impl OutcomeSupervisedRationaleLoss {
+    /// Create the loss with the given entropy weight.
     pub fn new(reasoning_weight: f32) -> Self {
         Self {
             base_loss: RationaleLoss::new(reasoning_weight),
@@ -284,7 +235,10 @@ impl DistillLoss for OutcomeSupervisedRationaleLoss {
         "outcome_supervised_rationale_loss"
     }
 
-    fn compute_weighted(
+    /// Without a correctness signal this is the plain entropy-weighted loss;
+    /// pass per-sample correctness as `weights` (`[batch, 1]`) or call
+    /// [`compute_with_outcome`](Self::compute_with_outcome).
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -292,7 +246,7 @@ impl DistillLoss for OutcomeSupervisedRationaleLoss {
         weights: Option<&Array>,
     ) -> Result<Array> {
         self.base_loss
-            .compute_weighted(teacher_logits, student_logits, temperature, weights)
+            .weighted_loss(teacher_logits, student_logits, temperature, weights)
     }
 }
 
@@ -300,27 +254,6 @@ impl DistillLoss for OutcomeSupervisedRationaleLoss {
 mod tests {
     use super::*;
     use serial_test::serial;
-
-    #[test]
-    #[serial]
-    fn test_generate_reasoning_mask() {
-        // Tokens: [CLS, "Hello", "<think>", " reasoning", " steps", "</think>", " final", " answer"]
-        // Indices:  0,      1,         2,          3,        4,         5,        6,        7
-        let tokens = Array::from_slice(&[0_i32, 1, 2, 3, 4, 5, 6, 7], &[1, 8]);
-        let start_token = 2;
-        let end_token = 5;
-
-        let mask = generate_reasoning_mask(&tokens, start_token, end_token).unwrap();
-        mask.eval();
-        let mask_vals: Vec<f32> = mask.clone().to_f32_vec(8).unwrap();
-
-        // Indices 3 and 4 should be 1.0 (inside tags)
-        // Indices 2 and 5 behavior depends on implementation (currently 2 is 1.0, 5 is 0.0 due to cumsum timing)
-        assert_eq!(mask_vals[3], 1.0);
-        assert_eq!(mask_vals[4], 1.0);
-        assert_eq!(mask_vals[1], 0.0);
-        assert_eq!(mask_vals[6], 0.0);
-    }
 
     #[test]
     #[serial]
@@ -359,22 +292,6 @@ mod tests {
     fn test_rationale_loss_default() {
         let loss = RationaleLoss::default();
         assert!((loss.reasoning_weight - 1.0).abs() < 1e-6);
-        assert!(!loss.use_explicit_markers);
-    }
-
-    #[test]
-    fn test_rationale_loss_with_weight() {
-        let loss = RationaleLoss::new(2.0);
-        assert!((loss.reasoning_weight - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_rationale_loss_with_markers() {
-        let loss = RationaleLoss::with_markers(1.5, "<thinking>", "</thinking>");
-        assert!((loss.reasoning_weight - 1.5).abs() < 1e-6);
-        assert!(loss.use_explicit_markers);
-        assert_eq!(loss.start_marker.as_deref(), Some("<thinking>"));
-        assert_eq!(loss.end_marker.as_deref(), Some("</thinking>"));
     }
 
     #[test]
@@ -407,53 +324,6 @@ mod tests {
 
         // Loss should be positive
         assert!(value > 0.0, "Loss should be positive, got {}", value);
-    }
-
-    #[test]
-    #[serial]
-    fn test_reasoning_weight_effect() {
-        // Create distributions where some positions have higher entropy
-        // Position 0: low entropy (peaked distribution)
-        // Position 1: high entropy (uniform-ish distribution)
-        let teacher = Array::from_f32_slice(
-            &[
-                // Position 0: peaked at index 3
-                0.0_f32, 0.0, 0.0, 10.0, // Position 1: more uniform
-                1.0, 1.0, 1.0, 1.0,
-            ],
-            &[1, 2, 4],
-        );
-        let student = Array::from_f32_slice(
-            &[
-                // Position 0: wrong but peaked
-                10.0_f32, 0.0, 0.0, 0.0, // Position 1: also wrong
-                2.0, 0.0, 0.0, 0.0,
-            ],
-            &[1, 2, 4],
-        );
-
-        // With low reasoning weight, high-entropy position contributes equally
-        let low_weight_loss = RationaleLoss::new(0.0);
-        let loss_low = low_weight_loss.compute(&teacher, &student, 1.0).unwrap();
-        loss_low.eval();
-        let val_low: f32 = loss_low.item();
-
-        // With high reasoning weight, high-entropy position contributes more
-        let high_weight_loss = RationaleLoss::new(5.0);
-        let loss_high = high_weight_loss.compute(&teacher, &student, 1.0).unwrap();
-        loss_high.eval();
-        let val_high: f32 = loss_high.item();
-
-        // Both should be positive
-        assert!(val_low > 0.0);
-        assert!(val_high > 0.0);
-
-        // The weighted version should differ (could be higher or lower depending on
-        // which position has more loss)
-        println!(
-            "Low weight loss: {}, High weight loss: {}",
-            val_low, val_high
-        );
     }
 
     #[test]

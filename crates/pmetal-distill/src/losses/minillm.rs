@@ -1,199 +1,210 @@
-//! MiniLLM-style reverse-KL distillation loss.
+//! MiniLLM: on-policy reverse-KL distillation by policy gradient.
 //!
-//! From Gu et al., 2024 (*MiniLLM: Knowledge Distillation of Large Language
-//! Models*) and the closely-related Speculative-KD line (Xu et al., 2024).
-//! The standard Hinton/KL formulation uses forward-KL(T || S), which is
-//! mode-covering: the student spreads probability mass across all teacher
-//! modes. For autoregressive language models this overspreads and produces
-//! low-quality samples. Reverse-KL(S || T) is mode-seeking: the student
-//! commits to high-probability teacher modes and ignores the tail.
+//! Gu, Dong, Wei and Huang, *MiniLLM: Knowledge Distillation of Large
+//! Language Models* (ICLR 2024). Forward KL `KL(p || q_θ)` makes a student
+//! that is too small to represent the teacher spread its mass over regions
+//! the teacher never visits, and it samples poorly. The reverse KL
+//! `KL(q_θ || p) = E_{y~q_θ}[log q_θ(y) - log p(y)]` is mode-seeking, but its
+//! expectation is over the *student's* samples, so it is optimized with a
+//! policy gradient. With `r_t = log p(y_t | y_<t) - log q_θ(y_t | y_<t)`:
 //!
-//! This module's loss is reverse-KL with two practical refinements:
-//!   * **Length normalization** — divide the per-sequence loss by the
-//!     number of valid tokens (already handled by `mean_axis`/`mean_all`,
-//!     but exposed via the per-token return so masked sequences aren't
-//!     length-biased).
-//!   * **Teacher-mix prob `mix`** — the loss is computed against the
-//!     mixture `M = mix · T + (1-mix) · S` instead of the bare teacher.
-//!     `mix = 1.0` recovers vanilla reverse-KL; smaller values stabilize
-//!     early training when the student is far from the teacher (the
-//!     "speculative" KD insight).
+//! * **Single-step decomposition** (eq. 3). The reward of the current token
+//!   is not sampled: it is summed exactly over the vocabulary, which is the
+//!   per-position reverse KL `Σ_v q(v)·(log q(v) - log p(v))`. This removes
+//!   most of the variance.
+//! * **Long-term term.** The rest of the sequence is a REINFORCE term
+//!   `R_{t+1} · ∇ log q_θ(y_t)` with `R_{t+1}` the sum of later rewards.
+//! * **Length normalization** (eq. 5). `R^Norm_{t+1}` divides that sum by the
+//!   number of later tokens, so short responses are not favoured.
+//! * **Teacher-mixed sampling.** Responses are drawn from
+//!   `p~ = α·p + (1-α)·q_θ` (α = 0.2 in the paper) so a poor early student
+//!   does not wander; the importance ratio `ρ_t = q_θ(y_t) / p~(y_t)` corrects
+//!   for it, and is clipped to `[1-ε, 1+ε]` as in Algorithm 1.
 //!
-//! Clean-room derivation from the paper's equation set; no third-party
-//! source consulted.
+//! [`MiniLlmLoss::compute`] is a surrogate whose gradient is
+//! `(∇L)_Single + (∇L)_Long^Norm`: the single-step term is weighted by the
+//! (clipped, constant) importance ratio, and the long-term term is the PPO
+//! clipped surrogate `-min(ρ·R, clip(ρ, 1-ε, 1+ε)·R)` whose gradient is
+//! `ρ·R·∇ log q_θ(y_t)` inside the clip range. Add the language-modelling loss
+//! on pre-training data (`L_PT`) in the caller if desired.
+//!
+//! This loss needs sampled responses, so it is not a [`DistillLoss`](super::DistillLoss):
+//! the rollout (sampling from [`MiniLlmLoss::mixed_log_probs`] position by
+//! position) belongs to the training loop.
+//!
+//! # Alignment
+//!
+//! `tokens[b, t]` is the token sampled at position `t`, and
+//! `logits[b, t]` the distribution it was sampled from; a causal LM's logits
+//! at position `t` predict token `t + 1`, so shift before calling. `mask` is
+//! 1 on response tokens and 0 on the prompt and on padding.
 
-#![allow(unsafe_code)]
-
-use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
+use super::{kl_from_log_probs, log_mixture, reduce_per_token};
 use crate::Result;
-use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
-/// Reverse-KL distillation with optional teacher mixing.
+/// The MiniLLM surrogate loss.
+#[derive(Debug, Clone, Copy)]
 pub struct MiniLlmLoss {
-    /// Mixing weight `mix ∈ [0, 1]`: target = mix · T + (1-mix) · S.
-    /// `mix = 1.0` is plain reverse-KL.
-    mix: f32,
-    sparse_top_k: i32,
+    teacher_mix: f32,
+    clip_epsilon: f32,
+    length_normalize: bool,
+}
+
+/// The terms of [`MiniLlmLoss::compute`].
+#[derive(Debug)]
+pub struct MiniLlmOutput {
+    /// The surrogate to differentiate: `single_step + long_term`.
+    pub total: Array,
+    /// Importance-weighted per-position reverse KL, `(∇L)_Single`.
+    pub single_step: Array,
+    /// The clipped policy-gradient surrogate, `(∇L)_Long^Norm`.
+    pub long_term: Array,
+}
+
+impl Default for MiniLlmLoss {
+    /// The paper's setting: `α = 0.2`, `ε = 0.2`, length-normalized.
+    fn default() -> Self {
+        Self::new(0.2)
+    }
 }
 
 impl MiniLlmLoss {
-    /// Construct with the given teacher mixing weight (clamped to [0, 1]).
-    pub fn new(mix: f32) -> Self {
+    /// A loss with teacher-mixing weight `α` (clamped to `[0, 1]`),
+    /// `ε = 0.2` and length normalization.
+    pub fn new(teacher_mix: f32) -> Self {
         Self {
-            mix: mix.clamp(0.0, 1.0),
-            sparse_top_k: SPARSE_TOPK_DEFAULT,
+            teacher_mix: teacher_mix.clamp(0.0, 1.0),
+            clip_epsilon: 0.2,
+            length_normalize: true,
         }
     }
 
-    /// Plain reverse-KL (no mixing).
-    pub fn reverse_only() -> Self {
-        Self::new(1.0)
-    }
-
-    /// Override the cross-vocab top-k.
-    pub fn with_sparse_top_k(mut self, k: i32) -> Self {
-        self.sparse_top_k = k.max(1);
+    /// Set the importance-ratio clip range `[1-ε, 1+ε]`.
+    pub fn with_clip_epsilon(mut self, epsilon: f32) -> Self {
+        self.clip_epsilon = epsilon.max(0.0);
         self
     }
 
-    /// The mixing weight in use.
-    pub fn mix(&self) -> f32 {
-        self.mix
+    /// Turn the length normalization of the long-term reward on or off.
+    pub fn with_length_normalization(mut self, on: bool) -> Self {
+        self.length_normalize = on;
+        self
     }
 
-    /// Per-token reverse-KL(S || M). Returned with the leading `[batch, seq]`
-    /// axes so callers can do their own masking / weighting.
-    fn compute_inner(
+    /// The teacher-mixing weight `α`.
+    pub fn teacher_mix(&self) -> f32 {
+        self.teacher_mix
+    }
+
+    /// `log p~ = log(α·p + (1-α)·q_θ)` over the vocabulary, f32: the
+    /// distribution responses are sampled from. Neither input carries
+    /// gradient out of it.
+    pub fn mixed_log_probs(&self, teacher_logits: &Array, student_logits: &Array) -> Array {
+        let lp = log_softmax_f32(&teacher_logits.stop_gradient());
+        let lq = log_softmax_f32(&student_logits.stop_gradient());
+        self.mix(&lp, &lq)
+    }
+
+    fn mix(&self, log_p: &Array, log_q: &Array) -> Array {
+        if self.teacher_mix <= 0.0 {
+            log_q.clone()
+        } else if self.teacher_mix >= 1.0 {
+            log_p.clone()
+        } else {
+            log_mixture(log_p, log_q, self.teacher_mix)
+        }
+    }
+
+    /// The surrogate loss on one batch of sampled responses.
+    ///
+    /// * `teacher_logits`, `student_logits` - `[batch, seq, vocab]` on the
+    ///   sampled sequences, teacher-forced.
+    /// * `behavior_logits` - the student's logits when the responses were
+    ///   sampled, if the student has been updated since; `None` means the
+    ///   current student (one gradient step per batch).
+    /// * `tokens` - `[batch, seq]` sampled ids.
+    /// * `mask` - `[batch, seq]`, 1 on response tokens.
+    ///
+    /// The result is averaged over the masked-in tokens.
+    pub fn compute(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
-        temperature: f32,
-    ) -> Result<Array> {
-        let (t_aligned, s_aligned, _) =
-            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
-
-        let inv_t = 1.0_f32 / temperature.max(1e-6);
-        let t_scaled = t_aligned.multiply(&Array::from_f32(inv_t));
-        let s_scaled = s_aligned.multiply(&Array::from_f32(inv_t));
-        let log_t = t_scaled.log_softmax(-1);
-        let log_s = s_scaled.log_softmax(-1);
-
-        // log_target = log_sum_exp(log_t + log(mix), log_s + log(1-mix)) when
-        // mix is strictly inside (0, 1); the two boundary cases shortcut to
-        // log_t / log_s directly to avoid log(0).
-        let log_target = if self.mix >= 1.0 - 1e-6 {
-            log_t.clone()
-        } else if self.mix <= 1e-6 {
-            log_s.clone()
-        } else {
-            let log_mix = Array::from_f32(self.mix.ln());
-            let log_1mix = Array::from_f32((1.0 - self.mix).ln());
-            let a = log_t.add(&log_mix);
-            let b = log_s.add(&log_1mix);
-            let m = ops::maximum(&a, &b);
-            m.add(&a.subtract(&m).exp().add(&b.subtract(&m).exp()).log())
+        behavior_logits: Option<&Array>,
+        tokens: &Array,
+        mask: Option<&Array>,
+    ) -> Result<MiniLlmOutput> {
+        let f32_ = Dtype::Float32.as_i32();
+        let log_p = log_softmax_f32(&teacher_logits.stop_gradient());
+        let log_q = log_softmax_f32(student_logits);
+        let log_q_behavior = match behavior_logits {
+            Some(b) => log_softmax_f32(&b.stop_gradient()),
+            None => log_q.stop_gradient(),
         };
 
-        // Reverse-KL(S || target) = Σ exp(log_s) · (log_s - log_target)
-        let p_s = log_s.exp();
-        let kl = p_s
-            .multiply(&log_s.subtract(&log_target))
-            .sum_axis(-1, false);
-        Ok(kl)
+        // Token ids are integers: keep them out of the gradient trace.
+        let index = tokens
+            .as_dtype(Dtype::Int32.as_i32())
+            .stop_gradient()
+            .expand_dims(-1);
+        let gather = |lp: &Array| lp.take_along_axis(&index, -1).squeeze(-1);
+        let log_p_y = gather(&log_p);
+        let log_q_y = gather(&log_q);
+        let log_q0_y = gather(&log_q_behavior);
+
+        // Rewards r_t = log p - log q, constants.
+        let ones = Array::ones(log_p_y.shape(), f32_);
+        let m = match mask {
+            Some(m) => m.reshape(log_p_y.shape()).as_dtype(f32_),
+            None => ones,
+        };
+        let reward = log_p_y.subtract(&log_q0_y).multiply(&m).stop_gradient();
+
+        // R_{t+1}: the rewards after position t, per remaining token if
+        // length-normalized. Constants.
+        let after = reward
+            .sum_axes(&[-1], true)
+            .subtract(&reward.cumsum(-1))
+            .stop_gradient();
+        let advantage = if self.length_normalize {
+            let remaining = m.sum_axes(&[-1], true).subtract(&m.cumsum(-1));
+            after.divide(&ops::maximum(&remaining, &Array::from_f32(1.0)))
+        } else {
+            after
+        };
+
+        // rho = q_θ(y_t) / p~(y_t), differentiable through q_θ only.
+        let log_mixed_y = if self.teacher_mix <= 0.0 {
+            log_q0_y.clone()
+        } else if self.teacher_mix >= 1.0 {
+            log_p_y.clone()
+        } else {
+            log_mixture(&log_p_y, &log_q0_y, self.teacher_mix)
+        };
+        let rho = log_q_y.subtract(&log_mixed_y).exp();
+        let lo = Array::from_f32(1.0 - self.clip_epsilon);
+        let hi = Array::from_f32(1.0 + self.clip_epsilon);
+        let clipped = ops::minimum(&ops::maximum(&rho, &lo), &hi);
+
+        // (∇L)_Single: the per-position reverse KL, weighted by the clipped
+        // ratio taken as a constant.
+        let kl = kl_from_log_probs(&log_q, &log_p);
+        let single = reduce_per_token(&kl.multiply(&clipped.stop_gradient()), mask)?;
+
+        // (∇L)_Long: PPO-clipped REINFORCE on the normalized later rewards.
+        let long_per_token =
+            ops::minimum(&rho.multiply(&advantage), &clipped.multiply(&advantage)).negative();
+        let long = reduce_per_token(&long_per_token, mask)?;
+
+        Ok(MiniLlmOutput {
+            total: single.add(&long),
+            single_step: single,
+            long_term: long,
+        })
     }
 }
 
-impl DistillLoss for MiniLlmLoss {
-    fn compute_weighted(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-        weights: Option<&Array>,
-    ) -> Result<Array> {
-        let per_token = self.compute_inner(teacher_logits, student_logits, temperature)?;
-        match weights {
-            None => Ok(per_token.mean_all()),
-            Some(w) => {
-                let weighted = per_token.multiply(w);
-                let sum = weighted.sum_all();
-                let denom = ops::maximum(&w.sum_all(), &Array::from_f32(1.0));
-                Ok(sum.divide(&denom))
-            }
-        }
-    }
-
-    fn name(&self) -> &'static str {
-        "minillm"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    /// Identical inputs → reverse-KL = 0.
-    #[test]
-    #[serial]
-    fn identical_inputs_zero_loss() {
-        let logits = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 0.5, 1.5, 2.5], &[1, 2, 3]);
-        let v: f32 = MiniLlmLoss::reverse_only()
-            .compute(&logits, &logits, 1.0)
-            .unwrap()
-            .item();
-        assert!(v.abs() < 1e-5, "got {}", v);
-    }
-
-    /// `mix = 1.0` must agree with the existing reverse-KL implementation
-    /// in `KlDivergenceLoss::reverse()`.
-    #[test]
-    #[serial]
-    fn mix_1_matches_reverse_kl() {
-        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_f32_slice(&[3.0_f32, 1.0, 4.0, 1.0], &[1, 1, 4]);
-        let mini: f32 = MiniLlmLoss::reverse_only()
-            .compute(&teacher, &student, 1.0)
-            .unwrap()
-            .item();
-        let kl: f32 = super::super::KlDivergenceLoss::reverse()
-            .compute(&teacher, &student, 1.0)
-            .unwrap()
-            .item();
-        assert!(
-            (mini - kl).abs() < 1e-3,
-            "mix=1 should match reverse-KL: minillm={} vs reverse_kl={}",
-            mini,
-            kl
-        );
-    }
-
-    /// `mix = 0.0` must reduce the target to the student itself, making the
-    /// loss exactly zero (reverse-KL of any distribution with itself).
-    #[test]
-    #[serial]
-    fn mix_0_yields_zero_loss() {
-        let teacher = Array::from_f32_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
-        let student = Array::from_f32_slice(&[3.0_f32, 1.0, 4.0, 1.0], &[1, 1, 4]);
-        let v: f32 = MiniLlmLoss::new(0.0)
-            .compute(&teacher, &student, 1.0)
-            .unwrap()
-            .item();
-        assert!(v.abs() < 1e-4, "mix=0 must yield ≈0, got {}", v);
-    }
-
-    /// Loss is finite and non-negative for every interior `mix`.
-    #[test]
-    #[serial]
-    fn finite_and_nonnegative() {
-        let teacher = Array::from_f32_slice(&[5.0_f32, -3.0, 2.0, 0.0], &[1, 1, 4]);
-        let student = Array::from_f32_slice(&[-2.0_f32, 4.0, -1.0, 1.0], &[1, 1, 4]);
-        for &mix in &[0.05_f32, 0.3, 0.7, 0.95] {
-            let v: f32 = MiniLlmLoss::new(mix)
-                .compute(&teacher, &student, 2.0)
-                .unwrap()
-                .item();
-            assert!(v.is_finite() && v >= -1e-6, "mix={} got {}", mix, v);
-        }
-    }
+fn log_softmax_f32(logits: &Array) -> Array {
+    logits.as_dtype(Dtype::Float32.as_i32()).log_softmax(-1)
 }

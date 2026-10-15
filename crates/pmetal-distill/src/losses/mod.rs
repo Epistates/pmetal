@@ -1,11 +1,18 @@
 //! Loss functions for knowledge distillation.
 //!
 //! This module provides various loss functions used in knowledge distillation:
-//! - KL Divergence (forward and reverse)
-//! - Jensen-Shannon Divergence
-//! - Soft Cross-Entropy
-//! - MSE on logits
-//! - Hidden state alignment losses
+//! - KL Divergence (forward and reverse), Jensen-Shannon and its generalization
+//!   `JSD(β)`, DistiLLM's skew KL, soft cross-entropy, total variation
+//! - Universal Logit Distillation, for teachers and students with different tokenizers
+//! - MiniLLM (policy gradient on student samples) and GKD (on-policy)
+//! - [`SparseKlLoss`], forward KL against a top-k teacher from an offline cache
+//! - MSE on logits, ranking losses
+//! - Hidden state and attention alignment losses
+//!
+//! A [`DistillLoss`] takes logits `[.., vocab]` and per-token weights; the
+//! teacher is a constant (its gradient is stopped before the loss runs), the
+//! softmax runs in f32 whatever the logits' dtype, and a weighted mean divides
+//! by the total weight.
 //!
 //! # Differentiability
 //!
@@ -34,21 +41,27 @@ mod kl_divergence;
 mod logistic_ranking;
 mod minillm;
 mod mse;
+mod sampled_token_kl;
+mod skew_kl;
 mod soft_cross_entropy;
+mod sparse_kl;
 mod tvd;
 mod universal_logit;
 
 pub use attention_transfer::AttentionTransferLoss;
-pub use gkd::{GkdLoss, GreedySampler, OnPolicySampler};
+pub use gkd::{GkdLoss, GreedySampler, OnPolicySampler, TemperatureSampler};
 pub use hidden_state::HiddenStateLoss;
 pub use hinge_ranking::HingeRankingLoss;
 pub use jensen_shannon::JensenShannonLoss;
 pub use jsd_skewed::JsdSkewedLoss;
 pub use kl_divergence::KlDivergenceLoss;
 pub use logistic_ranking::LogisticRankingLoss;
-pub use minillm::MiniLlmLoss;
+pub use minillm::{MiniLlmLoss, MiniLlmOutput};
 pub use mse::MseLoss;
+pub use sampled_token_kl::{SampledTokenKl, SampledTokenKlOutput, SampledTokenKlTarget};
+pub use skew_kl::SkewKlLoss;
 pub use soft_cross_entropy::SoftCrossEntropyLoss;
+pub use sparse_kl::SparseKlLoss;
 pub use tvd::TvdLoss;
 pub use universal_logit::UniversalLogitLoss;
 
@@ -62,7 +75,28 @@ use pmetal_runtime::compat::{Array, Dtype, ops};
 pub const SPARSE_TOPK_DEFAULT: i32 = 128;
 
 /// Trait for distillation loss functions.
+///
+/// An implementation provides [`weighted_loss`](Self::weighted_loss); the
+/// public entry points ([`compute`](Self::compute),
+/// [`compute_weighted`](Self::compute_weighted),
+/// [`compute_masked`](Self::compute_masked)) cut the teacher out of the
+/// autodiff graph before calling it, so a teacher forward that ran inside the
+/// differentiated function still contributes no gradient.
 pub trait DistillLoss: Send + Sync {
+    /// The loss between a teacher and a student, averaged over tokens.
+    ///
+    /// The teacher logits arrive already detached from the autodiff graph:
+    /// treat them as constants. `weights` is one entry per token; the result
+    /// is `sum(loss * w) / sum(w)` (a mean without weights, and zero when every
+    /// weight is zero).
+    fn weighted_loss(
+        &self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+        weights: Option<&Array>,
+    ) -> Result<Array>;
+
     /// Compute the distillation loss between teacher and student outputs.
     ///
     /// # Arguments
@@ -84,7 +118,7 @@ pub trait DistillLoss: Send + Sync {
     /// Compute weighted distillation loss.
     ///
     /// # Arguments
-    /// * `teacher_logits` - Teacher logits
+    /// * `teacher_logits` - Teacher logits; detached here
     /// * `student_logits` - Student logits
     /// * `temperature` - Softmax temperature
     /// * `weights` - Per-token weights `[batch, seq]`
@@ -94,7 +128,14 @@ pub trait DistillLoss: Send + Sync {
         student_logits: &Array,
         temperature: f32,
         weights: Option<&Array>,
-    ) -> Result<Array>;
+    ) -> Result<Array> {
+        self.weighted_loss(
+            &teacher_logits.stop_gradient(),
+            student_logits,
+            temperature,
+            weights,
+        )
+    }
 
     /// Compute token-level masked distillation loss.
     ///
@@ -119,6 +160,18 @@ pub trait DistillLoss: Send + Sync {
         self.compute_weighted(teacher_logits, student_logits, temperature, Some(mask))
     }
 
+    /// The factor [`Distiller`](crate::Distiller) multiplies this loss by.
+    ///
+    /// Softening both distributions by `T` shrinks a divergence's gradient
+    /// with respect to the student logits by `1/T²` (Hinton et al., 2015,
+    /// §2.1), and `T²` restores it. That holds for losses on the softened
+    /// distributions, the default. A loss that does not depend on the
+    /// temperature (a logit regression) has nothing to restore and returns
+    /// `1.0`.
+    fn temperature_scale(&self, temperature: f32) -> f32 {
+        temperature * temperature
+    }
+
     /// Get the name of this loss function.
     fn name(&self) -> &'static str;
 }
@@ -133,6 +186,54 @@ pub(crate) fn tempered_log_probs(logits: &Array, temperature: f32) -> Array {
         .as_dtype(Dtype::Float32.as_i32())
         .divide(&Array::from_f32(temperature))
         .log_softmax(-1)
+}
+
+/// Temperature-softened f32 log-probabilities of a teacher/student pair, after
+/// [`align_vocab_with_k`] has given them a common vocabulary axis.
+pub(crate) fn aligned_log_probs(
+    teacher_logits: &Array,
+    student_logits: &Array,
+    temperature: f32,
+    sparse_top_k: i32,
+) -> Result<(Array, Array)> {
+    let (teacher, student, _) = align_vocab_with_k(teacher_logits, student_logits, sparse_top_k)?;
+    Ok((
+        tempered_log_probs(&teacher, temperature),
+        tempered_log_probs(&student, temperature),
+    ))
+}
+
+/// Numerically stable `log(exp(a) + exp(b))` = `m + log(exp(a - m) + exp(b - m))`
+/// with `m = max(a, b)`.
+///
+/// `m` appears both outside and inside the log, so its own derivative cancels
+/// and the gradient splits evenly between `a` and `b` where they tie, as the
+/// derivative of `log(exp(a) + exp(b))` does. The shortcut
+/// `m + log(1 + exp(-|a - b|))` has the same value but not that property: the
+/// gradient of `maximum` sends a tie entirely to one argument and `|x|`
+/// contributes nothing there, so wherever teacher and student gave a token the
+/// same log-probability the student's gradient through the mixture came out
+/// wrong (tenfold on a permuted-row fixture).
+pub(crate) fn log_add_exp(a: &Array, b: &Array) -> Array {
+    let m = ops::maximum(a, b);
+    m.add(&a.subtract(&m).exp().add(&b.subtract(&m).exp()).log())
+}
+
+/// `log(w·P + (1-w)·Q)` from `log P` and `log Q`, for `0 < w < 1`.
+pub(crate) fn log_mixture(log_p: &Array, log_q: &Array, weight_p: f32) -> Array {
+    debug_assert!(weight_p > 0.0 && weight_p < 1.0);
+    log_add_exp(
+        &log_p.add(&Array::from_f32(weight_p.ln())),
+        &log_q.add(&Array::from_f32((1.0 - weight_p).ln())),
+    )
+}
+
+/// `KL(P || Q)` per row from `log P` and `log Q`, summed over the last axis.
+pub(crate) fn kl_from_log_probs(log_p: &Array, log_q: &Array) -> Array {
+    log_p
+        .exp()
+        .multiply(&log_p.subtract(log_q))
+        .sum_axes(&[-1], false)
 }
 
 /// Reduce per-token losses to a scalar, in the autodiff graph.
@@ -159,88 +260,19 @@ pub(crate) fn reduce_per_token(per_token: &Array, weights: Option<&Array>) -> Re
     Ok(per_token.multiply(&w).sum_all().divide(&safe_weight))
 }
 
-/// Combined distillation loss with hard and soft targets.
-pub struct CombinedLoss {
-    /// Soft target loss function.
-    soft_loss: Box<dyn DistillLoss>,
-    /// Alpha for blending (final = alpha * soft + (1-alpha) * hard).
-    alpha: f32,
-    /// Temperature for soft targets.
-    temperature: f32,
-}
-
-impl CombinedLoss {
-    /// Create a new combined loss.
-    pub fn new(soft_loss: Box<dyn DistillLoss>, alpha: f32, temperature: f32) -> Self {
-        Self {
-            soft_loss,
-            alpha,
-            temperature,
-        }
-    }
-
-    /// Compute combined loss with hard labels.
-    ///
-    /// # Arguments
-    /// * `teacher_logits` - Teacher model outputs
-    /// * `student_logits` - Student model outputs
-    /// * `labels` - Ground truth labels for hard loss
-    pub fn compute_with_labels(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        labels: &Array,
-    ) -> Result<Array> {
-        // Soft loss (temperature-scaled KL/CE between teacher and student)
-        let soft = self
-            .soft_loss
-            .compute(teacher_logits, student_logits, self.temperature)?;
-
-        // Hard loss (cross-entropy with ground truth)
-        let hard = cross_entropy_with_logits(student_logits, labels)?;
-
-        // Weighted combination
-        // Note: soft loss is scaled by T^2 to maintain gradient magnitude
-        let t_squared = self.temperature * self.temperature;
-        let soft_scaled = soft.multiply(&Array::from_f32(self.alpha * t_squared));
-        let hard_scaled = hard.multiply(&Array::from_f32(1.0 - self.alpha));
-
-        Ok(soft_scaled.add(&hard_scaled))
-    }
-}
-
-/// Standard cross-entropy loss with logits and integer labels.
-fn cross_entropy_with_logits(logits: &Array, labels: &Array) -> Result<Array> {
-    // Log-softmax for numerical stability
-    let log_probs = logits.log_softmax(-1);
-
-    // Gather the log probabilities at label positions
-    // Shape: logits [batch, seq, vocab], labels [batch, seq]
-    let vocab_size = logits.dim(2);
-
-    // Flatten for gather operation
-    let log_probs_flat = log_probs.reshape(&[-1, vocab_size]);
-    let labels_flat = labels.reshape(&[-1]);
-
-    // Get log prob at each label position using MLX take_along_axis
-    let gathered = gather_at_indices(&log_probs_flat, &labels_flat)?;
-
-    // Mean negative log probability
-    let neg_log_probs = gathered.negative();
-    let loss = neg_log_probs.mean_all();
-
-    Ok(loss)
-}
-
 /// Align teacher and student logits when their vocab sizes differ.
 ///
 /// Uses the default top-k of [`SPARSE_TOPK_DEFAULT`] (128).  For a custom `k`,
 /// call [`align_vocab_with_k`] directly.
 ///
-/// When teacher and student have different vocabulary sizes (cross-architecture
-/// distillation), aligning via sparse top-k is more principled than truncation
-/// or padding: it preserves the distribution information where it matters most
-/// and works regardless of which model has the larger vocabulary.
+/// When teacher and student have different vocabulary sizes, the losses compare
+/// them on the teacher's `k` most likely token ids, renormalized on each side.
+/// Ids are matched **by value**, so this is meaningful when the two models share
+/// a tokenizer and differ only in how far the embedding matrix is padded, or in
+/// a few added special tokens. Models with different tokenizers have unrelated
+/// ids: use [`UniversalLogitLoss`], which compares order statistics instead.
+/// For a pure padding difference [`align_vocab_truncate`] keeps the whole
+/// distribution.
 ///
 /// # Returns
 ///
@@ -252,10 +284,14 @@ pub fn align_vocab(teacher_logits: &Array, student_logits: &Array) -> Result<(Ar
 
 /// Align teacher and student logits when their vocab sizes differ, with a configurable top-k.
 ///
-/// When teacher and student have different vocabulary sizes (cross-architecture
-/// distillation), aligning via sparse top-k is more principled than truncation
-/// or padding: it preserves the distribution information where it matters most
-/// and works regardless of which model has the larger vocabulary.
+/// When teacher and student have different vocabulary sizes, the losses compare
+/// them on the teacher's `k` most likely token ids, renormalized on each side.
+/// Ids are matched **by value**, so this is meaningful when the two models share
+/// a tokenizer and differ only in how far the embedding matrix is padded, or in
+/// a few added special tokens. Models with different tokenizers have unrelated
+/// ids: use [`UniversalLogitLoss`], which compares order statistics instead.
+/// For a pure padding difference [`align_vocab_truncate`] keeps the whole
+/// distribution.
 ///
 /// # Algorithm
 ///
@@ -282,6 +318,9 @@ pub fn align_vocab_with_k(
     student_logits: &Array,
     top_k: i32,
 ) -> Result<(Array, Array, bool)> {
+    // The top-k ids are a function of the teacher alone and must stay out of
+    // the autodiff graph (MLX cannot differentiate a gather's indices).
+    let teacher_logits = &teacher_logits.stop_gradient();
     let teacher_vocab = teacher_logits.dim(-1) as usize;
     let student_vocab = student_logits.dim(-1) as usize;
 
@@ -339,43 +378,43 @@ pub fn align_vocab_with_k(
     let student_gathered = student_logits.take_along_axis(&clamped, -1);
 
     // Mask out positions where the teacher index fell outside the student vocab.
-    // Those positions receive -1e9 so their softmax weight is negligible (~0).
+    // Those tokens leave the support on BOTH sides (-1e9 gives them softmax
+    // weight ~0): the teacher is renormalized over the ids the student can
+    // score. Masking only the student left the teacher's probability on a
+    // token the student gives exactly zero, a KL term of ~1e9 per unit of mass.
     let student_vocab_arr = Array::from_i32(student_vocab as i32);
     let out_of_range = top_k_indices
         .as_dtype(Dtype::Int32.as_i32())
         .greater_equal(&student_vocab_arr);
     let neg_large = Array::from_f32(-1e9_f32);
     let student_aligned = ops::where_fn(&out_of_range, &neg_large, &student_gathered);
+    let teacher_aligned = ops::where_fn(&out_of_range, &neg_large, &teacher_aligned);
 
     Ok((teacher_aligned, student_aligned, true))
+}
+
+/// Cut both logit tensors to their common vocabulary, `[.., min(V_T, V_S)]`.
+///
+/// For models that share a tokenizer but pad the embedding matrix to
+/// different sizes (the extra ids are never real tokens), this is exact, and
+/// keeps the whole distribution where [`align_vocab`]'s top-k keeps only the
+/// teacher's head. Do not use it for models with different tokenizers: the
+/// ids mean different tokens there and nothing about their positions lines up
+/// (see [`UniversalLogitLoss`] for that case).
+pub fn align_vocab_truncate(teacher_logits: &Array, student_logits: &Array) -> (Array, Array) {
+    let common = teacher_logits.dim(-1).min(student_logits.dim(-1));
+    let cut = |logits: &Array| {
+        let mut stop = logits.shape().to_vec();
+        let last = stop.len() - 1;
+        stop[last] = common;
+        logits.slice(&vec![0; stop.len()], &stop)
+    };
+    (cut(teacher_logits), cut(student_logits))
 }
 
 /// Softmax along specified axis.
 pub fn softmax(x: &Array, axis: i32) -> Result<Array> {
     Ok(x.softmax(axis))
-}
-
-/// Gather values from a 2D array at specified column indices.
-///
-/// Uses MLX take operation for GPU-accelerated gather.
-fn gather_at_indices(values: &Array, indices: &Array) -> Result<Array> {
-    // values: [N, V], indices: [N] -> output: [N]
-    let n = values.dim(0);
-    let v = values.dim(1);
-
-    // Create row indices [0, 1, 2, ..., N-1] via GPU arange — stays in the
-    // MLX compute graph and avoids a CPU Vec<i32> allocation.
-    let row_indices_arr = Array::arange(n, Dtype::Int32.as_i32());
-
-    // Compute flat indices: row * V + col
-    let v_arr = Array::from_i32(v);
-    let flat_indices = row_indices_arr.multiply(&v_arr).add(indices);
-
-    // Flatten values and gather
-    let values_flat = values.reshape(&[-1]);
-    let gathered = values_flat.take_axis(&flat_indices, 0);
-
-    Ok(gathered)
 }
 
 #[cfg(test)]
@@ -416,19 +455,6 @@ mod tests {
         let probs_data: Vec<f32> = probs.clone().to_f32_vec(3).unwrap();
         let sum: f32 = probs_data.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    #[serial]
-    fn test_gather_at_indices() {
-        let values = Array::from_f32_slice(&[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
-        let indices = Array::from_i32_slice(&[1_i32, 2]);
-        let result = gather_at_indices(&values, &indices).unwrap();
-        let result_data: Vec<f32> = result.clone().to_f32_vec(2).unwrap();
-
-        assert_eq!(result_data.len(), 2);
-        assert!((result_data[0] - 0.2).abs() < 1e-5); // row 0, col 1
-        assert!((result_data[1] - 0.6).abs() < 1e-5); // row 1, col 2
     }
 
     // -----------------------------------------------------------------
@@ -538,18 +564,22 @@ mod tests {
         // teacher: [1, 6] with clear ordering
         // token 5 has highest logit (10.0), token 4 second (9.0), etc.
         let teacher_data = [1.0_f32, 2.0, 3.0, 4.0, 9.0, 10.0];
-        let student_data = [0.1_f32, 0.2, 0.3, 0.4]; // only 4 tokens
+        let student_data = [0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]; // 8 tokens
         let teacher = Array::from_f32_slice(&teacher_data, &[1, 6]);
-        let student = Array::from_f32_slice(&student_data, &[1, 4]);
+        let student = Array::from_f32_slice(&student_data, &[1, 8]);
 
-        let (ta, _sa, _) = align_vocab_with_k(&teacher, &student, 3).unwrap();
+        let (ta, sa, _) = align_vocab_with_k(&teacher, &student, 3).unwrap();
         ta.eval();
 
-        let ta_vals: Vec<f32> = ta.clone().to_f32_vec(3).unwrap();
-        // All three selected values must be from {4.0, 9.0, 10.0}
-        // i.e. all >= 4.0 (the 4th-highest)
-        for v in &ta_vals {
-            assert!(*v >= 4.0 - 1e-5, "unexpected value in top-3: {}", v);
+        let mut ta_vals: Vec<f32> = ta.clone().to_f32_vec(3).unwrap();
+        ta_vals.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(ta_vals, vec![10.0, 9.0, 4.0]);
+
+        // The student is read at the same three ids (5, 4, 3): 0.6, 0.5, 0.4.
+        let mut sa_vals: Vec<f32> = sa.clone().to_f32_vec(3).unwrap();
+        sa_vals.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        for (got, want) in sa_vals.iter().zip([0.6, 0.5, 0.4]) {
+            assert!((got - want).abs() < 1e-6, "{sa_vals:?}");
         }
     }
 

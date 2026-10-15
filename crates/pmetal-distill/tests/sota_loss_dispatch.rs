@@ -55,7 +55,22 @@ fn dispatch_every_sota_variant() {
             LossType::UniversalLogit { top_k: Some(4) },
             true,
         ),
-        ("minillm", LossType::MiniLlm { mix: 0.9 }, true),
+        (
+            "skew_kl",
+            LossType::SkewKl {
+                alpha: 0.1,
+                reverse: false,
+            },
+            true,
+        ),
+        (
+            "skew_reverse_kl",
+            LossType::SkewKl {
+                alpha: 0.1,
+                reverse: true,
+            },
+            true,
+        ),
         (
             "gkd",
             LossType::Gkd {

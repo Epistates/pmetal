@@ -126,6 +126,12 @@ impl AttentionTransferLoss {
             ),
         };
 
+        // Attention maps are often bf16, and their entries (a row's probabilities)
+        // are small: reduce in f32. The teacher is a constant.
+        let f32_ = pmetal_runtime::compat::Dtype::Float32.as_i32();
+        let teacher = teacher.stop_gradient().as_dtype(f32_);
+        let student = student.as_dtype(f32_);
+
         match self.loss_type {
             AttentionLossType::Mse => self.mse_loss(&teacher, &student),
             AttentionLossType::Kl => self.kl_loss(&teacher, &student),

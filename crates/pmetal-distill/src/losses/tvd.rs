@@ -6,20 +6,31 @@
 //! bounded in [0, 1], making it easy to interpret and compare across runs.
 
 use crate::Result;
-use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::compat::Array;
 
-use super::DistillLoss;
+use super::{DistillLoss, SPARSE_TOPK_DEFAULT, aligned_log_probs, reduce_per_token};
 
 /// Total Variation Distance loss.
 ///
 /// Computes `0.5 * Σ_i |P_teacher_i - P_student_i|` per token,
 /// then averages over all tokens.
-pub struct TvdLoss;
+pub struct TvdLoss {
+    /// Number of top-k teacher tokens to retain when vocab sizes differ.
+    sparse_top_k: i32,
+}
 
 impl TvdLoss {
     /// Create a new TVD loss.
     pub fn new() -> Self {
-        Self
+        Self {
+            sparse_top_k: SPARSE_TOPK_DEFAULT,
+        }
+    }
+
+    /// Set the number of top-k teacher tokens used in cross-vocab distillation.
+    pub fn with_sparse_top_k(mut self, k: i32) -> Self {
+        self.sparse_top_k = k.max(1);
+        self
     }
 }
 
@@ -30,37 +41,29 @@ impl Default for TvdLoss {
 }
 
 impl DistillLoss for TvdLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        let temp = Array::from_f32(temperature);
-
-        // Temperature-scaled softmax
-        let teacher_scaled = teacher_logits.divide(&temp);
-        let student_scaled = student_logits.divide(&temp);
-
-        let teacher_probs = super::softmax(&teacher_scaled, -1)?;
-        let student_probs = super::softmax(&student_scaled, -1)?;
+        let (teacher_log_probs, student_log_probs) = aligned_log_probs(
+            teacher_logits,
+            student_logits,
+            temperature,
+            self.sparse_top_k,
+        )?;
 
         // TVD = 0.5 * sum(|P - Q|, axis=-1)
-        let diff = teacher_probs.subtract(&student_probs);
-        let abs_diff = ops::abs(&diff);
-        let tvd_per_token = abs_diff.sum_axes(&[-1], false);
-        let tvd_per_token = tvd_per_token.multiply(&Array::from_f32(0.5));
+        let tvd_per_token = teacher_log_probs
+            .exp()
+            .subtract(&student_log_probs.exp())
+            .abs_val()
+            .sum_axes(&[-1], false)
+            .multiply(&Array::from_f32(0.5));
 
-        if let Some(w) = weights {
-            let weighted = tvd_per_token.multiply(w);
-            let sum = weighted.sum_all();
-            let w_sum = w.sum_all();
-            let safe_sum = ops::maximum(&w_sum, &Array::from_f32(1.0));
-            Ok(sum.divide(&safe_sum))
-        } else {
-            Ok(tvd_per_token.mean_all())
-        }
+        reduce_per_token(&tvd_per_token, weights)
     }
 
     fn name(&self) -> &'static str {

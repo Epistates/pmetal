@@ -4,8 +4,9 @@
 //! not just the final logits. This can improve student model quality
 //! by ensuring internal representations align with the teacher.
 
+use super::reduce_per_token;
 use crate::{HiddenStateLossType, Result};
-use pmetal_runtime::compat::Array;
+use pmetal_runtime::compat::{Array, Dtype};
 
 /// Hidden state alignment loss.
 ///
@@ -57,6 +58,25 @@ impl HiddenStateLoss {
     /// * `teacher_hidden` - Hidden states from teacher [batch, seq, hidden_teacher]
     /// * `student_hidden` - Hidden states from student [batch, seq, hidden_student]
     pub fn compute(&self, teacher_hidden: &Array, student_hidden: &Array) -> Result<Array> {
+        self.compute_with_mask(teacher_hidden, student_hidden, None)
+    }
+
+    /// [`compute`](Self::compute) averaged over the tokens a mask keeps.
+    ///
+    /// `mask` holds one weight per token (`[batch, seq]`, 1 = keep, 0 = a
+    /// padded or prompt position). The loss is taken per token (the mean over
+    /// the hidden axis for MSE and L1, `1 - cosine` for cosine) and reduced as
+    /// `sum(loss * w) / sum(w)`, so masked positions contribute neither loss
+    /// nor gradient. Without a mask every token counts equally.
+    ///
+    /// The teacher side is a constant: its gradient is stopped. The reduction
+    /// runs in f32 whatever the dtype of the hidden states.
+    pub fn compute_with_mask(
+        &self,
+        teacher_hidden: &Array,
+        student_hidden: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
         // Apply projection if dimensions don't match
         let student_aligned = if let Some(proj) = &self.projection {
             // Validate the matmul shape contract before reaching MLX so the
@@ -92,49 +112,19 @@ impl HiddenStateLoss {
             student_hidden.clone()
         };
 
-        match self.loss_type {
-            HiddenStateLossType::Mse => self.mse_loss_mlx(teacher_hidden, &student_aligned),
-            HiddenStateLossType::Cosine => self.cosine_loss_mlx(teacher_hidden, &student_aligned),
-            HiddenStateLossType::L1 => self.l1_loss_mlx(teacher_hidden, &student_aligned),
-        }
-    }
+        let f32_ = Dtype::Float32.as_i32();
+        let teacher = teacher_hidden.stop_gradient().as_dtype(f32_);
+        let student = student_aligned.as_dtype(f32_);
 
-    /// MSE loss on hidden states.
-    fn mse_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
-        let diff = student.subtract(teacher);
-        let squared = diff.multiply(&diff);
-        Ok(squared.mean_all())
-    }
-
-    /// Cosine similarity loss (1 - cosine_similarity).
-    fn cosine_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
-        // Cosine similarity along last dimension
-        // cos(t, s) = (t · s) / (||t|| * ||s||)
-
-        // Dot product
-        let dot = teacher.multiply(student).sum_axes(&[-1], true);
-
-        // Norms
-        let teacher_norm = teacher.multiply(teacher).sum_axes(&[-1], true).sqrt();
-        let student_norm = student.multiply(student).sum_axes(&[-1], true).sqrt();
-
-        // Cosine similarity with epsilon for stability
-        let eps = Array::from_f32(1e-8);
-        let norms = teacher_norm.multiply(&student_norm).add(&eps);
-        let cosine_sim = dot.divide(&norms);
-
-        // Loss = 1 - cosine_similarity
-        let one = Array::from_f32(1.0);
-        let loss = one.subtract(&cosine_sim);
-
-        Ok(loss.mean_all())
-    }
-
-    /// L1 loss on hidden states.
-    fn l1_loss_mlx(&self, teacher: &Array, student: &Array) -> Result<Array> {
-        let diff = student.subtract(teacher);
-        let abs_diff = diff.abs_val();
-        Ok(abs_diff.mean_all())
+        let per_token = match self.loss_type {
+            HiddenStateLossType::Mse => {
+                let diff = student.subtract(&teacher);
+                diff.multiply(&diff).mean_axes(&[-1], false)
+            }
+            HiddenStateLossType::Cosine => cosine_distance(&teacher, &student),
+            HiddenStateLossType::L1 => student.subtract(&teacher).abs_val().mean_axes(&[-1], false),
+        };
+        reduce_per_token(&per_token, mask)
     }
 
     /// Get the name of this loss.
@@ -145,6 +135,68 @@ impl HiddenStateLoss {
             HiddenStateLossType::L1 => "hidden_l1",
         }
     }
+}
+
+/// The weighted mean of `pair_loss` over the mapped `(teacher, student)` layer
+/// pairs, times `global_weight`; zero for an empty mapping.
+///
+/// A pair that names a layer the model did not return is a
+/// [`LayerMapping`](crate::DistillError::LayerMapping) error: a mapping that
+/// silently trains on fewer layers than configured is a misconfiguration, not
+/// a degraded mode.
+pub(crate) fn mean_over_layer_pairs(
+    mapping: &[(usize, usize)],
+    weights: &[f32],
+    global_weight: f32,
+    teacher_layers: &[Array],
+    student_layers: &[Array],
+    mut pair_loss: impl FnMut(&Array, &Array) -> Result<Array>,
+) -> Result<Array> {
+    if mapping.is_empty() {
+        return Ok(Array::from_f32(0.0));
+    }
+
+    let mut total_loss = Array::from_f32(0.0);
+    let mut weight_total = 0.0_f32;
+    for ((teacher_idx, student_idx), &w) in mapping.iter().zip(weights) {
+        let (Some(teacher), Some(student)) = (
+            teacher_layers.get(*teacher_idx),
+            student_layers.get(*student_idx),
+        ) else {
+            return Err(crate::DistillError::LayerMapping(format!(
+                "layer pair (teacher {teacher_idx}, student {student_idx}) is out of range: \
+                 the teacher returned {} layers and the student {}",
+                teacher_layers.len(),
+                student_layers.len()
+            )));
+        };
+        let loss = pair_loss(teacher, student)?;
+        total_loss = total_loss.add(&loss.multiply(&Array::from_f32(w)));
+        weight_total += w;
+    }
+
+    if weight_total > 0.0 {
+        let avg = total_loss.divide(&Array::from_f32(weight_total));
+        Ok(avg.multiply(&Array::from_f32(global_weight)))
+    } else {
+        Ok(Array::from_f32(0.0))
+    }
+}
+
+/// `1 - cos(t, s)` along the last axis.
+///
+/// Each norm is `sqrt(|x|² + ε)` rather than `|x|`: the derivative of a bare
+/// square root is infinite at zero, and its product with a zero vector is NaN,
+/// so a zero hidden vector (a padded position, a layer that outputs nothing)
+/// would poison the whole gradient. With `ε`, a zero vector has cosine 0 and a
+/// zero gradient.
+fn cosine_distance(teacher: &Array, student: &Array) -> Array {
+    const EPS: f32 = 1e-12;
+    let eps = Array::from_f32(EPS);
+    let dot = teacher.multiply(student).sum_axes(&[-1], false);
+    let t_norm = teacher.square().sum_axes(&[-1], false).add(&eps).sqrt();
+    let s_norm = student.square().sum_axes(&[-1], false).add(&eps).sqrt();
+    Array::from_f32(1.0).subtract(&dot.divide(&t_norm.multiply(&s_norm)))
 }
 
 /// Configuration for multi-layer hidden state distillation.
@@ -233,43 +285,33 @@ impl LayerDistillation {
     /// Compute total hidden state loss across all layer pairs.
     ///
     /// Each pair is weighted by its corresponding entry in `self.weights`.
-    /// The result is the sum of weighted losses divided by the total weight of
-    /// in-bounds pairs (so out-of-bounds pairs do not dilute the signal).
+    /// The result is the weighted mean of the pairs' losses times the global
+    /// weight.
+    ///
+    /// A pair that names a layer the model did not return is an error: a
+    /// mapping that silently trains on fewer layers than configured is a
+    /// misconfiguration, not a degraded mode.
     pub fn compute(&self, teacher_hiddens: &[Array], student_hiddens: &[Array]) -> Result<Array> {
-        if self.layer_mapping.is_empty() {
-            return Ok(Array::from_f32(0.0));
-        }
+        self.compute_with_mask(teacher_hiddens, student_hiddens, None)
+    }
 
-        let mut total_loss = Array::from_f32(0.0);
-        let mut weight_total = 0.0_f32;
-
-        for ((teacher_idx, student_idx), &w) in self.layer_mapping.iter().zip(self.weights.iter()) {
-            if *teacher_idx < teacher_hiddens.len() && *student_idx < student_hiddens.len() {
-                let loss = self.loss.compute(
-                    &teacher_hiddens[*teacher_idx],
-                    &student_hiddens[*student_idx],
-                )?;
-                total_loss = total_loss.add(&loss.multiply(&Array::from_f32(w)));
-                weight_total += w;
-            } else {
-                tracing::warn!(
-                    teacher_idx,
-                    student_idx,
-                    teacher_layers = teacher_hiddens.len(),
-                    student_layers = student_hiddens.len(),
-                    "layer pair ({}, {}) is out of bounds and will be skipped",
-                    teacher_idx,
-                    student_idx,
-                );
-            }
-        }
-
-        if weight_total > 0.0 {
-            let avg = total_loss.divide(&Array::from_f32(weight_total));
-            Ok(avg.multiply(&Array::from_f32(self.global_weight)))
-        } else {
-            Ok(Array::from_f32(0.0))
-        }
+    /// [`compute`](Self::compute) with a per-token mask (`[batch, seq]`, 1 =
+    /// keep) applied to every layer pair; see
+    /// [`HiddenStateLoss::compute_with_mask`].
+    pub fn compute_with_mask(
+        &self,
+        teacher_hiddens: &[Array],
+        student_hiddens: &[Array],
+        mask: Option<&Array>,
+    ) -> Result<Array> {
+        mean_over_layer_pairs(
+            &self.layer_mapping,
+            &self.weights,
+            self.global_weight,
+            teacher_hiddens,
+            student_hiddens,
+            |teacher, student| self.loss.compute_with_mask(teacher, student, mask),
+        )
     }
 
     /// Get the layer mapping.
@@ -297,14 +339,19 @@ unsafe impl Send for HiddenStateLoss {}
 unsafe impl Sync for HiddenStateLoss {}
 
 impl super::DistillLoss for HiddenStateLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher: &Array,
         student: &Array,
         _temperature: f32,
-        _weights: Option<&Array>,
+        weights: Option<&Array>,
     ) -> Result<Array> {
-        self.compute(teacher, student)
+        self.compute_with_mask(teacher, student, weights)
+    }
+
+    /// Hidden states are not softened by a temperature.
+    fn temperature_scale(&self, _temperature: f32) -> f32 {
+        1.0
     }
 
     fn name(&self) -> &'static str {

@@ -80,10 +80,14 @@ pub struct LossConfig {
     #[serde(default)]
     pub outcome_supervised: bool,
 
-    /// Start marker for explicit reasoning (e.g., `<think>`).
+    /// Start marker for explicit reasoning (e.g., `<think>`). Validated here
+    /// and left to the training loop, which owns the tokenizer: it resolves the
+    /// markers to token ids and passes
+    /// [`generate_reasoning_mask`](crate::reasoning::generate_reasoning_mask)
+    /// (scaled as it likes) as the per-token weights of the loss.
     pub start_marker: Option<String>,
 
-    /// End marker for explicit reasoning (e.g., `</think>`).
+    /// End marker for explicit reasoning (e.g., `</think>`); see `start_marker`.
     pub end_marker: Option<String>,
 
     /// Hidden state distillation configuration.
@@ -142,13 +146,26 @@ pub enum LossType {
     /// Mean Squared Error on logits.
     MseLoss,
 
-    /// Skewed Jensen-Shannon (DistiLLM-2, Ko et al. 2024) with mixing
-    /// weight `alpha`. `alpha = 0.5` matches symmetric JSD; values closer
-    /// to `1.0` weight the teacher term more heavily.
+    /// Generalized Jensen-Shannon divergence `JSD(β)` of Agarwal et al.
+    /// (ICLR 2024), with `alpha` as β: `β·KL(T || M) + (1-β)·KL(S || M)` with
+    /// `M = β·T + (1-β)·S`. `alpha = 0.5` is the symmetric JSD; `0` is the
+    /// forward KL `KL(T || S)` and `1` the reverse KL `KL(S || T)`.
     JsdSkewed {
-        /// Mixing weight, clamped to `[ε, 1-ε]` at construction time.
+        /// Mixing weight β, in `[0, 1]`.
         #[serde(default = "default_jsd_skewed_alpha")]
         alpha: f32,
+    },
+
+    /// DistiLLM's skew KL (Ko et al., ICML 2024): `KL(T || α·T + (1-α)·S)`,
+    /// or with `reverse` the skew reverse KL `KL(S || (1-α)·T + α·S)`. The
+    /// paper's best value is `alpha = 0.1`.
+    SkewKl {
+        /// Mixing weight, in `[0, 1)`.
+        #[serde(default = "default_skew_kl_alpha")]
+        alpha: f32,
+        /// Take the reverse direction.
+        #[serde(default)]
+        reverse: bool,
     },
 
     /// Universal Logit Distillation (Boizard et al. 2024). Cross-tokenizer
@@ -160,15 +177,6 @@ pub enum LossType {
         /// vocabularies ≫ 32K.
         #[serde(default)]
         top_k: Option<usize>,
-    },
-
-    /// MiniLLM-style reverse-KL (Gu et al. 2024) with optional teacher
-    /// mixing. `mix = 1.0` is plain reverse-KL; smaller values blend in
-    /// the student's own distribution to stabilize early training.
-    MiniLlm {
-        /// Teacher-mix weight, clamped to `[0, 1]`.
-        #[serde(default = "default_minillm_mix")]
-        mix: f32,
     },
 
     /// Generalized Knowledge Distillation (Agarwal et al. 2024). Loss-only
@@ -187,8 +195,8 @@ pub enum LossType {
 fn default_jsd_skewed_alpha() -> f32 {
     0.5
 }
-fn default_minillm_mix() -> f32 {
-    1.0
+fn default_skew_kl_alpha() -> f32 {
+    0.1
 }
 fn default_gkd_lambda() -> f32 {
     0.5
@@ -307,7 +315,8 @@ pub struct OfflineConfig {
     #[serde(default)]
     pub compression: CompressionMethod,
 
-    /// Top-k logits to keep (if using top-k compression).
+    /// Top-k logits to keep (if using top-k compression), or the number of
+    /// draws per token (if using sampled compression).
     #[serde(default = "default_top_k")]
     pub top_k: usize,
 
@@ -336,6 +345,13 @@ pub enum CompressionMethod {
 
     /// Quantize to 4-bit.
     Int4,
+
+    /// Random-sampling KD (Anshumann et al., ACL 2025): draw `top_k` tokens per
+    /// position from the teacher's distribution and keep their counts. An
+    /// unbiased estimate of the teacher where `TopK` is a biased one; about a
+    /// dozen draws match full distillation. The teacher is sampled at one
+    /// temperature, which the loss must then use.
+    Sampled,
 }
 
 /// Training configuration for distillation.
@@ -425,14 +441,22 @@ impl DistillConfig {
 
     /// Validate the configuration.
     pub fn validate(&self) -> crate::Result<()> {
-        if self.loss.temperature <= 0.0 {
+        // `!(x > 0)` rather than `x <= 0`: NaN must not pass.
+        if !(self.loss.temperature > 0.0 && self.loss.temperature.is_finite()) {
             return Err(crate::DistillError::InvalidTemperature(
                 self.loss.temperature,
             ));
         }
 
-        if self.loss.alpha < 0.0 || self.loss.alpha > 1.0 {
+        if !(0.0..=1.0).contains(&self.loss.alpha) {
             return Err(crate::DistillError::InvalidAlpha(self.loss.alpha));
+        }
+
+        if !(self.loss.rationale_weight >= 0.0 && self.loss.rationale_weight.is_finite()) {
+            return Err(crate::DistillError::InvalidConfig(format!(
+                "rationale_weight must be finite and non-negative, got {}",
+                self.loss.rationale_weight
+            )));
         }
 
         // Validate reasoning markers: if rationale is enabled and markers are used,
@@ -485,6 +509,37 @@ loss:
         assert_eq!(config.student, "meta-llama/Llama-2-7b");
         assert!(matches!(config.method, DistillMethod::Online));
         assert_eq!(config.loss.temperature, 2.0);
+    }
+
+    /// Every loss type reaches the builder from YAML, parameters and defaults
+    /// included, and builds the loss its name promises.
+    #[test]
+    fn test_parse_every_loss_type() {
+        let cases = [
+            ("kl_divergence", "kl_divergence"),
+            ("jensen_shannon", "jensen_shannon"),
+            ("soft_cross_entropy", "soft_cross_entropy"),
+            ("mse_loss", "mse"),
+            ("{ jsd_skewed: { alpha: 0.1 } }", "jsd_skewed"),
+            ("{ jsd_skewed: {} }", "jsd_skewed"),
+            ("{ skew_kl: { alpha: 0.1 } }", "skew_kl"),
+            (
+                "{ skew_kl: { alpha: 0.1, reverse: true } }",
+                "skew_reverse_kl",
+            ),
+            ("{ universal_logit: { top_k: 64 } }", "universal_logit"),
+            ("{ universal_logit: {} }", "universal_logit"),
+            ("{ gkd: { lambda: 0.3 } }", "gkd"),
+        ];
+        for (loss_type, name) in cases {
+            let yaml = format!(
+                "teacher: t\nstudent: s\nloss:\n  loss_type: {loss_type}\n  temperature: 2.0\n"
+            );
+            let config = DistillConfig::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("`{loss_type}` does not parse: {e}"));
+            let distiller = crate::Distiller::new(config).unwrap();
+            assert_eq!(distiller.loss_name(), name, "`{loss_type}`");
+        }
     }
 
     #[test]
