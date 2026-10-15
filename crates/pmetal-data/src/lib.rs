@@ -1,8 +1,9 @@
 //! Dataset handling and preprocessing for PMetal.
 //!
 //! This crate provides:
-//! - Dataset loading from various formats (JSONL, Alpaca, ShareGPT)
-//! - DataLoader for creating training batches
+//! - Dataset loading from JSONL, JSON, Parquet, Arrow and CSV, in chat,
+//!   instruction, prompt/completion and text layouts ([`rows`], [`dataset`])
+//! - DataLoader for creating training batches, sharded and resumable
 //! - Sequence packing for efficient training
 //! - Data collation and batching
 //! - Tokenizer integration

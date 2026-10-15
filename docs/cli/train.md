@@ -78,14 +78,17 @@ pmetal train --config training.yaml
 
 ## Dataset Formats
 
-Training data is auto-detected:
+Training data is auto-detected from a row's columns (structured layouts before `text`):
 
+- **OpenAI/Messages**: `{"messages": [{"role": "user", "content": "..."}, ...]}`
 - **ShareGPT**: `{"conversations": [{"from": "human", "value": "..."}, ...]}`
 - **Alpaca**: `{"instruction": "...", "input": "...", "output": "..."}`
-- **OpenAI/Messages**: `{"messages": [{"role": "user", "content": "..."}, ...]}`
+- **Prompt/completion**: `{"prompt": "...", "completion": "..."}`, strings or message lists
 - **Reasoning**: `{"problem": "...", "thinking": "...", "solution": "..."}`
 - **Simple**: `{"text": "..."}`
-- **Parquet**: Standard text columns or reasoning formats
+
+The file can be JSONL, JSON, Parquet, Arrow or CSV, or a directory holding a
+dataset's shards (its `train` split is read, every shard in order).
 
 ### Custom Columns
 
