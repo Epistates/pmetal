@@ -137,6 +137,52 @@ impl HiddenStateLoss {
     }
 }
 
+/// The weighted mean of `pair_loss` over the mapped `(teacher, student)` layer
+/// pairs, times `global_weight`; zero for an empty mapping.
+///
+/// A pair that names a layer the model did not return is a
+/// [`LayerMapping`](crate::DistillError::LayerMapping) error: a mapping that
+/// silently trains on fewer layers than configured is a misconfiguration, not
+/// a degraded mode.
+pub(crate) fn mean_over_layer_pairs(
+    mapping: &[(usize, usize)],
+    weights: &[f32],
+    global_weight: f32,
+    teacher_layers: &[Array],
+    student_layers: &[Array],
+    mut pair_loss: impl FnMut(&Array, &Array) -> Result<Array>,
+) -> Result<Array> {
+    if mapping.is_empty() {
+        return Ok(Array::from_f32(0.0));
+    }
+
+    let mut total_loss = Array::from_f32(0.0);
+    let mut weight_total = 0.0_f32;
+    for ((teacher_idx, student_idx), &w) in mapping.iter().zip(weights) {
+        let (Some(teacher), Some(student)) = (
+            teacher_layers.get(*teacher_idx),
+            student_layers.get(*student_idx),
+        ) else {
+            return Err(crate::DistillError::LayerMapping(format!(
+                "layer pair (teacher {teacher_idx}, student {student_idx}) is out of range: \
+                 the teacher returned {} layers and the student {}",
+                teacher_layers.len(),
+                student_layers.len()
+            )));
+        };
+        let loss = pair_loss(teacher, student)?;
+        total_loss = total_loss.add(&loss.multiply(&Array::from_f32(w)));
+        weight_total += w;
+    }
+
+    if weight_total > 0.0 {
+        let avg = total_loss.divide(&Array::from_f32(weight_total));
+        Ok(avg.multiply(&Array::from_f32(global_weight)))
+    } else {
+        Ok(Array::from_f32(0.0))
+    }
+}
+
 /// `1 - cos(t, s)` along the last axis.
 ///
 /// Each norm is `sqrt(|x|² + ε)` rather than `|x|`: the derivative of a bare
@@ -258,36 +304,14 @@ impl LayerDistillation {
         student_hiddens: &[Array],
         mask: Option<&Array>,
     ) -> Result<Array> {
-        if self.layer_mapping.is_empty() {
-            return Ok(Array::from_f32(0.0));
-        }
-
-        let mut total_loss = Array::from_f32(0.0);
-        let mut weight_total = 0.0_f32;
-
-        for ((teacher_idx, student_idx), &w) in self.layer_mapping.iter().zip(self.weights.iter()) {
-            let (Some(teacher), Some(student)) = (
-                teacher_hiddens.get(*teacher_idx),
-                student_hiddens.get(*student_idx),
-            ) else {
-                return Err(crate::DistillError::LayerMapping(format!(
-                    "layer pair (teacher {teacher_idx}, student {student_idx}) is out of range: \
-                     the teacher returned {} hidden states and the student {}",
-                    teacher_hiddens.len(),
-                    student_hiddens.len()
-                )));
-            };
-            let loss = self.loss.compute_with_mask(teacher, student, mask)?;
-            total_loss = total_loss.add(&loss.multiply(&Array::from_f32(w)));
-            weight_total += w;
-        }
-
-        if weight_total > 0.0 {
-            let avg = total_loss.divide(&Array::from_f32(weight_total));
-            Ok(avg.multiply(&Array::from_f32(self.global_weight)))
-        } else {
-            Ok(Array::from_f32(0.0))
-        }
+        mean_over_layer_pairs(
+            &self.layer_mapping,
+            &self.weights,
+            self.global_weight,
+            teacher_hiddens,
+            student_hiddens,
+            |teacher, student| self.loss.compute_with_mask(teacher, student, mask),
+        )
     }
 
     /// Get the layer mapping.

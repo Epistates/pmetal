@@ -9,9 +9,10 @@ use pmetal_runtime::training::CrossEntropy;
 use crate::{
     DistillConfig, DistillError, DistillMethod, LossType, Result,
     losses::{
-        DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
-        SoftCrossEntropyLoss, hidden_state::LayerDistillation, reduce_per_token,
-        tempered_log_probs,
+        AttentionTransferLoss, DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss,
+        MseLoss, SoftCrossEntropyLoss,
+        hidden_state::{LayerDistillation, mean_over_layer_pairs},
+        reduce_per_token, tempered_log_probs,
     },
 };
 
@@ -113,6 +114,15 @@ impl DistillerBuilder {
             }
         });
 
+        // The attention-transfer term, from `loss.attention`.
+        let attention = config.loss.attention.as_ref().map(|a| AttentionTerm {
+            loss: AttentionTransferLoss::new()
+                .with_loss_type(a.loss_type.clone())
+                .with_head_reduction(a.head_reduction.clone()),
+            layer_mapping: a.layer_mapping.clone(),
+            weight: a.weight,
+        });
+
         // The hidden-state term: the config names the layer pairs and the
         // weight; a loss handed to the builder replaces the config's loss type.
         let layer_distill = match (&config.loss.hidden_state, self.hidden_loss) {
@@ -134,6 +144,7 @@ impl DistillerBuilder {
             config,
             loss,
             layer_distill,
+            attention,
         })
     }
 }
@@ -152,6 +163,15 @@ pub struct Distiller {
     loss: Box<dyn DistillLoss>,
     /// Hidden-state alignment across the configured layer pairs, if any.
     layer_distill: Option<LayerDistillation>,
+    /// Attention-map transfer across the configured layer pairs, if any.
+    attention: Option<AttentionTerm>,
+}
+
+/// The attention-transfer term of a [`Distiller`], from `loss.attention`.
+struct AttentionTerm {
+    loss: AttentionTransferLoss,
+    layer_mapping: Vec<(usize, usize)>,
+    weight: f32,
 }
 
 impl Distiller {
@@ -264,6 +284,33 @@ impl Distiller {
         }
 
         Ok(output)
+    }
+
+    /// The attention-transfer term configured by `loss.attention`: the mean
+    /// over the mapped layer pairs of the chosen attention loss, times the
+    /// configured weight. `None` when no attention transfer is configured.
+    ///
+    /// `teacher_attn` and `student_attn` are the post-softmax attention maps
+    /// of every layer, `[batch, heads, q, k]` each. Add the result to the
+    /// total of [`compute_loss`](Self::compute_loss) like the hidden term.
+    pub fn compute_attention_loss(
+        &self,
+        teacher_attn: &[Array],
+        student_attn: &[Array],
+    ) -> Result<Option<Array>> {
+        let Some(term) = &self.attention else {
+            return Ok(None);
+        };
+        let weights = vec![1.0; term.layer_mapping.len()];
+        mean_over_layer_pairs(
+            &term.layer_mapping,
+            &weights,
+            term.weight,
+            teacher_attn,
+            student_attn,
+            |teacher, student| term.loss.compute(teacher, student),
+        )
+        .map(Some)
     }
 
     /// Get the configuration.
