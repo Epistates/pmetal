@@ -134,6 +134,32 @@ pub fn set_wired_limit_max() -> usize {
     }
 }
 
+/// The wired memory limit at the device's maximum recommended working set
+/// size for as long as the value lives, then back to what it was.
+///
+/// Wired buffers stay resident, which keeps Metal from paging a model's
+/// weights and KV cache out between decode steps. A generation holds one for
+/// its duration. Guards nest; each restores the limit it found.
+#[must_use = "the limit is raised only while this lives"]
+pub struct WiredLimit {
+    previous: usize,
+}
+
+impl WiredLimit {
+    /// Raise the wired limit to the device's maximum recommended size.
+    pub fn max() -> Self {
+        Self {
+            previous: set_wired_limit_max(),
+        }
+    }
+}
+
+impl Drop for WiredLimit {
+    fn drop(&mut self) {
+        set_wired_limit(self.previous);
+    }
+}
+
 /// Set the wired memory limit, clamped to what the device allows.
 ///
 /// Returns the previous limit. Asking for more than
@@ -449,6 +475,7 @@ mod tests {
     /// exception terminated the process before a single token was decoded.
     /// Both engines call this on every generate.
     #[test]
+    #[serial_test::serial(wired_limit)]
     fn the_recommended_size_is_always_a_legal_wired_limit() {
         let max = get_max_recommended_size();
         assert!(max > 0, "device reported no working set size");
@@ -462,9 +489,32 @@ mod tests {
     /// Over-asking is clamped rather than thrown, so a caller that does its own
     /// sizing arithmetic cannot take the process down.
     #[test]
+    #[serial_test::serial(wired_limit)]
     fn an_oversized_request_is_clamped_not_fatal() {
         let previous = set_wired_limit(usize::MAX);
         crate::check_unobserved_error().expect("an oversized request is clamped");
         set_wired_limit(previous);
+    }
+
+    /// The guard raises the limit and gives back exactly the one it found,
+    /// nested guards included.
+    #[test]
+    #[serial_test::serial(wired_limit)]
+    fn the_wired_limit_guard_restores_what_it_found() {
+        let found = set_wired_limit(1 << 30);
+        {
+            let _outer = WiredLimit::max();
+            let during = set_wired_limit(get_max_recommended_size());
+            assert!(during >= 1 << 30, "raised: {during}");
+            {
+                let _inner = WiredLimit::max();
+            }
+            // The inner guard restored the outer's raised limit, not the
+            // original one.
+            assert_eq!(set_wired_limit(get_max_recommended_size()), during);
+        }
+        let restored = set_wired_limit(found);
+        assert_eq!(restored, 1 << 30, "the guard restored the limit it found");
+        crate::check_unobserved_error().expect("no bridge op failed");
     }
 }
