@@ -447,7 +447,14 @@ fn attention_gradients_are_the_definitions() {
 /// Causal attention in f32 from primitives with known VJPs (a materialised
 /// `[L, L]` score matrix, grouped keys and values expanded per query head),
 /// with the sinks' extra softmax column when given.
-fn ops_attention(q: &Array, k: &Array, v: &Array, scale: f32, sinks: Option<&Array>) -> Array {
+fn ops_attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    scale: f32,
+    softcap: Option<f32>,
+    sinks: Option<&Array>,
+) -> Array {
     let (batch, heads, len) = (q.dim(0), q.dim(1), q.dim(2));
     let group = heads / k.dim(1);
     let expand = |x: &Array| {
@@ -459,8 +466,12 @@ fn ops_attention(q: &Array, k: &Array, v: &Array, scale: f32, sinks: Option<&Arr
     let (k, v) = (expand(k), expand(v));
     let mut scores = q
         .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
-        .multiply(&Array::from_f32(scale))
-        .add(&create_causal_mask(len, len).unwrap());
+        .multiply(&Array::from_f32(scale));
+    if let Some(cap) = softcap {
+        let cap = Array::from_f32(cap);
+        scores = ops::tanh(&scores.divide(&cap)).multiply(&cap);
+    }
+    scores = scores.add(&create_causal_mask(len, len).unwrap());
     if let Some(sinks) = sinks {
         let column = sinks
             .reshape(&[1, heads, 1, 1])
@@ -529,7 +540,7 @@ fn long_sequence_gradients_match_plain_attention() {
                 fused_sdpa(&a[0], &a[1], &a[2], &config, None).unwrap()
             }
         });
-        let reference = grads(&|a| ops_attention(&a[0], &a[1], &a[2], scale, a.get(3)));
+        let reference = grads(&|a| ops_attention(&a[0], &a[1], &a[2], scale, None, a.get(3)));
         for (name, (got, want)) in ["dq", "dk", "dv", "dsinks"]
             .iter()
             .zip(fused.iter().zip(&reference))
@@ -572,7 +583,7 @@ fn sink_attention_step_against_plain_ops() {
                         let out = if fused {
                             sink_sdpa(&a[0], &a[1], &a[2], &config, None, &a[3]).unwrap()
                         } else {
-                            ops_attention(&a[0], &a[1], &a[2], scale, Some(&a[3]))
+                            ops_attention(&a[0], &a[1], &a[2], scale, None, Some(&a[3]))
                         };
                         out.as_dtype(Dtype::Float32.as_i32()).square().sum_all()
                     },
@@ -594,6 +605,61 @@ fn sink_attention_step_against_plain_ops() {
             let ms = start.elapsed().as_secs_f64() * 1e3 / 3.0;
             let peak = get_peak_memory() as f64 / (1 << 20) as f64;
             eprintln!("L={len:5} {name:16} {ms:9.1} ms/step   peak {peak:8.0} MiB");
+        }
+    }
+}
+
+/// A training step's worth of Gemma 2's softcapped attention (forward and
+/// backward, bf16, 16 query heads over 8 key heads of width 256): scores in
+/// f32 with a broadcast group axis against plain ops (scores in the queries'
+/// dtype, keys and values expanded per query head, which is what the path
+/// did). Time and peak memory; run with `--ignored --nocapture`.
+#[test]
+#[serial]
+#[ignore = "benchmark"]
+fn softcapped_attention_step_against_plain_ops() {
+    use crate::memory::{get_peak_memory, reset_peak_memory};
+    use pmetal_runtime::compat::nn::value_and_grad_explicit;
+    use pmetal_runtime::compat::random;
+    use std::time::Instant;
+
+    let (heads, kv_heads, head_dim) = (16, 8, 256);
+    let bf16 = Dtype::Bfloat16.as_i32();
+    for len in [1024, 2048] {
+        let draw = |h: i32| random::normal(&[1, h, len, head_dim], Dtype::Float32).as_dtype(bf16);
+        let (q, k, v) = (draw(heads), draw(kv_heads), draw(kv_heads));
+        let config =
+            FusedAttentionConfig::new(heads, kv_heads, head_dim).with_logit_softcapping(50.0);
+        let scale = config.scale;
+        for (name, current) in [("plain ops", false), ("f32 scores", true)] {
+            let step = || {
+                let (_, grads) = value_and_grad_explicit(
+                    |a: &[Array]| {
+                        let out = if current {
+                            fused_sdpa(&a[0], &a[1], &a[2], &config, None).unwrap()
+                        } else {
+                            ops_attention(&a[0], &a[1], &a[2], scale, Some(50.0), None)
+                        };
+                        out.as_dtype(Dtype::Float32.as_i32()).square().sum_all()
+                    },
+                    &[q.clone(), k.clone(), v.clone()],
+                    &[],
+                )
+                .unwrap();
+                grads.iter().for_each(|g| {
+                    g.eval();
+                });
+                drain();
+            };
+            step();
+            reset_peak_memory();
+            let start = Instant::now();
+            for _ in 0..3 {
+                step();
+            }
+            let ms = start.elapsed().as_secs_f64() * 1e3 / 3.0;
+            let peak = get_peak_memory() as f64 / (1 << 20) as f64;
+            eprintln!("L={len:5} {name:12} {ms:9.1} ms/step   peak {peak:8.0} MiB");
         }
     }
 }
