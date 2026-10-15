@@ -64,6 +64,71 @@ fn resolve_gguf_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// A tokenized text: the ids, and for each token the span of the input it
+/// covers.
+///
+/// `offsets` are **byte** offsets into the text that was encoded, so
+/// `&text[start..end]` is the piece a token stands for. A token the
+/// tokenizer adds on its own (a BOS from the post-processor) has the empty
+/// span `(0, 0)`. Byte-level tokenizers can split one multi-byte character
+/// across tokens; each of those tokens then covers the whole character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenizedText {
+    /// Token ids.
+    pub ids: Vec<u32>,
+    /// Token strings, as they appear in the vocabulary (`Ġthe`, `▁the`).
+    pub tokens: Vec<String>,
+    /// `(start, end)` byte span of the input each token covers.
+    pub offsets: Vec<(usize, usize)>,
+    /// Whether each token is a special token (a BOS the post-processor
+    /// added, or a `<|im_start|>` found in the text).
+    pub special_tokens_mask: Vec<bool>,
+}
+
+impl TokenizedText {
+    fn from_encoding(encoding: &tokenizers::Encoding) -> Self {
+        Self {
+            ids: encoding.get_ids().to_vec(),
+            tokens: encoding.get_tokens().to_vec(),
+            offsets: encoding.get_offsets().to_vec(),
+            special_tokens_mask: encoding
+                .get_special_tokens_mask()
+                .iter()
+                .map(|&m| m != 0)
+                .collect(),
+        }
+    }
+
+    /// Number of tokens.
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether there are no tokens.
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// The offsets as character (not byte) positions of `text`, for callers
+    /// that index text by character. `text` must be what was encoded.
+    pub fn char_offsets(&self, text: &str) -> Vec<(usize, usize)> {
+        // Byte index -> character index, for every character boundary.
+        let mut char_at = vec![0usize; text.len() + 1];
+        let mut chars = 0;
+        for (byte, c) in text.char_indices() {
+            for slot in &mut char_at[byte..byte + c.len_utf8()] {
+                *slot = chars;
+            }
+            chars += 1;
+        }
+        char_at[text.len()] = chars;
+        self.offsets
+            .iter()
+            .map(|&(start, end)| (char_at[start.min(text.len())], char_at[end.min(text.len())]))
+            .collect()
+    }
+}
+
 /// Wrapper around the tokenizers library.
 pub struct Tokenizer {
     inner: tokenizers::Tokenizer,
@@ -152,22 +217,91 @@ impl Tokenizer {
         })
     }
 
-    /// Encode text to token IDs.
+    /// Encode text to token IDs, adding none of the tokenizer's own special
+    /// tokens.
+    ///
+    /// Special tokens that appear *in* `text` (`<|im_start|>`, `<bos>`, …) are
+    /// still recognised as single tokens. This is the call for text a chat
+    /// template rendered: the template already wrote the BOS its model wants,
+    /// and `transformers` tokenizes a rendered chat with
+    /// `add_special_tokens=False` for that reason.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .inner
-            .encode(text, false)
+            .encode_fast(text, false)
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
         Ok(encoding.get_ids().to_vec())
     }
 
-    /// Encode text with special tokens.
+    /// Encode text the way `tokenizer(text)` does: the tokenizer's
+    /// post-processor adds its own BOS / EOS around it.
+    ///
+    /// Use it for plain text (a pre-training document, a raw prompt). Text a
+    /// chat template rendered already carries its BOS, so it goes through
+    /// [`encode`](Self::encode); encoding it here would start it with two.
     pub fn encode_with_special_tokens(&self, text: &str) -> Result<Vec<u32>> {
         let encoding = self
             .inner
-            .encode(text, true)
+            .encode_fast(text, true)
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Encode text and keep the span of `text` each token covers.
+    ///
+    /// `add_special_tokens` is as in [`encode`](Self::encode) (`false`) and
+    /// [`encode_with_special_tokens`](Self::encode_with_special_tokens)
+    /// (`true`). Cross-tokenizer work (distillation aligning a teacher's
+    /// tokens with a student's) and loss masks over a character span read the
+    /// offsets.
+    pub fn encode_with_offsets(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<TokenizedText> {
+        let encoding = self
+            .inner
+            .encode(text, add_special_tokens)
+            .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
+        Ok(TokenizedText::from_encoding(&encoding))
+    }
+
+    /// Encode many texts at once, in parallel, with the offsets of each.
+    ///
+    /// This is the call for tokenizing a dataset: the batch is split across
+    /// the tokenizer's thread pool, and the results come back in input order.
+    pub fn encode_batch_with_offsets<S: AsRef<str> + Sync>(
+        &self,
+        texts: &[S],
+        add_special_tokens: bool,
+    ) -> Result<Vec<TokenizedText>> {
+        let inputs: Vec<tokenizers::EncodeInput<'_>> = texts
+            .iter()
+            .map(|t| tokenizers::EncodeInput::Single(t.as_ref().into()))
+            .collect();
+        let encodings = self
+            .inner
+            .encode_batch(inputs, add_special_tokens)
+            .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
+        Ok(encodings.iter().map(TokenizedText::from_encoding).collect())
+    }
+
+    /// Encode many texts at once, in parallel; the ids of
+    /// [`encode_batch_with_offsets`](Self::encode_batch_with_offsets).
+    pub fn encode_batch<S: AsRef<str> + Sync>(
+        &self,
+        texts: &[S],
+        add_special_tokens: bool,
+    ) -> Result<Vec<Vec<u32>>> {
+        let inputs: Vec<tokenizers::EncodeInput<'_>> = texts
+            .iter()
+            .map(|t| tokenizers::EncodeInput::Single(t.as_ref().into()))
+            .collect();
+        let encodings = self
+            .inner
+            .encode_batch_fast(inputs, add_special_tokens)
+            .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
+        Ok(encodings.iter().map(|e| e.get_ids().to_vec()).collect())
     }
 
     /// Decode token IDs to text.
@@ -387,5 +521,181 @@ pub mod testing {
             "model": {"type": "WordLevel", "vocab": vocab, "unk_token": words[0]}
         });
         Tokenizer::from_bytes(json.to_string().as_bytes()).expect("a word-level tokenizer")
+    }
+
+    /// GPT-2's byte-to-character table: the printable stand-in of each byte.
+    fn byte_chars() -> [char; 256] {
+        let printable: Vec<u32> = (0x21..=0x7e)
+            .chain(0xa1..=0xac)
+            .chain(0xae..=0xff)
+            .collect();
+        let mut table = ['\0'; 256];
+        let mut next = 0;
+        for byte in 0..256u32 {
+            let c = if printable.contains(&byte) {
+                byte
+            } else {
+                next += 1;
+                255 + next
+            };
+            table[byte as usize] = char::from_u32(c).expect("a scalar value");
+        }
+        table
+    }
+
+    /// A byte-level BPE tokenizer (the GPT-2 / Llama 3 / Qwen layout) whose
+    /// vocabulary is the 256 byte characters, then one token per entry of
+    /// `merges` (`"a b"`, in the byte-character alphabet), then `specials`
+    /// as added tokens. With `bos`, the post-processor puts that special
+    /// token (which must be among `specials`) in front of an encoding that
+    /// asks for special tokens.
+    pub fn byte_level_bpe(merges: &[&str], specials: &[&str], bos: Option<&str>) -> Tokenizer {
+        let table = byte_chars();
+        let mut vocab = serde_json::Map::new();
+        for (byte, c) in table.iter().enumerate() {
+            vocab.insert(c.to_string(), (byte as u32).into());
+        }
+        let mut next = 256u32;
+        for merge in merges {
+            let merged: String = merge.split(' ').collect();
+            vocab.insert(merged, next.into());
+            next += 1;
+        }
+        let mut added = Vec::new();
+        let mut bos_id = None;
+        for special in specials {
+            if Some(*special) == bos {
+                bos_id = Some(next);
+            }
+            added.push(serde_json::json!({
+                "id": next, "content": special, "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true
+            }));
+            vocab.insert((*special).to_string(), next.into());
+            next += 1;
+        }
+        let post_processor = match (bos, bos_id) {
+            (Some(bos), Some(id)) => serde_json::json!({
+                "type": "TemplateProcessing",
+                "single": [
+                    {"SpecialToken": {"id": bos, "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}}
+                ],
+                "pair": [
+                    {"SpecialToken": {"id": bos, "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}},
+                    {"Sequence": {"id": "B", "type_id": 1}}
+                ],
+                "special_tokens": {bos: {"id": bos, "ids": [id], "tokens": [bos]}}
+            }),
+            _ => serde_json::Value::Null,
+        };
+        let json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": added,
+            "normalizer": null,
+            "pre_tokenizer": {
+                "type": "ByteLevel", "add_prefix_space": false,
+                "trim_offsets": true, "use_regex": true
+            },
+            "post_processor": post_processor,
+            "decoder": {
+                "type": "ByteLevel", "add_prefix_space": true,
+                "trim_offsets": true, "use_regex": true
+            },
+            "model": {
+                "type": "BPE", "vocab": vocab, "merges": merges,
+                "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+                "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false,
+                "ignore_merges": false
+            }
+        });
+        Tokenizer::from_bytes(json.to_string().as_bytes()).expect("a byte-level BPE tokenizer")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{byte_level_bpe, word_level};
+
+    fn bpe() -> super::Tokenizer {
+        // "h" "i" -> "hi"; "Ġ" "t" -> "Ġt"
+        byte_level_bpe(&["h i", "\u{120} t"], &["<s>", "<|im_start|>"], Some("<s>"))
+    }
+
+    #[test]
+    fn offsets_are_byte_spans_of_the_input() {
+        let tk = bpe();
+        let text = "hi \u{e9}\u{1F600}";
+        let enc = tk.encode_with_offsets(text, false).unwrap();
+        assert_eq!(enc.ids.len(), enc.offsets.len());
+        assert_eq!(enc.ids, tk.encode(text).unwrap());
+        // Every token's span is a valid slice of the input, the spans never
+        // go backwards, and together they cover the whole text.
+        let mut end = 0;
+        for &(s, e) in &enc.offsets {
+            assert!(
+                text.is_char_boundary(s) && text.is_char_boundary(e),
+                "{s}..{e}"
+            );
+            assert!(s >= end.min(s) && e >= s);
+            end = end.max(e);
+        }
+        assert_eq!(end, text.len());
+        assert_eq!(&text[enc.offsets[0].0..enc.offsets[0].1], "hi");
+        // "hi" is one merged token; the e-acute is two bytes, two tokens, and
+        // both cover the whole character.
+        let last = enc.offsets.len() - 1;
+        assert_eq!(&text[enc.offsets[last].0..enc.offsets[last].1], "\u{1F600}");
+    }
+
+    #[test]
+    fn char_offsets_index_by_character() {
+        let tk = bpe();
+        let text = "h\u{e9}\u{1F600}i";
+        let enc = tk.encode_with_offsets(text, false).unwrap();
+        let chars: Vec<char> = text.chars().collect();
+        for (&(bs, be), (cs, ce)) in enc.offsets.iter().zip(enc.char_offsets(text)) {
+            let by_bytes: String = text[bs..be].to_string();
+            let by_chars: String = chars[cs..ce].iter().collect();
+            assert_eq!(by_bytes, by_chars);
+        }
+    }
+
+    #[test]
+    fn rendered_chat_text_is_not_given_a_second_bos() {
+        let tk = bpe();
+        let bos = tk.inner().token_to_id("<s>").unwrap();
+        // A chat template that writes `{{ bos_token }}` itself.
+        let rendered = "<s><|im_start|>hi";
+        let ids = tk.encode(rendered).unwrap();
+        assert_eq!(ids.iter().filter(|&&i| i == bos).count(), 1);
+        // The post-processor path adds one in front, as `tokenizer(text)` does.
+        let ids = tk.encode_with_special_tokens(rendered).unwrap();
+        assert_eq!(ids.iter().filter(|&&i| i == bos).count(), 2);
+        // Offsets: the added BOS covers nothing, the one in the text covers its text.
+        let enc = tk.encode_with_offsets(rendered, true).unwrap();
+        assert_eq!(enc.offsets[0], (0, 0));
+        assert!(enc.special_tokens_mask[0]);
+        assert_eq!(enc.offsets[1], (0, 3));
+    }
+
+    #[test]
+    fn batches_equal_one_at_a_time_in_order() {
+        let tk = bpe();
+        let texts: Vec<String> = (0..64).map(|i| format!("hi t{i} \u{e9}")).collect();
+        let batch = tk.encode_batch(&texts, false).unwrap();
+        let with_offsets = tk.encode_batch_with_offsets(&texts, true).unwrap();
+        for (i, text) in texts.iter().enumerate() {
+            assert_eq!(batch[i], tk.encode(text).unwrap());
+            assert_eq!(with_offsets[i], tk.encode_with_offsets(text, true).unwrap());
+        }
+    }
+
+    #[test]
+    fn word_level_offsets_follow_whitespace() {
+        let tk = word_level(&["<unk>", "a", "bb"], &[]);
+        let enc = tk.encode_with_offsets("a  bb", false).unwrap();
+        assert_eq!(enc.offsets, vec![(0, 1), (3, 5)]);
     }
 }
