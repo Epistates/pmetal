@@ -228,6 +228,9 @@ pub enum GgufReadError {
         /// The file's alignment.
         alignment: u64,
     },
+    /// A split model's shards are missing or disagree with each other.
+    #[error("Split GGUF model: {0}")]
+    Split(String),
     /// A tensor's data lies (partly) beyond the end of the file.
     #[error("Tensor {name} ends at byte {end}, past the end of the {file_len}-byte file")]
     TensorOutOfBounds {

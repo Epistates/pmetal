@@ -1,28 +1,34 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pmetal_gguf::reader::GgufContent;
+use pmetal_gguf::{GgufContent, dequant};
 use std::io::Cursor;
 
 fuzz_target!(|data: &[u8]| {
-    // Attempt to parse the GGUF header/metadata and tensor info.
-    // This exercises alignment validation, metadata parsing, tensor info reading,
-    // and all bounds-checking paths including alignment=0 rejection and
-    // integer overflow detection.
+    // Parse the header, metadata and tensor-info section. Every count and
+    // length in a hostile header is checked against the bytes the input has
+    // left, and every tensor's extent against its size, so neither parsing
+    // nor reading any tensor may allocate more than the input is long.
     let mut cursor = Cursor::new(data);
-    if let Ok(content) = GgufContent::read(&mut cursor) {
-        // If we successfully parsed the metadata, attempt to read any tensors
-        // that report lengths within a reasonable limit to avoid OOM
-        for name in content.tensor_names() {
-            if let Some(info) = content.get_tensor_info(name) {
-                // Use usize::MAX (not u64::MAX) for portability
-                let byte_size = info.byte_size_checked().unwrap_or(usize::MAX);
-                if byte_size < 1024 * 1024 {
-                    // Only read up to 1MB tensors during fuzzing
-                    let mut read_cursor = Cursor::new(data);
-                    let _ = content.read_tensor_data(&mut read_cursor, name);
-                }
-            }
+    let Ok(content) = GgufContent::read(&mut cursor) else {
+        return;
+    };
+
+    for info in content.tensors_by_offset() {
+        let mut reader = Cursor::new(data);
+        let bytes = content
+            .read_tensor_data(&mut reader, &info.name)
+            .expect("a tensor accepted at open lies inside the file");
+        assert_eq!(bytes.len(), info.byte_size());
+
+        // Decode what is cheap to decode; the shape is the file's own.
+        if info.n_elements() <= 1 << 16 && dequant::is_supported(info.dtype) {
+            let shape: Vec<i32> = info
+                .dimensions
+                .iter()
+                .map(|&d| i32::try_from(d).unwrap_or(i32::MAX))
+                .collect();
+            let _ = dequant::dequantize(&bytes, info.dtype, &shape);
         }
     }
 });
