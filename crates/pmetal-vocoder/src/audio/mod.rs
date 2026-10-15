@@ -1,12 +1,20 @@
-//! Audio processing utilities for vocoder.
+//! Audio front end for the vocoder.
 //!
-//! This module provides MLX-native implementations of:
-//! - STFT (Short-Time Fourier Transform)
-//! - Mel filterbank
-//! - Audio feature extraction
+//! MLX-native implementations of:
+//! - the STFT and its inverse, matching `torch.stft` / `torch.istft`
+//! - the librosa-compatible mel filterbank
+//! - the BigVGAN mel front end ([`MelFrontEnd`])
+//! - windowed-sinc sample-rate conversion ([`Resampler`])
+//! - the constant-Q transform ([`Cqt`])
 
+mod cqt;
 mod mel;
+mod pcm;
+mod resample;
 mod stft;
 
+pub use cqt::*;
 pub use mel::*;
+pub use pcm::*;
+pub use resample::*;
 pub use stft::*;

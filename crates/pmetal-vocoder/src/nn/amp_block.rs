@@ -1,274 +1,200 @@
-//! Anti-aliased Multi-Periodicity (AMP) blocks for BigVGAN.
+//! Anti-aliased Multi-Periodicity (AMP) residual blocks.
 //!
-//! AMP blocks combine multiple residual branches with different dilation rates
-//! and kernel sizes to capture audio signals at multiple periodicities.
-//! Anti-aliased activations prevent aliasing artifacts.
+//! An AMP block is a residual stack whose nonlinearities are anti-aliased
+//! Snake activations (BigVGAN, Lee et al. 2023). Two layouts exist upstream:
+//!
+//! * `AMPBlock1` - per dilation, `act -> conv(dilation d) -> act -> conv(dilation 1)`
+//!   with a residual connection around each pair (the HiFi-GAN ResBlock1 shape);
+//! * `AMPBlock2` - per dilation, `act -> conv(dilation d)` with a residual
+//!   connection around each (ResBlock2).
 
-use crate::error::Result;
-use crate::nn::{Activation1d, Snake, SnakeBeta, WeightNormConv1d};
-use pmetal_runtime::compat::Array;
+use super::activation::{Activation1d, PeriodicActivation};
+use super::conv::{Conv1d, Conv1dConfig};
+use super::weight_norm::{StateDict, join_key};
+use crate::config::{ActivationType, ResBlockKind};
+use crate::error::{Result, VocoderError};
+use pmetal_runtime::compat::{Array, Dtype};
+use pmetal_runtime::impl_module_params;
 
-/// Anti-aliased Multi-Periodicity (AMP) block.
-///
-/// Each AMP block consists of multiple residual branches, each with
-/// different dilation patterns to capture different periodicities in
-/// the audio signal.
+/// One AMP residual block.
 #[derive(Debug)]
 pub struct AMPBlock {
-    /// Number of channels.
-    pub channels: i32,
-    /// Kernel sizes for each branch.
-    pub kernel_sizes: Vec<i32>,
-    /// Dilation rates for each branch and layer.
-    pub dilations: Vec<Vec<i32>>,
-    /// Residual branches (each branch has multiple conv layers).
-    pub branches: Vec<ResidualBranch>,
-}
-
-/// A single residual branch within an AMP block.
-#[derive(Debug)]
-pub struct ResidualBranch {
-    /// Convolution layers with activations.
-    pub layers: Vec<(Activation1d<SnakeBeta>, WeightNormConv1d)>,
+    kind: ResBlockKind,
+    /// Dilated convolutions, one per entry of the dilation list.
+    pub convs1: Vec<Conv1d>,
+    /// Dilation-1 convolutions that follow each of `convs1` (empty for
+    /// [`ResBlockKind::Two`]).
+    pub convs2: Vec<Conv1d>,
+    /// Anti-aliased activations; two per dilation for kind one, one for kind two.
+    pub activations: Vec<Activation1d>,
 }
 
 impl AMPBlock {
-    /// Create a new AMP block.
+    /// Build a block of `channels` channels.
     ///
-    /// # Arguments
-    /// * `channels` - Number of input/output channels
-    /// * `kernel_size` - Kernel size for convolutions
-    /// * `dilations` - Dilation rates [[d1, d2, ...], [d1, d2, ...], ...]
-    ///   Each inner vec is a branch, each element is a dilation rate for a layer
-    pub fn new(channels: i32, kernel_size: i32, dilations: Vec<Vec<i32>>) -> Result<Self> {
-        let mut branches = Vec::with_capacity(dilations.len());
-
-        for branch_dilations in &dilations {
-            let mut layers = Vec::with_capacity(branch_dilations.len());
-
-            for &dilation in branch_dilations {
-                // Anti-aliased Snake activation
-                let activation = SnakeBeta::new(channels, true)?;
-                let act1d = Activation1d::new(activation, Some(2), Some(2))?;
-
-                // Weight-normalized convolution with dilation
-                let padding = (kernel_size - 1) * dilation / 2;
-                let conv = WeightNormConv1d::new(
-                    channels,
-                    channels,
-                    kernel_size,
-                    Some(1),
-                    Some(padding),
-                    Some(dilation),
-                    None,
-                    Some(true),
-                )?;
-
-                layers.push((act1d, conv));
-            }
-
-            branches.push(ResidualBranch { layers });
+    /// * `kernel_size` - convolution kernel size.
+    /// * `dilations` - dilation of each (first) convolution; its length is the
+    ///   number of residual stages.
+    /// * `activation` / `logscale` - the periodic activation and whether its
+    ///   parameters are stored in log scale.
+    pub fn new(
+        kind: ResBlockKind,
+        channels: i32,
+        kernel_size: i32,
+        dilations: &[i32],
+        activation: ActivationType,
+        logscale: bool,
+    ) -> Result<Self> {
+        if dilations.is_empty() {
+            return Err(VocoderError::Config(
+                "an AMP block needs at least one dilation".into(),
+            ));
         }
-
-        let kernel_sizes = vec![kernel_size; dilations.len()];
-
+        let conv = |dilation: i32| -> Result<Conv1d> {
+            Conv1d::new(
+                Conv1dConfig::new(channels, channels, kernel_size)
+                    .dilation(dilation)
+                    .same_padding(),
+            )
+        };
+        let convs1 = dilations
+            .iter()
+            .map(|&d| conv(d))
+            .collect::<Result<Vec<_>>>()?;
+        let convs2 = match kind {
+            ResBlockKind::One => dilations
+                .iter()
+                .map(|_| conv(1))
+                .collect::<Result<Vec<_>>>()?,
+            ResBlockKind::Two => Vec::new(),
+        };
+        let num_activations = convs1.len() + convs2.len();
+        let activations = (0..num_activations)
+            .map(|_| Activation1d::new(PeriodicActivation::new(activation, channels, logscale)?))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            channels,
-            kernel_sizes,
-            dilations,
-            branches,
+            kind,
+            convs1,
+            convs2,
+            activations,
         })
     }
 
-    /// Create an AMP block with BigVGAN v2 configuration.
-    ///
-    /// Default: kernel_size=3, `dilations=[[1,3,5], [1,3,5], [1,3,5]]`
-    pub fn bigvgan_v2(channels: i32) -> Result<Self> {
-        Self::new(
-            channels,
-            3,
-            vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
-        )
+    /// The block layout.
+    pub fn kind(&self) -> ResBlockKind {
+        self.kind
     }
 
-    /// Forward pass.
-    ///
-    /// # Arguments
-    /// * `x` - Input tensor [batch, channels, time]
-    ///
-    /// # Returns
-    /// Output tensor with same shape
+    /// The checkpoint name of the dilated convolution list: `convs1` in
+    /// `AMPBlock1` (paired with `convs2`), plain `convs` in `AMPBlock2`.
+    fn dilated_name(&self) -> &'static str {
+        match self.kind {
+            ResBlockKind::One => "convs1",
+            ResBlockKind::Two => "convs",
+        }
+    }
+
+    /// Radius, in samples, of the block's receptive field (one side).
+    pub fn receptive_radius(&self) -> i32 {
+        let conv_radius = |c: &Conv1d| c.config().dilation * (c.config().kernel_size - 1) / 2;
+        // Each Activation1d adds the reach of its resampling filters: the
+        // upsampler reads `kernel / ratio` input samples around each output and
+        // the decimator `kernel` upsampled ones (half as many at the input rate).
+        let act_radius = self.activations.first().map_or(0, |a| a.receptive_radius());
+        self.convs1.iter().map(conv_radius).sum::<i32>()
+            + self.convs2.iter().map(conv_radius).sum::<i32>()
+            + self.activations.len() as i32 * act_radius
+    }
+
+    /// Apply to `[batch, time, channels]`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        // Sum outputs from all branches
-        let mut output: Option<Array> = None;
-
-        for branch in &self.branches {
-            let mut branch_out = x.clone();
-
-            for (activation, conv) in &branch.layers {
-                // Apply anti-aliased activation then convolution
-                branch_out = activation.forward(&branch_out)?;
-                branch_out = conv.forward(&branch_out)?;
+        let mut x = x.clone();
+        match self.kind {
+            ResBlockKind::One => {
+                for ((c1, c2), acts) in self
+                    .convs1
+                    .iter()
+                    .zip(&self.convs2)
+                    .zip(self.activations.as_chunks::<2>().0)
+                {
+                    let mut xt = acts[0].forward(&x)?;
+                    xt = c1.forward(&xt)?;
+                    xt = acts[1].forward(&xt)?;
+                    xt = c2.forward(&xt)?;
+                    x = xt.add(&x);
+                }
             }
-
-            // Add to cumulative output
-            match &output {
-                Some(o) => output = Some(o.add(&branch_out)),
-                None => output = Some(branch_out),
-            }
-        }
-
-        // Average over branches and add residual
-        let num_branches = Array::from_i32(self.branches.len() as i32);
-        let branch_avg = output.unwrap().divide(&num_branches);
-
-        Ok(x.add(&branch_avg))
-    }
-}
-
-/// Simplified AMP block using Snake (single alpha parameter).
-#[derive(Debug)]
-pub struct AMPBlockSnake {
-    /// Number of channels.
-    pub channels: i32,
-    /// Residual branches.
-    pub branches: Vec<ResidualBranchSnake>,
-}
-
-/// Residual branch using Snake activation.
-#[derive(Debug)]
-pub struct ResidualBranchSnake {
-    /// Layers with Snake activation.
-    pub layers: Vec<(Activation1d<Snake>, WeightNormConv1d)>,
-}
-
-impl AMPBlockSnake {
-    /// Create a new AMP block with Snake activation.
-    pub fn new(channels: i32, kernel_size: i32, dilations: Vec<Vec<i32>>) -> Result<Self> {
-        let mut branches = Vec::with_capacity(dilations.len());
-
-        for branch_dilations in &dilations {
-            let mut layers = Vec::with_capacity(branch_dilations.len());
-
-            for &dilation in branch_dilations {
-                let activation = Snake::new(channels, true)?;
-                let act1d = Activation1d::new(activation, Some(2), Some(2))?;
-
-                let padding = (kernel_size - 1) * dilation / 2;
-                let conv = WeightNormConv1d::new(
-                    channels,
-                    channels,
-                    kernel_size,
-                    Some(1),
-                    Some(padding),
-                    Some(dilation),
-                    None,
-                    Some(true),
-                )?;
-
-                layers.push((act1d, conv));
-            }
-
-            branches.push(ResidualBranchSnake { layers });
-        }
-
-        Ok(Self { channels, branches })
-    }
-
-    /// Forward pass.
-    pub fn forward(&self, x: &Array) -> Result<Array> {
-        let mut output: Option<Array> = None;
-
-        for branch in &self.branches {
-            let mut branch_out = x.clone();
-
-            for (activation, conv) in &branch.layers {
-                branch_out = activation.forward(&branch_out)?;
-                branch_out = conv.forward(&branch_out)?;
-            }
-
-            match &output {
-                Some(o) => output = Some(o.add(&branch_out)),
-                None => output = Some(branch_out),
+            ResBlockKind::Two => {
+                for (c, act) in self.convs1.iter().zip(&self.activations) {
+                    let xt = c.forward(&act.forward(&x)?)?;
+                    x = xt.add(&x);
+                }
             }
         }
+        Ok(x)
+    }
 
-        let num_branches = Array::from_i32(self.branches.len() as i32);
-        let branch_avg = output.unwrap().divide(&num_branches);
+    /// Fold weight normalisation into the convolution weights.
+    pub fn fuse(&mut self) {
+        self.convs1.iter_mut().for_each(Conv1d::fuse);
+        self.convs2.iter_mut().for_each(Conv1d::fuse);
+    }
 
-        Ok(x.add(&branch_avg))
+    /// Re-impose weight normalisation on fused convolutions (to train).
+    pub fn normalize(&mut self) {
+        self.convs1.iter_mut().for_each(Conv1d::normalize);
+        self.convs2.iter_mut().for_each(Conv1d::normalize);
+    }
+
+    /// Switch every activation to the fused inference kernel (no gradient).
+    pub fn prepare_inference(&mut self) {
+        self.activations
+            .iter_mut()
+            .for_each(Activation1d::prepare_inference);
+    }
+
+    /// Return every activation to the differentiable op path.
+    pub fn unprepare_inference(&mut self) {
+        self.activations
+            .iter_mut()
+            .for_each(Activation1d::unprepare);
+    }
+
+    /// Cast parameters to `dtype`.
+    pub fn cast(&mut self, dtype: Dtype) {
+        self.convs1.iter_mut().for_each(|c| c.cast(dtype));
+        self.convs2.iter_mut().for_each(|c| c.cast(dtype));
+        self.activations.iter_mut().for_each(|a| a.cast(dtype));
+    }
+
+    /// Load from a PyTorch-layout state dict.
+    pub fn load_state(&mut self, sd: &mut StateDict, prefix: &str) -> Result<()> {
+        let dilated = self.dilated_name();
+        for (i, c) in self.convs1.iter_mut().enumerate() {
+            c.load_state(sd, &join_key(prefix, &format!("{dilated}.{i}")))?;
+        }
+        for (i, c) in self.convs2.iter_mut().enumerate() {
+            c.load_state(sd, &join_key(prefix, &format!("convs2.{i}")))?;
+        }
+        for (i, a) in self.activations.iter_mut().enumerate() {
+            a.load_state(sd, &join_key(prefix, &format!("activations.{i}")))?;
+        }
+        Ok(())
+    }
+
+    /// Append this block's tensors in PyTorch layout.
+    pub fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        let dilated = self.dilated_name();
+        for (i, c) in self.convs1.iter().enumerate() {
+            c.save_state(&join_key(prefix, &format!("{dilated}.{i}")), out);
+        }
+        for (i, c) in self.convs2.iter().enumerate() {
+            c.save_state(&join_key(prefix, &format!("convs2.{i}")), out);
+        }
+        for (i, a) in self.activations.iter().enumerate() {
+            a.save_state(&join_key(prefix, &format!("activations.{i}")), out);
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_amp_block_shape() {
-        let amp = AMPBlock::new(64, 3, vec![vec![1, 3, 5]]).unwrap();
-
-        let x = Array::random_normal(&[1, 64, 128], 10);
-        let y = amp.forward(&x).unwrap();
-        let y2 = y.clone();
-        y2.eval();
-
-        assert_eq!(y2.shape(), &[1, 64, 128]);
-    }
-
-    #[test]
-    fn test_amp_block_bigvgan_v2() {
-        let amp = AMPBlock::bigvgan_v2(128).unwrap();
-
-        let x = Array::random_normal(&[2, 128, 64], 10);
-        let y = amp.forward(&x).unwrap();
-        let y2 = y.clone();
-        y2.eval();
-
-        assert_eq!(y2.shape(), &[2, 128, 64]);
-        assert_eq!(amp.branches.len(), 3);
-    }
-
-    #[test]
-    fn test_amp_block_residual() {
-        // Verify residual connection works
-        let amp = AMPBlock::new(32, 3, vec![vec![1]]).unwrap();
-
-        let x = Array::random_normal(&[1, 32, 16], 10);
-        let y = amp.forward(&x).unwrap();
-        let x2 = x.clone();
-        x2.eval();
-        let y2 = y.clone();
-        y2.eval();
-
-        // Output should be different from input (processed) but same shape
-        assert_eq!(y2.shape(), x2.shape());
-    }
-
-    #[test]
-    fn test_amp_block_snake() {
-        let amp = AMPBlockSnake::new(64, 3, vec![vec![1, 3], vec![1, 3]]).unwrap();
-
-        let x = Array::random_normal(&[1, 64, 32], 10);
-        let y = amp.forward(&x).unwrap();
-        let y2 = y.clone();
-        y2.eval();
-
-        assert_eq!(y2.shape(), &[1, 64, 32]);
-    }
-
-    #[test]
-    fn test_amp_block_multiple_branches() {
-        // Test with 4 branches like some BigVGAN configs
-        let amp =
-            AMPBlock::new(256, 3, vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]]).unwrap();
-
-        let x = Array::random_normal(&[1, 256, 64], 10);
-        let y = amp.forward(&x).unwrap();
-        let y2 = y.clone();
-        y2.eval();
-
-        assert_eq!(y2.shape(), &[1, 256, 64]);
-        assert_eq!(amp.branches.len(), 4);
-    }
-}
+impl_module_params!(AMPBlock; convs1, convs2, activations);

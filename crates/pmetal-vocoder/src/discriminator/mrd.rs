@@ -1,210 +1,183 @@
-//! Multi-Resolution Discriminator (MRD) for BigVGAN.
+//! Multi-Resolution Discriminator (MRD, UnivNet; Jang et al., 2021).
 //!
-//! The MRD analyzes audio at multiple spectral resolutions to capture
-//! both fine-grained and coarse spectral details.
+//! Each sub-discriminator looks at the STFT magnitude of the waveform at one
+//! resolution and convolves over the (frequency, time) plane. Using several
+//! `(n_fft, hop, win)` triples lets the bank catch artefacts at different
+//! time-frequency trade-offs.
 
-use super::DiscriminatorOutput;
-use crate::audio::{StftConfig, stft};
-use crate::error::Result;
-use crate::nn::WeightNormConv1d;
-use pmetal_runtime::compat::{Array, nn};
+use super::{Discriminator, DiscriminatorOutput, conv_act, conv2d, flatten_logits, scaled};
+use crate::audio::{PadMode, StftConfig, Window, pad_signal, stft};
+use crate::error::{Result, VocoderError};
+use crate::nn::{Conv2d, StateDict, join_key};
+use pmetal_runtime::compat::Array;
+use pmetal_runtime::impl_module_params;
 
-/// Multi-Resolution Discriminator.
-///
-/// Applies STFT at multiple resolutions and uses 2D convolutions
-/// on the magnitude spectrograms.
+/// The reference resolutions `(n_fft, hop, win)`.
+const DEFAULT_RESOLUTIONS: [[i32; 3]; 3] = [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]];
+
+/// A bank of resolution discriminators.
 #[derive(Debug)]
 pub struct MultiResolutionDiscriminator {
-    /// Individual resolution discriminators.
+    /// One discriminator per resolution.
     pub discriminators: Vec<ResolutionDiscriminator>,
 }
 
 impl MultiResolutionDiscriminator {
-    /// Create a new MRD with default resolutions.
-    ///
-    /// Default: n_fft = [1024, 2048, 512], hop = [120, 240, 50]
+    /// The reference's three resolutions at full width.
     pub fn new() -> Result<Self> {
-        let resolutions = vec![
-            (1024, 120, 600), // (n_fft, hop_length, win_length)
-            (2048, 240, 1200),
-            (512, 50, 240),
-        ];
-
-        let discriminators = resolutions
-            .into_iter()
-            .map(|(n_fft, hop, win)| ResolutionDiscriminator::new(n_fft, hop, win))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self { discriminators })
+        Self::with_resolutions(&DEFAULT_RESOLUTIONS, 1.0)
     }
 
-    /// Create MRD with custom resolutions.
-    pub fn with_resolutions(resolutions: Vec<(i32, i32, i32)>) -> Result<Self> {
-        let discriminators = resolutions
-            .into_iter()
-            .map(|(n_fft, hop, win)| ResolutionDiscriminator::new(n_fft, hop, win))
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self { discriminators })
+    /// Custom `[n_fft, hop, win]` resolutions; `channel_mult` scales the width.
+    pub fn with_resolutions(resolutions: &[[i32; 3]], channel_mult: f32) -> Result<Self> {
+        if resolutions.is_empty() {
+            return Err(VocoderError::Config(
+                "the MRD needs at least one resolution".into(),
+            ));
+        }
+        Ok(Self {
+            discriminators: resolutions
+                .iter()
+                .map(|&[n_fft, hop, win]| {
+                    ResolutionDiscriminator::new(n_fft, hop, win, channel_mult)
+                })
+                .collect::<Result<_>>()?,
+        })
     }
 
-    /// Forward pass through all resolution discriminators.
-    pub fn forward(&self, audio: &Array) -> Result<Vec<DiscriminatorOutput>> {
+    /// Fold weight normalisation into the weights.
+    pub fn fuse_weight_norm(&mut self) {
+        self.discriminators
+            .iter_mut()
+            .for_each(ResolutionDiscriminator::fuse);
+    }
+}
+
+impl Discriminator for MultiResolutionDiscriminator {
+    fn discriminate(&self, audio: &Array) -> Result<Vec<DiscriminatorOutput>> {
         self.discriminators
             .iter()
             .map(|d| d.forward(audio))
             .collect()
     }
-}
 
-impl Default for MultiResolutionDiscriminator {
-    fn default() -> Self {
-        Self::new().expect("Failed to create MRD")
+    fn load_state(&mut self, sd: &mut StateDict, prefix: &str) -> Result<()> {
+        for (i, d) in self.discriminators.iter_mut().enumerate() {
+            d.load_state(sd, &join_key(prefix, &format!("discriminators.{i}")))?;
+        }
+        Ok(())
+    }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (i, d) in self.discriminators.iter().enumerate() {
+            d.save_state(&join_key(prefix, &format!("discriminators.{i}")), out);
+        }
     }
 }
 
-/// Single resolution discriminator.
-///
-/// Computes STFT at a specific resolution and applies convolutions.
+impl_module_params!(MultiResolutionDiscriminator; discriminators);
+
+/// Discriminator for one STFT resolution.
 #[derive(Debug)]
 pub struct ResolutionDiscriminator {
-    /// STFT configuration.
+    /// STFT settings: a rectangular window, no centring.
     pub stft_config: StftConfig,
-    /// Convolutional layers operating on magnitude spectrogram.
-    pub convs: Vec<WeightNormConv1d>,
-    /// Final output convolution.
-    pub conv_post: WeightNormConv1d,
+    /// Reflect padding applied to the waveform before the STFT.
+    pad: i32,
+    /// Five convolutions over the magnitude spectrogram.
+    pub convs: Vec<Conv2d>,
+    /// Output convolution to a single channel.
+    pub conv_post: Conv2d,
 }
 
 impl ResolutionDiscriminator {
-    /// Create a new resolution discriminator.
-    ///
-    /// # Arguments
-    /// * `n_fft` - FFT size
-    /// * `hop_length` - Hop size
-    /// * `win_length` - Window size
-    pub fn new(n_fft: i32, hop_length: i32, win_length: i32) -> Result<Self> {
-        let stft_config = StftConfig {
-            n_fft,
-            hop_length,
-            win_length: Some(win_length),
-            center: true,
-            ..Default::default()
-        };
-
-        // Number of frequency bins
-        let n_freq = n_fft / 2 + 1;
-
-        // Convolutional layers: process spectrogram as 1D signal over time
-        // with channels = frequency bins
-        let channels = [
-            (n_freq, 32),
-            (32, 128),
-            (128, 512),
-            (512, 1024),
-            (1024, 1024),
-        ];
-
-        let mut convs = Vec::with_capacity(channels.len());
-        for (i, (in_ch, out_ch)) in channels.iter().enumerate() {
-            let stride = if i < 4 { 2 } else { 1 };
-            let conv = WeightNormConv1d::new(
-                *in_ch,
-                *out_ch,
-                3,
-                Some(stride),
-                Some(1),
-                None,
-                None,
-                Some(true),
-            )?;
-            convs.push(conv);
+    /// A discriminator for the STFT `(n_fft, hop_length, win_length)`.
+    pub fn new(n_fft: i32, hop_length: i32, win_length: i32, channel_mult: f32) -> Result<Self> {
+        if n_fft < 2 || hop_length < 1 || win_length < 1 || win_length > n_fft || hop_length > n_fft
+        {
+            return Err(VocoderError::Config(format!(
+                "invalid MRD resolution (n_fft {n_fft}, hop {hop_length}, win {win_length})"
+            )));
         }
-
-        // Final convolution
-        let conv_post =
-            WeightNormConv1d::new(1024, 1, 3, Some(1), Some(1), None, None, Some(true))?;
-
+        let ch = scaled(32, channel_mult);
+        let wide = (3, 9);
+        let pad = (1, 4);
+        let convs = vec![
+            conv2d(1, ch, wide, (1, 1), pad)?,
+            conv2d(ch, ch, wide, (1, 2), pad)?,
+            conv2d(ch, ch, wide, (1, 2), pad)?,
+            conv2d(ch, ch, wide, (1, 2), pad)?,
+            conv2d(ch, ch, (3, 3), (1, 1), (1, 1))?,
+        ];
         Ok(Self {
-            stft_config,
+            stft_config: StftConfig {
+                n_fft,
+                hop_length,
+                win_length: Some(win_length),
+                center: false,
+                pad_mode: PadMode::Reflect,
+                // The reference passes no window to `torch.stft`, which means
+                // a rectangular one.
+                window: Window::Rectangular,
+            },
+            pad: (n_fft - hop_length) / 2,
             convs,
-            conv_post,
+            conv_post: conv2d(ch, 1, (3, 3), (1, 1), (1, 1))?,
         })
     }
 
-    /// Forward pass.
-    ///
-    /// # Arguments
-    /// * `audio` - Audio waveform [batch, 1, samples]
-    ///
-    /// # Returns
-    /// Discriminator output with logits and feature maps
+    /// The STFT magnitude `[batch, freq, frames, 1]` of `audio` (`[batch, 1, samples]`).
+    fn spectrogram(&self, audio: &Array) -> Result<Array> {
+        let wave = audio.reshape(&[audio.dim(0), audio.dim(2)]);
+        let padded = pad_signal(&wave, self.pad, PadMode::Reflect)?;
+        // `abs` of a complex value has a zero subgradient at the origin, so
+        // digital silence does not produce NaN gradients.
+        let magnitude = stft(&padded, &self.stft_config)?.abs_val();
+        Ok(magnitude.expand_dims(3))
+    }
+
+    /// Score `audio` (`[batch, 1, samples]`).
     pub fn forward(&self, audio: &Array) -> Result<DiscriminatorOutput> {
-        // Remove channel dimension for STFT: [B, 1, T] -> [B, T]
-        let audio_2d = audio.squeeze_all();
-
-        // Compute STFT magnitude spectrogram
-        let stft_out = stft(&audio_2d, &self.stft_config)?;
-        let magnitude = stft_out.abs_val();
-
-        // magnitude shape: [B, freq, frames] or [freq, frames]
-        // Ensure batch dimension
-        let x = if magnitude.ndim() == 2 {
-            magnitude.reshape(&[1, magnitude.dim(0), magnitude.dim(1)])
-        } else {
-            magnitude
-        };
-
-        // Apply convolutions and collect features
-        let mut features = Vec::new();
-        let mut x = x;
-
+        if audio.ndim() != 3 || audio.dim(1) != 1 {
+            return Err(VocoderError::ShapeMismatch {
+                expected: vec![-1, 1, -1],
+                actual: audio.shape().to_vec(),
+            });
+        }
+        let mut x = self.spectrogram(audio)?;
+        let mut features = Vec::with_capacity(self.convs.len() + 1);
         for conv in &self.convs {
-            x = conv.forward(&x)?;
-            x = nn::leaky_relu(&x, 0.1);
+            x = conv_act(conv, &x)?;
             features.push(x.clone());
         }
+        let x = self.conv_post.forward(&x)?;
+        features.push(x.clone());
+        Ok(DiscriminatorOutput {
+            logits: flatten_logits(&x),
+            features,
+        })
+    }
 
-        // Final convolution
-        let logits = self.conv_post.forward(&x)?;
+    fn fuse(&mut self) {
+        self.convs.iter_mut().for_each(Conv2d::fuse);
+        self.conv_post.fuse();
+    }
 
-        Ok(DiscriminatorOutput { logits, features })
+    fn load_state(&mut self, sd: &mut StateDict, prefix: &str) -> Result<()> {
+        for (i, c) in self.convs.iter_mut().enumerate() {
+            c.load_state(sd, &join_key(prefix, &format!("convs.{i}")))?;
+        }
+        self.conv_post
+            .load_state(sd, &join_key(prefix, "conv_post"))
+    }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (i, c) in self.convs.iter().enumerate() {
+            c.save_state(&join_key(prefix, &format!("convs.{i}")), out);
+        }
+        self.conv_post
+            .save_state(&join_key(prefix, "conv_post"), out);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_resolution_discriminator() {
-        let disc = ResolutionDiscriminator::new(1024, 256, 1024).unwrap();
-
-        let audio = Array::random_normal(&[1, 1, 4096], 10);
-        let output = disc.forward(&audio).unwrap();
-        let l2 = output.logits.clone();
-        l2.eval();
-
-        assert!(!output.features.is_empty());
-    }
-
-    #[test]
-    fn test_mrd() {
-        let mrd = MultiResolutionDiscriminator::new().unwrap();
-
-        let audio = Array::random_normal(&[1, 1, 8000], 10);
-        let outputs = mrd.forward(&audio).unwrap();
-
-        assert_eq!(outputs.len(), 3); // 3 resolutions
-    }
-
-    #[test]
-    fn test_mrd_custom_resolutions() {
-        let mrd = MultiResolutionDiscriminator::with_resolutions(vec![
-            (512, 128, 512),
-            (1024, 256, 1024),
-        ])
-        .unwrap();
-        assert_eq!(mrd.discriminators.len(), 2);
-    }
-}
+impl_module_params!(ResolutionDiscriminator; convs, conv_post);

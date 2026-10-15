@@ -1,15 +1,24 @@
 //! Neural network layers for BigVGAN.
 //!
-//! This module provides the core building blocks:
-//! - Snake/SnakeBeta periodic activations
-//! - Anti-aliased Activation1d wrapper
-//! - AMP (Anti-aliased Multi-Periodicity) blocks
-//! - Weight-normalized convolutions
+//! The building blocks, all channels-last (`[batch, time, channels]`):
+//! - Snake / SnakeBeta periodic activations
+//! - Kaiser-sinc up- and down-samplers and the anti-aliased [`Activation1d`]
+//! - AMP (Anti-aliased Multi-Periodicity) residual blocks
+//! - Weight-normalised convolutions ([`Conv1d`], [`ConvTranspose1d`], [`Conv2d`])
 
 mod activation;
 mod amp_block;
 mod conv;
+pub mod filter;
+mod fused;
+mod overlap;
+mod resample;
+mod weight_norm;
 
-pub use activation::{Activation1d, Snake, SnakeBeta};
-pub use amp_block::{AMPBlock, AMPBlockSnake, ResidualBranch, ResidualBranchSnake};
-pub use conv::{WeightNormConv1d, WeightNormConvTranspose1d};
+pub use activation::{Activation1d, PeriodicActivation, Snake, SnakeBeta};
+pub use amp_block::AMPBlock;
+pub use conv::{Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, ConvTranspose1d};
+pub use overlap::overlap_add;
+pub use resample::{DownSample1d, UpSample1d};
+pub(crate) use weight_norm::impl_no_linears;
+pub use weight_norm::{NormedWeight, StateDict, join_key};

@@ -1,33 +1,40 @@
 //! Mel filterbank and mel spectrogram computation.
+//!
+//! The filterbank follows librosa's `filters.mel` (Slaney mel scale and area
+//! normalisation by default), and [`MelFrontEnd`] reproduces the reference
+//! BigVGAN front end exactly, so a pretrained generator sees the same mel
+//! spectrogram it was trained on.
 
-use crate::error::Result;
-use pmetal_runtime::compat::{Array, ops};
+use super::stft::{PadMode, StftConfig, Window, pad_signal, stft};
+use crate::config::BigVGANConfig;
+use crate::error::{Result, VocoderError};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 /// Mel filterbank configuration.
 #[derive(Debug, Clone)]
 pub struct MelConfig {
     /// Sampling rate in Hz.
     pub sr: i32,
-    /// Number of FFT bins.
+    /// FFT size.
     pub n_fft: i32,
     /// Number of mel frequency bins.
     pub n_mels: i32,
     /// Minimum frequency in Hz.
     pub fmin: f32,
-    /// Maximum frequency in Hz (defaults to sr/2).
+    /// Maximum frequency in Hz (defaults to `sr / 2`).
     pub fmax: Option<f32>,
-    /// Whether to use HTK formula (vs Slaney).
+    /// Whether to use the HTK mel formula (otherwise Slaney's).
     pub htk: bool,
-    /// Normalization type for filterbank.
+    /// Normalisation of each filter.
     pub norm: MelNorm,
 }
 
-/// Mel filterbank normalization.
-#[derive(Debug, Clone, Copy, Default)]
+/// Mel filterbank normalisation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MelNorm {
-    /// No normalization.
+    /// Triangles with unit peak.
     None,
-    /// Slaney-style normalization (area = 1).
+    /// Slaney-style: each triangle has unit area (divided by its Hz width).
     #[default]
     Slaney,
 }
@@ -46,283 +53,216 @@ impl Default for MelConfig {
     }
 }
 
-/// Convert frequency in Hz to mel scale.
-///
-/// # Arguments
-/// * `freq` - Frequency in Hz
-/// * `htk` - Use HTK formula if true, Slaney otherwise
-pub fn hz_to_mel(freq: f32, htk: bool) -> f32 {
+// Slaney's mel scale: linear below 1 kHz, logarithmic above.
+const F_SP: f64 = 200.0 / 3.0;
+const MIN_LOG_HZ: f64 = 1000.0;
+const MIN_LOG_MEL: f64 = MIN_LOG_HZ / F_SP;
+
+fn log_step() -> f64 {
+    6.4f64.ln() / 27.0
+}
+
+fn hz_to_mel_f64(freq: f64, htk: bool) -> f64 {
     if htk {
-        // HTK formula: 2595 * log10(1 + f/700)
         2595.0 * (1.0 + freq / 700.0).log10()
+    } else if freq >= MIN_LOG_HZ {
+        MIN_LOG_MEL + (freq / MIN_LOG_HZ).ln() / log_step()
     } else {
-        // Slaney formula (used by librosa)
-        let f_min = 0.0;
-        let f_sp = 200.0 / 3.0;
-        let min_log_hz = 1000.0;
-        let min_log_mel = (min_log_hz - f_min) / f_sp;
-        let logstep = (6.4f32).ln() / 27.0; // log(6.4) / 27
-
-        if freq >= min_log_hz {
-            min_log_mel + (freq / min_log_hz).ln() / logstep
-        } else {
-            (freq - f_min) / f_sp
-        }
+        freq / F_SP
     }
 }
 
-/// Convert mel scale to frequency in Hz.
-///
-/// # Arguments
-/// * `mel` - Mel value
-/// * `htk` - Use HTK formula if true, Slaney otherwise
-pub fn mel_to_hz(mel: f32, htk: bool) -> f32 {
+fn mel_to_hz_f64(mel: f64, htk: bool) -> f64 {
     if htk {
-        // HTK formula: 700 * (10^(m/2595) - 1)
-        700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
+        700.0 * (10.0f64.powf(mel / 2595.0) - 1.0)
+    } else if mel >= MIN_LOG_MEL {
+        MIN_LOG_HZ * ((mel - MIN_LOG_MEL) * log_step()).exp()
     } else {
-        // Slaney formula
-        let f_min = 0.0;
-        let f_sp = 200.0 / 3.0;
-        let min_log_hz = 1000.0;
-        let min_log_mel = (min_log_hz - f_min) / f_sp;
-        let logstep = (6.4f32).ln() / 27.0;
-
-        if mel >= min_log_mel {
-            min_log_hz * ((mel - min_log_mel) * logstep).exp()
-        } else {
-            f_min + f_sp * mel
-        }
+        F_SP * mel
     }
 }
 
-/// Create mel filterbank matrix.
-///
-/// # Arguments
-/// * `config` - Mel filterbank configuration
-///
-/// # Returns
-/// Mel filterbank matrix [n_mels, n_fft/2+1]
-pub fn mel_filterbank(config: &MelConfig) -> Result<Array> {
-    let fmax = config.fmax.unwrap_or(config.sr as f32 / 2.0);
-    let n_freqs = config.n_fft / 2 + 1;
+/// Convert frequency in Hz to the mel scale (`htk`: HTK formula, else Slaney).
+pub fn hz_to_mel(freq: f32, htk: bool) -> f32 {
+    hz_to_mel_f64(f64::from(freq), htk) as f32
+}
 
-    // Compute mel points
-    let mel_min = hz_to_mel(config.fmin, config.htk);
-    let mel_max = hz_to_mel(fmax, config.htk);
+/// Convert the mel scale to frequency in Hz (`htk`: HTK formula, else Slaney).
+pub fn mel_to_hz(mel: f32, htk: bool) -> f32 {
+    mel_to_hz_f64(f64::from(mel), htk) as f32
+}
 
-    // Linearly spaced mel points
-    let n_mels_plus_2 = config.n_mels + 2;
-    let mel_points: Vec<f32> = (0..n_mels_plus_2)
-        .map(|i| mel_min + (mel_max - mel_min) * i as f32 / (n_mels_plus_2 - 1) as f32)
+/// The triangular mel filterbank as a row-major `[n_mels, n_fft / 2 + 1]`
+/// matrix of host floats (librosa's `filters.mel`, computed in double precision).
+pub fn mel_filterbank_values(config: &MelConfig) -> Result<Vec<f32>> {
+    if config.sr < 1 || config.n_fft < 2 || config.n_mels < 1 {
+        return Err(VocoderError::Audio(format!(
+            "invalid mel settings (sr {}, n_fft {}, n_mels {})",
+            config.sr, config.n_fft, config.n_mels
+        )));
+    }
+    let fmax = f64::from(config.fmax.unwrap_or(config.sr as f32 / 2.0));
+    let fmin = f64::from(config.fmin);
+    if !(0.0 <= fmin && fmin < fmax && fmax <= f64::from(config.sr) / 2.0 + 1e-3) {
+        return Err(VocoderError::Audio(format!(
+            "need 0 <= fmin < fmax <= sr / 2, got fmin {fmin}, fmax {fmax}, sr {}",
+            config.sr
+        )));
+    }
+    let n_freqs = (config.n_fft / 2 + 1) as usize;
+    let n_mels = config.n_mels as usize;
+
+    let mel_min = hz_to_mel_f64(fmin, config.htk);
+    let mel_max = hz_to_mel_f64(fmax, config.htk);
+    let edges: Vec<f64> = (0..n_mels + 2)
+        .map(|i| {
+            let mel = mel_min + (mel_max - mel_min) * i as f64 / (n_mels + 1) as f64;
+            mel_to_hz_f64(mel, config.htk)
+        })
         .collect();
+    let bin_hz = |k: usize| k as f64 * f64::from(config.sr) / f64::from(config.n_fft);
 
-    // Convert to Hz
-    let hz_points: Vec<f32> = mel_points
-        .iter()
-        .map(|&m| mel_to_hz(m, config.htk))
-        .collect();
-
-    // Convert to FFT bin indices
-    let bin_points: Vec<f32> = hz_points
-        .iter()
-        .map(|&f| config.n_fft as f32 * f / config.sr as f32)
-        .collect();
-
-    // Create filterbank matrix
-    let mut filterbank = vec![0.0f32; (config.n_mels * n_freqs) as usize];
-
-    for m in 0..config.n_mels as usize {
-        let f_left = bin_points[m];
-        let f_center = bin_points[m + 1];
-        let f_right = bin_points[m + 2];
-
-        for k in 0..n_freqs as usize {
-            let k_f = k as f32;
-
-            let weight = if k_f >= f_left && k_f <= f_center {
-                // Rising slope
-                (k_f - f_left) / (f_center - f_left + 1e-10)
-            } else if k_f >= f_center && k_f <= f_right {
-                // Falling slope
-                (f_right - k_f) / (f_right - f_center + 1e-10)
-            } else {
-                0.0
-            };
-
-            filterbank[m * n_freqs as usize + k] = weight;
-        }
-
-        // Apply Slaney normalization if requested
-        if matches!(config.norm, MelNorm::Slaney) {
-            let enorm = 2.0 / (hz_points[m + 2] - hz_points[m] + 1e-10);
-            for k in 0..n_freqs as usize {
-                filterbank[m * n_freqs as usize + k] *= enorm;
-            }
+    let mut fb = vec![0.0f32; n_mels * n_freqs];
+    for m in 0..n_mels {
+        let (lo, mid, hi) = (edges[m], edges[m + 1], edges[m + 2]);
+        let scale = match config.norm {
+            MelNorm::Slaney => 2.0 / (hi - lo),
+            MelNorm::None => 1.0,
+        };
+        for k in 0..n_freqs {
+            let f = bin_hz(k);
+            let rising = (f - lo) / (mid - lo);
+            let falling = (hi - f) / (hi - mid);
+            let weight = rising.min(falling).max(0.0);
+            fb[m * n_freqs + k] = (f64::from(weight as f32) * scale) as f32;
         }
     }
+    Ok(fb)
+}
 
+/// The mel filterbank as an array `[n_mels, n_fft / 2 + 1]`.
+pub fn mel_filterbank(config: &MelConfig) -> Result<Array> {
+    let values = mel_filterbank_values(config)?;
     Ok(Array::from_f32_slice(
-        &filterbank,
-        &[config.n_mels, n_freqs],
+        &values,
+        &[config.n_mels, config.n_fft / 2 + 1],
     ))
 }
 
-/// Compute mel spectrogram from audio.
+/// Apply a `[n_mels, freq]` filterbank to a magnitude spectrogram
+/// (`[freq, frames]` or `[batch, freq, frames]`).
+fn apply_filterbank(filterbank: &Array, magnitude: &Array) -> Array {
+    filterbank.matmul(magnitude)
+}
+
+/// Mel spectrogram (magnitude, not log) of `audio`.
 ///
-/// # Arguments
-/// * `audio` - Audio signal `[samples]` or `[batch, samples]`
-/// * `config` - Mel configuration
-/// * `stft_config` - STFT configuration
+/// * `audio` - `[samples]` or `[batch, samples]`.
 ///
-/// # Returns
-/// Mel spectrogram [batch, n_mels, frames] or [n_mels, frames]
+/// Returns `[n_mels, frames]` or `[batch, n_mels, frames]`.
 pub fn mel_spectrogram(
     audio: &Array,
     config: &MelConfig,
-    stft_config: &super::StftConfig,
+    stft_config: &StftConfig,
 ) -> Result<Array> {
-    // Compute STFT
-    let stft_out = super::stft(audio, stft_config)?;
-
-    // Compute magnitude
-    let magnitude = super::stft_magnitude(&stft_out)?;
-
-    // Get mel filterbank
-    let mel_fb = mel_filterbank(config)?;
-
-    // Apply filterbank: [n_mels, n_freqs] @ [n_freqs, frames]
-    // Need to handle batched case
-    let magnitude = if magnitude.ndim() == 2 {
-        magnitude
-    } else {
-        // [batch, freq, frames] -> process each batch
-        magnitude
-    };
-
-    // Transpose magnitude: [freq, frames] or [batch, freq, frames]
-    // mel_fb @ magnitude for [n_mels, freq] @ [freq, frames] -> [n_mels, frames]
-    if magnitude.ndim() == 2 {
-        Ok(mel_fb.matmul(&magnitude))
-    } else {
-        // Batched: [batch, freq, frames]
-        // Transpose to [batch, frames, freq], then matmul, then transpose back
-        let mag_t = magnitude.transpose_axes(&[0, 2, 1]); // [batch, frames, freq]
-        let mel_fb_t = mel_fb.transpose_axes(&[1, 0]); // [freq, n_mels]
-        let mel_spec = mag_t.matmul(&mel_fb_t); // [batch, frames, n_mels]
-        Ok(mel_spec.transpose_axes(&[0, 2, 1])) // [batch, n_mels, frames]
+    if stft_config.n_fft != config.n_fft {
+        return Err(VocoderError::Audio(format!(
+            "the STFT uses n_fft {} but the mel filterbank was built for {}",
+            stft_config.n_fft, config.n_fft
+        )));
     }
+    let magnitude = stft(audio, stft_config)?.abs_val();
+    Ok(apply_filterbank(&mel_filterbank(config)?, &magnitude))
 }
 
-/// Apply log compression to mel spectrogram.
-///
-/// # Arguments
-/// * `mel_spec` - Mel spectrogram
-/// * `clip_val` - Minimum value for clipping (default 1e-5)
-///
-/// # Returns
-/// Log-compressed mel spectrogram
-pub fn log_mel_spectrogram(mel_spec: &Array, clip_val: Option<f32>) -> Result<Array> {
-    let clip = Array::from_f32(clip_val.unwrap_or(1e-5));
-    let clipped = ops::maximum(mel_spec, &clip);
-    Ok(clipped.log())
-}
-
-/// Dynamic range compression for mel spectrogram.
-///
-/// # Arguments
-/// * `mel_spec` - Mel spectrogram
-/// * `c` - Compression factor (default 1.0)
-/// * `clip_val` - Minimum value (default 1e-5)
-///
-/// # Returns
-/// Compressed mel spectrogram
+/// `log(max(x, clip) * c)`: the reference's dynamic range compression.
 pub fn dynamic_range_compression(
-    mel_spec: &Array,
+    x: &Array,
     c: Option<f32>,
     clip_val: Option<f32>,
 ) -> Result<Array> {
-    let c = c.unwrap_or(1.0);
-    let clip = Array::from_f32(clip_val.unwrap_or(1e-5));
-    let c_arr = Array::from_f32(c);
-
-    let clipped = ops::maximum(mel_spec, &clip);
-    // log(1 + c * x) / log(1 + c)
-    let one = Array::from_f32(1.0);
-    let numerator = one.add(&clipped.multiply(&c_arr)).log();
-    let denominator = (1.0 + c).ln();
-    Ok(numerator.divide(&Array::from_f32(denominator)))
+    let clipped = ops::maximum(x, &Array::from_f32(clip_val.unwrap_or(1e-5)));
+    Ok(clipped.multiply(&Array::from_f32(c.unwrap_or(1.0))).log())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// `exp(x) / c`: the inverse of [`dynamic_range_compression`] above the clip.
+pub fn dynamic_range_decompression(x: &Array, c: Option<f32>) -> Result<Array> {
+    Ok(x.exp().divide(&Array::from_f32(c.unwrap_or(1.0))))
+}
 
-    #[test]
-    fn test_hz_to_mel_htk() {
-        // HTK formula
-        let mel = hz_to_mel(1000.0, true);
-        assert!((mel - 1000.0).abs() < 1.0); // ~1000 mels at 1000 Hz
+/// Log-compress a mel spectrogram, clamping at `clip_val` (default `1e-5`).
+pub fn log_mel_spectrogram(mel_spec: &Array, clip_val: Option<f32>) -> Result<Array> {
+    dynamic_range_compression(mel_spec, None, clip_val)
+}
+
+/// The mel front end a BigVGAN model was trained with.
+///
+/// Reflect-pads the waveform by `(n_fft - hop) / 2` on each side, takes a
+/// Hann-windowed STFT without further centring, forms the magnitude as
+/// `sqrt(re^2 + im^2 + 1e-9)`, projects onto the Slaney mel filterbank and
+/// log-compresses with a floor of `1e-5`. A waveform of `T` samples gives
+/// `T / hop_size` frames, so the generator returns exactly `T` samples.
+#[derive(Debug)]
+pub struct MelFrontEnd {
+    stft: StftConfig,
+    filterbank: Array,
+    pad: i32,
+}
+
+/// Added under the square root of the magnitude, as in the reference.
+const MAGNITUDE_EPS: f32 = 1e-9;
+
+impl MelFrontEnd {
+    /// The front end a model is conditioned on (the configuration's `fmax`).
+    pub fn new(config: &BigVGANConfig) -> Result<Self> {
+        Self::with_fmax(config, config.fmax)
     }
 
-    #[test]
-    fn test_hz_to_mel_slaney() {
-        // Slaney formula
-        let mel = hz_to_mel(1000.0, false);
-        // At 1000 Hz, should be ~15 mels (linear region ends at 1000 Hz)
-        assert!(mel > 10.0 && mel < 20.0);
+    /// The front end of the single-scale mel loss, which uses the
+    /// configuration's `fmax_for_loss` instead of `fmax`.
+    pub fn for_loss(config: &BigVGANConfig) -> Result<Self> {
+        Self::with_fmax(config, config.fmax_for_loss)
     }
 
-    #[test]
-    fn test_mel_to_hz_roundtrip() {
-        let freq = 2000.0;
-        let mel = hz_to_mel(freq, false);
-        let freq_back = mel_to_hz(mel, false);
-        assert!((freq - freq_back).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_mel_filterbank_shape() {
-        let config = MelConfig {
-            sr: 24000,
-            n_fft: 1024,
-            n_mels: 80,
-            fmin: 0.0,
-            fmax: Some(12000.0),
+    fn with_fmax(config: &BigVGANConfig, fmax: Option<i32>) -> Result<Self> {
+        let mel = MelConfig {
+            sr: config.sampling_rate,
+            n_fft: config.n_fft,
+            n_mels: config.num_mels,
+            fmin: config.fmin as f32,
+            fmax: fmax.map(|f| f as f32),
             htk: false,
             norm: MelNorm::Slaney,
         };
-
-        let fb = mel_filterbank(&config).unwrap();
-        let fb2 = fb.clone();
-        fb2.eval();
-
-        // Should be [n_mels, n_fft/2+1] = [80, 513]
-        assert_eq!(fb2.shape(), &[80, 513]);
+        Ok(Self {
+            stft: StftConfig {
+                n_fft: config.n_fft,
+                hop_length: config.hop_size,
+                win_length: Some(config.win_size),
+                center: false,
+                pad_mode: PadMode::Reflect,
+                window: Window::Hann,
+            },
+            filterbank: mel_filterbank(&mel)?,
+            pad: (config.n_fft - config.hop_size) / 2,
+        })
     }
 
-    #[test]
-    fn test_mel_filterbank_values() {
-        let config = MelConfig {
-            sr: 16000,
-            n_fft: 512,
-            n_mels: 40,
-            fmin: 0.0,
-            fmax: Some(8000.0),
-            htk: false,
-            norm: MelNorm::Slaney,
+    /// Log-mel spectrogram `[batch, n_mels, frames]` of `wav`
+    /// (`[samples]` or `[batch, samples]`, nominally in `[-1, 1]`).
+    pub fn forward(&self, wav: &Array) -> Result<Array> {
+        let wav = if wav.ndim() == 1 {
+            wav.reshape(&[1, -1])
+        } else {
+            wav.clone()
         };
-
-        let fb = mel_filterbank(&config).unwrap();
-        let fb2 = fb.clone();
-        fb2.eval();
-
-        // Sum of each filter should be reasonable (not all zeros)
-        let row_sums = fb2.sum_axis(1, false);
-        let rs2 = row_sums.clone();
-        rs2.eval();
-
-        // Each mel filter should sum to something positive
-        // (Slaney normalization makes area = 2)
+        let padded = pad_signal(&wav.as_dtype(Dtype::Float32), self.pad, PadMode::Reflect)?;
+        let power = {
+            let mag = stft(&padded, &self.stft)?.abs_val();
+            mag.multiply(&mag)
+        };
+        let magnitude = power.add(&Array::from_f32(MAGNITUDE_EPS)).sqrt();
+        let mel = apply_filterbank(&self.filterbank, &magnitude);
+        log_mel_spectrogram(&mel, None)
     }
 }

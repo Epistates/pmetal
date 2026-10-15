@@ -1,376 +1,317 @@
-//! BigVGAN Generator for mel-to-waveform synthesis.
+//! BigVGAN generator for mel-to-waveform synthesis.
 //!
-//! The generator converts mel spectrograms to high-fidelity audio waveforms
-//! using transposed convolutions for upsampling and AMP blocks for processing.
+//! The generator converts mel spectrograms to waveforms with a stack of
+//! transposed-convolution upsamplers, each followed by a bank of parallel AMP
+//! (anti-aliased multi-periodicity) residual blocks whose outputs are averaged
+//! (BigVGAN, Lee et al. 2023). Checkpoints released with the reference
+//! implementation load as they are.
+//!
+//! Inside the model tensors are channels-last; [`BigVGAN::forward`] takes and
+//! returns the reference's channels-first layout.
 
-use crate::config::BigVGANConfig;
+mod load;
+mod streaming;
+
+pub use streaming::StreamingSynthesizer;
+
+use crate::config::{ActivationType, BigVGANConfig};
 use crate::error::{Result, VocoderError};
-use crate::nn::{AMPBlock, Activation1d, SnakeBeta, WeightNormConv1d, WeightNormConvTranspose1d};
-use pmetal_runtime::compat::Array;
-use std::path::Path;
-use zerocopy::FromBytes;
+use crate::nn::{
+    AMPBlock, Activation1d, Conv1d, Conv1dConfig, ConvTranspose1d, PeriodicActivation, StateDict,
+    join_key,
+};
+use pmetal_runtime::compat::{Array, Dtype, ops};
+use pmetal_runtime::impl_module_params;
 
 /// BigVGAN neural vocoder.
 ///
-/// Converts mel spectrograms [batch, n_mels, frames] to audio waveforms
-/// [batch, 1, samples]. Uses anti-aliased upsampling with AMP blocks.
+/// Converts mel spectrograms `[batch, n_mels, frames]` to waveforms
+/// `[batch, 1, frames * hop_size]`.
 #[derive(Debug)]
 pub struct BigVGAN {
     /// Model configuration.
     pub config: BigVGANConfig,
-    /// Initial convolution from mel channels to hidden.
-    pub conv_pre: WeightNormConv1d,
-    /// Upsampling stages (transposed convolutions).
-    pub upsamples: Vec<WeightNormConvTranspose1d>,
-    /// AMP blocks after each upsample stage.
-    pub amp_blocks: Vec<Vec<AMPBlock>>,
-    /// Final activation.
-    pub activation_post: Activation1d<SnakeBeta>,
-    /// Final convolution to single channel audio.
-    pub conv_post: WeightNormConv1d,
+    /// Input convolution from mel bins to the widest hidden size.
+    pub conv_pre: Conv1d,
+    /// Transposed-convolution upsamplers, one per stage.
+    pub ups: Vec<ConvTranspose1d>,
+    /// AMP blocks, `num_kernels` per stage, stage-major
+    /// (`resblocks[stage * num_kernels + j]`).
+    pub resblocks: Vec<AMPBlock>,
+    /// Anti-aliased activation before the output convolution.
+    pub activation_post: Activation1d,
+    /// Output convolution to a single channel.
+    pub conv_post: Conv1d,
 }
 
 impl BigVGAN {
-    /// Create a new BigVGAN generator from configuration.
+    /// A freshly initialised generator.
     pub fn new(config: BigVGANConfig) -> Result<Self> {
-        let num_upsamples = config.upsample_rates.len();
-        let num_kernels = config.resblock_kernel_sizes.len();
+        config.validate()?;
+        let channels = config.channel_sizes();
+        let stages = config.num_upsample_stages();
 
-        // Initial convolution: n_mels -> initial_channel
-        let conv_pre = WeightNormConv1d::new(
-            config.num_mels,
-            config.upsample_initial_channel,
-            7,
-            Some(1),
-            Some(3),
-            None,
-            None,
-            Some(true),
+        let conv_pre = Conv1d::new(
+            Conv1dConfig::new(config.num_mels, config.upsample_initial_channel, 7).padding(3),
         )?;
 
-        // Build upsampling stages
-        let mut upsamples = Vec::with_capacity(num_upsamples);
-        let mut amp_blocks = Vec::with_capacity(num_upsamples);
-
-        let mut channels = config.upsample_initial_channel;
-
-        for i in 0..num_upsamples {
-            let out_channels = channels / 2;
-            let upsample_rate = config.upsample_rates[i];
-            let kernel_size = config.upsample_kernel_sizes[i];
-            let padding = (kernel_size - upsample_rate) / 2;
-
-            // Transposed convolution for upsampling
-            let upsample = WeightNormConvTranspose1d::new(
-                channels,
-                out_channels,
-                kernel_size,
-                Some(upsample_rate),
-                Some(padding),
-                None,
-                None,
-                None,
-                Some(true),
-            )?;
-            upsamples.push(upsample);
-
-            // AMP blocks after upsampling
-            let mut stage_amps = Vec::with_capacity(num_kernels);
-            for j in 0..num_kernels {
-                let kernel_size = config.resblock_kernel_sizes[j];
-                // Each dilation list becomes a single branch in AMP block
-                // Wrap it in a vec to create one branch
-                let dilations = vec![config.resblock_dilation_sizes[j].clone()];
-                let amp = AMPBlock::new(out_channels, kernel_size, dilations)?;
-                stage_amps.push(amp);
+        let mut ups = Vec::with_capacity(stages);
+        let mut resblocks = Vec::with_capacity(stages * config.resblock_kernel_sizes.len());
+        for i in 0..stages {
+            let (rate, kernel) = (config.upsample_rates[i], config.upsample_kernel_sizes[i]);
+            ups.push(ConvTranspose1d::new(
+                channels[i],
+                channels[i + 1],
+                kernel,
+                rate,
+                (kernel - rate) / 2,
+                true,
+            )?);
+            for (&k, dilations) in config
+                .resblock_kernel_sizes
+                .iter()
+                .zip(&config.resblock_dilation_sizes)
+            {
+                resblocks.push(AMPBlock::new(
+                    config.resblock,
+                    channels[i + 1],
+                    k,
+                    dilations,
+                    config.activation,
+                    config.snake_logscale,
+                )?);
             }
-            amp_blocks.push(stage_amps);
-
-            channels = out_channels;
         }
 
-        // Final activation and output convolution
-        let activation_post = Activation1d::new(SnakeBeta::new(channels, true)?, Some(2), Some(2))?;
-
-        let conv_post = WeightNormConv1d::new(
-            channels,
-            1, // mono audio output
-            7,
-            Some(1),
-            Some(3),
-            None,
-            None,
-            Some(true),
+        let final_channels = channels[stages];
+        let activation_post = Activation1d::new(PeriodicActivation::new(
+            config.activation,
+            final_channels,
+            config.snake_logscale,
+        )?)?;
+        let conv_post = Conv1d::new(
+            Conv1dConfig::new(final_channels, 1, 7)
+                .padding(3)
+                .bias(config.use_bias_at_final),
         )?;
 
         Ok(Self {
             config,
             conv_pre,
-            upsamples,
-            amp_blocks,
+            ups,
+            resblocks,
             activation_post,
             conv_post,
         })
     }
 
-    /// Create BigVGAN v2 24kHz 100-band model.
-    pub fn v2_24khz_100band() -> Result<Self> {
-        Self::new(BigVGANConfig::v2_24khz_100band())
+    /// Number of parallel AMP blocks per stage.
+    pub fn num_kernels(&self) -> usize {
+        self.config.resblock_kernel_sizes.len()
     }
 
-    /// Create BigVGAN v2 44.1kHz 128-band model.
-    pub fn v2_44khz_128band() -> Result<Self> {
-        Self::new(BigVGANConfig::v2_44khz_128band())
+    /// Samples produced per mel frame.
+    pub fn hop_size(&self) -> i32 {
+        self.config.hop_size
     }
 
-    /// Load pretrained weights from safetensors file.
-    pub fn load_weights(&mut self, path: &Path) -> Result<()> {
-        let file_data = std::fs::read(path).map_err(VocoderError::from)?;
-        let tensors = safetensors::SafeTensors::deserialize(&file_data)
-            .map_err(|e| VocoderError::WeightLoad(e.to_string()))?;
-
-        // Load conv_pre weights
-        if let Ok(weight_v) = tensors.tensor("conv_pre.weight_v") {
-            let arr = tensor_to_array(weight_v)?;
-            self.conv_pre.weight_v.value = arr;
-        }
-        if let Ok(weight_g) = tensors.tensor("conv_pre.weight_g") {
-            let arr = tensor_to_array(weight_g)?;
-            self.conv_pre.weight_g.value = arr;
-        }
-        if let Ok(bias) = tensors.tensor("conv_pre.bias") {
-            if let Some(ref mut b) = self.conv_pre.bias {
-                let arr = tensor_to_array(bias)?;
-                b.value = arr;
-            }
-        }
-
-        // Load upsample weights (weight_g normalization not yet applied)
-        for (i, upsample) in self.upsamples.iter_mut().enumerate() {
-            let prefix = format!("ups.{}", i);
-            if let Ok(weight_v) = tensors.tensor(&format!("{}.weight_v", prefix)) {
-                let arr = tensor_to_array(weight_v)?;
-                upsample.weight_v.value = arr;
-            }
-            if let Ok(weight_g) = tensors.tensor(&format!("{}.weight_g", prefix)) {
-                let arr = tensor_to_array(weight_g)?;
-                upsample.weight_g.value = arr;
-            }
-        }
-
-        // Load conv_post weights
-        if let Ok(weight_v) = tensors.tensor("conv_post.weight_v") {
-            let arr = tensor_to_array(weight_v)?;
-            self.conv_post.weight_v.value = arr;
-        }
-        if let Ok(weight_g) = tensors.tensor("conv_post.weight_g") {
-            let arr = tensor_to_array(weight_g)?;
-            self.conv_post.weight_g.value = arr;
-        }
-        if let Ok(bias) = tensors.tensor("conv_post.bias") {
-            if let Some(ref mut b) = self.conv_post.bias {
-                let arr = tensor_to_array(bias)?;
-                b.value = arr;
-            }
-        }
-
-        Ok(())
+    /// The precision the model computes in (that of its input convolution's
+    /// weight; see [`to_dtype`](Self::to_dtype)).
+    pub fn dtype(&self) -> Dtype {
+        self.conv_pre.weight.weight.value.dtype()
     }
 
-    /// Load pretrained model from HuggingFace Hub.
-    pub fn from_pretrained(model_id: &str) -> Result<Self> {
-        let client = hf_hub::HFClientSync::new().map_err(|e| VocoderError::Hub(e.to_string()))?;
-        let (owner, name) = hf_hub::split_id(model_id);
-        let repo = client.model(owner, name);
-        let get = |filename: &str| {
-            repo.download_file()
-                .filename(filename)
-                .send()
-                .map_err(|e| VocoderError::Hub(e.to_string()))
-        };
-
-        // Download config
-        let config_path = get("config.json")?;
-        let config_str = std::fs::read_to_string(&config_path).map_err(VocoderError::from)?;
-        let config: BigVGANConfig =
-            serde_json::from_str(&config_str).map_err(|e| VocoderError::Config(e.to_string()))?;
-
-        // Create model
-        let mut model = Self::new(config)?;
-
-        // Download and load weights
-        let weights_path = get("model.safetensors")?;
-        model.load_weights(&weights_path)?;
-
-        Ok(model)
-    }
-
-    /// Forward pass: convert mel spectrogram to audio.
-    ///
-    /// # Arguments
-    /// * `mel` - Mel spectrogram [batch, n_mels, frames]
-    ///
-    /// # Returns
-    /// Audio waveform [batch, 1, samples] normalized to [-1, 1]
-    pub fn forward(&self, mel: &Array) -> Result<Array> {
-        // Initial convolution
-        let mut x = self.conv_pre.forward(mel)?;
-
-        // Upsampling stages with AMP blocks
-        for (i, upsample) in self.upsamples.iter().enumerate() {
-            x = upsample.forward(&x)?;
-
-            // Apply AMP blocks and sum their outputs
-            let mut amp_out: Option<Array> = None;
-            for amp in &self.amp_blocks[i] {
-                let out = amp.forward(&x)?;
-                match &amp_out {
-                    Some(o) => amp_out = Some(o.add(&out)),
-                    None => amp_out = Some(out),
-                }
-            }
-
-            // Average AMP outputs
-            let num_amps = Array::from_i32(self.amp_blocks[i].len() as i32);
-            x = amp_out.unwrap().divide(&num_amps);
+    /// Synthesise from a channels-last mel `[batch, frames, n_mels]` to a
+    /// channels-last waveform `[batch, frames * hop_size, 1]`.
+    pub fn forward_nlc(&self, mel: &Array) -> Result<Array> {
+        if mel.ndim() != 3 || mel.dim(2) != self.config.num_mels {
+            return Err(VocoderError::ShapeMismatch {
+                expected: vec![-1, -1, self.config.num_mels],
+                actual: mel.shape().to_vec(),
+            });
         }
-
-        // Final activation and output convolution
+        // The mel runs in the model's precision (a half-precision model fed a
+        // float32 mel would otherwise promote every convolution back to float32).
+        let mut x = self.conv_pre.forward(&mel.as_dtype(self.dtype()))?;
+        let num_kernels = self.num_kernels();
+        for (i, up) in self.ups.iter().enumerate() {
+            x = up.forward(&x)?;
+            let mut sum: Option<Array> = None;
+            for block in &self.resblocks[i * num_kernels..(i + 1) * num_kernels] {
+                let y = block.forward(&x)?;
+                sum = Some(match sum {
+                    Some(s) => s.add(&y),
+                    None => y,
+                });
+            }
+            x = sum
+                .expect("validated: at least one resblock per stage")
+                .divide(&Array::from_f32(num_kernels as f32).as_dtype(x.dtype()));
+        }
         x = self.activation_post.forward(&x)?;
         x = self.conv_post.forward(&x)?;
-
-        // Tanh to normalize to [-1, 1]
-        // tanh(x) = 2*sigmoid(2x) - 1
-        let two = Array::from_f32(2.0);
-        let two_x = x.multiply(&two);
-        let sig = two_x.sigmoid();
-        let one = Array::from_f32(1.0);
-        let two2 = Array::from_f32(2.0);
-        Ok(sig.multiply(&two2).subtract(&one))
+        Ok(if self.config.use_tanh_at_final {
+            ops::tanh(&x)
+        } else {
+            let lo = Array::from_f32(-1.0).as_dtype(x.dtype());
+            let hi = Array::from_f32(1.0).as_dtype(x.dtype());
+            ops::clip(&x, Some(&lo), Some(&hi))
+        })
     }
 
-    /// Generate audio from mel spectrogram (inference helper).
-    ///
-    /// # Arguments
-    /// * `mel` - Mel spectrogram [n_mels, frames] or [batch, n_mels, frames]
-    ///
-    /// # Returns
-    /// Audio samples `[samples]` or `[batch, samples]`
+    /// Synthesise from a mel spectrogram `[batch, n_mels, frames]` to a waveform
+    /// `[batch, 1, frames * hop_size]` (the reference's layout).
+    pub fn forward(&self, mel: &Array) -> Result<Array> {
+        if mel.ndim() != 3 {
+            return Err(VocoderError::ShapeMismatch {
+                expected: vec![-1, self.config.num_mels, -1],
+                actual: mel.shape().to_vec(),
+            });
+        }
+        let audio = self.forward_nlc(&mel.transpose_axes(&[0, 2, 1]))?;
+        Ok(audio.transpose_axes(&[0, 2, 1]))
+    }
+
+    /// Synthesise audio from `[n_mels, frames]` or `[batch, n_mels, frames]`,
+    /// returning `[samples]` or `[batch, samples]`.
     pub fn generate(&self, mel: &Array) -> Result<Array> {
-        let (mel, was_2d) = if mel.ndim() == 2 {
-            (mel.reshape(&[1, mel.dim(0), mel.dim(1)]), true)
+        let unbatched = mel.ndim() == 2;
+        let batched = if unbatched {
+            mel.reshape(&[1, mel.dim(0), mel.dim(1)])
         } else {
-            (mel.clone(), false)
+            mel.clone()
         };
-
-        let audio = self.forward(&mel)?;
-
-        // Remove channel dimension and optionally batch dimension
-        let audio = audio.squeeze_all();
-
-        if was_2d {
-            Ok(audio.squeeze_all())
+        let audio = self.forward(&batched)?;
+        let audio = audio.squeeze_axes(&[1]);
+        Ok(if unbatched {
+            audio.squeeze_axes(&[0])
         } else {
-            Ok(audio)
+            audio
+        })
+    }
+
+    /// Fold weight normalisation into the convolution weights, as the
+    /// reference does before inference. Training is not possible afterwards
+    /// without re-imposing the normalisation.
+    pub fn fuse_weight_norm(&mut self) {
+        self.conv_pre.fuse();
+        self.ups.iter_mut().for_each(ConvTranspose1d::fuse);
+        self.resblocks.iter_mut().for_each(AMPBlock::fuse);
+        self.conv_post.fuse();
+    }
+
+    /// Get the model ready for fast synthesis: fold weight normalisation into
+    /// the weights ([`fuse_weight_norm`](Self::fuse_weight_norm)) and run every
+    /// anti-aliased activation as one fused GPU kernel. Neither can be
+    /// differentiated, so this is for inference; call it after the final
+    /// [`to_dtype`](Self::to_dtype) and weight loading (either drops the fused
+    /// kernels again).
+    pub fn prepare_for_inference(&mut self) {
+        self.fuse_weight_norm();
+        self.resblocks
+            .iter_mut()
+            .for_each(AMPBlock::prepare_inference);
+        self.activation_post.prepare_inference();
+    }
+
+    /// Undo [`prepare_for_inference`](Self::prepare_for_inference) so the model
+    /// can be trained: the activations return to differentiable ops and
+    /// weight normalisation is re-imposed on any fused convolution (`g` starts
+    /// at the weight's norm, so the function is unchanged).
+    pub fn prepare_for_training(&mut self) {
+        self.conv_pre.normalize();
+        self.ups.iter_mut().for_each(ConvTranspose1d::normalize);
+        self.resblocks.iter_mut().for_each(|b| {
+            b.normalize();
+            b.unprepare_inference();
+        });
+        self.activation_post.unprepare();
+        self.conv_post.normalize();
+    }
+
+    /// Cast every parameter to `dtype`. The periodic activations always
+    /// compute in float32 internally; convolutions run in `dtype`.
+    pub fn to_dtype(&mut self, dtype: Dtype) {
+        self.conv_pre.cast(dtype);
+        self.ups.iter_mut().for_each(|u| u.cast(dtype));
+        self.resblocks.iter_mut().for_each(|b| b.cast(dtype));
+        self.activation_post.cast(dtype);
+        self.conv_post.cast(dtype);
+    }
+
+    /// Load a PyTorch-layout state dict (weight-normalised or fused), strictly:
+    /// every tensor must be used and every parameter found.
+    pub fn load_state_dict(&mut self, mut sd: StateDict) -> Result<()> {
+        self.conv_pre.load_state(&mut sd, "conv_pre")?;
+        // The reference wraps each upsampler in a one-element ModuleList.
+        for (i, up) in self.ups.iter_mut().enumerate() {
+            let nested = join_key(&format!("ups.{i}"), "0");
+            let prefix = if sd.contains(&join_key(&nested, "weight_v"))
+                || sd.contains(&join_key(&nested, "weight"))
+            {
+                nested
+            } else {
+                format!("ups.{i}")
+            };
+            up.load_state(&mut sd, &prefix)?;
         }
+        for (i, block) in self.resblocks.iter_mut().enumerate() {
+            block.load_state(&mut sd, &format!("resblocks.{i}"))?;
+        }
+        self.activation_post
+            .load_state(&mut sd, "activation_post")?;
+        self.conv_post.load_state(&mut sd, "conv_post")?;
+        sd.finish()
+    }
+
+    /// The model's tensors under the reference's names and layout.
+    pub fn state_dict(&self) -> Vec<(String, Array)> {
+        let mut out = Vec::new();
+        self.conv_pre.save_state("conv_pre", &mut out);
+        for (i, up) in self.ups.iter().enumerate() {
+            up.save_state(&format!("ups.{i}.0"), &mut out);
+        }
+        for (i, block) in self.resblocks.iter().enumerate() {
+            block.save_state(&format!("resblocks.{i}"), &mut out);
+        }
+        self.activation_post.save_state("activation_post", &mut out);
+        self.conv_post.save_state("conv_post", &mut out);
+        out
+    }
+
+    /// Radius, in output samples, of the generator's receptive field: an
+    /// output sample is unaffected by mel frames more than this many samples
+    /// away (measured from the frame's start, `frame * hop_size`).
+    pub fn receptive_radius_samples(&self) -> i32 {
+        let num_kernels = self.num_kernels();
+        // Work in samples at the current rate, one side. The input convolution
+        // reaches `(7 - 1) / 2` frames.
+        let mut radius = self.conv_pre.config().kernel_size / 2;
+        for (i, up) in self.ups.iter().enumerate() {
+            let (rate, kernel, pad) = up.geometry();
+            // Output j reads inputs t with t*rate - pad <= j <= t*rate - pad + kernel - 1.
+            radius = radius * rate + pad.max(kernel - 1 - pad);
+            let blocks = &self.resblocks[i * num_kernels..(i + 1) * num_kernels];
+            radius += blocks
+                .iter()
+                .map(AMPBlock::receptive_radius)
+                .max()
+                .unwrap_or(0);
+        }
+        radius += self.activation_post.receptive_radius();
+        radius + self.conv_post.config().kernel_size / 2
+    }
+
+    /// The receptive-field radius in whole mel frames (rounded up).
+    pub fn receptive_radius_frames(&self) -> i32 {
+        let hop = self.config.hop_size;
+        (self.receptive_radius_samples() + hop - 1) / hop
+    }
+
+    /// The activation in use.
+    pub fn activation(&self) -> ActivationType {
+        self.config.activation
     }
 }
 
-/// Convert safetensors tensor to MLX Array.
-fn tensor_to_array(tensor: safetensors::tensor::TensorView<'_>) -> Result<Array> {
-    let shape: Vec<i32> = tensor.shape().iter().map(|&s| s as i32).collect();
-    let data = tensor.data();
-
-    // Handle different dtypes
-    match tensor.dtype() {
-        safetensors::Dtype::F32 => {
-            let floats: &[f32] = <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
-            Ok(Array::from_f32_slice(floats, &shape))
-        }
-        safetensors::Dtype::F16 => {
-            // Convert f16 to f32
-            let f16s: &[half::f16] =
-                <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
-            let floats: Vec<f32> = f16s.iter().map(|f| f.to_f32()).collect();
-            Ok(Array::from_f32_slice(&floats, &shape))
-        }
-        safetensors::Dtype::BF16 => {
-            // Convert bf16 to f32
-            let bf16s: &[half::bf16] =
-                <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
-            let floats: Vec<f32> = bf16s.iter().map(|f| f.to_f32()).collect();
-            Ok(Array::from_f32_slice(&floats, &shape))
-        }
-        _ => Err(VocoderError::WeightLoad(format!(
-            "Unsupported dtype: {:?}",
-            tensor.dtype()
-        ))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bigvgan_new() {
-        let config = BigVGANConfig::v2_24khz_100band();
-        let model = BigVGAN::new(config).unwrap();
-
-        assert_eq!(model.upsamples.len(), 6);
-        assert_eq!(model.amp_blocks.len(), 6);
-    }
-
-    #[test]
-    fn test_bigvgan_forward_shape() {
-        let config = BigVGANConfig::v2_24khz_100band();
-        let model = BigVGAN::new(config).unwrap();
-
-        // Create a small mel spectrogram
-        let mel = Array::random_normal(&[1, 100, 10], 10);
-        let audio = model.forward(&mel).unwrap();
-        let a2 = audio.clone();
-        a2.eval();
-
-        // Output should be [1, 1, samples]
-        // With 256x upsampling: 10 frames * 256 = 2560 samples
-        assert_eq!(a2.dim(0), 1); // batch
-        assert_eq!(a2.dim(1), 1); // mono channel
-        // Note: exact length may vary due to conv padding
-    }
-
-    #[test]
-    fn test_bigvgan_generate() {
-        let config = BigVGANConfig::base_24khz_100band();
-        let model = BigVGAN::new(config).unwrap();
-
-        // Test 2D input (no batch)
-        let mel = Array::random_normal(&[100, 8], 10);
-        let audio = model.generate(&mel).unwrap();
-        let a2 = audio.clone();
-        a2.eval();
-
-        // Should be 1D output
-        assert_eq!(a2.ndim(), 1);
-    }
-
-    #[test]
-    fn test_bigvgan_output_range() {
-        let config = BigVGANConfig::base_24khz_100band();
-        let model = BigVGAN::new(config).unwrap();
-
-        let mel = Array::random_normal(&[1, 100, 4], 10);
-        let audio = model.forward(&mel).unwrap();
-        let a2 = audio.clone();
-        a2.eval();
-
-        // Output should be in [-1, 1] due to tanh
-        let max_val = a2.max(None);
-        let min_val = a2.min(None);
-        max_val.eval();
-        min_val.eval();
-
-        assert!(max_val.item_f32() <= 1.0);
-        assert!(min_val.item_f32() >= -1.0);
-    }
-}
+impl_module_params!(BigVGAN; conv_pre, ups, resblocks, activation_post, conv_post);

@@ -658,6 +658,7 @@ fn build_and_link() {
         "bridge_cce.cpp",
         "bridge_gdn.cpp",
         "bridge_distributed.cpp",
+        "bridge_metal_kernel.cpp",
     ];
 
     let mut build = cc::Build::new();

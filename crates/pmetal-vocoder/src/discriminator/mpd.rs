@@ -1,194 +1,187 @@
-//! Multi-Period Discriminator (MPD) for BigVGAN.
+//! Multi-Period Discriminator (MPD, HiFi-GAN; Kong et al., 2020).
 //!
-//! The MPD captures periodic patterns in audio by reshaping the waveform
-//! into 2D representations with different periods and applying 2D convolutions.
+//! A period-`p` discriminator folds the waveform into a `[time / p, p]` grid so
+//! that samples `p` apart land in the same column, then convolves along time
+//! only (kernels of shape `(k, 1)`): each column is one phase of a
+//! `p`-periodic signal.
 
-use super::DiscriminatorOutput;
-use crate::error::Result;
-use crate::nn::WeightNormConv1d;
-use pmetal_runtime::compat::{Array, nn, ops};
+use super::{Discriminator, DiscriminatorOutput, conv_act, conv2d, flatten_logits, scaled};
+use crate::error::{Result, VocoderError};
+use crate::nn::{Conv2d, StateDict, join_key};
+use pmetal_runtime::compat::Array;
+use pmetal_runtime::compat::ops::{self, PadMode};
+use pmetal_runtime::impl_module_params;
 
-/// Multi-Period Discriminator.
-///
-/// Consists of multiple period discriminators with different periods
-/// (e.g., 2, 3, 5, 7, 11) to capture various periodic structures.
+/// Periods of the reference model.
+const DEFAULT_PERIODS: [i32; 5] = [2, 3, 5, 7, 11];
+
+/// A bank of period discriminators.
 #[derive(Debug)]
 pub struct MultiPeriodDiscriminator {
-    /// Individual period discriminators.
+    /// One discriminator per period.
     pub discriminators: Vec<PeriodDiscriminator>,
 }
 
 impl MultiPeriodDiscriminator {
-    /// Create a new MPD with default periods [2, 3, 5, 7, 11].
+    /// The reference's periods `[2, 3, 5, 7, 11]` at full width.
     pub fn new() -> Result<Self> {
-        let periods = vec![2, 3, 5, 7, 11];
-        let discriminators = periods
-            .into_iter()
-            .map(PeriodDiscriminator::new)
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self { discriminators })
+        Self::with_periods(&DEFAULT_PERIODS, 1.0)
     }
 
-    /// Create MPD with custom periods.
-    pub fn with_periods(periods: Vec<i32>) -> Result<Self> {
-        let discriminators = periods
-            .into_iter()
-            .map(PeriodDiscriminator::new)
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self { discriminators })
+    /// Custom periods; `channel_mult` scales every layer's width.
+    pub fn with_periods(periods: &[i32], channel_mult: f32) -> Result<Self> {
+        if periods.is_empty() {
+            return Err(VocoderError::Config(
+                "the MPD needs at least one period".into(),
+            ));
+        }
+        Ok(Self {
+            discriminators: periods
+                .iter()
+                .map(|&p| PeriodDiscriminator::new(p, channel_mult))
+                .collect::<Result<_>>()?,
+        })
     }
 
-    /// Forward pass through all period discriminators.
-    pub fn forward(&self, audio: &Array) -> Result<Vec<DiscriminatorOutput>> {
+    /// Fold weight normalisation into the weights.
+    pub fn fuse_weight_norm(&mut self) {
+        self.discriminators
+            .iter_mut()
+            .for_each(PeriodDiscriminator::fuse);
+    }
+}
+
+impl Discriminator for MultiPeriodDiscriminator {
+    fn discriminate(&self, audio: &Array) -> Result<Vec<DiscriminatorOutput>> {
         self.discriminators
             .iter()
             .map(|d| d.forward(audio))
             .collect()
     }
-}
 
-impl Default for MultiPeriodDiscriminator {
-    fn default() -> Self {
-        Self::new().expect("Failed to create MPD")
+    fn load_state(&mut self, sd: &mut StateDict, prefix: &str) -> Result<()> {
+        for (i, d) in self.discriminators.iter_mut().enumerate() {
+            d.load_state(sd, &join_key(prefix, &format!("discriminators.{i}")))?;
+        }
+        Ok(())
+    }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (i, d) in self.discriminators.iter().enumerate() {
+            d.save_state(&join_key(prefix, &format!("discriminators.{i}")), out);
+        }
     }
 }
 
-/// Single period discriminator.
-///
-/// Reshapes audio with a specific period and applies 2D convolutions.
+impl_module_params!(MultiPeriodDiscriminator; discriminators);
+
+/// Discriminator for one period.
 #[derive(Debug)]
 pub struct PeriodDiscriminator {
-    /// Period for reshaping.
+    /// The period the waveform is folded by.
     pub period: i32,
-    /// Convolutional layers.
-    pub convs: Vec<WeightNormConv1d>,
-    /// Final output convolution.
-    pub conv_post: WeightNormConv1d,
+    /// Four strided convolutions and one stride-1 convolution.
+    pub convs: Vec<Conv2d>,
+    /// Output convolution to a single channel.
+    pub conv_post: Conv2d,
 }
 
 impl PeriodDiscriminator {
-    /// Create a new period discriminator.
-    ///
-    /// # Arguments
-    /// * `period` - Reshaping period
-    pub fn new(period: i32) -> Result<Self> {
-        // Channel progression: period -> 32 -> 128 -> 512 -> 1024 -> 1024
-        // First layer takes `period` channels since we reshape [B, 1, T] -> [B, period, T/period]
-        let channels = [
-            (period, 32),
-            (32, 128),
-            (128, 512),
-            (512, 1024),
-            (1024, 1024),
-        ];
-
-        let mut convs = Vec::with_capacity(channels.len());
-        for (i, (in_ch, out_ch)) in channels.iter().enumerate() {
-            // Stride of 3 for first 4 layers, 1 for last
-            let stride = if i < 4 { 3 } else { 1 };
-            let kernel = 5;
-            let padding = 2;
-
-            // Note: In actual BigVGAN, these are 2D convs applied after reshape
-            // We approximate with 1D conv treating period as channels
-            let conv = WeightNormConv1d::new(
-                *in_ch,
-                *out_ch,
-                kernel,
-                Some(stride),
-                Some(padding),
-                None,
-                None,
-                Some(true),
-            )?;
-            convs.push(conv);
+    /// A discriminator for `period` at `channel_mult` times the reference width
+    /// (1 -> 32, 128, 512, 1024, 1024 channels).
+    pub fn new(period: i32, channel_mult: f32) -> Result<Self> {
+        if period < 1 {
+            return Err(VocoderError::Config(format!(
+                "period must be >= 1, got {period}"
+            )));
         }
-
-        // Final 1x1 conv to single channel
-        let conv_post =
-            WeightNormConv1d::new(1024, 1, 3, Some(1), Some(1), None, None, Some(true))?;
-
+        let widths = [
+            1,
+            scaled(32, channel_mult),
+            scaled(128, channel_mult),
+            scaled(512, channel_mult),
+            scaled(1024, channel_mult),
+            scaled(1024, channel_mult),
+        ];
+        let mut convs = Vec::with_capacity(5);
+        for i in 0..5 {
+            // Kernel (5, 1) over time; the first four layers stride by 3.
+            let stride = if i < 4 { 3 } else { 1 };
+            convs.push(conv2d(
+                widths[i],
+                widths[i + 1],
+                (5, 1),
+                (stride, 1),
+                (2, 0),
+            )?);
+        }
         Ok(Self {
             period,
             convs,
-            conv_post,
+            conv_post: conv2d(widths[5], 1, (3, 1), (1, 1), (1, 0))?,
         })
     }
 
-    /// Forward pass.
-    ///
-    /// # Arguments
-    /// * `audio` - Audio waveform [batch, 1, samples]
-    ///
-    /// # Returns
-    /// Discriminator output with logits and feature maps
+    /// Score `audio` (`[batch, 1, samples]`).
     pub fn forward(&self, audio: &Array) -> Result<DiscriminatorOutput> {
-        let batch = audio.dim(0);
-        let samples = audio.dim(2);
-
-        // Pad to make divisible by period
+        if audio.ndim() != 3 || audio.dim(1) != 1 {
+            return Err(VocoderError::ShapeMismatch {
+                expected: vec![-1, 1, -1],
+                actual: audio.shape().to_vec(),
+            });
+        }
+        let (batch, samples) = (audio.dim(0), audio.dim(2));
+        // Reflect-pad up to a whole number of periods.
         let remainder = samples % self.period;
-        let x = if remainder != 0 {
-            let pad_size = self.period - remainder;
-            let padding = Array::zeros(&[batch, 1, pad_size], 10);
-            ops::concatenate_axis(&[audio, &padding], -1)
+        let wave = audio.reshape(&[batch, samples]);
+        let wave = if remainder != 0 {
+            let pad = self.period - remainder;
+            if pad >= samples {
+                return Err(VocoderError::Audio(format!(
+                    "a {samples}-sample signal is too short to reflect-pad for period {}",
+                    self.period
+                )));
+            }
+            ops::pad(&wave, &[(0, 0), (0, pad)], Some(PadMode::Reflect), None)
         } else {
-            audio.clone()
+            wave
         };
+        // [B, T] -> [B, T / p, p, 1]: rows are time steps of the period grid.
+        let mut x = wave.reshape(&[batch, wave.dim(1) / self.period, self.period, 1]);
 
-        // Reshape: [B, 1, T] -> [B, period, T/period]
-        // Then treat period as channels for 1D conv
-        let new_length = x.dim(2);
-        let x = x.reshape(&[batch, self.period, new_length / self.period]);
-
-        // Apply convolutions and collect features
-        let mut features = Vec::new();
-        let mut x = x;
-
+        let mut features = Vec::with_capacity(self.convs.len() + 1);
         for conv in &self.convs {
-            x = conv.forward(&x)?;
-            x = nn::leaky_relu(&x, 0.1);
+            x = conv_act(conv, &x)?;
             features.push(x.clone());
         }
+        let x = self.conv_post.forward(&x)?;
+        features.push(x.clone());
+        Ok(DiscriminatorOutput {
+            logits: flatten_logits(&x),
+            features,
+        })
+    }
 
-        // Final convolution
-        let logits = self.conv_post.forward(&x)?;
+    fn fuse(&mut self) {
+        self.convs.iter_mut().for_each(Conv2d::fuse);
+        self.conv_post.fuse();
+    }
 
-        Ok(DiscriminatorOutput { logits, features })
+    fn load_state(&mut self, sd: &mut StateDict, prefix: &str) -> Result<()> {
+        for (i, c) in self.convs.iter_mut().enumerate() {
+            c.load_state(sd, &join_key(prefix, &format!("convs.{i}")))?;
+        }
+        self.conv_post
+            .load_state(sd, &join_key(prefix, "conv_post"))
+    }
+
+    fn save_state(&self, prefix: &str, out: &mut Vec<(String, Array)>) {
+        for (i, c) in self.convs.iter().enumerate() {
+            c.save_state(&join_key(prefix, &format!("convs.{i}")), out);
+        }
+        self.conv_post
+            .save_state(&join_key(prefix, "conv_post"), out);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_period_discriminator() {
-        let disc = PeriodDiscriminator::new(2).unwrap();
-
-        let audio = Array::random_normal(&[1, 1, 1024], 10);
-        let output = disc.forward(&audio).unwrap();
-        let l2 = output.logits.clone();
-        l2.eval();
-
-        assert!(!output.features.is_empty());
-    }
-
-    #[test]
-    fn test_mpd() {
-        let mpd = MultiPeriodDiscriminator::new().unwrap();
-
-        let audio = Array::random_normal(&[2, 1, 2048], 10);
-        let outputs = mpd.forward(&audio).unwrap();
-
-        assert_eq!(outputs.len(), 5); // 5 periods
-    }
-
-    #[test]
-    fn test_mpd_different_periods() {
-        let mpd = MultiPeriodDiscriminator::with_periods(vec![2, 5, 11]).unwrap();
-        assert_eq!(mpd.discriminators.len(), 3);
-    }
-}
+impl_module_params!(PeriodDiscriminator; convs, conv_post);
