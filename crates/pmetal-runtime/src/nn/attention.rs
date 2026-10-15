@@ -332,6 +332,32 @@ fn create_causal_mask(query_len: i32, key_len: i32) -> Result<Array, Exception> 
     Ok(mask.reshape(&[1, 1, query_len, key_len]))
 }
 
+/// A mask the caller built (a block-diagonal causal one for packed sequences,
+/// a padding mask) restricted to the sliding window of a local layer.
+///
+/// A custom mask replaces the configuration's mask type wholesale, so a layer
+/// that hands one to [`fused_sdpa`] attends as far back as that mask lets it,
+/// which for a causal mask is the whole sequence: a sliding-window model
+/// trained under one is a different model from the one it is served as, as
+/// soon as a sequence outruns the window. The result is `mask` plus the causal
+/// band of `window` keys, in the shapes [`create_sliding_window_mask`] has
+/// (queries aligned to the end of the keys). `mask` is additive, or boolean
+/// with true where a query may attend; the result is additive.
+pub fn restrict_to_sliding_window(
+    mask: &Array,
+    query_len: i32,
+    key_len: i32,
+    window: i32,
+) -> Result<Array, Exception> {
+    let band = create_sliding_window_mask(query_len, key_len, window)?;
+    let additive = if mask.dtype() == Dtype::Bool {
+        mask.where_cond(&Array::from_f32(0.0), &Array::from_f32(f32::NEG_INFINITY))
+    } else {
+        mask.as_dtype(Dtype::Float32.as_i32())
+    };
+    Ok(additive.add(&band))
+}
+
 /// Create sliding window causal mask.
 ///
 /// Positions can only attend to positions within `window_size` distance.

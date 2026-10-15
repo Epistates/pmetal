@@ -246,7 +246,10 @@ impl MtpDrafter<Gemma4MtpVerifier<'_>> for Gemma4MtpDrafter<'_> {
         position: usize,
     ) -> Result<(Array, Array), Exception> {
         let shared_states = self.kv_sources.shared_states(target.cache)?;
-        let embedding = embed_target_token(target.model, token);
+        let embedding = target
+            .model
+            .model
+            .embed_scaled(&prompt_tokens_to_input(&[token]));
         let inputs_embeds = concatenate_axis(&[&embedding, hidden], -1);
         // `[1, 1, H]` for the next step, `[1, V]` logits.
         self.assistant
@@ -264,15 +267,6 @@ impl MtpDrafter<Gemma4MtpVerifier<'_>> for Gemma4MtpDrafter<'_> {
     ) -> Result<(), Exception> {
         Ok(())
     }
-}
-
-fn embed_target_token(target: &Gemma4ForCausalLM, token: u32) -> Array {
-    let input = prompt_tokens_to_input(&[token]);
-    target
-        .model
-        .embed_tokens
-        .forward(&input)
-        .multiply(&Array::from_f32(target.model.embed_scale))
 }
 
 #[cfg(test)]

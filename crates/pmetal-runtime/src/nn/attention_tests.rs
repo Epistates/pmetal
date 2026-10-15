@@ -610,6 +610,62 @@ fn sink_attention_step_against_plain_ops() {
     }
 }
 
+/// A training step's worth of sliding-window attention (forward and backward,
+/// bf16, a Gemma 4 sliding layer's 16 query heads over 8 key heads of width
+/// 256 and window 1024) against full causal attention at the same length. Time
+/// and peak memory; run with `--ignored --nocapture`.
+#[test]
+#[serial]
+#[ignore = "benchmark"]
+fn sliding_attention_step_against_causal() {
+    use crate::compat::nn::value_and_grad_explicit;
+    use crate::compat::random;
+    use crate::inline_array::{get_peak_memory, reset_peak_memory};
+    use std::time::Instant;
+
+    let (heads, kv_heads, head_dim, window) = (16, 8, 256, 1024);
+    let bf16 = Dtype::Bfloat16.as_i32();
+    for len in [2048, 4096, 8192] {
+        let draw = |h: i32| random::normal(&[1, h, len, head_dim], Dtype::Float32).as_dtype(bf16);
+        let (q, k, v) = (draw(heads), draw(kv_heads), draw(kv_heads));
+        for (name, mask_type) in [
+            ("causal", AttentionMaskType::Causal),
+            ("sliding", AttentionMaskType::SlidingWindow(window)),
+        ] {
+            let config = FusedAttentionConfig::new(heads, kv_heads, head_dim)
+                .with_scale(1.0)
+                .with_mask_type(mask_type);
+            let step = || {
+                let (_, grads) = value_and_grad_explicit(
+                    |a: &[Array]| {
+                        fused_sdpa(&a[0], &a[1], &a[2], &config, None)
+                            .unwrap()
+                            .as_dtype(Dtype::Float32.as_i32())
+                            .square()
+                            .sum_all()
+                    },
+                    &[q.clone(), k.clone(), v.clone()],
+                    &[],
+                )
+                .unwrap();
+                grads.iter().for_each(|g| {
+                    g.eval();
+                });
+                drain();
+            };
+            step();
+            reset_peak_memory();
+            let start = Instant::now();
+            for _ in 0..3 {
+                step();
+            }
+            let ms = start.elapsed().as_secs_f64() * 1e3 / 3.0;
+            let peak = get_peak_memory() as f64 / (1 << 20) as f64;
+            eprintln!("L={len:5} {name:8} {ms:9.1} ms/step   peak {peak:8.0} MiB");
+        }
+    }
+}
+
 /// A training step's worth of Gemma 2's softcapped attention (forward and
 /// backward, bf16, 16 query heads over 8 key heads of width 256): scores in
 /// f32 with a broadcast group axis against plain ops (scores in the queries'

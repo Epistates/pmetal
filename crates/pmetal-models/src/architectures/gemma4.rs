@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 
 use pmetal_cache::kv_cache::KVCache;
 use pmetal_runtime::nn::{
-    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, restrict_to_sliding_window,
     rope::{RopePositions, rope, rope_with_periods},
 };
 
@@ -1544,6 +1544,18 @@ impl Gemma4Model {
         self.forward_with_capture(input_ids, mask, cache, None, None)
     }
 
+    /// The token embedding times `sqrt(hidden_size)`: what the first layer
+    /// reads, and what an MTP assistant reads for the newest token.
+    ///
+    /// `mul_scalar` casts the scalar to the embedding's dtype first. A bare
+    /// f32 here promotes a bf16 checkpoint's residual stream to f32 and
+    /// carries it through all forty-eight layers.
+    pub fn embed_scaled(&self, input_ids: &Array) -> Array {
+        self.embed_tokens
+            .forward(input_ids)
+            .mul_scalar(self.embed_scale)
+    }
+
     /// Forward pass with one rotary position per token, `[seq_len]`.
     ///
     /// Packed training concatenates several sequences into one row, so the
@@ -1567,13 +1579,7 @@ impl Gemma4Model {
         positions: Option<&Array>,
         mut capture: Option<&mut pmetal_cache::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
-        // `mul_scalar` casts the scalar to the embedding's dtype first. A bare
-        // f32 here promotes a bf16 checkpoint's residual stream to f32 and
-        // carries it through all forty-eight layers.
-        let mut h = self
-            .embed_tokens
-            .forward(input_ids)
-            .mul_scalar(self.embed_scale);
+        let mut h = self.embed_scaled(input_ids);
         let per_layer_inputs = self
             .per_layer_inputs
             .as_ref()
@@ -1588,7 +1594,26 @@ impl Gemma4Model {
         {
             buf.record_embedding(h.clone());
         }
+        // A mask the caller gives (packed sequences' block-diagonal one, a
+        // padding mask) says which sequence a token belongs to, not how far
+        // back a local layer reaches. Without the window a sliding layer
+        // attends to its whole sequence, and the model trained under that mask
+        // is not the model served without it.
+        let sliding_mask = match mask {
+            Some(mask) => Some(restrict_to_sliding_window(
+                mask,
+                input_ids.dim(1),
+                mask.dim(mask.ndim() - 1),
+                self.config.sliding_window,
+            )?),
+            None => None,
+        };
         for (i, layer) in self.layers.iter_mut().enumerate() {
+            let layer_mask = if layer.self_attn.sliding_window.is_some() {
+                sliding_mask.as_ref()
+            } else {
+                mask
+            };
             let layer_input = per_layer_inputs
                 .as_ref()
                 .map(|inputs| layer_per_input(inputs, i));
@@ -1611,7 +1636,7 @@ impl Gemma4Model {
                     })?;
                     h = layer.forward_with_shared_kv(
                         &h,
-                        mask,
+                        layer_mask,
                         &source_keys,
                         &source_values,
                         rope_positions,
@@ -1629,7 +1654,7 @@ impl Gemma4Model {
                         })?;
                     h = layer.forward_with_shared_kv(
                         &h,
-                        mask,
+                        layer_mask,
                         source_keys,
                         source_values,
                         rope_positions,
@@ -1639,7 +1664,7 @@ impl Gemma4Model {
             } else if let Some(ref mut shared_kv) = local_shared_kv {
                 let (next_h, keys, values) = layer.forward_collect_kv(
                     &h,
-                    mask,
+                    layer_mask,
                     RopePositions::resolve(positions, 0),
                     layer_input_ref,
                 )?;
@@ -1647,7 +1672,7 @@ impl Gemma4Model {
                 h = next_h;
             } else {
                 let c = cache.as_deref_mut().map(|c| (c, i));
-                h = layer.forward(&h, mask, c, positions, layer_input_ref)?;
+                h = layer.forward(&h, layer_mask, c, positions, layer_input_ref)?;
             }
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(i)
@@ -2495,6 +2520,57 @@ mod moe_tests {
             pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
             assert_eq!(hidden.dtype_raw(), bf16, "{label}: trunk output dtype");
             assert_eq!(logits.dtype_raw(), bf16, "{label}: logits dtype");
+        }
+    }
+
+    /// Two sequences packed into one row, under the block-diagonal causal mask
+    /// packed training builds, give each sequence what it gets alone. The mask
+    /// alone is a causal one; a sliding layer that took it as the whole story
+    /// would attend past its window inside every sequence longer than the
+    /// window, and the model trained would not be the model served.
+    #[test]
+    #[serial]
+    fn packed_sequences_keep_their_sliding_window() {
+        for moe in [false, true] {
+            random::seed(9);
+            let mut model = Gemma4ForCausalLM::new(tiny_config(moe)).unwrap();
+            for (_, p) in model.flatten_params_mut() {
+                *p = random::uniform_range(-0.5, 0.5, p.shape(), Dtype::Float32);
+            }
+            let (first, second) = (11usize, 13usize); // window 8
+            let n = first + second;
+            let mut mask = vec![f32::NEG_INFINITY; n * n];
+            for (start, len) in [(0, first), (first, second)] {
+                for i in 0..len {
+                    for j in 0..=i {
+                        mask[(start + i) * n + start + j] = 0.0;
+                    }
+                }
+            }
+            let mask = Array::from_f32_slice(&mask, &[1, 1, n as i32, n as i32]);
+            let positions: Vec<i32> = (0..first as i32).chain(0..second as i32).collect();
+            let positions = Array::from_slice(&positions, &[n as i32]);
+            let tokens: Vec<i32> = (0..n as i32).map(|i| (i * 7 + 3) % VOCAB).collect();
+            let vocab = VOCAB as usize;
+
+            let packed = Array::from_slice(&tokens, &[1, n as i32]);
+            let mut logits = model
+                .forward_with_positions(&packed, Some(&mask), Some(&positions))
+                .unwrap();
+            let packed_logits = logits.to_f32_vec(n * vocab).unwrap();
+            for (start, len) in [(0, first), (first, second)] {
+                let alone = Array::from_slice(&tokens[start..start + len], &[1, len as i32]);
+                let mut logits = model.forward(&alone, None).unwrap();
+                let alone_logits = logits.to_f32_vec(len * vocab).unwrap();
+                let rows = &packed_logits[start * vocab..(start + len) * vocab];
+                let worst = rows
+                    .iter()
+                    .zip(&alone_logits)
+                    .map(|(g, w)| (g - w).abs())
+                    .fold(0.0f32, |m, d| if d.is_nan() { f32::NAN } else { m.max(d) });
+                assert!(worst < 1e-3, "moe={moe}: a packed sequence is off by {worst}");
+            }
+            pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
         }
     }
 
