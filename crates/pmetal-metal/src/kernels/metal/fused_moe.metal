@@ -3,9 +3,11 @@
 /// Provides optimized dequant kernels for MoE inference using the qdot technique
 /// (pre-scaled activations, eliminating shifts from inner loop):
 ///
-/// 1. `fused_gate_up_swiglu` — Fused gate+up+SwiGLU for a single quantized expert
-/// 2. `dequant_matvec_4bit` — Optimized 4-bit dequant matrix-vector multiply
-/// 3. `dequant_matvec_2bit` — 2-bit variant for further compressed experts
+/// 1. `fused_gate_up_swiglu_{4,2}bit` — Fused gate+up+SwiGLU for a single quantized expert
+/// 2. `dequant_matvec_{4,2}bit` — dequant matrix-vector multiply (the down projection)
+///
+/// Weights are MLX's affine layout: element `j` of a word at bits `j * BITS`,
+/// bf16 scale and bias per group, `w = scale * q + bias`.
 ///
 /// Key techniques:
 ///   - qdot: pre-scale activations to eliminate per-nibble shifts
@@ -139,12 +141,48 @@ inline void load_x2(device const float* x_ptr, thread float* xl) {
 
 
 // ============================================================================
-// Kernel 1: Fused Gate+Up+SwiGLU (single expert, quantized 4-bit)
+// Bit-width traits
+// ============================================================================
+//
+// One kernel body per operation serves every bit width: the traits give the
+// number of values a word holds, the length of the pre-scaled x registers
+// (the values plus their sum), and the loader and dot product above.
+
+template <int BITS>
+struct QuantTraits;
+
+template <>
+struct QuantTraits<4> {
+    static constant constexpr uint VALUES = 8;
+    static constant constexpr uint XLEN = 9;
+    static inline void load_x(device const float* x_ptr, thread float* xl) {
+        load_x4(x_ptr, xl);
+    }
+    static inline float2 qdot(thread const float* xl, uint32_t packed) {
+        return qdot4_local(xl, packed);
+    }
+};
+
+template <>
+struct QuantTraits<2> {
+    static constant constexpr uint VALUES = 16;
+    static constant constexpr uint XLEN = 17;
+    static inline void load_x(device const float* x_ptr, thread float* xl) {
+        load_x2(x_ptr, xl);
+    }
+    static inline float2 qdot(thread const float* xl, uint32_t packed) {
+        return qdot2_local(xl, packed);
+    }
+};
+
+// ============================================================================
+// Kernel 1: Fused Gate+Up+SwiGLU (single expert, affine-quantized)
 // ============================================================================
 //
 // x loaded once per column into thread-local registers, reused across
 // RESULTS_PER_SG gate rows + RESULTS_PER_SG up rows = 8 qdot calls per col.
 
+template <int BITS>
 kernel void fused_gate_up_swiglu(
     device const uint32_t* gate_W      [[buffer(0)]],
     device const uint16_t* gate_scales [[buffer(1)]],
@@ -161,22 +199,23 @@ kernel void fused_gate_up_swiglu(
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
+    typedef QuantTraits<BITS> Q;
     uint row_base = tgid * ROWS_PER_TG + simd_group * RESULTS_PER_SG;
     if (row_base >= out_dim) return;
 
-    uint packed_cols = in_dim / 8;
+    uint packed_cols = in_dim / Q::VALUES;
     uint num_groups = in_dim / group_size;
-    uint pf_gs = group_size / 8;
+    uint words_per_group = group_size / Q::VALUES;
 
     float ga[RESULTS_PER_SG] = {0, 0, 0, 0};
     float ua[RESULTS_PER_SG] = {0, 0, 0, 0};
 
     for (uint col = simd_lane; col < packed_cols; col += 32) {
-        // Load x ONCE into thread-local registers — reused across all 8 qdot calls
-        thread float xl[9]; // 8 pre-scaled + x_sum
-        load_x4(x + col * 8, xl);
+        // Load x ONCE into thread-local registers, reused across the rows.
+        thread float xl[Q::XLEN];
+        Q::load_x(x + col * Q::VALUES, xl);
 
-        uint g = col / pf_gs;
+        uint g = col / words_per_group;
 
         for (uint r = 0; r < RESULTS_PER_SG; r++) {
             uint row = row_base + r;
@@ -185,11 +224,11 @@ kernel void fused_gate_up_swiglu(
             uint w_idx = row * packed_cols + col;
             uint sb_idx = row * num_groups + g;
 
-            float2 gqd = qdot4_local(xl, gate_W[w_idx]);
+            float2 gqd = Q::qdot(xl, gate_W[w_idx]);
             ga[r] += bf16_to_f32(gate_scales[sb_idx]) * gqd.x
                    + bf16_to_f32(gate_biases[sb_idx]) * gqd.y;
 
-            float2 uqd = qdot4_local(xl, up_W[w_idx]);
+            float2 uqd = Q::qdot(xl, up_W[w_idx]);
             ua[r] += bf16_to_f32(up_scales[sb_idx]) * uqd.x
                    + bf16_to_f32(up_biases[sb_idx]) * uqd.y;
         }
@@ -206,12 +245,12 @@ kernel void fused_gate_up_swiglu(
     }
 }
 
-
 // ============================================================================
-// Kernel 2: Optimized 4-bit dequant matrix-vector multiply (qdot)
+// Kernel 2: dequant matrix-vector multiply (qdot)
 // ============================================================================
 
-kernel void dequant_matvec_4bit(
+template <int BITS>
+kernel void dequant_matvec(
     device const uint32_t* W_packed   [[buffer(0)]],
     device const uint16_t* scales     [[buffer(1)]],
     device const uint16_t* biases     [[buffer(2)]],
@@ -224,26 +263,27 @@ kernel void dequant_matvec_4bit(
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
+    typedef QuantTraits<BITS> Q;
     uint row_base = tgid * ROWS_PER_TG + simd_group * RESULTS_PER_SG;
     if (row_base >= out_dim) return;
 
-    uint packed_cols = in_dim / 8;
+    uint packed_cols = in_dim / Q::VALUES;
     uint num_groups = in_dim / group_size;
-    uint pf_gs = group_size / 8;
+    uint words_per_group = group_size / Q::VALUES;
 
     float acc[RESULTS_PER_SG] = {0, 0, 0, 0};
 
     for (uint col = simd_lane; col < packed_cols; col += 32) {
-        thread float xl[9];
-        load_x4(x + col * 8, xl);
+        thread float xl[Q::XLEN];
+        Q::load_x(x + col * Q::VALUES, xl);
 
-        uint g = col / pf_gs;
+        uint g = col / words_per_group;
 
         for (uint r = 0; r < RESULTS_PER_SG; r++) {
             uint row = row_base + r;
             if (row >= out_dim) break;
 
-            float2 qd = qdot4_local(xl, W_packed[row * packed_cols + col]);
+            float2 qd = Q::qdot(xl, W_packed[row * packed_cols + col]);
             acc[r] += bf16_to_f32(scales[row * num_groups + g]) * qd.x
                     + bf16_to_f32(biases[row * num_groups + g]) * qd.y;
         }
@@ -259,56 +299,11 @@ kernel void dequant_matvec_4bit(
     }
 }
 
+#define INSTANTIATE_EXPERT_KERNELS(BITS)                                           \
+    template [[host_name("fused_gate_up_swiglu_" #BITS "bit")]] kernel               \
+        decltype(fused_gate_up_swiglu<BITS>) fused_gate_up_swiglu<BITS>;             \
+    template [[host_name("dequant_matvec_" #BITS "bit")]] kernel                     \
+        decltype(dequant_matvec<BITS>) dequant_matvec<BITS>;
 
-// ============================================================================
-// Kernel 3: 2-bit dequant matrix-vector multiply (qdot)
-// ============================================================================
-
-kernel void dequant_matvec_2bit(
-    device const uint32_t* W_packed   [[buffer(0)]],
-    device const uint16_t* scales     [[buffer(1)]],
-    device const uint16_t* biases     [[buffer(2)]],
-    device const float*    x          [[buffer(3)]],
-    device float*          out        [[buffer(4)]],
-    constant uint&         out_dim    [[buffer(5)]],
-    constant uint&         in_dim     [[buffer(6)]],
-    constant uint&         group_size [[buffer(7)]],
-    uint tgid       [[threadgroup_position_in_grid]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint row_base = tgid * ROWS_PER_TG + simd_group * RESULTS_PER_SG;
-    if (row_base >= out_dim) return;
-
-    uint packed_cols = in_dim / 16;
-    uint num_groups = in_dim / group_size;
-    uint pf_gs = group_size / 16;
-
-    float acc[RESULTS_PER_SG] = {0, 0, 0, 0};
-
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        thread float xl[17]; // 16 pre-scaled + x_sum
-        load_x2(x + col * 16, xl);
-
-        uint g = col / pf_gs;
-
-        for (uint r = 0; r < RESULTS_PER_SG; r++) {
-            uint row = row_base + r;
-            if (row >= out_dim) break;
-
-            float2 qd = qdot2_local(xl, W_packed[row * packed_cols + col]);
-            acc[r] += bf16_to_f32(scales[row * num_groups + g]) * qd.x
-                    + bf16_to_f32(biases[row * num_groups + g]) * qd.y;
-        }
-    }
-
-    for (uint r = 0; r < RESULTS_PER_SG; r++) {
-        uint row = row_base + r;
-        if (row >= out_dim) break;
-        float sum = simd_sum(acc[r]);
-        if (simd_lane == 0) {
-            out[row] = sum;
-        }
-    }
-}
-
+INSTANTIATE_EXPERT_KERNELS(4)
+INSTANTIATE_EXPERT_KERNELS(2)
