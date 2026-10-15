@@ -5,16 +5,13 @@
 //! safetensors conversions. Both load into a [`StateDict`] of float32 arrays
 //! under the reference's tensor names, from where a model takes what it needs.
 //!
-//! The `.pt` reader is self-contained and restricted: it parses the ZIP
-//! container and interprets the pickle with an allow-list of globals, so
-//! opening an untrusted file cannot execute code.
-
-mod pickle;
-mod zip;
+//! The `.pt` reader is `pmetal_hub::torch`: it maps the ZIP container and
+//! interprets the pickle with an allow-list of globals, so opening an
+//! untrusted file cannot execute code.
 
 use crate::error::{Result, VocoderError};
 use crate::nn::StateDict;
-use pickle::{Obj, StorageDtype, TensorRef};
+use pmetal_hub::torch::{TorchArchive, TorchDtype};
 use pmetal_runtime::compat::Array;
 use std::collections::HashMap;
 use std::path::Path;
@@ -103,79 +100,40 @@ fn to_f32(data: &[u8], elem: Elem) -> Vec<f32> {
 }
 
 /// Load a PyTorch archive's state dict (see [`load_state_dict`]).
+///
+/// The archive is memory-mapped and read by `pmetal_hub::torch`, whose
+/// unpickler runs nothing: only the tensor rebuilders and `OrderedDict` are
+/// understood, anything else is an error.
 pub fn load_torch(path: &Path, key: Option<&str>) -> Result<StateDict> {
-    let bytes = std::fs::read(path)?;
-    let archive = zip::StoredZip::parse(&bytes)?;
-    let (root_dir, pkl) = archive.find_suffix("data.pkl").ok_or_else(|| {
-        VocoderError::WeightLoad(format!(
-            "{}: no data.pkl; not a PyTorch archive",
-            path.display()
-        ))
-    })?;
-    let root = pickle::load(pkl)?;
-
-    let selected = match key {
-        Some(k) => root
-            .get(k)
-            .ok_or_else(|| VocoderError::WeightLoad(format!("checkpoint has no `{k}` entry")))?,
-        None => root.get("generator").unwrap_or_else(|| root.clone()),
-    };
-    let items = selected.dict_items().ok_or_else(|| {
-        VocoderError::WeightLoad("the selected checkpoint entry is not a dict".into())
-    })?;
+    let fail = |e: &dyn std::fmt::Display| VocoderError::WeightLoad(e.to_string());
+    let archive = TorchArchive::open(path).map_err(|e| fail(&e))?;
+    // The released checkpoints nest the generator's weights under `generator`.
+    let group = key.or_else(|| {
+        archive
+            .groups()
+            .contains(&"generator")
+            .then_some("generator")
+    });
 
     let mut tensors = HashMap::new();
-    for (name, value) in items {
-        let Some(name) = name.as_str() else { continue };
-        // Non-tensor entries (e.g. `_metadata`) are not weights.
-        if let Obj::Tensor(t) = value {
-            tensors.insert(name.to_owned(), materialize(&archive, root_dir, &t, name)?);
-        }
-    }
-    if tensors.is_empty() {
-        return Err(VocoderError::WeightLoad(format!(
-            "{}: the selected entry holds no tensors",
-            path.display()
-        )));
+    for t in archive.tensors(group).map_err(|e| fail(&e))? {
+        let elem = match t.dtype {
+            TorchDtype::F32 => Elem::F32,
+            TorchDtype::F16 => Elem::F16,
+            TorchDtype::Bf16 => Elem::Bf16,
+            TorchDtype::F64 => Elem::F64,
+            other => {
+                return Err(VocoderError::WeightLoad(format!(
+                    "tensor `{}`: has non-float dtype {other:?}",
+                    t.name
+                )));
+            }
+        };
+        let shape: Vec<i32> = t.shape.iter().map(|&d| d as i32).collect();
+        tensors.insert(
+            t.name.clone(),
+            Array::from_f32_slice(&to_f32(t.data, elem), &shape),
+        );
     }
     Ok(StateDict::new(tensors))
-}
-
-/// Read a tensor's elements as float32 from its storage file.
-fn materialize(
-    archive: &zip::StoredZip<'_>,
-    root_dir: &str,
-    t: &TensorRef,
-    name: &str,
-) -> Result<Array> {
-    let fail = |msg: &str| VocoderError::WeightLoad(format!("tensor `{name}`: {msg}"));
-    let entry = format!("{root_dir}/data/{}", t.storage.key);
-    let bytes = archive
-        .entry(&entry)
-        .ok_or_else(|| fail(&format!("storage `{entry}` is missing")))?;
-
-    // Only densely packed row-major tensors are produced by `state_dict()`.
-    let mut expected = 1usize;
-    for (&dim, &stride) in t.shape.iter().zip(&t.stride).rev() {
-        if dim > 1 && stride != expected {
-            return Err(fail("is not stored contiguously"));
-        }
-        expected *= dim;
-    }
-    let numel: usize = t.shape.iter().product();
-    let width = t.storage.dtype.size();
-    let start = t.offset * width;
-    let data = bytes
-        .get(start..start + numel * width)
-        .ok_or_else(|| fail("runs past the end of its storage"))?;
-
-    let elem = match t.storage.dtype {
-        StorageDtype::F32 => Elem::F32,
-        StorageDtype::F16 => Elem::F16,
-        StorageDtype::Bf16 => Elem::Bf16,
-        StorageDtype::F64 => Elem::F64,
-        other => return Err(fail(&format!("has non-float dtype {other:?}"))),
-    };
-    let shape: Vec<i32> = t.shape.iter().map(|&d| d as i32).collect();
-    Ok(Array::from_f32_slice(&to_f32(data, elem), &shape))
 }

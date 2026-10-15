@@ -6,14 +6,16 @@
 //! committed (and the ones that must never be), their bytes, the commit
 //! message, and the token on every request.
 
-#![allow(unsafe_code)] // `std::env::set_var` (edition 2024)
+mod support;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use pmetal_hub::{UploadOptions, upload_model};
+use pmetal_core::SecretString;
+use pmetal_hub::{HubOptions, TransferProgress, UploadOptions, upload_model};
 use serde_json::{Value, json};
+use support::fixtures::isolate_env;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
@@ -123,12 +125,6 @@ async fn upload_creates_the_repo_and_commits_only_the_model_files() {
     let log = Arc::new(Mutex::new(Vec::new()));
     tokio::spawn(serve(listener, base.clone(), log.clone()));
 
-    // No other test in this binary reads the environment.
-    unsafe {
-        std::env::set_var("HF_ENDPOINT", &base);
-        std::env::set_var("HF_TOKEN", "hf_fake_write_token");
-    }
-
     let model = tempfile::tempdir().unwrap();
     let dir = model.path();
     let config = br#"{"model_type":"qwen3"}"#;
@@ -143,6 +139,8 @@ async fn upload_creates_the_repo_and_commits_only_the_model_files() {
     write(dir, "._config.json", b"appledouble");
     write(dir, "adapter/._adapter_model.safetensors", b"appledouble");
     write(dir, ".git/HEAD", b"ref: refs/heads/main");
+    write(dir, ".env", b"HF_TOKEN=hf_a_secret_that_must_not_leave");
+    write(dir, "adapter/.env.local", b"SECRET=1");
     write(
         dir,
         "checkpoints/step-10/adapter_model.safetensors",
@@ -153,9 +151,16 @@ async fn upload_creates_the_repo_and_commits_only_the_model_files() {
         private: true,
         commit_message: Some("Publish the tiny adapter".into()),
         ignore: vec!["checkpoints/**".into()],
+        hub: HubOptions {
+            endpoint: Some(base.clone()),
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let report = upload_model(dir, "me/tiny", None, &options).await.unwrap();
+    let token = SecretString::new("hf_fake_write_token");
+    let report = upload_model(dir, "me/tiny", Some(&token), &options)
+        .await
+        .unwrap();
 
     assert_eq!(report.repo_url, format!("{base}/me/tiny"));
     assert_eq!(
@@ -234,6 +239,63 @@ async fn upload_creates_the_repo_and_commits_only_the_model_files() {
             ("tokenizer.json", tokenizer.to_vec()),
         ])
     );
+}
+
+#[tokio::test]
+async fn upload_without_a_token_fails_before_any_request() {
+    isolate_env();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let log = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(serve(listener, base.clone(), log.clone()));
+    let model = tempfile::tempdir().unwrap();
+    write(model.path(), "config.json", b"{}");
+    let options = UploadOptions {
+        hub: HubOptions {
+            endpoint: Some(base),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let err = upload_model(model.path(), "me/tiny", None, &options)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("HF_TOKEN"), "{err}");
+    assert!(
+        log.lock().unwrap().is_empty(),
+        "nothing may be sent without a token"
+    );
+}
+
+#[tokio::test]
+async fn upload_reports_progress_and_finishes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let log = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(serve(listener, base.clone(), log.clone()));
+    let model = tempfile::tempdir().unwrap();
+    write(model.path(), "config.json", br#"{"model_type":"qwen3"}"#);
+
+    let seen: Arc<Mutex<Vec<TransferProgress>>> = Arc::default();
+    let sink = seen.clone();
+    let options = UploadOptions {
+        hub: HubOptions {
+            endpoint: Some(base),
+            ..Default::default()
+        },
+        progress: Some(Arc::new(move |p| sink.lock().unwrap().push(p.clone()))),
+        ..Default::default()
+    };
+    let token = SecretString::new("hf_fake_write_token");
+    upload_model(model.path(), "me/tiny", Some(&token), &options)
+        .await
+        .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.last().is_some_and(|p| p.finished), "{seen:?}");
 }
 
 #[tokio::test]

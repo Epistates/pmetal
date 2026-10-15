@@ -1,24 +1,73 @@
 use indicatif::ProgressBar;
 
-/// Run HuggingFace Hub search with device fit analysis.
-pub(crate) async fn run_search(
-    query: &str,
-    limit: usize,
-    download: bool,
-    detailed: bool,
-    json_output: bool,
-) -> anyhow::Result<()> {
-    use pmetal_hub::{DeviceSpec, FitLevel, ModelSpec, estimate_fit, search_models};
+/// Context length the search results are sized for.
+const FIT_CONTEXT: u32 = 4096;
 
-    // Get device info for fit estimation
+/// How search results are ordered.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SortArg {
+    /// Most downloaded in the last 30 days
+    Downloads,
+    /// Most liked
+    Likes,
+    /// Trending
+    Trending,
+    /// Most recently updated
+    Updated,
+}
+
+impl From<SortArg> for pmetal_hub::search::SearchSort {
+    fn from(arg: SortArg) -> Self {
+        match arg {
+            SortArg::Downloads => Self::Downloads,
+            SortArg::Likes => Self::Likes,
+            SortArg::Trending => Self::Trending,
+            SortArg::Updated => Self::Updated,
+        }
+    }
+}
+
+/// What `pmetal search` was asked for.
+pub(crate) struct SearchRequest {
+    pub(crate) query: String,
+    pub(crate) limit: usize,
+    pub(crate) download: bool,
+    pub(crate) detailed: bool,
+    pub(crate) json: bool,
+    pub(crate) tags: Vec<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) pipeline_tag: String,
+    pub(crate) sort: SortArg,
+}
+
+/// Run HuggingFace Hub search with device fit analysis.
+pub(crate) async fn run_search(request: SearchRequest) -> anyhow::Result<()> {
+    use pmetal_hub::search::{SearchOptions, search_models_with};
+    use pmetal_hub::{DeviceSpec, FitLevel};
+
+    let SearchRequest {
+        query,
+        limit,
+        download,
+        detailed,
+        json: json_output,
+        tags,
+        author,
+        pipeline_tag,
+        sort,
+    } = request;
+    let query = query.as_str();
+
+    // The device's recommended working set, asked of the device: not a share
+    // of installed RAM.
     let device_spec = match pmetal_metal::context::MetalContext::global() {
         Ok(ctx) => {
             let props = ctx.properties();
-            Some(DeviceSpec {
-                memory_gb: props.recommended_working_set_size as f64 / (1024.0 * 1024.0 * 1024.0),
-                bandwidth_gbps: props.memory_bandwidth_gbps,
-                unified_memory: props.has_unified_memory,
-            })
+            Some(DeviceSpec::from_device(
+                props.recommended_working_set_size,
+                props.memory_bandwidth_gbps,
+                props.has_unified_memory,
+            ))
         }
         Err(_) => None,
     };
@@ -27,7 +76,13 @@ pub(crate) async fn run_search(
     bar.set_message(format!("Searching HuggingFace for '{query}'..."));
     bar.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    let results = search_models(query, limit, None).await?;
+    let mut options = SearchOptions::new(query);
+    options.limit = limit;
+    options.tags = tags;
+    options.author = author;
+    options.pipeline_tag = (pipeline_tag != "any").then_some(pipeline_tag);
+    options.sort = sort.into();
+    let results = search_models_with(&options).await?;
     bar.finish_and_clear();
 
     if results.is_empty() {
@@ -44,37 +99,30 @@ pub(crate) async fn run_search(
         let json_results: Vec<serde_json::Value> = results
             .iter()
             .map(|r| {
-                let fit_info =
-                    if let (Some(dev), Some(params_b)) = (&device_spec, r.estimated_params_b) {
-                        let quant = pmetal_hub::fit::detect_quantization_from_id(&r.model_id);
-                        let model_spec = pmetal_hub::ModelSpec {
-                            params_b,
-                            quantization: quant,
-                            context_length: 4096,
-                            num_kv_heads: None,
-                            head_dim: None,
-                            num_layers: None,
-                            is_moe: r.tags.iter().any(|t| t == "moe"),
-                            num_experts: None,
-                            active_experts: None,
-                            kv_cache_bits: None,
-                        };
-                        let fit = estimate_fit(&model_spec, dev);
+                let fit_info = device_spec
+                    .as_ref()
+                    .and_then(|dev| r.fit(dev, FIT_CONTEXT))
+                    .map(|fit| {
                         serde_json::json!({
                             "level": fit.fit_level.label(),
                             "total_gb": fit.total_required_gb,
                             "weights_gb": fit.weights_gb,
+                            "weights_measured": fit.weights_measured,
+                            "context_length": fit.context_length,
+                            "estimated_tps": fit.estimated_tps,
                         })
-                    } else {
-                        serde_json::Value::Null
-                    };
+                    })
+                    .unwrap_or(serde_json::Value::Null);
 
                 serde_json::json!({
                     "model_id": r.model_id,
                     "downloads": r.downloads,
                     "likes": r.likes,
                     "tags": r.tags,
+                    "license": r.license,
+                    "gated": r.gated,
                     "estimated_params_b": r.estimated_params_b,
+                    "safetensors_bytes": r.safetensors_bytes,
                     "fit": fit_info,
                 })
             })
@@ -92,77 +140,57 @@ pub(crate) async fn run_search(
     for result in &results {
         let size_str = result
             .estimated_params_b
-            .map(|b| {
-                if b >= 1.0 {
-                    format!("{:.1}B", b)
-                } else {
-                    format!("{:.0}M", b * 1000.0)
-                }
-            })
+            .map(pmetal_hub::fit::format_params)
             .unwrap_or_else(|| "?".to_string());
 
         // Fit indicator
-        let fit_str = if let (Some(dev), Some(params_b)) = (&device_spec, result.estimated_params_b)
-        {
-            let quant = pmetal_hub::fit::detect_quantization_from_id(&result.model_id);
-            let model_spec = ModelSpec {
-                params_b,
-                quantization: quant,
-                context_length: 4096,
-                num_kv_heads: None,
-                head_dim: None,
-                num_layers: None,
-                is_moe: result.tags.iter().any(|t| t == "moe"),
-                num_experts: None,
-                active_experts: None,
-                kv_cache_bits: None,
-            };
-            let fit = estimate_fit(&model_spec, dev);
-            if first_fit.is_none() && matches!(fit.fit_level, FitLevel::Fits | FitLevel::Tight) {
-                first_fit = Some(result.model_id.clone());
+        let fit = device_spec
+            .as_ref()
+            .and_then(|dev| result.fit(dev, FIT_CONTEXT));
+        let fit_str = match &fit {
+            Some(fit) => {
+                if first_fit.is_none() && matches!(fit.fit_level, FitLevel::Fits | FitLevel::Tight)
+                {
+                    first_fit = Some(result.model_id.clone());
+                }
+                match fit.fit_level {
+                    FitLevel::Fits => " [fits]".to_string(),
+                    FitLevel::Tight => " [tight]".to_string(),
+                    FitLevel::TooLarge => " [too large]".to_string(),
+                }
             }
-            match fit.fit_level {
-                FitLevel::Fits => " [fits]".to_string(),
-                FitLevel::Tight => " [tight]".to_string(),
-                FitLevel::TooLarge => " [too large]".to_string(),
-            }
-        } else {
-            String::new()
+            None => String::new(),
         };
+        let gated = if result.gated { " [gated]" } else { "" };
 
         println!(
-            "{} ({}, {}d, {}l{})",
-            result.model_id, size_str, result.downloads, result.likes, fit_str
+            "{} ({}, {}d, {}l{}{})",
+            result.model_id, size_str, result.downloads, result.likes, fit_str, gated
         );
 
         if detailed {
-            if let (Some(dev), Some(params_b)) = (&device_spec, result.estimated_params_b) {
-                let quant = pmetal_hub::fit::detect_quantization_from_id(&result.model_id);
-                let model_spec = ModelSpec {
-                    params_b,
-                    quantization: quant,
-                    context_length: 4096,
-                    num_kv_heads: None,
-                    head_dim: None,
-                    num_layers: None,
-                    is_moe: result.tags.iter().any(|t| t == "moe"),
-                    num_experts: None,
-                    active_experts: None,
-                    kv_cache_bits: None,
-                };
-                let fit = estimate_fit(&model_spec, dev);
+            if let Some(fit) = &fit {
                 println!(
-                    "  Weights: {:.1}GB  KV: {:.1}GB  Overhead: {:.1}GB  Training: {:.1}GB ({})  Batch: {}",
+                    "  Weights: {:.1}GB{}  KV: {:.1}GB ({} tokens)  Overhead: {:.1}GB  Training: {:.1}GB ({})  Batch: {}",
                     fit.weights_gb,
+                    if fit.weights_measured { "" } else { " (est.)" },
                     fit.kv_cache_gb,
+                    fit.context_length,
                     fit.overhead_gb,
                     fit.training_memory_gb,
                     fit.training_fit.label(),
                     fit.recommended_batch_size,
                 );
+                println!(
+                    "  Decode: ~{:.0} tok/s (estimated from memory bandwidth)",
+                    fit.estimated_tps
+                );
                 for note in &fit.notes {
                     println!("  {note}");
                 }
+            }
+            if let Some(license) = &result.license {
+                println!("  License: {license}");
             }
         }
     }
