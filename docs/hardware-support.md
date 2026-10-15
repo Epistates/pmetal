@@ -143,9 +143,6 @@ Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS.
 Replace hardcoded tier-based parameters with runtime optimization:
 
 - [x] Persist hot-path inference backend benchmarks across launches (MPP vs MLX matmul for quantized linears)
-- [x] Benchmark and persist MLX CutCrossEntropy vs Metal fused linear cross-entropy backend choice for benchmarkable shapes
-- [x] Benchmark and persist fused linear cross-entropy thread/chunk specialization per device, dtype, and problem shape
-- [x] Benchmark and persist standard-Metal `fused_merge` specialization choices, with device-safe cache keys and `merge.json` disk persistence
 - [x] Add a structured `pmetal bench-corpus` kernel benchmark command for comparable per-tier measurements on M1-M4 and M5, including initial MoE/model-family cases
 - [x] Add a real `pmetal bench-workload` command for fast end-to-end Qwen3/dataset regression runs on local Apple Silicon, and record the selected inference KV cache mode in the report
 - [x] Auto-select fp16 vs q8 KV cache for inference based on model/context fit instead of hardcoding q8 as the default on Apple7-Apple9

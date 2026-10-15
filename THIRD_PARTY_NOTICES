@@ -104,75 +104,7 @@ Reference: Gated Delta Networks: Improving Mamba2 with Delta Rule (https://arxiv
 File: crates/pmetal-mlx/src/kernels/gated_delta.rs
 
 
-4. FlashAttention (Tri Dao)
----------------------------
-
-PMetal's fused cross-entropy kernel follows the online softmax approach from
-the Flash-Attention Triton implementation. It is an independent Metal
-reimplementation; no source code was used from the original implementation.
-
-    Copyright (c) 2022, the respective contributors, as shown by the AUTHORS file.
-    All rights reserved.
-
-    Redistribution and use in source and binary forms, with or without
-    modification, are permitted provided that the following conditions are met:
-
-    1. Redistributions of source code must retain the above copyright notice, this
-       list of conditions and the following disclaimer.
-
-    2. Redistributions in binary form must reproduce the above copyright notice,
-       this list of conditions and the following disclaimer in the documentation
-       and/or other materials provided with the distribution.
-
-    3. Neither the name of the copyright holder nor the names of its
-       contributors may be used to endorse or promote products derived from
-       this software without specific prior written permission.
-
-    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-    OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
-Source: https://github.com/Dao-AILab/flash-attention
-License: BSD 3-Clause
-Reference: FlashAttention-2 (https://arxiv.org/abs/2307.08691)
-
-
-5. Unsloth (Unsloth AI, Inc.)
-------------------------------
-
-PMetal's fused linear cross-entropy kernels are independent Metal
-implementations informed by algorithmic techniques from the Unsloth project.
-The chunked vocabulary cross-entropy approach follows a design described in
-Unsloth's source. No source code was copied from the original repository.
-
-    Copyright 2024- Unsloth AI, Inc.
-
-    Licensed under the Apache License, Version 2.0 (the "License");
-    you may not use this file except in compliance with the License.
-    You may obtain a copy of the License at
-
-        http://www.apache.org/licenses/LICENSE-2.0
-
-    Unless required by applicable law or agreed to in writing, software
-    distributed under the License is distributed on an "AS IS" BASIS,
-    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-    See the License for the specific language governing permissions and
-    limitations under the License.
-
-Source: https://github.com/unslothai/unsloth
-License: Apache 2.0
-References: Cut Your Losses in Large-Vocabulary Language Models (https://arxiv.org/abs/2411.09009)
-File: crates/pmetal-metal/src/kernels/metal/fused_cross_entropy.metal
-
-
-6. llama.cpp / GGML
+4. llama.cpp / GGML
 --------------------
 
 PMetal's GGUF quantization infrastructure (K-quant and IQ-quant block
@@ -207,7 +139,7 @@ Files: crates/pmetal-gguf/src/k_quants.rs,
        crates/pmetal-metal/src/kernels/metal/dequant.metal
 
 
-7. Candle (Hugging Face)
+5. Candle (Hugging Face)
 -------------------------
 
 PMetal's GGUF quantization code is co-derived from Candle's quantized
@@ -241,7 +173,7 @@ Files: crates/pmetal-gguf/src/k_quants.rs,
        crates/pmetal-models/src/architectures/whisper.rs
 
 
-8. Burn (Tracel AI)
+6. Burn (Tracel AI)
 --------------------
 
 PMetal's distributed collective operations (ring all-reduce, tree reduce,
@@ -272,7 +204,7 @@ License: MIT / Apache 2.0
 File: crates/pmetal-distributed/src/collective.rs
 
 
-9. BigVGAN (NVIDIA)
+7. BigVGAN (NVIDIA)
 --------------------
 
 The pmetal-vocoder crate reimplements the BigVGAN vocoder (Lee et al., 2023)

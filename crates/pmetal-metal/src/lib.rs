@@ -47,30 +47,14 @@ pub mod kernels;
 pub(crate) mod msl_layout;
 pub mod neon_convert;
 pub mod pipeline;
-pub mod tuna;
 pub mod view;
 
 pub use buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use error::{MetalError, Result};
-pub use kernels::fused_cross_entropy::{
-    FusedCrossEntropy,
-    FusedCrossEntropyConfig,
-    FusedCrossEntropyOutput,
-    // Chunked vocabulary optimization: fused linear + cross-entropy (skips logits materialization)
-    FusedLinearCrossEntropy,
-    FusedLinearCrossEntropyConfig,
-    FusedLinearCrossEntropyOutput,
-};
-pub use kernels::fused_merge::{
-    FusedMergeMetal, MergeConfig as FusedMergeConfig, TensorInfo, build_merge_config,
-    build_tensor_info,
-};
 pub use kernels::fused_moe::{
     ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig,
 };
-pub use kernels::mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
-pub use kernels::turboquant::TurboQuantTransform;
 pub use pipeline::{FunctionConstant, PipelineCache};
 pub use view::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 
@@ -79,10 +63,6 @@ pub mod prelude {
     pub use crate::buffer::{BufferUsage, MetalBuffer};
     pub use crate::context::MetalContext;
     pub use crate::error::{MetalError, Result};
-    pub use crate::kernels::fused_cross_entropy::{
-        FusedCrossEntropy, FusedCrossEntropyConfig, FusedLinearCrossEntropy,
-        FusedLinearCrossEntropyConfig,
-    };
     pub use crate::pipeline::PipelineCache;
 }
 

@@ -8,11 +8,9 @@ This crate provides custom Metal shaders for the operations the tensor runtime h
 
 ## Features
 
-- **Fused Cross-Entropy**: Chunked vocabulary loss (avoids logits materialization)
-- **Fused AdamW** and **FP8 training** kernels
-- **Quantized and MoE GEMMs**: dequantizing matmuls, grouped expert GEMMs, fused expert MLPs
+- **Fused AdamW**: one-dispatch optimizer update over every parameter
+- **Offloaded MoE experts**: single-expert gate/up/down on 4- and 2-bit weights read straight from a record buffer
 - **dW GEMM**: the f32 weight-gradient GEMM the ANE trainer batches into one command buffer
-- **Model merging** and **TurboQuant** KV-cache transforms
 
 ## Architecture
 
@@ -61,18 +59,28 @@ The ANE module provides a complete training and inference pipeline using Apple's
 queue and pipeline cache are shared.
 
 ```rust,no_run
-use pmetal_metal::{
-    FusedCrossEntropy, FusedCrossEntropyConfig, MetalBuffer, MetalContext, Result,
-};
+use pmetal_metal::kernels::{AdamWConfig, FusedAdamW};
+use pmetal_metal::{BufferUsage, MetalBuffer, MetalContext, Result};
 
-fn loss(logits: &MetalBuffer<f32>, targets: &MetalBuffer<i32>) -> Result<()> {
+fn adamw_step() -> Result<()> {
     let ctx = MetalContext::global()?;
 
-    // 512 tokens over a 32k vocabulary.
-    let config = FusedCrossEntropyConfig::new(512, 32_768);
-    let cross_entropy = FusedCrossEntropy::new(ctx, config)?;
-    let _output = cross_entropy.forward(logits, targets)?;
-    Ok(())
+    // Two parameters, flattened into one buffer each for the weights, the
+    // gradients and the two moments.
+    let sizes = [4096, 1024];
+    let total: usize = sizes.iter().sum();
+    let buffer = || MetalBuffer::<f32>::zeros(&ctx, total, BufferUsage::Shared);
+    let (params, grads, m, v) = (buffer()?, buffer()?, buffer()?, buffer()?);
+
+    let adamw = FusedAdamW::new(ctx.clone(), &sizes)?;
+    let info = MetalBuffer::from_slice(
+        &ctx,
+        &FusedAdamW::build_param_info(&sizes),
+        BufferUsage::Shared,
+    )?;
+    // One set of scalars per parameter group; step 1 of a 1e-4 run.
+    let groups = [AdamWConfig::default().scalars()?];
+    adamw.execute_update(&params, &grads, &m, &v, &info, &groups)
 }
 ```
 
@@ -80,7 +88,8 @@ fn loss(logits: &MetalBuffer<f32>, targets: &MetalBuffer<i32>) -> Result<()> {
 
 | Kernel | Memory | Description |
 |--------|--------|-------------|
-| `fused_cross_entropy` | O(1) per chunk | Chunked loss computation |
+| `fused_training` | Same | One-dispatch AdamW over every parameter |
+| `fused_moe` | Same | Single-expert gate/up/down on 4- and 2-bit affine weights |
 | `dw_gemm` | Same | f32 weight-gradient GEMM for the ANE trainer |
 
 ## Requirements

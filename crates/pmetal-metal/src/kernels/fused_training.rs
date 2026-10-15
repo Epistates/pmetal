@@ -31,15 +31,7 @@
 //!
 //! This module provides:
 //! - [`FusedAdamW`]: All-parameter optimizer update in one dispatch
-//! - [`FusedGradientClipping`]: Global norm + scaling in two dispatches
-//! - `FusedCrossEntropy`: Loss + backward fused
 //! - [`BatchedCommandBuffer`]: Helper for batched execution
-//!
-//! # Performance Target
-//!
-//! - Current: ~1740 tok/s (per-kernel sync)
-//! - Target: ~2400 tok/s
-//! - Expected gain: ~40% from eliminating sync overhead
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -283,8 +275,7 @@ impl AdamWScalars {
     };
 }
 
-// `AdamWScalars` in `metal/fused_training.metal` and
-// `metal4/mpp_fused_training.metal`.
+// `AdamWScalars` in `metal/fused_training.metal`.
 crate::msl_layout::msl_layout!(AdamWScalars, size = 28, {
     decay: 0,
     one_minus_beta1: 4,
@@ -338,10 +329,49 @@ crate::msl_layout::msl_layout!(ParamInfo, size = 20, {
 // Fused AdamW Optimizer
 // =============================================================================
 
+/// Elements one threadgroup updates (`ADAMW_CHUNK` in the shader).
+const ADAMW_CHUNK: usize = 4096;
+
+/// Threads per threadgroup of the update kernel.
+const ADAMW_THREADS: usize = 256;
+
+/// A run of up to [`ADAMW_CHUNK`] elements of one parameter: the work of one
+/// threadgroup.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
+struct AdamWChunk {
+    /// Index into the parameter table.
+    param: u32,
+    /// First element of the run, within the parameter.
+    start: u32,
+}
+
+// `AdamWChunk` in `metal/fused_training.metal`.
+crate::msl_layout::msl_layout!(AdamWChunk, size = 8, {
+    param: 0,
+    start: 4,
+});
+
+/// The runs of elements that cover every parameter exactly once.
+fn adamw_chunks(param_sizes: &[usize]) -> Vec<AdamWChunk> {
+    param_sizes
+        .iter()
+        .enumerate()
+        .flat_map(|(param, &size)| {
+            (0..size.div_ceil(ADAMW_CHUNK)).map(move |run| AdamWChunk {
+                param: param as u32,
+                start: (run * ADAMW_CHUNK) as u32,
+            })
+        })
+        .collect()
+}
+
 /// Fused AdamW optimizer that updates all parameters in a single dispatch.
 ///
-/// Instead of launching N kernel dispatches for N parameters, this
-/// processes all parameters in parallel within a single Metal dispatch.
+/// Instead of launching N kernel dispatches for N parameters, this updates
+/// the whole flattened parameter space in one dispatch: a table of fixed-size
+/// runs of elements gives each threadgroup its share, so one huge tensor and
+/// hundreds of small ones cost the same per element.
 ///
 /// # Memory Layout
 ///
@@ -353,12 +383,15 @@ crate::msl_layout::msl_layout!(ParamInfo, size = 20, {
 /// - `param_info`: Metadata describing offset and size of each parameter
 pub struct FusedAdamW {
     ctx: Arc<MetalContext>,
-    /// Total number of parameters.
-    num_params: usize,
-    /// Maximum parameter size (for grid calculation).
-    max_param_size: usize,
+    /// Size of each parameter, as the table passed to [`Self::queue_update`]
+    /// must say.
+    sizes: Vec<usize>,
     /// Total elements across all parameters.
     total_elements: usize,
+    /// The runs of elements, one per threadgroup.
+    chunks: MetalBuffer<AdamWChunk>,
+    /// Threadgroups one update launches.
+    num_chunks: usize,
 }
 
 impl FusedAdamW {
@@ -367,17 +400,31 @@ impl FusedAdamW {
     /// # Arguments
     /// * `ctx` - Metal context
     /// * `param_sizes` - Sizes of each parameter tensor
-    pub fn new(ctx: Arc<MetalContext>, param_sizes: &[usize]) -> Self {
-        let num_params = param_sizes.len();
-        let max_param_size = param_sizes.iter().copied().max().unwrap_or(0);
+    ///
+    /// Fails if the parameters hold more elements than a 32-bit index
+    /// reaches.
+    pub fn new(ctx: Arc<MetalContext>, param_sizes: &[usize]) -> Result<Self> {
         let total_elements: usize = param_sizes.iter().sum();
-
-        Self {
-            ctx,
-            num_params,
-            max_param_size,
-            total_elements,
+        if u32::try_from(total_elements).is_err() {
+            return Err(MetalError::InvalidConfig(format!(
+                "fused AdamW indexes elements with 32 bits, but the parameters hold {total_elements}"
+            )));
         }
+        let chunks = adamw_chunks(param_sizes);
+        let num_chunks = chunks.len();
+        // A zero-length parameter has no chunks; an empty model has no work.
+        let chunks = if chunks.is_empty() {
+            MetalBuffer::zeros(&ctx, 1, BufferUsage::Shared)?
+        } else {
+            MetalBuffer::from_slice(&ctx, &chunks, BufferUsage::Shared)?
+        };
+        Ok(Self {
+            ctx,
+            sizes: param_sizes.to_vec(),
+            total_elements,
+            chunks,
+            num_chunks,
+        })
     }
 
     /// Build parameter info metadata from sizes, every parameter in group 0.
@@ -403,13 +450,69 @@ impl FusedAdamW {
     /// with `setBytes`, which carries at most 4 KiB.
     pub const MAX_GROUPS: usize = 4096 / std::mem::size_of::<AdamWScalars>();
 
+    /// Check that `param_info` describes the parameters this optimizer was
+    /// built for, and that every one lies inside its buffers.
+    fn validate(
+        &self,
+        buffers: [(&'static str, usize); 4],
+        param_info: &MetalBuffer<ParamInfo>,
+        groups: usize,
+    ) -> Result<()> {
+        let infos = param_info.as_slice();
+        if infos.len() < self.sizes.len() {
+            return Err(MetalError::InvalidConfig(format!(
+                "fused AdamW over {} parameters given metadata for {}",
+                self.sizes.len(),
+                infos.len()
+            )));
+        }
+        for (index, (info, &size)) in infos.iter().zip(&self.sizes).enumerate() {
+            if info.size as usize != size {
+                return Err(MetalError::InvalidConfig(format!(
+                    "fused AdamW parameter {index} was built with {size} elements, \
+                     but its metadata says {}",
+                    info.size
+                )));
+            }
+            if info.group as usize >= groups {
+                return Err(MetalError::InvalidConfig(format!(
+                    "a parameter at offset {} is in group {}, but the step has {groups} groups",
+                    info.offset, info.group
+                )));
+            }
+            let [
+                (p_name, p_len),
+                (g_name, g_len),
+                (m_name, m_len),
+                (v_name, v_len),
+            ] = buffers;
+            let spans = [
+                (p_name, p_len, info.offset),
+                (g_name, g_len, info.offset),
+                (m_name, m_len, info.m_offset),
+                (v_name, v_len, info.v_offset),
+            ];
+            for (name, len, start) in spans {
+                let end = start as usize + size;
+                if end > len {
+                    return Err(MetalError::InvalidConfig(format!(
+                        "fused AdamW parameter {index} spans [{start}..{end}) of the {name} \
+                         buffer, which holds {len}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Queue an AdamW update into a batched command buffer.
     ///
     /// Parameter `i` is updated with `groups[param_info[i].group]`: one set
     /// of scalars per parameter group, so each group trains at its own
     /// learning rate and weight decay. Fails if a parameter names a group
-    /// past the end of `groups`, or if there are more than
-    /// [`Self::MAX_GROUPS`].
+    /// past the end of `groups`, if there are more than
+    /// [`Self::MAX_GROUPS`], or if `param_info` or a buffer does not fit the
+    /// parameters this optimizer was built for.
     ///
     /// This does NOT execute immediately - call `batch.execute()` after
     /// queueing all operations.
@@ -425,41 +528,36 @@ impl FusedAdamW {
         groups: &[AdamWScalars],
     ) -> Result<()> {
         if groups.is_empty() || groups.len() > Self::MAX_GROUPS {
-            return Err(crate::error::MetalError::InvalidConfig(format!(
+            return Err(MetalError::InvalidConfig(format!(
                 "fused AdamW takes 1 to {} parameter groups, got {}",
                 Self::MAX_GROUPS,
                 groups.len()
             )));
         }
-        let infos = param_info.as_slice();
-        if infos.len() < self.num_params {
-            return Err(crate::error::MetalError::InvalidConfig(format!(
-                "fused AdamW over {} parameters given metadata for {}",
-                self.num_params,
-                infos.len()
-            )));
+        self.validate(
+            [
+                ("params", params.len()),
+                ("grads", grads.len()),
+                ("first moment", m.len()),
+                ("second moment", v.len()),
+            ],
+            param_info,
+            groups.len(),
+        )?;
+        if self.num_chunks == 0 {
+            return Ok(());
         }
-        if let Some(info) = infos[..self.num_params]
-            .iter()
-            .find(|info| info.group as usize >= groups.len())
-        {
-            return Err(crate::error::MetalError::InvalidConfig(format!(
-                "a parameter at offset {} is in group {}, but the step has {} groups",
-                info.offset,
-                info.group,
-                groups.len()
-            )));
-        }
-        let function_name = "fused_adamw_update";
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+            cache.get_or_create_pipeline(self.ctx.device(), "fused_adamw_update", None)?
         };
 
         let encoder = batch.encoder_mut()?;
         encoder.setComputePipelineState(&pipeline);
 
-        // Set buffers
+        // SAFETY: the buffers outlive the command buffer's execution, every
+        // parameter's span was validated against them, and the group scalars
+        // are copied by `setBytes`.
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(params.metal_buffer()), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(grads.metal_buffer()), 0, 1);
@@ -470,20 +568,17 @@ impl FusedAdamW {
             let groups_ptr = NonNull::from(groups).cast();
             encoder.setBytes_length_atIndex(groups_ptr, std::mem::size_of_val(groups), 5);
 
-            let num_params = self.num_params as u32;
-            let num_params_ptr = NonNull::from(&num_params).cast();
-            encoder.setBytes_length_atIndex(num_params_ptr, std::mem::size_of::<u32>(), 6);
+            encoder.setBuffer_offset_atIndex(Some(self.chunks.metal_buffer()), 0, 6);
         }
 
-        // Grid: [ceil(max_param_size / 32), num_params, 1]
+        // One threadgroup per run of elements.
         let grid_size = MTLSize {
-            width: self.max_param_size.div_ceil(32),
-            height: self.num_params,
+            width: self.num_chunks,
+            height: 1,
             depth: 1,
         };
-
         let threadgroup_size = MTLSize {
-            width: 32,
+            width: ADAMW_THREADS,
             height: 1,
             depth: 1,
         };
@@ -518,272 +613,10 @@ impl FusedAdamW {
     }
 }
 
-// =============================================================================
-// Fused Gradient Clipping
-// =============================================================================
-
-/// Fused gradient clipping that computes global norm and scales in two passes.
-pub struct FusedGradientClipping {
-    ctx: Arc<MetalContext>,
-    /// Total elements in gradient buffer.
-    total_elements: usize,
-    /// Number of threadgroups for partial reduction.
-    num_threadgroups: usize,
-}
-
-impl FusedGradientClipping {
-    /// Create a new gradient clipper.
-    pub fn new(ctx: Arc<MetalContext>, total_elements: usize) -> Self {
-        // Each threadgroup processes 4 * 256 = 1024 elements
-        let elements_per_tg = 1024;
-        let num_threadgroups = total_elements.div_ceil(elements_per_tg);
-
-        Self {
-            ctx,
-            total_elements,
-            num_threadgroups,
-        }
-    }
-
-    /// Compute gradient norm squared (returns buffer with partial sums).
-    pub fn compute_norm_squared_partial(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        grads: &MetalBuffer<f32>,
-        partial_sums: &MetalBuffer<f32>,
-    ) -> Result<()> {
-        let function_name = "gradient_norm_squared_partial";
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
-        };
-
-        let encoder = batch.encoder_mut()?;
-        encoder.setComputePipelineState(&pipeline);
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grads.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(partial_sums.metal_buffer()), 0, 1);
-
-            let total = self.total_elements as u32;
-            let total_ptr = NonNull::from(&total).cast();
-            encoder.setBytes_length_atIndex(total_ptr, std::mem::size_of::<u32>(), 2);
-        }
-
-        let grid_size = MTLSize {
-            width: self.num_threadgroups,
-            height: 1,
-            depth: 1,
-        };
-
-        let threadgroup_size = MTLSize {
-            width: 256,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        batch.add_dispatch();
-
-        Ok(())
-    }
-
-    /// Scale gradients by a factor.
-    pub fn scale_gradients(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        grads: &MetalBuffer<f32>,
-        scale: f32,
-    ) -> Result<()> {
-        let function_name = "scale_gradients";
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
-        };
-
-        let encoder = batch.encoder_mut()?;
-        encoder.setComputePipelineState(&pipeline);
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(grads.metal_buffer()), 0, 0);
-
-            let scale_ptr = NonNull::from(&scale).cast();
-            encoder.setBytes_length_atIndex(scale_ptr, std::mem::size_of::<f32>(), 1);
-
-            let total = self.total_elements as u32;
-            let total_ptr = NonNull::from(&total).cast();
-            encoder.setBytes_length_atIndex(total_ptr, std::mem::size_of::<u32>(), 2);
-        }
-
-        // Each thread processes 4 elements via float4/half4 vectorization,
-        // so we need total_elements / (32 threads * 4 elements/thread) threadgroups.
-        let grid_size = MTLSize {
-            width: self.total_elements.div_ceil(128),
-            height: 1,
-            depth: 1,
-        };
-
-        let threadgroup_size = MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        batch.add_dispatch();
-
-        Ok(())
-    }
-
-    /// Get number of threadgroups for partial reduction.
-    pub fn num_threadgroups(&self) -> usize {
-        self.num_threadgroups
-    }
-
-    /// Compute global gradient norm and, if it exceeds `max_norm`, queue a
-    /// scaling kernel into `batch` to clip the gradients in-place.
-    ///
-    /// # Algorithm
-    ///
-    /// Gradient clipping requires comparing the global L2 norm against a
-    /// threshold before deciding whether to scale.  This means we need a
-    /// GPU→CPU round-trip between the partial-reduction pass and the
-    /// conditional scaling pass.  The implementation therefore:
-    ///
-    /// 1. Allocates a CPU-visible shared buffer for partial squared sums
-    ///    (`num_threadgroups` elements).
-    /// 2. Executes the partial norm kernel in its own synchronous
-    ///    `BatchedCommandBuffer` so the values are visible on the CPU.
-    /// 3. Sums the partial results on the CPU to obtain the global L2 norm.
-    /// 4. If `norm > max_norm`, queues `scale_gradients` into the caller's
-    ///    `batch` with the appropriate clipping factor (`max_norm / norm`).
-    ///
-    /// The caller's `batch` is untouched when no clipping is needed, keeping
-    /// the common fast path allocation-free after the first call (assuming the
-    /// caller reuses the `FusedGradientClipping` instance).
-    pub fn queue_norm_and_clip(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        grads: &MetalBuffer<f32>,
-        max_norm: f32,
-    ) -> Result<()> {
-        // --- Step 1: allocate CPU-visible partial-sums buffer ---------------
-        let n_tg = self.num_threadgroups;
-        let partial_sums = MetalBuffer::<f32>::zeros(&self.ctx, n_tg, BufferUsage::Shared)?;
-
-        // --- Step 2: run partial norm² kernel synchronously -----------------
-        {
-            let mut norm_batch = BatchedCommandBuffer::new(self.ctx.clone())?;
-            self.compute_norm_squared_partial(&mut norm_batch, grads, &partial_sums)?;
-            norm_batch.execute()?;
-        }
-
-        // --- Step 3: reduce partial sums on CPU to get global L2 norm -------
-        let partial_slice = partial_sums.as_slice();
-        let norm_sq: f32 = partial_slice.iter().copied().sum();
-        let norm = norm_sq.sqrt();
-
-        // --- Step 4: queue conditional clipping into the caller's batch -----
-        if norm > max_norm {
-            let scale = max_norm / norm;
-            self.scale_gradients(batch, grads, scale)?;
-        }
-
-        Ok(())
-    }
-}
-
-// =============================================================================
-// Fused Cross-Entropy
-// =============================================================================
-
-/// Fused cross-entropy loss with backward pass.
-///
-/// Computes both loss and gradients in a single kernel, avoiding
-/// multiple passes over the logits tensor.
-pub struct FusedCrossEntropyTraining {
-    ctx: Arc<MetalContext>,
-}
-
-impl FusedCrossEntropyTraining {
-    /// Create a new fused cross-entropy module.
-    pub fn new(ctx: Arc<MetalContext>) -> Self {
-        Self { ctx }
-    }
-
-    /// Queue fused forward + backward pass.
-    ///
-    /// # Arguments
-    /// * `batch` - Command buffer to queue into
-    /// * `logits` - Model outputs [N, vocab_size]
-    /// * `labels` - Target labels `[N]`
-    /// * `grad_logits` - Output gradients [N, vocab_size]
-    /// * `loss` - Scalar loss (atomically accumulated)
-    /// * `n` - Number of positions (batch * seq after shift)
-    /// * `vocab_size` - Vocabulary size
-    /// * `ignore_index` - Label to ignore (-100 typically)
-    #[allow(clippy::too_many_arguments)]
-    pub fn queue_forward_backward(
-        &self,
-        batch: &mut BatchedCommandBuffer,
-        logits: &MetalBuffer<f32>,
-        labels: &MetalBuffer<i32>,
-        grad_logits: &MetalBuffer<f32>,
-        loss: &MetalBuffer<f32>,
-        n: usize,
-        vocab_size: usize,
-        ignore_index: i32,
-    ) -> Result<()> {
-        let function_name = "fused_cross_entropy_forward_backward";
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
-        };
-
-        let encoder = batch.encoder_mut()?;
-        encoder.setComputePipelineState(&pipeline);
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(logits.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(labels.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(grad_logits.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(loss.metal_buffer()), 0, 3);
-
-            let n_u32 = n as u32;
-            let n_ptr = NonNull::from(&n_u32).cast();
-            encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<u32>(), 4);
-
-            let vocab_u32 = vocab_size as u32;
-            let vocab_ptr = NonNull::from(&vocab_u32).cast();
-            encoder.setBytes_length_atIndex(vocab_ptr, std::mem::size_of::<u32>(), 5);
-
-            let ignore_ptr = NonNull::from(&ignore_index).cast();
-            encoder.setBytes_length_atIndex(ignore_ptr, std::mem::size_of::<i32>(), 6);
-        }
-
-        // One threadgroup per position
-        let grid_size = MTLSize {
-            width: n,
-            height: 1,
-            depth: 1,
-        };
-
-        let threadgroup_size = MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        batch.add_dispatch();
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::BufferUsage;
 
     fn create_test_context() -> Arc<MetalContext> {
         Arc::new(MetalContext::new().expect("Failed to create Metal context"))
@@ -815,11 +648,12 @@ mod tests {
     fn test_fused_adamw_creation() {
         let ctx = create_test_context();
         let param_sizes = vec![1024, 2048, 512];
-        let adamw = FusedAdamW::new(ctx, &param_sizes);
+        let adamw = FusedAdamW::new(ctx, &param_sizes).unwrap();
 
-        assert_eq!(adamw.num_params, 3);
-        assert_eq!(adamw.max_param_size, 2048);
+        assert_eq!(adamw.sizes, param_sizes);
         assert_eq!(adamw.total_elements, 1024 + 2048 + 512);
+        // One threadgroup per parameter: each fits in one run.
+        assert_eq!(adamw.num_chunks, 3);
     }
 
     #[test]
@@ -833,26 +667,235 @@ mod tests {
         assert!(batch.encoder().is_some());
     }
 
+    /// Every element of every parameter belongs to exactly one run, however
+    /// the sizes fall against the run length.
     #[test]
-    fn test_gradient_clipping_creation() {
-        let ctx = create_test_context();
-        let clipper = FusedGradientClipping::new(ctx, 10000);
+    fn the_chunk_table_covers_every_element_once() {
+        let sizes = [
+            0,
+            1,
+            ADAMW_CHUNK - 1,
+            ADAMW_CHUNK,
+            ADAMW_CHUNK + 1,
+            3 * ADAMW_CHUNK,
+            10_000,
+        ];
+        let chunks = adamw_chunks(&sizes);
+        let mut covered: Vec<Vec<u32>> = sizes.iter().map(|&n| vec![0; n]).collect();
+        for chunk in &chunks {
+            let size = sizes[chunk.param as usize];
+            let end = (chunk.start as usize + ADAMW_CHUNK).min(size);
+            assert!(
+                (chunk.start as usize) < size,
+                "a run starts past its parameter"
+            );
+            for hit in &mut covered[chunk.param as usize][chunk.start as usize..end] {
+                *hit += 1;
+            }
+        }
+        assert!(covered.iter().flatten().all(|&hits| hits == 1));
+    }
 
-        // 10000 elements / 1024 per threadgroup = 10 threadgroups
-        assert_eq!(clipper.num_threadgroups(), 10);
+    /// Deterministic values in [-1, 1).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    /// `torch.optim.AdamW`, in f64: decoupled decay on the old parameter,
+    /// bias-corrected moments, `eps` added after the second moment's root.
+    #[allow(clippy::too_many_arguments)]
+    fn adamw_f64(p: &mut [f64], m: &mut [f64], v: &mut [f64], g: &[f32], config: &AdamWConfig) {
+        let (lr, wd) = (
+            f64::from(config.learning_rate),
+            f64::from(config.weight_decay),
+        );
+        let (b1, b2) = (f64::from(config.beta1), f64::from(config.beta2));
+        let t = f64::from(config.step);
+        let (bc1, bc2) = (1.0 - b1.powf(t), 1.0 - b2.powf(t));
+        for i in 0..p.len() {
+            let g = f64::from(g[i]);
+            p[i] *= 1.0 - lr * wd;
+            m[i] = b1 * m[i] + (1.0 - b1) * g;
+            v[i] = b2 * v[i] + (1.0 - b2) * g * g;
+            let denom = (v[i] / bc2).sqrt() + f64::from(config.epsilon);
+            p[i] -= lr / bc1 * m[i] / denom;
+        }
+    }
+
+    /// Several steps over parameters whose sizes straddle the run length,
+    /// in three groups at their own rates and decay, against the float64
+    /// reference.
+    #[test]
+    fn fused_adamw_matches_the_float64_reference_over_steps() {
+        let ctx = create_test_context();
+        let sizes = [1usize, 4095, 4096, 4097, 10_000, 100_003, 7];
+        let total: usize = sizes.iter().sum();
+        let adamw = FusedAdamW::new(ctx.clone(), &sizes).unwrap();
+        let usage = BufferUsage::Shared;
+
+        let mut rng = Lcg(11);
+        let init: Vec<f32> = (0..total).map(|_| rng.next()).collect();
+        let params = MetalBuffer::from_slice(&ctx, &init, usage).unwrap();
+        let mut grads = MetalBuffer::<f32>::zeros(&ctx, total, usage).unwrap();
+        let m = MetalBuffer::<f32>::zeros(&ctx, total, usage).unwrap();
+        let v = MetalBuffer::<f32>::zeros(&ctx, total, usage).unwrap();
+
+        // Groups 0, 1, 2 in rotation.
+        let mut infos = FusedAdamW::build_param_info(&sizes);
+        for (i, info) in infos.iter_mut().enumerate() {
+            info.group = (i % 3) as u32;
+        }
+        let info_buf = MetalBuffer::from_slice(&ctx, &infos, usage).unwrap();
+
+        let mut ref_p: Vec<f64> = init.iter().map(|&x| f64::from(x)).collect();
+        let mut ref_m = vec![0.0f64; total];
+        let mut ref_v = vec![0.0f64; total];
+        let base = AdamWConfig {
+            learning_rate: 3e-3,
+            beta1: 0.9,
+            beta2: 0.95,
+            epsilon: 1e-8,
+            weight_decay: 0.1,
+            step: 1,
+        };
+        for step in 1..=4u32 {
+            let configs = [
+                AdamWConfig { step, ..base },
+                AdamWConfig {
+                    step,
+                    learning_rate: 1e-2,
+                    weight_decay: 0.0,
+                    ..base
+                },
+                AdamWConfig {
+                    step,
+                    learning_rate: 5e-4,
+                    weight_decay: 0.5,
+                    ..base
+                },
+            ];
+            let g: Vec<f32> = (0..total).map(|_| rng.next() * 0.3).collect();
+            grads.as_mut_slice().copy_from_slice(&g);
+            let scalars = configs.map(|c| c.scalars().unwrap());
+            adamw
+                .execute_update(&params, &grads, &m, &v, &info_buf, &scalars)
+                .unwrap();
+            for (info, &size) in infos.iter().zip(&sizes) {
+                let range = info.offset as usize..info.offset as usize + size;
+                adamw_f64(
+                    &mut ref_p[range.clone()],
+                    &mut ref_m[range.clone()],
+                    &mut ref_v[range.clone()],
+                    &g[range],
+                    &configs[info.group as usize],
+                );
+            }
+        }
+
+        let got = params.as_slice();
+        let mut worst = 0.0f64;
+        for i in 0..total {
+            let err = (f64::from(got[i]) - ref_p[i]).abs();
+            worst = worst.max(err);
+            assert!(
+                err <= 2e-6 * (1.0 + ref_p[i].abs()),
+                "element {i}: got {}, want {}, err {err:e}",
+                got[i],
+                ref_p[i]
+            );
+        }
+        let (gm, gv) = (m.as_slice(), v.as_slice());
+        for i in 0..total {
+            assert!((f64::from(gm[i]) - ref_m[i]).abs() <= 1e-6 * (1.0 + ref_m[i].abs()));
+            assert!((f64::from(gv[i]) - ref_v[i]).abs() <= 1e-6 * (1.0 + ref_v[i].abs()));
+        }
+        println!("worst parameter error {worst:e}");
+    }
+
+    #[test]
+    fn a_step_that_does_not_fit_the_optimizer_is_refused() {
+        let ctx = create_test_context();
+        let usage = BufferUsage::Shared;
+        let sizes = [100usize, 5000];
+        let total: usize = sizes.iter().sum();
+        let adamw = FusedAdamW::new(ctx.clone(), &sizes).unwrap();
+        let buf = || MetalBuffer::<f32>::zeros(&ctx, total, usage).unwrap();
+        let (params, grads, m, v) = (buf(), buf(), buf(), buf());
+        let infos = FusedAdamW::build_param_info(&sizes);
+        let info_buf = MetalBuffer::from_slice(&ctx, &infos, usage).unwrap();
+        let groups = [AdamWConfig::default().scalars().unwrap()];
+
+        adamw
+            .execute_update(&params, &grads, &m, &v, &info_buf, &groups)
+            .unwrap();
+
+        // Metadata for other sizes.
+        let other = FusedAdamW::build_param_info(&[100, 4000]);
+        let other_buf = MetalBuffer::from_slice(&ctx, &other, usage).unwrap();
+        assert!(
+            adamw
+                .execute_update(&params, &grads, &m, &v, &other_buf, &groups)
+                .is_err()
+        );
+
+        // A buffer shorter than the parameters it must hold.
+        let short = MetalBuffer::<f32>::zeros(&ctx, total - 1, usage).unwrap();
+        for case in 0..4 {
+            let mut bufs = [&params, &grads, &m, &v];
+            bufs[case] = &short;
+            let err = adamw
+                .execute_update(bufs[0], bufs[1], bufs[2], bufs[3], &info_buf, &groups)
+                .unwrap_err();
+            assert!(err.to_string().contains("buffer, which holds"), "{err}");
+        }
+
+        // No groups, and a group the step does not carry.
+        assert!(
+            adamw
+                .execute_update(&params, &grads, &m, &v, &info_buf, &[])
+                .is_err()
+        );
+        let mut grouped = infos.clone();
+        grouped[1].group = 1;
+        let grouped_buf = MetalBuffer::from_slice(&ctx, &grouped, usage).unwrap();
+        assert!(
+            adamw
+                .execute_update(&params, &grads, &m, &v, &grouped_buf, &groups)
+                .is_err()
+        );
+    }
+
+    /// An optimizer over no parameters has nothing to dispatch.
+    #[test]
+    fn an_empty_model_is_a_no_op() {
+        let ctx = create_test_context();
+        let usage = BufferUsage::Shared;
+        let adamw = FusedAdamW::new(ctx.clone(), &[]).unwrap();
+        let buf = MetalBuffer::<f32>::zeros(&ctx, 1, usage).unwrap();
+        let info = MetalBuffer::<ParamInfo>::zeros(&ctx, 1, usage).unwrap();
+        let groups = [AdamWConfig::default().scalars().unwrap()];
+        adamw
+            .execute_update(&buf, &buf, &buf, &buf, &info, &groups)
+            .unwrap();
     }
 
     #[test]
     fn test_fused_adamw_execution() {
-        use crate::buffer::BufferUsage;
-
         let ctx = create_test_context();
 
         // Simulate 3 parameters with sizes matching typical LoRA
         let param_sizes = vec![1024, 2048, 512];
         let total_elements: usize = param_sizes.iter().sum();
 
-        let adamw = FusedAdamW::new(ctx.clone(), &param_sizes);
+        let adamw = FusedAdamW::new(ctx.clone(), &param_sizes).unwrap();
 
         // Create buffers
         // Initialize params to 1.0, grads to 0.1
@@ -927,6 +970,54 @@ mod tests {
         );
     }
 
+    /// Resident memory of this process, in KiB.
+    fn resident_kib() -> i64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ps prints a number")
+    }
+
+    /// A training loop updates from a thread with no autorelease pool of its
+    /// own; the command buffer and encoder each step makes must not pile up.
+    #[test]
+    fn repeated_updates_do_not_accumulate_autoreleased_objects() {
+        let ctx = create_test_context();
+        let usage = BufferUsage::Shared;
+        let sizes = [64usize, 100];
+        let total: usize = sizes.iter().sum();
+        let adamw = FusedAdamW::new(ctx.clone(), &sizes).unwrap();
+        let buf = || MetalBuffer::<f32>::zeros(&ctx, total, usage).unwrap();
+        let (params, grads, m, v) = (buf(), buf(), buf(), buf());
+        let infos = FusedAdamW::build_param_info(&sizes);
+        let info_buf = MetalBuffer::from_slice(&ctx, &infos, usage).unwrap();
+        let groups = [AdamWConfig::default().scalars().unwrap()];
+        let step = || {
+            let mut batch = BatchedCommandBuffer::new(ctx.clone()).unwrap();
+            adamw
+                .queue_update(&mut batch, &params, &grads, &m, &v, &info_buf, &groups)
+                .unwrap();
+            batch.execute().unwrap();
+        };
+
+        for _ in 0..200 {
+            step();
+        }
+        let before = resident_kib();
+        for _ in 0..10_000 {
+            step();
+        }
+        let growth_kib = resident_kib() - before;
+        assert!(
+            growth_kib < 6 * 1024,
+            "10k updates grew resident memory by {growth_kib} KiB"
+        );
+    }
+
     #[test]
     fn adamw_step_zero_is_refused() {
         let config = AdamWConfig {
@@ -934,76 +1025,5 @@ mod tests {
             ..Default::default()
         };
         assert!(config.scalars().is_err());
-    }
-
-    #[test]
-    fn test_fused_adamw_batched() {
-        use crate::buffer::BufferUsage;
-        use std::time::Instant;
-
-        let ctx = create_test_context();
-
-        // Larger test for performance measurement
-        // 10M parameters (typical LoRA model)
-        let param_sizes = vec![1_000_000; 10]; // 10 params of 1M each
-        let total_elements: usize = param_sizes.iter().sum();
-
-        let adamw = FusedAdamW::new(ctx.clone(), &param_sizes);
-
-        // Create buffers
-        let params = MetalBuffer::zeros(&ctx, total_elements, BufferUsage::Shared)
-            .expect("Failed to create params buffer");
-        let grads = MetalBuffer::zeros(&ctx, total_elements, BufferUsage::Shared)
-            .expect("Failed to create grads buffer");
-        let m = MetalBuffer::zeros(&ctx, total_elements, BufferUsage::Shared)
-            .expect("Failed to create m buffer");
-        let v = MetalBuffer::zeros(&ctx, total_elements, BufferUsage::Shared)
-            .expect("Failed to create v buffer");
-
-        // Build param info
-        let param_info_vec = FusedAdamW::build_param_info(&param_sizes);
-        let param_info = MetalBuffer::from_slice(&ctx, &param_info_vec, BufferUsage::Shared)
-            .expect("Failed to create param_info buffer");
-
-        let config = [AdamWConfig {
-            learning_rate: 0.001,
-            ..Default::default()
-        }
-        .scalars()
-        .unwrap()];
-
-        // Warmup
-        adamw
-            .execute_update(&params, &grads, &m, &v, &param_info, &config)
-            .expect("Warmup failed");
-
-        // Benchmark
-        let iterations = 100;
-        let start = Instant::now();
-        for _ in 0..iterations {
-            let mut batch = BatchedCommandBuffer::new(ctx.clone()).unwrap();
-            adamw
-                .queue_update(&mut batch, &params, &grads, &m, &v, &param_info, &config)
-                .unwrap();
-            batch.execute().unwrap();
-        }
-        let elapsed = start.elapsed();
-
-        let ms_per_iter = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
-        let params_per_sec = (total_elements as f64 / ms_per_iter) * 1000.0;
-
-        println!(
-            "Fused AdamW: {:.2}ms per iter, {:.0} params/sec ({} total params)",
-            ms_per_iter, params_per_sec, total_elements
-        );
-
-        // Performance sanity check - very generous threshold for CI environments
-        // Local dev machines typically see <2ms, but CI can be 5-10x slower
-        if ms_per_iter > 50.0 {
-            eprintln!(
-                "Warning: AdamW update slower than expected: {:.2}ms (threshold: 50ms)",
-                ms_per_iter
-            );
-        }
     }
 }

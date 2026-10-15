@@ -497,8 +497,6 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 Custom Metal shaders provide significant speedups:
 
 - **Fused GDN**: Gated Delta Network recurrence kernel (ported from FLA Triton) — single-pass state update with SIMD reductions
-- **Fused Cross-Entropy**: Chunked vocabulary loss computation
-- **Fused Linear Cross-Entropy**: Skips logits materialization entirely
 - **Fused Sampler**: JIT-compiled token sampling
 - **Async Scheduler**: Double/triple-buffered GPU command scheduling
 

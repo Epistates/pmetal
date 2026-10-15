@@ -1,18 +1,13 @@
 use crate::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext};
 use anyhow::Context;
-use half::f16;
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
 use pmetal_core::{
     DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig,
 };
 use pmetal_data::{DatasetColumnConfig, DatasetFormat, TextSample, Tokenizer, TrainingDataset};
 use pmetal_lora::AdaptedModel;
+use pmetal_metal::MetalContext;
 use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
-use pmetal_metal::kernels::BatchedCommandBuffer;
-use pmetal_metal::{
-    BufferUsage, FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig, FusedMergeMetal,
-    MetalBuffer, MetalContext, build_merge_config, build_tensor_info,
-};
 use pmetal_mlx::kernels::gated_delta_update_with_chunk_size_override;
 use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
@@ -496,8 +491,6 @@ enum KernelBenchmarkOutcome {
 
 #[derive(Debug, Clone, Copy)]
 enum KernelBenchmarkCase {
-    FusedLinearCrossEntropy(FusedLinearCrossEntropyCase),
-    FusedMerge(FusedMergeCase),
     ModelMoe(ModelMoeCase),
 }
 
@@ -506,21 +499,6 @@ enum ModelMoeFamily {
     Llama4,
     Qwen3,
     DeepSeek,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FusedLinearCrossEntropyCase {
-    name: &'static str,
-    num_tokens: usize,
-    hidden_size: usize,
-    vocab_size: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct FusedMergeCase {
-    name: &'static str,
-    num_models: usize,
-    elements_per_model: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -537,8 +515,6 @@ struct ModelMoeCase {
 
 #[derive(Debug, Clone, Copy)]
 struct KernelBenchmarkTierProfile {
-    fused_linear_cross_entropy: FusedLinearCrossEntropyCase,
-    fused_merge: FusedMergeCase,
     llama4_moe: ModelMoeCase,
     qwen3_moe: ModelMoeCase,
     deepseek_moe: ModelMoeCase,
@@ -558,7 +534,6 @@ pub(crate) fn run_kernel_benchmark_corpus(
     let mut results = Vec::with_capacity(cases.len());
     for case in &cases {
         results.push(run_kernel_benchmark_case(
-            &ctx,
             case,
             warmup_iterations,
             benchmark_iterations,
@@ -3188,88 +3163,11 @@ fn print_gdn_decode_benchmark_report(report: &GdnDecodeBenchmarkReport, output: 
 }
 
 fn run_kernel_benchmark_case(
-    ctx: &Arc<MetalContext>,
     case: &KernelBenchmarkCase,
     warmup_iterations: usize,
     benchmark_iterations: usize,
 ) -> KernelBenchmarkCaseResult {
     match case {
-        KernelBenchmarkCase::FusedLinearCrossEntropy(case) => {
-            let parameters = fused_linear_cross_entropy_parameters(*case);
-            let config = FusedLinearCrossEntropyConfig::new(
-                case.num_tokens,
-                case.hidden_size,
-                case.vocab_size,
-            )
-            .with_fp16();
-            let tuning = match ctx.tuner().tune_fused_linear_cross_entropy(ctx, &config) {
-                Ok(tuned) => btree_map([
-                    ("threadgroup_size", tuned.threadgroup_size.to_string()),
-                    ("chunk_size", tuned.chunk_size.to_string()),
-                ]),
-                Err(error) => btree_map([("selection_error", error.to_string())]),
-            };
-
-            let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
-                let kernel = FusedLinearCrossEntropy::new(ctx.clone(), config)?;
-                let hidden_states = alloc_f16_buffer(ctx, case.num_tokens * case.hidden_size)?;
-                let lm_head_weight = alloc_f16_buffer(ctx, case.vocab_size * case.hidden_size)?;
-                let targets = alloc_i32_targets(ctx, case.num_tokens, case.vocab_size)?;
-
-                benchmark_operation(warmup_iterations, benchmark_iterations, || {
-                    let output = kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
-                    std::hint::black_box(output);
-                    Ok(())
-                })
-            })();
-
-            build_case_result(
-                case.name,
-                "fused_linear_cross_entropy",
-                parameters,
-                tuning,
-                outcome,
-            )
-        }
-        KernelBenchmarkCase::FusedMerge(case) => {
-            let parameters = fused_merge_parameters(*case);
-            let total_elements = case.num_models * case.elements_per_model;
-            let mut kernel = FusedMergeMetal::new(ctx.clone());
-            let tuning = match kernel.tune_for_problem_size(total_elements, case.num_models) {
-                Ok(tuned) => btree_map([
-                    ("threads_per_group", tuned.threads_per_group.to_string()),
-                    ("elements_per_thread", tuned.elements_per_thread.to_string()),
-                    ("use_simd", tuned.use_simd.to_string()),
-                ]),
-                Err(error) => btree_map([("selection_error", error.to_string())]),
-            };
-
-            let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
-                let sizes = vec![case.elements_per_model; case.num_models];
-                let densities = vec![0.5; case.num_models];
-                let tensor_info = build_tensor_info(&sizes, &densities);
-                let config = build_merge_config(&tensor_info, 1e-8);
-                let input = alloc_f32_buffer(ctx, total_elements)?;
-                let output = MetalBuffer::zeros(ctx, total_elements, BufferUsage::Shared)?;
-                let tensor_info_buffer =
-                    MetalBuffer::from_slice(ctx, &tensor_info, BufferUsage::Shared)?;
-
-                benchmark_operation(warmup_iterations, benchmark_iterations, || {
-                    let mut batch = BatchedCommandBuffer::new(ctx.clone())?;
-                    kernel.queue_compute_magnitudes(
-                        &mut batch,
-                        &input,
-                        &output,
-                        &tensor_info_buffer,
-                        &config,
-                    )?;
-                    batch.execute()?;
-                    Ok(())
-                })
-            })();
-
-            build_case_result(case.name, "fused_merge", parameters, tuning, outcome)
-        }
         KernelBenchmarkCase::ModelMoe(case) => {
             let parameters = model_moe_parameters(*case);
             let tuning = btree_map([
@@ -3422,8 +3320,6 @@ fn build_benchmark_corpus_for_profile(
 ) -> Vec<KernelBenchmarkCase> {
     let profile = benchmark_tier_profile(tier, quick);
     vec![
-        KernelBenchmarkCase::FusedLinearCrossEntropy(profile.fused_linear_cross_entropy),
-        KernelBenchmarkCase::FusedMerge(profile.fused_merge),
         KernelBenchmarkCase::ModelMoe(profile.llama4_moe),
         KernelBenchmarkCase::ModelMoe(profile.qwen3_moe),
         KernelBenchmarkCase::ModelMoe(profile.deepseek_moe),
@@ -3434,17 +3330,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
     let scale = if quick { 1 } else { 2 };
     match tier {
         DeviceTier::Base => KernelBenchmarkTierProfile {
-            fused_linear_cross_entropy: FusedLinearCrossEntropyCase {
-                name: "fused_linear_cross_entropy",
-                num_tokens: 32 * scale,
-                hidden_size: 1024,
-                vocab_size: 32_768,
-            },
-            fused_merge: FusedMergeCase {
-                name: "fused_merge_magnitudes",
-                num_models: 4,
-                elements_per_model: 65_536 * scale,
-            },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
                 family: ModelMoeFamily::Llama4,
@@ -3477,17 +3362,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
             },
         },
         DeviceTier::Pro => KernelBenchmarkTierProfile {
-            fused_linear_cross_entropy: FusedLinearCrossEntropyCase {
-                name: "fused_linear_cross_entropy",
-                num_tokens: 64 * scale,
-                hidden_size: 1536,
-                vocab_size: 32_768,
-            },
-            fused_merge: FusedMergeCase {
-                name: "fused_merge_magnitudes",
-                num_models: 6,
-                elements_per_model: 65_536 * scale,
-            },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
                 family: ModelMoeFamily::Llama4,
@@ -3520,17 +3394,6 @@ fn benchmark_tier_profile(tier: DeviceTier, quick: bool) -> KernelBenchmarkTierP
             },
         },
         DeviceTier::Max | DeviceTier::Ultra => KernelBenchmarkTierProfile {
-            fused_linear_cross_entropy: FusedLinearCrossEntropyCase {
-                name: "fused_linear_cross_entropy",
-                num_tokens: 64 * scale,
-                hidden_size: 2048,
-                vocab_size: 65_536,
-            },
-            fused_merge: FusedMergeCase {
-                name: "fused_merge_magnitudes",
-                num_models: 8,
-                elements_per_model: 131_072 * scale,
-            },
             llama4_moe: ModelMoeCase {
                 name: "llama4_moe_dispatch",
                 family: ModelMoeFamily::Llama4,
@@ -3598,27 +3461,6 @@ where
     })
 }
 
-fn alloc_f16_buffer(ctx: &Arc<MetalContext>, len: usize) -> anyhow::Result<MetalBuffer<f16>> {
-    let data: Vec<f16> = (0..len)
-        .map(|i| f16::from_f32(deterministic_value(i)))
-        .collect();
-    Ok(MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)?)
-}
-
-fn alloc_f32_buffer(ctx: &Arc<MetalContext>, len: usize) -> anyhow::Result<MetalBuffer<f32>> {
-    let data: Vec<f32> = (0..len).map(deterministic_value).collect();
-    Ok(MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)?)
-}
-
-fn alloc_i32_targets(
-    ctx: &Arc<MetalContext>,
-    len: usize,
-    vocab_size: usize,
-) -> anyhow::Result<MetalBuffer<i32>> {
-    let data: Vec<i32> = (0..len).map(|i| (i % vocab_size.max(1)) as i32).collect();
-    Ok(MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)?)
-}
-
 fn deterministic_value(index: usize) -> f32 {
     (((index.wrapping_mul(1103515245).wrapping_add(12345) >> 16) & 1023) as f32 / 512.0) - 1.0
 }
@@ -3628,27 +3470,6 @@ fn btree_map<const N: usize>(pairs: [(&str, String); N]) -> BTreeMap<String, Str
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
         .collect()
-}
-
-fn fused_linear_cross_entropy_parameters(
-    case: FusedLinearCrossEntropyCase,
-) -> BTreeMap<String, String> {
-    btree_map([
-        ("num_tokens", case.num_tokens.to_string()),
-        ("hidden_size", case.hidden_size.to_string()),
-        ("vocab_size", case.vocab_size.to_string()),
-    ])
-}
-
-fn fused_merge_parameters(case: FusedMergeCase) -> BTreeMap<String, String> {
-    btree_map([
-        ("num_models", case.num_models.to_string()),
-        ("elements_per_model", case.elements_per_model.to_string()),
-        (
-            "total_elements",
-            (case.num_models * case.elements_per_model).to_string(),
-        ),
-    ])
 }
 
 fn model_moe_parameters(case: ModelMoeCase) -> BTreeMap<String, String> {
@@ -3987,14 +3808,6 @@ mod tests {
         let pro = benchmark_tier_profile(DeviceTier::Pro, true);
         let max = benchmark_tier_profile(DeviceTier::Max, true);
 
-        assert!(
-            base.fused_linear_cross_entropy.hidden_size
-                < pro.fused_linear_cross_entropy.hidden_size
-        );
-        assert!(
-            pro.fused_linear_cross_entropy.hidden_size
-                <= max.fused_linear_cross_entropy.hidden_size
-        );
         assert!(base.llama4_moe.hidden_size < pro.llama4_moe.hidden_size);
         assert!(pro.llama4_moe.hidden_size < max.llama4_moe.hidden_size);
         assert!(base.qwen3_moe.num_experts <= pro.qwen3_moe.num_experts);
@@ -4006,15 +3819,10 @@ mod tests {
     #[test]
     fn benchmark_corpus_has_expected_categories() {
         let cases = build_benchmark_corpus_for_profile(DeviceTier::Base, false, true);
-        assert_eq!(cases.len(), 5);
-        assert!(matches!(
-            cases[0],
-            KernelBenchmarkCase::FusedLinearCrossEntropy(_)
-        ));
-        assert!(matches!(cases[1], KernelBenchmarkCase::FusedMerge(_)));
+        assert_eq!(cases.len(), 3);
+        assert!(matches!(cases[0], KernelBenchmarkCase::ModelMoe(_)));
+        assert!(matches!(cases[1], KernelBenchmarkCase::ModelMoe(_)));
         assert!(matches!(cases[2], KernelBenchmarkCase::ModelMoe(_)));
-        assert!(matches!(cases[3], KernelBenchmarkCase::ModelMoe(_)));
-        assert!(matches!(cases[4], KernelBenchmarkCase::ModelMoe(_)));
     }
 
     #[test]

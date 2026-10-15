@@ -386,7 +386,6 @@ impl std::fmt::Debug for PipelineCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::MetalContext;
 
     fn constants(pairs: &[(u64, FunctionConstant)]) -> HashMap<u64, FunctionConstant> {
         pairs.iter().copied().collect()
@@ -437,41 +436,5 @@ mod tests {
             (1, FunctionConstant::UInt(1)),
         ]);
         assert_ne!(specialized_key("f", &a), specialized_key("f", &swapped));
-    }
-
-    /// Two specializations of one kernel are two pipelines, and asking again
-    /// gets the cached one back.
-    #[test]
-    fn specialized_pipelines_are_cached_per_constant_set() {
-        let ctx = MetalContext::new().unwrap();
-        let mut cache = ctx.pipeline_cache_mut();
-        let before = cache.len();
-        let with = |threads: u32| constants(&[(0, FunctionConstant::UInt(threads))]);
-
-        let small = cache
-            .get_or_create_specialized_pipeline_typed(
-                ctx.device(),
-                "fused_linear_cross_entropy_forward",
-                &with(32),
-            )
-            .unwrap();
-        let large = cache
-            .get_or_create_specialized_pipeline_typed(
-                ctx.device(),
-                "fused_linear_cross_entropy_forward",
-                &with(256),
-            )
-            .unwrap();
-        let small_again = cache
-            .get_or_create_specialized_pipeline_typed(
-                ctx.device(),
-                "fused_linear_cross_entropy_forward",
-                &with(32),
-            )
-            .unwrap();
-
-        assert_eq!(cache.len(), before + 2);
-        assert!(!std::ptr::eq(&*small, &*large));
-        assert!(std::ptr::eq(&*small, &*small_again));
     }
 }

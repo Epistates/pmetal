@@ -31,15 +31,10 @@ use tracing::{debug, info};
 use crate::chip;
 use crate::error::{MetalError, Result};
 use crate::pipeline::PipelineCache;
-use crate::tuna::Tuner;
 
 /// Global Metal context singleton using OnceLock for thread-safe lazy initialization.
 static GLOBAL_CONTEXT: OnceLock<Result<Arc<MetalContext>>> = OnceLock::new();
 static DEVICE_AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-/// A digest of the compiled shader libraries, computed by the build script.
-/// Cached tuning results are scoped to it.
-const KERNEL_FINGERPRINT: &str = env!("PMETAL_KERNEL_FINGERPRINT");
 
 /// Embedded Metal 3 library binary (compiled at build time).
 const METAL_LIBRARY_BYTES: &[u8] =
@@ -64,9 +59,6 @@ pub struct MetalContext {
 
     /// Cached compute pipelines.
     pipeline_cache: RwLock<PipelineCache>,
-
-    /// Auto-tuner for kernel parameters.
-    tuner: Arc<Tuner>,
 
     /// Device properties.
     properties: DeviceProperties,
@@ -668,13 +660,11 @@ impl MetalContext {
         );
 
         let pipeline_cache = RwLock::new(cache);
-        let tuner = Arc::new(Tuner::for_device(&properties, KERNEL_FINGERPRINT));
 
         Ok(Self {
             device,
             command_queue,
             pipeline_cache,
-            tuner,
             properties,
         })
     }
@@ -689,12 +679,6 @@ impl MetalContext {
     #[inline]
     pub fn command_queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         &self.command_queue
-    }
-
-    /// Get a reference to the auto-tuner.
-    #[inline]
-    pub fn tuner(&self) -> &Arc<Tuner> {
-        &self.tuner
     }
 
     /// Get device properties.
@@ -759,8 +743,7 @@ impl MetalContext {
 // SAFETY: the Metal device, command queue and pipeline states a context holds
 // are documented as safe to use from any thread (Apple's Metal Programming
 // Guide: "Command queues, devices, libraries and pipeline states are thread
-// safe"). The pipeline cache is behind a lock and the tuner is internally
-// synchronized.
+// safe"). The pipeline cache is behind a lock.
 unsafe impl Send for MetalContext {}
 // SAFETY: see above.
 unsafe impl Sync for MetalContext {}

@@ -291,7 +291,7 @@ impl MlxMetalOptimizer {
             BufferUsage::Shared,
         )?;
 
-        let adamw = FusedAdamW::new(ctx.clone(), &[1]);
+        let adamw = FusedAdamW::new(ctx.clone(), &[1])?;
 
         Ok(Self {
             ctx,
@@ -369,7 +369,7 @@ impl MlxMetalOptimizer {
         self.param_info = MetalBuffer::from_slice(&self.ctx, &param_info_vec, BufferUsage::Shared)?;
 
         // Create fused AdamW with correct sizes
-        self.adamw = FusedAdamW::new(self.ctx.clone(), &self.layout.sizes);
+        self.adamw = FusedAdamW::new(self.ctx.clone(), &self.layout.sizes)?;
 
         self.initialized = true;
 

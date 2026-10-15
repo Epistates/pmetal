@@ -14,7 +14,10 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLComputeCommandEncoder, MTLSize,
+};
 
 use crate::{
     buffer::MetalBuffer,
@@ -44,7 +47,15 @@ impl ExpertBits {
         }
     }
 
-    /// Metal kernel suffix for the appropriate bit width.
+    /// The kernel that computes the gate and up rows with the SwiGLU.
+    fn gate_up_kernel_name(self) -> &'static str {
+        match self {
+            Self::Four => "fused_gate_up_swiglu_4bit",
+            Self::Two => "fused_gate_up_swiglu_2bit",
+        }
+    }
+
+    /// The kernel that computes the down projection.
     fn matvec_kernel_name(self) -> &'static str {
         match self {
             Self::Four => "dequant_matvec_4bit",
@@ -104,11 +115,11 @@ impl FusedMoeExpertConfig {
                 self.intermediate_dim, self.group_size
             )));
         }
-        // group_size must be >= pack_factor to prevent divide-by-zero
-        // in group index calculation (col / (group_size / pack_factor))
-        if self.group_size < pf {
+        // A group must be a whole number of packed words: the kernels find a
+        // word's group as `word / (group_size / pack_factor)`.
+        if self.group_size < pf || self.group_size % pf != 0 {
             return Err(MetalError::InvalidConfig(format!(
-                "group_size ({}) must be >= pack_factor ({}) for {:?}-bit quantization",
+                "group_size ({}) must be a multiple of pack_factor ({}) for {:?}-bit quantization",
                 self.group_size, pf, self.bits
             )));
         }
@@ -119,7 +130,7 @@ impl FusedMoeExpertConfig {
 /// Fused quantized expert forward kernel.
 ///
 /// For offloaded/single-expert inference (T=1 decode):
-/// 1. Phase A: `fused_gate_up_swiglu` — dequant gate+up weights, compute SwiGLU
+/// 1. Phase A: `fused_gate_up_swiglu_*bit` — dequant gate+up weights, compute SwiGLU
 /// 2. Phase B: `dequant_matvec_*bit` — dequant down weights, compute projection
 ///
 /// Both phases are dispatched in a single command buffer for minimal overhead.
@@ -168,7 +179,7 @@ impl FusedMoeExpert {
         // Verify both pipelines can be created
         {
             let mut cache = ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(ctx.device(), "fused_gate_up_swiglu", None)?;
+            cache.get_or_create_pipeline(ctx.device(), config.bits.gate_up_kernel_name(), None)?;
             cache.get_or_create_pipeline(ctx.device(), config.bits.matvec_kernel_name(), None)?;
         }
 
@@ -186,18 +197,9 @@ impl FusedMoeExpert {
         output: &MetalBuffer<f32>,
         intermediate: &MetalBuffer<f32>,
     ) -> Result<()> {
-        let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue.new_command_buffer()?;
-
+        let command_buffer = self.create_command_buffer()?;
         self.encode_into(&command_buffer, input, weights, output, intermediate)?;
-
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-
-        if let Some(error) = command_buffer.error() {
-            return Err(MetalError::ExecutionFailed(error.to_string()));
-        }
-        Ok(())
+        self.submit_and_wait(&command_buffer)
     }
 
     /// Encode both phases into an external command buffer (non-blocking).
@@ -207,7 +209,7 @@ impl FusedMoeExpert {
     /// — encode all K experts into one CMD buffer, submit, defer sync to next layer.
     pub fn encode_into(
         &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         input: &MetalBuffer<f32>,
         weights: &ExpertWeightBuffers,
         output: &MetalBuffer<f32>,
@@ -221,7 +223,7 @@ impl FusedMoeExpert {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_into_with_offsets(
         &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         input: &MetalBuffer<f32>,
         input_offset_elems: usize,
         weights: &ExpertWeightBuffers,
@@ -229,58 +231,47 @@ impl FusedMoeExpert {
         output_offset_elems: usize,
         intermediate: &MetalBuffer<f32>,
     ) -> Result<()> {
-        validate_offset_span(
-            input.len(),
-            input_offset_elems,
-            self.config.hidden_dim as usize,
-            "input",
-        )?;
-        validate_offset_span(
-            output.len(),
-            output_offset_elems,
-            self.config.hidden_dim as usize,
-            "output",
-        )?;
-        // Phase A: fused gate+up+SwiGLU
-        self.encode_gate_up_swiglu(
+        let part = Part::whole;
+        let parts = [
+            part(weights.gate_weights.metal_buffer()),
+            part(weights.gate_scales.metal_buffer()),
+            part(weights.gate_biases.metal_buffer()),
+            part(weights.up_weights.metal_buffer()),
+            part(weights.up_scales.metal_buffer()),
+            part(weights.up_biases.metal_buffer()),
+            part(weights.down_weights.metal_buffer()),
+            part(weights.down_scales.metal_buffer()),
+            part(weights.down_biases.metal_buffer()),
+        ];
+        self.encode_parts(
             command_buffer,
             input,
             input_offset_elems,
-            weights,
-            intermediate,
-        )?;
-        // Phase B: down projection
-        self.encode_down_projection(
-            command_buffer,
-            intermediate,
-            weights,
+            &parts,
             output,
             output_offset_elems,
-        )?;
-        Ok(())
+            intermediate,
+        )
     }
 
     /// Create a new command buffer from this context's queue.
     pub fn create_command_buffer(
         &self,
-    ) -> Result<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>>> {
+    ) -> Result<objc2::rc::Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         self.ctx.command_queue().new_command_buffer()
     }
 
     /// Submit a command buffer and wait for GPU completion.
     pub fn submit_and_wait(
         &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<()> {
         self.submit(command_buffer)?;
         self.wait_for_completion(command_buffer)
     }
 
     /// Submit a command buffer without waiting.
-    pub fn submit(
-        &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
-    ) -> Result<()> {
+    pub fn submit(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
         command_buffer.commit();
         Ok(())
     }
@@ -288,139 +279,12 @@ impl FusedMoeExpert {
     /// Wait for a previously submitted command buffer.
     pub fn wait_for_completion(
         &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
     ) -> Result<()> {
         command_buffer.waitUntilCompleted();
         if let Some(error) = command_buffer.error() {
             return Err(MetalError::ExecutionFailed(error.to_string()));
         }
-        Ok(())
-    }
-
-    /// Encode Phase A: fused gate+up+SwiGLU into a command buffer.
-    fn encode_gate_up_swiglu(
-        &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
-        input: &MetalBuffer<f32>,
-        input_offset_elems: usize,
-        weights: &ExpertWeightBuffers,
-        output: &MetalBuffer<f32>,
-    ) -> Result<()> {
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), "fused_gate_up_swiglu", None)?
-        };
-
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(weights.gate_weights.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weights.gate_scales.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(weights.gate_biases.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(weights.up_weights.metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(weights.up_scales.metal_buffer()), 0, 4);
-            encoder.setBuffer_offset_atIndex(Some(weights.up_biases.metal_buffer()), 0, 5);
-            encoder.setBuffer_offset_atIndex(
-                Some(input.metal_buffer()),
-                byte_offset::<f32>(input_offset_elems)?,
-                6,
-            );
-            encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 7);
-
-            let out_dim = self.config.intermediate_dim;
-            let in_dim = self.config.hidden_dim;
-            let group_size = self.config.group_size;
-
-            let out_dim_ptr = NonNull::from(&out_dim).cast();
-            encoder.setBytes_length_atIndex(out_dim_ptr, 4, 8);
-            let in_dim_ptr = NonNull::from(&in_dim).cast();
-            encoder.setBytes_length_atIndex(in_dim_ptr, 4, 9);
-            let gs_ptr = NonNull::from(&group_size).cast();
-            encoder.setBytes_length_atIndex(gs_ptr, 4, 10);
-        }
-
-        // ROWS_PER_TG = 8 (RESULTS_PER_SG=4 × NUM_SIMDGROUPS=2), TG_SIZE = 64
-        let rows_per_tg: u32 = 8;
-        let grid_size = objc2_metal::MTLSize {
-            width: self.config.intermediate_dim.div_ceil(rows_per_tg) as usize,
-            height: 1,
-            depth: 1,
-        };
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: 64,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-
-        Ok(())
-    }
-
-    /// Encode Phase B: down projection into a command buffer.
-    fn encode_down_projection(
-        &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
-        input: &MetalBuffer<f32>,
-        weights: &ExpertWeightBuffers,
-        output: &MetalBuffer<f32>,
-        output_offset_elems: usize,
-    ) -> Result<()> {
-        let kernel_name = self.config.bits.matvec_kernel_name();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), kernel_name, None)?
-        };
-
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
-
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(weights.down_weights.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(weights.down_scales.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(weights.down_biases.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(input.metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(
-                Some(output.metal_buffer()),
-                byte_offset::<f32>(output_offset_elems)?,
-                4,
-            );
-
-            let out_dim = self.config.hidden_dim;
-            let in_dim = self.config.intermediate_dim;
-            let group_size = self.config.group_size;
-
-            let out_dim_ptr = NonNull::from(&out_dim).cast();
-            encoder.setBytes_length_atIndex(out_dim_ptr, 4, 5);
-            let in_dim_ptr = NonNull::from(&in_dim).cast();
-            encoder.setBytes_length_atIndex(in_dim_ptr, 4, 6);
-            let gs_ptr = NonNull::from(&group_size).cast();
-            encoder.setBytes_length_atIndex(gs_ptr, 4, 7);
-        }
-
-        let rows_per_tg: u32 = 8;
-        let grid_size = objc2_metal::MTLSize {
-            width: self.config.hidden_dim.div_ceil(rows_per_tg) as usize,
-            height: 1,
-            depth: 1,
-        };
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: 64,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-
         Ok(())
     }
 
@@ -436,9 +300,9 @@ impl FusedMoeExpert {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_expert_aligned(
         &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         input: &MetalBuffer<f32>,
-        expert_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        expert_buf: &ProtocolObject<dyn MTLBuffer>,
         gate_w_off: usize,
         gate_s_off: usize,
         gate_b_off: usize,
@@ -475,10 +339,10 @@ impl FusedMoeExpert {
     #[allow(clippy::too_many_arguments)]
     pub fn encode_expert_aligned_with_offsets(
         &self,
-        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         input: &MetalBuffer<f32>,
         input_offset_elems: usize,
-        expert_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        expert_buf: &ProtocolObject<dyn MTLBuffer>,
         gate_w_off: usize,
         gate_s_off: usize,
         gate_b_off: usize,
@@ -492,126 +356,238 @@ impl FusedMoeExpert {
         output_offset_elems: usize,
         intermediate: &MetalBuffer<f32>,
     ) -> Result<()> {
-        validate_offset_span(
-            input.len(),
+        let part = |offset| Part {
+            buffer: expert_buf,
+            offset,
+        };
+        let parts = [
+            part(gate_w_off),
+            part(gate_s_off),
+            part(gate_b_off),
+            part(up_w_off),
+            part(up_s_off),
+            part(up_b_off),
+            part(down_w_off),
+            part(down_s_off),
+            part(down_b_off),
+        ];
+        self.encode_parts(
+            command_buffer,
+            input,
             input_offset_elems,
-            self.config.hidden_dim as usize,
-            "input",
-        )?;
-        validate_offset_span(
-            output.len(),
+            &parts,
+            output,
             output_offset_elems,
+            intermediate,
+        )
+    }
+
+    /// The bytes each of the nine weight parts must hold, in
+    /// [`Part`] order: gate, up and down, each as words, scales, biases.
+    fn part_bytes(&self) -> [usize; 9] {
+        let (hidden, inter) = (
             self.config.hidden_dim as usize,
-            "output",
-        )?;
-        // Phase A: gate+up+SwiGLU
-        {
-            let pipeline = {
-                let mut cache = self.ctx.pipeline_cache_mut();
-                cache.get_or_create_pipeline(self.ctx.device(), "fused_gate_up_swiglu", None)?
-            };
+            self.config.intermediate_dim as usize,
+        );
+        let (pack, group) = (
+            self.config.bits.pack_factor() as usize,
+            self.config.group_size as usize,
+        );
+        let words = |rows: usize, cols: usize| rows * (cols / pack) * std::mem::size_of::<u32>();
+        let halves = |rows: usize, cols: usize| rows * (cols / group) * std::mem::size_of::<u16>();
+        [
+            words(inter, hidden),
+            halves(inter, hidden),
+            halves(inter, hidden),
+            words(inter, hidden),
+            halves(inter, hidden),
+            halves(inter, hidden),
+            words(hidden, inter),
+            halves(hidden, inter),
+            halves(hidden, inter),
+        ]
+    }
 
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or(MetalError::EncoderCreation)?;
-
-            encoder.setComputePipelineState(&pipeline);
-
-            unsafe {
-                // All 6 weight components point to the same AlignedBuffer at different offsets
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), gate_w_off, 0);
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), gate_s_off, 1);
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), gate_b_off, 2);
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), up_w_off, 3);
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), up_s_off, 4);
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), up_b_off, 5);
-                encoder.setBuffer_offset_atIndex(
-                    Some(input.metal_buffer()),
-                    byte_offset::<f32>(input_offset_elems)?,
-                    6,
-                );
-                encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 7);
-
-                let out_dim = self.config.intermediate_dim;
-                let in_dim = self.config.hidden_dim;
-                let group_size = self.config.group_size;
-                let out_dim_ptr = NonNull::from(&out_dim).cast();
-                encoder.setBytes_length_atIndex(out_dim_ptr, 4, 8);
-                let in_dim_ptr = NonNull::from(&in_dim).cast();
-                encoder.setBytes_length_atIndex(in_dim_ptr, 4, 9);
-                let gs_ptr = NonNull::from(&group_size).cast();
-                encoder.setBytes_length_atIndex(gs_ptr, 4, 10);
-            }
-
-            let rows_per_tg: u32 = 8;
-            let grid_size = objc2_metal::MTLSize {
-                width: self.config.intermediate_dim.div_ceil(rows_per_tg) as usize,
-                height: 1,
-                depth: 1,
-            };
-            let threadgroup_size = objc2_metal::MTLSize {
-                width: 64,
-                height: 1,
-                depth: 1,
-            };
-
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-            encoder.endEncoding();
+    /// Both phases of one expert, in one compute encoder: the dispatches of a
+    /// serial encoder run in order, so the down projection sees the whole
+    /// intermediate vector.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_parts(
+        &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+        input: &MetalBuffer<f32>,
+        input_offset_elems: usize,
+        parts: &[Part<'_>; 9],
+        output: &MetalBuffer<f32>,
+        output_offset_elems: usize,
+        intermediate: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        let (hidden, inter) = (
+            self.config.hidden_dim as usize,
+            self.config.intermediate_dim as usize,
+        );
+        validate_offset_span(input.len(), input_offset_elems, hidden, "input")?;
+        validate_offset_span(output.len(), output_offset_elems, hidden, "output")?;
+        validate_offset_span(intermediate.len(), 0, inter, "intermediate")?;
+        const NAMES: [&str; 9] = [
+            "gate weights",
+            "gate scales",
+            "gate biases",
+            "up weights",
+            "up scales",
+            "up biases",
+            "down weights",
+            "down scales",
+            "down biases",
+        ];
+        for ((part, bytes), name) in parts.iter().zip(self.part_bytes()).zip(NAMES) {
+            part.validate(bytes, name)?;
         }
 
-        // Phase B: down projection
-        {
-            let kernel_name = self.config.bits.matvec_kernel_name();
-            let pipeline = {
-                let mut cache = self.ctx.pipeline_cache_mut();
-                cache.get_or_create_pipeline(self.ctx.device(), kernel_name, None)?
-            };
+        let gate_up = {
+            let mut cache = self.ctx.pipeline_cache_mut();
+            cache.get_or_create_pipeline(
+                self.ctx.device(),
+                self.config.bits.gate_up_kernel_name(),
+                None,
+            )?
+        };
+        let down = {
+            let mut cache = self.ctx.pipeline_cache_mut();
+            cache.get_or_create_pipeline(
+                self.ctx.device(),
+                self.config.bits.matvec_kernel_name(),
+                None,
+            )?
+        };
 
-            let encoder = command_buffer
-                .computeCommandEncoder()
-                .ok_or(MetalError::EncoderCreation)?;
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
+        let threadgroup_size = MTLSize {
+            width: TG_SIZE,
+            height: 1,
+            depth: 1,
+        };
+        let group_size = self.config.group_size;
 
-            encoder.setComputePipelineState(&pipeline);
-
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), down_w_off, 0);
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), down_s_off, 1);
-                encoder.setBuffer_offset_atIndex(Some(expert_buf), down_b_off, 2);
-                encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 3);
-                encoder.setBuffer_offset_atIndex(
-                    Some(output.metal_buffer()),
-                    byte_offset::<f32>(output_offset_elems)?,
-                    4,
-                );
-
-                let out_dim = self.config.hidden_dim;
-                let in_dim = self.config.intermediate_dim;
-                let group_size = self.config.group_size;
-                let out_dim_ptr = NonNull::from(&out_dim).cast();
-                encoder.setBytes_length_atIndex(out_dim_ptr, 4, 5);
-                let in_dim_ptr = NonNull::from(&in_dim).cast();
-                encoder.setBytes_length_atIndex(in_dim_ptr, 4, 6);
-                let gs_ptr = NonNull::from(&group_size).cast();
-                encoder.setBytes_length_atIndex(gs_ptr, 4, 7);
+        // Phase A: gate and up rows, with the SwiGLU, into `intermediate`.
+        encoder.setComputePipelineState(&gate_up);
+        // SAFETY: every buffer outlives the command buffer's execution, the
+        // part spans were validated above, and the scalars are copied by
+        // `setBytes`.
+        unsafe {
+            for (index, part) in parts[..6].iter().enumerate() {
+                encoder.setBuffer_offset_atIndex(Some(part.buffer), part.offset, index);
             }
-
-            let rows_per_tg: u32 = 8;
-            let grid_size = objc2_metal::MTLSize {
-                width: self.config.hidden_dim.div_ceil(rows_per_tg) as usize,
-                height: 1,
-                depth: 1,
-            };
-            let threadgroup_size = objc2_metal::MTLSize {
-                width: 64,
-                height: 1,
-                depth: 1,
-            };
-
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-            encoder.endEncoding();
+            encoder.setBuffer_offset_atIndex(
+                Some(input.metal_buffer()),
+                byte_offset::<f32>(input_offset_elems)?,
+                6,
+            );
+            encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 7);
+            set_u32(&encoder, inter as u32, 8);
+            set_u32(&encoder, hidden as u32, 9);
+            set_u32(&encoder, group_size, 10);
         }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: inter.div_ceil(ROWS_PER_TG),
+                height: 1,
+                depth: 1,
+            },
+            threadgroup_size,
+        );
 
+        // Phase B: the down projection of the intermediate vector.
+        encoder.setComputePipelineState(&down);
+        // SAFETY: as above.
+        unsafe {
+            for (index, part) in parts[6..].iter().enumerate() {
+                encoder.setBuffer_offset_atIndex(Some(part.buffer), part.offset, index);
+            }
+            encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(
+                Some(output.metal_buffer()),
+                byte_offset::<f32>(output_offset_elems)?,
+                4,
+            );
+            set_u32(&encoder, hidden as u32, 5);
+            set_u32(&encoder, inter as u32, 6);
+            set_u32(&encoder, group_size, 7);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: hidden.div_ceil(ROWS_PER_TG),
+                height: 1,
+                depth: 1,
+            },
+            threadgroup_size,
+        );
+        encoder.endEncoding();
         Ok(())
+    }
+}
+
+/// Output rows one threadgroup computes (`ROWS_PER_TG` in the shader:
+/// 2 simdgroups of 4 rows) and its thread count.
+const ROWS_PER_TG: usize = 8;
+const TG_SIZE: usize = 64;
+
+/// One weight component: a Metal buffer and the byte offset it starts at.
+struct Part<'a> {
+    buffer: &'a ProtocolObject<dyn MTLBuffer>,
+    offset: usize,
+}
+
+impl<'a> Part<'a> {
+    /// A whole buffer, from its first byte.
+    fn whole(buffer: &'a ProtocolObject<dyn MTLBuffer>) -> Self {
+        Self { buffer, offset: 0 }
+    }
+
+    /// Fail unless `bytes` bytes from the offset lie inside the buffer, and
+    /// the offset is a multiple of 4 (the kernels read 32-bit words, and a
+    /// scale or bias table may start mid-record).
+    fn validate(&self, bytes: usize, name: &'static str) -> Result<()> {
+        if self.offset % 4 != 0 {
+            return Err(MetalError::InvalidConfig(format!(
+                "expert {name} offset {} is not a multiple of 4",
+                self.offset
+            )));
+        }
+        let end = self
+            .offset
+            .checked_add(bytes)
+            .ok_or_else(|| MetalError::InvalidConfig(format!("expert {name} offset overflow")))?;
+        if end > self.buffer.length() {
+            return Err(MetalError::InvalidConfig(format!(
+                "expert {name} span [{}..{end}) exceeds its buffer of {} bytes",
+                self.offset,
+                self.buffer.length()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Bind a 32-bit scalar as a kernel constant.
+///
+/// # Safety
+///
+/// `index` must be a `constant uint&` argument of the bound pipeline.
+unsafe fn set_u32(
+    encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+    value: u32,
+    index: usize,
+) {
+    // SAFETY: `setBytes` copies the four bytes before returning.
+    unsafe {
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&value).cast(),
+            std::mem::size_of::<u32>(),
+            index,
+        );
     }
 }
 
@@ -717,5 +693,338 @@ mod tests {
             bits: ExpertBits::Four,
         };
         assert!(large_hidden.validate().is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // Numerical checks against a float64 reference.
+    // ------------------------------------------------------------------
+
+    use crate::buffer::BufferUsage;
+
+    /// Deterministic uniform values in [-1, 1).
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        }
+    }
+
+    fn bf16_bits(value: f64) -> u16 {
+        half::bf16::from_f64(value).to_bits()
+    }
+
+    fn bf16_value(bits: u16) -> f64 {
+        f64::from(half::bf16::from_bits(bits).to_f32())
+    }
+
+    /// An affine-quantized `[rows, cols]` matrix in MLX's layout (element
+    /// `j` of a word at bits `j * bits`, bf16 scales and biases per group),
+    /// with the f64 values it dequantizes to.
+    struct QuantMatrix {
+        words: Vec<u32>,
+        scales: Vec<u16>,
+        biases: Vec<u16>,
+        dequantized: Vec<f64>,
+    }
+
+    fn quantize(rng: &mut Lcg, rows: usize, cols: usize, group: usize, bits: usize) -> QuantMatrix {
+        let levels = (1u32 << bits) - 1;
+        let per_word = 32 / bits;
+        let mut words = vec![0u32; rows * cols / per_word];
+        let mut scales = vec![0u16; rows * cols / group];
+        let mut biases = vec![0u16; rows * cols / group];
+        let mut dequantized = vec![0.0; rows * cols];
+        for row in 0..rows {
+            for g in 0..cols / group {
+                let weights: Vec<f64> = (0..group).map(|_| rng.next() * 0.5).collect();
+                let lo = weights.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let scale = bf16_bits((hi - lo) / f64::from(levels));
+                let bias = bf16_bits(lo);
+                scales[row * (cols / group) + g] = scale;
+                biases[row * (cols / group) + g] = bias;
+                for (k, w) in weights.iter().enumerate() {
+                    let q = ((w - bf16_value(bias)) / bf16_value(scale))
+                        .round()
+                        .clamp(0.0, f64::from(levels)) as u32;
+                    let col = g * group + k;
+                    words[(row * cols + col) / per_word] |= q << (bits * (col % per_word));
+                    dequantized[row * cols + col] =
+                        bf16_value(scale) * f64::from(q) + bf16_value(bias);
+                }
+            }
+        }
+        QuantMatrix {
+            words,
+            scales,
+            biases,
+            dequantized,
+        }
+    }
+
+    fn matvec(w: &[f64], x: &[f64], rows: usize, cols: usize) -> Vec<f64> {
+        (0..rows)
+            .map(|r| (0..cols).map(|c| w[r * cols + c] * x[c]).sum())
+            .collect()
+    }
+
+    /// `down(silu(gate(x)) * up(x))` in f64, with the L1 mass of each output's
+    /// terms as the error scale (the kernel accumulates in f32).
+    fn reference_expert(
+        gate: &QuantMatrix,
+        up: &QuantMatrix,
+        down: &QuantMatrix,
+        x: &[f64],
+        hidden: usize,
+        inter: usize,
+    ) -> Vec<(f64, f64)> {
+        let g = matvec(&gate.dequantized, x, inter, hidden);
+        let u = matvec(&up.dequantized, x, inter, hidden);
+        let act: Vec<f64> = g
+            .iter()
+            .zip(&u)
+            .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+            .collect();
+        let out = matvec(&down.dequantized, &act, hidden, inter);
+        (0..hidden)
+            .map(|r| {
+                let mass: f64 = (0..inter)
+                    .map(|c| (down.dequantized[r * inter + c] * act[c]).abs())
+                    .sum();
+                (out[r], mass)
+            })
+            .collect()
+    }
+
+    fn weight_buffers(
+        ctx: &MetalContext,
+        gate: &QuantMatrix,
+        up: &QuantMatrix,
+        down: &QuantMatrix,
+    ) -> ExpertWeightBuffers {
+        let usage = BufferUsage::Shared;
+        ExpertWeightBuffers {
+            gate_weights: MetalBuffer::from_slice(ctx, &gate.words, usage).unwrap(),
+            gate_scales: MetalBuffer::from_slice(ctx, &gate.scales, usage).unwrap(),
+            gate_biases: MetalBuffer::from_slice(ctx, &gate.biases, usage).unwrap(),
+            up_weights: MetalBuffer::from_slice(ctx, &up.words, usage).unwrap(),
+            up_scales: MetalBuffer::from_slice(ctx, &up.scales, usage).unwrap(),
+            up_biases: MetalBuffer::from_slice(ctx, &up.biases, usage).unwrap(),
+            down_weights: MetalBuffer::from_slice(ctx, &down.words, usage).unwrap(),
+            down_scales: MetalBuffer::from_slice(ctx, &down.scales, usage).unwrap(),
+            down_biases: MetalBuffer::from_slice(ctx, &down.biases, usage).unwrap(),
+        }
+    }
+
+    fn check_expert(hidden: usize, inter: usize, group: usize, bits: ExpertBits, seed: u64) {
+        let ctx = MetalContext::global().expect("Metal context");
+        let b = match bits {
+            ExpertBits::Four => 4,
+            ExpertBits::Two => 2,
+        };
+        let mut rng = Lcg(seed);
+        let gate = quantize(&mut rng, inter, hidden, group, b);
+        let up = quantize(&mut rng, inter, hidden, group, b);
+        let down = quantize(&mut rng, hidden, inter, group, b);
+        let x32: Vec<f32> = (0..hidden).map(|_| rng.next() as f32).collect();
+        let x: Vec<f64> = x32.iter().map(|&v| f64::from(v)).collect();
+
+        let expert = FusedMoeExpert::new(
+            ctx.clone(),
+            FusedMoeExpertConfig {
+                hidden_dim: hidden as u32,
+                intermediate_dim: inter as u32,
+                group_size: group as u32,
+                bits,
+            },
+        )
+        .unwrap();
+        let weights = weight_buffers(&ctx, &gate, &up, &down);
+        let input = MetalBuffer::from_slice(&ctx, &x32, BufferUsage::Shared).unwrap();
+        let output = MetalBuffer::<f32>::zeros(&ctx, hidden, BufferUsage::Shared).unwrap();
+        let scratch = MetalBuffer::<f32>::zeros(&ctx, inter, BufferUsage::Shared).unwrap();
+        expert
+            .forward_single_expert(&input, &weights, &output, &scratch)
+            .unwrap();
+
+        let want = reference_expert(&gate, &up, &down, &x, hidden, inter);
+        for (row, (&got, &(want, mass))) in output.as_slice().iter().zip(&want).enumerate() {
+            let err = (f64::from(got) - want).abs();
+            assert!(
+                err <= 2e-5 * mass.max(1e-3),
+                "{bits:?} hidden {hidden} inter {inter} group {group} row {row}: \
+                 got {got}, want {want} (err {err:e}, mass {mass:e})"
+            );
+        }
+    }
+
+    #[test]
+    fn four_bit_expert_matches_float64_reference() {
+        check_expert(256, 128, 64, ExpertBits::Four, 1);
+        check_expert(2048, 512, 64, ExpertBits::Four, 2);
+        // A group no wider than the 8 values a word holds.
+        check_expert(64, 40, 8, ExpertBits::Four, 3);
+    }
+
+    #[test]
+    fn two_bit_expert_matches_float64_reference() {
+        check_expert(256, 128, 64, ExpertBits::Two, 4);
+        check_expert(2048, 512, 64, ExpertBits::Two, 5);
+        check_expert(128, 48, 16, ExpertBits::Two, 6);
+    }
+
+    /// The zero-copy path hands the kernel one buffer with every component at
+    /// a byte offset, as the expert reader fills it.
+    #[test]
+    fn an_expert_read_from_one_buffer_matches_its_separate_buffers() {
+        let ctx = MetalContext::global().expect("Metal context");
+        let (hidden, inter, group) = (256usize, 128usize, 64usize);
+        let mut rng = Lcg(7);
+        let gate = quantize(&mut rng, inter, hidden, group, 4);
+        let up = quantize(&mut rng, inter, hidden, group, 4);
+        let down = quantize(&mut rng, hidden, inter, group, 4);
+        let x32: Vec<f32> = (0..hidden).map(|_| rng.next() as f32).collect();
+
+        // One record: [gate w, s, b][up w, s, b][down w, s, b], each part
+        // starting on a 16-byte boundary.
+        let mut record: Vec<u8> = Vec::new();
+        let mut place = |bytes: &[u8]| {
+            while record.len() % 16 != 0 {
+                record.push(0);
+            }
+            let at = record.len();
+            record.extend_from_slice(bytes);
+            at
+        };
+        let words = |w: &[u32]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let halves = |h: &[u16]| h.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let offsets = [
+            place(&words(&gate.words)),
+            place(&halves(&gate.scales)),
+            place(&halves(&gate.biases)),
+            place(&words(&up.words)),
+            place(&halves(&up.scales)),
+            place(&halves(&up.biases)),
+            place(&words(&down.words)),
+            place(&halves(&down.scales)),
+            place(&halves(&down.biases)),
+        ];
+        let buffer = MetalBuffer::from_slice(&ctx, &record, BufferUsage::Shared).unwrap();
+
+        let expert = FusedMoeExpert::new(
+            ctx.clone(),
+            FusedMoeExpertConfig {
+                hidden_dim: hidden as u32,
+                intermediate_dim: inter as u32,
+                group_size: group as u32,
+                bits: ExpertBits::Four,
+            },
+        )
+        .unwrap();
+        let input = MetalBuffer::from_slice(&ctx, &x32, BufferUsage::Shared).unwrap();
+        let scratch = MetalBuffer::<f32>::zeros(&ctx, inter, BufferUsage::Shared).unwrap();
+        let aligned = MetalBuffer::<f32>::zeros(&ctx, hidden, BufferUsage::Shared).unwrap();
+        let command_buffer = expert.create_command_buffer().unwrap();
+        expert
+            .encode_expert_aligned(
+                &command_buffer,
+                &input,
+                buffer.metal_buffer(),
+                offsets[0],
+                offsets[1],
+                offsets[2],
+                offsets[3],
+                offsets[4],
+                offsets[5],
+                offsets[6],
+                offsets[7],
+                offsets[8],
+                &aligned,
+                &scratch,
+            )
+            .unwrap();
+        expert.submit_and_wait(&command_buffer).unwrap();
+
+        let separate = MetalBuffer::<f32>::zeros(&ctx, hidden, BufferUsage::Shared).unwrap();
+        let weights = weight_buffers(&ctx, &gate, &up, &down);
+        expert
+            .forward_single_expert(&input, &weights, &separate, &scratch)
+            .unwrap();
+        assert_eq!(aligned.as_slice(), separate.as_slice());
+    }
+
+    /// A weight table that runs off the end of its buffer would be read past
+    /// the allocation by the GPU, silently; the encode refuses it.
+    #[test]
+    fn a_weight_table_outside_its_buffer_is_refused() {
+        let ctx = MetalContext::global().expect("Metal context");
+        let (hidden, inter, group) = (64usize, 32usize, 32usize);
+        let mut rng = Lcg(8);
+        let gate = quantize(&mut rng, inter, hidden, group, 4);
+        let up = quantize(&mut rng, inter, hidden, group, 4);
+        let down = quantize(&mut rng, hidden, inter, group, 4);
+        let expert = FusedMoeExpert::new(
+            ctx.clone(),
+            FusedMoeExpertConfig {
+                hidden_dim: hidden as u32,
+                intermediate_dim: inter as u32,
+                group_size: group as u32,
+                bits: ExpertBits::Four,
+            },
+        )
+        .unwrap();
+        let usage = BufferUsage::Shared;
+        let input = MetalBuffer::<f32>::zeros(&ctx, hidden, usage).unwrap();
+        let output = MetalBuffer::<f32>::zeros(&ctx, hidden, usage).unwrap();
+        let scratch = MetalBuffer::<f32>::zeros(&ctx, inter, usage).unwrap();
+
+        let mut weights = weight_buffers(&ctx, &gate, &up, &down);
+        weights.up_scales =
+            MetalBuffer::from_slice(&ctx, &up.scales[..up.scales.len() - 1], usage).unwrap();
+        let err = expert
+            .forward_single_expert(&input, &weights, &output, &scratch)
+            .unwrap_err();
+        assert!(err.to_string().contains("up scales"), "{err}");
+
+        // An offset that is not word aligned.
+        let record = MetalBuffer::<u8>::zeros(&ctx, 1 << 16, usage).unwrap();
+        let command_buffer = expert.create_command_buffer().unwrap();
+        let err = expert
+            .encode_expert_aligned(
+                &command_buffer,
+                &input,
+                record.metal_buffer(),
+                0,
+                8192,
+                8194,
+                16384,
+                24576,
+                24580,
+                32768,
+                40960,
+                40964,
+                &output,
+                &scratch,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("multiple of 4"), "{err}");
+    }
+
+    /// The kernel finds a word's group by `column / (group_size / pack_factor)`,
+    /// which is only right when a group is a whole number of words.
+    #[test]
+    fn a_group_that_is_not_a_whole_number_of_words_is_refused() {
+        let config = FusedMoeExpertConfig {
+            hidden_dim: 48,
+            intermediate_dim: 48,
+            group_size: 12,
+            bits: ExpertBits::Four,
+        };
+        assert!(config.validate().is_err());
     }
 }
