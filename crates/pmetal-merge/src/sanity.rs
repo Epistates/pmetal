@@ -151,12 +151,38 @@ pub fn check_tensor(
     let mut copy = tensor.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32());
     let shape = copy.shape().to_vec();
     let n: usize = shape.iter().map(|&s| s as usize).product();
-    let data: Vec<f32> = copy.to_f32_vec(n).unwrap_or_default();
 
     let report = match level {
         SanityLevel::Off => unreachable!(),
-        SanityLevel::Quick => MergedTensorReport::quick(name.to_string(), shape, &data),
+        SanityLevel::Quick => {
+            // Count on the device and read back two scalars, not the tensor:
+            // the writer reads it back once itself.
+            let count = |mask: Array| {
+                mask.as_dtype(pmetal_runtime::compat::Dtype::Float32.as_i32())
+                    .sum_all()
+                    .item_f32() as usize
+            };
+            let n_nan = count(copy.not_equal(&copy));
+            let n_inf = count(copy.abs_val().equal(&Array::from_f32(f32::INFINITY)));
+            pmetal_runtime::check_unobserved_error()?;
+            MergedTensorReport {
+                name: name.to_string(),
+                shape,
+                n_elements: n,
+                n_nan,
+                n_inf,
+                mean: None,
+                std: None,
+                abs_max: None,
+                sparsity: None,
+            }
+        }
         SanityLevel::Full => {
+            let data = copy.to_f32_vec(n);
+            pmetal_runtime::check_unobserved_error()?;
+            let data = data.ok_or_else(|| {
+                MergeError::ModelLoad(format!("tensor {name}: failed to read {n} values"))
+            })?;
             let r = MergedTensorReport::full(name.to_string(), shape, &data);
             if let (Some(m), Some(s)) = (r.mean, r.std) {
                 if m.abs() > 10.0 || s > 100.0 {
@@ -234,6 +260,19 @@ mod tests {
         let r = r.expect("should report");
         assert!(!r.is_corrupt());
         assert_eq!(r.n_elements, 3);
+    }
+
+    #[test]
+    fn check_tensor_counts_nan_and_both_infinities_on_the_device() {
+        let arr = Array::from_f32_slice(
+            &[f32::NAN, 1.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN],
+            &[5],
+        );
+        let err = check_tensor("t", &arr, SanityLevel::Quick).unwrap_err();
+        assert!(
+            err.to_string().contains("2 NaN and 2 inf"),
+            "unexpected message: {err}"
+        );
     }
 
     #[test]
