@@ -513,7 +513,7 @@ mod tests {
 
     fn drain() {
         if let Err(e) = pmetal_runtime::check_unobserved_error() {
-            panic!("a bridge op threw: {e}");
+            panic!("a runtime op threw: {e}");
         }
     }
 
@@ -960,7 +960,7 @@ mod tests {
     }
 
     /// A fused call that fails (here, one target short) reports an error,
-    /// on its own and from inside a traced loss: there the bridge can't
+    /// on its own and from inside a traced loss: there the runtime can't
     /// panic in MLX's callback, and the error comes back to the loss as an
     /// `Err` rather than a result computed on placeholders.
     #[test]

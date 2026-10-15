@@ -372,6 +372,39 @@ fn softcapped_scores_in_the_tens_are_formed_in_f32() {
     check_values(&c, Dtype::Bfloat16, 8e-3);
 }
 
+/// A boolean mask means "may attend" (true) as MLX defines it, on every
+/// path; coerced to the queries' dtype it would be read as the additive
+/// values 0 and 1 and attend to everything, silently.
+#[test]
+#[serial]
+fn a_boolean_mask_means_attend() {
+    for spec in [
+        Spec::new(4, 2, 6, 6).mask(Mask::Custom),
+        Spec::new(4, 2, 6, 6).mask(Mask::Custom).softcap(5.0),
+        Spec::new(4, 2, 6, 6).mask(Mask::Custom).sinks(),
+    ] {
+        let c = case(spec, 600);
+        let mut x: Vec<Array> = fields(&c)
+            .iter()
+            .zip(shapes(&c))
+            .map(|(f, s)| arr(f, &s))
+            .collect();
+        let allowed: Vec<f32> = (0..c.lq * c.lk)
+            .map(|n| f32::from(u8::from(custom_allowed(n / c.lk, n % c.lk))))
+            .collect();
+        let mask = Array::from_f32_slice(&allowed, &[1, 1, c.lq as i32, c.lk as i32])
+            .as_dtype(Dtype::Bool.as_i32());
+        let config = config(&c);
+        let got = match &c.sinks {
+            Some(_) => sink_sdpa(&x[0], &x[1], &x[2], &config, Some(&mask), &x[3]).unwrap(),
+            None => fused_sdpa(&x[0], &x[1], &x[2], &config, Some(&mask)).unwrap(),
+        };
+        drain();
+        x.clear();
+        assert_close(&describe(&c), &vec_of(&got), &reference(&c), 2e-5);
+    }
+}
+
 /// Gradients of the queries, keys, values and sinks against finite
 /// differences of the float64 attention.
 #[test]

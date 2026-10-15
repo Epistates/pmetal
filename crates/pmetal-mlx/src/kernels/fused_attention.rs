@@ -13,7 +13,7 @@
 //! and could not be differentiated, so it was removed.
 //!
 //! Masks are additive: `0` where a query may attend and `-inf` where it may
-//! not. The causal mask and the sliding window are aligned to the bottom
+//! not; a boolean mask is true where it may. The causal mask and the sliding window are aligned to the bottom
 //! right, so a query shorter than its keys (the continuation of a cached
 //! prompt, or one decoded token) sees the most recent keys.
 
@@ -106,9 +106,12 @@ impl Masking {
     ) -> Result<Self, Exception> {
         let dtype = queries.dtype().as_i32();
         if let Some(mask) = custom_mask {
+            // A boolean mask (true = may attend) is MLX's own and passes
+            // through; coerced it would read as the additive values 0 and 1.
+            let keep = matches!(mask.dtype(), Dtype::Bool) || mask.dtype() == queries.dtype();
             return Ok(Self {
                 mode: "",
-                array: Some(if mask.dtype() == queries.dtype() {
+                array: Some(if keep {
                     mask.clone()
                 } else {
                     mask.as_dtype(dtype)
@@ -150,7 +153,7 @@ impl Masking {
 /// * `keys` - Key tensor [batch, n_kv_heads, seq_len, head_dim] (NOT pre-expanded for GQA)
 /// * `values` - Value tensor [batch, n_kv_heads, seq_len, value_dim] (NOT pre-expanded for GQA)
 /// * `config` - Attention configuration
-/// * `custom_mask` - Optional additive attention mask [batch?, 1?, seq_len, seq_len]
+/// * `custom_mask` - Optional attention mask [batch?, 1?, seq_len, seq_len]: additive, or boolean with true where a query may attend
 ///
 /// # Returns
 /// Attention output [batch, n_heads, seq_len, value_dim], in the queries' dtype
@@ -219,6 +222,9 @@ fn softcapped_sdpa(
     scores = ops::tanh(&scores.divide(&cap)).multiply(&cap);
 
     let mask = match (&masking.array, masking.mode) {
+        (Some(mask), _) if mask.dtype() == Dtype::Bool => {
+            Some(mask.where_cond(&Array::from_f32(0.0), &Array::from_f32(f32::NEG_INFINITY)))
+        }
         (Some(mask), _) => Some(mask.as_dtype(f32_)),
         (None, "causal") => Some(create_causal_mask(q_len, k_len)?),
         _ => None,

@@ -39,7 +39,7 @@ pub fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array
 /// Materialise an `Array` to a flat `Vec<f32>` regardless of its dtype.
 ///
 /// Clones the input to avoid mutating the caller, evals the clone, then
-/// reads it as f32 via the bridge's `to_f32_vec` (which handles the
+/// reads it as f32 via the runtime's `to_f32_vec` (which handles the
 /// fp16/bf16 → f32 conversion). Returns an empty `Vec` on materialise
 /// failure rather than panicking — callers that care should check the
 /// length explicitly.

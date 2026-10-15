@@ -79,7 +79,7 @@ fn resolve_chunk_size_override(chunk_size_override: Option<i32>, seq_len: i32) -
 
 /// Compute gating decay: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
-/// Uses the bridge's fused `compute_g` kernel (single dispatch instead of 6 ops).
+/// Uses the runtime's fused `compute_g` kernel (single dispatch instead of 6 ops).
 ///
 /// # Arguments
 /// * `a_log` - Log of decay rates, shape `[Hv]`
@@ -90,41 +90,6 @@ fn resolve_chunk_size_override(chunk_size_override: Option<i32>, seq_len: i32) -
 /// Gating decay values, shape `[B, T, Hv]`
 pub fn compute_g(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exception> {
     Ok(Array::fused_compute_g(a_log, a, dt_bias))
-}
-
-/// Raw (non-compiled) compute_g implementation.
-///
-/// Public so that callers embedding GDN inside an **outer** `mx.compile` closure
-/// can inline these ops directly, allowing the outer compile to fuse them with
-/// surrounding element-wise operations. Calling the compiled [`compute_g`] inside
-/// another compiled closure creates a fusion barrier (the inner `Compiled` primitive
-/// is opaque to the outer compile pass).
-pub fn compute_g_impl(a_log: &Array, a: &Array, dt_bias: &Array) -> Result<Array, Exception> {
-    let input_dtype = a_log.dtype();
-
-    // Upcast to f32 for stability
-    let a_log_f32 = if input_dtype != Dtype::Float32 {
-        a_log.as_dtype(Dtype::Float32.as_i32())
-    } else {
-        a_log.clone()
-    };
-
-    // exp(A_log) gives the decay rate A
-    let decay_rate = a_log_f32.exp();
-
-    // softplus(a + dt_bias)
-    let a_biased = a.add(dt_bias);
-    let sp = a_biased.softplus();
-
-    // g = exp(-A * softplus(a + dt_bias))
-    let g = decay_rate.multiply(&sp).negative().exp();
-
-    // Cast back to input dtype
-    if input_dtype != Dtype::Float32 {
-        Ok(g.as_dtype(input_dtype.as_i32()))
-    } else {
-        Ok(g)
-    }
 }
 
 /// Single recurrent step (ops-based reference).
@@ -294,7 +259,7 @@ fn to_f32(a: &Array) -> Array {
 ///
 /// # Returns
 /// (output `[B, T, Hv, Dv]`, final_state `[B, Hv, Dv, Dk]`)
-pub fn gated_delta_ops(
+pub(crate) fn gated_delta_ops(
     q: &Array,
     k: &Array,
     v: &Array,
@@ -744,11 +709,7 @@ fn gated_delta_chunk_ops_impl(
 // Threadgroup: (32, 4, 1) — 32 threads = one SIMD group, 4 dv per threadgroup
 
 /// Try the fused Metal GDN kernel. Returns None if conditions not met.
-///
-/// Public so that callers (e.g. compiled decode closures) can dispatch to the
-/// Metal kernel directly without going through `gated_delta_update` which
-/// would re-compute g/beta.
-pub fn try_gdn_metal_kernel(
+fn try_gdn_metal_kernel(
     q: &Array,
     k: &Array,
     v: &Array,

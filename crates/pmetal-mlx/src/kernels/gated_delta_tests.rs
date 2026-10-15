@@ -882,22 +882,14 @@ fn the_decay_is_the_formula() {
         &Array::from_f32_slice(&f(&dt_bias), &[3]),
     )
     .unwrap();
-    let raw_g = compute_g_impl(
-        &Array::from_f32_slice(&f(&a_log), &[3]),
-        &Array::from_f32_slice(&f(&a), &[1, 8, 3]),
-        &Array::from_f32_slice(&f(&dt_bias), &[3]),
-    )
-    .unwrap();
     drain();
-    for (what, got) in [("compute_g", g), ("compute_g_impl", raw_g)] {
-        let got = vec_of(&got);
-        assert!(got.iter().all(|v| v.is_finite()), "{what}: {got:?}");
-        let worst = got
-            .iter()
-            .zip(&want)
-            .fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
-        assert!(worst <= 1e-6, "{what}: off by {worst:e}");
-    }
+    let got = vec_of(&g);
+    assert!(got.iter().all(|v| v.is_finite()), "{got:?}");
+    let worst = got
+        .iter()
+        .zip(&want)
+        .fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()));
+    assert!(worst <= 1e-6, "off by {worst:e}");
 }
 
 /// The rollback primitive replays a prefix: the state after `n` of a verified
