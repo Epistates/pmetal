@@ -756,12 +756,24 @@ pub struct DeepSeekExpert {
 impl_module_params!(DeepSeekExpert; gate_proj, up_proj, down_proj);
 
 impl DeepSeekExpert {
-    /// A zero-initialised expert; a checkpoint fills the weights.
+    /// A randomly initialised expert (lazily: a checkpoint's weights replace
+    /// the draw before anything computes it).
     pub fn new(hidden_size: i32, intermediate_size: i32) -> Self {
+        let init = |in_features: i32, out_features: i32| {
+            let bound = (in_features as f32).sqrt().recip();
+            MoeLinear {
+                weight: pmetal_runtime::compat::random::uniform_range(
+                    -bound,
+                    bound,
+                    &[out_features, in_features],
+                    Dtype::Float32,
+                ),
+            }
+        };
         Self {
-            gate_proj: MoeLinear::new(hidden_size, intermediate_size),
-            up_proj: MoeLinear::new(hidden_size, intermediate_size),
-            down_proj: MoeLinear::new(intermediate_size, hidden_size),
+            gate_proj: init(hidden_size, intermediate_size),
+            up_proj: init(hidden_size, intermediate_size),
+            down_proj: init(intermediate_size, hidden_size),
         }
     }
 
