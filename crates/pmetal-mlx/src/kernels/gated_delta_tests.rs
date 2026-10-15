@@ -380,7 +380,14 @@ fn the_decode_path_is_the_rule() {
 #[test]
 #[serial]
 fn the_chunked_path_is_the_rule() {
-    for (chunk, t) in [(16, 40), (16, 64), (32, 100), (64, 130)] {
+    for (chunk, t) in [
+        (16, 40),
+        (16, 64),
+        (32, 100),
+        (64, 130),
+        (128, 300),
+        (256, 600),
+    ] {
         let c = case(Spec::new(2, t, 2, 16, 4, 8), 3 + t as u64);
         check_values(
             &format!("chunk {chunk}, T {t}"),
@@ -462,6 +469,69 @@ fn the_sequential_gradients_are_the_rules() {
 fn the_chunked_gradients_are_the_rules() {
     let c = case(Spec::new(1, 40, 2, 8, 4, 8), 13);
     check_gradients("chunked", &c, &chunk_impl(16), 2e-4);
+    let long = case(Spec::new(1, 150, 1, 8, 2, 8), 14);
+    check_gradients("chunked, 128", &long, &chunk_impl(128), 2e-4);
+}
+
+/// The inverse of `I + A` for strictly lower `A` by repeated squaring is the
+/// inverse, for chunk sizes that are and are not powers of two, with the
+/// entries of a WY system (`beta * decay * k . k`, normalised keys) and with
+/// larger ones.
+#[test]
+#[serial]
+fn the_unit_lower_inverse_is_the_inverse() {
+    for (chunk, amplitude) in [(16usize, 0.4), (50, 0.2), (64, 0.3), (64, 1.0)] {
+        let mut rng = Rng(chunk as u64);
+        let mut m = vec![0.0; chunk * chunk];
+        for i in 0..chunk {
+            m[i * chunk + i] = 1.0;
+            for j in 0..i {
+                m[i * chunk + j] =
+                    round32(amplitude * (2.0 * rng.uniform() - 1.0) / (i as f64).sqrt().max(1.0));
+            }
+        }
+        // Forward substitution in f64.
+        let mut want = vec![0.0; chunk * chunk];
+        for col in 0..chunk {
+            for i in col..chunk {
+                let rhs = if i == col { 1.0 } else { 0.0 };
+                let s: f64 = (col..i)
+                    .map(|j| m[i * chunk + j] * want[j * chunk + col])
+                    .sum();
+                want[i * chunk + col] = rhs - s;
+            }
+        }
+        let got = vec_of(&unit_lower_inverse(&arr(
+            &m,
+            &[2, chunk, chunk].map(|d| d)[1..],
+        )));
+        drain();
+        assert_close(
+            &format!("C {chunk}, amplitude {amplitude}"),
+            &got,
+            &want,
+            1e-4,
+        );
+    }
+}
+
+/// The default chunk is 64 tokens, and 128 from 512 tokens; an override wins
+/// and is kept in 16..=512, and zero or less asks for the sequential path.
+#[test]
+fn the_default_chunk_grows_with_the_sequence() {
+    assert!(
+        std::env::var(GDN_CHUNK_SIZE_ENV_VAR).is_err(),
+        "unset {GDN_CHUNK_SIZE_ENV_VAR} to run this test"
+    );
+    assert_eq!(resolve_chunk_size_override(None, 100), Some(64));
+    assert_eq!(resolve_chunk_size_override(None, 511), Some(64));
+    assert_eq!(resolve_chunk_size_override(None, 512), Some(128));
+    assert_eq!(resolve_chunk_size_override(None, 4096), Some(128));
+    assert_eq!(resolve_chunk_size_override(Some(32), 4096), Some(32));
+    assert_eq!(resolve_chunk_size_override(Some(7), 100), Some(16));
+    assert_eq!(resolve_chunk_size_override(Some(9000), 100), Some(512));
+    assert_eq!(resolve_chunk_size_override(Some(0), 4096), None);
+    assert_eq!(resolve_chunk_size_override(Some(-3), 4096), None);
 }
 
 /// A head that nearly forgets at every step (a decay of 0.005 to 0.05): over
@@ -645,7 +715,7 @@ fn update_arrays(base: &Case, raw: &Raw) -> Vec<Array> {
 fn the_update_is_the_rule_by_every_route() {
     let kernel_shape = Spec::new(2, 40, 2, 32, 4, 16);
     let ops_shape = Spec::new(2, 40, 2, 16, 4, 16);
-    let routes: [(&str, Spec, Option<i32>, bool); 6] = [
+    let routes: [(&str, Spec, Option<i32>, bool); 7] = [
         ("kernel", kernel_shape, None, false),
         (
             "kernel, one token",
@@ -656,6 +726,12 @@ fn the_update_is_the_rule_by_every_route() {
         ("forced chunks", ops_shape, Some(16), false),
         ("forced sequential", ops_shape, Some(0), false),
         ("past a chunk", Spec::new(1, 150, 2, 16, 4, 8), None, false),
+        (
+            "a long sequence (wide chunks)",
+            Spec::new(1, 600, 1, 16, 2, 8),
+            None,
+            false,
+        ),
         ("masked", kernel_shape, None, true),
     ];
     for (what, spec, chunk_override, masked) in routes {
@@ -896,7 +972,12 @@ fn chunked_training_step_against_sequential() {
             .as_dtype(Dtype::Bfloat16.as_i32());
 
         let mut results = Vec::new();
-        for (name, chunk) in [("sequential", Some(0)), ("chunked", Some(64))] {
+        for (name, chunk) in [
+            ("sequential", Some(0)),
+            ("chunk 64", Some(64)),
+            ("chunk 128", Some(128)),
+            ("chunk 256", Some(256)),
+        ] {
             let step = || {
                 let (_, grads) = value_and_grad_explicit(
                     |x: &[Array]| {

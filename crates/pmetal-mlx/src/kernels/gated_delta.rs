@@ -35,30 +35,45 @@
 //! - beta: `[B, T, Hv]`
 //! - state: `[B, Hv, Dv, Dk]`
 
-use pmetal_runtime::compat::{Array, Dtype, Exception, linalg, ops};
+use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
 
-/// Default chunk size for the chunkwise parallel GDN algorithm.
-/// Sequences longer than this use the parallel chunk path.
+/// Default chunk size for the chunkwise parallel GDN algorithm: sequences
+/// longer than this take the chunk path.
 const DEFAULT_GDN_CHUNK_SIZE: i32 = 64;
+/// The chunk size for sequences of [`LONG_SEQUENCE`] tokens or more. Each
+/// chunk hands its state to the next through a dozen small kernels (and twice
+/// that on the backward pass), so the hand-offs, not the matmuls, set the
+/// time of a long sequence: a forward and backward at 4,096 tokens (16 key
+/// heads, 32 value heads, width 128, bf16) took 179 ms at 64 and 125 ms at
+/// 128, with the same accuracy (the tests hold both to the rule in float64).
+/// Past 128 it stops paying (121 ms at 256).
+const LONG_SEQUENCE_CHUNK_SIZE: i32 = 128;
+const LONG_SEQUENCE: i32 = 512;
 const GDN_CHUNK_SIZE_ENV_VAR: &str = "PMETAL_GDN_CHUNK_SIZE";
 
 fn sanitize_gdn_chunk_size(chunk_size: i32) -> i32 {
     chunk_size.clamp(16, 512)
 }
 
-fn configured_gdn_chunk_size() -> i32 {
+/// The chunk size the environment asks for, else the default for a sequence
+/// of `seq_len` tokens.
+fn configured_gdn_chunk_size(seq_len: i32) -> i32 {
     std::env::var(GDN_CHUNK_SIZE_ENV_VAR)
         .ok()
         .and_then(|value| value.parse::<i32>().ok())
         .map(sanitize_gdn_chunk_size)
-        .unwrap_or(DEFAULT_GDN_CHUNK_SIZE)
+        .unwrap_or(if seq_len >= LONG_SEQUENCE {
+            LONG_SEQUENCE_CHUNK_SIZE
+        } else {
+            DEFAULT_GDN_CHUNK_SIZE
+        })
 }
 
-fn resolve_chunk_size_override(chunk_size_override: Option<i32>) -> Option<i32> {
+fn resolve_chunk_size_override(chunk_size_override: Option<i32>, seq_len: i32) -> Option<i32> {
     match chunk_size_override {
         Some(value) if value <= 0 => None,
         Some(value) => Some(sanitize_gdn_chunk_size(value)),
-        None => Some(configured_gdn_chunk_size()),
+        None => Some(configured_gdn_chunk_size(seq_len)),
     }
 }
 
@@ -400,8 +415,15 @@ fn chunk_decay_matrix(log_g: &Array) -> Result<Array, Exception> {
 /// The inverse of `m = I + A`, `A` strictly lower triangular, for a batch of
 /// matrices `[..., C, C]`, differentiable in `m`.
 ///
-/// MLX's `tri_inv` has no VJP, so the inverse is computed outside the graph
-/// and given its derivative by hand: `d(M⁻¹) = −M⁻¹ dM M⁻¹`. Writing
+/// `A` is nilpotent (`A^C = 0`), so `(I + A)⁻¹ = Σ (−A)^j` is a finite sum,
+/// and `Π_k (I + (−A)^{2^k})` for `2^k < C` is that sum: `⌈log₂ C⌉` squarings
+/// and as many products of `[C, C]` matrices, all batched on the GPU. MLX's
+/// `tri_inv` runs on the CPU stream (and has no VJP): on 2,048 matrices of
+/// 64 × 64 the product form takes 3.3 ms against its 16, agrees with it to
+/// 2e-7, and keeps the graph on one stream.
+///
+/// The inverse is computed outside the graph and given its derivative by hand,
+/// `d(M⁻¹) = −M⁻¹ dM M⁻¹`. Writing
 ///
 /// ```text
 /// Y = Y₀ − Y₀ (M − sg(M)) Y₀,        Y₀ = sg(M⁻¹)
@@ -415,11 +437,21 @@ fn chunk_decay_matrix(log_g: &Array) -> Result<Array, Exception> {
 /// two extra `[C, C]` batched matmuls forward and two backward, and is skipped
 /// where nothing is differentiated. Only the first derivative is exact.
 fn unit_lower_inverse(m: &Array) -> Array {
-    let inverse = linalg::tri_inv(&m.stop_gradient(), false);
+    let m_const = m.stop_gradient();
+    let chunk = m.dim(-1);
+    let eye = ops::eye(chunk, Dtype::Float32);
+    let mut power = eye.subtract(&m_const); // −A
+    let mut inverse = eye.add(&power);
+    let mut span = 2;
+    while span < chunk {
+        power = ops::matmul(&power, &power);
+        inverse = ops::matmul(&inverse, &eye.add(&power));
+        span *= 2;
+    }
     if !m.is_tracer() {
         return inverse;
     }
-    let delta = m.subtract(&m.stop_gradient());
+    let delta = m.subtract(&m_const);
     inverse.subtract(&ops::matmul(&ops::matmul(&inverse, &delta), &inverse))
 }
 
@@ -854,7 +886,7 @@ fn gated_delta_dispatch(
     }
 
     let t = q.dim(1);
-    if let Some(chunk_size) = resolve_chunk_size_override(chunk_size_override)
+    if let Some(chunk_size) = resolve_chunk_size_override(chunk_size_override, t)
         && t > chunk_size
     {
         return gated_delta_chunk_ops_impl(q, k, v, g, beta, state, mask, chunk_size);
@@ -902,7 +934,7 @@ pub fn gated_delta_update(
 /// specific prefill chunk size.
 ///
 /// `chunk_size_override` semantics:
-/// - `None`: use the configured runtime default (`PMETAL_GDN_CHUNK_SIZE` or 64)
+/// - `None`: use the configured runtime default (`PMETAL_GDN_CHUNK_SIZE`, else 64, or 128 from 512 tokens)
 /// - `Some(n > 0)`: force chunking with size `n` (clamped to 16..=512)
 /// - `Some(0)` or negative: force the sequential path even for long prompts
 #[allow(clippy::too_many_arguments)]
