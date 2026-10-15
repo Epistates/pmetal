@@ -21,6 +21,7 @@ pub mod jinja_chat;
 pub mod packing;
 pub mod pillow_resample;
 pub mod qwen_vl_processing;
+pub mod rows;
 pub mod stream_format;
 pub mod streaming;
 pub mod tokenizer;
