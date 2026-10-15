@@ -5295,6 +5295,7 @@ dependencies = [
  "half",
  "pmetal-core",
  "proptest",
+ "rayon",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",

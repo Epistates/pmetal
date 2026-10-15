@@ -37,6 +37,7 @@ pub mod dequant;
 pub mod dynamic;
 mod fp4;
 pub mod imatrix;
+mod iq_grids;
 pub mod iq_quants;
 pub mod k_quants;
 pub mod quantize;

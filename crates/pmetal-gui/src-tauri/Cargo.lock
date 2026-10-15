@@ -6222,6 +6222,7 @@ dependencies = [
  "byteorder",
  "half",
  "pmetal-core",
+ "rayon",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",

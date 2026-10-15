@@ -163,660 +163,165 @@ const _: () = assert!(std::mem::size_of::<BlockQ6K>() == 210);
 const _: () = assert!(std::mem::size_of::<BlockQ8K>() == 292);
 
 // =============================================================================
-// Block Size Helper Methods
+// Dequantization
 // =============================================================================
+//
+// Every decoder works on the raw little-endian block bytes, so it neither
+// depends on struct layout nor on the alignment of the tensor buffer. The
+// arithmetic is formed in the same order as the reference so results match it
+// to the last bit.
 
-impl BlockQ2K {
-    /// Calculate byte size for n_elements.
-    pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = n_elements.div_ceil(QK_K);
-        n_blocks * std::mem::size_of::<Self>()
-    }
+#[inline(always)]
+fn read_f16(bytes: &[u8], at: usize) -> f32 {
+    f16::from_le_bytes([bytes[at], bytes[at + 1]]).to_f32()
 }
 
-impl BlockQ3K {
-    /// Calculate byte size for n_elements.
-    pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = n_elements.div_ceil(QK_K);
-        n_blocks * std::mem::size_of::<Self>()
-    }
-}
+/// Decode one Q2_K block (84 bytes: `scales[16]`, `qs[64]`, `d`, `dmin`).
+pub(crate) fn dequantize_block_q2_k(block: &[u8; 84], y: &mut [f32; QK_K]) {
+    let scales = &block[..16];
+    let qs = &block[16..80];
+    let d = read_f16(block, 80);
+    let min = read_f16(block, 82);
 
-impl BlockQ4K {
-    /// Calculate byte size for n_elements.
-    pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = n_elements.div_ceil(QK_K);
-        n_blocks * std::mem::size_of::<Self>()
-    }
-}
-
-impl BlockQ5K {
-    /// Calculate byte size for n_elements.
-    pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = n_elements.div_ceil(QK_K);
-        n_blocks * std::mem::size_of::<Self>()
-    }
-}
-
-impl BlockQ6K {
-    /// Calculate byte size for n_elements.
-    pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = n_elements.div_ceil(QK_K);
-        n_blocks * std::mem::size_of::<Self>()
-    }
-}
-
-impl BlockQ8K {
-    /// Calculate byte size for n_elements.
-    pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = n_elements.div_ceil(QK_K);
-        n_blocks * std::mem::size_of::<Self>()
-    }
-}
-
-// =============================================================================
-// Dequantization Functions
-// =============================================================================
-
-/// Dequantize Q2K block to f32.
-///
-/// Layout: 256 elements split into 16 sub-blocks of 16 elements each.
-/// - `scales[i]`: lower nibble = scale for sub-block i, upper nibble = min for sub-block i
-/// - `qs[j]`: 4 elements packed as 2 bits each; within a 128-element chunk the same 32 qs
-///   bytes are re-used across 4 shift passes (shift = 0, 2, 4, 6), reading a fresh pair of
-///   scale bytes each pass.
-///
-/// Reference: GGML `dequantize_row_q2_K`.
-pub fn dequantize_q2k(block: &BlockQ2K, output: &mut [f32; QK_K]) {
-    let d = block.d.to_f32();
-    let min = block.dmin.to_f32();
-
-    let mut out_idx = 0;
-    let mut is = 0usize; // index into block.scales
-
-    // Two 128-element halves; each half uses 32 qs bytes and 8 scale bytes.
-    for qs in block.qs.as_chunks::<32>().0 {
-        // 4 shift passes of 64 output elements each (2 sub-blocks of 16 per pass).
-        let mut shift = 0u32;
-        for _j in 0..4 {
-            // First sub-block of 16: qs bytes [0..16], scale byte `is`
-            let sc = block.scales[is];
-            is += 1;
-            let dl = d * (sc & 0xF) as f32;
-            let ml = min * (sc >> 4) as f32;
-            for q in &qs[..16] {
-                output[out_idx] = dl * ((q >> shift) & 3) as f32 - ml;
-                out_idx += 1;
+    let mut is = 0;
+    for (half, q) in qs.as_chunks::<32>().0.iter().enumerate() {
+        for pass in 0..4 {
+            let shift = 2 * pass;
+            for (sub, qsub) in q.as_chunks::<16>().0.iter().enumerate() {
+                let sc = scales[is];
+                is += 1;
+                let dl = d * f32::from(sc & 0x0f);
+                let ml = min * f32::from(sc >> 4);
+                let out = &mut y[128 * half + 32 * pass + 16 * sub..][..16];
+                for (o, &b) in out.iter_mut().zip(qsub) {
+                    *o = dl * f32::from((b >> shift) & 3) - ml;
+                }
             }
-
-            // Second sub-block of 16: qs bytes [16..32], scale byte `is`
-            let sc = block.scales[is];
-            is += 1;
-            let dl = d * (sc & 0xF) as f32;
-            let ml = min * (sc >> 4) as f32;
-            for q in &qs[16..] {
-                output[out_idx] = dl * ((q >> shift) & 3) as f32 - ml;
-                out_idx += 1;
-            }
-
-            shift += 2;
         }
     }
 }
 
-/// Dequantize Q3K block to f32.
-///
-/// Scale encoding: 12 bytes encode 16 signed 6-bit values (bias 32, range -32..31).
-/// The reconstruction uses a u32-mask approach identical to the GGML reference:
-///
-/// ```text
-/// aux[0..3] = little-endian u32 from scales[0..12] (3 values)
-/// tmp = aux[2]  (the third u32 holds the upper-2-bit extensions)
-/// aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4)
-/// aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4)
-/// aux[0] = ( aux[0]       & KMASK2) | (((tmp     ) & KMASK1) << 4)
-/// aux[1] = ( aux[1]       & KMASK2) | (((tmp >> 2) & KMASK1) << 4)
-/// ```
-///
-/// The 16 bytes of aux[0..4] then hold the 16 unsigned 6-bit scale values; subtract 32 for
-/// the signed result.
-///
-/// Reference: GGML `dequantize_row_q3_K`.
-pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
-    let d = block.d.to_f32();
+/// Decode one Q3_K block (110 bytes: `hmask[32]`, `qs[64]`, `scales[12]`, `d`).
+pub(crate) fn dequantize_block_q3_k(block: &[u8; 110], y: &mut [f32; QK_K]) {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
 
-    // Decode 16 x 6-bit signed scales from the 12-byte packed representation.
-    const KMASK1: u32 = 0x03030303;
-    const KMASK2: u32 = 0x0f0f0f0f;
+    let hmask = &block[..32];
+    let qs = &block[32..96];
+    let d_all = read_f16(block, 108);
 
+    // Unpack the sixteen 6-bit scales from the 12 packed bytes.
     let mut aux = [0u32; 4];
-    aux[0] = u32::from_le_bytes([
-        block.scales[0],
-        block.scales[1],
-        block.scales[2],
-        block.scales[3],
-    ]);
-    aux[1] = u32::from_le_bytes([
-        block.scales[4],
-        block.scales[5],
-        block.scales[6],
-        block.scales[7],
-    ]);
-    aux[2] = u32::from_le_bytes([
-        block.scales[8],
-        block.scales[9],
-        block.scales[10],
-        block.scales[11],
-    ]);
-
+    for (a, chunk) in aux.iter_mut().zip(block[96..108].as_chunks::<4>().0) {
+        *a = u32::from_le_bytes(*chunk);
+    }
     let tmp = aux[2];
     aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
     aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
-    aux[0] = (aux[0] & KMASK2) | (((tmp) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
     aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
-
-    // Reinterpret the 16 bytes as i8 and subtract 32 to get signed scales.
-    let mut scales = [0i8; 16];
-    for (i, chunk) in aux.iter().enumerate() {
-        let bytes = chunk.to_le_bytes();
-        for (j, &b) in bytes.iter().enumerate() {
-            scales[i * 4 + j] = (b as i8).wrapping_sub(32);
+    let mut scales = [0i32; 16];
+    for (i, word) in aux.iter().enumerate() {
+        for (j, b) in word.to_le_bytes().iter().enumerate() {
+            scales[4 * i + j] = i32::from(*b) - 32;
         }
     }
 
-    // Dequantize elements.
-    //
-    // Layout: 256 elements, 2 x 128-element chunks. Each chunk has 32 qs bytes.
-    // Each qs byte holds one 2-bit value per shift pass (shift 0,2,4,6 across 4 passes).
-    // Each hmask byte (one per qs position) contributes one high bit per pass via bitmask m.
-    // Within a 128-chunk there are 4 passes of 32 output elements, each pass split into
-    // two 16-element sub-blocks with independent scales.
-    let mut is = 0usize;
-    let mut m = 1u8; // bitmask into hmask bytes: cycles 1,2,4,8,16,32,64,128
-
-    for (out_128, qs) in output
-        .as_chunks_mut::<128>()
-        .0
-        .iter_mut()
-        .zip(block.qs.as_chunks::<32>().0)
-    {
-        let mut shift = 0u32;
-        for shift_chunk in out_128.as_chunks_mut::<32>().0.iter_mut() {
-            for (scale_index, scale_chunk) in
-                shift_chunk.as_chunks_mut::<16>().0.iter_mut().enumerate()
-            {
-                let dl = d * scales[is] as f32;
+    let mut is = 0;
+    let mut m = 1u8;
+    for (half, q) in qs.as_chunks::<32>().0.iter().enumerate() {
+        for pass in 0..4 {
+            let shift = 2 * pass;
+            for sub in 0..2 {
+                let dl = d_all * scales[is] as f32;
                 is += 1;
-                for (i, out_val) in scale_chunk.iter_mut().enumerate() {
-                    let qs_idx = i + 16 * scale_index;
-                    let q_low = (qs[qs_idx] >> shift) & 3;
-                    let q_high = if block.hmask[qs_idx] & m != 0 {
-                        0i8
-                    } else {
-                        -4i8
-                    };
-                    let q = q_low as i8 + q_high;
-                    *out_val = dl * q as f32;
+                let out = &mut y[128 * half + 32 * pass + 16 * sub..][..16];
+                for (l, o) in out.iter_mut().enumerate() {
+                    let idx = 16 * sub + l;
+                    let low = i32::from((q[idx] >> shift) & 3);
+                    let high = if hmask[idx] & m != 0 { 0 } else { 4 };
+                    *o = dl * (low - high) as f32;
                 }
             }
-            shift += 2;
             m <<= 1;
         }
     }
 }
 
-/// Dequantize Q4K block to f32.
-pub fn dequantize_q4k(block: &BlockQ4K, output: &mut [f32; QK_K]) {
-    let d = block.d.to_f32();
-    let dmin = block.dmin.to_f32();
+/// Decode one Q4_K block (144 bytes: `d`, `dmin`, `scales[12]`, `qs[128]`).
+pub(crate) fn dequantize_block_q4_k(block: &[u8; 144], y: &mut [f32; QK_K]) {
+    let d = read_f16(block, 0);
+    let min = read_f16(block, 2);
+    let scales = &block[4..16];
+    let qs = &block[16..144];
 
-    let mut idx = 0;
-    let mut is = 0usize;
-
-    for j in (0..QK_K).step_by(64) {
-        // Get scale and min for this 32-element sub-block
-        let (sc1, m1) = get_scale_min_k4(is, &block.scales);
-        let d1 = d * sc1 as f32;
-        let dm1 = dmin * m1 as f32;
-
-        let (sc2, m2) = get_scale_min_k4(is + 1, &block.scales);
-        let d2 = d * sc2 as f32;
-        let dm2 = dmin * m2 as f32;
-
-        // Process 64 values (32 bytes of packed 4-bit)
-        let q_start = j / 2;
-
-        // First 32 values (lower nibbles then upper nibbles from first 16 bytes)
-        for l in 0..16 {
-            let q = block.qs[q_start + l];
-            output[idx] = d1 * (q & 0xF) as f32 - dm1;
-            idx += 1;
-        }
-        for l in 0..16 {
-            let q = block.qs[q_start + l];
-            output[idx] = d1 * (q >> 4) as f32 - dm1;
-            idx += 1;
-        }
-
-        // Second 32 values (lower nibbles then upper nibbles from second 16 bytes)
-        for l in 0..16 {
-            let q = block.qs[q_start + 16 + l];
-            output[idx] = d2 * (q & 0xF) as f32 - dm2;
-            idx += 1;
-        }
-        for l in 0..16 {
-            let q = block.qs[q_start + 16 + l];
-            output[idx] = d2 * (q >> 4) as f32 - dm2;
-            idx += 1;
-        }
-
-        is += 2;
-    }
-}
-
-/// Dequantize Q5K block to f32.
-pub fn dequantize_q5k(block: &BlockQ5K, output: &mut [f32; QK_K]) {
-    let d = block.d.to_f32();
-    let dmin = block.dmin.to_f32();
-
-    let mut idx = 0;
-    let mut is = 0usize;
-
-    for j in (0..QK_K).step_by(64) {
-        let (sc1, m1) = get_scale_min_k4(is, &block.scales);
-        let d1 = d * sc1 as f32;
-        let dm1 = dmin * m1 as f32;
-
-        let (sc2, m2) = get_scale_min_k4(is + 1, &block.scales);
-        let d2 = d * sc2 as f32;
-        let dm2 = dmin * m2 as f32;
-
-        let q_start = j / 2;
-        let qh_start = j / 8;
-
-        // First 32 values
+    for (j, q) in qs.as_chunks::<32>().0.iter().enumerate() {
+        let (sc1, m1) = get_scale_min_k4(2 * j, scales);
+        let (sc2, m2) = get_scale_min_k4(2 * j + 1, scales);
+        let (d1, m1) = (d * f32::from(sc1), min * f32::from(m1));
+        let (d2, m2) = (d * f32::from(sc2), min * f32::from(m2));
+        let out = &mut y[64 * j..64 * j + 64];
         for l in 0..32 {
-            let q_byte_idx = q_start + l / 2;
-            let q_nibble = if l % 2 == 0 {
-                block.qs[q_byte_idx] & 0xF
-            } else {
-                block.qs[q_byte_idx] >> 4
-            };
-
-            let qh_byte_idx = qh_start + l / 8;
-            let qh_bit = (block.qh[qh_byte_idx] >> (l % 8)) & 1;
-            let q = q_nibble | (qh_bit << 4);
-
-            output[idx] = d1 * q as f32 - dm1;
-            idx += 1;
+            out[l] = d1 * f32::from(q[l] & 0x0f) - m1;
+            out[l + 32] = d2 * f32::from(q[l] >> 4) - m2;
         }
+    }
+}
 
-        // Second 32 values
+/// Decode one Q5_K block (176 bytes: `d`, `dmin`, `scales[12]`, `qh[32]`, `qs[128]`).
+pub(crate) fn dequantize_block_q5_k(block: &[u8; 176], y: &mut [f32; QK_K]) {
+    let d = read_f16(block, 0);
+    let min = read_f16(block, 2);
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+
+    let (mut u1, mut u2) = (1u8, 2u8);
+    for (j, q) in qs.as_chunks::<32>().0.iter().enumerate() {
+        let (sc1, m1) = get_scale_min_k4(2 * j, scales);
+        let (sc2, m2) = get_scale_min_k4(2 * j + 1, scales);
+        let (d1, m1) = (d * f32::from(sc1), min * f32::from(m1));
+        let (d2, m2) = (d * f32::from(sc2), min * f32::from(m2));
+        let out = &mut y[64 * j..64 * j + 64];
         for l in 0..32 {
-            let q_byte_idx = q_start + 16 + l / 2;
-            let q_nibble = if l % 2 == 0 {
-                block.qs[q_byte_idx] & 0xF
-            } else {
-                block.qs[q_byte_idx] >> 4
-            };
-
-            let qh_byte_idx = qh_start + 4 + l / 8;
-            let qh_bit = (block.qh[qh_byte_idx] >> (l % 8)) & 1;
-            let q = q_nibble | (qh_bit << 4);
-
-            output[idx] = d2 * q as f32 - dm2;
-            idx += 1;
+            let h1 = if qh[l] & u1 != 0 { 16 } else { 0 };
+            let h2 = if qh[l] & u2 != 0 { 16 } else { 0 };
+            out[l] = d1 * f32::from((q[l] & 0x0f) + h1) - m1;
+            out[l + 32] = d2 * f32::from((q[l] >> 4) + h2) - m2;
         }
-
-        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
     }
 }
 
-/// Dequantize Q6K block to f32.
-///
-/// Layout: 256 elements split into two 128-element chunks, each processed with a single
-/// `for l in 0..32` loop that writes 4 output positions simultaneously:
-///
-/// ```text
-/// ys[l]      uses ql[l]      (low nibble)  | (qh[l] bits 0-1) << 4 -> scale sc[l/16]
-/// ys[l+32]   uses ql[l+32]   (low nibble)  | (qh[l] bits 2-3) << 4 -> scale sc[l/16 + 2]
-/// ys[l+64]   uses ql[l]      (high nibble) | (qh[l] bits 4-5) << 4 -> scale sc[l/16 + 4]
-/// ys[l+96]   uses ql[l+32]   (high nibble) | (qh[l] bits 6-7) << 4 -> scale sc[l/16 + 6]
-/// ```
-///
-/// Reference: GGML `dequantize_row_q6_K`.
-pub fn dequantize_q6k(block: &BlockQ6K, output: &mut [f32; QK_K]) {
-    let d = block.d.to_f32();
-
-    for n in (0..QK_K).step_by(128) {
-        let chunk_idx = n / 128;
-        let ys = &mut output[n..n + 128];
-        let sc = &block.scales[8 * chunk_idx..];
-        let ql = &block.ql[64 * chunk_idx..];
-        let qh = &block.qh[32 * chunk_idx..];
-
+/// Decode one Q6_K block (210 bytes: `ql[128]`, `qh[64]`, `scales[16]`, `d`).
+pub(crate) fn dequantize_block_q6_k(block: &[u8; 210], y: &mut [f32; QK_K]) {
+    let d = read_f16(block, 208);
+    for half in 0..2 {
+        let ql = &block[64 * half..64 * half + 64];
+        let qh = &block[128 + 32 * half..128 + 32 * half + 32];
+        let sc = &block[192 + 8 * half..192 + 8 * half + 8];
+        let out = &mut y[128 * half..128 * half + 128];
         for l in 0..32 {
-            let is = l / 16; // 0 or 1 within this chunk's 32-element l-range
-            let q1 = ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32;
-            let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
-            let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
-            let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
-            ys[l] = d * sc[is] as f32 * q1 as f32;
-            ys[l + 32] = d * sc[is + 2] as f32 * q2 as f32;
-            ys[l + 64] = d * sc[is + 4] as f32 * q3 as f32;
-            ys[l + 96] = d * sc[is + 6] as f32 * q4 as f32;
+            let is = l / 16;
+            let q1 = i32::from((ql[l] & 0x0f) | ((qh[l] & 3) << 4)) - 32;
+            let q2 = i32::from((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            let q3 = i32::from((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            let q4 = i32::from((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            out[l] = d * f32::from(sc[is] as i8) * q1 as f32;
+            out[l + 32] = d * f32::from(sc[is + 2] as i8) * q2 as f32;
+            out[l + 64] = d * f32::from(sc[is + 4] as i8) * q3 as f32;
+            out[l + 96] = d * f32::from(sc[is + 6] as i8) * q4 as f32;
         }
     }
 }
 
-/// Dequantize Q8K block to f32.
-pub fn dequantize_q8k(block: &BlockQ8K, output: &mut [f32; QK_K]) {
-    let d = block.d;
-
-    for (i, &q) in block.qs.iter().enumerate() {
-        output[i] = d * q as f32;
+/// Decode one Q8_K block (292 bytes: `d: f32`, `qs[256]`, `bsums[16]`).
+pub(crate) fn dequantize_block_q8_k(block: &[u8; 292], y: &mut [f32; QK_K]) {
+    let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+    for (o, &q) in y.iter_mut().zip(&block[4..260]) {
+        *o = d * f32::from(q as i8);
     }
-}
-
-// =============================================================================
-// Safe Dequantization from Byte Slices
-// =============================================================================
-
-/// Dequantize Q4K data from raw bytes.
-///
-/// # Safety
-/// The input data must be properly aligned and sized for BlockQ4K blocks.
-pub fn dequantize_q4k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
-    const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ4K>();
-    let n_blocks = n_elements.div_ceil(QK_K);
-
-    let mut output = vec![0.0f32; n_elements];
-    let mut out_idx = 0;
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_SIZE;
-        let block_end = block_start + BLOCK_SIZE;
-
-        if block_end > data.len() {
-            break;
-        }
-
-        let block_bytes = &data[block_start..block_end];
-
-        // Parse block manually from bytes
-        let d = f16::from_le_bytes([block_bytes[0], block_bytes[1]]);
-        let dmin = f16::from_le_bytes([block_bytes[2], block_bytes[3]]);
-
-        let mut scales = [0u8; K_SCALE_SIZE];
-        scales.copy_from_slice(&block_bytes[4..4 + K_SCALE_SIZE]);
-
-        let mut qs = [0u8; QK_K / 2];
-        qs.copy_from_slice(&block_bytes[4 + K_SCALE_SIZE..]);
-
-        let block = BlockQ4K {
-            d,
-            dmin,
-            scales,
-            qs,
-        };
-
-        // Dequantize this block
-        let mut block_output = [0.0f32; QK_K];
-        dequantize_q4k(&block, &mut block_output);
-
-        // Copy to output (handle partial last block)
-        let copy_count = (n_elements - out_idx).min(QK_K);
-        output[out_idx..out_idx + copy_count].copy_from_slice(&block_output[..copy_count]);
-        out_idx += copy_count;
-    }
-
-    output
-}
-
-/// Dequantize Q8K data from raw bytes.
-pub fn dequantize_q8k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
-    const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ8K>();
-    let n_blocks = n_elements.div_ceil(QK_K);
-
-    let mut output = vec![0.0f32; n_elements];
-    let mut out_idx = 0;
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_SIZE;
-        let block_end = block_start + BLOCK_SIZE;
-
-        if block_end > data.len() {
-            break;
-        }
-
-        let block_bytes = &data[block_start..block_end];
-
-        // Parse block from bytes
-        let d = f32::from_le_bytes([
-            block_bytes[0],
-            block_bytes[1],
-            block_bytes[2],
-            block_bytes[3],
-        ]);
-
-        let mut qs = [0i8; QK_K];
-        for (i, &b) in block_bytes[4..4 + QK_K].iter().enumerate() {
-            qs[i] = b as i8;
-        }
-
-        let mut bsums = [0i16; QK_K / 16];
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..(QK_K / 16) {
-            let offset = 4 + QK_K + i * 2;
-            bsums[i] = i16::from_le_bytes([block_bytes[offset], block_bytes[offset + 1]]);
-        }
-
-        let block = BlockQ8K { d, qs, bsums };
-
-        let mut block_output = [0.0f32; QK_K];
-        dequantize_q8k(&block, &mut block_output);
-
-        let copy_count = (n_elements - out_idx).min(QK_K);
-        output[out_idx..out_idx + copy_count].copy_from_slice(&block_output[..copy_count]);
-        out_idx += copy_count;
-    }
-
-    output
-}
-
-/// Dequantize Q6K data from raw bytes.
-pub fn dequantize_q6k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
-    const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ6K>();
-    let n_blocks = n_elements.div_ceil(QK_K);
-
-    let mut output = vec![0.0f32; n_elements];
-    let mut out_idx = 0;
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_SIZE;
-        let block_end = block_start + BLOCK_SIZE;
-
-        if block_end > data.len() {
-            break;
-        }
-
-        let block_bytes = &data[block_start..block_end];
-
-        // Parse block from bytes (Q6K layout: ql, qh, scales, d)
-        let mut ql = [0u8; QK_K / 2];
-        ql.copy_from_slice(&block_bytes[0..QK_K / 2]);
-
-        let mut qh = [0u8; QK_K / 4];
-        qh.copy_from_slice(&block_bytes[QK_K / 2..QK_K / 2 + QK_K / 4]);
-
-        let mut scales = [0i8; QK_K / 16];
-        for (i, &b) in block_bytes[QK_K / 2 + QK_K / 4..QK_K / 2 + QK_K / 4 + QK_K / 16]
-            .iter()
-            .enumerate()
-        {
-            scales[i] = b as i8;
-        }
-
-        let d_offset = QK_K / 2 + QK_K / 4 + QK_K / 16;
-        let d = f16::from_le_bytes([block_bytes[d_offset], block_bytes[d_offset + 1]]);
-
-        let block = BlockQ6K { ql, qh, scales, d };
-
-        let mut block_output = [0.0f32; QK_K];
-        dequantize_q6k(&block, &mut block_output);
-
-        let copy_count = (n_elements - out_idx).min(QK_K);
-        output[out_idx..out_idx + copy_count].copy_from_slice(&block_output[..copy_count]);
-        out_idx += copy_count;
-    }
-
-    output
-}
-
-/// Dequantize Q5K data from raw bytes.
-pub fn dequantize_q5k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
-    const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ5K>();
-    let n_blocks = n_elements.div_ceil(QK_K);
-
-    let mut output = vec![0.0f32; n_elements];
-    let mut out_idx = 0;
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_SIZE;
-        let block_end = block_start + BLOCK_SIZE;
-
-        if block_end > data.len() {
-            break;
-        }
-
-        let block_bytes = &data[block_start..block_end];
-
-        // Parse block (Q5K layout: d, dmin, scales, qh, qs)
-        let d = f16::from_le_bytes([block_bytes[0], block_bytes[1]]);
-        let dmin = f16::from_le_bytes([block_bytes[2], block_bytes[3]]);
-
-        let mut scales = [0u8; K_SCALE_SIZE];
-        scales.copy_from_slice(&block_bytes[4..4 + K_SCALE_SIZE]);
-
-        let mut qh = [0u8; QK_K / 8];
-        qh.copy_from_slice(&block_bytes[4 + K_SCALE_SIZE..4 + K_SCALE_SIZE + QK_K / 8]);
-
-        let mut qs = [0u8; QK_K / 2];
-        qs.copy_from_slice(&block_bytes[4 + K_SCALE_SIZE + QK_K / 8..]);
-
-        let block = BlockQ5K {
-            d,
-            dmin,
-            scales,
-            qh,
-            qs,
-        };
-
-        let mut block_output = [0.0f32; QK_K];
-        dequantize_q5k(&block, &mut block_output);
-
-        let copy_count = (n_elements - out_idx).min(QK_K);
-        output[out_idx..out_idx + copy_count].copy_from_slice(&block_output[..copy_count]);
-        out_idx += copy_count;
-    }
-
-    output
-}
-
-/// Dequantize Q3K data from raw bytes.
-pub fn dequantize_q3k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
-    const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ3K>();
-    let n_blocks = n_elements.div_ceil(QK_K);
-
-    let mut output = vec![0.0f32; n_elements];
-    let mut out_idx = 0;
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_SIZE;
-        let block_end = block_start + BLOCK_SIZE;
-
-        if block_end > data.len() {
-            break;
-        }
-
-        let block_bytes = &data[block_start..block_end];
-
-        // Parse block (Q3K layout: hmask, qs, scales, d)
-        let mut hmask = [0u8; QK_K / 8];
-        hmask.copy_from_slice(&block_bytes[0..QK_K / 8]);
-
-        let mut qs = [0u8; QK_K / 4];
-        qs.copy_from_slice(&block_bytes[QK_K / 8..QK_K / 8 + QK_K / 4]);
-
-        let mut scales = [0u8; 12];
-        scales.copy_from_slice(&block_bytes[QK_K / 8 + QK_K / 4..QK_K / 8 + QK_K / 4 + 12]);
-
-        let d_offset = QK_K / 8 + QK_K / 4 + 12;
-        let d = f16::from_le_bytes([block_bytes[d_offset], block_bytes[d_offset + 1]]);
-
-        let block = BlockQ3K {
-            hmask,
-            qs,
-            scales,
-            d,
-        };
-
-        let mut block_output = [0.0f32; QK_K];
-        dequantize_q3k(&block, &mut block_output);
-
-        let copy_count = (n_elements - out_idx).min(QK_K);
-        output[out_idx..out_idx + copy_count].copy_from_slice(&block_output[..copy_count]);
-        out_idx += copy_count;
-    }
-
-    output
-}
-
-/// Dequantize Q2K data from raw bytes.
-pub fn dequantize_q2k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
-    const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ2K>();
-    let n_blocks = n_elements.div_ceil(QK_K);
-
-    let mut output = vec![0.0f32; n_elements];
-    let mut out_idx = 0;
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_SIZE;
-        let block_end = block_start + BLOCK_SIZE;
-
-        if block_end > data.len() {
-            break;
-        }
-
-        let block_bytes = &data[block_start..block_end];
-
-        // Parse block (Q2K layout: scales, qs, d, dmin)
-        let mut scales = [0u8; QK_K / 16];
-        scales.copy_from_slice(&block_bytes[0..QK_K / 16]);
-
-        let mut qs = [0u8; QK_K / 4];
-        qs.copy_from_slice(&block_bytes[QK_K / 16..QK_K / 16 + QK_K / 4]);
-
-        let d_offset = QK_K / 16 + QK_K / 4;
-        let d = f16::from_le_bytes([block_bytes[d_offset], block_bytes[d_offset + 1]]);
-        let dmin = f16::from_le_bytes([block_bytes[d_offset + 2], block_bytes[d_offset + 3]]);
-
-        let block = BlockQ2K {
-            scales,
-            qs,
-            d,
-            dmin,
-        };
-
-        let mut block_output = [0.0f32; QK_K];
-        dequantize_q2k(&block, &mut block_output);
-
-        let copy_count = (n_elements - out_idx).min(QK_K);
-        output[out_idx..out_idx + copy_count].copy_from_slice(&block_output[..copy_count]);
-        out_idx += copy_count;
-    }
-
-    output
 }
 
 // =============================================================================
@@ -1356,47 +861,6 @@ mod tests {
     }
 
     #[test]
-    fn test_q8k_dequantize() {
-        // Simple Q8K block: scale=0.5, values [0, 1, 2, ...]
-        let mut block = BlockQ8K {
-            d: 0.5,
-            qs: [0i8; QK_K],
-            bsums: [0i16; QK_K / 16],
-        };
-
-        for i in 0..QK_K {
-            block.qs[i] = (i % 128) as i8;
-        }
-
-        let mut output = [0.0f32; QK_K];
-        dequantize_q8k(&block, &mut output);
-
-        // Verify: output[i] = 0.5 * qs[i]
-        assert!((output[0] - 0.0).abs() < 1e-6);
-        assert!((output[1] - 0.5).abs() < 1e-6);
-        assert!((output[2] - 1.0).abs() < 1e-6);
-        assert!((output[10] - 5.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_q4k_dequantize_simple() {
-        // Create a simple Q4K block with known values
-        let block = BlockQ4K {
-            d: f16::from_f32(1.0),
-            dmin: f16::from_f32(0.0),
-            scales: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], // sc=1, m=0 for all
-            qs: [0x21; QK_K / 2],                         // 0x21 = 0b00100001, lower=1, upper=2
-        };
-
-        let mut output = [0.0f32; QK_K];
-        dequantize_q4k(&block, &mut output);
-
-        // With scale=1, min=0, values should be the raw quantized values
-        // The exact pattern depends on nibble ordering
-        assert!(output.iter().all(|&x| (0.0..=15.0).contains(&x)));
-    }
-
-    #[test]
     fn test_get_scale_min_k4() {
         let scales: [u8; K_SCALE_SIZE] = [
             0x3F, 0x3F, 0x3F, 0x3F, // scales 0-3 (lower 6 bits)
@@ -1407,163 +871,6 @@ mod tests {
         let (sc, m) = get_scale_min_k4(0, &scales);
         assert_eq!(sc, 63);
         assert_eq!(m, 63);
-    }
-
-    // =========================================================================
-    // Roundtrip tests: quantize -> dequantize -> verify closeness
-    // =========================================================================
-
-    /// Compute RMSE between two slices.
-    fn compute_rmse(a: &[f32], b: &[f32]) -> f32 {
-        let n = a.len().min(b.len());
-        if n == 0 {
-            return 0.0;
-        }
-        let sum_sq: f32 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
-        (sum_sq / n as f32).sqrt()
-    }
-
-    /// Compute max absolute error between two slices.
-    fn compute_max_err(a: &[f32], b: &[f32]) -> f32 {
-        a.iter()
-            .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0f32, |max, err| max.max(err))
-    }
-
-    #[test]
-    fn test_q8k_roundtrip() {
-        // Create test data with a range typical for neural network weights
-        let original: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) * 0.01).collect();
-
-        // Quantize
-        let blocks = quantize_q8k(&original);
-        assert_eq!(blocks.len(), 1);
-
-        // Dequantize
-        let mut restored = [0.0f32; QK_K];
-        dequantize_q8k(&blocks[0], &mut restored);
-
-        // Q8K should be very accurate
-        let rmse = compute_rmse(&original, &restored);
-        let max_err = compute_max_err(&original, &restored);
-
-        assert!(rmse < 0.01, "Q8K RMSE too high: {} (expected < 0.01)", rmse);
-        assert!(
-            max_err < 0.02,
-            "Q8K max error too high: {} (expected < 0.02)",
-            max_err
-        );
-    }
-
-    #[test]
-    fn test_q4k_roundtrip() {
-        let original: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) * 0.01).collect();
-
-        let blocks = quantize_q4k(&original);
-        assert_eq!(blocks.len(), 1);
-
-        let bytes = blocks_to_bytes(&blocks);
-        let restored = dequantize_q4k_bytes(&bytes, QK_K);
-
-        let rmse = compute_rmse(&original, &restored);
-        let max_err = compute_max_err(&original, &restored);
-
-        // Q4K has more quantization error than Q8K
-        assert!(rmse < 0.15, "Q4K RMSE too high: {} (expected < 0.15)", rmse);
-        assert!(
-            max_err < 0.5,
-            "Q4K max error too high: {} (expected < 0.5)",
-            max_err
-        );
-    }
-
-    #[test]
-    fn test_q5k_roundtrip() {
-        let original: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) * 0.01).collect();
-
-        let blocks = quantize_q5k(&original);
-        assert_eq!(blocks.len(), 1);
-
-        let bytes = blocks_to_bytes(&blocks);
-        let restored = dequantize_q5k_bytes(&bytes, QK_K);
-
-        let rmse = compute_rmse(&original, &restored);
-        let max_err = compute_max_err(&original, &restored);
-
-        // Q5K should be more accurate than Q4K
-        assert!(rmse < 0.1, "Q5K RMSE too high: {} (expected < 0.1)", rmse);
-        assert!(
-            max_err < 0.4,
-            "Q5K max error too high: {} (expected < 0.4)",
-            max_err
-        );
-    }
-
-    #[test]
-    fn test_q6k_roundtrip() {
-        let original: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) * 0.01).collect();
-
-        let blocks = quantize_q6k(&original);
-        assert_eq!(blocks.len(), 1);
-
-        let bytes = blocks_to_bytes(&blocks);
-        let restored = dequantize_q6k_bytes(&bytes, QK_K);
-
-        let rmse = compute_rmse(&original, &restored);
-        let max_err = compute_max_err(&original, &restored);
-
-        // Q6K should be reasonably accurate
-        assert!(rmse < 0.1, "Q6K RMSE too high: {} (expected < 0.1)", rmse);
-        assert!(
-            max_err < 0.3,
-            "Q6K max error too high: {} (expected < 0.3)",
-            max_err
-        );
-    }
-
-    #[test]
-    fn test_q3k_roundtrip() {
-        let original: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) * 0.01).collect();
-
-        let blocks = quantize_q3k(&original);
-        assert_eq!(blocks.len(), 1);
-
-        let bytes = blocks_to_bytes(&blocks);
-        let restored = dequantize_q3k_bytes(&bytes, QK_K);
-
-        let rmse = compute_rmse(&original, &restored);
-        let max_err = compute_max_err(&original, &restored);
-
-        // Q3K has significant quantization error due to 3-bit precision
-        assert!(rmse < 1.5, "Q3K RMSE too high: {} (expected < 1.5)", rmse);
-        assert!(
-            max_err < 4.0,
-            "Q3K max error too high: {} (expected < 4.0)",
-            max_err
-        );
-    }
-
-    #[test]
-    fn test_q2k_roundtrip() {
-        let original: Vec<f32> = (0..QK_K).map(|i| (i as f32 - 128.0) * 0.01).collect();
-
-        let blocks = quantize_q2k(&original);
-        assert_eq!(blocks.len(), 1);
-
-        let bytes = blocks_to_bytes(&blocks);
-        let restored = dequantize_q2k_bytes(&bytes, QK_K);
-
-        let rmse = compute_rmse(&original, &restored);
-        let max_err = compute_max_err(&original, &restored);
-
-        // Q2K has the most quantization error due to only 2-bit precision
-        assert!(rmse < 1.0, "Q2K RMSE too high: {} (expected < 1.0)", rmse);
-        assert!(
-            max_err < 2.0,
-            "Q2K max error too high: {} (expected < 2.0)",
-            max_err
-        );
     }
 
     #[test]

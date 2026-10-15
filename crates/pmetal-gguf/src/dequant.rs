@@ -1,37 +1,38 @@
-//! Dequantization routines for GGUF quantized tensors.
+//! Dequantization of GGUF tensor data to `f32`.
 //!
-//! This module provides functions to convert quantized tensor data from GGUF files
-//! to floating-point representations.
+//! Every tensor type a GGUF file can carry (see [`GgmlType`]) is decoded here
+//! except the architecture-specific *repacked* layouts (`Q4_0_4_4` and
+//! friends), which interleave rows for a particular kernel and are not
+//! portable tensors.
 //!
-//! # Supported Quantization Types
+//! # Exactness
 //!
-//! - **F32**: No conversion needed
-//! - **F16**: Half-precision to f32
-//! - **BF16**: Brain float to f32
-//! - **Q4_0**: 4-bit quantization (32 values per block)
-//! - **Q8_0**: 8-bit quantization (32 values per block)
-//! - **Q2K-Q8K**: K-quant types (256 values per block, hierarchical scaling)
-//! - **Q1_0/TQ/MXFP4/NVFP4**: current GGML low-bit and FP4 formats
+//! Each decoder follows the reference block definition from the ggml sources
+//! (`ggml-common.h` for the layouts, `ggml-quants.c` for the arithmetic) and
+//! forms its products in the same order, so the results are bit-identical to
+//! the reference rather than merely close. `tests/dequant_reference.rs` pins
+//! this against values produced by the reference decoder.
 //!
-//! # Block Quantization
+//! # Rows and blocks
 //!
-//! Most GGUF quantization formats use block quantization where values are grouped
-//! into blocks (typically 32 values) that share a single scale factor.
+//! Quantized formats store whole blocks of 32, 64, 128 or 256 weights, and a
+//! block never straddles a row. A tensor shape is therefore only valid for a
+//! quantized type when its innermost dimension is a multiple of the block
+//! size; [`dequantize`] rejects anything else with
+//! [`DequantError::RowNotBlockAligned`] instead of silently truncating.
 //!
-//! For Q4_0:
-//! - Block size: 32 values
-//! - Block bytes: 18 (2 bytes scale + 16 bytes data)
-//! - Dequantization: `value = (quant - 8) * scale`
+//! # Performance
 //!
-//! For Q8_0:
-//! - Block size: 32 values
-//! - Block bytes: 34 (2 bytes scale + 32 bytes data)
-//! - Dequantization: `value = quant * scale`
+//! Large tensors are decoded in parallel, one block per work item, writing
+//! straight into the output buffer ([`dequantize_into`] avoids the
+//! allocation entirely).
+
+use rayon::prelude::*;
 
 use crate::GgmlType;
 use crate::fp4::{KVALUES_MXFP4, e8m0_to_fp32_half, ue4m3_to_fp32};
-use crate::iq_quants;
-use crate::k_quants;
+use crate::iq_quants as iq;
+use crate::k_quants as kq;
 
 /// Error type for dequantization.
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +46,14 @@ pub enum DequantError {
         /// Expected size in bytes.
         expected: usize,
         /// Actual size in bytes.
+        actual: usize,
+    },
+    /// The output buffer does not hold exactly one `f32` per element.
+    #[error("Output buffer holds {actual} values but the tensor has {expected} elements")]
+    InvalidOutputLength {
+        /// Element count of the tensor.
+        expected: usize,
+        /// Length of the output buffer.
         actual: usize,
     },
     /// Shape mismatch.
@@ -67,19 +76,38 @@ pub enum DequantError {
         /// Target shape.
         shape: Vec<i32>,
     },
+    /// The innermost dimension is not a whole number of blocks.
+    #[error(
+        "Row length {row_len} is not a multiple of the {dtype:?} block size {block_size} (shape {shape:?})"
+    )]
+    RowNotBlockAligned {
+        /// Tensor type.
+        dtype: GgmlType,
+        /// Block size of the type, in elements.
+        block_size: usize,
+        /// Length of the innermost dimension.
+        row_len: usize,
+        /// Tensor shape.
+        shape: Vec<i32>,
+    },
 }
+
+/// Below this many elements decoding runs on the calling thread.
+const PARALLEL_MIN_ELEMENTS: usize = 1 << 16;
+/// Blocks handed to one parallel task at minimum, to amortise scheduling.
+const PARALLEL_MIN_BLOCKS: usize = 64;
 
 /// Dequantize raw tensor data to f32 values.
 ///
 /// # Arguments
 ///
-/// * `data` - Raw quantized bytes from GGUF file
-/// * `dtype` - The quantization type
-/// * `shape` - Target tensor shape
+/// * `data` - Raw quantized bytes from the GGUF file
+/// * `dtype` - The tensor type
+/// * `shape` - Tensor shape in row-major order (outermost dimension first)
 ///
 /// # Returns
 ///
-/// Vector of f32 values in row-major order
+/// The tensor as `f32` values in row-major order.
 ///
 /// # Example
 ///
@@ -90,91 +118,51 @@ pub enum DequantError {
 /// let floats = dequantize(&data, info.dtype, &shape)?;
 /// ```
 pub fn dequantize(data: &[u8], dtype: GgmlType, shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    match dtype {
-        GgmlType::F32 => dequantize_f32(data, shape),
-        GgmlType::F16 => dequantize_f16(data, shape),
-        GgmlType::Bf16 => dequantize_bf16(data, shape),
-        GgmlType::Q4_0 => dequantize_q4_0(data, shape),
-        GgmlType::Q4_1 => dequantize_q4_1(data, shape),
-        GgmlType::Q5_0 => dequantize_q5_0(data, shape),
-        GgmlType::Q5_1 => dequantize_q5_1(data, shape),
-        GgmlType::Q8_0 => dequantize_q8_0(data, shape),
-        GgmlType::Q8_1 => dequantize_q8_1(data, shape),
-        GgmlType::Q1_0 => dequantize_q1_0(data, shape),
-        GgmlType::Tq1_0 => dequantize_tq1_0(data, shape),
-        GgmlType::Tq2_0 => dequantize_tq2_0(data, shape),
-        GgmlType::Mxfp4 => dequantize_mxfp4(data, shape),
-        GgmlType::Nvfp4 => dequantize_nvfp4(data, shape),
-        GgmlType::I8 => dequantize_i8(data, shape),
-        GgmlType::I16 => dequantize_i16(data, shape),
-        GgmlType::I32 => dequantize_i32(data, shape),
-        GgmlType::I64 => dequantize_i64(data, shape),
-        GgmlType::F64 => dequantize_f64(data, shape),
-        // K-quant types
-        GgmlType::Q2K => dequantize_q2k(data, shape),
-        GgmlType::Q3K => dequantize_q3k(data, shape),
-        GgmlType::Q4K => dequantize_q4k(data, shape),
-        GgmlType::Q5K => dequantize_q5k(data, shape),
-        GgmlType::Q6K => dequantize_q6k(data, shape),
-        GgmlType::Q8K => dequantize_q8k(data, shape),
-        // IQ types (importance-weighted quantization)
-        GgmlType::Iq4Nl => dequantize_iq4nl(data, shape),
-        GgmlType::Iq4Xs => dequantize_iq4xs(data, shape),
-        GgmlType::Iq2Xxs => dequantize_iq2xxs(data, shape),
-        GgmlType::Iq2Xs => dequantize_iq2xs(data, shape),
-        GgmlType::Iq2S => dequantize_iq2s(data, shape),
-        GgmlType::Iq3Xxs => dequantize_iq3xxs(data, shape),
-        GgmlType::Iq3S => dequantize_iq3s(data, shape),
-        GgmlType::Iq1S => dequantize_iq1s(data, shape),
-        GgmlType::Iq1M => dequantize_iq1m(data, shape),
-        other => Err(DequantError::UnsupportedType(other)),
-    }
+    let n_elements = checked_element_count(dtype, shape)?;
+    let mut out = vec![0.0f32; n_elements];
+    dequantize_validated(data, dtype, shape, &mut out)?;
+    Ok(out)
 }
 
-/// Check if a quantization type is supported for dequantization.
+/// Dequantize into a caller-provided buffer.
+///
+/// `out` must hold exactly one `f32` per tensor element. The shape is given
+/// as in [`dequantize`]; use this to decode straight into a pre-allocated
+/// (for example pooled or memory-mapped) buffer.
+pub fn dequantize_into(
+    data: &[u8],
+    dtype: GgmlType,
+    shape: &[i32],
+    out: &mut [f32],
+) -> Result<(), DequantError> {
+    let n_elements = checked_element_count(dtype, shape)?;
+    if out.len() != n_elements {
+        return Err(DequantError::InvalidOutputLength {
+            expected: n_elements,
+            actual: out.len(),
+        });
+    }
+    dequantize_validated(data, dtype, shape, out)
+}
+
+/// Check if a tensor type can be dequantized.
 pub fn is_supported(dtype: GgmlType) -> bool {
-    matches!(
+    !matches!(
         dtype,
-        GgmlType::F32
-            | GgmlType::F16
-            | GgmlType::Bf16
-            | GgmlType::Q4_0
-            | GgmlType::Q4_1
-            | GgmlType::Q5_0
-            | GgmlType::Q5_1
-            | GgmlType::Q8_0
-            | GgmlType::Q8_1
-            | GgmlType::Q1_0
-            | GgmlType::Tq1_0
-            | GgmlType::Tq2_0
-            | GgmlType::Mxfp4
-            | GgmlType::Nvfp4
-            | GgmlType::I8
-            | GgmlType::I16
-            | GgmlType::I32
-            | GgmlType::I64
-            | GgmlType::F64
-            // K-quant types
-            | GgmlType::Q2K
-            | GgmlType::Q3K
-            | GgmlType::Q4K
-            | GgmlType::Q5K
-            | GgmlType::Q6K
-            | GgmlType::Q8K
-            // IQ types
-            | GgmlType::Iq4Nl
-            | GgmlType::Iq4Xs
-            | GgmlType::Iq2Xxs
-            | GgmlType::Iq2Xs
-            | GgmlType::Iq2S
-            | GgmlType::Iq3Xxs
-            | GgmlType::Iq3S
-            | GgmlType::Iq1S
-            | GgmlType::Iq1M
+        GgmlType::Q4_0_4_4
+            | GgmlType::Q4_0_4_8
+            | GgmlType::Q4_0_8_8
+            | GgmlType::Iq4Nl_4_4
+            | GgmlType::Iq4Nl_4_8
+            | GgmlType::Iq4Nl_8_8
     )
 }
 
 /// Get the expected byte size for a tensor with given dtype and shape.
+///
+/// # Panics
+/// Panics if the shape is invalid; use [`expected_byte_size_checked`] for
+/// untrusted shapes.
 pub fn expected_byte_size(dtype: GgmlType, shape: &[i32]) -> usize {
     expected_byte_size_checked(dtype, shape)
         .expect("invalid GGUF tensor shape for expected_byte_size")
@@ -182,7 +170,7 @@ pub fn expected_byte_size(dtype: GgmlType, shape: &[i32]) -> usize {
 
 /// Get the expected byte size for a tensor with checked shape arithmetic.
 pub fn expected_byte_size_checked(dtype: GgmlType, shape: &[i32]) -> Result<usize, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
+    let n_elements = checked_element_count(dtype, shape)?;
     dtype
         .tensor_size_checked(n_elements)
         .ok_or_else(|| DequantError::ShapeTooLarge {
@@ -190,976 +178,464 @@ pub fn expected_byte_size_checked(dtype: GgmlType, shape: &[i32]) -> Result<usiz
         })
 }
 
-fn shape_n_elements(shape: &[i32]) -> Result<usize, DequantError> {
+/// Element count of `shape`, rejecting negative dimensions, overflow and
+/// (for blocked types) rows that are not a whole number of blocks.
+fn checked_element_count(dtype: GgmlType, shape: &[i32]) -> Result<usize, DequantError> {
     if shape.iter().any(|&d| d < 0) {
         return Err(DequantError::InvalidShape {
             shape: shape.to_vec(),
         });
     }
-
-    shape.iter().try_fold(1usize, |acc, &dim| {
+    let n_elements = shape.iter().try_fold(1usize, |acc, &dim| {
         acc.checked_mul(dim as usize)
             .ok_or_else(|| DequantError::ShapeTooLarge {
                 shape: shape.to_vec(),
             })
-    })
+    })?;
+    let block_size = dtype.block_size();
+    if block_size > 1 && n_elements > 0 {
+        let row_len = shape.last().map_or(1, |&d| d as usize);
+        if row_len % block_size != 0 {
+            return Err(DequantError::RowNotBlockAligned {
+                dtype,
+                block_size,
+                row_len,
+                shape: shape.to_vec(),
+            });
+        }
+    }
+    Ok(n_elements)
 }
 
-fn validate_data_size(data: &[u8], expected: usize) -> Result<(), DequantError> {
+fn dequantize_validated(
+    data: &[u8],
+    dtype: GgmlType,
+    shape: &[i32],
+    out: &mut [f32],
+) -> Result<(), DequantError> {
+    if !is_supported(dtype) {
+        return Err(DequantError::UnsupportedType(dtype));
+    }
+    let expected =
+        dtype
+            .tensor_size_checked(out.len())
+            .ok_or_else(|| DequantError::ShapeTooLarge {
+                shape: shape.to_vec(),
+            })?;
     if data.len() != expected {
         return Err(DequantError::InvalidSize {
             expected,
             actual: data.len(),
         });
     }
+
+    match dtype {
+        GgmlType::F32 => convert_elements::<4>(data, out, f32::from_le_bytes),
+        GgmlType::F16 => convert_elements::<2>(data, out, |b| half::f16::from_le_bytes(b).to_f32()),
+        GgmlType::Bf16 => {
+            convert_elements::<2>(data, out, |b| half::bf16::from_le_bytes(b).to_f32())
+        }
+        GgmlType::F64 => convert_elements::<8>(data, out, |b| f64::from_le_bytes(b) as f32),
+        GgmlType::I8 => convert_elements::<1>(data, out, |b| f32::from(i8::from_le_bytes(b))),
+        GgmlType::I16 => convert_elements::<2>(data, out, |b| f32::from(i16::from_le_bytes(b))),
+        GgmlType::I32 => convert_elements::<4>(data, out, |b| i32::from_le_bytes(b) as f32),
+        GgmlType::I64 => convert_elements::<8>(data, out, |b| i64::from_le_bytes(b) as f32),
+
+        GgmlType::Q4_0 => decode_blocks(data, out, dequantize_block_q4_0),
+        GgmlType::Q4_1 => decode_blocks(data, out, dequantize_block_q4_1),
+        GgmlType::Q5_0 => decode_blocks(data, out, dequantize_block_q5_0),
+        GgmlType::Q5_1 => decode_blocks(data, out, dequantize_block_q5_1),
+        GgmlType::Q8_0 => decode_blocks(data, out, dequantize_block_q8_0),
+        GgmlType::Q8_1 => decode_blocks(data, out, dequantize_block_q8_1),
+        GgmlType::Q1_0 => decode_blocks(data, out, dequantize_block_q1_0),
+        GgmlType::Tq1_0 => decode_blocks(data, out, dequantize_block_tq1_0),
+        GgmlType::Tq2_0 => decode_blocks(data, out, dequantize_block_tq2_0),
+        GgmlType::Mxfp4 => decode_blocks(data, out, dequantize_block_mxfp4),
+        GgmlType::Nvfp4 => decode_blocks(data, out, dequantize_block_nvfp4),
+
+        GgmlType::Q2K => decode_blocks(data, out, kq::dequantize_block_q2_k),
+        GgmlType::Q3K => decode_blocks(data, out, kq::dequantize_block_q3_k),
+        GgmlType::Q4K => decode_blocks(data, out, kq::dequantize_block_q4_k),
+        GgmlType::Q5K => decode_blocks(data, out, kq::dequantize_block_q5_k),
+        GgmlType::Q6K => decode_blocks(data, out, kq::dequantize_block_q6_k),
+        GgmlType::Q8K => decode_blocks(data, out, kq::dequantize_block_q8_k),
+
+        GgmlType::Iq4Nl => decode_blocks(data, out, iq::dequantize_block_iq4_nl),
+        GgmlType::Iq4Xs => decode_blocks(data, out, iq::dequantize_block_iq4_xs),
+        GgmlType::Iq2Xxs => decode_blocks(data, out, iq::dequantize_block_iq2_xxs),
+        GgmlType::Iq2Xs => decode_blocks(data, out, iq::dequantize_block_iq2_xs),
+        GgmlType::Iq2S => decode_blocks(data, out, iq::dequantize_block_iq2_s),
+        GgmlType::Iq3Xxs => decode_blocks(data, out, iq::dequantize_block_iq3_xxs),
+        GgmlType::Iq3S => decode_blocks(data, out, iq::dequantize_block_iq3_s),
+        GgmlType::Iq1S => decode_blocks(data, out, iq::dequantize_block_iq1_s),
+        GgmlType::Iq1M => decode_blocks(data, out, iq::dequantize_block_iq1_m),
+
+        GgmlType::Q4_0_4_4
+        | GgmlType::Q4_0_4_8
+        | GgmlType::Q4_0_8_8
+        | GgmlType::Iq4Nl_4_4
+        | GgmlType::Iq4Nl_4_8
+        | GgmlType::Iq4Nl_8_8 => return Err(DequantError::UnsupportedType(dtype)),
+    }
     Ok(())
 }
 
-/// F32 - direct conversion (no dequantization needed).
-fn dequantize_f32(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = n_elements * 4;
-    validate_data_size(data, expected_size)?;
-
-    let floats: Vec<f32> = data
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect();
-
-    Ok(floats)
+/// Decode a buffer of fixed-width scalar elements.
+fn convert_elements<const W: usize>(data: &[u8], out: &mut [f32], f: fn([u8; W]) -> f32) {
+    let (src, _) = data.as_chunks::<W>();
+    debug_assert_eq!(src.len(), out.len());
+    if out.len() < PARALLEL_MIN_ELEMENTS {
+        for (o, s) in out.iter_mut().zip(src) {
+            *o = f(*s);
+        }
+    } else {
+        out.par_iter_mut()
+            .zip(src.par_iter())
+            .with_min_len(PARALLEL_MIN_ELEMENTS / 4)
+            .for_each(|(o, s)| *o = f(*s));
+    }
 }
 
-/// F16 - half-precision to f32.
-fn dequantize_f16(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = n_elements * 2;
-    validate_data_size(data, expected_size)?;
-
-    let floats: Vec<f32> = data
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| half::f16::from_le_bytes(*b).to_f32())
-        .collect();
-
-    Ok(floats)
-}
-
-/// BF16 - brain float to f32.
-fn dequantize_bf16(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = n_elements * 2;
-    validate_data_size(data, expected_size)?;
-
-    let floats: Vec<f32> = data
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
-        .collect();
-
-    Ok(floats)
-}
-
-/// Q1_0 dequantization.
+/// Decode a buffer of `B`-byte blocks holding `E` elements each.
 ///
-/// Block structure (18 bytes per 128 values):
-/// - bytes 0-1: scale `d` (f16)
-/// - bytes 2-17: 128 sign bits packed LSB-first
-///
-/// Dequantization: `value = bit ? d : -d`
-fn dequantize_q1_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 128;
-    const BLOCK_BYTES: usize = 18;
+/// `data` and `out` have been validated to hold the same whole number of
+/// blocks.
+fn decode_blocks<const B: usize, const E: usize>(
+    data: &[u8],
+    out: &mut [f32],
+    decode: fn(&[u8; B], &mut [f32; E]),
+) {
+    let (src, _) = data.as_chunks::<B>();
+    let (dst, _) = out.as_chunks_mut::<E>();
+    debug_assert_eq!(src.len(), dst.len());
+    if dst.len() * E < PARALLEL_MIN_ELEMENTS {
+        for (s, d) in src.iter().zip(dst.iter_mut()) {
+            decode(s, d);
+        }
+    } else {
+        src.par_iter()
+            .zip(dst.par_iter_mut())
+            .with_min_len(PARALLEL_MIN_BLOCKS)
+            .for_each(|(s, d)| decode(s, d));
+    }
+}
 
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
+#[inline(always)]
+fn read_f16(block: &[u8], at: usize) -> f32 {
+    half::f16::from_le_bytes([block[at], block[at + 1]]).to_f32()
+}
 
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+/// Q1_0: `d: f16`, then 128 sign bits, LSB first. A set bit is `+d`.
+fn dequantize_block_q1_0(block: &[u8; 18], y: &mut [f32; 128]) {
+    let d = read_f16(block, 0);
+    for (i, o) in y.iter_mut().enumerate() {
+        let bit = (block[2 + i / 8] >> (i % 8)) & 1;
+        *o = if bit == 1 { d } else { -d };
+    }
+}
 
-        for i in 0..BLOCK_SIZE {
-            let byte = block[2 + i / 8];
-            let bit = (byte >> (i % 8)) & 1;
-            output.push(if bit == 1 { scale } else { -scale });
+/// Q4_0: `d: f16`, 16 bytes of nibbles. Low nibbles hold elements 0..16 and
+/// high nibbles elements 16..32. `value = (q - 8) * d`.
+fn dequantize_block_q4_0(block: &[u8; 18], y: &mut [f32; 32]) {
+    let d = read_f16(block, 0);
+    for j in 0..16 {
+        let b = block[2 + j];
+        y[j] = (i32::from(b & 0x0f) - 8) as f32 * d;
+        y[j + 16] = (i32::from(b >> 4) - 8) as f32 * d;
+    }
+}
+
+/// Q4_1: `d: f16`, `m: f16`, 16 bytes of nibbles. `value = q * d + m`.
+fn dequantize_block_q4_1(block: &[u8; 20], y: &mut [f32; 32]) {
+    let d = read_f16(block, 0);
+    let m = read_f16(block, 2);
+    for j in 0..16 {
+        let b = block[4 + j];
+        y[j] = f32::from(b & 0x0f) * d + m;
+        y[j + 16] = f32::from(b >> 4) * d + m;
+    }
+}
+
+/// Q5_0: `d: f16`, `qh: u32` (fifth bits), 16 bytes of nibbles.
+/// `value = (q - 16) * d`.
+fn dequantize_block_q5_0(block: &[u8; 22], y: &mut [f32; 32]) {
+    let d = read_f16(block, 0);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    for j in 0..16 {
+        let b = block[6 + j];
+        let lo = i32::from(b & 0x0f) | (((qh >> j) & 1) << 4) as i32;
+        let hi = i32::from(b >> 4) | (((qh >> (j + 16)) & 1) << 4) as i32;
+        y[j] = (lo - 16) as f32 * d;
+        y[j + 16] = (hi - 16) as f32 * d;
+    }
+}
+
+/// Q5_1: `d: f16`, `m: f16`, `qh: u32`, 16 bytes of nibbles.
+/// `value = q * d + m`.
+fn dequantize_block_q5_1(block: &[u8; 24], y: &mut [f32; 32]) {
+    let d = read_f16(block, 0);
+    let m = read_f16(block, 2);
+    let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    for j in 0..16 {
+        let b = block[8 + j];
+        let lo = i32::from(b & 0x0f) | (((qh >> j) & 1) << 4) as i32;
+        let hi = i32::from(b >> 4) | (((qh >> (j + 16)) & 1) << 4) as i32;
+        y[j] = lo as f32 * d + m;
+        y[j + 16] = hi as f32 * d + m;
+    }
+}
+
+/// Q8_0: `d: f16`, 32 signed bytes. `value = q * d`.
+fn dequantize_block_q8_0(block: &[u8; 34], y: &mut [f32; 32]) {
+    let d = read_f16(block, 0);
+    for (o, &q) in y.iter_mut().zip(&block[2..]) {
+        *o = f32::from(q as i8) * d;
+    }
+}
+
+/// Q8_1: `d: f16`, `s: f16` (sum helper for dot kernels, unused here),
+/// 32 signed bytes. `value = q * d`.
+fn dequantize_block_q8_1(block: &[u8; 36], y: &mut [f32; 32]) {
+    let d = read_f16(block, 0);
+    for (o, &q) in y.iter_mut().zip(&block[4..]) {
+        *o = f32::from(q as i8) * d;
+    }
+}
+
+/// MXFP4: one E8M0 shared exponent, 16 bytes of E2M1 nibbles (low nibbles are
+/// elements 0..16, high nibbles 16..32).
+fn dequantize_block_mxfp4(block: &[u8; 17], y: &mut [f32; 32]) {
+    let d = e8m0_to_fp32_half(block[0]);
+    for j in 0..16 {
+        let b = block[1 + j];
+        y[j] = f32::from(KVALUES_MXFP4[usize::from(b & 0x0f)]) * d;
+        y[j + 16] = f32::from(KVALUES_MXFP4[usize::from(b >> 4)]) * d;
+    }
+}
+
+/// NVFP4: four UE4M3 scales (one per 16 elements) then 32 bytes of E2M1
+/// nibbles; within a sub-block the low nibbles are elements 0..8 and the high
+/// nibbles 8..16.
+fn dequantize_block_nvfp4(block: &[u8; 36], y: &mut [f32; 64]) {
+    for sub in 0..4 {
+        let d = ue4m3_to_fp32(block[sub]);
+        for j in 0..8 {
+            let b = block[4 + 8 * sub + j];
+            y[16 * sub + j] = f32::from(KVALUES_MXFP4[usize::from(b & 0x0f)]) * d;
+            y[16 * sub + j + 8] = f32::from(KVALUES_MXFP4[usize::from(b >> 4)]) * d;
         }
     }
-
-    output.truncate(n_elements);
-    Ok(output)
 }
 
-/// Q4_0 dequantization.
-///
-/// Block structure (18 bytes per 32 values):
-/// - bytes 0-1: scale (f16)
-/// - bytes 2-17: 32 4-bit quantized values packed in 16 bytes
-///
-/// Dequantization: `value = (quant - 8) * scale`
-fn dequantize_q4_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 32;
-    const BLOCK_BYTES: usize = 18;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let mut block_values = [0.0f32; BLOCK_SIZE];
-
-        // Scale is f16 at start of block
-        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-
-        // Low nibbles encode elements 0..16, high nibbles encode 16..32.
-        for i in 0..16 {
-            let byte = block[2 + i];
-            let low = (byte & 0x0F) as i8 - 8;
-            let high = ((byte >> 4) & 0x0F) as i8 - 8;
-            block_values[i] = low as f32 * scale;
-            block_values[i + 16] = high as f32 * scale;
-        }
-        output.extend_from_slice(&block_values);
-    }
-
-    // Truncate to exact element count (last block may be partial)
-    output.truncate(n_elements);
-
-    Ok(output)
-}
-
-/// Q4_1 dequantization.
-///
-/// Block structure (20 bytes per 32 values):
-/// - bytes 0-1: scale `d` (f16)
-/// - bytes 2-3: minimum `m` (f16)
-/// - bytes 4-19: 32 unsigned 4-bit values packed in 16 bytes
-///
-/// Dequantization: `value = quant * d + m`
-fn dequantize_q4_1(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 32;
-    const BLOCK_BYTES: usize = 20;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let mut block_values = [0.0f32; BLOCK_SIZE];
-        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-        let min = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
-
-        for i in 0..16 {
-            let byte = block[4 + i];
-            block_values[i] = (byte & 0x0F) as f32 * scale + min;
-            block_values[i + 16] = (byte >> 4) as f32 * scale + min;
-        }
-        output.extend_from_slice(&block_values);
-    }
-
-    output.truncate(n_elements);
-    Ok(output)
-}
-
-/// Q5_0 dequantization.
-///
-/// Block structure (22 bytes per 32 values):
-/// - bytes 0-1: scale `d` (f16)
-/// - bytes 2-5: high fifth bits for all 32 values
-/// - bytes 6-21: low 4-bit nibbles
-///
-/// Dequantization: `value = (quant - 16) * d`
-fn dequantize_q5_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 32;
-    const BLOCK_BYTES: usize = 22;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let mut block_values = [0.0f32; BLOCK_SIZE];
-        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
-        let qs = &block[6..22];
-
-        for i in 0..16 {
-            let byte = qs[i];
-            let high_lo = ((qh >> i) & 1) as i32;
-            let high_hi = ((qh >> (i + 16)) & 1) as i32;
-            let q_lo = (byte & 0x0F) as i32 | (high_lo << 4);
-            let q_hi = (byte >> 4) as i32 | (high_hi << 4);
-            block_values[i] = (q_lo - 16) as f32 * scale;
-            block_values[i + 16] = (q_hi - 16) as f32 * scale;
-        }
-        output.extend_from_slice(&block_values);
-    }
-
-    output.truncate(n_elements);
-    Ok(output)
-}
-
-/// Q5_1 dequantization.
-///
-/// Block structure (24 bytes per 32 values):
-/// - bytes 0-1: scale `d` (f16)
-/// - bytes 2-3: minimum `m` (f16)
-/// - bytes 4-7: high fifth bits for all 32 values
-/// - bytes 8-23: low 4-bit nibbles
-///
-/// Dequantization: `value = quant * d + m`
-fn dequantize_q5_1(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 32;
-    const BLOCK_BYTES: usize = 24;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let mut block_values = [0.0f32; BLOCK_SIZE];
-        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-        let min = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
-        let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-        let qs = &block[8..24];
-
-        for i in 0..16 {
-            let byte = qs[i];
-            let high_lo = ((qh >> i) & 1) as i32;
-            let high_hi = ((qh >> (i + 16)) & 1) as i32;
-            let q_lo = (byte & 0x0F) as i32 | (high_lo << 4);
-            let q_hi = (byte >> 4) as i32 | (high_hi << 4);
-            block_values[i] = q_lo as f32 * scale + min;
-            block_values[i + 16] = q_hi as f32 * scale + min;
-        }
-        output.extend_from_slice(&block_values);
-    }
-
-    output.truncate(n_elements);
-    Ok(output)
-}
-
-/// Q8_0 dequantization.
-///
-/// Block structure (34 bytes per 32 values):
-/// - bytes 0-1: scale (f16)
-/// - bytes 2-33: 32 8-bit quantized values
-///
-/// Dequantization: `value = quant * scale`
-fn dequantize_q8_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 32;
-    const BLOCK_BYTES: usize = 34;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-
-        // Scale is f16 at start of block
-        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-
-        // 32 i8 values
-        for i in 0..32 {
-            let quant = block[2 + i] as i8;
-            output.push(quant as f32 * scale);
-        }
-    }
-
-    // Truncate to exact element count (last block may be partial)
-    output.truncate(n_elements);
-
-    Ok(output)
-}
-
-/// Q8_1 dequantization.
-///
-/// Block structure (36 bytes per 32 values):
-/// - bytes 0-1: scale `d` (f16)
-/// - bytes 2-3: sum helper `s` (f16), used by dot kernels but not needed here
-/// - bytes 4-35: 32 i8 quantized values
-///
-/// Dequantization: `value = quant * d`
-fn dequantize_q8_1(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 32;
-    const BLOCK_BYTES: usize = 36;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-
-        for i in 0..32 {
-            let quant = block[4 + i] as i8;
-            output.push(quant as f32 * scale);
-        }
-    }
-
-    output.truncate(n_elements);
-    Ok(output)
-}
-
-/// MXFP4 dequantization.
-///
-/// Block structure (17 bytes per 32 values):
-/// - byte 0: E8M0 shared scale
-/// - bytes 1-16: packed 4-bit E2M1 values
-fn dequantize_mxfp4(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 32;
-    const BLOCK_BYTES: usize = 17;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let scale = e8m0_to_fp32_half(block[0]);
-        let mut block_values = [0.0f32; BLOCK_SIZE];
-
-        for i in 0..16 {
-            let byte = block[1 + i];
-            let low = KVALUES_MXFP4[(byte & 0x0f) as usize];
-            let high = KVALUES_MXFP4[(byte >> 4) as usize];
-            block_values[i] = low as f32 * scale;
-            block_values[i + 16] = high as f32 * scale;
-        }
-        output.extend_from_slice(&block_values);
-    }
-
-    output.truncate(n_elements);
-    Ok(output)
-}
-
-/// NVFP4 dequantization.
-///
-/// Block structure (36 bytes per 64 values):
-/// - bytes 0-3: UE4M3 scales, one per 16-value sub-block
-/// - bytes 4-35: packed 4-bit E2M1 values
-fn dequantize_nvfp4(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 64;
-    const SUB_BLOCK_SIZE: usize = 16;
-    const N_SUB_BLOCKS: usize = BLOCK_SIZE / SUB_BLOCK_SIZE;
-    const BLOCK_BYTES: usize = 36;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let mut block_values = [0.0f32; BLOCK_SIZE];
-
-        for sub in 0..N_SUB_BLOCKS {
-            let scale = ue4m3_to_fp32(block[sub]);
-            let qs_offset = 4 + sub * (SUB_BLOCK_SIZE / 2);
-            let value_offset = sub * SUB_BLOCK_SIZE;
-
-            for i in 0..SUB_BLOCK_SIZE / 2 {
-                let byte = block[qs_offset + i];
-                let low = KVALUES_MXFP4[(byte & 0x0f) as usize];
-                let high = KVALUES_MXFP4[(byte >> 4) as usize];
-                block_values[value_offset + i] = low as f32 * scale;
-                block_values[value_offset + i + SUB_BLOCK_SIZE / 2] = high as f32 * scale;
-            }
-        }
-        output.extend_from_slice(&block_values);
-    }
-
-    output.truncate(n_elements);
-    Ok(output)
-}
-
-/// TQ1_0 dequantization.
-///
-/// Block structure (54 bytes per 256 values):
-/// - bytes 0-47: 5 ternary values per byte
-/// - bytes 48-51: 4 ternary values per byte
-/// - bytes 52-53: scale `d` (f16)
-fn dequantize_tq1_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 256;
-    const QS_BYTES: usize = 48;
-    const QH_BYTES: usize = 4;
-    const BLOCK_BYTES: usize = 54;
+/// TQ1_0: 5 ternary digits per byte in `qs[48]`, 4 per byte in `qh[4]`, then
+/// `d: f16`. A digit `t` in `{0,1,2}` decodes to `(t - 1) * d`.
+fn dequantize_block_tq1_0(block: &[u8; 54], y: &mut [f32; 256]) {
     const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+    let qs = &block[..48];
+    let qh = &block[48..52];
+    let d = read_f16(block, 52);
 
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
+    #[inline(always)]
+    fn digit(byte: u8, pow: u8) -> i32 {
+        let q = byte.wrapping_mul(pow);
+        ((u16::from(q) * 3) >> 8) as i32 - 1
+    }
 
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let qs = &block[..QS_BYTES];
-        let qh = &block[QS_BYTES..QS_BYTES + QH_BYTES];
-        let scale = half::f16::from_le_bytes([block[52], block[53]]).to_f32();
-
-        for j in (0..QS_BYTES - QS_BYTES % 32).step_by(32) {
-            for pow in POW3.iter().take(5) {
-                for m in 0..32 {
-                    let q = qs[j + m].wrapping_mul(*pow);
-                    let xi = ((u16::from(q) * 3) >> 8) as i16;
-                    output.push((xi - 1) as f32 * scale);
-                }
-            }
-        }
-        for j in (QS_BYTES - QS_BYTES % 32..QS_BYTES).step_by(16) {
-            for pow in POW3.iter().take(5) {
-                for m in 0..16 {
-                    let q = qs[j + m].wrapping_mul(*pow);
-                    let xi = ((u16::from(q) * 3) >> 8) as i16;
-                    output.push((xi - 1) as f32 * scale);
-                }
-            }
-        }
-        for pow in POW3.iter().take(4) {
-            for qh_byte in qh {
-                let q = qh_byte.wrapping_mul(*pow);
-                let xi = ((u16::from(q) * 3) >> 8) as i16;
-                output.push((xi - 1) as f32 * scale);
+    let mut out = 0;
+    // 32-byte groups (5 digits per byte), then the 16-byte remainder.
+    for (start, width) in [(0usize, 32usize), (32, 16)] {
+        for pow in &POW3[..5] {
+            for m in 0..width {
+                y[out] = digit(qs[start + m], *pow) as f32 * d;
+                out += 1;
             }
         }
     }
-
-    output.truncate(n_elements);
-    Ok(output)
+    for pow in &POW3[..4] {
+        for &b in qh {
+            y[out] = digit(b, *pow) as f32 * d;
+            out += 1;
+        }
+    }
+    debug_assert_eq!(out, 256);
 }
 
-/// TQ2_0 dequantization.
-///
-/// Block structure (66 bytes per 256 values):
-/// - bytes 0-63: four 2-bit ternary values per byte
-/// - bytes 64-65: scale `d` (f16)
-fn dequantize_tq2_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    const BLOCK_SIZE: usize = 256;
-    const QS_BYTES: usize = 64;
-    const BLOCK_BYTES: usize = 66;
-
-    let n_elements = shape_n_elements(shape)?;
-    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
-    let expected_size = n_blocks * BLOCK_BYTES;
-    validate_data_size(data, expected_size)?;
-
-    let mut output = Vec::with_capacity(n_elements);
-    for block_idx in 0..n_blocks {
-        let block_start = block_idx * BLOCK_BYTES;
-        let block = &data[block_start..block_start + BLOCK_BYTES];
-        let scale = half::f16::from_le_bytes([block[64], block[65]]).to_f32();
-
-        for j in (0..QS_BYTES).step_by(32) {
-            for lane in 0..4 {
-                for m in 0..32 {
-                    let q = ((block[j + m] >> (lane * 2)) & 3) as i8;
-                    output.push((q - 1) as f32 * scale);
-                }
+/// TQ2_0: four 2-bit ternary values per byte in `qs[64]`, then `d: f16`.
+fn dequantize_block_tq2_0(block: &[u8; 66], y: &mut [f32; 256]) {
+    let d = read_f16(block, 64);
+    for j in 0..2 {
+        for lane in 0..4 {
+            for m in 0..32 {
+                let q = i32::from((block[32 * j + m] >> (2 * lane)) & 3);
+                y[128 * j + 32 * lane + m] = (q - 1) as f32 * d;
             }
         }
     }
-
-    output.truncate(n_elements);
-    Ok(output)
-}
-
-fn dequantize_i8(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    validate_data_size(data, n_elements)?;
-    Ok(data.iter().map(|&value| (value as i8) as f32).collect())
-}
-
-fn dequantize_i16(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    validate_data_size(data, n_elements * 2)?;
-    Ok(data
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| i16::from_le_bytes(*b) as f32)
-        .collect())
-}
-
-fn dequantize_i32(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    validate_data_size(data, n_elements * 4)?;
-    Ok(data
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| i32::from_le_bytes(*b) as f32)
-        .collect())
-}
-
-fn dequantize_i64(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    validate_data_size(data, n_elements * 8)?;
-    Ok(data
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|b| i64::from_le_bytes(*b) as f32)
-        .collect())
-}
-
-fn dequantize_f64(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    validate_data_size(data, n_elements * 8)?;
-    Ok(data
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|b| f64::from_le_bytes(*b) as f32)
-        .collect())
-}
-
-// =============================================================================
-// K-Quant Dequantization Wrappers (Q2K-Q8K)
-// =============================================================================
-
-/// Q2K dequantization (2-bit K-quant, 256 values per block).
-fn dequantize_q2k(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = k_quants::BlockQ2K::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(k_quants::dequantize_q2k_bytes(data, n_elements))
-}
-
-/// Q3K dequantization (3-bit K-quant, 256 values per block).
-fn dequantize_q3k(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = k_quants::BlockQ3K::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(k_quants::dequantize_q3k_bytes(data, n_elements))
-}
-
-/// Q4K dequantization (4-bit K-quant, 256 values per block).
-fn dequantize_q4k(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = k_quants::BlockQ4K::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(k_quants::dequantize_q4k_bytes(data, n_elements))
-}
-
-/// Q5K dequantization (5-bit K-quant, 256 values per block).
-fn dequantize_q5k(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = k_quants::BlockQ5K::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(k_quants::dequantize_q5k_bytes(data, n_elements))
-}
-
-/// Q6K dequantization (6-bit K-quant, 256 values per block).
-fn dequantize_q6k(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = k_quants::BlockQ6K::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(k_quants::dequantize_q6k_bytes(data, n_elements))
-}
-
-/// Q8K dequantization (8-bit K-quant, 256 values per block).
-fn dequantize_q8k(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = k_quants::BlockQ8K::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(k_quants::dequantize_q8k_bytes(data, n_elements))
-}
-
-// =============================================================================
-// IQ Dequantization Wrappers (Importance-weighted Quantization)
-// =============================================================================
-
-/// IQ4_NL dequantization (4-bit non-linear, 32 values per block).
-fn dequantize_iq4nl(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq4Nl::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq4nl_bytes(data, n_elements))
-}
-
-/// IQ4_XS dequantization (4-bit non-linear with scales, 256 values per block).
-fn dequantize_iq4xs(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq4Xs::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq4xs_bytes(data, n_elements))
-}
-
-/// IQ2_XXS dequantization (2-bit extra-extra-small, 256 values per block).
-fn dequantize_iq2xxs(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq2Xxs::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq2xxs_bytes(data, n_elements))
-}
-
-/// IQ2_XS dequantization (2-bit extra-small, 256 values per block).
-fn dequantize_iq2xs(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq2Xs::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq2xs_bytes(data, n_elements))
-}
-
-/// IQ2_S dequantization (2-bit small, 256 values per block).
-fn dequantize_iq2s(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq2S::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq2s_bytes(data, n_elements))
-}
-
-/// IQ3_XXS dequantization (3-bit extra-extra-small, 256 values per block).
-fn dequantize_iq3xxs(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq3Xxs::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq3xxs_bytes(data, n_elements))
-}
-
-/// IQ3_S dequantization (3-bit small, 256 values per block).
-fn dequantize_iq3s(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq3S::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq3s_bytes(data, n_elements))
-}
-
-/// IQ1_S dequantization (1-bit small, 256 values per block).
-fn dequantize_iq1s(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq1S::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq1s_bytes(data, n_elements))
-}
-
-/// IQ1_M dequantization (1-bit medium, 256 values per block).
-fn dequantize_iq1m(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> {
-    let n_elements = shape_n_elements(shape)?;
-    let expected_size = iq_quants::BlockIq1M::byte_size(n_elements);
-    validate_data_size(data, expected_size)?;
-
-    Ok(iq_quants::dequantize_iq1m_bytes(data, n_elements))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_dequantize_f32() {
-        let data: Vec<u8> = vec![
-            0x00, 0x00, 0x80, 0x3f, // 1.0f
-            0x00, 0x00, 0x00, 0x40, // 2.0f
-            0x00, 0x00, 0x40, 0x40, // 3.0f
-        ];
-        let shape = [3];
-        let result = dequantize_f32(&data, &shape).unwrap();
-        assert_eq!(result, vec![1.0, 2.0, 3.0]);
+    fn f16_bytes(v: f32) -> [u8; 2] {
+        half::f16::from_f32(v).to_le_bytes()
     }
 
     #[test]
-    fn test_dequantize_f16() {
-        // f16 representations
-        let one_f16 = half::f16::from_f32(1.0).to_le_bytes();
-        let two_f16 = half::f16::from_f32(2.0).to_le_bytes();
+    fn scalar_types_round_trip() {
+        let f32s: Vec<u8> = [1.0f32, -2.5, 3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            dequantize(&f32s, GgmlType::F32, &[3]).unwrap(),
+            vec![1.0, -2.5, 3.0]
+        );
 
-        let mut data = Vec::new();
-        data.extend_from_slice(&one_f16);
-        data.extend_from_slice(&two_f16);
+        let f16s: Vec<u8> = [1.0f32, 2.0].iter().flat_map(|&v| f16_bytes(v)).collect();
+        assert_eq!(
+            dequantize(&f16s, GgmlType::F16, &[2]).unwrap(),
+            vec![1.0, 2.0]
+        );
 
-        let shape = [2];
-        let result = dequantize_f16(&data, &shape).unwrap();
+        let bf16s: Vec<u8> = [1.0f32, -2.0]
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+            .collect();
+        assert_eq!(
+            dequantize(&bf16s, GgmlType::Bf16, &[2]).unwrap(),
+            vec![1.0, -2.0]
+        );
 
-        assert!((result[0] - 1.0).abs() < 0.01);
-        assert!((result[1] - 2.0).abs() < 0.01);
+        let i16s: Vec<u8> = [-3i16, 7].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(
+            dequantize(&i16s, GgmlType::I16, &[2]).unwrap(),
+            vec![-3.0, 7.0]
+        );
+        assert_eq!(
+            dequantize(&[0xff, 0x02], GgmlType::I8, &[2]).unwrap(),
+            vec![-1.0, 2.0]
+        );
     }
 
     #[test]
-    fn test_dequantize_bf16() {
-        // bf16 representations
-        let one_bf16 = half::bf16::from_f32(1.0).to_le_bytes();
-        let two_bf16 = half::bf16::from_f32(2.0).to_le_bytes();
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&one_bf16);
-        data.extend_from_slice(&two_bf16);
-
-        let shape = [2];
-        let result = dequantize_bf16(&data, &shape).unwrap();
-
-        assert!((result[0] - 1.0).abs() < 0.01);
-        assert!((result[1] - 2.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_q4_0_block_structure() {
-        // Create a Q4_0 block with scale=1.0 and values 0-7 repeated
-        let scale = half::f16::from_f32(1.0).to_le_bytes();
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&scale);
-
-        // 16 bytes of packed 4-bit values
-        // Each byte contains two 4-bit values: low nibble first, high nibble second
-        // For value i, the quantized value is i + 8 (since we subtract 8 during dequant)
-        for i in 0..16u8 {
-            // Pack two values per byte
-            let low = (i % 16 + 8) & 0x0F; // Will be (i+8)-8 = i after dequant
-            let high = ((i + 1) % 16 + 8) & 0x0F;
-            data.push(low | (high << 4));
+    fn q4_0_places_low_nibbles_first() {
+        let mut data = f16_bytes(0.5).to_vec();
+        // byte j holds element j in the low nibble and element j+16 in the high nibble
+        data.extend((0..16u8).map(|j| j | ((15 - j) << 4)));
+        let out = dequantize(&data, GgmlType::Q4_0, &[32]).unwrap();
+        for j in 0..16 {
+            assert_eq!(out[j], (j as f32 - 8.0) * 0.5);
+            assert_eq!(out[j + 16], ((15 - j) as f32 - 8.0) * 0.5);
         }
-
-        let shape = [32];
-        let result = dequantize_q4_0(&data, &shape).unwrap();
-
-        assert_eq!(result.len(), 32);
-        // Verify first few values
-        assert!((result[0] - 0.0).abs() < 0.01); // (8 - 8) * 1.0 = 0
-        assert!((result[1] - 1.0).abs() < 0.01); // (9 - 8) * 1.0 = 1
-        assert!((result[16] - 1.0).abs() < 0.01); // high nibble from first byte
     }
 
     #[test]
-    fn test_q1_0_block_structure() {
-        let scale = half::f16::from_f32(0.5).to_le_bytes();
-        let mut data = Vec::new();
-        data.extend_from_slice(&scale);
-        data.extend(std::iter::repeat_n(0b1010_1010, 16));
-
-        let result = dequantize_q1_0(&data, &[128]).unwrap();
-        assert_eq!(result.len(), 128);
-        assert!((result[0] + 0.5).abs() < 0.01);
-        assert!((result[1] - 0.5).abs() < 0.01);
+    fn wrong_data_length_is_an_error() {
+        assert!(matches!(
+            dequantize(&[0u8; 10], GgmlType::F32, &[4]),
+            Err(DequantError::InvalidSize {
+                expected: 16,
+                actual: 10
+            })
+        ));
+        assert!(matches!(
+            dequantize(&[0u8; 17], GgmlType::Q4_0, &[32]),
+            Err(DequantError::InvalidSize {
+                expected: 18,
+                actual: 17
+            })
+        ));
     }
 
     #[test]
-    fn test_q4_1_block_structure() {
-        let scale = half::f16::from_f32(0.5).to_le_bytes();
-        let min = half::f16::from_f32(1.0).to_le_bytes();
-        let mut data = Vec::new();
-        data.extend_from_slice(&scale);
-        data.extend_from_slice(&min);
-        data.push(2 | (4 << 4));
-        data.extend(std::iter::repeat_n(0, 15));
-
-        let result = dequantize_q4_1(&data, &[32]).unwrap();
-        assert!((result[0] - 2.0).abs() < 0.01);
-        assert!((result[16] - 3.0).abs() < 0.01);
+    fn rows_must_be_whole_blocks() {
+        // 2 x 48 elements is 3 blocks of Q4_0 in total, but a row of 48 is
+        // 1.5 blocks: blocks never straddle rows.
+        let data = vec![0u8; 3 * 18];
+        assert!(matches!(
+            dequantize(&data, GgmlType::Q4_0, &[2, 48]),
+            Err(DequantError::RowNotBlockAligned {
+                row_len: 48,
+                block_size: 32,
+                ..
+            })
+        ));
+        assert!(dequantize(&data, GgmlType::Q4_0, &[3, 32]).is_ok());
     }
 
     #[test]
-    fn test_q5_legacy_block_structures() {
-        let scale = half::f16::from_f32(1.0).to_le_bytes();
-        let min = half::f16::from_f32(0.25).to_le_bytes();
-
-        let mut q5_0 = Vec::new();
-        q5_0.extend_from_slice(&scale);
-        q5_0.extend_from_slice(&1u32.to_le_bytes()); // high bit for element 0
-        q5_0.push(1 | (15 << 4));
-        q5_0.extend(std::iter::repeat_n(0, 15));
-        let result = dequantize_q5_0(&q5_0, &[32]).unwrap();
-        assert!((result[0] - 1.0).abs() < 0.01); // (17 - 16) * 1
-        assert!((result[16] + 1.0).abs() < 0.01); // (15 - 16) * 1
-
-        let mut q5_1 = Vec::new();
-        q5_1.extend_from_slice(&scale);
-        q5_1.extend_from_slice(&min);
-        q5_1.extend_from_slice(&1u32.to_le_bytes());
-        q5_1.push(1 | (15 << 4));
-        q5_1.extend(std::iter::repeat_n(0, 15));
-        let result = dequantize_q5_1(&q5_1, &[32]).unwrap();
-        assert!((result[0] - 17.25).abs() < 0.01);
-        assert!((result[16] - 15.25).abs() < 0.01);
+    fn invalid_shapes_are_errors() {
+        assert!(matches!(
+            dequantize(&[], GgmlType::F32, &[-1]),
+            Err(DequantError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            dequantize(
+                &[],
+                GgmlType::F32,
+                &[i32::MAX, i32::MAX, i32::MAX, i32::MAX]
+            ),
+            Err(DequantError::ShapeTooLarge { .. })
+        ));
     }
 
     #[test]
-    fn test_q8_0_block_structure() {
-        // Create a Q8_0 block with scale=0.5 and values
-        let scale = half::f16::from_f32(0.5).to_le_bytes();
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&scale);
-
-        // 32 i8 values
-        for i in 0..32i8 {
-            data.push(i as u8);
-        }
-
-        let shape = [32];
-        let result = dequantize_q8_0(&data, &shape).unwrap();
-
-        assert_eq!(result.len(), 32);
-        // Verify: value = quant * 0.5
-        assert!((result[0] - 0.0).abs() < 0.01); // 0 * 0.5
-        assert!((result[2] - 1.0).abs() < 0.01); // 2 * 0.5
-        assert!((result[4] - 2.0).abs() < 0.01); // 4 * 0.5
+    fn output_buffer_length_is_checked() {
+        let mut out = [0.0f32; 3];
+        assert!(matches!(
+            dequantize_into(&[0u8; 16], GgmlType::F32, &[4], &mut out),
+            Err(DequantError::InvalidOutputLength {
+                expected: 4,
+                actual: 3
+            })
+        ));
     }
 
     #[test]
-    fn test_q8_1_block_structure() {
-        let scale = half::f16::from_f32(0.25).to_le_bytes();
-        let sum = half::f16::from_f32(0.0).to_le_bytes();
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&scale);
-        data.extend_from_slice(&sum);
-        for i in 0..32i8 {
-            data.push(i as u8);
-        }
-
-        let result = dequantize_q8_1(&data, &[32]).unwrap();
-        assert_eq!(result.len(), 32);
-        assert!((result[4] - 1.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_mxfp4_block_structure() {
-        let mut data = Vec::new();
-        data.push(128); // d = 1.0
-        data.push(1 | (9 << 4)); // +1, -1
-        data.extend(std::iter::repeat_n(0, 15));
-
-        let result = dequantize_mxfp4(&data, &[32]).unwrap();
-        assert!((result[0] - 1.0).abs() < 0.01);
-        assert!((result[16] + 1.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_nvfp4_block_structure() {
-        let mut data = vec![64, 0, 0, 0]; // first sub-block d = 1.0
-        data.push(5 | (13 << 4)); // +6, -6
-        data.extend(std::iter::repeat_n(0, 31));
-
-        let result = dequantize_nvfp4(&data, &[64]).unwrap();
-        assert!((result[0] - 6.0).abs() < 0.01);
-        assert!((result[8] + 6.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_tq2_0_block_structure() {
-        let mut data = vec![0u8; 66];
-        data[0] = (1 << 2) | (2 << 4);
-        data[64..66].copy_from_slice(&half::f16::from_f32(2.0).to_le_bytes());
-
-        let result = dequantize_tq2_0(&data, &[256]).unwrap();
-        assert!((result[0] + 2.0).abs() < 0.01);
-        assert!(result[32].abs() < 0.01);
-        assert!((result[64] - 2.0).abs() < 0.01);
-        assert!((result[96] + 2.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_is_supported() {
-        // Basic types
-        assert!(is_supported(GgmlType::F32));
-        assert!(is_supported(GgmlType::F16));
-        assert!(is_supported(GgmlType::Bf16));
-        assert!(is_supported(GgmlType::Q4_0));
-        assert!(is_supported(GgmlType::Q4_1));
-        assert!(is_supported(GgmlType::Q5_0));
-        assert!(is_supported(GgmlType::Q5_1));
-        assert!(is_supported(GgmlType::Q8_0));
-        assert!(is_supported(GgmlType::Q8_1));
-        assert!(is_supported(GgmlType::Q1_0));
-        assert!(is_supported(GgmlType::Tq1_0));
-        assert!(is_supported(GgmlType::Tq2_0));
-        assert!(is_supported(GgmlType::Mxfp4));
-        assert!(is_supported(GgmlType::Nvfp4));
-        assert!(is_supported(GgmlType::I8));
-        assert!(is_supported(GgmlType::I16));
-        assert!(is_supported(GgmlType::I32));
-        assert!(is_supported(GgmlType::I64));
-        assert!(is_supported(GgmlType::F64));
-
-        // K-quant types
-        assert!(is_supported(GgmlType::Q2K));
-        assert!(is_supported(GgmlType::Q3K));
-        assert!(is_supported(GgmlType::Q4K));
-        assert!(is_supported(GgmlType::Q5K));
-        assert!(is_supported(GgmlType::Q6K));
-        assert!(is_supported(GgmlType::Q8K));
-
-        // IQ types
-        assert!(is_supported(GgmlType::Iq4Nl));
-        assert!(is_supported(GgmlType::Iq4Xs));
-        assert!(is_supported(GgmlType::Iq2Xxs));
-        assert!(is_supported(GgmlType::Iq2Xs));
-        assert!(is_supported(GgmlType::Iq2S));
-        assert!(is_supported(GgmlType::Iq3Xxs));
-        assert!(is_supported(GgmlType::Iq3S));
-        assert!(is_supported(GgmlType::Iq1S));
-        assert!(is_supported(GgmlType::Iq1M));
-
-        // Repacked kernel-specific layouts are not decoded as portable tensors.
+    fn repacked_layouts_are_rejected() {
         assert!(!is_supported(GgmlType::Q4_0_4_4));
-        assert!(!is_supported(GgmlType::Iq4Nl_4_4));
+        assert!(!is_supported(GgmlType::Iq4Nl_8_8));
+        assert!(matches!(
+            dequantize(&[0u8; 18], GgmlType::Q4_0_4_4, &[32]),
+            Err(DequantError::UnsupportedType(_))
+        ));
     }
 
     #[test]
-    fn test_invalid_size() {
-        let data = vec![0u8; 10]; // Wrong size for 4 f32 values
-        let shape = [4];
-        let result = dequantize_f32(&data, &shape);
-        assert!(matches!(result, Err(DequantError::InvalidSize { .. })));
+    fn every_other_type_is_supported() {
+        for id in 0..=41u32 {
+            if let Ok(t) = GgmlType::try_from(id) {
+                let repacked = matches!(id, 31..=33 | 36..=38);
+                assert_eq!(is_supported(t), !repacked, "{t:?}");
+            }
+        }
     }
 
     #[test]
-    fn test_invalid_shape() {
-        let result = dequantize_f32(&[], &[-1]);
-        assert!(matches!(result, Err(DequantError::InvalidShape { .. })));
+    fn parallel_and_serial_decoding_agree() {
+        // 2^17 elements is above the parallel threshold; compare with a
+        // block-at-a-time decode.
+        let n_blocks = (1 << 17) / 32;
+        let mut data = Vec::with_capacity(n_blocks * 34);
+        let mut state = 0x1234_5678u32;
+        for _ in 0..n_blocks {
+            data.extend_from_slice(&f16_bytes(0.25));
+            for _ in 0..32 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                data.push((state >> 24) as u8);
+            }
+        }
+        let parallel = dequantize(&data, GgmlType::Q8_0, &[n_blocks as i32, 32]).unwrap();
+        let mut serial = vec![0.0f32; n_blocks * 32];
+        for (s, d) in data
+            .as_chunks::<34>()
+            .0
+            .iter()
+            .zip(serial.as_chunks_mut::<32>().0)
+        {
+            dequantize_block_q8_0(s, d);
+        }
+        assert_eq!(parallel, serial);
     }
 }
