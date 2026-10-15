@@ -133,7 +133,9 @@ is based on the llama.cpp/GGML implementation.
 
 Source: https://github.com/ggerganov/llama.cpp
 License: MIT
-Files: crates/pmetal-gguf/src/k_quants.rs,
+Files: crates/pmetal-data/src/gguf_tokenizer/pre_table.rs (the pre-tokenizer
+       patterns by `tokenizer.ggml.pre` name),
+       crates/pmetal-gguf/src/k_quants.rs,
        crates/pmetal-gguf/src/iq_quants.rs,
        crates/pmetal-gguf/src/quantize.rs,
        crates/pmetal-metal/src/kernels/metal/dequant.metal
@@ -246,3 +248,23 @@ multi-scale mel loss (MIT), Vocos' multi-band discriminator (MIT) and Amphion's
 CQT discriminator (MIT). The constant-Q transform follows nnAudio (MIT) and
 the sample-rate converter follows torchaudio's windowed-sinc kernel (BSD
 2-Clause); the mel filterbank follows librosa (ISC).
+
+
+8. Chat templates of released models (test fixtures)
+-----------------------------------------------------
+
+crates/pmetal-data/tests/fixtures/chat_template_suite_reference.json holds the
+Jinja chat templates that ten model families publish with their tokenizers,
+verbatim, with the text they render for a fixed set of conversations. They are
+test data: nothing in PMetal's code is derived from them.
+
+    Qwen2.5, Qwen3, Qwen3.5 (Alibaba Cloud)        Apache License 2.0
+    Gemma 4 (Google)                                Apache License 2.0
+    gpt-oss (OpenAI)                                Apache License 2.0
+    Mistral-7B-Instruct-v0.3 (Mistral AI)           Apache License 2.0
+    Granite 3.1 (IBM)                               Apache License 2.0
+    Phi-3-mini, Phi-4-mini (Microsoft)              MIT License
+    DeepSeek-V3-0324 (DeepSeek)                     MIT License
+
+The Apache License 2.0 is at https://www.apache.org/licenses/LICENSE-2.0 and
+the MIT License is reproduced above.

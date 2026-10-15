@@ -46,7 +46,7 @@
 //! let tokenizer = Tokenizer::from_model_dir(&model_path)?;
 //! let template = detect_chat_template(&model_path, "Qwen/Qwen3-0.6B");
 //! let formatted = template.apply(&[Message::user("What is 2+2?")]).text;
-//! let input_ids = tokenizer.encode_with_special_tokens(&formatted)?;
+//! let input_ids = tokenizer.encode(&formatted)?; // the template wrote the BOS
 //!
 //! let mut model = DynamicModel::load(&model_path)?;
 //! let mut cache = model.create_cache(input_ids.len() + 256);
