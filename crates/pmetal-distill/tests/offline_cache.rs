@@ -327,6 +327,98 @@ fn sparse_kl_gradient_is_softmax_minus_teacher() {
     }
 }
 
+/// The distiller's sparse path is its dense path on the densified teacher:
+/// same total, soft and hard terms, hard labels included.
+#[test]
+#[serial]
+fn the_distiller_with_a_sparse_teacher_equals_the_dense_distiller() {
+    use pmetal_distill::{DistillConfig, DistillMethod, Distiller, LossConfig, LossType};
+
+    let (seq, vocab, k) = (3_usize, 11_usize, 4_usize);
+    let teacher_logits = distinct(seq, vocab);
+    let student_logits: Vec<f32> = (0..seq * vocab)
+        .map(|i| 2.0 * ((i as f32) * 0.37 + 0.1).cos())
+        .collect();
+    let shape = [1, seq as i32, vocab as i32];
+    let compressor = LogitCompressor::new(CompressionMethod::TopK, k);
+    let compressed = compressor
+        .compress(&Array::from_f32_slice(&teacher_logits, &shape))
+        .unwrap();
+    let dense_teacher = compressor.decompress(&compressed, vocab).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cache = LogitCache::new(dir.path(), CompressionMethod::TopK, k).unwrap();
+    cache
+        .cache_sequence(0, &Array::from_f32_slice(&teacher_logits, &shape))
+        .unwrap();
+    let sparse = cache.load_sequence_sparse(0).unwrap();
+
+    let make = |loss_type: LossType, reverse_kl: bool| {
+        Distiller::new(DistillConfig {
+            teacher: "t".to_string(),
+            student: "s".to_string(),
+            method: DistillMethod::Online,
+            loss: LossConfig {
+                loss_type,
+                reverse_kl,
+                temperature: 2.0,
+                alpha: 0.7,
+                ..LossConfig::default()
+            },
+            offline: None,
+            output_path: None,
+            training: Default::default(),
+        })
+        .unwrap()
+    };
+
+    let student = Array::from_f32_slice(&student_logits, &shape);
+    let labels = Array::from_i32_slice_shaped(&[3, -100, 7], &[1, seq as i32]);
+    let weights = Array::from_f32_slice(&[1.0, 0.0, 1.0], &[1, seq as i32]);
+    let distiller = make(LossType::KlDivergence, false);
+    let dense = distiller
+        .compute_loss(
+            &dense_teacher,
+            &student,
+            Some(&labels),
+            Some(&weights),
+            0,
+            1,
+        )
+        .unwrap();
+    let sparse_out = distiller
+        .compute_loss_sparse(&sparse, &student, Some(&labels), Some(&weights), 0, 1)
+        .unwrap();
+    for (name, a, b) in [
+        ("total", &dense.total, &sparse_out.total),
+        ("soft", &dense.soft, &sparse_out.soft),
+        (
+            "hard",
+            dense.hard.as_ref().unwrap(),
+            sparse_out.hard.as_ref().unwrap(),
+        ),
+    ] {
+        let (a, b) = (a.item::<f32>(), b.item::<f32>());
+        drain();
+        assert!(
+            (a - b).abs() <= 1e-5 * a.abs().max(1e-3),
+            "{name}: dense {a} vs sparse {b}"
+        );
+    }
+
+    // Losses that need the whole teacher are refused, not swapped.
+    for unsupported in [
+        make(LossType::KlDivergence, true),
+        make(LossType::JensenShannon, false),
+    ] {
+        assert!(
+            unsupported
+                .compute_loss_sparse(&sparse, &student, None, None, 0, 1)
+                .is_err()
+        );
+    }
+}
+
 /// Collating sequences of different lengths pads, truncates and keeps ids.
 #[test]
 #[serial]

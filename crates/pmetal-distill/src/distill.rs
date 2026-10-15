@@ -7,10 +7,10 @@ use pmetal_runtime::compat::{Array, Dtype, ops};
 use pmetal_runtime::training::CrossEntropy;
 
 use crate::{
-    DistillConfig, DistillError, DistillMethod, LossType, Result,
+    DistillConfig, DistillError, DistillMethod, LossType, Result, SparseLogits,
     losses::{
         AttentionTransferLoss, DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss,
-        MseLoss, SoftCrossEntropyLoss,
+        MseLoss, SoftCrossEntropyLoss, SparseKlLoss,
         hidden_state::{LayerDistillation, mean_over_layer_pairs},
         reduce_per_token, tempered_log_probs,
     },
@@ -203,27 +203,92 @@ impl Distiller {
         total_steps: usize,
     ) -> Result<DistillLossOutput> {
         check_logit_pair(teacher_logits, student_logits)?;
+        let (temperature, alpha) = self.schedule(step, total_steps);
 
-        // Resolve (temperature, alpha): static config or progressive schedule.
-        let (temperature, alpha) = if self.config.method == DistillMethod::Progressive {
-            self.progressive_params(step, total_steps)
-        } else {
-            (self.config.loss.temperature, self.config.loss.alpha)
-        };
-
-        // Soft distillation loss
         let soft_loss =
             self.loss
                 .compute_weighted(teacher_logits, student_logits, temperature, weights)?;
+        self.combine(
+            soft_loss,
+            self.loss.temperature_scale(temperature),
+            alpha,
+            student_logits,
+            labels,
+        )
+    }
 
+    /// [`compute_loss`](Self::compute_loss) against a top-k teacher read from
+    /// an offline cache ([`LogitCache::load_sequence_sparse`](crate::LogitCache::load_sequence_sparse),
+    /// collated with [`SparseLogits::stack`](crate::SparseLogits::stack)),
+    /// without ever forming the dense `[batch, seq, vocab]` teacher.
+    ///
+    /// The soft term is the forward KL
+    /// ([`SparseKlLoss`](crate::losses::SparseKlLoss)), so this needs the
+    /// configured loss to be the forward KL (or the soft cross-entropy, which
+    /// has the same gradient); any other loss needs the dense teacher and is
+    /// refused rather than silently swapped for another.
+    pub fn compute_loss_sparse(
+        &self,
+        teacher: &SparseLogits,
+        student_logits: &Array,
+        labels: Option<&Array>,
+        weights: Option<&Array>,
+        step: usize,
+        total_steps: usize,
+    ) -> Result<DistillLossOutput> {
+        let cfg = &self.config.loss;
+        let forward_kl = !cfg.rationale
+            && match cfg.loss_type {
+                LossType::KlDivergence => !cfg.reverse_kl,
+                LossType::SoftCrossEntropy => true,
+                _ => false,
+            };
+        if !forward_kl {
+            return Err(DistillError::InvalidConfig(
+                "a top-k teacher supports the forward KL (loss_type kl_divergence without \
+                 reverse_kl, or soft_cross_entropy); this configuration needs the dense teacher \
+                 logits"
+                    .to_string(),
+            ));
+        }
+        let (temperature, alpha) = self.schedule(step, total_steps);
+        let soft_loss =
+            SparseKlLoss::new().compute(teacher, student_logits, temperature, weights)?;
+        self.combine(
+            soft_loss,
+            temperature * temperature,
+            alpha,
+            student_logits,
+            labels,
+        )
+    }
+
+    /// `(temperature, alpha)` at `step`: the static config, or the progressive
+    /// schedule when the method is `Progressive`, so the schedule takes effect.
+    fn schedule(&self, step: usize, total_steps: usize) -> (f32, f32) {
+        if self.config.method == DistillMethod::Progressive {
+            self.progressive_params(step, total_steps)
+        } else {
+            (self.config.loss.temperature, self.config.loss.alpha)
+        }
+    }
+
+    /// Scale the soft loss and blend it with the hard-label loss.
+    fn combine(
+        &self,
+        soft_loss: Array,
+        temperature_scale: f32,
+        alpha: f32,
+        student_logits: &Array,
+        labels: Option<&Array>,
+    ) -> Result<DistillLossOutput> {
         // Scale by T² (Hinton et al. 2015, §2.1): when teacher/student logits
         // are softened by `T`, the gradient with respect to student logits is
         // attenuated by 1/T². Multiplying the loss by T² restores the
         // gradient magnitude so a single optimizer step has the same effect
         // regardless of the temperature setting. A loss that never softens
         // anything (logit MSE) opts out through `temperature_scale`.
-        let soft_scaled =
-            soft_loss.multiply(&Array::from_f32(self.loss.temperature_scale(temperature)));
+        let soft_scaled = soft_loss.multiply(&Array::from_f32(temperature_scale));
 
         // Combined with hard labels if provided
         let (total_loss, hard_loss_opt) = if let Some(labels) = labels {
@@ -242,7 +307,7 @@ impl Distiller {
 
         Ok(DistillLossOutput {
             total: total_loss,
-            soft: soft_scaled.clone(),
+            soft: soft_scaled,
             hard: hard_loss_opt,
             hidden: None,
             metrics: std::collections::HashMap::new(),
@@ -311,6 +376,11 @@ impl Distiller {
             |teacher, student| term.loss.compute(teacher, student),
         )
         .map(Some)
+    }
+
+    /// The name of the soft loss in use (`"kl_divergence"`, `"skew_kl"`, ...).
+    pub fn loss_name(&self) -> &'static str {
+        self.loss.name()
     }
 
     /// Get the configuration.

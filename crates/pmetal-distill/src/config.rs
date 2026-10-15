@@ -499,6 +499,37 @@ loss:
         assert_eq!(config.loss.temperature, 2.0);
     }
 
+    /// Every loss type reaches the builder from YAML, parameters and defaults
+    /// included, and builds the loss its name promises.
+    #[test]
+    fn test_parse_every_loss_type() {
+        let cases = [
+            ("kl_divergence", "kl_divergence"),
+            ("jensen_shannon", "jensen_shannon"),
+            ("soft_cross_entropy", "soft_cross_entropy"),
+            ("mse_loss", "mse"),
+            ("{ jsd_skewed: { alpha: 0.1 } }", "jsd_skewed"),
+            ("{ jsd_skewed: {} }", "jsd_skewed"),
+            ("{ skew_kl: { alpha: 0.1 } }", "skew_kl"),
+            (
+                "{ skew_kl: { alpha: 0.1, reverse: true } }",
+                "skew_reverse_kl",
+            ),
+            ("{ universal_logit: { top_k: 64 } }", "universal_logit"),
+            ("{ universal_logit: {} }", "universal_logit"),
+            ("{ gkd: { lambda: 0.3 } }", "gkd"),
+        ];
+        for (loss_type, name) in cases {
+            let yaml = format!(
+                "teacher: t\nstudent: s\nloss:\n  loss_type: {loss_type}\n  temperature: 2.0\n"
+            );
+            let config = DistillConfig::from_yaml(&yaml)
+                .unwrap_or_else(|e| panic!("`{loss_type}` does not parse: {e}"));
+            let distiller = crate::Distiller::new(config).unwrap();
+            assert_eq!(distiller.loss_name(), name, "`{loss_type}`");
+        }
+    }
+
     #[test]
     fn test_parse_offline_config() {
         let yaml = r#"
