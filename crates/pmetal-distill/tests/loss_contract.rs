@@ -645,6 +645,79 @@ fn teacher_ids_beyond_the_student_vocabulary_leave_the_support() {
     );
 }
 
+/// The ranking losses against their definitions. Over the teacher's top-k
+/// tokens, every ordered pair `(i, j)` with a teacher probability gap above
+/// 1e-6 is penalised: hinge by `relu(gap_T - gap_S)` on softened
+/// probabilities, logistic by `softplus(-(z_i - z_j))` on the student's softened
+/// logits; each is averaged over a token's valid pairs, then over tokens.
+#[test]
+#[serial]
+fn ranking_losses_match_their_definitions() {
+    let (t, s) = (logits(0.3), logits(1.9));
+    let (t64, s64) = (rounded(&t, Dtype::Float32), rounded(&s, Dtype::Float32));
+    let (teacher, student) = (array(&t, Dtype::Float32), array(&s, Dtype::Float32));
+    let temperature = 2.0_f64;
+    let k = 4;
+
+    let mut hinge = 0.0;
+    let mut logistic = 0.0;
+    for tok in 0..TOKENS {
+        let tp: Vec<f64> = log_softmax(&t64[tok * VOCAB..(tok + 1) * VOCAB], temperature)
+            .iter()
+            .map(|x| x.exp())
+            .collect();
+        let sp: Vec<f64> = log_softmax(&s64[tok * VOCAB..(tok + 1) * VOCAB], temperature)
+            .iter()
+            .map(|x| x.exp())
+            .collect();
+        let sz: Vec<f64> = s64[tok * VOCAB..(tok + 1) * VOCAB]
+            .iter()
+            .map(|x| x / temperature)
+            .collect();
+        let mut order: Vec<usize> = (0..VOCAB).collect();
+        order.sort_by(|&a, &b| tp[b].partial_cmp(&tp[a]).unwrap());
+        let top = &order[..k];
+
+        let (mut h, mut l, mut pairs) = (0.0, 0.0, 0.0);
+        for &i in top {
+            for &j in top {
+                let gap = tp[i] - tp[j];
+                if gap > 1e-6 {
+                    h += (gap - (sp[i] - sp[j])).max(0.0);
+                    let d = sz[i] - sz[j];
+                    l += (-d).max(0.0) + (-d.abs()).exp().ln_1p();
+                    pairs += 1.0;
+                }
+            }
+        }
+        hinge += h / pairs;
+        logistic += l / pairs;
+    }
+    hinge /= TOKENS as f64;
+    logistic /= TOKENS as f64;
+
+    let got_hinge = scalar(
+        &HingeRankingLoss::new()
+            .with_top_k(k as i32)
+            .compute(&teacher, &student, temperature as f32)
+            .unwrap(),
+    ) as f64;
+    let got_logistic = scalar(
+        &LogisticRankingLoss::new()
+            .with_top_k(k as i32)
+            .compute(&teacher, &student, temperature as f32)
+            .unwrap(),
+    ) as f64;
+    assert!(
+        (got_hinge - hinge).abs() <= 2e-5 * hinge.abs().max(1e-3),
+        "hinge: {got_hinge} vs {hinge}"
+    );
+    assert!(
+        (got_logistic - logistic).abs() <= 2e-5 * logistic,
+        "logistic: {got_logistic} vs {logistic}"
+    );
+}
+
 /// Models that share a tokenizer but pad their embeddings differently compare
 /// on the common vocabulary, whole: the loss equals the loss of the two
 /// logit tensors cut by hand.
