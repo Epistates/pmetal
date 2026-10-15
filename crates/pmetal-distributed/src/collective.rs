@@ -41,7 +41,8 @@ use crate::error::DistributedError;
 use crate::transport::{TransportReceiver, TransportSender};
 use anyhow::Result;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -147,6 +148,8 @@ pub struct RingCollective {
     world_size: usize,
     link: Mutex<RingLink>,
     poisoned: AtomicBool,
+    sent: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
 }
 
 /// Poisons the ring unless the collective it guards ran to completion, which
@@ -191,12 +194,24 @@ impl RingCollective {
             world_size >= 1 && rank < world_size,
             "rank {rank} outside a world of {world_size}"
         );
+        let (sent, received) = (next.byte_counter(), prev.byte_counter());
         Self {
             rank,
             world_size,
             link: Mutex::new(RingLink { next, prev, seq: 0 }),
             poisoned: AtomicBool::new(false),
+            sent,
+            received,
         }
+    }
+
+    /// Payload bytes this rank has sent and received over the ring so far
+    /// (not counting framing or encryption overhead).
+    pub fn traffic(&self) -> (u64, u64) {
+        (
+            self.sent.load(Ordering::Relaxed),
+            self.received.load(Ordering::Relaxed),
+        )
     }
 
     /// This rank.
@@ -523,3 +538,7 @@ pub(crate) fn bytes_as_f32_mut(buffer: &mut [u8]) -> Option<&mut [f32]> {
 #[cfg(test)]
 #[path = "collective_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "traffic_tests.rs"]
+mod traffic_tests;

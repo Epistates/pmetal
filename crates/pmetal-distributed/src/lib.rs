@@ -287,6 +287,12 @@ pub trait DistributedBackend: Send + Sync {
 
     /// Barrier synchronization.
     async fn barrier(&self) -> Result<()>;
+
+    /// Payload bytes this node has sent and received so far, for backends that
+    /// do their own networking.
+    fn traffic(&self) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 fn unsupported(op: &str) -> anyhow::Error {
@@ -297,6 +303,12 @@ fn unsupported(op: &str) -> anyhow::Error {
 pub struct DistributedContext {
     backend: Box<dyn DistributedBackend>,
     metrics: Option<SharedMetrics>,
+}
+
+/// When an operation began and what the backend had moved by then.
+struct OperationStart {
+    at: std::time::Instant,
+    traffic: Option<(u64, u64)>,
 }
 
 impl DistributedContext {
@@ -334,14 +346,15 @@ impl DistributedContext {
     /// [`all_reduce_f32`](Self::all_reduce_f32), which needs no byte view.
     pub async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()> {
         let bytes = buffer.len();
+        let start = self.begin();
         let result = self.backend.all_reduce(buffer, op).await;
-        self.observe(|m| &m.all_reduce, bytes, std::time::Instant::now(), &result);
+        self.observe(|m| &m.all_reduce, bytes, start, &result);
         result
     }
 
     /// Reduce `data` (sum or mean) across all nodes, in place.
     pub async fn all_reduce_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = self.begin();
         let result = self.backend.all_reduce_f32(data, op).await;
         self.observe(|m| &m.all_reduce, data.len() * 4, start, &result);
         result
@@ -358,7 +371,7 @@ impl DistributedContext {
         data: &mut [f32],
         op: ReduceOp,
     ) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = self.begin();
         let result =
             compression::all_reduce_compressed(self.backend.as_ref(), compressor, data, op).await;
         let sent = result.as_ref().map_or(0, |sent| *sent);
@@ -373,7 +386,7 @@ impl DistributedContext {
     /// Reduce `data` across all nodes, leaving this node with only its own
     /// chunk reduced; returns that chunk's range.
     pub async fn reduce_scatter_f32(&self, data: &mut [f32], op: ReduceOp) -> Result<Range<usize>> {
-        let start = std::time::Instant::now();
+        let start = self.begin();
         let result = self.backend.reduce_scatter_f32(data, op).await;
         self.observe(|m| &m.reduce, data.len() * 4, start, &result);
         result
@@ -381,7 +394,7 @@ impl DistributedContext {
 
     /// Complete `data` on every node from each node's own final chunk.
     pub async fn all_gather_f32_in_place(&self, data: &mut [f32]) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = self.begin();
         let result = self.backend.all_gather_f32_in_place(data).await;
         self.observe(|m| &m.reduce, data.len() * 4, start, &result);
         result
@@ -389,7 +402,7 @@ impl DistributedContext {
 
     /// Collect every node's `local` bytes; element `r` is node `r`'s.
     pub async fn all_gather_bytes(&self, local: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let start = std::time::Instant::now();
+        let start = self.begin();
         let result = self.backend.all_gather_bytes(local).await;
         self.observe(|m| &m.reduce, local.len(), start, &result);
         result
@@ -398,7 +411,7 @@ impl DistributedContext {
     /// Copy `buffer` from node `root` to every node.
     pub async fn broadcast(&self, buffer: &mut [u8], root: usize) -> Result<()> {
         let bytes = buffer.len();
-        let start = std::time::Instant::now();
+        let start = self.begin();
         let result = self.backend.broadcast(buffer, root).await;
         self.observe(|m| &m.broadcast, bytes, start, &result);
         result
@@ -408,23 +421,42 @@ impl DistributedContext {
     ///
     /// All nodes must call this method, and none will proceed until all have.
     pub async fn barrier(&self) -> Result<()> {
-        let start = std::time::Instant::now();
+        let start = self.begin();
         let result = self.backend.barrier().await;
         self.observe(|m| &m.barrier, 0, start, &result);
         result
+    }
+
+    /// Start timing an operation, noting the traffic so far.
+    fn begin(&self) -> OperationStart {
+        OperationStart {
+            at: std::time::Instant::now(),
+            traffic: self.backend.traffic(),
+        }
     }
 
     fn observe<T>(
         &self,
         select: impl Fn(&DistributedMetrics) -> &metrics::OperationMetrics,
         bytes: usize,
-        start: std::time::Instant,
+        start: OperationStart,
         result: &Result<T>,
     ) {
         if let Some(ref metrics) = self.metrics {
+            // What crossed the network during the operation: ring operations
+            // are serialised, so the difference since the start is theirs.
+            if let (Some((sent0, received0)), Some((sent, received))) =
+                (start.traffic, self.backend.traffic())
+            {
+                metrics.network.bytes_sent.add(sent.saturating_sub(sent0));
+                metrics
+                    .network
+                    .bytes_received
+                    .add(received.saturating_sub(received0));
+            }
             let op = select(metrics);
             op.duration_ms
-                .observe(start.elapsed().as_secs_f64() * 1000.0);
+                .observe(start.at.elapsed().as_secs_f64() * 1000.0);
             op.bytes_processed.add(bytes as u64);
             if result.is_ok() {
                 op.completed.inc();
@@ -437,6 +469,12 @@ impl DistributedContext {
     /// Check if this is the master node (rank 0).
     pub fn is_master(&self) -> bool {
         self.rank() == 0
+    }
+
+    /// Payload bytes the backend has sent and received so far, if it does its
+    /// own networking.
+    pub fn traffic(&self) -> Option<(u64, u64)> {
+        self.backend.traffic()
     }
 
     /// Get metrics snapshot if enabled.

@@ -52,6 +52,7 @@ use sha3::{Digest, Sha3_256};
 use snow::{Builder, StatelessTransportState};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -430,11 +431,15 @@ fn worth_parallelising(frames: usize) -> bool {
 /// Sender half of the transport.
 pub struct TransportSender {
     inner: TransportSenderInner,
+    /// Payload bytes sent so far (not counting framing or encryption).
+    bytes: Arc<AtomicU64>,
 }
 
 /// Receiver half of the transport.
 pub struct TransportReceiver {
     inner: TransportReceiverInner,
+    /// Payload bytes received so far.
+    bytes: Arc<AtomicU64>,
 }
 
 enum TransportSenderInner {
@@ -752,7 +757,14 @@ impl TransportSender {
                 })?;
             }
         }
+        self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// A shared count of payload bytes this half has sent, which keeps
+    /// counting after the half moves into a collective.
+    pub fn byte_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.bytes)
     }
 }
 
@@ -777,12 +789,24 @@ impl TransportReceiver {
                 buffer.copy_from_slice(&data);
             }
         }
+        self.bytes.fetch_add(buffer.len() as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// A shared count of payload bytes this half has received.
+    pub fn byte_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.bytes)
     }
 
     /// Receive one message of unknown size (activations with variable
     /// shapes), at most [`MAX_VEC_MESSAGE_BYTES`].
     pub async fn recv_vec(&mut self) -> Result<Vec<u8>> {
+        let data = self.recv_vec_uncounted().await?;
+        self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(data)
+    }
+
+    async fn recv_vec_uncounted(&mut self) -> Result<Vec<u8>> {
         match &mut self.inner {
             TransportReceiverInner::Tcp(reader) => Ok(reader.recv_vec().await?),
             TransportReceiverInner::Memory(receiver) => {
@@ -820,9 +844,11 @@ pub fn in_memory_channel(capacity: usize) -> (TransportSender, TransportReceiver
     (
         TransportSender {
             inner: TransportSenderInner::Memory(tx),
+            bytes: Arc::default(),
         },
         TransportReceiver {
             inner: TransportReceiverInner::Memory(rx),
+            bytes: Arc::default(),
         },
     )
 }
@@ -892,9 +918,11 @@ fn split(stream: TcpStream, protection: Protection) -> Link {
     Link {
         sender: TransportSender {
             inner: TransportSenderInner::Tcp(TcpWriter::new(write, protection.clone())),
+            bytes: Arc::default(),
         },
         receiver: TransportReceiver {
             inner: TransportReceiverInner::Tcp(TcpReader::new(read, protection)),
+            bytes: Arc::default(),
         },
     }
 }

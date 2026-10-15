@@ -466,6 +466,10 @@ impl DistributedBackend for AutoDiscoveryBackend {
     async fn barrier(&self) -> Result<()> {
         self.ring().await?.barrier().await
     }
+
+    fn traffic(&self) -> Option<(u64, u64)> {
+        self.ring.get().map(RingCollective::traffic)
+    }
 }
 
 /// Build the deduplicated `(addr, kind)` list for a freshly-connected peer.

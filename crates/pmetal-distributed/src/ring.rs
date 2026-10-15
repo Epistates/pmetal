@@ -80,6 +80,10 @@ impl DistributedBackend for RingBackend {
     async fn barrier(&self) -> Result<()> {
         self.ring.barrier().await
     }
+
+    fn traffic(&self) -> Option<(u64, u64)> {
+        Some(self.ring.traffic())
+    }
 }
 
 #[cfg(kani)]
