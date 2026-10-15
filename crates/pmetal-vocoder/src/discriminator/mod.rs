@@ -4,17 +4,21 @@
 //! - the Multi-Period Discriminator (MPD, HiFi-GAN): reshapes the waveform
 //!   into 2-D grids of several periods to expose periodic structure;
 //! - a spectral discriminator: the Multi-Resolution Discriminator (MRD,
-//!   BigVGAN v1) on STFT magnitudes, or in v2 the Multi-Band Discriminator
-//!   (MBD) on band-split complex spectrograms.
+//!   BigVGAN v1) on STFT magnitudes, or in v2 either the Multi-Band
+//!   Discriminator (MBD) on band-split complex spectrograms or the
+//!   Multi-Scale Sub-band CQT Discriminator (the one the released v2 models
+//!   were trained with).
 //!
 //! All take waveforms `[batch, 1, samples]` and return, per sub-discriminator,
 //! logits `[batch, n]` and the intermediate feature maps used by the feature
 //! matching loss. Feature maps are channels-last (`[batch, h, w, channels]`).
 
+mod cqt;
 mod mbd;
 mod mpd;
 mod mrd;
 
+pub use cqt::{CqtDiscriminator, CqtDiscriminatorConfig, MultiScaleSubbandCqtDiscriminator};
 pub use mbd::{BandDiscriminator, MultiBandDiscriminator};
 pub use mpd::{MultiPeriodDiscriminator, PeriodDiscriminator};
 pub use mrd::{MultiResolutionDiscriminator, ResolutionDiscriminator};
@@ -55,6 +59,8 @@ pub enum SpectralKind {
     Resolution,
     /// Multi-band, multi-window complex-spectrogram discriminator.
     MultiBand,
+    /// Multi-scale sub-band constant-Q discriminator (BigVGAN v2).
+    Cqt,
 }
 
 /// Discriminator settings; deserialises from the reference `config.json`.
@@ -68,7 +74,7 @@ pub struct DiscriminatorConfig {
     #[serde(default = "default_resolutions")]
     pub resolutions: Vec<[i32; 3]>,
 
-    /// Multiplier on the discriminators' channel widths.
+    /// Multiplier on the discriminators' channel widths (MPD and MRD).
     #[serde(default = "default_channel_mult")]
     pub discriminator_channel_mult: f32,
 
@@ -83,6 +89,46 @@ pub struct DiscriminatorConfig {
     /// FFT sizes of the multi-band discriminator.
     #[serde(default = "default_mbd_fft_sizes")]
     pub mbd_fft_sizes: Vec<i32>,
+
+    /// Use the CQT discriminator instead of the MRD.
+    #[serde(default)]
+    pub use_cqtd_instead_of_mrd: bool,
+
+    /// Sampling rate of the audio (the CQT discriminator resamples it).
+    #[serde(default = "default_sampling_rate")]
+    pub sampling_rate: i32,
+
+    /// Channels of the CQT discriminator's first convolution.
+    #[serde(default = "default_cqtd_filters")]
+    pub cqtd_filters: i32,
+
+    /// Cap on the CQT discriminator's channel count.
+    #[serde(default = "default_cqtd_max_filters")]
+    pub cqtd_max_filters: i32,
+
+    /// Per-layer growth of the CQT discriminator's channel count.
+    #[serde(default = "default_cqtd_filters_scale")]
+    pub cqtd_filters_scale: i32,
+
+    /// Time dilations of the CQT discriminator's strided layers.
+    #[serde(default = "default_cqtd_dilations")]
+    pub cqtd_dilations: Vec<i32>,
+
+    /// CQT hop (at twice the audio rate) of each scale.
+    #[serde(default = "default_cqtd_hop_lengths")]
+    pub cqtd_hop_lengths: Vec<i32>,
+
+    /// Octaves of each scale.
+    #[serde(default = "default_cqtd_n_octaves")]
+    pub cqtd_n_octaves: Vec<i32>,
+
+    /// Bins per octave of each scale.
+    #[serde(default = "default_cqtd_bins_per_octaves")]
+    pub cqtd_bins_per_octaves: Vec<i32>,
+
+    /// Remove DC and peak-normalise the audio before the CQT discriminator.
+    #[serde(default)]
+    pub cqtd_normalize_volume: bool,
 }
 
 fn default_mpd_reshapes() -> Vec<i32> {
@@ -97,6 +143,30 @@ fn default_channel_mult() -> f32 {
 fn default_mbd_fft_sizes() -> Vec<i32> {
     vec![2048, 1024, 512]
 }
+fn default_sampling_rate() -> i32 {
+    24000
+}
+fn default_cqtd_filters() -> i32 {
+    32
+}
+fn default_cqtd_max_filters() -> i32 {
+    1024
+}
+fn default_cqtd_filters_scale() -> i32 {
+    1
+}
+fn default_cqtd_dilations() -> Vec<i32> {
+    vec![1, 2, 4]
+}
+fn default_cqtd_hop_lengths() -> Vec<i32> {
+    vec![512, 256, 256]
+}
+fn default_cqtd_n_octaves() -> Vec<i32> {
+    vec![9, 9, 9]
+}
+fn default_cqtd_bins_per_octaves() -> Vec<i32> {
+    vec![24, 36, 48]
+}
 
 impl Default for DiscriminatorConfig {
     fn default() -> Self {
@@ -107,6 +177,16 @@ impl Default for DiscriminatorConfig {
             use_spectral_norm: false,
             use_mbd_instead_of_mrd: false,
             mbd_fft_sizes: default_mbd_fft_sizes(),
+            use_cqtd_instead_of_mrd: false,
+            sampling_rate: default_sampling_rate(),
+            cqtd_filters: default_cqtd_filters(),
+            cqtd_max_filters: default_cqtd_max_filters(),
+            cqtd_filters_scale: default_cqtd_filters_scale(),
+            cqtd_dilations: default_cqtd_dilations(),
+            cqtd_hop_lengths: default_cqtd_hop_lengths(),
+            cqtd_n_octaves: default_cqtd_n_octaves(),
+            cqtd_bins_per_octaves: default_cqtd_bins_per_octaves(),
+            cqtd_normalize_volume: false,
         }
     }
 }
@@ -117,12 +197,30 @@ impl DiscriminatorConfig {
         serde_json::from_str(json).map_err(|e| VocoderError::Config(e.to_string()))
     }
 
-    /// The spectral discriminator this configuration selects.
+    /// The spectral discriminator this configuration selects (the reference
+    /// checks the multi-band flag first, then the CQT one).
     pub fn spectral_kind(&self) -> SpectralKind {
         if self.use_mbd_instead_of_mrd {
             SpectralKind::MultiBand
+        } else if self.use_cqtd_instead_of_mrd {
+            SpectralKind::Cqt
         } else {
             SpectralKind::Resolution
+        }
+    }
+
+    /// The CQT discriminator's settings.
+    pub fn cqt_config(&self) -> CqtDiscriminatorConfig {
+        CqtDiscriminatorConfig {
+            sampling_rate: self.sampling_rate,
+            filters: self.cqtd_filters,
+            max_filters: self.cqtd_max_filters,
+            filters_scale: self.cqtd_filters_scale,
+            dilations: self.cqtd_dilations.clone(),
+            hop_lengths: self.cqtd_hop_lengths.clone(),
+            n_octaves: self.cqtd_n_octaves.clone(),
+            bins_per_octaves: self.cqtd_bins_per_octaves.clone(),
+            normalize_volume: self.cqtd_normalize_volume,
         }
     }
 
@@ -156,8 +254,7 @@ pub(crate) fn flatten_logits(x: &Array) -> Array {
     x.reshape(&[x.dim(0), -1])
 }
 
-/// The generator-side view of a Conv2d stack: build a weight-normalised
-/// convolution with the reference's `get_padding`.
+/// A weight-normalised convolution with explicit geometry.
 pub(crate) fn conv2d(
     in_channels: i32,
     out_channels: i32,
@@ -189,6 +286,8 @@ pub enum SpectralDiscriminator {
     Resolution(MultiResolutionDiscriminator),
     /// Multi-band complex-spectrogram discriminator.
     MultiBand(MultiBandDiscriminator),
+    /// Multi-scale sub-band constant-Q discriminator.
+    Cqt(MultiScaleSubbandCqtDiscriminator),
 }
 
 impl BigVGANDiscriminator {
@@ -204,6 +303,9 @@ impl BigVGANDiscriminator {
             }
             SpectralKind::MultiBand => SpectralDiscriminator::MultiBand(
                 MultiBandDiscriminator::new(&config.mbd_fft_sizes, 32)?,
+            ),
+            SpectralKind::Cqt => SpectralDiscriminator::Cqt(
+                MultiScaleSubbandCqtDiscriminator::new(&config.cqt_config())?,
             ),
         };
         Ok(Self {
@@ -244,6 +346,7 @@ impl SpectralDiscriminator {
         match self {
             Self::Resolution(d) => d.discriminate(audio),
             Self::MultiBand(d) => d.discriminate(audio),
+            Self::Cqt(d) => d.discriminate(audio),
         }
     }
 
@@ -252,6 +355,7 @@ impl SpectralDiscriminator {
         match self {
             Self::Resolution(d) => d.load_state(sd, prefix),
             Self::MultiBand(d) => d.load_state(sd, prefix),
+            Self::Cqt(d) => d.load_state(sd, prefix),
         }
     }
 }
@@ -265,6 +369,7 @@ impl ModuleParameters for SpectralDiscriminator {
         match self {
             Self::Resolution(d) => d.num_parameters(),
             Self::MultiBand(d) => d.num_parameters(),
+            Self::Cqt(d) => d.num_parameters(),
         }
     }
 
@@ -272,6 +377,7 @@ impl ModuleParameters for SpectralDiscriminator {
         match self {
             Self::Resolution(d) => d.parameters(),
             Self::MultiBand(d) => d.parameters(),
+            Self::Cqt(d) => d.parameters(),
         }
     }
 
@@ -279,6 +385,7 @@ impl ModuleParameters for SpectralDiscriminator {
         match self {
             Self::Resolution(d) => d.parameters_mut(),
             Self::MultiBand(d) => d.parameters_mut(),
+            Self::Cqt(d) => d.parameters_mut(),
         }
     }
 }

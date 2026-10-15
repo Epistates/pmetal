@@ -63,11 +63,23 @@ fn check_dtype(name: &str, dtype: Option<Dtype>, max_diff: f32, min_snr_db: f32)
 #[test]
 #[ignore = "needs a downloaded checkpoint (see the module docs)"]
 fn bigvgan_base_discriminators_match_reference() {
+    check_discriminators("base24");
+}
+
+/// BigVGAN-v2's discriminators: the MPD and the multi-scale sub-band CQT
+/// discriminator, including its derived CQT / resampler buffers.
+#[test]
+#[ignore = "needs a downloaded checkpoint (see the module docs)"]
+fn bigvgan_v2_discriminators_match_reference() {
+    check_discriminators("v2_24");
+}
+
+fn check_discriminators(name: &str) {
     use pmetal_runtime::compat::Array;
     use pmetal_vocoder::discriminator::{BigVGANDiscriminator, DiscriminatorConfig};
 
-    let Some(dir) = model_dir("base24") else {
-        eprintln!("BIGVGAN_CHECKPOINT_DIR/base24 not found; skipping");
+    let Some(dir) = model_dir(name) else {
+        eprintln!("BIGVGAN_CHECKPOINT_DIR/{name} not found; skipping");
         return;
     };
     let checkpoint = dir.join("bigvgan_discriminator_optimizer.pt");
@@ -75,7 +87,11 @@ fn bigvgan_base_discriminators_match_reference() {
         eprintln!("{} not found; skipping", checkpoint.display());
         return;
     }
-    let mut disc = BigVGANDiscriminator::new(&DiscriminatorConfig::default()).unwrap();
+    let config = DiscriminatorConfig::from_json(
+        &std::fs::read_to_string(dir.join("config.json")).expect("config.json"),
+    )
+    .expect("discriminator settings");
+    let mut disc = BigVGANDiscriminator::new(&config).unwrap();
     disc.load_checkpoint(&checkpoint)
         .expect("load the released discriminators");
     let fx = Fixture::load_path(&dir.join("ref_disc.safetensors"));

@@ -106,6 +106,84 @@ pub fn kaiser_sinc_filter(cutoff: f64, half_width: f64, kernel_size: usize) -> R
     Ok(taps.into_iter().map(|t| (t / sum) as f32).collect())
 }
 
+/// Frequency-sampling FIR design (`scipy.signal.firwin2`) for a linear-phase
+/// filter of `numtaps` taps with a Hamming window.
+///
+/// `freq` (from 0 to 1, where 1 is Nyquist) and `gain` describe the desired
+/// piecewise-linear magnitude response. Only the type I (odd `numtaps`) and
+/// type II (even `numtaps`, which must have zero gain at Nyquist) cases are
+/// supported, with strictly increasing `freq`.
+pub fn firwin2(numtaps: usize, freq: &[f64], gain: &[f64]) -> Result<Vec<f32>> {
+    let err = |msg: &str| Err(VocoderError::Config(format!("firwin2: {msg}")));
+    if numtaps < 2 || freq.len() != gain.len() || freq.len() < 2 {
+        return err("needs at least two taps and matching freq/gain lists");
+    }
+    if freq[0] != 0.0 || freq[freq.len() - 1] != 1.0 {
+        return err("freq must start at 0 and end at 1");
+    }
+    if freq.windows(2).any(|w| w[1] <= w[0]) {
+        return err("freq must be strictly increasing");
+    }
+    if numtaps % 2 == 0 && gain[gain.len() - 1] != 0.0 {
+        return err("an even-length filter must have zero gain at Nyquist");
+    }
+
+    // Frequency grid: 1 + 2^ceil(log2(numtaps)) points on [0, 1].
+    let nfreqs = 1 + (1usize << (numtaps as f64).log2().ceil() as u32);
+    let interp = |x: f64| -> f64 {
+        let i = freq.partition_point(|&f| f <= x).clamp(1, freq.len() - 1);
+        let (x0, x1) = (freq[i - 1], freq[i]);
+        let t = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0);
+        gain[i - 1] + t * (gain[i] - gain[i - 1])
+    };
+    let grid: Vec<f64> = (0..nfreqs)
+        .map(|k| k as f64 / (nfreqs - 1) as f64)
+        .collect();
+    // Linear phase: delay the response by (numtaps - 1) / 2 samples so the
+    // first `numtaps` samples of the inverse transform are the filter.
+    let delay = (numtaps - 1) as f64 / 2.0;
+    let spectrum: Vec<(f64, f64)> = grid
+        .iter()
+        .map(|&x| {
+            let magnitude = interp(x);
+            let phase = -delay * PI * x;
+            (magnitude * phase.cos(), magnitude * phase.sin())
+        })
+        .collect();
+
+    // Inverse real DFT of length n = 2 (nfreqs - 1); only n < numtaps is needed.
+    let n = 2 * (nfreqs - 1);
+    let hamming = |i: usize| 0.54 - 0.46 * (2.0 * PI * i as f64 / (numtaps - 1) as f64).cos();
+    Ok((0..numtaps)
+        .map(|i| {
+            let mut acc =
+                spectrum[0].0 + spectrum[nfreqs - 1].0 * if i % 2 == 0 { 1.0 } else { -1.0 };
+            for (k, &(re, im)) in spectrum.iter().enumerate().take(nfreqs - 1).skip(1) {
+                let angle = 2.0 * PI * ((k * i) % n) as f64 / n as f64;
+                acc += 2.0 * (re * angle.cos() - im * angle.sin());
+            }
+            (acc / n as f64 * hamming(i)) as f32
+        })
+        .collect())
+}
+
+/// The low-pass filter `nnAudio` builds for downsampling in a CQT: pass band
+/// up to `band_center / (1 + transition)`, stop band from
+/// `band_center * (1 + transition)` (frequencies relative to Nyquist).
+pub fn cqt_lowpass_filter(
+    band_center: f64,
+    kernel_length: usize,
+    transition_bandwidth: f64,
+) -> Result<Vec<f32>> {
+    let pass_max = band_center / (1.0 + transition_bandwidth);
+    let stop_min = band_center * (1.0 + transition_bandwidth);
+    firwin2(
+        kernel_length,
+        &[0.0, pass_max, stop_min, 1.0],
+        &[1.0, 1.0, 0.0, 0.0],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
