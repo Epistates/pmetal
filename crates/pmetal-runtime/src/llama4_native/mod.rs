@@ -1,7 +1,7 @@
 //! Standalone Llama 4 inference engine, independent of pmetal-models.
 //!
 //! Every op on the hot path uses [`InlineArray`](crate::InlineArray) (stack-allocated `mlx::core::array`,
-//! direct C++ bridge). This eliminates ALL per-op heap allocation, matching
+//! direct C++ calls). This eliminates ALL per-op heap allocation, matching
 //! Python/nanobind's direct C++ binding performance.
 //!
 //! Architecture details (from the reference implementation):

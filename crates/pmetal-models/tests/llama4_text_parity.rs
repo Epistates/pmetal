@@ -71,8 +71,8 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
     slice_axis(a, 1, start, end)
 }
 
-fn drain_bridge(op: &str) {
-    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+fn drain_runtime(op: &str) {
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: runtime error: {e}"));
 }
 
 fn max_abs_diff(a: &Array, b: &Array) -> f32 {
@@ -125,7 +125,7 @@ fn check_dynamic(variant: &str) {
     let want = fx.tensor("logits");
 
     let logits = model.forward(&ids, None).expect("forward");
-    drain_bridge("dynamic forward");
+    drain_runtime("dynamic forward");
     assert_all_pass(
         &format!("{variant}: dynamic forward"),
         &[ParityReport::compute_with_per_position(
@@ -139,7 +139,7 @@ fn check_dynamic(variant: &str) {
     let explicit = model
         .forward_with_positions(&ids, None, Some(&positions))
         .expect("forward with positions");
-    drain_bridge("dynamic forward with positions");
+    drain_runtime("dynamic forward with positions");
     assert!(max_abs_diff(&explicit, &logits) <= 1e-5);
 
     let mut cache = model.create_cache(t as usize + 1);
@@ -154,7 +154,7 @@ fn check_dynamic(variant: &str) {
                 .forward_with_cache(&rows(&ids, pos, pos + 1), None, Some(&mut cache))
                 .expect("decode step"),
         );
-        drain_bridge("dynamic decode step");
+        drain_runtime("dynamic decode step");
     }
     assert_all_pass(
         &format!("{variant}: dynamic cached decode"),
@@ -171,14 +171,14 @@ fn check_native(variant: &str) {
     let fx = checkpoint(variant);
     let config = load_config(fx.path()).expect("native config parses");
     let weights = load_model(fx.path(), &config).expect("native weights load");
-    drain_bridge("native load");
+    drain_runtime("native load");
     let ids = fx.tensor("input_ids");
     let t = ids.dim(1);
     let want = fx.tensor("logits");
 
     let mut cache = NativeCache::new_empty(&weights);
     let logits = forward_step(&weights, &ids, &mut cache);
-    drain_bridge("native prefill");
+    drain_runtime("native prefill");
     assert_all_pass(
         &format!("{variant}: native prefill"),
         &[ParityReport::compute_with_per_position(
@@ -196,7 +196,7 @@ fn check_native(variant: &str) {
                 &rows(&ids, pos, pos + 1),
                 &mut cache,
             ));
-            drain_bridge("native decode step");
+            drain_runtime("native decode step");
         }
         pmetal_runtime::decode::set_compiled_decode(true);
         steps
@@ -235,7 +235,7 @@ fn check_native(variant: &str) {
             chunk,
             pmetal_runtime::llama4_native::forward_step_last,
         );
-        drain_bridge("last-row prefill");
+        drain_runtime("last-row prefill");
         assert_eq!(last.dim(0), 1);
         assert_eq!(
             last.dim(1),
@@ -376,10 +376,10 @@ fn native_llama4_runs_an_mlx_quantized_checkpoint() {
             &entries,
         )
         .expect("save the weights");
-        drain_bridge(name);
+        drain_runtime(name);
         let config = load_config(dir.path()).expect("config parses");
         let weights = load_model(dir.path(), &config).expect("weights load");
-        drain_bridge(name);
+        drain_runtime(name);
         (dir, weights)
     };
     let (_packed_dir, packed_weights) = write("packed", &packed, true);
@@ -405,7 +405,7 @@ fn native_llama4_runs_an_mlx_quantized_checkpoint() {
             ));
             start += len;
         }
-        drain_bridge("forward");
+        drain_runtime("forward");
         logits
     };
     let mut steps = vec![PREFILL];

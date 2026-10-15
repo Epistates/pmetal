@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn topk_normalize_when_requested() {
         let scores = Array::from_slice(&[0.2, 0.3, 0.1, 0.4], &[1, 4]);
-        let (_, mut weights) = topk_normalize(&scores, 2, true).unwrap();
+        let (_, weights) = topk_normalize(&scores, 2, true).unwrap();
         let mut w = weights.clone();
         let sel = w.to_f32_vec(2).unwrap();
         let sum: f32 = sel.iter().sum();

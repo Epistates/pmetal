@@ -65,7 +65,7 @@ fn checkpoint(variant: &str, weights_file: &str) -> Fixture {
     .expect("copy weights");
     let config = load_config(dir.path()).expect("config parses");
     let weights = load_model(dir.path(), &config).expect("weights load");
-    drain_bridge("load");
+    drain_runtime("load");
     Fixture {
         _dir: dir,
         weights,
@@ -79,8 +79,8 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
     slice_axis(a, 1, start, end)
 }
 
-fn drain_bridge(op: &str) {
-    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+fn drain_runtime(op: &str) {
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: runtime error: {e}"));
 }
 
 fn assert_all_pass(title: &str, reports: &[ParityReport]) {
@@ -103,7 +103,7 @@ fn run_chunks(fx: &Fixture, chunks: &[i32]) -> Vec<(i32, InlineArray)> {
     let mut out = Vec::new();
     for &len in chunks {
         let logits = forward_step(&fx.weights, &rows(&ids, start, start + len), &mut cache);
-        drain_bridge("forward step");
+        drain_runtime("forward step");
         out.push((start, logits));
         start += len;
         if start == chunks[0] {
@@ -160,7 +160,7 @@ fn check(variant: &str, weights_file: &str) {
     for chunk in [5, 4, usize::MAX] {
         let mut cache = NativeCache::new_empty(&fx.weights);
         let last = prefill_last_logits(&fx.weights, &mut cache, &prompt, chunk, forward_step_last);
-        drain_bridge("last-row prefill");
+        drain_runtime("last-row prefill");
         assert_eq!(last.dim(0), 1);
         assert_eq!(
             last.dim(1),
@@ -275,10 +275,10 @@ fn native_deepseek_runs_an_mlx_quantized_checkpoint() {
             &entries,
         )
         .expect("save the weights");
-        drain_bridge(name);
+        drain_runtime(name);
         let config = load_config(dir.path()).expect("config parses");
         let weights = load_model(dir.path(), &config).expect("weights load");
-        drain_bridge(name);
+        drain_runtime(name);
         (dir, weights)
     };
     let (_packed_dir, packed_weights) = write("packed", &packed, true);
@@ -303,7 +303,7 @@ fn native_deepseek_runs_an_mlx_quantized_checkpoint() {
             ));
             start += len;
         }
-        drain_bridge("forward");
+        drain_runtime("forward");
         logits
     };
     let t = ids.dim(1);

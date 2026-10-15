@@ -286,7 +286,7 @@ fn rank_of(row: &[f32], token: i32) -> usize {
 /// while attention computes nothing.
 fn drain(stage: &str) -> Result<(), String> {
     pmetal_runtime::check_unobserved_error()
-        .map_err(|e| format!("{stage} raised a bridge exception: {e}"))
+        .map_err(|e| format!("{stage} raised a runtime exception: {e}"))
 }
 
 /// Everything one checkpoint contributes: the taps it produced, whatever went

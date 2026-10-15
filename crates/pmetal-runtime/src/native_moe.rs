@@ -708,7 +708,7 @@ mod dispatch_tests {
                 }
             }
         }
-        crate::check_unobserved_error().expect("bridge ops succeeded");
+        crate::check_unobserved_error().expect("runtime ops succeeded");
         let worst = to_vec(&got)
             .iter()
             .zip(&want)
@@ -783,7 +783,7 @@ mod dispatch_tests {
 
         let (want_loss, want) = value_and_grad(per_row, &inputs, &constants);
         let (got_loss, got) = value_and_grad(grouped, &inputs, &constants);
-        crate::check_unobserved_error().expect("bridge ops succeeded");
+        crate::check_unobserved_error().expect("runtime ops succeeded");
         assert!((got_loss.item_f32() - want_loss.item_f32()).abs() < 1e-4);
         for (n, (g, w)) in got.iter().zip(&want).enumerate() {
             let worst = to_vec(g)
@@ -849,7 +849,7 @@ mod dispatch_tests {
             );
             let both =
                 switch_glu_fused(&x, &fused, &down, &inds, &scores, InlineArray::fused_swiglu);
-            crate::check_unobserved_error().expect("bridge ops succeeded");
+            crate::check_unobserved_error().expect("runtime ops succeeded");
             let worst = to_vec(&split)
                 .iter()
                 .zip(to_vec(&both))
@@ -889,7 +889,7 @@ mod dispatch_tests {
             &gates,
             InlineArray::fused_swiglu,
         );
-        crate::check_unobserved_error().expect("bridge ops succeeded");
+        crate::check_unobserved_error().expect("runtime ops succeeded");
 
         let (mut want_in, mut want_out) =
             (vec![0f32; (s * h) as usize], vec![0f32; (s * h) as usize]);
@@ -944,7 +944,7 @@ mod dispatch_tests {
         // Scores are probabilities or sigmoids: positive.
         let scores = array(&[7, 9], 11).add(&InlineArray::scalar_like(0.6, &array(&[1], 1)));
         let (inds, weights) = top_k_scores(&scores, 3, true);
-        crate::check_unobserved_error().expect("bridge ops succeeded");
+        crate::check_unobserved_error().expect("runtime ops succeeded");
         let host = to_vec(&scores);
         let inds = {
             let a = inds.as_dtype(crate::dtype::I32);

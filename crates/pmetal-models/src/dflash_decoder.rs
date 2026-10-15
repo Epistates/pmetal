@@ -134,7 +134,7 @@ pub trait DFlashTarget {
     /// verify step. Default: delegates to [`KVCache::rollback`] on the
     /// provided external cache.
     ///
-    /// Native-bridge targets own their own cache and override this to
+    /// Native-engine targets own their own cache and override this to
     /// rewind the internal state (recurrent layers included, from what
     /// [`Self::verify_with_capture`] recorded), ignoring the external
     /// `kv_cache` arg.
@@ -173,7 +173,7 @@ pub trait DFlashTarget {
     /// Compact the target's KV cache after a tree-verify round: the
     /// `tree_length` rows at `[past_length..past_length+tree_length]`
     /// are reduced to `accepted_indices.len()` rows (in the same
-    /// order). Default: no-op. Only the native-bridge target
+    /// order). Default: no-op. Only the native-engine target
     /// implements this today.
     fn compact_tree_cache(
         &mut self,

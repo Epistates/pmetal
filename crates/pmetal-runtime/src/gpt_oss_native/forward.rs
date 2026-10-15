@@ -1,7 +1,7 @@
 //! Full-model forward step + prefill/prime/generate wrappers.
 
 use crate::InlineArray;
-use crate::inline_array as bridge;
+use crate::inline_array;
 
 use super::attention::attn_forward;
 use super::cache::NativeCache;
@@ -125,7 +125,7 @@ pub fn prefill_first_token(
 
 fn prepare_generation_cache(cache: &mut NativeCache) {
     cache.eval_and_detach_states();
-    bridge::clear_cache();
+    inline_array::clear_cache();
 }
 
 fn prime_generation_impl(

@@ -296,7 +296,7 @@ mod tests {
                 ..Default::default()
             };
             let report = pack_projections(&mut model, None, &config).expect("pack");
-            pmetal_runtime::check_unobserved_error().expect("no bridge error");
+            pmetal_runtime::check_unobserved_error().expect("no runtime error");
             assert_eq!(report.packed, 1, "{scheme}");
             assert_eq!(report.dense_bytes, n * 4, "{scheme}: f32 dense");
             // The 4-byte NVFP4 tensor scale rounds into the comparison.
@@ -379,7 +379,7 @@ mod tests {
         );
         assert!(model.embed_out.quant.is_none(), "the head was packed");
         assert!(model.lm_head.quant.is_some(), "`lm_head` was kept by name");
-        pmetal_runtime::check_unobserved_error().expect("no bridge op failed");
+        pmetal_runtime::check_unobserved_error().expect("no runtime op failed");
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
                 .square()
                 .sum(None);
             diff.eval();
-            pmetal_runtime::check_unobserved_error().expect("no bridge error");
+            pmetal_runtime::check_unobserved_error().expect("no runtime error");
             let relative = diff.item_f32().sqrt() / norm;
             assert!(relative < bound, "{scheme}: relative error {relative}");
         }

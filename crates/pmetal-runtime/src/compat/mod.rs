@@ -37,7 +37,7 @@ pub use lora::LoraAdapter;
 /// Array element type — integer codes matching MLX's `mlx_dtype` enum.
 ///
 /// The `#[repr(i32)]` discriminants are kept in sync with `bridge.h` so that
-/// `dtype.as_i32()` can be passed directly to every bridge function that
+/// `dtype.as_i32()` can be passed directly to every runtime function that
 /// accepts a `dtype: i32` parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i32)]
@@ -58,7 +58,7 @@ pub enum Dtype {
 }
 
 impl Dtype {
-    /// Return the raw `i32` code expected by bridge functions.
+    /// Return the raw `i32` code expected by runtime functions.
     #[inline]
     pub fn as_i32(self) -> i32 {
         self as i32
@@ -814,7 +814,7 @@ pub mod ops_ext {
         Array::addmm(c, a, b)
     }
     pub fn argmax_axis(a: &Array, axis: i32, keepdims: bool) -> Array {
-        // bridge has argmax(axis) without keepdims; wrap manually
+        // runtime has argmax(axis) without keepdims; wrap manually
         let out = a.argmax(axis);
         if keepdims { out.expand_dims(axis) } else { out }
     }

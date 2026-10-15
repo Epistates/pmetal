@@ -554,7 +554,7 @@ pub fn stage(case: &ArchCase) -> Result<PathBuf, String> {
 /// `assign_loaded_weights` match by exact name. Gemma differs, and handles it
 /// with a bespoke loader that walks the struct instead of matching names, so
 /// nothing in production notices — but it does mean its flattened parameters
-/// are not a valid checkpoint, and this test has to bridge the gap itself.
+/// are not a valid checkpoint, and this test has to span the gap itself.
 ///
 /// **Gemma.** `GemmaLayers` holds `gemma1` and `gemma2` as separate fields so
 /// one struct can carry either layer shape, and `impl_module_params!` puts that
@@ -635,7 +635,7 @@ pub fn silent_adapters(prepare: impl Fn(&mut DynamicModel)) -> Vec<String> {
             )]);
             model.set_lora_parameters(&nudged);
             let after = model.forward(&ids, None).expect("forward");
-            pmetal_runtime::check_unobserved_error().expect("no bridge error");
+            pmetal_runtime::check_unobserved_error().expect("no runtime error");
             let moved = max_abs_diff(&before, &after);
             // NaN compares unequal to everything, so a broken forward would
             // pass for one the adapter reached.
