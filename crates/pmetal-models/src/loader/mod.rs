@@ -2,15 +2,15 @@
 //!
 //! The pipeline, front to back:
 //!
-//! 1. [`checkpoint`]: find the weight files (safetensors, sharded or not, or a
+//! 1. `checkpoint`: find the weight files (safetensors, sharded or not, or a
 //!    PyTorch pickle) and read tensors from them, lazily.
-//! 2. [`quant`]: unpack a quantized checkpoint (MLX, ModelOpt, block FP8) to
+//! 2. `quant`: unpack a quantized checkpoint (MLX, ModelOpt, block FP8) to
 //!    dense tensors.
-//! 3. [`assign`]: assign tensors to a model's parameters by name, and
-//!    [`audit`]: fail unless every tensor was consumed (or exempted for a stated
+//! 3. `assign`: assign tensors to a model's parameters by name, and
+//!    `audit`: fail unless every tensor was consumed (or exempted for a stated
 //!    reason) and every parameter was filled.
 //!
-//! [`families`] and [`diffusion`] hold the loaders for the architectures whose
+//! `families` and `diffusion` hold the loaders for the architectures whose
 //! checkpoint layout needs more than a name match.
 
 use pmetal_runtime::compat::Array;
