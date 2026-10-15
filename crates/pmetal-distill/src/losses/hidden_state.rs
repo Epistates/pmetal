@@ -297,7 +297,7 @@ unsafe impl Send for HiddenStateLoss {}
 unsafe impl Sync for HiddenStateLoss {}
 
 impl super::DistillLoss for HiddenStateLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher: &Array,
         student: &Array,

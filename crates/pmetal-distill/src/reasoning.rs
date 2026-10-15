@@ -167,7 +167,7 @@ impl DistillLoss for RationaleLoss {
         "rationale_loss"
     }
 
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -284,7 +284,7 @@ impl DistillLoss for OutcomeSupervisedRationaleLoss {
         "outcome_supervised_rationale_loss"
     }
 
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -292,7 +292,7 @@ impl DistillLoss for OutcomeSupervisedRationaleLoss {
         weights: Option<&Array>,
     ) -> Result<Array> {
         self.base_loss
-            .compute_weighted(teacher_logits, student_logits, temperature, weights)
+            .weighted_loss(teacher_logits, student_logits, temperature, weights)
     }
 }
 

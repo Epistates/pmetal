@@ -24,9 +24,12 @@
 
 #![allow(unsafe_code)]
 
-use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
+use super::{
+    DistillLoss, SPARSE_TOPK_DEFAULT, aligned_log_probs, kl_from_log_probs, log_mixture,
+    reduce_per_token,
+};
 use crate::Result;
-use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::compat::Array;
 
 /// Reverse-KL distillation with optional teacher mixing.
 pub struct MiniLlmLoss {
@@ -69,42 +72,31 @@ impl MiniLlmLoss {
         student_logits: &Array,
         temperature: f32,
     ) -> Result<Array> {
-        let (t_aligned, s_aligned, _) =
-            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
+        let (log_t, log_s) = aligned_log_probs(
+            teacher_logits,
+            student_logits,
+            temperature,
+            self.sparse_top_k,
+        )?;
 
-        let inv_t = 1.0_f32 / temperature.max(1e-6);
-        let t_scaled = t_aligned.multiply(&Array::from_f32(inv_t));
-        let s_scaled = s_aligned.multiply(&Array::from_f32(inv_t));
-        let log_t = t_scaled.log_softmax(-1);
-        let log_s = s_scaled.log_softmax(-1);
-
-        // log_target = log_sum_exp(log_t + log(mix), log_s + log(1-mix)) when
-        // mix is strictly inside (0, 1); the two boundary cases shortcut to
-        // log_t / log_s directly to avoid log(0).
+        // log_target = log(mix·T + (1-mix)·S) when mix is strictly inside
+        // (0, 1); the two boundary cases shortcut to log_t / log_s directly to
+        // avoid log(0).
         let log_target = if self.mix >= 1.0 - 1e-6 {
             log_t.clone()
         } else if self.mix <= 1e-6 {
             log_s.clone()
         } else {
-            let log_mix = Array::from_f32(self.mix.ln());
-            let log_1mix = Array::from_f32((1.0 - self.mix).ln());
-            let a = log_t.add(&log_mix);
-            let b = log_s.add(&log_1mix);
-            let m = ops::maximum(&a, &b);
-            m.add(&a.subtract(&m).exp().add(&b.subtract(&m).exp()).log())
+            log_mixture(&log_t, &log_s, self.mix)
         };
 
-        // Reverse-KL(S || target) = Σ exp(log_s) · (log_s - log_target)
-        let p_s = log_s.exp();
-        let kl = p_s
-            .multiply(&log_s.subtract(&log_target))
-            .sum_axis(-1, false);
-        Ok(kl)
+        // Reverse-KL(S || target)
+        Ok(kl_from_log_probs(&log_s, &log_target))
     }
 }
 
 impl DistillLoss for MiniLlmLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -112,15 +104,7 @@ impl DistillLoss for MiniLlmLoss {
         weights: Option<&Array>,
     ) -> Result<Array> {
         let per_token = self.compute_inner(teacher_logits, student_logits, temperature)?;
-        match weights {
-            None => Ok(per_token.mean_all()),
-            Some(w) => {
-                let weighted = per_token.multiply(w);
-                let sum = weighted.sum_all();
-                let denom = ops::maximum(&w.sum_all(), &Array::from_f32(1.0));
-                Ok(sum.divide(&denom))
-            }
-        }
+        reduce_per_token(&per_token, weights)
     }
 
     fn name(&self) -> &'static str {

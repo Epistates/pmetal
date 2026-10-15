@@ -62,7 +62,27 @@ use pmetal_runtime::compat::{Array, Dtype, ops};
 pub const SPARSE_TOPK_DEFAULT: i32 = 128;
 
 /// Trait for distillation loss functions.
+///
+/// An implementation provides [`weighted_loss`](Self::weighted_loss); the
+/// public entry points ([`compute`](Self::compute),
+/// [`compute_weighted`](Self::compute_weighted),
+/// [`compute_masked`](Self::compute_masked)) cut the teacher out of the
+/// autodiff graph before calling it, so a teacher forward that ran inside the
+/// differentiated function still contributes no gradient.
 pub trait DistillLoss: Send + Sync {
+    /// The loss between a teacher and a student, averaged over tokens.
+    ///
+    /// The teacher logits arrive already detached from the autodiff graph:
+    /// treat them as constants. `weights` is one entry per token; the result
+    /// is `sum(loss * w) / sum(w)`, which [`reduce_per_token`] computes.
+    fn weighted_loss(
+        &self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+        weights: Option<&Array>,
+    ) -> Result<Array>;
+
     /// Compute the distillation loss between teacher and student outputs.
     ///
     /// # Arguments
@@ -84,7 +104,7 @@ pub trait DistillLoss: Send + Sync {
     /// Compute weighted distillation loss.
     ///
     /// # Arguments
-    /// * `teacher_logits` - Teacher logits
+    /// * `teacher_logits` - Teacher logits; detached here
     /// * `student_logits` - Student logits
     /// * `temperature` - Softmax temperature
     /// * `weights` - Per-token weights `[batch, seq]`
@@ -94,7 +114,14 @@ pub trait DistillLoss: Send + Sync {
         student_logits: &Array,
         temperature: f32,
         weights: Option<&Array>,
-    ) -> Result<Array>;
+    ) -> Result<Array> {
+        self.weighted_loss(
+            &teacher_logits.stop_gradient(),
+            student_logits,
+            temperature,
+            weights,
+        )
+    }
 
     /// Compute token-level masked distillation loss.
     ///
@@ -119,6 +146,18 @@ pub trait DistillLoss: Send + Sync {
         self.compute_weighted(teacher_logits, student_logits, temperature, Some(mask))
     }
 
+    /// The factor [`Distiller`](crate::Distiller) multiplies this loss by.
+    ///
+    /// Softening both distributions by `T` shrinks a divergence's gradient
+    /// with respect to the student logits by `1/T²` (Hinton et al., 2015,
+    /// §2.1), and `T²` restores it. That holds for losses on the softened
+    /// distributions, the default. A loss that does not depend on the
+    /// temperature (a logit regression) has nothing to restore and returns
+    /// `1.0`.
+    fn temperature_scale(&self, temperature: f32) -> f32 {
+        temperature * temperature
+    }
+
     /// Get the name of this loss function.
     fn name(&self) -> &'static str;
 }
@@ -133,6 +172,54 @@ pub(crate) fn tempered_log_probs(logits: &Array, temperature: f32) -> Array {
         .as_dtype(Dtype::Float32.as_i32())
         .divide(&Array::from_f32(temperature))
         .log_softmax(-1)
+}
+
+/// Temperature-softened f32 log-probabilities of a teacher/student pair, after
+/// [`align_vocab_with_k`] has given them a common vocabulary axis.
+pub(crate) fn aligned_log_probs(
+    teacher_logits: &Array,
+    student_logits: &Array,
+    temperature: f32,
+    sparse_top_k: i32,
+) -> Result<(Array, Array)> {
+    let (teacher, student, _) = align_vocab_with_k(teacher_logits, student_logits, sparse_top_k)?;
+    Ok((
+        tempered_log_probs(&teacher, temperature),
+        tempered_log_probs(&student, temperature),
+    ))
+}
+
+/// Numerically stable `log(exp(a) + exp(b))` = `m + log(exp(a - m) + exp(b - m))`
+/// with `m = max(a, b)`.
+///
+/// `m` appears both outside and inside the log, so its own derivative cancels
+/// and the gradient splits evenly between `a` and `b` where they tie, as the
+/// derivative of `log(exp(a) + exp(b))` does. The shortcut
+/// `m + log(1 + exp(-|a - b|))` has the same value but not that property: the
+/// gradient of `maximum` sends a tie entirely to one argument and `|x|`
+/// contributes nothing there, so wherever teacher and student gave a token the
+/// same log-probability the student's gradient through the mixture came out
+/// wrong (tenfold on a permuted-row fixture).
+pub(crate) fn log_add_exp(a: &Array, b: &Array) -> Array {
+    let m = ops::maximum(a, b);
+    m.add(&a.subtract(&m).exp().add(&b.subtract(&m).exp()).log())
+}
+
+/// `log(w·P + (1-w)·Q)` from `log P` and `log Q`, for `0 < w < 1`.
+pub(crate) fn log_mixture(log_p: &Array, log_q: &Array, weight_p: f32) -> Array {
+    debug_assert!(weight_p > 0.0 && weight_p < 1.0);
+    log_add_exp(
+        &log_p.add(&Array::from_f32(weight_p.ln())),
+        &log_q.add(&Array::from_f32((1.0 - weight_p).ln())),
+    )
+}
+
+/// `KL(P || Q)` per row from `log P` and `log Q`, summed over the last axis.
+pub(crate) fn kl_from_log_probs(log_p: &Array, log_q: &Array) -> Array {
+    log_p
+        .exp()
+        .multiply(&log_p.subtract(log_q))
+        .sum_axes(&[-1], false)
 }
 
 /// Reduce per-token losses to a scalar, in the autodiff graph.
@@ -157,79 +244,6 @@ pub(crate) fn reduce_per_token(per_token: &Array, weights: Option<&Array>) -> Re
         .as_dtype(Dtype::Float32.as_i32());
     let safe_weight = ops::maximum(&w.sum_all(), &Array::from_f32(1e-8));
     Ok(per_token.multiply(&w).sum_all().divide(&safe_weight))
-}
-
-/// Combined distillation loss with hard and soft targets.
-pub struct CombinedLoss {
-    /// Soft target loss function.
-    soft_loss: Box<dyn DistillLoss>,
-    /// Alpha for blending (final = alpha * soft + (1-alpha) * hard).
-    alpha: f32,
-    /// Temperature for soft targets.
-    temperature: f32,
-}
-
-impl CombinedLoss {
-    /// Create a new combined loss.
-    pub fn new(soft_loss: Box<dyn DistillLoss>, alpha: f32, temperature: f32) -> Self {
-        Self {
-            soft_loss,
-            alpha,
-            temperature,
-        }
-    }
-
-    /// Compute combined loss with hard labels.
-    ///
-    /// # Arguments
-    /// * `teacher_logits` - Teacher model outputs
-    /// * `student_logits` - Student model outputs
-    /// * `labels` - Ground truth labels for hard loss
-    pub fn compute_with_labels(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        labels: &Array,
-    ) -> Result<Array> {
-        // Soft loss (temperature-scaled KL/CE between teacher and student)
-        let soft = self
-            .soft_loss
-            .compute(teacher_logits, student_logits, self.temperature)?;
-
-        // Hard loss (cross-entropy with ground truth)
-        let hard = cross_entropy_with_logits(student_logits, labels)?;
-
-        // Weighted combination
-        // Note: soft loss is scaled by T^2 to maintain gradient magnitude
-        let t_squared = self.temperature * self.temperature;
-        let soft_scaled = soft.multiply(&Array::from_f32(self.alpha * t_squared));
-        let hard_scaled = hard.multiply(&Array::from_f32(1.0 - self.alpha));
-
-        Ok(soft_scaled.add(&hard_scaled))
-    }
-}
-
-/// Standard cross-entropy loss with logits and integer labels.
-fn cross_entropy_with_logits(logits: &Array, labels: &Array) -> Result<Array> {
-    // Log-softmax for numerical stability
-    let log_probs = logits.log_softmax(-1);
-
-    // Gather the log probabilities at label positions
-    // Shape: logits [batch, seq, vocab], labels [batch, seq]
-    let vocab_size = logits.dim(2);
-
-    // Flatten for gather operation
-    let log_probs_flat = log_probs.reshape(&[-1, vocab_size]);
-    let labels_flat = labels.reshape(&[-1]);
-
-    // Get log prob at each label position using MLX take_along_axis
-    let gathered = gather_at_indices(&log_probs_flat, &labels_flat)?;
-
-    // Mean negative log probability
-    let neg_log_probs = gathered.negative();
-    let loss = neg_log_probs.mean_all();
-
-    Ok(loss)
 }
 
 /// Align teacher and student logits when their vocab sizes differ.
@@ -355,29 +369,6 @@ pub fn softmax(x: &Array, axis: i32) -> Result<Array> {
     Ok(x.softmax(axis))
 }
 
-/// Gather values from a 2D array at specified column indices.
-///
-/// Uses MLX take operation for GPU-accelerated gather.
-fn gather_at_indices(values: &Array, indices: &Array) -> Result<Array> {
-    // values: [N, V], indices: [N] -> output: [N]
-    let n = values.dim(0);
-    let v = values.dim(1);
-
-    // Create row indices [0, 1, 2, ..., N-1] via GPU arange — stays in the
-    // MLX compute graph and avoids a CPU Vec<i32> allocation.
-    let row_indices_arr = Array::arange(n, Dtype::Int32.as_i32());
-
-    // Compute flat indices: row * V + col
-    let v_arr = Array::from_i32(v);
-    let flat_indices = row_indices_arr.multiply(&v_arr).add(indices);
-
-    // Flatten values and gather
-    let values_flat = values.reshape(&[-1]);
-    let gathered = values_flat.take_axis(&flat_indices, 0);
-
-    Ok(gathered)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,19 +407,6 @@ mod tests {
         let probs_data: Vec<f32> = probs.clone().to_f32_vec(3).unwrap();
         let sum: f32 = probs_data.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    #[serial]
-    fn test_gather_at_indices() {
-        let values = Array::from_f32_slice(&[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
-        let indices = Array::from_i32_slice(&[1_i32, 2]);
-        let result = gather_at_indices(&values, &indices).unwrap();
-        let result_data: Vec<f32> = result.clone().to_f32_vec(2).unwrap();
-
-        assert_eq!(result_data.len(), 2);
-        assert!((result_data[0] - 0.2).abs() < 1e-5); // row 0, col 1
-        assert!((result_data[1] - 0.6).abs() < 1e-5); // row 1, col 2
     }
 
     // -----------------------------------------------------------------

@@ -1,0 +1,298 @@
+//! Contracts every [`DistillLoss`] owes its caller, checked against float64
+//! references computed on the host.
+//!
+//! * the weighted mean divides by the total weight, so a uniform weight of any
+//!   size gives the unweighted mean;
+//! * the teacher is a constant: no gradient reaches it, even when it was
+//!   computed inside the differentiated function;
+//! * logits of any dtype are normalized in f32.
+
+use pmetal_distill::losses::{
+    DistillLoss, HingeRankingLoss, JensenShannonLoss, JsdSkewedLoss, KlDivergenceLoss,
+    LogisticRankingLoss, MiniLlmLoss, MseLoss, SoftCrossEntropyLoss, TvdLoss, UniversalLogitLoss,
+};
+use pmetal_runtime::compat::nn::value_and_grad_explicit;
+use pmetal_runtime::compat::{Array, Dtype};
+use serial_test::serial;
+
+const TOKENS: usize = 2;
+const VOCAB: usize = 7;
+
+fn drain() {
+    pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+}
+
+/// Logits spread over a range wide enough that a bf16 normalizer is visibly
+/// wrong, but with a distinct maximum per row.
+fn logits(seed: f32) -> Vec<f32> {
+    (0..TOKENS * VOCAB)
+        .map(|i| 9.0 * ((i as f32) * 1.37 + seed).sin() + 0.3 * (i as f32))
+        .collect()
+}
+
+fn array(data: &[f32], dtype: Dtype) -> Array {
+    Array::from_f32_slice(data, &[1, TOKENS as i32, VOCAB as i32]).as_dtype(dtype.as_i32())
+}
+
+/// What an array holds after the cast to `dtype` and back: the values the
+/// loss actually sees.
+fn rounded(data: &[f32], dtype: Dtype) -> Vec<f64> {
+    array(data, dtype)
+        .as_dtype(Dtype::Float32.as_i32())
+        .to_f32_vec(data.len())
+        .unwrap()
+        .into_iter()
+        .map(f64::from)
+        .collect()
+}
+
+fn scalar(a: &Array) -> f32 {
+    a.eval();
+    drain();
+    a.item::<f32>()
+}
+
+fn every_loss() -> Vec<(&'static str, Box<dyn DistillLoss>)> {
+    vec![
+        ("kl", Box::new(KlDivergenceLoss::new())),
+        ("reverse_kl", Box::new(KlDivergenceLoss::reverse())),
+        ("jsd", Box::new(JensenShannonLoss::new())),
+        ("soft_ce", Box::new(SoftCrossEntropyLoss::new())),
+        ("tvd", Box::new(TvdLoss::new())),
+        ("jsd_skewed", Box::new(JsdSkewedLoss::new(0.3))),
+        ("minillm", Box::new(MiniLlmLoss::new(0.8))),
+        ("uld", Box::new(UniversalLogitLoss::new())),
+        ("mse", Box::new(MseLoss::new())),
+        ("hinge", Box::new(HingeRankingLoss::new().with_top_k(5))),
+        (
+            "logistic",
+            Box::new(LogisticRankingLoss::new().with_top_k(5)),
+        ),
+    ]
+}
+
+/// Weights of 0.25 on two tokens sum to 0.5. The mean over weighted tokens is
+/// the same as the unweighted mean; dividing by `max(sum, 1)` instead halves
+/// it.
+#[test]
+#[serial]
+fn uniform_fractional_weights_leave_the_mean_unchanged() {
+    let teacher = array(&logits(0.3), Dtype::Float32);
+    let student = array(&logits(1.9), Dtype::Float32);
+    let weights = Array::from_f32_slice(&[0.25_f32, 0.25], &[1, 2]);
+    for (name, loss) in every_loss() {
+        let plain = scalar(&loss.compute(&teacher, &student, 2.0).unwrap());
+        let weighted = scalar(
+            &loss
+                .compute_weighted(&teacher, &student, 2.0, Some(&weights))
+                .unwrap(),
+        );
+        assert!(
+            (plain - weighted).abs() <= 1e-4 * plain.abs().max(1.0),
+            "{name}: unweighted {plain} vs uniform-weight {weighted}"
+        );
+    }
+}
+
+/// Every token masked out: the loss is zero, not NaN.
+#[test]
+#[serial]
+fn all_zero_weights_give_zero_loss() {
+    let teacher = array(&logits(0.3), Dtype::Float32);
+    let student = array(&logits(1.9), Dtype::Float32);
+    let weights = Array::from_f32_slice(&[0.0_f32, 0.0], &[1, 2]);
+    for (name, loss) in every_loss() {
+        let v = scalar(
+            &loss
+                .compute_weighted(&teacher, &student, 2.0, Some(&weights))
+                .unwrap(),
+        );
+        assert!(v == 0.0, "{name}: got {v}");
+    }
+}
+
+/// The teacher is a target. Differentiating a loss with respect to both
+/// logits (as happens when the teacher forward runs inside the differentiated
+/// function) must leave the teacher's gradient at zero.
+#[test]
+#[serial]
+fn the_teacher_receives_no_gradient() {
+    let t = logits(0.3);
+    let s = logits(1.9);
+    for (name, loss) in every_loss().into_iter().filter(|(n, _)| *n != "uld") {
+        let shape = [1, TOKENS as i32, VOCAB as i32];
+        let f = |a: &[Array]| loss.compute(&a[0], &a[1], 2.0).unwrap();
+        let (value, mut grads) = value_and_grad_explicit(
+            f,
+            &[
+                Array::from_f32_slice(&t, &shape),
+                Array::from_f32_slice(&s, &shape),
+            ],
+            &[],
+        )
+        .unwrap();
+        value.eval();
+        grads[0].eval();
+        grads[1].eval();
+        drain();
+        let g_teacher = grads[0].to_f32_vec(t.len()).unwrap();
+        let g_student = grads[1].to_f32_vec(s.len()).unwrap();
+        assert!(
+            g_student.iter().any(|g| g.abs() > 1e-6),
+            "{name}: the student received no gradient"
+        );
+        assert!(
+            g_teacher.iter().all(|g| *g == 0.0),
+            "{name}: the teacher received gradient {g_teacher:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// float64 references
+// ---------------------------------------------------------------------------
+
+fn log_softmax(row: &[f64], temperature: f64) -> Vec<f64> {
+    let scaled: Vec<f64> = row.iter().map(|x| x / temperature).collect();
+    let max = scaled.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let lse = max + scaled.iter().map(|x| (x - max).exp()).sum::<f64>().ln();
+    scaled.iter().map(|x| x - lse).collect()
+}
+
+/// Mean over tokens of `per_token(log p_teacher, log p_student)`.
+fn reference(
+    teacher: &[f64],
+    student: &[f64],
+    temperature: f64,
+    per_token: impl Fn(&[f64], &[f64]) -> f64,
+) -> f64 {
+    (0..TOKENS)
+        .map(|t| {
+            let lt = log_softmax(&teacher[t * VOCAB..(t + 1) * VOCAB], temperature);
+            let ls = log_softmax(&student[t * VOCAB..(t + 1) * VOCAB], temperature);
+            per_token(&lt, &ls)
+        })
+        .sum::<f64>()
+        / TOKENS as f64
+}
+
+fn tvd(lt: &[f64], ls: &[f64]) -> f64 {
+    0.5 * lt
+        .iter()
+        .zip(ls)
+        .map(|(a, b)| (a.exp() - b.exp()).abs())
+        .sum::<f64>()
+}
+
+/// `alpha * KL(T || M) + (1 - alpha) * KL(S || M)`, `M = alpha T + (1 - alpha) S`.
+fn skewed_jsd(alpha: f64) -> impl Fn(&[f64], &[f64]) -> f64 {
+    move |lt, ls| {
+        lt.iter()
+            .zip(ls)
+            .map(|(a, b)| {
+                let (pt, ps) = (a.exp(), b.exp());
+                let m = alpha * pt + (1.0 - alpha) * ps;
+                alpha * pt * (a - m.ln()) + (1.0 - alpha) * ps * (b - m.ln())
+            })
+            .sum()
+    }
+}
+
+/// `KL(S || mix T + (1 - mix) S)`.
+fn mixed_reverse_kl(mix: f64) -> impl Fn(&[f64], &[f64]) -> f64 {
+    move |lt, ls| {
+        lt.iter()
+            .zip(ls)
+            .map(|(a, b)| {
+                let (pt, ps) = (a.exp(), b.exp());
+                let m = mix * pt + (1.0 - mix) * ps;
+                ps * (b - m.ln())
+            })
+            .sum()
+    }
+}
+
+fn kl(lt: &[f64], ls: &[f64]) -> f64 {
+    lt.iter().zip(ls).map(|(a, b)| a.exp() * (a - b)).sum()
+}
+
+/// A bf16 logit tensor is normalized in f32: the loss matches float64 on the
+/// same (bf16-rounded) logits to f32 accuracy, not to bf16's three digits.
+#[test]
+#[serial]
+fn bf16_logits_are_normalised_in_f32() {
+    let (t, s) = (logits(0.3), logits(1.9));
+    let teacher = array(&t, Dtype::Bfloat16);
+    let student = array(&s, Dtype::Bfloat16);
+    let (t64, s64) = (rounded(&t, Dtype::Bfloat16), rounded(&s, Dtype::Bfloat16));
+    let temperature = 2.0_f32;
+
+    type Case = (
+        &'static str,
+        Box<dyn DistillLoss>,
+        Box<dyn Fn(&[f64], &[f64]) -> f64>,
+    );
+    let cases: Vec<Case> = vec![
+        ("kl", Box::new(KlDivergenceLoss::new()), Box::new(kl)),
+        ("tvd", Box::new(TvdLoss::new()), Box::new(tvd)),
+        (
+            "jsd_skewed",
+            Box::new(JsdSkewedLoss::new(0.3)),
+            Box::new(skewed_jsd(0.3)),
+        ),
+        (
+            "minillm",
+            Box::new(MiniLlmLoss::new(0.8)),
+            Box::new(mixed_reverse_kl(0.8)),
+        ),
+    ];
+    for (name, loss, per_token) in cases {
+        let got = scalar(&loss.compute(&teacher, &student, temperature).unwrap()) as f64;
+        let want = reference(&t64, &s64, temperature as f64, per_token);
+        assert!(
+            (got - want).abs() <= 2e-5 * want.abs().max(1e-2),
+            "{name}: got {got}, float64 reference {want}"
+        );
+    }
+}
+
+/// A logit regression never softens a distribution, so the temperature must
+/// not change what the student is trained toward. `Distiller` multiplies a
+/// softened divergence by `T²` to restore its gradient; doing the same to MSE
+/// inflated it sixteenfold at `T = 4`.
+#[test]
+#[serial]
+fn mse_distillation_is_independent_of_the_temperature() {
+    use pmetal_distill::{DistillConfig, DistillMethod, Distiller, LossConfig, LossType};
+
+    let loss_at = |temperature: f32| {
+        let distiller = Distiller::new(DistillConfig {
+            teacher: "t".to_string(),
+            student: "s".to_string(),
+            method: DistillMethod::Online,
+            loss: LossConfig {
+                loss_type: LossType::MseLoss,
+                temperature,
+                alpha: 1.0,
+                ..LossConfig::default()
+            },
+            offline: None,
+            output_path: None,
+            training: Default::default(),
+        })
+        .unwrap();
+        let teacher = array(&logits(0.3), Dtype::Float32);
+        let student = array(&logits(1.9), Dtype::Float32);
+        scalar(
+            &distiller
+                .compute_loss(&teacher, &student, None, None, 0, 1)
+                .unwrap()
+                .total,
+        )
+    };
+    let (cold, hot) = (loss_at(1.0), loss_at(4.0));
+    assert!(
+        (cold - hot).abs() <= 1e-5 * cold.abs(),
+        "MSE at T=1 is {cold}, at T=4 is {hot}"
+    );
+}

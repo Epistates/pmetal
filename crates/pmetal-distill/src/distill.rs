@@ -188,13 +188,14 @@ impl Distiller {
             self.loss
                 .compute_weighted(teacher_logits, student_logits, temperature, weights)?;
 
-        // Scale by T². Hinton et al. 2015 (§2.2): when teacher/student logits
+        // Scale by T² (Hinton et al. 2015, §2.1): when teacher/student logits
         // are softened by `T`, the gradient with respect to student logits is
         // attenuated by 1/T². Multiplying the loss by T² restores the
         // gradient magnitude so a single optimizer step has the same effect
-        // regardless of the temperature setting.
-        let t_squared = temperature * temperature;
-        let soft_scaled = soft_loss.multiply(&Array::from_f32(t_squared));
+        // regardless of the temperature setting. A loss that never softens
+        // anything (logit MSE) opts out through `temperature_scale`.
+        let soft_scaled =
+            soft_loss.multiply(&Array::from_f32(self.loss.temperature_scale(temperature)));
 
         // Combined with hard labels if provided
         let (total_loss, hard_loss_opt) = if let Some(labels) = labels {

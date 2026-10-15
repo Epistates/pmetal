@@ -38,9 +38,9 @@
 
 #![allow(unsafe_code)]
 
-use super::DistillLoss;
+use super::{DistillLoss, reduce_per_token};
 use crate::Result;
-use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::compat::Array;
 
 /// Universal Logit Distillation loss.
 ///
@@ -122,7 +122,7 @@ impl Default for UniversalLogitLoss {
 }
 
 impl DistillLoss for UniversalLogitLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -130,15 +130,7 @@ impl DistillLoss for UniversalLogitLoss {
         weights: Option<&Array>,
     ) -> Result<Array> {
         let per_token = self.compute_inner(teacher_logits, student_logits, temperature)?;
-        match weights {
-            None => Ok(per_token.mean_all()),
-            Some(w) => {
-                let weighted = per_token.multiply(w);
-                let sum = weighted.sum_all();
-                let denom = ops::maximum(&w.sum_all(), &Array::from_f32(1.0));
-                Ok(sum.divide(&denom))
-            }
-        }
+        reduce_per_token(&per_token, weights)
     }
 
     fn name(&self) -> &'static str {

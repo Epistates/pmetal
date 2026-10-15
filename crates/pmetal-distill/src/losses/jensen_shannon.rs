@@ -9,26 +9,11 @@
 //! stable than KL divergence for distillation.
 
 use super::{
-    DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, reduce_per_token, tempered_log_probs,
+    DistillLoss, SPARSE_TOPK_DEFAULT, aligned_log_probs, kl_from_log_probs, log_mixture,
+    reduce_per_token,
 };
 use crate::Result;
-use pmetal_runtime::compat::{Array, ops};
-
-/// Numerically stable `log(exp(a) + exp(b))` = `m + log(exp(a - m) + exp(b - m))`
-/// with `m = max(a, b)`.
-///
-/// `m` appears both outside and inside the log, so its own derivative cancels
-/// and the gradient splits evenly between `a` and `b` where they tie, as the
-/// derivative of `log(exp(a) + exp(b))` does. The shortcut
-/// `m + log(1 + exp(-|a - b|))` has the same value but not that property: the
-/// gradient of `maximum` sends a tie entirely to one argument and `|x|`
-/// contributes nothing there, so wherever teacher and student gave a token the
-/// same log-probability the student's gradient through the mixture came out
-/// wrong (tenfold on a permuted-row fixture).
-fn log_sum_exp(a: &Array, b: &Array) -> Array {
-    let m = ops::maximum(a, b);
-    m.add(&a.subtract(&m).exp().add(&b.subtract(&m).exp()).log())
-}
+use pmetal_runtime::compat::Array;
 
 /// Jensen-Shannon Divergence loss for knowledge distillation.
 ///
@@ -69,35 +54,27 @@ impl Default for JensenShannonLoss {
 }
 
 impl DistillLoss for JensenShannonLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        // Align vocab sizes (sparse top-k over the teacher when they differ).
-        let (teacher_logits, student_logits, _) =
-            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
-
-        // Log-domain throughout for stability.
-        let teacher_log_probs = tempered_log_probs(&teacher_logits, temperature);
-        let student_log_probs = tempered_log_probs(&student_logits, temperature);
-        let teacher_probs = teacher_log_probs.exp();
+        // Align vocab sizes (sparse top-k over the teacher when they differ),
+        // then stay in the log domain for stability.
+        let (teacher_log_probs, student_log_probs) = aligned_log_probs(
+            teacher_logits,
+            student_logits,
+            temperature,
+            self.sparse_top_k,
+        )?;
 
         // log(M) via log-sum-exp for stability (avoids 0*-inf = NaN for disjoint distributions)
-        let log2 = Array::from_f32(2.0_f32.ln());
-        let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs).subtract(&log2);
-
-        let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture));
-        let student_probs = student_log_probs.exp();
-        let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture));
-
-        let half = Array::from_f32(0.5);
-        let js_per_token = kl_teacher_m
-            .add(&kl_student_m)
-            .multiply(&half)
-            .sum_axes(&[-1], false);
+        let log_m = log_mixture(&teacher_log_probs, &student_log_probs, 0.5);
+        let js_per_token = kl_from_log_probs(&teacher_log_probs, &log_m)
+            .add(&kl_from_log_probs(&student_log_probs, &log_m))
+            .multiply(&Array::from_f32(0.5));
 
         reduce_per_token(&js_per_token, weights)
     }

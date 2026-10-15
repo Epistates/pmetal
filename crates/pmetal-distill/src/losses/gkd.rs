@@ -132,7 +132,7 @@ impl DistillLoss for GkdLoss {
     /// which is a worse failure mode than "loss magnitude doesn't track
     /// the eventual blend". Callers that want the blended magnitude
     /// must use `compute_full`.
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -140,7 +140,7 @@ impl DistillLoss for GkdLoss {
         weights: Option<&Array>,
     ) -> Result<Array> {
         self.inner
-            .compute_weighted(teacher_logits, student_logits, temperature, weights)
+            .weighted_loss(teacher_logits, student_logits, temperature, weights)
     }
 
     fn name(&self) -> &'static str {

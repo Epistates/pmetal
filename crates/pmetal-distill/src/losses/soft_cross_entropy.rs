@@ -4,9 +4,7 @@
 //! instead of one-hot labels (Hinton et al., 2015):
 //! CE(teacher_soft, student_logits) = -sum(softmax(t / T) * log_softmax(s / T))
 
-use super::{
-    DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, reduce_per_token, tempered_log_probs,
-};
+use super::{DistillLoss, SPARSE_TOPK_DEFAULT, aligned_log_probs, reduce_per_token};
 use crate::Result;
 use pmetal_runtime::compat::Array;
 
@@ -50,7 +48,7 @@ impl Default for SoftCrossEntropyLoss {
 }
 
 impl DistillLoss for SoftCrossEntropyLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
@@ -58,11 +56,13 @@ impl DistillLoss for SoftCrossEntropyLoss {
         weights: Option<&Array>,
     ) -> Result<Array> {
         // Align vocab sizes (sparse top-k over the teacher when they differ).
-        let (teacher_logits, student_logits, _) =
-            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
-
-        let teacher_probs = tempered_log_probs(&teacher_logits, temperature).exp();
-        let student_log_probs = tempered_log_probs(&student_logits, temperature);
+        let (teacher_log_probs, student_log_probs) = aligned_log_probs(
+            teacher_logits,
+            student_logits,
+            temperature,
+            self.sparse_top_k,
+        )?;
+        let teacher_probs = teacher_log_probs.exp();
 
         let ce_per_token = teacher_probs
             .multiply(&student_log_probs)

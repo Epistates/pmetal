@@ -3,9 +3,9 @@
 //! A simple alternative to KL-based losses that directly matches logit values.
 //! MSE = mean((teacher_logits - student_logits)^2)
 
-use super::DistillLoss;
+use super::{DistillLoss, reduce_per_token};
 use crate::Result;
-use pmetal_runtime::compat::{Array, ops};
+use pmetal_runtime::compat::{Array, Dtype};
 
 /// Mean Squared Error loss on logits.
 ///
@@ -28,29 +28,29 @@ impl Default for MseLoss {
 }
 
 impl DistillLoss for MseLoss {
-    fn compute_weighted(
+    fn weighted_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        // MSE on raw logits. Note: temperature scaling is intentionally NOT applied
-        // because MSE(x/T, y/T) * T^2 = MSE(x, y), making temperature a no-op after
-        // the T^2 re-scaling in Distiller::compute_loss. This is a fundamental property
-        // of MSE — use KL/JS/soft-CE losses when temperature softening is desired.
-        let _ = temperature; // explicitly unused
-        let diff = student_logits.subtract(teacher_logits);
+        // MSE on raw logits, in f32. Softening both sides by `T` would only
+        // scale the loss by 1/T², and `temperature_scale` is 1, so the
+        // temperature has no role here.
+        let _ = temperature;
+        let f32_ = Dtype::Float32.as_i32();
+        let diff = student_logits
+            .as_dtype(f32_)
+            .subtract(&teacher_logits.as_dtype(f32_));
         let mse_per_token = diff.multiply(&diff).mean_axes(&[-1], false);
+        reduce_per_token(&mse_per_token, weights)
+    }
 
-        if let Some(w) = weights {
-            let weighted = mse_per_token.multiply(w);
-            let total_weight = w.sum_all();
-            let safe_weight = ops::maximum(&total_weight, &Array::from_f32(1e-8));
-            Ok(weighted.sum_all().divide(&safe_weight))
-        } else {
-            Ok(mse_per_token.mean_all())
-        }
+    /// A regression on raw logits has no softened distribution whose gradient
+    /// shrank, so there is nothing for `T²` to restore.
+    fn temperature_scale(&self, _temperature: f32) -> f32 {
+        1.0
     }
 
     fn name(&self) -> &'static str {
