@@ -139,8 +139,18 @@ pub fn config_value(config_content: &str) -> Result<serde_json::Value, Exception
 fn unwrap_text_config(config_content: &str) -> Result<std::borrow::Cow<'_, str>, Exception> {
     let config_json = config_value(config_content)?;
     if config_json.get("text_config").is_some() && config_json.get("hidden_size").is_none() {
-        let inner = serde_json::to_string(&config_json["text_config"])
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        // `tie_word_embeddings` of a wrapper sits beside `text_config`, and
+        // governs the text model's head when the text config says nothing: a
+        // model that read only the inner config would build an untied head the
+        // checkpoint has no tensor for.
+        let mut text = config_json["text_config"].clone();
+        if let (Some(obj), Some(tie)) =
+            (text.as_object_mut(), config_json.get("tie_word_embeddings"))
+        {
+            obj.entry("tie_word_embeddings")
+                .or_insert_with(|| tie.clone());
+        }
+        let inner = serde_json::to_string(&text).map_err(|e| Exception::custom(e.to_string()))?;
         Ok(std::borrow::Cow::Owned(inner))
     } else {
         Ok(std::borrow::Cow::Borrowed(config_content))
@@ -899,7 +909,6 @@ impl DynamicModel {
     fn init_post_load_fast_paths(&mut self) -> Result<(), Exception> {
         match self {
             Self::Qwen3MoE(model) => model.init_stacked_moe(),
-            Self::DeepSeek(model) => model.init_stacked_moe(),
             Self::NemotronH(model) => model.init_stacked_moe(),
             Self::GptOss(model) => model.init_stacked_moe(),
             _ => Ok(()),
@@ -1068,7 +1077,7 @@ impl DynamicModel {
                 let mut model = Llama4ForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                let weights = crate::architectures::llama4::sanitize_checkpoint(weights)?;
+                let weights = crate::architectures::llama4::sanitize_checkpoint(weights);
                 assign_weights(
                     &mut model,
                     weights,
@@ -1157,10 +1166,13 @@ impl DynamicModel {
             // no parameter for and therefore discards without a word.
             ModelArchitecture::Phi => Self::load_phi_variant(&config_content, model_dir, false),
             ModelArchitecture::Phi4 => Self::load_phi_variant(&config_content, model_dir, true),
-            // DeepSeek cannot use `simple_load_moe!`: its MoE layers name the
-            // router, the shared expert and every routed expert differently
-            // from the checkpoint, and the generic loader drops what it cannot
-            // match by exact name. See `deepseek_param_name`.
+            // The parameter tree is the checkpoint's layout (router and
+            // `e_score_correction_bias` under `mlp.gate`, `mlp.shared_experts`)
+            // with each layer's experts stacked, which is how a released
+            // expert-per-key checkpoint is held (`stack_experts`) and how an
+            // MLX conversion stores them (`mlp.switch_mlp`). The tensors of a
+            // multi-token-prediction layer the config does not enable have no
+            // parameter and are left unread.
             ModelArchitecture::DeepSeek => {
                 let config: DeepSeekConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -1175,17 +1187,13 @@ impl DynamicModel {
                     ));
                 }
                 let mut model = DeepSeek::new(config)?;
-                load_generic_weights_with(
-                    &mut model,
-                    model_dir,
-                    crate::loader::deepseek_param_name,
-                    &policy,
-                )
-                .map_err(|e| Exception::custom(e.to_string()))?;
+                let weights = crate::loader::load_weights(model_dir)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let weights = crate::architectures::deepseek::stack_experts(weights)?;
+                assign_weights(&mut model, weights, &policy)
+                    .map_err(|e| Exception::custom(e.with_quantization_hint(model_dir).to_string()))?;
                 eval_module_parameters_batched(&model)?;
-                let mut model = Self::DeepSeek(model);
-                model.init_post_load_fast_paths()?;
-                Ok(model)
+                Ok(Self::DeepSeek(model))
             }
             ModelArchitecture::Cohere => simple_load!(
                 CohereConfig,
@@ -1327,9 +1335,7 @@ impl DynamicModel {
                     }
                 }
                 let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
-                let mut weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                crate::loader::fuse_switch_glu_experts(&mut weights)
+                let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 let report = load_checked(&mut model, model_dir, &policy, |model| {
                     crate::architectures::gemma4::load_gemma4_weights(model, &weights)
@@ -2014,7 +2020,7 @@ impl DynamicModel {
     fn lm_head_layer(&self) -> Option<&nn::Linear> {
         match self {
             Self::Llama(m) => m.lm_head.as_ref(),
-            Self::Llama4(m) => Some(&m.lm_head),
+            Self::Llama4(m) => m.lm_head.as_ref(),
             Self::Qwen2(m) => m.lm_head.as_ref(),
             Self::Qwen3(m) => m.lm_head.as_ref(),
             Self::Qwen3MoE(m) => m.lm_head.as_ref(),
@@ -2022,10 +2028,10 @@ impl DynamicModel {
             Self::Qwen4Exp(m) => m.lm_head.as_ref(),
             Self::Mistral(m) => m.lm_head.as_ref(),
             Self::Phi(m) | Self::Phi4(m) => m.lm_head.as_ref(),
-            Self::DeepSeek(m) => Some(&m.lm_head),
+            Self::DeepSeek(m) => m.lm_head.as_ref(),
             Self::Cohere(m) => m.lm_head.as_ref(),
             Self::Granite(m) => m.lm_head.as_ref(),
-            Self::GptOss(m) => Some(&m.lm_head),
+            Self::GptOss(m) => m.lm_head.as_ref(),
             Self::NemotronH(m) => m.lm_head.as_ref(),
             Self::Mllama(m) => Some(&m.lm_head),
             Self::Gemma(_)
@@ -2780,23 +2786,6 @@ mod tests {
         }
     }
 
-    fn tiny_deepseek_config() -> DeepSeekConfig {
-        DeepSeekConfig {
-            hidden_size: 16,
-            intermediate_size: 32,
-            moe_intermediate_size: 24,
-            num_hidden_layers: 2,
-            num_attention_heads: 4,
-            num_key_value_heads: Some(4),
-            n_shared_experts: Some(1),
-            n_routed_experts: Some(4),
-            num_experts_per_tok: 2,
-            moe_layer_freq: 1,
-            first_k_dense_replace: 0,
-            ..DeepSeekConfig::default()
-        }
-    }
-
     fn tiny_nemotron_h_config() -> NemotronHConfig {
         NemotronHConfig {
             model_type: "nemotron_h".to_string(),
@@ -3001,21 +2990,6 @@ mod tests {
             panic!("expected qwen3-moe model");
         };
         let Qwen3MoEFeedForward::MoE(moe) = &model.model.layers[0].ffn else {
-            panic!("expected moe layer");
-        };
-        assert!(moe.has_stacked_moe());
-    }
-
-    #[test]
-    #[serial]
-    fn deepseek_post_load_fast_paths_initialize_stacked_experts() {
-        let mut model = DynamicModel::DeepSeek(DeepSeek::new(tiny_deepseek_config()).unwrap());
-        model.init_post_load_fast_paths().unwrap();
-
-        let DynamicModel::DeepSeek(model) = &model else {
-            panic!("expected deepseek model");
-        };
-        let DeepSeekMLPType::MoE(moe) = &model.model.layers[0].mlp else {
             panic!("expected moe layer");
         };
         assert!(moe.has_stacked_moe());

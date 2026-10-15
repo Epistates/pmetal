@@ -463,9 +463,6 @@ pub struct NativeWeights {
     /// cast its weights per-op. Owned here so the forward step can reuse
     /// it without per-step construction.
     pub embed_scale_scalar: InlineArray,
-    /// `final_logit_softcapping` pre-cast to `model_dtype` (only set when
-    /// the config opts in). Same reasoning as `embed_scale_scalar`.
-    pub softcap_scalar: Option<InlineArray>,
 }
 
 /// Slots a sliding layer's decode buffer holds beyond the window it keeps, so
@@ -1552,9 +1549,6 @@ pub fn load_model(
     // Pre-cast scalars once so the forward step never constructs an
     // f32 broadcast and quietly promotes the bf16 residual stream.
     let embed_scale_scalar = InlineArray::scalar_with_dtype(config.embed_scale(), model_dtype);
-    let softcap_scalar = config
-        .final_logit_softcapping
-        .map(|cap| InlineArray::scalar_with_dtype(cap, model_dtype));
 
     let weights = NativeWeights {
         embed_w,
@@ -1565,7 +1559,6 @@ pub fn load_model(
         model_dtype,
         config: config.clone(),
         embed_scale_scalar,
-        softcap_scalar,
     };
 
     // Eagerly evaluate so load-time cost is paid here instead of on first
@@ -1959,13 +1952,8 @@ fn logits_from_hidden(weights: &NativeWeights, normed: &InlineArray) -> InlineAr
         // runs a quantized matmul against the packed rows otherwise.
         None => weights.embed_w.as_linear(normed),
     };
-    match weights.softcap_scalar.as_ref() {
-        Some(cap_arr) => {
-            use crate::compat::ops;
-            let scaled = raw_logits.divide(cap_arr);
-            let t = ops::tanh(&scaled);
-            t.multiply(cap_arr)
-        }
+    match weights.config.final_logit_softcapping {
+        Some(cap) => crate::nn::softcap(&raw_logits, cap),
         None => raw_logits,
     }
 }
@@ -2399,7 +2387,6 @@ mod tests {
             model_dtype: Dtype::Float32.as_i32(),
             config,
             embed_scale_scalar: InlineArray::scalar_with_dtype(2.0, Dtype::Float32.as_i32()),
-            softcap_scalar: None,
         };
         let input_ids = InlineArray::from_i32_slice_shaped(&[1, 2], &[1, 2]);
         let inputs_embeds = InlineArray::zeros(&[1, 2, 4], Dtype::Float32.as_i32());
@@ -2605,5 +2592,75 @@ mod tests {
         ] {
             assert_eq!(normalize_checkpoint_key(key), None, "should skip {key}");
         }
+    }
+
+    /// The compiled attention block is traced per cache capacity, and a server
+    /// sees a new capacity per request. Past the number of traces a call site
+    /// keeps, the oldest is dropped and made again on its next use, which has
+    /// to give the answer it gave the first time.
+    #[test]
+    fn compiled_attention_block_is_unchanged_by_trace_eviction() {
+        use crate::compat::random;
+        let bf16 = Dtype::Bfloat16.as_i32();
+        let (hidden_size, n_heads, n_kv, head_dim) = (64, 2, 1, 32);
+        let rand = |shape: &[i32]| random::normal(shape, Dtype::Float32).as_dtype(bf16);
+        let dense = |shape: &[i32]| LayerWeight::Dense(rand(shape));
+        let (q_w, k_w, v_w) = (
+            dense(&[hidden_size, n_heads * head_dim]),
+            dense(&[hidden_size, n_kv * head_dim]),
+            dense(&[hidden_size, n_kv * head_dim]),
+        );
+        let o_w = dense(&[n_heads * head_dim, hidden_size]);
+        let ones = |n: i32| InlineArray::ones(&[n], bf16);
+        let (in_norm, q_norm, k_norm, post_norm) = (
+            ones(hidden_size),
+            ones(head_dim),
+            ones(head_dim),
+            ones(hidden_size),
+        );
+        let x = rand(&[1, 1, hidden_size]);
+        let run = |capacity: i32| -> Vec<f32> {
+            let keys = rand(&[1, n_kv, capacity, head_dim]);
+            let values = rand(&[1, n_kv, capacity, head_dim]);
+            let (out, _, _) = InlineArray::compiled_gemma4_attn_block(
+                &x,
+                &in_norm,
+                &q_w,
+                &k_w,
+                Some(&v_w),
+                &o_w,
+                &q_norm,
+                &k_norm,
+                &post_norm,
+                None,
+                &keys,
+                &values,
+                capacity / 2,
+                0,
+                n_heads,
+                n_kv,
+                head_dim,
+                1e-6,
+                1e-6,
+                1e-6,
+                0,
+                10000.0,
+                head_dim,
+            );
+            out.as_dtype(Dtype::Float32.as_i32())
+                .to_f32_vec(hidden_size as usize)
+                .unwrap()
+        };
+        // The same cache contents on every call at one capacity.
+        random::seed(7);
+        let first = run(16);
+        for capacity in 17..17 + 2 * 64 {
+            run(capacity);
+        }
+        random::seed(7);
+        let again = run(16);
+        crate::check_unobserved_error().expect("a runtime op threw");
+        assert!(first.iter().all(|v| v.is_finite()));
+        assert_eq!(first, again, "a re-traced block changed its answer");
     }
 }

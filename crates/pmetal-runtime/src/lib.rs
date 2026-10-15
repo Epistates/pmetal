@@ -44,6 +44,7 @@ pub mod try_ops;
 pub mod compat;
 pub mod decode;
 pub mod distributed;
+pub mod logits_processor;
 
 pub mod optimizer;
 pub use optimizer::{AdamW, ParamClass, ParamSet};

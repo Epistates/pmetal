@@ -5,7 +5,7 @@ use pmetal_data::streaming::{StreamConfig, StreamingShardReader};
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::DFlashDraftModel;
 use pmetal_models::architectures::dflash_draft::DFlashDraftConfig;
-use pmetal_models::dflash_decoder::load_dflash_draft_from_dir;
+use pmetal_models::dflash_drafts::load_dflash_draft_from_dir;
 use pmetal_trainer::{MtpTrainingConfig, batch_from_tokens, run_dflash_draft_training};
 
 use crate::cli::train_draft::TrainDraftArgs;

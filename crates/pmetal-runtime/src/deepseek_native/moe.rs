@@ -1,7 +1,7 @@
 //! Dense SwiGLU MLP and DeepSeek's routed MoE: the router (V3's `noaux_tc`
 //! and V2's softmax, plain or group-limited) and the routed experts.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::InlineArray;
 use crate::dtype;
@@ -10,7 +10,7 @@ use super::weights::{Mlp, MoeWeights};
 
 /// How the router turns its logits into expert scores: the config's
 /// `scoring_func`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScoringFunc {
     /// V3: an independent sigmoid per expert.
@@ -20,7 +20,7 @@ pub enum ScoringFunc {
 }
 
 /// How the router picks the top-k experts: the config's `topk_method`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TopkMethod {
     /// V3: the bias-corrected scores, restricted to the `topk_group` groups
@@ -32,6 +32,28 @@ pub enum TopkMethod {
     /// V2 (the 236B): the `top_k` best scores among the `topk_group` groups
     /// whose best expert scores highest.
     GroupLimitedGreedy,
+}
+
+impl ScoringFunc {
+    /// What a config without `scoring_func` means: V2 softmax, V3 sigmoid.
+    pub fn default_for(model_type: &str) -> Self {
+        if model_type == "deepseek_v2" {
+            Self::Softmax
+        } else {
+            Self::Sigmoid
+        }
+    }
+}
+
+impl TopkMethod {
+    /// What a config without `topk_method` means: V2 `greedy`, V3 `noaux_tc`.
+    pub fn default_for(model_type: &str) -> Self {
+        if model_type == "deepseek_v2" {
+            Self::Greedy
+        } else {
+            Self::NoauxTc
+        }
+    }
 }
 
 pub(super) fn mlp_forward(mlp: &Mlp, x: &InlineArray) -> InlineArray {
@@ -63,45 +85,91 @@ pub(super) fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> 
     y.reshape(&[b, s, hidden])
 }
 
-/// The router: gate weights and the settings of one MoE layer's top-k.
-pub(super) struct Router {
-    /// `[hidden, experts]`, `f32`: the gate is applied to the `f32` hidden
-    /// state, as transformers does, so near-ties between experts resolve as
-    /// they do there.
-    pub(super) weight: InlineArray,
-    /// `[experts]`, `f32`: V3's `e_score_correction_bias`, which steers the
-    /// choice and never the weights.
-    pub(super) bias: Option<InlineArray>,
-    pub(super) scoring: ScoringFunc,
-    pub(super) method: TopkMethod,
-    pub(super) n_group: i32,
-    pub(super) topk_group: i32,
-    pub(super) top_k: i32,
-    pub(super) routed_scaling_factor: f32,
-    pub(super) norm_topk_prob: bool,
+/// The settings of one MoE layer's top-k, and the top-k itself: DeepSeek's
+/// router from its logits on.
+///
+/// This is the one implementation. The native engine's [`Router`] and the
+/// shared-path model (`pmetal_models`' `DeepSeekMoEGate`, which training and
+/// the adapters run) both route through [`DeepseekRouting::route`], so the
+/// model that is trained picks the experts the model that is served picks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeepseekRouting {
+    /// How the logits become scores.
+    pub scoring: ScoringFunc,
+    /// How the top-k is chosen from them.
+    pub method: TopkMethod,
+    /// Expert groups the grouped methods pick among (`Greedy` ignores it).
+    pub n_group: i32,
+    /// Groups the grouped methods keep (`Greedy` ignores it).
+    pub topk_group: i32,
+    /// Experts per token.
+    pub top_k: i32,
+    /// Multiplies the final weights.
+    pub routed_scaling_factor: f32,
+    /// Renormalise the chosen scores to sum 1 before scaling.
+    pub norm_topk_prob: bool,
 }
 
-impl Router {
-    /// `[rows, hidden]` to each row's `top_k` experts, `[rows, top_k]` `int32`,
-    /// and their weights, `[rows, top_k]` `f32`.
+impl DeepseekRouting {
+    /// Refuse settings that do not fit `experts` routed experts: a top-k that
+    /// exceeds them, groups that do not divide them, or kept groups too small
+    /// to hold `top_k` experts. The ops would otherwise return placeholder
+    /// arrays rather than fail.
+    pub fn validate(&self, experts: i32) -> Result<(), String> {
+        let (groups, kept, top_k) = (self.n_group, self.topk_group, self.top_k);
+        if experts < 1 || top_k < 1 || top_k > experts {
+            return Err(format!(
+                "num_experts_per_tok {top_k} does not fit n_routed_experts {experts}"
+            ));
+        }
+        if self.method != TopkMethod::Greedy {
+            if groups < 1 || experts % groups != 0 {
+                return Err(format!(
+                    "n_routed_experts {experts} does not divide into n_group {groups}"
+                ));
+            }
+            if kept < 1 || kept > groups {
+                return Err(format!("topk_group {kept} is not within n_group {groups}"));
+            }
+            if top_k > kept * (experts / groups) {
+                return Err(format!(
+                    "num_experts_per_tok {top_k} exceeds the {} experts of the {kept} kept groups",
+                    kept * (experts / groups)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[rows, experts]` `f32` router logits to each row's `top_k` experts,
+    /// `[rows, top_k]` `int32`, and their weights, `[rows, top_k]` `f32`.
+    /// `bias` is V3's `e_score_correction_bias`, `[experts]` `f32`; it steers
+    /// the choice of `NoauxTc` and nothing else.
     ///
     /// ```text
-    ///   scores  = sigmoid(x @ W) | softmax(x @ W)           (f32)
+    ///   scores  = sigmoid(logits) | softmax(logits)          (f32)
     ///   choice  = scores + bias                              (noaux_tc only)
     ///   choice  = choice, limited to the best groups         (grouped methods)
     ///   experts = top_k(choice)
     ///   weights = scores[experts], normalised to sum 1 when norm_topk_prob,
     ///             times routed_scaling_factor
     /// ```
-    pub(super) fn route(&self, x_flat: &InlineArray) -> (InlineArray, InlineArray) {
-        let logits = x_flat.as_dtype(dtype::F32).matmul(&self.weight);
+    ///
+    /// The logits are expected in `f32`, which is how transformers computes
+    /// them (`F.linear(x.float(), W.float())`): bf16 logits would round away
+    /// the near-ties between experts the choice turns on.
+    pub fn route(
+        &self,
+        logits: &InlineArray,
+        bias: Option<&InlineArray>,
+    ) -> (InlineArray, InlineArray) {
         let scores = match self.scoring {
             ScoringFunc::Sigmoid => logits.sigmoid(),
             ScoringFunc::Softmax => logits.softmax_precise(-1),
         };
-        let choice = match &self.bias {
-            Some(bias) => scores.add(bias),
-            None => scores.clone(),
+        let choice = match (self.method, bias) {
+            (TopkMethod::NoauxTc, Some(bias)) => scores.add(bias),
+            _ => scores.clone(),
         };
         let choice = match self.method {
             TopkMethod::Greedy => choice,
@@ -138,6 +206,27 @@ impl Router {
         };
         let scale = InlineArray::scalar_like(self.routed_scaling_factor, &weights);
         (inds, weights.multiply(&scale))
+    }
+}
+
+/// The router: the gate weight and the layer's [`DeepseekRouting`].
+pub(super) struct Router {
+    /// `[hidden, experts]`, `f32`: the gate is applied to the `f32` hidden
+    /// state, as transformers does, so near-ties between experts resolve as
+    /// they do there.
+    pub(super) weight: InlineArray,
+    /// `[experts]`, `f32`: V3's `e_score_correction_bias`, which steers the
+    /// choice and never the weights.
+    pub(super) bias: Option<InlineArray>,
+    pub(super) routing: DeepseekRouting,
+}
+
+impl Router {
+    /// `[rows, hidden]` to each row's experts and their weights, see
+    /// [`DeepseekRouting::route`].
+    pub(super) fn route(&self, x_flat: &InlineArray) -> (InlineArray, InlineArray) {
+        let logits = x_flat.as_dtype(dtype::F32).matmul(&self.weight);
+        self.routing.route(&logits, self.bias.as_ref())
     }
 }
 

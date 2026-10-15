@@ -28,8 +28,9 @@ use common::{fixture_path, load_shard, ref_tensor};
 use pmetal_cache::test_utils::{ParityReport, Tolerance, argmax_last_axis, print_report_table};
 use pmetal_runtime::InlineArray;
 use pmetal_runtime::compat::{Array, ops::slice_axis};
+use pmetal_runtime::decode::prefill_last_logits;
 use pmetal_runtime::deepseek_native::{
-    NativeCache, NativeWeights, forward_step, load_config, load_model,
+    NativeCache, NativeWeights, forward_step, forward_step_last, load_config, load_model,
 };
 use serial_test::serial;
 
@@ -64,7 +65,7 @@ fn checkpoint(variant: &str, weights_file: &str) -> Fixture {
     .expect("copy weights");
     let config = load_config(dir.path()).expect("config parses");
     let weights = load_model(dir.path(), &config).expect("weights load");
-    drain_bridge("load");
+    drain_runtime("load");
     Fixture {
         _dir: dir,
         weights,
@@ -78,8 +79,8 @@ fn rows(a: &Array, start: i32, end: i32) -> Array {
     slice_axis(a, 1, start, end)
 }
 
-fn drain_bridge(op: &str) {
-    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: bridge error: {e}"));
+fn drain_runtime(op: &str) {
+    pmetal_runtime::check_unobserved_error().unwrap_or_else(|e| panic!("{op}: runtime error: {e}"));
 }
 
 fn assert_all_pass(title: &str, reports: &[ParityReport]) {
@@ -102,7 +103,7 @@ fn run_chunks(fx: &Fixture, chunks: &[i32]) -> Vec<(i32, InlineArray)> {
     let mut out = Vec::new();
     for &len in chunks {
         let logits = forward_step(&fx.weights, &rows(&ids, start, start + len), &mut cache);
-        drain_bridge("forward step");
+        drain_runtime("forward step");
         out.push((start, logits));
         start += len;
         if start == chunks[0] {
@@ -146,6 +147,35 @@ fn check(variant: &str, weights_file: &str) {
             })
             .collect();
         assert_all_pass(&format!("{variant}: {title}"), &reports);
+    }
+
+    // The prompt prefilled in passes through the last-row forward, as
+    // generation does for a long prompt: the logits of the final position,
+    // and no other row's.
+    let prompt: Vec<u32> = {
+        let ids = fx.tensor("input_ids");
+        ids.eval();
+        ids.as_slice::<i32>().iter().map(|&t| t as u32).collect()
+    };
+    for chunk in [5, 4, usize::MAX] {
+        let mut cache = NativeCache::new_empty(&fx.weights);
+        let last = prefill_last_logits(&fx.weights, &mut cache, &prompt, chunk, forward_step_last);
+        drain_runtime("last-row prefill");
+        assert_eq!(last.dim(0), 1);
+        assert_eq!(
+            last.dim(1),
+            want.dim(2),
+            "one row of logits, not one per token"
+        );
+        assert_all_pass(
+            &format!("{variant}: last-row prefill in passes of {chunk}"),
+            &[ParityReport::compute(
+                "last_logits",
+                &last.expand_dims(1),
+                &rows(&want, t - 1, t),
+                TOL,
+            )],
+        );
     }
 }
 
@@ -245,10 +275,10 @@ fn native_deepseek_runs_an_mlx_quantized_checkpoint() {
             &entries,
         )
         .expect("save the weights");
-        drain_bridge(name);
+        drain_runtime(name);
         let config = load_config(dir.path()).expect("config parses");
         let weights = load_model(dir.path(), &config).expect("weights load");
-        drain_bridge(name);
+        drain_runtime(name);
         (dir, weights)
     };
     let (_packed_dir, packed_weights) = write("packed", &packed, true);
@@ -273,7 +303,7 @@ fn native_deepseek_runs_an_mlx_quantized_checkpoint() {
             ));
             start += len;
         }
-        drain_bridge("forward");
+        drain_runtime("forward");
         logits
     };
     let t = ids.dim(1);

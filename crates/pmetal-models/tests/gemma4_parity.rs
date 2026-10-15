@@ -23,6 +23,9 @@
 
 mod common;
 
+use common::gemma4::{
+    moe_synthetic_config_json, shared_synthetic_config_json, synthetic_config_json,
+};
 use common::{fixture_path, load_shard, ref_tensor};
 
 use std::collections::HashMap;
@@ -35,46 +38,6 @@ use pmetal_cache::test_utils::{
 use pmetal_runtime::compat::{Array, ops};
 
 use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4ForCausalLM, load_gemma4_weights};
-
-/// The synthetic config the fixture was generated with. Changing a field
-/// here without regenerating the fixture breaks the comparison.
-fn synthetic_config_json() -> &'static str {
-    r#"{
-        "model_type": "gemma4_text",
-        "vocab_size": 512,
-        "hidden_size": 128,
-        "intermediate_size": 256,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 32,
-        "global_head_dim": 64,
-        "num_global_key_value_heads": 1,
-        "max_position_embeddings": 131072,
-        "rms_norm_eps": 1e-6,
-        "attention_k_eq_v": true,
-        "tie_word_embeddings": true,
-        "sliding_window": 8,
-        "final_logit_softcapping": 30.0,
-        "layer_types": ["sliding_attention", "full_attention"],
-        "rope_parameters": {
-            "full_attention": {
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
-                "rope_type": "proportional"
-            },
-            "sliding_attention": {
-                "partial_rotary_factor": 1.0,
-                "rope_theta": 10000.0,
-                "rope_type": "default"
-            }
-        },
-        "hidden_size_per_layer_input": 0,
-        "num_kv_shared_layers": 0,
-        "use_double_wide_mlp": false,
-        "enable_moe_block": false
-    }"#
-}
 
 /// Tolerance table used by the synthetic test.
 ///
@@ -115,94 +78,6 @@ fn gemma4_31b_tolerances(tap_layers: &[i32]) -> Vec<(String, Tolerance)> {
         t.push((format!("layer_{idx}_hidden"), Tolerance::new(atol, rtol)));
     }
     t
-}
-
-/// MoE synthetic config the fixture was generated with (same geometry as the
-/// dense fixture with the routed-experts branch enabled).
-fn moe_synthetic_config_json() -> &'static str {
-    r#"{
-        "model_type": "gemma4_text",
-        "vocab_size": 512,
-        "hidden_size": 128,
-        "intermediate_size": 256,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 32,
-        "global_head_dim": 64,
-        "num_global_key_value_heads": 1,
-        "max_position_embeddings": 131072,
-        "rms_norm_eps": 1e-6,
-        "attention_k_eq_v": true,
-        "tie_word_embeddings": true,
-        "sliding_window": 8,
-        "final_logit_softcapping": 30.0,
-        "layer_types": ["sliding_attention", "full_attention"],
-        "rope_parameters": {
-            "full_attention": {
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
-                "rope_type": "proportional"
-            },
-            "sliding_attention": {
-                "partial_rotary_factor": 1.0,
-                "rope_theta": 10000.0,
-                "rope_type": "default"
-            }
-        },
-        "hidden_size_per_layer_input": 0,
-        "num_kv_shared_layers": 0,
-        "use_double_wide_mlp": false,
-        "enable_moe_block": true,
-        "num_experts": 4,
-        "top_k_experts": 2,
-        "moe_intermediate_size": 64
-    }"#
-}
-
-/// The E2B/E4B shape: six layers, the last two sharing the KV cache of the
-/// last layer of their own attention type (3 for sliding, 2 for full), with
-/// per-layer input embeddings. The native engine's only fixture for either.
-fn shared_synthetic_config_json() -> &'static str {
-    r#"{
-        "model_type": "gemma4_text",
-        "vocab_size": 512,
-        "hidden_size": 128,
-        "intermediate_size": 256,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "head_dim": 32,
-        "global_head_dim": 64,
-        "num_global_key_value_heads": 1,
-        "max_position_embeddings": 131072,
-        "rms_norm_eps": 1e-6,
-        "attention_k_eq_v": true,
-        "tie_word_embeddings": true,
-        "sliding_window": 8,
-        "final_logit_softcapping": 30.0,
-        "layer_types": [
-            "sliding_attention", "sliding_attention", "full_attention",
-            "sliding_attention", "sliding_attention", "full_attention"
-        ],
-        "rope_parameters": {
-            "full_attention": {
-                "partial_rotary_factor": 0.25,
-                "rope_theta": 1000000.0,
-                "rope_type": "proportional"
-            },
-            "sliding_attention": {
-                "partial_rotary_factor": 1.0,
-                "rope_theta": 10000.0,
-                "rope_type": "default"
-            }
-        },
-        "hidden_size_per_layer_input": 16,
-        "vocab_size_per_layer_input": 512,
-        "num_kv_shared_layers": 2,
-        "use_double_wide_mlp": false,
-        "enable_moe_block": false
-    }"#
 }
 
 /// Build the Rust Gemma4 model from a config JSON + weight fixture and return
@@ -691,6 +566,80 @@ fn run_native_synthetic_parity(
         argmax, argmax_ref,
         "Gemma 4 native {label}: argmax mismatch"
     );
+}
+
+/// The module-based port's cached decode, far past the sliding window (8), is
+/// the whole sequence run at once: the same logits at every position, through
+/// a prefill in two passes and then one token at a time. This is the path the
+/// generic engines and every speculative decoder run Gemma 4 on; the native
+/// engine has its own check above. The shared-KV fixture covers layers that
+/// read an earlier layer's cache, the MoE one routing per pass.
+#[test]
+fn gemma4_module_port_cached_decode_matches_the_full_forward() {
+    use pmetal_cache::kv_cache::{KVCache, KVCacheConfig};
+
+    for (label, config_json, weights, reference) in [
+        (
+            "dense",
+            synthetic_config_json(),
+            "gemma4_synth_weights.safetensors",
+            "gemma4_synth_reference.safetensors",
+        ),
+        (
+            "shared-KV",
+            shared_synthetic_config_json(),
+            "gemma4_shared_synth_weights.safetensors",
+            "gemma4_shared_synth_reference.safetensors",
+        ),
+        (
+            "MoE",
+            moe_synthetic_config_json(),
+            "gemma4_moe_synth_weights.safetensors",
+            "gemma4_moe_synth_reference.safetensors",
+        ),
+    ] {
+        let ids = input_ids_from_shard(&load_shard(&fixture_path(reference)));
+        let tokens: Vec<i32> = to_f32_vec_eval(&ids)
+            .into_iter()
+            .map(|v| v as i32)
+            .collect();
+        let t = tokens.len();
+        let mut model = build_model(config_json, weights);
+        let want = model.forward(&ids, None).expect("full forward");
+
+        let mut cache = KVCache::new(KVCacheConfig::new(
+            model.config.num_hidden_layers as usize,
+            t + 8,
+            model.config.num_key_value_heads as usize,
+            model.config.head_dim as usize,
+        ));
+        let chunks = [(0, 5.min(t)), (5.min(t), 9.min(t))]
+            .into_iter()
+            .chain((9.min(t)..t).map(|i| (i, i + 1)));
+        let mut rows = Vec::new();
+        for (start, stop) in chunks {
+            let chunk = Array::from_slice(&tokens[start..stop], &[1, (stop - start) as i32]);
+            rows.push(
+                model
+                    .forward_with_cache(&chunk, None, Some(&mut cache))
+                    .expect("cached forward"),
+            );
+        }
+        let got = ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1);
+        pmetal_runtime::check_unobserved_error().expect("a runtime op threw");
+        let report = ParityReport::compute_with_per_position(
+            "logits",
+            &got,
+            &want,
+            Tolerance::new(2e-5, 0.0),
+        );
+        println!("\n== Gemma 4 module port cached decode, {label} ==");
+        print_report_table(std::slice::from_ref(&report));
+        assert!(
+            report.passed(),
+            "{label}: cached decode is off the full forward"
+        );
+    }
 }
 
 fn run_synthetic_parity(

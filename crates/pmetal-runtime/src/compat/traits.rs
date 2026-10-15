@@ -1,6 +1,6 @@
 use super::{
-    Array, Exception, FlattenedModuleParam, ModuleParamMut, ModuleParamRef, ModuleParameters,
-    NestedValue, Param,
+    Array, Buffer, Exception, FlattenedModuleParam, ModuleParamMut, ModuleParamRef,
+    ModuleParameters, NestedValue, Param,
 };
 
 // ── ModuleParametersExt ───────────────────────────────────────────────────────
@@ -84,6 +84,29 @@ impl Parameter for Param<Array> {
     }
     fn count_params(&self) -> usize {
         1
+    }
+}
+
+// Buffer — one leaf, loaded and saved, never trainable
+impl Parameter for Buffer {
+    fn collect_params<'a>(&'a self, key: &str, out: &mut ModuleParamRef<'a>) {
+        out.insert(std::rc::Rc::from(key), NestedValue::Value(&self.0));
+    }
+    fn collect_trainable_params<'a>(&'a self, _key: &str, _out: &mut ModuleParamRef<'a>) {}
+    fn collect_params_mut<'a>(&'a mut self, key: &str, out: &mut ModuleParamMut<'a>) {
+        out.insert(std::rc::Rc::from(key), NestedValue::Value(&mut self.0));
+    }
+    fn count_params(&self) -> usize {
+        1
+    }
+}
+
+impl VisitLinears for Buffer {
+    fn visit_linears_mut(
+        &mut self,
+        _prefix: &str,
+        _f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    ) {
     }
 }
 

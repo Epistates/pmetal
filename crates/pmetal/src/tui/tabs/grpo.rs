@@ -152,12 +152,6 @@ impl GrpoTab {
             .value("Max Image Size")
             .parse()
             .unwrap_or(spec.max_image_size);
-        spec.speculative = self.form.value("Speculative Decoding") == "Enabled";
-        spec.speculative_draft_tokens = self
-            .form
-            .value("Speculative Draft Tokens")
-            .parse()
-            .unwrap_or(spec.speculative_draft_tokens);
         spec.async_rewards = self.form.value("Async Rewards") == "Enabled";
         let rm = self.form.value("Reward Model");
         spec.reward_model = if rm.is_empty() { None } else { Some(rm) };

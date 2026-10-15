@@ -292,6 +292,7 @@ pub async fn chat_completions(
         extra_stop_token_ids: resolved_stops.token_ids.clone(),
         stop_sequences: resolved_stops.sequences.clone(),
         logprobs_top_n,
+        logit_bias: parse_logit_bias(req.logit_bias.as_ref())?,
     };
     state.engine.validate_sampling_params(&params)?;
 
@@ -409,6 +410,34 @@ pub async fn chat_completions(
     .into_response())
 }
 
+/// A request's `logit_bias` as `(token, bias)` pairs, in token order. The
+/// keys are token ids as decimal strings, as OpenAI sends them; anything else
+/// is a bad request (the range of the biases is checked with the rest of the
+/// sampling parameters).
+fn parse_logit_bias(
+    bias: Option<&std::collections::HashMap<String, f32>>,
+) -> Result<Vec<(u32, f32)>, ServeError> {
+    let Some(bias) = bias else {
+        return Ok(Vec::new());
+    };
+    let mut pairs = bias
+        .iter()
+        .map(|(token, &value)| {
+            token
+                .trim()
+                .parse::<u32>()
+                .map(|id| (id, value))
+                .map_err(|_| {
+                    ServeError::BadRequest(format!(
+                        "logit_bias keys are token ids; {token:?} is not one"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    pairs.sort_by_key(|&(id, _)| id);
+    Ok(pairs)
+}
+
 /// POST /v1/completions
 pub async fn completions(
     State(state): State<Arc<AppState>>,
@@ -460,6 +489,7 @@ pub async fn completions(
         extra_stop_token_ids: resolved_stops.token_ids.clone(),
         stop_sequences: resolved_stops.sequences.clone(),
         logprobs_top_n,
+        logit_bias: parse_logit_bias(req.logit_bias.as_ref())?,
     };
     state.engine.validate_sampling_params(&params)?;
 
@@ -1125,6 +1155,21 @@ pub(crate) fn resolve_stop_sequences(
 mod batching_gate_tests {
     use super::*;
 
+    #[test]
+    fn logit_bias_keys_are_token_ids_and_come_back_in_order() {
+        let bias =
+            std::collections::HashMap::from([("42".to_string(), -100.0), ("7".to_string(), 2.5)]);
+        assert_eq!(
+            parse_logit_bias(Some(&bias)).unwrap(),
+            vec![(7, 2.5), (42, -100.0)]
+        );
+        assert!(parse_logit_bias(None).unwrap().is_empty());
+        let words = std::collections::HashMap::from([("hello".to_string(), 1.0)]);
+        assert!(parse_logit_bias(Some(&words)).is_err());
+        let negative = std::collections::HashMap::from([("-3".to_string(), 1.0)]);
+        assert!(parse_logit_bias(Some(&negative)).is_err());
+    }
+
     fn base_params() -> SamplingParams {
         SamplingParams {
             max_tokens: 16,
@@ -1139,6 +1184,7 @@ mod batching_gate_tests {
             extra_stop_token_ids: vec![],
             stop_sequences: vec![],
             logprobs_top_n: None,
+            logit_bias: Vec::new(),
         }
     }
 

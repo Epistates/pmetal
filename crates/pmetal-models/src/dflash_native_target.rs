@@ -1,4 +1,4 @@
-//! Native-bridge [`DFlashTarget`] for Qwen3 / Qwen3.5.
+//! Native-runtime [`DFlashTarget`] for Qwen3 / Qwen3.5.
 //!
 //! Routes the DFlash verify-step target forward through the fused
 //! `pmetal_runtime::qwen3_native::forward_step_with_capture` path instead
@@ -7,7 +7,7 @@
 //! 1. **Speed** — the native path runs the parallel-replay verify
 //!    forward on the fused kernels with minimal per-op dispatch, which
 //!    cuts the target-forward cost per verify step.
-//! 2. **Numerical parity with the reference** — the native bridge uses
+//! 2. **Numerical parity with the reference** — the native runtime uses
 //!    the same fused attention + MLP kernels as the reference Qwen3
 //!    forward, which is what the DFlash draft was trained against. Without this, the
 //!    draft's cross-attention sees subtly different target hidden
@@ -26,7 +26,7 @@ use pmetal_runtime::qwen3_native::{self, GdnReplay, NativeCache, NativeWeights};
 
 use crate::dflash_decoder::DFlashTarget;
 
-/// DFlash target backed by the fused native-bridge Qwen3 forward.
+/// DFlash target backed by the fused native-runtime Qwen3 forward.
 ///
 /// On Qwen3.5 (GDN + gated attention) a verify records each GDN layer's
 /// recurrence inputs, and a partial accept replays them over the accepted
@@ -46,7 +46,7 @@ pub struct NativeQwen3Target {
 }
 
 impl NativeQwen3Target {
-    /// Load weights from `model_dir` into the fused native bridge.
+    /// Load weights from `model_dir` into the fused native runtime.
     /// Returns a target that owns its own `NativeCache`.
     ///
     /// Fails cleanly if the model is not a supported Qwen3 / Qwen3.5
@@ -91,12 +91,14 @@ impl NativeQwen3Target {
     }
 
     /// Forward `input_ids`, recording the tapped layers into `capture` and,
-    /// when `rewindable`, what undoing a tail of it takes.
+    /// when `rewindable`, what undoing a tail of it takes. With
+    /// `last_logits_only` the logits are those of the last position alone.
     fn forward_tapped(
         &mut self,
         input_ids: &Array,
         capture: &mut SpecCapture,
         rewindable: bool,
+        last_logits_only: bool,
     ) -> Result<Array, Exception> {
         // Snapshot the requested layers the decoder is tapping. The
         // native forward writes them in ascending layer order; we then
@@ -111,6 +113,7 @@ impl NativeQwen3Target {
             &tap_layers,
             &mut captured,
             replays,
+            last_logits_only,
         );
         if captured.len() != tap_layers.len() {
             return Err(Exception::custom(format!(
@@ -121,51 +124,10 @@ impl NativeQwen3Target {
                 tap_layers
             )));
         }
-        // Diagnostic: dump last-position values at each tapped layer so
-        // we can compare to the reference per-layer output and
-        // localize the DFlash acceptance-gap divergence. Only active
-        // when `PMETAL_DFLASH_TAP_TRACE` is set; the f32 copy costs a
-        // few microseconds but is only taken once the var is present.
-        if std::env::var_os("PMETAL_DFLASH_TAP_TRACE").is_some() {
-            trace_taps(&tap_layers, &captured);
-        }
         for (idx, h) in tap_layers.iter().zip(captured) {
             capture.record_hidden(*idx, h);
         }
         Ok(logits)
-    }
-}
-
-/// Dump per-position tap values so we can diff against upstream
-/// iter-by-iter. When the tap sequence is short (verify block or
-/// accepted-prefix slice) we print every position; for a full prompt we
-/// only print the last.
-fn trace_taps(tap_layers: &[usize], captured: &[Array]) {
-    use pmetal_runtime::compat::Dtype;
-    for (idx, h) in tap_layers.iter().zip(captured.iter()) {
-        let t = h.dim(1);
-        let hidden_dim = h.dim(2);
-        let positions: Vec<i32> = if t <= 16 {
-            (0..t).collect()
-        } else {
-            vec![t - 1]
-        };
-        for pos in positions {
-            let slice = h.slice(&[0, pos, 0], &[1, pos + 1, hidden_dim]);
-            let slice_f32 = slice.as_dtype(Dtype::Float32.as_i32());
-            let _ = slice_f32.eval();
-            let data = slice_f32.as_slice::<f32>();
-            let first4: Vec<f32> = data.iter().take(4).copied().collect();
-            let l2: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
-            eprintln!(
-                "[pmetal tap] layer_{idx:02} pos={pos:02} [:4]={:?} ||.||={:.4}",
-                first4
-                    .iter()
-                    .map(|x| (x * 10000.0).round() / 10000.0)
-                    .collect::<Vec<_>>(),
-                l2
-            );
-        }
     }
 }
 
@@ -186,7 +148,19 @@ impl DFlashTarget for NativeQwen3Target {
     ) -> Result<Array, Exception> {
         self.gdn_replays.clear();
         self.verified = 0;
-        self.forward_tapped(input_ids, capture, false)
+        self.forward_tapped(input_ids, capture, false, false)
+    }
+
+    fn prefill_with_capture(
+        &mut self,
+        input_ids: &Array,
+        _kv_cache: Option<&mut KVCache>,
+        _mamba_cache: Option<&mut MambaCache>,
+        capture: &mut SpecCapture,
+    ) -> Result<Array, Exception> {
+        self.gdn_replays.clear();
+        self.verified = 0;
+        self.forward_tapped(input_ids, capture, false, true)
     }
 
     fn verify_with_capture(
@@ -197,7 +171,7 @@ impl DFlashTarget for NativeQwen3Target {
         capture: &mut SpecCapture,
     ) -> Result<Array, Exception> {
         self.verified = input_ids.dim(1);
-        self.forward_tapped(input_ids, capture, true)
+        self.forward_tapped(input_ids, capture, true, false)
     }
 
     fn lm_head_project(&mut self, hidden: &Array) -> Result<Array, Exception> {
@@ -246,6 +220,10 @@ impl DFlashTarget for NativeQwen3Target {
             .map_err(|e| Exception::custom(format!("NativeQwen3Target: {e}")))?;
         self.gdn_replays.clear();
         Ok(())
+    }
+
+    fn tree_mask_dtype(&self) -> i32 {
+        self.weights.model_dtype
     }
 
     /// Tree verify ranks siblings by attention masking, which a GDN layer,

@@ -116,14 +116,6 @@ pub struct GrpoArgs {
     #[arg(long = "reward-model-template")]
     pub reward_model_template: Option<String>,
 
-    /// Enable speculative decoding for faster rollout generation.
-    #[arg(long = "speculative")]
-    pub speculative: bool,
-
-    /// Number of draft tokens per speculative decode step (default: 3).
-    #[arg(long = "speculative-draft-tokens", default_value = "3")]
-    pub speculative_draft_tokens: usize,
-
     /// Enable pipelined (asynchronous) reward scoring.
     #[arg(long = "async-rewards")]
     pub async_rewards: bool,

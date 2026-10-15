@@ -27,7 +27,7 @@ use pmetal_models::architectures::{
     Gemma4AssistantConfig, Gemma4AssistantForCausalLM, Gemma4AssistantSharedKvStates, Gemma4Config,
     Gemma4ForCausalLM, Qwen3NextForCausalLM, Qwen3NextMtpForCausalLM, load_qwen3_next_mtp_from_dir,
 };
-use pmetal_models::generation::{GenerationConfig, GenerationOutput, Sampler};
+use pmetal_models::generation::{GenerationConfig, GenerationOutput};
 use pmetal_models::mtp::{MtpDrafter, MtpTarget, generate_mtp_streaming};
 use pmetal_models::{
     DynamicModel, Gemma4MtpDrafter, Gemma4MtpVerifier, NativeQwen3MtpVerifier, Qwen3NextMtpDrafter,
@@ -120,7 +120,7 @@ struct OracleDrafter<O: MtpTarget> {
     oracle: O,
     vocab: i32,
     wrong_every: Option<usize>,
-    sampler: Sampler,
+    config: GenerationConfig,
     prompt_len: usize,
     committed: Vec<u32>,
     round: Vec<u32>,
@@ -134,7 +134,7 @@ impl<O: MtpTarget> OracleDrafter<O> {
             oracle,
             vocab,
             wrong_every,
-            sampler: Sampler::new(config.clone()),
+            config: config.clone(),
             prompt_len: 0,
             committed: Vec::new(),
             round: Vec::new(),
@@ -148,15 +148,11 @@ impl<O: MtpTarget> OracleDrafter<O> {
     fn greedy_after_round(&mut self) -> u32 {
         let (_, logits) = from_scratch(&mut self.oracle, &self.round);
         let (prompt, generated) = self.round.split_at(self.prompt_len);
-        let mut penalties = self.sampler.decode_penalties(prompt);
-        if let Some(penalties) = penalties.as_mut() {
-            for &token in generated {
-                penalties.record_id(token);
-            }
+        let mut sampler = self.config.sampler(prompt);
+        for &token in generated {
+            sampler.record_id(token);
         }
-        self.sampler
-            .sample(&last_token_logits(&logits), penalties.as_mut())
-            .expect("oracle sample")
+        sampler.sample(&last_token_logits(&logits)).item_u32()
     }
 }
 
@@ -847,18 +843,15 @@ fn penalized_config() -> GenerationConfig {
     }
 }
 
-/// Plain greedy decoding through the `Sampler`, which applies the penalties
-/// before its argmax and takes every token it samples into them, with the
-/// target recomputed from scratch every step.
+/// Plain greedy decoding through the `DecodeSampler`, which applies the
+/// penalties before its argmax and takes every token it samples into them,
+/// with the target recomputed from scratch every step.
 fn plain_penalized<T: MtpTarget>(target: &mut T, prompt: &[u32], n: usize) -> Vec<u32> {
-    let sampler = Sampler::new(penalized_config());
-    let mut penalties = sampler.decode_penalties(prompt);
+    let mut sampler = penalized_config().sampler(prompt);
     let mut seq = prompt.to_vec();
     for _ in 0..n {
         let (_, logits) = from_scratch(target, &seq);
-        let token = sampler
-            .sample(&last_token_logits(&logits), penalties.as_mut())
-            .expect("sample");
+        let token = sampler.sample(&last_token_logits(&logits)).item_u32();
         seq.push(token);
     }
     drain("plain penalized greedy");

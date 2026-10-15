@@ -13,9 +13,12 @@
 
 use std::path::PathBuf;
 
+pub mod gemma4;
+
 pub use pmetal_cache::test_utils::{load_shard, ref_tensor};
 
 /// Resolve `tests/fixtures/<name>` relative to this crate.
+#[allow(dead_code)]
 pub fn fixture_path(name: &str) -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tests");

@@ -384,6 +384,7 @@ pub async fn messages(
         stop_sequences: resolved_stops.sequences.clone(),
         // Anthropic /v1/messages does not expose OpenAI-style logprobs.
         logprobs_top_n: None,
+        logit_bias: Vec::new(),
     };
     state.engine.validate_sampling_params(&params)?;
 

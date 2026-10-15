@@ -94,7 +94,8 @@ fn main() {
     eprintln!("First token: {first_tok_id}");
 
     if dump_decode_graph {
-        pmetal_runtime::decode::begin_generation_session("NATIVE-GRAPH", weights.model_dtype);
+        let _session =
+            pmetal_runtime::decode::begin_generation_session("NATIVE-GRAPH", weights.model_dtype);
         cache.eval_and_detach_states();
         pmetal_runtime::inline_array::clear_cache();
 

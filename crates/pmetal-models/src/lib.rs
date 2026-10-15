@@ -81,7 +81,10 @@ pub use qwen3_next_mtp::*;
 pub use rl_generation::{
     BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator, generate_rl_completions,
 };
-pub use speculative::{SpeculativeConfig, SpeculativeDecoder, SpeculativeStats};
+pub use speculative::{
+    SpeculativeDecodeMetrics, SpeculativeDraws, correction_log_probs,
+    token_probability_from_log_probs,
+};
 pub use traits::{CausalLMModel, ModelConfig};
 pub use weight_format::{GgufModelConfig, WeightFormat, WeightFormatError, WeightLoader};
 

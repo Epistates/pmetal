@@ -905,9 +905,6 @@ impl PmetalMcpServer {
         #[description("Reward model weight in combined score (default: 1.0)")]
         reward_model_weight: Option<f64>,
         #[description("Chat template for reward model")] reward_model_template: Option<String>,
-        #[description("Enable speculative decoding for rollouts")] speculative: Option<bool>,
-        #[description("Draft tokens per speculative step (default: 3)")]
-        speculative_draft_tokens: Option<u64>,
         #[description("Enable pipelined async reward scoring")] async_rewards: Option<bool>,
         #[description("Custom JSONL text column name")] text_column: Option<String>,
         #[description("Prompt column for SFT label masking")] prompt_column: Option<String>,
@@ -943,8 +940,6 @@ impl PmetalMcpServer {
             reward_model_max_length: reward_model_max_length.unwrap_or(2048) as usize,
             reward_model_weight: reward_model_weight.unwrap_or(1.0),
             reward_model_template,
-            speculative: speculative.unwrap_or(false),
-            speculative_draft_tokens: speculative_draft_tokens.unwrap_or(3) as usize,
             async_rewards: async_rewards.unwrap_or(false),
             text_column,
             prompt_column,
