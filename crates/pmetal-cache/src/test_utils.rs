@@ -50,11 +50,24 @@ pub fn to_f32_vec_eval(arr: &Array) -> Vec<f32> {
     evaled.to_f32_vec(n).unwrap_or_default()
 }
 
+/// The larger of two magnitudes, where a NaN on either side wins.
+///
+/// `f32::max` returns the other operand when one is NaN, so a plain fold over
+/// `|l - r|` reports a tensor of NaNs as identical to its reference.
+fn max_propagating_nan(acc: f32, v: f32) -> f32 {
+    if acc.is_nan() || v.is_nan() {
+        f32::NAN
+    } else {
+        acc.max(v)
+    }
+}
+
 /// Maximum absolute element-wise difference between two arrays.
 ///
 /// Both arrays are flattened to `Vec<f32>` before comparison, so
 /// element-order matters but axis layout does not (the function does NOT
-/// transpose). Returns `0.0` for empty inputs.
+/// transpose). Returns `0.0` for empty inputs, and NaN when either array
+/// holds one.
 pub fn max_abs_diff(lhs: &Array, rhs: &Array) -> f32 {
     let lhs_v = to_f32_vec_eval(lhs);
     let rhs_v = to_f32_vec_eval(rhs);
@@ -62,7 +75,7 @@ pub fn max_abs_diff(lhs: &Array, rhs: &Array) -> f32 {
         .iter()
         .zip(rhs_v.iter())
         .map(|(l, r)| (l - r).abs())
-        .fold(0.0f32, f32::max)
+        .fold(0.0f32, max_propagating_nan)
 }
 
 /// Mean absolute element-wise difference. Returns `0.0` for empty inputs.
@@ -113,7 +126,7 @@ pub fn max_abs_value(arr: &Array) -> f32 {
     to_f32_vec_eval(arr)
         .iter()
         .map(|v| v.abs())
-        .fold(0.0f32, f32::max)
+        .fold(0.0f32, max_propagating_nan)
 }
 
 /// Argmax along the last axis, materialised to a flat `Vec<i32>`.
@@ -258,10 +271,11 @@ impl ParityReport {
         report
     }
 
-    /// `true` when shapes match and the checkpoint passes either the
-    /// absolute or relative tolerance.
+    /// `true` when shapes match, something was compared, and the checkpoint
+    /// passes either the absolute or relative tolerance. NaN fails both
+    /// tolerances.
     pub fn passed(&self) -> bool {
-        if self.shape_rust != self.shape_ref {
+        if self.shape_rust != self.shape_ref || self.n_compared == 0 {
             return false;
         }
         let abs_pass = self.max_abs_diff <= self.tolerance.atol;
@@ -356,6 +370,27 @@ mod tests {
         let mismatch = ParityReport::compute("x", &reshaped, &reference, Tolerance::new(9.0, 9.0));
         assert!(!mismatch.passed());
         assert_eq!(mismatch.status_str(), "FAIL");
+    }
+
+    /// `f32::max` returns its other operand when one is NaN, so a fold over
+    /// `|l - r|` reports a model that emitted NaN everywhere as an exact
+    /// match. A NaN on either side is a failure, and an unreadable tensor
+    /// (which reads back empty) is not a tensor that matched.
+    #[test]
+    fn a_nan_or_an_unreadable_tensor_never_passes() {
+        let reference = row(&[1.0, 2.0, 3.0]);
+        let tol = Tolerance::new(1e9, 1e9);
+
+        let nan = row(&[1.0, f32::NAN, 3.0]);
+        assert!(max_abs_diff(&nan, &reference).is_nan());
+        assert!(max_abs_diff(&reference, &nan).is_nan());
+        assert!(max_abs_value(&nan).is_nan());
+        assert!(!ParityReport::compute("nan", &nan, &reference, tol).passed());
+        assert!(!ParityReport::compute("nan_ref", &reference, &nan, tol).passed());
+
+        let empty = Array::from_f32_slice(&[], &[1, 0]);
+        let report = ParityReport::compute("empty", &empty, &empty, tol);
+        assert!(!report.passed(), "an empty comparison compares nothing");
     }
 
     /// The per-position breakdown localises a difference to its position on
