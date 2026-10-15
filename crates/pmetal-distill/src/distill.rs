@@ -3,35 +3,21 @@
 //! This module provides the high-level API for running knowledge distillation,
 //! including online, offline, and progressive distillation modes.
 
-use std::path::PathBuf;
-
-use pmetal_runtime::compat::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 use pmetal_runtime::training::CrossEntropy;
 
 use crate::{
     DistillConfig, DistillError, DistillMethod, LossType, Result,
     losses::{
         DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
-        SoftCrossEntropyLoss, hidden_state::LayerDistillation,
+        SoftCrossEntropyLoss, hidden_state::LayerDistillation, reduce_per_token,
+        tempered_log_probs,
     },
 };
 
-/// Loss-only entry point. End-to-end orchestration (model loading, dataset
-/// iteration, optimizer steps, checkpointing) lives in `pmetal-trainer` —
-/// this crate intentionally exposes only the loss math + per-batch
-/// `Distiller::compute_loss`. Calling this returns a descriptive error so the
-/// caller is steered to the trainer crate or the `pmetal distill` CLI.
-pub fn run_distillation(config: &DistillConfig) -> Result<PathBuf> {
-    config.validate()?;
-    let _ = config; // accepted but not consumed — the validation above is the
-    // only effect inside this crate.
-    Err(DistillError::InvalidConfig(
-        "end-to-end distillation orchestration is not available in `pmetal-distill` alone; \
-         use the `pmetal distill` CLI or `pmetal_trainer::DistillationTrainer` with \
-         model, dataset, and adapter configuration"
-            .to_string(),
-    ))
-}
+// End-to-end orchestration (model loading, dataset iteration, optimizer steps,
+// checkpointing) lives in `pmetal-trainer`; this crate is the loss math and the
+// per-batch `Distiller::compute_loss`.
 
 /// Builder for creating a Distiller instance.
 pub struct DistillerBuilder {
@@ -73,6 +59,7 @@ impl DistillerBuilder {
         let config = self
             .config
             .ok_or_else(|| DistillError::InvalidConfig("Configuration is required".to_string()))?;
+        config.validate()?;
 
         // Create loss function from config if not provided
         let loss: Box<dyn DistillLoss> = self.loss.unwrap_or_else(|| {
@@ -195,6 +182,8 @@ impl Distiller {
         step: usize,
         total_steps: usize,
     ) -> Result<DistillLossOutput> {
+        check_logit_pair(teacher_logits, student_logits)?;
+
         // Resolve (temperature, alpha): static config or progressive schedule.
         let (temperature, alpha) = if self.config.method == DistillMethod::Progressive {
             self.progressive_params(step, total_steps)
@@ -334,48 +323,73 @@ impl DistillLossOutput {
     /// - `top1_agreement`: fraction of tokens where argmax agrees.
     /// - `kl_per_token`: mean fwd-KL(teacher || student) in nats.
     pub fn with_metrics(
-        mut self,
+        self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
     ) -> Self {
-        // Probabilities (and clamp for log) at the configured temperature.
-        let inv_t = 1.0_f32 / temperature.max(1e-6);
-        let t_scaled = teacher_logits.multiply(&Array::from_f32(inv_t));
-        let s_scaled = student_logits.multiply(&Array::from_f32(inv_t));
-        let t_log_p = t_scaled.log_softmax(-1);
-        let s_log_p = s_scaled.log_softmax(-1);
+        self.with_weighted_metrics(teacher_logits, student_logits, temperature, None)
+    }
+
+    /// [`with_metrics`](Self::with_metrics) averaged over the tokens the
+    /// per-token `weights` (`[batch, seq]`, e.g. the loss mask) keep, so
+    /// padding and prompt positions do not pollute the telemetry.
+    ///
+    /// The teacher and the student must share a vocabulary. All four values
+    /// come back in one device-to-host transfer.
+    pub fn with_weighted_metrics(
+        mut self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+        weights: Option<&Array>,
+    ) -> Self {
+        let teacher_logits = teacher_logits.stop_gradient();
+        let student_logits = student_logits.stop_gradient();
+        let t_log_p = tempered_log_probs(&teacher_logits, temperature);
+        let s_log_p = tempered_log_probs(&student_logits, temperature);
         let t_p = t_log_p.exp();
         let s_p = s_log_p.exp();
 
-        // Per-token entropies, then mean over all axes except the last
-        // (which is the vocab axis we already summed across).
-        let neg = Array::from_f32(-1.0);
-        let h_teacher = t_p.multiply(&t_log_p).sum_axis(-1, false).multiply(&neg);
-        let h_student = s_p.multiply(&s_log_p).sum_axis(-1, false).multiply(&neg);
-
-        // Forward-KL(teacher || student) per token, then mean.
+        // Per-token entropies and forward KL(teacher || student).
+        let h_teacher = t_p.multiply(&t_log_p).sum_axis(-1, false).negative();
+        let h_student = s_p.multiply(&s_log_p).sum_axis(-1, false).negative();
         let kl = t_p
             .multiply(&t_log_p.subtract(&s_log_p))
             .sum_axis(-1, false);
 
-        // top-1 agreement: fraction where argmax(teacher) == argmax(student).
-        let t_top = teacher_logits.argmax(-1);
-        let s_top = student_logits.argmax(-1);
-        let agree = t_top
-            .equal(&s_top)
-            .as_dtype(Dtype::Float32.as_i32())
-            .mean_all();
+        // top-1 agreement: whether argmax(teacher) == argmax(student).
+        let agree = teacher_logits
+            .argmax(-1)
+            .equal(&student_logits.argmax(-1))
+            .as_dtype(Dtype::Float32.as_i32());
 
-        let h_t_mean: f32 = h_teacher.mean_all().item();
-        let h_s_mean: f32 = h_student.mean_all().item();
-        let kl_mean: f32 = kl.mean_all().item();
-        let agree_f: f32 = agree.item();
+        let mean = |per_token: &Array| -> Array {
+            // A weight tensor of the wrong size is a caller bug; telemetry
+            // reports it as NaN rather than panicking mid-training.
+            reduce_per_token(per_token, weights)
+                .unwrap_or_else(|_| Array::from_f32(f32::NAN))
+                .reshape(&[1])
+        };
+        let packed = ops::concatenate_axis(
+            &[
+                &mean(&h_teacher),
+                &mean(&h_student),
+                &mean(&kl),
+                &mean(&agree),
+            ],
+            0,
+        );
+        let [h_t, h_s, kl_mean, agree_mean] = packed
+            .clone()
+            .to_f32_vec(4)
+            .and_then(|v| <[f32; 4]>::try_from(v).ok())
+            .unwrap_or([f32::NAN; 4]);
 
-        self.metrics.insert("teacher_entropy", h_t_mean);
-        self.metrics.insert("student_entropy", h_s_mean);
+        self.metrics.insert("teacher_entropy", h_t);
+        self.metrics.insert("student_entropy", h_s);
         self.metrics.insert("kl_per_token", kl_mean);
-        self.metrics.insert("top1_agreement", agree_f);
+        self.metrics.insert("top1_agreement", agree_mean);
         self
     }
 }
@@ -383,6 +397,22 @@ impl DistillLossOutput {
 /// Compute hard cross-entropy loss with labels, masking positions whose label
 /// equals `ignore_index` (PyTorch convention: `-100`).
 ///
+/// Teacher and student logits must agree on every axis but the vocabulary
+/// (a differing vocabulary is a cross-vocabulary run, which the losses align).
+///
+/// An exception inside the runtime does not abort: it leaves a placeholder
+/// array behind, so a mismatch has to be caught before the first op.
+fn check_logit_pair(teacher: &Array, student: &Array) -> Result<()> {
+    let (t, s) = (teacher.shape(), student.shape());
+    if t.len() < 2 || t.len() != s.len() || t[..t.len() - 1] != s[..s.len() - 1] {
+        return Err(DistillError::ShapeMismatch {
+            teacher: t.to_vec(),
+            student: s.to_vec(),
+        });
+    }
+    Ok(())
+}
+
 /// The runtime's fused cross-entropy evaluates in f32 whatever the logits'
 /// dtype (a bf16 normalizer over a large vocabulary is off by tenths of a
 /// nat), keeps the labels out of the gradient trace, and ignores the masked
@@ -493,15 +523,6 @@ mod tests {
         config.loss.loss_type = LossType::MseLoss;
         let d = Distiller::new(config.clone()).unwrap();
         assert_eq!(d.loss.name(), "mse");
-    }
-
-    #[test]
-    fn test_run_distillation_requires_external_orchestration() {
-        let err = run_distillation(&test_config()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("end-to-end distillation orchestration is not available")
-        );
     }
 
     /// `compute_hard_loss` must obey `TrainingConfig.ignore_index`. The two

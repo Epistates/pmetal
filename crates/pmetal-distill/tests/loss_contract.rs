@@ -592,6 +592,88 @@ fn hard_label_loss_is_computed_in_f32() {
     );
 }
 
+fn distiller_with(
+    loss: pmetal_distill::LossConfig,
+) -> pmetal_distill::Result<pmetal_distill::Distiller> {
+    pmetal_distill::Distiller::new(pmetal_distill::DistillConfig {
+        teacher: "t".to_string(),
+        student: "s".to_string(),
+        method: pmetal_distill::DistillMethod::Online,
+        loss,
+        offline: None,
+        output_path: None,
+        training: Default::default(),
+    })
+}
+
+/// A configuration that fails validation does not build a Distiller: a zero
+/// temperature divides every logit by zero.
+#[test]
+fn an_invalid_config_does_not_build() {
+    use pmetal_distill::LossConfig;
+
+    for bad in [
+        LossConfig {
+            temperature: 0.0,
+            ..LossConfig::default()
+        },
+        LossConfig {
+            temperature: f32::NAN,
+            ..LossConfig::default()
+        },
+        LossConfig {
+            alpha: 1.5,
+            ..LossConfig::default()
+        },
+    ] {
+        assert!(distiller_with(bad).is_err());
+    }
+}
+
+/// Logit tensors that do not line up are an error the caller can read, not a
+/// placeholder array out of a backend exception.
+#[test]
+#[serial]
+fn mismatched_logit_shapes_are_an_error() {
+    let distiller = distiller_with(pmetal_distill::LossConfig::default()).unwrap();
+    let teacher = Array::from_f32_slice(&[0.0; 2 * 3 * 4], &[2, 3, 4]);
+    let student = Array::from_f32_slice(&[0.0; 2 * 5 * 4], &[2, 5, 4]);
+    let err = distiller
+        .compute_loss(&teacher, &student, None, None, 0, 1)
+        .expect_err("[2, 3, 4] against [2, 5, 4]");
+    assert!(err.to_string().contains("Shape mismatch"), "{err}");
+}
+
+/// Telemetry respects the token mask: a padded position with wild logits does
+/// not move the agreement, entropy or KL it reports.
+#[test]
+#[serial]
+fn metrics_ignore_masked_tokens() {
+    let distiller = distiller_with(pmetal_distill::LossConfig::default()).unwrap();
+    let mut t = logits(0.3);
+    let mut s = logits(0.3); // identical on token 0, so KL there is 0 ...
+    // ... and token 1 is junk the mask removes.
+    for v in &mut s[VOCAB..] {
+        *v = -*v * 3.0;
+    }
+    for v in &mut t[VOCAB..] {
+        *v *= 5.0;
+    }
+    let (teacher, student) = (array(&t, Dtype::Float32), array(&s, Dtype::Float32));
+    let mask = Array::from_f32_slice(&[1.0, 0.0], &[1, 2]);
+    let out = distiller
+        .compute_loss(&teacher, &student, None, None, 0, 1)
+        .unwrap()
+        .with_weighted_metrics(&teacher, &student, 2.0, Some(&mask));
+    drain();
+    assert!(
+        out.metrics["kl_per_token"].abs() < 1e-5,
+        "{:?}",
+        out.metrics
+    );
+    assert_eq!(out.metrics["top1_agreement"], 1.0, "{:?}", out.metrics);
+}
+
 // ---------------------------------------------------------------------------
 // Hidden-state alignment
 // ---------------------------------------------------------------------------

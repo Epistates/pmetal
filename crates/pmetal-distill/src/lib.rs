@@ -56,7 +56,7 @@ pub use config::{
     DistillMethod, HiddenStateConfig, HiddenStateLossType, LossConfig, LossType, OfflineConfig,
     TrainingConfig,
 };
-pub use distill::{DistillLossOutput, Distiller, DistillerBuilder, run_distillation};
+pub use distill::{DistillLossOutput, Distiller, DistillerBuilder};
 pub use error::{DistillError, Result};
 pub use losses::{
     AttentionTransferLoss, DistillLoss, GkdLoss, GreedySampler, HiddenStateLoss, HingeRankingLoss,

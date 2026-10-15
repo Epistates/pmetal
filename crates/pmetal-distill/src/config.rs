@@ -429,14 +429,22 @@ impl DistillConfig {
 
     /// Validate the configuration.
     pub fn validate(&self) -> crate::Result<()> {
-        if self.loss.temperature <= 0.0 {
+        // `!(x > 0)` rather than `x <= 0`: NaN must not pass.
+        if !(self.loss.temperature > 0.0 && self.loss.temperature.is_finite()) {
             return Err(crate::DistillError::InvalidTemperature(
                 self.loss.temperature,
             ));
         }
 
-        if self.loss.alpha < 0.0 || self.loss.alpha > 1.0 {
+        if !(0.0..=1.0).contains(&self.loss.alpha) {
             return Err(crate::DistillError::InvalidAlpha(self.loss.alpha));
+        }
+
+        if !(self.loss.rationale_weight >= 0.0 && self.loss.rationale_weight.is_finite()) {
+            return Err(crate::DistillError::InvalidConfig(format!(
+                "rationale_weight must be finite and non-negative, got {}",
+                self.loss.rationale_weight
+            )));
         }
 
         // Validate reasoning markers: if rationale is enabled and markers are used,

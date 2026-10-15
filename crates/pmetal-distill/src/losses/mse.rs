@@ -39,6 +39,12 @@ impl DistillLoss for MseLoss {
         // scale the loss by 1/T², and `temperature_scale` is 1, so the
         // temperature has no role here.
         let _ = temperature;
+        if teacher_logits.shape() != student_logits.shape() {
+            return Err(crate::DistillError::ShapeMismatch {
+                teacher: teacher_logits.shape().to_vec(),
+                student: student_logits.shape().to_vec(),
+            });
+        }
         let f32_ = Dtype::Float32.as_i32();
         let diff = student_logits
             .as_dtype(f32_)
