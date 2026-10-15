@@ -605,6 +605,137 @@ fn a_sample_truncated_to_its_prompt_is_dropped() {
     assert!(trained_text(ds.get(0).unwrap(), &tokenizer).starts_with("kept"));
 }
 
+// -- robustness ------------------------------------------------------------------
+
+/// A small deterministic generator, so the cases are the same every run.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn string(&mut self) -> String {
+        const PIECES: [&str; 12] = [
+            "a",
+            "hello",
+            " ",
+            "\n",
+            "é",
+            "日本",
+            "🙂",
+            "<|im_end|>",
+            "</s>",
+            "\"",
+            "\\",
+            "{",
+        ];
+        (0..self.below(6))
+            .map(|_| PIECES[self.below(PIECES.len() as u64) as usize])
+            .collect()
+    }
+
+    /// An arbitrary JSON value of bounded depth.
+    fn value(&mut self, depth: u32) -> Value {
+        match self.below(if depth == 0 { 5 } else { 8 }) {
+            0 => Value::Null,
+            1 => json!(self.below(2) == 0),
+            2 => json!(self.next() as i64 - 1_000),
+            3 | 4 => Value::String(self.string()),
+            5 | 6 => Value::Array((0..self.below(4)).map(|_| self.value(depth - 1)).collect()),
+            _ => self.object(depth - 1),
+        }
+    }
+
+    fn object(&mut self, depth: u32) -> Value {
+        const KEYS: [&str; 20] = [
+            "role",
+            "content",
+            "from",
+            "value",
+            "messages",
+            "conversations",
+            "prompt",
+            "completion",
+            "instruction",
+            "input",
+            "output",
+            "text",
+            "tools",
+            "tool_calls",
+            "tool_call_id",
+            "weight",
+            "system",
+            "type",
+            "name",
+            "arguments",
+        ];
+        let mut map = serde_json::Map::new();
+        for _ in 0..self.below(6) {
+            map.insert(
+                KEYS[self.below(KEYS.len() as u64) as usize].into(),
+                self.value(depth),
+            );
+        }
+        Value::Object(map)
+    }
+}
+
+/// Whatever a row holds, reading it ends in a sample or an error, never a
+/// panic: a dataset is untrusted input.
+#[test]
+fn arbitrary_rows_never_panic() {
+    use pmetal_data::AssistantLoss;
+    let tokenizer = char_tokenizer(None);
+    let templates = [
+        None,
+        Some(ChatTemplate::chatml()),
+        Some(ChatTemplate::llama3()),
+        Some(ChatTemplate::gemma()),
+        Some(ChatTemplate::mistral()),
+    ];
+    let mut rng = Lcg(7);
+    let mut loaded = 0usize;
+    for round in 0..4000 {
+        // Rows shaped like the layouts, with arbitrary contents, and wholly
+        // arbitrary ones.
+        let row = match round % 4 {
+            0 => json!({"messages": rng.value(3)}),
+            1 => json!({"conversations": [rng.object(2), rng.object(2)], "tools": rng.value(2)}),
+            2 => json!({"prompt": rng.value(3), "completion": rng.value(3)}),
+            _ => rng.object(3),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.jsonl");
+        write_jsonl(&path, &[row]);
+        for template in &templates {
+            for loss in [AssistantLoss::AllTurns, AssistantLoss::LastTurn] {
+                let options = pmetal_data::DatasetLoadOptions::new(64)
+                    .template(template.as_ref())
+                    .assistant_loss(loss);
+                if let Ok(ds) = TrainingDataset::load(&path, &tokenizer, &options) {
+                    loaded += ds.len();
+                    for s in ds.samples() {
+                        assert_eq!(s.labels.as_ref().map(Vec::len), Some(s.input_ids.len()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        loaded > 0,
+        "the generator should produce some readable rows"
+    );
+}
+
 // -- a real byte-level BPE tokenizer ---------------------------------------------
 
 /// The masks above, read off a real byte-level BPE tokenizer (offsets trimmed,
