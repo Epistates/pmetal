@@ -4140,7 +4140,6 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
     let config = FullTrainingConfig {
         model: ModelConfig {
             model_id: "meta-llama/Llama-3.2-1B".to_string(),
-            max_seq_len: 2048,
             ..Default::default()
         },
         lora: LoraConfig {
@@ -4168,7 +4167,6 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
         dataset: DatasetConfig {
             dataset_id: "./data/train.jsonl".to_string(),
             shuffle: true,
-            ..Default::default()
         },
     };
 
@@ -4182,7 +4180,7 @@ pub(crate) fn generate_sample_config(output: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Benchmark FFI overhead of the Rust bridge against Python MLX.
+/// Benchmark FFI overhead of the Rust runtime against Python MLX.
 ///
 /// Python baseline: ~7420 argmax ops/sec (~0.135ms per op) on Qwen3 vocab size.
 pub(crate) fn run_ffi_benchmark() -> anyhow::Result<()> {
@@ -4371,6 +4369,18 @@ pub(crate) async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn the_sample_config_pmetal_init_writes_loads_back_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sample.yaml");
+        generate_sample_config(path.to_str().unwrap()).expect("write sample");
+        let loaded = pmetal_core::FullTrainingConfig::from_yaml_file(&path).expect("load sample");
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        assert_eq!(loaded.config.model.model_id, "meta-llama/Llama-3.2-1B");
+        assert_eq!(loaded.config.training.num_epochs, 3);
+        assert_eq!(loaded.config.training.save_steps, Some(500));
+    }
 
     #[test]
     fn benchmark_tier_profile_scales_by_tier() {

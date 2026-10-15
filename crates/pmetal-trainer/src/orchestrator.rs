@@ -11,7 +11,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingCallback, TrainingConfig};
+/// The sections of a training config file, loaded and checked by `pmetal-core`.
+pub use pmetal_core::FullTrainingConfig;
+use pmetal_core::{ConfigValidator, LoraConfig, TrainingCallback, TrainingConfig};
 use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
     TrainingDataset, resolve_dataset_source,
@@ -264,6 +266,9 @@ fn merge_training_overrides(target: &mut TrainingConfig, overrides: &TrainingCon
     if overrides.wsd_stable_ratio != defaults.wsd_stable_ratio {
         target.wsd_stable_ratio = overrides.wsd_stable_ratio;
     }
+    if overrides.wsd_decay_style != defaults.wsd_decay_style {
+        target.wsd_decay_style = overrides.wsd_decay_style;
+    }
     if overrides.cosine_num_restarts != defaults.cosine_num_restarts {
         target.cosine_num_restarts = overrides.cosine_num_restarts;
     }
@@ -290,6 +295,44 @@ fn merge_training_overrides(target: &mut TrainingConfig, overrides: &TrainingCon
     }
     if overrides.max_seq_len != defaults.max_seq_len {
         target.max_seq_len = overrides.max_seq_len;
+    }
+}
+
+/// The training loop's settings for a run: the config's training and LoRA
+/// sections, and the dispatch choices.
+fn build_training_loop_config(
+    full_config: &FullTrainingConfig,
+    dispatch: &DispatchConfig,
+    dataloader: &DataLoaderConfig,
+    has_eval_dataset: bool,
+) -> TrainingLoopConfig {
+    TrainingLoopConfig {
+        training: full_config.training.clone(),
+        dataloader: dataloader.clone(),
+        use_metal_flash_attention: dispatch.flash_attention,
+        log_every: full_config.training.logging_steps.max(1),
+        checkpoint_every: full_config.training.save_steps.unwrap_or(500),
+        eval_every: if has_eval_dataset {
+            full_config.training.eval_steps.unwrap_or(100)
+        } else {
+            0
+        },
+        use_jit_compilation: dispatch.jit_compilation,
+        use_sequence_packing: dispatch.sequence_packing,
+        pack_max_seq_len: dispatch.pack_max_seq_len,
+        gradient_checkpointing: dispatch.gradient_checkpointing,
+        gradient_checkpointing_layers: dispatch.gradient_checkpointing_layers,
+        embedding_lr: full_config
+            .training
+            .embedding_learning_rate
+            .map(|v| v as f32),
+        eager_evaluation: true,
+        use_metal_fused_optimizer: dispatch.metal_fused_optimizer,
+        loraplus_lr_ratio: full_config.lora.loraplus_lr_ratio,
+        neftune_noise_alpha: None,
+        use_cut_cross_entropy: dispatch.cut_cross_entropy,
+        #[cfg(feature = "distributed")]
+        distributed: dispatch.distributed.clone(),
     }
 }
 
@@ -402,8 +445,11 @@ pub async fn run_training(
     // -----------------------------------------------------------------------
     let has_config_file = config.config_path.is_some();
     let mut full_config = if let Some(ref path) = config.config_path {
-        let content = std::fs::read_to_string(path)?;
-        serde_saphyr::from_str(&content)?
+        let loaded = FullTrainingConfig::from_yaml_file(path)?;
+        for note in &loaded.notes {
+            tracing::warn!("{path}: {note}");
+        }
+        loaded.config
     } else {
         FullTrainingConfig::default()
     };
@@ -416,6 +462,10 @@ pub async fn run_training(
         full_config.lora = config.lora.clone();
         full_config.training = config.training.clone();
     }
+
+    // The merged config is what runs: a file that was valid alone can still
+    // contradict the command line (a warmup ratio against `--warmup-steps`).
+    full_config.validate()?;
 
     // Validate required fields after the YAML file has had a chance to provide them.
     if full_config.model.model_id.is_empty() {
@@ -773,34 +823,12 @@ pub async fn run_training(
     #[cfg(not(feature = "distributed"))]
     let mut distributed_sync: DistributedSyncOption = None;
 
-    let training_loop_config = TrainingLoopConfig {
-        training: full_config.training.clone(),
-        dataloader: dataloader_config.clone(),
-        use_metal_flash_attention: config.dispatch.flash_attention,
-        log_every: full_config.training.logging_steps.max(1),
-        checkpoint_every: full_config.training.save_steps.unwrap_or(500),
-        eval_every: if eval_dataset.is_some() {
-            full_config.training.eval_steps.unwrap_or(100)
-        } else {
-            0
-        },
-        use_jit_compilation: config.dispatch.jit_compilation,
-        use_sequence_packing: config.dispatch.sequence_packing,
-        pack_max_seq_len: config.dispatch.pack_max_seq_len,
-        gradient_checkpointing: config.dispatch.gradient_checkpointing,
-        gradient_checkpointing_layers: config.dispatch.gradient_checkpointing_layers,
-        embedding_lr: full_config
-            .training
-            .embedding_learning_rate
-            .map(|v| v as f32),
-        eager_evaluation: true,
-        use_metal_fused_optimizer: config.dispatch.metal_fused_optimizer,
-        loraplus_lr_ratio: None,
-        neftune_noise_alpha: None,
-        use_cut_cross_entropy: config.dispatch.cut_cross_entropy,
-        #[cfg(feature = "distributed")]
-        distributed: config.dispatch.distributed.clone(),
-    };
+    let training_loop_config = build_training_loop_config(
+        &full_config,
+        &config.dispatch,
+        &dataloader_config,
+        eval_dataset.is_some(),
+    );
 
     // -----------------------------------------------------------------------
     // Phase 9: Load model + run training
@@ -1902,26 +1930,27 @@ pub fn format_param_count(count: usize) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Internal: YAML config wrapper (moved from CLI)
-// ---------------------------------------------------------------------------
-
-/// Full training config loaded from YAML.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct FullTrainingConfig {
-    #[serde(default)]
-    pub model: ModelConfig,
-    #[serde(default)]
-    pub lora: LoraConfig,
-    #[serde(default)]
-    pub training: TrainingConfig,
-    #[serde(default)]
-    pub dataset: DatasetConfig,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_loop_gets_the_lora_plus_ratio_and_embedding_rate_the_config_sets() {
+        // `lora.loraplus_lr_ratio` used to be read from the file and then
+        // handed to the training loop as `None`, so LoRA+ never ran.
+        let mut full = FullTrainingConfig::default();
+        full.lora.loraplus_lr_ratio = Some(16.0);
+        full.training.embedding_learning_rate = Some(5e-5);
+        let loop_config = build_training_loop_config(
+            &full,
+            &DispatchConfig::default(),
+            &DataLoaderConfig::default(),
+            false,
+        );
+        assert_eq!(loop_config.loraplus_lr_ratio, Some(16.0));
+        assert_eq!(loop_config.embedding_lr, Some(5e-5));
+        assert_eq!(loop_config.eval_every, 0, "no eval dataset, no evaluation");
+    }
 
     #[test]
     fn the_adapter_config_names_its_base_model() {

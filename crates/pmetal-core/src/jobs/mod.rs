@@ -34,6 +34,9 @@ pub mod rlkd;
 pub mod serve;
 pub mod tokenize;
 pub mod train;
+pub mod train_diffusion;
+pub mod train_draft;
+pub mod train_mtp;
 
 pub use bench::BenchSpec;
 pub use decide::DecideSpec;
@@ -53,6 +56,9 @@ pub use rlkd::RlkdSpec;
 pub use serve::ServeSpec;
 pub use tokenize::TokenizeSpec;
 pub use train::TrainSpec;
+pub use train_diffusion::TrainDiffusionSpec;
+pub use train_draft::TrainDraftSpec;
+pub use train_mtp::TrainMtpSpec;
 
 /// Default of every spec's `optimizer` field.
 pub(crate) fn default_optimizer() -> String {
@@ -63,5 +69,11 @@ pub(crate) fn default_optimizer() -> String {
 /// checked the name against the field's options, so this only fails on a
 /// spec that skipped it.
 pub fn parse_optimizer(name: &str) -> Result<crate::OptimizerType, String> {
+    name.parse()
+}
+
+/// The schedule a spec's `lr_schedule` field names. An unknown name is an
+/// error, never a quiet fall back to cosine.
+pub fn parse_lr_scheduler(name: &str) -> Result<crate::LrSchedulerType, String> {
     name.parse()
 }

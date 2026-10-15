@@ -48,9 +48,10 @@ pub struct TrainDraftArgs {
     #[arg(long = "warmup-steps", default_value = "100")]
     pub warmup_steps: usize,
 
-    /// LR schedule: constant, linear, cosine.
+    /// LR schedule: cosine, linear, constant, cosine_with_restarts,
+    /// polynomial or wsd.
     #[arg(long = "lr-schedule", default_value = "cosine")]
-    pub lr_schedule: String,
+    pub lr_schedule: pmetal_core::LrSchedulerType,
 
     /// AdamW weight decay.
     #[arg(long = "weight-decay", default_value = "0.01")]

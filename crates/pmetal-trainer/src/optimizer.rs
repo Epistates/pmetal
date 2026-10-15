@@ -33,7 +33,7 @@ use pmetal_runtime::compat::{
     module::ModuleParameters,
     optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable, apply_updates},
 };
-// The update rules live beside AdamW in the bridge; they are re-exported here
+// The update rules live beside AdamW in the runtime; they are re-exported here
 // where the trainer's callers have always found them.
 use pmetal_core::{OptimizerType, TrainingConfig};
 pub use pmetal_runtime::compat::optimizers::{Adafactor, Lion, MomentumSgd, SecondMoment};
@@ -69,6 +69,12 @@ impl TrainOptimizer {
             OptimizerType::Sgd => Self::Sgd(MomentumSgd::new(lr, weight_decay)),
             OptimizerType::Lion => Self::Lion(Lion::new(lr, weight_decay)),
             OptimizerType::Adafactor => Self::Adafactor(Adafactor::new(lr, weight_decay)),
+            OptimizerType::Muon | OptimizerType::AdamWScheduleFree | OptimizerType::AdamW8bit => {
+                panic!(
+                    "the {kind} optimizer is not built by this trainer yet; \
+                     TrainingConfig::validate refuses it, so a validated config never gets here"
+                )
+            }
         }
     }
 

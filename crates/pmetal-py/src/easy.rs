@@ -786,7 +786,7 @@ fn run_train_mtp_blocking(opts: MtpTrainOptions) -> Result<MtpTrainingResult, St
             opts.output.clone(),
             opts.log_every,
             opts.num_assistant_tokens,
-        );
+        )?;
         let batches = shard_batches(
             &opts.shards,
             opts.seq_len,
@@ -879,7 +879,7 @@ fn run_train_draft_blocking(opts: DraftTrainOptions) -> Result<MtpTrainingResult
             opts.output,
             opts.log_every,
             1,
-        );
+        )?;
         let batches = shard_batches(&opts.shards, opts.seq_len, opts.batch_size, opts.eos_token_id)?;
         let target_path = pmetal_hub::resolve_model_path(&opts.target, None, None)
             .await
@@ -940,13 +940,15 @@ fn build_mtp_config(
     output: String,
     log_every: usize,
     num_assistant_tokens: usize,
-) -> MtpTrainingConfig {
-    MtpTrainingConfig {
+) -> Result<MtpTrainingConfig, String> {
+    Ok(MtpTrainingConfig {
         num_steps: steps,
         learning_rate,
         min_lr,
         warmup_steps,
-        lr_schedule: parse_lr_schedule(lr_schedule),
+        lr_schedule: lr_schedule
+            .parse::<LrSchedulerType>()
+            .map_err(|e| format!("lr_schedule: {e}"))?,
         weight_decay,
         max_grad_norm: if max_grad_norm > 0.0 {
             Some(max_grad_norm)
@@ -962,15 +964,7 @@ fn build_mtp_config(
         log_every,
         num_assistant_tokens: num_assistant_tokens.max(1),
         ..Default::default()
-    }
-}
-
-fn parse_lr_schedule(value: &str) -> LrSchedulerType {
-    match value.to_ascii_lowercase().as_str() {
-        "constant" => LrSchedulerType::Constant,
-        "linear" => LrSchedulerType::Linear,
-        _ => LrSchedulerType::Cosine,
-    }
+    })
 }
 
 fn shard_batches(

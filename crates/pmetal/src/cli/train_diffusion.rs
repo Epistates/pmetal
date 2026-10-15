@@ -60,7 +60,11 @@ pub struct TrainDiffusionArgs {
 
     /// Restrict the denoising loss to corrupted canvas positions (ELBO
     /// reconstruction term). When false, average over the whole canvas.
-    #[arg(long = "corrupted-only", default_value = "true")]
+    #[arg(
+        long = "corrupted-only",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
     pub corrupted_only: bool,
 
     /// Quantization method for QLoRA (none, nf4, fp4, int8), as for `pmetal

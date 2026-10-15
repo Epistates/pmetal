@@ -1176,7 +1176,7 @@ fn main() -> anyhow::Result<()> {
     if cli.command.uses_mlx() {
         ensure_metallib();
         // Load the library now: if MLX can't, the command would otherwise fail
-        // later, possibly by aborting from a bridge call with no error guard.
+        // later, possibly by aborting from a runtime call with no error guard.
         pmetal_runtime::inline_array::init_device().map_err(|e| {
             anyhow::anyhow!(
                 "MLX could not load its Metal library: {e}\n\
@@ -1351,20 +1351,9 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             use pmetal_trainer::orchestrator;
 
             // Parse LR schedule
-            let lr_scheduler = match lr_schedule.to_lowercase().as_str() {
-                "constant" => pmetal_core::LrSchedulerType::Constant,
-                "linear" => pmetal_core::LrSchedulerType::Linear,
-                "cosine" => pmetal_core::LrSchedulerType::Cosine,
-                "cosine_with_restarts" => pmetal_core::LrSchedulerType::CosineWithRestarts,
-                "polynomial" => pmetal_core::LrSchedulerType::Polynomial,
-                "wsd" => pmetal_core::LrSchedulerType::Wsd,
-                other => {
-                    anyhow::bail!(
-                        "Unknown lr-schedule '{}'. Valid: constant, linear, cosine, cosine_with_restarts, polynomial, wsd",
-                        other
-                    );
-                }
-            };
+            let lr_scheduler = lr_schedule
+                .parse::<pmetal_core::LrSchedulerType>()
+                .map_err(|e| anyhow::anyhow!("--lr-schedule: {e}"))?;
 
             // Build QLoRA config if quantization is requested
             let qlora = if !matches!(quantization, QuantizationMethod::None) {
@@ -2470,12 +2459,9 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             );
 
             // Parse LR schedule
-            let lr_sched = match lr_schedule.to_lowercase().as_str() {
-                "constant" => pmetal_core::LrSchedulerType::Constant,
-                "linear" => pmetal_core::LrSchedulerType::Linear,
-                "cosine" => pmetal_core::LrSchedulerType::Cosine,
-                other => anyhow::bail!("unknown lr-schedule: {other}"),
-            };
+            let lr_sched = lr_schedule
+                .parse::<pmetal_core::LrSchedulerType>()
+                .map_err(|e| anyhow::anyhow!("--lr-schedule: {e}"))?;
 
             // Build model via factory (supports llama, qwen2, qwen3, gemma, gemma4, mistral, phi, gpt-oss)
             use pmetal_runtime::compat::module::ModuleParameters;
@@ -2736,6 +2722,102 @@ mod argv_roundtrip {
             "TrainSpec argv failed to parse: {}",
             result.unwrap_err()
         );
+    }
+
+    #[cfg(feature = "trainer")]
+    #[test]
+    fn train_mtp_draft_and_diffusion_specs_round_trip() {
+        use pmetal_core::jobs::{TrainDiffusionSpec, TrainDraftSpec, TrainMtpSpec};
+        for family in ["auto", "qwen3-next", "gemma4"] {
+            let spec = TrainMtpSpec {
+                model: "m".into(),
+                family: family.into(),
+                shards: vec!["a.bin".into(), "b.bin".into()],
+                lr_schedule: "wsd".into(),
+                init_mtp: Some("mtp".into()),
+                ..Default::default()
+            };
+            let parsed = try_parse("train-mtp", spec.to_argv())
+                .unwrap_or_else(|e| panic!("family {family}: {e}"));
+            let Commands::TrainMtp(args) = parsed else {
+                panic!("not train-mtp")
+            };
+            assert_eq!(args.shards, ["a.bin", "b.bin"]);
+            assert_eq!(args.lr_schedule, pmetal_core::LrSchedulerType::Wsd);
+        }
+        let spec = TrainDraftSpec {
+            target: "t".into(),
+            draft_config: Some("c.json".into()),
+            shards: vec!["a.bin".into()],
+            ..Default::default()
+        };
+        let Commands::TrainDraft(args) = try_parse("train-draft", spec.to_argv()).unwrap() else {
+            panic!("not train-draft")
+        };
+        assert_eq!(args.draft_config.as_deref(), Some("c.json"));
+        for quantization in ["none", "nf4", "fp4", "int8"] {
+            let spec = TrainDiffusionSpec {
+                model: "m".into(),
+                dataset: "d".into(),
+                quantization: quantization.into(),
+                double_quant: quantization == "nf4",
+                ..Default::default()
+            };
+            let parsed = try_parse("train-diffusion", spec.to_argv())
+                .unwrap_or_else(|e| panic!("quantization {quantization}: {e}"));
+            let Commands::TrainDiffusion(args) = parsed else {
+                panic!("not train-diffusion")
+            };
+            assert_eq!(args.lora_targets, ["q_proj", "k_proj", "v_proj", "o_proj"]);
+        }
+    }
+
+    #[cfg(feature = "trainer")]
+    #[test]
+    fn train_diffusion_corrupted_only_can_be_turned_off() {
+        // `--corrupted-only` defaults to true and used to be a set-true flag,
+        // so the documented "when false, average over the whole canvas" mode
+        // could not be selected.
+        let parse = |extra: &[&str]| {
+            let mut argv: Vec<String> = ["--model", "m", "--dataset", "d"]
+                .map(String::from)
+                .to_vec();
+            argv.extend(extra.iter().map(|s| s.to_string()));
+            match try_parse("train-diffusion", argv) {
+                Ok(Commands::TrainDiffusion(args)) => args.corrupted_only,
+                Ok(_) => panic!("not train-diffusion"),
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert!(parse(&[]));
+        assert!(parse(&["--corrupted-only", "true"]));
+        assert!(!parse(&["--corrupted-only", "false"]));
+    }
+
+    #[cfg(feature = "trainer")]
+    #[test]
+    fn a_schedule_the_trainer_supports_reaches_it_and_a_typo_is_refused() {
+        // `train-mtp` and `train-draft` used to read any name but constant
+        // and linear as cosine, so `wsd` trained on the wrong curve.
+        for (subcommand, model_flag) in [("train-mtp", "--model"), ("train-draft", "--target")] {
+            let parse = |schedule: &str| {
+                try_parse(
+                    subcommand,
+                    [model_flag, "t", "--shards", "s", "--lr-schedule", schedule]
+                        .map(String::from)
+                        .to_vec(),
+                )
+            };
+            let parsed = parse("wsd").unwrap_or_else(|e| panic!("{subcommand}: {e}"));
+            let got = match parsed {
+                Commands::TrainMtp(a) => a.lr_schedule,
+                Commands::TrainDraft(a) => a.lr_schedule,
+                _ => panic!("{subcommand} parsed as another command"),
+            };
+            assert_eq!(got, pmetal_core::LrSchedulerType::Wsd);
+            let err = parse("cosin").unwrap_err();
+            assert!(err.contains("cosin"), "{subcommand}: {err}");
+        }
     }
 
     #[test]

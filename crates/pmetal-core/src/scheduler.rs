@@ -4,7 +4,7 @@
 //! used across all trainers. Use these instead of implementing schedulers
 //! in individual trainer modules.
 
-use crate::{LrSchedulerType, Result};
+use crate::{LrSchedulerType, WsdDecayStyle};
 use std::f64::consts::PI;
 
 /// Learning rate scheduler that computes LR based on training progress.
@@ -27,6 +27,8 @@ pub struct LearningRateScheduler {
     num_restarts: usize,
     /// Fraction of post-warmup steps at stable (peak) LR for WSD (0.0-1.0).
     stable_ratio: f64,
+    /// Shape of the WSD decay phase.
+    wsd_decay_style: WsdDecayStyle,
     /// Exponent for polynomial decay (default 1.0 = linear).
     polynomial_power: f64,
     /// Current step.
@@ -49,6 +51,7 @@ impl LearningRateScheduler {
             scheduler_type,
             num_restarts: 1,
             stable_ratio: 0.7,
+            wsd_decay_style: WsdDecayStyle::default(),
             polynomial_power: 1.0,
             current_step: 0,
         }
@@ -58,6 +61,11 @@ impl LearningRateScheduler {
     /// steps: its scheduler type, warmup (`warmup_ratio` of the total when
     /// set, else `warmup_steps`), `min_lr`, restarts, WSD stable share and
     /// polynomial power.
+    ///
+    /// The knobs are taken as given, not clamped: a config that has not passed
+    /// [`ConfigValidator::validate`](crate::ConfigValidator::validate) (a
+    /// stable ratio of 3, a power of -1) gets the schedule those numbers
+    /// describe, not a corrected one.
     pub fn for_training(config: &crate::TrainingConfig, total_steps: usize) -> Self {
         let mut scheduler = Self::new(
             config.learning_rate,
@@ -72,10 +80,19 @@ impl LearningRateScheduler {
         if let Some(ratio) = config.wsd_stable_ratio {
             scheduler = scheduler.with_stable_ratio(ratio);
         }
+        if let Some(style) = config.wsd_decay_style {
+            scheduler = scheduler.with_wsd_decay_style(style);
+        }
         if let Some(power) = config.polynomial_power {
             scheduler = scheduler.with_polynomial_power(power);
         }
         scheduler
+    }
+
+    /// Set the shape of the WSD decay phase (default linear).
+    pub fn with_wsd_decay_style(mut self, style: WsdDecayStyle) -> Self {
+        self.wsd_decay_style = style;
+        self
     }
 
     /// Set minimum learning rate.
@@ -84,7 +101,8 @@ impl LearningRateScheduler {
         self
     }
 
-    /// Set number of restarts for cosine with restarts.
+    /// Set the number of cosine cycles for cosine with restarts (1 is a
+    /// single cosine; `n` cycles restart `n - 1` times).
     pub fn with_num_restarts(mut self, num_restarts: usize) -> Self {
         self.num_restarts = num_restarts;
         self
@@ -92,13 +110,13 @@ impl LearningRateScheduler {
 
     /// Set stable phase ratio for WSD scheduler (default 0.7).
     pub fn with_stable_ratio(mut self, ratio: f64) -> Self {
-        self.stable_ratio = ratio.clamp(0.0, 1.0);
+        self.stable_ratio = ratio;
         self
     }
 
     /// Set polynomial decay exponent (default 1.0 = linear, 2.0 = quadratic).
     pub fn with_polynomial_power(mut self, power: f64) -> Self {
-        self.polynomial_power = power.max(0.1); // clamp to positive
+        self.polynomial_power = power;
         self
     }
 
@@ -133,12 +151,13 @@ impl LearningRateScheduler {
             }
 
             LrSchedulerType::CosineWithRestarts => {
-                let cycle_length = decay_steps.div_ceil(self.num_restarts.max(1));
-                let cycle_progress = if cycle_length > 0 {
-                    (current_decay_step % cycle_length) as f64 / cycle_length as f64
-                } else {
-                    0.0
-                };
+                // `num_restarts` hard-restarted cosine cycles over the decay
+                // span, then the floor: the same curve as transformers'
+                // `get_cosine_with_hard_restarts_schedule_with_warmup`.
+                if progress >= 1.0 {
+                    return self.min_lr;
+                }
+                let cycle_progress = (self.num_restarts.max(1) as f64 * progress) % 1.0;
                 self.min_lr
                     + (self.base_lr - self.min_lr) * 0.5 * (1.0 + (PI * cycle_progress).cos())
             }
@@ -164,7 +183,8 @@ impl LearningRateScheduler {
                     } else {
                         1.0
                     };
-                    self.min_lr + (self.base_lr - self.min_lr) * (1.0 - decay_progress)
+                    self.min_lr
+                        + (self.base_lr - self.min_lr) * self.wsd_decay_style.factor(decay_progress)
                 }
             }
         }
@@ -231,118 +251,6 @@ pub fn total_training_steps(
         micro_batches_per_epoch * epochs / per_step
     };
     total.max(1)
-}
-
-/// Builder for `LearningRateScheduler`.
-#[derive(Debug, Clone)]
-pub struct SchedulerBuilder {
-    base_lr: f64,
-    min_lr: f64,
-    total_steps: usize,
-    warmup_steps: usize,
-    warmup_ratio: Option<f64>,
-    scheduler_type: LrSchedulerType,
-    num_restarts: usize,
-    stable_ratio: f64,
-    polynomial_power: f64,
-}
-
-impl Default for SchedulerBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl SchedulerBuilder {
-    /// Create a new scheduler builder.
-    pub fn new() -> Self {
-        Self {
-            base_lr: crate::defaults::LEARNING_RATE,
-            min_lr: 0.0,
-            total_steps: 1000,
-            warmup_steps: crate::defaults::WARMUP_STEPS,
-            warmup_ratio: None,
-            scheduler_type: LrSchedulerType::Cosine,
-            num_restarts: 1,
-            stable_ratio: 0.7,
-            polynomial_power: 1.0,
-        }
-    }
-
-    /// Set polynomial decay exponent (default 1.0 = linear).
-    pub fn polynomial_power(mut self, power: f64) -> Self {
-        self.polynomial_power = power;
-        self
-    }
-
-    /// Set base learning rate.
-    pub fn base_lr(mut self, lr: f64) -> Self {
-        self.base_lr = lr;
-        self
-    }
-
-    /// Set minimum learning rate.
-    pub fn min_lr(mut self, lr: f64) -> Self {
-        self.min_lr = lr;
-        self
-    }
-
-    /// Set total training steps.
-    pub fn total_steps(mut self, steps: usize) -> Self {
-        self.total_steps = steps;
-        self
-    }
-
-    /// Set warmup steps.
-    pub fn warmup_steps(mut self, steps: usize) -> Self {
-        self.warmup_steps = steps;
-        self.warmup_ratio = None;
-        self
-    }
-
-    /// Set warmup ratio (alternative to warmup_steps).
-    pub fn warmup_ratio(mut self, ratio: f64) -> Self {
-        self.warmup_ratio = Some(ratio);
-        self
-    }
-
-    /// Set scheduler type.
-    pub fn scheduler_type(mut self, scheduler: LrSchedulerType) -> Self {
-        self.scheduler_type = scheduler;
-        self
-    }
-
-    /// Set number of restarts for cosine with restarts.
-    pub fn num_restarts(mut self, restarts: usize) -> Self {
-        self.num_restarts = restarts;
-        self
-    }
-
-    /// Set WSD stable phase ratio (fraction of post-warmup at peak LR).
-    pub fn stable_ratio(mut self, ratio: f64) -> Self {
-        self.stable_ratio = ratio;
-        self
-    }
-
-    /// Build the scheduler.
-    pub fn build(self) -> Result<LearningRateScheduler> {
-        let warmup_steps = if let Some(ratio) = self.warmup_ratio {
-            (self.total_steps as f64 * ratio).ceil() as usize
-        } else {
-            self.warmup_steps
-        };
-
-        Ok(LearningRateScheduler::new(
-            self.base_lr,
-            self.total_steps,
-            warmup_steps,
-            self.scheduler_type,
-        )
-        .with_min_lr(self.min_lr)
-        .with_num_restarts(self.num_restarts)
-        .with_stable_ratio(self.stable_ratio)
-        .with_polynomial_power(self.polynomial_power))
-    }
 }
 
 #[cfg(test)]
@@ -443,20 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn test_builder() {
-        let scheduler = SchedulerBuilder::new()
-            .base_lr(2e-4)
-            .warmup_ratio(0.1)
-            .total_steps(1000)
-            .scheduler_type(LrSchedulerType::Cosine)
-            .build()
-            .unwrap();
-
-        // Warmup should be 10% of total steps = 100
-        assert!(scheduler.get_lr(50) < scheduler.get_lr(99));
-    }
-
-    #[test]
     fn test_wsd_scheduler() {
         // 1000 steps, 100 warmup, stable_ratio=0.7 → 630 stable steps, 270 decay steps
         let scheduler = LearningRateScheduler::new(1e-4, 1000, 100, LrSchedulerType::Wsd)
@@ -498,6 +392,136 @@ mod tests {
         // All post-warmup steps at base LR
         assert!((scheduler.get_lr(50) - 1e-4).abs() < 1e-10);
         assert!((scheduler.get_lr(99) - 1e-4).abs() < 1e-10);
+    }
+
+    /// transformers' `_get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda`,
+    /// term for term.
+    fn reference_hard_restarts(step: usize, warmup: usize, total: usize, cycles: usize) -> f64 {
+        if step < warmup {
+            return step as f64 / warmup.max(1) as f64;
+        }
+        let progress = (step - warmup) as f64 / total.saturating_sub(warmup).max(1) as f64;
+        if progress >= 1.0 {
+            return 0.0;
+        }
+        (0.5 * (1.0 + (PI * ((cycles as f64 * progress) % 1.0)).cos())).max(0.0)
+    }
+
+    #[test]
+    fn cosine_with_restarts_matches_the_reference_schedule() {
+        for (total, warmup, cycles) in [
+            (100, 0, 1),
+            (100, 10, 2),
+            (97, 7, 3),
+            (50, 0, 5),
+            (9, 0, 3),
+            (10, 2, 4),
+        ] {
+            let s =
+                LearningRateScheduler::new(1.0, total, warmup, LrSchedulerType::CosineWithRestarts)
+                    .with_num_restarts(cycles);
+            for step in 0..=total + 3 {
+                let want = reference_hard_restarts(step, warmup, total, cycles);
+                let got = s.get_lr(step);
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "total={total} warmup={warmup} cycles={cycles} step={step}: got {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decay_schedules_match_the_reference_formulas() {
+        // transformers' get_linear_schedule_with_warmup,
+        // get_cosine_schedule_with_warmup (num_cycles = 0.5) and
+        // get_polynomial_decay_schedule_with_warmup (lr_end = 0), as the
+        // multiplier on the peak rate.
+        for (total, warmup) in [(100usize, 0usize), (100, 10), (37, 5), (8, 7), (10, 1)] {
+            let denom = total.saturating_sub(warmup).max(1) as f64;
+            for step in 0..=total {
+                let warm = step as f64 / warmup.max(1) as f64;
+                let progress = step.saturating_sub(warmup) as f64 / denom;
+                let (linear, cosine, quad) = if step < warmup {
+                    (warm, warm, warm)
+                } else {
+                    (
+                        ((total - step) as f64 / denom).max(0.0),
+                        (0.5 * (1.0 + (PI * 2.0 * 0.5 * progress).cos())).max(0.0),
+                        (1.0 - progress).powi(2),
+                    )
+                };
+                for (kind, want) in [
+                    (LrSchedulerType::Linear, linear),
+                    (LrSchedulerType::Cosine, cosine),
+                    (LrSchedulerType::Polynomial, quad),
+                ] {
+                    let mut s = LearningRateScheduler::new(1.0, total, warmup, kind);
+                    if kind == LrSchedulerType::Polynomial {
+                        s = s.with_polynomial_power(2.0);
+                    }
+                    assert!(
+                        (s.get_lr(step) - want).abs() < 1e-12,
+                        "{kind:?} total={total} warmup={warmup} step={step}: got {}, want {want}",
+                        s.get_lr(step)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wsd_decay_styles_match_the_reference_schedule() {
+        // transformers' `_get_wsd_scheduler_lambda`, with min_lr_ratio 0.1.
+        let (peak, ratio) = (2.0, 0.1);
+        let (warmup, total, stable_ratio) = (10usize, 110usize, 0.5);
+        let decay_span = total - warmup;
+        let stable = (decay_span as f64 * stable_ratio) as usize;
+        let decay = decay_span - stable;
+        for (style, factor) in [
+            (WsdDecayStyle::Linear, (|p: f64| 1.0 - p) as fn(f64) -> f64),
+            (WsdDecayStyle::Cosine, |p| 0.5 * (1.0 + (PI * p).cos())),
+            (WsdDecayStyle::OneMinusSqrt, |p| 1.0 - p.sqrt()),
+        ] {
+            let s = LearningRateScheduler::new(peak, total, warmup, LrSchedulerType::Wsd)
+                .with_min_lr(peak * ratio)
+                .with_stable_ratio(stable_ratio)
+                .with_wsd_decay_style(style);
+            for step in 0..=total {
+                let want = if step < warmup {
+                    let p = step as f64 / warmup as f64;
+                    p * (1.0 - ratio) + ratio
+                } else if step < warmup + stable {
+                    1.0
+                } else if step < warmup + stable + decay {
+                    let p = (step - warmup - stable) as f64 / decay as f64;
+                    factor(p) * (1.0 - ratio) + ratio
+                } else {
+                    ratio
+                } * peak;
+                assert!(
+                    (s.get_lr(step) - want).abs() < 1e-12,
+                    "{style:?} step={step}: got {}, want {want}",
+                    s.get_lr(step)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cosine_with_restarts_ends_at_the_floor_and_stays_there() {
+        let s = LearningRateScheduler::new(1e-3, 100, 0, LrSchedulerType::CosineWithRestarts)
+            .with_num_restarts(2)
+            .with_min_lr(1e-5);
+        // The last step of the run and everything past it sit at the floor
+        // instead of jumping back to the peak for a restart nobody asked for.
+        for step in [100, 101, 150, 1_000] {
+            assert!(
+                (s.get_lr(step) - 1e-5).abs() < 1e-12,
+                "step {step}: {}",
+                s.get_lr(step)
+            );
+        }
     }
 
     #[test]

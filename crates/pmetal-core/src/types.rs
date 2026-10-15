@@ -2,6 +2,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Deserializers that read JSON's stand-in for a non-finite float back.
+///
+/// JSON has no NaN or infinity, so `serde_json` writes them as `null`. A
+/// plain `f64` field then fails to read its own output, which loses the one
+/// event a monitor most needs: the step where the loss diverged. Fields that
+/// carry measurements read `null` as NaN instead.
+pub(crate) mod lenient_f64 {
+    use serde::{Deserialize, Deserializer};
+    use std::collections::HashMap;
+
+    /// A float, or `null` read as NaN.
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+        Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
+    }
+
+    /// A map of floats, any of which may be `null`.
+    pub(crate) fn map<'de, D: Deserializer<'de>>(d: D) -> Result<HashMap<String, f64>, D::Error> {
+        let raw = HashMap::<String, Option<f64>>::deserialize(d)?;
+        Ok(raw
+            .into_iter()
+            .map(|(k, v)| (k, v.unwrap_or(f64::NAN)))
+            .collect())
+    }
+}
+
 /// Data type for tensors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -36,36 +61,6 @@ impl Dtype {
             Self::Float16 | Self::BFloat16 => 2,
             Self::Float8E4M3 | Self::Float8E5M2 | Self::UInt8 | Self::Bool => 1,
             Self::Int64 => 8,
-        }
-    }
-}
-
-/// Compute device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Device {
-    /// CPU computation.
-    Cpu,
-    /// GPU computation (Metal on macOS).
-    #[cfg_attr(not(feature = "ane"), default)]
-    Gpu,
-    /// Apple Neural Engine (ANE) computation.
-    #[cfg(feature = "ane")]
-    #[cfg_attr(feature = "ane", default)]
-    Ane,
-}
-
-impl Device {
-    /// Returns true if this device targets the Apple Neural Engine.
-    #[inline]
-    pub fn is_ane(&self) -> bool {
-        #[cfg(feature = "ane")]
-        {
-            matches!(self, Self::Ane)
-        }
-        #[cfg(not(feature = "ane"))]
-        {
-            false
         }
     }
 }
@@ -152,29 +147,20 @@ impl MemoryStats {
     }
 }
 
-/// Model output from forward pass.
-#[derive(Debug, Clone)]
-pub struct ModelOutput<T> {
-    /// Logits tensor.
-    pub logits: T,
-    /// Hidden states (optional).
-    pub hidden_states: Option<Vec<T>>,
-    /// Attention weights (optional).
-    pub attentions: Option<Vec<T>>,
-    /// Past key-value cache (optional).
-    pub past_key_values: Option<Vec<(T, T)>>,
-}
-
 /// Evaluation metrics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EvalMetrics {
     /// Loss value.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub loss: f64,
     /// Perplexity.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub perplexity: f64,
     /// Accuracy (if applicable).
     pub accuracy: Option<f64>,
     /// Custom metrics.
+    #[serde(deserialize_with = "lenient_f64::map")]
     pub custom: std::collections::HashMap<String, f64>,
 }
 
@@ -183,14 +169,17 @@ pub struct EvalMetrics {
 /// This is the canonical training state used across all trainers.
 /// Algorithm-specific trainers can extend this with additional fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TrainingState {
     /// Current global step.
     pub step: usize,
     /// Current epoch.
     pub epoch: usize,
     /// Current loss value.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub loss: f64,
     /// Current learning rate.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub learning_rate: f64,
     /// Total tokens processed.
     pub tokens_processed: usize,
@@ -201,6 +190,7 @@ pub struct TrainingState {
     /// Samples processed in current epoch.
     pub epoch_samples: usize,
     /// Total training time in seconds.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub elapsed_secs: f64,
 }
 
@@ -242,6 +232,7 @@ impl TrainingState {
 /// Used by `TrainingCallback::on_step_end_with_metrics` to feed real-time
 /// dashboards and JSONL loggers with complete training telemetry.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StepMetrics {
     /// Step number.
     pub step: usize,
@@ -252,38 +243,47 @@ pub struct StepMetrics {
     /// Total number of training steps (if known).
     pub total_steps: usize,
     /// Loss value.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub loss: f64,
     /// Learning rate.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub lr: f64,
     /// Tokens processed per second.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub tok_sec: f64,
     /// ANE forward pass time (ms). Zero for GPU-only training.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub ane_fwd_ms: f64,
     /// ANE backward pass time (ms). Zero for GPU-only training.
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub ane_bwd_ms: f64,
     /// RMSNorm CPU time (ms).
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub rmsnorm_ms: f64,
     /// cblas weight gradient time (ms).
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub cblas_ms: f64,
     /// Adam optimizer time (ms).
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub adam_ms: f64,
     /// Total step time (ms).
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub total_ms: f64,
     /// Number of tokens in this step.
     pub tokens: usize,
     /// Gradient norm (if computed).
     pub grad_norm: Option<f64>,
     /// GPU forward+backward time (ms). Zero for ANE-only training.
-    #[serde(default)]
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub gpu_fwd_bwd_ms: f64,
     /// Optimizer step time (ms) — covers Metal fused, MLX, or CPU Adam.
-    #[serde(default)]
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub optimizer_ms: f64,
     /// I/O staging time (ms) — IOSurface writes + expert pread.
-    #[serde(default)]
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub io_staging_ms: f64,
     /// Overhead not attributed to any category (ms).
-    #[serde(default)]
+    #[serde(deserialize_with = "lenient_f64::deserialize")]
     pub overhead_ms: f64,
 }
 

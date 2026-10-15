@@ -3,11 +3,14 @@
 //! This crate provides the foundational abstractions used throughout the PMetal
 //! framework, including:
 //!
-//! - Core trait definitions for models, trainers, and quantizers
-//! - Configuration types for training, LoRA, and model loading
-//! - Common type definitions (Dtype, Device, etc.)
-//! - Error handling infrastructure
+//! - Configuration types for training, LoRA, dataset and model loading, the
+//!   strict loader for the config file ([`FullTrainingConfig`]) and their
+//!   validation ([`ConfigValidator`])
+//! - The job specs every surface builds jobs from ([`jobs`]) and the events
+//!   a job streams back ([`events`])
 //! - Learning rate schedulers
+//! - Training callbacks and shared metric types
+//! - Error handling infrastructure
 //! - Secure handling of secrets (tokens, credentials)
 
 #![warn(missing_docs)]
@@ -18,6 +21,7 @@
 extern crate self as pmetal_core;
 
 mod config;
+mod config_file;
 pub mod constants;
 mod error;
 pub mod events;
@@ -27,8 +31,10 @@ pub mod scheduler;
 mod secrets;
 mod traits;
 mod types;
+mod validation;
 
 pub use config::*;
+pub use config_file::{FullTrainingConfig, LoadedConfig};
 pub use error::*;
 pub use events::{
     BenchTrialMetrics, BroadcastSink, CompletionSummary, JobEvent, JobEventSink, JobKind,
@@ -36,9 +42,7 @@ pub use events::{
     ServeRequestMetrics, TrainingCallbackToSink, parse_event, write_event,
 };
 pub use fields::{DefaultValue, FieldDescriptor, FieldError, FieldKind, JobFields};
-pub use scheduler::{
-    LearningRateScheduler, SchedulerBuilder, total_training_steps, warmup_steps_for,
-};
+pub use scheduler::{LearningRateScheduler, total_training_steps, warmup_steps_for};
 pub use secrets::SecretString;
 pub use traits::*;
 pub use types::*;
@@ -50,10 +54,11 @@ pub use pmetal_core_derive::JobSpec;
 /// Prelude module for convenient imports.
 pub mod prelude {
     pub use crate::config::*;
+    pub use crate::config_file::{FullTrainingConfig, LoadedConfig};
     pub use crate::error::{PMetalError, Result};
     pub use crate::events::{JobEvent, JobEventSink, JobKind, JobStatus, MetricPayload, Phase};
     pub use crate::fields::{DefaultValue, FieldDescriptor, FieldError, FieldKind, JobFields};
-    pub use crate::scheduler::{LearningRateScheduler, SchedulerBuilder};
+    pub use crate::scheduler::LearningRateScheduler;
     pub use crate::secrets::SecretString;
     pub use crate::traits::*;
     pub use crate::types::*;

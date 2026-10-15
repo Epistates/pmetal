@@ -1,6 +1,9 @@
 //! `pmetal train` — supervised fine-tuning / LoRA / QLoRA / ANE.
 
-use crate::{FieldError, JobFields, defaults};
+use crate::{
+    DistributedCompression, DistributedTrainingConfig, FieldError, JobFields, LoraConfig,
+    TrainingConfig, defaults,
+};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
@@ -507,6 +510,68 @@ impl TrainSpec {
         let errs = self.validate_descriptors();
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
+
+    /// The adapter this spec asks for. Every surface that runs a spec builds
+    /// its `LoraConfig` here, so a field (`dora`, `rslora`, `lora_dropout`)
+    /// cannot be honoured by one surface and dropped by another.
+    pub fn lora_config(&self) -> LoraConfig {
+        LoraConfig {
+            r: self.lora_r,
+            alpha: self.lora_alpha,
+            dropout: self.lora_dropout,
+            use_rslora: self.rslora,
+            use_dora: self.dora,
+            ..Default::default()
+        }
+    }
+
+    /// The optimisation settings this spec asks for. An optimizer or schedule
+    /// name that is not a known one is an error rather than a default.
+    pub fn training_config(&self) -> Result<TrainingConfig, String> {
+        Ok(TrainingConfig {
+            learning_rate: self.learning_rate,
+            embedding_learning_rate: self.embedding_lr,
+            batch_size: self.batch_size,
+            gradient_accumulation_steps: self.gradient_accumulation_steps,
+            num_epochs: self.epochs,
+            warmup_steps: self.warmup_steps,
+            weight_decay: self.weight_decay,
+            max_grad_norm: self.max_grad_norm,
+            lr_scheduler: super::parse_lr_scheduler(&self.lr_schedule)?,
+            optimizer: super::parse_optimizer(&self.optimizer)?,
+            seed: self.seed,
+            output_dir: self.output_dir.clone(),
+            max_seq_len: self.max_seq_len,
+            use_packing: !self.no_sequence_packing,
+            ..Default::default()
+        })
+    }
+
+    /// The multi-Mac settings, or `None` when neither peers nor discovery is
+    /// asked for.
+    pub fn distributed_config(&self) -> Result<Option<DistributedTrainingConfig>, String> {
+        let peers: Vec<String> = self
+            .distributed_peers
+            .as_deref()
+            .map(|csv| {
+                csv.split(',')
+                    .map(str::trim)
+                    .filter(|peer| !peer.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let compression: DistributedCompression = self.compression_strategy.parse()?;
+        if peers.is_empty() && !self.distributed_auto {
+            return Ok(None);
+        }
+        Ok(Some(DistributedTrainingConfig {
+            peers,
+            auto_discover: self.distributed_auto,
+            compression,
+            ..Default::default()
+        }))
+    }
 }
 
 // -- defaults shims (for `#[serde(default = "...")]`) -----------------------
@@ -650,6 +715,101 @@ mod tests {
     fn subcommand_and_kind() {
         assert_eq!(TrainSpec::subcommand(), "train");
         assert_eq!(TrainSpec::job_kind(), crate::JobKind::Train);
+    }
+
+    fn enum_options(field: &str) -> Vec<&'static str> {
+        let descriptor = TrainSpec::field_descriptors()
+            .iter()
+            .find(|d| d.name == field)
+            .unwrap_or_else(|| panic!("no field {field}"));
+        match descriptor.kind {
+            crate::FieldKind::Enum { options } => options.to_vec(),
+            other => panic!("{field} is not an enum: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_fields_offer_exactly_what_the_config_types_parse() {
+        // The option lists live in attributes, so they cannot be read from the
+        // enums; this keeps the two from drifting apart.
+        let names = |all: Vec<&'static str>| {
+            let mut all = all;
+            all.sort_unstable();
+            all
+        };
+        assert_eq!(
+            names(enum_options("optimizer")),
+            names(crate::OptimizerType::SUPPORTED.map(|k| k.as_str()).to_vec())
+        );
+        assert_eq!(
+            names(enum_options("lr_schedule")),
+            names(crate::LrSchedulerType::ALL.map(|k| k.as_str()).to_vec())
+        );
+        assert_eq!(
+            names(enum_options("compression_strategy")),
+            names(DistributedCompression::ALL.map(|k| k.as_str()).to_vec())
+        );
+    }
+
+    #[test]
+    fn the_spec_builds_the_configs_every_surface_runs() {
+        let spec = TrainSpec {
+            lora_r: 8,
+            lora_alpha: 24.0,
+            lora_dropout: 0.05,
+            dora: true,
+            rslora: true,
+            learning_rate: 1e-4,
+            embedding_lr: Some(5e-5),
+            epochs: 2,
+            optimizer: "lion".into(),
+            lr_schedule: "wsd".into(),
+            no_sequence_packing: true,
+            distributed_peers: Some("a:1, b:2,".into()),
+            compression_strategy: "topk".into(),
+            ..Default::default()
+        };
+        let lora = spec.lora_config();
+        assert_eq!((lora.r, lora.alpha, lora.dropout), (8, 24.0, 0.05));
+        assert!(lora.use_dora && lora.use_rslora);
+
+        let training = spec.training_config().unwrap();
+        assert_eq!(training.learning_rate, 1e-4);
+        assert_eq!(training.embedding_learning_rate, Some(5e-5));
+        assert_eq!(training.num_epochs, 2);
+        assert_eq!(training.optimizer, crate::OptimizerType::Lion);
+        assert_eq!(training.lr_scheduler, crate::LrSchedulerType::Wsd);
+        assert!(!training.use_packing);
+
+        let distributed = spec.distributed_config().unwrap().unwrap();
+        assert_eq!(distributed.peers, ["a:1", "b:2"]);
+        assert_eq!(distributed.compression, DistributedCompression::TopK);
+        assert!(TrainSpec::default().distributed_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unknown_optimizer_or_schedule_is_an_error() {
+        let bad_schedule = TrainSpec {
+            lr_schedule: "cosin".into(),
+            ..Default::default()
+        };
+        assert!(
+            bad_schedule
+                .training_config()
+                .unwrap_err()
+                .contains("cosin")
+        );
+        let bad_optimizer = TrainSpec {
+            optimizer: "adam".into(),
+            ..Default::default()
+        };
+        assert!(bad_optimizer.training_config().is_err());
+        let bad_compression = TrainSpec {
+            distributed_auto: true,
+            compression_strategy: "zstd".into(),
+            ..Default::default()
+        };
+        assert!(bad_compression.distributed_config().is_err());
     }
 
     #[test]

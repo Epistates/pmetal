@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use pmetal_core::LrSchedulerType;
 use pmetal_data::streaming::{StreamConfig, StreamingShardReader};
 use pmetal_models::DynamicModel;
 use pmetal_models::architectures::DFlashDraftModel;
@@ -78,7 +77,7 @@ fn build_config(args: &TrainDraftArgs) -> MtpTrainingConfig {
         learning_rate: args.learning_rate,
         min_lr: args.min_lr,
         warmup_steps: args.warmup_steps,
-        lr_schedule: parse_lr_schedule(&args.lr_schedule),
+        lr_schedule: args.lr_schedule,
         weight_decay: args.weight_decay,
         max_grad_norm: if args.max_grad_norm > 0.0 {
             Some(args.max_grad_norm)
@@ -93,14 +92,6 @@ fn build_config(args: &TrainDraftArgs) -> MtpTrainingConfig {
         checkpoint_dir: PathBuf::from(&args.output),
         log_every: args.log_every,
         ..Default::default()
-    }
-}
-
-fn parse_lr_schedule(value: &str) -> LrSchedulerType {
-    match value.to_ascii_lowercase().as_str() {
-        "constant" => LrSchedulerType::Constant,
-        "linear" => LrSchedulerType::Linear,
-        _ => LrSchedulerType::Cosine,
     }
 }
 
