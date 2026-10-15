@@ -2118,7 +2118,40 @@ impl DynamicModel {
         }
     }
 
+    /// The dtype the model computes in: that of its floating-point parameters.
+    ///
+    /// Read from a one-dimensional parameter (a norm weight, which no quantizer
+    /// touches), falling back to any floating-point one, never from a packed
+    /// weight: a `uint32` payload read as the model dtype is silent noise.
+    /// `Float32` for a model with no floating-point parameter at all.
+    pub fn compute_dtype(&self) -> Dtype {
+        let params = self.flatten_params();
+        params
+            .iter()
+            .filter(|(_, array)| {
+                matches!(
+                    array.dtype(),
+                    Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32
+                )
+            })
+            .min_by_key(|(name, array)| (array.ndim() != 1, name.to_string()))
+            .map_or(Dtype::Float32, |(_, array)| array.dtype())
+    }
+
+    /// A KV cache for `max_seq_len` tokens, holding keys and values in the
+    /// model's [`compute_dtype`](Self::compute_dtype).
+    ///
+    /// The layout (layers, heads, head size) is the architecture's own. The
+    /// dtype used to be `KVCacheConfig`'s default of f32 whatever the model ran
+    /// in, which doubled every memory estimate made from the cache's config and
+    /// allocated a fused batch cache twice the size of the one the model fills.
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        let layout = self.create_cache_layout(max_seq_len);
+        let config = layout.config().clone().with_dtype(self.compute_dtype());
+        KVCache::new(config)
+    }
+
+    fn create_cache_layout(&self, max_seq_len: usize) -> KVCache {
         match self {
             Self::Llama(m) => m.create_cache(max_seq_len),
             Self::Llama4(m) => KVCache::new(KVCacheConfig::new(
