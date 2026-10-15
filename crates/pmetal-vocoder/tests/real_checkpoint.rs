@@ -121,6 +121,81 @@ fn check_discriminators(name: &str) {
     assert_runtime_ok();
 }
 
+/// Fine-tune a released model with its released discriminators for a few
+/// steps: the step runs at full size, stays finite and does not blow the
+/// generator up.
+fn fine_tune_smoke(name: &str) {
+    use pmetal_runtime::compat::ops;
+    use pmetal_vocoder::BigVGANConfig;
+    use pmetal_vocoder::audio::MelFrontEnd;
+    use pmetal_vocoder::discriminator::{BigVGANDiscriminator, DiscriminatorConfig};
+    use pmetal_vocoder::train::{GanTrainer, TrainingConfig};
+
+    let Some(dir) = model_dir(name) else {
+        eprintln!("BIGVGAN_CHECKPOINT_DIR/{name} not found; skipping");
+        return;
+    };
+    let discriminator_checkpoint = dir.join("bigvgan_discriminator_optimizer.pt");
+    if !discriminator_checkpoint.is_file() {
+        eprintln!("{} not found; skipping", discriminator_checkpoint.display());
+        return;
+    }
+    let json = std::fs::read_to_string(dir.join("config.json")).expect("config.json");
+    let model_config = BigVGANConfig::from_json(&json).unwrap();
+    let mut training = TrainingConfig::from_json(&json).unwrap();
+    training.learning_rate = 1e-6; // a gentle fine-tune
+    let mut discriminator =
+        BigVGANDiscriminator::new(&DiscriminatorConfig::from_json(&json).unwrap()).unwrap();
+    discriminator
+        .load_checkpoint(&discriminator_checkpoint)
+        .expect("load the released discriminators");
+    let generator = BigVGAN::from_dir(&dir).expect("load the released generator");
+    let mut trainer = GanTrainer::new(generator, discriminator, training).unwrap();
+
+    // 8192 samples of the reference signal and their mel.
+    let fx = Fixture::load_path(&dir.join("ref.safetensors"));
+    let samples = 32 * model_config.hop_size;
+    let wav = ops::slice_axis(&fx.array("signal"), 1, 0, samples);
+    let mel = MelFrontEnd::new(&model_config)
+        .unwrap()
+        .forward(&wav)
+        .unwrap();
+    let wav = wav.reshape(&[1, 1, samples]);
+
+    let started = std::time::Instant::now();
+    let mut history = Vec::new();
+    for _ in 0..3 {
+        history.push(trainer.step(&mel, &wav).expect("training step"));
+    }
+    eprintln!(
+        "{name}: {:.2} s per step; mel error {:?}",
+        started.elapsed().as_secs_f64() / 3.0,
+        history.iter().map(|m| m.mel_error).collect::<Vec<_>>()
+    );
+    for m in &history {
+        assert!(m.generator_loss.is_finite() && m.mel_error.is_finite());
+        assert!(m.discriminator_loss.is_some_and(f32::is_finite));
+    }
+    assert!(
+        history[2].mel_error < 1.5 * history[0].mel_error,
+        "the mel error grew: {:?}",
+        history
+    );
+    assert_runtime_ok();
+}
+
+#[test]
+#[ignore = "needs a downloaded checkpoint (see the module docs)"]
+fn bigvgan_base_fine_tunes_with_its_released_discriminators() {
+    fine_tune_smoke("base24");
+}
+
+#[test]
+#[ignore = "needs a downloaded checkpoint (see the module docs)"]
+fn bigvgan_v2_fine_tunes_with_its_released_discriminators() {
+    fine_tune_smoke("v2_24");
+}
+
 #[test]
 #[ignore = "needs a downloaded checkpoint (see the module docs)"]
 fn bigvgan_base_24khz_matches_reference() {
