@@ -24,7 +24,6 @@ pub mod qwen_vl_processing;
 pub mod stream_format;
 pub mod streaming;
 pub mod tokenizer;
-pub mod vocab_compact;
 
 pub use collator::*;
 pub use dataloader::*;
@@ -32,7 +31,6 @@ pub use dataset::*;
 pub use image_processing::*;
 pub use packing::*;
 pub use tokenizer::*;
-pub use vocab_compact::VocabCompactor;
 
 /// Compiles the code blocks in `README.md` as doctests, so the crate's front
 /// page cannot drift away from its API. `cfg(doctest)` keeps the item out of
