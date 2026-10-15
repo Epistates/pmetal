@@ -5,7 +5,7 @@
 //! - [`gated_delta`]: the gated delta rule (Qwen 3.5's linear attention), with
 //!   a chunkwise parallel form for training
 //! - [`cut_cross_entropy`]: the LM-head loss without materializing the logits
-//! - [`rope`]: rotary embeddings at contiguous or explicit positions
+//! - [`mod@rope`]: rotary embeddings at contiguous or explicit positions
 //! - [`fused_moe`]: the combine step of a mixture-of-experts block
 //! - [`training_context`]: the training-mode flag the model forwards read
 //! - [`utils`]: whether autograd is tracing a set of arrays

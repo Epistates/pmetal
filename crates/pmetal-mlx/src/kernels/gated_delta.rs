@@ -19,7 +19,7 @@
 //!   of `C = 64` tokens into a few batched matmuls and leaves only the
 //!   `O(T / C)` state hand-offs sequential. Differentiable, so training uses
 //!   it for sequences longer than a chunk;
-//! - [`gated_delta_ops`], the plain recurrence, for decode and short inputs.
+//! - the plain recurrence, for decode and short inputs.
 //!
 //! Every path carries the recurrence in f32 whatever the inputs' dtype and
 //! returns the output in the queries' dtype and the state in the state's.
