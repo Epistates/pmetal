@@ -14,8 +14,8 @@
 use std::{sync::OnceLock, time::Instant};
 
 use pmetal_metal::{
-    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, KernelDispatch,
-    MetalContext, MppFlashAttention, MppFlashAttentionConfig,
+    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, MetalContext,
+    MppFlashAttention, MppFlashAttentionConfig,
     context::{DeviceProperties, DeviceTier},
 };
 use pmetal_runtime::compat::{Array, Dtype, Exception, ops};
@@ -430,7 +430,7 @@ fn benchmark_attention_backends(
         }
     }
 
-    if mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.dispatch()) {
+    if mpp_flash_attention_supported(queries, keys, values, None, metal_ctx) {
         if let Some((elapsed, output)) = benchmark_attention_candidate(
             AttentionBackendChoice::MppFlash,
             queries,
@@ -629,7 +629,7 @@ fn flash_attention_supported(
 /// Shape-only eligibility check for MPP flash attention (no hardware check).
 ///
 /// Separated from [`mpp_flash_attention_supported`] so that unit tests can
-/// exercise shape logic without needing a live [`KernelDispatch`].
+/// exercise shape logic without needing a live [`MetalContext`].
 fn mpp_flash_attention_shape_ok(
     queries: &Array,
     keys: &Array,
@@ -642,17 +642,16 @@ fn mpp_flash_attention_shape_ok(
 
 /// Full eligibility check for MPP flash attention: hardware capability + shape.
 ///
-/// Uses [`KernelDispatch::preferred_backend`] to determine whether the Metal 4
-/// backend is available on this device, rather than calling `has_nax()` directly.
+/// Asks [`MetalContext::supports_mpp`] whether the Metal 4 kernels can run on this
+/// device.
 fn mpp_flash_attention_supported(
     queries: &Array,
     keys: &Array,
     values: &Array,
     custom_mask: Option<&Array>,
-    dispatch: &KernelDispatch,
+    metal_ctx: &MetalContext,
 ) -> bool {
-    dispatch.preferred_backend().caps().has_mpp_flash_attention
-        && mpp_flash_attention_shape_ok(queries, keys, values, custom_mask)
+    metal_ctx.supports_mpp() && mpp_flash_attention_shape_ok(queries, keys, values, custom_mask)
 }
 
 /// Largest magnitude in `array`, as f32.
@@ -756,7 +755,7 @@ fn run_mpp_flash_attention(
     config: &FusedAttentionConfig,
     metal_ctx: &std::sync::Arc<MetalContext>,
 ) -> Result<Array, Exception> {
-    if !mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.dispatch()) {
+    if !mpp_flash_attention_supported(queries, keys, values, None, metal_ctx) {
         return Err(Exception::custom(
             "MPP FlashAttention unsupported for current device or shape".to_string(),
         ));
@@ -1797,7 +1796,7 @@ mod tests {
 
     #[test]
     fn test_mpp_flash_attention_shape_ok_accepted_and_rejected_head_dims() {
-        // Hardware capability gating (has_nax / preferred_backend) is exercised
+        // Hardware capability gating (supports_mpp) is exercised
         // by integration tests that run on a live MetalContext.  Unit tests here
         // verify only the shape predicate via `mpp_flash_attention_shape_ok`.
 

@@ -64,17 +64,12 @@
 pub mod accelerate;
 #[cfg(feature = "ane")]
 pub mod ane;
-pub mod backend;
 pub mod bridge;
 pub mod buffer;
 pub mod context;
-pub mod dispatch;
 pub mod error;
 pub mod expert_buffer;
 pub mod kernels;
-pub mod metal3_backend;
-#[cfg(has_metal4)]
-pub mod metal4;
 pub(crate) mod msl_layout;
 pub mod neon_convert;
 pub mod pipeline;
@@ -83,7 +78,6 @@ pub mod tuna;
 pub use bridge::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 pub use buffer::{AsMetalBuffer, BufferUsage, MetalBuffer};
 pub use context::MetalContext;
-pub use dispatch::KernelDispatch;
 pub use error::{MetalError, Result};
 pub use kernels::flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,

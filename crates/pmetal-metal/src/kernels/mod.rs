@@ -4,7 +4,6 @@
 //! with a focus on transformer attention mechanisms and efficient training
 //! operations.
 
-pub mod batch_encoder;
 pub mod dequant;
 pub mod dispatch;
 pub mod dw_gemm;
@@ -19,7 +18,6 @@ pub mod fused_rope;
 pub mod fused_swiglu;
 pub mod fused_training;
 pub mod moe;
-pub mod mpp_bench;
 pub mod mpp_dispatch;
 pub mod mpp_flash_attention;
 pub mod mpp_gemm;
@@ -30,7 +28,6 @@ pub mod turboquant;
 pub mod mpp_dw_gemm;
 #[cfg(has_metal4)]
 pub mod mpp_fused_cross_entropy;
-#[cfg(has_metal4)]
 #[cfg(has_metal4)]
 pub mod mpp_fused_lora;
 #[cfg(has_metal4)]
