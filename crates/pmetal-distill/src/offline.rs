@@ -10,6 +10,12 @@
 //!   as `(value, index)` pairs. Read back sparse with [`LogitCache::load_sequence_sparse`]
 //!   and fed to [`SparseKlLoss`](crate::losses::SparseKlLoss), no dense
 //!   `[tokens, vocab]` teacher is ever formed.
+//! - **Sampled**: Random-Sampling KD (Anshumann et al., ACL 2025). Draw a few
+//!   tokens per position from the teacher's distribution and keep the distinct
+//!   ones with their frequencies ([`SparseTargets`]). Their empirical
+//!   distribution is an *unbiased* estimate of the teacher, where the top-k's
+//!   is biased toward its head; about twelve draws match full distillation.
+//!   The draws are taken at one temperature, which the loss must then use.
 //! - **Int8**: Quantize full logits to 8-bit codes with a scale and offset per token.
 //! - **Int4**: Quantize full logits to 4-bit codes with a scale and offset per token.
 //!
@@ -24,7 +30,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
 
-use pmetal_runtime::compat::{Array, Dtype, ops};
+use pmetal_runtime::compat::{Array, Dtype, ops, random};
 use serde::{Deserialize, Serialize};
 
 use crate::{CompressionMethod, DistillError, Result};
@@ -40,8 +46,10 @@ pub struct LogitCache {
     cache_dir: PathBuf,
     /// Compression method used.
     compression: CompressionMethod,
-    /// Number of top-k logits to keep.
+    /// Number of top-k logits to keep (or draws per token when sampling).
     top_k: usize,
+    /// Temperature of a `sampled` cache's draws.
+    sampling_temperature: f32,
     /// Metadata about cached sequences.
     metadata: CacheMetadata,
 }
@@ -82,6 +90,7 @@ fn compression_name(method: &CompressionMethod) -> &'static str {
         CompressionMethod::TopK => "top_k",
         CompressionMethod::Int8 => "int8",
         CompressionMethod::Int4 => "int4",
+        CompressionMethod::Sampled => "sampled",
     }
 }
 
@@ -107,6 +116,7 @@ impl LogitCache {
             cache_dir,
             compression,
             top_k,
+            sampling_temperature: 1.0,
             metadata,
         })
     }
@@ -130,10 +140,11 @@ impl LogitCache {
             "top_k" => CompressionMethod::TopK,
             "int8" => CompressionMethod::Int8,
             "int4" => CompressionMethod::Int4,
+            "sampled" => CompressionMethod::Sampled,
             other => {
                 return Err(DistillError::LogitCache(format!(
                     "cache metadata names an unknown compression '{other}' \
-                     (expected none, top_k, int8 or int4)"
+                     (expected none, top_k, int8, int4 or sampled)"
                 )));
             }
         };
@@ -142,8 +153,19 @@ impl LogitCache {
             cache_dir,
             compression,
             top_k: metadata.top_k,
+            sampling_temperature: 1.0,
             metadata,
         })
+    }
+
+    /// The temperature a `sampled` cache draws its tokens at (default 1).
+    ///
+    /// The teacher's tokens are sampled from `softmax(logits / T)`, and the
+    /// loss that reads them back must use the same `T`. Ignored by the other
+    /// compressions.
+    pub fn with_sampling_temperature(mut self, temperature: f32) -> Self {
+        self.sampling_temperature = temperature;
+        self
     }
 
     fn sequence_path(&self, sequence_id: usize) -> PathBuf {
@@ -156,7 +178,8 @@ impl LogitCache {
     /// crash cannot leave a truncated sequence that [`has_sequence`](Self::has_sequence)
     /// would accept.
     pub fn cache_sequence(&mut self, sequence_id: usize, logits: &Array) -> Result<()> {
-        let compressor = LogitCompressor::new(self.compression.clone(), self.top_k);
+        let compressor = LogitCompressor::new(self.compression.clone(), self.top_k)
+            .with_sampling_temperature(self.sampling_temperature);
         let compressed = compressor.compress(logits)?;
 
         let path = self.sequence_path(sequence_id);
@@ -200,6 +223,36 @@ impl LogitCache {
         let compressed = self.read_compressed(sequence_id)?;
         let compressor = LogitCompressor::new(self.compression.clone(), self.top_k);
         compressor.decompress(&compressed, self.metadata.vocab_size)
+    }
+
+    /// Load a `sampled` sequence as the empirical teacher distribution of its
+    /// draws: per position, the distinct tokens drawn and their frequencies.
+    ///
+    /// Errors if the cache holds anything but sampled draws.
+    pub fn load_sequence_sampled(&self, sequence_id: usize) -> Result<SparseTargets> {
+        match self.read_compressed(sequence_id)? {
+            CompressedLogits::Sampled {
+                probs,
+                indices,
+                slots,
+                shape,
+                temperature,
+            } => {
+                let mut out_shape = shape[..shape.len() - 1].to_vec();
+                out_shape.push(slots as i32);
+                SparseTargets::new(
+                    Array::from_f32_slice(&probs, &out_shape),
+                    Array::from_i32_slice_shaped(&indices, &out_shape),
+                    shape[shape.len() - 1] as usize,
+                    temperature,
+                )
+            }
+            _ => Err(DistillError::LogitCache(
+                "this cache does not hold sampled draws; \
+                 use `load_sequence_sparse` (top-k) or `load_sequence`"
+                    .to_string(),
+            )),
+        }
     }
 
     /// Load a top-k sequence without densifying it: the kept logits and their
@@ -382,6 +435,130 @@ impl SparseLogits {
     }
 }
 
+/// A teacher distribution as sampled draws: for each position the distinct
+/// tokens drawn and the frequency of each (`[.., slots]` each, the frequencies
+/// of a position summing to 1; unused slots hold frequency 0).
+///
+/// This is Random-Sampling KD (Anshumann et al., ACL 2025): `N` draws from
+/// `softmax(logits / T)` make an unbiased estimate of the teacher distribution,
+/// so the expected gradient of the loss against it is the full distillation
+/// gradient, where truncating to the top-k is a biased estimate. About a dozen
+/// draws match full distillation at a fraction of the storage.
+#[derive(Debug, Clone)]
+pub struct SparseTargets {
+    probs: Array,
+    indices: Array,
+    vocab_size: usize,
+    temperature: f32,
+}
+
+impl SparseTargets {
+    /// Wrap `[.., slots]` frequencies (f32) and `[.., slots]` ids (int32) drawn
+    /// at `temperature` from a `vocab_size` vocabulary.
+    pub fn new(probs: Array, indices: Array, vocab_size: usize, temperature: f32) -> Result<Self> {
+        if probs.shape() != indices.shape() || probs.shape().is_empty() {
+            return Err(DistillError::LogitCache(format!(
+                "sparse targets need frequencies and indices of one shape [.., slots]; got {:?} and {:?}",
+                probs.shape(),
+                indices.shape()
+            )));
+        }
+        Ok(Self {
+            probs,
+            indices,
+            vocab_size,
+            temperature,
+        })
+    }
+
+    /// The drawn tokens' frequencies, `[.., slots]` f32.
+    pub fn probs(&self) -> &Array {
+        &self.probs
+    }
+
+    /// The drawn tokens' ids, `[.., slots]` int32.
+    pub fn indices(&self) -> &Array {
+        &self.indices
+    }
+
+    /// Size of the vocabulary the ids index into.
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    /// The temperature the tokens were drawn at; the loss must use it too.
+    pub fn temperature(&self) -> f32 {
+        self.temperature
+    }
+
+    /// Slots per position.
+    pub fn slots(&self) -> usize {
+        self.probs.dim(-1) as usize
+    }
+
+    /// The tensor's shape, `[.., slots]`.
+    pub fn shape(&self) -> &[i32] {
+        self.probs.shape()
+    }
+
+    /// The dense `[.., vocab]` empirical distribution.
+    pub fn to_dense_probs(&self) -> Array {
+        let slots = self.slots();
+        let positions = self.probs.size() / slots;
+        let probs = self.probs.as_slice::<f32>();
+        let indices = self.indices.as_slice::<i32>();
+        let mut dense = vec![0.0_f32; positions * self.vocab_size];
+        for p in 0..positions {
+            for s in 0..slots {
+                // Unused slots have frequency 0 and add nothing.
+                dense[p * self.vocab_size + indices[p * slots + s] as usize] +=
+                    probs[p * slots + s];
+            }
+        }
+        let mut shape = self.probs.shape()[..self.probs.shape().len() - 1].to_vec();
+        shape.push(self.vocab_size as i32);
+        Array::from_f32_slice(&dense, &shape)
+    }
+
+    /// Collate per-sequence targets into one `[batch, seq_len, slots]` batch,
+    /// as [`SparseLogits::stack`] does. Padded positions have frequency 0 and
+    /// must be masked out by the loss's token weights. All rows must share the
+    /// slots, vocabulary and temperature.
+    pub fn stack(rows: &[SparseTargets], seq_len: usize) -> Result<SparseTargets> {
+        let Some(first) = rows.first() else {
+            return Err(DistillError::LogitCache(
+                "cannot stack zero sequences".to_string(),
+            ));
+        };
+        let slots = first.slots();
+        let mut probs = vec![0.0_f32; rows.len() * seq_len * slots];
+        let mut indices = vec![0_i32; rows.len() * seq_len * slots];
+        for (b, row) in rows.iter().enumerate() {
+            if row.slots() != slots
+                || row.vocab_size != first.vocab_size
+                || row.temperature != first.temperature
+            {
+                return Err(DistillError::LogitCache(
+                    "cannot stack sampled sequences with different slots, vocabulary or \
+                     temperature"
+                        .to_string(),
+                ));
+            }
+            let take = (row.probs.size() / slots).min(seq_len) * slots;
+            let dst = b * seq_len * slots;
+            probs[dst..dst + take].copy_from_slice(&row.probs.as_slice::<f32>()[..take]);
+            indices[dst..dst + take].copy_from_slice(&row.indices.as_slice::<i32>()[..take]);
+        }
+        let shape = [rows.len() as i32, seq_len as i32, slots as i32];
+        SparseTargets::new(
+            Array::from_f32_slice(&probs, &shape),
+            Array::from_i32_slice_shaped(&indices, &shape),
+            first.vocab_size,
+            first.temperature,
+        )
+    }
+}
+
 /// Compressed logits representation.
 ///
 /// Variants are serialized by position: new ones go at the end, and the old
@@ -481,6 +658,21 @@ pub enum CompressedLogits {
         /// Shape of the original tensor; the trailing axis is the per-token axis.
         shape: Vec<i32>,
     },
+    /// Random-sampling KD: draws from `softmax(logits / temperature)`, as the
+    /// distinct tokens drawn per position and their frequencies.
+    Sampled {
+        /// Frequencies, `num_tokens * slots` of them, most frequent first;
+        /// unused slots are 0.
+        probs: Vec<f32>,
+        /// The tokens' ids, same layout (unused slots hold 0).
+        indices: Vec<i32>,
+        /// Slots per position (the number of draws bounds it).
+        slots: usize,
+        /// Shape of the original tensor, `[.., vocab]`.
+        shape: Vec<i32>,
+        /// The temperature the draws were taken at.
+        temperature: f32,
+    },
 }
 
 /// `(num_tokens, token_size)` of a `[.., vocab]` shape.
@@ -577,6 +769,30 @@ impl CompressedLogits {
                 }
                 Ok(())
             }
+            CompressedLogits::Sampled {
+                probs,
+                indices,
+                slots,
+                shape,
+                ..
+            } => {
+                let (num_tokens, vocab) = token_layout(shape)?;
+                let expected = num_tokens * slots;
+                if probs.len() != expected || indices.len() != expected {
+                    return Err(DistillError::LogitCache(format!(
+                        "Sampled payload mismatch: expected {expected} frequencies and ids \
+                         (num_tokens={num_tokens} * slots={slots}), got {} and {}",
+                        probs.len(),
+                        indices.len(),
+                    )));
+                }
+                if indices.iter().any(|&i| i < 0 || i as usize >= vocab) {
+                    return Err(DistillError::LogitCache(format!(
+                        "Sampled ids outside the vocabulary of {vocab}"
+                    )));
+                }
+                Ok(())
+            }
             CompressedLogits::Int4PerToken {
                 packed,
                 per_token_meta,
@@ -609,8 +825,10 @@ impl CompressedLogits {
 pub struct LogitCompressor {
     /// Compression method.
     method: CompressionMethod,
-    /// Top-k value.
+    /// Top-k value (draws per token for `Sampled`).
     top_k: usize,
+    /// Temperature of `Sampled` draws.
+    sampling_temperature: f32,
 }
 
 /// The logits as host f32, with the finiteness the quantizers require.
@@ -645,9 +863,20 @@ fn quantize_row(row: &[f32], levels: f32, mut emit: impl FnMut(u8)) -> (f32, f32
 }
 
 impl LogitCompressor {
-    /// Create a new compressor.
+    /// Create a new compressor. `top_k` is the number of logits kept per token
+    /// for `TopK` and the number of draws per token for `Sampled`.
     pub fn new(method: CompressionMethod, top_k: usize) -> Self {
-        Self { method, top_k }
+        Self {
+            method,
+            top_k,
+            sampling_temperature: 1.0,
+        }
+    }
+
+    /// The temperature `Sampled` draws at (default 1).
+    pub fn with_sampling_temperature(mut self, temperature: f32) -> Self {
+        self.sampling_temperature = temperature;
+        self
     }
 
     /// Compress logits.
@@ -657,6 +886,7 @@ impl LogitCompressor {
             CompressionMethod::TopK => self.compress_topk(logits),
             CompressionMethod::Int8 => self.compress_int8(logits),
             CompressionMethod::Int4 => self.compress_int4(logits),
+            CompressionMethod::Sampled => self.compress_sampled(logits),
         }
     }
 
@@ -708,7 +938,99 @@ impl LogitCompressor {
                 per_token_meta,
                 shape,
             } => self.decompress_int4_per_token(packed, per_token_meta, shape),
+            CompressedLogits::Sampled {
+                probs,
+                indices,
+                slots,
+                shape,
+                temperature,
+            } => {
+                // Dense logits whose softmax at `temperature` is the empirical
+                // distribution: `T · ln(frequency)` where drawn, very negative
+                // elsewhere.
+                let (num_tokens, vocab) = token_layout(shape)?;
+                let mut dense = vec![MASKED_LOGIT; num_tokens * vocab];
+                for t in 0..num_tokens {
+                    for s in 0..*slots {
+                        let p = probs[t * slots + s];
+                        if p > 0.0 {
+                            dense[t * vocab + indices[t * slots + s] as usize] =
+                                temperature * p.ln();
+                        }
+                    }
+                }
+                Ok(Array::from_f32_slice(&dense, shape))
+            }
         }
+    }
+
+    /// Random-sampling KD: `top_k` draws per token from
+    /// `softmax(logits / T)`, kept as the distinct tokens and their counts.
+    ///
+    /// The draws are taken on the device a few rows at a time (each draw costs
+    /// a pass over its rows' logits), from MLX's global key, so
+    /// `random::seed` makes a cache reproducible.
+    fn compress_sampled(&self, logits: &Array) -> Result<CompressedLogits> {
+        const ROWS_PER_CHUNK: usize = 64;
+        let shape = logits.shape().to_vec();
+        let (num_tokens, vocab) = token_layout(&shape)?;
+        let draws = self.top_k.max(1);
+        let temperature = self.sampling_temperature;
+        if !(temperature > 0.0 && temperature.is_finite()) {
+            return Err(DistillError::LogitCache(format!(
+                "the sampling temperature must be positive and finite, got {temperature}"
+            )));
+        }
+
+        let flat = logits
+            .reshape(&[num_tokens as i32, vocab as i32])
+            .as_dtype(Dtype::Float32.as_i32())
+            .multiply(&Array::from_f32(1.0 / temperature));
+        if ops::item_bool(&flat.isnan().any(None, false)) {
+            return Err(DistillError::LogitCache(
+                "teacher logits contain NaN (did the teacher forward diverge?)".to_string(),
+            ));
+        }
+
+        let slots = draws.min(vocab);
+        let mut probs = vec![0.0_f32; num_tokens * slots];
+        let mut indices = vec![0_i32; num_tokens * slots];
+        for start in (0..num_tokens).step_by(ROWS_PER_CHUNK) {
+            let rows = ROWS_PER_CHUNK.min(num_tokens - start);
+            let chunk = flat.slice(&[start as i32, 0], &[(start + rows) as i32, vocab as i32]);
+            let picks: Vec<Array> = (0..draws)
+                .map(|_| random::categorical(&chunk, -1, None).reshape(&[rows as i32, 1]))
+                .collect();
+            let refs: Vec<&Array> = picks.iter().collect();
+            let drawn = ops::concatenate_axis(&refs, 1).as_dtype(Dtype::Int32.as_i32());
+            let drawn = drawn.as_slice::<i32>();
+
+            for r in 0..rows {
+                let mut row = drawn[r * draws..(r + 1) * draws].to_vec();
+                row.sort_unstable();
+                // Distinct tokens with their counts, most frequent first.
+                let mut counts: Vec<(i32, usize)> = Vec::new();
+                for id in row {
+                    match counts.last_mut() {
+                        Some((last, n)) if *last == id => *n += 1,
+                        _ => counts.push((id, 1)),
+                    }
+                }
+                counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+                for (s, (id, n)) in counts.into_iter().take(slots).enumerate() {
+                    probs[(start + r) * slots + s] = n as f32 / draws as f32;
+                    indices[(start + r) * slots + s] = id;
+                }
+            }
+        }
+
+        Ok(CompressedLogits::Sampled {
+            probs,
+            indices,
+            slots,
+            shape,
+            temperature,
+        })
     }
 
     fn compress_none(&self, logits: &Array) -> Result<CompressedLogits> {

@@ -23,9 +23,9 @@
 //! teacher; at `k = 128` it keeps the mass that matters for peaked LM
 //! distributions.
 
-use crate::offline::SparseLogits;
+use crate::offline::{SparseLogits, SparseTargets};
 use crate::{DistillError, Result};
-use pmetal_runtime::compat::{Array, Dtype};
+use pmetal_runtime::compat::{Array, Dtype, ops};
 
 use super::reduce_per_token;
 
@@ -53,48 +53,115 @@ impl SparseKlLoss {
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        let t_shape = teacher.shape();
-        let s_shape = student_logits.shape();
-        let leading = t_shape.len() - 1;
-        if s_shape.len() != t_shape.len() || s_shape[..leading] != t_shape[..leading] {
-            return Err(DistillError::ShapeMismatch {
-                teacher: t_shape.to_vec(),
-                student: s_shape.to_vec(),
-            });
-        }
-        let vocab = s_shape[leading] as usize;
-        if vocab != teacher.vocab_size() {
-            return Err(DistillError::VocabMismatch {
-                teacher: teacher.vocab_size(),
-                student: vocab,
-            });
-        }
-
+        check_pair(
+            teacher.shape(),
+            teacher.vocab_size(),
+            student_logits.shape(),
+        )?;
         let f32_ = Dtype::Float32.as_i32();
-        let inv_t = Array::from_f32(1.0 / temperature.max(1e-6));
-
         // log p over the kept tokens; the teacher is a constant.
         let log_p = teacher
             .values()
             .as_dtype(f32_)
-            .multiply(&inv_t)
+            .multiply(&Array::from_f32(1.0 / temperature.max(1e-6)))
             .stop_gradient()
             .log_softmax(-1);
-
-        // log q at the kept tokens: gather the scaled logits, subtract the
-        // full-vocabulary log-sum-exp.
-        let scaled = student_logits.as_dtype(f32_).multiply(&inv_t);
-        let lse = scaled.logsumexp(-1, true);
-        let log_q = scaled
-            .take_along_axis(&teacher.indices().stop_gradient(), -1)
-            .subtract(&lse);
-
-        let per_token = log_p
-            .exp()
-            .multiply(&log_p.subtract(&log_q))
-            .sum_axes(&[-1], false);
-        reduce_per_token(&per_token, weights)
+        let p = log_p.exp();
+        kl_to_sparse(
+            &p,
+            &log_p,
+            teacher.indices(),
+            student_logits,
+            temperature,
+            weights,
+        )
     }
+
+    /// The same loss against sampled draws ([`SparseTargets`], Random-Sampling
+    /// KD): `KL(empirical || student)` where the empirical distribution is the
+    /// frequencies of the drawn tokens.
+    ///
+    /// The draws were taken from `softmax(logits / T_cache)`, so `temperature`
+    /// must be the temperature they were drawn at. Its expected gradient is the
+    /// full distillation gradient `(q − p)/T`: an unbiased estimate where the
+    /// top-k's is biased. (The value differs from the full KL by the entropy
+    /// of the empirical distribution, which does not move the student.)
+    pub fn compute_sampled(
+        &self,
+        teacher: &SparseTargets,
+        student_logits: &Array,
+        temperature: f32,
+        weights: Option<&Array>,
+    ) -> Result<Array> {
+        check_pair(
+            teacher.shape(),
+            teacher.vocab_size(),
+            student_logits.shape(),
+        )?;
+        if (temperature - teacher.temperature()).abs() > 1e-6 * temperature.abs().max(1.0) {
+            return Err(DistillError::InvalidConfig(format!(
+                "the sampled teacher was drawn at temperature {} but the loss uses {temperature}; \
+                 the draws estimate the teacher at their own temperature only",
+                teacher.temperature()
+            )));
+        }
+        let p = teacher.probs().as_dtype(Dtype::Float32.as_i32());
+        // Unused slots have frequency 0: their log is clamped so 0 * log 0 is
+        // exactly 0 rather than NaN.
+        let log_p = ops::maximum(&p, &Array::from_f32(f32::MIN_POSITIVE)).log();
+        kl_to_sparse(
+            &p,
+            &log_p,
+            teacher.indices(),
+            student_logits,
+            temperature,
+            weights,
+        )
+    }
+}
+
+/// The teacher's `[.., k]` layout must sit on the student's leading axes and
+/// vocabulary.
+fn check_pair(teacher_shape: &[i32], teacher_vocab: usize, student_shape: &[i32]) -> Result<()> {
+    let leading = teacher_shape.len() - 1;
+    if student_shape.len() != teacher_shape.len()
+        || student_shape[..leading] != teacher_shape[..leading]
+    {
+        return Err(DistillError::ShapeMismatch {
+            teacher: teacher_shape.to_vec(),
+            student: student_shape.to_vec(),
+        });
+    }
+    let vocab = student_shape[leading] as usize;
+    if vocab != teacher_vocab {
+        return Err(DistillError::VocabMismatch {
+            teacher: teacher_vocab,
+            student: vocab,
+        });
+    }
+    Ok(())
+}
+
+/// `Σ_i p_i · (log p_i − log q_{idx_i})` per token, averaged by `weights`:
+/// `log q` at the kept tokens is the student's scaled logit there minus its
+/// full-vocabulary log-sum-exp.
+fn kl_to_sparse(
+    p: &Array,
+    log_p: &Array,
+    indices: &Array,
+    student_logits: &Array,
+    temperature: f32,
+    weights: Option<&Array>,
+) -> Result<Array> {
+    let scaled = student_logits
+        .as_dtype(Dtype::Float32.as_i32())
+        .multiply(&Array::from_f32(1.0 / temperature.max(1e-6)));
+    let lse = scaled.logsumexp(-1, true);
+    let log_q = scaled
+        .take_along_axis(&indices.stop_gradient(), -1)
+        .subtract(&lse);
+    let per_token = p.multiply(&log_p.subtract(&log_q)).sum_axes(&[-1], false);
+    reduce_per_token(&per_token, weights)
 }
 
 #[cfg(test)]

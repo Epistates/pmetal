@@ -7,7 +7,7 @@ use pmetal_runtime::compat::{Array, Dtype, ops};
 use pmetal_runtime::training::CrossEntropy;
 
 use crate::{
-    DistillConfig, DistillError, DistillMethod, LossType, Result, SparseLogits,
+    DistillConfig, DistillError, DistillMethod, LossType, Result, SparseLogits, SparseTargets,
     losses::{
         AttentionTransferLoss, DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss,
         MseLoss, SoftCrossEntropyLoss, SparseKlLoss,
@@ -236,21 +236,7 @@ impl Distiller {
         step: usize,
         total_steps: usize,
     ) -> Result<DistillLossOutput> {
-        let cfg = &self.config.loss;
-        let forward_kl = !cfg.rationale
-            && match cfg.loss_type {
-                LossType::KlDivergence => !cfg.reverse_kl,
-                LossType::SoftCrossEntropy => true,
-                _ => false,
-            };
-        if !forward_kl {
-            return Err(DistillError::InvalidConfig(
-                "a top-k teacher supports the forward KL (loss_type kl_divergence without \
-                 reverse_kl, or soft_cross_entropy); this configuration needs the dense teacher \
-                 logits"
-                    .to_string(),
-            ));
-        }
+        self.require_forward_kl()?;
         let (temperature, alpha) = self.schedule(step, total_steps);
         let soft_loss =
             SparseKlLoss::new().compute(teacher, student_logits, temperature, weights)?;
@@ -261,6 +247,55 @@ impl Distiller {
             student_logits,
             labels,
         )
+    }
+
+    /// [`compute_loss_sparse`](Self::compute_loss_sparse) against sampled
+    /// draws ([`SparseTargets`], Random-Sampling KD).
+    ///
+    /// The draws estimate the teacher at the temperature they were taken at,
+    /// so the configured temperature must be that one (an error otherwise;
+    /// with the progressive method, whose temperature moves, it never is).
+    pub fn compute_loss_sampled(
+        &self,
+        teacher: &SparseTargets,
+        student_logits: &Array,
+        labels: Option<&Array>,
+        weights: Option<&Array>,
+        step: usize,
+        total_steps: usize,
+    ) -> Result<DistillLossOutput> {
+        self.require_forward_kl()?;
+        let (temperature, alpha) = self.schedule(step, total_steps);
+        let soft_loss =
+            SparseKlLoss::new().compute_sampled(teacher, student_logits, temperature, weights)?;
+        self.combine(
+            soft_loss,
+            temperature * temperature,
+            alpha,
+            student_logits,
+            labels,
+        )
+    }
+
+    /// A sparse teacher only has a forward-KL form.
+    fn require_forward_kl(&self) -> Result<()> {
+        let cfg = &self.config.loss;
+        let forward_kl = !cfg.rationale
+            && match cfg.loss_type {
+                LossType::KlDivergence => !cfg.reverse_kl,
+                LossType::SoftCrossEntropy => true,
+                _ => false,
+            };
+        if forward_kl {
+            Ok(())
+        } else {
+            Err(DistillError::InvalidConfig(
+                "a sparse teacher supports the forward KL (loss_type kl_divergence without \
+                 reverse_kl, or soft_cross_entropy); this configuration needs the dense teacher \
+                 logits"
+                    .to_string(),
+            ))
+        }
     }
 
     /// `(temperature, alpha)` at `step`: the static config, or the progressive

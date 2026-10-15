@@ -311,7 +311,8 @@ pub struct OfflineConfig {
     #[serde(default)]
     pub compression: CompressionMethod,
 
-    /// Top-k logits to keep (if using top-k compression).
+    /// Top-k logits to keep (if using top-k compression), or the number of
+    /// draws per token (if using sampled compression).
     #[serde(default = "default_top_k")]
     pub top_k: usize,
 
@@ -340,6 +341,13 @@ pub enum CompressionMethod {
 
     /// Quantize to 4-bit.
     Int4,
+
+    /// Random-sampling KD (Anshumann et al., ACL 2025): draw `top_k` tokens per
+    /// position from the teacher's distribution and keep their counts. An
+    /// unbiased estimate of the teacher where `TopK` is a biased one; about a
+    /// dozen draws match full distillation. The teacher is sampled at one
+    /// temperature, which the loss must then use.
+    Sampled,
 }
 
 /// Training configuration for distillation.

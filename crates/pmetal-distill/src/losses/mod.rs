@@ -1,11 +1,18 @@
 //! Loss functions for knowledge distillation.
 //!
 //! This module provides various loss functions used in knowledge distillation:
-//! - KL Divergence (forward and reverse)
-//! - Jensen-Shannon Divergence
-//! - Soft Cross-Entropy
-//! - MSE on logits
-//! - Hidden state alignment losses
+//! - KL Divergence (forward and reverse), Jensen-Shannon and its generalization
+//!   `JSD(β)`, DistiLLM's skew KL, soft cross-entropy, total variation
+//! - Universal Logit Distillation, for teachers and students with different tokenizers
+//! - MiniLLM (policy gradient on student samples) and GKD (on-policy)
+//! - [`SparseKlLoss`], forward KL against a top-k teacher from an offline cache
+//! - MSE on logits, ranking losses
+//! - Hidden state and attention alignment losses
+//!
+//! A [`DistillLoss`] takes logits `[.., vocab]` and per-token weights; the
+//! teacher is a constant (its gradient is stopped before the loss runs), the
+//! softmax runs in f32 whatever the logits' dtype, and a weighted mean divides
+//! by the total weight.
 //!
 //! # Differentiability
 //!

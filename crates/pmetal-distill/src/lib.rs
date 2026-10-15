@@ -3,7 +3,8 @@
 //! This crate provides knowledge distillation capabilities with GPU-first architecture
 //! optimized for Apple Silicon:
 //!
-//! - **Loss Functions**: KL Divergence, Jensen-Shannon, Soft Cross-Entropy
+//! - **Loss Functions**: KL Divergence, Jensen-Shannon / generalized JSD, skew KL,
+//!   Soft Cross-Entropy, Universal Logit Distillation, MiniLLM, GKD
 //! - **Hidden State Alignment**: MSE, Cosine, L1 losses between teacher/student layers
 //! - **Offline Distillation**: Compressed logit caching for efficient training
 //! - **Progressive Distillation**: Temperature annealing support
@@ -64,7 +65,9 @@ pub use losses::{
     MiniLlmOutput, MseLoss, OnPolicySampler, SkewKlLoss, SoftCrossEntropyLoss, SparseKlLoss,
     TemperatureSampler, TvdLoss, UniversalLogitLoss,
 };
-pub use offline::{CacheMetadata, CompressedLogits, LogitCache, LogitCompressor, SparseLogits};
+pub use offline::{
+    CacheMetadata, CompressedLogits, LogitCache, LogitCompressor, SparseLogits, SparseTargets,
+};
 pub use reasoning::RationaleLoss;
 pub use taid::{TaidConfig, TaidDistiller, TaidError, TaidLossOutput};
 
