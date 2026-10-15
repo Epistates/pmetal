@@ -2465,34 +2465,25 @@ impl TrainingSampleBuilder {
 
     /// Build a training sample and tokenize it with label masking.
     ///
-    /// Returns (input_ids, labels) where labels have -100 for prompt tokens.
+    /// Returns (input_ids, labels) where labels have -100 for everything but
+    /// the conversation's final assistant turn, truncated to `max_length`
+    /// tokens. Tokenized the way dataset loading tokenizes a conversation
+    /// ([`TrainingDataset::load`](crate::TrainingDataset::load)): the mask is
+    /// cut from the token offsets, and the template's own special tokens are
+    /// not doubled by the tokenizer's.
     pub fn build_tokenized(
         &self,
         messages: &[Message],
         tokenizer: &super::Tokenizer,
         max_length: usize,
     ) -> pmetal_core::Result<(Vec<u32>, Vec<i64>)> {
-        let formatted = self.template.apply(messages);
-
-        // Tokenize full text
-        let mut input_ids = tokenizer.encode_with_special_tokens(&formatted.text)?;
-
-        // Truncate if needed
-        if input_ids.len() > max_length {
-            input_ids.truncate(max_length);
-        }
-
-        // Tokenize just the prompt to find the split point
-        let prompt_ids = tokenizer.encode_with_special_tokens(formatted.prompt())?;
-        let prompt_len = prompt_ids.len().min(input_ids.len());
-
-        // Create labels with prompt masked
-        let mut labels: Vec<i64> = input_ids.iter().map(|&id| id as i64).collect();
-        for label in labels.iter_mut().take(prompt_len) {
-            *label = -100;
-        }
-
-        Ok((input_ids, labels))
+        crate::dataset::tokenize_messages(
+            messages,
+            &self.template,
+            tokenizer,
+            max_length,
+            crate::AssistantLoss::LastTurn,
+        )
     }
 }
 

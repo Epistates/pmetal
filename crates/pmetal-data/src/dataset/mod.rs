@@ -18,6 +18,7 @@ mod render;
 
 pub use embedding::{EmbeddingDataset, EmbeddingPair, EmbeddingTriplet};
 pub use format::{DatasetColumnConfig, DatasetFormat};
+pub(crate) use render::tokenize_messages;
 pub use render::{AssistantLoss, TextSample};
 
 use super::chat_templates::ChatTemplate;

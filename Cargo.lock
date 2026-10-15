@@ -5526,13 +5526,11 @@ name = "pmetal-trainer"
 version = "0.6.0"
 dependencies = [
  "anyhow",
- "arrow",
  "chrono",
  "crc",
  "dirs 7.0.0",
  "image",
  "indicatif",
- "parquet",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",

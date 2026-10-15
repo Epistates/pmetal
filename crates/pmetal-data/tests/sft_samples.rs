@@ -613,6 +613,35 @@ fn last_turn_loss_trains_only_the_final_assistant_turn() {
     );
 }
 
+/// The builder the preference trainers use tokenizes a conversation as dataset
+/// loading does: one BOS, the final assistant turn trained.
+#[test]
+fn the_training_sample_builder_agrees_with_dataset_loading() {
+    use pmetal_data::chat_templates::{Message, TrainingSampleBuilder};
+    let tokenizer = char_tokenizer(Some("<|begin_of_text|> $A"));
+    let template = ChatTemplate::llama3();
+    let (ids, labels) = TrainingSampleBuilder::new(template.clone())
+        .build_tokenized(
+            &[Message::user("hi"), Message::assistant("yo")],
+            &tokenizer,
+            4096,
+        )
+        .unwrap();
+    assert_eq!(ids.iter().filter(|&&id| id == 104).count(), 1);
+    let sample = Sample::with_labels(ids, labels);
+    assert!(trained_text(&sample, &tokenizer).starts_with("yo"));
+
+    let ds = load(
+        &[json!({"messages": [
+            {"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]})],
+        &tokenizer,
+        DatasetFormat::OpenAi,
+        Some(&template),
+    );
+    assert_eq!(ds.get(0).unwrap().input_ids, sample.input_ids);
+    assert_eq!(ds.get(0).unwrap().labels, sample.labels);
+}
+
 /// Loading is chunked; rows past the first chunk are read the same way.
 #[test]
 fn a_dataset_larger_than_a_chunk_loads_in_order() {

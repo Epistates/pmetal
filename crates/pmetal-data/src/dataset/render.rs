@@ -224,6 +224,26 @@ fn render_plain(messages: &[Message], trained: &[usize]) -> TextSample {
     TextSample::with_spans(text, spans, false)
 }
 
+/// Render `messages` through `template` and tokenize them: the ids and the
+/// labels (unshifted; [`IGNORE_INDEX`] outside the assistant turns `loss`
+/// names), cut to `max_length`.
+pub(crate) fn tokenize_messages(
+    messages: &[Message],
+    template: &ChatTemplate,
+    tokenizer: &Tokenizer,
+    max_length: usize,
+    loss: AssistantLoss,
+) -> Result<(Vec<u32>, Vec<i64>)> {
+    let conversation = Conversation {
+        messages: messages.to_vec(),
+        tools: Vec::new(),
+        trained: vec![None; messages.len()],
+    };
+    let sample = render_chat(&conversation, Some(template), loss);
+    let tokenized = tokenize(tokenizer, &sample, max_length)?;
+    Ok((tokenized.input_ids, tokenized.labels))
+}
+
 /// A tokenized sample.
 #[derive(Debug, Clone)]
 pub(crate) struct Tokenized {
