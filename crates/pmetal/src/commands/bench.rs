@@ -1149,7 +1149,6 @@ fn run_gdn_prefill_backend(
             &setup.dt_bias,
             None,
             None,
-            false,
             chunk_size_override,
         )?;
         pmetal_runtime::compat::transforms::eval([&y])?;
@@ -1167,7 +1166,6 @@ fn run_gdn_prefill_backend(
         &setup.dt_bias,
         None,
         None,
-        false,
         chunk_size_override,
     )?;
     pmetal_runtime::compat::transforms::eval([&output])?;
@@ -1646,7 +1644,6 @@ fn build_gdn_decode_benchmark_setup(
                     &dt_bias,
                     None,
                     None,
-                    false,
                     Some(0),
                 )?;
             pmetal_runtime::compat::transforms::eval([&reference_output])?;

@@ -63,7 +63,7 @@ use pmetal_data::{
     compute_pack_seq_len,
 };
 use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::{init_training_context, with_training_mode};
+use pmetal_mlx::kernels::with_training_mode;
 
 use crate::mlx_metal_optimizer::{MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available};
 use crate::step_check::{check_grad_norm, check_step};
@@ -316,18 +316,9 @@ impl TrainingLoop {
     pub fn new(mut config: TrainingLoopConfig) -> Self {
         config.log_every = config.log_every.max(1);
 
-        // Try to initialize Metal FlashAttention context
-        let metal_fa_available = if config.use_metal_flash_attention {
-            init_training_context().is_ok()
-        } else {
-            false
-        };
-
-        if metal_fa_available {
-            tracing::info!("Metal FlashAttention enabled for training");
-        } else if config.use_metal_flash_attention {
-            tracing::warn!("Metal FlashAttention requested but not available, using MLX fallback");
-        }
+        // Whether gradient steps run in `with_training_mode`, which the model
+        // forwards read to skip generation-only paths.
+        let metal_fa_available = config.use_metal_flash_attention;
 
         Self {
             config,
@@ -1246,11 +1237,7 @@ impl TrainingLoop {
 
             let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
             let (loss, grads) = if self.metal_fa_available {
-                let result = with_training_mode(|| {
-                    loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
-                        .map_err(pmetal_mlx::error::MlxError::from)
-                });
-                result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+                with_training_mode(|| loss_and_grad_fn(model, (&batch.input_ids, &batch.labels)))?
             } else {
                 loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
             };
@@ -1274,11 +1261,7 @@ impl TrainingLoop {
 
             let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
             let (loss, grads) = if self.metal_fa_available {
-                let result = with_training_mode(|| {
-                    loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
-                        .map_err(pmetal_mlx::error::MlxError::from)
-                });
-                result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+                with_training_mode(|| loss_and_grad_fn(model, (&batch.input_ids, &batch.labels)))?
             } else {
                 loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
             };
@@ -1317,11 +1300,7 @@ impl TrainingLoop {
 
         // Optionally enable Metal FlashAttention for forward pass
         let (loss, grads) = if self.metal_fa_available {
-            let result = with_training_mode(|| {
-                loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))
-                    .map_err(pmetal_mlx::error::MlxError::from)
-            });
-            result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+            with_training_mode(|| loss_and_grad_fn(model, (&batch.input_ids, &batch.labels)))?
         } else {
             loss_and_grad_fn(model, (&batch.input_ids, &batch.labels))?
         };

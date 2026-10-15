@@ -6348,9 +6348,6 @@ dependencies = [
  "pmetal-metal",
  "pmetal-runtime",
  "rand 0.10.3",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
  "tracing",
 ]
 

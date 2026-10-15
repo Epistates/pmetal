@@ -1,8 +1,9 @@
-//! Memory management utilities for Apple Silicon.
+//! Memory statistics for Apple Silicon.
 //!
-//! Re-exports MLX Metal memory management via pmetal-runtime and adds
-//! pmetal-specific helpers (RSS tracking, system memory queries, estimation
-//! functions, and training-oriented diagnostics).
+//! The allocator's own counters come from `pmetal-runtime` (re-exported
+//! below for the callers that already reach them here); this module adds the
+//! process-level figures, the installed RAM as the device reports it, and the
+//! estimates the trainers use to size a run.
 
 #![allow(unsafe_code)]
 
@@ -11,24 +12,9 @@ use std::sync::OnceLock;
 
 use pmetal_core::MemoryStats;
 
-// ---------------------------------------------------------------------------
-// Re-export MLX Metal memory management via pmetal-runtime
-// ---------------------------------------------------------------------------
-
 pub use pmetal_runtime::inline_array::{
     clear_cache, get_active_memory, get_cache_memory, get_peak_memory, reset_peak_memory,
-    set_wired_limit,
 };
-
-/// Get the current memory limit (returns maximum recommended working set size).
-pub fn get_memory_limit() -> usize {
-    pmetal_runtime::inline_array::get_max_recommended_size()
-}
-
-/// Set the memory limit. Maps to set_wired_limit in the bridge.
-pub fn set_memory_limit(limit: usize) -> usize {
-    pmetal_runtime::inline_array::set_wired_limit(limit)
-}
 
 #[cfg(target_os = "macos")]
 static SYSTEM_MEMORY_BYTES: OnceLock<Option<u64>> = OnceLock::new();
@@ -39,16 +25,13 @@ static SYSTEM_MEMORY_BYTES: OnceLock<Option<u64>> = OnceLock::new();
 
 /// Log current MLX memory state at INFO level.
 pub fn log_memory_stats() {
-    let active = get_active_memory();
-    let cache = get_cache_memory();
-    let peak = get_peak_memory();
-    let limit = get_memory_limit();
     tracing::info!(
-        "MLX memory: active={}, cache={}, peak={}, limit={}",
-        format_bytes(active as u64),
-        format_bytes(cache as u64),
-        format_bytes(peak as u64),
-        format_bytes(limit as u64),
+        "MLX memory: active={}, cache={}, peak={}, limit={}, recommended working set={}",
+        format_bytes(get_active_memory() as u64),
+        format_bytes(get_cache_memory() as u64),
+        format_bytes(get_peak_memory() as u64),
+        format_bytes(pmetal_runtime::inline_array::get_memory_limit() as u64),
+        format_bytes(pmetal_runtime::inline_array::get_max_recommended_size() as u64),
     );
 }
 
@@ -94,7 +77,7 @@ mod sys {
     }
 }
 
-/// Get the current Resident Set Size (RSS) in bytes.
+/// The process's peak resident set size in bytes (`ru_maxrss`).
 #[cfg(unix)]
 fn get_rss() -> u64 {
     // SAFETY: getrusage is a POSIX system call; zeroed rusage is valid.
@@ -118,14 +101,14 @@ fn get_rss() -> u64 {
 
 /// Get current memory statistics.
 ///
-/// Combines MLX allocator stats with process-level RSS.
+/// The allocator's active and peak bytes; before anything is allocated, the
+/// process's peak resident size stands in for the active figure.
 pub fn get_memory_stats() -> MemoryStats {
     let total_bytes = get_system_memory().unwrap_or(0);
     let active = get_active_memory() as u64;
     let peak = get_peak_memory() as u64;
-    let rss = get_rss();
 
-    let used_bytes = if active > 0 { active } else { rss };
+    let used_bytes = if active > 0 { active } else { get_rss() };
 
     MemoryStats {
         total_bytes,
@@ -134,11 +117,15 @@ pub fn get_memory_stats() -> MemoryStats {
     }
 }
 
-/// Get total system memory in bytes.
+/// Installed RAM in bytes, as the Metal device reports it (the GPU shares it).
 pub fn get_system_memory() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        *SYSTEM_MEMORY_BYTES.get_or_init(query_system_memory)
+        *SYSTEM_MEMORY_BYTES.get_or_init(|| {
+            pmetal_runtime::inline_array::device_info()
+                .ok()
+                .map(|device| device.memory_size)
+        })
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -147,74 +134,9 @@ pub fn get_system_memory() -> Option<u64> {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn query_system_memory() -> Option<u64> {
-    use std::process::Command;
-
-    let output = Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .ok()?;
-    let mem_str = String::from_utf8(output.stdout).ok()?;
-    mem_str.trim().parse().ok()
-}
-
-/// Get GPU memory limit (recommended working set size).
-///
-/// Falls back to the device's own recommendation rather than a fraction of
-/// installed RAM: that ratio is not a constant, and guessing it is what made
-/// `set_wired_limit` abort on a 16 GB Mac mini.
-pub fn get_gpu_memory_limit() -> Option<u64> {
-    let limit = get_memory_limit();
-    if limit > 0 {
-        return Some(limit as u64);
-    }
-    match pmetal_runtime::inline_array::get_max_recommended_size() {
-        0 => None,
-        recommended => Some(recommended as u64),
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Memory-efficient context
+// Estimation and formatting
 // ---------------------------------------------------------------------------
-
-/// RAII guard that clears the MLX buffer cache on drop.
-#[derive(Debug)]
-pub struct MemoryEfficientContext {
-    _private: (),
-}
-
-impl MemoryEfficientContext {
-    /// Create a new memory-efficient context.
-    /// Resets peak memory tracking for profiling.
-    pub fn new() -> Self {
-        reset_peak_memory();
-        Self { _private: () }
-    }
-}
-
-impl Default for MemoryEfficientContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for MemoryEfficientContext {
-    fn drop(&mut self) {
-        clear_cache();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Estimation helpers
-// ---------------------------------------------------------------------------
-
-/// Estimate memory required for a tensor.
-pub fn estimate_tensor_memory(shape: &[usize], dtype_size: usize) -> u64 {
-    let num_elements: usize = shape.iter().product();
-    (num_elements * dtype_size) as u64
-}
 
 /// Estimate memory required for a model with given parameters.
 pub fn estimate_model_memory(
@@ -228,25 +150,6 @@ pub fn estimate_model_memory(
     let optimizer_factor = if include_optimizer { 2 } else { 0 };
     base * (1 + gradient_factor + optimizer_factor)
 }
-
-/// Estimate memory required for training a model.
-pub fn estimate_training_memory(
-    num_params: u64,
-    dtype_size: usize,
-    batch_size: usize,
-    seq_len: usize,
-    hidden_size: usize,
-    num_layers: usize,
-) -> u64 {
-    let model_memory = estimate_model_memory(num_params, dtype_size, true, true);
-    let activation_per_layer = (batch_size * seq_len * hidden_size * dtype_size) as u64 * 4;
-    let activation_memory = activation_per_layer * num_layers as u64;
-    model_memory + activation_memory
-}
-
-// ---------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------
 
 /// Format bytes as human-readable string.
 pub fn format_bytes(bytes: u64) -> String {
@@ -265,68 +168,9 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Print memory statistics to stdout.
-pub fn print_memory_stats() {
-    let stats = get_memory_stats();
-    let cache = get_cache_memory();
-
-    println!("Memory Statistics:");
-    println!("  System Total:    {}", format_bytes(stats.total_bytes));
-    println!("  MLX Active:      {}", format_bytes(stats.used_bytes));
-    println!("  MLX Cache:       {}", format_bytes(cache as u64));
-    println!("  MLX Peak:        {}", format_bytes(stats.peak_bytes));
-    println!(
-        "  MLX Limit:       {}",
-        format_bytes(get_memory_limit() as u64)
-    );
-}
-
-/// Check if memory usage is approaching limit.
-pub fn memory_warning(estimated_bytes: u64, warning_threshold: f64) -> bool {
-    if let Some(limit) = get_gpu_memory_limit() {
-        let threshold = (limit as f64 * warning_threshold) as u64;
-        estimated_bytes > threshold
-    } else {
-        false
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_memory_stats() {
-        let stats = get_memory_stats();
-        #[cfg(target_os = "macos")]
-        {
-            assert!(stats.total_bytes > 0);
-        }
-        let _ = stats;
-    }
-
-    #[test]
-    fn test_mlx_memory_queries() {
-        let active = get_active_memory();
-        let peak = get_peak_memory();
-        let cache = get_cache_memory();
-        let limit = get_memory_limit();
-        let _ = (active, peak, cache, limit);
-    }
-
-    #[test]
-    fn test_clear_cache() {
-        clear_cache();
-    }
-
-    #[test]
-    fn test_reset_peak_memory() {
-        reset_peak_memory();
-    }
 
     #[test]
     fn test_format_bytes() {
@@ -336,12 +180,6 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(1048576), "1.0 MB");
         assert_eq!(format_bytes(1073741824), "1.0 GB");
-    }
-
-    #[test]
-    fn test_estimate_tensor_memory() {
-        let mem = estimate_tensor_memory(&[2, 3, 4], 4);
-        assert_eq!(mem, 2 * 3 * 4 * 4);
     }
 
     #[test]
@@ -359,34 +197,38 @@ mod tests {
         assert_eq!(with_all, 8_000_000);
     }
 
-    #[test]
-    fn test_estimate_training_memory() {
-        let mem = estimate_training_memory(7_000_000_000, 2, 4, 2048, 4096, 32);
-        assert!(mem > 50_000_000_000);
-    }
-
-    #[test]
-    fn test_memory_efficient_context() {
-        {
-            let _ctx = MemoryEfficientContext::new();
-        }
-    }
-
+    /// The installed RAM is what `sysctl hw.memsize` reports; the device's
+    /// figure must agree with the machine's.
     #[test]
     #[cfg(target_os = "macos")]
-    fn test_system_memory() {
-        let mem = get_system_memory();
-        assert!(mem.is_some());
-        assert!(mem.unwrap() > 0);
+    fn the_system_memory_is_the_installed_ram() {
+        let from_sysctl: u64 = String::from_utf8(
+            std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+        assert_eq!(get_system_memory(), Some(from_sysctl));
+        assert_eq!(get_system_memory(), get_system_memory(), "cached");
     }
 
+    /// The stats read the allocator's counters: while a 4 MiB array is alive,
+    /// both the active and the peak figure cover it. (Other tests allocate
+    /// and free concurrently, so only a lower bound is stable.)
     #[test]
-    #[cfg(target_os = "macos")]
-    fn test_system_memory_is_cached() {
-        let first = get_system_memory();
-        let second = get_system_memory();
-
-        assert_eq!(first, second);
-        assert_eq!(first, query_system_memory());
+    fn the_stats_follow_the_allocator() {
+        use pmetal_runtime::compat::{Dtype, ops};
+        let x = ops::ones(&[1024, 1024], Dtype::Float32);
+        x.eval();
+        let stats = get_memory_stats();
+        assert!(stats.used_bytes >= 4 << 20, "{stats:?}");
+        assert!(stats.peak_bytes >= 4 << 20, "{stats:?}");
+        assert!(stats.total_bytes >= stats.used_bytes, "{stats:?}");
+        drop(x);
     }
 }

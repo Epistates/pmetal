@@ -39,7 +39,7 @@ pub fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array
 /// Materialise an `Array` to a flat `Vec<f32>` regardless of its dtype.
 ///
 /// Clones the input to avoid mutating the caller, evals the clone, then
-/// reads it as f32 via the bridge's `to_f32_vec` (which handles the
+/// reads it as f32 via the runtime's `to_f32_vec` (which handles the
 /// fp16/bf16 → f32 conversion). Returns an empty `Vec` on materialise
 /// failure rather than panicking — callers that care should check the
 /// length explicitly.
@@ -122,20 +122,6 @@ pub fn argmax_last_axis(arr: &Array) -> Vec<i32> {
     let evaled = argmax.clone();
     let _ = evaled.eval();
     evaled.as_slice::<u32>().iter().map(|&u| u as i32).collect()
-}
-
-/// Counts the positions where the argmax along the last axis matches.
-/// Returns the count, not a fraction — divide by `argmax_last_axis(lhs).len()`
-/// for a ratio.
-pub fn argmax_last_axis_match_count(lhs: &Array, rhs: &Array) -> usize {
-    let l = argmax_last_axis(lhs);
-    let r = argmax_last_axis(rhs);
-    l.iter().zip(r.iter()).filter(|(a, b)| a == b).count()
-}
-
-/// True when both arrays have exactly the same shape vector.
-pub fn shapes_equal(lhs: &Array, rhs: &Array) -> bool {
-    lhs.shape() == rhs.shape()
 }
 
 /// Per-position max abs diff along axis 1 (the seq axis for `[B, T, …]`
@@ -326,5 +312,68 @@ pub fn print_report_table(reports: &[ParityReport]) {
                 .collect();
             println!("    per-pos cos_sim:  {}", preview.join("  "));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(values: &[f32]) -> Array {
+        Array::from_f32_slice(values, &[1, values.len() as i32])
+    }
+
+    #[test]
+    fn differences_are_taken_elementwise_over_the_flattened_arrays() {
+        let (a, b) = (row(&[1.0, 2.0, 3.0]), row(&[1.0, 2.5, 1.0]));
+        assert_eq!(max_abs_diff(&a, &b), 2.0);
+        assert!((mean_abs_diff(&a, &b) - 2.5 / 3.0).abs() < 1e-6);
+        assert_eq!(max_abs_value(&row(&[-4.0, 3.0])), 4.0);
+    }
+
+    #[test]
+    fn cosine_similarity_treats_zero_vectors_as_documented() {
+        let zero = row(&[0.0, 0.0]);
+        let unit = row(&[1.0, 0.0]);
+        assert_eq!(cosine_similarity_flat(&zero, &zero), 1.0);
+        assert_eq!(cosine_similarity_flat(&zero, &unit), 0.0);
+        assert!((cosine_similarity_flat(&unit, &row(&[2.0, 0.0])) - 1.0).abs() < 1e-6);
+        assert!(cosine_similarity_flat(&unit, &row(&[0.0, 1.0])).abs() < 1e-6);
+    }
+
+    /// A checkpoint passes on either tolerance, and never on a shape mismatch.
+    #[test]
+    fn a_report_passes_on_either_tolerance_and_not_across_shapes() {
+        let reference = row(&[10.0, 20.0]);
+        let off_by_one = row(&[10.0, 21.0]);
+        let report = |tol| ParityReport::compute("x", &off_by_one, &reference, tol);
+
+        assert!(report(Tolerance::new(1.5, 0.0)).passed(), "absolute only");
+        assert!(report(Tolerance::new(0.0, 0.1)).passed(), "relative only");
+        assert!(!report(Tolerance::new(0.5, 0.01)).passed(), "neither");
+
+        let reshaped = off_by_one.reshape(&[2, 1]);
+        let mismatch = ParityReport::compute("x", &reshaped, &reference, Tolerance::new(9.0, 9.0));
+        assert!(!mismatch.passed());
+        assert_eq!(mismatch.status_str(), "FAIL");
+    }
+
+    /// The per-position breakdown localises a difference to its position on
+    /// axis 1.
+    #[test]
+    fn the_per_position_breakdown_finds_the_position() {
+        let a = Array::from_f32_slice(&[0.0; 6], &[1, 3, 2]);
+        let b = Array::from_f32_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.5], &[1, 3, 2]);
+        assert_eq!(per_position_max_abs_diff(&a, &b), vec![0.0, 0.0, 0.5]);
+        let cos = per_position_cosine_similarity(&a, &b);
+        assert_eq!(cos.len(), 3);
+        assert_eq!(cos[0], 1.0, "two zero rows are identical");
+        assert_eq!(cos[2], 0.0, "a zero row and a non-zero row are orthogonal");
+    }
+
+    #[test]
+    fn argmax_reads_the_last_axis() {
+        let x = Array::from_f32_slice(&[0.1, 0.9, 0.0, 3.0, 2.0, 1.0], &[2, 3]);
+        assert_eq!(argmax_last_axis(&x), vec![1, 0]);
     }
 }

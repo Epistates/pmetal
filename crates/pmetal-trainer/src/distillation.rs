@@ -244,14 +244,12 @@ impl DistillationTrainer {
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
 
         let (loss, grads) = if self.loop_state.metal_fa_available {
-            let result = with_training_mode(|| {
+            with_training_mode(|| {
                 loss_and_grad_fn(
                     student,
                     (&batch.input_ids, &batch.labels, teacher_logits, &weights),
                 )
-                .map_err(pmetal_mlx::error::MlxError::from)
-            });
-            result.map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+            })?
         } else {
             loss_and_grad_fn(
                 student,

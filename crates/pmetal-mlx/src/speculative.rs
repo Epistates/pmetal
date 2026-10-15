@@ -142,3 +142,71 @@ impl SpecCapture {
         self.embedding = None;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hidden(values: &[f32]) -> Array {
+        Array::from_f32_slice(values, &[1, 2, values.len() as i32 / 2])
+    }
+
+    fn read(a: &Array) -> Vec<f32> {
+        let mut a = a.clone();
+        a.eval();
+        a.to_f32_vec(a.size()).unwrap()
+    }
+
+    /// The tap list is sorted and de-duplicated, and a layer is wanted
+    /// exactly when it is on it.
+    #[test]
+    fn the_requested_layers_are_sorted_and_unique() {
+        let capture = SpecCapture::with_layers(vec![9, 2, 9, 5, 2]);
+        assert_eq!(capture.requested_hidden_layers, vec![2, 5, 9]);
+        for layer in 0..12 {
+            assert_eq!(
+                capture.wants_hidden_for(layer),
+                [2, 5, 9].contains(&layer),
+                "layer {layer}"
+            );
+        }
+        assert!(!capture.wants_embedding());
+        assert!(SpecCapture::with_layers_and_embedding(vec![], true).wants_embedding());
+        assert!(!SpecCapture::default().wants_hidden_for(0));
+    }
+
+    /// `stack_hidden` concatenates the taps along the hidden axis in the order
+    /// of the requested layers, whatever order they were recorded in.
+    #[test]
+    fn the_taps_stack_along_the_hidden_axis_in_layer_order() {
+        let mut capture = SpecCapture::with_layers(vec![7, 3]);
+        capture.record_hidden(7, hidden(&[5.0, 6.0, 7.0, 8.0]));
+        capture.record_hidden(3, hidden(&[1.0, 2.0, 3.0, 4.0]));
+        let stacked = capture.stack_hidden().unwrap();
+        assert_eq!(stacked.shape(), &[1, 2, 4]);
+        assert_eq!(read(&stacked), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn stacking_names_what_is_missing() {
+        let none = SpecCapture::default().stack_hidden().unwrap_err();
+        assert!(none.to_string().contains("no hidden layers"), "{none}");
+
+        let mut capture = SpecCapture::with_layers(vec![1, 4]);
+        capture.record_hidden(1, hidden(&[0.0, 0.0]));
+        let missing = capture.stack_hidden().unwrap_err();
+        assert!(missing.to_string().contains("layer 4"), "{missing}");
+    }
+
+    /// `clear` empties the recordings and keeps the request, so a buffer is
+    /// reused across verify steps.
+    #[test]
+    fn clearing_keeps_the_request() {
+        let mut capture = SpecCapture::with_layers(vec![2]);
+        capture.record_hidden(2, hidden(&[1.0, 2.0]));
+        capture.record_embedding(hidden(&[3.0, 4.0]));
+        capture.clear();
+        assert!(capture.hidden_states.is_empty() && capture.embedding.is_none());
+        assert_eq!(capture.requested_hidden_layers, vec![2]);
+    }
+}
